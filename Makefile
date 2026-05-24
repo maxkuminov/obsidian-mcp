@@ -103,6 +103,8 @@ deploy: image
 	@echo "$(GREEN)Deploying Obsidian MCP...$(NC)"
 	@$(MAKE) db-backup 2>/dev/null || true
 	$(COMPOSE) up -d --force-recreate
+	@docker image prune -f
+	@docker builder prune -f --filter until=168h
 	@HOST=$$(grep -E '^MCP_HOSTNAME=' $(ENV_FILE) 2>/dev/null | cut -d= -f2); \
 	echo "$(GREEN)Deployed! https://$${HOST:-localhost}$(NC)"
 
