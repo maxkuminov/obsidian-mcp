@@ -102,7 +102,10 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Honor X-Forwarded-Proto/For from upstream reverse proxy so that scheme-aware
 # redirects (e.g. trailing-slash on /mcp) keep the https:// scheme.
-app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+app.add_middleware(
+    ProxyHeadersMiddleware,
+    trusted_hosts=["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+)
 
 # GZip compression for responses >= 1000 bytes
 app.add_middleware(GZipMiddleware, minimum_size=1000)

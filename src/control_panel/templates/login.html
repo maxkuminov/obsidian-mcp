@@ -13,6 +13,7 @@
 
     <form method="post" action="/admin/auth/login">
         <input type="hidden" name="next" value="{{ next or '/admin/' }}">
+        {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
 
         <div class="field">
             <label class="field-label" for="username">Username</label>

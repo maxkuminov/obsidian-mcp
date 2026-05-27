@@ -27,6 +27,7 @@
             </div>
             <div class="card-body">
                 <form method="POST" action="/admin/users/{{ target.id }}/edit">
+                    {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                     <div class="field">
                         <label class="field-label">Vault Path</label>
                         <select name="vault_path" class="field-select" id="vault-select">
@@ -85,6 +86,7 @@
             </div>
             <div class="card-body">
                 <form method="POST" action="/admin/users/{{ target.id }}/reset-password">
+                    {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                     <div class="field">
                         <label class="field-label">New password</label>
                         <input type="password" name="new_password" required minlength="8"
@@ -116,6 +118,7 @@
                     </div>
                 </div>
                 <form method="POST" action="/admin/users/{{ target.id }}/delete">
+                    {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                     <button type="submit" class="btn btn-danger"
                             onclick="return confirm('Deactivate {{ target.username }}? They will no longer be able to log in.')">
                         Deactivate
@@ -132,6 +135,7 @@
                     </div>
                 </div>
                 <form method="POST" action="/admin/users/{{ target.id }}/delete?permanent=true">
+                    {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                     <button type="submit" class="btn btn-danger"
                             onclick="return confirm('PERMANENTLY DELETE {{ target.username }} and all their data? This cannot be undone.')">
                         Permanently delete

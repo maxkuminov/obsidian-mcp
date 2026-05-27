@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.session import _SingleUserSentinel, get_current_user
 from src.config import settings
+from src.csrf import generate_csrf_token, verify_csrf
 from src.database import get_session
 from src.mcp_server.auth import hash_key
 from src.models.db import (
@@ -126,9 +127,11 @@ async def require_admin_panel(
 # zone; FastAPI runs both dependencies but the redirect from the user one
 # fires first if there's no session.
 router.dependencies.append(Depends(require_user_panel))
+router.dependencies.append(Depends(verify_csrf))
 
 
 def _panel_context(
+    request: Request,
     user: User | _SingleUserSentinel,
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -143,6 +146,7 @@ def _panel_context(
         "is_admin": bool(user.is_admin),
         "username": user.username,
         "multi_user_mode": bool(settings.multi_user_mode),
+        "csrf_token": generate_csrf_token(request),
     }
     if extra:
         ctx.update(extra)
@@ -334,7 +338,7 @@ async def dashboard(
     graph = await _graph_stats(session, uid)
     from src.services.indexer import link_backfill_in_progress
 
-    return templates.TemplateResponse(request, "dashboard.html", _panel_context(user, {
+    return templates.TemplateResponse(request, "dashboard.html", _panel_context(request, user, {
         "active": "dashboard",
         "stats": {
             "notes_indexed": notes_count,
@@ -379,14 +383,18 @@ async def keys_page(
             "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
             "user_id": k.user_id,
         })
-    new_key = request.query_params.get("new_key")
-    return templates.TemplateResponse(request, "keys.html", _panel_context(user, {
+    try:
+        new_key = request.session.pop("flash_new_key", None)
+    except (AssertionError, AttributeError):
+        new_key = None
+    return templates.TemplateResponse(request, "keys.html", _panel_context(request, user, {
         "active": "keys", "keys": keys, "new_key": new_key,
     }))
 
 
 @router.post("/keys/create")
 async def create_key_form(
+    request: Request,
     name: str = Form(...),
     permission: str = Form("read"),
     session: AsyncSession = Depends(get_session),
@@ -405,7 +413,11 @@ async def create_key_form(
     )
     session.add(api_key)
     await session.commit()
-    return RedirectResponse(f"/admin/keys?new_key={raw_key}", status_code=303)
+    try:
+        request.session["flash_new_key"] = raw_key
+    except (AssertionError, AttributeError):
+        pass
+    return RedirectResponse("/admin/keys", status_code=303)
 
 
 @router.post("/keys/delete-revoked")
@@ -521,7 +533,7 @@ async def oauth_page(
             "created_at": c.created_at.isoformat(),
             "tokens": tokens,
         })
-    return templates.TemplateResponse(request, "oauth.html", _panel_context(user, {
+    return templates.TemplateResponse(request, "oauth.html", _panel_context(request, user, {
         "active": "oauth", "clients": clients,
     }))
 
@@ -686,7 +698,7 @@ async def usage_page(
         "values": [r.cnt for r in chart_rows],
     }
 
-    return templates.TemplateResponse(request, "usage.html", _panel_context(user, {
+    return templates.TemplateResponse(request, "usage.html", _panel_context(request, user, {
         "active": "usage", "logs": logs, "chart_data": chart_data,
     }))
 
@@ -719,7 +731,7 @@ async def vault_page(
     try:
         vault = _vault_root(user.id)
     except RuntimeError as e:
-        return templates.TemplateResponse(request, "vault.html", _panel_context(user, {
+        return templates.TemplateResponse(request, "vault.html", _panel_context(request, user, {
             "active": "vault",
             "current_folder": "",
             "breadcrumbs": [],
@@ -732,6 +744,13 @@ async def vault_page(
             "vault_error": str(e),
         }))
 
+    if folder:
+        try:
+            resolved = (vault / folder).resolve()
+            if not resolved.is_relative_to(vault.resolve()):
+                folder = ""
+        except (ValueError, OSError):
+            folder = ""
     base = vault / folder if folder else vault
 
     # Breadcrumbs
@@ -771,7 +790,7 @@ async def vault_page(
         except Exception:
             note_content = "Error reading note"
 
-    return templates.TemplateResponse(request, "vault.html", _panel_context(user, {
+    return templates.TemplateResponse(request, "vault.html", _panel_context(request, user, {
         "active": "vault",
         "current_folder": folder,
         "breadcrumbs": breadcrumbs,
@@ -785,17 +804,11 @@ async def vault_page(
 
 
 def _mask_openai_key(key: str | None) -> str:
-    """Return a display-safe prefix/suffix of an OpenAI key.
-
-    Format: `key[:8] + "..." + key[-4:]`. Returns "(not set)" if missing.
-    Short keys (less than 13 chars) collapse to a fully redacted form so the
-    full key is never recoverable from the rendered HTML.
-    """
     if not key:
         return "(not set)"
-    if len(key) < 13:
+    if len(key) < 8:
         return "***"
-    return f"{key[:8]}...{key[-4:]}"
+    return f"***...{key[-4:]}"
 
 
 # --- Settings (admin only) ------------------------------------------------
@@ -845,7 +858,7 @@ async def settings_page(
     except Exception:
         pass
 
-    return templates.TemplateResponse(request, "settings.html", _panel_context(user, {
+    return templates.TemplateResponse(request, "settings.html", _panel_context(request, user, {
         "active": "settings",
         "stats": {
             "notes_indexed": notes_count,
@@ -889,7 +902,7 @@ async def reembed_confirm_page(
 ):
     """Generate a one-time signed token and render a confirmation page."""
     token = _reembed_serializer().dumps(secrets.token_hex(16))
-    return templates.TemplateResponse(request, "reembed_confirm.html", _panel_context(user, {
+    return templates.TemplateResponse(request, "reembed_confirm.html", _panel_context(request, user, {
         "active": "settings",
         "token": token,
     }))

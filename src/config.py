@@ -75,9 +75,10 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_multi_user_secret(self) -> "Settings":
-        if self.multi_user_mode and self.secret_key == "changeme":
+        if self.secret_key == "changeme":
             raise ValueError(
-                "SECRET_KEY must be set to a strong random value when MULTI_USER_MODE=true"
+                "SECRET_KEY must not be 'changeme'. Generate a strong key with: "
+                "python -c \"import secrets; print(secrets.token_hex(32))\""
             )
         return self
 

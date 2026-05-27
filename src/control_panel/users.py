@@ -38,6 +38,7 @@ from src.auth.passwords import hash_password
 from src.auth.session import _SingleUserSentinel
 from src.config import settings
 from src.control_panel.routes import _panel_context, require_admin_panel
+from src.csrf import verify_csrf
 from src.database import get_session
 from src.models.db import APIKey, NoteMetadata, User
 from src.services.vault import clear_user_vault_cache
@@ -51,6 +52,7 @@ templates = Jinja2Templates(
 
 # Attach `require_admin_panel` to every route. Non-admin sessions get 403.
 router.dependencies.append(Depends(require_admin_panel))
+router.dependencies.append(Depends(verify_csrf))
 
 
 # --- Helpers --------------------------------------------------------------
@@ -177,7 +179,7 @@ async def list_users(
     flash_kind = request.query_params.get("flash_kind", "ok")
     error = request.query_params.get("error")
 
-    return templates.TemplateResponse(request, "users.html", _panel_context(user, {
+    return templates.TemplateResponse(request, "users.html", _panel_context(request, user, {
         "active": "users",
         "users": users,
         "flash": flash,
@@ -255,7 +257,7 @@ async def edit_user_form(
 
     error = request.query_params.get("error")
     flash = request.query_params.get("flash")
-    return templates.TemplateResponse(request, "user_edit.html", _panel_context(user, {
+    return templates.TemplateResponse(request, "user_edit.html", _panel_context(request, user, {
         "active": "users",
         "target": {
             "id": target.id,

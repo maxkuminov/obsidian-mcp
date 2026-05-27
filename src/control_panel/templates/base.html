@@ -884,6 +884,7 @@
                 {% if is_admin %}<span class="user-badge-role">Admin</span>{% endif %}
             </span>
             <form method="POST" action="/admin/auth/logout" style="margin:0;">
+                {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                 <button type="submit" class="logout-btn" title="Sign out">Logout</button>
             </form>
         </div>

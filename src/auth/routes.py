@@ -24,11 +24,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.passwords import hash_password, verify_password
 from src.config import settings
+from src.csrf import generate_csrf_token, verify_csrf
 from src.database import get_session
+from src.limiter import limiter
 from src.models.db import APIKey, NoteMetadata, OAuthClient, OAuthCode, OAuthToken, UsageLog, User
 from src.services.vault import warm_user_vault_cache
 
-router = APIRouter(tags=["auth"])
+router = APIRouter(tags=["auth"], dependencies=[Depends(verify_csrf)])
 
 # Templates resolved from the panel directory so all auth templates can
 # extend `auth_base.html` co-located with the existing panel templates.
@@ -77,7 +79,7 @@ def _render_login(
     return templates.TemplateResponse(
         request,
         "login.html",
-        {"error": error, "next": next_url, "username": username},
+        {"error": error, "next": next_url, "username": username, "csrf_token": generate_csrf_token(request)},
         status_code=status_code,
     )
 
@@ -98,6 +100,7 @@ def _render_register(
             "error": error,
             "username": username if username is not None else default_username,
             "vault_path": vault_path if vault_path is not None else settings.vault_path,
+            "csrf_token": generate_csrf_token(request),
         },
         status_code=status_code,
     )
@@ -114,6 +117,7 @@ async def login_form(request: Request, next: str = "/admin/"):
     return _render_login(request, next_url=_safe_next(next))
 
 
+@limiter.limit("5/minute")
 @router.post("/admin/auth/login")
 async def login_submit(
     request: Request,
@@ -152,6 +156,7 @@ async def login_submit(
     # (warm_user_vault_cache filters them out).
     await warm_user_vault_cache(session, user.id)
 
+    request.session.clear()
     request.session["user_id"] = user.id
     request.session["is_admin"] = bool(user.is_admin)
     request.session["username"] = user.username
@@ -284,6 +289,7 @@ async def register_submit(
     # in phase 4 will load the dashboard for `uid`.
     await warm_user_vault_cache(session, uid)
 
+    request.session.clear()
     request.session["user_id"] = uid
     request.session["is_admin"] = True
     request.session["username"] = normalized

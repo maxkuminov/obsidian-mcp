@@ -90,6 +90,7 @@
     <div class="modal-panel">
         <div class="modal-title">Create User</div>
         <form method="POST" action="/admin/users/create">
+            {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
             <div class="field">
                 <label class="field-label">Username</label>
                 <input type="text" name="username" required class="field-input"

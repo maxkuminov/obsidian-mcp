@@ -355,7 +355,7 @@ async def _handle_auth_code(form):
             select(OAuthClient).where(OAuthClient.client_id == client_id)
         )
         client = result.scalar_one_or_none()
-        if not client or client.client_secret_hash != _hash(client_secret):
+        if not client or not secrets.compare_digest(client.client_secret_hash, _hash(client_secret)):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
         # Verify code
@@ -434,7 +434,7 @@ async def _handle_refresh(form):
                 select(OAuthClient).where(OAuthClient.client_id == client_id)
             )
             client = result.scalar_one_or_none()
-            if not client or client.client_secret_hash != _hash(client_secret):
+            if not client or not secrets.compare_digest(client.client_secret_hash, _hash(client_secret)):
                 return JSONResponse({"error": "invalid_client"}, status_code=401)
 
             # Verify refresh token

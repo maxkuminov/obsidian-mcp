@@ -8,6 +8,7 @@
         {% set revoked_count = keys | selectattr('is_active', 'equalto', false) | list | length %}
         {% if revoked_count > 0 %}
         <form method="POST" action="/admin/keys/delete-revoked" style="display:inline;">
+            {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
             <button type="submit" class="btn btn-danger" onclick="return confirm('Permanently delete all {{ revoked_count }} revoked key{{ 's' if revoked_count != 1 }}?')">
                 Delete Revoked ({{ revoked_count }})
             </button>
@@ -76,10 +77,12 @@
                     <td style="white-space:nowrap;">
                         {% if key.is_active %}
                         <form method="POST" action="/admin/keys/{{ key.id }}/revoke" style="display:inline;">
+                            {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                             <button type="submit" class="btn btn-link" onclick="return confirm('Revoke this key?')">Revoke</button>
                         </form>
                         {% else %}
                         <form method="POST" action="/admin/keys/{{ key.id }}/delete" style="display:inline;">
+                            {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                             <button type="submit" class="btn btn-link" onclick="return confirm('Permanently delete this key?')">Delete</button>
                         </form>
                         {% endif %}
@@ -103,6 +106,7 @@
     <div class="modal-panel">
         <div class="modal-title">Create API Key</div>
         <form method="POST" action="/admin/keys/create">
+            {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
             <div class="field">
                 <label class="field-label">Name</label>
                 <input type="text" name="name" required class="field-input" placeholder="e.g. Claude Desktop">

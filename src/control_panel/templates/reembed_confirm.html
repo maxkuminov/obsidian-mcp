@@ -24,6 +24,7 @@
             <div style="display:flex;gap:10px;">
                 <form method="POST" action="/admin/settings/reembed">
                     <input type="hidden" name="token" value="{{ token }}">
+                    {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                     <button type="submit" class="btn btn-danger" style="font-size:13px;padding:9px 18px;">
                         Yes, Re-embed All
                     </button>
