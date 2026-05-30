@@ -241,6 +241,7 @@
                     </div>
                 </label>
 
+                {% if client_can_write %}
                 <label class="scope-option">
                     <input type="radio" name="scope" value="readwrite">
                     <div>
@@ -248,6 +249,7 @@
                         <div class="scope-option-desc">Full access: search, read, create, and edit notes.</div>
                     </div>
                 </label>
+                {% endif %}
 
                 <div class="actions">
                     <button type="submit" name="action" value="approve" class="btn-approve">Approve</button>

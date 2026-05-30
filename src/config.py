@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import model_validator
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings
 
 
@@ -9,13 +9,13 @@ class Settings(BaseSettings):
     ollama_url: str = "http://ollama:11434"
     vault_path: str = "/obsidian"
     secret_key: str = "changeme"
-    index_interval_seconds: int = 300
+    index_interval_seconds: int = Field(300, ge=1)
     embedding_model: str = "bge-m3"
-    embedding_dimensions: int = 1024
-    chunk_size: int = 512  # bge-m3 design point
+    embedding_dimensions: int = Field(1024, ge=1, le=16000)
+    chunk_size: int = Field(512, ge=1)  # bge-m3 design point
     # Overlap disabled: 2025 chunking benchmarks show no measurable retrieval
     # benefit; some research finds zero overlap optimal.
-    chunk_overlap: int = 0
+    chunk_overlap: int = Field(0, ge=0)
     # Path globs (fnmatch) skipped by the embedder — files remain
     # keyword-searchable but produce no vectors. Default skips Excalidraw
     # plugin files (drawings + downloaded scripts) which contain serialized
@@ -73,12 +73,18 @@ class Settings(BaseSettings):
             )
         return self
 
+    # Known weak placeholders shipped in .env.example / defaults. Matched
+    # case-insensitively so e.g. CHANGE_ME and changeme are both rejected.
+    _SECRET_KEY_PLACEHOLDERS = frozenset(
+        {"changeme", "change_me", "change-me", ""}
+    )
+
     @model_validator(mode="after")
     def _validate_multi_user_secret(self) -> "Settings":
-        if self.secret_key == "changeme":
+        if self.secret_key.strip().lower() in self._SECRET_KEY_PLACEHOLDERS:
             raise ValueError(
-                "SECRET_KEY must not be 'changeme'. Generate a strong key with: "
-                "python -c \"import secrets; print(secrets.token_hex(32))\""
+                "SECRET_KEY must not be a placeholder value. Generate a strong "
+                'key with: python -c "import secrets; print(secrets.token_hex(32))"'
             )
         return self
 

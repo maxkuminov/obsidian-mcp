@@ -26,10 +26,10 @@ def validate_csrf_token(request: Request, token: str | None) -> bool:
     try:
         session = request.session
     except (AssertionError, AttributeError):
-        return True
+        return False
     nonce = session.get("csrf_nonce")
     if nonce is None:
-        return True
+        return False
     if not token:
         return False
     try:
@@ -42,7 +42,12 @@ def validate_csrf_token(request: Request, token: str | None) -> bool:
 async def verify_csrf(request: Request):
     if request.method in ("GET", "HEAD", "OPTIONS"):
         return
-    form = await request.form()
-    token = form.get("csrf_token")
+    token = request.headers.get("x-csrf-token")
+    if token is None:
+        try:
+            form = await request.form()
+        except Exception:
+            form = {}
+        token = form.get("csrf_token")
     if not validate_csrf_token(request, token):
         raise HTTPException(status_code=403, detail="CSRF validation failed")

@@ -41,6 +41,9 @@ def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[st
     """
     char_size = chunk_size * 4
     char_overlap = overlap * 4
+    # Guard against overlap >= chunk_size, which would make the window
+    # never advance (start <= previous start) and loop forever.
+    step = max(char_size - char_overlap, 1)
 
     if len(content) <= char_size:
         return [content] if content.strip() else []
@@ -54,7 +57,7 @@ def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[st
             chunks.append(chunk.strip())
         if end >= len(content):
             break
-        start = end - char_overlap
+        start += step
 
     return chunks
 
@@ -187,15 +190,18 @@ async def embed_note(session: AsyncSession, note: NoteMetadata, content: str):
     if not chunks:
         return 0
 
-    await session.execute(
-        delete(NoteEmbedding).where(NoteEmbedding.note_id == note.id)
-    )
-
     try:
         embeddings = await get_embeddings_batch(chunks)
     except Exception as e:
         logger.warning(f"Failed to embed {note.file_path}: {e}")
         return 0
+
+    # Only delete the old embeddings once new ones are in hand. If the provider
+    # call above had failed, deleting first would let embed_vault commit the
+    # DELETE and drop good vectors (issue #11).
+    await session.execute(
+        delete(NoteEmbedding).where(NoteEmbedding.note_id == note.id)
+    )
 
     for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
         session.add(NoteEmbedding(
