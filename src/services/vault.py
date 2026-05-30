@@ -336,6 +336,13 @@ def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None,
         body_end = len(text)
 
     inserted = new_body
+    # If the retained prefix lacks a trailing newline (an end-of-file heading
+    # with no trailing newline, where the heading match consumed to EOF),
+    # the new body would glue directly onto the heading text. Prepend one
+    # newline to separate them. No-op when the prefix already ends in "\n".
+    prefix = text[:body_start]
+    if prefix and not prefix.endswith("\n"):
+        inserted = "\n" + inserted
     if next_heading_line_start is not None and not inserted.endswith("\n"):
         inserted = inserted + "\n"
 
@@ -353,6 +360,9 @@ def extract_tags(raw: str, frontmatter: dict) -> list[str]:
     elif isinstance(fm_tags, str):
         tags.update(t.strip() for t in fm_tags.split(","))
     # Inline #tags (not inside code blocks)
-    for match in re.finditer(r"(?:^|\s)#([a-zA-Z][a-zA-Z0-9_/-]*)", raw):
+    from src.services.links import mask_code
+
+    masked = mask_code(raw)
+    for match in re.finditer(r"(?:^|\s)#([a-zA-Z][a-zA-Z0-9_/-]*)", masked):
         tags.add(match.group(1))
     return sorted(tags)

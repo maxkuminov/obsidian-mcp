@@ -52,6 +52,22 @@ def _validate_scope(scope: str) -> str:
     return " ".join(parts & VALID_SCOPES) or "read"
 
 
+def _clamp_scope(requested: str, registered: str) -> str:
+    """Restrict a requested scope to what the client registered for.
+
+    Both inputs are already validated scope strings. The user can only ever
+    be granted the intersection of what they asked for at consent time and
+    what the client is registered to hold. `readwrite` implies `read`, so a
+    client registered for `readwrite` may still be granted plain `read`.
+    """
+    requested_parts = set(requested.split())
+    registered_parts = set(registered.split())
+    if "readwrite" in registered_parts:
+        registered_parts.add("read")
+    granted = requested_parts & registered_parts
+    return " ".join(sorted(granted)) or "read"
+
+
 def _state_serializer() -> URLSafeTimedSerializer:
     return URLSafeTimedSerializer(settings.secret_key, salt="oauth-state")
 
@@ -211,9 +227,14 @@ async def authorize_get(
     server_state = secrets.token_urlsafe(16)
     signed_state = _state_serializer().dumps(server_state)
 
+    # The registered scope caps what the user can grant; surface it so the
+    # consent screen only offers access levels the client can actually hold.
+    client_can_write = "readwrite" in client.scope.split()
+
     response = templates.TemplateResponse(request, "authorize.html", {
         "client_name": client.client_name,
         "scope": scope,
+        "client_can_write": client_can_write,
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "code_challenge": code_challenge,
@@ -264,19 +285,11 @@ async def authorize_post(
     except ValueError as exc:
         return JSONResponse({"error": "invalid_scope", "error_description": str(exc)}, status_code=400)
 
-    if action != "approve":
-        # Denied — redirect with error
-        sep = "&" if "?" in redirect_uri else "?"
-        url = f"{redirect_uri}{sep}error=access_denied"
-        if client_state:
-            url += f"&state={client_state}"
-        return RedirectResponse(url, status_code=302)
-
     # Multi-user mode: refuse to mint a code without a session. The GET
     # handler already redirects to login, but defend against a stale POST
     # arriving after the session expired.
     session_user_id: int | None = None
-    if settings.multi_user_mode:
+    if action == "approve" and settings.multi_user_mode:
         try:
             session_user_id = request.session.get("user_id")
         except (AssertionError, AttributeError):
@@ -287,20 +300,46 @@ async def authorize_post(
                 status_code=401,
             )
 
-    code = secrets.token_hex(32)
-
     async with async_session() as session:
+        # Re-validate redirect_uri against the client's registered list. The
+        # GET handler does this, but redirect_uri arrives here as an
+        # attacker-controllable form field, so a confused-deputy / open
+        # redirect is possible unless we re-check before any redirect or code
+        # minting. Load the client once and reuse it for the multi-user
+        # first-authorizer binding below.
+        result = await session.execute(
+            select(OAuthClient).where(OAuthClient.client_id == client_id)
+        )
+        client_row = result.scalar_one_or_none()
+
+        if client_row is None:
+            return JSONResponse({"error": "invalid_client"}, status_code=400)
+
+        if redirect_uri not in client_row.redirect_uris:
+            return JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
+
+        # Clamp the consent-form scope to what the client registered for.
+        # `scope` arrives as an attacker-controllable form field (the radio
+        # buttons are client-side and trivially bypassed), so a client
+        # registered for read-only could otherwise mint a readwrite code.
+        scope = _clamp_scope(scope, client_row.scope)
+
+        if action != "approve":
+            # Denied — redirect with error (redirect_uri now verified)
+            sep = "&" if "?" in redirect_uri else "?"
+            url = f"{redirect_uri}{sep}error=access_denied"
+            if client_state:
+                url += f"&state={client_state}"
+            return RedirectResponse(url, status_code=302)
+
+        code = secrets.token_hex(32)
+
         # Bind the OAuth client to its first-authorizing user. RFC 7591
         # dynamic registration is unauthenticated, so we can't bind at
         # registration time — first /authorize wins. Subsequent authorizes
         # for the same client leave `user_id` alone.
-        if session_user_id is not None:
-            result = await session.execute(
-                select(OAuthClient).where(OAuthClient.client_id == client_id)
-            )
-            client_row = result.scalar_one_or_none()
-            if client_row is not None and client_row.user_id is None:
-                client_row.user_id = session_user_id
+        if session_user_id is not None and client_row.user_id is None:
+            client_row.user_id = session_user_id
 
         oauth_code = OAuthCode(
             code_hash=_hash(code),

@@ -401,6 +401,12 @@ async def create_key_form(
     user=Depends(require_user_panel),
 ):
     raw_key = f"omcp_{secrets.token_hex(24)}"
+    # The keys.html <select> only constrains the UI; a scripted/tampered POST
+    # can submit any value. Mirror the JSON API's invariant (src/api/routes.py)
+    # and fail safe to read-only so the column never holds nonsense like
+    # "admin" or a trailing-space "readwrite " that silently behaves as read.
+    if permission not in ("read", "readwrite"):
+        permission = "read"
     # Always stamp the creator's user_id (even admins get their own keys
     # attributed to themselves — admin's omniscient view doesn't extend to
     # "create keys on behalf of"; that's a separate per-user-edit action).
@@ -962,13 +968,24 @@ async def reset_embeddings(
         await session.execute(
             text("UPDATE notes_metadata SET embedded_content_hash = NULL")
         )
-        await session.execute(
-            text(
-                "CREATE INDEX ix_note_embeddings_embedding_hnsw "
-                "ON note_embeddings USING hnsw (embedding vector_cosine_ops) "
-                "WITH (m = 16, ef_construction = 64)"
+        # pgvector caps HNSW-indexable vectors at 2000 dims; above that, CREATE
+        # INDEX ... USING hnsw hard-errors. Skip the index so the reset still
+        # completes; semantic_search falls back to a sequential scan. See issue #6.
+        hnsw = dim <= 2000
+        if hnsw:
+            await session.execute(
+                text(
+                    "CREATE INDEX ix_note_embeddings_embedding_hnsw "
+                    "ON note_embeddings USING hnsw (embedding vector_cosine_ops) "
+                    "WITH (m = 16, ef_construction = 64)"
+                )
             )
-        )
+        else:
+            logger.warning(
+                "Skipping HNSW index: embedding_dimensions=%d exceeds pgvector's "
+                "2000-dim HNSW limit; semantic_search will use a sequential scan.",
+                dim,
+            )
         await session.commit()
     finally:
         indexer_paused = False
@@ -976,7 +993,7 @@ async def reset_embeddings(
     _spawn(_reindex_background())
 
     if "application/json" in request.headers.get("accept", ""):
-        return JSONResponse({"status": "reset", "dimensions": dim})
+        return JSONResponse({"status": "reset", "dimensions": dim, "hnsw": hnsw})
     return RedirectResponse("/admin/settings", status_code=303)
 
 
@@ -1007,17 +1024,25 @@ async def _reindex_background():
     # Panel-triggered on-demand reindex. Mirrors `run_indexer_loop` so the
     # multi-user-mode case fans out to every active user; in single-user
     # mode it stays a single legacy pass with user_id=None.
-    from src.services.indexer import index_vault, embed_vault, _active_user_ids
-    if settings.multi_user_mode:
-        for uid in await _active_user_ids():
-            try:
-                await index_vault(user_id=uid)
-            except Exception as e:
-                logger.error(f"On-demand index failed (user_id={uid}): {e}")
-            try:
-                await embed_vault(user_id=uid)
-            except Exception as e:
-                logger.error(f"On-demand embedding failed (user_id={uid}): {e}")
-    else:
-        await index_vault()
-        await embed_vault()
+    #
+    # Acquire `index_pass_lock` for the whole pass: without it this task can
+    # run index_vault/embed_vault concurrently with the periodic loop over the
+    # same scope, racing on move-detection, deleted-path removal, and per-note
+    # embedding delete+insert.
+    from src.services.indexer import (
+        index_vault, embed_vault, _active_user_ids, index_pass_lock,
+    )
+    async with index_pass_lock:
+        if settings.multi_user_mode:
+            for uid in await _active_user_ids():
+                try:
+                    await index_vault(user_id=uid)
+                except Exception as e:
+                    logger.error(f"On-demand index failed (user_id={uid}): {e}")
+                try:
+                    await embed_vault(user_id=uid)
+                except Exception as e:
+                    logger.error(f"On-demand embedding failed (user_id={uid}): {e}")
+        else:
+            await index_vault()
+            await embed_vault()

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.session import _SingleUserSentinel
 from src.control_panel.routes import require_admin_panel, require_user_panel
+from src.csrf import verify_csrf
 from src.database import get_session
 from src.limiter import limiter
 from src.mcp_server.auth import hash_key
@@ -14,6 +15,7 @@ from src.models.db import APIKey, User, UsageLog
 
 router = APIRouter(prefix="/api", tags=["api"])
 router.dependencies.append(Depends(require_user_panel))
+router.dependencies.append(Depends(verify_csrf))
 
 
 class CreateKeyRequest(BaseModel):
@@ -121,6 +123,7 @@ async def get_usage(
     session: AsyncSession = Depends(get_session),
     user: User | _SingleUserSentinel = Depends(require_user_panel),
 ):
+    limit = max(1, min(limit, 500))
     query = select(UsageLog).order_by(UsageLog.created_at.desc()).limit(limit)
     if key_id:
         query = query.where(UsageLog.key_id == key_id)

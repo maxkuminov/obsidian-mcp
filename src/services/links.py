@@ -33,10 +33,15 @@ _WIKILINK_RE = re.compile(
     r"(?:\|(?P<alias>[^\]\n]*))?\]\]"
 )
 
-# Markdown link: `[text](href.md)` or `[text](href.md#anchor)`. Href must
-# end in `.md` (with optional `#anchor`) — we ignore non-note links here.
+# Markdown link: `[text](href.md)`, `[text](href.md#anchor)`, or the
+# CommonMark angle-bracket form `[text](<href.md>)`. Href must end in `.md`
+# (with optional `#anchor`) — we ignore non-note links here. The href class
+# forbids only newlines (not all whitespace), so raw-space note names like
+# `My Note.md` and `folder/My Note.md` are captured.
 _MDLINK_RE = re.compile(
-    r"\[(?P<text>[^\]\n]+)\]\((?P<href>[^)\s]+?\.md)(?:#[^)]*)?\)"
+    r"\[(?P<text>[^\]\n]+)\]\("
+    r"(?:<(?P<href_ab>[^>\n]+?\.md)(?:#[^>]*)?>"
+    r"|(?P<href>[^)\n]+?\.md)(?:#[^)\n]*)?)\)"
 )
 
 # Fenced code blocks (``` or ~~~) — match the whole fence including newlines.
@@ -77,7 +82,7 @@ def extract_links(content: str) -> list[ExtractedLink]:
         ))
 
     for m in _MDLINK_RE.finditer(masked):
-        href = m.group("href").strip()
+        href = (m.group("href_ab") or m.group("href") or "").strip()
         if not href:
             continue
         # Decode percent-encoded characters (e.g. `%20` → space).

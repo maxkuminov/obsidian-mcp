@@ -86,13 +86,15 @@ async def lifespan(app: FastAPI):
     await _check_embedding_dim()
     indexer_task = asyncio.create_task(run_indexer_loop())
     indexer_task.add_done_callback(_on_indexer_done)
-    async with mcp.session_manager.run():
-        yield
-    indexer_task.cancel()
     try:
-        await asyncio.wait_for(asyncio.shield(indexer_task), timeout=10.0)
-    except (asyncio.CancelledError, asyncio.TimeoutError):
-        pass
+        async with mcp.session_manager.run():
+            yield
+    finally:
+        indexer_task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(indexer_task), timeout=10.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
 
 
 app = FastAPI(title="Obsidian MCP", lifespan=lifespan)

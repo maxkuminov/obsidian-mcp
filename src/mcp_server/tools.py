@@ -1,3 +1,4 @@
+import inspect
 import logging
 import os
 import re
@@ -73,17 +74,27 @@ def _truncate_params(params: dict) -> dict:
 def _tracked(tool_name: str, param_keys: list[str]):
     """Decorator that times the call and logs it to usage_logs."""
     def decorator(fn):
+        sig = inspect.signature(fn)
+
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             start = time.monotonic()
             result = await fn(*args, **kwargs)
             duration_ms = int((time.monotonic() - start) * 1000)
             params = {}
-            for i, key in enumerate(param_keys):
-                if i < len(args):
-                    params[key] = args[i]
-                elif key in kwargs:
-                    params[key] = kwargs[key]
+            # Resolve logged params by NAME via the wrapped signature so that
+            # a non-logged positional arg between logged ones can't shift the
+            # mapping (positional zipping silently mislabelled params before).
+            try:
+                bound = sig.bind(*args, **kwargs)
+                bound.apply_defaults()
+                params = {
+                    key: bound.arguments[key]
+                    for key in param_keys
+                    if key in bound.arguments
+                }
+            except TypeError:
+                params = {}
             await _log_usage(tool_name, _truncate_params(params), duration_ms, len(str(result)))
             return result
         return wrapper
@@ -690,6 +701,11 @@ async def edit_note_impl(
         if err is not None:
             return err
     elif find is not None:
+        if find == "":
+            return (
+                "edit_note: find must be a non-empty string. "
+                "An empty find would match every position and corrupt the note."
+            )
         count = existing.count(find)
         if count == 0:
             preview = existing[:500]
@@ -745,7 +761,7 @@ _WIKILINK_REWRITE_RE = re.compile(
     r"(?P<rest>(?:#[^\]\|\n]*)?(?:\|[^\]\n]*)?)\]\]"
 )
 _MDLINK_REWRITE_RE = re.compile(
-    r"\[(?P<text>[^\]\n]+)\]\((?P<href>[^)\s]+?\.md)(?P<anchor>#[^)]*)?\)"
+    r"\[(?P<text>[^\]\n]+)\]\((?P<href>[^)\n]+?\.md)(?P<anchor>#[^)]*)?\)"
 )
 
 

@@ -25,20 +25,37 @@ from src.services.vault import (
 # progress" while the one-shot backfill is running.
 link_backfill_in_progress: bool = False
 
+# Serializes full index/embed passes so the periodic loop and a
+# panel-triggered on-demand reindex can never run index_vault/embed_vault
+# concurrently for the same scope. Two overlapping passes share no DB lock and
+# would race on move-detection, deleted-path removal, and per-note embedding
+# delete+insert (duplicate-key errors, lost/duplicated rows). Both
+# `run_indexer_loop` and `_reindex_background` acquire this before doing work.
+index_pass_lock: asyncio.Lock = asyncio.Lock()
+
+
+def _sanitize_value(v):
+    """Recursively coerce a frontmatter value into a JSON-serializable form.
+
+    Lists and dicts are walked element-by-element; non-string dict keys and
+    any non-serializable scalar (e.g. a YAML date/datetime) are stringified.
+    """
+    if isinstance(v, (str, int, float, bool, type(None))):
+        return v
+    elif isinstance(v, list):
+        return [_sanitize_value(i) for i in v]
+    elif isinstance(v, dict):
+        return {
+            (k if isinstance(k, str) else str(k)): _sanitize_value(val)
+            for k, val in v.items()
+        }
+    else:
+        return str(v)
+
 
 def _sanitize_frontmatter(fm: dict) -> dict:
     """Convert non-JSON-serializable values (dates, etc) to strings."""
-    sanitized = {}
-    for k, v in fm.items():
-        if isinstance(v, (str, int, float, bool, type(None))):
-            sanitized[k] = v
-        elif isinstance(v, list):
-            sanitized[k] = [str(i) if not isinstance(i, (str, int, float, bool, type(None))) else i for i in v]
-        elif isinstance(v, dict):
-            sanitized[k] = _sanitize_frontmatter(v)
-        else:
-            sanitized[k] = str(v)
-    return sanitized
+    return _sanitize_value(fm)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +96,11 @@ async def index_vault(user_id: int | None = None):
 
         # Determine changes
         to_upsert = []
+        # Body text parsed during this scan, keyed by rel_path. The tsvector
+        # loop below reuses these instead of re-reading from disk — a concurrent
+        # delete between the two passes would otherwise raise FileNotFoundError
+        # and leave the just-committed row's content_tsvector null/stale.
+        path_to_content: dict[str, str] = {}
         for rel_path, full_path in files.items():
             try:
                 raw = full_path.read_text(encoding="utf-8", errors="strict")
@@ -94,6 +116,7 @@ async def index_vault(user_id: int | None = None):
                 continue  # No change
 
             frontmatter, content = parse_frontmatter(raw)
+            path_to_content[rel_path] = content
             title = frontmatter.get("title") or full_path.stem
             tags = extract_tags(raw, frontmatter)
             stat = full_path.stat()
@@ -236,14 +259,13 @@ async def index_vault(user_id: int | None = None):
                       AND user_id = :uid
                 """
             for path in paths:
-                full_path = vault / path
+                # Reuse the body parsed during the scan loop above instead of
+                # re-reading from disk; a concurrent delete between the passes
+                # would otherwise leave content_tsvector null/stale (issue #18).
+                if path not in path_to_content:
+                    continue
+                content = path_to_content[path]
                 try:
-                    try:
-                        raw = full_path.read_text(encoding="utf-8", errors="strict")
-                    except UnicodeDecodeError:
-                        logger.warning(f"Skipping non-UTF8 file: {path}")
-                        continue
-                    _, content = parse_frontmatter(raw)
                     params: dict = {"content": content[:100000], "path": path}
                     if user_id is not None:
                         params["uid"] = user_id
@@ -358,37 +380,45 @@ async def _update_links_for_changed(
     # belongs to the same user — otherwise alice's newly-created `foo.md`
     # would silently get attached as the target of bob's dangling
     # `[[foo]]` link.
-    if user_id is None:
-        reresolve_sql = """
-            UPDATE note_links
-            SET target_note_id = :nid
-            WHERE target_note_id IS NULL
-              AND target_path IN (:full, :stem, :no_ext)
-        """
-    else:
-        reresolve_sql = """
-            UPDATE note_links
-            SET target_note_id = :nid
-            WHERE target_note_id IS NULL
-              AND target_path IN (:full, :stem, :no_ext)
-              AND source_note_id IN (
-                  SELECT id FROM notes_metadata WHERE user_id = :uid
-              )
-        """
+    #
+    # The bare-stem form (`[[Foo]]`) is only safe to match when exactly one
+    # note in the vault carries that stem. With a shared stem the resolver
+    # (`resolve_target`) uses same-folder preference and an alphabetical
+    # tie-break, so a blind `target_path = stem` match here would mis-attach
+    # dangling rows that belong to a *different* note. Ambiguous stems stay
+    # dangling and resolve later when their own source note is reindexed.
+    stems: dict[str, list[tuple[str, int]]] = vault_index["stems"]
     for path in changed_paths:
         nid = paths_to_id.get(path)
         if nid is None:
             continue
         stem = os.path.splitext(os.path.basename(path))[0]
         path_no_ext = path[:-3] if path.endswith(".md") else path
+        # Always-safe canonical forms keyed to the exact stored path.
         params: dict = {
             "nid": nid,
             "full": path,
-            "stem": stem,
             "no_ext": path_no_ext,
         }
+        # Only fold in the bare stem when it maps to a single note.
+        if len(stems.get(stem, [])) == 1:
+            params["stem"] = stem
+        in_clause = ", ".join(f":{p}" for p in ("full", "no_ext", "stem")
+                              if p in params)
+        where_extra = ""
         if user_id is not None:
             params["uid"] = user_id
+            where_extra = (
+                " AND source_note_id IN ("
+                "SELECT id FROM notes_metadata WHERE user_id = :uid)"
+            )
+        reresolve_sql = (
+            "UPDATE note_links "
+            "SET target_note_id = :nid "
+            "WHERE target_note_id IS NULL "
+            f"AND target_path IN ({in_clause})"
+            f"{where_extra}"
+        )
         await session.execute(text(reresolve_sql), params)
     if changed_paths:
         await session.commit()
@@ -510,6 +540,12 @@ async def embed_vault(user_id: int | None = None):
         total_chunks = 0
         skipped_excluded = 0
         for i, row in enumerate(unembedded):
+            # Re-check the pause flag every iteration so a panel-driven pause
+            # (e.g. reset-embeddings) stops an in-flight embed pass promptly
+            # instead of grinding through the whole backlog first (issue #19).
+            if _is_paused():
+                logger.info(f"Embedding pass paused, stopping early{log_suffix}")
+                break
             try:
                 # Skip files matching exclude patterns. Drop any pre-existing
                 # embeddings (in case the file was indexed before exclusion was
@@ -637,43 +673,46 @@ async def run_indexer_loop():
     parallelism can come later). Single-user mode runs one legacy pass with
     `user_id=None`.
     """
-    if settings.multi_user_mode:
-        # Initial pass per user.
-        user_ids = await _active_user_ids()
-        for uid in user_ids:
-            try:
-                await index_vault(user_id=uid)
-            except Exception as e:
-                logger.error(f"Initial index failed (user_id={uid}): {e}")
-        try:
-            # Link backfill still uses the global "table empty" guard but
-            # runs the per-user pass when triggered. Iterate every user so
-            # each user's notes get their links resolved against their own
-            # vault_index.
+    # Hold `index_pass_lock` for the initial pass too, so a panel-triggered
+    # `_reindex_background` fired during startup is serialized against it.
+    async with index_pass_lock:
+        if settings.multi_user_mode:
+            # Initial pass per user.
+            user_ids = await _active_user_ids()
             for uid in user_ids:
-                await link_backfill_pass(user_id=uid)
-        except Exception as e:
-            logger.error(f"Link backfill failed: {e}")
-        for uid in user_ids:
+                try:
+                    await index_vault(user_id=uid)
+                except Exception as e:
+                    logger.error(f"Initial index failed (user_id={uid}): {e}")
             try:
-                await embed_vault(user_id=uid)
+                # Link backfill still uses the global "table empty" guard but
+                # runs the per-user pass when triggered. Iterate every user so
+                # each user's notes get their links resolved against their own
+                # vault_index.
+                for uid in user_ids:
+                    await link_backfill_pass(user_id=uid)
             except Exception as e:
-                logger.error(f"Initial embedding failed (user_id={uid}): {e}")
-    else:
-        try:
-            await index_vault()
-        except Exception as e:
-            logger.error(f"Initial index failed: {e}")
+                logger.error(f"Link backfill failed: {e}")
+            for uid in user_ids:
+                try:
+                    await embed_vault(user_id=uid)
+                except Exception as e:
+                    logger.error(f"Initial embedding failed (user_id={uid}): {e}")
+        else:
+            try:
+                await index_vault()
+            except Exception as e:
+                logger.error(f"Initial index failed: {e}")
 
-        try:
-            await link_backfill_pass()
-        except Exception as e:
-            logger.error(f"Link backfill failed: {e}")
+            try:
+                await link_backfill_pass()
+            except Exception as e:
+                logger.error(f"Link backfill failed: {e}")
 
-        try:
-            await embed_vault()
-        except Exception as e:
-            logger.error(f"Initial embedding failed: {e}")
+            try:
+                await embed_vault()
+            except Exception as e:
+                logger.error(f"Initial embedding failed: {e}")
 
     consecutive_failures = 0
     logger.info(
@@ -687,14 +726,18 @@ async def run_indexer_loop():
             logger.info("Periodic tick skipped (paused)")
             continue
         try:
-            if settings.multi_user_mode:
-                # Re-fetch the user list every cycle so newly-added or
-                # newly-deactivated users are picked up without a restart.
-                for uid in await _active_user_ids():
-                    await _index_pass_once(uid)
-            else:
-                await index_vault()
-                await embed_vault()
+            # Hold `index_pass_lock` for the whole index/embed pass so a
+            # concurrent panel-triggered `_reindex_background` cannot run a
+            # second index_vault/embed_vault over the same scope.
+            async with index_pass_lock:
+                if settings.multi_user_mode:
+                    # Re-fetch the user list every cycle so newly-added or
+                    # newly-deactivated users are picked up without a restart.
+                    for uid in await _active_user_ids():
+                        await _index_pass_once(uid)
+                else:
+                    await index_vault()
+                    await embed_vault()
             await cleanup_expired_tokens()
             consecutive_failures = 0
         except Exception as e:
