@@ -117,8 +117,8 @@ async def login_form(request: Request, next: str = "/admin/"):
     return _render_login(request, next_url=_safe_next(next))
 
 
-@limiter.limit("5/minute")
 @router.post("/admin/auth/login")
+@limiter.limit("5/minute")
 async def login_submit(
     request: Request,
     username: str = Form(...),

@@ -117,8 +117,8 @@ async def oauth_protected_resource_mcp():
 # --- Dynamic Client Registration ---
 
 
-@limiter.limit("3/minute")
 @router.post("/register")
+@limiter.limit("3/minute")
 async def register_client(request: Request):
     body = await request.json()
     client_name = body.get("client_name", "Unknown Client")
@@ -364,8 +364,8 @@ async def authorize_post(
 # --- Token Endpoint ---
 
 
-@limiter.limit("10/minute")
 @router.post("/token")
+@limiter.limit("10/minute")
 async def token_endpoint(request: Request):
     form = await request.form()
     grant_type = form.get("grant_type")
