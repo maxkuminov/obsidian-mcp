@@ -24,4 +24,8 @@ USER appuser
 
 EXPOSE 8000
 
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# --forwarded-allow-ips: trust X-Forwarded-* only from private ranges (the
+# reverse proxy lives in the Docker network), not from "*" which would let any
+# client spoof its forwarded IP. Narrow to the specific compose subnet CIDR if
+# desired.
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "172.16.0.0/12,10.0.0.0/8"]
