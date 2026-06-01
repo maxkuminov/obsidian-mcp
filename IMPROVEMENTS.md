@@ -334,9 +334,11 @@ Small items that don't need their own roadmap section but are worth doing:
 - **`reembed_confirm` idempotency.** If two reembed clicks land within
   60 s, two background tasks run. Add a module-level `asyncio.Lock` or a
   DB sentinel.
-- **Pin requirements via lockfile in container.** `requirements-lock.txt`
-  exists in repo; verify the Dockerfile installs from it (and not from the
-  loose `requirements.txt`).
+- **Pin requirements via lockfile in container.** For reproducible builds,
+  generate a real lockfile from inside the container venv
+  (`docker run --rm <image> pip freeze > requirements-lock.txt`) and have the
+  Dockerfile install from it instead of the loose `requirements.txt`. (A prior
+  `requirements-lock.txt` was a stray host `pip freeze` and has been removed.)
 
 **Effort.** ½ day across the lot.
 
