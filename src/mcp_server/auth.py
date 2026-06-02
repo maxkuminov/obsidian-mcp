@@ -27,6 +27,17 @@ def hash_key(key: str) -> str:
     return hashlib.sha256(key.encode()).hexdigest()
 
 
+def _redacted_prefix(token: str) -> str:
+    """Stable, non-reversible tag for an auth-failure log line.
+
+    A SHA-256 prefix keeps failures correlatable (same token -> same tag)
+    without writing raw credential material to logs, unlike the previous
+    `token[:8]` which leaked the first 8 chars of an attacker-supplied
+    (or, worst case, valid) token.
+    """
+    return "sha:" + hashlib.sha256(token.encode()).hexdigest()[:8]
+
+
 class APIKeyMiddleware:
     """ASGI middleware that authenticates requests via Bearer token against api_keys table."""
 
@@ -73,7 +84,7 @@ class APIKeyMiddleware:
                     api_key = result.scalar_one_or_none()
 
                     if api_key is None:
-                        logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": token[:8]})
+                        logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": _redacted_prefix(token)})
                         response = JSONResponse({"error": "Invalid or revoked key"}, status_code=401)
                         await response(scope, receive, send)
                         return
@@ -124,7 +135,7 @@ class APIKeyMiddleware:
                     oauth_token = result.scalar_one_or_none()
 
                     if oauth_token is None:
-                        logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": token[:8]})
+                        logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": _redacted_prefix(token)})
                         response = JSONResponse({"error": "Invalid or revoked token"}, status_code=401)
                         await response(scope, receive, send)
                         return
