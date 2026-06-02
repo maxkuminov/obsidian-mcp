@@ -41,8 +41,8 @@ class KeyInfo(BaseModel):
     last_used_at: str | None
 
 
-@limiter.limit("5/minute")
 @router.post("/keys", response_model=CreateKeyResponse)
+@limiter.limit("5/minute")
 async def create_key(
     request: Request,
     req: CreateKeyRequest,
