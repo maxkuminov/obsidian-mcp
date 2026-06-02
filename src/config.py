@@ -88,5 +88,22 @@ class Settings(BaseSettings):
             )
         return self
 
+    @model_validator(mode="after")
+    def _reject_sandbox_with_public_hostname(self) -> "Settings":
+        """Refuse to boot a publicly-routed deployment with auth disabled.
+
+        MCP_SANDBOX_MODE bypasses all authentication on /mcp (registry-eval
+        only). Combined with a public MCP_HOSTNAME that would expose the
+        vault unauthenticated to the internet, so reject the combination at
+        startup — analogous to the SECRET_KEY placeholder guard above.
+        """
+        if self.mcp_sandbox_mode and (self.mcp_hostname or "").strip():
+            raise ValueError(
+                "MCP_SANDBOX_MODE disables all authentication on /mcp and must "
+                "never run on a publicly-routed deployment. Either unset "
+                "MCP_SANDBOX_MODE or remove MCP_HOSTNAME."
+            )
+        return self
+
 
 settings = Settings()
