@@ -60,6 +60,28 @@ async def _check_embedding_dim() -> None:
         sys.exit(1)
 
 
+async def _warm_embedding_model() -> None:
+    """Pre-load the embedding model so the first semantic_search after startup
+    isn't a cold reload. Combined with OLLAMA_KEEP_ALIVE the model then stays
+    resident. Best-effort: any failure is logged, never fatal. Ollama only —
+    the OpenAI provider has no local warm state.
+    """
+    if settings.embedding_provider != "ollama":
+        return
+    try:
+        from src.services.embeddings import get_provider
+
+        await get_provider().embed_one("warmup")
+        logging.getLogger(__name__).info(
+            "Embedding model warm-up complete (keep_alive=%s)",
+            settings.ollama_keep_alive,
+        )
+    except Exception as e:  # noqa: BLE001 - warm-up must never block startup
+        logging.getLogger(__name__).warning(
+            "Embedding model warm-up failed (non-fatal): %s", e
+        )
+
+
 def _on_indexer_done(task: asyncio.Task) -> None:
     if task.cancelled():
         logging.getLogger(__name__).info("Indexer task cancelled (lifespan shutdown)")
@@ -84,12 +106,16 @@ async def lifespan(app: FastAPI):
             yield
         return
     await _check_embedding_dim()
+    # Fire-and-forget so a ~15s cold load doesn't block the app from serving.
+    # The lifespan frame stays suspended at `yield`, keeping this referenced.
+    warmup_task = asyncio.create_task(_warm_embedding_model())
     indexer_task = asyncio.create_task(run_indexer_loop())
     indexer_task.add_done_callback(_on_indexer_done)
     try:
         async with mcp.session_manager.run():
             yield
     finally:
+        warmup_task.cancel()
         indexer_task.cancel()
         try:
             await asyncio.wait_for(asyncio.shield(indexer_task), timeout=10.0)

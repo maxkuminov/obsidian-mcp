@@ -7,6 +7,12 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://obsidian_mcp:changeme@postgres:5432/obsidian_mcp"
     ollama_url: str = "http://ollama:11434"
+    # How long Ollama keeps the embedding model resident after a call.
+    # "-1" pins it in VRAM indefinitely (sent as the integer Ollama requires),
+    # which avoids the ~15s cold reload when semantic_search runs infrequently
+    # and the model has been evicted. A Go duration like "30m" instead frees
+    # VRAM when idle. Ollama provider only — ignored by the OpenAI provider.
+    ollama_keep_alive: str = "-1"
     vault_path: str = "/obsidian"
     secret_key: str = "changeme"
     index_interval_seconds: int = Field(300, ge=1)

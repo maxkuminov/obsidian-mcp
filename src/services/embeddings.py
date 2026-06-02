@@ -67,15 +67,34 @@ class EmbeddingProvider(Protocol):
     async def embed_batch(self, texts: list[str]) -> list[list[float]]: ...
 
 
+def _coerce_keep_alive(value: str):
+    """Normalize `settings.ollama_keep_alive` for the `/api/embed` payload.
+
+    Ollama's `keep_alive` JSON field wants an *integer* for second-counts and
+    for -1 (pin in VRAM forever); a bare string like "-1" is rejected by its
+    Go duration parser ("missing unit in duration"). So integer-like values
+    are sent as ints, while duration strings ("30m", "1h") pass through.
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
 class OllamaProvider:
     """Default provider — POSTs to a self-hosted Ollama instance, one input
-    per request. Matches pre-change behavior exactly."""
+    per request. Sends `keep_alive` so the model stays resident between
+    (often infrequent) calls instead of paying a cold reload each time."""
 
     async def embed_one(self, text: str) -> list[float]:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 f"{settings.ollama_url}/api/embed",
-                json={"model": settings.embedding_model, "input": text},
+                json={
+                    "model": settings.embedding_model,
+                    "input": text,
+                    "keep_alive": _coerce_keep_alive(settings.ollama_keep_alive),
+                },
             )
             response.raise_for_status()
             data = response.json()
