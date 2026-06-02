@@ -13,6 +13,7 @@
     <div class="page-actions">
         <span id="reindex-status" class="inline-status ok" role="status" aria-live="polite"></span>
         <form id="reindex-form" onsubmit="event.preventDefault(); triggerReindex(this);" style="display:inline;">
+            {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
             <button type="submit" class="btn btn-primary btn-lg" title="Scan the vault for new or changed notes and embed them">
                 <svg class="btn-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                     <path d="M13.5 8 A5.5 5.5 0 1 1 11.5 3.8"/>
@@ -229,9 +230,13 @@ async function triggerReindex(form) {
     status.textContent = '';
 
     try {
+        const csrf = form.querySelector('input[name="csrf_token"]');
         const r = await fetch('/admin/settings/reindex', {
             method: 'POST',
-            headers: { 'Accept': 'application/json' },
+            headers: {
+                'Accept': 'application/json',
+                ...(csrf ? { 'X-CSRF-Token': csrf.value } : {}),
+            },
         });
         if (!r.ok) throw new Error('HTTP ' + r.status);
         status.textContent = '✓ Reindex started — new notes will appear shortly';
