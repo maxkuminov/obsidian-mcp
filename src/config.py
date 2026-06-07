@@ -76,15 +76,24 @@ class Settings(BaseSettings):
         lowercase, drop empties, and dedupe (order-preserving). Reject empty."""
         if isinstance(v, str):
             s = v.strip()
-            parsed = None
             if s.startswith("["):
                 import json
 
                 try:
                     parsed = json.loads(s)
-                except ValueError:
-                    parsed = None
-            v = parsed if isinstance(parsed, list) else s.split(",")
+                except ValueError as e:
+                    # Looks like JSON (leading "[") but isn't — fail loudly
+                    # rather than silently CSV-splitting into junk config names.
+                    raise ValueError(
+                        f"FTS_CONFIGS looks like JSON but failed to parse: {e}. "
+                        'Use a JSON list (["simple","norwegian"]) or a '
+                        "comma-separated string (simple,norwegian)."
+                    ) from e
+                if not isinstance(parsed, list):
+                    raise ValueError("FTS_CONFIGS JSON must be a list of config names")
+                v = parsed
+            else:
+                v = s.split(",")
         if not isinstance(v, (list, tuple)):
             raise ValueError(
                 "FTS_CONFIGS must be a list of PostgreSQL text-search config "

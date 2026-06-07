@@ -243,9 +243,9 @@ async def index_vault(user_id: int | None = None):
         if to_upsert:
             paths = [n["file_path"] for n in to_upsert]
             # In multi-user mode the same `file_path` can exist for multiple
-            # users; the UPDATE must also scope by `user_id IS NOT DISTINCT
-            # FROM :uid` (NULL-safe equality so single-user rows match).
-            # The tsvector expression is built from `settings.fts_configs`
+            # users, so the UPDATE scopes by user: `user_id IS NULL` in
+            # single-user mode, `user_id = :uid` (never NULL) in multi-user
+            # mode. The tsvector expression is built from `settings.fts_configs`
             # (see `src/services/fts.py`) so index-time configs match the
             # query-time configs in `search.py`.
             tsv_frag, tsv_params = index_tsvector_sql("content")
@@ -613,7 +613,7 @@ async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
     `reset-embeddings`.
 
     Scoped to `user_id` when set (multi-user mode); single-user mode passes
-    `None` and rebuilds every note. Reuses the §5.1 helper so the rebuilt
+    `None` and rebuilds every note. Reuses `index_tsvector_sql` so the rebuilt
     tsvector is byte-identical to what the indexer would write for the same
     config(s).
     """

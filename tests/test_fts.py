@@ -63,6 +63,18 @@ def test_fts_configs_rejects_whitespace_only():
         Settings(fts_configs="   ,  ", _env_file=None)
 
 
+def test_fts_configs_rejects_invalid_bracketed_json():
+    # Leading "[" signals JSON intent; malformed JSON must fail loudly rather
+    # than silently CSV-splitting into junk config names.
+    with pytest.raises(ValidationError):
+        Settings(fts_configs="[english, norwegian", _env_file=None)
+
+
+def test_fts_configs_rejects_non_list_json():
+    with pytest.raises(ValidationError):
+        Settings(fts_configs='["english"', _env_file=None)
+
+
 # ── index_tsvector_sql ───────────────────────────────────────────────────
 
 
@@ -228,3 +240,36 @@ async def test_rebuild_tsvectors_updates_every_note(monkeypatch, tmp_path):
         assert "CAST(:fts_cfg_0 AS regconfig)" in text_sql
         assert "CAST(:fts_cfg_1 AS regconfig)" in text_sql
         assert "body" in p["content"]
+
+
+# ── validate_fts_configs (offline: fake session over pg_ts_config) ────────
+
+
+class _ConfigRowsSession:
+    """Minimal async session whose execute() returns a fixed set of
+    `pg_ts_config` rows, mimicking the (cfgname,) tuples the real query yields."""
+
+    def __init__(self, available):
+        self._rows = [(name,) for name in available]
+
+    async def execute(self, *args, **kwargs):
+        return self._rows  # iterating yields (cfgname,) tuples
+
+
+@pytest.mark.asyncio
+async def test_validate_fts_configs_passes_when_all_present(monkeypatch):
+    fts = _set_configs(monkeypatch, ["english", "norwegian"])
+    session = _ConfigRowsSession(["english", "norwegian", "simple"])
+    # Must not raise.
+    await fts.validate_fts_configs(session)
+
+
+@pytest.mark.asyncio
+async def test_validate_fts_configs_raises_on_unknown(monkeypatch):
+    fts = _set_configs(monkeypatch, ["english", "klingon"])
+    session = _ConfigRowsSession(["english", "norwegian", "simple"])
+    with pytest.raises(SystemExit) as exc:
+        await fts.validate_fts_configs(session)
+    msg = str(exc.value)
+    assert "klingon" in msg  # the offending config is named
+    assert "english" not in msg.split("Available:")[0]  # not flagged as missing

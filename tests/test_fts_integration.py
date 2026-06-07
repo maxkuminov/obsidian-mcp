@@ -36,14 +36,30 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 async def conn():
-    """A throwaway async connection, rolled back after each test."""
+    """A throwaway async connection, rolled back after each test.
+
+    Skips (rather than errors) when TEST_DATABASE_URL is set but the database is
+    unreachable, so the behavior matches the module docstring on a host without
+    a running Postgres.
+
+    A fresh engine per test is intentional, not an oversight: pytest-asyncio's
+    default function-scoped event loop means a module-scoped engine's asyncpg
+    pool would be bound to a stale loop and raise "attached to a different
+    loop". The connect cost is negligible next to the queries themselves.
+    """
     from sqlalchemy.ext.asyncio import create_async_engine
 
     engine = create_async_engine(DB_URL)
     try:
-        async with engine.connect() as connection:
+        try:
+            connection = await engine.connect()
+        except Exception as e:  # DB configured but down/misconfigured
+            pytest.skip(f"TEST_DATABASE_URL set but database unreachable: {e}")
+        try:
             yield connection
             await connection.rollback()
+        finally:
+            await connection.close()
     finally:
         await engine.dispose()
 
