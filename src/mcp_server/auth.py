@@ -38,6 +38,24 @@ def _redacted_prefix(token: str) -> str:
     return "sha:" + hashlib.sha256(token.encode()).hexdigest()[:8]
 
 
+def _www_authenticate(error: str | None = None) -> str:
+    """Build a `WWW-Authenticate: Bearer ...` value pointing redirect-averse
+    MCP clients at our RFC 9728 protected-resource metadata.
+
+    Emitted on every 401 from this middleware so a client can (re)discover the
+    auth server whether it sent no token, an invalid one, or an expired one.
+    `error` is an RFC 6750 code (`invalid_token` for a credential that was
+    presented but rejected); omit it when no credential was presented at all.
+    """
+    base_url = settings.base_url.rstrip("/")
+    resource_metadata = f"{base_url}/.well-known/oauth-protected-resource/mcp"
+    parts = []
+    if error:
+        parts.append(f'error="{error}"')
+    parts.append(f'resource_metadata="{resource_metadata}"')
+    return "Bearer " + ", ".join(parts)
+
+
 class APIKeyMiddleware:
     """ASGI middleware that authenticates requests via Bearer token against api_keys table."""
 
@@ -57,14 +75,10 @@ class APIKeyMiddleware:
         auth_header = request.headers.get("authorization", "")
 
         if not auth_header.startswith("Bearer "):
-            base_url = settings.base_url.rstrip("/")
-            resource_metadata = f"{base_url}/.well-known/oauth-protected-resource/mcp"
             response = JSONResponse(
                 {"error": "Missing Bearer token"},
                 status_code=401,
-                headers={
-                    "WWW-Authenticate": f'Bearer resource_metadata="{resource_metadata}"',
-                },
+                headers={"WWW-Authenticate": _www_authenticate()},
             )
             await response(scope, receive, send)
             return
@@ -93,14 +107,22 @@ class APIKeyMiddleware:
 
                     if api_key is None:
                         logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": _redacted_prefix(token)})
-                        response = JSONResponse({"error": "Invalid or revoked key"}, status_code=401)
+                        response = JSONResponse(
+                            {"error": "Invalid or revoked key"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
                         await response(scope, receive, send)
                         return
 
                     # Check expiry
                     if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
                         logger.warning("auth_failure", extra={"reason": "key_expired", "key_id": api_key.id})
-                        response = JSONResponse({"error": "Key expired"}, status_code=401)
+                        response = JSONResponse(
+                            {"error": "Key expired"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
                         await response(scope, receive, send)
                         return
 
@@ -144,13 +166,21 @@ class APIKeyMiddleware:
 
                     if oauth_token is None:
                         logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": _redacted_prefix(token)})
-                        response = JSONResponse({"error": "Invalid or revoked token"}, status_code=401)
+                        response = JSONResponse(
+                            {"error": "Invalid or revoked token"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
                         await response(scope, receive, send)
                         return
 
                     if oauth_token.expires_at < datetime.now(timezone.utc):
                         logger.warning("auth_failure", extra={"reason": "key_expired", "key_id": oauth_token.id})
-                        response = JSONResponse({"error": "Token expired"}, status_code=401)
+                        response = JSONResponse(
+                            {"error": "Token expired"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
                         await response(scope, receive, send)
                         return
 
