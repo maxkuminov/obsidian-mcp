@@ -210,6 +210,22 @@ async def mcp_handler(scope, receive, send):
 app.mount("/mcp", APIKeyMiddleware(mcp_handler))
 
 
+class MCPSlashRewriteMiddleware:
+    """Rewrite /mcp to /mcp/ so Starlette's Mount doesn't 307 redirect.
+
+    Many MCP clients (including claude.ai) don't follow redirects on POST,
+    which breaks the OAuth discovery flow.
+    """
+
+    def __init__(self, app: ASGIApp):
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send):
+        if scope["type"] in ("http", "websocket") and scope["path"] == "/mcp":
+            scope = dict(scope, path="/mcp/", raw_path=b"/mcp/")
+        await self.app(scope, receive, send)
+
+
 class RootMCPProxyMiddleware:
     """Intercept POST/GET/DELETE to / with Bearer token and route to MCP.
 
@@ -232,3 +248,4 @@ class RootMCPProxyMiddleware:
 
 
 app.add_middleware(RootMCPProxyMiddleware)
+app.add_middleware(MCPSlashRewriteMiddleware)
