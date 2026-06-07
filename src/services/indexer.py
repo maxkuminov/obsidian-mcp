@@ -13,6 +13,7 @@ from src.config import settings
 from src.database import async_session
 from src.models.db import NoteEmbedding, NoteLink, NoteMetadata, OAuthCode, OAuthToken, User
 from src.services.embeddings import embed_note
+from src.services.fts import index_tsvector_sql
 from src.services.links import build_vault_index, extract_links, resolve_target
 from src.services.vault import (
     _vault_root,
@@ -242,19 +243,23 @@ async def index_vault(user_id: int | None = None):
         if to_upsert:
             paths = [n["file_path"] for n in to_upsert]
             # In multi-user mode the same `file_path` can exist for multiple
-            # users; the UPDATE must also scope by `user_id IS NOT DISTINCT
-            # FROM :uid` (NULL-safe equality so single-user rows match).
+            # users, so the UPDATE scopes by user: `user_id IS NULL` in
+            # single-user mode, `user_id = :uid` (never NULL) in multi-user
+            # mode. The tsvector expression is built from `settings.fts_configs`
+            # (see `src/services/fts.py`) so index-time configs match the
+            # query-time configs in `search.py`.
+            tsv_frag, tsv_params = index_tsvector_sql("content")
             if user_id is None:
-                tsv_sql = """
+                tsv_sql = f"""
                     UPDATE notes_metadata
-                    SET content_tsvector = to_tsvector('english', :content)
+                    SET content_tsvector = {tsv_frag}
                     WHERE file_path = :path
                       AND user_id IS NULL
                 """
             else:
-                tsv_sql = """
+                tsv_sql = f"""
                     UPDATE notes_metadata
-                    SET content_tsvector = to_tsvector('english', :content)
+                    SET content_tsvector = {tsv_frag}
                     WHERE file_path = :path
                       AND user_id = :uid
                 """
@@ -266,7 +271,7 @@ async def index_vault(user_id: int | None = None):
                     continue
                 content = path_to_content[path]
                 try:
-                    params: dict = {"content": content[:100000], "path": path}
+                    params: dict = {"content": content[:100000], "path": path, **tsv_params}
                     if user_id is not None:
                         params["uid"] = user_id
                     await session.execute(text(tsv_sql), params)
@@ -594,6 +599,55 @@ async def embed_vault(user_id: int | None = None):
             f"Embedding complete{log_suffix}: {len(unembedded)} notes, {total_chunks} chunks"
             + (f", {skipped_excluded} skipped by exclude patterns" if skipped_excluded else "")
         )
+
+
+async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
+    """Recompute `content_tsvector` for every indexed note under the currently
+    configured `FTS_CONFIGS` (see `src/services/fts.py`). Returns the count of
+    notes updated.
+
+    Run this after changing `FTS_CONFIGS`, since `notes_metadata` stores no raw
+    body column — the tsvector must be rebuilt by re-reading each note's file.
+    This rebuilds the KEYWORD index only: it does NOT touch embeddings and makes
+    NO API calls, so it's cheap (seconds for a few thousand notes), unlike
+    `reset-embeddings`.
+
+    Scoped to `user_id` when set (multi-user mode); single-user mode passes
+    `None` and rebuilds every note. Reuses `index_tsvector_sql` so the rebuilt
+    tsvector is byte-identical to what the indexer would write for the same
+    config(s).
+    """
+    vault = _vault_root(user_id)
+    log_suffix = f" (user_id={user_id})" if user_id is not None else ""
+    tsv_frag, tsv_params = index_tsvector_sql("content")
+    upd_sql = text(
+        f"UPDATE notes_metadata SET content_tsvector = {tsv_frag} WHERE id = :id"
+    )
+
+    rows_stmt = select(NoteMetadata.id, NoteMetadata.file_path)
+    if user_id is not None:
+        rows_stmt = rows_stmt.where(NoteMetadata.user_id == user_id)
+    rows = (await session.execute(rows_stmt)).all()
+    logger.info(f"Rebuilding tsvectors for {len(rows)} notes{log_suffix}")
+
+    updated = 0
+    for row in rows:
+        full_path = vault / row.file_path
+        try:
+            raw = full_path.read_text(encoding="utf-8", errors="strict")
+        except (UnicodeDecodeError, FileNotFoundError, OSError):
+            continue
+        _, content = parse_frontmatter(raw)
+        await session.execute(
+            upd_sql, {"content": content[:100000], "id": row.id, **tsv_params}
+        )
+        updated += 1
+        if updated % 500 == 0:
+            await session.commit()
+            logger.info(f"rebuild_tsvectors: {updated}/{len(rows)} notes{log_suffix}")
+    await session.commit()
+    logger.info(f"rebuild_tsvectors complete: {updated} notes{log_suffix}")
+    return updated
 
 
 async def cleanup_expired_tokens():

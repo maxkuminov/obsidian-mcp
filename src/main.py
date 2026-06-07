@@ -60,6 +60,18 @@ async def _check_embedding_dim() -> None:
         sys.exit(1)
 
 
+async def _validate_fts_configs() -> None:
+    """Fail fast at startup if `FTS_CONFIGS` names a text-search config that
+    isn't installed in this Postgres instance (e.g. a typo), so a bad config
+    surfaces with a clear message instead of silent zero-result keyword
+    searches. Delegates to `src.services.fts.validate_fts_configs`.
+    """
+    from src.services.fts import validate_fts_configs
+
+    async with async_session() as session:
+        await validate_fts_configs(session)
+
+
 async def _warm_embedding_model() -> None:
     """Pre-load the embedding model so the first semantic_search after startup
     isn't a cold reload. Combined with OLLAMA_KEEP_ALIVE the model then stays
@@ -106,6 +118,7 @@ async def lifespan(app: FastAPI):
             yield
         return
     await _check_embedding_dim()
+    await _validate_fts_configs()
     # Fire-and-forget so a ~15s cold load doesn't block the app from serving.
     # The lifespan frame stays suspended at `yield`, keeping this referenced.
     warmup_task = asyncio.create_task(_warm_embedding_model())
