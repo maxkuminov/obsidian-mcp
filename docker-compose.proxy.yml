@@ -1,0 +1,120 @@
+# Deployment behind an EXTERNAL reverse proxy.
+#
+# Use this when something else already terminates TLS — Nginx Proxy Manager
+# (NPM), a standalone nginx, an existing Traefik, or a Caddy you run yourself.
+# Unlike docker-compose.simple.yml, this bundles NO TLS and NO Caddy: your
+# proxy owns the certificate and HTTPS. This stack only brings up Postgres and
+# the MCP server, listening on plain HTTP for the proxy to forward to.
+#
+#   docker compose -f docker-compose.proxy.yml up -d
+#
+# ── Required .env (copy from .env.example) ────────────────────────────────
+#   MCP_HOSTNAME      Public hostname your proxy serves (e.g. obsidian.example.com).
+#                     The app derives base_url / allowed_origins / allowed_hosts
+#                     from it, so OAuth discovery and the 401 WWW-Authenticate
+#                     metadata URL resolve to the correct https:// origin. Without
+#                     it, base_url falls back to http://localhost:8000 and MCP
+#                     clients like claude.ai cannot complete the OAuth flow.
+#   SECRET_KEY        itsdangerous signer. python3 -c "import secrets; print(secrets.token_hex(32))"
+#   VAULT_HOST_PATH   Host path to your Obsidian vault (bind-mounted at /obsidian).
+#   POSTGRES_PASSWORD Strong DB password (also propagate into DATABASE_URL in .env).
+#   OPENAI_API_KEY    If EMBEDDING_PROVIDER=openai (the realistic path without a GPU).
+#
+# ── Point your proxy at the app — pick ONE pattern ────────────────────────
+#   A) Proxy runs in Docker (typical for Nginx Proxy Manager).
+#      Put the proxy and this stack on a shared Docker network and forward to
+#      http://obsidian-mcp:8000. Uncomment the two `proxy_net` blocks below and
+#      DELETE the `ports:` entry — nothing needs publishing to the host. Most
+#      secure: the app is unreachable except through the proxy.
+#
+#   B) Proxy reaches the host by IP/port.
+#      Keep the `ports:` mapping and point your proxy at http://<host-ip>:${MCP_PORT:-8000}.
+#      If the proxy is on the SAME host, bind to loopback so the port isn't world-
+#      reachable: set the mapping to "127.0.0.1:${MCP_PORT:-8000}:8000".
+#
+# ── Your proxy MUST forward ───────────────────────────────────────────────
+#   - the original Host header,
+#   - X-Forwarded-Proto: https      (so the app knows the public scheme),
+#   - X-Forwarded-For,
+#   - and support streaming / chunked responses + the WebSocket upgrade on /mcp
+#     (disable response buffering; in NPM, tick "Websockets Support" and add
+#     `proxy_buffering off;` in the Advanced tab).
+#
+# The app already honors X-Forwarded-* via its built-in ProxyHeadersMiddleware,
+# scoped in main.py to loopback + private (RFC1918) ranges — which covers both a
+# loopback-published port (pattern B) and a shared Docker network (pattern A). So
+# no `--proxy-headers` flag or `FORWARDED_ALLOW_IPS=*` is needed here, and we
+# avoid the trust-any-peer footgun. Still keep the published port private to the
+# proxy.
+#
+# Note: /mcp is always API-key protected at the application layer. The proxy is
+# only responsible for TLS and (optionally) protecting the human-facing /admin UI.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: obsidian-mcp-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: obsidian_mcp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: obsidian_mcp
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./docker/db-init-simple.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U obsidian_mcp -d obsidian_mcp"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - mcp_internal
+
+  obsidian-mcp:
+    build: .
+    image: obsidian-mcp:local
+    container_name: obsidian-mcp
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    # Forwarded headers (X-Forwarded-Proto/For) are handled by the app's built-in
+    # ProxyHeadersMiddleware (main.py), scoped to loopback + private ranges — no
+    # FORWARDED_ALLOW_IPS / --proxy-headers needed here.
+    # Pattern B: publish a host port for a proxy that forwards by IP/port.
+    # Default is loopback-only; change to "${MCP_PORT:-8000}:8000" only if your
+    # proxy runs on another host and you firewall the port to that proxy.
+    # Pattern A (NPM/Traefik in Docker): delete this and use proxy_net below.
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8000}:8000"
+    volumes:
+      - ${VAULT_HOST_PATH:-./vault}:/obsidian
+    networks:
+      - mcp_internal
+      # Pattern A: also attach to your proxy's network and forward to
+      # http://obsidian-mcp:8000 (then remove the `ports:` block above).
+      # - proxy_net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    command: >
+      sh -c "alembic upgrade head &&
+             uvicorn src.main:app --host 0.0.0.0 --port 8000"
+
+networks:
+  mcp_internal:
+    driver: bridge
+  # Pattern A: the external network your reverse proxy already runs on.
+  # Create it once (docker network create proxy_net) or name your proxy's
+  # existing network here, then uncomment the proxy_net line under the service.
+  # proxy_net:
+  #   external: true
+
+volumes:
+  pg_data:
