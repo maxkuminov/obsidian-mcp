@@ -40,9 +40,12 @@
 #     (disable response buffering; in NPM, tick "Websockets Support" and add
 #     `proxy_buffering off;` in the Advanced tab).
 #
-# The app trusts those headers via --proxy-headers + FORWARDED_ALLOW_IPS=* below.
-# That trusts ANY client that can reach the port, so keep the published port
-# private to the proxy (pattern A, or the 127.0.0.1 bind in pattern B).
+# The app already honors X-Forwarded-* via its built-in ProxyHeadersMiddleware,
+# scoped in main.py to loopback + private (RFC1918) ranges — which covers both a
+# loopback-published port (pattern B) and a shared Docker network (pattern A). So
+# no `--proxy-headers` flag or `FORWARDED_ALLOW_IPS=*` is needed here, and we
+# avoid the trust-any-peer footgun. Still keep the published port private to the
+# proxy.
 #
 # Note: /mcp is always API-key protected at the application layer. The proxy is
 # only responsible for TLS and (optionally) protecting the human-facing /admin UI.
@@ -78,10 +81,9 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    environment:
-      # Honor X-Forwarded-* from the reverse proxy (see header notes above).
-      # Keep the published port private to the proxy, since this trusts all peers.
-      FORWARDED_ALLOW_IPS: "*"
+    # Forwarded headers (X-Forwarded-Proto/For) are handled by the app's built-in
+    # ProxyHeadersMiddleware (main.py), scoped to loopback + private ranges — no
+    # FORWARDED_ALLOW_IPS / --proxy-headers needed here.
     # Pattern B: publish a host port for a proxy that forwards by IP/port.
     # Default is loopback-only; change to "${MCP_PORT:-8000}:8000" only if your
     # proxy runs on another host and you firewall the port to that proxy.
@@ -103,7 +105,7 @@ services:
       start_period: 60s
     command: >
       sh -c "alembic upgrade head &&
-             uvicorn src.main:app --host 0.0.0.0 --port 8000 --proxy-headers"
+             uvicorn src.main:app --host 0.0.0.0 --port 8000"
 
 networks:
   mcp_internal:

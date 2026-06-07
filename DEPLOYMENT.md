@@ -137,11 +137,22 @@ docker compose -f docker-compose.proxy.yml up -d
 
 Set `MCP_HOSTNAME` in `.env` to the public hostname your proxy serves
 — the app derives `base_url` (and the OAuth discovery URLs) from it.
-Point your proxy at the container (`http://obsidian-mcp:8000` over a
-shared Docker network, or `http://<host>:${MCP_PORT:-8000}`), forward
-`Host` + `X-Forwarded-Proto: https`, and enable WebSocket / streaming
-passthrough on `/mcp`. The file's header comment walks through both
-wiring patterns and the exact headers your proxy must forward.
+Then wire your proxy to the container via one of two paths:
+
+- **Proxy in Docker (e.g. NPM):** put the proxy and this stack on a
+  shared Docker network — in `docker-compose.proxy.yml`, uncomment the
+  `proxy_net` blocks (under the service and under `networks:`) and
+  **remove the `ports:` mapping** — then forward your proxy to
+  `http://obsidian-mcp:8000`. Nothing is published to the host.
+- **Proxy on the host / another machine:** keep the default
+  loopback-bound `ports:` mapping and forward to
+  `http://127.0.0.1:${MCP_PORT:-8000}` (same host) or widen the bind and
+  firewall the port to the proxy (another host).
+
+Either way, forward `Host` + `X-Forwarded-Proto: https` and enable
+WebSocket / streaming passthrough on `/mcp`. The file's header comment
+walks through both patterns and the exact headers your proxy must
+forward.
 
 > [!WARNING]
 > `docker-compose.proxy.yml` trusts proxy headers and, in single-user
