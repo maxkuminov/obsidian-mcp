@@ -15,10 +15,13 @@ together:
 4. Embeddings. OpenAI API for VPS deployments without GPUs (Ollama on
    a CPU-only VPS is too slow to be usable).
 5. TLS and reverse proxy. Caddy for the simplest path, Traefik if you
-   already run it.
+   already run it, or your own external proxy (Nginx Proxy Manager,
+   nginx, …) if you already terminate TLS elsewhere.
 
 The included `docker-compose.simple.yml` bundles 1, 2, and 5 plus the
-MCP server itself. You handle 3 and 4 separately.
+MCP server itself. You handle 3 and 4 separately. If you already run a
+reverse proxy, use `docker-compose.proxy.yml` instead — see
+[Already have a reverse proxy?](#already-have-a-reverse-proxy) below.
 
 ## What you need before starting
 
@@ -118,6 +121,34 @@ You should see "Application startup complete" within ~30 seconds, then
 "Starting vault index scan..." (which will report 0 files until Step
 4). The control panel is at `https://your-hostname/admin`. You'll set
 up auth on it in Step 6.
+
+### Already have a reverse proxy?
+
+If you already run Nginx Proxy Manager (NPM), a standalone nginx, or
+another external proxy that terminates TLS, use
+`docker-compose.proxy.yml` instead. It brings up Postgres and the MCP
+server on plain HTTP — no bundled Caddy — and lets your existing proxy
+own certificates and HTTPS:
+
+```bash
+docker compose -f docker-compose.proxy.yml build
+docker compose -f docker-compose.proxy.yml up -d
+```
+
+Set `MCP_HOSTNAME` in `.env` to the public hostname your proxy serves
+— the app derives `base_url` (and the OAuth discovery URLs) from it.
+Point your proxy at the container (`http://obsidian-mcp:8000` over a
+shared Docker network, or `http://<host>:${MCP_PORT:-8000}`), forward
+`Host` + `X-Forwarded-Proto: https`, and enable WebSocket / streaming
+passthrough on `/mcp`. The file's header comment walks through both
+wiring patterns and the exact headers your proxy must forward.
+
+> [!WARNING]
+> `docker-compose.proxy.yml` trusts proxy headers and, in single-user
+> mode, relies on your reverse proxy to protect `/admin`. Keep the app's
+> upstream private to the proxy (shared Docker network, or a
+> loopback/firewalled published port). Do not expose the MCP container
+> port publicly.
 
 ## Step 4. Get your vault onto the VPS
 
