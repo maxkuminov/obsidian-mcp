@@ -60,7 +60,14 @@ hostnames) must stay out of tracked files. The mechanism:
   implementations (Ollama, OpenAI). Single `EMBEDDING_PROVIDER` env var
   picks the backend; `get_provider()` is a cached singleton. Default is
   Ollama bge-m3 at 1024 dim, 512 token chunks, no overlap.
-- Full-text search via PostgreSQL tsvector
+- Full-text search via PostgreSQL tsvector. The text-search config(s) are
+  configurable via `FTS_CONFIGS` (default `["english"]`; e.g. `["simple"]` or
+  `["english","norwegian"]`). Index- and query-time configs are kept in sync
+  through `src/services/fts.py` (`index_tsvector_sql` / `combined_tsquery`).
+  A note is indexed under every config (tsvectors `||`-concatenated) and a
+  query matches if any config hits (tsqueries OR'd). Startup validates the
+  config names against `pg_ts_config`. Changing `FTS_CONFIGS` requires `make
+  rebuild-tsvectors` — keyword index only, no embeddings, no API calls.
 - Vector search via pgvector HNSW index on `note_embeddings.embedding`
   (`vector_cosine_ops`, `m=16, ef_construction=64`); `semantic_search`
   sets `hnsw.ef_search=80` per query and dedupes per note in Python

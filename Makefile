@@ -20,7 +20,7 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-backup db-restore status clean reindex reset-embeddings audit trivy
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-backup db-restore status clean reindex reset-embeddings rebuild-tsvectors audit trivy
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -51,6 +51,7 @@ help:
 	@echo "$(YELLOW)Operations:$(NC)"
 	@echo "  make reindex      - Trigger full vault reindex"
 	@echo "  make reset-embeddings - Drop & recreate embedding column at configured dim"
+	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS (no embeddings, no API calls)"
 	@echo "  make status       - Show container and health status"
 	@echo "  make clean        - Remove containers and images"
 	@echo ""
@@ -163,6 +164,11 @@ reset-embeddings:
 	@sleep 5
 	$(COMPOSE) exec obsidian-mcp python -m scripts.reset_embeddings
 	@echo "$(GREEN)Done. The next indexer pass will re-embed all notes.$(NC)"
+
+rebuild-tsvectors:
+	@echo "$(YELLOW)Rebuilding keyword (FTS) index for the configured FTS_CONFIGS...$(NC)"
+	$(COMPOSE) exec obsidian-mcp python -m scripts.rebuild_tsvectors
+	@echo "$(GREEN)Done. Keyword search now reflects FTS_CONFIGS (embeddings untouched, no API calls).$(NC)"
 
 status:
 	@echo "$(GREEN)Obsidian MCP Status:$(NC)"

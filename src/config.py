@@ -1,7 +1,7 @@
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import Field, model_validator
-from pydantic_settings import BaseSettings
+from pydantic import Field, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode
 
 
 class Settings(BaseSettings):
@@ -34,6 +34,23 @@ class Settings(BaseSettings):
     allowed_origins: list[str] | None = None
     allowed_hosts: list[str] | None = None
 
+    # PostgreSQL text-search configuration(s) for full-text (keyword) search,
+    # applied at both index and query time. A note is indexed under every
+    # listed config (lexeme sets concatenated) and a query matches if ANY
+    # config's parse hits (tsqueries OR'd). See `src/services/fts.py`.
+    #   ["english"]            current/default behavior (English stemmer)
+    #   ["simple"]             language-agnostic, exact word forms, no stemming
+    #   ["english","norwegian"] both stemmers — mixed-language vault
+    #   ["simple","norwegian"]  verbatim lexemes PLUS Norwegian stems
+    # Named `fts_configs` (not `fts_languages`) because `simple` is a config,
+    # not a language. Env `FTS_CONFIGS` accepts JSON (`["simple","norwegian"]`)
+    # or comma-separated (`simple,norwegian`). Changing this makes stored
+    # tsvectors stale — run `make rebuild-tsvectors` (keyword index only; no
+    # embeddings touched, no API calls). `NoDecode` defers env parsing to the
+    # validator below so the CSV form doesn't trip pydantic-settings' JSON
+    # decode of complex (list) fields.
+    fts_configs: Annotated[list[str], NoDecode] = ["english"]
+
     embedding_provider: Literal["ollama", "openai"] = "ollama"
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
@@ -51,6 +68,39 @@ class Settings(BaseSettings):
     mcp_sandbox_mode: bool = False
 
     model_config = {"env_file": ".env"}
+
+    @field_validator("fts_configs", mode="before")
+    @classmethod
+    def _parse_fts_configs(cls, v):
+        """Accept a JSON list, a comma-separated string, or a list; then strip,
+        lowercase, drop empties, and dedupe (order-preserving). Reject empty."""
+        if isinstance(v, str):
+            s = v.strip()
+            parsed = None
+            if s.startswith("["):
+                import json
+
+                try:
+                    parsed = json.loads(s)
+                except ValueError:
+                    parsed = None
+            v = parsed if isinstance(parsed, list) else s.split(",")
+        if not isinstance(v, (list, tuple)):
+            raise ValueError(
+                "FTS_CONFIGS must be a list of PostgreSQL text-search config "
+                "names (JSON or comma-separated)"
+            )
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in v:
+            name = str(item).strip().lower()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            out.append(name)
+        if not out:
+            raise ValueError("FTS_CONFIGS must contain at least one config name")
+        return out
 
     @model_validator(mode="after")
     def _derive_public_urls(self) -> "Settings":

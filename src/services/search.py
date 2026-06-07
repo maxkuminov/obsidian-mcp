@@ -3,6 +3,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.db import NoteMetadata
 from src.services.filters import apply_note_filters
+from src.services.fts import combined_tsquery
 
 
 async def full_text_search(
@@ -14,8 +15,12 @@ async def full_text_search(
     frontmatter: dict | None = None,
     user_id: int | None = None,
 ) -> list[dict]:
-    """Full-text search over notes_metadata using tsvector."""
-    tsquery = func.websearch_to_tsquery("english", query)
+    """Full-text search over notes_metadata using tsvector.
+
+    The tsquery is built from `settings.fts_configs` (see `src/services/fts.py`)
+    so query-time configs match the index-time configs in `indexer.py`.
+    """
+    tsquery = combined_tsquery(query)
     rank = func.ts_rank_cd(NoteMetadata.content_tsvector, tsquery).label("rank")
 
     stmt = (

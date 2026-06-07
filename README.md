@@ -178,7 +178,9 @@ The server exposes 17 MCP tools across five concerns.
 
 ### Search and discovery
 - `keyword_search(query, folder?, tags?, frontmatter?, limit=20)`,
-  full-text via PostgreSQL `tsvector`
+  full-text via PostgreSQL `tsvector`; the text-search config(s) are
+  configurable via `FTS_CONFIGS` (see
+  [Full-text search language(s)](#full-text-search-languages))
 - `semantic_search(query, folder?, tags?, frontmatter?, limit=15)`,
   vector similarity via pgvector, one preview chunk per note
 - `list_notes(folder?, limit=50)`, sorted by modified time
@@ -572,6 +574,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `VAULT_PATH` | `/obsidian` | In-container vault mount |
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
+| `FTS_CONFIGS` | `english` | Keyword-search text-search config(s). JSON or CSV. See [Full-text search language(s)](#full-text-search-languages). |
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | — | Used when provider is Ollama |
@@ -604,6 +607,56 @@ control panel, which performs the same SQL while the server is running
 If you change `EMBEDDING_DIMENSIONS` without running the reset, the
 server detects the mismatch at startup and exits non-zero with a
 pointer to the reset target.
+
+### Full-text search language(s)
+
+`keyword_search` runs over a PostgreSQL `tsvector`. The *text-search
+configuration* it uses — the stemmer and stop-word dictionary — is
+controlled by `FTS_CONFIGS`. It defaults to `english`, which reproduces
+the historical behavior exactly, so existing deployments need no action.
+
+`FTS_CONFIGS` is a **list**, settable as JSON
+(`FTS_CONFIGS=["simple","norwegian"]`) or comma-separated
+(`FTS_CONFIGS=simple,norwegian`). Each note is indexed under *every*
+listed config, and a query matches if *any* listed config's parse hits.
+This is what makes a mixed-language vault work:
+
+| `FTS_CONFIGS` | Behavior |
+| --- | --- |
+| `english` | English Snowball stemmer (default; `running` ↔ `run`). |
+| `simple` | Language-agnostic. No stemming or stop-words — matches exact word *forms*. A principled default for mixed-language vaults: keyword search is the exact-match arm, while `semantic_search` (bge-m3 is multilingual) handles morphological recall. |
+| `english,norwegian` | Both stemmers applied — keyword-side morphology for two languages at once. |
+| `simple,norwegian` | Verbatim lexemes **plus** Norwegian stems. |
+
+The setting is **global** — applied to every vault (consistent with
+`EMBEDDING_MODEL`, `CHUNK_SIZE`, etc., which are global too). For a
+mixed-language multi-user instance, set a superset (e.g.
+`["english","norwegian"]`, or `["simple"]`). Per-user FTS config is a
+clean future extension but is not implemented.
+
+A typo'd or uninstalled config name fails fast at startup with a message
+listing the configs available in your Postgres instance, rather than
+producing silent zero-result searches.
+
+**Changing `FTS_CONFIGS` requires a rebuild.** Stored tsvectors are
+computed at index time, so they go stale when the config list changes.
+After editing `.env` and redeploying, run:
+
+```
+make rebuild-tsvectors
+```
+
+This re-reads each note and recomputes its `content_tsvector` under the
+new config(s). It rebuilds the **keyword index only** — it does **not**
+touch embeddings/vectors and makes **no API calls**, so it finishes in
+seconds for a few thousand notes. (Do not confuse it with the expensive
+`make reset-embeddings` flow.)
+
+> **Tokenization caveat:** the tsvector *parser* still splits on
+> punctuation and hyphens regardless of config, so `bge-m3` tokenizes to
+> `bge` + `m3`. `simple` preserves word *forms*, not punctuation-bearing
+> strings; exact-string-with-punctuation matching would need a trigram
+> index and is out of scope.
 
 ## Architecture
 
@@ -728,6 +781,7 @@ make db-backup        Dump database to backups dir
 make logs             Tail container logs
 make reindex          Trigger a reindex via the API
 make reset-embeddings Drop and recreate embedding column at configured dim
+make rebuild-tsvectors Recompute keyword index for FTS_CONFIGS (no embeddings, no API calls)
 make status           Show container and health status
 ```
 
