@@ -221,7 +221,7 @@ class MCPSlashRewriteMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
-        if scope["type"] in ("http", "websocket") and scope["path"] == "/mcp":
+        if scope["type"] == "http" and scope["path"] == "/mcp":
             scope = dict(scope, path="/mcp/", raw_path=b"/mcp/")
         await self.app(scope, receive, send)
 
