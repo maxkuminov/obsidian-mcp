@@ -1,5 +1,8 @@
+import base64
+import binascii
 import inspect
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -8,16 +11,25 @@ from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
 
+from mcp.server.fastmcp import Image
 from sqlalchemy import text
 
 from src.auth.session import current_user_id
+from src.config import settings
 from src.database import async_session
 from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
 from src.models.db import UsageLog
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.search import full_text_search
-from src.services.vault import read_file, write_file
+from src.services.vault import (
+    classify_bytes,
+    list_dir,
+    read_bytes,
+    read_file,
+    write_bytes,
+    write_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1086,3 +1098,151 @@ async def set_frontmatter_impl(
     if not summary:
         summary.append("no key changes (whitespace-only)")
     return f"Updated frontmatter in {path} ({'; '.join(summary)})"
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Raw file-access tools: read_file / write_file / list_files
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _base64_payload(path: str, data: bytes, mime: str) -> str:
+    """Format raw bytes as a labeled base64 block.
+
+    The header makes the encoding explicit and warns that the body is opaque
+    (a skill/client decodes it; the model cannot read it). The base64 string
+    is the final block, separated by a blank line.
+    """
+    b64 = base64.b64encode(data).decode("ascii")
+    return (
+        "encoding: base64\n"
+        f"mime: {mime}\n"
+        f"bytes: {len(data)}\n"
+        f"path: {path}\n"
+        "(opaque bytes — not human-readable; pass to a skill/client to decode)\n\n"
+        f"{b64}"
+    )
+
+
+@_tracked("read_file", ["path", "encoding"])
+async def read_file_impl(path: str, encoding: str = "auto"):
+    """Read any vault file: text, inline image block, or base64 bytes."""
+    if encoding not in ("auto", "text", "base64"):
+        return f"Invalid encoding '{encoding}'. Use 'auto', 'text', or 'base64'."
+
+    uid = current_user_id.get()
+    try:
+        data = read_bytes(path, user_id=uid, max_bytes=settings.max_file_read_bytes)
+    except FileNotFoundError:
+        return f"File not found: {path}"
+    except ValueError as e:
+        return str(e)
+
+    if encoding == "text":
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return (
+                f"Cannot decode {path} as UTF-8 text (not valid UTF-8). "
+                'Use encoding="base64" for binary files.'
+            )
+
+    if encoding == "base64":
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        return _base64_payload(path, data, mime)
+
+    # encoding == "auto"
+    kind, mime = classify_bytes(data, path)
+    if kind == "text":
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return _base64_payload(path, data, mime)
+    if kind == "image":
+        # FastMCP wraps this into an MCP image content block. `format` becomes
+        # the `image/<format>` MIME (e.g. "png", "jpeg", "gif", "webp").
+        return Image(data=data, format=mime.split("/", 1)[1])
+    return _base64_payload(path, data, mime)
+
+
+@_tracked("write_file", ["path", "encoding", "overwrite"])
+async def write_file_impl(
+    path: str,
+    content: str,
+    encoding: str = "base64",
+    overwrite: bool = False,
+) -> str:
+    """Write a file into the vault from base64 or text content."""
+    if err := _require_write():
+        return err
+    if encoding not in ("base64", "text"):
+        return f"Invalid encoding '{encoding}'. Use 'base64' or 'text'."
+
+    if encoding == "base64":
+        try:
+            data = base64.b64decode(content, validate=True)
+        except (binascii.Error, ValueError):
+            return "Invalid base64 content: could not decode. No file was written."
+    else:
+        data = content.encode("utf-8")
+
+    if len(data) > settings.max_file_write_bytes:
+        return (
+            f"Content too large ({len(data):,} bytes, "
+            f"max {settings.max_file_write_bytes:,}). No file was written."
+        )
+
+    uid = current_user_id.get()
+    try:
+        write_bytes(path, data, overwrite=overwrite, user_id=uid)
+    except FileExistsError:
+        return f"File already exists: {path}. Pass overwrite=True to replace it."
+    except ValueError as e:
+        return str(e)
+    return f"Wrote {len(data):,} bytes to {path}"
+
+
+@_tracked("list_files", ["folder", "pattern", "recursive", "limit"])
+async def list_files_impl(
+    folder: str = ".",
+    pattern: str = "*",
+    recursive: bool = False,
+    limit: int = 200,
+) -> str:
+    """Browse vault files and subdirectories (`ls`-style)."""
+    uid = current_user_id.get()
+    limit = max(1, min(limit, 1000))
+    try:
+        entries, truncated = list_dir(
+            folder, pattern=pattern, recursive=recursive, limit=limit, user_id=uid
+        )
+    except NotADirectoryError as e:
+        return str(e)
+    except ValueError as e:
+        return str(e)
+
+    where = folder or "."
+    if not entries:
+        return f"No entries in '{where}' matching '{pattern}'"
+
+    header = f"{len(entries)} " + ("entry" if len(entries) == 1 else "entries")
+    header += f" in '{where}'"
+    if pattern != "*":
+        header += f" matching '{pattern}'"
+    if recursive:
+        header += " (recursive)"
+    if truncated:
+        header += ", truncated"
+    lines = [header + ":\n"]
+    for e in entries:
+        if e["is_dir"]:
+            lines.append(f"- 📁 `{e['path']}/`")
+        else:
+            mod = datetime.fromtimestamp(e["mtime"], timezone.utc).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            lines.append(f"- `{e['path']}` ({e['size']:,}B, modified {mod})")
+    if truncated:
+        lines.append(
+            f"\n… more than {limit} entries; narrow with `pattern` or a subfolder."
+        )
+    return "\n".join(lines)
