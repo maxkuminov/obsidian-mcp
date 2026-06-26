@@ -14,12 +14,15 @@ from src.mcp_server.tools import (
     get_recent_impl,
     get_tags_impl,
     get_vault_guide_impl,
+    list_files_impl,
     list_notes_impl,
     move_note_impl,
+    read_file_impl,
     read_note_impl,
     search_notes_impl,
     semantic_search_impl,
     set_frontmatter_impl,
+    write_file_impl,
 )
 
 mcp = FastMCP(
@@ -398,3 +401,98 @@ async def set_frontmatter(
             silently ignored.
     """
     return await set_frontmatter_impl(path, updates=updates, remove=remove)
+
+
+@mcp.tool()
+async def read_file(path: str, encoding: str = "auto"):
+    """Read any file in the vault — including non-markdown (PDFs, images,
+    skill HTML/JS, data files). Peer to `read_note`, which stays markdown-only.
+
+    This is pure byte transport: the server does NOT extract or parse PDFs and
+    cannot interpret binary bytes. Non-text/non-image files come back as an
+    opaque base64 string intended for a client-side skill to decode — not as
+    something the model can read directly.
+
+    Encoding:
+    - `"auto"` (default): text-like files (HTML, JSON, CSV, source, …) return
+      as readable text; images (PNG/JPEG/GIF/WebP) return as an inline image
+      block that renders in-client; everything else returns as a labeled
+      base64 string.
+    - `"text"`: force a UTF-8 text decode; errors if the file is not valid UTF-8.
+    - `"base64"`: force a raw-bytes base64 string regardless of type.
+
+    Files larger than `MAX_FILE_READ_BYTES` (default 10 MB) are refused with a
+    size report. Base64 reads pass through the model context and inflate ~33%,
+    so they are token-heavy — check a file's size with `list_files` before
+    reading large binaries. Dot-directories (`.obsidian`, `.git`, `.trash`, …)
+    and path traversal are rejected.
+
+    Args:
+        path: Vault-relative path to the file (e.g. "Reference Docs/spec.pdf").
+        encoding: One of "auto" (default), "text", or "base64".
+    """
+    return await read_file_impl(path, encoding=encoding)
+
+
+@mcp.tool()
+async def write_file(
+    path: str,
+    content: str,
+    encoding: str = "base64",
+    overwrite: bool = False,
+) -> str:
+    """Write a file into the vault — including non-markdown (e.g. save a
+    generated PDF or image). Requires a readwrite API key. Peer to
+    `create_note`/`edit_note`, which stay markdown-only.
+
+    `content` carries the bytes: with `encoding="base64"` (default) it is
+    base64-decoded to raw bytes; with `encoding="text"` it is written verbatim
+    as UTF-8. The write is atomic (tmp file + `os.replace`), missing parent
+    folders are created, and content over `MAX_FILE_WRITE_BYTES` (default
+    25 MB, decoded length) is refused.
+
+    No-clobber by default: writing over an existing file requires
+    `overwrite=True`. Dot-directories and path traversal are rejected; invalid
+    base64 errors without writing anything.
+
+    Args:
+        path: Vault-relative destination path (e.g. "Outputs/report.pdf").
+        content: File contents — base64 string (default) or UTF-8 text.
+        encoding: "base64" (default) or "text".
+        overwrite: If True, replace an existing file. Off by default.
+    """
+    return await write_file_impl(
+        path, content, encoding=encoding, overwrite=overwrite
+    )
+
+
+@mcp.tool()
+async def list_files(
+    folder: str = ".",
+    pattern: str = "*",
+    recursive: bool = False,
+    limit: int = 200,
+) -> str:
+    """Browse the vault filesystem (`ls`-style), including non-markdown files.
+    Peer to `list_notes`, which lists indexed markdown only; `list_files` reads
+    the filesystem directly and reports sizes so you can gauge a binary before
+    `read_file`.
+
+    By default lists the immediate children of `folder` — subdirectories and
+    files, each file with size and modification time. `pattern` is a glob that
+    filters file entries (e.g. "*.pdf"); `recursive=True` descends into
+    subfolders and returns matching files. Dot-directories (`.obsidian`,
+    `.git`, `.trash`, …) are hidden, and a dot-directory `folder` is rejected.
+
+    At most `limit` entries are returned (default 200, hard cap 1000); the
+    response indicates when the listing was truncated.
+
+    Args:
+        folder: Vault-relative folder (default "." = vault root).
+        pattern: Glob applied to file names (default "*").
+        recursive: If True, descend into subfolders. Off by default.
+        limit: Maximum entries to return (default 200, hard cap 1000).
+    """
+    return await list_files_impl(
+        folder, pattern=pattern, recursive=recursive, limit=limit
+    )

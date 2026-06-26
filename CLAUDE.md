@@ -113,3 +113,11 @@ Link extraction lives in `src/services/links.py`. The extractor strips fenced/in
 - `set_frontmatter(path, updates, remove=[])` — structured YAML frontmatter mutation. Round-trips via `yaml.safe_dump` (does not preserve YAML comments). Leaves the body byte-identical.
 
 All write tools route through `src/services/vault.py::write_file`, which writes to a tmp file in the same directory and `os.replace()`s it into place — a crash mid-write cannot truncate the destination.
+
+## File-access tools (non-markdown)
+Raw read/write/browse of arbitrary vault files, distinct peers to the note tools (note tools stay markdown-only). Pure byte transport — no server-side PDF/text extraction, no embedding or indexing of non-markdown files.
+- `read_file(path, encoding="auto")` — `auto` resolves text-like MIME → text, image → inline MCP image content block (renders in-client), everything else → base64 string. `text` forces UTF-8 decode (errors on non-UTF-8); `base64` forces raw-bytes base64. Capped by `MAX_FILE_READ_BYTES` (default 10 MB), checked against on-disk size before reading. Base64 reads are token-heavy — check size with `list_files` first.
+- `write_file(path, content, encoding="base64", overwrite=False)` — `base64` decodes `content` to raw bytes; `text` writes UTF-8. No-clobber by default (`overwrite=True` to replace), auto-creates parent dirs, atomic via `vault.write_file`. Capped by `MAX_FILE_WRITE_BYTES` (default 25 MB) on decoded length.
+- `list_files(folder=".", pattern="*", recursive=False, limit=200)` — `ls`-style: immediate children (subdirs + files) by default, each file with size + mtime; glob-filterable; capped at `limit` with a truncation note.
+
+All three reuse `validate_path` (traversal guard) and a shared dot-dir guard (`is_hidden_path`) that rejects any path component starting with `.` — same visibility rule as the indexer, keeping `.obsidian`/`.git`/`.trash`/`.smart-env` out of reach. Vault helpers (`read_bytes`, `write_bytes`, `list_dir`, MIME classification) live in `src/services/vault.py`. MIME detection uses stdlib `mimetypes` plus a magic-byte sniff for PNG/JPEG/GIF/WebP. `read_file` is the first tool returning a non-`str` MCP content object.

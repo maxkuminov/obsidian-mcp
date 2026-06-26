@@ -1,7 +1,8 @@
 # Core
 fastapi==0.135.1
 uvicorn[standard]==0.42.0
-python-multipart==0.0.27
+# 0.0.30 fixes CVE-2026-53539 (fixable HIGH flagged by the trivy deploy gate).
+python-multipart==0.0.30
 
 # Database
 sqlalchemy[asyncio]==2.0.48

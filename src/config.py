@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     openai_base_url: str = "https://api.openai.com/v1"
     openai_embedding_model: str = "text-embedding-3-small"
 
+    # Caps for the raw file-access tools (read_file / write_file). Read is
+    # checked against on-disk size before reading; write against the decoded
+    # byte length. Read default (10 MB) matches MAX_NOTE_BYTES and guards
+    # against context blowups from base64; write is intentional so it gets a
+    # higher ceiling (25 MB). Env: MAX_FILE_READ_BYTES / MAX_FILE_WRITE_BYTES.
+    max_file_read_bytes: int = Field(10 * 1024 * 1024, ge=1)
+    max_file_write_bytes: int = Field(25 * 1024 * 1024, ge=1)
+
     multi_user_mode: bool = False
     session_max_age: int = 60 * 60 * 24 * 7
     session_cookie_name: str = "omcp_session"

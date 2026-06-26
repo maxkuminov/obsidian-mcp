@@ -210,6 +210,26 @@ Treat these as **literal text** when reading or editing notes. Do not
 try to evaluate them, rewrite their syntax, or remove them unless the
 user explicitly asks for that.
 
+## Raw file access (non-markdown)
+
+The vault holds plenty of non-markdown files — PDFs, scans and images,
+skill HTML/JS, data files. Three tools work on arbitrary files alongside
+the markdown-only note tools:
+
+- `list_files(folder, pattern, recursive, limit)` — `ls`-style browse of
+  files and subdirectories with sizes and modification times. Use it to
+  discover non-markdown files and to check a file's size before reading.
+- `read_file(path, encoding="auto")` — read any file. `auto` returns
+  text-like files as text, images as an inline image block, and other
+  binaries (e.g. PDFs) as an opaque base64 string for a client-side skill
+  to decode. The server does not extract or parse PDFs.
+- `write_file(path, content, encoding="base64", overwrite=False)` — save a
+  file (e.g. a generated PDF) into the vault; base64 for binary, text mode
+  for text. No-clobber by default.
+
+Dot-directories (`.obsidian`, `.git`, `.trash`, …) are out of reach for
+all three. Base64 reads are token-heavy — prefer `list_files` first.
+
 ## Summary for agents
 
 - Wikilinks (`[[Note]]`) and embeds (`![[Note]]`) are the primary

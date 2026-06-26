@@ -1,4 +1,5 @@
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -101,6 +102,31 @@ def validate_path(relative_path: str, user_id: int | None = None) -> Path:
     return resolved
 
 
+def is_hidden_path(rel: "str | Path") -> bool:
+    """True if any component of a vault-relative path starts with a dot.
+
+    Mirrors the indexer's visibility rule
+    (`any(part.startswith(".") for part in rel.parts)`) so the file-access
+    tools keep `.obsidian`, `.git`, `.trash`, `.smart-env`, … out of reach.
+    """
+    return any(part.startswith(".") for part in Path(rel).parts)
+
+
+def validate_visible_path(relative_path: str, user_id: int | None = None) -> Path:
+    """`validate_path` plus the dot-dir visibility guard.
+
+    Rejects path traversal (via `validate_path`) and any path that resolves
+    into a dot-directory. Used by the raw file-access tools so they expose
+    exactly the files the indexer would consider.
+    """
+    resolved = validate_path(relative_path, user_id=user_id)
+    vault = _vault_root(user_id).resolve()
+    rel = resolved.relative_to(vault)
+    if is_hidden_path(rel):
+        raise ValueError(f"Hidden path denied: {relative_path}")
+    return resolved
+
+
 def read_file(relative_path: str, user_id: int | None = None) -> dict:
     """Read a note, returning frontmatter + content."""
     path = validate_path(relative_path, user_id=user_id)
@@ -121,28 +147,32 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
     }
 
 
-def write_file(relative_path: str, content: str, user_id: int | None = None) -> Path:
-    """Write content to a note atomically (tmp file in same dir + os.replace).
+def _atomic_write(path: Path, *, text: str | None = None, data: bytes | None = None) -> Path:
+    """Write `text` (UTF-8) or `data` (raw bytes) to `path` atomically.
 
-    A crash between the tmp-file write and the rename leaves the destination
-    untouched. `os.replace` is atomic on POSIX same-FS renames; if the vault
-    ever spans filesystems (EXDEV), fall back to a non-atomic copy+remove and
-    log a warning.
+    Shared core for `write_file` (notes) and `write_bytes` (raw files): writes
+    a tmp file in the same directory then `os.replace`s it into place. A crash
+    between the tmp-file write and the rename leaves the destination untouched.
+    `os.replace` is atomic on POSIX same-FS renames; if the vault ever spans
+    filesystems (EXDEV), fall back to a non-atomic `shutil.move` and log a
+    warning. Creates missing parent directories.
     """
-    path = validate_path(relative_path, user_id=user_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(
         f".tmp-{path.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     )
     try:
-        tmp.write_text(content, encoding="utf-8")
+        if data is not None:
+            tmp.write_bytes(data)
+        else:
+            tmp.write_text(text or "", encoding="utf-8")
         try:
             os.replace(tmp, path)
         except OSError as e:
             if getattr(e, "errno", None) == 18:  # EXDEV
                 logger.warning(
                     "Cross-FS rename for %s; falling back to shutil.move (non-atomic)",
-                    relative_path,
+                    path.name,
                 )
                 shutil.move(str(tmp), str(path))
             else:
@@ -155,6 +185,182 @@ def write_file(relative_path: str, content: str, user_id: int | None = None) -> 
             pass
         raise
     return path
+
+
+def write_file(relative_path: str, content: str, user_id: int | None = None) -> Path:
+    """Write content to a note atomically (tmp file in same dir + os.replace)."""
+    path = validate_path(relative_path, user_id=user_id)
+    return _atomic_write(path, text=content)
+
+
+def read_bytes(
+    relative_path: str,
+    user_id: int | None = None,
+    max_bytes: int | None = None,
+) -> bytes:
+    """Read raw bytes of an arbitrary vault file (dot-dirs rejected).
+
+    Validates path + visibility, then stat-checks the on-disk size against
+    `max_bytes` (when given) before reading so an over-cap file is refused
+    without loading it into memory. Raises `FileNotFoundError` for a missing
+    file and `ValueError` for traversal, a hidden path, or an over-cap size
+    (the message reports the actual size and path).
+    """
+    path = validate_visible_path(relative_path, user_id=user_id)
+    if not path.is_file():
+        raise FileNotFoundError(f"File not found: {relative_path}")
+    size = path.stat().st_size
+    if max_bytes is not None and size > max_bytes:
+        raise ValueError(
+            f"File too large: {relative_path} is {size:,} bytes "
+            f"(max {max_bytes:,})"
+        )
+    return path.read_bytes()
+
+
+def write_bytes(
+    relative_path: str,
+    data: bytes,
+    overwrite: bool = False,
+    user_id: int | None = None,
+) -> Path:
+    """Write raw bytes to an arbitrary vault file atomically (dot-dirs rejected).
+
+    Validates path + visibility, enforces no-clobber unless `overwrite`,
+    creates any missing parent directories, and routes through the shared
+    atomic temp-file + `os.replace` write. Raises `FileExistsError` when the
+    target exists and `overwrite` is False, leaving the existing file
+    untouched.
+    """
+    path = validate_visible_path(relative_path, user_id=user_id)
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"File already exists: {relative_path}")
+    return _atomic_write(path, data=data)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# File-access helpers: MIME classification + directory listing
+# ────────────────────────────────────────────────────────────────────────────
+
+
+def _sniff_image_mime(head: bytes) -> str | None:
+    """Return an image MIME type if `head` carries a known image signature.
+
+    Covers the common web image formats (PNG, JPEG, GIF, WebP). Used to
+    confirm — and to catch mislabeled — images independent of the file
+    extension. Returns None when no signature matches.
+    """
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if head[:6] in (b"GIF87a", b"GIF89a"):
+        return "image/gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "image/webp"
+    return None
+
+
+def _is_text_like_mime(mime: str | None) -> bool:
+    """Whether a MIME type is safe to return as decoded text.
+
+    `text/*` plus the common structured-text application types
+    (JSON, JavaScript, XML, and any `*+xml`/`*+json` suffix).
+    """
+    if not mime:
+        return False
+    if mime.startswith("text/"):
+        return True
+    if mime in {
+        "application/json",
+        "application/javascript",
+        "application/xml",
+        "application/x-yaml",
+        "application/yaml",
+    }:
+        return True
+    return mime.endswith("+xml") or mime.endswith("+json")
+
+
+def classify_bytes(data: bytes, name: str) -> tuple[str, str]:
+    """Classify a file as ``"text"`` / ``"image"`` / ``"other"`` plus its MIME.
+
+    Detection uses a magic-byte sniff (authoritative for images, so a
+    mislabeled image still renders and a non-image with an image extension
+    does not) and falls back to stdlib `mimetypes` for the text/binary split.
+    """
+    img_mime = _sniff_image_mime(data[:16])
+    if img_mime is not None:
+        return "image", img_mime
+    mime, _ = mimetypes.guess_type(name)
+    if _is_text_like_mime(mime):
+        return "text", mime  # type: ignore[return-value]
+    return "other", mime or "application/octet-stream"
+
+
+def list_dir(
+    folder: str = ".",
+    pattern: str = "*",
+    recursive: bool = False,
+    limit: int = 200,
+    user_id: int | None = None,
+) -> tuple[list[dict], bool]:
+    """Browse the vault filesystem, excluding dot-directories.
+
+    Returns ``(entries, truncated)``. Each entry is a dict with
+    ``path`` (vault-relative POSIX), ``is_dir``, ``size`` (bytes), and
+    ``mtime`` (epoch float). Dot-directories — and a dot-directory `folder` —
+    are rejected/omitted via `validate_visible_path`.
+
+    Non-recursive (default): immediate children only — subdirectories (always)
+    and files whose name matches `pattern`. Recursive: files matching `pattern`
+    beneath `folder`, pruning dot-directories. At most `limit` entries are
+    returned; `truncated` is True when more matched.
+    """
+    import fnmatch
+
+    base = validate_visible_path(folder or ".", user_id=user_id)
+    if not base.is_dir():
+        raise NotADirectoryError(f"Not a directory: {folder}")
+    vault = _vault_root(user_id).resolve()
+
+    def _entry(p: Path, is_dir: bool) -> dict:
+        st = p.stat()
+        return {
+            "path": p.resolve().relative_to(vault).as_posix(),
+            "is_dir": is_dir,
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+        }
+
+    entries: list[dict] = []
+    truncated = False
+
+    if recursive:
+        for root, dirnames, filenames in os.walk(base):
+            # Prune dot-directories in place so os.walk never descends them.
+            dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+            for fname in sorted(filenames):
+                if fname.startswith(".") or not fnmatch.fnmatch(fname, pattern):
+                    continue
+                if len(entries) >= limit:
+                    truncated = True
+                    return entries, truncated
+                entries.append(_entry(Path(root) / fname, False))
+    else:
+        children = sorted(base.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+        for child in children:
+            if child.name.startswith("."):
+                continue
+            is_dir = child.is_dir()
+            if not is_dir and not fnmatch.fnmatch(child.name, pattern):
+                continue
+            if len(entries) >= limit:
+                truncated = True
+                break
+            entries.append(_entry(child, is_dir))
+
+    return entries, truncated
 
 
 def parse_frontmatter(raw: str) -> tuple[dict, str]:

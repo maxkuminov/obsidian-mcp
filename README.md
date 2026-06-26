@@ -174,7 +174,7 @@ makes this feel natural.
 
 ## What's in the box
 
-The server exposes 17 MCP tools across five concerns.
+The server exposes 20 MCP tools across six concerns.
 
 ### Search and discovery
 - `keyword_search(query, folder?, tags?, frontmatter?, limit=20)`,
@@ -206,6 +206,27 @@ The server exposes 17 MCP tools across five concerns.
   does a hard `os.unlink`.
 - `set_frontmatter(path, updates, remove?)`, structured YAML
   mutation. Body is byte-identical when only frontmatter changes.
+
+### File access (non-markdown)
+Raw read/write/browse of arbitrary vault files (PDFs, images, skill
+assets, data files) — distinct peers to the note tools, which stay
+markdown-only. Pure byte transport: no server-side PDF/text extraction,
+no embedding or indexing of non-markdown files.
+- `read_file(path, encoding="auto")`, returns text-like files as text,
+  images as an inline image block that renders in-client, and other
+  binaries as a base64 string. `text`/`base64` force the form. Refuses
+  files over `MAX_FILE_READ_BYTES` (default 10 MB).
+- `write_file(path, content, encoding="base64", overwrite=False)`,
+  lands a file in the vault; base64 for binary, `text` for UTF-8.
+  No-clobber by default, auto-creates parent dirs, atomic write.
+  Capped at `MAX_FILE_WRITE_BYTES` (default 25 MB).
+- `list_files(folder=".", pattern="*", recursive=False, limit=200)`,
+  `ls`-style browse of files and subdirectories with size and mtime,
+  glob-filterable and result-capped.
+
+All three reuse the path-traversal guard and exclude dot-directories
+(`.obsidian`, `.git`, `.trash`, …), matching the indexer's visibility
+rule.
 
 ### Wikilink graph
 - `get_backlinks(path, limit=50)`, notes linking TO `path`
@@ -574,6 +595,8 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `VAULT_PATH` | `/obsidian` | In-container vault mount |
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
+| `MAX_FILE_READ_BYTES` | `10485760` | `read_file` cap (10 MB); bounds inline/base64 responses |
+| `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
 | `FTS_CONFIGS` | `english` | Keyword-search text-search config(s). JSON or CSV. See [Full-text search language(s)](#full-text-search-languages). |
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
@@ -665,7 +688,7 @@ seconds for a few thousand notes. (Do not confuse it with the expensive
 │ MCP clients  │   HTTP + Bearer key   │   FastAPI app        │
 │  Claude Desk │ ────────────────────▶ │  ┌────────────────┐  │
 │  Claude Code │                       │  │  MCP server    │  │
-│  n8n agents  │                       │  │  (17 tools)    │  │
+│  n8n agents  │                       │  │  (20 tools)    │  │
 │  OpenWebUI   │                       │  └─────┬──────────┘  │
 └──────────────┘                       │        ▼             │
                                        │  ┌────────────────┐  │
