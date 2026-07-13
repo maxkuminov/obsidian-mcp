@@ -86,6 +86,16 @@ OPENAI_EMBEDDING_MODEL=text-embedding-3-small
 Generate a strong DB password and use it in both `DATABASE_URL` and
 the Postgres service env in the compose file (Step 3).
 
+Before starting Caddy, generate a password hash and replace the
+`$2a$14$REPLACE_WITH_BCRYPT_HASH` placeholder in `Caddyfile.example`:
+
+```bash
+docker run --rm caddy:2 caddy hash-password --plaintext 'your-password'
+```
+
+The bundled configuration protects `/admin`, `/api`, and `/authorize` and
+fails closed while the placeholder remains.
+
 > Leave `MCP_SANDBOX_MODE` unset (it appears commented-out in
 > `.env.example`). It exists only for the Glama registry's automated
 > sandbox build, where it bypasses Postgres, the embedding provider,
@@ -119,8 +129,8 @@ docker compose -f docker-compose.simple.yml logs -f obsidian-mcp
 
 You should see "Application startup complete" within ~30 seconds, then
 "Starting vault index scan..." (which will report 0 files until Step
-4). The control panel is at `https://your-hostname/admin`. You'll set
-up auth on it in Step 6.
+4). The control panel is at `https://your-hostname/admin` and uses the
+Caddy credentials configured above.
 
 ### Already have a reverse proxy?
 
@@ -277,16 +287,14 @@ After Step 4 the indexer will pick up your vault on the next pass
 
 ## Step 6. Lock down the control panel
 
-The control panel is at `https://your-hostname/admin`. By default
-there is no authentication on it, anyone who knows the URL can manage
-API keys and trigger destructive operations. Pick one of the options
-below before you go further.
+The control panel is at `https://your-hostname/admin`. The bundled Caddy
+configuration denies access until you replace its placeholder basic-auth
+hash. Keep that protection or replace it with one of the options below.
 
 ### Caddy basic auth (simplest)
 
 In `Caddyfile.example` (which `docker-compose.simple.yml` uses by
-default), uncomment the `basic_auth` block and replace the bcrypt
-hash. Generate a hash with:
+default), replace the placeholder bcrypt hash. Generate a hash with:
 
 ```bash
 docker run --rm caddy:2 caddy hash-password --plaintext 'your-password'

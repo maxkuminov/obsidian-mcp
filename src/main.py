@@ -11,6 +11,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
 from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from src.api.routes import router as api_router
@@ -148,20 +149,22 @@ app.add_middleware(
     trusted_hosts=["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
 )
 
+# Reject forged Host headers at the application boundary. This complements
+# FastMCP's DNS-rebinding checks and also protects OAuth/admin routes.
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
+
 # GZip compression for responses >= 1000 bytes
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 if settings.multi_user_mode:
     from starlette.middleware.sessions import SessionMiddleware
-    # Browsers refuse Secure cookies on plain HTTP, so local dev (uvicorn on
-    # http://localhost) needs https_only=False. mcp_hostname is only set in
-    # the deployed Traefik config, so it doubles as a "this is production"
-    # signal here.
+    # Browsers refuse Secure cookies on plain HTTP, so only localhost dev uses
+    # insecure cookies. BASE_URL is authoritative for proxy deployments.
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings.secret_key,
         max_age=settings.session_max_age,
-        https_only=bool(settings.mcp_hostname),
+        https_only=settings.base_url.startswith("https://"),
         same_site="lax",
         session_cookie=settings.session_cookie_name,
     )
@@ -182,6 +185,7 @@ async def add_security_headers(request: Request, call_next):
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
     return response
 
 

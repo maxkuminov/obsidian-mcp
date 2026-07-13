@@ -1,4 +1,5 @@
 from typing import Annotated, Literal
+from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode
@@ -136,6 +137,30 @@ class Settings(BaseSettings):
                 self.allowed_origins = ["http://localhost:8000"]
             if self.allowed_hosts is None:
                 self.allowed_hosts = ["localhost"]
+        return self
+
+    @model_validator(mode="after")
+    def _validate_public_transport(self) -> "Settings":
+        """Permit plaintext OAuth only for loopback development."""
+        base = self.base_url.rstrip("/")
+        parsed = urlparse(base)
+        if (
+            not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or parsed.path not in ("", "/")
+        ):
+            raise ValueError("BASE_URL must be an origin without credentials, path, query, or fragment")
+        is_loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        if parsed.scheme != "https" and not (parsed.scheme == "http" and is_loopback):
+            raise ValueError("BASE_URL must use HTTPS except for loopback development")
+        if self.mcp_hostname and (
+            parsed.scheme != "https" or parsed.hostname != self.mcp_hostname.lower()
+        ):
+            raise ValueError("BASE_URL must use HTTPS and match MCP_HOSTNAME")
+        self.base_url = base
         return self
 
     @model_validator(mode="after")

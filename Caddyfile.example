@@ -24,18 +24,20 @@
     }
 
     # ── Admin panel + REST API ──
-    # Uncomment ONE of the auth blocks below before going live.
+    # Fail closed by default. Replace the placeholder hash before starting
+    # Caddy; leaving it unchanged does not grant access.
     @admin {
         path /admin* /api* /authorize
     }
     handle @admin {
         # ── Option 1: Caddy basic auth ──
         # Generate hash: docker run --rm caddy:2 caddy hash-password --plaintext 'YOUR_PASSWORD'
-        # basic_auth {
-        #     youruser $2a$14$REPLACE_WITH_BCRYPT_HASH
-        # }
+        basic_auth {
+            youruser $2a$14$REPLACE_WITH_BCRYPT_HASH
+        }
 
         # ── Option 2: IP allowlist ──
+        # To use this option, remove the basic_auth block above and uncomment:
         # @trusted {
         #     remote_ip 1.2.3.4 5.6.7.8/32
         # }

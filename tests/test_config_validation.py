@@ -42,3 +42,23 @@ def test_ollama_default_no_key_required():
 def test_invalid_provider_value():
     with pytest.raises(ValidationError):
         Settings(embedding_provider="cohere", _env_file=None)
+
+
+def test_public_base_url_requires_https():
+    with pytest.raises(ValidationError) as exc:
+        Settings(base_url="http://mcp.example.com", _env_file=None)
+    assert "HTTPS" in str(exc.value)
+
+
+def test_loopback_base_url_may_use_http():
+    settings = Settings(base_url="http://127.0.0.1:8000/", _env_file=None)
+    assert settings.base_url == "http://127.0.0.1:8000"
+
+
+def test_base_url_must_match_public_hostname():
+    with pytest.raises(ValidationError):
+        Settings(
+            mcp_hostname="mcp.example.com",
+            base_url="https://other.example.com",
+            _env_file=None,
+        )

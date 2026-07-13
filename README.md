@@ -242,8 +242,10 @@ rule.
 - API keys with the `omcp_` prefix, stored as SHA-256 hashes, with
   `read` and `readwrite` permission scopes. Write tools refuse on
   read-only keys.
-- OAuth 2.0 PKCE (S256) flow for clients like Claude Desktop and
-  claude.ai.
+- OAuth 2.0 PKCE (S256) flow for public and confidential clients,
+  including ChatGPT, Claude Desktop, and claude.ai. Dynamic registration
+  defaults to both vault permission levels; the user chooses the actual
+  grant on the consent screen.
 - Control panel (Jinja2, htmx, Tailwind) for keys, usage logs,
   indexer status, embedding-provider info, and a danger-zone reset.
 - Every tool call is logged to `usage_logs` with name, params
@@ -332,8 +334,10 @@ tokens on something it shouldn't.
 ### API keys and OAuth clients
 
 Bearer keys with `read` / `readwrite` scopes for API clients, and a
-separate OAuth 2.0 PKCE flow for clients like Claude Desktop and
-claude.ai that expect a proper authorization-code dance.
+separate OAuth 2.0 PKCE flow for clients like ChatGPT, Claude Desktop,
+and claude.ai that expect a proper authorization-code dance. The OAuth
+server supports public (`none`) and confidential (`client_secret_post`)
+token-endpoint authentication plus refresh tokens.
 
 ![API keys](screenshots/api-keys.png)
 ![OAuth clients](screenshots/oauth-clients.png)
@@ -358,6 +362,9 @@ at the configured dimension. Use this when switching providers.
 > Deploying on a VPS from scratch? See [`DEPLOYMENT.md`](./DEPLOYMENT.md)
 > for the full walkthrough: Postgres setup, Caddy and TLS, vault sync
 > via Nextcloud, and the gotchas that bite first-time deploys.
+
+The bundled Caddy configuration fails closed on `/admin`, `/api`, and
+`/authorize`; replace its placeholder basic-auth hash before starting it.
 
 ### Prerequisites
 
@@ -797,7 +804,7 @@ DATABASE_URL=... SECRET_KEY=... VAULT_PATH=... uvicorn src.main:app --reload
 ```
 make init             First-time setup (data dirs, .env)
 make build            Build Docker image (no cache)
-make deploy           Build, push, backup, recreate container
+make deploy           Build, scan, push, backup, migrate, recreate container
 make db-init          Create database, user, and pgvector extension
 make db-migrate       Run alembic migrations
 make db-backup        Dump database to backups dir
