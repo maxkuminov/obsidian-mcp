@@ -23,6 +23,7 @@ header/scope assertion. Config loads hermetically via the env-file guard so the
 dev host's `.env` can't leak in.
 """
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import pydantic_settings
 import pytest
@@ -43,6 +44,7 @@ try:
     from src.main import MCPSlashRewriteMiddleware
     from src.mcp_server.auth import APIKeyMiddleware, _www_authenticate
     from src.mcp_server import auth as auth_mod
+    from src.models.db import OAuthToken
 finally:
     pydantic_settings.BaseSettings.__init__ = _orig_init
 
@@ -155,3 +157,51 @@ def test_missing_bearer_returns_401_with_discovery_header():
     assert www.startswith("Bearer ")
     assert "error=" not in www  # no credential was presented
     assert _METADATA_PATH in www
+
+
+def test_inactive_user_oauth_token_is_rejected(monkeypatch):
+    oauth_token = OAuthToken(
+        id=9,
+        user_id=42,
+        token_hash=auth_mod.hash_key("access-token"),
+        token_type="access",
+        client_id="client",
+        scope="read",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        revoked=False,
+    )
+
+    class _Result:
+        def __init__(self, value):
+            self.value = value
+
+        def scalar_one_or_none(self):
+            return self.value
+
+    class _Session:
+        def __init__(self):
+            self.results = iter((oauth_token, False))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def execute(self, _query):
+            return _Result(next(self.results))
+
+    capture = _CaptureApp()
+    monkeypatch.setattr(auth_mod, "async_session", lambda: _Session())
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp/",
+        "headers": [(b"authorization", b"Bearer access-token")],
+    }
+
+    status, headers = _run(_capture_response(APIKeyMiddleware(capture), scope))
+
+    assert status == 401
+    assert not capture.called
+    assert 'error="invalid_token"' in headers["www-authenticate"]

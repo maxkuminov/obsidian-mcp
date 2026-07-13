@@ -103,6 +103,10 @@ image: build trivy push
 deploy: image
 	@echo "$(GREEN)Deploying Obsidian MCP...$(NC)"
 	@$(MAKE) db-backup 2>/dev/null || true
+	# Migrate with the newly built image before replacing the live container.
+	# Migrations are backward-compatible, avoiding a window where new code runs
+	# against the old schema (and matching README's documented deploy behavior).
+	$(COMPOSE) run --rm obsidian-mcp alembic upgrade head
 	$(COMPOSE) up -d --force-recreate
 	@docker image prune -f
 	@docker builder prune -f --filter until=168h

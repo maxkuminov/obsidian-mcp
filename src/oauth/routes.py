@@ -1,8 +1,9 @@
 import hashlib
 import os
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qsl, quote, urlencode, urlparse, urlunparse
 
 from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -20,8 +21,14 @@ templates = Jinja2Templates(
     directory=os.path.join(os.path.dirname(__file__), "..", "control_panel", "templates")
 )
 
-# Valid OAuth scopes
-VALID_SCOPES = {"read", "readwrite"}
+# Valid OAuth scopes. ChatGPT requests ``offline_access`` when the provider
+# advertises refresh-token support. It does not change vault permissions; it
+# only makes the already-issued refresh token explicit in the grant.
+VALID_SCOPES = {"read", "readwrite", "offline_access"}
+DEFAULT_CLIENT_SCOPE = "read readwrite offline_access"
+TOKEN_ENDPOINT_AUTH_METHODS = {"none", "client_secret_post"}
+_PKCE_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
+_PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
 def _hash(value: str) -> str:
@@ -42,6 +49,27 @@ def _valid_redirect_uri(uri: str) -> bool:
         return p.scheme == "https" and bool(p.netloc) and not p.fragment
     except Exception:
         return False
+
+
+def _append_query(uri: str, **params: str) -> str:
+    """Append OAuth response parameters without allowing parameter injection."""
+    parsed = urlparse(uri)
+    query = parse_qsl(parsed.query, keep_blank_values=True)
+    query.extend((key, value) for key, value in params.items() if value != "")
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+def _valid_pkce_challenge(challenge: str, method: str) -> bool:
+    return method == "S256" and bool(_PKCE_CHALLENGE_RE.fullmatch(challenge))
+
+
+def _oauth_json(content: dict, status_code: int = 200) -> JSONResponse:
+    """OAuth responses containing credentials must never be cached."""
+    return JSONResponse(
+        content,
+        status_code=status_code,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 def _validate_scope(scope: str) -> str:
@@ -87,8 +115,8 @@ async def oauth_metadata():
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["client_secret_post"],
-        "scopes_supported": ["read", "readwrite"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "scopes_supported": ["read", "readwrite", "offline_access"],
     })
 
 
@@ -99,7 +127,7 @@ def _protected_resource_metadata() -> dict:
     return {
         "resource": f"{base}/mcp",
         "authorization_servers": [base],
-        "scopes_supported": ["read", "readwrite"],
+        "scopes_supported": ["read", "readwrite", "offline_access"],
         "bearer_methods_supported": ["header"],
     }
 
@@ -120,12 +148,26 @@ async def oauth_protected_resource_mcp():
 @router.post("/register")
 @limiter.limit("3/minute")
 async def register_client(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
     client_name = body.get("client_name", "Unknown Client")
     redirect_uris = body.get("redirect_uris", [])
 
-    if not redirect_uris:
+    if not isinstance(client_name, str) or not client_name.strip() or len(client_name) > 255:
+        return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
+    if (
+        not isinstance(redirect_uris, list)
+        or not redirect_uris
+        or len(redirect_uris) > 10
+        or any(not isinstance(uri, str) or len(uri) > 2048 for uri in redirect_uris)
+    ):
         return JSONResponse({"error": "redirect_uris required"}, status_code=400)
+    if len(set(redirect_uris)) != len(redirect_uris):
+        return JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
 
     # Validate all redirect URIs
     for uri in redirect_uris:
@@ -135,20 +177,42 @@ async def register_client(request: Request):
                 status_code=400,
             )
 
-    # Validate requested scope
-    raw_scope = body.get("scope", "read")
+    # DCR clients commonly omit ``scope`` and ask for the desired subset at
+    # /authorize. Register the full supported set in that case so consent can
+    # offer both read-only and read/write access. The user still chooses the
+    # actual grant on the consent screen.
+    raw_scope = body.get("scope", DEFAULT_CLIENT_SCOPE)
+    if not isinstance(raw_scope, str):
+        return JSONResponse({"error": "invalid_scope"}, status_code=400)
     try:
         scope = _validate_scope(raw_scope)
     except ValueError as exc:
         return JSONResponse({"error": "invalid_scope", "error_description": str(exc)}, status_code=400)
 
+    token_endpoint_auth_method = body.get(
+        "token_endpoint_auth_method", "client_secret_post"
+    )
+    if token_endpoint_auth_method not in TOKEN_ENDPOINT_AUTH_METHODS:
+        return JSONResponse(
+            {
+                "error": "invalid_client_metadata",
+                "error_description": "Unsupported token_endpoint_auth_method",
+            },
+            status_code=400,
+        )
+
     client_id = secrets.token_hex(16)
-    client_secret = secrets.token_hex(32)
+    client_secret = (
+        secrets.token_hex(32)
+        if token_endpoint_auth_method == "client_secret_post"
+        else None
+    )
 
     async with async_session() as session:
         client = OAuthClient(
             client_id=client_id,
-            client_secret_hash=_hash(client_secret),
+            client_secret_hash=_hash(client_secret) if client_secret else None,
+            token_endpoint_auth_method=token_endpoint_auth_method,
             client_name=client_name,
             redirect_uris=redirect_uris,
             scope=scope,
@@ -156,12 +220,18 @@ async def register_client(request: Request):
         session.add(client)
         await session.commit()
 
-    return JSONResponse({
+    registration = {
         "client_id": client_id,
-        "client_secret": client_secret,
         "client_name": client_name,
         "redirect_uris": redirect_uris,
-    }, status_code=201)
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": token_endpoint_auth_method,
+        "scope": scope,
+    }
+    if client_secret:
+        registration["client_secret"] = client_secret
+    return JSONResponse(registration, status_code=201)
 
 
 # --- Authorization Endpoint ---
@@ -202,8 +272,8 @@ async def authorize_get(
     if response_type != "code":
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
 
-    if code_challenge_method != "S256":
-        return JSONResponse({"error": "invalid_request", "error_description": "Only S256 supported"}, status_code=400)
+    if not _valid_pkce_challenge(code_challenge, code_challenge_method):
+        return JSONResponse({"error": "invalid_request", "error_description": "A valid S256 PKCE challenge is required"}, status_code=400)
 
     # Validate scope
     try:
@@ -231,10 +301,14 @@ async def authorize_get(
     # consent screen only offers access levels the client can actually hold.
     client_can_write = "readwrite" in client.scope.split()
 
+    offline_access_requested = "offline_access" in scope.split()
+
     response = templates.TemplateResponse(request, "authorize.html", {
         "client_name": client.client_name,
         "scope": scope,
         "client_can_write": client_can_write,
+        "read_scope": "read offline_access" if offline_access_requested else "read",
+        "readwrite_scope": "readwrite offline_access" if offline_access_requested else "readwrite",
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "code_challenge": code_challenge,
@@ -278,6 +352,9 @@ async def authorize_post(
 
     if not state_valid:
         return JSONResponse({"error": "invalid_state", "error_description": "CSRF state mismatch or missing"}, status_code=400)
+
+    if not _valid_pkce_challenge(code_challenge, code_challenge_method):
+        return JSONResponse({"error": "invalid_request", "error_description": "A valid S256 PKCE challenge is required"}, status_code=400)
 
     # Validate scope
     try:
@@ -326,10 +403,7 @@ async def authorize_post(
 
         if action != "approve":
             # Denied — redirect with error (redirect_uri now verified)
-            sep = "&" if "?" in redirect_uri else "?"
-            url = f"{redirect_uri}{sep}error=access_denied"
-            if client_state:
-                url += f"&state={client_state}"
+            url = _append_query(redirect_uri, error="access_denied", state=client_state)
             return RedirectResponse(url, status_code=302)
 
         code = secrets.token_hex(32)
@@ -354,10 +428,7 @@ async def authorize_post(
         session.add(oauth_code)
         await session.commit()
 
-    sep = "&" if "?" in redirect_uri else "?"
-    url = f"{redirect_uri}{sep}code={code}"
-    if client_state:
-        url += f"&state={client_state}"
+    url = _append_query(redirect_uri, code=code, state=client_state)
     return RedirectResponse(url, status_code=302)
 
 
@@ -385,41 +456,58 @@ async def _handle_auth_code(form):
     code_verifier = form.get("code_verifier")
     redirect_uri = form.get("redirect_uri")
 
-    if not all([code, client_id, client_secret, code_verifier]):
+    if not all([code, code_verifier]):
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     async with async_session() as session:
-        # Verify client
-        result = await session.execute(
-            select(OAuthClient).where(OAuthClient.client_id == client_id)
-        )
-        client = result.scalar_one_or_none()
-        if not client or not secrets.compare_digest(client.client_secret_hash, _hash(client_secret)):
-            return JSONResponse({"error": "invalid_client"}, status_code=401)
-
-        # Verify code
+        # Resolve the authorization code first. Some ChatGPT connector builds
+        # omit client_id at the public-client token exchange. PKCE still binds
+        # the request to the initiating client, and the code tells us which
+        # registered client and auth method must be enforced.
         code_hash = _hash(code)
-        result = await session.execute(
-            select(OAuthCode).where(
-                OAuthCode.code_hash == code_hash,
-                OAuthCode.client_id == client_id,
-                OAuthCode.used == False,
-            )
-        )
+        code_query = select(OAuthCode).where(
+            OAuthCode.code_hash == code_hash,
+            OAuthCode.used == False,
+        ).with_for_update()
+        if client_id:
+            code_query = code_query.where(OAuthCode.client_id == client_id)
+        result = await session.execute(code_query)
         oauth_code = result.scalar_one_or_none()
 
         if not oauth_code:
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
+        result = await session.execute(
+            select(OAuthClient).where(OAuthClient.client_id == oauth_code.client_id)
+        )
+        client = result.scalar_one_or_none()
+        if not client:
+            return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+        auth_method = getattr(
+            client, "token_endpoint_auth_method", "client_secret_post"
+        )
+        if auth_method == "client_secret_post":
+            if not client_secret or not client.client_secret_hash or not secrets.compare_digest(
+                client.client_secret_hash, _hash(client_secret)
+            ):
+                return JSONResponse({"error": "invalid_client"}, status_code=401)
+        elif auth_method != "none":
+            return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+        client_id = oauth_code.client_id
+
         if oauth_code.expires_at < datetime.now(timezone.utc):
             return JSONResponse({"error": "invalid_grant", "error_description": "code expired"}, status_code=400)
 
-        if redirect_uri and oauth_code.redirect_uri != redirect_uri:
+        if not redirect_uri or oauth_code.redirect_uri != redirect_uri:
             return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
 
         # Verify PKCE
+        if not isinstance(code_verifier, str) or not _PKCE_RE.fullmatch(code_verifier):
+            return JSONResponse({"error": "invalid_grant", "error_description": "Invalid PKCE verifier"}, status_code=400)
         expected_challenge = _base64url_sha256(code_verifier)
-        if expected_challenge != oauth_code.code_challenge:
+        if not secrets.compare_digest(expected_challenge, oauth_code.code_challenge):
             return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
 
         # Mark code as used
@@ -449,7 +537,7 @@ async def _handle_auth_code(form):
         ))
         await session.commit()
 
-    return JSONResponse({
+    return _oauth_json({
         "access_token": access_token,
         "token_type": "Bearer",
         "expires_in": 3600,
@@ -463,33 +551,47 @@ async def _handle_refresh(form):
     client_id = form.get("client_id")
     client_secret = form.get("client_secret")
 
-    if not all([refresh_token, client_id, client_secret]):
+    if not refresh_token:
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     async with async_session() as session:
         try:
-            # Verify client
-            result = await session.execute(
-                select(OAuthClient).where(OAuthClient.client_id == client_id)
-            )
-            client = result.scalar_one_or_none()
-            if not client or not secrets.compare_digest(client.client_secret_hash, _hash(client_secret)):
-                return JSONResponse({"error": "invalid_client"}, status_code=401)
-
-            # Verify refresh token
+            # Resolve the token before authenticating the client so public
+            # clients can refresh without a client secret (or, for ChatGPT
+            # compatibility, a repeated client_id).
             token_hash = _hash(refresh_token)
-            result = await session.execute(
-                select(OAuthToken).where(
-                    OAuthToken.token_hash == token_hash,
-                    OAuthToken.token_type == "refresh",
-                    OAuthToken.client_id == client_id,
-                    OAuthToken.revoked == False,
-                )
-            )
+            token_query = select(OAuthToken).where(
+                OAuthToken.token_hash == token_hash,
+                OAuthToken.token_type == "refresh",
+                OAuthToken.revoked == False,
+            ).with_for_update()
+            if client_id:
+                token_query = token_query.where(OAuthToken.client_id == client_id)
+            result = await session.execute(token_query)
             old_token = result.scalar_one_or_none()
 
             if not old_token:
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+            result = await session.execute(
+                select(OAuthClient).where(OAuthClient.client_id == old_token.client_id)
+            )
+            client = result.scalar_one_or_none()
+            if not client:
+                return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+            auth_method = getattr(
+                client, "token_endpoint_auth_method", "client_secret_post"
+            )
+            if auth_method == "client_secret_post":
+                if not client_secret or not client.client_secret_hash or not secrets.compare_digest(
+                    client.client_secret_hash, _hash(client_secret)
+                ):
+                    return JSONResponse({"error": "invalid_client"}, status_code=401)
+            elif auth_method != "none":
+                return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+            client_id = old_token.client_id
 
             if old_token.expires_at < datetime.now(timezone.utc):
                 return JSONResponse({"error": "invalid_grant", "error_description": "refresh token expired"}, status_code=400)
@@ -523,7 +625,7 @@ async def _handle_refresh(form):
             await session.rollback()
             return JSONResponse({"error": "server_error", "error_description": "Token rotation failed"}, status_code=500)
 
-    return JSONResponse({
+    return _oauth_json({
         "access_token": new_access,
         "token_type": "Bearer",
         "expires_in": 3600,
@@ -536,6 +638,7 @@ async def _handle_refresh(form):
 
 
 @router.post("/revoke")
+@limiter.limit("20/minute")
 async def revoke_token(request: Request):
     form = await request.form()
     token = form.get("token")

@@ -3,6 +3,7 @@ import datetime
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
@@ -191,7 +192,12 @@ class OAuthClient(Base):
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
     )
     client_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
-    client_secret_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Public PKCE clients (token_endpoint_auth_method="none") do not have a
+    # client secret. Confidential clients continue to store only its hash.
+    client_secret_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    token_endpoint_auth_method: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="client_secret_post"
+    )
     client_name: Mapped[str] = mapped_column(String(255), nullable=False)
     redirect_uris: Mapped[list] = mapped_column(JSONB, nullable=False)
     scope: Mapped[str] = mapped_column(String(50), nullable=False, default="read")
@@ -200,6 +206,14 @@ class OAuthClient(Base):
     )
 
     user: Mapped["User | None"] = relationship(back_populates="oauth_clients")
+
+    __table_args__ = (
+        CheckConstraint(
+            "(token_endpoint_auth_method = 'none' AND client_secret_hash IS NULL) OR "
+            "(token_endpoint_auth_method = 'client_secret_post' AND client_secret_hash IS NOT NULL)",
+            name="ck_oauth_clients_auth_method_secret",
+        ),
+    )
 
 
 class OAuthCode(Base):

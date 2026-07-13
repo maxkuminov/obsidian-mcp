@@ -12,7 +12,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from src.auth.session import current_user_id
 from src.config import settings
 from src.database import async_session
-from src.models.db import APIKey, OAuthToken
+from src.models.db import APIKey, OAuthToken, User
 from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
@@ -115,6 +115,23 @@ class APIKeyMiddleware:
                         await response(scope, receive, send)
                         return
 
+                    if api_key.user_id is not None:
+                        result = await session.execute(
+                            select(User.is_active).where(User.id == api_key.user_id)
+                        )
+                        if result.scalar_one_or_none() is not True:
+                            logger.warning(
+                                "auth_failure",
+                                extra={"reason": "inactive_user", "key_id": api_key.id},
+                            )
+                            response = JSONResponse(
+                                {"error": "Invalid or revoked key"},
+                                status_code=401,
+                                headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                            )
+                            await response(scope, receive, send)
+                            return
+
                     # Check expiry
                     if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
                         logger.warning("auth_failure", extra={"reason": "key_expired", "key_id": api_key.id})
@@ -173,6 +190,24 @@ class APIKeyMiddleware:
                         )
                         await response(scope, receive, send)
                         return
+
+
+                    if oauth_token.user_id is not None:
+                        result = await session.execute(
+                            select(User.is_active).where(User.id == oauth_token.user_id)
+                        )
+                        if result.scalar_one_or_none() is not True:
+                            logger.warning(
+                                "auth_failure",
+                                extra={"reason": "inactive_user", "key_id": oauth_token.id},
+                            )
+                            response = JSONResponse(
+                                {"error": "Invalid or revoked token"},
+                                status_code=401,
+                                headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                            )
+                            await response(scope, receive, send)
+                            return
 
                     if oauth_token.expires_at < datetime.now(timezone.utc):
                         logger.warning("auth_failure", extra={"reason": "key_expired", "key_id": oauth_token.id})

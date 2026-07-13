@@ -30,7 +30,7 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
   - Panel routes: OAuth protected via `chain-oauth@file`
   - MCP routes (`/mcp/*`): API key auth at app level
 - Registry: `localhost:5000` (or change in `Makefile`)
-- Deploy: `make deploy` (build → push → backup → recreate)
+- Deploy: `make deploy` (build → scan → push → backup → migrate → recreate)
 
 ## Public repo — host paths live outside the tree
 This repo is published on GitHub. Anything host-specific (paths, secrets,
@@ -47,7 +47,7 @@ hostnames) must stay out of tracked files. The mechanism:
 
 ## Commands
 - `make init` — first-time setup
-- `make deploy` — full build and deploy
+- `make deploy` — full build, backup, migration, and deploy
 - `make db-init` — create database + pgvector extension
 - `make db-migrate` — run alembic migrations
 - `make logs` — tail container logs

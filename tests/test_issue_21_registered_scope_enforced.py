@@ -112,7 +112,7 @@ def _approve(client, *, requested_scope):
                 action="approve",
                 client_id="client123",
                 redirect_uri=REGISTERED_URI,
-                code_challenge="challenge",
+                code_challenge="A" * 43,
                 code_challenge_method="S256",
                 scope=requested_scope,
                 state=server_state,
