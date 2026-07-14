@@ -179,6 +179,7 @@ async def edit_note(
     path: str,
     content: str,
     append: bool = False,
+    operation: str | None = None,
     find: str | None = None,
     section: str | None = None,
     replace_all: bool = False,
@@ -199,6 +200,9 @@ async def edit_note(
        appears more than once. Setext (`====`/`----`) headings are not matched.
 
     Flags:
+    - `operation="append"`: legacy alias for `append=True`. This is accepted to
+      prevent older clients from silently falling through to full replacement.
+      `operation="replace"` explicitly selects full replacement.
     - `replace_all=True`: with `find`, replace every occurrence rather than failing on
       multiple matches. Ignored when `find` is unset.
     - `dry_run=True`: compute the would-be result and return a unified diff without
@@ -212,6 +216,7 @@ async def edit_note(
         path: Vault-relative path to the note.
         content: New full content, replacement text, text to append, or section body.
         append: If True, append content to the end of the note.
+        operation: Legacy mode selector; accepts "append" or "replace".
         find: Exact text to find and replace.
         section: ATX heading text identifying the section whose body to replace.
             Use `Parent/Child` to disambiguate repeated headings.
@@ -222,6 +227,7 @@ async def edit_note(
         path,
         content,
         append=append,
+        operation=operation,
         find=find,
         section=section,
         replace_all=replace_all,

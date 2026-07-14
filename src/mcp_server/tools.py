@@ -663,12 +663,13 @@ async def find_orphans_impl(folder: str | None = None, limit: int = 50) -> str:
 
 @_tracked(
     "edit_note",
-    ["path", "append", "find", "section", "replace_all", "dry_run"],
+    ["path", "append", "operation", "find", "section", "replace_all", "dry_run"],
 )
 async def edit_note_impl(
     path: str,
     content: str,
     append: bool = False,
+    operation: str | None = None,
     find: str | None = None,
     section: str | None = None,
     replace_all: bool = False,
@@ -678,6 +679,16 @@ async def edit_note_impl(
     if err := _require_write():
         return err
 
+    if operation is not None:
+        operation = operation.lower()
+        if operation not in {"append", "replace"}:
+            return (
+                'edit_note: operation must be "append" or "replace" '
+                f'(got {operation!r}).'
+            )
+        if operation == "append":
+            append = True
+
     selected = []
     if append:
         selected.append("append=True")
@@ -685,6 +696,8 @@ async def edit_note_impl(
         selected.append("find=...")
     if section is not None:
         selected.append("section=...")
+    if operation == "replace" and selected:
+        selected.append('operation="replace"')
     if len(selected) > 1:
         return (
             "edit_note: choose at most one of append, find, section "
