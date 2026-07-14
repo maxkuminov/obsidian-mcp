@@ -196,7 +196,8 @@ The server exposes 20 MCP tools across six concerns.
   replace (default), `append=True`, `find=…` (with optional
   `replace_all`), or `section=<heading>` (ATX headings, supports
   `Parent/Child` path-style disambiguation). `dry_run=True` returns a
-  unified diff without writing.
+  unified diff without writing. Legacy clients may use
+  `operation="append"`; `operation="replace"` explicitly selects full replace.
 - `move_note(from_path, to_path, rewrite_links=False)`, relocates and
   optionally rewrites incoming `[[Old]]`, `[[Old|alias]]`,
   `[[Old#anchor]]`, `![[Old]]`, and `[[folder/Old]]` references in
