@@ -74,6 +74,13 @@ async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: i
 
 
 _MAX_PARAM_LEN = 200  # truncate long string params (e.g. note content)
+_MAX_QUERY_RESULTS = 500
+_MAX_SEMANTIC_RESULTS = 50
+
+
+def _clamp_limit(limit: int, maximum: int = _MAX_QUERY_RESULTS) -> int:
+    """Keep authenticated callers from creating unbounded DB/response work."""
+    return max(1, min(limit, maximum))
 
 
 def _truncate_params(params: dict) -> dict:
@@ -122,6 +129,7 @@ async def search_notes_impl(
     frontmatter: dict | None = None,
 ) -> str:
     """Full-text keyword search across vault notes."""
+    limit = _clamp_limit(limit)
     uid = current_user_id.get()
     async with async_session() as session:
         results = await full_text_search(
@@ -175,6 +183,7 @@ async def list_notes_impl(
     from sqlalchemy import select
     from src.models.db import NoteMetadata
 
+    limit = _clamp_limit(limit)
     uid = current_user_id.get()
     async with async_session() as session:
         stmt = select(NoteMetadata).order_by(NoteMetadata.modified_at.desc())
@@ -205,6 +214,7 @@ async def get_tags_impl(limit: int = 50) -> str:
     from sqlalchemy import func, select
     from src.models.db import NoteMetadata
 
+    limit = _clamp_limit(limit)
     uid = current_user_id.get()
     async with async_session() as session:
         tag_query = select(
@@ -240,6 +250,7 @@ async def get_recent_impl(
     from sqlalchemy import select
     from src.models.db import NoteMetadata
 
+    limit = _clamp_limit(limit)
     uid = current_user_id.get()
     async with async_session() as session:
         query = select(NoteMetadata).order_by(NoteMetadata.modified_at.desc())
@@ -270,6 +281,7 @@ async def semantic_search_impl(
     frontmatter: dict | None = None,
 ) -> str:
     """Vector similarity search using bge-m3 embeddings."""
+    limit = _clamp_limit(limit, _MAX_SEMANTIC_RESULTS)
     uid = current_user_id.get()
     async with async_session() as session:
         results = await semantic_search(

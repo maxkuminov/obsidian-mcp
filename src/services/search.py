@@ -20,6 +20,7 @@ async def full_text_search(
     The tsquery is built from `settings.fts_configs` (see `src/services/fts.py`)
     so query-time configs match the index-time configs in `indexer.py`.
     """
+    limit = max(1, min(limit, 500))
     tsquery = combined_tsquery(query)
     rank = func.ts_rank_cd(NoteMetadata.content_tsvector, tsquery).label("rank")
 

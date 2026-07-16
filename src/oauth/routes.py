@@ -321,7 +321,7 @@ async def authorize_get(
         "oauth_state",
         signed_state,
         httponly=True,
-        secure=True,
+        secure=settings.base_url.startswith("https://"),
         samesite="lax",
         max_age=600,  # 10 minutes, matching auth code lifetime
     )

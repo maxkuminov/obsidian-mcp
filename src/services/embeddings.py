@@ -251,6 +251,7 @@ async def semantic_search(
     to a note plus its most-relevant chunk as preview — the caller should `read_note`
     for full content.
     """
+    limit = max(1, min(limit, 50))
     query_embedding = await get_embedding(query)
 
     # ef_search=80 lifts HNSW recall@10 to ~98% at modest latency cost.
