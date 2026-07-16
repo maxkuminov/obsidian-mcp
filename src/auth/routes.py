@@ -28,7 +28,7 @@ from src.csrf import generate_csrf_token, verify_csrf
 from src.database import get_session
 from src.limiter import limiter
 from src.models.db import APIKey, NoteMetadata, OAuthClient, OAuthCode, OAuthToken, UsageLog, User
-from src.services.vault import warm_user_vault_cache
+from src.services.vault import validate_vault_root_path, warm_user_vault_cache
 
 router = APIRouter(tags=["auth"], dependencies=[Depends(verify_csrf)])
 
@@ -228,6 +228,16 @@ async def register_submit(
             vault_path=vault_path,
             status_code=status.HTTP_400_BAD_REQUEST,
         )
+    normalized_vp, vp_err = validate_vault_root_path(vault_path)
+    if vp_err:
+        return _render_register(
+            request,
+            error=vp_err,
+            username=normalized,
+            vault_path=vault_path,
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    vault_path = normalized_vp or vault_path
 
     # Critical section: take a transaction-scoped advisory lock so two
     # concurrent first-visits serialize. Inside the lock we re-check that

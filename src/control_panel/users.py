@@ -41,7 +41,7 @@ from src.control_panel.routes import _panel_context, require_admin_panel
 from src.csrf import verify_csrf
 from src.database import get_session
 from src.models.db import APIKey, NoteMetadata, User
-from src.services.vault import clear_user_vault_cache
+from src.services.vault import clear_user_vault_cache, validate_vault_root_path
 
 router = APIRouter(prefix="/admin/users", tags=["users"])
 
@@ -61,33 +61,7 @@ router.dependencies.append(Depends(verify_csrf))
 # Allowed vault_path patterns: absolute paths under /vaults/, OR the
 # legacy single-user mount `settings.vault_path` (default /obsidian) for
 # max's existing setup post-flag-flip.
-def _validate_vault_path(p: str) -> tuple[str | None, str | None]:
-    """Return `(normalized_path, error)` — at most one of the two is set.
-
-    Empty or None → returns `(None, None)`: it's valid to clear a user's
-    vault_path (their vault tools just error until reassigned).
-    """
-    raw = (p or "").strip()
-    if not raw:
-        return None, None
-    # Canonicalize: forbid `..` traversal and trailing slashes.
-    if ".." in Path(raw).parts:
-        return None, "Vault path may not contain '..' traversal."
-    normalized = os.path.normpath(raw)
-    # `os.path.normpath` collapses double slashes and trailing slashes.
-    # We accept either the legacy mount or a strict /vaults/ subpath.
-    legacy = settings.vault_path.rstrip("/")
-    if normalized != legacy and not normalized.startswith("/vaults/"):
-        return None, (
-            f"Vault path must be either '{legacy}' (legacy mount) or a "
-            "subpath of '/vaults/'."
-        )
-    if not Path(normalized).is_dir():
-        return None, (
-            f"Vault path '{normalized}' does not exist as a directory "
-            "inside the container. Check the docker-compose volume mount."
-        )
-    return normalized, None
+_validate_vault_path = validate_vault_root_path
 
 
 async def _check_vault_path_unique(
