@@ -398,6 +398,7 @@ async def reset_password(
         raise HTTPException(404, "User not found")
 
     target.password_hash = hash_password(new_password)
+    target.session_version += 1
     await session.commit()
 
     return RedirectResponse(

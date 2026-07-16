@@ -158,6 +158,7 @@ async def login_submit(
 
     request.session.clear()
     request.session["user_id"] = user.id
+    request.session["session_version"] = user.session_version
     request.session["is_admin"] = bool(user.is_admin)
     request.session["username"] = user.username
 
@@ -301,6 +302,7 @@ async def register_submit(
 
     request.session.clear()
     request.session["user_id"] = uid
+    request.session["session_version"] = new_user.session_version
     request.session["is_admin"] = True
     request.session["username"] = normalized
 

@@ -34,7 +34,16 @@ async def get_current_user(
     if user_id is None:
         return None
     result = await session.execute(select(User).where(User.id == user_id))
-    return result.scalar_one_or_none()
+    user = result.scalar_one_or_none()
+    if user is None:
+        return None
+    # Starlette sessions are signed client-side cookies. Binding the cookie
+    # to a database-backed version lets password resets invalidate every
+    # previously issued session without introducing a server-side store.
+    if request.session.get("session_version") != user.session_version:
+        request.session.clear()
+        return None
+    return user
 
 
 async def require_user(
