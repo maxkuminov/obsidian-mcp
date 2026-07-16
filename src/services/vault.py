@@ -91,6 +91,42 @@ def _vault_root(user_id: int | None = None) -> Path:
     return cached
 
 
+def validate_vault_root_path(p: str) -> tuple[str | None, str | None]:
+    """Validate an absolute container path as an acceptable vault root.
+
+    Returns ``(normalized_path, error)`` — at most one of the two is set.
+    Empty / None input → ``(None, None)``: callers that allow clearing a
+    vault_path assignment treat this as "no change".
+
+    Accepted values:
+    - ``settings.vault_path`` (the legacy single-user ``/obsidian`` mount)
+    - Any non-empty subpath of ``/vaults/``
+
+    The ``/vaults/`` restriction prevents an admin from accidentally (or
+    deliberately) pointing a user at ``/etc``, the host home dir, or another
+    container path that happens to be visible.  The directory-existence check
+    catches a docker-compose mount that was configured but not yet applied.
+    """
+    raw = (p or "").strip()
+    if not raw:
+        return None, None
+    if ".." in Path(raw).parts:
+        return None, "Vault path may not contain '..' traversal."
+    normalized = os.path.normpath(raw)
+    legacy = settings.vault_path.rstrip("/")
+    if normalized != legacy and not normalized.startswith("/vaults/"):
+        return None, (
+            f"Vault path must be either '{legacy}' (legacy mount) or a "
+            "subpath of '/vaults/'."
+        )
+    if not Path(normalized).is_dir():
+        return None, (
+            f"Vault path '{normalized}' does not exist as a directory "
+            "inside the container. Check the docker-compose volume mount."
+        )
+    return normalized, None
+
+
 def validate_path(relative_path: str, user_id: int | None = None) -> Path:
     """Resolve a relative path within the vault, preventing traversal."""
     vault = _vault_root(user_id)
