@@ -11,7 +11,9 @@ alembic==1.18.4
 pgvector==0.4.2
 
 # MCP
-mcp[cli]==1.26.0
+# 1.28.1 fixes CVE-2026-52869, CVE-2026-52870, and CVE-2026-59950
+# (fixable HIGH findings enforced by the Trivy deploy gate).
+mcp[cli]==1.28.1
 
 # Embeddings & search
 httpx==0.28.1
