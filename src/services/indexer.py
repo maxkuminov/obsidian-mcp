@@ -459,7 +459,9 @@ async def link_backfill_pass(user_id: int | None = None):
             return
 
         rows_stmt = select(NoteMetadata.id, NoteMetadata.file_path)
-        if user_id is not None:
+        if user_id is None:
+            rows_stmt = rows_stmt.where(NoteMetadata.user_id.is_(None))
+        else:
             rows_stmt = rows_stmt.where(NoteMetadata.user_id == user_id)
         rows = (await session.execute(rows_stmt)).all()
         if not rows:
