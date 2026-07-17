@@ -13,6 +13,7 @@
 - [x] 2.3 Deny hidden paths across note mutation APIs.
 - [x] 2.4 Preserve source-relative Markdown links and rewrite moved self-links.
 - [x] 2.5 Enforce bounded single-descriptor file reads.
+- [x] 2.6 Prevent concurrent soft-delete trash collisions.
 
 ## 3. Authentication and Routing Integrity
 

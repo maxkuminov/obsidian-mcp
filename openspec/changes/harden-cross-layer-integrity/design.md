@@ -26,7 +26,7 @@ Creation and non-overwrite writes use an atomic create/link operation rather tha
 
 ### Use optimistic content comparison for read-modify-write tools
 
-Edits, frontmatter changes, and backlink rewrites compare the content read with the content still present immediately before replacement. A mismatch produces a conflict rather than overwriting a newer external edit. This avoids server-wide locks that cannot coordinate with Obsidian itself.
+Edits, frontmatter changes, and backlink rewrites compare the content read with the content still present immediately before replacement. A mismatch observed by that check produces a conflict rather than overwriting a newer external edit. This avoids server-wide locks that cannot coordinate with Obsidian itself; it is optimistic detection, not a filesystem-wide compare-and-swap guarantee.
 
 ### Commit one coherent derived-index snapshot
 

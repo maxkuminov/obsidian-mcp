@@ -20,6 +20,14 @@ Startup link backfill SHALL determine completion independently for each user sco
 - **THEN** its partial transaction SHALL roll back
 - **AND** startup SHALL retry that user's complete backfill later
 
+### Requirement: Single-user index work is NULL-owned scoped
+When an index operation is invoked with no user identifier, the operation SHALL select, mutate, embed, rebuild, and resolve links only for metadata whose `user_id` is NULL. Rows owned by named users MUST remain unchanged, including after a deployment-mode transition leaves mixed scopes in the database.
+
+#### Scenario: Mixed ownership survives single-user indexing
+- **WHEN** NULL-owned and user-owned metadata coexist and a single-user index, embed, link, or FTS rebuild pass runs
+- **THEN** only NULL-owned rows SHALL be selected or mutated
+- **AND** user-owned metadata, vectors, and links SHALL remain unchanged
+
 ### Requirement: Embedding completion has exact cardinality
 The system SHALL accept an embedding batch only when it contains exactly one vector for every requested chunk. It SHALL record an empty or fully-cleaned note as current with zero vectors.
 
@@ -32,4 +40,3 @@ The system SHALL accept an embedding batch only when it contains exactly one vec
 - **WHEN** cleaning and chunking produces zero chunks
 - **THEN** the note's embedded content hash SHALL be marked current
 - **AND** the note SHALL have zero embedding rows
-
