@@ -25,5 +25,5 @@
 - [x] 4.1 Run focused regression suites for all three tracks.
 - [x] 4.2 Run the complete automated test suite.
 - [x] 4.3 Run strict OpenSpec validation.
-- [ ] 4.4 Run a fresh OpenSpec implementation verifier and resolve drift.
-- [ ] 4.5 Run a fresh adversarial verifier and resolve actionable findings.
+- [x] 4.4 Run a fresh OpenSpec implementation verifier and resolve drift.
+- [x] 4.5 Run a fresh adversarial verifier and resolve actionable findings.
