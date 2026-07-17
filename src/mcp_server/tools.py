@@ -4,6 +4,7 @@ import inspect
 import logging
 import mimetypes
 import os
+import posixpath
 import re
 import shutil
 import time
@@ -343,12 +344,10 @@ async def create_note_impl(path: str, content: str) -> str:
         path += ".md"
     uid = current_user_id.get()
     try:
-        from src.services.vault import validate_path
-        full_path = validate_path(path, user_id=uid)
-        if full_path.exists():
-            return f"Note already exists: {path}. Use edit_note to modify it."
-        write_file(path, content, user_id=uid)
+        write_file(path, content, user_id=uid, overwrite=False)
         return f"Created note: {path}"
+    except FileExistsError:
+        return f"Note already exists: {path}. Use edit_note to modify it."
     except ValueError as e:
         return str(e)
 
@@ -718,15 +717,16 @@ async def edit_note_impl(
 
     uid = current_user_id.get()
     try:
-        from src.services.vault import replace_section, validate_path
-        full_path = validate_path(path, user_id=uid)
+        from src.services.vault import replace_section, validate_visible_path
+        full_path = validate_visible_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.exists():
         return f"Note not found: {path}. Use create_note to create it."
 
     try:
-        existing = full_path.read_text(encoding="utf-8")
+        existing_bytes = read_bytes(path, user_id=uid, max_bytes=MAX_NOTE_BYTES)
+        existing = existing_bytes.decode("utf-8")
     except Exception as e:
         return f"Failed to read {path}: {e}"
 
@@ -782,8 +782,8 @@ async def edit_note_impl(
         return diff or f"No changes for {path}"
 
     try:
-        write_file(path, new_content, user_id=uid)
-    except ValueError as e:
+        write_file(path, new_content, user_id=uid, expected=existing_bytes)
+    except (ValueError, RuntimeError) as e:
         return str(e)
     return success_message
 
@@ -855,10 +855,12 @@ def _rewrite_links_in_text(
         if resolve_target(target_for_resolve, source_path, pre_move_index) != from_id:
             continue
         anchor = m.group("anchor") or ""
+        source_dir = PurePosixPath(source_path).parent.as_posix()
+        relative_target = posixpath.relpath(to_rel, source_dir)
         rewrites.append((
             m.start(),
             m.end(),
-            f"[{m.group('text')}]({to_rel}{anchor})",
+            f"[{m.group('text')}]({relative_target}{anchor})",
         ))
 
     if not rewrites:
@@ -883,19 +885,16 @@ async def move_note_impl(
     from sqlalchemy import select, update
     from src.models.db import NoteLink, NoteMetadata
     from src.services.links import build_vault_index
-    from src.services.vault import _vault_root, validate_path
+    from src.services.vault import _vault_root, move_no_clobber, validate_visible_path
 
     uid = current_user_id.get()
     try:
-        src_full = validate_path(from_path, user_id=uid)
-        dst_full = validate_path(to_path, user_id=uid)
+        src_full = validate_visible_path(from_path, user_id=uid)
+        dst_full = validate_visible_path(to_path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not src_full.is_file():
         return f"Source note not found: {from_path}"
-    if dst_full.exists():
-        return f"Destination already exists: {to_path}"
-
     vault = _vault_root(uid).resolve()
     from_rel = src_full.resolve().relative_to(vault).as_posix()
     to_rel = dst_full.resolve().relative_to(vault).as_posix()
@@ -922,17 +921,12 @@ async def move_note_impl(
                 src_rows = (await session.execute(src_q)).all()
                 rewrite_sources = [r.file_path for r in src_rows]
 
-    dst_full.parent.mkdir(parents=True, exist_ok=True)
     try:
-        os.replace(src_full, dst_full)
+        move_no_clobber(src_full, dst_full)
+    except FileExistsError:
+        return f"Destination already exists: {to_path}"
     except OSError as e:
-        if getattr(e, "errno", None) == 18:
-            logger.warning(
-                "Cross-FS move for %s → %s; using shutil.move", from_rel, to_rel
-            )
-            shutil.move(str(src_full), str(dst_full))
-        else:
-            return f"Move failed: {e}"
+        return f"Move failed: {e}"
 
     db_failed = False
     try:
@@ -979,17 +973,27 @@ async def move_note_impl(
     rewrites_done = 0
     files_modified = 0
     if rewrite_links and pre_move_index is not None:
-        for src_path in rewrite_sources:
+        for original_src_path in rewrite_sources:
             try:
-                src_file = validate_path(src_path, user_id=uid)
+                # A moved note may link to itself. Read it at its new location,
+                # but resolve its old link text in the pre-move location.
+                src_path = (
+                    to_rel if original_src_path == from_rel else original_src_path
+                )
+                src_file = validate_visible_path(src_path, user_id=uid)
                 if not src_file.is_file():
                     continue
-                content = src_file.read_text(encoding="utf-8")
+                original_bytes = read_bytes(
+                    src_path, user_id=uid, max_bytes=MAX_NOTE_BYTES
+                )
+                content = original_bytes.decode("utf-8")
                 new_content, n = _rewrite_links_in_text(
-                    content, from_rel, to_rel, src_path, pre_move_index
+                    content, from_rel, to_rel, original_src_path, pre_move_index
                 )
                 if n > 0:
-                    write_file(src_path, new_content, user_id=uid)
+                    write_file(
+                        src_path, new_content, user_id=uid, expected=original_bytes
+                    )
                     rewrites_done += n
                     files_modified += 1
             except Exception as e:
@@ -1016,11 +1020,11 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
     if err := _require_write():
         return err
 
-    from src.services.vault import _vault_root, validate_path
+    from src.services.vault import _vault_root, validate_visible_path
 
     uid = current_user_id.get()
     try:
-        full_path = validate_path(path, user_id=uid)
+        full_path = validate_visible_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.is_file():
@@ -1075,12 +1079,12 @@ async def set_frontmatter_impl(
     from src.services.vault import (
         parse_frontmatter,
         serialize_frontmatter,
-        validate_path,
+        validate_visible_path,
     )
 
     uid = current_user_id.get()
     try:
-        full_path = validate_path(path, user_id=uid)
+        full_path = validate_visible_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.is_file():
@@ -1090,7 +1094,8 @@ async def set_frontmatter_impl(
         return f"No changes for {path} (empty updates and remove)"
 
     try:
-        raw = full_path.read_text(encoding="utf-8")
+        raw_bytes = read_bytes(path, user_id=uid, max_bytes=MAX_NOTE_BYTES)
+        raw = raw_bytes.decode("utf-8")
     except Exception as e:
         return f"Failed to read {path}: {e}"
 
@@ -1111,8 +1116,8 @@ async def set_frontmatter_impl(
         return f"No changes for {path}"
 
     try:
-        write_file(path, new_raw, user_id=uid)
-    except ValueError as e:
+        write_file(path, new_raw, user_id=uid, expected=raw_bytes)
+    except (ValueError, RuntimeError) as e:
         return str(e)
 
     summary: list[str] = []
