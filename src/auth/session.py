@@ -30,12 +30,31 @@ async def get_current_user(
 ) -> User | _SingleUserSentinel | None:
     if not settings.multi_user_mode:
         return _SINGLE_USER_SENTINEL
-    user_id = request.session.get("user_id") if hasattr(request, "session") else None
+    return await get_active_session_user(request, session)
+
+
+async def get_active_session_user(
+    request: Request,
+    session: AsyncSession,
+) -> User | None:
+    """Resolve and validate a multi-user browser session.
+
+    Keep every browser entry point on the same database-backed checks: the
+    user must still exist, be active, and have the session version encoded in
+    the signed cookie. Invalid cookies are cleared so they cannot be reused by
+    another route (notably OAuth consent) after a password reset or account
+    deactivation.
+    """
+    try:
+        user_id = request.session.get("user_id")
+    except (AssertionError, AttributeError):
+        return None
     if user_id is None:
         return None
     result = await session.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
-    if user is None:
+    if user is None or not user.is_active:
+        request.session.clear()
         return None
     # Starlette sessions are signed client-side cookies. Binding the cookie
     # to a database-backed version lets password resets invalidate every

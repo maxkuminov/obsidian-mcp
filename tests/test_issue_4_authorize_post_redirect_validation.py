@@ -33,6 +33,8 @@ def _no_env_file_init(self, *args, **kwargs):
 pydantic_settings.BaseSettings.__init__ = _no_env_file_init
 try:
     import asyncio
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
 
     import pytest
     from fastapi.responses import JSONResponse, RedirectResponse
@@ -121,6 +123,12 @@ def _call(client, *, action, redirect_uri, multi_user=False):
         req = _FakeRequest(signed)
         if multi_user:
             req.session["user_id"] = 7
+            req.session["session_version"] = 1
+            monkeypatch.setattr(
+                routes,
+                "get_active_session_user",
+                AsyncMock(return_value=SimpleNamespace(id=7)),
+            )
         resp = asyncio.run(
             routes.authorize_post(
                 req,

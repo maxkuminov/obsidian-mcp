@@ -263,8 +263,11 @@ class RootMCPProxyMiddleware:
             headers = dict(scope.get("headers", []))
             auth = headers.get(b"authorization", b"").decode()
             if auth.startswith("Bearer "):
-                await APIKeyMiddleware(mcp_handler)(scope, receive, send)
-                return
+                # Rewrite into the normal mounted MCP route. Calling the MCP
+                # handler directly here would bypass every middleware already
+                # wrapped by ``self.app`` (TrustedHost, CORS, proxy headers,
+                # security headers, sessions, and gzip).
+                scope = dict(scope, path="/mcp/", raw_path=b"/mcp/")
         await self.app(scope, receive, send)
 
 
