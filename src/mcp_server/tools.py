@@ -808,6 +808,7 @@ def _rewrite_links_in_text(
     to_rel: str,
     source_path: str,
     pre_move_index: dict,
+    output_source_path: str | None = None,
 ) -> tuple[str, int]:
     """Rewrite any wikilink/embed/markdown-link in `content` whose pre-move
     resolution would have pointed at `from_rel`, so it now refers to `to_rel`.
@@ -855,7 +856,11 @@ def _rewrite_links_in_text(
         if resolve_target(target_for_resolve, source_path, pre_move_index) != from_id:
             continue
         anchor = m.group("anchor") or ""
-        source_dir = PurePosixPath(source_path).parent.as_posix()
+        # Resolve against the original source location, but generate the new
+        # href relative to where that source lives after the move. These differ
+        # for a moved note rewriting its own Markdown self-link.
+        output_path = output_source_path or source_path
+        source_dir = PurePosixPath(output_path).parent.as_posix()
         relative_target = posixpath.relpath(to_rel, source_dir)
         rewrites.append((
             m.start(),
@@ -870,6 +875,19 @@ def _rewrite_links_in_text(
     for start, end, replacement in rewrites:
         out = out[:start] + replacement + out[end:]
     return out, len(rewrites)
+
+
+def _rewrite_failure_warning(failed_sources: list[str]) -> str | None:
+    """Describe backlink rewrites that failed after the move completed."""
+    if not failed_sources:
+        return None
+    preview = ", ".join(failed_sources[:3])
+    if len(failed_sources) > 3:
+        preview += f", and {len(failed_sources) - 3} more"
+    return (
+        "partial success: note moved, but link rewrites failed in "
+        f"{len(failed_sources)} note(s): {preview}"
+    )
 
 
 @_tracked("move_note", ["from_path", "to_path", "rewrite_links"])
@@ -972,6 +990,7 @@ async def move_note_impl(
 
     rewrites_done = 0
     files_modified = 0
+    failed_rewrite_sources: list[str] = []
     if rewrite_links and pre_move_index is not None:
         for original_src_path in rewrite_sources:
             try:
@@ -988,7 +1007,12 @@ async def move_note_impl(
                 )
                 content = original_bytes.decode("utf-8")
                 new_content, n = _rewrite_links_in_text(
-                    content, from_rel, to_rel, original_src_path, pre_move_index
+                    content,
+                    from_rel,
+                    to_rel,
+                    original_src_path,
+                    pre_move_index,
+                    output_source_path=src_path,
                 )
                 if n > 0:
                     write_file(
@@ -998,6 +1022,7 @@ async def move_note_impl(
                     files_modified += 1
             except Exception as e:
                 logger.warning("Failed to rewrite links in %s: %s", src_path, e)
+                failed_rewrite_sources.append(src_path)
 
     parts = [f"Moved {from_rel} → {to_rel}"]
     if db_failed:
@@ -1006,6 +1031,9 @@ async def move_note_impl(
         parts.append(
             f"rewrote {rewrites_done} link(s) across {files_modified} note(s)"
         )
+        warning = _rewrite_failure_warning(failed_rewrite_sources)
+        if warning is not None:
+            parts.append(f"(warning: {warning})")
     return " — ".join(parts) if len(parts) > 1 else parts[0]
 
 

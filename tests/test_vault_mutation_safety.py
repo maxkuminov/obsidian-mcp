@@ -150,6 +150,33 @@ def test_moved_note_path_style_self_link_is_rewritten():
     assert rewritten == "Self: [[new/renamed#section]]"
 
 
+def test_moved_note_markdown_self_link_is_relative_to_new_folder():
+    index = {
+        "paths": {"old/folder/target.md": 7},
+        "stems": {"target": [("old/folder/target.md", 7)]},
+    }
+    rewritten, count = tools._rewrite_links_in_text(
+        "Self: [target](target.md#section)",
+        "old/folder/target.md",
+        "new/deeper/renamed.md",
+        "old/folder/target.md",
+        index,
+        output_source_path="new/deeper/renamed.md",
+    )
+    assert count == 1
+    assert rewritten == "Self: [target](renamed.md#section)"
+
+
+def test_move_rewrite_failure_warning_reports_partial_success():
+    warning = tools._rewrite_failure_warning(
+        ["sources/one.md", "sources/two.md"]
+    )
+    assert warning is not None
+    assert "partial success: note moved" in warning
+    assert "link rewrites failed in 2 note(s)" in warning
+    assert "sources/one.md" in warning
+
+
 def test_bounded_read_uses_open_inode_when_path_is_swapped(offline, monkeypatch):
     path = offline / "data.bin"
     path.write_bytes(b"small")
