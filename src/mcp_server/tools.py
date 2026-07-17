@@ -889,6 +889,27 @@ def _rewrite_failure_warning(failed_sources: list[str]) -> str | None:
     )
 
 
+def _note_owner_predicate(uid: int | None):
+    """Return the exact NoteMetadata ownership predicate for a vault context."""
+    from src.models.db import NoteMetadata
+
+    return (
+        NoteMetadata.user_id.is_(None)
+        if uid is None
+        else NoteMetadata.user_id == uid
+    )
+
+
+def _ensure_move_source_in_index(index: dict, from_rel: str) -> None:
+    """Make stale/missing metadata unable to suppress moved-note self rewrites."""
+    if from_rel in index["paths"]:
+        return
+    synthetic_id = -1
+    index["paths"][from_rel] = synthetic_id
+    stem = PurePosixPath(from_rel).stem
+    index["stems"].setdefault(stem, []).append((from_rel, synthetic_id))
+
+
 @_tracked("move_note", ["from_path", "to_path", "rewrite_links"])
 async def move_note_impl(
     from_path: str,
@@ -917,14 +938,15 @@ async def move_note_impl(
     to_rel = dst_full.resolve().relative_to(vault).as_posix()
 
     pre_move_index: dict | None = None
-    rewrite_sources: list[str] = []
+    rewrite_sources: list[str] = [from_rel] if rewrite_links else []
     if rewrite_links:
         async with async_session() as session:
-            rows_stmt = select(NoteMetadata.file_path, NoteMetadata.id)
-            if uid is not None:
-                rows_stmt = rows_stmt.where(NoteMetadata.user_id == uid)
+            rows_stmt = select(NoteMetadata.file_path, NoteMetadata.id).where(
+                _note_owner_predicate(uid)
+            )
             rows = (await session.execute(rows_stmt)).all()
             pre_move_index = build_vault_index([(r.file_path, r.id) for r in rows])
+            _ensure_move_source_in_index(pre_move_index, from_rel)
             target_id = pre_move_index["paths"].get(from_rel)
             if target_id is not None:
                 src_q = (
@@ -933,10 +955,10 @@ async def move_note_impl(
                     .where(NoteLink.target_note_id == target_id)
                     .distinct()
                 )
-                if uid is not None:
-                    src_q = src_q.where(NoteMetadata.user_id == uid)
+                src_q = src_q.where(_note_owner_predicate(uid))
                 src_rows = (await session.execute(src_q)).all()
-                rewrite_sources = [r.file_path for r in src_rows]
+                rewrite_sources.extend(r.file_path for r in src_rows)
+                rewrite_sources = list(dict.fromkeys(rewrite_sources))
 
     try:
         move_no_clobber(src_full, dst_full)
@@ -950,35 +972,29 @@ async def move_note_impl(
         async with async_session() as session:
             nm_update = (
                 update(NoteMetadata)
-                .where(NoteMetadata.file_path == from_rel)
+                .where(
+                    NoteMetadata.file_path == from_rel,
+                    _note_owner_predicate(uid),
+                )
                 .values(file_path=to_rel)
             )
-            if uid is not None:
-                nm_update = nm_update.where(NoteMetadata.user_id == uid)
             await session.execute(nm_update)
 
             # Scope the NoteLink.target_path update to this user's link rows
             # by joining through their source notes. In single-user mode the
             # subquery selects every notes_metadata row (user_id IS NULL) so
             # the legacy behavior is preserved.
-            if uid is None:
-                link_update = (
-                    update(NoteLink)
-                    .where(NoteLink.target_path == from_rel)
-                    .values(target_path=to_rel)
+            user_note_ids = select(NoteMetadata.id).where(
+                _note_owner_predicate(uid)
+            )
+            link_update = (
+                update(NoteLink)
+                .where(
+                    NoteLink.target_path == from_rel,
+                    NoteLink.source_note_id.in_(user_note_ids),
                 )
-            else:
-                user_note_ids = select(NoteMetadata.id).where(
-                    NoteMetadata.user_id == uid
-                )
-                link_update = (
-                    update(NoteLink)
-                    .where(
-                        NoteLink.target_path == from_rel,
-                        NoteLink.source_note_id.in_(user_note_ids),
-                    )
-                    .values(target_path=to_rel)
-                )
+                .values(target_path=to_rel)
+            )
             await session.execute(link_update)
             await session.commit()
     except Exception as e:

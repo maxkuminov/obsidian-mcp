@@ -4,10 +4,12 @@ import os
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select, update
 
 import src.mcp_server.tools as tools
 from src.mcp_server.auth import current_permission
 from src.services import vault as vault_service
+from src.models.db import NoteLink, NoteMetadata
 
 
 @pytest.fixture(autouse=True)
@@ -203,6 +205,72 @@ def test_move_rewrite_failure_warning_reports_partial_success():
     assert "partial success: note moved" in warning
     assert "link rewrites failed in 2 note(s)" in warning
     assert "sources/one.md" in warning
+
+
+def test_single_user_move_queries_are_explicitly_null_owned():
+    metadata_select = select(NoteMetadata.id).where(
+        tools._note_owner_predicate(None)
+    )
+    owned_ids = select(NoteMetadata.id).where(tools._note_owner_predicate(None))
+    link_update = update(NoteLink).where(NoteLink.source_note_id.in_(owned_ids))
+    metadata_sql = str(metadata_select.compile())
+    link_sql = str(link_update.compile())
+    assert "notes_metadata.user_id IS NULL" in metadata_sql
+    assert "notes_metadata.user_id IS NULL" in link_sql
+
+
+def test_stale_index_still_rewrites_moved_note_self_link():
+    index = {"paths": {}, "stems": {}}
+    tools._ensure_move_source_in_index(index, "old/target.md")
+    rewritten, count = tools._rewrite_links_in_text(
+        "Self: [[old/target]]",
+        "old/target.md",
+        "new/target.md",
+        "old/target.md",
+        index,
+        output_source_path="new/target.md",
+    )
+    assert count == 1
+    assert rewritten == "Self: [[new/target]]"
+
+
+async def test_move_end_to_end_scopes_null_owner_and_rewrites_unindexed_self_link(
+    offline, monkeypatch
+):
+    source = offline / "old" / "target.md"
+    source.parent.mkdir()
+    source.write_text("Self: [[old/target]]", encoding="utf-8")
+    statements = []
+
+    class EmptyResult:
+        def all(self):
+            return []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def execute(self, statement):
+            statements.append(statement)
+            return EmptyResult()
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(tools, "async_session", FakeSession)
+    result = await tools.move_note_impl(
+        "old/target.md", "new/target.md", rewrite_links=True
+    )
+
+    assert "Moved" in result
+    assert (offline / "new" / "target.md").read_text() == "Self: [[new/target]]"
+    sql = [str(statement.compile()) for statement in statements]
+    assert len(sql) == 4  # metadata index, backlinks, metadata update, link update
+    assert all("notes_metadata.user_id IS NULL" in query for query in sql)
+    assert "source_note_id IN" in sql[3]
 
 
 def test_bounded_read_uses_open_inode_when_path_is_swapped(offline, monkeypatch):
