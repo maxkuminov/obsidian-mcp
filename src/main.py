@@ -156,18 +156,19 @@ app.add_middleware(TrustedHostMiddleware, allowed_hosts=settings.allowed_hosts)
 # GZip compression for responses >= 1000 bytes
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
-if settings.multi_user_mode:
-    from starlette.middleware.sessions import SessionMiddleware
-    # Browsers refuse Secure cookies on plain HTTP, so only localhost dev uses
-    # insecure cookies. BASE_URL is authoritative for proxy deployments.
-    app.add_middleware(
-        SessionMiddleware,
-        secret_key=settings.secret_key,
-        max_age=settings.session_max_age,
-        https_only=settings.base_url.startswith("https://"),
-        same_site="lax",
-        session_cookie=settings.session_cookie_name,
-    )
+from starlette.middleware.sessions import SessionMiddleware
+# Browsers refuse Secure cookies on plain HTTP, so only localhost dev uses
+# insecure cookies. BASE_URL is authoritative for proxy deployments.
+# SessionMiddleware is always required: verify_csrf runs on all /admin routes
+# regardless of multi_user_mode, and it depends on request.session.
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=settings.secret_key,
+    max_age=settings.session_max_age,
+    https_only=settings.base_url.startswith("https://"),
+    same_site="lax",
+    session_cookie=settings.session_cookie_name,
+)
 
 # CORS
 app.add_middleware(
