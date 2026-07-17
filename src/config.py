@@ -137,6 +137,11 @@ class Settings(BaseSettings):
                 self.allowed_origins = ["http://localhost:8000"]
             if self.allowed_hosts is None:
                 self.allowed_hosts = ["localhost"]
+        # Always ensure localhost is allowed so Docker health checks (which hit
+        # http://localhost:8000/health) are never blocked by TrustedHostMiddleware,
+        # even when ALLOWED_HOSTS is set explicitly in the environment.
+        if self.allowed_hosts and "localhost" not in self.allowed_hosts:
+            self.allowed_hosts = list(self.allowed_hosts) + ["localhost"]
         return self
 
     @model_validator(mode="after")
