@@ -14,8 +14,8 @@ session manager whose `__aenter__` raises and asserts the indexer task ends up
 cancelled (and that the original exception still propagates).
 
 Fully offline: no DB, no network, no embedding provider. `run_indexer_loop`,
-`_check_embedding_dim`, and `session_manager.run()` are all replaced with
-fakes/stubs before the generator runs.
+the startup database checks, and `session_manager.run()` are all replaced
+with fakes/stubs before the generator runs.
 """
 
 import asyncio
@@ -82,11 +82,13 @@ async def _never_returns():
 def _install_fakes(monkeypatch, session_manager):
     # Force the non-sandbox branch.
     monkeypatch.setattr(main.settings, "mcp_sandbox_mode", False, raising=False)
-    # Skip the DB dim check (would otherwise open a DB session).
+    # Skip startup DB checks (both would otherwise open a DB session before
+    # the lifecycle behavior under test is reached).
     async def _noop_check():
         return None
 
     monkeypatch.setattr(main, "_check_embedding_dim", _noop_check)
+    monkeypatch.setattr(main, "_validate_fts_configs", _noop_check)
     # Replace the indexer loop with a forever-sleeping coroutine so it never
     # touches a DB/network and is observably cancellable.
     monkeypatch.setattr(main, "run_indexer_loop", _never_returns)
