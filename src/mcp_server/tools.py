@@ -6,7 +6,6 @@ import mimetypes
 import os
 import posixpath
 import re
-import shutil
 import time
 from datetime import datetime, timezone
 from functools import wraps
@@ -1048,7 +1047,7 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
     if err := _require_write():
         return err
 
-    from src.services.vault import _vault_root, validate_visible_path
+    from src.services.vault import _vault_root, move_no_clobber, validate_visible_path
 
     uid = current_user_id.get()
     try:
@@ -1070,17 +1069,18 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
     trash.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     base = f"{timestamp}-{full_path.name}"
-    dest = trash / base
-    counter = 1
-    while dest.exists():
-        dest = trash / f"{timestamp}-{counter}-{full_path.name}"
-        counter += 1
-    try:
-        os.replace(full_path, dest)
-    except OSError as e:
-        if getattr(e, "errno", None) == 18:
-            shutil.move(str(full_path), str(dest))
-        else:
+    counter = 0
+    while True:
+        suffix = "" if counter == 0 else f"-{counter}"
+        dest = trash / f"{timestamp}{suffix}-{full_path.name}"
+        try:
+            move_no_clobber(full_path, dest)
+            break
+        except FileExistsError:
+            # Another delete may publish this name after we choose it. Retry
+            # rather than replacing existing trash content.
+            counter += 1
+        except OSError as e:
             return f"Soft-delete failed: {e}"
     rel = dest.relative_to(vault).as_posix()
     return f"Soft-deleted: {path} → {rel}"

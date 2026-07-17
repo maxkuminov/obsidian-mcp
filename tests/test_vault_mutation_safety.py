@@ -70,6 +70,34 @@ def test_move_loses_race_without_clobber(offline, monkeypatch):
     assert destination.read_text() == "other writer"
 
 
+async def test_soft_delete_retries_concurrent_trash_collision(
+    offline, monkeypatch
+):
+    source = offline / "note.md"
+    source.write_text("deleted note", encoding="utf-8")
+    real_link = os.link
+    collided_destination: Path | None = None
+
+    def concurrent_link(src, dst, *args, **kwargs):
+        nonlocal collided_destination
+        if collided_destination is None:
+            collided_destination = Path(dst)
+            collided_destination.write_text("other trash", encoding="utf-8")
+        return real_link(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(vault_service.os, "link", concurrent_link)
+    result = await tools.delete_note_impl("note.md")
+
+    assert "Soft-deleted" in result
+    assert collided_destination is not None
+    assert collided_destination.read_text() == "other trash"
+    trash_files = sorted((offline / ".trash").iterdir())
+    assert len(trash_files) == 2
+    moved = next(path for path in trash_files if path != collided_destination)
+    assert moved.read_text() == "deleted note"
+    assert not source.exists()
+
+
 @pytest.mark.parametrize("operation", ["edit", "frontmatter"])
 async def test_note_mutations_reject_hidden_paths(offline, operation):
     hidden = offline / ".obsidian"
