@@ -55,6 +55,11 @@ def test_loopback_base_url_may_use_http():
     assert settings.base_url == "http://127.0.0.1:8000"
 
 
+def test_explicit_empty_allowed_hosts_still_allows_localhost_healthcheck():
+    settings = Settings(allowed_hosts=[], _env_file=None)
+    assert settings.allowed_hosts == ["localhost"]
+
+
 def test_base_url_must_match_public_hostname():
     with pytest.raises(ValidationError):
         Settings(
