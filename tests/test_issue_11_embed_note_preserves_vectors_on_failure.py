@@ -113,5 +113,26 @@ async def test_empty_content_short_circuits(monkeypatch):
     result = await embeddings.embed_note(session, note, "   \n  ")
 
     assert result == 0
+    assert session.delete_executed is True
+    assert session.added == []
+    assert session.flushed is True
+    assert note.embedded_content_hash == note.content_hash
+
+
+@pytest.mark.asyncio
+async def test_partial_provider_response_preserves_existing_embeddings(monkeypatch):
+    session = _RecordingSession()
+    note = _FakeNote()
+    monkeypatch.setattr(embeddings.settings, "chunk_size", 1)
+    monkeypatch.setattr(embeddings.settings, "chunk_overlap", 0)
+
+    async def partial(_chunks):
+        return [[0.0, 1.0, 2.0]]
+
+    monkeypatch.setattr(embeddings, "get_embeddings_batch", partial)
+    result = await embeddings.embed_note(session, note, "first chunk second chunk")
+
+    assert result == 0
     assert session.delete_executed is False
     assert session.added == []
+    assert note.embedded_content_hash == "oldhash"

@@ -11,6 +11,7 @@ from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import select
 
+from src.auth.session import get_active_session_user
 from src.config import settings
 from src.database import async_session
 from src.limiter import limiter
@@ -254,11 +255,9 @@ async def authorize_get(
     # user mode is unchanged — the consent screen renders without any
     # session requirement.
     if settings.multi_user_mode:
-        try:
-            current_uid = request.session.get("user_id")
-        except (AssertionError, AttributeError):
-            current_uid = None
-        if current_uid is None:
+        async with async_session() as session:
+            current_user = await get_active_session_user(request, session)
+        if current_user is None:
             # Preserve the entire /authorize URL (path + query) so the
             # client doesn't have to re-issue the request after login.
             target = request.url.path
@@ -362,22 +361,19 @@ async def authorize_post(
     except ValueError as exc:
         return JSONResponse({"error": "invalid_scope", "error_description": str(exc)}, status_code=400)
 
-    # Multi-user mode: refuse to mint a code without a session. The GET
-    # handler already redirects to login, but defend against a stale POST
-    # arriving after the session expired.
-    session_user_id: int | None = None
-    if action == "approve" and settings.multi_user_mode:
-        try:
-            session_user_id = request.session.get("user_id")
-        except (AssertionError, AttributeError):
-            session_user_id = None
-        if session_user_id is None:
-            return JSONResponse(
-                {"error": "login_required", "error_description": "Session required"},
-                status_code=401,
-            )
-
     async with async_session() as session:
+        # GET already validates this identity, but the consent form can remain
+        # open across a password reset, logout, or account deactivation.
+        session_user_id: int | None = None
+        if action == "approve" and settings.multi_user_mode:
+            current_user = await get_active_session_user(request, session)
+            if current_user is None:
+                return JSONResponse(
+                    {"error": "login_required", "error_description": "Session required"},
+                    status_code=401,
+                )
+            session_user_id = current_user.id
+
         # Re-validate redirect_uri against the client's registered list. The
         # GET handler does this, but redirect_uri arrives here as an
         # attacker-controllable form field, so a confused-deputy / open

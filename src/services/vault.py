@@ -3,6 +3,7 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
 import uuid
 from pathlib import Path
 
@@ -165,7 +166,7 @@ def validate_visible_path(relative_path: str, user_id: int | None = None) -> Pat
 
 def read_file(relative_path: str, user_id: int | None = None) -> dict:
     """Read a note, returning frontmatter + content."""
-    path = validate_path(relative_path, user_id=user_id)
+    path = validate_visible_path(relative_path, user_id=user_id)
     if not path.is_file():
         raise FileNotFoundError(f"Note not found: {relative_path}")
     raw = path.read_text(encoding="utf-8")
@@ -183,15 +184,22 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
     }
 
 
-def _atomic_write(path: Path, *, text: str | None = None, data: bytes | None = None) -> Path:
+def _atomic_write(
+    path: Path,
+    *,
+    text: str | None = None,
+    data: bytes | None = None,
+    overwrite: bool = True,
+    expected: bytes | None = None,
+) -> Path:
     """Write `text` (UTF-8) or `data` (raw bytes) to `path` atomically.
 
     Shared core for `write_file` (notes) and `write_bytes` (raw files): writes
     a tmp file in the same directory then `os.replace`s it into place. A crash
     between the tmp-file write and the rename leaves the destination untouched.
-    `os.replace` is atomic on POSIX same-FS renames; if the vault ever spans
-    filesystems (EXDEV), fall back to a non-atomic `shutil.move` and log a
-    warning. Creates missing parent directories.
+    `os.replace` is atomic on POSIX same-FS renames. No-clobber publication
+    uses a hard link from the same-directory temp file. Creates missing parent
+    directories.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(
@@ -203,13 +211,29 @@ def _atomic_write(path: Path, *, text: str | None = None, data: bytes | None = N
         else:
             tmp.write_text(text or "", encoding="utf-8")
         try:
-            os.replace(tmp, path)
+            if expected is not None:
+                try:
+                    current = _read_path_bytes(path)
+                except FileNotFoundError:
+                    raise RuntimeError(f"File changed while editing: {path.name}")
+                if current != expected:
+                    raise RuntimeError(f"File changed while editing: {path.name}")
+            if overwrite:
+                os.replace(tmp, path)
+            else:
+                # A hard link publishes the completed temp inode only when the
+                # destination does not exist. Unlike exists()+replace(), this
+                # is an atomic no-clobber operation on the same filesystem.
+                os.link(tmp, path)
+                tmp.unlink()
         except OSError as e:
             if getattr(e, "errno", None) == 18:  # EXDEV
-                logger.warning(
-                    "Cross-FS rename for %s; falling back to shutil.move (non-atomic)",
-                    path.name,
-                )
+                # Temp and destination deliberately share a directory, so an
+                # EXDEV indicates an unusual/non-POSIX filesystem. Never turn
+                # a promised no-clobber write into an overwriting move.
+                if not overwrite:
+                    raise
+                logger.warning("Cross-FS rename for %s; using shutil.move", path.name)
                 shutil.move(str(tmp), str(path))
             else:
                 raise
@@ -223,10 +247,47 @@ def _atomic_write(path: Path, *, text: str | None = None, data: bytes | None = N
     return path
 
 
-def write_file(relative_path: str, content: str, user_id: int | None = None) -> Path:
+def _read_path_bytes(path: Path, max_bytes: int | None = None) -> bytes:
+    """Read and bound a regular file through one descriptor.
+
+    The size check and read refer to the same opened inode. ``O_NOFOLLOW``
+    prevents a final-component symlink swap on platforms that provide it.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"Not a regular file: {path.name}")
+        if max_bytes is not None and info.st_size > max_bytes:
+            raise ValueError(
+                f"File too large: {path.name} is {info.st_size:,} bytes "
+                f"(max {max_bytes:,})"
+            )
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            data = stream.read(None if max_bytes is None else max_bytes + 1)
+        if max_bytes is not None and len(data) > max_bytes:
+            raise ValueError(
+                f"File too large: {path.name} exceeds {max_bytes:,} bytes"
+            )
+        return data
+    finally:
+        os.close(fd)
+
+
+def write_file(
+    relative_path: str,
+    content: str,
+    user_id: int | None = None,
+    *,
+    overwrite: bool = True,
+    expected: bytes | None = None,
+) -> Path:
     """Write content to a note atomically (tmp file in same dir + os.replace)."""
-    path = validate_path(relative_path, user_id=user_id)
-    return _atomic_write(path, text=content)
+    path = validate_visible_path(relative_path, user_id=user_id)
+    return _atomic_write(
+        path, text=content, overwrite=overwrite, expected=expected
+    )
 
 
 def read_bytes(
@@ -245,13 +306,11 @@ def read_bytes(
     path = validate_visible_path(relative_path, user_id=user_id)
     if not path.is_file():
         raise FileNotFoundError(f"File not found: {relative_path}")
-    size = path.stat().st_size
-    if max_bytes is not None and size > max_bytes:
-        raise ValueError(
-            f"File too large: {relative_path} is {size:,} bytes "
-            f"(max {max_bytes:,})"
-        )
-    return path.read_bytes()
+    try:
+        return _read_path_bytes(path, max_bytes=max_bytes)
+    except ValueError as exc:
+        # Retain the caller-facing vault-relative path in size errors.
+        raise ValueError(str(exc).replace(path.name, relative_path, 1)) from exc
 
 
 def write_bytes(
@@ -269,9 +328,58 @@ def write_bytes(
     untouched.
     """
     path = validate_visible_path(relative_path, user_id=user_id)
-    if path.exists() and not overwrite:
-        raise FileExistsError(f"File already exists: {relative_path}")
-    return _atomic_write(path, data=data)
+    try:
+        return _atomic_write(path, data=data, overwrite=overwrite)
+    except FileExistsError:
+        raise FileExistsError(f"File already exists: {relative_path}") from None
+
+
+def move_no_clobber(source: Path, destination: Path) -> None:
+    """Move one regular file without ever replacing ``destination``.
+
+    On the normal same-filesystem vault layout, link+unlink is an atomic
+    no-clobber publication. The EXDEV fallback uses exclusive creation and
+    copies the bytes before unlinking the source; it preserves no-clobber but
+    cannot make the cross-filesystem move itself atomic.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.link(source, destination, follow_symlinks=False)
+        source.unlink()
+        return
+    except OSError as exc:
+        if getattr(exc, "errno", None) != 18:  # EXDEV
+            raise
+
+    src_fd = os.open(
+        source,
+        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
+    )
+    dst_fd: int | None = None
+    try:
+        dst_fd = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
+            0o600,
+        )
+        with os.fdopen(src_fd, "rb", closefd=False) as src, os.fdopen(
+            dst_fd, "wb", closefd=False
+        ) as dst:
+            shutil.copyfileobj(src, dst)
+            dst.flush()
+            os.fsync(dst_fd)
+        source.unlink()
+    except Exception:
+        if dst_fd is not None:
+            try:
+                destination.unlink()
+            except OSError:
+                pass
+        raise
+    finally:
+        os.close(src_fd)
+        if dst_fd is not None:
+            os.close(dst_fd)
 
 
 # ────────────────────────────────────────────────────────────────────────────

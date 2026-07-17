@@ -17,7 +17,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from src.api.routes import router as api_router
 from src.config import settings
 from src.control_panel.routes import router as panel_router
-from src.database import async_session
+from src.database import async_session, engine
 from src.limiter import limiter
 from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
@@ -135,6 +135,9 @@ async def lifespan(app: FastAPI):
             await asyncio.wait_for(asyncio.shield(indexer_task), timeout=10.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
+        # Explicitly close pooled database connections during application
+        # shutdown (important for reloads and test/application lifecycles).
+        await engine.dispose()
 
 
 app = FastAPI(title="Obsidian MCP", lifespan=lifespan)
@@ -260,8 +263,11 @@ class RootMCPProxyMiddleware:
             headers = dict(scope.get("headers", []))
             auth = headers.get(b"authorization", b"").decode()
             if auth.startswith("Bearer "):
-                await APIKeyMiddleware(mcp_handler)(scope, receive, send)
-                return
+                # Rewrite into the normal mounted MCP route. Calling the MCP
+                # handler directly here would bypass every middleware already
+                # wrapped by ``self.app`` (TrustedHost, CORS, proxy headers,
+                # security headers, sessions, and gzip).
+                scope = dict(scope, path="/mcp/", raw_path=b"/mcp/")
         await self.app(scope, receive, send)
 
 

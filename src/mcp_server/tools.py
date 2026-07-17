@@ -4,8 +4,8 @@ import inspect
 import logging
 import mimetypes
 import os
+import posixpath
 import re
-import shutil
 import time
 from datetime import datetime, timezone
 from functools import wraps
@@ -343,12 +343,10 @@ async def create_note_impl(path: str, content: str) -> str:
         path += ".md"
     uid = current_user_id.get()
     try:
-        from src.services.vault import validate_path
-        full_path = validate_path(path, user_id=uid)
-        if full_path.exists():
-            return f"Note already exists: {path}. Use edit_note to modify it."
-        write_file(path, content, user_id=uid)
+        write_file(path, content, user_id=uid, overwrite=False)
         return f"Created note: {path}"
+    except FileExistsError:
+        return f"Note already exists: {path}. Use edit_note to modify it."
     except ValueError as e:
         return str(e)
 
@@ -718,15 +716,16 @@ async def edit_note_impl(
 
     uid = current_user_id.get()
     try:
-        from src.services.vault import replace_section, validate_path
-        full_path = validate_path(path, user_id=uid)
+        from src.services.vault import replace_section, validate_visible_path
+        full_path = validate_visible_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.exists():
         return f"Note not found: {path}. Use create_note to create it."
 
     try:
-        existing = full_path.read_text(encoding="utf-8")
+        existing_bytes = read_bytes(path, user_id=uid, max_bytes=MAX_NOTE_BYTES)
+        existing = existing_bytes.decode("utf-8")
     except Exception as e:
         return f"Failed to read {path}: {e}"
 
@@ -782,8 +781,8 @@ async def edit_note_impl(
         return diff or f"No changes for {path}"
 
     try:
-        write_file(path, new_content, user_id=uid)
-    except ValueError as e:
+        write_file(path, new_content, user_id=uid, expected=existing_bytes)
+    except (ValueError, RuntimeError) as e:
         return str(e)
     return success_message
 
@@ -808,6 +807,7 @@ def _rewrite_links_in_text(
     to_rel: str,
     source_path: str,
     pre_move_index: dict,
+    output_source_path: str | None = None,
 ) -> tuple[str, int]:
     """Rewrite any wikilink/embed/markdown-link in `content` whose pre-move
     resolution would have pointed at `from_rel`, so it now refers to `to_rel`.
@@ -855,10 +855,16 @@ def _rewrite_links_in_text(
         if resolve_target(target_for_resolve, source_path, pre_move_index) != from_id:
             continue
         anchor = m.group("anchor") or ""
+        # Resolve against the original source location, but generate the new
+        # href relative to where that source lives after the move. These differ
+        # for a moved note rewriting its own Markdown self-link.
+        output_path = output_source_path or source_path
+        source_dir = PurePosixPath(output_path).parent.as_posix()
+        relative_target = posixpath.relpath(to_rel, source_dir)
         rewrites.append((
             m.start(),
             m.end(),
-            f"[{m.group('text')}]({to_rel}{anchor})",
+            f"[{m.group('text')}]({relative_target}{anchor})",
         ))
 
     if not rewrites:
@@ -868,6 +874,40 @@ def _rewrite_links_in_text(
     for start, end, replacement in rewrites:
         out = out[:start] + replacement + out[end:]
     return out, len(rewrites)
+
+
+def _rewrite_failure_warning(failed_sources: list[str]) -> str | None:
+    """Describe backlink rewrites that failed after the move completed."""
+    if not failed_sources:
+        return None
+    preview = ", ".join(failed_sources[:3])
+    if len(failed_sources) > 3:
+        preview += f", and {len(failed_sources) - 3} more"
+    return (
+        "partial success: note moved, but link rewrites failed in "
+        f"{len(failed_sources)} note(s): {preview}"
+    )
+
+
+def _note_owner_predicate(uid: int | None):
+    """Return the exact NoteMetadata ownership predicate for a vault context."""
+    from src.models.db import NoteMetadata
+
+    return (
+        NoteMetadata.user_id.is_(None)
+        if uid is None
+        else NoteMetadata.user_id == uid
+    )
+
+
+def _ensure_move_source_in_index(index: dict, from_rel: str) -> None:
+    """Make stale/missing metadata unable to suppress moved-note self rewrites."""
+    if from_rel in index["paths"]:
+        return
+    synthetic_id = -1
+    index["paths"][from_rel] = synthetic_id
+    stem = PurePosixPath(from_rel).stem
+    index["stems"].setdefault(stem, []).append((from_rel, synthetic_id))
 
 
 @_tracked("move_note", ["from_path", "to_path", "rewrite_links"])
@@ -883,32 +923,30 @@ async def move_note_impl(
     from sqlalchemy import select, update
     from src.models.db import NoteLink, NoteMetadata
     from src.services.links import build_vault_index
-    from src.services.vault import _vault_root, validate_path
+    from src.services.vault import _vault_root, move_no_clobber, validate_visible_path
 
     uid = current_user_id.get()
     try:
-        src_full = validate_path(from_path, user_id=uid)
-        dst_full = validate_path(to_path, user_id=uid)
+        src_full = validate_visible_path(from_path, user_id=uid)
+        dst_full = validate_visible_path(to_path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not src_full.is_file():
         return f"Source note not found: {from_path}"
-    if dst_full.exists():
-        return f"Destination already exists: {to_path}"
-
     vault = _vault_root(uid).resolve()
     from_rel = src_full.resolve().relative_to(vault).as_posix()
     to_rel = dst_full.resolve().relative_to(vault).as_posix()
 
     pre_move_index: dict | None = None
-    rewrite_sources: list[str] = []
+    rewrite_sources: list[str] = [from_rel] if rewrite_links else []
     if rewrite_links:
         async with async_session() as session:
-            rows_stmt = select(NoteMetadata.file_path, NoteMetadata.id)
-            if uid is not None:
-                rows_stmt = rows_stmt.where(NoteMetadata.user_id == uid)
+            rows_stmt = select(NoteMetadata.file_path, NoteMetadata.id).where(
+                _note_owner_predicate(uid)
+            )
             rows = (await session.execute(rows_stmt)).all()
             pre_move_index = build_vault_index([(r.file_path, r.id) for r in rows])
+            _ensure_move_source_in_index(pre_move_index, from_rel)
             target_id = pre_move_index["paths"].get(from_rel)
             if target_id is not None:
                 src_q = (
@@ -917,57 +955,46 @@ async def move_note_impl(
                     .where(NoteLink.target_note_id == target_id)
                     .distinct()
                 )
-                if uid is not None:
-                    src_q = src_q.where(NoteMetadata.user_id == uid)
+                src_q = src_q.where(_note_owner_predicate(uid))
                 src_rows = (await session.execute(src_q)).all()
-                rewrite_sources = [r.file_path for r in src_rows]
+                rewrite_sources.extend(r.file_path for r in src_rows)
+                rewrite_sources = list(dict.fromkeys(rewrite_sources))
 
-    dst_full.parent.mkdir(parents=True, exist_ok=True)
     try:
-        os.replace(src_full, dst_full)
+        move_no_clobber(src_full, dst_full)
+    except FileExistsError:
+        return f"Destination already exists: {to_path}"
     except OSError as e:
-        if getattr(e, "errno", None) == 18:
-            logger.warning(
-                "Cross-FS move for %s → %s; using shutil.move", from_rel, to_rel
-            )
-            shutil.move(str(src_full), str(dst_full))
-        else:
-            return f"Move failed: {e}"
+        return f"Move failed: {e}"
 
     db_failed = False
     try:
         async with async_session() as session:
             nm_update = (
                 update(NoteMetadata)
-                .where(NoteMetadata.file_path == from_rel)
+                .where(
+                    NoteMetadata.file_path == from_rel,
+                    _note_owner_predicate(uid),
+                )
                 .values(file_path=to_rel)
             )
-            if uid is not None:
-                nm_update = nm_update.where(NoteMetadata.user_id == uid)
             await session.execute(nm_update)
 
             # Scope the NoteLink.target_path update to this user's link rows
             # by joining through their source notes. In single-user mode the
             # subquery selects every notes_metadata row (user_id IS NULL) so
             # the legacy behavior is preserved.
-            if uid is None:
-                link_update = (
-                    update(NoteLink)
-                    .where(NoteLink.target_path == from_rel)
-                    .values(target_path=to_rel)
+            user_note_ids = select(NoteMetadata.id).where(
+                _note_owner_predicate(uid)
+            )
+            link_update = (
+                update(NoteLink)
+                .where(
+                    NoteLink.target_path == from_rel,
+                    NoteLink.source_note_id.in_(user_note_ids),
                 )
-            else:
-                user_note_ids = select(NoteMetadata.id).where(
-                    NoteMetadata.user_id == uid
-                )
-                link_update = (
-                    update(NoteLink)
-                    .where(
-                        NoteLink.target_path == from_rel,
-                        NoteLink.source_note_id.in_(user_note_ids),
-                    )
-                    .values(target_path=to_rel)
-                )
+                .values(target_path=to_rel)
+            )
             await session.execute(link_update)
             await session.commit()
     except Exception as e:
@@ -978,22 +1005,39 @@ async def move_note_impl(
 
     rewrites_done = 0
     files_modified = 0
+    failed_rewrite_sources: list[str] = []
     if rewrite_links and pre_move_index is not None:
-        for src_path in rewrite_sources:
+        for original_src_path in rewrite_sources:
             try:
-                src_file = validate_path(src_path, user_id=uid)
+                # A moved note may link to itself. Read it at its new location,
+                # but resolve its old link text in the pre-move location.
+                src_path = (
+                    to_rel if original_src_path == from_rel else original_src_path
+                )
+                src_file = validate_visible_path(src_path, user_id=uid)
                 if not src_file.is_file():
                     continue
-                content = src_file.read_text(encoding="utf-8")
+                original_bytes = read_bytes(
+                    src_path, user_id=uid, max_bytes=MAX_NOTE_BYTES
+                )
+                content = original_bytes.decode("utf-8")
                 new_content, n = _rewrite_links_in_text(
-                    content, from_rel, to_rel, src_path, pre_move_index
+                    content,
+                    from_rel,
+                    to_rel,
+                    original_src_path,
+                    pre_move_index,
+                    output_source_path=src_path,
                 )
                 if n > 0:
-                    write_file(src_path, new_content, user_id=uid)
+                    write_file(
+                        src_path, new_content, user_id=uid, expected=original_bytes
+                    )
                     rewrites_done += n
                     files_modified += 1
             except Exception as e:
                 logger.warning("Failed to rewrite links in %s: %s", src_path, e)
+                failed_rewrite_sources.append(src_path)
 
     parts = [f"Moved {from_rel} → {to_rel}"]
     if db_failed:
@@ -1002,6 +1046,9 @@ async def move_note_impl(
         parts.append(
             f"rewrote {rewrites_done} link(s) across {files_modified} note(s)"
         )
+        warning = _rewrite_failure_warning(failed_rewrite_sources)
+        if warning is not None:
+            parts.append(f"(warning: {warning})")
     return " — ".join(parts) if len(parts) > 1 else parts[0]
 
 
@@ -1016,11 +1063,11 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
     if err := _require_write():
         return err
 
-    from src.services.vault import _vault_root, validate_path
+    from src.services.vault import _vault_root, move_no_clobber, validate_visible_path
 
     uid = current_user_id.get()
     try:
-        full_path = validate_path(path, user_id=uid)
+        full_path = validate_visible_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.is_file():
@@ -1038,17 +1085,18 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
     trash.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     base = f"{timestamp}-{full_path.name}"
-    dest = trash / base
-    counter = 1
-    while dest.exists():
-        dest = trash / f"{timestamp}-{counter}-{full_path.name}"
-        counter += 1
-    try:
-        os.replace(full_path, dest)
-    except OSError as e:
-        if getattr(e, "errno", None) == 18:
-            shutil.move(str(full_path), str(dest))
-        else:
+    counter = 0
+    while True:
+        suffix = "" if counter == 0 else f"-{counter}"
+        dest = trash / f"{timestamp}{suffix}-{full_path.name}"
+        try:
+            move_no_clobber(full_path, dest)
+            break
+        except FileExistsError:
+            # Another delete may publish this name after we choose it. Retry
+            # rather than replacing existing trash content.
+            counter += 1
+        except OSError as e:
             return f"Soft-delete failed: {e}"
     rel = dest.relative_to(vault).as_posix()
     return f"Soft-deleted: {path} → {rel}"
@@ -1075,12 +1123,12 @@ async def set_frontmatter_impl(
     from src.services.vault import (
         parse_frontmatter,
         serialize_frontmatter,
-        validate_path,
+        validate_visible_path,
     )
 
     uid = current_user_id.get()
     try:
-        full_path = validate_path(path, user_id=uid)
+        full_path = validate_visible_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.is_file():
@@ -1090,7 +1138,8 @@ async def set_frontmatter_impl(
         return f"No changes for {path} (empty updates and remove)"
 
     try:
-        raw = full_path.read_text(encoding="utf-8")
+        raw_bytes = read_bytes(path, user_id=uid, max_bytes=MAX_NOTE_BYTES)
+        raw = raw_bytes.decode("utf-8")
     except Exception as e:
         return f"Failed to read {path}: {e}"
 
@@ -1111,8 +1160,8 @@ async def set_frontmatter_impl(
         return f"No changes for {path}"
 
     try:
-        write_file(path, new_raw, user_id=uid)
-    except ValueError as e:
+        write_file(path, new_raw, user_id=uid, expected=raw_bytes)
+    except (ValueError, RuntimeError) as e:
         return str(e)
 
     summary: list[str] = []

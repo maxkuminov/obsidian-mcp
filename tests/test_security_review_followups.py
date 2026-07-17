@@ -56,7 +56,7 @@ class _Request:
 @pytest.mark.asyncio
 async def test_current_user_accepts_matching_session_version(monkeypatch):
     monkeypatch.setattr("src.auth.session.settings.multi_user_mode", True)
-    user = SimpleNamespace(id=7, session_version=3)
+    user = SimpleNamespace(id=7, session_version=3, is_active=True)
     result = MagicMock()
     result.scalar_one_or_none.return_value = user
     db = AsyncMock()
@@ -71,7 +71,7 @@ async def test_current_user_accepts_matching_session_version(monkeypatch):
 @pytest.mark.parametrize("cookie_version", [None, 2])
 async def test_current_user_rejects_and_clears_stale_session(monkeypatch, cookie_version):
     monkeypatch.setattr("src.auth.session.settings.multi_user_mode", True)
-    user = SimpleNamespace(id=7, session_version=3)
+    user = SimpleNamespace(id=7, session_version=3, is_active=True)
     result = MagicMock()
     result.scalar_one_or_none.return_value = user
     db = AsyncMock()
