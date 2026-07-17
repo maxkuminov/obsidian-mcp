@@ -17,7 +17,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from src.api.routes import router as api_router
 from src.config import settings
 from src.control_panel.routes import router as panel_router
-from src.database import async_session
+from src.database import async_session, engine
 from src.limiter import limiter
 from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
@@ -135,6 +135,9 @@ async def lifespan(app: FastAPI):
             await asyncio.wait_for(asyncio.shield(indexer_task), timeout=10.0)
         except (asyncio.CancelledError, asyncio.TimeoutError):
             pass
+        # Explicitly close pooled database connections during application
+        # shutdown (important for reloads and test/application lifecycles).
+        await engine.dispose()
 
 
 app = FastAPI(title="Obsidian MCP", lifespan=lifespan)

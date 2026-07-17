@@ -74,6 +74,7 @@ class _FakeSession:
     def __init__(self, on_metadata_insert):
         self._on_metadata_insert = on_metadata_insert
         self.tsvector_params = []
+        self.commits = 0
 
     async def __aenter__(self):
         return self
@@ -97,7 +98,7 @@ class _FakeSession:
         return _FakeResult()
 
     async def commit(self):
-        return None
+        self.commits += 1
 
     async def rollback(self):
         return None
@@ -139,3 +140,25 @@ async def test_tsvector_written_despite_concurrent_delete(monkeypatch, tmp_path)
     assert body in matching[0]["content"], (
         "tsvector content did not come from the in-memory scan body"
     )
+    assert fake.commits == 1, "the index snapshot must commit exactly once"
+
+
+@pytest.mark.asyncio
+async def test_link_failure_does_not_commit_new_metadata_hash(monkeypatch, tmp_path):
+    vault = tmp_path / "vault"
+    vault.mkdir()
+    note = vault / "note.md"
+    note.write_text("body", encoding="utf-8")
+    monkeypatch.setattr(indexer.settings, "vault_path", str(vault), raising=False)
+
+    fake = _FakeSession(on_metadata_insert=lambda: None)
+    monkeypatch.setattr(indexer, "async_session", lambda: fake)
+
+    async def fail_links(*_args, **_kwargs):
+        raise RuntimeError("link insert failed")
+
+    monkeypatch.setattr(indexer, "_update_links_for_changed", fail_links)
+    with pytest.raises(RuntimeError, match="link insert failed"):
+        await indexer.index_vault()
+
+    assert fake.commits == 0

@@ -207,12 +207,27 @@ async def embed_note(session: AsyncSession, note: NoteMetadata, content: str):
     cleaned = clean_for_embedding(content)
     chunks = chunk_text(cleaned, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
     if not chunks:
+        # Empty/fully-filtered notes are successfully represented by zero
+        # vectors. Remove stale vectors and stamp the hash so they do not get
+        # selected on every embedding pass forever.
+        await session.execute(
+            delete(NoteEmbedding).where(NoteEmbedding.note_id == note.id)
+        )
+        note.embedded_content_hash = note.content_hash
+        await session.flush()
         return 0
 
     try:
         embeddings = await get_embeddings_batch(chunks)
     except Exception as e:
         logger.warning(f"Failed to embed {note.file_path}: {e}")
+        return 0
+
+    if len(embeddings) != len(chunks):
+        logger.warning(
+            "Embedding provider returned %d vectors for %d chunks in %s",
+            len(embeddings), len(chunks), note.file_path,
+        )
         return 0
 
     # Only delete the old embeddings once new ones are in hand. If the provider

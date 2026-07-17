@@ -201,7 +201,6 @@ async def index_vault(user_id: int | None = None):
 
                 moved_new_paths.add(new)
 
-            await session.commit()
             logger.info(
                 f"Detected {len(moves)} file move(s) — preserved ids{log_suffix}"
             )
@@ -236,7 +235,6 @@ async def index_vault(user_id: int | None = None):
                     },
                 )
                 await session.execute(stmt)
-            await session.commit()
             logger.info(f"Upserted {len(to_upsert)} notes")
 
         # Update tsvectors for changed notes
@@ -275,9 +273,9 @@ async def index_vault(user_id: int | None = None):
                     if user_id is not None:
                         params["uid"] = user_id
                     await session.execute(text(tsv_sql), params)
-                except Exception as e:
-                    logger.warning(f"Failed to update tsvector for {path}: {e}")
-            await session.commit()
+                except Exception:
+                    logger.exception(f"Failed to update tsvector for {path}")
+                    raise
             logger.info(f"Updated tsvectors for {len(paths)} notes{log_suffix}")
 
         # Remove deleted files (scoped to this user when set). `deleted_paths`
@@ -290,7 +288,6 @@ async def index_vault(user_id: int | None = None):
             if user_id is not None:
                 del_stmt = del_stmt.where(NoteMetadata.user_id == user_id)
             await session.execute(del_stmt)
-            await session.commit()
             logger.info(f"Removed {len(deleted_paths)} deleted notes{log_suffix}")
 
         # ── Link extraction for changed notes ───────────────────────────
@@ -307,6 +304,12 @@ async def index_vault(user_id: int | None = None):
                 [n["file_path"] for n in to_upsert] + list(moved_new_paths),
                 user_id=user_id,
             )
+
+        # Metadata hashes, keyword vectors, deletions, and link rows describe
+        # one filesystem snapshot. Commit them together so a failure in a
+        # later stage cannot leave a new hash paired with stale search data
+        # (which would make the next scan incorrectly skip the note).
+        await session.commit()
 
     logger.info(f"Vault index scan complete{log_suffix}")
 
@@ -371,7 +374,6 @@ async def _update_links_for_changed(
                             new_rows[batch_start:batch_start + 1000]
                         )
                     )
-            await session.commit()
             logger.info(
                 f"Re-extracted links for {len(change_ids)} notes "
                 f"({len(new_rows)} link rows)"
@@ -425,27 +427,34 @@ async def _update_links_for_changed(
             f"{where_extra}"
         )
         await session.execute(text(reresolve_sql), params)
-    if changed_paths:
-        await session.commit()
 
 
 async def link_backfill_pass(user_id: int | None = None):
     """One-shot backfill that populates `note_links` for every note.
 
-    Runs on startup if the table is empty. Iterates all notes, extracts
-    links, resolves targets, batches inserts, and logs progress.
+    Runs on startup when this user's graph has no rows. Rebuilds the graph in one transaction so a
+    restart after any batch rolls back cleanly instead of mistaking a partial
+    graph for a completed backfill.
 
     In multi-user mode each user's pass scopes its scan + vault_index to its
-    own `notes_metadata` rows. The "table is empty" guard still checks the
-    global count to preserve the original one-shot semantics across mode
-    flips.
+    own `notes_metadata` rows and replaces only links sourced by those rows.
     """
     global link_backfill_in_progress
     vault = _vault_root(user_id)
     async with async_session() as session:
-        existing = (await session.execute(
+        # Completion is inferred per user, never from the global table. The
+        # rebuild itself commits atomically below, so any visible row proves a
+        # prior pass for this scope completed (a zero-link vault is harmlessly
+        # rescanned on the next startup).
+        existing_stmt = (
             select(func.count(NoteLink.id))
-        )).scalar() or 0
+            .join(NoteMetadata, NoteLink.source_note_id == NoteMetadata.id)
+        )
+        if user_id is None:
+            existing_stmt = existing_stmt.where(NoteMetadata.user_id.is_(None))
+        else:
+            existing_stmt = existing_stmt.where(NoteMetadata.user_id == user_id)
+        existing = (await session.execute(existing_stmt)).scalar() or 0
         if existing > 0:
             return
 
@@ -463,6 +472,10 @@ async def link_backfill_pass(user_id: int | None = None):
         vault_index = build_vault_index([(r.file_path, r.id) for r in rows])
 
         try:
+            note_ids = [r.id for r in rows]
+            await session.execute(
+                delete(NoteLink).where(NoteLink.source_note_id.in_(note_ids))
+            )
             buffer: list[dict] = []
             for i, row in enumerate(rows, start=1):
                 full_path = vault / row.file_path
@@ -483,14 +496,14 @@ async def link_backfill_pass(user_id: int | None = None):
                     })
                 if len(buffer) >= 1000:
                     await session.execute(insert(NoteLink).values(buffer))
-                    await session.commit()
                     buffer.clear()
                 if i % 500 == 0:
                     logger.info(f"Link backfill: {i}/{len(rows)} notes")
 
             if buffer:
                 await session.execute(insert(NoteLink).values(buffer))
-                await session.commit()
+
+            await session.commit()
 
             logger.info(f"Link backfill complete: {len(rows)} notes scanned")
         finally:
