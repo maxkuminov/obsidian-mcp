@@ -281,13 +281,33 @@ def test_ordinal_out_of_range_is_reported():
     assert "#1–#4" in err
 
 
-def test_ordinal_selector_does_not_shadow_a_literal_heading():
-    """A heading literally named '#2' must still win over the ordinal form."""
+def test_bare_ordinal_always_selects_by_position():
+    """A bare `#N` must mean the ordinal even when a heading is titled '#N'.
+
+    The outline advertises ordinals as the reliable selector, so note content
+    must not be able to shadow one — otherwise the section we told the caller
+    to request by `#2` is unreachable by `#2`.
+    """
     text = "# Top\n\n## Alpha\n\naaa\n\n## #2\n\nliteral\n"
     section, err = extract_section(text, "#2")
     assert err is None
+    assert "aaa" in section          # ordinal 2 == '## Alpha'
+    assert "literal" not in section
+
+
+def test_a_heading_titled_like_an_ordinal_stays_reachable():
+    """Shadowing the literal title is only acceptable if it stays addressable."""
+    text = "# Top\n\n## Alpha\n\naaa\n\n## #2\n\nliteral\n"
+
+    # ...by the path-style form, which never takes the ordinal branch
+    section, err = extract_section(text, "Top/#2")
+    assert err is None
     assert "literal" in section
-    assert "aaa" not in section
+
+    # ...and by its own ordinal (it is the 3rd heading)
+    section, err = extract_section(text, "#3")
+    assert err is None
+    assert "literal" in section
 
 
 @pytest.mark.asyncio
@@ -297,6 +317,65 @@ async def test_outline_flags_duplicates_and_prints_ordinals(vault, cap):
     out = await tools.read_note_impl("dupes.md")
     assert "`#2`" in out and "`#4`" in out
     assert "duplicate title, use the ordinal" in out
+
+
+# --- the outline must not itself blow the cap -------------------------------
+#
+# Caught in pre-merge review: the outline is appended to a response that exists
+# *because* the content was too large. Unbounded, a note with many headings
+# produced an outline 213x the cap — reintroducing the exact failure this
+# module prevents.
+
+
+def test_outline_is_bounded_by_the_cap():
+    big = "# Top\n\n" + "".join(f"## {'S' * 78}{i}\n\nbody\n\n" for i in range(1000))
+    out = tools._outline_text(big, 500)
+    assert len(out) <= 500 + 400, f"outline was {len(out)} chars for a 500 cap"
+    assert "more section(s) not shown" in out
+    assert "#1–#1001" in out
+
+
+def test_outline_elides_overlong_titles():
+    text = "# Top\n\n## " + "T" * 300 + "\n\nbody\n"
+    out = tools._outline_text(text, 5_000)
+    assert "…" in out
+    assert "T" * 300 not in out
+
+
+def test_outline_emits_at_least_one_entry_even_when_a_title_blows_the_budget():
+    text = "# Top\n\n## " + "T" * 300 + "\n\nbody\n\n## Second\n\nmore\n"
+    out = tools._outline_text(text, 20)
+    assert out and out.startswith("- `#1`")
+
+
+@pytest.mark.asyncio
+async def test_truncated_response_stays_bounded_for_a_heading_heavy_note(vault, cap):
+    """End-to-end: the whole response, outline included, stays proportionate."""
+    big = "# Top\n\n" + "".join(f"## {'S' * 78}{i}\n\nbody\n\n" for i in range(1000))
+    _write(vault, "many.md", big)
+    out = await tools.read_note_impl("many.md")
+    assert len(out) < cap * 4, f"response was {len(out)} chars for a {cap} cap"
+
+
+# --- offset exactly at the end ----------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_offset_exactly_at_end_is_distinguished_from_past_it(vault, cap):
+    _write(vault, "n.md", "z" * 900)
+    at_end = await tools.read_note_impl("n.md", offset=900)
+    past = await tools.read_note_impl("n.md", offset=901)
+    assert "exactly the end" in at_end and "nothing further" in at_end
+    assert "past the end" in past
+    assert "exactly the end" not in past
+
+
+@pytest.mark.asyncio
+async def test_read_file_offset_exactly_at_end(vault, cap):
+    _write(vault, "f.txt", "abcde")
+    out = await tools.read_file_impl("f.txt", offset=5)
+    assert "exactly the end" in out
+    assert "past the end" not in out
 
 
 @pytest.mark.asyncio

@@ -50,3 +50,32 @@
 - [x] 7.2 Run `openspec validate bound-read-response-size --strict`.
 - [x] 7.3 Confirm `replace_section` regressions still pass, including the end-of-file-heading case (`test_issue_5_replace_section_eof_heading.py`).
 - [x] 7.4 Smoke against the running server: whole-note read of a 2.9 MB note returns ~43K chars with an outline; a section read returns ~1.4K; ordinals resolve duplicate siblings.
+
+## 8. Pre-merge review round (Codex adversarial pass)
+
+Three findings, all reproduced before accepting.
+
+- [x] 8.1 **Ordinal shadowing.** `#N` resolved only after exact-text matching, so a
+  heading literally titled `#2` made ordinal 2 unreachable — breaking the guarantee the
+  outline advertises, with no fallback for duplicate siblings. Ordinals now resolve first
+  and always select by position; a selector containing `/` never takes the ordinal branch,
+  keeping the literal heading reachable via `Parent/#2` and via its own ordinal.
+- [x] 8.2 **Unbounded outline.** The outline was appended without a budget, so a
+  92,000-char note with 1,000 headings produced a **106,842-char** outline against a
+  500-char cap — recreating the context blowup this change exists to prevent. Outline now
+  carries its own budget: titles elided at 80 chars, listing stops at the cap, tail reports
+  omitted count and full ordinal range, always at least one entry. Now 631 chars for the
+  same input.
+- [x] 8.3 **`offset == len(body)` reported as "past the end."** Exactly-at-the-end is a
+  completed read, not a caller error. Now distinguished from `offset > len` in both
+  `read_note` and `read_file`.
+- [x] 8.4 Update specs, archived deltas, design rationale, README, CLAUDE.md, and the
+  `read_note` docstring to match; invert the test that codified the wrong ordinal priority.
+- [x] 8.5 Re-run: 300 passed, 5 skipped; `openspec validate --specs --strict` 9 passed.
+
+Confirmed NOT bugs by the same pass: `replace_section` remains equivalent to `main` for all
+existing selectors (the derived `next_heading_line_start` cannot differ — a terminating
+heading's `line_start` is necessarily `< len(text)`, otherwise `body_end == len(text)`);
+no gaps or overlaps between consecutive windows; content exactly at the cap is returned
+untruncated; Python slicing is code-point aligned so it cannot corrupt the UTF-8/JSON
+payload (it can split a grapheme cluster, which is presentation only).

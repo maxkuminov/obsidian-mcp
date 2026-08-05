@@ -33,13 +33,25 @@ A prefix plus "call again with offset=40000" is technically sufficient and pract
 
 The outline is emitted only for whole-note reads. A truncated **section** read does not re-list the note's other sections: the caller has already chosen, and repeating the map on every window would waste the context this change exists to protect.
 
-### `#N` ordinals, resolved after text matching
+### `#N` ordinals, checked before text matching
 
 The existing selector grammar is heading text, or `Parent/Child` to disambiguate. That covers headings distinguished by ancestry and cannot express *"the second `## Report.xlsx` under this same parent"* — duplicate siblings share every ancestor, so no chain separates them. Generated notes hit this constantly; the note behind this change contains its entire document set twice, making roughly half its sections unreachable by name.
 
-Resolution order is deliberate: exact text match first, ordinal only if that finds nothing. A note with a heading literally titled `#2` keeps working, and no existing selector changes meaning. The cost is that such a note cannot be addressed by ordinal 2 — an acceptable trade against silently breaking a real heading.
+A bare `#N` is checked **first**, ahead of exact text matching, and always selects by position.
 
-Ambiguity remains an **error** that names the resolving ordinals rather than a silent pick of the first match. Selecting arbitrarily is how an agent edits the wrong section and reports success.
+The first implementation had this the other way round — text first, ordinal only as a fallback — on the reasoning that a note with a heading literally titled `#2` should keep resolving to that heading. Pre-merge review showed that reasoning is wrong, because it breaks the guarantee the outline makes. The outline we emit on truncation hands the caller `#N` selectors and presents them as the reliable way to reach a section; if note content can shadow one, the section we just told the caller to fetch by `#2` is unreachable by `#2`, and for duplicate siblings there is no other selector to fall back to.
+
+The two orderings are not symmetric. Under ordinal-first, **every section stays addressable**: the heading titled `#2` is reachable by the path-style form (`Parent/#2`, which never takes the ordinal branch) and by its own ordinal. Under text-first, an ordinal can become unreachable with nothing to fall back on. A selector containing `/` is therefore never interpreted as an ordinal — that is what keeps the escape hatch open.
+
+Ambiguity between two *text* matches remains an **error** that names the resolving ordinals rather than a silent pick of the first match. Selecting arbitrarily is how an agent edits the wrong section and reports success.
+
+### The outline is bounded too
+
+The outline is appended to a response that exists *because* the content was too large, which makes it the one place where adding "helpful" context can recreate the problem being solved. Unbounded, it does: a 92,000-character note with 1,000 headings produced a **106,842-character** outline against a 500-character cap — 213× over, and larger than the note itself.
+
+So the outline carries its own budget: titles are elided at 80 characters, the listing stops when it would exceed the cap, and the tail reports how many sections were omitted plus the full ordinal range so nothing becomes unaddressable. At least one entry is always emitted, so a single pathological heading degrades to a short outline rather than none. Worst-case response is therefore bounded at roughly `2 × cap` plus the fixed notice text.
+
+This was also caught in pre-merge review, not by the original design — which is a fair signal that "bound the response" needed to mean *every* part of the response, not just the content window.
 
 ### Shared resolver for read and write
 

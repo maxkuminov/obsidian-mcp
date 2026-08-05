@@ -86,6 +86,9 @@ async def read_note(
             1-based document order) — the ordinal is the only form that can
             address duplicate headings sharing the same parent. The outline
             printed with a truncated note lists the ordinal for every section.
+            A bare "#N" always selects by position and is never shadowed by a
+            heading whose text happens to be "#N"; use "Parent/#N" to reach
+            such a heading by title.
         offset: Character offset to start reading from (default 0). Use the
             value the truncation notice reports to continue.
         limit: Maximum characters to return. Only lowers the server cap; it

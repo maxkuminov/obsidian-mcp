@@ -126,16 +126,20 @@ heading and the next heading of equal-or-shallower depth (or end of file)
 with the supplied `content`. The matched heading line itself SHALL NOT be
 removed or rewritten.
 
-The selector SHALL accept three forms, resolved in this order:
+The selector SHALL accept three forms:
 
-1. **Exact heading text** (e.g. `Tasks`).
+1. **Ordinal** (e.g. `#7`) — a selector consisting solely of `#` followed by
+   digits SHALL select the Nth ATX heading in document order, 1-based. A bare
+   ordinal SHALL always select by position, even when some heading's literal
+   text is the same string. Ordinals are advertised to callers as the reliable
+   selector, so note content MUST NOT be able to shadow one.
 2. **Path-style chain** (e.g. `Parent/Child`), where the final part is the
    target heading and the preceding parts are ancestors in outermost-first
-   order.
-3. **Ordinal** (e.g. `#7`), selecting the Nth ATX heading in document order,
-   1-based. The ordinal form SHALL be attempted only when no heading's text
-   matches the selector exactly, so a heading literally titled `#7` continues
-   to resolve to itself.
+   order. A selector containing `/` SHALL NOT be interpreted as an ordinal.
+3. **Exact heading text** (e.g. `Tasks`).
+
+A heading whose literal text is `#N` SHALL remain addressable by the path-style
+form (`Parent/#N`) and by its own ordinal.
 
 The ordinal form exists because the path-style form cannot separate duplicate
 **sibling** headings — headings with identical text under the same parent share
@@ -194,8 +198,10 @@ for writing.
 
 - **WHEN** a note contains a heading whose text is exactly `#2` and the
   client supplies `section="#2"`
-- **THEN** that heading SHALL be selected by exact text match
-- **AND** the second heading in the note SHALL NOT be selected
+- **THEN** the second heading in the note SHALL be selected, because a bare
+  ordinal always selects by position
+- **AND** the heading titled `#2` SHALL remain reachable via the path-style
+  form and via its own ordinal
 
 ### Requirement: `dry_run` returns a unified diff without mutating
 

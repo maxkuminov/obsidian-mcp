@@ -49,9 +49,15 @@ When the selected content exceeds the cap, the tool SHALL return the first windo
 
 #### Scenario: Offset beyond the content
 
-- **WHEN** `read_note` is invoked with an `offset` past the end of the selected content
+- **WHEN** `read_note` is invoked with an `offset` strictly greater than the length of the selected content
 - **THEN** the tool SHALL return a message reporting the offset and the total size
 - **AND** the tool SHALL NOT return an empty response that could be mistaken for an empty note
+
+#### Scenario: Offset exactly at the end of the content
+
+- **WHEN** `read_note` is invoked with an `offset` exactly equal to the length of the selected content
+- **THEN** the tool SHALL report that the end has been reached and nothing further remains
+- **AND** SHALL distinguish this from an offset that is past the end, which is a caller error
 
 #### Scenario: Invalid offset or limit
 
@@ -104,6 +110,8 @@ When a whole-note read is truncated and the note contains ATX headings, the resp
 
 The outline SHALL NOT be included when a `section` was explicitly selected, since the caller has already chosen.
 
+The outline SHALL itself be bounded by `MAX_READ_RESPONSE_CHARS`. It is appended to a response that exists because the content was too large, so an unbounded outline would reintroduce the failure this capability prevents: a note with very many headings can otherwise produce an outline far larger than the content window it accompanies. Overlong headings SHALL be elided, and when the listing does not fit, it SHALL stop and report how many sections were omitted along with the full ordinal range. At least one entry SHALL always be emitted.
+
 #### Scenario: Truncated note with headings
 
 - **WHEN** a whole-note read is truncated on a note containing ATX headings
@@ -116,6 +124,18 @@ The outline SHALL NOT be included when a `section` was explicitly selected, sinc
 - **WHEN** a whole-note read is truncated on a note containing no ATX headings
 - **THEN** the response SHALL still be truncated with a continuation offset
 - **AND** SHALL suggest narrowing the request by search rather than offering an outline
+
+#### Scenario: Outline of a heading-heavy note stays bounded
+
+- **WHEN** a truncated note contains so many headings that a full listing would exceed `MAX_READ_RESPONSE_CHARS`
+- **THEN** the outline SHALL be truncated to stay within the cap
+- **AND** SHALL report the number of sections omitted and the full ordinal range
+- **AND** the total response SHALL remain proportionate to the cap
+
+#### Scenario: Overlong heading text is elided
+
+- **WHEN** a section's heading text is longer than the outline's per-title limit
+- **THEN** the entry SHALL show an elided title rather than the full text
 
 #### Scenario: Truncated section read omits the outline
 

@@ -635,11 +635,29 @@ def _resolve_section_index(
     which the path-style form cannot disambiguate because they share ancestors.
     Auto-generated notes hit this routinely (e.g. the same source filename
     extracted twice under one parent).
+
+    **A bare `#N` selector always means the ordinal**, even if some heading's
+    literal text is also `#N`. The outline emitted with a truncated read
+    advertises these ordinals as the reliable way to reach a section, so they
+    cannot be shadowed by note content — otherwise a section could become
+    unaddressable by the very selector we told the caller to use. A heading
+    genuinely titled `#2` stays reachable two ways: by its own ordinal, or by
+    the path-style form (`Parent/#2`), which never takes the ordinal branch.
     """
     if not headings:
         return None, (
             f"Section heading '{heading}' not found: note has no ATX headings."
         )
+
+    ordinal = heading.strip()
+    if "/" not in ordinal and ordinal.startswith("#") and ordinal[1:].isdigit():
+        n = int(ordinal[1:])
+        if not 1 <= n <= len(headings):
+            return None, (
+                f"Section ordinal '{heading}' is out of range: this note has "
+                f"{len(headings)} headings (valid #1–#{len(headings)})."
+            )
+        return n - 1, None
 
     if "/" in heading:
         parts = [p.strip() for p in heading.split("/")]
@@ -664,17 +682,6 @@ def _resolve_section_index(
 
     candidates = [i for i, h in enumerate(headings) if h["text"] == heading]
     if not candidates:
-        # Ordinal fallback, tried only after exact text matching so a heading
-        # literally titled "#2" still wins over the ordinal interpretation.
-        ordinal = heading.strip()
-        if ordinal.startswith("#") and ordinal[1:].isdigit():
-            n = int(ordinal[1:])
-            if not 1 <= n <= len(headings):
-                return None, (
-                    f"Section ordinal '{heading}' is out of range: this note "
-                    f"has {len(headings)} headings (valid #1–#{len(headings)})."
-                )
-            return n - 1, None
         return None, (
             f"Section heading '{heading}' not found. "
             f"Headings present: {_format_heading_list(headings)}."

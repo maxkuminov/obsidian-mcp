@@ -164,23 +164,51 @@ def _window(body: str, offset: int, limit: int) -> tuple[str, int | None]:
     return chunk, (end if end < len(body) else None)
 
 
+_MAX_OUTLINE_TITLE = 80
+
+
 def _outline_text(content: str, cap: int) -> str | None:
-    """Render a navigable heading outline, or None if there are no headings."""
+    """Render a navigable heading outline, or None if there are no headings.
+
+    The outline is itself bounded by `cap`. It is appended to a response that
+    exists *because* the content was too large, so an unbounded outline would
+    reintroduce the exact context blowup this module prevents: a note with
+    thousands of headings can produce an outline many times the size of the
+    content window it accompanies. Long titles are elided and the listing stops
+    at the budget, reporting how many sections were omitted.
+    """
     sections = outline_sections(content)
     if not sections:
         return None
     seen = Counter(s["text"] for s in sections)
-    lines = []
-    for s in sections:
+    lines: list[str] = []
+    used = 0
+    for i, s in enumerate(sections):
         marker = "#" * s["depth"]
+        title = s["text"]
+        if len(title) > _MAX_OUTLINE_TITLE:
+            title = title[:_MAX_OUTLINE_TITLE - 1] + "…"
         flag = "" if s["size"] <= cap else "  ⚠ over the cap, will page"
         # A repeated heading can only be addressed by its ordinal — the
         # path-style form cannot separate duplicate siblings.
         dup = "  ← duplicate title, use the ordinal" if seen[s["text"]] > 1 else ""
-        lines.append(
-            f"- `#{s['ordinal']}` `{marker} {s['text']}` "
+        line = (
+            f"- `#{s['ordinal']}` `{marker} {title}` "
             f"({s['size']:,} chars){flag}{dup}"
         )
+        # Always emit at least one line, so a single pathological heading still
+        # tells the caller the outline exists rather than silently vanishing.
+        if lines and used + len(line) + 1 > cap:
+            omitted = len(sections) - i
+            lines.append(
+                f"- … {omitted:,} more section(s) not shown (outline truncated "
+                f"to stay within the response cap). Ordinals run #1–"
+                f"#{len(sections)}; request one directly, or narrow with "
+                f"`search_notes`."
+            )
+            break
+        lines.append(line)
+        used += len(line) + 1
     return "\n".join(lines)
 
 
@@ -232,6 +260,12 @@ async def read_note_impl(
 
     chunk, next_offset = _window(body, offset, cap)
     if not chunk and offset > 0:
+        if offset == len(body):
+            return (
+                f"read_note: offset {offset:,} is exactly the end of {origin} "
+                f"in {path} ({len(body):,} chars) — the whole {origin} has "
+                f"been read, there is nothing further."
+            )
         return (
             f"read_note: offset {offset:,} is past the end of {origin} in {path} "
             f"({len(body):,} chars)."
@@ -255,7 +289,8 @@ async def read_note_impl(
                 "Prefer jumping straight to what you need — this note's sections "
                 f'are listed below. Read one with `read_note(path="{path}", '
                 'section="<heading>")`, or by the `#N` ordinal shown '
-                '(`section="#7"`), which always works even when titles repeat:\n'
+                '(`section="#7"`). A bare `#N` always selects by position, so '
+                'it stays reliable when titles repeat:\n'
                 + outline
             )
         notice.append(
@@ -1299,6 +1334,12 @@ def _capped_text(text: str, path: str, offset: int, cap: int) -> str:
         return text
     chunk, next_offset = _window(text, offset, cap)
     if not chunk and offset > 0:
+        if offset == len(text):
+            return (
+                f"read_file: offset {offset:,} is exactly the end of {path} "
+                f"({len(text):,} chars) — the whole file has been read, there "
+                f"is nothing further."
+            )
         return (
             f"read_file: offset {offset:,} is past the end of {path} "
             f"({len(text):,} chars)."

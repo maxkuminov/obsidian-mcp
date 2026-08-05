@@ -140,13 +140,17 @@ Over-cap reads return the first window, a `[TRUNCATED]` notice with the exact co
 
 ## Section addressing
 
-`read_note(section=…)` and `edit_note(section=…)` share one resolver in `src/services/vault.py`, so a selector names the same section for both. Three forms, resolved in order:
+`read_note(section=…)` and `edit_note(section=…)` share one resolver in `src/services/vault.py`, so a selector names the same section for both. Three forms:
 
-1. Exact heading text — `"Tasks"`.
-2. Path-style chain — `"Parent/Child"`, ancestors outermost-first.
-3. Ordinal — `"#7"`, the 7th ATX heading in document order, 1-based.
+1. Ordinal — `"#7"`, the 7th ATX heading in document order, 1-based. Checked **first**.
+2. Path-style chain — `"Parent/Child"`, ancestors outermost-first. A selector containing `/` never takes the ordinal branch.
+3. Exact heading text — `"Tasks"`.
 
-The ordinal exists because **path-style cannot disambiguate duplicate siblings**: two `## Report.xlsx` under the same parent share every ancestor, so no chain separates them. Bulk-extraction notes are full of these. Ordinals are tried **only after exact-text matching fails**, so a heading literally titled `#2` still resolves to itself — don't reorder that.
+The ordinal exists because **path-style cannot disambiguate duplicate siblings**: two `## Report.xlsx` under the same parent share every ancestor, so no chain separates them. Bulk-extraction notes are full of these.
+
+**A bare `#N` always wins over a heading literally titled `#N` — don't "fix" this by preferring text.** The outline we emit on truncation advertises ordinals as the reliable selector; if note content could shadow one, the section we just told the caller to fetch by `#2` would be unreachable by `#2`. Text-first was the original implementation and pre-merge review caught it. The literal heading loses nothing: it stays reachable by the path form (`Parent/#2`) and by its own ordinal, so under ordinal-first every section is addressable, which is not true the other way round.
+
+Ambiguity stays an error that names the resolving ordinals; it never silently picks the first match (that is how an agent edits the wrong section and reports success).
 
 Ambiguity stays an error that names the resolving ordinals; it never silently picks the first match (that is how an agent edits the wrong section and reports success).
 
