@@ -597,6 +597,11 @@ def _format_heading_list(headings: list[dict]) -> str:
     return "; ".join(f"{'#' * h['depth']} {h['text']}" for h in headings)
 
 
+def _format_ordinal_choices(candidates: list[int]) -> str:
+    """Render candidate indices as the `#N` selectors a caller can pass back."""
+    return ", ".join(f"#{i + 1}" for i in candidates)
+
+
 def _path_chain_match(target_idx: int, headings: list[dict], ancestors: list[str]) -> bool:
     """Check if the heading at `target_idx` has `ancestors` (outermost-first)
     as a leading sequence of its enclosing-heading chain (innermost-first).
@@ -616,20 +621,21 @@ def _path_chain_match(target_idx: int, headings: list[dict], ancestors: list[str
     return chain[: len(expected)] == expected
 
 
-def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None, str | None]:
-    """Replace the body under a named ATX heading.
+def _resolve_section_index(
+    headings: list[dict], heading: str
+) -> tuple[int | None, str | None]:
+    """Resolve a heading selector to an index into `headings`.
 
-    Returns `(new_text, error)`. On success: `error is None`. On failure:
-    `new_text is None` and `error` is an actionable message.
+    Returns `(idx, error)`. `heading` may be plain heading text (`Tasks`), a
+    path-style chain (`Parent/Child`) where the last part is the target and the
+    preceding parts are ancestors in outermost-first order, or a `#N` ordinal
+    (`#7`) selecting the Nth heading in document order, 1-based.
 
-    `heading` may be a plain heading text (e.g. `Tasks`) or a path-style
-    chain (`Parent/Child`, `Outer/Inner/Leaf`, …) where the last part is
-    the target heading and the preceding parts are ancestors in
-    outermost-first order. The replacement runs from the line after the
-    matched heading up to (but not including) the next heading at depth
-    less than or equal to the matched depth, or end of file.
+    The ordinal form is the only way to address duplicate *sibling* headings,
+    which the path-style form cannot disambiguate because they share ancestors.
+    Auto-generated notes hit this routinely (e.g. the same source filename
+    extracted twice under one parent).
     """
-    headings = _scan_headings(text)
     if not headings:
         return None, (
             f"Section heading '{heading}' not found: note has no ATX headings."
@@ -651,39 +657,115 @@ def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None,
         if len(candidates) > 1:
             return None, (
                 f"Section heading '{heading}' is still ambiguous "
-                f"({len(candidates)} matches). Add more ancestors to the path."
+                f"({len(candidates)} matches). Add more ancestors to the path, "
+                f"or select one by ordinal: {_format_ordinal_choices(candidates)}."
             )
-        idx = candidates[0]
-    else:
-        candidates = [i for i, h in enumerate(headings) if h["text"] == heading]
-        if not candidates:
-            return None, (
-                f"Section heading '{heading}' not found. "
-                f"Headings present: {_format_heading_list(headings)}."
-            )
-        if len(candidates) > 1:
-            return None, (
-                f"Section heading '{heading}' matches {len(candidates)} headings. "
-                "Use the path-style form 'Parent/Child' to disambiguate."
-            )
-        idx = candidates[0]
+        return candidates[0], None
 
+    candidates = [i for i, h in enumerate(headings) if h["text"] == heading]
+    if not candidates:
+        # Ordinal fallback, tried only after exact text matching so a heading
+        # literally titled "#2" still wins over the ordinal interpretation.
+        ordinal = heading.strip()
+        if ordinal.startswith("#") and ordinal[1:].isdigit():
+            n = int(ordinal[1:])
+            if not 1 <= n <= len(headings):
+                return None, (
+                    f"Section ordinal '{heading}' is out of range: this note "
+                    f"has {len(headings)} headings (valid #1–#{len(headings)})."
+                )
+            return n - 1, None
+        return None, (
+            f"Section heading '{heading}' not found. "
+            f"Headings present: {_format_heading_list(headings)}."
+        )
+    if len(candidates) > 1:
+        return None, (
+            f"Section heading '{heading}' matches {len(candidates)} headings. "
+            "Use the path-style form 'Parent/Child' to disambiguate, or select "
+            f"one by ordinal: {_format_ordinal_choices(candidates)}."
+        )
+    return candidates[0], None
+
+
+def _section_body_span(text: str, headings: list[dict], idx: int) -> tuple[int, int]:
+    """Return `(body_start, body_end)` for the section at `idx`.
+
+    The body runs from the line after the matched heading up to (but not
+    including) the next heading at depth less than or equal to the matched
+    depth, or end of text.
+    """
     matched = headings[idx]
     matched_depth = matched["depth"]
 
-    next_heading_line_start: int | None = None
+    body_end = len(text)
     for j in range(idx + 1, len(headings)):
         if headings[j]["depth"] <= matched_depth:
-            next_heading_line_start = headings[j]["line_start"]
+            body_end = headings[j]["line_start"]
             break
 
     body_start = matched["line_end"]
     if body_start < len(text) and text[body_start] == "\n":
         body_start += 1
-    if next_heading_line_start is not None:
-        body_end = next_heading_line_start
-    else:
-        body_end = len(text)
+    return body_start, body_end
+
+
+def outline_sections(text: str) -> list[dict]:
+    """Summarise a note's ATX headings without returning their bodies.
+
+    Each entry carries `depth`, `text`, `size` (characters spanned by the
+    heading line plus its body, i.e. what `extract_section` would return), and
+    `ordinal` (1-based document order, usable as an `#N` section selector).
+    Used to let a caller navigate a note too large to return whole.
+    """
+    headings = _scan_headings(text)
+    out: list[dict] = []
+    for i, h in enumerate(headings):
+        _, body_end = _section_body_span(text, headings, i)
+        out.append({
+            "depth": h["depth"],
+            "text": h["text"],
+            "size": body_end - h["line_start"],
+            "ordinal": i + 1,
+        })
+    return out
+
+
+def extract_section(text: str, heading: str) -> tuple[str | None, str | None]:
+    """Return the heading line plus its body for a named ATX heading.
+
+    Returns `(section_text, error)`; exactly one is non-None. Selector syntax
+    matches `replace_section`.
+    """
+    headings = _scan_headings(text)
+    idx, err = _resolve_section_index(headings, heading)
+    if err is not None:
+        return None, err
+    _, body_end = _section_body_span(text, headings, idx)
+    return text[headings[idx]["line_start"]:body_end], None
+
+
+def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None, str | None]:
+    """Replace the body under a named ATX heading.
+
+    Returns `(new_text, error)`. On success: `error is None`. On failure:
+    `new_text is None` and `error` is an actionable message.
+
+    `heading` may be a plain heading text (e.g. `Tasks`) or a path-style
+    chain (`Parent/Child`, `Outer/Inner/Leaf`, …) where the last part is
+    the target heading and the preceding parts are ancestors in
+    outermost-first order. The replacement runs from the line after the
+    matched heading up to (but not including) the next heading at depth
+    less than or equal to the matched depth, or end of file.
+    """
+    headings = _scan_headings(text)
+    idx, err = _resolve_section_index(headings, heading)
+    if err is not None:
+        return None, err
+
+    body_start, body_end = _section_body_span(text, headings, idx)
+    # `body_end` lands on the next same-or-shallower heading, or end of text.
+    next_heading_line_start = body_end if body_end < len(text) else None
 
     inserted = new_body
     # If the retained prefix lacks a trailing newline (an end-of-file heading

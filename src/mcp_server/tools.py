@@ -7,6 +7,7 @@ import os
 import posixpath
 import re
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
@@ -24,7 +25,9 @@ from src.services.filters import apply_note_filters
 from src.services.search import full_text_search
 from src.services.vault import (
     classify_bytes,
+    extract_section,
     list_dir,
+    outline_sections,
     read_bytes,
     read_file,
     write_bytes,
@@ -150,9 +153,45 @@ async def search_notes_impl(
     return "\n".join(lines)
 
 
-@_tracked("read_note", ["path"])
-async def read_note_impl(path: str) -> str:
-    """Read a note by its vault-relative path."""
+def _window(body: str, offset: int, limit: int) -> tuple[str, int | None]:
+    """Slice `body` to a window. Returns `(chunk, next_offset)`.
+
+    `next_offset` is None when the window reached the end of `body`.
+    """
+    start = max(0, offset)
+    chunk = body[start:start + limit]
+    end = start + len(chunk)
+    return chunk, (end if end < len(body) else None)
+
+
+def _outline_text(content: str, cap: int) -> str | None:
+    """Render a navigable heading outline, or None if there are no headings."""
+    sections = outline_sections(content)
+    if not sections:
+        return None
+    seen = Counter(s["text"] for s in sections)
+    lines = []
+    for s in sections:
+        marker = "#" * s["depth"]
+        flag = "" if s["size"] <= cap else "  ⚠ over the cap, will page"
+        # A repeated heading can only be addressed by its ordinal — the
+        # path-style form cannot separate duplicate siblings.
+        dup = "  ← duplicate title, use the ordinal" if seen[s["text"]] > 1 else ""
+        lines.append(
+            f"- `#{s['ordinal']}` `{marker} {s['text']}` "
+            f"({s['size']:,} chars){flag}{dup}"
+        )
+    return "\n".join(lines)
+
+
+@_tracked("read_note", ["path", "section", "offset", "limit"])
+async def read_note_impl(
+    path: str,
+    section: str | None = None,
+    offset: int = 0,
+    limit: int | None = None,
+) -> str:
+    """Read a note by its vault-relative path, capped to a context-safe size."""
     uid = current_user_id.get()
     try:
         note = read_file(path, user_id=uid)
@@ -161,6 +200,24 @@ async def read_note_impl(path: str) -> str:
     except ValueError as e:
         return str(e)
 
+    cap = settings.max_read_response_chars
+    if limit is not None:
+        if limit < 1:
+            return f"read_note: limit must be >= 1 (got {limit})."
+        cap = min(limit, cap)
+    if offset < 0:
+        return f"read_note: offset must be >= 0 (got {offset})."
+
+    content = note["content"]
+    body = content
+    origin = "note"
+    if section is not None:
+        extracted, err = extract_section(content, section)
+        if err is not None:
+            return err
+        body = extracted
+        origin = f"section '{section}'"
+
     parts = [f"# {note['title']}\n**Path:** `{note['path']}`"]
     if note["tags"]:
         parts.append(f"**Tags:** {', '.join(note['tags'])}")
@@ -168,7 +225,46 @@ async def read_note_impl(path: str) -> str:
         fm_lines = [f"  {k}: {v}" for k, v in note["frontmatter"].items() if k not in ("title", "tags")]
         if fm_lines:
             parts.append("**Frontmatter:**\n" + "\n".join(fm_lines))
-    parts.append(f"\n---\n{note['content']}")
+
+    if offset == 0 and len(body) <= cap:
+        parts.append(f"\n---\n{body}")
+        return "\n".join(parts)
+
+    chunk, next_offset = _window(body, offset, cap)
+    if not chunk and offset > 0:
+        return (
+            f"read_note: offset {offset:,} is past the end of {origin} in {path} "
+            f"({len(body):,} chars)."
+        )
+
+    shown_to = min(offset, len(body)) + len(chunk)
+    notice = [
+        f"\n\n---\n**[TRUNCATED]** Showing chars {offset:,}–{shown_to:,} "
+        f"of {len(body):,} for this {origin}."
+    ]
+    if next_offset is not None:
+        notice.append(
+            f'Continue with `read_note(path="{path}"'
+            + (f', section="{section}"' if section is not None else "")
+            + f', offset={next_offset})`.'
+        )
+    if section is None:
+        outline = _outline_text(content, cap)
+        if outline:
+            notice.append(
+                "Prefer jumping straight to what you need — this note's sections "
+                f'are listed below. Read one with `read_note(path="{path}", '
+                'section="<heading>")`, or by the `#N` ordinal shown '
+                '(`section="#7"`), which always works even when titles repeat:\n'
+                + outline
+            )
+        notice.append(
+            "You can also narrow the search first with `search_notes` instead of "
+            "reading the whole note."
+        )
+
+    parts.append(f"\n---\n{chunk}")
+    parts.append("\n\n".join(notice))
     return "\n".join(parts)
 
 
@@ -1197,11 +1293,45 @@ def _base64_payload(path: str, data: bytes, mime: str) -> str:
     )
 
 
-@_tracked("read_file", ["path", "encoding"])
-async def read_file_impl(path: str, encoding: str = "auto"):
+def _capped_text(text: str, path: str, offset: int, cap: int) -> str:
+    """Return a context-safe window of decoded file text."""
+    if offset == 0 and len(text) <= cap:
+        return text
+    chunk, next_offset = _window(text, offset, cap)
+    if not chunk and offset > 0:
+        return (
+            f"read_file: offset {offset:,} is past the end of {path} "
+            f"({len(text):,} chars)."
+        )
+    shown_to = min(offset, len(text)) + len(chunk)
+    notice = (
+        f"\n\n---\n**[TRUNCATED]** Showing chars {offset:,}–{shown_to:,} "
+        f"of {len(text):,} for {path}."
+    )
+    if next_offset is not None:
+        notice += (
+            f' Continue with `read_file(path="{path}", offset={next_offset})`.'
+        )
+    return chunk + notice
+
+
+@_tracked("read_file", ["path", "encoding", "offset", "limit"])
+async def read_file_impl(
+    path: str,
+    encoding: str = "auto",
+    offset: int = 0,
+    limit: int | None = None,
+):
     """Read any vault file: text, inline image block, or base64 bytes."""
     if encoding not in ("auto", "text", "base64"):
         return f"Invalid encoding '{encoding}'. Use 'auto', 'text', or 'base64'."
+    if offset < 0:
+        return f"read_file: offset must be >= 0 (got {offset})."
+    cap = settings.max_read_response_chars
+    if limit is not None:
+        if limit < 1:
+            return f"read_file: limit must be >= 1 (got {limit})."
+        cap = min(limit, cap)
 
     uid = current_user_id.get()
     try:
@@ -1213,7 +1343,7 @@ async def read_file_impl(path: str, encoding: str = "auto"):
 
     if encoding == "text":
         try:
-            return data.decode("utf-8")
+            return _capped_text(data.decode("utf-8"), path, offset, cap)
         except UnicodeDecodeError:
             return (
                 f"Cannot decode {path} as UTF-8 text (not valid UTF-8). "
@@ -1228,7 +1358,7 @@ async def read_file_impl(path: str, encoding: str = "auto"):
     kind, mime = classify_bytes(data, path)
     if kind == "text":
         try:
-            return data.decode("utf-8")
+            return _capped_text(data.decode("utf-8"), path, offset, cap)
         except UnicodeDecodeError:
             return _base64_payload(path, data, mime)
     if kind == "image":

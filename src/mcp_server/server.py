@@ -65,13 +65,33 @@ async def keyword_search(
 
 
 @mcp.tool()
-async def read_note(path: str) -> str:
+async def read_note(
+    path: str,
+    section: str | None = None,
+    offset: int = 0,
+    limit: int | None = None,
+) -> str:
     """Read a note from the Obsidian vault by its relative path.
+
+    Responses are capped to a context-safe size. If the note is larger than the
+    cap, you get the first window plus an outline of the note's headings — read
+    the one section you need with `section=` rather than paging through the
+    whole note.
 
     Args:
         path: Vault-relative path to the note (e.g. "Cards/My Note.md")
+        section: Optional ATX heading to read instead of the whole note. Plain
+            text ("Balance Sheet"), a path-style chain ("Parent/Child") when the
+            heading appears under different parents, or a "#N" ordinal ("#7",
+            1-based document order) — the ordinal is the only form that can
+            address duplicate headings sharing the same parent. The outline
+            printed with a truncated note lists the ordinal for every section.
+        offset: Character offset to start reading from (default 0). Use the
+            value the truncation notice reports to continue.
+        limit: Maximum characters to return. Only lowers the server cap; it
+            cannot raise it.
     """
-    return await read_note_impl(path)
+    return await read_note_impl(path, section=section, offset=offset, limit=limit)
 
 
 @mcp.tool()
@@ -410,7 +430,12 @@ async def set_frontmatter(
 
 
 @mcp.tool()
-async def read_file(path: str, encoding: str = "auto"):
+async def read_file(
+    path: str,
+    encoding: str = "auto",
+    offset: int = 0,
+    limit: int | None = None,
+):
     """Read any file in the vault — including non-markdown (PDFs, images,
     skill HTML/JS, data files). Peer to `read_note`, which stays markdown-only.
 
@@ -433,11 +458,18 @@ async def read_file(path: str, encoding: str = "auto"):
     reading large binaries. Dot-directories (`.obsidian`, `.git`, `.trash`, …)
     and path traversal are rejected.
 
+    Text results are additionally capped to a context-safe size and continue
+    via `offset`; base64 and image results are not windowed.
+
     Args:
         path: Vault-relative path to the file (e.g. "Reference Docs/spec.pdf").
         encoding: One of "auto" (default), "text", or "base64".
+        offset: Character offset to start a text read from (default 0). Use the
+            value the truncation notice reports to continue.
+        limit: Maximum characters to return for a text read. Only lowers the
+            server cap; it cannot raise it.
     """
-    return await read_file_impl(path, encoding=encoding)
+    return await read_file_impl(path, encoding=encoding, offset=offset, limit=limit)
 
 
 @mcp.tool()

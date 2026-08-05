@@ -65,6 +65,13 @@ class Settings(BaseSettings):
     max_file_read_bytes: int = Field(10 * 1024 * 1024, ge=1)
     max_file_write_bytes: int = Field(25 * 1024 * 1024, ge=1)
 
+    # Cap on how much note/file text a single read_note / read_file call may
+    # return to the model. The byte caps above stop the server from reading a
+    # huge file into memory; this one stops a legitimately-read file from
+    # blowing the caller's context window. ~40k chars ≈ 10k tokens.
+    # Env: MAX_READ_RESPONSE_CHARS.
+    max_read_response_chars: int = Field(40_000, ge=1_000)
+
     multi_user_mode: bool = False
     session_max_age: int = 60 * 60 * 24 * 7
     session_cookie_name: str = "omcp_session"
