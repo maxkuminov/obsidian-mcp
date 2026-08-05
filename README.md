@@ -190,14 +190,19 @@ The server exposes 20 MCP tools across six concerns.
   `CLAUDE.md`, served live
 
 ### Read and write
-- `read_note(path)`
+- `read_note(path, section?, offset=0, limit?)`, bounded by
+  `MAX_READ_RESPONSE_CHARS` (default 40,000) — see
+  [Response size limits](#response-size-limits). `section=<heading>`
+  returns one section instead of the whole note; `offset` continues a
+  truncated read.
 - `create_note(path, content)`, atomic write, refuses overwrite
 - `edit_note(path, …)` with four mutually exclusive modes: full
   replace (default), `append=True`, `find=…` (with optional
   `replace_all`), or `section=<heading>` (ATX headings, supports
-  `Parent/Child` path-style disambiguation). `dry_run=True` returns a
-  unified diff without writing. Legacy clients may use
-  `operation="append"`; `operation="replace"` explicitly selects full replace.
+  `Parent/Child` path-style and `#N` ordinal disambiguation).
+  `dry_run=True` returns a unified diff without writing. Legacy clients
+  may use `operation="append"`; `operation="replace"` explicitly selects
+  full replace.
 - `move_note(from_path, to_path, rewrite_links=False)`, relocates and
   optionally rewrites incoming `[[Old]]`, `[[Old|alias]]`,
   `[[Old#anchor]]`, `![[Old]]`, and `[[folder/Old]]` references in
@@ -213,10 +218,12 @@ Raw read/write/browse of arbitrary vault files (PDFs, images, skill
 assets, data files) — distinct peers to the note tools, which stay
 markdown-only. Pure byte transport: no server-side PDF/text extraction,
 no embedding or indexing of non-markdown files.
-- `read_file(path, encoding="auto")`, returns text-like files as text,
-  images as an inline image block that renders in-client, and other
-  binaries as a base64 string. `text`/`base64` force the form. Refuses
-  files over `MAX_FILE_READ_BYTES` (default 10 MB).
+- `read_file(path, encoding="auto", offset=0, limit?)`, returns
+  text-like files as text, images as an inline image block that renders
+  in-client, and other binaries as a base64 string. `text`/`base64`
+  force the form. Refuses files over `MAX_FILE_READ_BYTES` (default
+  10 MB); text results are additionally bounded by
+  `MAX_READ_RESPONSE_CHARS` and continue via `offset`.
 - `write_file(path, content, encoding="base64", overwrite=False)`,
   lands a file in the vault; base64 for binary, `text` for UTF-8.
   No-clobber by default, auto-creates parent dirs, atomic write.
@@ -603,8 +610,9 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `VAULT_PATH` | `/obsidian` | In-container vault mount |
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
-| `MAX_FILE_READ_BYTES` | `10485760` | `read_file` cap (10 MB); bounds inline/base64 responses |
+| `MAX_FILE_READ_BYTES` | `10485760` | `read_file` cap (10 MB); bounds what the server reads from disk |
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
+| `MAX_READ_RESPONSE_CHARS` | `40000` | `read_note` / `read_file` cap on what is returned to the caller (≈10K tokens). See [Response size limits](#response-size-limits). |
 | `FTS_CONFIGS` | `english` | Keyword-search text-search config(s). JSON or CSV. See [Full-text search language(s)](#full-text-search-languages). |
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
@@ -688,6 +696,67 @@ seconds for a few thousand notes. (Do not confuse it with the expensive
 > `bge` + `m3`. `simple` preserves word *forms*, not punctuation-bearing
 > strings; exact-string-with-punctuation matching would need a trigram
 > index and is out of scope.
+
+### Response size limits
+
+A tool result is model input. Whatever `read_note` returns is fed
+straight back into the caller's next request, so an unbounded read is
+an unbounded prompt — and the caller usually finds out only when its
+inference provider rejects the request.
+
+`MAX_READ_RESPONSE_CHARS` (default 40,000, roughly 10K tokens) bounds
+what `read_note` and the text results of `read_file` return. It is a
+**different limit** from `MAX_FILE_READ_BYTES`, which bounds what the
+server reads off disk. A 3 MB note is comfortably within the 10 MB read
+cap and will still destroy a context window; both caps are needed and
+they have different correct values.
+
+It applies **per component**, not once to the whole response: the
+content window gets the cap, and the heading outline gets it
+independently. A truncated read can carry both, so budget for a
+worst case of roughly `2 × MAX_READ_RESPONSE_CHARS` plus a few hundred
+characters of fixed notice text — not one cap's worth.
+
+When a note exceeds the cap you get the first window plus a
+`[TRUNCATED]` notice carrying the exact `offset` to continue from, and
+— for a whole-note read — an outline of the note's sections:
+
+```
+- `#1` `# Client Records` (2,855,343 chars)  ⚠ over the cap, will page
+- `#2` `## Balance Sheet.xlsx` (391,199 chars)  ⚠ over the cap, will page
+- `#3` `## Lease Agreement.pdf` (464 chars)
+- `#4` `## Invoice 2025-044.pdf` (1,075 chars)  ← duplicate title, use the ordinal
+```
+
+Paging a multi-megabyte note 40K at a time is technically possible and
+practically useless, so prefer the outline: read the one section you
+want with `read_note(path, section="Lease Agreement.pdf")`. Sections are
+addressable three ways — the `#N` ordinal shown in the outline, the
+`Parent/Child` path-style form, and exact heading text. The ordinal is
+the only form that separates **duplicate sibling** headings, which share
+every ancestor and so cannot be disambiguated by path; notes generated
+by bulk extraction tend to be full of them.
+
+A bare `#N` **always** selects by position, so an ordinal we hand you in
+an outline can never be shadowed by a heading that happens to be titled
+`#2`. Such a heading stays reachable via the path form (`Parent/#2`) or
+via its own ordinal.
+
+The outline is itself bounded by the cap: a note with thousands of
+headings gets a truncated listing that reports how many sections were
+omitted and the full ordinal range, rather than an outline larger than
+the content window it accompanies.
+
+`limit` can lower the cap for a single call but never raise it. If your
+clients genuinely want larger reads, raise `MAX_READ_RESPONSE_CHARS` —
+that is an operator decision, made once, by someone who knows the
+deployment.
+
+> **Upgrading:** this is a visible contract change. Before this, a
+> `read_note` on a large note returned the whole thing; now it
+> truncates. The notice is self-describing, so an agent needs no prior
+> knowledge to continue, but a script that assumed whole-note reads
+> should either pass `section=` or raise the cap.
 
 ## Architecture
 

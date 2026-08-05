@@ -377,6 +377,17 @@ is pennies a month.
 - `/admin` exposed without auth. Don't skip Step 6. The MCP endpoint
   itself is API-key gated, but the panel can mint new keys and reset
   embeddings.
+- Large notes come back truncated. Expected. If your vault holds very
+  large generated notes (bulk document extracts, exported archives),
+  `read_note` returns a bounded window rather than the whole note:
+  `MAX_READ_RESPONSE_CHARS` defaults to 40,000 characters (~10K tokens)
+  so one read cannot exhaust the calling model's context. The response
+  carries the offset to continue from plus an outline of the note's
+  sections, so an agent can fetch just the section it needs. Raise it in
+  `.env` if your clients genuinely want larger single reads — but the
+  failure mode it prevents is your inference provider rejecting the
+  request outright with "input exceeds the context window", which is far
+  harder to diagnose than a truncation notice.
 
 ## What's not covered
 

@@ -7,6 +7,7 @@ import os
 import posixpath
 import re
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
@@ -24,7 +25,9 @@ from src.services.filters import apply_note_filters
 from src.services.search import full_text_search
 from src.services.vault import (
     classify_bytes,
+    extract_section,
     list_dir,
+    outline_sections,
     read_bytes,
     read_file,
     write_bytes,
@@ -150,9 +153,109 @@ async def search_notes_impl(
     return "\n".join(lines)
 
 
-@_tracked("read_note", ["path"])
-async def read_note_impl(path: str) -> str:
-    """Read a note by its vault-relative path."""
+def _window(body: str, offset: int, limit: int) -> tuple[str, int | None]:
+    """Slice `body` to a window. Returns `(chunk, next_offset)`.
+
+    `next_offset` is None when the window reached the end of `body`.
+    """
+    start = max(0, offset)
+    chunk = body[start:start + limit]
+    end = start + len(chunk)
+    return chunk, (end if end < len(body) else None)
+
+
+_MAX_OUTLINE_TITLE = 80
+
+
+def _outline_text(content: str, cap: int) -> str | None:
+    """Render a navigable heading outline, or None if there are no headings.
+
+    The returned string NEVER exceeds `cap` characters. The outline is appended
+    to a response that exists *because* the content was too large, so it is the
+    one place where adding context can recreate the problem being solved: a note
+    with thousands of headings otherwise produces an outline many times the size
+    of the content window it accompanies.
+
+    The budget is enforced in layers, because each has a hole that only shows
+    up at an extreme:
+      1. Long titles are elided at `_MAX_OUTLINE_TITLE`.
+      2. If the complete listing fits, it is emitted as-is. No summary is
+         needed when nothing is omitted, so no room is reserved for one —
+         reserving unconditionally drops entries that had room and returns a
+         near-empty outline for a small note.
+      3. Otherwise entries are added only while they fit, with room reserved
+         for the omitted-sections summary, which is itself text and must be
+         paid for before it is spent.
+      4. A final hard truncation, so the guarantee holds unconditionally even
+         for a degenerate `cap` (a caller may pass `limit=1`) where not even
+         one entry or the bare summary can fit. In that case the outline
+         degrades to a marker; there is no `cap`-respecting alternative.
+    """
+    sections = outline_sections(content)
+    if not sections:
+        return None
+    seen = Counter(s["text"] for s in sections)
+
+    def _summary(omitted: int) -> str:
+        return (
+            f"- … {omitted:,} more section(s) not shown (outline truncated "
+            f"to stay within the response cap). Ordinals run #1–"
+            f"#{len(sections)}; request one directly, or narrow with "
+            f"`search_notes`."
+        )
+
+    def _entry(s: dict) -> str:
+        marker = "#" * s["depth"]
+        title = s["text"]
+        if len(title) > _MAX_OUTLINE_TITLE:
+            title = title[:_MAX_OUTLINE_TITLE - 1] + "…"
+        flag = "" if s["size"] <= cap else "  ⚠ over the cap, will page"
+        # A repeated heading can only be addressed by its ordinal — the
+        # path-style form cannot separate duplicate siblings.
+        dup = "  ← duplicate title, use the ordinal" if seen[s["text"]] > 1 else ""
+        return f"- `#{s['ordinal']}` `{marker} {title}` ({s['size']:,} chars){flag}{dup}"
+
+    entries = [_entry(s) for s in sections]
+
+    # Fast path: if the complete listing fits, emit it. The summary is only
+    # needed when something is actually omitted, so charging its reservation
+    # here would drop entries that had room — a short outline is a worse
+    # answer than a complete one, and the cap is not under threat.
+    full = "\n".join(entries)
+    if len(full) <= cap:
+        return full
+
+    # Truncating: now the summary is real text that must be paid for before
+    # it is spent, or appending it pushes the result back over `cap`.
+    reserve = len(_summary(len(sections))) + 1
+    lines: list[str] = []
+    used = 0
+    for i, line in enumerate(entries):
+        if used + len(line) + 1 + reserve > cap:
+            lines.append(_summary(len(sections) - i))
+            break
+        lines.append(line)
+        used += len(line) + 1
+
+    if not lines:
+        lines.append(_summary(len(sections)))
+
+    out = "\n".join(lines)
+    if len(out) > cap:
+        # Degenerate cap: even the summary does not fit. Truncating to a bare
+        # marker is better than silently blowing the budget we are enforcing.
+        out = out[:cap - 1] + "…" if cap > 1 else out[:cap]
+    return out
+
+
+@_tracked("read_note", ["path", "section", "offset", "limit"])
+async def read_note_impl(
+    path: str,
+    section: str | None = None,
+    offset: int = 0,
+    limit: int | None = None,
+) -> str:
+    """Read a note by its vault-relative path, capped to a context-safe size."""
     uid = current_user_id.get()
     try:
         note = read_file(path, user_id=uid)
@@ -161,6 +264,24 @@ async def read_note_impl(path: str) -> str:
     except ValueError as e:
         return str(e)
 
+    cap = settings.max_read_response_chars
+    if limit is not None:
+        if limit < 1:
+            return f"read_note: limit must be >= 1 (got {limit})."
+        cap = min(limit, cap)
+    if offset < 0:
+        return f"read_note: offset must be >= 0 (got {offset})."
+
+    content = note["content"]
+    body = content
+    origin = "note"
+    if section is not None:
+        extracted, err = extract_section(content, section)
+        if err is not None:
+            return err
+        body = extracted
+        origin = f"section '{section}'"
+
     parts = [f"# {note['title']}\n**Path:** `{note['path']}`"]
     if note["tags"]:
         parts.append(f"**Tags:** {', '.join(note['tags'])}")
@@ -168,7 +289,53 @@ async def read_note_impl(path: str) -> str:
         fm_lines = [f"  {k}: {v}" for k, v in note["frontmatter"].items() if k not in ("title", "tags")]
         if fm_lines:
             parts.append("**Frontmatter:**\n" + "\n".join(fm_lines))
-    parts.append(f"\n---\n{note['content']}")
+
+    if offset == 0 and len(body) <= cap:
+        parts.append(f"\n---\n{body}")
+        return "\n".join(parts)
+
+    chunk, next_offset = _window(body, offset, cap)
+    if not chunk and offset > 0:
+        if offset == len(body):
+            return (
+                f"read_note: offset {offset:,} is exactly the end of {origin} "
+                f"in {path} ({len(body):,} chars) — the whole {origin} has "
+                f"been read, there is nothing further."
+            )
+        return (
+            f"read_note: offset {offset:,} is past the end of {origin} in {path} "
+            f"({len(body):,} chars)."
+        )
+
+    shown_to = min(offset, len(body)) + len(chunk)
+    notice = [
+        f"\n\n---\n**[TRUNCATED]** Showing chars {offset:,}–{shown_to:,} "
+        f"of {len(body):,} for this {origin}."
+    ]
+    if next_offset is not None:
+        notice.append(
+            f'Continue with `read_note(path="{path}"'
+            + (f', section="{section}"' if section is not None else "")
+            + f', offset={next_offset})`.'
+        )
+    if section is None:
+        outline = _outline_text(content, cap)
+        if outline:
+            notice.append(
+                "Prefer jumping straight to what you need — this note's sections "
+                f'are listed below. Read one with `read_note(path="{path}", '
+                'section="<heading>")`, or by the `#N` ordinal shown '
+                '(`section="#7"`). A bare `#N` always selects by position, so '
+                'it stays reliable when titles repeat:\n'
+                + outline
+            )
+        notice.append(
+            "You can also narrow the search first with `search_notes` instead of "
+            "reading the whole note."
+        )
+
+    parts.append(f"\n---\n{chunk}")
+    parts.append("\n\n".join(notice))
     return "\n".join(parts)
 
 
@@ -1197,11 +1364,51 @@ def _base64_payload(path: str, data: bytes, mime: str) -> str:
     )
 
 
-@_tracked("read_file", ["path", "encoding"])
-async def read_file_impl(path: str, encoding: str = "auto"):
+def _capped_text(text: str, path: str, offset: int, cap: int) -> str:
+    """Return a context-safe window of decoded file text."""
+    if offset == 0 and len(text) <= cap:
+        return text
+    chunk, next_offset = _window(text, offset, cap)
+    if not chunk and offset > 0:
+        if offset == len(text):
+            return (
+                f"read_file: offset {offset:,} is exactly the end of {path} "
+                f"({len(text):,} chars) — the whole file has been read, there "
+                f"is nothing further."
+            )
+        return (
+            f"read_file: offset {offset:,} is past the end of {path} "
+            f"({len(text):,} chars)."
+        )
+    shown_to = min(offset, len(text)) + len(chunk)
+    notice = (
+        f"\n\n---\n**[TRUNCATED]** Showing chars {offset:,}–{shown_to:,} "
+        f"of {len(text):,} for {path}."
+    )
+    if next_offset is not None:
+        notice += (
+            f' Continue with `read_file(path="{path}", offset={next_offset})`.'
+        )
+    return chunk + notice
+
+
+@_tracked("read_file", ["path", "encoding", "offset", "limit"])
+async def read_file_impl(
+    path: str,
+    encoding: str = "auto",
+    offset: int = 0,
+    limit: int | None = None,
+):
     """Read any vault file: text, inline image block, or base64 bytes."""
     if encoding not in ("auto", "text", "base64"):
         return f"Invalid encoding '{encoding}'. Use 'auto', 'text', or 'base64'."
+    if offset < 0:
+        return f"read_file: offset must be >= 0 (got {offset})."
+    cap = settings.max_read_response_chars
+    if limit is not None:
+        if limit < 1:
+            return f"read_file: limit must be >= 1 (got {limit})."
+        cap = min(limit, cap)
 
     uid = current_user_id.get()
     try:
@@ -1213,7 +1420,7 @@ async def read_file_impl(path: str, encoding: str = "auto"):
 
     if encoding == "text":
         try:
-            return data.decode("utf-8")
+            return _capped_text(data.decode("utf-8"), path, offset, cap)
         except UnicodeDecodeError:
             return (
                 f"Cannot decode {path} as UTF-8 text (not valid UTF-8). "
@@ -1228,7 +1435,7 @@ async def read_file_impl(path: str, encoding: str = "auto"):
     kind, mime = classify_bytes(data, path)
     if kind == "text":
         try:
-            return data.decode("utf-8")
+            return _capped_text(data.decode("utf-8"), path, offset, cap)
         except UnicodeDecodeError:
             return _base64_payload(path, data, mime)
     if kind == "image":
