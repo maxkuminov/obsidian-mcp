@@ -5,7 +5,7 @@ Raw read, write, and browse access to arbitrary (non-markdown and markdown) file
 ## Requirements
 ### Requirement: read_file tool
 
-The MCP server SHALL expose a tool named `read_file` that returns the contents of an arbitrary file in the vault. The tool SHALL accept `path` (string, required) and `encoding` (string, optional, default `"auto"`, one of `"auto"`, `"text"`, `"base64"`).
+The MCP server SHALL expose a tool named `read_file` that returns the contents of an arbitrary file in the vault. The tool SHALL accept `path` (string, required), `encoding` (string, optional, default `"auto"`, one of `"auto"`, `"text"`, `"base64"`), `offset` (integer, optional, default 0), and `limit` (integer, optional).
 
 The tool SHALL resolve the encoding as follows:
 - `"auto"`: text-like files (by MIME type, e.g. `text/*`, `application/json`, `application/javascript`, `*+xml`) SHALL be returned as a text payload; image files (e.g. `image/png`, `image/jpeg`, `image/gif`, `image/webp`) SHALL be returned as an inline MCP image content block; all other files SHALL be returned as a base64-encoded string.
@@ -14,10 +14,13 @@ The tool SHALL resolve the encoding as follows:
 
 File type SHALL be detected using the standard-library `mimetypes` mapping, with a magic-byte sniff used to confirm image types.
 
+`offset` and `limit` apply only to text results and window the decoded text; they SHALL have no effect on base64 or image results.
+
 #### Scenario: Tool is registered
 
 - **WHEN** an MCP client lists available tools on the server
 - **THEN** the listing SHALL contain `read_file`
+- **AND** its input schema SHALL accept `path`, `encoding`, `offset`, and `limit`
 
 #### Scenario: Auto encoding returns text for a text-like file
 
@@ -178,15 +181,63 @@ The `read_file`, `write_file`, and `list_files` tools SHALL reject any path that
 
 ### Requirement: Configurable file size limits
 
-The server configuration SHALL expose `MAX_FILE_READ_BYTES` (default 10 MB) and `MAX_FILE_WRITE_BYTES` (default 25 MB) as settings loadable from the environment, governing `read_file` and `write_file` respectively.
+The server configuration SHALL expose `MAX_FILE_READ_BYTES` (default 10 MB), `MAX_FILE_WRITE_BYTES` (default 25 MB), and `MAX_READ_RESPONSE_CHARS` (default 40,000) as settings loadable from the environment.
+
+`MAX_FILE_READ_BYTES` and `MAX_FILE_WRITE_BYTES` bound what the server reads from and writes to disk. `MAX_READ_RESPONSE_CHARS` bounds what a read tool returns to the caller. These are distinct limits: satisfying the byte caps does not bound the response, and a file well within `MAX_FILE_READ_BYTES` can still be far too large to return.
 
 #### Scenario: Defaults apply when unset
 
-- **WHEN** neither environment variable is set
-- **THEN** `MAX_FILE_READ_BYTES` SHALL default to 10 MB and `MAX_FILE_WRITE_BYTES` SHALL default to 25 MB
+- **WHEN** none of the environment variables is set
+- **THEN** `MAX_FILE_READ_BYTES` SHALL default to 10 MB, `MAX_FILE_WRITE_BYTES` to 25 MB, and `MAX_READ_RESPONSE_CHARS` to 40,000
 
 #### Scenario: Overrides are honored
 
-- **WHEN** `MAX_FILE_READ_BYTES` or `MAX_FILE_WRITE_BYTES` is set in the environment
+- **WHEN** any of the three variables is set in the environment
 - **THEN** the corresponding tool SHALL enforce the configured value
+
+#### Scenario: Byte cap does not imply a bounded response
+
+- **WHEN** a file is within `MAX_FILE_READ_BYTES` but its text far exceeds `MAX_READ_RESPONSE_CHARS`
+- **THEN** the read SHALL succeed
+- **AND** the returned text SHALL still be bounded by `MAX_READ_RESPONSE_CHARS`
+
+### Requirement: read_file response size cap
+
+Text results from `read_file` SHALL be bounded by `MAX_READ_RESPONSE_CHARS`, independently of the `MAX_FILE_READ_BYTES` on-disk cap. `MAX_FILE_READ_BYTES` governs how much the server reads into memory; `MAX_READ_RESPONSE_CHARS` governs how much is returned to the caller, whose context the result consumes.
+
+The tool SHALL accept `offset` (integer, optional, default 0) and `limit` (integer, optional) to window a text result. When a text result is truncated, the response SHALL state the character range shown, the total size, and the `offset` that continues the read. A `limit` above the configured cap SHALL NOT raise it.
+
+Base64 results and inline image results SHALL NOT be windowed, since a partial encoding or a partial image is not usable.
+
+#### Scenario: Text file within the response cap
+
+- **WHEN** `read_file` returns a text result at or below `MAX_READ_RESPONSE_CHARS`
+- **THEN** the full text SHALL be returned with no truncation notice
+
+#### Scenario: Text file exceeds the response cap
+
+- **WHEN** `read_file` returns a text result larger than `MAX_READ_RESPONSE_CHARS`
+- **THEN** the response SHALL contain at most that many characters
+- **AND** SHALL state the range shown, the total size, and the continuing `offset`
+
+#### Scenario: Forced text encoding is capped
+
+- **WHEN** `read_file` is invoked with `encoding="text"` on a file larger than the response cap
+- **THEN** the result SHALL be truncated with a continuation offset
+
+#### Scenario: Continuing a truncated text read
+
+- **WHEN** `read_file` is reissued with the reported `offset`
+- **THEN** the returned window SHALL begin exactly where the previous window ended
+
+#### Scenario: Invalid offset or limit
+
+- **WHEN** `read_file` is invoked with a negative `offset` or a `limit` below 1
+- **THEN** the tool SHALL return an error naming the offending value
+- **AND** SHALL NOT return file content
+
+#### Scenario: Binary results are not windowed
+
+- **WHEN** `read_file` returns a base64 payload or an inline image block
+- **THEN** the result SHALL NOT be truncated by the response cap
 

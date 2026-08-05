@@ -51,6 +51,13 @@ for writing.
 - **AND** SHALL NOT modify the file until the call is reissued
   unambiguously
 
+#### Scenario: Path-style heading disambiguation
+
+- **WHEN** the client calls `edit_note(path, content, section="Tasks/Today")`
+  and the note contains `## Tasks` followed by `### Today`
+- **THEN** the system SHALL replace the body under `### Today` (bounded
+  by the next heading of depth ≤ 3) with `content`
+
 #### Scenario: Duplicate sibling headings resolved by ordinal
 
 - **WHEN** a note contains two headings with identical text under the same
