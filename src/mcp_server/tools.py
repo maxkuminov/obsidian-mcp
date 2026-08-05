@@ -176,15 +176,20 @@ def _outline_text(content: str, cap: int) -> str | None:
     with thousands of headings otherwise produces an outline many times the size
     of the content window it accompanies.
 
-    The budget is enforced in three layers, because the first two each have a
-    hole that only shows up at the extremes:
+    The budget is enforced in layers, because each has a hole that only shows
+    up at an extreme:
       1. Long titles are elided at `_MAX_OUTLINE_TITLE`.
-      2. Entries are added only while they fit, with room *reserved up front*
-         for the omitted-sections summary — that summary is itself text and
-         must be paid for before it is spent.
-      3. A final hard truncation, so the guarantee holds unconditionally even
+      2. If the complete listing fits, it is emitted as-is. No summary is
+         needed when nothing is omitted, so no room is reserved for one —
+         reserving unconditionally drops entries that had room and returns a
+         near-empty outline for a small note.
+      3. Otherwise entries are added only while they fit, with room reserved
+         for the omitted-sections summary, which is itself text and must be
+         paid for before it is spent.
+      4. A final hard truncation, so the guarantee holds unconditionally even
          for a degenerate `cap` (a caller may pass `limit=1`) where not even
-         one entry or the bare summary can fit.
+         one entry or the bare summary can fit. In that case the outline
+         degrades to a marker; there is no `cap`-respecting alternative.
     """
     sections = outline_sections(content)
     if not sections:
@@ -199,13 +204,7 @@ def _outline_text(content: str, cap: int) -> str | None:
             f"`search_notes`."
         )
 
-    # Reserve room for the worst-case summary before spending any budget on
-    # entries, so appending it can never push the result over `cap`.
-    reserve = len(_summary(len(sections))) + 1
-
-    lines: list[str] = []
-    used = 0
-    for i, s in enumerate(sections):
+    def _entry(s: dict) -> str:
         marker = "#" * s["depth"]
         title = s["text"]
         if len(title) > _MAX_OUTLINE_TITLE:
@@ -214,10 +213,24 @@ def _outline_text(content: str, cap: int) -> str | None:
         # A repeated heading can only be addressed by its ordinal — the
         # path-style form cannot separate duplicate siblings.
         dup = "  ← duplicate title, use the ordinal" if seen[s["text"]] > 1 else ""
-        line = (
-            f"- `#{s['ordinal']}` `{marker} {title}` "
-            f"({s['size']:,} chars){flag}{dup}"
-        )
+        return f"- `#{s['ordinal']}` `{marker} {title}` ({s['size']:,} chars){flag}{dup}"
+
+    entries = [_entry(s) for s in sections]
+
+    # Fast path: if the complete listing fits, emit it. The summary is only
+    # needed when something is actually omitted, so charging its reservation
+    # here would drop entries that had room — a short outline is a worse
+    # answer than a complete one, and the cap is not under threat.
+    full = "\n".join(entries)
+    if len(full) <= cap:
+        return full
+
+    # Truncating: now the summary is real text that must be paid for before
+    # it is spent, or appending it pushes the result back over `cap`.
+    reserve = len(_summary(len(sections))) + 1
+    lines: list[str] = []
+    used = 0
+    for i, line in enumerate(entries):
         if used + len(line) + 1 + reserve > cap:
             lines.append(_summary(len(sections) - i))
             break

@@ -110,7 +110,7 @@ When a whole-note read is truncated and the note contains ATX headings, the resp
 
 The outline SHALL NOT be included when a `section` was explicitly selected, since the caller has already chosen.
 
-The outline SHALL itself be bounded by `MAX_READ_RESPONSE_CHARS`. It is appended to a response that exists because the content was too large, so an unbounded outline would reintroduce the failure this capability prevents: a note with very many headings can otherwise produce an outline far larger than the content window it accompanies. Overlong headings SHALL be elided, and when the listing does not fit, it SHALL stop and report how many sections were omitted along with the full ordinal range. At least one entry SHALL always be emitted.
+The outline SHALL itself be bounded by `MAX_READ_RESPONSE_CHARS`. It is appended to a response that exists because the content was too large, so an unbounded outline would reintroduce the failure this capability prevents: a note with very many headings can otherwise produce an outline far larger than the content window it accompanies. Overlong headings SHALL be elided, and when the listing does not fit, it SHALL stop and report how many sections were omitted along with the full ordinal range. When the complete listing fits within the cap it SHALL be emitted in full, with no omission summary — no room SHALL be reserved for a summary that is not needed, since that would drop entries the budget could afford. At least one entry SHALL be emitted whenever one fits; when the cap is too small for even a single entry or the summary itself, the outline SHALL degrade to a truncated marker rather than exceed the cap. The cap is the binding constraint: there is no output the outline may exceed it to produce.
 
 #### Scenario: Truncated note with headings
 
@@ -131,6 +131,18 @@ The outline SHALL itself be bounded by `MAX_READ_RESPONSE_CHARS`. It is appended
 - **THEN** the outline SHALL be truncated to stay within the cap
 - **AND** SHALL report the number of sections omitted and the full ordinal range
 - **AND** the total response SHALL remain proportionate to the cap
+
+#### Scenario: A listing that fits is emitted in full
+
+- **WHEN** the complete section listing fits within `MAX_READ_RESPONSE_CHARS`
+- **THEN** every section SHALL be listed
+- **AND** the response SHALL NOT contain an omission summary
+
+#### Scenario: Cap too small for any entry
+
+- **WHEN** the effective cap cannot accommodate even one outline entry
+- **THEN** the outline SHALL be truncated to the cap
+- **AND** SHALL NOT exceed it in order to satisfy the at-least-one-entry preference
 
 #### Scenario: Overlong heading text is elided
 

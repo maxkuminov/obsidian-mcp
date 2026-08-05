@@ -97,3 +97,32 @@ payload (it can split a grapheme cluster, which is presentation only).
   (outline "lists every section", text-first ordinals) while the spec deltas and canonical
   specs described the corrected behavior. Reconciled.
 - [x] 9.4 Re-verified both round-1 reproductions and swept 63 outline combinations: 0 violations.
+
+## 10. Third review round
+
+The cap itself was confirmed unbreakable this round — the reviewer could not produce
+`len(_outline_text(...)) > cap` across caps 0/1/2, one section to 20,000, duplicate titles,
+79/80/81-char boundary titles, Cyrillic/CJK/emoji/joined-grapheme titles, depth-6 headings,
+and wide size formatting; and confirmed the hard slice cannot corrupt UTF-8 or the JSON
+payload (Python slices code points; escaping happens after).
+
+- [x] 10.1 **Over-reservation made valid outlines pathologically short.** The worst-case
+  summary was reserved unconditionally, so `_outline_text("# A\nbody\n", 160)` returned a
+  157-char "1 more section not shown" summary instead of the 22-char entry that fit. Added a
+  fast path: if the complete listing fits, emit it and reserve nothing — a summary is only
+  owed when something is actually omitted.
+- [x] 10.2 **The sweep constrained length but not usefulness.** It would have accepted an
+  implementation returning one arbitrary character. Added tests that a fitting listing is
+  emitted whole with no summary, that every section and ordinal appears when the budget
+  allows, and that a truncated outline still spends its budget on entries rather than
+  degenerating to one entry plus a summary.
+- [x] 10.3 **Spec said "At least one entry SHALL always be emitted"** while the
+  implementation truncates to a marker at a degenerate cap. Reconciled honestly: at least one
+  entry when one fits; otherwise a truncated marker, because the cap is the binding
+  constraint and there is no output worth exceeding it for.
+- [x] 10.4 **Contract-level inaccuracy in the docs.** `.env.example`, README and CLAUDE.md
+  described the cap as bounding "what read_note returns", but it is a per-component budget:
+  content window and outline are each bounded, so a truncated response can carry both and the
+  worst case is ~2x cap plus fixed notice prose. Corrected in all three, matching what
+  design.md already said and what the end-to-end test asserts.
+- [x] 10.5 Removed a paragraph duplicated verbatim in CLAUDE.md.

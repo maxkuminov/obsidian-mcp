@@ -711,6 +711,12 @@ server reads off disk. A 3 MB note is comfortably within the 10 MB read
 cap and will still destroy a context window; both caps are needed and
 they have different correct values.
 
+It applies **per component**, not once to the whole response: the
+content window gets the cap, and the heading outline gets it
+independently. A truncated read can carry both, so budget for a
+worst case of roughly `2 × MAX_READ_RESPONSE_CHARS` plus a few hundred
+characters of fixed notice text — not one cap's worth.
+
 When a note exceeds the cap you get the first window plus a
 `[TRUNCATED]` notice carrying the exact `offset` to continue from, and
 — for a whole-note read — an outline of the note's sections:

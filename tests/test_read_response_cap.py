@@ -380,6 +380,43 @@ def test_outline_still_says_something_when_nothing_fits():
     assert out and len(out) <= 20
 
 
+# The length sweep above is satisfied by an implementation that returns one
+# arbitrary character, so it cannot be the only constraint. These pin the
+# outline's usefulness: when the listing fits, it must actually be the listing.
+
+
+def test_a_listing_that_fits_is_emitted_whole_with_no_summary():
+    """Regression: the summary reservation used to be charged unconditionally.
+
+    `_outline_text("# A\\nbody\\n", 160)` returned a 157-char "1 more section
+    not shown" summary instead of the 22-char entry that fit comfortably.
+    """
+    out = tools._outline_text("# A\nbody\n", 160)
+    assert out == "- `#1` `# A` (9 chars)"
+    assert "not shown" not in out
+
+
+def test_every_section_is_listed_when_the_budget_allows():
+    note = "# Top\n\n" + "".join(f"## Section {i}\n\nbody\n\n" for i in range(20))
+    out = tools._outline_text(note, 5_000)
+    assert "not shown" not in out
+    assert len(out.splitlines()) == 21          # 1 H1 + 20 H2
+    for i in range(20):
+        assert f"## Section {i}`" in out
+    for ordinal in range(1, 22):
+        assert f"`#{ordinal}`" in out
+
+
+def test_truncated_outline_still_lists_as_many_entries_as_fit():
+    """Not just one entry and a summary — the budget should be spent on entries."""
+    note = "# Top\n\n" + "".join(f"## Section {i}\n\nbody\n\n" for i in range(500))
+    out = tools._outline_text(note, 2_000)
+    lines = out.splitlines()
+    assert len(lines) >= 10, f"only {len(lines)} lines used out of a 2,000 char budget"
+    assert "not shown" in lines[-1]
+    assert len(out) <= 2_000
+
+
 @pytest.mark.asyncio
 async def test_truncated_response_stays_within_its_documented_worst_case(vault, cap):
     """End-to-end bound, stated as the design does: ~2x cap + fixed notice text.
