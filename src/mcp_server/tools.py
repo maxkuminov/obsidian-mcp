@@ -170,17 +170,39 @@ _MAX_OUTLINE_TITLE = 80
 def _outline_text(content: str, cap: int) -> str | None:
     """Render a navigable heading outline, or None if there are no headings.
 
-    The outline is itself bounded by `cap`. It is appended to a response that
-    exists *because* the content was too large, so an unbounded outline would
-    reintroduce the exact context blowup this module prevents: a note with
-    thousands of headings can produce an outline many times the size of the
-    content window it accompanies. Long titles are elided and the listing stops
-    at the budget, reporting how many sections were omitted.
+    The returned string NEVER exceeds `cap` characters. The outline is appended
+    to a response that exists *because* the content was too large, so it is the
+    one place where adding context can recreate the problem being solved: a note
+    with thousands of headings otherwise produces an outline many times the size
+    of the content window it accompanies.
+
+    The budget is enforced in three layers, because the first two each have a
+    hole that only shows up at the extremes:
+      1. Long titles are elided at `_MAX_OUTLINE_TITLE`.
+      2. Entries are added only while they fit, with room *reserved up front*
+         for the omitted-sections summary — that summary is itself text and
+         must be paid for before it is spent.
+      3. A final hard truncation, so the guarantee holds unconditionally even
+         for a degenerate `cap` (a caller may pass `limit=1`) where not even
+         one entry or the bare summary can fit.
     """
     sections = outline_sections(content)
     if not sections:
         return None
     seen = Counter(s["text"] for s in sections)
+
+    def _summary(omitted: int) -> str:
+        return (
+            f"- … {omitted:,} more section(s) not shown (outline truncated "
+            f"to stay within the response cap). Ordinals run #1–"
+            f"#{len(sections)}; request one directly, or narrow with "
+            f"`search_notes`."
+        )
+
+    # Reserve room for the worst-case summary before spending any budget on
+    # entries, so appending it can never push the result over `cap`.
+    reserve = len(_summary(len(sections))) + 1
+
     lines: list[str] = []
     used = 0
     for i, s in enumerate(sections):
@@ -196,20 +218,21 @@ def _outline_text(content: str, cap: int) -> str | None:
             f"- `#{s['ordinal']}` `{marker} {title}` "
             f"({s['size']:,} chars){flag}{dup}"
         )
-        # Always emit at least one line, so a single pathological heading still
-        # tells the caller the outline exists rather than silently vanishing.
-        if lines and used + len(line) + 1 > cap:
-            omitted = len(sections) - i
-            lines.append(
-                f"- … {omitted:,} more section(s) not shown (outline truncated "
-                f"to stay within the response cap). Ordinals run #1–"
-                f"#{len(sections)}; request one directly, or narrow with "
-                f"`search_notes`."
-            )
+        if used + len(line) + 1 + reserve > cap:
+            lines.append(_summary(len(sections) - i))
             break
         lines.append(line)
         used += len(line) + 1
-    return "\n".join(lines)
+
+    if not lines:
+        lines.append(_summary(len(sections)))
+
+    out = "\n".join(lines)
+    if len(out) > cap:
+        # Degenerate cap: even the summary does not fit. Truncating to a bare
+        # marker is better than silently blowing the budget we are enforcing.
+        out = out[:cap - 1] + "…" if cap > 1 else out[:cap]
+    return out
 
 
 @_tracked("read_note", ["path", "section", "offset", "limit"])

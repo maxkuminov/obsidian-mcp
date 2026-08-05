@@ -8,7 +8,7 @@
 - [x] 2.1 Extract heading resolution from `replace_section` into `_resolve_section_index(headings, heading) -> (idx, error)`, preserving the existing text and `Parent/Child` behavior.
 - [x] 2.2 Extract span computation into `_section_body_span(text, headings, idx) -> (body_start, body_end)`.
 - [x] 2.3 Rewrite `replace_section` on top of both helpers with no behavior change (the end-of-file-heading newline handling in particular).
-- [x] 2.4 Add `#N` ordinal support to `_resolve_section_index`, attempted only after exact-text matching fails; report an out-of-range ordinal with the valid range.
+- [x] 2.4 Add `#N` ordinal support to `_resolve_section_index`, checked ahead of text matching and skipped for selectors containing `/`; report an out-of-range ordinal with the valid range. (Ordering corrected in task 8.1 after review.)
 - [x] 2.5 Add `_format_ordinal_choices` and name the resolving ordinals in both ambiguity errors.
 - [x] 2.6 Add `extract_section(text, heading) -> (section_text, error)` returning the heading line plus its body.
 - [x] 2.7 Add `outline_sections(text) -> list[dict]` returning `depth`, `text`, `size`, and 1-based `ordinal` per section.
@@ -40,7 +40,7 @@
 - [x] 6.2 Windowing: reported offset continues with no gap or overlap; final window offers no continuation; offset past the end is reported; negative offset and zero limit rejected.
 - [x] 6.3 Sections: reading one section avoids the rest of the note; an over-cap section pages within itself and preserves the selection; an unknown section lists the headings present.
 - [x] 6.4 Outline: emitted with ordinals and sizes on whole-note truncation; over-cap sections flagged; omitted on a section read; headingless note still truncates and suggests search.
-- [x] 6.5 Ordinals: duplicate siblings addressable by ordinal; ambiguity error names the ordinals; out-of-range reported; a heading literally titled `#2` wins over the ordinal.
+- [x] 6.5 Ordinals: duplicate siblings addressable by ordinal; ambiguity error names the ordinals; out-of-range reported; a bare `#2` selects by position while a heading titled `#2` stays reachable via the path form and its own ordinal.
 - [x] 6.6 `read_file`: text capped and pages; forced `text` encoding capped; small text unchanged.
 - [x] 6.7 Vault helpers: `extract_section` returns heading + body, stops at equal depth but not deeper, disambiguates by path; `outline_sections` sizes match `extract_section` output.
 
@@ -79,3 +79,21 @@ heading's `line_start` is necessarily `< len(text)`, otherwise `body_end == len(
 no gaps or overlaps between consecutive windows; content exactly at the cap is returned
 untruncated; Python slicing is code-point aligned so it cannot corrupt the UTF-8/JSON
 payload (it can split a grapheme cluster, which is presentation only).
+
+## 9. Second review round
+
+- [x] 9.1 **Outline still leaked past its budget.** The per-entry check reserved nothing for
+  the omitted-sections summary, and the always-emit-first-entry escape was unchecked — so a
+  cap could still be exceeded (1,000 duplicate headings at cap=500 gave 634 chars; 10,000
+  headings at cap=1 gave 251). Budget now reserves the worst-case summary up front, and a
+  final hard truncation makes `len(outline) <= cap` hold unconditionally, including for a
+  degenerate cap reachable via `limit=1`.
+- [x] 9.2 **The outline tests were vacuous.** They allowed `cap + 400` and `4 x cap`, which is
+  why 9.1 passed review the first time. Replaced with an exact `<= cap` assertion plus a
+  30-combination sweep over section counts (1…10,000) and caps (1…5,000), duplicate-title and
+  multibyte-title cases, and an end-to-end bound stated as the design states it (2 x cap plus
+  a fixed notice allowance).
+- [x] 9.3 **Archived `proposal.md` / `tasks.md` still described the pre-review behavior**
+  (outline "lists every section", text-first ordinals) while the spec deltas and canonical
+  specs described the corrected behavior. Reconciled.
+- [x] 9.4 Re-verified both round-1 reproductions and swept 63 outline combinations: 0 violations.

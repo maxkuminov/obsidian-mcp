@@ -327,12 +327,43 @@ async def test_outline_flags_duplicates_and_prints_ordinals(vault, cap):
 # module prevents.
 
 
-def test_outline_is_bounded_by_the_cap():
+def test_outline_never_exceeds_the_cap():
+    """The invariant is `<= cap`, exactly — not `cap` plus slack.
+
+    An earlier version of this test allowed `cap + 400`, which let a real
+    budget leak pass: the omitted-sections summary was appended without being
+    paid for. Assert the specified invariant, not a padded one.
+    """
     big = "# Top\n\n" + "".join(f"## {'S' * 78}{i}\n\nbody\n\n" for i in range(1000))
     out = tools._outline_text(big, 500)
-    assert len(out) <= 500 + 400, f"outline was {len(out)} chars for a 500 cap"
+    assert len(out) <= 500, f"outline was {len(out)} chars for a 500 cap"
     assert "more section(s) not shown" in out
     assert "#1–#1001" in out
+
+
+@pytest.mark.parametrize("n_sections", [1, 2, 50, 1_000, 10_000])
+@pytest.mark.parametrize("cap", [1, 2, 40, 120, 500, 5_000])
+def test_outline_honors_every_cap_for_every_shape(cap, n_sections):
+    """Sweep the extremes: tiny caps, huge caps, one section, ten thousand."""
+    note = "# Top\n\n" + "".join(f"## S{i}\n\nbody\n\n" for i in range(n_sections))
+    out = tools._outline_text(note, cap)
+    assert len(out) <= cap, f"{len(out)} chars for cap={cap}, {n_sections} sections"
+
+
+def test_outline_honors_the_cap_with_duplicate_titles():
+    """Duplicate markers add per-line text; they must be paid for too."""
+    note = "# Top\n\n" + "".join("## Same\n\nbody\n\n" for _ in range(1_000))
+    for cap in (1, 50, 200, 500, 5_000):
+        out = tools._outline_text(note, cap)
+        assert len(out) <= cap, f"{len(out)} chars for cap={cap}"
+
+
+def test_outline_honors_the_cap_with_multibyte_titles():
+    note = "# Top\n\n" + "".join(f"## Раздел документа {i} 文書 {'я' * 40}\n\nb\n\n"
+                                 for i in range(500))
+    for cap in (1, 80, 500, 5_000):
+        out = tools._outline_text(note, cap)
+        assert len(out) <= cap, f"{len(out)} chars for cap={cap}"
 
 
 def test_outline_elides_overlong_titles():
@@ -342,19 +373,27 @@ def test_outline_elides_overlong_titles():
     assert "T" * 300 not in out
 
 
-def test_outline_emits_at_least_one_entry_even_when_a_title_blows_the_budget():
+def test_outline_still_says_something_when_nothing_fits():
+    """A too-small budget must degrade to a marker, never to a silent nothing."""
     text = "# Top\n\n## " + "T" * 300 + "\n\nbody\n\n## Second\n\nmore\n"
     out = tools._outline_text(text, 20)
-    assert out and out.startswith("- `#1`")
+    assert out and len(out) <= 20
 
 
 @pytest.mark.asyncio
-async def test_truncated_response_stays_bounded_for_a_heading_heavy_note(vault, cap):
-    """End-to-end: the whole response, outline included, stays proportionate."""
+async def test_truncated_response_stays_within_its_documented_worst_case(vault, cap):
+    """End-to-end bound, stated as the design does: ~2x cap + fixed notice text.
+
+    Two windows of `cap` can appear in one response — the content window and
+    the outline — plus the notices, which are fixed-size prose. Anything beyond
+    that means a component escaped its budget.
+    """
+    NOTICE_ALLOWANCE = 1_200
     big = "# Top\n\n" + "".join(f"## {'S' * 78}{i}\n\nbody\n\n" for i in range(1000))
     _write(vault, "many.md", big)
     out = await tools.read_note_impl("many.md")
-    assert len(out) < cap * 4, f"response was {len(out)} chars for a {cap} cap"
+    limit = 2 * cap + NOTICE_ALLOWANCE
+    assert len(out) <= limit, f"response was {len(out)} chars, worst case is {limit}"
 
 
 # --- offset exactly at the end ----------------------------------------------
