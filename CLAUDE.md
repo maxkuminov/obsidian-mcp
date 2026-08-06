@@ -53,6 +53,34 @@ hostnames) must stay out of tracked files. The mechanism:
 - `make logs` — tail container logs
 - `make status` — check health
 
+## Engineering workflow
+
+The standard flow — supervisor main thread, **Opus** subagents, OpenSpec, the
+two Codex audit gates, `openspec-verifier`, and the `user-representative`
+browser pass — is defined once in `~/.claude/rules/engineering-workflow.md` and
+applies here. Read it; don't restate it. This section records only what is
+specific to this MCP server.
+
+**Local gates**
+
+| Gate | Command |
+| --- | --- |
+| Dependency audit | `make audit` (pip-audit) |
+| Migrations | `make db-migrate` (alembic) |
+| Deploy | `make deploy` (build, backup, migrate, deploy) |
+
+**Codex framing for this product.** The consumer here is an **agent**, not a
+person, and the vault is Max's single source of truth for every project. The
+expensive failures are **destructive writes** (an edit or append that clobbers
+a note — this has actually happened) and **silently wrong search results**,
+which an agent will act on without a human ever seeing the query. Treat any
+change to the write tools, section addressing, or the chunking/embedding path
+as a mandatory adversarial-pass trigger.
+
+**No `user-representative` pass** — there is no browser UI. Substitute an
+end-to-end exercise of the affected MCP tools against the live server, and say
+in the report which tools were actually called.
+
 ## Key Decisions
 - API keys use `omcp_` prefix, stored as SHA-256 hashes
 - Vault mounted read-write at /obsidian in container
