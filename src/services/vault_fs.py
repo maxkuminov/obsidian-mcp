@@ -477,7 +477,7 @@ RENAME_NOREPLACE = 1
 # syscall, which is far worse than refusing.
 _SYS_RENAMEAT2 = {
     "x86_64": 316,
-    "aarch64": 38,
+    "aarch64": 276,  # asm-generic; 38 is renameat (replacing!) — never confuse them
     "armv7l": 382,
     "armv8l": 382,
     "i686": 353,

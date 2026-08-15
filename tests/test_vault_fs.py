@@ -962,3 +962,17 @@ def test_failed_walks_do_not_leak_descriptors(root_fd, vault):
         with pytest.raises(FileNotFoundError):
             open_dir_beneath(root_fd, "a/missing")
     assert _open_fd_count() <= before + 2
+
+
+def test_renameat2_syscall_table_matches_kernel_headers():
+    """The raw-syscall fallback must never point at a *different* syscall:
+    on arm64 ``__NR_renameat`` is 38 (a replacing rename) and
+    ``__NR_renameat2`` is 276 (asm-generic). Pin the numbers we ship."""
+    from src.services import vault_fs
+
+    assert vault_fs._SYS_RENAMEAT2["x86_64"] == 316
+    assert vault_fs._SYS_RENAMEAT2["aarch64"] == 276
+    assert vault_fs._SYS_RENAMEAT2["armv7l"] == 382
+    assert vault_fs._SYS_RENAMEAT2["i686"] == 353
+    assert vault_fs._SYS_RENAMEAT2["ppc64le"] == 357
+    assert vault_fs._SYS_RENAMEAT2["s390x"] == 347
