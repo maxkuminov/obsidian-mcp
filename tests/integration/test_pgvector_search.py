@@ -7,20 +7,29 @@ similarity per row, `find_related` averages a note's chunk vectors and then
 scores candidates), so the shape change is exactly the kind of thing a unit
 test with fake rows would miss.
 
-Skipped unless `TEST_DATABASE_URL` is set. Never point it at a real database:
-the test runs migrations and truncates the note tables.
+Skipped unless `PGVECTOR_TEST_ADMIN_URL` is set. That variable names a
+**server** to create a throwaway database on — the fixture never touches the
+database in the URL itself beyond using it as a maintenance connection. It
+`CREATE DATABASE test_pgvector_<uuid>`, migrates *that*, runs the tests there,
+and drops it in teardown, so a mistyped URL cannot cost data. The URL's own
+database name may not be `obsidian_mcp` (the production name) — that is a hard
+failure, not a skip. It is deliberately a different variable from the
+`TEST_DATABASE_URL` that `tests/test_fts_integration.py` uses in place.
 
     docker run --rm -d --name pgvector-test -e POSTGRES_PASSWORD=test \\
         -p 55432:5432 pgvector/pgvector:pg16
-    TEST_DATABASE_URL=postgresql+asyncpg://postgres:test@localhost:55432/postgres \\
+    PGVECTOR_TEST_ADMIN_URL=postgresql+asyncpg://postgres:test@localhost:55432/postgres \\
         pytest -q tests/integration/test_pgvector_search.py
     docker rm -f pgvector-test
 """
+import asyncio
 import math
 import os
 import subprocess
 import sys
+import uuid
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 import pytest
 import pytest_asyncio
@@ -32,17 +41,49 @@ from src.config import settings
 from src.models.db import NoteEmbedding, NoteMetadata
 from src.services.embeddings import semantic_search
 
-TEST_DATABASE_URL = os.environ.get("TEST_DATABASE_URL")
+PGVECTOR_TEST_ADMIN_URL = os.environ.get("PGVECTOR_TEST_ADMIN_URL")
+
+# The production database name. Refusing it is a backstop against someone
+# exporting the live URL here: the fixture would otherwise open a maintenance
+# connection to it (and, on a bad edit, run migrations against it).
+FORBIDDEN_DB_NAMES = {"obsidian_mcp"}
 
 pytestmark = [
     pytest.mark.skipif(
-        not TEST_DATABASE_URL, reason="set TEST_DATABASE_URL to run pgvector integration tests"
+        not PGVECTOR_TEST_ADMIN_URL,
+        reason="set PGVECTOR_TEST_ADMIN_URL to run pgvector integration tests",
     ),
     pytest.mark.asyncio(loop_scope="module"),
 ]
 
 ROOT = Path(__file__).resolve().parent.parent.parent
 DIM = settings.embedding_dimensions
+
+
+def _with_database(url: str, dbname: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit(parts._replace(path=f"/{dbname}"))
+
+
+def _asyncpg_dsn(url: str) -> str:
+    """SQLAlchemy URL → a DSN asyncpg.connect() accepts."""
+    parts = urlsplit(url)
+    return urlunsplit(parts._replace(scheme=parts.scheme.split("+", 1)[0]))
+
+
+async def _run_maintenance(admin_url: str, statement: str) -> None:
+    """Run a CREATE/DROP DATABASE on the admin URL's own database.
+
+    asyncpg is autocommit outside an explicit transaction, which is what
+    CREATE/DROP DATABASE requires.
+    """
+    import asyncpg
+
+    conn = await asyncpg.connect(_asyncpg_dsn(admin_url))
+    try:
+        await conn.execute(statement)
+    finally:
+        await conn.close()
 
 
 def _unit(*leading: float) -> list[float]:
@@ -64,18 +105,41 @@ FAR = _unit(0.0, 1.0)
 
 @pytest.fixture(scope="module")
 def migrated_database():
-    result = subprocess.run(
-        [sys.executable, "-m", "alembic", "upgrade", "head"],
-        cwd=ROOT,
-        env={**os.environ, "DATABASE_URL": TEST_DATABASE_URL},
-        capture_output=True,
-        text=True,
-        timeout=300,
+    """Create a throwaway database on the admin server, migrate it, drop it."""
+    admin_db = urlsplit(PGVECTOR_TEST_ADMIN_URL).path.lstrip("/")
+    if admin_db in FORBIDDEN_DB_NAMES:
+        pytest.fail(
+            "PGVECTOR_TEST_ADMIN_URL points at the production database name "
+            f"{admin_db!r}. Point it at a throwaway server (see the module "
+            "docstring); this fixture creates and drops databases."
+        )
+
+    dbname = f"test_pgvector_{uuid.uuid4().hex}"
+    asyncio.run(
+        _run_maintenance(PGVECTOR_TEST_ADMIN_URL, f'CREATE DATABASE "{dbname}"')
     )
-    assert result.returncode == 0, (
-        f"alembic upgrade head failed\n{result.stdout}\n{result.stderr}"
-    )
-    return TEST_DATABASE_URL
+    try:
+        url = _with_database(PGVECTOR_TEST_ADMIN_URL, dbname)
+        result = subprocess.run(
+            [sys.executable, "-m", "alembic", "upgrade", "head"],
+            cwd=ROOT,
+            env={**os.environ, "DATABASE_URL": url},
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        assert result.returncode == 0, (
+            f"alembic upgrade head failed\n{result.stdout}\n{result.stderr}"
+        )
+        yield url
+    finally:
+        # FORCE terminates any connection the test left behind, so a failing
+        # test still cleans up its database.
+        asyncio.run(
+            _run_maintenance(
+                PGVECTOR_TEST_ADMIN_URL, f'DROP DATABASE IF EXISTS "{dbname}" (FORCE)'
+            )
+        )
 
 
 @pytest_asyncio.fixture(loop_scope="module", scope="module")
@@ -166,9 +230,10 @@ async def test_embedding_rows_are_plain_lists_on_pgvector_05(sessionmaker, seede
                 select(NoteEmbedding.embedding).limit(1)
             )
         ).scalar_one()
-    # Documents the shape the NumPy post-processing has to accept. `list` on
-    # pgvector 0.5; `numpy.ndarray` on 0.4. Either must work — this asserts the
-    # code is exercised against whatever the installed version returns.
+    # Pins the shape the NumPy post-processing has to accept: pgvector 0.5
+    # returns a plain `list` where 0.4 returned a `numpy.ndarray`. Asserting
+    # `list` is what makes a silent revert to the old shape visible.
+    assert isinstance(row, list), type(row)
     assert len(row) == DIM
     assert float(row[0]) == pytest.approx(NEAR[0], abs=1e-6)
 

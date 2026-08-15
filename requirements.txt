@@ -1,7 +1,8 @@
 # Core
 fastapi==0.141.1
 uvicorn[standard]==0.42.0
-# 0.0.30 fixes CVE-2026-53539 (fixable HIGH flagged by the trivy deploy gate).
+# CVE-2026-53539 (fixable HIGH flagged by the Trivy deploy gate) was fixed in
+# 0.0.30 and remains fixed here.
 python-multipart==0.0.32
 
 # Database

@@ -189,6 +189,106 @@ async def test_set_frontmatter_uses_the_real_10_mib_cap(offline):
     assert str(MAX_NOTE_BYTES) in result
 
 
+# ── move_note(rewrite_links=True): an over-cap rewrite is skipped ───────────
+
+
+class _Row:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+def _fake_session_returning(*result_rows):
+    """A minimal `async_session` stand-in that replays canned `.all()` rows.
+
+    `move_note_impl` issues, in order: the vault-index select, the backlink
+    source select, then the two post-move UPDATEs.
+    """
+    calls = {"n": 0}
+
+    class Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def execute(self, statement):
+            i = calls["n"]
+            calls["n"] += 1
+            return Result(result_rows[i] if i < len(result_rows) else [])
+
+        async def commit(self):
+            return None
+
+    return FakeSession
+
+
+async def test_move_note_skips_over_cap_link_rewrite(offline, small_cap, monkeypatch):
+    """An over-cap rewrite leaves that source byte-identical; the rest proceed."""
+    from_rel = "old/target.md"
+    to_rel = "new/deeper/a-much-longer-renamed-name.md"
+
+    (offline / "old").mkdir()
+    (offline / from_rel).write_text("moved note\n", encoding="utf-8")
+
+    # Two backlink sources. `big.md` sits just under the cap, so expanding
+    # `old/target` (10 chars) to the longer new path pushes it over; `small.md`
+    # has room to spare.
+    link = "See [[old/target]]\n"
+    big = offline / "big.md"
+    big.write_text("p" * (small_cap - len(link) - 3) + "\n" + link, encoding="utf-8")
+    assert big.stat().st_size == small_cap - 2
+    big_before = big.read_bytes()
+
+    small = offline / "small.md"
+    small.write_text(link, encoding="utf-8")
+
+    monkeypatch.setattr(
+        tools,
+        "async_session",
+        _fake_session_returning(
+            [
+                _Row(file_path=from_rel, id=1),
+                _Row(file_path="big.md", id=2),
+                _Row(file_path="small.md", id=3),
+            ],
+            [_Row(file_path="big.md"), _Row(file_path="small.md")],
+        ),
+    )
+
+    seen: list[bytes | None] = []
+    real_write = tools.write_file
+
+    def spy(path, content, **kwargs):
+        seen.append(kwargs.get("expected"))
+        return real_write(path, content, **kwargs)
+
+    monkeypatch.setattr(tools, "write_file", spy)
+
+    result = await tools.move_note_impl(from_rel, to_rel, rewrite_links=True)
+
+    # The move itself happened.
+    assert "Moved" in result, result
+    assert not (offline / from_rel).exists()
+    assert (offline / to_rel).read_text(encoding="utf-8") == "moved note\n"
+
+    # The over-cap source is untouched and named, with the limit, in the result.
+    assert big.read_bytes() == big_before
+    assert "big.md" in result
+    assert str(small_cap) in result
+
+    # The other source was rewritten, under the `expected=` conflict guard.
+    assert "a-much-longer-renamed-name" in small.read_text(encoding="utf-8")
+    assert seen == [link.encode("utf-8")]
+
+
 # ── the size check must not displace the conflict check ─────────────────────
 
 

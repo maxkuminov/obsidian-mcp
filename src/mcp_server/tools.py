@@ -1072,6 +1072,19 @@ def _rewrite_failure_warning(failed_sources: list[str]) -> str | None:
     )
 
 
+def _rewrite_oversize_warning(oversize_sources: list[str]) -> str | None:
+    """Describe backlink rewrites skipped because the result exceeded the cap."""
+    if not oversize_sources:
+        return None
+    preview = ", ".join(oversize_sources[:3])
+    if len(oversize_sources) > 3:
+        preview += f", and {len(oversize_sources) - 3} more"
+    return (
+        f"{len(oversize_sources)} note(s) left unchanged because the rewritten "
+        f"content would exceed the {MAX_NOTE_BYTES}-byte note limit: {preview}"
+    )
+
+
 def _note_owner_predicate(uid: int | None):
     """Return the exact NoteMetadata ownership predicate for a vault context."""
     from src.models.db import NoteMetadata
@@ -1189,6 +1202,7 @@ async def move_note_impl(
     rewrites_done = 0
     files_modified = 0
     failed_rewrite_sources: list[str] = []
+    oversize_rewrite_sources: list[str] = []
     if rewrite_links and pre_move_index is not None:
         for original_src_path in rewrite_sources:
             try:
@@ -1213,6 +1227,15 @@ async def move_note_impl(
                     output_source_path=src_path,
                 )
                 if n > 0:
+                    # A rewrite can only grow a note (the new path is usually
+                    # longer than the old one), so it is a note write like any
+                    # other and gets the same cap. Over-cap sources are skipped
+                    # and named in the result: the move itself and the other
+                    # rewrites still stand, and the skipped file is left
+                    # byte-identical rather than half-updated.
+                    if _note_size_error(new_content) is not None:
+                        oversize_rewrite_sources.append(src_path)
+                        continue
                     write_file(
                         src_path, new_content, user_id=uid, expected=original_bytes
                     )
@@ -1232,6 +1255,9 @@ async def move_note_impl(
         warning = _rewrite_failure_warning(failed_rewrite_sources)
         if warning is not None:
             parts.append(f"(warning: {warning})")
+        oversize = _rewrite_oversize_warning(oversize_rewrite_sources)
+        if oversize is not None:
+            parts.append(f"(warning: {oversize})")
     return " — ".join(parts) if len(parts) > 1 else parts[0]
 
 

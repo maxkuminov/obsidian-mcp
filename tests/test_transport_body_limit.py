@@ -75,6 +75,10 @@ def test_transport_body_limit_cases_pass_in_an_isolated_process(tmp_path):
         "DATABASE_URL": "postgresql+asyncpg://test:test@localhost/test",
         "SECRET_KEY": "test",
         "MCP_HOSTNAME": "",
+        # This env dict *is* the controlled environment: `tests/conftest.py`
+        # otherwise scrubs every Settings-shaped variable before importing
+        # `src.config`, which would undo the import-time settings above.
+        "OMCP_TEST_TRUST_ENV": "1",
     }
     result = subprocess.run(
         [sys.executable, "-m", "pytest", str(CASES), "-q", "-p", "no:cacheprovider"],
