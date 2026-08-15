@@ -8,8 +8,8 @@
 
 ## 2. Keyword plan
 
-- [ ] 2.1 `src/services/search.py::full_text_search`: `await session.execute(text("SET LOCAL random_page_cost = 1.1"))` before the select, with a comment on the detoast/seq-scan cost-model gap; add `NoteMetadata.file_path.asc()` as a secondary `ORDER BY` after `rank.desc()`.
-- [ ] 2.2 Unit test: the statement is issued before the select; ordering clause includes the tie-break.
+- [x] 2.1 `src/services/search.py::full_text_search`: `await session.execute(text("SET LOCAL random_page_cost = 1.1"))` before the select, with a comment on the detoast/seq-scan cost-model gap; add `NoteMetadata.file_path.asc()` as a secondary `ORDER BY` after `rank.desc()`.
+- [x] 2.2 Unit test: the statement is issued before the select; ordering clause includes the tie-break.
 
 ## 3. Pre-warm
 

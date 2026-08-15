@@ -99,6 +99,14 @@ in the report which tools were actually called.
   query matches if any config hits (tsqueries OR'd). Startup validates the
   config names against `pg_ts_config`. Changing `FTS_CONFIGS` requires `make
   rebuild-tsvectors` — keyword index only, no embeddings, no API calls.
+  `full_text_search` also issues `SET LOCAL random_page_cost = 1.1` (the
+  planner costs the heap at `relpages` and does not model detoast I/O, so it
+  seq-scanned and detoasted every tsvector: 13,086 buffers vs 1,146) and
+  orders by `rank DESC, file_path ASC`. The tie-break is not cosmetic — a
+  plan change would otherwise change *which* tied rows survive the LIMIT.
+  Index usage is the expected plan for rare terms on a production-sized
+  corpus, not a guarantee; a tiny table or a very common term may legitimately
+  seq-scan.
 - Vector search via pgvector HNSW index on `note_embeddings.embedding`
   (`vector_cosine_ops`, `m=16, ef_construction=64`); `semantic_search`
   sets `hnsw.ef_search=80` per query and dedupes per note in Python
