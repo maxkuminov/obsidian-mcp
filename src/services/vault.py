@@ -1,3 +1,4 @@
+import errno
 import logging
 import mimetypes
 import os
@@ -290,6 +291,85 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
     }
 
 
+# How many `.tmp-…` names `_atomic_write` tries before giving up. A collision
+# is astronomically unlikely; the retry exists so a process that pre-creates
+# the name (a symlink decoy, or a leftover from a crash) cannot wedge a write.
+_TEMP_ATTEMPTS = 3
+
+# Mode a plain `open(..., "w")` produces, cached for the life of the process.
+_default_file_mode_cache: int | None = None
+
+
+def _default_file_mode() -> int:
+    """The mode a plain `open(..., "w")` would give a new file: 0o666 & ~umask.
+
+    `_atomic_write` creates its temp file at 0o600 so the content is never
+    readable by anyone else while it is being written, then relaxes it to this
+    before publication. Without that, every note the server rewrote would
+    silently drop from the umask default (0o644 on the container) to 0o600 and
+    become unreadable to anything else sharing the vault.
+
+    Read from `/proc/self/status` where available; the `os.umask` read-restore
+    dance is the portable fallback and is only reached once.
+    """
+    global _default_file_mode_cache
+    if _default_file_mode_cache is None:
+        mask: int | None = None
+        try:
+            with open("/proc/self/status", encoding="ascii") as status:
+                for line in status:
+                    if line.startswith("Umask:"):
+                        mask = int(line.split()[1], 8)
+                        break
+        except OSError:
+            mask = None
+        if mask is None:
+            mask = os.umask(0o022)
+            os.umask(mask)
+        _default_file_mode_cache = 0o666 & ~mask
+    return _default_file_mode_cache
+
+
+def _temp_candidate(path: Path) -> Path:
+    """A fresh same-directory temp name for `path`.
+
+    Factored out so a test can make the name predictable and pre-create it.
+    """
+    return path.with_name(f".tmp-{path.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+
+
+def _create_temp_exclusively(path: Path) -> tuple[int, Path]:
+    """Create a same-directory temp file for `path`; return `(fd, tmp)`.
+
+    `O_CREAT|O_EXCL|O_NOFOLLOW` means the name we write through cannot
+    pre-exist and cannot be a symlink: a process that guessed the temp name and
+    planted `.tmp-note.md-…  ->  /some/decoy` would otherwise have had our
+    write truncate the decoy. `O_EXCL` reports that as `EEXIST` (a symlink at
+    the final component fails the same way), so we simply take another name.
+    """
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    last: OSError | None = None
+    for _ in range(_TEMP_ATTEMPTS):
+        tmp = _temp_candidate(path)
+        try:
+            return os.open(tmp, flags, 0o600), tmp
+        except FileExistsError as exc:
+            last = exc
+        except OSError as exc:  # ELOOP on platforms that prefer it for symlinks
+            if getattr(exc, "errno", None) != errno.ELOOP:
+                raise
+            last = exc
+    raise RuntimeError(
+        f"Could not create a temporary file next to {path.name}"
+    ) from last
+
+
 def _atomic_write(
     path: Path,
     *,
@@ -306,16 +386,21 @@ def _atomic_write(
     `os.replace` is atomic on POSIX same-FS renames. No-clobber publication
     uses a hard link from the same-directory temp file. Creates missing parent
     directories.
+
+    The temp file is created exclusively and `O_NOFOLLOW` (see
+    `_create_temp_exclusively`), so the staging step cannot be redirected
+    through a planted symlink.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(
-        f".tmp-{path.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    )
+    payload = data if data is not None else (text or "").encode("utf-8")
+    fd, tmp = _create_temp_exclusively(path)
     try:
-        if data is not None:
-            tmp.write_bytes(data)
-        else:
-            tmp.write_text(text or "", encoding="utf-8")
+        try:
+            with os.fdopen(fd, "wb", closefd=False) as stream:
+                stream.write(payload)
+            os.fchmod(fd, _default_file_mode())
+        finally:
+            os.close(fd)
         try:
             if expected is not None:
                 try:
@@ -344,10 +429,11 @@ def _atomic_write(
             else:
                 raise
     except Exception:
+        # The temp is a regular file we created ourselves, so an unconditional
+        # unlink is safe and also clears a name `exists()` would miss.
         try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
+            os.unlink(tmp)
+        except OSError:
             pass
         raise
     return path

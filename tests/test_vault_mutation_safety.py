@@ -291,3 +291,61 @@ def test_bounded_read_uses_open_inode_when_path_is_swapped(offline, monkeypatch)
 
     monkeypatch.setattr(vault_service.os, "fstat", fstat_then_swap)
     assert vault_service.read_bytes("data.bin", max_bytes=10) == b"small"
+
+
+def test_planted_temp_symlink_cannot_be_written_through(offline, monkeypatch):
+    """A symlink squatting on the temp name never receives the write.
+
+    `_atomic_write` used to stage through `Path.write_bytes`, which follows a
+    symlink at the temp name: a process that guessed the name could point it at
+    any file the server can write and have the note's bytes truncate it.
+    Exclusive `O_CREAT|O_EXCL|O_NOFOLLOW` creation makes that name unusable, so
+    the write takes the next candidate and still succeeds.
+    """
+    decoy = offline / "decoy.txt"
+    decoy.write_text("do not clobber", encoding="utf-8")
+
+    names = iter(["planted", "second", "third"])
+
+    def next_candidate(path: Path) -> Path:
+        return path.with_name(f".tmp-{next(names)}")
+
+    monkeypatch.setattr(vault_service, "_temp_candidate", next_candidate)
+    planted = offline / ".tmp-planted"
+    planted.symlink_to(decoy)
+
+    vault_service.write_file("note.md", "fresh content")
+
+    assert decoy.read_text() == "do not clobber"
+    assert (offline / "note.md").read_text() == "fresh content"
+    # The squatted name is left exactly as it was — untouched, not published.
+    assert planted.is_symlink()
+    assert not (offline / ".tmp-second").exists()
+
+
+def test_planted_temp_symlink_exhausting_every_candidate_fails_closed(
+    offline, monkeypatch
+):
+    monkeypatch.setattr(
+        vault_service, "_temp_candidate", lambda path: path.with_name(".tmp-fixed")
+    )
+    decoy = offline / "decoy.txt"
+    decoy.write_text("do not clobber", encoding="utf-8")
+    (offline / ".tmp-fixed").symlink_to(decoy)
+
+    with pytest.raises(RuntimeError, match="temporary file"):
+        vault_service.write_file("note.md", "fresh content")
+
+    assert decoy.read_text() == "do not clobber"
+    assert not (offline / "note.md").exists()
+
+
+def test_written_note_keeps_the_umask_default_mode(offline):
+    """Staging at 0600 must not leak into the published note's permissions."""
+    vault_service.write_file("mode.md", "body")
+    reference = offline / "reference.md"
+    reference.write_text("body", encoding="utf-8")
+
+    published = (offline / "mode.md").stat().st_mode & 0o777
+    assert published == reference.stat().st_mode & 0o777
+    assert published == vault_service._default_file_mode()
