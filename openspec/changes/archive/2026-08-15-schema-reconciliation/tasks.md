@@ -7,6 +7,6 @@
 - [x] 2.4 Review findings (round 2): resolve a non-canonical/NOT VALID same-named CHECK *before* `ALTER COLUMN … TYPE` — that ALTER re-validates dependent CHECKs against live rows, so an impostor (e.g. `pg_typeof(…) = 'text'`) would abort the repair on every run; canonical rendering compared against the **current** column types so the plain wrong-type path is still a no-op; case (g5) for the impostor+wrong-type path incl. downgrade; marker outcome pinned True/False on every path (no `None`); `make test-schema` publishes on 127.0.0.1 and traps teardown in one shell.
 ## 3. Verify & ship
 - [x] 3.1 `openspec validate schema-reconciliation --strict`; offline suite; integration module run once against a throwaway pgvector container (14 cases).
-- [ ] 3.2 `openspec-verifier`; adversarial Codex (live-DB migration). Iterate to no BLOCKER/MAJOR.
+- [x] 3.2 `openspec-verifier`; adversarial Codex (live-DB migration). Iterate to no BLOCKER/MAJOR.
 - [ ] 3.3 `make deploy`; post-deploy `docker exec obsidian-mcp alembic check` clean; `pg_constraint` shows the CHECK.
 - [ ] 3.4 Archive, PR closing #53, merge.
