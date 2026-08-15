@@ -6,8 +6,8 @@
 
 ## 2. Settings: filtered dotenv source
 
-- [ ] 2.1 `src/config.py`: keep `extra="forbid"`; override `settings_customise_sources` to wrap the dotenv source so keys that are not `Settings` fields (case-insensitive) are dropped before validation. Comment names the compose-only keys (`VAULT_HOST_PATH`, `BACKUPS_HOST_PATH`) as the reason.
-- [ ] 2.2 Tests: (a) a temp `.env` containing `VAULT_HOST_PATH=/x` plus required keys loads; (b) `Settings(databse_url=..., _env_file=None)` still raises a validation error; (c) `pytest -q tests/test_config_validation.py` alone collects and passes from a checkout whose `.env` has the compose-only keys.
+- [x] 2.1 `src/config.py`: keep `extra="forbid"`; override `settings_customise_sources` to wrap the dotenv source so keys that are not `Settings` fields (case-insensitive) are dropped before validation. Comment names the compose-only keys (`VAULT_HOST_PATH`, `BACKUPS_HOST_PATH`) as the reason.
+- [x] 2.2 Tests: (a) a temp `.env` containing `VAULT_HOST_PATH=/x` plus required keys loads; (b) `Settings(databse_url=..., _env_file=None)` still raises a validation error; (c) `pytest -q tests/test_config_validation.py` alone collects and passes from a checkout whose `.env` has the compose-only keys.
 
 ## 3. MCP SDK 1.29.0 + transport body limit + note write caps
 

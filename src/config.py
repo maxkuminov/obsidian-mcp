@@ -1,8 +1,60 @@
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, NoDecode
+from pydantic.fields import FieldInfo
+from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
+
+
+class _FieldFilteredSource(PydanticBaseSettingsSource):
+    """Wraps a settings source and drops keys that are not `Settings` fields.
+
+    Used for the **dotenv source only**. The repo-root `.env` is shared with
+    `docker-compose.yml` and legitimately carries compose-only keys
+    (`VAULT_HOST_PATH`, `BACKUPS_HOST_PATH`) that are not settings; with
+    pydantic-settings' `extra="forbid"` they make `Settings()` — and therefore
+    a single-file `pytest` run from a checkout — fail at import.
+
+    Filtering the source instead of relaxing `extra` on the model keeps
+    `Settings(databse_url=...)` (a misspelled constructor kwarg) a hard error,
+    and leaves process environment variables untouched (pydantic-settings never
+    applies `extra` checks to those, which is why the container is unaffected).
+
+    Field entries arrive keyed by field name regardless of `env_prefix` (only
+    unknown extras keep their raw, prefixed name), so matching on field names
+    and aliases is prefix-safe. Matching is case-insensitive.
+    """
+
+    def __init__(self, inner: PydanticBaseSettingsSource):
+        super().__init__(inner.settings_cls)
+        self._inner = inner
+
+    def _set_current_state(self, state: dict[str, Any]) -> None:
+        super()._set_current_state(state)
+        self._inner._set_current_state(state)
+
+    def _set_settings_sources_data(self, states: dict[str, dict[str, Any]]) -> None:
+        super()._set_settings_sources_data(states)
+        self._inner._set_settings_sources_data(states)
+
+    def _allowed_keys(self) -> set[str]:
+        allowed: set[str] = set()
+        for name, field in self.settings_cls.model_fields.items():
+            allowed.add(name.lower())
+            for alias in (field.alias, field.validation_alias, field.serialization_alias):
+                if isinstance(alias, str):
+                    allowed.add(alias.lower())
+        return allowed
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        allowed = self._allowed_keys()
+        return {k: v for k, v in self._inner().items() if k.lower() in allowed}
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self._inner!r})"
 
 
 class Settings(BaseSettings):
@@ -83,7 +135,34 @@ class Settings(BaseSettings):
     # production — tools register but cannot run.
     mcp_sandbox_mode: bool = False
 
+    # `extra` stays at pydantic-settings' default ("forbid") so a misspelled
+    # constructor kwarg or an unknown init value is still a hard error; only the
+    # dotenv source is filtered (see `settings_customise_sources` below).
     model_config = {"env_file": ".env"}
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Default source order, with the dotenv source filtered to known fields.
+
+        The repo-root `.env` doubles as the compose env file and carries
+        compose-only keys (`VAULT_HOST_PATH`, `BACKUPS_HOST_PATH`) that are not
+        `Settings` fields. Under `extra="forbid"` those abort `Settings()` at
+        import time. Dropping them from the dotenv source only keeps every other
+        surface strict.
+        """
+        return (
+            init_settings,
+            env_settings,
+            _FieldFilteredSource(dotenv_settings),
+            file_secret_settings,
+        )
 
     @field_validator("fts_configs", mode="before")
     @classmethod
