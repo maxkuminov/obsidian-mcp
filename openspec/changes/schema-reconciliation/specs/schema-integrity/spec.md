@@ -19,6 +19,11 @@ After migrating to head, `alembic check` SHALL report no pending operations, on 
 - **WHEN** `oauth_clients` carries a constraint named `ck_oauth_clients_auth_method_secret` whose definition differs from the canonical predicate (e.g. `CHECK (true)`) and 013 runs on data with no violations
 - **THEN** 013 SHALL replace it with the exact predicate in the same transaction
 
+#### Scenario: A wrong same-named constraint cannot block the column repair
+
+- **WHEN** a constraint named `ck_oauth_clients_auth_method_secret` exists whose definition differs from the canonical rendering **for the column types the database currently has**, or which is `NOT VALID`, and `token_endpoint_auth_method` has also drifted to another type (e.g. `text` carrying a squatting `CHECK (pg_typeof(token_endpoint_auth_method) = 'text'::regtype)`)
+- **THEN** 013 SHALL drop that constraint after verifying the rows and **before** altering the column's type, default or nullability — `ALTER COLUMN ... TYPE` re-validates every dependent CHECK against the live rows, so leaving the impostor in place would abort the repair on every run — and SHALL then add the canonical validated constraint, marked with its COMMENT so a downgrade to 012 removes it
+
 #### Scenario: Other 010 effects verified
 
 - **WHEN** 013 runs

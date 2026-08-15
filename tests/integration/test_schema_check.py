@@ -206,15 +206,16 @@ def insert_client(url, client_id, method, secret):
 # --------------------------------------------------------------------------
 
 
-def assert_reconciled(url: str, *, marker_expected: bool | None):
+def assert_reconciled(url: str, *, marker_expected: bool):
     """Everything migration 013 promises, read straight out of the catalog.
 
-    `marker_expected=None` leaves the COMMENT unasserted, for the one drift
-    (wrong column *type*) where whether the constraint had to be re-created is a
-    Postgres implementation detail: `ALTER COLUMN … TYPE` rebuilds dependent
-    CHECKs, so the constraint may come back already rendered canonically and 013
-    then leaves it alone. What must hold either way — canonical, validated,
-    enforced — is asserted below.
+    `marker_expected` is not optional, and deliberately so: the COMMENT is the
+    only thing `downgrade()` reads, so "013 owns this constraint" is a fact
+    every case has to commit to. Leaving it unasserted on a path would let the
+    ownership flip in either direction — a fresh database silently losing 010's
+    constraint on downgrade, or a repaired one silently keeping 013's — with the
+    whole suite still green. Each caller therefore pins True or False and
+    asserts the matching downgrade outcome.
     """
     check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
     assert check.returncode == 0, (
@@ -227,10 +228,7 @@ def assert_reconciled(url: str, *, marker_expected: bool | None):
     validated, definition, comment = row
     assert validated, f"{CONSTRAINT} exists but is NOT VALID"
     assert definition == CANONICAL_CONSTRAINTDEF, definition
-    if marker_expected is True:
-        assert comment == MARKER, comment
-    elif marker_expected is False:
-        assert comment is None, comment
+    assert comment == (MARKER if marker_expected else None), comment
 
     assert not_null_flags(url) == {
         f"{table}.{column}": True for table, column, _ in NOT_NULL_COLUMNS
@@ -516,7 +514,25 @@ def test_wrong_server_default_is_reconciled():
 
 
 def test_wrong_column_type_is_reconciled():
-    """(g2) A widened `text` column loses the length bound 010 declared."""
+    """(g2) A widened `text` column loses the length bound 010 declared.
+
+    The marker is pinned to False, which is an observed PostgreSQL 16 behaviour
+    and not an arbitrary choice — worth spelling out, because it is the one path
+    where the constraint 013 ends up with was neither found intact nor created
+    by 013. `ALTER COLUMN … TYPE` re-parses and re-validates every dependent
+    CHECK, so 010's constraint follows the column: at `text` it is reprinted
+    without the `(col)::text` casts, which is *exactly* what this server renders
+    for a freshly created constraint on a `text` column, so 013 recognises it as
+    canonical-for-the-current-type and leaves it; the repair back to
+    `varchar(32)` reprints it with the casts again, canonical once more. 013
+    therefore never touches it and never comments it — it remains 010's, which
+    is why the downgrade below must keep it.
+
+    If a future PostgreSQL changes how a rebuilt CHECK is reprinted, this
+    assertion flips to True rather than failing silently: 013 would see a
+    non-canonical definition, replace it, and take ownership. Both outcomes are
+    correct behaviour; the point of pinning is that the change is *noticed*.
+    """
     with throwaway_db("schema_bad_type", revision="012") as url:
         sql(
             url,
@@ -529,7 +545,69 @@ def test_wrong_column_type_is_reconciled():
 
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
-        assert_reconciled(url, marker_expected=None)
+        assert_reconciled(url, marker_expected=False)
+
+        # The other half of the pin: unmarked means 010 owns it, so 012 keeps it.
+        _harness.run_alembic(url, "downgrade", "012", dimensions=DIM)
+        assert constraint_row(url) is not None, (
+            "downgrade dropped a constraint 013 did not create"
+        )
+        assert constraint_row(url)[1] == CANONICAL_CONSTRAINTDEF
+
+
+def test_impostor_constraint_does_not_block_the_type_repair():
+    """(g5) An impostor under our name must not be able to *veto* the repair.
+
+    The sharp edge is that `ALTER COLUMN … TYPE` re-validates every CHECK that
+    reads the column against the live rows. So a constraint squatting on our
+    name is not merely unenforced — it is a lock on the door: here the column
+    has drifted to `text` and the squatter asserts `pg_typeof(…) = 'text'`, so
+    the `ALTER … TYPE character varying(32)` that repairs the column would abort
+    with "check constraint … is violated by some row", every run, forever. 013
+    would never reach the step that replaces it. The fix is ordering — the rows
+    are verified, then the non-canonical constraint is dropped, and only then is
+    the column touched.
+
+    The predicate is contrived; what it stands in for is not. Any same-named
+    CHECK a human or an older tool left behind that the reconciled rows or the
+    reconciled *type* do not satisfy has this shape, and the failure mode is a
+    migration that cannot self-heal.
+    """
+    with throwaway_db("schema_impostor_type", revision="012") as url:
+        sql(url, f"ALTER TABLE oauth_clients DROP CONSTRAINT {CONSTRAINT}")
+        sql(
+            url,
+            "ALTER TABLE oauth_clients ALTER COLUMN token_endpoint_auth_method "
+            "TYPE text",
+        )
+        sql(
+            url,
+            f"ALTER TABLE oauth_clients ADD CONSTRAINT {CONSTRAINT} "
+            "CHECK (pg_typeof(token_endpoint_auth_method) = 'text'::regtype)",
+        )
+        # One valid client, so the offender check passes and the migration is
+        # blocked by the constraint or by nothing — no other reason to fail.
+        insert_client(url, "kept-confidential", "client_secret_post", "s" * 64)
+        assert column_shape(url, "oauth_clients", "token_endpoint_auth_method")[1] == (
+            "text"
+        )
+        assert "pg_typeof" in constraint_row(url)[1]
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        # 013 dropped the squatter and added the real thing, so it owns it.
+        assert_reconciled(url, marker_expected=True)
+        assert fetchval(
+            url,
+            "SELECT client_secret_hash FROM oauth_clients "
+            "WHERE client_id = 'kept-confidential'",
+        ) == "s" * 64
+
+        _harness.run_alembic(url, "downgrade", "012", dimensions=DIM)
+        assert alembic_version(url) == "012"
+        assert constraint_row(url) is None, (
+            "downgrade kept a constraint 013 created"
+        )
 
 
 def test_client_secret_hash_not_null_is_reconciled():

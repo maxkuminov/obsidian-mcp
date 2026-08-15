@@ -43,6 +43,20 @@ If `token_endpoint_auth_method` is absent entirely the migration refuses: 010
 always adds it, so its absence means the database never had 010's shape at all
 and 013's job -- reconciling a database that *did* -- is not the right repair.
 
+**A non-canonical constraint squatting on our name is resolved before the
+column is touched, not after.** `ALTER COLUMN ... TYPE` re-validates every CHECK
+that reads the column against the live rows, so an impostor does not merely fail
+to enforce the right thing -- it *blocks the repair*: on a column widened to
+`text`, a same-named `CHECK (pg_typeof(token_endpoint_auth_method) =
+'text'::regtype)` makes the `ALTER ... TYPE character varying(32)` abort with
+"check constraint ... is violated by some row", and 013 never reaches the step
+that would have replaced it. So the sequence is: verify the rows, drop a
+same-named constraint that is not the canonical one *for the current column
+types* (or that is NOT VALID), then fix type/default/nullability, then add the
+canonical constraint. Dropping is only safe in that position because the rows
+have already been verified and the table lock is already held; if anything later
+in the migration fails, the DROP rolls back with it.
+
 Locks and timeouts (design D3a/D3b): `SET NOT NULL` takes ACCESS EXCLUSIVE and
 scans the table without rewriting it; `usage_logs` (~10k rows) scans in
 milliseconds. `LOCK TABLE oauth_clients IN SHARE ROW EXCLUSIVE MODE` blocks
@@ -271,6 +285,52 @@ def _assert_no_violating_rows(bind) -> None:
         )
 
 
+def _existing_named_check(bind):
+    """`(convalidated, pg_get_constraintdef)` for our CHECK, or None if absent."""
+    return bind.execute(
+        sa.text(
+            "SELECT convalidated, pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid = 'oauth_clients'::regclass AND contype = 'c' "
+            "  AND conname = :name"
+        ),
+        {"name": CONSTRAINT_NAME},
+    ).first()
+
+
+def _drop_stale_named_check(bind) -> None:
+    """Clear a non-canonical constraint off our name *before* the column changes.
+
+    An impostor under our name is not just wrong, it is *obstructive*: `ALTER
+    COLUMN ... TYPE` re-validates every CHECK that reads the column, so a
+    same-named `CHECK (pg_typeof(token_endpoint_auth_method) = 'text'::regtype)`
+    on a widened column aborts the type repair before 013 ever gets to the step
+    that would replace it. Resolving the constraint first breaks that knot.
+
+    The comparison is against the canonical rendering **for the current column
+    types**, which is exactly what `_canonical_constraintdef` computes -- its
+    scratch table is `LIKE oauth_clients`, so on a `text` column it renders the
+    predicate the way this server renders it for a `text` column. A constraint
+    matching that is the real one, merely carried along by an earlier drift; it
+    is left in place so `ALTER ... TYPE` rebuilds it and 013 stays a no-op for
+    it (which is what keeps the plain wrong-type path from acquiring a marker it
+    did not earn). Anything else -- a different predicate, or ours but NOT VALID
+    -- is dropped here.
+
+    Safe only in this position: `_assert_no_violating_rows` has already proved
+    every row satisfies the canonical predicate, and the SHARE ROW EXCLUSIVE
+    lock is already held, so nothing can slip in during the window where the
+    table carries no constraint. The window closes inside the same transaction,
+    and a later failure rolls the DROP back with everything else.
+    """
+    existing = _existing_named_check(bind)
+    if existing is None:
+        return
+    validated, definition = existing
+    if validated and _normalize(definition) == _canonical_constraintdef(bind):
+        return
+    op.execute(f"ALTER TABLE oauth_clients DROP CONSTRAINT {CONSTRAINT_NAME}")
+
+
 def _reconcile_oauth_clients_shape(bind) -> None:
     """Everything 010 promised about `oauth_clients` other than the CHECK.
 
@@ -313,24 +373,28 @@ def _reconcile_oauth_clients_shape(bind) -> None:
 
 
 def _reconcile_check_constraint(bind) -> None:
+    """The final word on the constraint, judged against the *reconciled* types.
+
+    `_drop_stale_named_check` already cleared anything non-canonical, but it
+    judged against the column types as they were *then*. The type may have
+    changed since, which re-renders a constraint Postgres rebuilt for us, so the
+    comparison is made again here against the canonical rendering for the types
+    the column now has.
+    """
     canonical = _canonical_constraintdef(bind)
-    existing = bind.execute(
-        sa.text(
-            "SELECT convalidated, pg_get_constraintdef(oid) FROM pg_constraint "
-            "WHERE conrelid = 'oauth_clients'::regclass AND contype = 'c' "
-            "  AND conname = :name"
-        ),
-        {"name": CONSTRAINT_NAME},
-    ).first()
+    existing = _existing_named_check(bind)
 
     if existing is not None:
         validated, definition = existing
         if validated and _normalize(definition) == canonical:
-            # 010 (or a previous 013) already did it. Leave the comment alone:
-            # its presence or absence is what downgrade() reads.
+            # 010 (or a previous 013) already did it -- or `ALTER ... TYPE`
+            # rebuilt 010's constraint canonically for the repaired type. Leave
+            # the comment alone: its presence or absence is what downgrade()
+            # reads, and 013 adding nothing here must not claim ownership.
             return
-        # Same name, different meaning (e.g. `CHECK (true)`) or NOT VALID.
-        # Data was verified above, so replacing it in this transaction is safe.
+        # Backstop. Reaching it means a rebuild landed on a rendering the server
+        # does not produce for a freshly created constraint; the data was
+        # verified above, so replacing it in this transaction is safe.
         op.execute(f"ALTER TABLE oauth_clients DROP CONSTRAINT {CONSTRAINT_NAME}")
 
     op.create_check_constraint(CONSTRAINT_NAME, "oauth_clients", CANONICAL_PREDICATE)
@@ -373,10 +437,13 @@ def upgrade() -> None:
     # check and ADD CONSTRAINT.
     op.execute("LOCK TABLE oauth_clients IN SHARE ROW EXCLUSIVE MODE")
 
-    # Order is load-bearing: verify the rows the CHECK reads before touching
-    # anything that feeds it.
+    # Order is load-bearing, twice over. Verify the rows the CHECK reads before
+    # touching anything that feeds it -- and clear a non-canonical constraint
+    # off the name before `ALTER ... TYPE`, which would otherwise re-validate
+    # that impostor against the live rows and abort the repair.
     _require_check_columns(bind)
     _assert_no_violating_rows(bind)
+    _drop_stale_named_check(bind)
     _reconcile_oauth_clients_shape(bind)
     _reconcile_check_constraint(bind)
     _set_not_null(OAUTH_CLIENTS_NOT_NULL_COLUMNS)
