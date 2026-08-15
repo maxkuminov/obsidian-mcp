@@ -16,7 +16,7 @@ from mcp.server.fastmcp import Image
 from sqlalchemy import text
 
 from src.auth.session import current_user_id
-from src.config import MAX_NOTE_BYTES, settings
+from src.config import MAX_MOVE_REWRITE_BYTES, MAX_NOTE_BYTES, settings
 from src.database import async_session
 from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
 from src.models.db import UsageLog
@@ -495,6 +495,18 @@ def _require_write() -> str | None:
     return None
 
 
+def _note_size_error_for(size: int) -> str | None:
+    """`_note_size_error` for a caller that already knows the encoded length.
+
+    Split out so a path that must encode the content anyway (the `move_note`
+    preflight, which also sums the encoded lengths) can reuse that one encode
+    instead of paying for a second one inside the check.
+    """
+    if size > MAX_NOTE_BYTES:
+        return f"Content too large ({size} bytes, max {MAX_NOTE_BYTES})"
+    return None
+
+
 def _note_size_error(content: str) -> str | None:
     """Refuse a note write whose *result* would exceed `MAX_NOTE_BYTES`.
 
@@ -502,10 +514,7 @@ def _note_size_error(content: str) -> str | None:
     a supported write is always decided here — with an actionable message —
     rather than by the MCP transport's body limit, which sits well above it.
     """
-    size = len(content.encode("utf-8"))
-    if size > MAX_NOTE_BYTES:
-        return f"Content too large ({size} bytes, max {MAX_NOTE_BYTES})"
-    return None
+    return _note_size_error_for(len(content.encode("utf-8")))
 
 
 @_tracked("create_note", ["path"])
@@ -1150,11 +1159,13 @@ async def move_note_impl(
     # link the vault bytes do not contain, and an agent acting on that graph
     # never sees the discrepancy.
     #
-    # Memory: `read_bytes` bounds each source at MAX_NOTE_BYTES, so holding all
-    # rewritten bodies at once costs at most (#backlink sources × 10 MiB) —
-    # acceptable for the backlink fan-in of a single note, and the price of
-    # never half-applying a move.
+    # Memory: `read_bytes` bounds each source at MAX_NOTE_BYTES, but the number
+    # of sources is unbounded — a target with hundreds of near-cap backlinks
+    # would buffer gigabytes before a single byte is mutated. So the originals
+    # and the rewrites are summed as they accumulate and the move aborts (still
+    # before any mutation) once that total would exceed MAX_MOVE_REWRITE_BYTES.
     planned_rewrites: list[tuple[str, bytes, str, int]] = []
+    rewrite_bytes_held = 0
     failed_rewrite_sources: list[str] = []
     if rewrite_links and pre_move_index is not None:
         for original_src_path in rewrite_sources:
@@ -1190,12 +1201,25 @@ async def move_note_impl(
                 continue
             # A rewrite can only grow a note (the new path is usually longer
             # than the old one), so it is a note write like any other and gets
-            # the same cap — enforced here, where refusing costs nothing.
-            if err := _note_size_error(new_content):
+            # the same cap — enforced here, where refusing costs nothing. The
+            # one encode also feeds the aggregate below.
+            new_size = len(new_content.encode("utf-8"))
+            if err := _note_size_error_for(new_size):
                 return (
                     f"Move aborted: rewriting links in {original_src_path} would "
                     f"exceed the note size limit ({err}). Nothing was moved, "
                     "rewritten or reindexed."
+                )
+            rewrite_bytes_held += len(original_bytes) + new_size
+            if rewrite_bytes_held > MAX_MOVE_REWRITE_BYTES:
+                return (
+                    f"Move aborted: rewriting links across "
+                    f"{len(planned_rewrites) + 1} notes would need "
+                    f"{rewrite_bytes_held} bytes in memory (limit "
+                    f"{MAX_MOVE_REWRITE_BYTES} bytes, "
+                    f"{MAX_MOVE_REWRITE_BYTES // (1024 * 1024)} MiB). Nothing "
+                    "was moved, rewritten or reindexed. Move without "
+                    "rewrite_links and update links in batches instead."
                 )
             planned_rewrites.append((out_path, original_bytes, new_content, n))
 

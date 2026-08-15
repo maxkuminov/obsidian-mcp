@@ -370,6 +370,9 @@ async def move_note(
     All rewrites are computed before anything changes: if one would push a
     source note past the 10 MiB note limit the whole move is refused, naming
     that source, so the link graph never disagrees with the vault bytes.
+    That preflight is also bounded in aggregate: if the originals plus rewrites
+    for all backlink sources would exceed 256 MiB in memory the move is refused
+    before anything changes, naming the note count and the limit.
 
     Writes are atomic. See `get_vault_guide` for vault folder conventions.
 

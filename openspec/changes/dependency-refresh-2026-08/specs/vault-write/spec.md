@@ -2,7 +2,7 @@
 
 ### Requirement: Note write tools bound the resulting note size
 
-`create_note`, `edit_note`, `set_frontmatter`, and the link-rewriting path of `move_note(rewrite_links=True)` SHALL refuse to produce a note whose UTF-8 encoded content exceeds `MAX_NOTE_BYTES` (10 MiB). The check SHALL be applied to the content that would be written (after the edit, frontmatter mutation, or link rewrite is computed), SHALL return a tool-level error that names the limit, and SHALL NOT write that file. Under `edit_note(dry_run=True)` the same error SHALL be reported instead of a diff. For `move_note(rewrite_links=True)`, all rewrites SHALL be computed before any mutation; if any rewritten source would exceed the cap the tool SHALL abort the entire move before touching the filesystem or the database, returning an error that names the offending source and the limit, so vault bytes and `note_links` never disagree. Every note-writing path therefore has a tool-level size cap strictly below the MCP transport body limit, so a supported write is never rejected only by the transport.
+`create_note`, `edit_note`, `set_frontmatter`, and the link-rewriting path of `move_note(rewrite_links=True)` SHALL refuse to produce a note whose UTF-8 encoded content exceeds `MAX_NOTE_BYTES` (10 MiB). The check SHALL be applied to the content that would be written (after the edit, frontmatter mutation, or link rewrite is computed), SHALL return a tool-level error that names the limit, and SHALL NOT write that file. Under `edit_note(dry_run=True)` the same error SHALL be reported instead of a diff. For `move_note(rewrite_links=True)`, all rewrites SHALL be computed before any mutation; if any rewritten source would exceed the cap the tool SHALL abort the entire move before touching the filesystem or the database, returning an error that names the offending source and the limit, so vault bytes and `note_links` never disagree, and SHALL abort before any mutation when the aggregate bytes held for the rewrite (originals plus rewritten content) would exceed `MAX_MOVE_REWRITE_BYTES` (256 MiB), naming the count and the limit. Every note-writing path therefore has a tool-level size cap strictly below the MCP transport body limit, so a supported write is never rejected only by the transport.
 
 #### Scenario: edit_note result over the cap
 
@@ -21,6 +21,11 @@
 - **WHEN** `move_note(rewrite_links=True)` would expand a source note's links such that the rewritten note exceeds `MAX_NOTE_BYTES`
 - **THEN** the move SHALL NOT happen: the note stays at its original path, no source is rewritten, `notes_metadata`/`note_links` are unchanged, and the tool returns an error naming the offending source and the limit
 - **AND** when no source is over the cap, rewrites proceed with the `expected=` conflict guard as before
+
+#### Scenario: move_note aggregate rewrite bound
+
+- **WHEN** `move_note(rewrite_links=True)` has backlink sources whose originals plus rewritten content sum to more than `MAX_MOVE_REWRITE_BYTES`, even though every individual source is under `MAX_NOTE_BYTES`
+- **THEN** the move SHALL NOT happen: the note stays at its original path, no source is rewritten, `notes_metadata`/`note_links` are unchanged, and the tool returns an error naming the number of notes involved and the limit
 
 #### Scenario: Result at the cap is accepted
 

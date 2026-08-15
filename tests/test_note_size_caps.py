@@ -371,6 +371,104 @@ async def test_move_note_rewrites_unchanged_when_nothing_is_over_cap(
     assert journal.commits == 1
 
 
+# ── move_note: the preflight is also bounded in aggregate ───────────────────
+
+
+async def test_move_note_aborts_when_the_preflight_would_hold_too_much(
+    offline, small_cap, monkeypatch
+):
+    """Many small sources can blow the memory budget the per-note cap misses.
+
+    The preflight retains every original *and* its rewrite before mutating, so
+    the bound that matters is the sum, not the largest source. Three sources,
+    each comfortably under `MAX_NOTE_BYTES`, exceed a patched aggregate bound.
+    """
+    monkeypatch.setattr(tools, "MAX_MOVE_REWRITE_BYTES", 900)
+
+    from_rel = "old/target.md"
+    to_rel = "new/deeper/a-much-longer-renamed-name.md"
+    (offline / "old").mkdir()
+    (offline / from_rel).write_text("moved note\n", encoding="utf-8")
+
+    # ~201 bytes each: two fit inside the 900-byte budget (originals +
+    # rewrites), the third cannot.
+    link = "See [[old/target]]\n"
+    names = ["a.md", "b.md", "c.md"]
+    sources = []
+    for name in names:
+        note = offline / name
+        note.write_text("p" * 181 + "\n" + link, encoding="utf-8")
+        assert note.stat().st_size < small_cap
+        sources.append((note, note.read_bytes()))
+
+    factory, journal = _fake_session_returning(
+        [_Row(file_path=from_rel, id=1)]
+        + [_Row(file_path=n, id=i) for i, n in enumerate(names, start=2)],
+        [_Row(file_path=n) for n in names],
+    )
+    monkeypatch.setattr(tools, "async_session", factory)
+
+    seen: list[bytes | None] = []
+    real_write = tools.write_file
+
+    def spy(path, content, **kwargs):
+        seen.append(kwargs.get("expected"))
+        return real_write(path, content, **kwargs)
+
+    monkeypatch.setattr(tools, "write_file", spy)
+
+    result = await tools.move_note_impl(from_rel, to_rel, rewrite_links=True)
+
+    # The error names how many notes were involved and the limit it hit.
+    assert "3 notes" in result, result
+    assert "900" in result, result
+    assert "Moved" not in result
+
+    # Nothing moved, nothing rewritten, nothing written at all.
+    assert (offline / from_rel).read_text(encoding="utf-8") == "moved note\n"
+    assert not (offline / to_rel).exists()
+    for note, before in sources:
+        assert note.read_bytes() == before
+    assert seen == []
+
+    # And the DB saw only the two preflight SELECTs — no UPDATE, no commit.
+    assert journal.mutating() == []
+    assert journal.commits == 0
+
+
+async def test_move_note_within_the_aggregate_bound_still_rewrites(
+    offline, small_cap, monkeypatch
+):
+    """The same three sources under a bound that fits: the move goes through."""
+    monkeypatch.setattr(tools, "MAX_MOVE_REWRITE_BYTES", 10_000)
+
+    from_rel = "old/target.md"
+    to_rel = "new/deeper/a-much-longer-renamed-name.md"
+    (offline / "old").mkdir()
+    (offline / from_rel).write_text("moved note\n", encoding="utf-8")
+
+    link = "See [[old/target]]\n"
+    names = ["a.md", "b.md", "c.md"]
+    for name in names:
+        (offline / name).write_text("p" * 181 + "\n" + link, encoding="utf-8")
+
+    factory, journal = _fake_session_returning(
+        [_Row(file_path=from_rel, id=1)]
+        + [_Row(file_path=n, id=i) for i, n in enumerate(names, start=2)],
+        [_Row(file_path=n) for n in names],
+    )
+    monkeypatch.setattr(tools, "async_session", factory)
+
+    result = await tools.move_note_impl(from_rel, to_rel, rewrite_links=True)
+
+    assert "rewrote 3 link(s) across 3 note(s)" in result, result
+    for name in names:
+        assert "a-much-longer-renamed-name" in (offline / name).read_text(
+            encoding="utf-8"
+        )
+    assert journal.commits == 1
+
+
 # ── the size check must not displace the conflict check ─────────────────────
 
 

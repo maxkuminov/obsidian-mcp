@@ -11,6 +11,16 @@ from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
 # below can reference it without a circular import.
 MAX_NOTE_BYTES = 10 * 1024 * 1024  # 10 MB
 
+# Aggregate bound on the preflight of `move_note(rewrite_links=True)`. That
+# preflight holds, for every backlink source, both the original bytes and the
+# rewritten content in memory before a single byte is mutated — the price of
+# never half-applying a move. Each source is individually bounded by
+# `MAX_NOTE_BYTES`, but the *number* of sources is not: a heavily linked target
+# with hundreds of near-cap backlinks would otherwise buffer gigabytes. This
+# caps the sum (originals plus rewrites) and aborts the move before any
+# mutation when it would be exceeded.
+MAX_MOVE_REWRITE_BYTES = 256 * 1024 * 1024  # 256 MiB
+
 # Headroom for the JSON-RPC envelope around a tool call's content argument:
 # method name, tool name, request id, the other arguments. See
 # `Settings.mcp_max_request_body_bytes`.
