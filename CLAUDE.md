@@ -200,6 +200,21 @@ Consequences that are easy to undo by accident:
   `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault is under the cap;
   those are the next knobs, not `ef_search`.
 
+## Per-phase search timing
+
+`usage_logs.params` carries `embed_ms` + `db_ms` + `exact_fallback` for
+`semantic_search`, and `db_ms` + `exact_fallback` for `find_related` (it makes
+no embedding call). A single whole-call `duration_ms` could not separate the
+two independent cold paths — provider eviction and HNSW page cache — so the
+last regression had to be diagnosed with hand-run probes against the live DB.
+
+The holder is a `ContextVar` in `src/services/timing.py`, **owned by
+`_tracked`**: fresh dict at call start, cleared in `finally`. The ContextVar
+lives in a service module only to avoid an import cycle (`tools` imports
+`semantic_search`); nothing but `_tracked` calls `begin()`/`clear()`. Service
+return types are unchanged — a direct call outside a tracked tool finds no
+holder and records nothing. No migration: `params` is JSONB.
+
 ## Graph tools
 - `get_backlinks(path, limit)` — notes that link TO `path` (resolved links only).
 - `get_links(path)` — outgoing links from `path`, both resolved and dangling.

@@ -19,9 +19,9 @@
 
 ## 4. Per-phase timing
 
-- [ ] 4.1 `src/mcp_server/tools.py::_tracked`: create a `ContextVar[dict | None]` `_phase_timing`; set to `{}` at call start, read+merge `embed_ms`/`db_ms` into `params` before logging, reset in `finally`.
-- [ ] 4.2 `src/services/embeddings.py::semantic_search`: measure `embed_ms` around `get_embedding` and `db_ms` around the `SET LOCAL`s + execute + fetch; write into the holder if present. `find_related_impl`: `db_ms` around the source-chunk fetch + vector query. Return types unchanged.
-- [ ] 4.3 Tests: usage log params include integer `embed_ms`/`db_ms` and boolean `exact_fallback` for `semantic_search` with `embed_ms + db_ms ≤ duration_ms`; `find_related` has `db_ms` only (also on the "not embedded yet" early return); a subsequent different tracked tool in the same task has neither; direct service call outside `_tracked` does not raise.
+- [x] 4.1 `src/mcp_server/tools.py::_tracked`: create a `ContextVar[dict | None]` `_phase_timing`; set to `{}` at call start, read+merge `embed_ms`/`db_ms` into `params` before logging, reset in `finally`.
+- [x] 4.2 `src/services/embeddings.py::semantic_search`: measure `embed_ms` around `get_embedding` and `db_ms` around the `SET LOCAL`s + execute + fetch; write into the holder if present. `find_related_impl`: `db_ms` around the source-chunk fetch + vector query. Return types unchanged.
+- [x] 4.3 Tests: usage log params include integer `embed_ms`/`db_ms` and boolean `exact_fallback` for `semantic_search` with `embed_ms + db_ms ≤ duration_ms`; `find_related` has `db_ms` only (also on the "not embedded yet" early return); a subsequent different tracked tool in the same task has neither; direct service call outside `_tracked` does not raise.
 
 ## 5. Integration test (opt-in, reuses the pgvector harness from `dependency-refresh-2026-08`; add it identically here if that change has not merged)
 

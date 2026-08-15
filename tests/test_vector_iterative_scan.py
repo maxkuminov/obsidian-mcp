@@ -283,13 +283,18 @@ class _FindRelatedSession(_RecordingSession):
         return await super().execute(clause, *_a, **_k)
 
 
-def _install_find_related_session(monkeypatch, session):
+def _install_find_related_session(monkeypatch, session) -> dict:
+    """Wire the fake session in and return a dict that receives the params
+    `_tracked` logs. `_tracked` owns the timing holder and clears it on the way
+    out, so the usage row is the only place to observe `exact_fallback`."""
     monkeypatch.setattr(tools, "async_session", lambda: session)
+    logged: dict = {}
 
-    async def _noop(*_a, **_k):
-        return None
+    async def _capture(_tool, params, _duration_ms, _size):
+        logged.update(params)
 
-    monkeypatch.setattr(tools, "_log_usage", _noop)
+    monkeypatch.setattr(tools, "_log_usage", _capture)
+    return logged
 
 
 @pytest.mark.asyncio
@@ -344,7 +349,7 @@ async def test_find_related_zero_rows_falls_back_to_exact_scan(monkeypatch, hold
         [[1.0, 0.0, 0.0]],
         [[], [_RelatedRow(2, "b.md", [1.0, 0.0, 0.0], 0.1)]],
     )
-    _install_find_related_session(monkeypatch, session)
+    logged = _install_find_related_session(monkeypatch, session)
 
     out = await tools.find_related_impl("src.md", limit=10)
 
@@ -352,7 +357,7 @@ async def test_find_related_zero_rows_falls_back_to_exact_scan(monkeypatch, hold
     assert "SET LOCAL enable_indexscan = off" in " | ".join(session.statements)
     selects = _selects(session.statements)
     assert selects[-1] == selects[-2]
-    assert holder["exact_fallback"] is True
+    assert logged["exact_fallback"] is True
 
 
 @pytest.mark.asyncio

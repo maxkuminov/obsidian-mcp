@@ -102,24 +102,38 @@ def _tracked(tool_name: str, param_keys: list[str]):
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             start = time.monotonic()
-            result = await fn(*args, **kwargs)
-            duration_ms = int((time.monotonic() - start) * 1000)
-            params = {}
-            # Resolve logged params by NAME via the wrapped signature so that
-            # a non-logged positional arg between logged ones can't shift the
-            # mapping (positional zipping silently mislabelled params before).
+            # The decorator owns the per-phase timing holder: a fresh dict per
+            # call, reset in `finally`. That is what makes cross-call
+            # attribution impossible — an early return or an exception leaves
+            # measured phases at their measured value, and the *next* call in
+            # the same task starts from empty rather than inheriting them.
+            token = timing.begin()
             try:
-                bound = sig.bind(*args, **kwargs)
-                bound.apply_defaults()
-                params = {
-                    key: bound.arguments[key]
-                    for key in param_keys
-                    if key in bound.arguments
-                }
-            except TypeError:
+                result = await fn(*args, **kwargs)
+                duration_ms = int((time.monotonic() - start) * 1000)
                 params = {}
-            await _log_usage(tool_name, _truncate_params(params), duration_ms, len(str(result)))
-            return result
+                # Resolve logged params by NAME via the wrapped signature so
+                # that a non-logged positional arg between logged ones can't
+                # shift the mapping (positional zipping silently mislabelled
+                # params before).
+                try:
+                    bound = sig.bind(*args, **kwargs)
+                    bound.apply_defaults()
+                    params = {
+                        key: bound.arguments[key]
+                        for key in param_keys
+                        if key in bound.arguments
+                    }
+                except TypeError:
+                    params = {}
+                logged = _truncate_params(params)
+                # Whatever the service measured. Absent for tools that measure
+                # nothing, so `params` keeps its current shape for them.
+                logged.update(timing.current() or {})
+                await _log_usage(tool_name, logged, duration_ms, len(str(result)))
+                return result
+            finally:
+                timing.clear(token)
         return wrapper
     return decorator
 
@@ -743,16 +757,22 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
     limit = max(1, min(limit, 50))
 
     async with async_session() as session:
+        # `db_ms` covers every database phase of this tool, the source-chunk
+        # fetch included — it is accumulated, so the early returns below still
+        # report the work they actually did.
+        db_start = time.monotonic()
         src_stmt = select(NoteMetadata).where(NoteMetadata.file_path == path)
         if uid is not None:
             src_stmt = src_stmt.where(NoteMetadata.user_id == uid)
         source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
+            timing.add_ms("db_ms", time.monotonic() - db_start)
             return f"Note not found: {path}"
 
         chunks = (await session.execute(
             select(NoteEmbedding.embedding).where(NoteEmbedding.note_id == source.id)
         )).scalars().all()
+        timing.add_ms("db_ms", time.monotonic() - db_start)
         if not chunks:
             return (
                 f"`{path}` has not been embedded yet — "
@@ -762,6 +782,7 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         avg = np.mean([np.asarray(c, dtype=float) for c in chunks], axis=0)
         avg_list = avg.tolist()
 
+        vector_start = time.monotonic()
         # Same HNSW tuning as semantic_search — see embeddings.py for the
         # full rationale, including why iterative_scan is what keeps a
         # filtered vector query from silently coming back empty. This query is
@@ -802,6 +823,7 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
             rows = (await session.execute(stmt)).all()
             exact_fallback = True
         timing.record("exact_fallback", exact_fallback)
+        timing.add_ms("db_ms", time.monotonic() - vector_start)
 
         # `relaxed_order` does not promise a globally sorted stream; re-sort
         # before dedupe so the presented order is monotone in distance.
