@@ -14,6 +14,9 @@ someone later closes the window, the first one is the test that should change.
 import errno
 import hashlib
 import os
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -27,11 +30,14 @@ from src.services.vault_fs import (
     fingerprint,
     open_dir_beneath,
     open_root,
-    probe_filesystem,
+    probe_publication,
+    probe_trash,
     publish,
     remove,
     soft_delete,
 )
+
+TRASH_NAME = re.compile(r"^\d{8}-\d{6}-(?P<base>.+)-[0-9a-f]{8}$")
 
 
 @pytest.fixture
@@ -470,7 +476,7 @@ def test_soft_delete_moves_the_file_into_trash(root_fd, vault):
     (vault / "Attachments" / "a.png").write_bytes(b"bytes")
     dest = soft_delete(root_fd, "Attachments/a.png")
     assert dest.startswith(".trash/")
-    assert dest.endswith("-a.png")
+    assert TRASH_NAME.fullmatch(dest.split("/", 1)[1]).group("base") == "a.png"
     assert not (vault / "Attachments" / "a.png").exists()
     assert (vault / dest).read_bytes() == b"bytes"
 
@@ -505,63 +511,105 @@ def test_soft_delete_refuses_a_directory(root_fd, vault):
     assert (vault / "Attachments").is_dir()
 
 
-def test_soft_delete_does_not_unlink_a_replacement(root_fd, vault, monkeypatch):
-    """A file that replaces the source between link and unlink must survive.
+def test_soft_delete_moves_a_replacement_rather_than_destroying_it(
+    root_fd, vault, monkeypatch
+):
+    """A file that replaces the source before the move must not be unlinked.
 
-    `link` + `unlink` is two syscalls. Without an inode check the second one
-    removes whatever is at the name *now* — so a writer landing in between has
-    its file deleted with no trash copy of it, which is a silent destructive
-    delete. The check makes that a `Conflict` instead.
+    `link` + `unlink` was two syscalls, and the second one removed whatever
+    was at the name *then* — a writer landing in between had its file deleted
+    with no trash copy of it, a silent destructive delete. `rename` moves
+    whichever inode is at the source when it runs, so the replacement lands in
+    the trash intact and nothing is ever unlinked.
     """
     source = vault / "Attachments" / "a.png"
     source.write_bytes(b"original")
 
-    real_link = os.link
+    real_reserve = vault_fs._reserve_trash_name
 
-    def swapping_link(*args, **kwargs):
-        real_link(*args, **kwargs)
-        # The window: the trash now holds `original`, and someone replaces the
+    def racing_reserve(trash_fd, base):
+        reserved = real_reserve(trash_fd, base)
+        # The window: the destination is claimed, and someone now replaces the
         # source name with a different inode.
         replacement = vault / "Attachments" / "a.png.new"
         replacement.write_bytes(b"replacement")
         os.replace(replacement, source)
+        return reserved
 
-    monkeypatch.setattr(os, "link", swapping_link)
-    with pytest.raises(Conflict):
-        soft_delete(root_fd, "Attachments/a.png")
-    monkeypatch.undo()
-
-    # The replacement is untouched, and the trash link we made was cleaned up
-    # rather than left as a half-finished delete.
-    assert source.read_bytes() == b"replacement"
-    trash = vault / ".trash"
-    assert not trash.exists() or list(trash.iterdir()) == []
-
-
-def test_soft_delete_succeeds_when_the_source_vanished_after_the_link(
-    root_fd, vault, monkeypatch
-):
-    """Someone else deleted it; our trash copy is still the promised copy."""
-    source = vault / "Attachments" / "a.png"
-    source.write_bytes(b"original")
-
-    real_link = os.link
-
-    def vanishing_link(*args, **kwargs):
-        real_link(*args, **kwargs)
-        source.unlink()
-
-    monkeypatch.setattr(os, "link", vanishing_link)
+    monkeypatch.setattr(vault_fs, "_reserve_trash_name", racing_reserve)
     dest = soft_delete(root_fd, "Attachments/a.png")
     monkeypatch.undo()
 
-    assert (vault / dest).read_bytes() == b"original"
+    # The replacement was moved, not destroyed, and the trash holds exactly one
+    # entry — no orphaned placeholder from a half-finished delete.
+    assert (vault / dest).read_bytes() == b"replacement"
     assert not source.exists()
+    assert [p.name for p in (vault / ".trash").iterdir()] == [dest.split("/", 1)[1]]
+
+
+def test_soft_delete_reports_a_source_that_vanished_before_the_move(
+    root_fd, vault, monkeypatch
+):
+    """Someone else deleted it first: nothing to move, nothing left behind."""
+    source = vault / "Attachments" / "a.png"
+    source.write_bytes(b"original")
+
+    real_reserve = vault_fs._reserve_trash_name
+
+    def vanishing_reserve(trash_fd, base):
+        reserved = real_reserve(trash_fd, base)
+        source.unlink()
+        return reserved
+
+    monkeypatch.setattr(vault_fs, "_reserve_trash_name", vanishing_reserve)
+    with pytest.raises(FileNotFoundError):
+        soft_delete(root_fd, "Attachments/a.png")
+    monkeypatch.undo()
+
+    # The reserved placeholder is cleaned up: an empty file in `.trash` would
+    # claim a copy exists when none does.
+    assert list((vault / ".trash").iterdir()) == []
+
+
+def test_concurrent_soft_deletes_of_the_same_basename_get_distinct_names(
+    root_fd, vault
+):
+    """Same second, same basename, two threads: two files, two names."""
+    for i in range(8):
+        (vault / f"d{i}").mkdir()
+        (vault / f"d{i}" / "shot.png").write_bytes(f"body-{i}".encode())
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        dests = list(
+            pool.map(lambda i: soft_delete(root_fd, f"d{i}/shot.png"), range(8))
+        )
+
+    assert len(set(dests)) == 8
+    for i, dest in enumerate(dests):
+        assert TRASH_NAME.fullmatch(dest.split("/", 1)[1]).group("base") == "shot.png"
+        assert (vault / dest).read_bytes() == f"body-{i}".encode()
+    assert len(list((vault / ".trash").iterdir())) == 8
 
 
 def test_soft_delete_missing_file(root_fd):
     with pytest.raises(FileNotFoundError):
         soft_delete(root_fd, "Attachments/nope.png")
+
+
+def test_soft_delete_maps_a_cross_device_trash(root_fd, vault, monkeypatch):
+    """`.trash` on another mount cannot be reached by an atomic rename."""
+    (vault / "Attachments" / "a.png").write_bytes(b"bytes")
+
+    def refuse(*args, **kwargs):
+        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+
+    monkeypatch.setattr(vault_fs.os, "rename", refuse)
+    with pytest.raises(UnsupportedFilesystem):
+        soft_delete(root_fd, "Attachments/a.png")
+    monkeypatch.undo()
+
+    assert (vault / "Attachments" / "a.png").read_bytes() == b"bytes"
+    assert list((vault / ".trash").iterdir()) == []
 
 
 def test_remove_unlinks_permanently(root_fd, vault):
@@ -599,72 +647,93 @@ def test_deletion_through_a_symlinked_ancestor_is_refused(root_fd, vault, tmp_pa
 # ── filesystem probe ────────────────────────────────────────────────────────
 
 
-def test_probe_filesystem_passes_on_a_normal_filesystem(root_fd, vault):
-    probe_filesystem(root_fd)
+def test_probe_publication_passes_on_a_normal_filesystem(root_fd, vault):
+    probe_publication(root_fd)
     assert _temps(vault) == []
 
 
+def test_probe_publication_does_not_create_the_trash(root_fd, vault):
+    """It probes publication only; `.trash` belongs to the delete path."""
+    probe_publication(root_fd)
+    assert not (vault / ".trash").exists()
+
+
 @pytest.mark.parametrize("code", [errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP])
-def test_probe_filesystem_maps_link_refusals(root_fd, vault, monkeypatch, code):
+def test_probe_publication_maps_link_refusals(root_fd, vault, monkeypatch, code):
     def refuse(*args, **kwargs):
         raise OSError(code, os.strerror(code))
 
     monkeypatch.setattr(vault_fs.os, "link", refuse)
     with pytest.raises(UnsupportedFilesystem):
-        probe_filesystem(root_fd)
+        probe_publication(root_fd)
     # Even on the failure path the probe leaves nothing behind.
     assert _temps(vault) == []
 
 
-def test_probe_filesystem_catches_a_cross_device_trash(root_fd, vault, monkeypatch):
-    """A `.trash` on a separate mount passes the in-root link and fails this one.
+def test_probe_trash_passes_and_leaves_nothing(root_fd, vault):
+    probe_trash(root_fd)
+    assert _temps(vault) == []
+    assert list((vault / ".trash").iterdir()) == []
+
+
+def test_probe_trash_catches_a_cross_device_trash(root_fd, vault, monkeypatch):
+    """A `.trash` on a separate mount cannot receive an atomic rename.
 
     That combination is the dangerous one: `publish` keeps working, so nothing
-    looks wrong until the first `delete_file` cannot link into the trash — by
-    which point a naive implementation has already unlinked the original.
+    looks wrong until the first `delete_file` cannot move anything into the
+    trash — and a naive implementation would have unlinked the original by then.
     """
-    real_link = vault_fs.os.link
-    calls = []
-
-    def refuse_second(*args, **kwargs):
-        calls.append(kwargs.get("dst_dir_fd"))
-        if len(calls) == 1:
-            return real_link(*args, **kwargs)
+    def refuse(*args, **kwargs):
         raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
 
-    monkeypatch.setattr(vault_fs.os, "link", refuse_second)
+    monkeypatch.setattr(vault_fs.os, "rename", refuse)
     with pytest.raises(UnsupportedFilesystem, match=r"\.trash"):
-        probe_filesystem(root_fd)
+        probe_trash(root_fd)
+    monkeypatch.undo()
     assert _temps(vault) == []
 
 
-def test_probe_filesystem_propagates_unrelated_errors(root_fd, monkeypatch):
+def test_probe_trash_tolerates_a_filesystem_without_hard_links(
+    root_fd, vault, monkeypatch
+):
+    """A soft delete renames; it never links. Refusing here would be wrong."""
+    def refuse(*args, **kwargs):
+        raise OSError(errno.EPERM, "no links")
+
+    monkeypatch.setattr(vault_fs.os, "link", refuse)
+    probe_trash(root_fd)
+
+
+def test_probe_publication_propagates_unrelated_errors(root_fd, monkeypatch):
     def refuse(*args, **kwargs):
         raise OSError(errno.EIO, "io error")
 
     monkeypatch.setattr(vault_fs.os, "link", refuse)
     with pytest.raises(OSError) as exc:
-        probe_filesystem(root_fd)
+        probe_publication(root_fd)
     assert not isinstance(exc.value, UnsupportedFilesystem)
 
 
-def test_check_filesystem_support_caches_the_verdict(vault, monkeypatch):
+def test_the_probes_are_cached_independently(vault, monkeypatch):
     vault_fs.reset_filesystem_probe_cache()
     calls = []
-    real = vault_fs.probe_filesystem
+    real_pub, real_trash = vault_fs.probe_publication, vault_fs.probe_trash
 
-    def counting(fd):
-        calls.append(fd)
-        return real(fd)
-
-    monkeypatch.setattr(vault_fs, "probe_filesystem", counting)
-    vault_fs.check_filesystem_support(vault)
-    vault_fs.check_filesystem_support(vault)
-    assert len(calls) == 1
+    monkeypatch.setattr(
+        vault_fs, "probe_publication", lambda fd: (calls.append("pub"), real_pub(fd))[1]
+    )
+    monkeypatch.setattr(
+        vault_fs, "probe_trash", lambda fd: (calls.append("trash"), real_trash(fd))[1]
+    )
+    vault_fs.check_publication_support(vault)
+    vault_fs.check_publication_support(vault)
+    vault_fs.check_trash_support(vault)
+    vault_fs.check_trash_support(vault)
+    assert calls == ["pub", "trash"]
     vault_fs.reset_filesystem_probe_cache()
 
 
-def test_check_filesystem_support_reraises_the_cached_failure(vault, monkeypatch):
+def test_check_publication_support_reraises_the_cached_failure(vault, monkeypatch):
     vault_fs.reset_filesystem_probe_cache()
 
     def refuse(*args, **kwargs):
@@ -672,11 +741,59 @@ def test_check_filesystem_support_reraises_the_cached_failure(vault, monkeypatch
 
     monkeypatch.setattr(vault_fs.os, "link", refuse)
     with pytest.raises(UnsupportedFilesystem):
-        vault_fs.check_filesystem_support(vault)
+        vault_fs.check_publication_support(vault)
     # Second call must fail the same way from the cache, without touching disk.
-    monkeypatch.setattr(vault_fs, "probe_filesystem", lambda fd: pytest.fail("reprobed"))
+    monkeypatch.setattr(
+        vault_fs, "probe_publication", lambda fd: pytest.fail("reprobed")
+    )
     with pytest.raises(UnsupportedFilesystem):
-        vault_fs.check_filesystem_support(vault)
+        vault_fs.check_publication_support(vault)
+    vault_fs.reset_filesystem_probe_cache()
+
+
+# ── stale staging sweep ─────────────────────────────────────────────────────
+
+
+def _stage(vault: Path, name: str, age_seconds: float) -> Path:
+    staging = vault / vault_fs.STAGING_DIR
+    staging.mkdir(exist_ok=True)
+    path = staging / name
+    path.write_bytes(b"abandoned")
+    when = time.time() - age_seconds
+    os.utime(path, (when, when))
+    return path
+
+
+def test_prune_stale_staging_removes_only_the_old_ones(root_fd, vault):
+    old = _stage(vault, ".tmp-old", 25 * 3600)
+    fresh = _stage(vault, ".tmp-fresh", 5)
+    kept = _stage(vault, "not-a-temp", 25 * 3600)
+
+    assert vault_fs.prune_stale_staging(root_fd) == 1
+    assert not old.exists()
+    assert fresh.exists()
+    assert kept.exists()
+
+
+def test_prune_stale_staging_is_a_no_op_without_a_staging_dir(root_fd, vault):
+    assert vault_fs.prune_stale_staging(root_fd) == 0
+    assert not (vault / vault_fs.STAGING_DIR).exists()
+
+
+def test_the_first_publication_probe_sweeps_stale_staging(vault, monkeypatch):
+    """The sweep rides the probe: one walk, once per root, on a write path."""
+    vault_fs.reset_filesystem_probe_cache()
+    old = _stage(vault, ".tmp-old", 25 * 3600)
+    fresh = _stage(vault, ".tmp-fresh", 5)
+
+    vault_fs.check_publication_support(vault)
+    assert not old.exists()
+    assert fresh.exists()
+
+    # Cached: a second call neither probes nor sweeps again.
+    second = _stage(vault, ".tmp-old-2", 25 * 3600)
+    vault_fs.check_publication_support(vault)
+    assert second.exists()
     vault_fs.reset_filesystem_probe_cache()
 
 

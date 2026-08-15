@@ -8,6 +8,7 @@ import posixpath
 import re
 import time
 from collections import Counter
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
@@ -1711,6 +1712,12 @@ def _mint_preflight(path: str, *, need_write: bool) -> tuple | str:
 
     Returns `(uid, root, rel, base)` or an error string. Every refusal happens
     before a row is written, so a failed mint leaves nothing behind.
+
+    **The filesystem probe runs only for a write.** `probe_publication` creates
+    a temp file and a hard link; running it for `request_download` would mean a
+    read-only identity's read tool writing to the vault — on a fresh vault, the
+    first thing it ever did would be to create files. A download publishes
+    nothing, so it needs no proof that publication works.
     """
     if need_write and (err := _require_write()):
         return err
@@ -1724,12 +1731,13 @@ def _mint_preflight(path: str, *, need_write: bool) -> tuple | str:
         return str(e)
     except RuntimeError as e:  # cold vault-path cache in multi-user mode
         return str(e)
-    try:
-        vault_fs.check_filesystem_support(root)
-    except vault_fs.UnsupportedFilesystem as e:
-        return str(e)
-    except (OSError, vault_fs.VaultFSError) as e:
-        return f"Vault root is not usable: {e}"
+    if need_write:
+        try:
+            vault_fs.check_publication_support(root)
+        except vault_fs.UnsupportedFilesystem as e:
+            return str(e)
+        except (OSError, vault_fs.VaultFSError) as e:
+            return f"Vault root is not usable: {e}"
     return uid, root, rel, base.rstrip("/")
 
 
@@ -1793,9 +1801,32 @@ async def request_upload_impl(
     )
 
 
-@_tracked("check_upload", ["upload_id"])
+def _loggable_upload_id(value) -> str:
+    """What `check_upload` logs in place of a malformed `upload_id`.
+
+    An `upload_id` is 22 characters of URL-safe base64 and nothing else. An
+    agent that passes the whole `…/transfer/upload#<token>` URL, or the token
+    itself, would otherwise put a live capability into `usage_logs` — a table
+    the panel renders. Anything off-shape is logged as a fixed marker, so the
+    log records *that* the tool was misused without recording the secret.
+    """
+    return value if transfer.is_public_id(value) else "<invalid>"
+
+
+@_tracked(
+    "check_upload", ["upload_id"], transforms={"upload_id": _loggable_upload_id}
+)
 async def check_upload_impl(upload_id: str) -> str:
     """Report the state of an upload link this identity minted."""
+    if not transfer.is_public_id(upload_id):
+        # Refused before the lookup *and* before `_tracked` logs it. The
+        # message deliberately does not echo the value back: it may be the
+        # token, and the tool result is itself model context.
+        return (
+            "not found: that is not an upload_id. `check_upload` takes the "
+            "`upload_id` from `request_upload` (22 characters), not the upload "
+            "URL and not the token after the `#`."
+        )
     identity = _transfer_identity()
     async with async_session() as session:
         row = await transfer.lookup_by_public_id(
@@ -1941,7 +1972,8 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
 
     # The four fields `stream_to_vault` reads. Not a token row: an import is
     # authenticated by the caller's own MCP identity, so there is no capability
-    # to mint and nothing to re-validate mid-stream.
+    # to mint — but there is still an identity to re-validate, because the
+    # fetch can run for 30 s and the key can die inside that window.
     row = SimpleNamespace(
         vault_root=root,
         path=rel,
@@ -1949,6 +1981,22 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
         expected_fingerprint=fingerprint if overwrite else None,
     )
     cap = settings.max_file_write_bytes
+    identity = _transfer_identity()
+
+    @asynccontextmanager
+    async def gate():
+        """Lock this caller's own credential and user rows across the publish.
+
+        Same guarantee the upload route's token gate gives, for the tool that
+        has no token: a revocation, downgrade, deletion or root reassignment
+        committed while the body streams either waits for these locks or beats
+        us to them, and in the second case nothing is published.
+        """
+        async with async_session() as session:
+            async with transfer.lock_identity_for_publish(
+                session, identity, vault_root=root, need_write=True
+            ) as handle:
+                yield handle
 
     try:
         async with transfer.fetch_url_guarded(url, max_bytes=cap) as fetched:
@@ -1958,6 +2006,7 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
                 max_bytes=cap,
                 deadline=time.monotonic() + transfer.DEFAULT_FETCH_DEADLINE,
                 idle_timeout=30.0,
+                before_publish=gate,
             )
             final_url = fetched.final_url
     except transfer.SSRFError as e:
@@ -1966,6 +2015,12 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
         return f"{e}. Nothing was written."
     except transfer.Timeout as e:
         return f"{e}. Nothing was written."
+    except transfer.PrePublishAborted:
+        return (
+            f"Your credentials are no longer valid for writing to {rel} (the key "
+            "was revoked, downgraded, or repointed while the fetch was in "
+            "flight). Nothing was written."
+        )
     except vault_fs.Conflict as e:
         return f"{e}. Nothing was written."
     except vault_fs.UnsafePath as e:
@@ -1986,23 +2041,35 @@ async def delete_file_impl(path: str, permanent: bool = False) -> str:
     """Delete a non-markdown vault file, soft by default."""
     if err := _require_write():
         return err
-    if path.lower().endswith(".md"):
-        return (
-            f"{path} is a markdown note. Use `delete_note` for notes — it is the "
-            "tool that knows about the index and about backlinks. `delete_file` "
-            "handles everything else."
-        )
     uid = current_user_id.get()
     try:
         root, rel = _vault_context(path, uid)
     except (ValueError, RuntimeError) as e:
         return str(e)
-    try:
-        vault_fs.check_filesystem_support(root)
-    except vault_fs.UnsupportedFilesystem as e:
-        return str(e)
-    except (OSError, vault_fs.VaultFSError) as e:
-        return f"Vault root is not usable: {e}"
+
+    # **Canonicalise first, then refuse.** The markdown guard has to run on the
+    # component the filesystem will actually open, because the caller's string
+    # and that component are not the same thing: `note.md/.`, `note.md/` and
+    # `a//note.md` all reach a `.md` file while failing a naive
+    # `path.lower().endswith(".md")`, which is how a note gets deleted by the
+    # tool that does not know about the index or the backlink graph.
+    if PurePosixPath(rel).name.lower().endswith(".md"):
+        return (
+            f"{rel} is a markdown note. Use `delete_note` for notes — it is the "
+            "tool that knows about the index and about backlinks. `delete_file` "
+            "handles everything else."
+        )
+
+    if not permanent:
+        # Only the soft delete needs the trash to be usable; `permanent=True` is
+        # a plain unlink, and probing for it would create `.trash` for a caller
+        # who explicitly asked not to use it.
+        try:
+            vault_fs.check_trash_support(root)
+        except vault_fs.UnsupportedFilesystem as e:
+            return str(e)
+        except (OSError, vault_fs.VaultFSError) as e:
+            return f"Vault root is not usable: {e}"
 
     root_fd = vault_fs.open_root(root)
     try:

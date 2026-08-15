@@ -1194,3 +1194,161 @@ async def test_download_round_trip_through_the_route(clean, vault_root, wired):
         logs = (await session.execute(select(UsageLog))).scalars().all()
     assert [log.tool for log in logs] == ["download_file", "download_file"]
     assert all(log.user_id == user.id for log in logs)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 5.4 — `import_from_url` publishes through a locked identity gate
+#
+# The import tool has no capability to re-validate: it is authorised by the
+# caller's own MCP session. But the fetch holds a network stream open for up to
+# 30 s, which is ample time for the key to be revoked, downgraded, or pointed at
+# another vault — and without a gate the bytes would land under whatever the
+# identity looked like when the tool started. Only real row locks can show that
+# the revocation either waits for the publisher or wins outright.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def import_caller(vault_root, sessionmaker, monkeypatch):
+    """Run `import_from_url` as a seeded identity against the throwaway database."""
+    import src.mcp_server.tools as tools
+    from src.auth.session import current_user_id
+    from src.mcp_server.auth import current_api_key_id, current_permission
+    from src.services import vault as vault_service
+
+    monkeypatch.setattr(tools, "async_session", sessionmaker)
+    monkeypatch.setattr(tools.settings, "mcp_hostname", "vault.example.com")
+    monkeypatch.setattr(tools.settings, "base_url", "https://vault.example.com")
+    monkeypatch.setattr(tools.settings, "_public_origin_explicit", True)
+
+    def become(user, key):
+        # The tools read identity from contextvars, exactly as the MCP auth
+        # middleware sets them, and the vault root from the warmed cache. No
+        # reset on teardown: pytest-asyncio runs each test coroutine in its own
+        # task, which copies the context, so a `set` in here cannot escape into
+        # the next test — and a `reset` from the fixture's (different) context
+        # is an error, not a cleanup.
+        vault_service._user_vault_cache[user.id] = Path(vault_root)
+        current_permission.set(key.permission)
+        current_api_key_id.set(key.id)
+        current_user_id.set(user.id)
+
+    yield become
+
+    vault_service.clear_user_vault_cache()
+
+
+def _paused_fetch(gate: asyncio.Event, released: asyncio.Event):
+    """A canned origin whose body stalls once, so the test can mutate the DB."""
+    from contextlib import asynccontextmanager
+
+    async def body():
+        yield PAYLOAD[:16]
+        released.set()
+        await asyncio.wait_for(gate.wait(), timeout=10)
+        yield PAYLOAD[16:]
+
+    @asynccontextmanager
+    async def fake_fetch(url, **kwargs):
+        yield transfer.FetchResult(
+            chunks=body(), final_url=url, content_type="image/png"
+        )
+
+    return fake_fetch
+
+
+async def _start_import(clean, vault_root, import_caller, monkeypatch):
+    """Seed an identity, start an import, and pause it mid-body.
+
+    Returns `(task, gate, user, key)`. The caller mutates the identity in the
+    database, sets `gate`, and awaits the task — so every mutation lands while
+    the tool is between its first and last chunk, i.e. before the publish.
+    """
+    import src.mcp_server.tools as tools
+
+    async with clean() as session:
+        user, key, _ = await _seed_identity(session, vault_path=str(vault_root))
+    import_caller(user, key)
+
+    gate, released = asyncio.Event(), asyncio.Event()
+    monkeypatch.setattr(transfer, "fetch_url_guarded", _paused_fetch(gate, released))
+
+    task = asyncio.create_task(
+        tools.import_from_url_impl("https://example.com/a.png", "Attachments/a.png")
+    )
+    await asyncio.wait_for(released.wait(), timeout=10)
+    return task, gate, user, key
+
+
+async def test_import_publishes_nothing_when_the_key_is_revoked_mid_fetch(
+    clean, vault_root, wired, import_caller, monkeypatch
+):
+    task, gate, _user, key = await _start_import(
+        clean, vault_root, import_caller, monkeypatch
+    )
+    async with wired() as session:
+        await session.execute(
+            update(APIKey).where(APIKey.id == key.id).values(is_active=False)
+        )
+        await session.commit()
+    gate.set()
+
+    result = await asyncio.wait_for(task, timeout=20)
+    assert "no longer valid" in result
+    assert not (vault_root / "Attachments" / "a.png").exists()
+    staging = vault_root / ".transfer-tmp"
+    assert not staging.exists() or list(staging.iterdir()) == []
+
+
+async def test_import_publishes_nothing_when_the_key_is_downgraded_mid_fetch(
+    clean, vault_root, wired, import_caller, monkeypatch
+):
+    task, gate, _user, key = await _start_import(
+        clean, vault_root, import_caller, monkeypatch
+    )
+    async with wired() as session:
+        await session.execute(
+            update(APIKey).where(APIKey.id == key.id).values(permission="read")
+        )
+        await session.commit()
+    gate.set()
+
+    result = await asyncio.wait_for(task, timeout=20)
+    assert "no longer valid" in result
+    assert not (vault_root / "Attachments" / "a.png").exists()
+
+
+async def test_import_publishes_nothing_when_the_root_is_reassigned_mid_fetch(
+    clean, vault_root, wired, import_caller, monkeypatch, tmp_path
+):
+    """The gate compares the *database's* root with the one the tool started on."""
+    task, gate, user, _key = await _start_import(
+        clean, vault_root, import_caller, monkeypatch
+    )
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    async with wired() as session:
+        await session.execute(
+            update(User).where(User.id == user.id).values(vault_path=str(elsewhere))
+        )
+        await session.commit()
+    gate.set()
+
+    result = await asyncio.wait_for(task, timeout=20)
+    assert "no longer valid" in result
+    assert not (vault_root / "Attachments" / "a.png").exists()
+    assert list(elsewhere.iterdir()) == []
+
+
+async def test_import_completes_under_an_untouched_identity(
+    clean, vault_root, wired, import_caller, monkeypatch
+):
+    """The gate is a guard, not a wall: an unchanged identity still publishes."""
+    task, gate, _user, _key = await _start_import(
+        clean, vault_root, import_caller, monkeypatch
+    )
+    gate.set()
+
+    result = await asyncio.wait_for(task, timeout=20)
+    assert "Imported" in result
+    assert (vault_root / "Attachments" / "a.png").read_bytes() == PAYLOAD

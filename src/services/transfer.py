@@ -155,6 +155,24 @@ def new_public_id() -> str:
     return secrets.token_urlsafe(PUBLIC_ID_BYTES)
 
 
+# `secrets.token_urlsafe(16)` is always 22 characters of the URL-safe base64
+# alphabet — no padding, no other punctuation.
+PUBLIC_ID_RE = re.compile(r"[A-Za-z0-9_-]{22}")
+
+
+def is_public_id(value: object) -> bool:
+    """Does `value` have the exact shape `new_public_id()` produces?
+
+    Checked *before* the value reaches a log line, not just before it reaches
+    the database. `check_upload`'s argument is agent-supplied, and the two
+    mistakes an agent actually makes are pasting the whole
+    `…/transfer/upload#<token>` URL or the bare token in place of the handle —
+    both of which would otherwise write a capability into `usage_logs`, which
+    is precisely the place a capability must never appear.
+    """
+    return isinstance(value, str) and PUBLIC_ID_RE.fullmatch(value) is not None
+
+
 def clamp_expires_in(expires_in: int | None) -> int:
     """Clamp a caller-supplied TTL into `[60, 3600]`; `None` → the configured default.
 
@@ -564,6 +582,104 @@ class GateHandle:
 PrePublishGate = Callable[[], AsyncContextManager[GateHandle]]
 
 
+@dataclass(frozen=True)
+class _IdentityRow:
+    """The one field `_credential_ok` reads off a token row.
+
+    `import_from_url` has no token — it is authorised by the caller's own MCP
+    session — but the predicate that decides whether a credential may still
+    write is exactly the same one, and it must not be reimplemented.
+    """
+
+    user_id: int | None
+
+
+async def _load_identity_credential(session, identity: Identity, *, lock: bool = False):
+    if identity.key_id is not None:
+        stmt = select(APIKey).where(APIKey.id == identity.key_id)
+    elif identity.oauth_token_id is not None:
+        stmt = select(OAuthToken).where(OAuthToken.id == identity.oauth_token_id)
+    else:
+        # No credential to re-validate means nothing can be proven about the
+        # caller at publish time, so the gate refuses. Every authenticated MCP
+        # path sets one of the two.
+        return None
+    if lock:
+        stmt = stmt.with_for_update()
+    return (
+        await session.execute(stmt.execution_options(populate_existing=True))
+    ).scalar_one_or_none()
+
+
+async def _identity_publish_ok(
+    session, identity: Identity, *, vault_root: str, need_write: bool
+) -> bool:
+    """D4's predicates, run against rows this transaction holds `FOR UPDATE`."""
+    cred = await _load_identity_credential(session, identity, lock=True)
+    if cred is None:
+        return False
+    if not _credential_ok(
+        cred, need_write=need_write, row=_IdentityRow(user_id=identity.user_id)
+    ):
+        return False
+    expected = canonical_vault_root(vault_root)
+    if identity.user_id is None:
+        return canonical_vault_root(settings.vault_path) == expected
+    user = (
+        await session.execute(
+            select(User)
+            .where(User.id == identity.user_id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+    ).scalar_one_or_none()
+    if user is None or not user.is_active or not user.vault_path:
+        return False
+    return canonical_vault_root(user.vault_path) == expected
+
+
+@asynccontextmanager
+async def lock_identity_for_publish(
+    session,
+    identity: Identity,
+    *,
+    vault_root: str,
+    need_write: bool = True,
+    on_complete: "Callable[[dict, bool], Awaitable[None]] | None" = None,
+) -> AsyncIterator[GateHandle]:
+    """The publish gate for a write authorised by a *session*, not a token.
+
+    `lock_for_publish` protects a capability: it locks the transfer row plus the
+    credential that minted it. This is the same guarantee for `import_from_url`,
+    which has no capability but does hold a network stream open for up to 30 s —
+    long enough for the key to be revoked, downgraded, deleted, or pointed at a
+    different vault while the bytes are still arriving. Without a gate the
+    publish would land under whatever the identity looked like when the tool
+    *started*.
+
+    So: `SELECT … FOR UPDATE` on the caller's credential row and (multi-user)
+    their user row, re-run D4's predicates against those locked rows, and check
+    the vault root the database reports still equals the root captured when the
+    tool began resolving paths. The locks are held for as long as the caller
+    keeps the context open — which `stream_to_vault` keeps open across the
+    filesystem publish — so a revocation either waits for us or wins outright.
+
+    Lock order is credential → user, the same relative order `lock_for_publish`
+    uses, so an import and an upload cannot deadlock against each other.
+
+    `complete()` is a no-op unless the caller supplies `on_complete`: an import
+    has no token row to move to `completed`, and its `usage_logs` row is written
+    by `_tracked` after the tool returns.
+    """
+    async with session.begin():
+        ok = await _identity_publish_ok(
+            session, identity, vault_root=vault_root, need_write=need_write
+        )
+        yield GateHandle(
+            ok=ok, session=session, on_complete=on_complete if ok else None
+        )
+
+
 def _write_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
@@ -644,6 +760,14 @@ async def stream_to_vault(
     Returns `{"size", "sha256", "mime"}`. Raises `TooLarge`, `Timeout`,
     `PrePublishAborted`, or `vault_fs.Conflict` / `vault_fs.UnsafePath` — and
     in every case leaves no temp file and nothing at the target path.
+
+    **The contract callers depend on: `PostPublishFailure` is the only error
+    raised after the bytes are in place.** Every other exception — including an
+    unexpected `OSError` from the stream or a database error opening the gate —
+    means nothing was published and no temp file survives, which is what lets
+    the upload route release the claim rather than stranding the token. If you
+    add a step between `publish` and the return, it must raise
+    `PostPublishFailure` too.
     """
     if content_length is not None and content_length > max_bytes:
         # Refuse before opening anything: a declared oversize body should cost

@@ -20,8 +20,9 @@ Three properties are load-bearing and easy to break by accident:
    header parse and one indexed lookup.
 3. **Every non-usable token gets the same 404.** Unknown, expired, consumed,
    claimed by someone else, minted by a since-revoked key, minted for a user
-   whose root was reassigned — one body, one status, no branch a caller can
-   time. `_not_found()` is the only way to say no.
+   whose root was reassigned — one body, one status. `_not_found()` is the only
+   way to say no. (The claim is about the *response*, not about latency: the
+   branches do different amounts of work and nothing here is constant-time.)
 
 `GZipMiddleware` is app-wide, so `download/file` sets `Content-Encoding:
 identity`; Starlette's middleware leaves a response that already declares an
@@ -305,7 +306,9 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
             return _not_found()
 
         try:
-            vault_fs.check_filesystem_support(row.vault_root)
+            # Publication only: the trash probe belongs to `delete_file`, and
+            # this route never soft-deletes anything.
+            vault_fs.check_publication_support(row.vault_root)
         except vault_fs.UnsupportedFilesystem as exc:
             logger.error("Transfer refused: %s", exc)
             await transfer.release_claim(session, row)
@@ -404,12 +407,17 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
             await transfer.release_claim(session, row)
             raise
         except Exception:
-            # Deliberately *not* released. Anything else — an OS error, a
-            # database failure after the bytes landed — leaves the claim in
-            # place, because from here we cannot prove nothing was published and
-            # a replayable token is the worse failure. `claimed` is terminal
-            # until the TTL passes.
-            logger.exception("Upload failed after claim (token left claimed)")
+            # Everything else out of `stream_to_vault` is *demonstrably*
+            # pre-publication: a full disk while writing the staged body, a
+            # database error opening the gate, a walk that failed. The helper
+            # raises `PostPublishFailure` — handled above — for every failure
+            # once the bytes are in place, so reaching here means nothing was
+            # published and no temp file survives. Releasing is then the
+            # correct answer: the human gets to retry the same link instead of
+            # holding a capability that is stuck until its TTL for a transfer
+            # that never touched the vault.
+            logger.exception("Upload failed before publication (claim released)")
+            await transfer.release_claim(session, row)
             raise
 
         # Reaching here means the gate recorded `result` and its transaction
@@ -525,6 +533,12 @@ async def download_file(request: Request, token: str | None = Depends(_bearer)) 
             # same uniform 404. Nothing here tells the caller which.
             return _not_found()
 
+        # The descriptor is closed on every exit but one: the streaming
+        # response, which takes ownership of it and closes it when the body is
+        # done. A `return` inside this block — a fingerprint mismatch, a HEAD —
+        # must not leak it, and a mismatching token can be retried at the rate
+        # limit, so a leak here is a slow file-descriptor exhaustion.
+        handed_off = False
         try:
             want = row.expected_fingerprint or {}
             if not _fingerprint_matches(want, st):
@@ -554,7 +568,6 @@ async def download_file(request: Request, token: str | None = Depends(_bearer)) 
             }
 
             if request.method == "HEAD":
-                os.close(fd)
                 return Response(status_code=200, media_type=mime, headers=headers)
 
             session.add(
@@ -566,9 +579,10 @@ async def download_file(request: Request, token: str | None = Depends(_bearer)) 
                 )
             )
             await session.commit()
-        except BaseException:
-            os.close(fd)
-            raise
+            handed_off = True
+        finally:
+            if not handed_off:
+                os.close(fd)
 
     return StreamingResponse(
         _stream_fd(fd, st.st_size), media_type=mime, headers=headers

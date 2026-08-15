@@ -232,8 +232,9 @@ no embedding or indexing of non-markdown files.
   `ls`-style browse of files and subdirectories with size and mtime,
   glob-filterable and result-capped.
 - `delete_file(path, permanent=False)`, soft-deletes a non-markdown
-  file to `.trash/<YYYYMMDD-HHMMSS>-<basename>`. Refuses markdown
-  (that is `delete_note`), directories, and symlinks.
+  file to `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` with a single
+  atomic rename. Refuses markdown (that is `delete_note`), directories,
+  and symlinks.
 
 All four reuse the path-traversal guard and exclude dot-directories
 (`.obsidian`, `.git`, `.trash`, …), matching the indexer's visibility

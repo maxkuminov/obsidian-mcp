@@ -462,6 +462,9 @@ async def test_body_is_not_read_before_the_claim(client, harness, vault):
     response = await client.put("/transfer/upload", headers=auth(harness), content=body())
     assert response.status_code == 404
     assert response.json() == {"error": "not found"}
+    # Not one chunk was pulled off the wire: the claim runs to completion first,
+    # so an unknown token cannot make us spool gigabytes.
+    assert consumed == 0
     assert temp_files(vault / "Attachments") == []
     assert not (vault / "Attachments" / "shot.png").exists()
 
@@ -661,6 +664,47 @@ async def test_a_failure_after_publication_leaves_the_token_claimed(
     assert harness.row.state == "claimed"
 
 
+async def test_a_full_disk_mid_stream_releases_the_claim(
+    client, harness, vault, monkeypatch
+):
+    """An ENOSPC while staging is demonstrably before publication.
+
+    Leaving the token `claimed` there would strand the capability for its whole
+    TTL over a transfer that never touched the vault. `claimed`-forever is
+    reserved for `PostPublishFailure`, where we genuinely cannot tell.
+    """
+    import errno
+
+    def no_space(fd, data):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(transfer, "_write_all", no_space)
+    with pytest.raises(OSError):
+        await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+
+    assert harness.released == 1
+    assert harness.consumed == 0
+    assert harness.row.state == "pending"
+    assert not (vault / "Attachments" / "shot.png").exists()
+    assert temp_files(vault / vault_fs.STAGING_DIR) == []
+
+
+async def test_a_gate_entry_failure_releases_the_claim(client, harness, vault, monkeypatch):
+    """The gate raising on the way *in* means the publish never happened."""
+
+    async def exploding(session, token_id):
+        raise RuntimeError("could not reach the database")
+
+    monkeypatch.setattr(transfer, "lock_for_publish", exploding)
+    with pytest.raises(RuntimeError):
+        await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+
+    assert harness.released == 1
+    assert harness.row.state == "pending"
+    assert not (vault / "Attachments" / "shot.png").exists()
+    assert temp_files(vault / vault_fs.STAGING_DIR) == []
+
+
 async def test_the_gate_refusing_publishes_nothing(client, harness, vault):
     harness.locked_ok = False
     response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
@@ -800,6 +844,38 @@ async def test_download_refuses_a_symlinked_target(client, harness, vault, downl
     download.symlink_to(secret)
     response = await client.get("/transfer/download/file", headers=auth(harness))
     assert response.status_code == 404
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/self/fd"), reason="needs /proc")
+async def test_refused_downloads_do_not_leak_descriptors(client, harness, download):
+    """Every early return past the open must close the file.
+
+    The fingerprint compare happens with the file already open, and a token
+    bound to a file that has since changed can be retried up to the rate limit,
+    so a descriptor leaked on that path is slow fd exhaustion of the whole
+    process — not a one-off.
+    """
+    harness.row.expected_fingerprint = dict(harness.row.expected_fingerprint)
+    harness.row.expected_fingerprint["size"] += 1  # guaranteed mismatch
+
+    before = len(os.listdir("/proc/self/fd"))
+    for _ in range(20):
+        limiter.reset()  # the byte endpoints allow 10/minute; this is about fds
+        response = await client.get("/transfer/download/file", headers=auth(harness))
+        assert response.status_code == 404
+    assert len(os.listdir("/proc/self/fd")) <= before + 2
+
+
+@pytest.mark.skipif(not os.path.exists("/proc/self/fd"), reason="needs /proc")
+async def test_head_downloads_do_not_leak_descriptors(client, harness, download):
+    """`HEAD` returns the headers and no body, so nothing streams the fd out."""
+    before = len(os.listdir("/proc/self/fd"))
+    for _ in range(20):
+        limiter.reset()
+        assert (
+            await client.head("/transfer/download/file", headers=auth(harness))
+        ).status_code == 200
+    assert len(os.listdir("/proc/self/fd")) <= before + 2
 
 
 async def test_disposition_strips_crlf_and_quotes(client, harness, vault):

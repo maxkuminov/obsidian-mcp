@@ -618,6 +618,10 @@ async def check_upload(upload_id: str) -> str:
     mid-flight. That link will never complete — mint a new one with
     `request_upload`.
 
+    Pass the `upload_id` itself — the short handle from `request_upload`, not
+    the upload URL and not the token after the `#`. Anything else is refused
+    without a lookup.
+
     Args:
         upload_id: The `upload_id` that `request_upload` returned.
     """
@@ -689,9 +693,9 @@ async def delete_file(path: str, permanent: bool = False) -> str:
     Peer to `delete_note`, which stays markdown-only.
 
     By default this is a soft delete: the file moves to
-    `.trash/<YYYYMMDD-HHMMSS>-<basename>` inside the vault, keeping a copy the
-    user can recover. Two files with the same name deleted in the same second
-    both survive — the trash never clobbers.
+    `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` inside the vault, keeping a
+    copy the user can recover. Two files with the same name deleted in the same
+    second both survive — the trash never clobbers.
 
     With `permanent=True` the file is unlinked outright and this server has no
     recovery path; the user's backups are the only rollback.

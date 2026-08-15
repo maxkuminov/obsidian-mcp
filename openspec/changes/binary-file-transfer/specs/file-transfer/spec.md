@@ -94,7 +94,12 @@ The bearer-protected transfer endpoints (`GET|HEAD /transfer/upload/info`, `GET|
 
 ### Requirement: Upload endpoint claims first, streams within the cap, publishes atomically to the pre-committed path
 
-`GET /transfer/upload` SHALL serve a static self-contained HTML page (no external assets, nonce-based CSP) whose script reads the token from the URL fragment, calls `GET /transfer/upload/info` with the bearer header to display the bound path, cap and expiry, and sends the chosen file as the raw body of `PUT /transfer/upload` with the bearer header. `PUT /transfer/upload` SHALL: (1) atomically transition the token from `pending` to `claimed` in a committed statement conditioned on `state='pending' AND expires_at > now()`, returning 404 if no row transitions, before reading any body byte; (2) re-validate identity (exact predicates: active, unexpired, write-capable credential; active user), vault root, and path from the token row; (3) reject early on a `Content-Length` above `MAX_FILE_WRITE_BYTES`; (4) stream the body — under a `TRANSFER_MAX_CONCURRENT_UPLOADS` semaphore, a deadline of `min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)`, and a 30 s per-chunk idle timeout — to a temporary file created in the target directory through descriptor-anchored operations (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600), counting bytes and aborting with HTTP 413 at cap+1; (5) compute `sha256` and MIME during the stream; (6) in a short transaction, lock (`SELECT … FOR UPDATE`) the token, credential, and user rows, re-validate identity and vault root from those locked rows, hold the locks across the filesystem publish, and commit completion and the usage-log row in that transaction; then publish via hard-link no-clobber when the token was minted without `overwrite` (kernel-linearizable), or via fingerprint-checked replace when minted with `overwrite` (optimistic: `stat`+hash compare then `replace`; a writer landing inside that window is a documented limitation), returning 409 if the target appeared, changed, or is a symlink; (7) move the token to `completed` with `size`, `sha256`, `mime`, `completed_at`, insert a `usage_logs` row (`tool="upload_file"`) attributed to the minting identity, and return JSON `{path, size, sha256, mime}`. On any handled failure before publication (413, 409, disconnect, malformed request) the temporary file SHALL be removed and the claim released to `pending`; on deadline or idle timeout the temporary file SHALL be removed and the token SHALL become `consumed`; a crash after publication SHALL leave the token `claimed` (never replayable). Publication SHALL be tracked separately from temp cleanup: a failed trailing temp unlink after a successful `link`/`replace` SHALL be logged and SHALL NOT release the claim. The path SHALL never be taken from the request.
+`GET /transfer/upload` SHALL serve a static self-contained HTML page (no external assets, nonce-based CSP) whose script reads the token from the URL fragment, calls `GET /transfer/upload/info` with the bearer header to display the bound path, cap and expiry, and sends the chosen file as the raw body of `PUT /transfer/upload` with the bearer header. `PUT /transfer/upload` SHALL: (1) atomically transition the token from `pending` to `claimed` in a committed statement conditioned on `state='pending' AND expires_at > now()`, returning 404 if no row transitions, before reading any body byte; (2) re-validate identity (exact predicates: active, unexpired, write-capable credential; active user), vault root, and path from the token row; (3) reject early on a `Content-Length` above `MAX_FILE_WRITE_BYTES`; (4) stream the body — under a `TRANSFER_MAX_CONCURRENT_UPLOADS` semaphore, a deadline of `min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)`, and a 30 s per-chunk idle timeout — to a temporary file created in the target directory through descriptor-anchored operations (`O_CREAT|O_EXCL|O_NOFOLLOW`, mode 0600), counting bytes and aborting with HTTP 413 at cap+1; (5) compute `sha256` and MIME during the stream; (6) in a short transaction, lock (`SELECT … FOR UPDATE`) the token, credential, and user rows, re-validate identity and vault root from those locked rows, hold the locks across the filesystem publish, and commit completion and the usage-log row in that transaction; then publish via hard-link no-clobber when the token was minted without `overwrite` (kernel-linearizable), or via fingerprint-checked replace when minted with `overwrite` (optimistic: `stat`+hash compare then `replace`; a writer landing inside that window is a documented limitation), returning 409 if the target appeared, changed, or is a symlink; (7) move the token to `completed` with `size`, `sha256`, `mime`, `completed_at`, insert a `usage_logs` row (`tool="upload_file"`) attributed to the minting identity, and return JSON `{path, size, sha256, mime}`. On any handled failure before publication (413, 409, disconnect, malformed request) the temporary file SHALL be removed and the claim released to `pending`; on deadline or idle timeout the temporary file SHALL be removed and the token SHALL become `consumed`; a crash after publication SHALL leave the token `claimed` (never replayable). Publication SHALL be tracked separately from temp cleanup: a failed trailing temp unlink after a successful `link`/`replace` SHALL be logged and SHALL NOT release the claim. The path SHALL never be taken from the request. An **unexpected** failure that is demonstrably before publication — an `OSError` while writing the staged body, an error opening the publish gate — SHALL also remove the temporary file and release the claim; only a failure after the bytes are in place (`PostPublishFailure`) SHALL leave the token `claimed`.
+
+#### Scenario: A full disk mid-stream releases the claim
+
+- **WHEN** writing the staged body fails with an `OSError` (e.g. `ENOSPC`)
+- **THEN** the token SHALL be `pending` again, no temporary file SHALL remain, and nothing SHALL exist at the bound path
 
 #### Scenario: Successful upload via PUT
 
@@ -143,7 +148,12 @@ The bearer-protected transfer endpoints (`GET|HEAD /transfer/upload/info`, `GET|
 
 ### Requirement: `check_upload` tool
 
-`check_upload(upload_id)` SHALL return `pending`, `uploading` (claimed, not completed), `completed` (with `path`, `size`, `sha256`, `mime`, `completed_at`), or `expired`, and SHALL report `not found` for an `upload_id` minted by a different identity (or, in multi-user mode, a different user). The docstring SHALL tell the agent to mint a new token if `uploading` persists.
+`check_upload(upload_id)` SHALL return `pending`, `uploading` (claimed, not completed), `completed` (with `path`, `size`, `sha256`, `mime`, `completed_at`), or `expired`, and SHALL report `not found` for an `upload_id` minted by a different identity (or, in multi-user mode, a different user). The docstring SHALL tell the agent to mint a new token if `uploading` persists. The argument SHALL be validated against the exact shape `upload_id`s are minted with (22 characters of the URL-safe base64 alphabet) **before** it is written to `usage_logs`: an off-shape value SHALL be logged as a fixed `<invalid>` marker, SHALL NOT reach the database lookup, and SHALL return `not found`.
+
+#### Scenario: A misused argument never reaches the log
+
+- **WHEN** `check_upload` is called with a whole `…/transfer/upload#<token>` URL, or with the token itself, in place of the handle
+- **THEN** the tool SHALL return `not found` and the `usage_logs` row SHALL record `upload_id` as `<invalid>`, containing no part of the supplied value
 
 #### Scenario: Status transitions
 
@@ -186,7 +196,12 @@ The bearer-protected transfer endpoints (`GET|HEAD /transfer/upload/info`, `GET|
 
 ### Requirement: `import_from_url` tool with SSRF guard
 
-`import_from_url(url, path, overwrite=False)` SHALL require a `readwrite` identity, validate `path` with the vault guards and no-clobber (recording the target fingerprint when `overwrite` is true), and fetch `url` under all of the following rules, re-applied at every redirect hop: scheme `https` (or `http` only when `IMPORT_ALLOW_HTTP` is true); no userinfo; host is a multi-label IDNA-encodable name or an IP literal without zone id, and is not `localhost` nor ends in `.localhost`, `.local`, `.internal`, or `.home.arpa`; ports are scheme-paired: `https` → 443 or 8443, `http` → 80 or 8080 (only when allowed), re-checked after any scheme change; every resolved address SHALL pass an explicit deny policy — loopback, private (RFC 1918, ULA `fc00::/7`), link-local, CGNAT `100.64/10`, `0.0.0.0/8`, `240.0.0.0/4`, `198.18/15`, `192.0.0.0/24`, documentation ranges, multicast, unspecified, reserved, IPv4-mapped/compat (unmapped and re-checked), NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`; embedded IPv4 extracted and re-checked), 6to4 (`2002::/16`; embedded IPv4 re-checked), Teredo (`2001::/32`; embedded IPv4 re-checked) — and then be `is_global`, in decimal/octal/hex/IPv6 spellings alike; the connection SHALL be made to a validated resolved address (not re-resolved) with `Host` and TLS SNI set to the original name; a new HTTP client per hop; environment proxies disabled; HTTP/2 disabled; redirects followed manually up to 5 hops with relative `Location`s resolved against the current URL; one 30 s wall-clock deadline covering resolution, connects, redirects, headers and body; `Accept-Encoding: identity` with any response `Content-Encoding` rejected; final status must be 200; the body streamed through the same size-capped, anchored, fingerprint-checked publish path as uploads. The tool SHALL return `{path, size, sha256, mime, final_url}` on success and a tool-level error naming the violated rule otherwise, without writing.
+`import_from_url(url, path, overwrite=False)` SHALL require a `readwrite` identity, validate `path` with the vault guards and no-clobber (recording the target fingerprint when `overwrite` is true), and fetch `url` under all of the following rules, re-applied at every redirect hop: scheme `https` (or `http` only when `IMPORT_ALLOW_HTTP` is true); no userinfo; host is a multi-label IDNA-encodable name or an IP literal without zone id, and is not `localhost` nor ends in `.localhost`, `.local`, `.internal`, or `.home.arpa`; ports are scheme-paired: `https` → 443 or 8443, `http` → 80 or 8080 (only when allowed), re-checked after any scheme change; every resolved address SHALL pass an explicit deny policy — loopback, private (RFC 1918, ULA `fc00::/7`), link-local, CGNAT `100.64/10`, `0.0.0.0/8`, `240.0.0.0/4`, `198.18/15`, `192.0.0.0/24`, documentation ranges, multicast, unspecified, reserved, IPv4-mapped/compat (unmapped and re-checked), NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`; embedded IPv4 extracted and re-checked), 6to4 (`2002::/16`; embedded IPv4 re-checked), Teredo (`2001::/32`; embedded IPv4 re-checked) — and then be `is_global`, in decimal/octal/hex/IPv6 spellings alike; the connection SHALL be made to a validated resolved address (not re-resolved) with `Host` and TLS SNI set to the original name; a new HTTP client per hop; environment proxies disabled; HTTP/2 disabled; redirects followed manually up to 5 hops with relative `Location`s resolved against the current URL; one 30 s wall-clock deadline covering resolution, connects, redirects, headers and body; `Accept-Encoding: identity` with any response `Content-Encoding` rejected; final status must be 200; the body streamed through the same size-capped, anchored, fingerprint-checked publish path as uploads. The tool SHALL return `{path, size, sha256, mime, final_url}` on success and a tool-level error naming the violated rule otherwise, without writing. The publish SHALL happen inside a locked gate of the same kind the upload route uses: a transaction that `SELECT … FOR UPDATE`s the calling identity's credential row and (multi-user) user row, re-validates the write predicates and that the database's current vault root still equals the root captured when the tool started, and holds those locks across the filesystem publish.
+
+#### Scenario: The identity dies while the body streams
+
+- **WHEN** the calling API key is revoked or downgraded to `read`, or the user's vault root is reassigned, after `import_from_url` has begun streaming the response body
+- **THEN** nothing SHALL be published, no temporary file SHALL remain, and the tool SHALL return an error saying the credentials are no longer valid
 
 #### Scenario: Public https asset imported
 
@@ -220,7 +235,17 @@ The bearer-protected transfer endpoints (`GET|HEAD /transfer/upload/info`, `GET|
 
 ### Requirement: `delete_file` tool
 
-`delete_file(path, permanent=False)` SHALL require a `readwrite` identity, validate the path with the vault guards, refuse markdown files (pointing to `delete_note`), directories, and symlinks, and by default move the file through anchored operations to `.trash/<YYYYMMDD-HHMMSS>-<basename>` without clobbering an existing trash entry (collision suffix); with `permanent=True` it SHALL unlink the file.
+`delete_file(path, permanent=False)` SHALL require a `readwrite` identity, validate the path with the vault guards, refuse markdown files (pointing to `delete_note`), directories, and symlinks, and by default move the file through anchored operations to `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>`; with `permanent=True` it SHALL unlink the file. The markdown refusal SHALL be applied case-insensitively to the **canonical** final path component — the one the filesystem will open — not to the caller's raw string. The soft delete SHALL be a single `rename` onto a destination name reserved in the trash with `O_CREAT|O_EXCL|O_NOFOLLOW`, so that it never unlinks anything, never clobbers an existing trash entry, and moves a file that replaced the source concurrently into the trash rather than destroying it.
+
+#### Scenario: Markdown is refused however the path is spelled
+
+- **WHEN** `delete_file` is called with `note.md/.`, `note.md/`, `a//note.md`, or `NOTE.MD`
+- **THEN** each SHALL be refused with the pointer to `delete_note` and nothing SHALL be deleted
+
+#### Scenario: The source is replaced while it is being trashed
+
+- **WHEN** a different file replaces the source name after the trash destination has been reserved but before the move completes
+- **THEN** that replacement SHALL end up in `.trash/` intact and no file SHALL be unlinked
 
 #### Scenario: Soft delete
 
@@ -241,6 +266,20 @@ The bearer-protected transfer endpoints (`GET|HEAD /transfer/upload/info`, `GET|
 
 - **WHEN** two files with the same basename are soft-deleted within the same second
 - **THEN** both SHALL exist in `.trash/` under distinct names
+
+### Requirement: Filesystem probes run only on write paths, and sweep stale staging
+
+The filesystem capability probes SHALL be split by the capability they test and SHALL run only where that capability is about to be used: a **publication** probe (hard link within the vault root) SHALL run on `request_upload`, `import_from_url` and `PUT /transfer/upload`, and a **trash** probe (`rename` of a temp file into `.trash/`) SHALL run only on a `delete_file` soft delete. Each SHALL be cached per vault root. No read path — `request_download`, `check_upload`, `GET|HEAD /transfer/download/info`, `GET|HEAD /transfer/download/file` — SHALL run any probe, because a probe writes. On the first publication probe per root the server SHALL remove `.transfer-tmp/.tmp-*` files whose mtime is older than 24 hours, and SHALL NOT remove newer ones.
+
+#### Scenario: A read creates nothing
+
+- **WHEN** a read-only identity calls `request_download` against a fresh vault
+- **THEN** the vault SHALL contain exactly the files and directories it contained before the call — no `.trash/`, no probe temp file, no staging directory
+
+#### Scenario: Stale staged uploads are swept, live ones are not
+
+- **WHEN** `.transfer-tmp/` holds one `.tmp-*` file with an mtime 25 hours old and one written moments ago, and the publication probe runs for the first time for that root
+- **THEN** the old file SHALL be removed and the recent one SHALL remain
 
 ### Requirement: Transfer routes are rate-limited and bypass the panel OAuth chain
 

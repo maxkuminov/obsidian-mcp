@@ -39,6 +39,7 @@ import logging
 import os
 import secrets
 import stat
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -53,8 +54,16 @@ _HASH_CHUNK = 1024 * 1024
 # cannot wedge an upload silently).
 _TEMP_ATTEMPTS = 8
 
-# How many `-<n>` suffixes to try when a `.trash/` entry already exists.
-_TRASH_ATTEMPTS = 1000
+# How many trash names to try before giving up. Each candidate carries 32 bits
+# of randomness and is claimed with `O_EXCL`, so one attempt effectively always
+# wins; the retry exists so a hostile pre-creation loop cannot wedge a delete.
+_TRASH_ATTEMPTS = 8
+
+# How stale an abandoned `.transfer-tmp/.tmp-*` file must be before the
+# first-use sweep removes it. A day is far longer than any upload may run
+# (`TRANSFER_MAX_UPLOAD_SECONDS` is capped at minutes), so nothing in flight can
+# be inside the window.
+STALE_STAGING_SECONDS = 24 * 60 * 60
 
 _O_COMMON = os.O_CLOEXEC | os.O_NOFOLLOW
 _O_DIR = os.O_RDONLY | os.O_DIRECTORY | _O_COMMON
@@ -95,11 +104,13 @@ class Conflict(VaultFSError):
 
 
 class UnsupportedFilesystem(VaultFSError):
-    """The vault filesystem cannot support atomic no-clobber publication.
+    """The vault filesystem cannot support an operation this module needs.
 
-    Hard links (`EPERM`/`EOPNOTSUPP`) or a cross-device `.trash` (`EXDEV`) mean
-    the no-clobber and soft-delete guarantees do not hold. The transfer tools
-    refuse rather than silently degrading to an overwriting move.
+    Two independent capabilities, probed separately because different callers
+    need different ones: hard links within the root (`EPERM`/`EOPNOTSUPP`/
+    `EXDEV`) for the no-clobber publish, and a same-device `rename` into
+    `.trash` (`EXDEV`) for the soft delete. The transfer tools refuse rather
+    than silently degrading to an overwriting move.
     """
 
 
@@ -409,7 +420,7 @@ def _link_no_clobber(dir_fd: int, src: str, dst: str, *, dst_dir_fd: int | None 
         if exc.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV):
             raise UnsupportedFilesystem(
                 "The vault filesystem does not support hard links, which the "
-                "no-clobber publish depends on (see probe_filesystem)"
+                "no-clobber publish depends on (see probe_publication)"
             ) from exc
         raise
 
@@ -461,29 +472,58 @@ def remove(root_fd: int, rel_path: str | Path) -> None:
         os.close(dir_fd)
 
 
+def _reserve_trash_name(trash_fd: int, base: str) -> str:
+    """Claim an unused `<base>-<8 hex>` name in the trash with `O_EXCL`.
+
+    The placeholder is a real (empty, 0600) file, not just a name we intend to
+    use: `rename` needs a destination it may replace, and one we created
+    ourselves under `O_EXCL` is provably not somebody else's data. The random
+    suffix is what makes two same-second, same-basename deletes land on
+    different names — a `-1`, `-2` counter would need a check-then-act loop to
+    find the free number, and this needs none.
+    """
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_COMMON
+    last: OSError | None = None
+    for _ in range(_TRASH_ATTEMPTS):
+        candidate = f"{base}-{secrets.token_hex(4)}"
+        try:
+            fd = os.open(candidate, flags, 0o600, dir_fd=trash_fd)
+        except FileExistsError as exc:  # pragma: no cover - 32-bit collision
+            last = exc
+            continue
+        os.close(fd)
+        return candidate
+    raise Conflict(
+        f"Could not reserve a name in the trash for {base}"
+    ) from last
+
+
 def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) -> str:
-    """Link a regular file into `trash_dir` under a timestamped name, then unlink it.
+    """Move a regular file into `trash_dir` under a timestamped name, atomically.
 
-    Returns the trash-relative path that was created. Never clobbers an
-    existing trash entry: the link is no-clobber and collisions get a `-<n>`
-    suffix, so two files with the same basename deleted in the same second both
-    survive. `.trash` lives inside the vault root, so it is same-device by
-    construction and the link cannot fail `EXDEV` on a sane filesystem.
+    Returns the trash-relative path that was created:
+    `<trash_dir>/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>`.
 
-    **The unlink is inode-verified.** `link` + `unlink` is two syscalls, and a
-    writer that replaces the source name in between would otherwise have its
-    replacement unlinked with no trash copy of it — a silent destructive
-    delete, which is the one thing this module exists to prevent. So after the
-    link we reopen the source name `O_NOFOLLOW` and only unlink it if it is
-    still the inode we just linked; if it is not, the *new* file is left alone,
-    the trash link we made is removed, and the caller gets a `Conflict`.
+    **The move is one `rename`, and nothing is ever unlinked.** A unique
+    destination name is first reserved in the trash with
+    `O_CREAT|O_EXCL|O_NOFOLLOW` — so it cannot be an existing entry and cannot
+    be a symlink — and the source is then `rename`d onto that placeholder. The
+    kernel makes that single step atomic, which is the whole point: the earlier
+    `link` + `unlink` pair could unlink a *different* inode than the one it had
+    copied, silently destroying a file that replaced the source in between.
+    There is no such window here. `rename` moves whatever inode currently sits
+    at the source name, so a concurrent replacement is moved to the trash
+    rather than lost, and no verification step is needed to make that safe.
 
-    That check is optimistic, not linearizable: `renameat2(RENAME_NOREPLACE)`
-    is what would close the window properly and Python exposes no binding for
-    it. The window is now a few microseconds between an `fstat` and an
-    `unlink` rather than the whole link-then-unlink pair, and — this is the
-    part that matters — losing the race can no longer destroy data that was
-    never copied.
+    The `lstat` refusal of symlinks and non-regular files still runs first, and
+    is deliberately *not* re-checked: a symlink swapped in after the `lstat` is
+    moved into the trash intact — never followed, never dereferenced, nothing
+    outside the vault touched — which is a harmless outcome for an operation
+    the caller already asked to remove that name.
+
+    `.trash` lives inside the vault root, so the rename is same-device by
+    construction; `EXDEV` means the trash is a separate mount and raises
+    `UnsupportedFilesystem` (`probe_trash` catches that up front).
     """
     src_fd, name = _open_parent(root_fd, rel_path, create=False)
     trash_fd: int | None = None
@@ -495,78 +535,32 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) 
 
         trash_fd = open_dir_beneath(root_fd, trash_dir, create=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        base = f"{stamp}-{name}"
-        for attempt in range(_TRASH_ATTEMPTS):
-            candidate = base if attempt == 0 else f"{base}-{attempt}"
-            try:
-                os.link(
-                    name,
-                    candidate,
-                    src_dir_fd=src_fd,
-                    dst_dir_fd=trash_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
-                continue
-            except OSError as exc:
-                if exc.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV):
-                    raise UnsupportedFilesystem(
-                        "The vault filesystem does not support hard links into "
-                        f"{trash_dir}/ (see probe_filesystem)"
-                    ) from exc
-                raise
-            _unlink_if_same_inode(
-                src_fd, name, trash_fd, candidate, rel_path=rel_path, trash_dir=trash_dir
-            )
-            return f"{trash_dir}/{candidate}"
-        raise Conflict(
-            f"Could not find a free name in {trash_dir}/ for {name}"
-        )
+        reserved = _reserve_trash_name(trash_fd, f"{stamp}-{name}")
+        try:
+            os.rename(name, reserved, src_dir_fd=src_fd, dst_dir_fd=trash_fd)
+        except FileNotFoundError:
+            # Somebody else removed the source between the `lstat` and here.
+            # Nothing was moved, so the placeholder must not be left behind
+            # pretending a copy exists.
+            _unlink_quietly(trash_fd, reserved, published=False)
+            raise FileNotFoundError(f"File not found: {rel_path}") from None
+        except OSError as exc:
+            _unlink_quietly(trash_fd, reserved, published=False)
+            if exc.errno == errno.EXDEV:
+                raise UnsupportedFilesystem(
+                    f"{trash_dir}/ is on a different filesystem than the vault "
+                    "root, so a soft delete cannot be atomic (see probe_trash)"
+                ) from exc
+            if exc.errno in (errno.EISDIR, errno.ENOTDIR):
+                # The name became a directory after the `lstat`. Never take a
+                # directory with us.
+                raise UnsafePath(f"Not a regular file: {rel_path}") from None
+            raise
+        return f"{trash_dir}/{reserved}"
     finally:
         os.close(src_fd)
         if trash_fd is not None:
             os.close(trash_fd)
-
-
-def _unlink_if_same_inode(
-    src_fd: int,
-    name: str,
-    trash_fd: int,
-    candidate: str,
-    *,
-    rel_path,
-    trash_dir: str,
-) -> None:
-    """Unlink `name` only if it is still the inode now sitting in the trash."""
-    linked = os.stat(candidate, dir_fd=trash_fd, follow_symlinks=False)
-    try:
-        probe = os.open(name, os.O_RDONLY | _O_COMMON, dir_fd=src_fd)
-    except FileNotFoundError:
-        # Someone else removed the source after we copied it. The trash entry
-        # is the copy we promised; there is nothing left to unlink.
-        return
-    except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-            # The name became a symlink under us — never follow it, and never
-            # unlink it blind.
-            _unlink_quietly(trash_fd, candidate, published=False)
-            raise Conflict(
-                f"Source was replaced by a symlink while being trashed: {rel_path}"
-            ) from None
-        raise
-    try:
-        current = os.fstat(probe)
-    finally:
-        os.close(probe)
-
-    if (current.st_dev, current.st_ino) != (linked.st_dev, linked.st_ino):
-        # A different file lives at that name now. Unlinking it would destroy
-        # content nothing has a copy of.
-        _unlink_quietly(trash_fd, candidate, published=False)
-        raise Conflict(
-            f"Source was replaced while being moved to {trash_dir}/: {rel_path}"
-        )
-    os.unlink(name, dir_fd=src_fd)
 
 
 def _open_parent(root_fd: int, rel_path: str | Path, *, create: bool) -> tuple[int, str]:
@@ -610,45 +604,121 @@ def _probe_link(src_dir_fd: int, name: str, dst_dir_fd: int, link_name: str, wha
     _unlink_quietly(dst_dir_fd, link_name, published=False)
 
 
-def probe_filesystem(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
-    """Verify the vault filesystem supports the operations this module needs.
+def probe_publication(root_fd: int) -> None:
+    """Verify a no-clobber publish can work: hard links within the vault root.
 
-    Two links, not one: within the root (which is what `publish` needs) **and**
-    from the root into `trash_dir` (which is what `soft_delete` needs). A vault
-    whose `.trash` is a separate mount passes the first and fails the second
-    with `EXDEV` — and would then silently lose every soft-deleted file, so it
-    has to be caught here rather than at the first delete.
+    **This probe writes** (a temp file and a link, both removed again), so it
+    belongs only on paths that are about to write. A read — a download, a
+    `check_upload` — must never call it: a read-only capability that creates
+    files, however briefly, is a write the caller did not ask for.
 
     Raises `UnsupportedFilesystem` when links are refused (`EPERM`/
-    `EOPNOTSUPP`) or would cross a device (`EXDEV`). Cached per root by
-    `check_filesystem_support`.
+    `EOPNOTSUPP`/`ENOSYS`) or would cross a device (`EXDEV`).
+    """
+    fd, tmp_name = create_temp(root_fd)
+    os.close(fd)
+    try:
+        _probe_link(root_fd, tmp_name, root_fd, f"{tmp_name}-probe", "within the vault root")
+    finally:
+        _unlink_quietly(root_fd, tmp_name, published=False)
+
+
+def probe_trash(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
+    """Verify a soft delete can work: a `rename` from the root into `trash_dir`.
+
+    Separate from `probe_publication` because it tests a different syscall on a
+    different pair of directories, and because only `delete_file` needs it. A
+    vault whose `.trash` is a separate mount passes the publication probe and
+    fails this one with `EXDEV` — and would then be unable to soft-delete at
+    all, so it has to be caught here rather than at the first delete.
+
+    Note it probes `rename`, not `link`: `soft_delete` moves the file with one
+    `rename`, so a filesystem that refuses hard links but renames fine is
+    perfectly able to soft-delete and must not be refused.
     """
     fd, tmp_name = create_temp(root_fd)
     os.close(fd)
     trash_fd: int | None = None
+    moved = False
     try:
-        _probe_link(root_fd, tmp_name, root_fd, f"{tmp_name}-probe", "within the vault root")
         trash_fd = open_dir_beneath(root_fd, trash_dir, create=True)
-        _probe_link(root_fd, tmp_name, trash_fd, f"{tmp_name}-probe", f"into {trash_dir}/")
+        probe_name = f"{tmp_name}-probe"
+        try:
+            os.rename(tmp_name, probe_name, src_dir_fd=root_fd, dst_dir_fd=trash_fd)
+            moved = True
+        except OSError as exc:
+            if exc.errno in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS):
+                raise UnsupportedFilesystem(
+                    f"The vault filesystem cannot move files into {trash_dir}/ "
+                    f"({errno.errorcode.get(exc.errno, exc.errno)}). "
+                    "`delete_file`'s soft delete relies on an atomic rename and "
+                    "is disabled; pass permanent=True to unlink instead."
+                ) from exc
+            raise
+        _unlink_quietly(trash_fd, probe_name, published=False)
     finally:
         if trash_fd is not None:
             os.close(trash_fd)
-        _unlink_quietly(root_fd, tmp_name, published=False)
+        if not moved:
+            _unlink_quietly(root_fd, tmp_name, published=False)
 
 
-# Cached per vault root: the probe touches the disk, and every transfer tool
-# needs the answer. `None` means "supported"; an exception instance means the
-# tools must refuse with that message.
-_probe_cache: dict[str, UnsupportedFilesystem | None] = {}
+def prune_stale_staging(
+    root_fd: int, *, max_age_seconds: float = STALE_STAGING_SECONDS
+) -> int:
+    """Remove `.transfer-tmp/.tmp-*` files older than `max_age_seconds`.
+
+    A crash or a hard kill mid-upload leaves a staged temp file nothing will
+    ever publish. It is invisible to the indexer and to every dot-dir-guarded
+    tool, so it would otherwise sit there consuming disk forever.
+
+    Age is `mtime`, and the comparison is strictly older-than: a file being
+    written *right now* has a fresh mtime, so an in-flight upload can never be
+    swept out from under itself. Never raises — janitorial work must not be
+    able to fail an operation.
+    """
+    try:
+        staging_fd = open_dir_beneath(root_fd, STAGING_DIR, create=False)
+    except (FileNotFoundError, VaultFSError, OSError):
+        return 0
+    removed = 0
+    try:
+        cutoff = time.time() - max_age_seconds
+        try:
+            entries = os.listdir(staging_fd)
+        except OSError as exc:  # pragma: no cover - unreadable staging dir
+            logger.warning("Could not list %s for pruning: %s", STAGING_DIR, exc)
+            return 0
+        for entry in entries:
+            if not entry.startswith(".tmp-"):
+                continue
+            try:
+                st = os.stat(entry, dir_fd=staging_fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_mtime >= cutoff:
+                continue
+            if _unlink_quietly(staging_fd, entry, published=False):
+                removed += 1
+    finally:
+        os.close(staging_fd)
+    if removed:
+        logger.info("Pruned %d stale staged upload(s) from %s", removed, STAGING_DIR)
+    return removed
 
 
-def check_filesystem_support(root: Path | str) -> None:
-    """Cached `probe_filesystem` for one vault root; raises when unsupported."""
-    key = str(root)
+# Cached per (vault root, probe kind): a probe touches the disk, and every
+# transfer tool needs the answer. `None` means "supported"; an exception
+# instance means the caller must refuse with that message.
+_probe_cache: dict[tuple[str, str], UnsupportedFilesystem | None] = {}
+
+
+def _cached_probe(root: Path | str, kind: str, probe) -> None:
+    key = (str(root), kind)
     if key not in _probe_cache:
         root_fd = open_root(root)
         try:
-            probe_filesystem(root_fd)
+            probe(root_fd)
             _probe_cache[key] = None
         except UnsupportedFilesystem as exc:
             _probe_cache[key] = exc
@@ -657,6 +727,29 @@ def check_filesystem_support(root: Path | str) -> None:
     cached = _probe_cache[key]
     if cached is not None:
         raise cached
+
+
+def check_publication_support(root: Path | str) -> None:
+    """Cached `probe_publication` for one root; raises when unsupported.
+
+    First use per root is also where abandoned staged uploads are swept, since
+    it is the one moment we already know the root is writable and have not yet
+    charged anybody for the walk.
+    """
+    key = (str(root), "publication")
+    first = key not in _probe_cache
+    _cached_probe(root, "publication", probe_publication)
+    if first:
+        root_fd = open_root(root)
+        try:
+            prune_stale_staging(root_fd)
+        finally:
+            os.close(root_fd)
+
+
+def check_trash_support(root: Path | str) -> None:
+    """Cached `probe_trash` for one vault root; raises when unsupported."""
+    _cached_probe(root, "trash", probe_trash)
 
 
 def reset_filesystem_probe_cache() -> None:

@@ -195,14 +195,22 @@
    `os.stat(final, dir_fd, follow_symlinks=False)` (symlink → refuse;
    fingerprint mismatch → conflict) then `os.replace(src_dir_fd, dst_dir_fd)`;
    `remove(dir_fd, name)` / `soft_delete(...)` with `lstat` symlink refusal and
-   link-then-unlink into `.trash/` under the same no-clobber discipline as
-   `move_no_clobber`. Temp files are unlinked in `finally`, and publication is tracked
+   an **atomic move** into `.trash/`: a unique `<ts>-<basename>-<8 hex>` name is
+   reserved with `O_CREAT|O_EXCL|O_NOFOLLOW` and the source is `rename`d onto
+   that placeholder, so nothing is ever unlinked and a file that replaced the
+   source mid-delete is moved to the trash rather than destroyed. Temp files are unlinked in `finally`, and publication is tracked
    separately from cleanup: once `link`/`replace` has succeeded the upload
    is complete even if the trailing temp unlink fails (logged, never releases
-   the claim). Filesystem prerequisites — hard links and same-device
-   `.trash` — are probed once at startup by linking a temp file in the vault
-   root (`EPERM`/`EOPNOTSUPP`/`EXDEV` → the transfer tools return a stable
-   "unsupported filesystem" error naming the probe, and nothing is written);
+   the claim). The filesystem prerequisites are probed **separately, on first
+   use per root, and only on paths that write**: `probe_publication` links a
+   temp file within the vault root (what an upload needs) and `probe_trash`
+   renames one into `.trash` (what a soft delete needs); `EPERM`/`EOPNOTSUPP`/
+   `EXDEV` → a stable "unsupported filesystem" error naming the probe, and
+   nothing is written. A read path — `request_download`, `check_upload`,
+   `GET /transfer/download/file` — runs **no** probe, because a probe writes.
+   The publication probe's first run per root also sweeps
+   `.transfer-tmp/.tmp-*` files older than 24 h, which is where a crashed
+   upload's staged bytes would otherwise sit forever.
    `.trash` is created inside the vault root, so it is same-device by
    construction. `openat2`
    `RESOLVE_BENEATH` would be stronger but is not exposed by Python's stdlib;
@@ -232,8 +240,7 @@
    origins do not include foreign origins, so a cross-origin preflight is
    refused there); a bare `OPTIONS` reaching the router → 405. Same-origin
    `fetch` with a custom header needs no preflight. Uniform-404 applies to
-   the bearer-protected endpoints, not to the pages or to method dispatch. The public route is not an oracle (same body, no timing-distinct
-   branches beyond a single indexed lookup); the authenticated agent gets
+   the bearer-protected endpoints, not to the pages or to method dispatch. The public route is not an oracle: every refusal is the same status and the same body. That is a claim about the *response* only — the branches do different amounts of work and none of this is constant-time, so no timing indistinguishability is claimed or tested. The authenticated agent gets
    `pending | uploading | completed | expired` from `check_upload`, scoped to
    the minting identity (another key/user → `not found`). If `uploading`
    persists (crash window), the agent mints a new token; the docstring says so.
@@ -308,9 +315,11 @@
 
 12. **`delete_file` for non-markdown files, anchored (D6).** Refuses `.md`
     with a pointer to `delete_note` (keeps the note/file split crisp and the
-    destructive surface for an agent unchanged for notes), refuses directories
-    and symlinks, soft-deletes to `.trash/<YYYYMMDD-HHMMSS>-<basename>` with
-    collision suffixing, `permanent=True` unlinks. Index cleanup is not
+    destructive surface for an agent unchanged for notes) — checked against the
+    *canonical* final component, so `note.md/.`, `a//note.md` and `NOTE.MD` are
+    refused too — refuses directories
+    and symlinks, soft-deletes to `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>`,
+    `permanent=True` unlinks. Index cleanup is not
     involved (non-markdown files are not indexed).
 
 13. **Public origin must be explicit.** New `Settings.public_base_url` property:

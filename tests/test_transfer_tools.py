@@ -12,6 +12,7 @@ boundaries live in `tests/integration/test_transfer_pg.py`.
 """
 
 import os
+import re
 import tempfile
 from pathlib import Path
 
@@ -31,6 +32,10 @@ from src.models.db import TransferToken  # noqa: E402
 from src.services import transfer, vault_fs  # noqa: E402
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + bytes(range(64))
+
+# A handle of the exact shape `request_upload` mints (22 URL-safe characters).
+# `check_upload` refuses anything else before it reaches the log or the lookup.
+PUB_ID = transfer.new_public_id()
 
 
 # ── harness ─────────────────────────────────────────────────────────────────
@@ -91,6 +96,31 @@ def vault(monkeypatch, tmp_path):
     vault_fs.reset_filesystem_probe_cache()
     yield tmp_path
     vault_fs.reset_filesystem_probe_cache()
+
+
+@pytest.fixture
+def publish_gate(monkeypatch, minted):
+    """Stand in for the locked identity gate `import_from_url` publishes through.
+
+    The gate's real work — `SELECT … FOR UPDATE` on the caller's credential and
+    user rows, held across the publish — is a transaction boundary and is tested
+    against real Postgres in `tests/integration/test_transfer_pg.py`. What this
+    proves is that the tool *goes through* it, with the right identity and root,
+    and publishes nothing when it says no.
+    """
+    from contextlib import asynccontextmanager
+
+    state = {"calls": [], "ok": True}
+
+    @asynccontextmanager
+    async def fake(session, identity, *, vault_root, need_write=True, on_complete=None):
+        state["calls"].append(
+            {"identity": identity, "vault_root": vault_root, "need_write": need_write}
+        )
+        yield transfer.GateHandle(ok=state["ok"])
+
+    monkeypatch.setattr(transfer, "lock_identity_for_publish", fake)
+    return state
 
 
 @pytest.fixture
@@ -215,10 +245,10 @@ async def test_request_upload_clamps_expires_in(vault, readwrite, minted, asked,
 async def test_request_upload_reports_an_unsupported_filesystem(
     vault, readwrite, minted, monkeypatch
 ):
-    def refuse(root_fd, trash_dir=".trash"):
+    def refuse(root_fd):
         raise vault_fs.UnsupportedFilesystem("no hard links here")
 
-    monkeypatch.setattr(vault_fs, "probe_filesystem", refuse)
+    monkeypatch.setattr(vault_fs, "probe_publication", refuse)
     vault_fs.reset_filesystem_probe_cache()
     result = await tools.request_upload_impl("Attachments/shot.png")
     assert "no hard links here" in result
@@ -259,7 +289,7 @@ def _row(**kwargs) -> TransferToken:
     import datetime
 
     defaults = dict(
-        public_id="pub-1",
+        public_id=PUB_ID,
         token_hash="x" * 64,
         direction="upload",
         state="pending",
@@ -275,7 +305,7 @@ def _row(**kwargs) -> TransferToken:
 
 async def test_check_upload_reports_pending(vault, readwrite, looked_up):
     looked_up["row"] = _row()
-    result = await tools.check_upload_impl("pub-1")
+    result = await tools.check_upload_impl(PUB_ID)
     assert result.startswith("pending")
     assert "Attachments/shot.png" in result
 
@@ -284,7 +314,7 @@ async def test_check_upload_reports_uploading_with_the_stuck_advice(
     vault, readwrite, looked_up
 ):
     looked_up["row"] = _row(state="claimed")
-    result = await tools.check_upload_impl("pub-1")
+    result = await tools.check_upload_impl(PUB_ID)
     assert result.startswith("uploading")
     assert "mint a new link" in result
 
@@ -299,7 +329,7 @@ async def test_check_upload_reports_completed_with_the_hash(vault, readwrite, lo
         mime="image/png",
         completed_at=datetime.datetime.now(datetime.timezone.utc),
     )
-    result = await tools.check_upload_impl("pub-1")
+    result = await tools.check_upload_impl(PUB_ID)
     assert result.startswith("completed")
     assert "a" * 64 in result
     assert "1,234 bytes" in result
@@ -312,7 +342,7 @@ async def test_check_upload_reports_expired(vault, readwrite, looked_up):
         expires_at=datetime.datetime.now(datetime.timezone.utc)
         - datetime.timedelta(seconds=1)
     )
-    result = await tools.check_upload_impl("pub-1")
+    result = await tools.check_upload_impl(PUB_ID)
     assert result.startswith("expired")
 
 
@@ -320,7 +350,7 @@ async def test_check_upload_reports_a_consumed_link_as_expired(
     vault, readwrite, looked_up
 ):
     looked_up["row"] = _row(state="consumed")
-    result = await tools.check_upload_impl("pub-1")
+    result = await tools.check_upload_impl(PUB_ID)
     assert result.startswith("expired")
     assert "cut short" in result
 
@@ -329,12 +359,48 @@ async def test_check_upload_scopes_the_lookup_to_the_calling_identity(
     vault, readwrite, looked_up
 ):
     looked_up["row"] = None
-    result = await tools.check_upload_impl("someone-elses-id")
+    other = transfer.new_public_id()
+    result = await tools.check_upload_impl(other)
     assert result.startswith("not found")
     (public_id, identity, direction) = looked_up["calls"][0]
-    assert public_id == "someone-elses-id"
+    assert public_id == other
     assert direction == "upload"
     assert identity.key_id == 11
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://vault.example.com/transfer/upload#" + "t" * 43,
+        "t" * 43,  # the raw token
+        "pub-1",
+        "",
+        "  " + PUB_ID,
+        PUB_ID + "=",
+    ],
+)
+async def test_check_upload_refuses_an_off_shape_id_before_the_lookup(
+    vault, readwrite, looked_up, usage_log, bad
+):
+    """The handle is 22 URL-safe characters. Anything else never gets looked up."""
+    result = await tools.check_upload_impl(bad)
+    assert result.startswith("not found")
+    assert looked_up["calls"] == []
+
+
+@pytest.mark.parametrize(
+    "bad", ["https://vault.example.com/transfer/upload#" + "s" * 43, "s" * 43]
+)
+async def test_a_pasted_url_or_token_never_reaches_usage_logs(
+    vault, readwrite, looked_up, usage_log, bad
+):
+    """The mistake an agent actually makes must not write a capability to a log."""
+    await tools.check_upload_impl(bad)
+    entry = next(e for e in usage_log if e["tool"] == "check_upload")
+    assert entry["params"] == {"upload_id": "<invalid>"}
+    logged = str(usage_log)
+    assert "s" * 43 not in logged
+    assert "transfer/upload#" not in logged
 
 
 # ── 5.3 request_download ────────────────────────────────────────────────────
@@ -390,6 +456,44 @@ async def test_request_download_refuses_a_hidden_path(vault, readonly, minted):
     assert minted == []
 
 
+def _tree(root: Path) -> set:
+    return {p.relative_to(root) for p in root.rglob("*")}
+
+
+async def test_a_read_only_mint_writes_nothing_to_the_vault(vault, readonly, minted):
+    """A read must not probe: the probe creates a temp file, a link and `.trash`.
+
+    On a fresh vault the first `request_download` would otherwise be the thing
+    that created directories in it — a read-only capability performing writes
+    nobody asked for.
+    """
+    (vault / "Attachments" / "spec.pdf").write_bytes(b"%PDF-1.4\n")
+    before = _tree(vault)
+
+    result = await tools.request_download_impl("Attachments/spec.pdf")
+    assert "transfer/download#" in result
+
+    assert _tree(vault) == before
+    assert not (vault / ".trash").exists()
+    assert not (vault / vault_fs.STAGING_DIR).exists()
+
+
+async def test_request_download_does_not_probe_the_filesystem(
+    vault, readonly, minted, monkeypatch
+):
+    """Pinned as an explicit call assertion, not only as an absence of files."""
+    def fail(*args, **kwargs):
+        pytest.fail("a read path probed the filesystem")
+
+    (vault / "Attachments" / "spec.pdf").write_bytes(b"%PDF-1.4\n")
+    monkeypatch.setattr(vault_fs, "probe_publication", fail)
+    monkeypatch.setattr(vault_fs, "probe_trash", fail)
+    vault_fs.reset_filesystem_probe_cache()
+    assert "transfer/download#" in await tools.request_download_impl(
+        "Attachments/spec.pdf"
+    )
+
+
 # ── 5.4 import_from_url ─────────────────────────────────────────────────────
 
 
@@ -431,8 +535,9 @@ async def test_import_refuses_an_existing_target(vault, readwrite):
     assert (vault / "Attachments" / "a.png").read_bytes() == b"mine"
 
 
-async def test_import_writes_the_fetched_body(vault, readwrite, monkeypatch):
-    """The happy path, with the guarded fetch replaced by a canned stream."""
+@pytest.fixture
+def canned_fetch(monkeypatch):
+    """Replace the guarded fetch with a two-chunk canned stream."""
     from contextlib import asynccontextmanager
 
     async def body():
@@ -442,16 +547,51 @@ async def test_import_writes_the_fetched_body(vault, readwrite, monkeypatch):
     @asynccontextmanager
     async def fake_fetch(url, **kwargs):
         yield transfer.FetchResult(
-            chunks=body(), final_url="https://cdn.example.com/a.png", content_type="image/png"
+            chunks=body(),
+            final_url="https://cdn.example.com/a.png",
+            content_type="image/png",
         )
 
     monkeypatch.setattr(transfer, "fetch_url_guarded", fake_fetch)
+
+
+async def test_import_writes_the_fetched_body(
+    vault, readwrite, canned_fetch, publish_gate
+):
+    """The happy path, with the guarded fetch replaced by a canned stream."""
     result = await tools.import_from_url_impl(
         "https://example.com/a.png", "Attachments/a.png"
     )
     assert "Imported" in result
     assert "https://cdn.example.com/a.png" in result
     assert (vault / "Attachments" / "a.png").read_bytes() == PNG
+
+
+async def test_import_publishes_through_the_locked_identity_gate(
+    vault, readwrite, canned_fetch, publish_gate
+):
+    """The tool's own identity and root are what the gate re-validates."""
+    await tools.import_from_url_impl("https://example.com/a.png", "Attachments/a.png")
+    (call,) = publish_gate["calls"]
+    assert call["identity"].key_id == 11
+    assert call["vault_root"] == str(vault)
+    assert call["need_write"] is True
+
+
+async def test_import_publishes_nothing_when_the_gate_refuses(
+    vault, readwrite, canned_fetch, publish_gate
+):
+    """A key revoked or repointed mid-fetch must not land the bytes."""
+    publish_gate["ok"] = False
+    result = await tools.import_from_url_impl(
+        "https://example.com/a.png", "Attachments/a.png"
+    )
+    assert "no longer valid" in result
+    assert "Nothing was written" in result
+    assert not (vault / "Attachments" / "a.png").exists()
+    assert list((vault / "Attachments").iterdir()) == []
+    staging = vault / vault_fs.STAGING_DIR
+    assert not staging.exists() or list(staging.iterdir()) == []
 
 
 async def test_import_logs_only_the_url_host(vault, readwrite, usage_log):
@@ -476,7 +616,9 @@ async def test_delete_file_soft_deletes_into_trash(vault, readwrite):
     trashed = list((vault / ".trash").iterdir())
     assert len(trashed) == 1
     assert trashed[0].read_bytes() == PNG
-    assert trashed[0].name.endswith("-shot.png")
+    # `<YYYYMMDD-HHMMSS>-<basename>-<8 hex>`: the random tail is what makes two
+    # same-second deletes of the same basename land on different names.
+    assert re.fullmatch(r"\d{8}-\d{6}-shot\.png-[0-9a-f]{8}", trashed[0].name)
 
 
 async def test_delete_file_permanent_leaves_no_trash_copy(vault, readwrite):
@@ -494,6 +636,38 @@ async def test_delete_file_refuses_markdown_and_points_at_delete_note(vault, rea
     result = await tools.delete_file_impl("note.md")
     assert "delete_note" in result
     assert note.exists()
+
+
+@pytest.mark.parametrize(
+    "spelling", ["note.md/.", "note.md/", "a//note.md", "NOTE.MD", "./note.md"]
+)
+async def test_delete_file_refuses_markdown_however_it_is_spelled(
+    vault, readwrite, spelling
+):
+    """The guard must run on the component the filesystem will open.
+
+    `path.lower().endswith(".md")` reads the caller's string, and the caller's
+    string is not the path: `note.md/.` and `a//note.md` both name a note while
+    failing that test, which would delete it with the tool that knows nothing
+    about the index or the backlink graph.
+    """
+    (vault / "a").mkdir()
+    for note in (vault / "note.md", vault / "NOTE.MD", vault / "a" / "note.md"):
+        note.write_text("# hi", encoding="utf-8")
+
+    result = await tools.delete_file_impl(spelling)
+    assert "delete_note" in result, result
+    assert (vault / "note.md").exists()
+    assert (vault / "NOTE.MD").exists()
+    assert (vault / "a" / "note.md").exists()
+    assert not (vault / ".trash").exists()
+
+
+async def test_permanent_delete_does_not_create_the_trash(vault, readwrite):
+    """`permanent=True` never uses `.trash`, so it must not probe it either."""
+    (vault / "Attachments" / "shot.png").write_bytes(PNG)
+    await tools.delete_file_impl("Attachments/shot.png", permanent=True)
+    assert not (vault / ".trash").exists()
 
 
 async def test_delete_file_refuses_a_directory(vault, readwrite):
@@ -558,9 +732,9 @@ async def test_mint_tools_log_the_allow_listed_params(vault, readwrite, minted, 
 
 async def test_check_upload_logs_only_the_public_id(vault, readwrite, looked_up, usage_log):
     looked_up["row"] = _row()
-    await tools.check_upload_impl("pub-1")
+    await tools.check_upload_impl(PUB_ID)
     entry = next(e for e in usage_log if e["tool"] == "check_upload")
-    assert entry["params"] == {"upload_id": "pub-1"}
+    assert entry["params"] == {"upload_id": PUB_ID}
 
 
 # ── the symlink-retargeting regression ──────────────────────────────────────
