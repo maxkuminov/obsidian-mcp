@@ -226,9 +226,28 @@ the markdown-only note tools:
 - `write_file(path, content, encoding="base64", overwrite=False)` — save a
   file (e.g. a generated PDF) into the vault; base64 for binary, text mode
   for text. No-clobber by default.
+- `delete_file(path, permanent=False)` — remove a non-markdown file,
+  soft-deleting it to `.trash/` by default. Notes go through
+  `delete_note` instead.
 
 Dot-directories (`.obsidian`, `.git`, `.trash`, …) are out of reach for
-all three. Base64 reads are token-heavy — prefer `list_files` first.
+all four. Base64 reads are token-heavy — prefer `list_files` first.
+
+## Getting files in and out
+
+`write_file` needs the bytes, and most clients cannot give a tool the bytes
+of a file the user is looking at. Four tools cover the gap:
+`request_upload(path)` returns a short-lived link bound to that one
+destination — hand it to the person, they open it and pick a file, then
+`check_upload(upload_id)` confirms the bytes landed and reports the sha256.
+`request_download(path)` returns the mirror image, a link the person can
+save one vault file from. `import_from_url(url, path)` pulls a public https
+asset straight in without it passing through the conversation. Transfer
+links carry a secret in the URL fragment: treat the whole URL as sensitive,
+and never put it in a query string.
+
+Once a file is stored, embed it in a note the usual way — `![[path]]` via
+`edit_note`, exactly as for any other attachment.
 
 ## Summary for agents
 

@@ -21,6 +21,12 @@ mcp[cli]==1.29.0
 
 # Embeddings & search
 httpx==0.28.1
+# Direct dependency: `src/services/transfer.py` calls `idna.encode(uts46=True)`
+# to fold a URL host to canonical ASCII *before* the SSRF policy runs. The
+# stdlib codec is IDNA 2003 and splits labels on U+002E only, so it would let
+# `svc.prod。internal` (U+3002) past a suffix check and then resolve it as
+# `svc.prod.internal`. Previously present only transitively via httpx.
+idna==3.18
 # Direct dependency: imported by src/services/embeddings.py and
 # src/mcp_server/tools.py (find_related's cosine similarity). Previously only
 # present transitively via pgvector, which stops requiring numpy in 0.5.0.

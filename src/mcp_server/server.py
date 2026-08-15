@@ -3,7 +3,9 @@ from mcp.server.transport_security import TransportSecuritySettings
 
 from src.config import settings
 from src.mcp_server.tools import (
+    check_upload_impl,
     create_note_impl,
+    delete_file_impl,
     delete_note_impl,
     edit_note_impl,
     find_orphans_impl,
@@ -14,11 +16,14 @@ from src.mcp_server.tools import (
     get_recent_impl,
     get_tags_impl,
     get_vault_guide_impl,
+    import_from_url_impl,
     list_files_impl,
     list_notes_impl,
     move_note_impl,
     read_file_impl,
     read_note_impl,
+    request_download_impl,
+    request_upload_impl,
     search_notes_impl,
     semantic_search_impl,
     set_frontmatter_impl,
@@ -554,3 +559,153 @@ async def list_files(
     return await list_files_impl(
         folder, pattern=pattern, recursive=recursive, limit=limit
     )
+
+
+@mcp.tool()
+async def request_upload(
+    path: str,
+    overwrite: bool = False,
+    expires_in: int | None = None,
+) -> str:
+    """Get a short-lived link a person can use to put a file into the vault.
+    Requires a readwrite API key. Peer to `write_file`, which takes the bytes
+    directly — use this one when you do not have them.
+
+    No MCP client can hand a tool the bytes of a file the user is looking at,
+    and your shell cannot reach their machine. This mints a link bound to
+    exactly one destination path: hand it to the person you are helping, they
+    open it and pick a file, and it lands at `path`. Nothing else can be
+    written with it.
+
+    The token lives in the URL's `#` fragment, which browsers never send to a
+    server, so it stays out of access logs. **Treat the whole URL as a secret**
+    — whoever holds it can write that one path, once, until it expires. Never
+    put it in a query string: that *would* log it.
+
+    Single use, and no-clobber unless you ask otherwise. With
+    `overwrite=True` the link also remembers what the file looked like now and
+    refuses to publish if it changed in the meantime, so a stale link cannot
+    silently undo an edit someone made while it was waiting.
+
+    From a shell you can upload without the page:
+    `curl -H "Authorization: Bearer <token>" -T <file> <base>/transfer/upload`.
+
+    Then call `check_upload(upload_id)` to confirm the bytes landed and get
+    their sha256. See `get_vault_guide` for how files fit into the vault.
+
+    Args:
+        path: Vault-relative destination (e.g. "Attachments/photo.png").
+        overwrite: If True, allow replacing an existing file at `path`.
+        expires_in: Seconds until the link dies. Clamped to 60–3600; defaults
+            to `TRANSFER_TOKEN_TTL_SECONDS` (600).
+    """
+    return await request_upload_impl(path, overwrite=overwrite, expires_in=expires_in)
+
+
+@mcp.tool()
+async def check_upload(upload_id: str) -> str:
+    """Ask what happened to an upload link you minted with `request_upload`.
+
+    Returns one of `pending` (nothing sent yet), `uploading` (bytes are in
+    flight), `completed` (with the path, size, sha256 and MIME type of what
+    landed), or `expired`. Use it to confirm a transfer really finished before
+    you tell the user it did, and to get the sha256 if they want to verify it.
+
+    Only links minted by this same API key or OAuth token are visible; anyone
+    else's `upload_id` reads as `not found`.
+
+    If it says `uploading` for more than a couple of minutes, the transfer died
+    mid-flight. That link will never complete — mint a new one with
+    `request_upload`.
+
+    Pass the `upload_id` itself — the short handle from `request_upload`, not
+    the upload URL and not the token after the `#`. Anything else is refused
+    without a lookup.
+
+    Args:
+        upload_id: The `upload_id` that `request_upload` returned.
+    """
+    return await check_upload_impl(upload_id)
+
+
+@mcp.tool()
+async def request_download(path: str, expires_in: int | None = None) -> str:
+    """Get a short-lived link a person can use to save a vault file. Peer to
+    `read_file`, which returns the bytes to you — use this one when the file is
+    for the human, not for you.
+
+    Handy for anything `read_file` would waste context on or cannot render: a
+    PDF, a large image, an archive. Reading works with a read-only key.
+
+    The token lives in the URL's `#` fragment, so it never reaches an access
+    log. **Treat the whole URL as a secret** — whoever holds it can read that
+    one file until it expires. Never put it in a query string.
+
+    The link is bound to the file *as it is now*: if it is edited or replaced,
+    the link stops working rather than serving different content than you
+    described. Unlike an upload link it can be used more than once, so the
+    person can preview and then save.
+
+    From a shell: `curl -H "Authorization: Bearer <token>" -o <file>
+    <base>/transfer/download/file`.
+
+    Args:
+        path: Vault-relative path of the file to share.
+        expires_in: Seconds until the link dies. Clamped to 60–3600; defaults
+            to `TRANSFER_TOKEN_TTL_SECONDS` (600).
+    """
+    return await request_download_impl(path, expires_in=expires_in)
+
+
+@mcp.tool()
+async def import_from_url(url: str, path: str, overwrite: bool = False) -> str:
+    """Fetch a file from a public https URL straight into the vault. Requires a
+    readwrite API key. Peer to `write_file` and `request_upload` — use this one
+    when the bytes are already somewhere public.
+
+    The server does the fetching, so nothing passes through your context: a
+    20 MB PDF costs one tool call. Returns the path, size, sha256, MIME type
+    and the final URL after any redirects.
+
+    **Only genuinely public addresses.** This server sits on a private network
+    next to a database and other services, so the fetch is restricted: https
+    only, no credentials in the URL, no private/loopback/link-local/metadata
+    addresses in any spelling, and the same rules re-checked at every redirect.
+    A refusal names the rule that was violated — that is information about the
+    URL, not a hint to work around it. Rewriting the URL to evade the check is
+    never the right next step; ask the user for a public link instead.
+
+    Size-capped at `MAX_FILE_WRITE_BYTES`, with one 30-second deadline for the
+    whole fetch. No-clobber unless `overwrite=True`. Nothing is written unless
+    the whole body arrives intact.
+
+    Args:
+        url: Public https URL of the file.
+        path: Vault-relative destination (e.g. "Attachments/paper.pdf").
+        overwrite: If True, allow replacing an existing file at `path`.
+    """
+    return await import_from_url_impl(url, path, overwrite=overwrite)
+
+
+@mcp.tool()
+async def delete_file(path: str, permanent: bool = False) -> str:
+    """Delete a non-markdown file from the vault. Requires a readwrite API key.
+    Peer to `delete_note`, which stays markdown-only.
+
+    By default this is a soft delete: the file moves to
+    `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` inside the vault, keeping a
+    copy the user can recover. Two files with the same name deleted in the same
+    second both survive — the trash never clobbers.
+
+    With `permanent=True` the file is unlinked outright and this server has no
+    recovery path; the user's backups are the only rollback.
+
+    Refuses markdown files (use `delete_note`, which understands the index and
+    backlinks), directories, and symlinks. Non-markdown files are not indexed,
+    so search and embeddings are unaffected either way.
+
+    Args:
+        path: Vault-relative path to the file.
+        permanent: If True, unlink instead of moving to `.trash/`.
+    """
+    return await delete_file_impl(path, permanent=permanent)

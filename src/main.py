@@ -23,6 +23,7 @@ from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
 from src.oauth.routes import router as oauth_router
 from src.services.indexer import run_indexer_loop
+from src.transfer.routes import router as transfer_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -256,6 +257,14 @@ app.include_router(oauth_router)
 
 # API routes (protected by Traefik OAuth)
 app.include_router(api_router)
+
+# Capability-token transfer routes. Public by design: no OAuth chain in
+# Traefik and no `APIKeyMiddleware` in the app — `APIKeyMiddleware` wraps only
+# the `/mcp` mount, and `RootMCPProxyMiddleware` only rewrites a bare `/`, so a
+# `/transfer/*` request carrying a bearer transfer token reaches these routes
+# untouched. `tests/test_transfer_routes.py` asserts that rather than trusting
+# it. Each handler authenticates its own request from the token row.
+app.include_router(transfer_router)
 
 # Control panel routes at /admin (protected by Traefik OAuth)
 app.include_router(panel_router)

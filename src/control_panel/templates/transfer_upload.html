@@ -1,0 +1,136 @@
+{#-
+  Upload drop page. Identical bytes for every token: nothing token- or
+  path-specific is rendered server-side, so the token never reaches a template
+  and cannot end up in a cached page. The script reads it from the URL
+  fragment, which the browser never sends to the server.
+
+  Everything is inline and nonce-guarded (no CDN, no external font, no image):
+  the CSP the route sets is `default-src 'none'`, so anything fetched from
+  another origin simply would not load.
+-#}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Upload to vault</title>
+<style nonce="{{ nonce }}">
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; padding: 2.5rem 1.25rem;
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #f6f7f9; color: #16191d;
+  }
+  main { max-width: 34rem; margin: 0 auto; background: #fff; border-radius: 12px;
+         padding: 1.75rem; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  h1 { font-size: 1.15rem; margin: 0 0 1rem; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: .35rem 1rem; margin: 0 0 1.25rem; }
+  dt { color: #666; }
+  dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  input[type=file] { width: 100%; margin-bottom: 1rem; }
+  button { font: inherit; padding: .55rem 1.1rem; border: 0; border-radius: 8px;
+           background: #2f6feb; color: #fff; cursor: pointer; }
+  button[disabled] { background: #9bb4e4; cursor: default; }
+  progress { width: 100%; margin-top: 1rem; }
+  #status { margin-top: 1rem; white-space: pre-wrap; }
+  .err { color: #b3261e; }
+  .ok { color: #1a7f37; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #16191d; color: #e6e6e6; }
+    main { background: #21262d; box-shadow: none; }
+    dt { color: #9aa4ae; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Upload a file to the vault</h1>
+  <dl>
+    <dt>Destination</dt><dd id="path">…</dd>
+    <dt>Maximum size</dt><dd id="max">…</dd>
+    <dt>Link expires</dt><dd id="expires">…</dd>
+  </dl>
+  <input type="file" id="file" disabled>
+  <button id="send" disabled>Upload</button>
+  <progress id="bar" max="1" value="0" hidden></progress>
+  <p id="status"></p>
+</main>
+<script nonce="{{ nonce }}">
+(function () {
+  "use strict";
+  // The capability lives in the fragment, so it is never sent in the request
+  // line and never reaches an access log. It goes out again only as a header.
+  var token = location.hash.replace(/^#/, "");
+  var $ = function (id) { return document.getElementById(id); };
+  var status = $("status");
+
+  function say(text, cls) {
+    status.textContent = text;          // textContent, never innerHTML
+    status.className = cls || "";
+  }
+
+  function bytes(n) {
+    if (typeof n !== "number") { return "—"; }
+    var units = ["B", "KB", "MB", "GB"], i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
+    return (i === 0 ? n : n.toFixed(1)) + " " + units[i];
+  }
+
+  if (!token) {
+    say("This page needs the full link, including the part after the # sign.", "err");
+    return;
+  }
+
+  var auth = { "Authorization": "Bearer " + token };
+
+  fetch("/transfer/upload/info", { headers: auth, cache: "no-store" })
+    .then(function (r) {
+      if (!r.ok) { throw new Error("This upload link is not valid any more."); }
+      return r.json();
+    })
+    .then(function (info) {
+      $("path").textContent = info.path;
+      $("max").textContent = bytes(info.max_bytes);
+      $("expires").textContent = new Date(info.expires_at).toLocaleString();
+      $("file").disabled = false;
+      $("send").disabled = false;
+      say("Choose a file, then press Upload. The link works once.");
+    })
+    .catch(function (e) { say(e.message, "err"); });
+
+  $("send").addEventListener("click", function () {
+    var file = $("file").files[0];
+    if (!file) { say("Choose a file first.", "err"); return; }
+    $("send").disabled = true;
+    $("file").disabled = true;
+    $("bar").hidden = false;
+    say("Uploading…");
+    fetch("/transfer/upload", { method: "PUT", headers: auth, body: file })
+      .then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (body) {
+          return { ok: r.ok, status: r.status, body: body };
+        });
+      })
+      .then(function (res) {
+        $("bar").hidden = true;
+        if (res.ok) {
+          say("Uploaded " + bytes(res.body.size) + " to " + res.body.path +
+              "\nsha256 " + res.body.sha256, "ok");
+          return;
+        }
+        $("send").disabled = false;
+        $("file").disabled = false;
+        say(res.body.error || ("Upload failed (HTTP " + res.status + ")."), "err");
+      })
+      .catch(function () {
+        $("bar").hidden = true;
+        $("send").disabled = false;
+        $("file").disabled = false;
+        say("Upload failed: the connection was interrupted.", "err");
+      });
+  });
+})();
+</script>
+</body>
+</html>

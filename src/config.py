@@ -1,7 +1,7 @@
 from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
 
@@ -138,6 +138,24 @@ class Settings(BaseSettings):
     max_file_read_bytes: int = Field(10 * 1024 * 1024, ge=1)
     max_file_write_bytes: int = Field(25 * 1024 * 1024, ge=1)
 
+    # ── Out-of-band binary transfer (`/transfer/*` capability routes) ────────
+    # Default lifetime of a mint (`request_upload` / `request_download`). A
+    # per-call `expires_in` is clamped to [60, 3600]; this default is clamped
+    # to the same window at load time so an operator cannot configure a
+    # capability that outlives the bound it is documented to have.
+    transfer_token_ttl_seconds: int = Field(600, ge=60, le=3600)
+    # Wall-clock bound on one claimed upload's body: the deadline is
+    # `min(expires_at, claimed_at + this)`. Bounds a slow-drip stream that
+    # would otherwise hold a claim (and a semaphore slot) indefinitely.
+    transfer_max_upload_seconds: int = Field(600, ge=1)
+    # Simultaneous streaming uploads. Each holds an open temp file and a
+    # request task; this is the only thing bounding aggregate upload memory
+    # and disk churn on a public route.
+    transfer_max_concurrent_uploads: int = Field(4, ge=1)
+    # `import_from_url` refuses plain http by default. Turning this on also
+    # admits ports 80/8080 for the http scheme (443/8443 stay https-only).
+    import_allow_http: bool = False
+
     @property
     def mcp_max_request_body_bytes(self) -> int:
         """Maximum MCP streamable-HTTP request body, derived from the write caps.
@@ -267,6 +285,40 @@ class Settings(BaseSettings):
         if not out:
             raise ValueError("FTS_CONFIGS must contain at least one config name")
         return out
+
+    # Set by `_record_public_origin`, which must run *before*
+    # `_derive_public_urls` fills in the localhost fallback. Once that
+    # fallback has been applied, `base_url` is no longer evidence of what the
+    # operator configured — which is exactly the state the transfer mint tools
+    # must be able to distinguish (a capability URL on `http://localhost:8000`
+    # is useless to the human who is supposed to open it).
+    _public_origin_explicit: bool = PrivateAttr(default=False)
+
+    @model_validator(mode="after")
+    def _record_public_origin(self) -> "Settings":
+        """Record whether a public origin was operator-supplied.
+
+        Pydantic runs `mode="after"` model validators in definition order, so
+        at this point `mcp_hostname` and `base_url` still hold exactly what the
+        environment / `.env` / constructor provided. Ordering matters: this
+        method must stay above `_derive_public_urls`.
+        """
+        self._public_origin_explicit = bool(
+            (self.mcp_hostname or "").strip() or (self.base_url or "").strip()
+        )
+        return self
+
+    @property
+    def public_base_url(self) -> str | None:
+        """The origin a human-openable link may be built on, or `None`.
+
+        `base_url` always has a value (the localhost fallback), so it cannot
+        answer "did anyone configure a public origin?". This can: it is `None`
+        unless `MCP_HOSTNAME` or `BASE_URL` was operator-supplied. The transfer
+        mint tools refuse — naming both settings — rather than hand an agent a
+        link that resolves to the container's own loopback.
+        """
+        return self.base_url if self._public_origin_explicit else None
 
     @model_validator(mode="after")
     def _derive_public_urls(self) -> "Settings":
