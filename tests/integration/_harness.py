@@ -84,7 +84,7 @@ def _with_database(url: str, dbname: str) -> str:
     return urlunsplit(parts._replace(path=f"/{dbname}"))
 
 
-def _asyncpg_dsn(url: str) -> str:
+def asyncpg_dsn(url: str) -> str:
     """SQLAlchemy URL → a DSN asyncpg.connect() accepts."""
     parts = urlsplit(url)
     return urlunsplit(parts._replace(scheme=parts.scheme.split("+", 1)[0]))
@@ -107,15 +107,61 @@ async def _run_maintenance(admin_url: str, statement: str) -> None:
     """
     import asyncpg
 
-    conn = await asyncpg.connect(_asyncpg_dsn(admin_url))
+    conn = await asyncpg.connect(asyncpg_dsn(admin_url))
     try:
         await conn.execute(statement)
     finally:
         await conn.close()
 
 
-def throwaway_database(prefix: str, dimensions: int):
-    """Generator body for a module-scoped fixture: yields a migrated URL."""
+def run_alembic(
+    url: str,
+    *args: str,
+    dimensions: int = 64,
+    check: bool = True,
+) -> subprocess.CompletedProcess:
+    """Run `python -m alembic <args>` against `url` in a subprocess.
+
+    A subprocess rather than `alembic.command`: `alembic/env.py` reads
+    `DATABASE_URL` from the environment and drives its own event loop, neither
+    of which survives being called from inside a test process that already has
+    `src.config` imported with different settings.
+
+    `check=False` returns the failed result instead of asserting, for the cases
+    that assert on *how* a migration fails.
+    """
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", *args],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "DATABASE_URL": url,
+            "EMBEDDING_DIMENSIONS": str(dimensions),
+            # Several offline test modules `os.environ.setdefault(
+            # "SECRET_KEY", "test")` at import time, and that sticks for the
+            # whole process. `Settings` rejects placeholder secrets, so the
+            # subprocess would fail to import `src.config` depending on which
+            # modules pytest collected first. Give it a real one.
+            "SECRET_KEY": secrets.token_hex(32),
+        },
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    if check:
+        assert result.returncode == 0, (
+            f"alembic {' '.join(args)} failed\n{result.stdout}\n{result.stderr}"
+        )
+    return result
+
+
+def throwaway_database(prefix: str, dimensions: int, revision: str = "head"):
+    """Generator body for a module-scoped fixture: yields a migrated URL.
+
+    `revision` is the alembic target — `head` for the usual "give me the
+    current schema", or an explicit revision for tests that need to stand a
+    database up at an older shape and migrate it forward themselves.
+    """
     admin_db = _admin_database_name(PGVECTOR_TEST_ADMIN_URL)
     if admin_db in FORBIDDEN_DB_NAMES:
         pytest.fail(
@@ -134,28 +180,7 @@ def throwaway_database(prefix: str, dimensions: int):
             _run_maintenance(PGVECTOR_TEST_ADMIN_URL, f'CREATE DATABASE "{dbname}"')
         )
         url = _with_database(PGVECTOR_TEST_ADMIN_URL, dbname)
-        result = subprocess.run(
-            [sys.executable, "-m", "alembic", "upgrade", "head"],
-            cwd=ROOT,
-            env={
-                **os.environ,
-                "DATABASE_URL": url,
-                "EMBEDDING_DIMENSIONS": str(dimensions),
-                # Several offline test modules `os.environ.setdefault(
-                # "SECRET_KEY", "test")` at import time, and that sticks for
-                # the whole process. `Settings` rejects placeholder secrets, so
-                # the migration subprocess would fail to import `src.config`
-                # depending on which modules pytest collected first. Give it a
-                # real one.
-                "SECRET_KEY": secrets.token_hex(32),
-            },
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        assert result.returncode == 0, (
-            f"alembic upgrade head failed\n{result.stdout}\n{result.stderr}"
-        )
+        run_alembic(url, "upgrade", revision, dimensions=dimensions)
         yield url
     finally:
         # FORCE terminates any connection the test left behind, so a failing
