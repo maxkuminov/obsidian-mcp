@@ -20,7 +20,7 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-backup db-restore status clean reindex reset-embeddings rebuild-tsvectors audit trivy
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status clean reindex reset-embeddings rebuild-tsvectors audit trivy
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -45,6 +45,7 @@ help:
 	@echo "$(YELLOW)Database:$(NC)"
 	@echo "  make db-init      - Create database, user, and extensions"
 	@echo "  make db-migrate   - Run Alembic migrations"
+	@echo "  make db-check     - Verify the schema matches the ORM models"
 	@echo "  make db-backup    - Backup database"
 	@echo "  make db-restore FILE=<path> - Restore from backup"
 	@echo ""
@@ -137,6 +138,10 @@ db-migrate:
 	@echo "$(GREEN)Running migrations...$(NC)"
 	$(COMPOSE) exec obsidian-mcp alembic upgrade head
 	@echo "$(GREEN)Migrations complete$(NC)"
+
+db-check:
+	@echo "$(GREEN)Checking schema against the models...$(NC)"
+	@$(COMPOSE) exec obsidian-mcp alembic check
 
 db-backup:
 	@mkdir -p $(DATA_DIR)/backups 2>/dev/null || true

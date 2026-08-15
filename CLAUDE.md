@@ -53,6 +53,7 @@ hostnames) must stay out of tracked files. The mechanism:
 - `make deploy` — full build, backup, migration, and deploy
 - `make db-init` — create database + pgvector extension
 - `make db-migrate` — run alembic migrations
+- `make db-check` — `alembic check`: schema vs. ORM models (must be clean)
 - `make logs` — tail container logs
 - `make status` — check health
 
@@ -70,7 +71,15 @@ specific to this MCP server.
 | --- | --- |
 | Dependency audit | `make audit` (pip-audit) |
 | Migrations | `make db-migrate` (alembic) |
+| Schema drift | `make db-check` (`docker exec obsidian-mcp alembic check`) |
 | Deploy | `make deploy` (build, backup, migrate, deploy) |
+
+**`alembic check` must be clean** — "No new upgrade operations detected." Run
+it after any migration and after any deploy that ran one (`make db-check`, or
+`docker exec obsidian-mcp alembic check` directly). A dirty check means the
+database and the models disagree, which makes the next autogenerate emit noise
+and, worse, hides a real missing constraint in it — see "Schema drift is not
+only what `alembic check` sees" below.
 
 **Codex framing for this product.** The consumer here is an **agent**, not a
 person, and the vault is Max's single source of truth for every project. The
@@ -83,6 +92,56 @@ as a mandatory adversarial-pass trigger.
 **No `user-representative` pass** — there is no browser UI. Substitute an
 end-to-end exercise of the affected MCP tools against the live server, and say
 in the report which tools were actually called.
+
+## Schema drift is not only what `alembic check` sees
+
+`alembic check` autogenerates against the live database and reports what it
+would emit. It compares tables, columns, nullability and indexes — it does
+**not** compare CHECK constraint predicates. So it is the cheap gate, not the
+whole gate.
+
+Issue #53 found both kinds at once. The models declare nine columns NOT NULL
+that their migrations left nullable (`api_keys.is_active/created_at`,
+`notes_metadata.indexed_at`, `oauth_clients.created_at`,
+`oauth_codes.used/created_at`, `oauth_tokens.revoked/created_at`,
+`usage_logs.created_at`) — `alembic check` sees that, and a freshly migrated
+001→012 database has it too, so it was a migration bug. Separately, the CHECK
+`ck_oauth_clients_auth_method_secret` that migration 010 creates was **absent
+on the live database** while `alembic_version` read 012 — `alembic check`
+cannot see that at all, and neither can a lookup by constraint name, which a
+same-named `CHECK (true)` would satisfy while enforcing nothing.
+
+Migration `013_schema_reconciliation` fixes both and enforces the *complete*
+010 shape rather than just the missing piece, because how the live database
+lost the constraint is unknown. Its rules, all load-bearing:
+
+- The constraint is resolved through `pg_constraint` — `conrelid`, `contype`,
+  `convalidated`, and `pg_get_constraintdef` compared against the canonical
+  predicate — never by name. The canonical rendering is derived at runtime from
+  an empty scratch table (`CREATE TEMP TABLE … (LIKE oauth_clients)`) so it is
+  the server's own normalization, not a hand-written string pinned to one
+  Postgres major.
+- **Rows are never mutated to satisfy a constraint.** A violating
+  `oauth_clients` row makes the migration raise, naming the `client_id`s; the
+  transaction rolls back and the deploy aborts before the container is
+  recreated.
+- `LOCK TABLE oauth_clients IN SHARE ROW EXCLUSIVE MODE` is held from before
+  the offender check to the end, so no insert can land between the check and
+  `ADD CONSTRAINT`. `lock_timeout=10s` / `statement_timeout=60s` make a
+  blocked migration fail fast instead of stalling the deploy.
+- Downgrade drops the constraint **only if it carries 013's COMMENT marker**.
+  A fresh 001→013 database got its constraint from 010, so downgrading to 012
+  must keep it. NOT NULL is never relaxed on downgrade — that would re-create
+  the drift the migration exists to remove.
+
+`tests/integration/test_schema_check.py` is the gate. Opt-in via
+`PGVECTOR_TEST_ADMIN_URL` (same throwaway-database harness as the other
+integration modules), it asserts `alembic check` clean *and* the catalog
+directly *and* that the two forbidden inserts are actually rejected, across
+fresh / drifted / impostor-constraint / violating-row / stamp-back / downgrade
+paths. Idempotence is exercised by `alembic stamp 012` then `upgrade head`, not
+by a second `upgrade head` — the latter is a no-op at the alembic level and
+proves nothing about the migration body.
 
 ## Key Decisions
 - API keys use `omcp_` prefix, stored as SHA-256 hashes
