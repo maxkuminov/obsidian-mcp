@@ -1,0 +1,124 @@
+{#-
+  Download page. Same shape as the upload page and the same guarantees: static
+  for every token, nonce-guarded inline CSS/JS, nothing loaded from another
+  origin, the capability read from the fragment and sent only as a header.
+
+  The save is a fetch → Blob → `<a download>` click rather than a plain link,
+  because a plain link would have to carry the token in the request line. For
+  vault-sized files buffering the body in the tab is a fair trade.
+-#}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Download from vault</title>
+<style nonce="{{ nonce }}">
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0; padding: 2.5rem 1.25rem;
+    font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: #f6f7f9; color: #16191d;
+  }
+  main { max-width: 34rem; margin: 0 auto; background: #fff; border-radius: 12px;
+         padding: 1.75rem; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  h1 { font-size: 1.15rem; margin: 0 0 1rem; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: .35rem 1rem; margin: 0 0 1.25rem; }
+  dt { color: #666; }
+  dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+  button { font: inherit; padding: .55rem 1.1rem; border: 0; border-radius: 8px;
+           background: #2f6feb; color: #fff; cursor: pointer; }
+  button[disabled] { background: #9bb4e4; cursor: default; }
+  #status { margin-top: 1rem; white-space: pre-wrap; }
+  .err { color: #b3261e; }
+  .ok { color: #1a7f37; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #16191d; color: #e6e6e6; }
+    main { background: #21262d; box-shadow: none; }
+    dt { color: #9aa4ae; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <h1>Download a file from the vault</h1>
+  <dl>
+    <dt>File</dt><dd id="path">…</dd>
+    <dt>Size</dt><dd id="size">…</dd>
+    <dt>Link expires</dt><dd id="expires">…</dd>
+  </dl>
+  <button id="save" disabled>Save file</button>
+  <p id="status"></p>
+</main>
+<script nonce="{{ nonce }}">
+(function () {
+  "use strict";
+  var token = location.hash.replace(/^#/, "");
+  var $ = function (id) { return document.getElementById(id); };
+  var status = $("status");
+  var name = "download";
+
+  function say(text, cls) {
+    status.textContent = text;
+    status.className = cls || "";
+  }
+
+  function bytes(n) {
+    if (typeof n !== "number") { return "—"; }
+    var units = ["B", "KB", "MB", "GB"], i = 0;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i += 1; }
+    return (i === 0 ? n : n.toFixed(1)) + " " + units[i];
+  }
+
+  if (!token) {
+    say("This page needs the full link, including the part after the # sign.", "err");
+    return;
+  }
+
+  var auth = { "Authorization": "Bearer " + token };
+
+  fetch("/transfer/download/info", { headers: auth, cache: "no-store" })
+    .then(function (r) {
+      if (!r.ok) { throw new Error("This download link is not valid any more."); }
+      return r.json();
+    })
+    .then(function (info) {
+      name = String(info.path).split("/").pop() || "download";
+      $("path").textContent = info.path;
+      $("size").textContent = bytes(info.size);
+      $("expires").textContent = new Date(info.expires_at).toLocaleString();
+      $("save").disabled = false;
+      say("Press Save file. The link keeps working until it expires.");
+    })
+    .catch(function (e) { say(e.message, "err"); });
+
+  $("save").addEventListener("click", function () {
+    $("save").disabled = true;
+    say("Fetching…");
+    fetch("/transfer/download/file", { headers: auth, cache: "no-store" })
+      .then(function (r) {
+        if (!r.ok) { throw new Error("The file is no longer available at this link."); }
+        return r.blob();
+      })
+      .then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = url;
+        a.download = name;          // set as a property, never interpolated
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        $("save").disabled = false;
+        say("Saved " + bytes(blob.size) + ".", "ok");
+      })
+      .catch(function (e) {
+        $("save").disabled = false;
+        say(e.message, "err");
+      });
+  });
+})();
+</script>
+</body>
+</html>

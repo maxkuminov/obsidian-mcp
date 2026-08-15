@@ -38,7 +38,7 @@ from sqlalchemy import delete as sa_delete
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-from src.models.db import APIKey, OAuthClient, OAuthToken, TransferToken, User
+from src.models.db import APIKey, OAuthClient, OAuthToken, TransferToken, UsageLog, User
 from src.services import transfer
 
 PGVECTOR_TEST_ADMIN_URL = os.environ.get("PGVECTOR_TEST_ADMIN_URL")
@@ -165,6 +165,10 @@ async def clean(sessionmaker):
     """Empty every table this module writes to, before each test."""
     async with sessionmaker() as session:
         await session.execute(sa_delete(TransferToken))
+        # Before `api_keys`: `usage_logs.key_id` has no `ON DELETE` (a
+        # pre-existing shape, unchanged by this work), so a usage-log row
+        # written by an upload route blocks its key's delete.
+        await session.execute(sa_delete(UsageLog))
         await session.execute(sa_delete(OAuthToken))
         await session.execute(sa_delete(OAuthClient))
         await session.execute(sa_delete(APIKey))
@@ -228,6 +232,7 @@ async def _add_token(session, *, key=None, oauth=None, user=None, direction="upl
                      state="pending", path="Attachments/a.png", root="/obsidian",
                      ttl=600):
     row = TransferToken(
+        public_id=transfer.new_public_id(),
         token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
         direction=direction,
         state=state,
@@ -365,6 +370,7 @@ async def test_mint_prunes_long_dead_rows(clean):
     async with clean() as session:
         user, key, _ = await _seed_identity(session)
         stale = TransferToken(
+            public_id=transfer.new_public_id(),
             token_hash="0" * 64,
             direction="upload",
             state="completed",
@@ -376,6 +382,7 @@ async def test_mint_prunes_long_dead_rows(clean):
             expires_at=_now() - datetime.timedelta(days=3),
         )
         recent = TransferToken(
+            public_id=transfer.new_public_id(),
             token_hash="1" * 64,
             direction="upload",
             state="completed",
@@ -807,3 +814,383 @@ async def test_claim_and_publish_lock_do_not_deadlock_on_a_single_connection(
             assert fresh.state == "completed"
     finally:
         await engine.dispose()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 4.7 — the same properties, driven through the real HTTP route
+#
+# The service-level tests above prove the primitives. These prove the *route*
+# uses them correctly, which is a different claim: a handler that takes the
+# right locks and then releases a claim it should not have released is green on
+# every test above and still wrong. Only the claim's transaction boundary and
+# the `FOR UPDATE` barrier make these meaningful, so they live here rather than
+# in `tests/test_transfer_routes.py`.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def vault_root(tmp_path):
+    from src.services import vault_fs
+
+    (tmp_path / "Attachments").mkdir()
+    vault_fs.reset_filesystem_probe_cache()
+    yield tmp_path
+    vault_fs.reset_filesystem_probe_cache()
+
+
+@pytest.fixture
+def wired(sessionmaker, monkeypatch):
+    """Point the transfer routes at the throwaway database."""
+    from src.limiter import limiter
+    from src.transfer import routes as transfer_routes
+
+    monkeypatch.setattr(transfer_routes, "async_session", sessionmaker)
+    limiter.reset()
+    yield sessionmaker
+    limiter.reset()
+
+
+def _client(ip: str):
+    import httpx
+
+    from src.main import app
+
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, client=(ip, 1)),
+        base_url="http://localhost:8000",
+    )
+
+
+async def _mint_upload(session, vault_root, *, path="Attachments/shot.png", permission="readwrite"):
+    user, key, _ = await _seed_identity(
+        session, permission=permission, vault_path=str(vault_root)
+    )
+    token, row = await transfer.mint_token(
+        session,
+        "upload",
+        path,
+        overwrite=False,
+        identity=transfer.Identity(key_id=key.id, user_id=user.id),
+        vault_root=str(vault_root),
+        expected_fingerprint=None,
+    )
+    return user, key, token, row
+
+
+PAYLOAD = b"\x89PNG\r\n\x1a\n" + b"payload-bytes " * 64
+
+
+async def test_route_upload_round_trip(clean, vault_root, wired):
+    async with clean() as session:
+        _user, key, token, row = await _mint_upload(session, vault_root)
+
+    async with _client("203.0.113.20") as client:
+        response = await client.put(
+            "/transfer/upload",
+            headers={"Authorization": f"Bearer {token}"},
+            content=PAYLOAD,
+        )
+    assert response.status_code == 200, response.text
+    assert (vault_root / "Attachments" / "shot.png").read_bytes() == PAYLOAD
+
+    async with wired() as session:
+        fresh = (
+            await session.execute(
+                select(TransferToken)
+                .where(TransferToken.id == row.id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+        assert fresh.state == "completed"
+        assert fresh.sha256 == response.json()["sha256"]
+        logs = (await session.execute(select(UsageLog))).scalars().all()
+    assert [log.tool for log in logs] == ["upload_file"]
+    assert logs[0].key_id == key.id
+    assert token not in str(logs[0].params)
+
+
+async def test_two_concurrent_puts_yield_one_200_one_404_and_one_file(
+    clean, vault_root, wired
+):
+    """The claim is a transaction boundary; only a real race can prove it."""
+    async with clean() as session:
+        _user, _key, token, _row = await _mint_upload(session, vault_root)
+
+    headers = {"Authorization": f"Bearer {token}"}
+
+    async def put(ip: str):
+        async with _client(ip) as client:
+            return await client.put("/transfer/upload", headers=headers, content=PAYLOAD)
+
+    first, second = await asyncio.gather(put("203.0.113.21"), put("203.0.113.22"))
+    statuses = sorted([first.status_code, second.status_code])
+    assert statuses == [200, 404], (first.text, second.text)
+
+    written = sorted(p.name for p in (vault_root / "Attachments").iterdir())
+    assert written == ["shot.png"]
+    assert (vault_root / "Attachments" / "shot.png").read_bytes() == PAYLOAD
+
+
+async def test_a_failure_recording_the_completion_leaves_the_token_claimed(
+    clean, vault_root, wired, monkeypatch
+):
+    """The bytes are published; the row must stay `claimed`, never `pending`.
+
+    Releasing here would hand back a token that replays over a path already
+    holding the upload — the one outcome worse than a stuck capability.
+    """
+    async with clean() as session:
+        _user, _key, token, row = await _mint_upload(session, vault_root)
+
+    async def exploding(*args, **kwargs):
+        raise RuntimeError("connection reset while committing")
+
+    monkeypatch.setattr(transfer, "complete_upload", exploding)
+
+    async with _client("203.0.113.23") as client:
+        with pytest.raises(transfer.PostPublishFailure):
+            await client.put(
+                "/transfer/upload",
+                headers={"Authorization": f"Bearer {token}"},
+                content=PAYLOAD,
+            )
+
+    assert (vault_root / "Attachments" / "shot.png").read_bytes() == PAYLOAD
+    async with wired() as session:
+        fresh = (
+            await session.execute(
+                select(TransferToken)
+                .where(TransferToken.id == row.id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+    assert fresh.state == "claimed"
+    assert fresh.completed_at is None
+
+
+async def _gated_body(gate: asyncio.Event, released: asyncio.Event):
+    """A body that hands control back mid-stream so a test can mutate the DB."""
+    yield PAYLOAD[:16]
+    released.set()
+    await asyncio.wait_for(gate.wait(), timeout=10)
+    yield PAYLOAD[16:]
+
+
+async def test_cascade_deleting_the_key_mid_upload_publishes_nothing(
+    clean, vault_root, wired
+):
+    async with clean() as session:
+        _user, key, token, row = await _mint_upload(session, vault_root)
+
+    gate, released = asyncio.Event(), asyncio.Event()
+
+    async def upload():
+        async with _client("203.0.113.24") as client:
+            return await client.put(
+                "/transfer/upload",
+                headers={"Authorization": f"Bearer {token}"},
+                content=_gated_body(gate, released),
+            )
+
+    task = asyncio.create_task(upload())
+    await asyncio.wait_for(released.wait(), timeout=10)
+    async with wired() as session:
+        # Cascades the transfer row away with the key.
+        await session.execute(sa_delete(APIKey).where(APIKey.id == key.id))
+        await session.commit()
+    gate.set()
+
+    response = await asyncio.wait_for(task, timeout=20)
+    assert response.status_code == 404
+    assert response.json() == {"error": "not found"}
+    assert not (vault_root / "Attachments" / "shot.png").exists()
+    async with wired() as session:
+        assert (
+            await session.execute(select(func.count()).select_from(TransferToken))
+        ).scalar_one() == 0
+
+
+async def test_revocation_mid_upload_never_publishes(clean, vault_root, wired):
+    """The locked re-check runs against the committed revocation, not a cache."""
+    async with clean() as session:
+        _user, key, token, row = await _mint_upload(session, vault_root)
+
+    gate, released = asyncio.Event(), asyncio.Event()
+
+    async def upload():
+        async with _client("203.0.113.25") as client:
+            return await client.put(
+                "/transfer/upload",
+                headers={"Authorization": f"Bearer {token}"},
+                content=_gated_body(gate, released),
+            )
+
+    task = asyncio.create_task(upload())
+    await asyncio.wait_for(released.wait(), timeout=10)
+    async with wired() as session:
+        await session.execute(
+            update(APIKey).where(APIKey.id == key.id).values(is_active=False)
+        )
+        await session.commit()
+    gate.set()
+
+    response = await asyncio.wait_for(task, timeout=20)
+    assert response.status_code == 404
+    assert not (vault_root / "Attachments" / "shot.png").exists()
+    async with wired() as session:
+        fresh = (
+            await session.execute(
+                select(TransferToken)
+                .where(TransferToken.id == row.id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one()
+    # Nothing was published, so the claim goes back: the link still works if
+    # the key is reinstated.
+    assert fresh.state == "pending"
+
+
+async def test_a_permission_downgrade_mid_upload_never_publishes(
+    clean, vault_root, wired
+):
+    async with clean() as session:
+        _user, key, token, _row = await _mint_upload(session, vault_root)
+
+    gate, released = asyncio.Event(), asyncio.Event()
+
+    async def upload():
+        async with _client("203.0.113.26") as client:
+            return await client.put(
+                "/transfer/upload",
+                headers={"Authorization": f"Bearer {token}"},
+                content=_gated_body(gate, released),
+            )
+
+    task = asyncio.create_task(upload())
+    await asyncio.wait_for(released.wait(), timeout=10)
+    async with wired() as session:
+        await session.execute(
+            update(APIKey).where(APIKey.id == key.id).values(permission="read")
+        )
+        await session.commit()
+    gate.set()
+
+    response = await asyncio.wait_for(task, timeout=20)
+    assert response.status_code == 404
+    assert not (vault_root / "Attachments" / "shot.png").exists()
+
+
+async def test_root_reassignment_is_a_404_not_a_500(clean, vault_root, wired, tmp_path):
+    """Read from the database, and never let a reassignment become a 500."""
+    async with clean() as session:
+        user, _key, token, _row = await _mint_upload(session, vault_root)
+
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    async with wired() as session:
+        await session.execute(
+            update(User).where(User.id == user.id).values(vault_path=str(elsewhere))
+        )
+        await session.commit()
+
+    headers = {"Authorization": f"Bearer {token}"}
+    async with _client("203.0.113.27") as client:
+        info = await client.get("/transfer/upload/info", headers=headers)
+        put = await client.put("/transfer/upload", headers=headers, content=PAYLOAD)
+
+    assert info.status_code == 404
+    assert put.status_code == 404
+    assert info.json() == put.json() == {"error": "not found"}
+    assert not (vault_root / "Attachments" / "shot.png").exists()
+    assert list(elsewhere.iterdir()) == []
+
+
+async def test_root_reassignment_mid_upload_publishes_nothing(
+    clean, vault_root, wired, tmp_path
+):
+    async with clean() as session:
+        user, _key, token, _row = await _mint_upload(session, vault_root)
+
+    elsewhere = tmp_path / "elsewhere2"
+    elsewhere.mkdir()
+    gate, released = asyncio.Event(), asyncio.Event()
+
+    async def upload():
+        async with _client("203.0.113.28") as client:
+            return await client.put(
+                "/transfer/upload",
+                headers={"Authorization": f"Bearer {token}"},
+                content=_gated_body(gate, released),
+            )
+
+    task = asyncio.create_task(upload())
+    await asyncio.wait_for(released.wait(), timeout=10)
+    async with wired() as session:
+        await session.execute(
+            update(User).where(User.id == user.id).values(vault_path=str(elsewhere))
+        )
+        await session.commit()
+    gate.set()
+
+    response = await asyncio.wait_for(task, timeout=20)
+    assert response.status_code == 404
+    assert not (vault_root / "Attachments" / "shot.png").exists()
+    assert list(elsewhere.iterdir()) == []
+
+
+async def test_a_replayed_token_is_a_404(clean, vault_root, wired):
+    async with clean() as session:
+        _user, _key, token, _row = await _mint_upload(session, vault_root)
+
+    headers = {"Authorization": f"Bearer {token}"}
+    async with _client("203.0.113.29") as client:
+        first = await client.put("/transfer/upload", headers=headers, content=PAYLOAD)
+        second = await client.put("/transfer/upload", headers=headers, content=PAYLOAD)
+        info = await client.get("/transfer/upload/info", headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 404
+    assert info.status_code == 404
+    assert (vault_root / "Attachments" / "shot.png").read_bytes() == PAYLOAD
+
+
+async def test_download_round_trip_through_the_route(clean, vault_root, wired):
+    from src.services import vault_fs
+
+    target = vault_root / "Attachments" / "spec.pdf"
+    target.write_bytes(b"%PDF-1.4\n" + b"body " * 100)
+
+    root_fd = vault_fs.open_root(vault_root)
+    try:
+        dir_fd, name = vault_fs.open_parent(root_fd, "Attachments/spec.pdf")
+        try:
+            fingerprint = vault_fs.fingerprint(dir_fd, name, hash_up_to=10**9)
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(root_fd)
+
+    async with clean() as session:
+        user, key, _ = await _seed_identity(session, vault_path=str(vault_root))
+        token, _row = await transfer.mint_token(
+            session,
+            "download",
+            "Attachments/spec.pdf",
+            overwrite=False,
+            identity=transfer.Identity(key_id=key.id, user_id=user.id),
+            vault_root=str(vault_root),
+            expected_fingerprint=fingerprint,
+        )
+
+    headers = {"Authorization": f"Bearer {token}"}
+    async with _client("203.0.113.30") as client:
+        got = await client.get("/transfer/download/file", headers=headers)
+        # Multi-use within the TTL, unlike an upload token.
+        again = await client.get("/transfer/download/file", headers=headers)
+
+    assert got.status_code == again.status_code == 200
+    assert got.content == target.read_bytes()
+    async with wired() as session:
+        logs = (await session.execute(select(UsageLog))).scalars().all()
+    assert [log.tool for log in logs] == ["download_file", "download_file"]
+    assert all(log.user_id == user.id for log in logs)

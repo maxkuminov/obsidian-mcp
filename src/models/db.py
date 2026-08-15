@@ -266,6 +266,12 @@ class TransferToken(Base):
     __tablename__ = "transfer_tokens"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    # The handle the tools hand back to the agent. Deliberately *not* `id`: the
+    # row id is a small sequential integer, so an `upload_id` built on it is
+    # enumerable and an agent that leaks one leaks the shape of the table.
+    # Identity scoping still applies on top — this is defence in depth, not a
+    # replacement for it.
+    public_id: Mapped[str] = mapped_column(String(43), unique=True, nullable=False)
     token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
     direction: Mapped[str] = mapped_column(String(16), nullable=False)
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")

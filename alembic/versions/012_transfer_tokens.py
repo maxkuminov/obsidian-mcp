@@ -20,6 +20,7 @@ def upgrade() -> None:
     op.create_table(
         "transfer_tokens",
         sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("public_id", sa.String(length=43), unique=True, nullable=False),
         sa.Column("token_hash", sa.String(length=64), unique=True, nullable=False),
         sa.Column("direction", sa.String(length=16), nullable=False),
         sa.Column("state", sa.String(length=16), nullable=False, server_default="pending"),
