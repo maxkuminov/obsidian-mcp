@@ -20,6 +20,7 @@ from src.config import MAX_MOVE_REWRITE_BYTES, MAX_NOTE_BYTES, settings
 from src.database import async_session
 from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
 from src.models.db import UsageLog
+from src.services import timing
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.search import full_text_search
@@ -761,11 +762,19 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         avg = np.mean([np.asarray(c, dtype=float) for c in chunks], axis=0)
         avg_list = avg.tolist()
 
-        # Same HNSW tuning as semantic_search — see embeddings.py for context.
+        # Same HNSW tuning as semantic_search — see embeddings.py for the
+        # full rationale, including why iterative_scan is what keeps a
+        # filtered vector query from silently coming back empty. This query is
+        # always filtered (`note_id != source.id`, plus the user scope), so it
+        # is exposed to exactly the same post-filter candidate loss.
         await session.execute(text("SET LOCAL hnsw.ef_search = 80"))
         await session.execute(text("SET LOCAL random_page_cost = 1.1"))
+        await session.execute(text("SET LOCAL hnsw.iterative_scan = 'relaxed_order'"))
 
-        # Pull more than `limit` so we can dedupe by note.
+        # Pull more than `limit` so we can dedupe by note. Same overfetch as
+        # semantic_search so both vector paths share one recall contract.
+        overfetch = max(limit * 5, 50)
+        distance = NoteEmbedding.embedding.cosine_distance(avg_list)
         stmt = (
             select(
                 NoteEmbedding.note_id,
@@ -774,15 +783,29 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
                 NoteMetadata.file_path,
                 NoteMetadata.title,
                 NoteMetadata.tags,
+                distance.label("distance"),
             )
             .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
             .where(NoteEmbedding.note_id != source.id)
-            .order_by(NoteEmbedding.embedding.cosine_distance(avg_list))
-            .limit(limit * 5)
         )
         if uid is not None:
             stmt = stmt.where(NoteMetadata.user_id == uid)
+        stmt = stmt.order_by(distance).limit(overfetch)
         rows = (await session.execute(stmt)).all()
+
+        # Zero-row exact fallback, as in semantic_search: an empty result from
+        # an approximate filtered scan is ambiguous, so re-run the identical
+        # statement as an exact sequential scan before believing it.
+        exact_fallback = False
+        if not rows:
+            await session.execute(text("SET LOCAL enable_indexscan = off"))
+            rows = (await session.execute(stmt)).all()
+            exact_fallback = True
+        timing.record("exact_fallback", exact_fallback)
+
+        # `relaxed_order` does not promise a globally sorted stream; re-sort
+        # before dedupe so the presented order is monotone in distance.
+        rows = sorted(rows, key=lambda r: r.distance)
 
     if not rows:
         return f"No related notes for `{path}`"

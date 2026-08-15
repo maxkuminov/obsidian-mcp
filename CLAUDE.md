@@ -102,7 +102,8 @@ in the report which tools were actually called.
 - Vector search via pgvector HNSW index on `note_embeddings.embedding`
   (`vector_cosine_ops`, `m=16, ef_construction=64`); `semantic_search`
   sets `hnsw.ef_search=80` per query and dedupes per note in Python
-  after a 5x overfetch
+  after a 5x overfetch. See "Filtered vector search" below — the
+  `SET LOCAL`s are load-bearing for *correctness*, not just speed.
 - Indexer runs on startup then every 5 minutes, hash-based change detection
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
@@ -126,6 +127,51 @@ in the report which tools were actually called.
   the live column dim and `sys.exit(1)`s if it disagrees with
   `EMBEDDING_DIMENSIONS`, with a log message pointing to
   `make reset-embeddings`.
+- pgvector version guard (`_check_pgvector_version`, next to the dim guard in
+  `src/main.py`): reads `pg_extension.extversion` for `vector` and
+  `sys.exit(1)`s below **0.8.0**, naming `hnsw.iterative_scan`. Skipped in
+  sandbox mode and when the extension is not installed yet (alembic's job).
+  See "Filtered vector search" for why an older backend fails *silently*
+  without it.
+
+## Filtered vector search — the SET LOCALs are correctness, not tuning
+
+Both vector paths (`semantic_search` in `src/services/embeddings.py`,
+`find_related_impl` in `src/mcp_server/tools.py`) issue three transaction-scoped
+settings before the query, and all three matter:
+
+- `hnsw.ef_search = 80` — recall@10 ≈ 98%.
+- `random_page_cost = 1.1` — SSD costing; without it the planner prefers a
+  seq scan + sort, which is fine on a small table and degrades linearly.
+- `hnsw.iterative_scan = 'relaxed_order'` — **the recall fix.** With
+  `random_page_cost` lowered, the planner picks HNSW → nested loop → filter.
+  A non-iterative HNSW scan yields at most `ef_search` candidates; a `folder` /
+  `tags` / `frontmatter` / `user_id` predicate then discards most of them and
+  *nothing refills*. Measured: 45 of 120 folder-filtered probes returned zero
+  rows, 100 returned short. `relaxed_order` keeps walking the graph until the
+  overfetch is satisfied after filtering.
+
+Consequences that are easy to undo by accident:
+
+- **Re-sort before dedupe.** `relaxed_order` may emit rows slightly out of
+  distance order across iterations, so both paths select the cosine distance as
+  a column and sort by it before per-note dedupe/truncation. This is
+  presentation only — it cannot recover candidates the scan never returned.
+- **Zero-row exact fallback.** An empty result from an approximate *filtered*
+  scan is ambiguous. Both paths re-run the identical statement after
+  `SET LOCAL enable_indexscan = off` (pgvector's documented exact search) and
+  use those rows, recording `exact_fallback: true` in `usage_logs.params`. This
+  is what makes "empty only when nothing matches" a construction rather than a
+  benchmark hope. It is O(n), which is acceptable only because it is the rare
+  path — do not make it unconditional.
+- **The recall contract is a benchmark SLO**, not a per-query guarantee: set
+  recall ≥ 0.9 against an *exact filtered sequential scan taken at the same
+  overfetch with the same dedupe*. HNSW is approximate and the overfetch is
+  fixed at `max(5 × limit, 50)` for both paths, so a verbose note can still
+  crowd out others after dedupe — the baseline shares that property.
+- Recall is bounded by `hnsw.max_scan_tuples` (20,000) and
+  `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault is under the cap;
+  those are the next knobs, not `ef_search`.
 
 ## Graph tools
 - `get_backlinks(path, limit)` — notes that link TO `path` (resolved links only).
