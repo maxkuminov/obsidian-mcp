@@ -20,6 +20,7 @@ from src.config import MAX_MOVE_REWRITE_BYTES, MAX_NOTE_BYTES, settings
 from src.database import async_session
 from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
 from src.models.db import UsageLog
+from src.services import timing
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.search import full_text_search
@@ -101,24 +102,38 @@ def _tracked(tool_name: str, param_keys: list[str]):
         @wraps(fn)
         async def wrapper(*args, **kwargs):
             start = time.monotonic()
-            result = await fn(*args, **kwargs)
-            duration_ms = int((time.monotonic() - start) * 1000)
-            params = {}
-            # Resolve logged params by NAME via the wrapped signature so that
-            # a non-logged positional arg between logged ones can't shift the
-            # mapping (positional zipping silently mislabelled params before).
+            # The decorator owns the per-phase timing holder: a fresh dict per
+            # call, reset in `finally`. That is what makes cross-call
+            # attribution impossible — an early return or an exception leaves
+            # measured phases at their measured value, and the *next* call in
+            # the same task starts from empty rather than inheriting them.
+            token = timing.begin()
             try:
-                bound = sig.bind(*args, **kwargs)
-                bound.apply_defaults()
-                params = {
-                    key: bound.arguments[key]
-                    for key in param_keys
-                    if key in bound.arguments
-                }
-            except TypeError:
+                result = await fn(*args, **kwargs)
+                duration_ms = int((time.monotonic() - start) * 1000)
                 params = {}
-            await _log_usage(tool_name, _truncate_params(params), duration_ms, len(str(result)))
-            return result
+                # Resolve logged params by NAME via the wrapped signature so
+                # that a non-logged positional arg between logged ones can't
+                # shift the mapping (positional zipping silently mislabelled
+                # params before).
+                try:
+                    bound = sig.bind(*args, **kwargs)
+                    bound.apply_defaults()
+                    params = {
+                        key: bound.arguments[key]
+                        for key in param_keys
+                        if key in bound.arguments
+                    }
+                except TypeError:
+                    params = {}
+                logged = _truncate_params(params)
+                # Whatever the service measured. Absent for tools that measure
+                # nothing, so `params` keeps its current shape for them.
+                logged.update(timing.current() or {})
+                await _log_usage(tool_name, logged, duration_ms, len(str(result)))
+                return result
+            finally:
+                timing.clear(token)
         return wrapper
     return decorator
 
@@ -731,6 +746,39 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
     return "\n".join(lines)
 
 
+def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int | None,
+                      limit: int):
+    """The vector statement `find_related` runs, and its overfetch.
+
+    Factored out of `find_related_impl` so the recall benchmark in
+    `tests/integration/test_search_recall.py` can EXPLAIN and re-run *this*
+    statement rather than a hand-copied lookalike — a benchmark that measures a
+    query production does not issue measures nothing.
+    """
+    from sqlalchemy import select
+    from src.models.db import NoteEmbedding, NoteMetadata
+
+    # Pull more than `limit` so we can dedupe by note. Same overfetch as
+    # semantic_search so both vector paths share one recall contract.
+    overfetch = max(limit * 5, 50)
+    distance = NoteEmbedding.embedding.cosine_distance(avg_embedding)
+    stmt = (
+        select(
+            NoteEmbedding.note_id,
+            NoteEmbedding.chunk_text,
+            NoteMetadata.file_path,
+            NoteMetadata.title,
+            NoteMetadata.tags,
+            distance.label("distance"),
+        )
+        .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
+        .where(NoteEmbedding.note_id != source_id)
+    )
+    if user_id is not None:
+        stmt = stmt.where(NoteMetadata.user_id == user_id)
+    return stmt.order_by(distance).limit(overfetch)
+
+
 @_tracked("find_related", ["path", "limit"])
 async def find_related_impl(path: str, limit: int = 10) -> str:
     """Semantic neighbors via averaged chunk embeddings."""
@@ -742,74 +790,98 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
     limit = max(1, min(limit, 50))
 
     async with async_session() as session:
+        # `db_ms` covers every database phase of this tool, the source-chunk
+        # fetch included — it is accumulated, so the early returns below still
+        # report the work they actually did.
+        db_start = time.monotonic()
         src_stmt = select(NoteMetadata).where(NoteMetadata.file_path == path)
         if uid is not None:
             src_stmt = src_stmt.where(NoteMetadata.user_id == uid)
         source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
+            timing.add_ms("db_ms", time.monotonic() - db_start)
             return f"Note not found: {path}"
 
         chunks = (await session.execute(
             select(NoteEmbedding.embedding).where(NoteEmbedding.note_id == source.id)
         )).scalars().all()
+        timing.add_ms("db_ms", time.monotonic() - db_start)
         if not chunks:
             return (
                 f"`{path}` has not been embedded yet — "
                 "the indexer is still catching up. Try again in a few minutes."
             )
 
-        avg = np.mean([np.asarray(c, dtype=float) for c in chunks], axis=0)
-        avg_list = avg.tolist()
+        # The query vector: the mean of this note's own chunk vectors. NumPy is
+        # still the right tool here (pgvector returns plain lists); what moved
+        # to the database is the *scoring*, below.
+        avg_list = np.mean(
+            [np.asarray(c, dtype=float) for c in chunks], axis=0
+        ).tolist()
 
-        # Same HNSW tuning as semantic_search — see embeddings.py for context.
+        vector_start = time.monotonic()
+        # Same HNSW tuning as semantic_search — see embeddings.py for the
+        # full rationale, including why iterative_scan is what keeps a
+        # filtered vector query from silently coming back empty. This query is
+        # always filtered (`note_id != source.id`, plus the user scope), so it
+        # is exposed to exactly the same post-filter candidate loss.
         await session.execute(text("SET LOCAL hnsw.ef_search = 80"))
         await session.execute(text("SET LOCAL random_page_cost = 1.1"))
+        await session.execute(text("SET LOCAL hnsw.iterative_scan = 'relaxed_order'"))
 
-        # Pull more than `limit` so we can dedupe by note.
-        stmt = (
-            select(
-                NoteEmbedding.note_id,
-                NoteEmbedding.chunk_text,
-                NoteEmbedding.embedding,
-                NoteMetadata.file_path,
-                NoteMetadata.title,
-                NoteMetadata.tags,
-            )
-            .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
-            .where(NoteEmbedding.note_id != source.id)
-            .order_by(NoteEmbedding.embedding.cosine_distance(avg_list))
-            .limit(limit * 5)
-        )
-        if uid is not None:
-            stmt = stmt.where(NoteMetadata.user_id == uid)
+        stmt = find_related_stmt(source.id, avg_list, uid, limit)
         rows = (await session.execute(stmt)).all()
+
+        # Zero-row exact fallback, as in semantic_search: an empty result from
+        # an approximate filtered scan is ambiguous, so re-run the identical
+        # statement as an exact sequential scan before believing it.
+        exact_fallback = False
+        if not rows:
+            # Transaction-scoped, like every other SET LOCAL here: it applies
+            # to the re-run below and dies with this transaction. The session
+            # closes immediately after the re-sort, so nothing else in this
+            # call can inherit the exact plan — do not append further
+            # statements to this block without re-reading that.
+            await session.execute(text("SET LOCAL enable_indexscan = off"))
+            rows = (await session.execute(stmt)).all()
+            exact_fallback = True
+        timing.record("exact_fallback", exact_fallback)
+        timing.add_ms("db_ms", time.monotonic() - vector_start)
+
+        # `relaxed_order` does not promise a globally sorted stream; re-sort
+        # before dedupe so the presented order is monotone in distance.
+        rows = sorted(rows, key=lambda r: r.distance)
 
     if not rows:
         return f"No related notes for `{path}`"
 
-    # Dedupe by note_id, keeping the highest-similarity chunk.
-    avg_norm = float(np.linalg.norm(avg)) or 1.0
+    # Dedupe by note_id, keeping the nearest chunk — ranked by the *same*
+    # cosine distance the database ordered by, never by a distance recomputed
+    # here. pgvector compares float32 vectors; NumPy would recompute in
+    # float64 from the round-tripped values and order near-ties differently,
+    # so a recomputed ranking could invert two rows relative to the ORDER BY
+    # that selected them (and relative to the recall baseline). `similarity`
+    # is the cosine similarity that distance encodes: `1 - distance`.
     best: dict[int, dict] = {}
     for r in rows:
-        emb = np.asarray(r.embedding, dtype=float)
-        sim = float(np.dot(emb, avg) / ((np.linalg.norm(emb) or 1.0) * avg_norm))
+        dist = float(r.distance)
         prev = best.get(r.note_id)
-        if prev is None or sim > prev["similarity"]:
+        if prev is None or dist < prev["distance"]:
             best[r.note_id] = {
                 "path": r.file_path,
                 "title": r.title,
                 "tags": r.tags,
-                "similarity": sim,
+                "distance": dist,
                 "chunk": r.chunk_text,
             }
 
-    ranked = sorted(best.values(), key=lambda x: x["similarity"], reverse=True)[:limit]
+    ranked = sorted(best.values(), key=lambda x: x["distance"])[:limit]
     lines = [f"Top {len(ranked)} related notes for `{path}`:\n"]
     for r in ranked:
         tags_str = f" [{', '.join(r['tags'])}]" if r["tags"] else ""
         snippet = r["chunk"].replace("\n", " ")[:200]
         lines.append(
-            f"- **{r['title']}** (`{r['path']}`){tags_str} — sim: {r['similarity']:.3f}"
+            f"- **{r['title']}** (`{r['path']}`){tags_str} — sim: {1 - r['distance']:.3f}"
         )
         lines.append(f"  > {snippet}…")
     return "\n".join(lines)

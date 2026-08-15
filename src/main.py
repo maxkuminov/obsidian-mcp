@@ -61,6 +61,63 @@ async def _check_embedding_dim() -> None:
         sys.exit(1)
 
 
+MIN_PGVECTOR_VERSION = (0, 8, 0)
+
+
+def _parse_pgvector_version(raw: str) -> tuple[int, ...] | None:
+    """`'0.8.2'` → `(0, 8, 2)`. None when the string is not parseable.
+
+    Only the leading numeric dot-separated components are read, so a suffixed
+    build string (`0.8.0-rc1`) still compares as `0.8.0` rather than being
+    treated as unknown.
+    """
+    parts: list[int] = []
+    for chunk in raw.strip().split("."):
+        digits = ""
+        for ch in chunk:
+            if not ch.isdigit():
+                break
+            digits += ch
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) if parts else None
+
+
+async def _check_pgvector_version() -> None:
+    """Require pgvector >= 0.8.0, which is where `hnsw.iterative_scan` landed.
+
+    This is not cosmetic. Postgres accepts `SET LOCAL hnsw.iterative_scan` on
+    an older backend as an unrecognised *placeholder* GUC — no error, no
+    warning — and the extension simply ignores it. Filtered semantic search
+    would then keep silently dropping post-filter candidates while the code
+    looks like it asked for the fix. Failing at startup makes that impossible.
+    """
+    async with async_session() as session:
+        result = await session.execute(
+            text("SELECT extversion FROM pg_extension WHERE extname = 'vector'")
+        )
+        row = result.first()
+    if row is None:
+        # Extension not installed yet (fresh database before `make db-init` /
+        # the first migration). Alembic creates it; the dim guard above takes
+        # the same "defer to migrations" stance.
+        return
+    parsed = _parse_pgvector_version(str(row[0]))
+    if parsed is None or parsed < MIN_PGVECTOR_VERSION:
+        logging.getLogger(__name__).critical(
+            "pgvector %s is too old: filtered semantic search needs "
+            "hnsw.iterative_scan, which requires pgvector >= %s. Older "
+            "versions accept the setting as an unknown placeholder GUC and "
+            "silently run the non-iterative plan, which loses recall on every "
+            "filtered search. Upgrade the pgvector extension "
+            "(ALTER EXTENSION vector UPDATE) or the database image.",
+            row[0],
+            ".".join(str(p) for p in MIN_PGVECTOR_VERSION),
+        )
+        sys.exit(1)
+
+
 async def _validate_fts_configs() -> None:
     """Fail fast at startup if `FTS_CONFIGS` names a text-search config that
     isn't installed in this Postgres instance (e.g. a typo), so a bad config
@@ -119,6 +176,7 @@ async def lifespan(app: FastAPI):
             yield
         return
     await _check_embedding_dim()
+    await _check_pgvector_version()
     await _validate_fts_configs()
     # Fire-and-forget so a ~15s cold load doesn't block the app from serving.
     # The lifespan frame stays suspended at `yield`, keeping this referenced.

@@ -100,11 +100,39 @@ in the report which tools were actually called.
   query matches if any config hits (tsqueries OR'd). Startup validates the
   config names against `pg_ts_config`. Changing `FTS_CONFIGS` requires `make
   rebuild-tsvectors` — keyword index only, no embeddings, no API calls.
+  `full_text_search` also issues `SET LOCAL random_page_cost = 1.1` (the
+  planner costs the heap at `relpages` and does not model detoast I/O, so it
+  seq-scanned and detoasted every tsvector: 13,086 buffers vs 1,146) and
+  orders by `rank DESC, file_path ASC`. The tie-break is not cosmetic — a
+  plan change would otherwise change *which* tied rows survive the LIMIT.
+  Index usage is the expected plan for rare terms on a production-sized
+  corpus, not a guarantee; a tiny table or a very common term may legitimately
+  seq-scan.
 - Vector search via pgvector HNSW index on `note_embeddings.embedding`
   (`vector_cosine_ops`, `m=16, ef_construction=64`); `semantic_search`
   sets `hnsw.ef_search=80` per query and dedupes per note in Python
-  after a 5x overfetch
-- Indexer runs on startup then every 5 minutes, hash-based change detection
+  after a 5x overfetch. See "Filtered vector search" below — the
+  `SET LOCAL`s are load-bearing for *correctness*, not just speed.
+- Indexer runs on startup then every 5 minutes, hash-based change detection.
+  Each periodic tick ends with `prewarm_search_caches()` **inside**
+  `index_pass_lock`: one `get_embedding("warmup")` (Ollama only — a remote API
+  has no warm state) and one HNSW probe with a deterministic non-zero unit
+  vector, the whole thing under a single 15 s `asyncio.wait_for`. It exists
+  because `semantic_search` is bimodal (≈0.47 s warm, ≈17.5 s cold: 14 s of
+  Ollama reloading bge-m3, 3 s of HNSW pages missing from a 128 MB shared
+  `shared_buffers`) and the median gap between calls has grown to ~28 min.
+  It logs and swallows ordinary failures (the indexer's `consecutive_failures`
+  must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
+  still stops the loop.
+- **Because the pre-warm holds `index_pass_lock`, the panel's destructive
+  actions take it too.** `reset_embeddings` and `trigger_reembed` set
+  `indexer_paused`, then `await session.close()` on the request's own session
+  **before** waiting for the lock — a waiter that keeps its pooled connection
+  deadlocks against a lock holder that needs one — and only then open a fresh
+  session inside the lock (`_pass_lock_without_a_connection`). `trigger_reembed`
+  also NULLs `notes_metadata.embedded_content_hash` in the same transaction as
+  the `DELETE`: `embed_vault` selects on hash mismatch, so deleting vectors
+  alone meant the reindex it spawns re-embedded nothing.
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
@@ -127,6 +155,97 @@ in the report which tools were actually called.
   the live column dim and `sys.exit(1)`s if it disagrees with
   `EMBEDDING_DIMENSIONS`, with a log message pointing to
   `make reset-embeddings`.
+- pgvector version guard (`_check_pgvector_version`, next to the dim guard in
+  `src/main.py`): reads `pg_extension.extversion` for `vector` and
+  `sys.exit(1)`s below **0.8.0**, naming `hnsw.iterative_scan`. Skipped in
+  sandbox mode and when the extension is not installed yet (alembic's job).
+  See "Filtered vector search" for why an older backend fails *silently*
+  without it.
+
+## Filtered vector search — the SET LOCALs are correctness, not tuning
+
+Both vector paths (`semantic_search` in `src/services/embeddings.py`,
+`find_related_impl` in `src/mcp_server/tools.py`) issue three transaction-scoped
+settings before the query, and all three matter:
+
+- `hnsw.ef_search = 80` — recall@10 ≈ 98%.
+- `random_page_cost = 1.1` — SSD costing; without it the planner prefers a
+  seq scan + sort, which is fine on a small table and degrades linearly.
+- `hnsw.iterative_scan = 'relaxed_order'` — **the recall fix.** With
+  `random_page_cost` lowered, the planner picks HNSW → nested loop → filter.
+  A non-iterative HNSW scan yields at most `ef_search` candidates; a `folder` /
+  `tags` / `frontmatter` / `user_id` predicate then discards most of them and
+  *nothing refills*. Measured: 45 of 120 folder-filtered probes returned zero
+  rows, 100 returned short. `relaxed_order` keeps walking the graph until the
+  overfetch is satisfied after filtering.
+
+Consequences that are easy to undo by accident:
+
+- **Re-sort before dedupe.** `relaxed_order` may emit rows slightly out of
+  distance order across iterations, so both paths select the cosine distance as
+  a column and sort by it before per-note dedupe/truncation. This is
+  presentation only — it cannot recover candidates the scan never returned.
+- **Zero-row exact fallback.** An empty result from an approximate *filtered*
+  scan is ambiguous. Both paths re-run the identical statement after
+  `SET LOCAL enable_indexscan = off` (pgvector's documented exact search) and
+  use those rows, recording `exact_fallback: true` in `usage_logs.params`. This
+  is what makes "empty only when nothing matches" a construction rather than a
+  benchmark hope. It is O(n), which is acceptable only because it is the rare
+  path — do not make it unconditional.
+- **The recall contract is a benchmark SLO**, not a per-query guarantee: set
+  recall ≥ 0.9 against an *exact filtered sequential scan taken at the same
+  overfetch with the same dedupe*. HNSW is approximate and the overfetch is
+  fixed at `max(5 × limit, 50)` for both paths, so a verbose note can still
+  crowd out others after dedupe — the baseline shares that property.
+- Recall is bounded by `hnsw.max_scan_tuples` (20,000) and
+  `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault is under the cap;
+  those are the next knobs, not `ef_search`.
+
+## Search benchmarks (opt-in integration)
+
+`tests/integration/test_search_recall.py` and `test_keyword_plan.py` run only
+when `PGVECTOR_TEST_ADMIN_URL` names a throwaway Postgres **server** (the
+harness creates and drops its own database per module — see
+`tests/integration/_harness.py`):
+
+```sh
+docker run --rm -d --name pgvector-search-test -e POSTGRES_PASSWORD=test \
+    -p 55433:5432 pgvector/pgvector:pg16
+PGVECTOR_TEST_ADMIN_URL=postgresql+asyncpg://postgres:test@localhost:55433/postgres \
+    pytest -q tests/integration/
+docker rm -f pgvector-search-test
+```
+
+Two things about these fixtures are load-bearing and non-obvious:
+
+- **The filtered slice must be a large fraction of the corpus.** A filter
+  matching a few percent makes the planner estimate a tiny join and pick a seq
+  scan + sort — the HNSW nested-loop plan the recall bug lives in never
+  appears, and every assertion passes against a plan production does not use.
+- **The keyword corpus needs `VACUUM`, not just `ANALYZE`.** A GIN index's cost
+  estimate comes from its metapage stats, which only VACUUM writes. Without it
+  `gincostestimate` assumes the whole index must be scanned (cost 621 vs 4.15
+  here) and the planner hint looks broken. Production gets this from
+  autovacuum; a freshly-seeded test database does not.
+
+Recorded numbers on that corpus: rare-term keyword query 228 buffers with the
+hint vs 29,071 sequential; common-term 57,799 either way (seq scan is the right
+plan there, so it is recorded, not asserted).
+
+## Per-phase search timing
+
+`usage_logs.params` carries `embed_ms` + `db_ms` + `exact_fallback` for
+`semantic_search`, and `db_ms` + `exact_fallback` for `find_related` (it makes
+no embedding call). A single whole-call `duration_ms` could not separate the
+two independent cold paths — provider eviction and HNSW page cache — so the
+last regression had to be diagnosed with hand-run probes against the live DB.
+
+The holder is a `ContextVar` in `src/services/timing.py`, **owned by
+`_tracked`**: fresh dict at call start, cleared in `finally`. The ContextVar
+lives in a service module only to avoid an import cycle (`tools` imports
+`semantic_search`); nothing but `_tracked` calls `begin()`/`clear()`. Service
+return types are unchanged — a direct call outside a tracked tool finds no
+holder and records nothing. No migration: `params` is JSONB.
 
 ## Graph tools
 - `get_backlinks(path, limit)` — notes that link TO `path` (resolved links only).

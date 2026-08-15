@@ -37,7 +37,9 @@ async def test_semantic_search_clamps_before_overfetch(monkeypatch):
     session = AsyncMock()
     result = MagicMock()
     result.fetchall.return_value = []
-    session.execute.side_effect = [None, None, result]
+    # Three `SET LOCAL`s (ef_search, random_page_cost, iterative_scan) then
+    # the vector select.
+    session.execute.side_effect = [None, None, None, result]
     monkeypatch.setattr(
         embeddings, "get_embedding", AsyncMock(return_value=[0.0] * 1024)
     )

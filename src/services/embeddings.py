@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.models.db import NoteEmbedding, NoteMetadata
+from src.services import timing
 from src.services.filters import apply_note_filters
 
 logger = logging.getLogger(__name__)
@@ -267,36 +268,76 @@ async def semantic_search(
     for full content.
     """
     limit = max(1, min(limit, 50))
+    embed_start = time.monotonic()
     query_embedding = await get_embedding(query)
+    timing.add_ms("embed_ms", time.monotonic() - embed_start)
 
+    db_start = time.monotonic()
     # ef_search=80 lifts HNSW recall@10 to ~98% at modest latency cost.
     # random_page_cost=1.1 reflects SSD storage; the postgres default of 4
     # makes the planner avoid the HNSW index in favor of a seq+sort, which
     # is faster on small tables but degrades linearly as the vault grows.
-    # Both SET LOCALs scope to the current transaction.
+    # All three SET LOCALs scope to the current transaction.
     await session.execute(text("SET LOCAL hnsw.ef_search = 80"))
     await session.execute(text("SET LOCAL random_page_cost = 1.1"))
+    # iterative_scan (pgvector >= 0.8; guarded at startup by
+    # `_check_pgvector_version`) is what keeps a *filtered* search honest.
+    # Without it the HNSW scan hands the planner at most `ef_search`
+    # candidates, the folder/tags/frontmatter/user predicate throws most of
+    # them away, and nothing refills — 45 of 120 folder-filtered probes came
+    # back empty. `relaxed_order` lets the scan keep walking the graph until
+    # the LIMIT is satisfied *after* filtering. Recall is still bounded by
+    # `hnsw.max_scan_tuples` (20,000) and `hnsw.scan_mem_multiplier` (1);
+    # those are the next knobs if the vault outgrows them (~16.7k chunks
+    # today). `relaxed_order` may emit rows slightly out of distance order
+    # across iterations, so we re-sort below — that is presentation only, it
+    # cannot recover candidates the scan never returned.
+    await session.execute(text("SET LOCAL hnsw.iterative_scan = 'relaxed_order'"))
 
     # Over-fetch by 5x: HNSW is logarithmic so this is essentially free, and it
     # gives the per-note dedup enough headroom when a note contributes many chunks.
     overfetch = max(limit * 5, 50)
+    distance = NoteEmbedding.embedding.cosine_distance(query_embedding)
     stmt = (
-        select(NoteEmbedding, NoteMetadata)
+        select(NoteEmbedding, NoteMetadata, distance.label("distance"))
         .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
     )
     stmt = apply_note_filters(
         stmt, folder=folder, tags=tags, frontmatter=frontmatter, user_id=user_id
     )
-    stmt = stmt.order_by(
-        NoteEmbedding.embedding.cosine_distance(query_embedding)
-    ).limit(overfetch)
+    stmt = stmt.order_by(distance).limit(overfetch)
 
     result = await session.execute(stmt)
     rows = result.fetchall()
 
+    # Zero-row safety net. HNSW is approximate, so "no rows" from a *filtered*
+    # query is ambiguous: it can mean "nothing matches" or "the scan ran out of
+    # budget before it found anything that matched". Re-running the identical
+    # statement with index scans off is pgvector's documented exact search — it
+    # is O(n), but only on this rare path, and it turns "non-empty whenever a
+    # match exists" from a benchmark hope into a construction.
+    filtered = bool(folder or tags or frontmatter or user_id is not None)
+    exact_fallback = False
+    if filtered and not rows:
+        # Transaction-scoped, like the three SET LOCALs above: it applies to
+        # the re-run on the next line and dies with this transaction. The sole
+        # caller (`search_notes_impl`) closes the session as soon as this
+        # function returns, so nothing else can inherit the exact plan — do not
+        # append further statements after the re-run without re-reading that.
+        await session.execute(text("SET LOCAL enable_indexscan = off"))
+        rows = (await session.execute(stmt)).fetchall()
+        exact_fallback = True
+    timing.record("exact_fallback", exact_fallback)
+    timing.add_ms("db_ms", time.monotonic() - db_start)
+
+    # Re-sort by distance before dedupe/truncate: `relaxed_order` does not
+    # promise a globally sorted stream, and the dedupe below keeps the *first*
+    # chunk seen per note.
+    rows = sorted(rows, key=lambda r: r[2])
+
     seen: set[int] = set()
     deduped: list[tuple] = []
-    for ne, nm in rows:
+    for ne, nm, _distance in rows:
         if ne.note_id in seen:
             continue
         seen.add(ne.note_id)
