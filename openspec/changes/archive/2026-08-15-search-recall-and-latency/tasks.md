@@ -30,9 +30,9 @@
 
 ## 6. Verification & ship
 
-- [ ] 6.1 `openspec validate search-recall-and-latency --strict`.
-- [ ] 6.2 `openspec-verifier` audit; adversarial Codex pass framed per `CLAUDE.md` (search result correctness). Iterate to no BLOCKER/MAJOR.
-- [ ] 6.3 Pre-deploy: capture live results for one unfiltered `semantic_search`, one folder-filtered one that is short/empty today, one `keyword_search`.
-- [ ] 6.4 `make deploy`; `make status`; re-issue the three queries; verify filtered results are now consistent with unfiltered; verify `usage_logs` rows carry `embed_ms`/`db_ms`; observe one pre-warm log line. Record tools called.
-- [ ] 6.5 Tell the operator: raise `shared_buffers` on the shared Postgres (128 MB → 2–4 GB) — outside this repo.
+- [x] 6.1 `openspec validate search-recall-and-latency --strict`.
+- [x] 6.2 `openspec-verifier` audit; adversarial Codex pass framed per `CLAUDE.md` (search result correctness). Iterate to no BLOCKER/MAJOR.
+- [x] 6.3 Pre-deploy: capture live results for one unfiltered `semantic_search`, one folder-filtered one that is short/empty today, one `keyword_search`.
+- [x] 6.4 `make deploy`; `make status`; re-issue the three queries; verify filtered results are now consistent with unfiltered; verify `usage_logs` rows carry `embed_ms`/`db_ms`; observe one pre-warm log line. Record tools called.
+- [x] 6.5 Tell the operator: raise `shared_buffers` on the shared Postgres (128 MB → 2–4 GB) — outside this repo (filed as GitHub issue #55).
 - [ ] 6.6 Archive, PR, merge, push (closes the coordination issue).
