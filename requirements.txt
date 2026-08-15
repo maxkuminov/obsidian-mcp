@@ -1,6 +1,6 @@
 # Core
 fastapi==0.141.1
-uvicorn[standard]==0.42.0
+uvicorn[standard]==0.52.3
 # CVE-2026-53539 (fixable HIGH flagged by the Trivy deploy gate) was fixed in
 # 0.0.30 and remains fixed here.
 python-multipart==0.0.32
@@ -44,10 +44,9 @@ jinja2==3.1.6
 
 # Security
 itsdangerous==2.2.0
-passlib[bcrypt]==1.7.4
-# passlib 1.7.4 probes bcrypt with >72 byte passwords on init; bcrypt 4.1+
-# raises instead of warning, so pin to the last compatible release.
-bcrypt<4.1
+# Called directly by src/auth/passwords.py; passlib (unmaintained since 2020,
+# and the only reason bcrypt was held at <4.1) was dropped in favour of it.
+bcrypt==5.0.0
 
 # Rate limiting (Phase 8)
 slowapi==0.1.10

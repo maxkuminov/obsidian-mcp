@@ -88,6 +88,7 @@ def _install_fakes(monkeypatch, session_manager):
         return None
 
     monkeypatch.setattr(main, "_check_embedding_dim", _noop_check)
+    monkeypatch.setattr(main, "_check_pgvector_version", _noop_check)
     monkeypatch.setattr(main, "_validate_fts_configs", _noop_check)
     # Replace the indexer loop with a forever-sleeping coroutine so it never
     # touches a DB/network and is observably cancellable.

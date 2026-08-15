@@ -3,10 +3,11 @@ import fnmatch
 import hashlib
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import delete, func, or_, select, text
+from sqlalchemy import delete, func, literal, or_, select, text
 from sqlalchemy.dialects.postgresql import insert
 
 from src.config import settings
@@ -737,6 +738,162 @@ async def _active_user_ids() -> list[int]:
         return [row[0] for row in result.all()]
 
 
+# One wall-clock bound for the whole pre-warm. It runs while holding
+# `index_pass_lock`, so an unbounded hang would block the panel's reindex and
+# reset-embeddings actions indefinitely.
+PREWARM_TIMEOUT_SECONDS = 15.0
+
+_HNSW_INDEX_NAME = "ix_note_embeddings_embedding_hnsw"
+
+# Tri-state cache for "does an HNSW index exist on note_embeddings.embedding".
+# None = not yet looked up. Deployments with EMBEDDING_DIMENSIONS > 2000 have
+# no such index (pgvector's HNSW limit) and must not pay a sequential scan
+# every five minutes just to warm a cache. `reset_embeddings` drops and
+# recreates the index, so it invalidates this via `invalidate_hnsw_index_cache`.
+_hnsw_index_present: bool | None = None
+
+
+def invalidate_hnsw_index_cache() -> None:
+    """Forget the cached `pg_indexes` lookup.
+
+    Called by the panel's reset-embeddings action, which drops the HNSW index
+    and only recreates it when the configured dimension allows one — so the
+    cached answer can go stale in either direction.
+    """
+    global _hnsw_index_present
+    _hnsw_index_present = None
+
+
+async def _hnsw_index_exists(session) -> bool:
+    global _hnsw_index_present
+    if _hnsw_index_present is None:
+        result = await session.execute(
+            text(
+                "SELECT 1 FROM pg_indexes "
+                "WHERE tablename = 'note_embeddings' AND indexname = :name"
+            ),
+            {"name": _HNSW_INDEX_NAME},
+        )
+        _hnsw_index_present = result.first() is not None
+    return _hnsw_index_present
+
+
+def _probe_vector() -> list[float]:
+    """A deterministic non-zero unit vector of `EMBEDDING_DIMENSIONS`.
+
+    Non-zero matters: a zero vector has no cosine direction, so
+    `embedding <=> '[0,...]'` is undefined and the scan would not traverse the
+    graph — it would warm nothing.
+    """
+    dim = int(settings.embedding_dimensions)
+    return [1.0] + [0.0] * (dim - 1)
+
+
+# The planner hint the search path uses. Named so the probe and the test that
+# EXPLAINs it cannot drift apart from each other.
+PROBE_PLANNER_SETTING = "SET LOCAL random_page_cost = 1.1"
+
+
+def probe_statement():
+    """The HNSW probe statement, exactly as `_prewarm_once` issues it.
+
+    Factored out so `tests/integration/test_prewarm_probe.py` can EXPLAIN the
+    statement production runs (under `PROBE_PLANNER_SETTING`) instead of a
+    hand-copied lookalike: the whole point of the probe is that it walks the
+    HNSW index, and only the plan of *this* statement can show that.
+    """
+    return (
+        select(literal(1))
+        .select_from(NoteEmbedding)
+        .order_by(NoteEmbedding.embedding.cosine_distance(_probe_vector()))
+        .limit(1)
+    )
+
+
+async def _prewarm_once() -> tuple[float | None, float | None]:
+    """The body of the pre-warm. Returns `(embed_ms, probe_ms)`, either None
+    when that half was skipped. Raises freely — the caller contains it."""
+    embed_ms: float | None = None
+    probe_ms: float | None = None
+
+    # Only local providers have warm state worth keeping. A remote API would
+    # just be billed once per tick for nothing.
+    if settings.embedding_provider == "ollama":
+        from src.services.embeddings import get_embedding
+
+        start = time.monotonic()
+        await get_embedding("warmup")
+        embed_ms = (time.monotonic() - start) * 1000
+
+    async with async_session() as session:
+        if not await _hnsw_index_exists(session):
+            logger.info(
+                "Pre-warm: HNSW probe skipped (no %s index; "
+                "embedding_dimensions=%s exceeds pgvector's 2000-dim limit?)",
+                _HNSW_INDEX_NAME,
+                settings.embedding_dimensions,
+            )
+            return embed_ms, None
+
+        # Same planner hint the search path uses, so the probe walks the index
+        # and pulls the pages a real search would need — a seq scan here would
+        # warm the heap instead, which is not what goes cold.
+        await session.execute(text(PROBE_PLANNER_SETTING))
+        stmt = probe_statement()
+        start = time.monotonic()
+        await session.execute(stmt)
+        probe_ms = (time.monotonic() - start) * 1000
+
+    return embed_ms, probe_ms
+
+
+async def prewarm_search_caches() -> None:
+    """Keep the embedding model resident and the HNSW hot pages cached.
+
+    `semantic_search` latency is bimodal: ~0.47 s warm, ~17.5 s cold — 14 s of
+    that is Ollama reloading bge-m3 after eviction, ~3 s is HNSW index pages
+    missing from a 128 MB `shared_buffers` shared with another tenant. As the
+    median gap between calls grew from 135 s to 1,676 s, more calls paid the
+    cold price (p50 1.2 s → 4.8 s over five weeks). One warm-up per indexer
+    tick costs ≈ 0.4 s + 6 ms per five minutes and removes both.
+
+    Runs under `index_pass_lock` (the caller holds it), so it can never overlap
+    an index pass, a panel reindex, or a reset-embeddings. Never raises for an
+    ordinary failure: a broken embedding provider is the indexer's business,
+    not the pre-warm's, and the loop's failure counter must not react to it.
+    `CancelledError` is re-raised so lifespan shutdown still stops the loop.
+    """
+    if settings.mcp_sandbox_mode:
+        return
+    # Re-checked here, not just before the pass: a panel action can set the
+    # pause flag *during* a long index pass, and it does so precisely because
+    # it is about to run destructive statements.
+    if _is_paused():
+        logger.info("Pre-warm skipped (paused)")
+        return
+
+    try:
+        embed_ms, probe_ms = await asyncio.wait_for(
+            _prewarm_once(), timeout=PREWARM_TIMEOUT_SECONDS
+        )
+    except asyncio.CancelledError:
+        # Lifespan shutdown. Must propagate, or the indexer task outlives the
+        # app and keeps holding DB sessions.
+        raise
+    except TimeoutError:
+        logger.warning(
+            "Pre-warm exceeded %.0fs and was abandoned", PREWARM_TIMEOUT_SECONDS
+        )
+    except Exception as e:  # noqa: BLE001 - pre-warm must never break the loop
+        logger.warning("Pre-warm failed (non-fatal): %s", e)
+    else:
+        logger.info(
+            "Pre-warm complete (embed_ms=%s, probe_ms=%s)",
+            "skipped" if embed_ms is None else f"{embed_ms:.0f}",
+            "skipped" if probe_ms is None else f"{probe_ms:.0f}",
+        )
+
+
 async def _index_pass_once(user_id: int | None) -> None:
     """One full index + embed pass for a single user (or single-user mode)."""
     try:
@@ -821,6 +978,11 @@ async def run_indexer_loop():
                 else:
                     await index_vault()
                     await embed_vault()
+                # Still under the lock: serialised against a panel reindex and
+                # against reset-embeddings, which also takes this lock. It
+                # never raises, so `consecutive_failures` cannot react to it,
+                # and it delays the next tick by at most PREWARM_TIMEOUT_SECONDS.
+                await prewarm_search_caches()
             await cleanup_expired_tokens()
             consecutive_failures = 0
         except Exception as e:

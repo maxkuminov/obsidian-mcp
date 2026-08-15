@@ -2,10 +2,11 @@
 
 pgvector 0.5.0 stopped requiring NumPy and now returns SQLAlchemy vector
 columns as **plain Python lists** instead of `numpy.ndarray`. Both vector query
-paths post-process those rows with NumPy (`semantic_search` computes a cosine
-similarity per row, `find_related` averages a note's chunk vectors and then
-scores candidates), so the shape change is exactly the kind of thing a unit
-test with fake rows would miss.
+paths feed those rows to NumPy (`semantic_search` computes a cosine similarity
+per row; `find_related` averages the source note's chunk vectors into its query
+vector, then reports the distance pgvector returned), so the shape change is
+exactly the kind of thing a unit test with fake rows would miss — as is a
+`find_related` similarity that no longer matches what the database ranked by.
 
 Skipped unless `PGVECTOR_TEST_ADMIN_URL` is set. That variable names a
 **server** to create a throwaway database on — the fixture never touches the
@@ -25,6 +26,7 @@ failure, not a skip. It is deliberately a different variable from the
 import asyncio
 import math
 import os
+import secrets
 import subprocess
 import sys
 import uuid
@@ -139,7 +141,16 @@ def migrated_database():
         result = subprocess.run(
             [sys.executable, "-m", "alembic", "upgrade", "head"],
             cwd=ROOT,
-            env={**os.environ, "DATABASE_URL": url},
+            env={
+                **os.environ,
+                "DATABASE_URL": url,
+                # `tests/conftest.py` leaves `SECRET_KEY=test` in the process
+                # environment, and `Settings` rejects placeholder secrets — so
+                # the migration subprocess failed to import `src.config` and
+                # every test in this module errored in setup. `_harness.py`
+                # (this fixture's shared descendant) carries the same fix.
+                "SECRET_KEY": secrets.token_hex(32),
+            },
             capture_output=True,
             text=True,
             timeout=300,
@@ -272,6 +283,19 @@ async def test_find_related_ranks_by_averaged_chunk_similarity(seeded):
     assert middle_at < far_at, output
     # near.md averages NEAR and MIDDLE, so middle.md is the closer neighbour.
     assert "Top 2 related notes" in output
+
+    # The printed similarity is `1 - <=>`, i.e. the cosine similarity pgvector
+    # itself computed. Pinning the values against a real backend is what
+    # distinguishes "reported the database's distance" from "reported something
+    # plausible": the mean of NEAR and MIDDLE normalizes to (0.94868, 0.31623),
+    # whose cosine to MIDDLE is 0.94868 and to FAR is 0.31623.
+    sims = {
+        line.split("(`", 1)[1].split("`)", 1)[0]: float(line.rsplit("sim: ", 1)[1])
+        for line in output.splitlines()
+        if "sim: " in line
+    }
+    assert sims["middle.md"] == pytest.approx(0.949, abs=1e-3), sims
+    assert sims["far.md"] == pytest.approx(0.316, abs=1e-3), sims
 
 
 async def test_find_related_dedupes_per_note(sessionmaker, seeded):
