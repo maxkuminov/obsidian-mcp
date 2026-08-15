@@ -200,6 +200,10 @@ async def create_note(path: str, content: str) -> str:
     See `get_vault_guide` for Obsidian syntax and any vault-specific conventions
     (naming, folder placement, frontmatter, tags).
 
+    Refuses a path whose final component is a symlink, naming its target, so a
+    write never lands on a note other than the one named; symlinked folders
+    inside the vault work normally.
+
     Args:
         path: Vault-relative path for the new note (e.g. "Cards/New Topic.md"). The .md extension is added if missing.
         content: Full markdown content for the note, including any frontmatter.
@@ -243,7 +247,9 @@ async def edit_note(
 
     Writes are atomic (tmp file + os.replace) so a crash mid-write cannot truncate
     the destination. Frontmatter mutation is better done via `set_frontmatter` —
-    PyYAML serialization there discards YAML comments.
+    PyYAML serialization there discards YAML comments. A path whose final
+    component is a symlink is refused in every mode (`dry_run` included), naming
+    the link's target; symlinked folders inside the vault work normally.
 
     Args:
         path: Vault-relative path to the note.
@@ -379,7 +385,10 @@ async def move_note(
     for all backlink sources would exceed 256 MiB in memory the move is refused
     before anything changes, naming the note count and the limit.
 
-    Writes are atomic. See `get_vault_guide` for vault folder conventions.
+    Writes are atomic. Either path is refused, naming the link's target, when
+    its final component is a symlink; symlinked folders inside the vault work
+    normally and the recorded paths are the real ones behind them. See
+    `get_vault_guide` for vault folder conventions.
 
     Args:
         from_path: Vault-relative path of the existing note.
@@ -407,6 +416,10 @@ async def delete_note(path: str, permanent: bool = False) -> str:
 
     With `permanent=True`, the file is `os.unlink`-ed directly with no
     recovery path inside this server. Existing backups are the rollback story.
+
+    A path whose final component is a symlink is refused, naming its target, so
+    a delete never removes a note other than the one named; symlinked folders
+    inside the vault work normally.
 
     Dangling backlinks left behind by a delete are surfaced via
     `get_backlinks` and `find_orphans`. See `get_vault_guide` for context.
@@ -436,6 +449,10 @@ async def set_frontmatter(
     sort_keys=False, allow_unicode=True)`. **Caveat:** PyYAML does NOT preserve
     YAML comments — any `# comment` in the original frontmatter will be lost on
     the first `set_frontmatter` call.
+
+    A path whose final component is a symlink is refused, naming its target, so
+    the frontmatter of an unnamed note is never rewritten; symlinked folders
+    inside the vault work normally.
 
     See `get_vault_guide` for vault frontmatter conventions.
 
@@ -510,7 +527,9 @@ async def write_file(
 
     No-clobber by default: writing over an existing file requires
     `overwrite=True`. Dot-directories and path traversal are rejected; invalid
-    base64 errors without writing anything.
+    base64 errors without writing anything. A path whose final component is a
+    symlink is refused, naming its target, so `overwrite=True` cannot clobber a
+    file through an alias; symlinked folders inside the vault work normally.
 
     The MCP transport also bounds the whole request body (sized so a base64
     write at the cap always gets through). Base64 is therefore the always-safe

@@ -990,8 +990,11 @@ async def edit_note_impl(
 
     uid = current_user_id.get()
     try:
-        from src.services.vault import replace_section, validate_visible_path
-        full_path = validate_visible_path(path, user_id=uid)
+        from src.services.vault import replace_section, validate_mutable_path
+        # Resolved before the read, so every mode — `dry_run` included —
+        # refuses an alias rather than diffing (and then reporting on) a note
+        # the caller did not name.
+        full_path = validate_mutable_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.exists():
@@ -1204,19 +1207,22 @@ async def move_note_impl(
     from sqlalchemy import select, update
     from src.models.db import NoteLink, NoteMetadata
     from src.services.links import build_vault_index
-    from src.services.vault import _vault_root, move_no_clobber, validate_visible_path
+    from src.services.vault import _vault_root, move_no_clobber, validate_mutable_path
 
     uid = current_user_id.get()
     try:
-        src_full = validate_visible_path(from_path, user_id=uid)
-        dst_full = validate_visible_path(to_path, user_id=uid)
+        src_full = validate_mutable_path(from_path, user_id=uid)
+        dst_full = validate_mutable_path(to_path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not src_full.is_file():
         return f"Source note not found: {from_path}"
     vault = _vault_root(uid).resolve()
-    from_rel = src_full.resolve().relative_to(vault).as_posix()
-    to_rel = dst_full.resolve().relative_to(vault).as_posix()
+    # Both paths are already `resolved_parent / name`, so this is the path the
+    # indexer stores for a note reached through a symlinked folder — the DB
+    # rows below, and the backlink lookup keyed on `from_rel`, line up with it.
+    from_rel = src_full.relative_to(vault).as_posix()
+    to_rel = dst_full.relative_to(vault).as_posix()
 
     pre_move_index: dict | None = None
     rewrite_sources: list[str] = [from_rel] if rewrite_links else []
@@ -1393,11 +1399,11 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
     if err := _require_write():
         return err
 
-    from src.services.vault import _vault_root, move_no_clobber, validate_visible_path
+    from src.services.vault import _vault_root, move_no_clobber, validate_mutable_path
 
     uid = current_user_id.get()
     try:
-        full_path = validate_visible_path(path, user_id=uid)
+        full_path = validate_mutable_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.is_file():
@@ -1453,12 +1459,12 @@ async def set_frontmatter_impl(
     from src.services.vault import (
         parse_frontmatter,
         serialize_frontmatter,
-        validate_visible_path,
+        validate_mutable_path,
     )
 
     uid = current_user_id.get()
     try:
-        full_path = validate_visible_path(path, user_id=uid)
+        full_path = validate_mutable_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
     if not full_path.is_file():
