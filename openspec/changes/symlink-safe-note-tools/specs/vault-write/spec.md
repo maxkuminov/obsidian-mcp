@@ -20,6 +20,12 @@
 - **WHEN** `Real/A.md` is indexed, `Shared -> Real`, and `move_note("Shared/A.md", "Shared/B.md", rewrite_links=True)` is invoked
 - **THEN** the file SHALL move to `Real/B.md`, `notes_metadata.file_path` and `note_links` SHALL be updated for `Real/A.md` → `Real/B.md`, and backlinks to `A` SHALL be rewritten
 
+#### Scenario: An ancestor repointed mid-mutation cannot redirect the write
+
+- **WHEN** a tool reads a note through a symlinked ancestor directory and that ancestor is repointed at a different directory before the write is published
+- **THEN** the write SHALL land in the directory that was validated at the start of the call
+- **AND** the directory the link now points at SHALL be unchanged, even when it holds a byte-identical copy of the note
+
 #### Scenario: Multi-user vault root
 
 - **WHEN** the same alias case occurs under a per-user vault root

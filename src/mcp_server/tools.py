@@ -36,10 +36,12 @@ from src.services.vault import (
     list_dir,
     outline_sections,
     read_bytes,
+    read_bytes_at,
     read_file,
+    validate_mutable_path,
     validate_visible_path,
-    write_bytes,
-    write_file,
+    write_bytes_at,
+    write_file_at,
 )
 
 logger = logging.getLogger(__name__)
@@ -554,18 +556,27 @@ async def create_note_impl(path: str, content: str) -> str:
     """Create a new note in the vault."""
     if err := _require_write():
         return err
-    if err := _note_size_error(content):
-        return err
     if not path.endswith(".md"):
         path += ".md"
     uid = current_user_id.get()
+    # Validate before the size check: a caller naming an alias should learn
+    # that the path is a symlink, not that its content is too big — the second
+    # message sends it off to trim content that was never the problem.
     try:
-        write_file(path, content, user_id=uid, overwrite=False)
+        full_path = validate_mutable_path(path, user_id=uid)
+    except ValueError as e:
+        return str(e)
+    if err := _note_size_error(content):
+        return err
+    try:
+        write_file_at(full_path, content, overwrite=False)
         return f"Created note: {path}"
     except FileExistsError:
         return f"Note already exists: {path}. Use edit_note to modify it."
     except ValueError as e:
         return str(e)
+    except OSError as e:
+        return f"Failed to write {path}: {e}"
 
 
 @_tracked("get_backlinks", ["path", "limit"])
@@ -990,10 +1001,12 @@ async def edit_note_impl(
 
     uid = current_user_id.get()
     try:
-        from src.services.vault import replace_section, validate_mutable_path
+        from src.services.vault import replace_section
         # Resolved before the read, so every mode — `dry_run` included —
         # refuses an alias rather than diffing (and then reporting on) a note
-        # the caller did not name.
+        # the caller did not name. Everything below acts on this Path: the
+        # caller's string is never re-resolved, so an ancestor symlink
+        # repointed between the read and the write cannot redirect the write.
         full_path = validate_mutable_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
@@ -1001,9 +1014,13 @@ async def edit_note_impl(
         return f"Note not found: {path}. Use create_note to create it."
 
     try:
-        existing_bytes = read_bytes(path, user_id=uid, max_bytes=MAX_NOTE_BYTES)
+        existing_bytes = read_bytes_at(
+            full_path, max_bytes=MAX_NOTE_BYTES, label=path
+        )
         existing = existing_bytes.decode("utf-8")
     except Exception as e:
+        # Includes OSError: an ELOOP from the `O_NOFOLLOW` read means the leaf
+        # became a symlink after validation. That is a refusal, not a crash.
         return f"Failed to read {path}: {e}"
 
     new_content: str | None = None
@@ -1065,9 +1082,11 @@ async def edit_note_impl(
         return diff or f"No changes for {path}"
 
     try:
-        write_file(path, new_content, user_id=uid, expected=existing_bytes)
+        write_file_at(full_path, new_content, expected=existing_bytes)
     except (ValueError, RuntimeError) as e:
         return str(e)
+    except OSError as e:
+        return f"Failed to write {path}: {e}"
     return success_message
 
 
@@ -1207,7 +1226,7 @@ async def move_note_impl(
     from sqlalchemy import select, update
     from src.models.db import NoteLink, NoteMetadata
     from src.services.links import build_vault_index
-    from src.services.vault import _vault_root, move_no_clobber, validate_mutable_path
+    from src.services.vault import _vault_root, move_no_clobber
 
     uid = current_user_id.get()
     try:
@@ -1254,28 +1273,38 @@ async def move_note_impl(
     # link the vault bytes do not contain, and an agent acting on that graph
     # never sees the discrepancy.
     #
-    # Memory: `read_bytes` bounds each source at MAX_NOTE_BYTES, but the number
+    # Memory: `read_bytes_at` bounds each source at MAX_NOTE_BYTES, but the number
     # of sources is unbounded — a target with hundreds of near-cap backlinks
     # would buffer gigabytes before a single byte is mutated. So the originals
     # and the rewrites are summed as they accumulate and the move aborts (still
     # before any mutation) once that total would exceed MAX_MOVE_REWRITE_BYTES.
-    planned_rewrites: list[tuple[str, bytes, str, int]] = []
+    planned_rewrites: list[tuple[str, Path, bytes, str, int]] = []
     rewrite_bytes_held = 0
     failed_rewrite_sources: list[str] = []
     if rewrite_links and pre_move_index is not None:
         for original_src_path in rewrite_sources:
             # A moved note may link to itself: it is still at its old path now,
             # so read it there, but emit link targets relative to where it is
-            # about to land.
-            out_path = (
-                to_rel if original_src_path == from_rel else original_src_path
-            )
+            # about to land — and write it at its new location.
+            moved_note = original_src_path == from_rel
+            out_path = to_rel if moved_note else original_src_path
             try:
-                src_file = validate_visible_path(original_src_path, user_id=uid)
-                if not src_file.is_file():
+                # Each source is resolved once here and mutated through that
+                # Path in phase 3. Re-passing the string to `write_file` would
+                # resolve it a second time, after the move, so an ancestor
+                # symlink repointed in between would send the rewritten body
+                # somewhere the preflight never checked.
+                if moved_note:
+                    read_target, write_target = src_full, dst_full
+                else:
+                    read_target = validate_mutable_path(
+                        original_src_path, user_id=uid
+                    )
+                    write_target = read_target
+                if not read_target.is_file():
                     continue
-                original_bytes = read_bytes(
-                    original_src_path, user_id=uid, max_bytes=MAX_NOTE_BYTES
+                original_bytes = read_bytes_at(
+                    read_target, max_bytes=MAX_NOTE_BYTES, label=original_src_path
                 )
                 content = original_bytes.decode("utf-8")
                 new_content, n = _rewrite_links_in_text(
@@ -1316,7 +1345,9 @@ async def move_note_impl(
                     "was moved, rewritten or reindexed. Move without "
                     "rewrite_links and update links in batches instead."
                 )
-            planned_rewrites.append((out_path, original_bytes, new_content, n))
+            planned_rewrites.append(
+                (out_path, write_target, original_bytes, new_content, n)
+            )
 
     # ── Phase 2: commit ─────────────────────────────────────────────────────
     try:
@@ -1364,11 +1395,9 @@ async def move_note_impl(
 
     rewrites_done = 0
     files_modified = 0
-    for write_path, original_bytes, new_content, n in planned_rewrites:
+    for write_path, write_target, original_bytes, new_content, n in planned_rewrites:
         try:
-            write_file(
-                write_path, new_content, user_id=uid, expected=original_bytes
-            )
+            write_file_at(write_target, new_content, expected=original_bytes)
             rewrites_done += n
             files_modified += 1
         except Exception as e:
@@ -1456,14 +1485,11 @@ async def set_frontmatter_impl(
     updates = dict(updates or {})
     remove = list(remove or [])
 
-    from src.services.vault import (
-        parse_frontmatter,
-        serialize_frontmatter,
-        validate_mutable_path,
-    )
+    from src.services.vault import parse_frontmatter, serialize_frontmatter
 
     uid = current_user_id.get()
     try:
+        # One resolution for the whole read-modify-write (see `edit_note_impl`).
         full_path = validate_mutable_path(path, user_id=uid)
     except ValueError as e:
         return str(e)
@@ -1474,9 +1500,11 @@ async def set_frontmatter_impl(
         return f"No changes for {path} (empty updates and remove)"
 
     try:
-        raw_bytes = read_bytes(path, user_id=uid, max_bytes=MAX_NOTE_BYTES)
+        raw_bytes = read_bytes_at(full_path, max_bytes=MAX_NOTE_BYTES, label=path)
         raw = raw_bytes.decode("utf-8")
     except Exception as e:
+        # OSError included — an ELOOP here means the leaf was swapped for a
+        # link after validation; report it rather than raising.
         return f"Failed to read {path}: {e}"
 
     fm, body = parse_frontmatter(raw)
@@ -1501,9 +1529,11 @@ async def set_frontmatter_impl(
         return err
 
     try:
-        write_file(path, new_raw, user_id=uid, expected=raw_bytes)
+        write_file_at(full_path, new_raw, expected=raw_bytes)
     except (ValueError, RuntimeError) as e:
         return str(e)
+    except OSError as e:
+        return f"Failed to write {path}: {e}"
 
     summary: list[str] = []
     if set_keys:
@@ -1632,6 +1662,15 @@ async def write_file_impl(
     if encoding not in ("base64", "text"):
         return f"Invalid encoding '{encoding}'. Use 'base64' or 'text'."
 
+    uid = current_user_id.get()
+    # Validate before decoding and before the size check, for the same reason
+    # as `create_note_impl`: a symlinked destination is a path problem, and
+    # saying so beats sending the caller away to shrink its payload.
+    try:
+        full_path = validate_mutable_path(path, user_id=uid)
+    except ValueError as e:
+        return str(e)
+
     if encoding == "base64":
         try:
             data = base64.b64decode(content, validate=True)
@@ -1646,13 +1685,14 @@ async def write_file_impl(
             f"max {settings.max_file_write_bytes:,}). No file was written."
         )
 
-    uid = current_user_id.get()
     try:
-        write_bytes(path, data, overwrite=overwrite, user_id=uid)
+        write_bytes_at(full_path, data, overwrite=overwrite)
     except FileExistsError:
         return f"File already exists: {path}. Pass overwrite=True to replace it."
     except ValueError as e:
         return str(e)
+    except OSError as e:
+        return f"Failed to write {path}: {e}"
     return f"Wrote {len(data):,} bytes to {path}"
 
 

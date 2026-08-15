@@ -118,13 +118,13 @@ async def test_note_mutations_reject_hidden_paths(offline, operation):
 async def test_edit_detects_intervening_change(offline, monkeypatch):
     note = offline / "note.md"
     note.write_text("before", encoding="utf-8")
-    real_write = tools.write_file
+    real_write = tools.write_file_at
 
     def concurrent_write(*args, **kwargs):
         note.write_text("external edit", encoding="utf-8")
         return real_write(*args, **kwargs)
 
-    monkeypatch.setattr(tools, "write_file", concurrent_write)
+    monkeypatch.setattr(tools, "write_file_at", concurrent_write)
     result = await tools.edit_note_impl("note.md", "ours")
     assert "changed while editing" in result.lower()
     assert note.read_text() == "external edit"
@@ -133,13 +133,13 @@ async def test_edit_detects_intervening_change(offline, monkeypatch):
 async def test_frontmatter_detects_intervening_change(offline, monkeypatch):
     note = offline / "note.md"
     note.write_text("---\nstatus: old\n---\nbody\n", encoding="utf-8")
-    real_write = tools.write_file
+    real_write = tools.write_file_at
 
     def concurrent_write(*args, **kwargs):
         note.write_text("external edit", encoding="utf-8")
         return real_write(*args, **kwargs)
 
-    monkeypatch.setattr(tools, "write_file", concurrent_write)
+    monkeypatch.setattr(tools, "write_file_at", concurrent_write)
     result = await tools.set_frontmatter_impl(
         "note.md", updates={"status": "ours"}
     )

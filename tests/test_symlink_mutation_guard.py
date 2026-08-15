@@ -18,8 +18,10 @@ import pytest
 
 import src.mcp_server.tools as tools
 from src.auth.session import current_user_id
+from src.config import MAX_NOTE_BYTES, settings
 from src.mcp_server.auth import current_permission
 from src.services import vault as vault_service
+from src.services.indexer import discover_markdown_files
 from src.services.vault import validate_mutable_path
 
 
@@ -379,21 +381,47 @@ def _fake_session_recording(*result_rows):
     return FakeSession, statements
 
 
+def test_discovery_sees_a_note_under_a_symlinked_folder_only_at_its_real_path(
+    vault,
+):
+    """The premise the move test rests on, checked against the real discovery.
+
+    `Path.rglob` does not descend directory symlinks, so the indexer never
+    walks `Shared/`. Whatever this function returns is what
+    `notes_metadata.file_path` ends up holding.
+    """
+    (vault / "Real").mkdir()
+    (vault / "Real" / "A.md").write_text("moved note\n", encoding="utf-8")
+    (vault / "Shared").symlink_to(vault / "Real")
+    (vault / "src.md").write_text("See [[A]]\n", encoding="utf-8")
+
+    assert sorted(discover_markdown_files(vault)) == ["Real/A.md", "src.md"]
+
+
 async def test_move_through_a_symlinked_folder_keeps_the_index_consistent(
     writable, monkeypatch
 ):
-    """`os.walk` does not follow directory links, so the indexer stores
-    `Real/A.md` for a note reachable as `Shared/A.md`. The move has to update
-    *those* rows — keying the UPDATEs on the path the caller typed would leave
-    `notes_metadata` pointing at a file that no longer exists.
+    """The indexer stores `Real/A.md` for a note reachable as `Shared/A.md`.
+    The move has to update *those* rows — keying the UPDATEs on the path the
+    caller typed would leave `notes_metadata` pointing at a file that no longer
+    exists.
+
+    The indexed rows here come from the indexer's own discovery rather than a
+    canned string, so the test breaks if discovery ever starts following
+    directory links (which would make `Shared/A.md` a second, competing row).
     """
     (writable / "Real").mkdir()
     (writable / "Real" / "A.md").write_text("moved note\n", encoding="utf-8")
     (writable / "Shared").symlink_to(writable / "Real")
     (writable / "src.md").write_text("See [[A]]\n", encoding="utf-8")
 
+    indexed = {
+        rel: i + 1 for i, rel in enumerate(sorted(discover_markdown_files(writable)))
+    }
+    assert indexed == {"Real/A.md": 1, "src.md": 2}
+
     factory, statements = _fake_session_recording(
-        [_Row(file_path="Real/A.md", id=1), _Row(file_path="src.md", id=2)],
+        [_Row(file_path=rel, id=note_id) for rel, note_id in indexed.items()],
         [_Row(file_path="src.md")],
     )
     monkeypatch.setattr(tools, "async_session", factory)
@@ -409,9 +437,9 @@ async def test_move_through_a_symlinked_folder_keeps_the_index_consistent(
     assert (writable / "Shared" / "B.md").exists()
 
     # Backlink discovery looked up `Real/A.md` in the index, so it found the
-    # real note id (1) rather than the synthetic id a miss would have invented.
+    # real note id rather than the synthetic id a miss would have invented.
     backlink_params = statements[1].compile().params
-    assert 1 in backlink_params.values()
+    assert indexed["Real/A.md"] in backlink_params.values()
     assert -1 not in backlink_params.values()
 
     # And the backlink itself was rewritten.
@@ -424,6 +452,202 @@ async def test_move_through_a_symlinked_folder_keeps_the_index_consistent(
         assert "Real/B.md" in values
         assert "Shared/A.md" not in values
         assert "Shared/B.md" not in values
+
+
+# ── one resolution per mutation ─────────────────────────────────────────────
+#
+# The guard resolves the parent once. That is only worth anything if the tool
+# then acts on the returned Path: a tool that keeps the Path for the check and
+# re-passes its own string to `read_bytes`/`write_file` resolves it again, and
+# an ancestor repointed in between redirects the write to a note nobody named.
+# `expected=` does not save it — the decoy can hold byte-identical content.
+
+
+@pytest.fixture
+def repoint_after_read(monkeypatch):
+    """Repoint `link` at `new_target` in the window between the read and the
+    write — the moment the tool has the old bytes in hand and has not yet
+    published the new ones.
+
+    Hooked on `_read_path_bytes`, the one read primitive every path shares, so
+    the test does not encode *how* a tool reads. It fires once: the compare in
+    `_atomic_write` reads again, and swapping twice would prove nothing.
+    """
+
+    def install(link: Path, new_target: Path):
+        original = vault_service._read_path_bytes
+        fired: list[bool] = []
+
+        def swapping(path, max_bytes=None):
+            data = original(path, max_bytes=max_bytes)
+            if not fired:
+                fired.append(True)
+                link.unlink()
+                link.symlink_to(new_target)
+            return data
+
+        monkeypatch.setattr(vault_service, "_read_path_bytes", swapping)
+
+    return install
+
+
+def _two_directories_with_identical_notes(root: Path) -> tuple[Path, Path]:
+    """`RealA/note.md` and `RealB/note.md`, byte-identical on purpose."""
+    (root / "RealA").mkdir()
+    (root / "RealB").mkdir()
+    (root / "RealA" / "note.md").write_text("before\n", encoding="utf-8")
+    (root / "RealB" / "note.md").write_text("before\n", encoding="utf-8")
+    return root / "RealA" / "note.md", root / "RealB" / "note.md"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda: tools.edit_note_impl("Shared/note.md", "after\n"),
+            id="edit_note",
+        ),
+        pytest.param(
+            lambda: tools.set_frontmatter_impl(
+                "Shared/note.md", updates={"status": "done"}
+            ),
+            id="set_frontmatter",
+        ),
+    ],
+)
+async def test_repointing_an_ancestor_mid_write_cannot_redirect_it(
+    writable, repoint_after_read, mutate
+):
+    note, decoy = _two_directories_with_identical_notes(writable)
+    link = writable / "Shared"
+    link.symlink_to(writable / "RealA")
+    repoint_after_read(link, writable / "RealB")
+
+    result = await mutate()
+
+    assert "note.md" in result, result
+    # The write landed in the directory that was validated…
+    assert note.read_text(encoding="utf-8") != "before\n"
+    # …and the note the link now points at was never touched.
+    assert decoy.read_text(encoding="utf-8") == "before\n"
+
+
+async def test_repointing_a_symlinked_vault_root_mid_write_cannot_redirect_it(
+    writable, monkeypatch, tmp_path_factory, repoint_after_read
+):
+    """Same hazard one level up: the vault root itself is a link."""
+    real_root = tmp_path_factory.mktemp("real-root")
+    decoy_root = tmp_path_factory.mktemp("decoy-root")
+    (real_root / "note.md").write_text("before\n", encoding="utf-8")
+    (decoy_root / "note.md").write_text("before\n", encoding="utf-8")
+    root_link = tmp_path_factory.mktemp("roots") / "vault"
+    root_link.symlink_to(real_root)
+    monkeypatch.setattr(vault_service.settings, "vault_path", str(root_link))
+
+    repoint_after_read(root_link, decoy_root)
+
+    result = await tools.edit_note_impl("note.md", "after\n")
+
+    assert "Updated note" in result, result
+    assert (real_root / "note.md").read_text(encoding="utf-8") == "after\n"
+    assert (decoy_root / "note.md").read_text(encoding="utf-8") == "before\n"
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        pytest.param(
+            lambda: tools.edit_note_impl("note.md", "after\n"), id="edit_note"
+        ),
+        pytest.param(
+            lambda: tools.set_frontmatter_impl("note.md", updates={"a": 1}),
+            id="set_frontmatter",
+        ),
+    ],
+)
+async def test_a_leaf_swapped_for_a_link_after_validation_is_reported(
+    writable, monkeypatch, mutate
+):
+    """The residual TOCTOU the design accepts: the leaf becomes a symlink
+    between the `lstat` and the read. `O_NOFOLLOW` turns that into an ELOOP
+    `OSError` — the tool must report it, not raise through the MCP layer."""
+    note = writable / "note.md"
+    note.write_text("before\n", encoding="utf-8")
+    (writable / "elsewhere.md").write_text("elsewhere\n", encoding="utf-8")
+
+    original = vault_service.validate_mutable_path
+
+    def swap_after_validating(relative_path, user_id=None):
+        resolved = original(relative_path, user_id=user_id)
+        note.unlink()
+        note.symlink_to(writable / "elsewhere.md")
+        return resolved
+
+    monkeypatch.setattr(tools, "validate_mutable_path", swap_after_validating)
+
+    result = await mutate()
+
+    assert "Failed to read note.md" in result, result
+    assert (writable / "elsewhere.md").read_text(encoding="utf-8") == "elsewhere\n"
+
+
+# ── an in-vault `..` is refused, but says why ───────────────────────────────
+
+
+def test_an_in_vault_dotdot_names_the_normalised_path(vault):
+    (vault / "Folder").mkdir()
+    (vault / "note.md").write_text("real", encoding="utf-8")
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_mutable_path("Folder/../note.md")
+
+    message = str(excinfo.value)
+    # Still refused — a mutating tool never resolves a component away — but
+    # "traversal denied" would be a lie the caller cannot act on.
+    assert "Path traversal denied" not in message
+    assert "note.md" in message
+
+    # Reads are unchanged: `..` inside the vault still resolves.
+    assert vault_service.validate_visible_path("Folder/../note.md") == (
+        vault / "note.md"
+    ).resolve()
+
+
+async def test_edit_note_passes_the_dotdot_message_through(writable):
+    (writable / "Folder").mkdir()
+    (writable / "note.md").write_text("real\n", encoding="utf-8")
+
+    result = await tools.edit_note_impl("Folder/../note.md", "clobber")
+
+    assert "Path traversal denied" not in result, result
+    assert "note.md" in result, result
+    assert (writable / "note.md").read_text(encoding="utf-8") == "real\n"
+
+
+# ── the symlink error outranks the size check ───────────────────────────────
+
+
+async def test_create_note_reports_the_alias_rather_than_the_size_limit(alias):
+    """An oversize body through an alias is a *path* problem. Reporting the
+    size limit would send the caller off to trim content that was never why
+    the write is refused."""
+    target, link, before_bytes, _ = alias
+
+    result = await tools.create_note_impl("alias.md", "x" * (MAX_NOTE_BYTES + 1))
+
+    assert "symbolic link" in result, result
+    assert "important.md" in result, result
+    assert target.read_bytes() == before_bytes
+
+
+async def test_write_file_reports_the_alias_rather_than_the_size_limit(alias):
+    target, link, before_bytes, _ = alias
+    oversize = base64.b64encode(b"x" * (settings.max_file_write_bytes + 1)).decode()
+
+    result = await tools.write_file_impl("alias.md", oversize, overwrite=True)
+
+    assert "symbolic link" in result, result
+    assert target.read_bytes() == before_bytes
 
 
 # ── reads are deliberately unchanged ────────────────────────────────────────

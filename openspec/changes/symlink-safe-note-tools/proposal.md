@@ -12,22 +12,30 @@ vault. Symlinked *directories* inside a vault are a common Obsidian setup
 
 ## What Changes
 
-- **Rule:** mutating tools act on the path as named (lexically normalised,
-  containment-checked on the resolved form as today) and **refuse when the
-  final path component is a symlink**, with an error naming the link target so
-  the agent can operate on the real note. Symlinked ancestor directories remain
-  allowed when they resolve inside the vault. Reads (`read_note`, `read_file`,
-  `list_*`, graph tools) keep following links (harmless, and what users expect
-  from an alias).
+- **Rule:** mutating tools act on the **final component as named** and **refuse
+  when it is a symlink**, with an error naming the link target so the agent can
+  operate on the real note. Symlinked ancestor directories remain allowed when
+  they resolve inside the vault. Reads (`read_note`, `read_file`, `list_*`,
+  graph tools) keep following links (harmless, and what users expect from an
+  alias).
 - Applies to `create_note`, `edit_note` (all modes), `set_frontmatter`,
   `move_note` (source and destination), `delete_note`, `write_file`; `delete_file`
   already refuses (uses the anchored helper).
-- Implementation: one helper in `src/services/vault.py` —
-  `validate_mutable_path(rel, user_id) -> Path` = `validate_visible_path` +
-  `os.lstat` on the lexical `vault/rel` final component (`S_ISLNK` → error) —
-  returning the **lexical** path (not the resolved one) for the write. Existing
-  `_atomic_write` (same-dir temp + link/replace) then operates on the link's own
-  directory entry, which is what refusing makes unreachable anyway.
+- Implementation (design D2): one helper in `src/services/vault.py` —
+  `validate_mutable_path(rel, user_id) -> Path`. It normalises `rel`
+  (`PurePosixPath`; rejects absolute, NUL, trailing slash, and `..` — an
+  in-vault `..` gets its own message naming the normalised path), **resolves
+  the parent directory** and requires it to stay inside the resolved vault root
+  (this is where in-vault symlinked ancestors are permitted and escaping ones
+  become the traversal error), applies the hidden-path check to the resolved
+  relative path, `os.lstat`s the **leaf** — `S_ISLNK` → refuse, naming the
+  canonical vault-relative target — and returns **`resolved_parent / name`**:
+  the real directory entry the indexer sees, so `_atomic_write` gets a real
+  directory for its temp file and `move_note`'s DB paths line up with
+  `notes_metadata`. Resolving once also means an allowed symlinked ancestor is
+  never re-traversed during the mutation — which requires the tools to act on
+  the returned `Path`, so the read-modify-write pairs use `read_bytes_at` /
+  `write_file_at` / `write_bytes_at` rather than re-passing the caller's string.
 - Docs: `CLAUDE.md` write-tools section, tool docstrings one sentence.
 
 ## Capabilities

@@ -1,6 +1,7 @@
 import logging
 import mimetypes
 import os
+import posixpath
 import re
 import shutil
 import stat
@@ -189,13 +190,16 @@ def validate_mutable_path(relative_path: str, user_id: int | None = None) -> Pat
 
     Resolving the parent once, here, also means an allowed symlinked ancestor is
     never re-traversed during the mutation: repointing it afterwards cannot
-    redirect the write. The residual TOCTOU — the leaf swapped for a link
-    between this `lstat` and the write — is the same optimistic level as every
-    other note write today, and closes when these paths migrate to the anchored
-    `vault_fs` helpers.
+    redirect the write — **provided the caller mutates the returned `Path` and
+    never re-passes its own string**. That is why the `*_at` helpers below
+    exist; see their docstrings. The residual TOCTOU — the leaf swapped for a
+    link between this `lstat` and the write — is the same optimistic level as
+    every other note write today, and closes when these paths migrate to the
+    anchored `vault_fs` helpers.
 
     Raises `ValueError` for traversal, a hidden (dot-directory) path, a
-    non-file-shaped path, or a symlinked final component.
+    non-file-shaped path, an in-vault `..` segment, or a symlinked final
+    component.
     """
     vault = _vault_root(user_id)
     vault_resolved = vault.resolve()
@@ -210,7 +214,21 @@ def validate_mutable_path(relative_path: str, user_id: int | None = None) -> Pat
         raise ValueError(f"Path traversal denied: {relative_path}")
     parts = [part for part in rel.parts if part not in ("", ".")]
     if any(part == ".." for part in parts):
-        raise ValueError(f"Path traversal denied: {relative_path}")
+        # A `..` that stays inside the vault is not an attack — it is an agent
+        # passing a path it built by hand. Refusing it is still right (a
+        # mutating tool must not resolve components away; that is the whole
+        # point of this validator), but "Path traversal denied" tells the
+        # caller nothing it can act on. Name the normalised path instead.
+        normalised = posixpath.normpath("/".join(parts))
+        if normalised == ".":
+            raise ValueError(f"Not a file path: {relative_path!r}")
+        if normalised == ".." or normalised.startswith("../"):
+            raise ValueError(f"Path traversal denied: {relative_path}")
+        raise ValueError(
+            f"{relative_path} contains a '..' segment. Mutating tools take the "
+            "path as named and never resolve a component away — pass the "
+            f"normalised path instead: {normalised}. (Reads still accept '..'.)"
+        )
     if not parts:
         raise ValueError(f"Not a file path: {relative_path!r}")
 
@@ -363,6 +381,80 @@ def _read_path_bytes(path: Path, max_bytes: int | None = None) -> bytes:
         os.close(fd)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Resolve once, then act on the Path — the `*_at` helpers
+# ────────────────────────────────────────────────────────────────────────────
+#
+# `validate_mutable_path` resolves the parent exactly once and hands back the
+# real directory entry. That guarantee only holds if the caller then *uses*
+# that Path. A tool that validates a string, keeps the Path for a guard, and
+# then calls `read_bytes(path_str)` / `write_file(path_str)` re-resolves the
+# caller's string a second and a third time: an ancestor symlink repointed
+# between the read and the write redirects the write to a note nobody named,
+# and the `expected=` compare-and-swap does not catch it (the decoy can hold
+# byte-identical content).
+#
+# So every read-modify-write inside one tool call goes through the helpers
+# below, which take an ALREADY-VALIDATED absolute Path and never touch the
+# vault root or the caller's string again. The string-taking `read_bytes` /
+# `write_file` / `write_bytes` wrappers remain for single-shot callers and are
+# now thin: validate, then delegate.
+
+
+def write_file_at(
+    path: Path,
+    content: str,
+    *,
+    overwrite: bool = True,
+    expected: bytes | None = None,
+) -> Path:
+    """Atomically write a note to an already-validated absolute `path`.
+
+    `path` MUST come from `validate_mutable_path` (or be another path the
+    caller has already proven safe) — no traversal, visibility or symlink
+    check happens here.
+    """
+    return _atomic_write(
+        path, text=content, overwrite=overwrite, expected=expected
+    )
+
+
+def write_bytes_at(
+    path: Path,
+    data: bytes,
+    overwrite: bool = False,
+) -> Path:
+    """Atomically write raw bytes to an already-validated absolute `path`.
+
+    Same contract as `write_file_at`. Raises `FileExistsError` when the target
+    exists and `overwrite` is False.
+    """
+    return _atomic_write(path, data=data, overwrite=overwrite)
+
+
+def read_bytes_at(
+    path: Path,
+    max_bytes: int | None = None,
+    *,
+    label: str | None = None,
+) -> bytes:
+    """Read an already-validated absolute `path` through one `O_NOFOLLOW` fd.
+
+    The counterpart to `write_file_at`: the read and the subsequent write refer
+    to the same resolved location, so nothing between them can redirect either.
+    `label` (a vault-relative path) replaces the bare filename in size errors so
+    the caller sees the path it passed. Raises `FileNotFoundError` when the file
+    is gone, `OSError` (ELOOP) when the leaf has been swapped for a symlink, and
+    `ValueError` for a non-regular file or an over-cap size.
+    """
+    try:
+        return _read_path_bytes(path, max_bytes=max_bytes)
+    except ValueError as exc:
+        if label is None:
+            raise
+        raise ValueError(str(exc).replace(path.name, label, 1)) from exc
+
+
 def write_file(
     relative_path: str,
     content: str,
@@ -376,10 +468,14 @@ def write_file(
     Validation goes through `validate_mutable_path`, so a symlinked final
     component is refused rather than silently retargeted, and `_atomic_write`
     receives `resolved_parent / name` — a real directory for its temp file.
+
+    Single-shot convenience only. A tool that already validated the path (or
+    that reads before it writes) must use `write_file_at` instead: re-passing
+    the string here resolves it again.
     """
     path = validate_mutable_path(relative_path, user_id=user_id)
-    return _atomic_write(
-        path, text=content, overwrite=overwrite, expected=expected
+    return write_file_at(
+        path, content, overwrite=overwrite, expected=expected
     )
 
 
@@ -390,20 +486,21 @@ def read_bytes(
 ) -> bytes:
     """Read raw bytes of an arbitrary vault file (dot-dirs rejected).
 
-    Validates path + visibility, then stat-checks the on-disk size against
-    `max_bytes` (when given) before reading so an over-cap file is refused
-    without loading it into memory. Raises `FileNotFoundError` for a missing
-    file and `ValueError` for traversal, a hidden path, or an over-cap size
-    (the message reports the actual size and path).
+    Validates path + visibility, then reads through a single `O_NOFOLLOW`
+    descriptor whose `fstat` bounds the size against `max_bytes` (when given),
+    so an over-cap file is refused without loading it into memory. Raises
+    `FileNotFoundError` for a missing file and `ValueError` for traversal, a
+    hidden path, or an over-cap size (the message reports the actual size and
+    path).
+
+    Reads follow symlinks by design (`validate_visible_path` resolves), so this
+    is *not* the helper for the read half of a read-modify-write — use
+    `read_bytes_at` on the validated mutable path for that.
     """
     path = validate_visible_path(relative_path, user_id=user_id)
     if not path.is_file():
         raise FileNotFoundError(f"File not found: {relative_path}")
-    try:
-        return _read_path_bytes(path, max_bytes=max_bytes)
-    except ValueError as exc:
-        # Retain the caller-facing vault-relative path in size errors.
-        raise ValueError(str(exc).replace(path.name, relative_path, 1)) from exc
+    return read_bytes_at(path, max_bytes=max_bytes, label=relative_path)
 
 
 def write_bytes(
@@ -424,7 +521,7 @@ def write_bytes(
     """
     path = validate_mutable_path(relative_path, user_id=user_id)
     try:
-        return _atomic_write(path, data=data, overwrite=overwrite)
+        return write_bytes_at(path, data, overwrite=overwrite)
     except FileExistsError:
         raise FileExistsError(f"File already exists: {relative_path}") from None
 

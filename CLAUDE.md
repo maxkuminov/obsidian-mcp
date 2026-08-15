@@ -282,7 +282,11 @@ Applies to `create_note`, `edit_note` (all modes — `dry_run` refuses too, rath
 
 **Reads are deliberately unchanged.** `read_note`/`read_file`/`list_*`/graph tools still follow links — an alias reading as its target is what a user expects from an alias, and a read cannot destroy anything.
 
-Two consequences worth keeping: resolving the parent *once, at validation* means an allowed symlinked ancestor is never re-traversed during the write, so repointing it afterwards cannot redirect the write; and the residual TOCTOU (leaf swapped for a link between the `lstat` and the write) is the same optimistic level as every other note write here — it closes when these paths migrate to the anchored `vault_fs` helpers, not before.
+**Resolve once, then act on the `Path` — never re-pass the caller's string.** Resolving the parent at validation only helps if the rest of the tool uses the returned `Path`. A tool that keeps the `Path` for the guard and then calls `read_bytes(path_str)` / `write_file(path_str)` resolves the string again, per call: an ancestor symlink repointed between the read and the write redirects the *write* to a note nobody named, and `expected=` cannot catch it because the decoy may hold byte-identical bytes. So every read-modify-write inside one tool call goes through the `*_at` helpers in `vault.py` — `read_bytes_at`, `write_file_at`, `write_bytes_at` — which take an already-validated absolute `Path` and never touch the vault root again. The string-taking `read_bytes` / `write_file` / `write_bytes` are single-shot conveniences; if you find yourself calling one *after* `validate_mutable_path`, you have reintroduced the bug.
+
+The residual TOCTOU (leaf swapped for a link between the `lstat` and the read/write) is the same optimistic level as every other note write here — `O_NOFOLLOW` turns it into an `OSError`, which the write tools report as a tool error. It closes when these paths migrate to the anchored `vault_fs` helpers, not before.
+
+An in-vault `..` (`Folder/../note.md`) is also refused by `validate_mutable_path` — a mutating tool never resolves a component away — but with a message naming the normalised path rather than "Path traversal denied", which would be a lie the caller cannot act on. Reads still resolve `..`.
 
 ## File-access tools (non-markdown)
 Raw read/write/browse of arbitrary vault files, distinct peers to the note tools (note tools stay markdown-only). Pure byte transport — no server-side PDF/text extraction, no embedding or indexing of non-markdown files.
@@ -294,7 +298,7 @@ Raw read/write/browse of arbitrary vault files, distinct peers to the note tools
 
 `write_file` additionally goes through `validate_mutable_path`, so it refuses a symlinked final component the way the note tools do (see "Mutations act on the path as named" above) — `overwrite=True` cannot clobber a file through an alias. `read_file` and `list_files` still follow links.
 
-All four reuse `validate_path` (traversal guard) and a shared dot-dir guard (`is_hidden_path`) that rejects any path component starting with `.` — same visibility rule as the indexer, keeping `.obsidian`/`.git`/`.trash`/`.smart-env` out of reach. Vault helpers (`read_bytes`, `write_bytes`, `list_dir`, MIME classification) live in `src/services/vault.py`. MIME detection uses stdlib `mimetypes` plus a magic-byte sniff for PNG/JPEG/GIF/WebP. `read_file` is the first tool returning a non-`str` MCP content object.
+All four enforce the same traversal guard and the same dot-dir guard (`is_hidden_path`, rejecting any path component starting with `.` — the indexer's visibility rule, keeping `.obsidian`/`.git`/`.trash`/`.smart-env` out of reach), but **not through the same validator**: `read_file` and `list_files` use `validate_visible_path` (which resolves, so links are followed), `write_file` uses `validate_mutable_path` (parent resolved, symlinked leaf refused), and `delete_file` canonicalises lexically and walks with `O_NOFOLLOW` via `vault_fs`. Vault helpers (`read_bytes`, `write_bytes`, `list_dir`, MIME classification) live in `src/services/vault.py`. MIME detection uses stdlib `mimetypes` plus a magic-byte sniff for PNG/JPEG/GIF/WebP. `read_file` is the first tool returning a non-`str` MCP content object.
 
 ## File transfer
 

@@ -3,10 +3,14 @@
 ## 2. Call sites
 - [x] 2.1 `create_note_impl`, `edit_note_impl` (all modes incl. dry_run: still refuse — no write, but say so), `set_frontmatter_impl`, `move_note_impl` (source + destination; `from_rel`/`to_rel` for DB/link work derived from the returned resolved paths relative to the vault root), `delete_note_impl`, `write_file_impl` → use `validate_mutable_path` for the path they mutate; keep reads on `validate_visible_path`. Confirm `_atomic_write` receives `resolved_parent/name`.
 - [x] 2.2 Docstrings (`server.py`) one sentence each; `CLAUDE.md` write-tools + file-access sections.
+- [x] 2.3 Resolve **once** per mutation: `read_bytes_at` / `write_file_at` / `write_bytes_at` in `src/services/vault.py` take an already-validated absolute `Path`; `edit_note_impl` (all modes incl. the `dry_run` read), `set_frontmatter_impl`, `create_note_impl`, `write_file_impl` and `move_note_impl`'s backlink-rewrite sources use them instead of re-passing the caller's string. `create_note_impl` / `write_file_impl` validate before the size check so an alias returns the symlink error. `edit_note_impl` / `set_frontmatter_impl` report `OSError` (ELOOP from the `O_NOFOLLOW` read) as a tool error.
+- [x] 2.4 `validate_mutable_path`: an **in-vault** `..` gets a distinct message naming the normalised path (still refused; reads unchanged).
 ## 3. Tests
 - [x] 3.1 Per tool: alias → error names canonical target, target + link byte-identical (mtime too); symlinked dir inside vault → write lands in the real dir; move through a symlinked folder → file at `Real/B.md`, fake-session journal shows `notes_metadata`/`note_links` updates keyed on `Real/A.md`→`Real/B.md` and backlink rewrite discovery uses the resolved path; dangling link destination → refused; escaping → traversal error; `read_note`/`read_file` through the alias still work; multi-user root case; existing suites green.
+- [x] 3.2 The move test's indexed rows come from the indexer's real discovery (`discover_markdown_files`, extracted from `index_vault`), asserted to yield `Real/A.md` — not a canned row.
+- [x] 3.3 Resolve-once regressions: repoint a symlinked ancestor (and a symlinked vault root) between the read and the write, with a byte-identical decoy in the new directory → the write lands in the validated directory and the decoy is untouched. Plus: leaf swapped for a link after validation → reported, not raised; in-vault `..` message; alias beats the size limit.
 ## 4. Verify & ship
-- [ ] 4.1 `openspec validate symlink-safe-note-tools --strict`; suite.
+- [x] 4.1 `openspec validate symlink-safe-note-tools --strict`; suite.
 - [ ] 4.2 `openspec-verifier`; adversarial Codex (write tools). Iterate to no BLOCKER/MAJOR.
 - [ ] 4.3 `make deploy`; live e2e per design; record tools called.
 - [ ] 4.4 Archive, PR closing #54, merge.
