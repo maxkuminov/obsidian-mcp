@@ -282,13 +282,13 @@ def _move_fixture(offline, small_cap, monkeypatch, *, over_cap: bool):
     monkeypatch.setattr(tools, "async_session", factory)
 
     seen: list[bytes | None] = []
-    real_write = tools.write_file
+    real_write = tools.write_file_at
 
     def spy(path, content, **kwargs):
         seen.append(kwargs.get("expected"))
         return real_write(path, content, **kwargs)
 
-    monkeypatch.setattr(tools, "write_file", spy)
+    monkeypatch.setattr(tools, "write_file_at", spy)
     return (
         from_rel,
         to_rel,
@@ -409,13 +409,13 @@ async def test_move_note_aborts_when_the_preflight_would_hold_too_much(
     monkeypatch.setattr(tools, "async_session", factory)
 
     seen: list[bytes | None] = []
-    real_write = tools.write_file
+    real_write = tools.write_file_at
 
     def spy(path, content, **kwargs):
         seen.append(kwargs.get("expected"))
         return real_write(path, content, **kwargs)
 
-    monkeypatch.setattr(tools, "write_file", spy)
+    monkeypatch.setattr(tools, "write_file_at", spy)
 
     result = await tools.move_note_impl(from_rel, to_rel, rewrite_links=True)
 
@@ -477,7 +477,7 @@ async def test_size_check_runs_before_the_conflict_detecting_write(
 ):
     """A concurrent write between read and write is still detected.
 
-    The size check sits ahead of `write_file(..., expected=...)`; it must not
+    The size check sits ahead of `write_file_at(..., expected=...)`; it must not
     have replaced it. (`tests/test_vault_mutation_safety.py` covers the
     conflict path in full; this pins the ordering.)
     """
@@ -485,13 +485,13 @@ async def test_size_check_runs_before_the_conflict_detecting_write(
     _write(note, "seed\n")
     seen = {}
 
-    real_write = tools.write_file
+    real_write = tools.write_file_at
 
     def spy(path, content, **kwargs):
         seen["expected"] = kwargs.get("expected")
         return real_write(path, content, **kwargs)
 
-    monkeypatch.setattr(tools, "write_file", spy)
+    monkeypatch.setattr(tools, "write_file_at", spy)
     result = await tools.edit_note_impl("note.md", "small enough")
 
     assert "Updated note" in result, result

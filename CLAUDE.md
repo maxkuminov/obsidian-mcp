@@ -268,6 +268,28 @@ Link extraction lives in `src/services/links.py`. The extractor strips fenced/in
 
 All write tools route through `src/services/vault.py::write_file`, which writes to a tmp file in the same directory and `os.replace()`s it into place — a crash mid-write cannot truncate the destination.
 
+### Mutations act on the path as named — never through a symlink
+
+`validate_path` returns `(vault / rel).resolve()`, which **follows symlinks**. Every mutating tool used to act on that resolved path, so an in-vault alias `alias.md -> important.md` made `edit_note("alias.md", …)` rewrite `important.md` and report success for `alias.md` — a destructive write on a path nobody named (#54).
+
+`validate_mutable_path(rel, user_id)` in `src/services/vault.py` is the guard, and it is what `write_file` / `write_bytes` validate with, so every mutation entry point is covered:
+
+- the **parent** is resolved and must stay inside the vault. Symlinked *directories* inside the vault (shared attachment folders — a common Obsidian setup) therefore keep working; an ancestor pointing out of the vault is still the traversal error.
+- the **final component is taken as named** and `os.lstat`-ed. A symlink — dangling included — is refused with an error naming the link's canonical vault-relative target ("`outside the vault`" when it escapes), so the agent can operate on the real note.
+- it returns `resolved_parent / name`: the real directory entry the indexer sees. `move_note` derives `from_rel` / `to_rel` from it, so `notes_metadata.file_path`, `note_links` and backlink discovery agree with the filesystem for notes under a symlinked folder.
+
+Applies to `create_note`, `edit_note` (all modes — `dry_run` refuses too, rather than diffing a note the caller did not name), `set_frontmatter`, `move_note` (source and destination), `delete_note` and `write_file`. `delete_file` already refused, via the anchored `vault_fs` walk.
+
+**Reads are deliberately unchanged.** `read_note`/`read_file`/`list_*`/graph tools still follow links — an alias reading as its target is what a user expects from an alias, and a read cannot destroy anything.
+
+**Resolve once, then act on the `Path` — never re-pass the caller's string.** Resolving the parent at validation only helps if the rest of the tool uses the returned `Path`. A tool that keeps the `Path` for the guard and then calls `read_bytes(path_str)` / `write_file(path_str)` resolves the string again, per call: an ancestor symlink repointed between the read and the write redirects the *write* to a note nobody named, and `expected=` cannot catch it because the decoy may hold byte-identical bytes. So every read-modify-write inside one tool call goes through the `*_at` helpers in `vault.py` — `read_bytes_at`, `write_file_at`, `write_bytes_at` — which take an already-validated absolute `Path` and never touch the vault root again. The string-taking `read_bytes` / `write_file` / `write_bytes` are single-shot conveniences; if you find yourself calling one *after* `validate_mutable_path`, you have reintroduced the bug.
+
+The residual TOCTOU (leaf swapped for a link between the `lstat` and the read/write) is the same optimistic level as every other note write here — `O_NOFOLLOW` turns it into an `OSError`, which the write tools report as a tool error. Staging is covered too: `_atomic_write` creates its `.tmp-…` file with `O_CREAT|O_EXCL|O_NOFOLLOW` and retries the name a couple of times, so a planted symlink on the temp name is an `EEXIST` we step around rather than a decoy we truncate.
+
+**The accepted residual, precisely.** A *static* alias — a symlink sitting in the vault, the #54 vector — cannot redirect any mutation: the parent is resolved once and the leaf is taken as named. What remains is a live race: a concurrent process that renames the resolved parent directory (putting a symlink at its name) or repoints a symlinked vault root *between two syscalls of a single write or soft-delete* can still send that operation somewhere else. That needs write access to the vault's directories at exactly the wrong microsecond, and it closes with the descriptor-anchored migration to the `vault_fs` helpers tracked in issue #59, not before.
+
+An in-vault `..` (`Folder/../note.md`) is also refused by `validate_mutable_path` — a mutating tool never resolves a component away — but with a message naming the normalised path rather than "Path traversal denied", which would be a lie the caller cannot act on. Reads still resolve `..`.
+
 ## File-access tools (non-markdown)
 Raw read/write/browse of arbitrary vault files, distinct peers to the note tools (note tools stay markdown-only). Pure byte transport — no server-side PDF/text extraction, no embedding or indexing of non-markdown files.
 - `read_file(path, encoding="auto", offset=0, limit=None)` — `auto` resolves text-like MIME → text, image → inline MCP image content block (renders in-client), everything else → base64 string. `text` forces UTF-8 decode (errors on non-UTF-8); `base64` forces raw-bytes base64. Capped by `MAX_FILE_READ_BYTES` (default 10 MB), checked against on-disk size before reading. Text results are additionally bounded by `MAX_READ_RESPONSE_CHARS` and page via `offset`; base64 and image results are not windowed. Base64 reads are token-heavy — check size with `list_files` first.
@@ -276,7 +298,9 @@ Raw read/write/browse of arbitrary vault files, distinct peers to the note tools
 
 - `delete_file(path, permanent=False)` — soft-deletes to `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` through the anchored helper; `permanent=True` unlinks. Refuses `.md` (pointing at `delete_note`), directories and symlinks. The `.md` refusal runs on the **canonical** final component, so `note.md/.`, `a//note.md` and `NOTE.MD` are refused too — the caller's string is not the path.
 
-All four reuse `validate_path` (traversal guard) and a shared dot-dir guard (`is_hidden_path`) that rejects any path component starting with `.` — same visibility rule as the indexer, keeping `.obsidian`/`.git`/`.trash`/`.smart-env` out of reach. Vault helpers (`read_bytes`, `write_bytes`, `list_dir`, MIME classification) live in `src/services/vault.py`. MIME detection uses stdlib `mimetypes` plus a magic-byte sniff for PNG/JPEG/GIF/WebP. `read_file` is the first tool returning a non-`str` MCP content object.
+`write_file` additionally goes through `validate_mutable_path`, so it refuses a symlinked final component the way the note tools do (see "Mutations act on the path as named" above) — `overwrite=True` cannot clobber a file through an alias. `read_file` and `list_files` still follow links.
+
+All four enforce the same traversal guard and the same dot-dir guard (`is_hidden_path`, rejecting any path component starting with `.` — the indexer's visibility rule, keeping `.obsidian`/`.git`/`.trash`/`.smart-env` out of reach), but **not through the same validator**: `read_file` and `list_files` use `validate_visible_path` (which resolves, so links are followed), `write_file` uses `validate_mutable_path` (parent resolved, symlinked leaf refused), and `delete_file` canonicalises lexically and walks with `O_NOFOLLOW` via `vault_fs`. Vault helpers (`read_bytes`, `write_bytes`, `list_dir`, MIME classification) live in `src/services/vault.py`. MIME detection uses stdlib `mimetypes` plus a magic-byte sniff for PNG/JPEG/GIF/WebP. `read_file` is the first tool returning a non-`str` MCP content object.
 
 ## File transfer
 

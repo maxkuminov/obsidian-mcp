@@ -66,6 +66,28 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+def discover_markdown_files(vault: Path) -> dict[str, Path]:
+    """Every indexable note under `vault`, as `vault-relative str -> abs Path`.
+
+    This is the single definition of "what the index contains", so it also
+    decides what `notes_metadata.file_path` holds — which the write tools must
+    agree with. Two properties matter:
+
+    - dot-directories are skipped (`.obsidian`, `.git`, `.trash`, …);
+    - `Path.rglob` does **not** descend directory symlinks, so a note under a
+      symlinked folder is discovered once, at its real path (`Real/A.md`), never
+      at the alias (`Shared/A.md`). `validate_mutable_path` returns that same
+      real path, which is why `move_note` keys its DB updates on it.
+    """
+    files: dict[str, Path] = {}
+    for p in vault.rglob("*.md"):
+        rel = p.relative_to(vault)
+        if any(part.startswith(".") for part in rel.parts):
+            continue
+        files[str(rel)] = p
+    return files
+
+
 async def index_vault(user_id: int | None = None):
     """Scan vault, upsert notes_metadata with tsvector, remove deleted files.
 
@@ -79,12 +101,7 @@ async def index_vault(user_id: int | None = None):
     logger.info(f"Starting vault index scan...{log_suffix}")
 
     # Collect all .md files (skip dot-dirs)
-    files: dict[str, Path] = {}
-    for p in vault.rglob("*.md"):
-        rel = p.relative_to(vault)
-        if any(part.startswith(".") for part in rel.parts):
-            continue
-        files[str(rel)] = p
+    files = discover_markdown_files(vault)
 
     logger.info(f"Found {len(files)} markdown files{log_suffix}")
 

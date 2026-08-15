@@ -1,11 +1,13 @@
+import errno
 import logging
 import mimetypes
 import os
+import posixpath
 import re
 import shutil
 import stat
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 from sqlalchemy import select
@@ -164,6 +166,111 @@ def validate_visible_path(relative_path: str, user_id: int | None = None) -> Pat
     return resolved
 
 
+def validate_mutable_path(relative_path: str, user_id: int | None = None) -> Path:
+    """Validate a path a tool is about to **mutate**, refusing a symlinked leaf.
+
+    `validate_path` returns `(vault / rel).resolve()`, which follows symlinks —
+    so an in-vault alias `alias.md -> important.md` made every write tool act on
+    `important.md` while reporting success for `alias.md`. That is a destructive
+    write on a path nobody named. Reads may keep following links (an alias
+    reading as its target is what a user expects); mutations may not.
+
+    The rule (see `openspec/specs/vault-write`):
+
+    - the *parent* directory is resolved and must stay inside the vault, so
+      symlinked directories inside the vault (shared attachment folders, a
+      common Obsidian setup) keep working while an escaping one is still
+      rejected by the containment check;
+    - the final component is taken **as named** and `os.lstat`-ed: if it is a
+      symbolic link — including a dangling one — the operation is refused with
+      an error naming the link's canonical vault-relative target;
+    - the returned path is `resolved_parent / name`, i.e. the real directory
+      entry the indexer sees. Callers that record vault-relative paths in the
+      database (`move_note`) derive them from this path, so they match what the
+      indexer stores for notes under a symlinked directory.
+
+    Resolving the parent once, here, also means an allowed symlinked ancestor is
+    never re-traversed during the mutation: repointing it afterwards cannot
+    redirect the write — **provided the caller mutates the returned `Path` and
+    never re-passes its own string**. That is why the `*_at` helpers below
+    exist; see their docstrings. The residual TOCTOU — the leaf swapped for a
+    link between this `lstat` and the write — is the same optimistic level as
+    every other note write today, and closes when these paths migrate to the
+    anchored `vault_fs` helpers.
+
+    Raises `ValueError` for traversal, a hidden (dot-directory) path, a
+    non-file-shaped path, an in-vault `..` segment, or a symlinked final
+    component.
+    """
+    vault = _vault_root(user_id)
+    vault_resolved = vault.resolve()
+
+    raw = str(relative_path).replace(os.sep, "/")
+    if "\x00" in raw:
+        raise ValueError(f"Path traversal denied: {relative_path}")
+    if raw.endswith("/"):
+        raise ValueError(f"Not a file path: {relative_path!r}")
+    rel = PurePosixPath(raw)
+    if rel.is_absolute():
+        raise ValueError(f"Path traversal denied: {relative_path}")
+    parts = [part for part in rel.parts if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        # A `..` that stays inside the vault is not an attack — it is an agent
+        # passing a path it built by hand. Refusing it is still right (a
+        # mutating tool must not resolve components away; that is the whole
+        # point of this validator), but "Path traversal denied" tells the
+        # caller nothing it can act on. Name the normalised path instead.
+        normalised = posixpath.normpath("/".join(parts))
+        if normalised == ".":
+            raise ValueError(f"Not a file path: {relative_path!r}")
+        if normalised == ".." or normalised.startswith("../"):
+            raise ValueError(f"Path traversal denied: {relative_path}")
+        raise ValueError(
+            f"{relative_path} contains a '..' segment. Mutating tools take the "
+            "path as named and never resolve a component away — pass the "
+            f"normalised path instead: {normalised}. (Reads still accept '..'.)"
+        )
+    if not parts:
+        raise ValueError(f"Not a file path: {relative_path!r}")
+
+    name = parts[-1]
+    resolved_parent = vault.joinpath(*parts[:-1]).resolve()
+    try:
+        parent_rel = resolved_parent.relative_to(vault_resolved)
+    except ValueError:
+        raise ValueError(f"Path traversal denied: {relative_path}") from None
+
+    target = resolved_parent / name
+    if is_hidden_path(parent_rel / name):
+        raise ValueError(f"Hidden path denied: {relative_path}")
+
+    try:
+        info = os.lstat(target)
+    except (FileNotFoundError, NotADirectoryError):
+        info = None
+    if info is not None and stat.S_ISLNK(info.st_mode):
+        raise ValueError(
+            f"{relative_path} is a symbolic link to "
+            f"{_link_target_label(target, vault_resolved)} — mutating tools act "
+            "only on the named file; operate on the target instead."
+        )
+    return target
+
+
+def _link_target_label(link: Path, vault_resolved: Path) -> str:
+    """Name a symlink's ultimate target for an error message.
+
+    Vault-relative POSIX when the target lands inside the vault (dangling links
+    included — the caller still learns which note the alias was meant to name),
+    otherwise the literal string `outside the vault`.
+    """
+    try:
+        destination = Path(os.path.realpath(link))
+        return destination.relative_to(vault_resolved).as_posix()
+    except (ValueError, OSError):
+        return "outside the vault"
+
+
 def read_file(relative_path: str, user_id: int | None = None) -> dict:
     """Read a note, returning frontmatter + content."""
     path = validate_visible_path(relative_path, user_id=user_id)
@@ -184,6 +291,85 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
     }
 
 
+# How many `.tmp-…` names `_atomic_write` tries before giving up. A collision
+# is astronomically unlikely; the retry exists so a process that pre-creates
+# the name (a symlink decoy, or a leftover from a crash) cannot wedge a write.
+_TEMP_ATTEMPTS = 3
+
+# Mode a plain `open(..., "w")` produces, cached for the life of the process.
+_default_file_mode_cache: int | None = None
+
+
+def _default_file_mode() -> int:
+    """The mode a plain `open(..., "w")` would give a new file: 0o666 & ~umask.
+
+    `_atomic_write` creates its temp file at 0o600 so the content is never
+    readable by anyone else while it is being written, then relaxes it to this
+    before publication. Without that, every note the server rewrote would
+    silently drop from the umask default (0o644 on the container) to 0o600 and
+    become unreadable to anything else sharing the vault.
+
+    Read from `/proc/self/status` where available; the `os.umask` read-restore
+    dance is the portable fallback and is only reached once.
+    """
+    global _default_file_mode_cache
+    if _default_file_mode_cache is None:
+        mask: int | None = None
+        try:
+            with open("/proc/self/status", encoding="ascii") as status:
+                for line in status:
+                    if line.startswith("Umask:"):
+                        mask = int(line.split()[1], 8)
+                        break
+        except OSError:
+            mask = None
+        if mask is None:
+            mask = os.umask(0o022)
+            os.umask(mask)
+        _default_file_mode_cache = 0o666 & ~mask
+    return _default_file_mode_cache
+
+
+def _temp_candidate(path: Path) -> Path:
+    """A fresh same-directory temp name for `path`.
+
+    Factored out so a test can make the name predictable and pre-create it.
+    """
+    return path.with_name(f".tmp-{path.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+
+
+def _create_temp_exclusively(path: Path) -> tuple[int, Path]:
+    """Create a same-directory temp file for `path`; return `(fd, tmp)`.
+
+    `O_CREAT|O_EXCL|O_NOFOLLOW` means the name we write through cannot
+    pre-exist and cannot be a symlink: a process that guessed the temp name and
+    planted `.tmp-note.md-…  ->  /some/decoy` would otherwise have had our
+    write truncate the decoy. `O_EXCL` reports that as `EEXIST` (a symlink at
+    the final component fails the same way), so we simply take another name.
+    """
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    last: OSError | None = None
+    for _ in range(_TEMP_ATTEMPTS):
+        tmp = _temp_candidate(path)
+        try:
+            return os.open(tmp, flags, 0o600), tmp
+        except FileExistsError as exc:
+            last = exc
+        except OSError as exc:  # ELOOP on platforms that prefer it for symlinks
+            if getattr(exc, "errno", None) != errno.ELOOP:
+                raise
+            last = exc
+    raise RuntimeError(
+        f"Could not create a temporary file next to {path.name}"
+    ) from last
+
+
 def _atomic_write(
     path: Path,
     *,
@@ -200,16 +386,21 @@ def _atomic_write(
     `os.replace` is atomic on POSIX same-FS renames. No-clobber publication
     uses a hard link from the same-directory temp file. Creates missing parent
     directories.
+
+    The temp file is created exclusively and `O_NOFOLLOW` (see
+    `_create_temp_exclusively`), so the staging step cannot be redirected
+    through a planted symlink.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(
-        f".tmp-{path.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-    )
+    payload = data if data is not None else (text or "").encode("utf-8")
+    fd, tmp = _create_temp_exclusively(path)
     try:
-        if data is not None:
-            tmp.write_bytes(data)
-        else:
-            tmp.write_text(text or "", encoding="utf-8")
+        try:
+            with os.fdopen(fd, "wb", closefd=False) as stream:
+                stream.write(payload)
+            os.fchmod(fd, _default_file_mode())
+        finally:
+            os.close(fd)
         try:
             if expected is not None:
                 try:
@@ -238,10 +429,11 @@ def _atomic_write(
             else:
                 raise
     except Exception:
+        # The temp is a regular file we created ourselves, so an unconditional
+        # unlink is safe and also clears a name `exists()` would miss.
         try:
-            if tmp.exists():
-                tmp.unlink()
-        except Exception:
+            os.unlink(tmp)
+        except OSError:
             pass
         raise
     return path
@@ -275,6 +467,80 @@ def _read_path_bytes(path: Path, max_bytes: int | None = None) -> bytes:
         os.close(fd)
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# Resolve once, then act on the Path — the `*_at` helpers
+# ────────────────────────────────────────────────────────────────────────────
+#
+# `validate_mutable_path` resolves the parent exactly once and hands back the
+# real directory entry. That guarantee only holds if the caller then *uses*
+# that Path. A tool that validates a string, keeps the Path for a guard, and
+# then calls `read_bytes(path_str)` / `write_file(path_str)` re-resolves the
+# caller's string a second and a third time: an ancestor symlink repointed
+# between the read and the write redirects the write to a note nobody named,
+# and the `expected=` compare-and-swap does not catch it (the decoy can hold
+# byte-identical content).
+#
+# So every read-modify-write inside one tool call goes through the helpers
+# below, which take an ALREADY-VALIDATED absolute Path and never touch the
+# vault root or the caller's string again. The string-taking `read_bytes` /
+# `write_file` / `write_bytes` wrappers remain for single-shot callers and are
+# now thin: validate, then delegate.
+
+
+def write_file_at(
+    path: Path,
+    content: str,
+    *,
+    overwrite: bool = True,
+    expected: bytes | None = None,
+) -> Path:
+    """Atomically write a note to an already-validated absolute `path`.
+
+    `path` MUST come from `validate_mutable_path` (or be another path the
+    caller has already proven safe) — no traversal, visibility or symlink
+    check happens here.
+    """
+    return _atomic_write(
+        path, text=content, overwrite=overwrite, expected=expected
+    )
+
+
+def write_bytes_at(
+    path: Path,
+    data: bytes,
+    overwrite: bool = False,
+) -> Path:
+    """Atomically write raw bytes to an already-validated absolute `path`.
+
+    Same contract as `write_file_at`. Raises `FileExistsError` when the target
+    exists and `overwrite` is False.
+    """
+    return _atomic_write(path, data=data, overwrite=overwrite)
+
+
+def read_bytes_at(
+    path: Path,
+    max_bytes: int | None = None,
+    *,
+    label: str | None = None,
+) -> bytes:
+    """Read an already-validated absolute `path` through one `O_NOFOLLOW` fd.
+
+    The counterpart to `write_file_at`: the read and the subsequent write refer
+    to the same resolved location, so nothing between them can redirect either.
+    `label` (a vault-relative path) replaces the bare filename in size errors so
+    the caller sees the path it passed. Raises `FileNotFoundError` when the file
+    is gone, `OSError` (ELOOP) when the leaf has been swapped for a symlink, and
+    `ValueError` for a non-regular file or an over-cap size.
+    """
+    try:
+        return _read_path_bytes(path, max_bytes=max_bytes)
+    except ValueError as exc:
+        if label is None:
+            raise
+        raise ValueError(str(exc).replace(path.name, label, 1)) from exc
+
+
 def write_file(
     relative_path: str,
     content: str,
@@ -283,10 +549,19 @@ def write_file(
     overwrite: bool = True,
     expected: bytes | None = None,
 ) -> Path:
-    """Write content to a note atomically (tmp file in same dir + os.replace)."""
-    path = validate_visible_path(relative_path, user_id=user_id)
-    return _atomic_write(
-        path, text=content, overwrite=overwrite, expected=expected
+    """Write content to a note atomically (tmp file in same dir + os.replace).
+
+    Validation goes through `validate_mutable_path`, so a symlinked final
+    component is refused rather than silently retargeted, and `_atomic_write`
+    receives `resolved_parent / name` — a real directory for its temp file.
+
+    Single-shot convenience only. A tool that already validated the path (or
+    that reads before it writes) must use `write_file_at` instead: re-passing
+    the string here resolves it again.
+    """
+    path = validate_mutable_path(relative_path, user_id=user_id)
+    return write_file_at(
+        path, content, overwrite=overwrite, expected=expected
     )
 
 
@@ -297,20 +572,21 @@ def read_bytes(
 ) -> bytes:
     """Read raw bytes of an arbitrary vault file (dot-dirs rejected).
 
-    Validates path + visibility, then stat-checks the on-disk size against
-    `max_bytes` (when given) before reading so an over-cap file is refused
-    without loading it into memory. Raises `FileNotFoundError` for a missing
-    file and `ValueError` for traversal, a hidden path, or an over-cap size
-    (the message reports the actual size and path).
+    Validates path + visibility, then reads through a single `O_NOFOLLOW`
+    descriptor whose `fstat` bounds the size against `max_bytes` (when given),
+    so an over-cap file is refused without loading it into memory. Raises
+    `FileNotFoundError` for a missing file and `ValueError` for traversal, a
+    hidden path, or an over-cap size (the message reports the actual size and
+    path).
+
+    Reads follow symlinks by design (`validate_visible_path` resolves), so this
+    is *not* the helper for the read half of a read-modify-write — use
+    `read_bytes_at` on the validated mutable path for that.
     """
     path = validate_visible_path(relative_path, user_id=user_id)
     if not path.is_file():
         raise FileNotFoundError(f"File not found: {relative_path}")
-    try:
-        return _read_path_bytes(path, max_bytes=max_bytes)
-    except ValueError as exc:
-        # Retain the caller-facing vault-relative path in size errors.
-        raise ValueError(str(exc).replace(path.name, relative_path, 1)) from exc
+    return read_bytes_at(path, max_bytes=max_bytes, label=relative_path)
 
 
 def write_bytes(
@@ -325,11 +601,13 @@ def write_bytes(
     creates any missing parent directories, and routes through the shared
     atomic temp-file + `os.replace` write. Raises `FileExistsError` when the
     target exists and `overwrite` is False, leaving the existing file
-    untouched.
+    untouched, and `ValueError` when the final component is a symlink
+    (`validate_mutable_path`) — writing through an alias would clobber the
+    target under a path the caller never named.
     """
-    path = validate_visible_path(relative_path, user_id=user_id)
+    path = validate_mutable_path(relative_path, user_id=user_id)
     try:
-        return _atomic_write(path, data=data, overwrite=overwrite)
+        return write_bytes_at(path, data, overwrite=overwrite)
     except FileExistsError:
         raise FileExistsError(f"File already exists: {relative_path}") from None
 
