@@ -12,7 +12,7 @@
 
 ## 3. Verification & ship
 
-- [ ] 3.1 `openspec validate replace-passlib-with-bcrypt --strict`; full suite green; `pip-audit -r requirements.txt` clean.
-- [ ] 3.2 `openspec-verifier`; adversarial Codex (auth). Iterate to no BLOCKER/MAJOR.
-- [ ] 3.3 `make deploy`; post-deploy: log in to the panel with the test user (or `POST /admin/auth/login`), change a password and back; record what was exercised.
+- [x] 3.1 `openspec validate replace-passlib-with-bcrypt --strict`; full suite green; `pip-audit -r requirements.txt` clean.
+- [x] 3.2 `openspec-verifier`; adversarial Codex (auth). Iterate to no BLOCKER/MAJOR.
+- [ ] 3.3 Deploy with the next `make deploy` after merge; post-deploy the operator logs in to the panel and changes a password and back (needs real credentials — deliberately not automated).
 - [ ] 3.4 Archive, PR, merge, push.
