@@ -1,8 +1,8 @@
 ## 1. Data model & config
 
-- [ ] 1.1 `src/models/db.py`: `TransferToken` ORM model per design D1 (`token_hash` unique, `direction`, `state`, `path`, `vault_root`, `overwrite`, `expected_fingerprint` JSONB nullable `{dev,inode,size,mtime_ns,ctime_ns,sha256|null}`, `key_id`/`oauth_token_id`/`user_id` FKs nullable **`ON DELETE CASCADE`**, `created_at`, `expires_at`, `claimed_at`, `completed_at`, `size`, `sha256`, `mime`); index on `expires_at`. Test: deleting a key/oauth token/user with transfer rows succeeds and removes them (existing key-deletion flow in the panel must keep working).
-- [ ] 1.2 Alembic migration (next free number in `alembic/versions`) creating the table.
-- [ ] 1.3 `src/config.py`: `transfer_token_ttl_seconds: int = 600` (validate 60–3600), `transfer_max_upload_seconds: int = 600`, `transfer_max_concurrent_uploads: int = 4`, `import_allow_http: bool = False`; `public_base_url` property that is `None` unless `MCP_HOSTNAME` or `BASE_URL` was operator-supplied (track a private flag before `_derive_public_urls`); tests for both states.
+- [x] 1.1 `src/models/db.py`: `TransferToken` ORM model per design D1 (`token_hash` unique, `direction`, `state`, `path`, `vault_root`, `overwrite`, `expected_fingerprint` JSONB nullable `{dev,inode,size,mtime_ns,ctime_ns,sha256|null}`, `key_id`/`oauth_token_id`/`user_id` FKs nullable **`ON DELETE CASCADE`**, `created_at`, `expires_at`, `claimed_at`, `completed_at`, `size`, `sha256`, `mime`); index on `expires_at`. Test: deleting a key/oauth token/user with transfer rows succeeds and removes them (existing key-deletion flow in the panel must keep working).
+- [x] 1.2 Alembic migration (next free number in `alembic/versions`) creating the table.
+- [x] 1.3 `src/config.py`: `transfer_token_ttl_seconds: int = 600` (validate 60–3600), `transfer_max_upload_seconds: int = 600`, `transfer_max_concurrent_uploads: int = 4`, `import_allow_http: bool = False`; `public_base_url` property that is `None` unless `MCP_HOSTNAME` or `BASE_URL` was operator-supplied (track a private flag before `_derive_public_urls`); tests for both states.
 
 ## 2. Anchored filesystem helper (`src/services/vault_fs.py`)
 

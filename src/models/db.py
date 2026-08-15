@@ -2,6 +2,7 @@ import datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -236,6 +237,74 @@ class OAuthCode(Base):
     used: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class TransferToken(Base):
+    """Capability token for one out-of-band binary transfer.
+
+    Never stores the token itself — only its SHA-256, exactly like `api_keys`.
+    Everything the redemption routes are allowed to act on is committed here at
+    mint time (direction, canonical vault-relative `path`, the absolute
+    `vault_root` in effect for the minting user, the minting identity, and — for
+    overwrite uploads and for downloads — the target's fingerprint). The routes
+    never take a path from the request.
+
+    `expected_fingerprint` is `{dev, inode, size, mtime_ns, ctime_ns, sha256}`
+    where `sha256` is null for targets above `MAX_FILE_WRITE_BYTES` (hashing
+    multi-GB media at mint is not acceptable tool latency — a documented
+    metadata-only binding). A **null column value** is different: on an
+    overwrite token it is the *expected-absence sentinel* ("the target did not
+    exist at mint"), and the publish step requires it to still be absent. It
+    never means "skip the comparison".
+
+    Identity FKs are `ON DELETE CASCADE` so revoking a key or deleting a user
+    stays a simple delete; an in-flight upload whose row was cascaded away
+    fails its locked pre-publication re-read and publishes nothing.
+    """
+
+    __tablename__ = "transfer_tokens"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token_hash: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    direction: Mapped[str] = mapped_column(String(16), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+    path: Mapped[str] = mapped_column(String(1024), nullable=False)
+    vault_root: Mapped[str] = mapped_column(String(1024), nullable=False)
+    overwrite: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    expected_fingerprint: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    key_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    oauth_token_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("oauth_tokens.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    claimed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    mime: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    __table_args__ = (
+        Index("ix_transfer_tokens_expires_at", "expires_at"),
+        CheckConstraint(
+            "direction IN ('upload', 'download')",
+            name="ck_transfer_tokens_direction",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'claimed', 'completed', 'consumed')",
+            name="ck_transfer_tokens_state",
+        ),
     )
 
 
