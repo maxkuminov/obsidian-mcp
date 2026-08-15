@@ -287,3 +287,12 @@ For a canonical `tools/call` envelope whose JSON-RPC framing and non-content arg
 - **WHEN** `MAX_FILE_WRITE_BYTES` is raised via the environment above `3 × MAX_NOTE_BYTES`
 - **THEN** the derived transport limit SHALL equal `2 × MAX_FILE_WRITE_BYTES + 1 MiB` for the new value without any further configuration
 
+### Requirement: write_file refuses a symlinked final component
+
+`write_file` SHALL apply the same rule as the mutating note tools: it acts on the named path and refuses (naming the link target, no write) when the final component is a symbolic link, including a dangling one; symlinked directory components resolving inside the vault remain permitted. `read_file` is unchanged.
+
+#### Scenario: write_file on an alias
+
+- **WHEN** `alias.png` is a symlink to `real.png` and `write_file("alias.png", …, overwrite=True)` is invoked
+- **THEN** the tool SHALL return an error naming `real.png` and `real.png` SHALL be unchanged
+

@@ -11,6 +11,6 @@
 - [x] 3.3 Resolve-once regressions: repoint a symlinked ancestor (and a symlinked vault root) between the read and the write, with a byte-identical decoy in the new directory → the write lands in the validated directory and the decoy is untouched. Plus: leaf swapped for a link after validation → reported, not raised; in-vault `..` message; alias beats the size limit.
 ## 4. Verify & ship
 - [x] 4.1 `openspec validate symlink-safe-note-tools --strict`; suite.
-- [ ] 4.2 `openspec-verifier`; adversarial Codex (write tools). Iterate to no BLOCKER/MAJOR.
+- [x] 4.2 `openspec-verifier`; adversarial Codex (write tools). Iterate to no BLOCKER/MAJOR.
 - [ ] 4.3 `make deploy`; live e2e per design; record tools called.
 - [ ] 4.4 Archive, PR closing #54, merge.
