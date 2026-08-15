@@ -367,6 +367,9 @@ async def move_note(
     `[[Old|alias]]` → `[[New|alias]]`, `[[Old#anchor]]` → `[[New#anchor]]`,
     `![[Old]]` → `![[New]]`, and path-style `[[folder/Old]]` → `[[new/folder/New]]`.
     Aliases and anchors are preserved; only the title portion is rewritten.
+    All rewrites are computed before anything changes: if one would push a
+    source note past the 10 MiB note limit the whole move is refused, naming
+    that source, so the link graph never disagrees with the vault bytes.
 
     Writes are atomic. See `get_vault_guide` for vault folder conventions.
 

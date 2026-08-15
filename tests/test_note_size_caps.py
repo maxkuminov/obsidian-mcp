@@ -189,7 +189,7 @@ async def test_set_frontmatter_uses_the_real_10_mib_cap(offline):
     assert str(MAX_NOTE_BYTES) in result
 
 
-# ── move_note(rewrite_links=True): an over-cap rewrite is skipped ───────────
+# ── move_note(rewrite_links=True): an over-cap rewrite aborts the move ──────
 
 
 class _Row:
@@ -197,13 +197,31 @@ class _Row:
         self.__dict__.update(kwargs)
 
 
+class _Journal:
+    """Records what the fake session was asked to do, so a test can prove
+    nothing mutated: `statements` holds every executed statement and `commits`
+    counts the commits."""
+
+    def __init__(self):
+        self.statements = []
+        self.commits = 0
+
+    def mutating(self):
+        """Executed statements that would change rows (the two post-move UPDATEs)."""
+        from sqlalchemy.sql.expression import Delete, Insert, Update
+
+        return [s for s in self.statements if isinstance(s, (Update, Insert, Delete))]
+
+
 def _fake_session_returning(*result_rows):
     """A minimal `async_session` stand-in that replays canned `.all()` rows.
 
     `move_note_impl` issues, in order: the vault-index select, the backlink
-    source select, then the two post-move UPDATEs.
+    source select, then — only once it commits — the two post-move UPDATEs.
+    Returns `(session_factory, journal)`.
     """
     calls = {"n": 0}
+    journal = _Journal()
 
     class Result:
         def __init__(self, rows):
@@ -220,48 +238,48 @@ def _fake_session_returning(*result_rows):
             return None
 
         async def execute(self, statement):
+            journal.statements.append(statement)
             i = calls["n"]
             calls["n"] += 1
             return Result(result_rows[i] if i < len(result_rows) else [])
 
         async def commit(self):
+            journal.commits += 1
             return None
 
-    return FakeSession
+    return FakeSession, journal
 
 
-async def test_move_note_skips_over_cap_link_rewrite(offline, small_cap, monkeypatch):
-    """An over-cap rewrite leaves that source byte-identical; the rest proceed."""
+def _move_fixture(offline, small_cap, monkeypatch, *, over_cap: bool):
+    """Set up a move with two backlink sources; `big.md` is over cap or not."""
     from_rel = "old/target.md"
     to_rel = "new/deeper/a-much-longer-renamed-name.md"
 
     (offline / "old").mkdir()
     (offline / from_rel).write_text("moved note\n", encoding="utf-8")
 
-    # Two backlink sources. `big.md` sits just under the cap, so expanding
-    # `old/target` (10 chars) to the longer new path pushes it over; `small.md`
-    # has room to spare.
+    # `big.md` sits just under the cap when `over_cap`, so expanding
+    # `old/target` (10 chars) to the longer new path pushes it over. Otherwise
+    # it has room to spare, like `small.md`.
     link = "See [[old/target]]\n"
     big = offline / "big.md"
-    big.write_text("p" * (small_cap - len(link) - 3) + "\n" + link, encoding="utf-8")
-    assert big.stat().st_size == small_cap - 2
-    big_before = big.read_bytes()
+    filler = (small_cap - len(link) - 3) if over_cap else 32
+    big.write_text("p" * filler + "\n" + link, encoding="utf-8")
+    if over_cap:
+        assert big.stat().st_size == small_cap - 2
 
     small = offline / "small.md"
     small.write_text(link, encoding="utf-8")
 
-    monkeypatch.setattr(
-        tools,
-        "async_session",
-        _fake_session_returning(
-            [
-                _Row(file_path=from_rel, id=1),
-                _Row(file_path="big.md", id=2),
-                _Row(file_path="small.md", id=3),
-            ],
-            [_Row(file_path="big.md"), _Row(file_path="small.md")],
-        ),
+    factory, journal = _fake_session_returning(
+        [
+            _Row(file_path=from_rel, id=1),
+            _Row(file_path="big.md", id=2),
+            _Row(file_path="small.md", id=3),
+        ],
+        [_Row(file_path="big.md"), _Row(file_path="small.md")],
     )
+    monkeypatch.setattr(tools, "async_session", factory)
 
     seen: list[bytes | None] = []
     real_write = tools.write_file
@@ -271,22 +289,86 @@ async def test_move_note_skips_over_cap_link_rewrite(offline, small_cap, monkeyp
         return real_write(path, content, **kwargs)
 
     monkeypatch.setattr(tools, "write_file", spy)
+    return (
+        from_rel,
+        to_rel,
+        big,
+        small,
+        big.read_bytes(),
+        small.read_bytes(),
+        seen,
+        journal,
+    )
+
+
+async def test_move_note_aborts_when_a_link_rewrite_would_exceed_cap(
+    offline, small_cap, monkeypatch
+):
+    """Over-cap source → the whole move is refused before anything mutates."""
+    (
+        from_rel,
+        to_rel,
+        big,
+        small,
+        big_before,
+        small_before,
+        seen,
+        journal,
+    ) = _move_fixture(offline, small_cap, monkeypatch, over_cap=True)
 
     result = await tools.move_note_impl(from_rel, to_rel, rewrite_links=True)
 
-    # The move itself happened.
+    # The error names the offending source and the limit, and does not claim
+    # the move happened.
+    assert "big.md" in result
+    assert str(small_cap) in result
+    assert "Moved" not in result
+
+    # The filesystem is exactly as it was: the note never moved, and no source
+    # — not even the under-cap one — was rewritten.
+    assert (offline / from_rel).read_text(encoding="utf-8") == "moved note\n"
+    assert not (offline / to_rel).exists()
+    assert big.read_bytes() == big_before
+    assert small.read_bytes() == small_before
+    assert seen == []
+
+    # And the DB saw only the two preflight SELECTs — no UPDATE, no commit.
+    assert journal.mutating() == []
+    assert journal.commits == 0
+
+
+async def test_move_note_rewrites_unchanged_when_nothing_is_over_cap(
+    offline, small_cap, monkeypatch
+):
+    """No over-cap source → move, DB update and rewrites behave as before."""
+    (
+        from_rel,
+        to_rel,
+        big,
+        small,
+        big_before,
+        small_before,
+        seen,
+        journal,
+    ) = _move_fixture(offline, small_cap, monkeypatch, over_cap=False)
+
+    result = await tools.move_note_impl(from_rel, to_rel, rewrite_links=True)
+
     assert "Moved" in result, result
+    assert "rewrote 2 link(s) across 2 note(s)" in result
+    assert "warning" not in result
     assert not (offline / from_rel).exists()
     assert (offline / to_rel).read_text(encoding="utf-8") == "moved note\n"
 
-    # The over-cap source is untouched and named, with the limit, in the result.
-    assert big.read_bytes() == big_before
-    assert "big.md" in result
-    assert str(small_cap) in result
-
-    # The other source was rewritten, under the `expected=` conflict guard.
+    # Both sources were rewritten...
+    assert "a-much-longer-renamed-name" in big.read_text(encoding="utf-8")
     assert "a-much-longer-renamed-name" in small.read_text(encoding="utf-8")
-    assert seen == [link.encode("utf-8")]
+    # ...each under the `expected=` conflict guard, carrying the pre-move bytes.
+    assert seen == [big_before, small_before]
+
+    # The move's DB updates still ran and committed.
+    assert len(journal.mutating()) == 2
+    assert journal.commits == 1
 
 
 # ── the size check must not displace the conflict check ─────────────────────

@@ -66,6 +66,14 @@ CONTROLLED_TEST_ENV = {
 TRUST_ENV_VAR = "OMCP_TEST_TRUST_ENV"
 
 
+# pydantic-settings matches environment variables **case-insensitively**, so
+# `base_url=…` feeds the singleton exactly like `BASE_URL=…`. Scrubbing only the
+# canonical upper-case spellings therefore left the hole open for any other
+# casing, which is why the scrub below walks the real environment and compares
+# folded names instead of popping a fixed list of keys.
+SETTINGS_ENV_KEYS_FOLDED = frozenset(k.casefold() for k in SETTINGS_ENV_KEYS)
+
+
 @contextmanager
 def _hermetic_settings_env():
     """Replace every `Settings`-shaped variable with controlled values.
@@ -76,19 +84,29 @@ def _hermetic_settings_env():
     CORS/TrustedHost middleware allowed — and therefore what the suite asserted
     — depended on the machine. Env vars outrank dotenv in pydantic-settings, so
     suppressing the `.env` file alone does not close this.
+
+    Every entry whose *casefolded* name matches a `Settings` field is removed,
+    whatever its spelling, and the exact original entries (original casing and
+    value) are put back afterwards.
     """
-    saved = {k: os.environ.get(k) for k in SETTINGS_ENV_KEYS}
+    saved = {
+        key: value
+        for key, value in os.environ.items()
+        if key.casefold() in SETTINGS_ENV_KEYS_FOLDED
+    }
     try:
-        for key in SETTINGS_ENV_KEYS:
+        for key in saved:
             os.environ.pop(key, None)
         os.environ.update(CONTROLLED_TEST_ENV)
         yield
     finally:
-        for key, value in saved.items():
-            if value is None:
+        # Drop the controlled values we introduced (a differently-cased
+        # original is restored below under its own name), then put back exactly
+        # what was there.
+        for key in CONTROLLED_TEST_ENV:
+            if key not in saved:
                 os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        os.environ.update(saved)
 
 
 # Build the `src.config.settings` singleton *without* the repo-root `.env` and

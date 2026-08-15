@@ -29,7 +29,7 @@ import subprocess
 import sys
 import uuid
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 import pytest
 import pytest_asyncio
@@ -103,10 +103,21 @@ MIDDLE = _unit(0.8, 0.6)
 FAR = _unit(0.0, 1.0)
 
 
+def _admin_database_name(url: str) -> str:
+    """The database an admin URL points at, normalized for comparison.
+
+    A URL path is percent-encoded (`/obsidian%5Fmcp`) and Postgres identifiers
+    fold case, so the raw path is not what the server will resolve. Decode,
+    strip the leading slash, and casefold before matching the deny list —
+    otherwise `OBSIDIAN_MCP` or an encoded spelling walks straight past it.
+    """
+    return unquote(urlsplit(url).path).lstrip("/").casefold()
+
+
 @pytest.fixture(scope="module")
 def migrated_database():
     """Create a throwaway database on the admin server, migrate it, drop it."""
-    admin_db = urlsplit(PGVECTOR_TEST_ADMIN_URL).path.lstrip("/")
+    admin_db = _admin_database_name(PGVECTOR_TEST_ADMIN_URL)
     if admin_db in FORBIDDEN_DB_NAMES:
         pytest.fail(
             "PGVECTOR_TEST_ADMIN_URL points at the production database name "
@@ -115,10 +126,15 @@ def migrated_database():
         )
 
     dbname = f"test_pgvector_{uuid.uuid4().hex}"
-    asyncio.run(
-        _run_maintenance(PGVECTOR_TEST_ADMIN_URL, f'CREATE DATABASE "{dbname}"')
-    )
     try:
+        # CREATE sits inside the try so the DROP below runs even if creation is
+        # interrupted (KeyboardInterrupt, a timeout, a half-applied CREATE): the
+        # name is generated, `IF EXISTS` makes the drop a no-op when it never
+        # got made, and leaving a stray database behind is the one outcome this
+        # fixture must not have.
+        asyncio.run(
+            _run_maintenance(PGVECTOR_TEST_ADMIN_URL, f'CREATE DATABASE "{dbname}"')
+        )
         url = _with_database(PGVECTOR_TEST_ADMIN_URL, dbname)
         result = subprocess.run(
             [sys.executable, "-m", "alembic", "upgrade", "head"],
@@ -134,12 +150,17 @@ def migrated_database():
         yield url
     finally:
         # FORCE terminates any connection the test left behind, so a failing
-        # test still cleans up its database.
-        asyncio.run(
-            _run_maintenance(
-                PGVECTOR_TEST_ADMIN_URL, f'DROP DATABASE IF EXISTS "{dbname}" (FORCE)'
+        # test still cleans up its database. Best effort: a drop that itself
+        # fails must not mask the test's own error.
+        try:
+            asyncio.run(
+                _run_maintenance(
+                    PGVECTOR_TEST_ADMIN_URL,
+                    f'DROP DATABASE IF EXISTS "{dbname}" (FORCE)',
+                )
             )
-        )
+        except Exception as e:  # pragma: no cover - cleanup best effort
+            print(f"warning: could not drop throwaway database {dbname}: {e}")
 
 
 @pytest_asyncio.fixture(loop_scope="module", scope="module")
