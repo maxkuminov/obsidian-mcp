@@ -5,7 +5,7 @@ import re
 import shutil
 import stat
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import yaml
 from sqlalchemy import select
@@ -164,6 +164,94 @@ def validate_visible_path(relative_path: str, user_id: int | None = None) -> Pat
     return resolved
 
 
+def validate_mutable_path(relative_path: str, user_id: int | None = None) -> Path:
+    """Validate a path a tool is about to **mutate**, refusing a symlinked leaf.
+
+    `validate_path` returns `(vault / rel).resolve()`, which follows symlinks —
+    so an in-vault alias `alias.md -> important.md` made every write tool act on
+    `important.md` while reporting success for `alias.md`. That is a destructive
+    write on a path nobody named. Reads may keep following links (an alias
+    reading as its target is what a user expects); mutations may not.
+
+    The rule (see `openspec/specs/vault-write`):
+
+    - the *parent* directory is resolved and must stay inside the vault, so
+      symlinked directories inside the vault (shared attachment folders, a
+      common Obsidian setup) keep working while an escaping one is still
+      rejected by the containment check;
+    - the final component is taken **as named** and `os.lstat`-ed: if it is a
+      symbolic link — including a dangling one — the operation is refused with
+      an error naming the link's canonical vault-relative target;
+    - the returned path is `resolved_parent / name`, i.e. the real directory
+      entry the indexer sees. Callers that record vault-relative paths in the
+      database (`move_note`) derive them from this path, so they match what the
+      indexer stores for notes under a symlinked directory.
+
+    Resolving the parent once, here, also means an allowed symlinked ancestor is
+    never re-traversed during the mutation: repointing it afterwards cannot
+    redirect the write. The residual TOCTOU — the leaf swapped for a link
+    between this `lstat` and the write — is the same optimistic level as every
+    other note write today, and closes when these paths migrate to the anchored
+    `vault_fs` helpers.
+
+    Raises `ValueError` for traversal, a hidden (dot-directory) path, a
+    non-file-shaped path, or a symlinked final component.
+    """
+    vault = _vault_root(user_id)
+    vault_resolved = vault.resolve()
+
+    raw = str(relative_path).replace(os.sep, "/")
+    if "\x00" in raw:
+        raise ValueError(f"Path traversal denied: {relative_path}")
+    if raw.endswith("/"):
+        raise ValueError(f"Not a file path: {relative_path!r}")
+    rel = PurePosixPath(raw)
+    if rel.is_absolute():
+        raise ValueError(f"Path traversal denied: {relative_path}")
+    parts = [part for part in rel.parts if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        raise ValueError(f"Path traversal denied: {relative_path}")
+    if not parts:
+        raise ValueError(f"Not a file path: {relative_path!r}")
+
+    name = parts[-1]
+    resolved_parent = vault.joinpath(*parts[:-1]).resolve()
+    try:
+        parent_rel = resolved_parent.relative_to(vault_resolved)
+    except ValueError:
+        raise ValueError(f"Path traversal denied: {relative_path}") from None
+
+    target = resolved_parent / name
+    if is_hidden_path(parent_rel / name):
+        raise ValueError(f"Hidden path denied: {relative_path}")
+
+    try:
+        info = os.lstat(target)
+    except (FileNotFoundError, NotADirectoryError):
+        info = None
+    if info is not None and stat.S_ISLNK(info.st_mode):
+        raise ValueError(
+            f"{relative_path} is a symbolic link to "
+            f"{_link_target_label(target, vault_resolved)} — mutating tools act "
+            "only on the named file; operate on the target instead."
+        )
+    return target
+
+
+def _link_target_label(link: Path, vault_resolved: Path) -> str:
+    """Name a symlink's ultimate target for an error message.
+
+    Vault-relative POSIX when the target lands inside the vault (dangling links
+    included — the caller still learns which note the alias was meant to name),
+    otherwise the literal string `outside the vault`.
+    """
+    try:
+        destination = Path(os.path.realpath(link))
+        return destination.relative_to(vault_resolved).as_posix()
+    except (ValueError, OSError):
+        return "outside the vault"
+
+
 def read_file(relative_path: str, user_id: int | None = None) -> dict:
     """Read a note, returning frontmatter + content."""
     path = validate_visible_path(relative_path, user_id=user_id)
@@ -283,8 +371,13 @@ def write_file(
     overwrite: bool = True,
     expected: bytes | None = None,
 ) -> Path:
-    """Write content to a note atomically (tmp file in same dir + os.replace)."""
-    path = validate_visible_path(relative_path, user_id=user_id)
+    """Write content to a note atomically (tmp file in same dir + os.replace).
+
+    Validation goes through `validate_mutable_path`, so a symlinked final
+    component is refused rather than silently retargeted, and `_atomic_write`
+    receives `resolved_parent / name` — a real directory for its temp file.
+    """
+    path = validate_mutable_path(relative_path, user_id=user_id)
     return _atomic_write(
         path, text=content, overwrite=overwrite, expected=expected
     )
@@ -325,9 +418,11 @@ def write_bytes(
     creates any missing parent directories, and routes through the shared
     atomic temp-file + `os.replace` write. Raises `FileExistsError` when the
     target exists and `overwrite` is False, leaving the existing file
-    untouched.
+    untouched, and `ValueError` when the final component is a symlink
+    (`validate_mutable_path`) — writing through an alias would clobber the
+    target under a path the caller never named.
     """
-    path = validate_visible_path(relative_path, user_id=user_id)
+    path = validate_mutable_path(relative_path, user_id=user_id)
     try:
         return _atomic_write(path, data=data, overwrite=overwrite)
     except FileExistsError:
