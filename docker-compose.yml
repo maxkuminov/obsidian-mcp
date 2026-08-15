@@ -48,8 +48,9 @@ services:
       # contains spaces. Admin assigns the container path on the user
       # record via /admin/users/<id>/edit.
 
-      # Oksana — assign vault_path=/vaults/oksana in the panel after she's created.
-      - "/storage/shared/Oksana Documents/Obsidian:/vaults/oksana"
+      # Second user — assign vault_path=/vaults/oksana in the panel after the
+      # user is created. The host path lives in .env (this file is public).
+      - "${OKSANA_VAULT_HOST_PATH:-./vaults/oksana}:/vaults/oksana"
 
       # Additional users — add an entry per user as you invite them.
       # Example: "/storage/vaults/alice:/vaults/alice"
