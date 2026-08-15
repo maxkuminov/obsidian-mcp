@@ -17,9 +17,10 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
 - `src/main.py` — FastAPI app, lifespan, MCP mount
 - `src/config.py` — pydantic-settings
 - `src/database.py` — async SQLAlchemy engine/session
-- `src/models/db.py` — ORM models (api_keys, usage_logs, notes_metadata, note_embeddings, note_links)
+- `src/models/db.py` — ORM models (api_keys, usage_logs, notes_metadata, note_embeddings, note_links, transfer_tokens)
 - `src/mcp_server/` — MCP server, tools, auth middleware
-- `src/services/` — vault ops, search, embeddings, indexer
+- `src/services/` — vault ops, search, embeddings, indexer, transfer, anchored FS
+- `src/transfer/` — public `/transfer/*` capability-redemption routes
 - `src/api/` — control panel REST endpoints
 - `src/control_panel/` — Jinja2 templates + static assets
 - `alembic/` — database migrations
@@ -29,6 +30,8 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
 - Traefik routes: hostname driven by `MCP_HOSTNAME` in `.env`
   - Panel routes: OAuth protected via `chain-oauth@file`
   - MCP routes (`/mcp/*`): API key auth at app level
+  - Transfer routes (`/transfer/*`): same router as `/mcp` (no OAuth chain);
+    capability-token auth at app level
 - Registry: `localhost:5000` (or change in `Makefile`)
 - Deploy: `make deploy` (build → scan → push → backup → migrate → recreate)
 
@@ -151,7 +154,61 @@ Raw read/write/browse of arbitrary vault files, distinct peers to the note tools
 - `write_file(path, content, encoding="base64", overwrite=False)` — `base64` decodes `content` to raw bytes; `text` writes UTF-8. No-clobber by default (`overwrite=True` to replace), auto-creates parent dirs, atomic via `vault.write_file`. Capped by `MAX_FILE_WRITE_BYTES` (default 25 MB) on decoded length.
 - `list_files(folder=".", pattern="*", recursive=False, limit=200)` — `ls`-style: immediate children (subdirs + files) by default, each file with size + mtime; glob-filterable; capped at `limit` with a truncation note.
 
-All three reuse `validate_path` (traversal guard) and a shared dot-dir guard (`is_hidden_path`) that rejects any path component starting with `.` — same visibility rule as the indexer, keeping `.obsidian`/`.git`/`.trash`/`.smart-env` out of reach. Vault helpers (`read_bytes`, `write_bytes`, `list_dir`, MIME classification) live in `src/services/vault.py`. MIME detection uses stdlib `mimetypes` plus a magic-byte sniff for PNG/JPEG/GIF/WebP. `read_file` is the first tool returning a non-`str` MCP content object.
+- `delete_file(path, permanent=False)` — soft-deletes to `.trash/<YYYYMMDD-HHMMSS>-<basename>` through the anchored helper; `permanent=True` unlinks. Refuses `.md` (pointing at `delete_note`), directories and symlinks.
+
+All four reuse `validate_path` (traversal guard) and a shared dot-dir guard (`is_hidden_path`) that rejects any path component starting with `.` — same visibility rule as the indexer, keeping `.obsidian`/`.git`/`.trash`/`.smart-env` out of reach. Vault helpers (`read_bytes`, `write_bytes`, `list_dir`, MIME classification) live in `src/services/vault.py`. MIME detection uses stdlib `mimetypes` plus a magic-byte sniff for PNG/JPEG/GIF/WebP. `read_file` is the first tool returning a non-`str` MCP content object.
+
+## File transfer
+
+No MCP client can hand a tool the bytes of a file the user is looking at, and
+the server cannot reach the user's disk. Five tools plus a public route family
+close that gap. The whole design is one idea: **a capability pins everything it
+may do at mint time, and the route acts on nothing else.**
+
+**Tools** (`src/mcp_server/tools.py`, registered in `server.py`):
+- `request_upload(path, overwrite=False, expires_in=None)` — readwrite. Mints a single-use upload capability; returns `upload_id` (opaque `public_id`, never the row id), a `…/transfer/upload#<token>` URL, `expires_at` and `max_bytes`.
+- `check_upload(upload_id)` — `pending` | `uploading` | `completed{path,size,sha256,mime,completed_at}` | `expired`, scoped to the exact minting credential *and* user. Another identity's handle is `not found`.
+- `request_download(path, expires_in=None)` — read is enough. Multi-use within its TTL; bound to the file's exact bytes at mint.
+- `import_from_url(url, path, overwrite=False)` — readwrite. Server-side fetch under the SSRF policy, straight through the same capped, anchored publish.
+- `delete_file(path, permanent=False)` — readwrite. See "File-access tools".
+
+**Routes** (`src/transfer/routes.py`, mounted in `src/main.py`): `GET|HEAD /transfer/{upload,download}` (static pages), `GET|HEAD /transfer/{upload,download}/info`, `PUT /transfer/upload`, `GET|HEAD /transfer/download/file`. Rate-limited 30/min for pages and info, 10/min for the two that move bytes. Any other method is a 405.
+
+### Fragment, not query string
+The token travels in the URL **fragment**, which browsers never send, so Traefik and Uvicorn access logs see only `/transfer/upload`. It is redeemed *only* from `Authorization: Bearer`; a token in the path or query is ignored, so pasting a link into a URL bar cannot be replayed out of a log. Two operator constraints follow: **Traefik header logging must stay at its default `drop`**, and no APM may capture request headers. `_tracked` allow-lists log `upload_id`, `path`, `expires_in`, `overwrite` and — for imports — the URL *host* only.
+
+### Token state machine
+`pending → claimed → completed`, with `consumed` as the dead end.
+- **`claim_upload` is one committed conditional `UPDATE … RETURNING`, run before a single body byte is read.** Zero rows → the uniform 404. That is what makes single-use linearizable and what stops an unknown token from streaming gigabytes to disk.
+- Handled pre-publication failures (413, 409, disconnect, dead identity) **release** the claim: nothing was published, so the human may retry the same link.
+- Deadline or idle timeout **consumes** it: the request died mid-stream and a retry should mint afresh.
+- A failure *after* publication — `PostPublishFailure` — leaves it **`claimed`**, forever. Never release there: from that state we cannot prove nothing landed, and a replayable token over an already-written path is the worse failure.
+
+### Uniform 404
+Unknown, expired, consumed, claimed, revoked credential, downgraded permission, inactive user, reassigned vault root — one status, one body, no branch a caller can time. `_not_found()` is the only way for a bearer-protected endpoint to say no. Precise status comes from the *authenticated* side, via `check_upload`.
+
+### Fingerprint binding — and its two honest limits
+An overwrite upload and every download record `{dev, inode, size, mtime_ns, ctime_ns, sha256}` of the target at mint. At publish (or before a download's first byte) the incumbent is `fstat`ed and, when the mint recorded a hash, re-hashed **from the descriptor**. Mismatch → 409 / 404.
+- **Optimistic, not linearizable.** `stat` → `replace` is check-then-act; a writer landing in that window is still overwritten. Same guarantee level as `edit_note(expected=…)`, declared rather than implied. The no-clobber path (`overwrite=False`) *is* kernel-linearizable — it is `link()`.
+- **Metadata-only above `MAX_FILE_WRITE_BYTES`.** Hashing multi-GB media at mint is not acceptable tool latency, so `sha256` is null there and only the metadata part binds.
+- **A null `expected_fingerprint` on an overwrite token is the expected-*absence* sentinel** — the target must still be absent. It never means "skip the check".
+
+### The publish gate
+`before_publish()` yields a `GateHandle` (`ok`, `session`, `complete`). Its transaction takes `SELECT … FOR UPDATE` on token → credential → user *in that fixed order* and **holds those locks across the filesystem publish**; `stream_to_vault` calls `gate.complete(result, published=…)` the instant the bytes are in place, so completion and the `usage_logs` row commit with the locks still held. A revocation, downgrade, reassignment or cascade delete needs the same rows, so it either waits for the publisher or beats it — there is no interleaving that publishes under a revoked identity.
+
+### Anchored filesystem (`src/services/vault_fs.py`)
+Every transfer write and `delete_file` walks one component at a time with `O_NOFOLLOW` from an open root descriptor, so a symlink anywhere in the chain raises instead of being followed. Bytes stage in **`<root>/.transfer-tmp/`** and the destination parent is re-walked *inside the gate* — a descriptor opened before a minutes-long stream keeps pointing at the same directory after a rename, and publishing through it would follow the move. `soft_delete`'s unlink is inode-verified against the inode it linked, so a file that replaced the source mid-delete is never destroyed. `check_filesystem_support(root)` probes hard links root→root and root→`.trash` **on first use per root** (cached), not in the lifespan; the tools and routes surface `UnsupportedFilesystem` as a stable error.
+
+**Follow-ups:** `vault._atomic_write` should adopt this helper (it is written to make that easy), and `usage_logs.key_id` still has no `ON DELETE` — a usage-log row written by an upload blocks its key's delete, exactly as before this change. Both are pre-existing, neither is regressed here.
+
+### Path canonicalisation — do not "simplify" this
+`validate_visible_path` runs (it is the shared traversal and dot-dir guard, and it is what refuses a link pointing out of the vault) but its **return value is the resolved path, and resolving follows symlinks**. The vault-relative path a transfer acts on is normalised *lexically* in `tools._vault_context`. Taking it from the resolved result silently retargets the operation: `delete_file("Attachments/alias.png")` where `alias.png` links to `secret.png` resolved to `secret.png` and deleted **that**, reporting success for a path nobody named. Keeping the caller's own components means the anchored walk is what meets the symlink — and refuses it.
+
+### SSRF policy for `import_from_url`
+The host is folded to canonical ASCII **first** (NFKC, the alternative full stops `。．｡`, then `idna.encode(uts46=True)`) and every check runs on that form — checking before normalising let `svc.prod。internal` past a suffix check and then resolved it as `svc.prod.internal`. Then: https only (`IMPORT_ALLOW_HTTP` for http), no userinfo, no zone ids, no single-label or `.localhost`/`.local`/`.internal`/`.home.arpa` names, no ambiguous numeric hosts, scheme-paired ports (443/8443, 80/8080). Every resolved address must pass an **explicit deny list** — loopback, RFC 1918, ULA, link-local, CGNAT, `0.0.0.0/8`, `240/4`, `198.18/15`, `192.0.0.0/24`, documentation, multicast, unspecified, reserved, IPv4-mapped/compat, NAT64, 6to4, Teredo (embedded IPv4 extracted and re-checked) — *and then* `is_global`. `is_global` alone is not enough; it admits IPv6 multicast and the NAT64 prefix. The connection is pinned to the validated address with `Host` and SNI kept as the original name, a new client per hop, `trust_env=False`, `http2=False`, ≤ 5 manual redirects with every rule re-applied, and one 30 s deadline over the whole thing.
+
+### Declared filesystem semantics
+Case-sensitive, non-normalising filesystems (ext4/xfs — the production bind mount). Hard links must work within the root and into `.trash`; the probe refuses otherwise rather than degrading to an overwriting move. Case-insensitive or normalising mounts are out of scope.
 
 ## Three kinds of size cap — don't confuse them
 

@@ -231,10 +231,41 @@ no embedding or indexing of non-markdown files.
 - `list_files(folder=".", pattern="*", recursive=False, limit=200)`,
   `ls`-style browse of files and subdirectories with size and mtime,
   glob-filterable and result-capped.
+- `delete_file(path, permanent=False)`, soft-deletes a non-markdown
+  file to `.trash/<YYYYMMDD-HHMMSS>-<basename>`. Refuses markdown
+  (that is `delete_note`), directories, and symlinks.
 
-All three reuse the path-traversal guard and exclude dot-directories
+All four reuse the path-traversal guard and exclude dot-directories
 (`.obsidian`, `.git`, `.trash`, …), matching the indexer's visibility
 rule.
+
+### File transfer
+No MCP client can hand a tool the bytes of a file the user is looking
+at, so `write_file` is only usable when the agent already has the
+content. These tools close that gap with short-lived capability links,
+redeemed over the public `/transfer/*` routes.
+- `request_upload(path, overwrite=False, expires_in?)`, mints a
+  single-use link bound to exactly one destination path. The human
+  opens it, picks a file, and it lands at `path` — nothing else can be
+  written with it.
+- `check_upload(upload_id)`, reports `pending` / `uploading` /
+  `completed` (with size, sha256 and MIME) / `expired`, scoped to the
+  identity that minted it.
+- `request_download(path, expires_in?)`, mints a link the human can
+  save one vault file from. Usable more than once until it expires, and
+  bound to the file's exact bytes at mint time.
+- `import_from_url(url, path, overwrite=False)`, fetches a public https
+  asset straight into the vault under an explicit outbound deny policy
+  (no private, loopback, link-local, metadata or tunnelled addresses,
+  in any spelling, re-checked at every redirect).
+
+The token travels in the URL *fragment*, which browsers never send, so
+no server-generated request target or access log contains it. Uploads
+are claimed before a body byte is read, published atomically with
+no-clobber semantics, and bound at mint time to the file state they
+were minted against — a link cannot silently undo an edit made while it
+was waiting. `MCP_HOSTNAME` or `BASE_URL` must be set; without a public
+origin the mint tools refuse rather than emit a localhost link.
 
 ### Wikilink graph
 - `get_backlinks(path, limit=50)`, notes linking TO `path`
@@ -614,6 +645,10 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
 | `MAX_READ_RESPONSE_CHARS` | `40000` | `read_note` / `read_file` cap on what is returned to the caller (≈10K tokens). See [Response size limits](#response-size-limits). |
 | `FTS_CONFIGS` | `english` | Keyword-search text-search config(s). JSON or CSV. See [Full-text search language(s)](#full-text-search-languages). |
+| `TRANSFER_TOKEN_TTL_SECONDS` | `600` | Default life of a transfer link. Per-call `expires_in` is clamped to 60–3600. |
+| `TRANSFER_MAX_UPLOAD_SECONDS` | `600` | How long one claimed upload may stream before the token is spent |
+| `TRANSFER_MAX_CONCURRENT_UPLOADS` | `4` | Simultaneous upload streams |
+| `IMPORT_ALLOW_HTTP` | `false` | Let `import_from_url` fetch plain http. Off by default. |
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | — | Used when provider is Ollama |

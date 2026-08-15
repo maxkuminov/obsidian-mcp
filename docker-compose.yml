@@ -64,7 +64,7 @@ services:
       - "traefik.http.routers.obsidian-mcp-panel-rtr.service=obsidian-mcp-svc"
       # API/MCP/OAuth public router (no OAuth — app-level auth)
       - "traefik.http.routers.obsidian-mcp-api-rtr.entrypoints=https"
-      - "traefik.http.routers.obsidian-mcp-api-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && (PathPrefix(`/mcp`) || Path(`/health`) || PathPrefix(`/.well-known`) || Path(`/register`) || Path(`/token`) || Path(`/revoke`))"
+      - "traefik.http.routers.obsidian-mcp-api-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && (PathPrefix(`/mcp`) || PathPrefix(`/transfer`) || Path(`/health`) || PathPrefix(`/.well-known`) || Path(`/register`) || Path(`/token`) || Path(`/revoke`))"
       - "traefik.http.routers.obsidian-mcp-api-rtr.tls=true"
       - "traefik.http.routers.obsidian-mcp-api-rtr.tls.certresolver=dns-namecheap"
       - "traefik.http.routers.obsidian-mcp-api-rtr.service=obsidian-mcp-svc"

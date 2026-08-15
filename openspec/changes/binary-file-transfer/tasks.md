@@ -39,9 +39,9 @@
 
 ## 6. Docs & deploy config
 
-- [ ] 6.1 `docker-compose.yml` (repo) **and** `$(DEPLOY_DIR)/docker-compose.yml`: add `PathPrefix(\`/transfer\`)` to the `obsidian-mcp-api-rtr` rule; diff the two files afterwards to confirm they are identical apart from the documented host-specific lines.
-- [ ] 6.2 `src/mcp_server/vault_guide_primer.md`: "getting files in and out" paragraph (spec `vault-guide` delta); update `get_vault_guide` tests that assert tool mentions.
-- [ ] 6.3 `CLAUDE.md`: "File transfer" section (tools, routes, fragment/bearer redemption, token state machine, fingerprint binding and its optimistic-window + above-cap limitations, upload deadlines/concurrency, anchored FS helper + startup probe and the follow-up to adopt it for `_atomic_write`, SSRF deny policy summary, Traefik note incl. the operator constraint that Traefik header logging stays `drop`, `delete_file` markdown refusal, declared FS semantics); `README.md` tool table.
+- [x] 6.1 `docker-compose.yml` (repo) **and** `$(DEPLOY_DIR)/docker-compose.yml`: add `PathPrefix(\`/transfer\`)` to the `obsidian-mcp-api-rtr` rule; diff the two files afterwards to confirm they are identical apart from the documented host-specific lines.
+- [x] 6.2 `src/mcp_server/vault_guide_primer.md`: "getting files in and out" paragraph (spec `vault-guide` delta); update `get_vault_guide` tests that assert tool mentions.
+- [x] 6.3 `CLAUDE.md`: "File transfer" section (tools, routes, fragment/bearer redemption, token state machine, fingerprint binding and its optimistic-window + above-cap limitations, upload deadlines/concurrency, anchored FS helper + startup probe and the follow-up to adopt it for `_atomic_write`, SSRF deny policy summary, Traefik note incl. the operator constraint that Traefik header logging stays `drop`, `delete_file` markdown refusal, declared FS semantics); `README.md` tool table.
 
 ## 7. Verification & ship
 

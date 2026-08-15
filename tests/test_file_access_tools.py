@@ -276,8 +276,23 @@ async def test_list_dotdir_folder_rejected(vault):
 
 async def test_guide_mentions_file_tools(vault):
     result = await tools.get_vault_guide_impl()
-    for name in ("read_file", "write_file", "list_files"):
+    for name in ("read_file", "write_file", "list_files", "delete_file"):
         assert name in result
+    assert "non-markdown" in result
+
+
+async def test_guide_explains_the_transfer_flow(vault):
+    """An agent that cannot pass bytes has to discover the link flow here."""
+    result = await tools.get_vault_guide_impl()
+    for name in (
+        "request_upload",
+        "check_upload",
+        "request_download",
+        "import_from_url",
+    ):
+        assert name in result
+    # …and how a stored file gets into a note.
+    assert "![[path]]" in result
 
 
 # ── extra: mtime sanity for list output ──────────────────────────────────────
