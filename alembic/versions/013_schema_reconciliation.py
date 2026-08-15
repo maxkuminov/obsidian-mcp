@@ -25,19 +25,54 @@ confidential one must. It is resolved through the catalog, never by name
 alone -- a same-named `CHECK (true)` would satisfy a name lookup while
 enforcing nothing.
 
-**Rows are never mutated to satisfy the CHECK.** If any `oauth_clients` row
-violates the predicate the migration raises, naming the offending
-`client_id`s, and the whole transaction rolls back: schema and rows unchanged,
-`make deploy` aborts before recreating the container, the old container keeps
-serving.
+**Rows are never mutated to satisfy the CHECK, and nothing that the CHECK
+reads is touched before it has been verified.** The offender query runs over
+the raw `oauth_clients` rows, *before* any reconciliation of
+`token_endpoint_auth_method` -- a NULL there is counted as an offender rather
+than quietly backfilled to `client_secret_post`, because backfilling it is
+exactly what would turn a row the constraint should reject (NULL method with a
+secret, or without one) into a row that passes. If any row violates the
+predicate the migration raises, naming the offending `client_id`s, and the
+whole transaction rolls back: schema and rows unchanged, `make deploy` aborts
+before recreating the container, the old container keeps serving. Only after
+that check passes does 013 touch the column's *type, default and NOT NULL* --
+declarative fixes that change no row's value. (`oauth_clients.created_at` is
+backfilled, but it is not an input to the CHECK.)
 
-Locks and timeouts (design D3a): `SET NOT NULL` takes ACCESS EXCLUSIVE and
+If `token_endpoint_auth_method` is absent entirely the migration refuses: 010
+always adds it, so its absence means the database never had 010's shape at all
+and 013's job -- reconciling a database that *did* -- is not the right repair.
+
+Locks and timeouts (design D3a/D3b): `SET NOT NULL` takes ACCESS EXCLUSIVE and
 scans the table without rewriting it; `usage_logs` (~10k rows) scans in
 milliseconds. `LOCK TABLE oauth_clients IN SHARE ROW EXCLUSIVE MODE` blocks
 concurrent DML for the rest of the transaction so the offender check cannot
-race an insert. `lock_timeout`/`statement_timeout` bound the whole thing, so a
-long-lived transaction elsewhere makes the deploy fail fast instead of
-stalling behind a lock.
+race an insert.
+
+**Lock order is child-first.** The five other tables (`api_keys`,
+`notes_metadata`, `oauth_codes`, `oauth_tokens`, `usage_logs`) are backfilled
+and set NOT NULL *before* `oauth_clients` is locked, so this migration never
+holds the parent's lock while asking for a child's. That matches the
+application's own order: the token exchange in `src/oauth/routes.py` takes
+`SELECT ... FOR UPDATE` on `oauth_codes` first, then reads `oauth_clients`,
+then inserts `oauth_tokens`. Same direction on both sides means a concurrent
+OAuth request queues behind the migration instead of closing a wait cycle with
+it.
+
+That is an ordering guarantee, **not** a promise of no contention. The residual
+behaviour under concurrent OAuth traffic is *rollback and retry*: a request
+already holding a row lock the migration needs will make the migration wait,
+and if it waits past `lock_timeout` the migration aborts, the transaction rolls
+back whole, and the deploy fails before the container is recreated -- re-run it
+when traffic is quiet. Note the timeouts are per **statement** and per **lock
+acquisition**, not a budget for the transaction as a whole: a migration made of
+many fast statements can exceed 60s in total without any single one tripping
+`statement_timeout`.
+
+`_canonical_constraintdef` and `_canonical_default` build a scratch `TEMP`
+table, so the migration role needs the **TEMP privilege** on the database
+(`GRANT TEMPORARY ON DATABASE ... TO ...`). The owner/superuser role the deploy
+uses has it; a locked-down migration role may not.
 
 Revision ID: 013
 Revises: 012
@@ -65,6 +100,10 @@ CANONICAL_PREDICATE = (
     "(token_endpoint_auth_method = 'client_secret_post' AND client_secret_hash IS NOT NULL)"
 )
 
+# What 010 declares for the column, and what the model's server_default says.
+AUTH_METHOD_TYPE = "character varying(32)"
+AUTH_METHOD_DEFAULT = "client_secret_post"
+
 # Written as a COMMENT on the constraint when *this* migration creates it, so
 # `downgrade()` can tell "013 added it" from "010 added it and 013 left it
 # alone". A fresh 001->013 database must keep 010's constraint on downgrade to
@@ -85,6 +124,22 @@ NOT_NULL_COLUMNS = (
     ("usage_logs", "created_at", "now()"),
 )
 
+# Split by table so the child tables can be done before `oauth_clients` is
+# locked -- see the lock-order paragraph in the module docstring.
+OTHER_NOT_NULL_COLUMNS = tuple(c for c in NOT_NULL_COLUMNS if c[0] != "oauth_clients")
+OAUTH_CLIENTS_NOT_NULL_COLUMNS = tuple(
+    c for c in NOT_NULL_COLUMNS if c[0] == "oauth_clients"
+)
+
+
+def _scratch_like_oauth_clients(bind, name: str) -> None:
+    """An empty TEMP table with `oauth_clients`' exact current column shapes.
+
+    `ON COMMIT DROP` is belt-and-braces: every caller drops it explicitly so a
+    second call in the same transaction does not collide on the name.
+    """
+    bind.execute(sa.text(f"CREATE TEMP TABLE {name} (LIKE oauth_clients) ON COMMIT DROP"))
+
 
 def _canonical_constraintdef(bind) -> str:
     """What this server prints for the 010 predicate on `oauth_clients`.
@@ -98,7 +153,7 @@ def _canonical_constraintdef(bind) -> str:
     read back how it was printed. The table is temporary and empty, so
     validating the constraint is free, and it disappears with the transaction.
     """
-    bind.execute(sa.text("CREATE TEMP TABLE _ck_canon (LIKE oauth_clients) ON COMMIT DROP"))
+    _scratch_like_oauth_clients(bind, "_ck_canon")
     bind.execute(
         sa.text(
             f"ALTER TABLE _ck_canon ADD CONSTRAINT {CONSTRAINT_NAME} "
@@ -115,8 +170,30 @@ def _canonical_constraintdef(bind) -> str:
     return _normalize(definition)
 
 
+def _canonical_default(bind) -> str:
+    """What this server stores for `DEFAULT 'client_secret_post'` on that column.
+
+    Same reasoning as `_canonical_constraintdef`: the server normalizes a
+    default expression (`'client_secret_post'::character varying`), and the
+    rendering depends on the column's type, so comparing against a hand-written
+    string would either miss a real drift or "reconcile" a correct default on
+    every run. Callers fix the column *type* first, so the scratch table copies
+    the canonical type and the derived default is the one we want to see.
+    """
+    _scratch_like_oauth_clients(bind, "_def_canon")
+    bind.execute(
+        sa.text(
+            "ALTER TABLE _def_canon ALTER COLUMN token_endpoint_auth_method "
+            f"SET DEFAULT '{AUTH_METHOD_DEFAULT}'"
+        )
+    )
+    default_expr = _column(bind, "_def_canon", "token_endpoint_auth_method")[2]
+    bind.execute(sa.text("DROP TABLE _def_canon"))
+    return _normalize(default_expr)
+
+
 def _normalize(definition: str) -> str:
-    """Whitespace-insensitive form of a constraint definition."""
+    """Whitespace-insensitive form of a catalog-printed expression."""
     return " ".join(definition.split())
 
 
@@ -135,65 +212,51 @@ def _column(bind, table: str, column: str):
     ).first()
 
 
-def _reconcile_oauth_clients_shape(bind) -> None:
-    """Everything 010 promised about `oauth_clients` other than the CHECK."""
-    secret = _column(bind, "oauth_clients", "client_secret_hash")
-    if secret is None:  # pragma: no cover - would mean 002 never ran
-        raise RuntimeError(
-            "oauth_clients.client_secret_hash is missing; the database is not "
-            "at the shape migration 010 expects."
-        )
-    if secret[0]:  # attnotnull -- 010 made it nullable for public clients
-        op.execute("ALTER TABLE oauth_clients ALTER COLUMN client_secret_hash DROP NOT NULL")
+def _require_check_columns(bind) -> None:
+    """Both columns the CHECK predicate reads must exist before we query it.
 
-    method = _column(bind, "oauth_clients", "token_endpoint_auth_method")
-    if method is None:
-        op.add_column(
-            "oauth_clients",
-            sa.Column(
-                "token_endpoint_auth_method",
-                sa.String(32),
-                nullable=False,
-                server_default="client_secret_post",
-            ),
-        )
-        return
-
-    attnotnull, formatted_type, default_expr = method
-    if formatted_type != "character varying(32)":
-        op.execute(
-            "ALTER TABLE oauth_clients ALTER COLUMN token_endpoint_auth_method "
-            "TYPE character varying(32)"
-        )
-    if default_expr is None or "client_secret_post" not in default_expr:
-        op.execute(
-            "ALTER TABLE oauth_clients ALTER COLUMN token_endpoint_auth_method "
-            "SET DEFAULT 'client_secret_post'"
-        )
-    if not attnotnull:
-        # 010 added the column with this default, so every pre-existing row got
-        # it; a NULL here means someone relaxed the column afterwards. Backfill
-        # with the declared default rather than inferring intent from the
-        # secret -- if that leaves the row inconsistent, the offender check
-        # below names it and nothing is written.
-        op.execute(
-            "UPDATE oauth_clients SET token_endpoint_auth_method = 'client_secret_post' "
-            "WHERE token_endpoint_auth_method IS NULL"
-        )
-        op.execute(
-            "ALTER TABLE oauth_clients ALTER COLUMN token_endpoint_auth_method SET NOT NULL"
-        )
+    Historically impossible for `token_endpoint_auth_method`: 010 always adds
+    it, and the live database is past 010. If it is nevertheless gone, the
+    database is not one that ever had 010's shape, so silently re-adding the
+    column here would invent auth methods for every existing client -- the
+    operator has to decide what those clients are.
+    """
+    for column, hint in (
+        (
+            "client_secret_hash",
+            "migration 002 creates it; the database is not at the shape 010 expects",
+        ),
+        (
+            "token_endpoint_auth_method",
+            "migration 010 always adds it, so its absence means 010's shape was "
+            "never applied. Apply 010's column by hand (deciding the right "
+            "token_endpoint_auth_method for each existing client -- 013 will not "
+            "guess it) and re-run",
+        ),
+    ):
+        if _column(bind, "oauth_clients", column) is None:
+            raise RuntimeError(
+                f"oauth_clients.{column} is missing: {hint}. Nothing has been changed."
+            )
 
 
 def _assert_no_violating_rows(bind) -> None:
-    # `IS DISTINCT FROM true` rather than `NOT (...)`: a three-valued NULL
-    # result (possible only on a drifted, nullable column) is a row the
-    # constraint would reject, and `NOT NULL` is NULL, so a plain NOT would
-    # skip it and let ADD CONSTRAINT fail with a far less useful message.
+    """No row may violate the CHECK -- read *before* anything is reconciled.
+
+    Ordering is the whole point: this runs over the raw rows, so a NULL
+    `token_endpoint_auth_method` is reported as an offender instead of being
+    backfilled into a passing row first. `IS DISTINCT FROM true` rather than
+    `NOT (...)`: a three-valued NULL result (possible only on a drifted,
+    nullable column) is a row the constraint would reject, and `NOT NULL` is
+    NULL, so a plain NOT would skip it and let ADD CONSTRAINT fail with a far
+    less useful message. The explicit `IS NULL` disjunct is redundant with that
+    -- it is there so the intent survives an edit to the predicate.
+    """
     offenders = bind.execute(
         sa.text(
             f"SELECT client_id FROM oauth_clients "
-            f"WHERE ({CANONICAL_PREDICATE}) IS DISTINCT FROM true "
+            f"WHERE token_endpoint_auth_method IS NULL "
+            f"   OR ({CANONICAL_PREDICATE}) IS DISTINCT FROM true "
             f"ORDER BY client_id"
         )
     ).scalars().all()
@@ -202,9 +265,50 @@ def _assert_no_violating_rows(bind) -> None:
             f"{len(offenders)} oauth_clients row(s) violate {CONSTRAINT_NAME}: "
             + ", ".join(repr(c) for c in offenders)
             + ". A public client (token_endpoint_auth_method='none') must have "
-            "no client_secret_hash and a confidential one must have it. "
-            "Migration 013 will not delete or rewrite these rows -- fix them by "
-            "hand, then re-run. Nothing has been changed."
+            "no client_secret_hash and a confidential one must have it, and the "
+            "method must not be NULL. Migration 013 will not delete or rewrite "
+            "these rows -- fix them by hand, then re-run. Nothing has been changed."
+        )
+
+
+def _reconcile_oauth_clients_shape(bind) -> None:
+    """Everything 010 promised about `oauth_clients` other than the CHECK.
+
+    Declarative fixes only -- column type, default, nullability. No row's value
+    is written here. Runs *after* `_assert_no_violating_rows`, which is what
+    makes `SET NOT NULL` on `token_endpoint_auth_method` safe without a
+    backfill: a NULL would have been reported as an offender and we would never
+    have got here.
+    """
+    secret = _column(bind, "oauth_clients", "client_secret_hash")
+    if secret[0]:  # attnotnull -- 010 made it nullable for public clients
+        op.execute("ALTER TABLE oauth_clients ALTER COLUMN client_secret_hash DROP NOT NULL")
+
+    attnotnull, formatted_type, default_expr = _column(
+        bind, "oauth_clients", "token_endpoint_auth_method"
+    )
+
+    if formatted_type != AUTH_METHOD_TYPE:
+        op.execute(
+            "ALTER TABLE oauth_clients ALTER COLUMN token_endpoint_auth_method "
+            f"TYPE {AUTH_METHOD_TYPE}"
+        )
+        # Changing the type re-coerces any stored default, so the value read
+        # before the ALTER is stale.
+        default_expr = _column(bind, "oauth_clients", "token_endpoint_auth_method")[2]
+
+    # Exact comparison against the server's own rendering, derived now that the
+    # type is canonical. `"client_secret_post" in default_expr` would accept
+    # `'not_client_secret_post'`.
+    if default_expr is None or _normalize(default_expr) != _canonical_default(bind):
+        op.execute(
+            "ALTER TABLE oauth_clients ALTER COLUMN token_endpoint_auth_method "
+            f"SET DEFAULT '{AUTH_METHOD_DEFAULT}'"
+        )
+
+    if not attnotnull:
+        op.execute(
+            "ALTER TABLE oauth_clients ALTER COLUMN token_endpoint_auth_method SET NOT NULL"
         )
 
 
@@ -239,31 +343,50 @@ def _reconcile_check_constraint(bind) -> None:
     )
 
 
-def upgrade() -> None:
-    bind = op.get_bind()
-
-    # Fail fast instead of queueing behind a long-lived transaction: the deploy
-    # migrates before recreating the container, so a stalled migration is a
-    # stalled deploy while the old container is still serving.
-    op.execute("SET LOCAL lock_timeout = '10s'")
-    op.execute("SET LOCAL statement_timeout = '60s'")
-
-    # Held for the rest of the transaction: blocks INSERT/UPDATE/DELETE (but
-    # not SELECT) on oauth_clients, so no row can slip in between the offender
-    # check and ADD CONSTRAINT.
-    op.execute("LOCK TABLE oauth_clients IN SHARE ROW EXCLUSIVE MODE")
-
-    _reconcile_oauth_clients_shape(bind)
-    _assert_no_violating_rows(bind)
-    _reconcile_check_constraint(bind)
-
-    for table, column, default_expr in NOT_NULL_COLUMNS:
+def _set_not_null(columns) -> None:
+    for table, column, default_expr in columns:
         op.execute(
             f"UPDATE {table} SET {column} = {default_expr} WHERE {column} IS NULL"
         )
         # Idempotent in Postgres: SET NOT NULL on an already-NOT NULL column is
         # accepted and does nothing.
         op.execute(f"ALTER TABLE {table} ALTER COLUMN {column} SET NOT NULL")
+
+
+def upgrade() -> None:
+    bind = op.get_bind()
+
+    # Fail fast instead of queueing behind a long-lived transaction: the deploy
+    # migrates before recreating the container, so a stalled migration is a
+    # stalled deploy while the old container is still serving. Per statement and
+    # per lock acquisition, not a budget for the whole transaction.
+    op.execute("SET LOCAL lock_timeout = '10s'")
+    op.execute("SET LOCAL statement_timeout = '60s'")
+
+    # Child tables first, before `oauth_clients` is locked, so the migration
+    # never holds the parent lock while requesting a child's -- same direction
+    # as the OAuth token exchange. See the module docstring.
+    _set_not_null(OTHER_NOT_NULL_COLUMNS)
+
+    # Held for the rest of the transaction: blocks INSERT/UPDATE/DELETE (but
+    # not SELECT) on oauth_clients, so no row can slip in between the offender
+    # check and ADD CONSTRAINT.
+    op.execute("LOCK TABLE oauth_clients IN SHARE ROW EXCLUSIVE MODE")
+
+    # Order is load-bearing: verify the rows the CHECK reads before touching
+    # anything that feeds it.
+    _require_check_columns(bind)
+    _assert_no_violating_rows(bind)
+    _reconcile_oauth_clients_shape(bind)
+    _reconcile_check_constraint(bind)
+    _set_not_null(OAUTH_CLIENTS_NOT_NULL_COLUMNS)
+
+    # `SET LOCAL` is scoped to the transaction, and alembic runs every pending
+    # revision in *one* transaction -- so without this a future 014 would
+    # silently inherit 013's 10s lock timeout and 60s statement timeout and
+    # blame its own SQL when a long index build trips them.
+    op.execute("RESET lock_timeout")
+    op.execute("RESET statement_timeout")
 
 
 def downgrade() -> None:

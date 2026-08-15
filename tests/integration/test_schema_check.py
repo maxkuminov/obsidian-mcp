@@ -21,17 +21,38 @@ re-stamp the schema and must not see each other's edits.
     PGVECTOR_TEST_ADMIN_URL=postgresql+asyncpg://postgres:test@localhost:55438/postgres \\
         pytest -q tests/integration/test_schema_check.py
     docker rm -f pgvector-schema
+
+**`make test-schema` runs exactly that** — container up, module, container
+gone — and is the gate to run before any deploy that carries a migration. It
+sets `OMCP_REQUIRE_SCHEMA_INTEGRATION=1`, which turns the opt-in skip into a
+hard failure: a gate that silently skips because nobody exported the URL is not
+a gate, and this module is the only thing that looks at the parts of the schema
+`alembic check` is blind to.
 """
 import asyncio
 import contextlib
 import datetime
+import os
 
 import asyncpg
 import pytest
 
 import _harness
 
-pytestmark = [_harness.requires_pgvector]
+# The gate flag. Off (the default), a missing `PGVECTOR_TEST_ADMIN_URL` skips —
+# the right behaviour for `pytest tests/` on a laptop with no Postgres. On, the
+# same condition fails at import, so `make test-schema` cannot report success
+# for a run that asserted nothing.
+REQUIRED = os.environ.get("OMCP_REQUIRE_SCHEMA_INTEGRATION") == "1"
+
+if REQUIRED and not _harness.PGVECTOR_TEST_ADMIN_URL:
+    raise RuntimeError(
+        "OMCP_REQUIRE_SCHEMA_INTEGRATION=1 but PGVECTOR_TEST_ADMIN_URL is unset, "
+        "so the schema gate would skip instead of run. Use `make test-schema`, "
+        "which starts a throwaway pgvector container and sets both."
+    )
+
+pytestmark = [] if REQUIRED else [_harness.requires_pgvector]
 
 DIM = 64  # irrelevant here; keeps the migration cheap.
 
@@ -50,6 +71,15 @@ CANONICAL_CONSTRAINTDEF = (
     "OR (((token_endpoint_auth_method)::text = 'client_secret_post'::text) "
     "AND (client_secret_hash IS NOT NULL))))"
 )
+
+# The rest of the 010 shape, likewise as PostgreSQL 16 prints it. `alembic
+# check` compares the type but *not* the server default (`compare_server_default`
+# is off by default), so the default is asserted here or nowhere — which is why
+# the migration compares it exactly instead of asking whether the string
+# `client_secret_post` appears somewhere in it (`'not_client_secret_post'`
+# contains it).
+CANONICAL_AUTH_METHOD_TYPE = "character varying(32)"
+CANONICAL_AUTH_METHOD_DEFAULT = "'client_secret_post'::character varying"
 
 # The nine columns the models declare NOT NULL that their migrations left
 # nullable, with the value 013 must backfill NULLs to.
@@ -126,6 +156,24 @@ def constraint_row(url: str):
     return rows[0]["convalidated"], " ".join(rows[0]["def"].split()), rows[0]["comment"]
 
 
+def column_shape(url: str, table: str, column: str):
+    """`(attnotnull, formatted_type, default_expr)` straight from the catalog."""
+    rows = fetch(
+        url,
+        "SELECT a.attnotnull, format_type(a.atttypid, a.atttypmod) AS coltype, "
+        "       pg_get_expr(d.adbin, d.adrelid) AS coldefault "
+        "FROM pg_attribute a "
+        "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+        "WHERE a.attrelid = $1::regclass AND a.attname = $2 "
+        "  AND a.attnum > 0 AND NOT a.attisdropped",
+        table,
+        column,
+    )
+    if not rows:
+        return None
+    return rows[0]["attnotnull"], rows[0]["coltype"], rows[0]["coldefault"]
+
+
 def not_null_flags(url: str) -> dict[str, bool]:
     rows = fetch(
         url,
@@ -158,8 +206,16 @@ def insert_client(url, client_id, method, secret):
 # --------------------------------------------------------------------------
 
 
-def assert_reconciled(url: str, *, marker_expected: bool):
-    """Everything migration 013 promises, read straight out of the catalog."""
+def assert_reconciled(url: str, *, marker_expected: bool | None):
+    """Everything migration 013 promises, read straight out of the catalog.
+
+    `marker_expected=None` leaves the COMMENT unasserted, for the one drift
+    (wrong column *type*) where whether the constraint had to be re-created is a
+    Postgres implementation detail: `ALTER COLUMN … TYPE` rebuilds dependent
+    CHECKs, so the constraint may come back already rendered canonically and 013
+    then leaves it alone. What must hold either way — canonical, validated,
+    enforced — is asserted below.
+    """
     check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
     assert check.returncode == 0, (
         f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
@@ -171,16 +227,35 @@ def assert_reconciled(url: str, *, marker_expected: bool):
     validated, definition, comment = row
     assert validated, f"{CONSTRAINT} exists but is NOT VALID"
     assert definition == CANONICAL_CONSTRAINTDEF, definition
-    if marker_expected:
+    if marker_expected is True:
         assert comment == MARKER, comment
-    else:
+    elif marker_expected is False:
         assert comment is None, comment
 
     assert not_null_flags(url) == {
         f"{table}.{column}": True for table, column, _ in NOT_NULL_COLUMNS
     }
 
+    assert_010_column_shape(url)
     assert_constraint_enforced(url)
+
+
+def assert_010_column_shape(url: str):
+    """The non-CHECK half of what 010 promised, asserted in the catalog.
+
+    `alembic check` covers the type and the nullability; nothing but this covers
+    the server default.
+    """
+    assert column_shape(url, "oauth_clients", "token_endpoint_auth_method") == (
+        True,
+        CANONICAL_AUTH_METHOD_TYPE,
+        CANONICAL_AUTH_METHOD_DEFAULT,
+    )
+    secret_not_null, _, _ = column_shape(url, "oauth_clients", "client_secret_hash")
+    assert secret_not_null is False, (
+        "client_secret_hash must be nullable — 010 relaxed it so a public PKCE "
+        "client can exist without a secret"
+    )
 
 
 def assert_constraint_enforced(url: str):
@@ -345,6 +420,169 @@ def test_violating_row_fails_loudly_and_changes_nothing():
             "SELECT client_secret_hash FROM oauth_clients "
             "WHERE client_id = 'public-with-secret'",
         ) == "z" * 64
+
+
+def test_null_auth_method_row_is_an_offender_not_a_backfill():
+    """(d2) A NULL `token_endpoint_auth_method` must never be repaired silently.
+
+    This is the ordering bug the review caught. A CHECK passes when its
+    predicate evaluates to NULL, so a row with a NULL method and a secret sits
+    happily under 010's constraint on a database where someone relaxed the
+    column — it is drift, not an impossibility. If 013 backfilled that NULL to
+    `client_secret_post` before looking for offenders it would *manufacture* a
+    passing row: a client whose auth method nobody chose, now trusted to
+    authenticate with the secret it happens to carry. The offender check has to
+    run over the raw rows and count NULL as a violation.
+    """
+    with throwaway_db("schema_null_method", revision="012") as url:
+        sql(
+            url,
+            "ALTER TABLE oauth_clients ALTER COLUMN token_endpoint_auth_method "
+            "DROP NOT NULL",
+        )
+        before_shape = column_shape(url, "oauth_clients", "token_endpoint_auth_method")
+        insert_client(url, "null-method-with-secret", None, "z" * 64)
+
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "null-method-with-secret" in combined
+        assert CONSTRAINT in combined
+
+        # Nothing written: the row still has no auth method, the column is still
+        # nullable, the nine columns are still nullable, version still 012.
+        assert alembic_version(url) == "012"
+        assert fetchval(
+            url,
+            "SELECT token_endpoint_auth_method FROM oauth_clients "
+            "WHERE client_id = 'null-method-with-secret'",
+        ) is None
+        assert column_shape(
+            url, "oauth_clients", "token_endpoint_auth_method"
+        ) == before_shape
+        assert not any(not_null_flags(url).values())
+
+
+def test_missing_auth_method_column_refuses_to_guess():
+    """(d3) 013 reconciles a database that had 010's shape; it does not create it.
+
+    Re-adding the column here would stamp `client_secret_post` on every existing
+    client — inventing an auth method for each of them — so the migration stops
+    and says so.
+    """
+    with throwaway_db("schema_no_method_column", revision="012") as url:
+        sql(url, f"ALTER TABLE oauth_clients DROP CONSTRAINT {CONSTRAINT}")
+        sql(url, "ALTER TABLE oauth_clients DROP COLUMN token_endpoint_auth_method")
+
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "token_endpoint_auth_method is missing" in combined
+
+        assert alembic_version(url) == "012"
+        assert column_shape(url, "oauth_clients", "token_endpoint_auth_method") is None
+        assert not any(not_null_flags(url).values())
+
+
+def test_wrong_server_default_is_reconciled():
+    """(g1) `'not_client_secret_post'` contains `client_secret_post`.
+
+    A substring test would call this default correct. `alembic check` does not
+    compare server defaults at all, so nothing else would catch it either — a
+    new confidential client inserted without an explicit method would land with
+    a garbage auth method that matches neither branch of the CHECK and be
+    rejected, or worse, silently mis-typed.
+    """
+    with throwaway_db("schema_bad_default", revision="012") as url:
+        sql(
+            url,
+            "ALTER TABLE oauth_clients ALTER COLUMN token_endpoint_auth_method "
+            "SET DEFAULT 'not_client_secret_post'",
+        )
+        assert column_shape(url, "oauth_clients", "token_endpoint_auth_method")[2] == (
+            "'not_client_secret_post'::character varying"
+        )
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        # 010's constraint was never touched, so it keeps carrying no marker.
+        assert_reconciled(url, marker_expected=False)
+
+
+def test_wrong_column_type_is_reconciled():
+    """(g2) A widened `text` column loses the length bound 010 declared."""
+    with throwaway_db("schema_bad_type", revision="012") as url:
+        sql(
+            url,
+            "ALTER TABLE oauth_clients ALTER COLUMN token_endpoint_auth_method "
+            "TYPE text",
+        )
+        assert column_shape(url, "oauth_clients", "token_endpoint_auth_method")[1] == (
+            "text"
+        )
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert_reconciled(url, marker_expected=None)
+
+
+def test_client_secret_hash_not_null_is_reconciled():
+    """(g3) A NOT NULL secret column makes public PKCE clients unrepresentable.
+
+    With it, every row must carry a secret, so the `'none'` branch of the CHECK
+    can never be satisfied — the constraint still exists and still enforces
+    something, just not the thing it means.
+    """
+    with throwaway_db("schema_secret_not_null", revision="012") as url:
+        sql(
+            url,
+            "ALTER TABLE oauth_clients ALTER COLUMN client_secret_hash SET NOT NULL",
+        )
+        assert column_shape(url, "oauth_clients", "client_secret_hash")[0] is True
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert_reconciled(url, marker_expected=False)
+
+
+def test_nullable_auth_method_is_reconciled_without_touching_rows():
+    """(g4) The column is re-tightened, and valid rows keep their own values.
+
+    The offender check has already proved there is no NULL to backfill, so
+    `SET NOT NULL` needs no `UPDATE` — and the confidential client below must
+    come back out with exactly the method it went in with.
+    """
+    with throwaway_db("schema_nullable_method", revision="012") as url:
+        sql(
+            url,
+            "ALTER TABLE oauth_clients ALTER COLUMN token_endpoint_auth_method "
+            "DROP NOT NULL",
+        )
+        insert_client(url, "kept-confidential", "client_secret_post", "s" * 64)
+        insert_client(url, "kept-public", "none", None)
+        assert column_shape(url, "oauth_clients", "token_endpoint_auth_method")[0] is (
+            False
+        )
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert_reconciled(url, marker_expected=False)
+        assert fetchval(
+            url,
+            "SELECT token_endpoint_auth_method FROM oauth_clients "
+            "WHERE client_id = 'kept-public'",
+        ) == "none"
+        assert fetchval(
+            url,
+            "SELECT client_secret_hash FROM oauth_clients "
+            "WHERE client_id = 'kept-confidential'",
+        ) == "s" * 64
 
 
 def test_rerunning_013_changes_nothing():

@@ -20,7 +20,12 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status clean reindex reset-embeddings rebuild-tsvectors audit trivy
+PYTHON ?= python3
+SCHEMA_TEST_CONTAINER ?= obsidian-mcp-schema-test
+SCHEMA_TEST_PORT ?= 55438
+SCHEMA_TEST_IMAGE ?= pgvector/pgvector:pg16
+
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -46,6 +51,7 @@ help:
 	@echo "  make db-init      - Create database, user, and extensions"
 	@echo "  make db-migrate   - Run Alembic migrations"
 	@echo "  make db-check     - Verify the schema matches the ORM models"
+	@echo "  make test-schema  - Schema gate: migrations vs. models on a throwaway pgvector"
 	@echo "  make db-backup    - Backup database"
 	@echo "  make db-restore FILE=<path> - Restore from backup"
 	@echo ""
@@ -142,6 +148,36 @@ db-migrate:
 db-check:
 	@echo "$(GREEN)Checking schema against the models...$(NC)"
 	@$(COMPOSE) exec obsidian-mcp alembic check
+
+# The pre-deploy gate for any change that carries a migration. `db-check` only
+# runs `alembic check`, which cannot see a CHECK predicate; this stands up a
+# disposable Postgres, migrates throwaway databases through fresh / drifted /
+# impostor-constraint / violating-row / downgrade paths and asserts the catalog
+# directly. Nothing it touches outlives the target: the container is removed
+# even when the tests fail, and it never reads the deploy .env or the live DB.
+test-schema:
+	@echo "$(GREEN)Schema gate: throwaway $(SCHEMA_TEST_IMAGE) on :$(SCHEMA_TEST_PORT)$(NC)"
+	@docker rm -f $(SCHEMA_TEST_CONTAINER) >/dev/null 2>&1 || true
+	@docker run --rm -d --name $(SCHEMA_TEST_CONTAINER) \
+		-e POSTGRES_PASSWORD=test -p $(SCHEMA_TEST_PORT):5432 \
+		$(SCHEMA_TEST_IMAGE) >/dev/null
+	@ready=0; \
+	for i in $$(seq 1 60); do \
+		if docker exec $(SCHEMA_TEST_CONTAINER) pg_isready -U postgres -q 2>/dev/null; then ready=1; break; fi; \
+		sleep 1; \
+	done; \
+	if [ "$$ready" -eq 1 ]; then \
+		OMCP_REQUIRE_SCHEMA_INTEGRATION=1 \
+		PGVECTOR_TEST_ADMIN_URL=postgresql+asyncpg://postgres:test@localhost:$(SCHEMA_TEST_PORT)/postgres \
+		$(PYTHON) -m pytest -q tests/integration/test_schema_check.py; \
+		status=$$?; \
+	else \
+		echo "$(RED)$(SCHEMA_TEST_CONTAINER) never became ready$(NC)"; status=1; \
+	fi; \
+	docker rm -f $(SCHEMA_TEST_CONTAINER) >/dev/null 2>&1 || true; \
+	if [ $$status -eq 0 ]; then echo "$(GREEN)Schema gate passed$(NC)"; \
+	else echo "$(RED)Schema gate FAILED — do not deploy$(NC)"; fi; \
+	exit $$status
 
 db-backup:
 	@mkdir -p $(DATA_DIR)/backups 2>/dev/null || true

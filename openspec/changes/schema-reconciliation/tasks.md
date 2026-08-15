@@ -3,8 +3,9 @@
 ## 2. Tests & docs
 - [x] 2.1 `tests/integration/test_schema_check.py` (opt-in `PGVECTOR_TEST_ADMIN_URL`, reuse the throwaway-DB harness): (a) empty→head: `alembic check` clean AND catalog assertions (pg_constraint row on oauth_clients, contype c, convalidated, `pg_get_constraintdef` == canonical predicate; `attnotnull` for the nine columns) AND negative inserts rejected; (b) drift simulation: upgrade to 012, drop the CHECK, DROP NOT NULL on the nine, insert NULL rows where FKs allow, run 013 → same assertions + backfilled values; (c) same-named `CHECK (true)` → replaced (constraintdef equals canonical afterwards); (d) violating row → RuntimeError naming client_id, catalog unchanged; (e) idempotence: `alembic stamp 012` then `upgrade head` on the reconciled DB → ok, nothing changed; (f) downgrade: fresh path keeps 010's CHECK; drifted path (013 created it, marker present) drops it.
 - [x] 2.2 `CLAUDE.md`: "`alembic check` must be clean" line + how to run in the container; `Makefile`: `db-check` target.
+- [x] 2.3 Review findings (D2a/D2b/D3a/D3b/D4a): offender check before any change to the columns it reads, NULL method an offender, missing column a refusal; exact `pg_attrdef` default comparison against a server-derived canonical; child-first lock order; `RESET lock_timeout`/`statement_timeout` at the end of `upgrade()`; `OMCP_REQUIRE_SCHEMA_INTEGRATION=1` + `make test-schema`; cases for each.
 ## 3. Verify & ship
-- [ ] 3.1 `openspec validate schema-reconciliation --strict`; offline suite; integration module run once against a throwaway pgvector container.
+- [x] 3.1 `openspec validate schema-reconciliation --strict`; offline suite; integration module run once against a throwaway pgvector container (13 cases).
 - [ ] 3.2 `openspec-verifier`; adversarial Codex (live-DB migration). Iterate to no BLOCKER/MAJOR.
 - [ ] 3.3 `make deploy`; post-deploy `docker exec obsidian-mcp alembic check` clean; `pg_constraint` shows the CHECK.
 - [ ] 3.4 Archive, PR closing #53, merge.

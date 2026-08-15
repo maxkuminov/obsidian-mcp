@@ -22,11 +22,11 @@ After migrating to head, `alembic check` SHALL report no pending operations, on 
 #### Scenario: Other 010 effects verified
 
 - **WHEN** 013 runs
-- **THEN** `oauth_clients.client_secret_hash` SHALL be nullable and `token_endpoint_auth_method` SHALL be NOT NULL with default `client_secret_post`, reconciled if drifted
+- **THEN** `oauth_clients.client_secret_hash` SHALL be nullable and `token_endpoint_auth_method` SHALL be `character varying(32)` NOT NULL with default `client_secret_post`, reconciled if drifted, where the default is compared **exactly** against the server's own rendering of it (`pg_get_expr` on `pg_attrdef` versus a canonical default derived from a scratch `TEMP` table) — not by substring, which would accept `'not_client_secret_post'`
 
 ### Requirement: Reconciliation is idempotent and fails loudly on conflicting data
 
-Migration 013 SHALL be safe to run on a database that already satisfies the target state, and SHALL NOT delete or modify rows to satisfy the CHECK constraint: if any `oauth_clients` row violates the predicate, the migration SHALL fail before altering the schema with a message naming the offending `client_id`s.
+Migration 013 SHALL be safe to run on a database that already satisfies the target state, and SHALL NOT delete or modify rows to satisfy the CHECK constraint: if any `oauth_clients` row violates the predicate, the migration SHALL fail before altering the schema with a message naming the offending `client_id`s. The offender check SHALL run over the raw rows **before** any change to a column the predicate reads, and SHALL count a NULL `token_endpoint_auth_method` as a violation rather than backfilling it. If `token_endpoint_auth_method` is absent entirely the migration SHALL refuse rather than add it.
 
 #### Scenario: Already reconciled
 
@@ -36,7 +36,17 @@ Migration 013 SHALL be safe to run on a database that already satisfies the targ
 #### Scenario: Data check cannot race an insert
 
 - **WHEN** 013 verifies `oauth_clients` for violating rows
-- **THEN** it SHALL hold a table lock that blocks concurrent DML for the remainder of its transaction, under bounded `lock_timeout`/`statement_timeout`
+- **THEN** it SHALL hold a table lock that blocks concurrent DML for the remainder of its transaction, under bounded `lock_timeout`/`statement_timeout`, and it SHALL `RESET` both before returning so a later revision in the same alembic transaction does not inherit them
+
+#### Scenario: Locks are taken child-first
+
+- **WHEN** 013 backfills and tightens the nine columns
+- **THEN** it SHALL complete the child/other tables (`api_keys`, `notes_metadata`, `oauth_codes`, `oauth_tokens`, `usage_logs`) before locking `oauth_clients`, matching the application's child→parent order, so a concurrent OAuth request queues behind the migration; the residual behaviour under contention SHALL be a whole-transaction rollback and a retried deploy, not a partially applied migration
+
+#### Scenario: NULL auth method is an offender, not a backfill
+
+- **WHEN** an `oauth_clients` row has a NULL `token_endpoint_auth_method` (possible on a drifted database, where the CHECK passes because the predicate evaluates to NULL) and 013 runs
+- **THEN** the migration SHALL name that `client_id` and fail, leaving the row's `token_endpoint_auth_method` NULL and the schema unchanged
 
 #### Scenario: Downgrade preserves a pre-existing constraint
 
