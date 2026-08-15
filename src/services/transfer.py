@@ -336,6 +336,34 @@ async def lookup_token(session, token: str, *, direction: str) -> TransferToken 
     return result.scalar_one_or_none()
 
 
+async def lookup_by_public_id(
+    session, public_id: str, *, identity: Identity, direction: str
+) -> TransferToken | None:
+    """A transfer row by its public handle, **scoped to the calling identity**.
+
+    `check_upload` is the only read that is not gated by a capability, so the
+    scoping is the access control: the credential must be the exact one that
+    minted the row, and the user must match too. A handle minted by another key
+    — or by the same key after it was reassigned to another user — is simply
+    not found. No state filter: reporting `expired` and `completed` is the
+    whole job.
+    """
+    def same(column, value):
+        # `column == None` renders as `= NULL`, which is never true — and would
+        # silently turn "single-user API key" into "matches nothing".
+        return column.is_(None) if value is None else column == value
+
+    stmt = select(TransferToken).where(
+        TransferToken.public_id == public_id,
+        TransferToken.direction == direction,
+        same(TransferToken.key_id, identity.key_id),
+        same(TransferToken.oauth_token_id, identity.oauth_token_id),
+        same(TransferToken.user_id, identity.user_id),
+    )
+    result = await session.execute(stmt.execution_options(populate_existing=True))
+    return result.scalar_one_or_none()
+
+
 async def lookup_download(session, token: str) -> TransferToken | None:
     return await lookup_token(session, token, direction="download")
 

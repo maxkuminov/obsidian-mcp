@@ -11,6 +11,8 @@ from collections import Counter
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 from mcp.server.fastmcp import Image
 from sqlalchemy import text
@@ -23,13 +25,17 @@ from src.models.db import UsageLog
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.search import full_text_search
+from src.services import transfer, vault_fs
 from src.services.vault import (
+    _vault_root,
     classify_bytes,
     extract_section,
+    is_hidden_path,
     list_dir,
     outline_sections,
     read_bytes,
     read_file,
+    validate_visible_path,
     write_bytes,
     write_file,
 )
@@ -93,8 +99,17 @@ def _truncate_params(params: dict) -> dict:
     }
 
 
-def _tracked(tool_name: str, param_keys: list[str]):
-    """Decorator that times the call and logs it to usage_logs."""
+def _tracked(tool_name: str, param_keys: list[str], transforms: dict | None = None):
+    """Decorator that times the call and logs it to usage_logs.
+
+    `transforms` maps a parameter name to a function applied before the value
+    is logged. It exists for `import_from_url`, whose `url` must be reduced to
+    its host: the whole point of the allow-list is that a capability or a URL
+    carrying one never reaches `usage_logs`, and "just don't log the URL" would
+    lose the one field that makes an import auditable.
+    """
+    transforms = transforms or {}
+
     def decorator(fn):
         sig = inspect.signature(fn)
 
@@ -111,7 +126,7 @@ def _tracked(tool_name: str, param_keys: list[str]):
                 bound = sig.bind(*args, **kwargs)
                 bound.apply_defaults()
                 params = {
-                    key: bound.arguments[key]
+                    key: transforms.get(key, lambda v: v)(bound.arguments[key])
                     for key in param_keys
                     if key in bound.arguments
                 }
@@ -1606,3 +1621,408 @@ async def list_files_impl(
             f"\n… more than {limit} entries; narrow with `pattern` or a subfolder."
         )
     return "\n".join(lines)
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# File-transfer tools: request_upload / check_upload / request_download /
+# import_from_url / delete_file
+#
+# No MCP client can hand a tool raw attachment bytes, and no agent shell can
+# reach into the user's downloads folder. These five close that gap without
+# widening the vault's write surface: each mint pins one path, one direction
+# and one identity into a short-lived capability, and the `/transfer/*` routes
+# will act on nothing but what was pinned.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+_NO_PUBLIC_ORIGIN = (
+    "This server has no public origin configured, so it cannot build a "
+    "shareable transfer link. Set MCP_HOSTNAME (preferred) or BASE_URL in the "
+    "server's environment and restart. Nothing was minted."
+)
+
+
+def _transfer_identity() -> transfer.Identity:
+    return transfer.Identity(
+        key_id=current_api_key_id.get(),
+        oauth_token_id=current_oauth_token_id.get(),
+        user_id=current_user_id.get(),
+    )
+
+
+def _vault_context(path: str, uid: int | None) -> tuple[str, str]:
+    """`(canonical vault root, canonical vault-relative path)` for a transfer.
+
+    Both are frozen into the token, so both have to be exactly what the routes
+    will later re-derive: the root as `_vault_root` yields it, the path as the
+    caller named it.
+
+    **The relative path is normalised lexically, not through `resolve()`.**
+    `validate_visible_path` still runs — it is the shared traversal and dot-dir
+    guard, and it is what refuses a link that points out of the vault — but its
+    *return value* is the resolved path, and resolving follows symlinks. Taking
+    the relative path from there would silently retarget the operation: a
+    `delete_file("Attachments/alias.png")` where `alias.png` links to
+    `secret.png` inside the vault would resolve to `secret.png` and delete
+    that, reporting success for a path the caller never named. Keeping the
+    caller's own components means the anchored `O_NOFOLLOW` walk in
+    `vault_fs` is the thing that meets the symlink, and it refuses it.
+    """
+    root = _vault_root(uid)
+    validate_visible_path(path, user_id=uid)
+
+    rel = PurePosixPath(str(path).replace(os.sep, "/"))
+    if rel.is_absolute():
+        raise ValueError(f"Path traversal denied: {path}")
+    parts = [part for part in rel.parts if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        raise ValueError(f"Path traversal denied: {path}")
+    if not parts:
+        raise ValueError(f"Not a file path: {path!r}")
+    canonical = "/".join(parts)
+    if is_hidden_path(canonical):
+        raise ValueError(f"Hidden path denied: {path}")
+    return str(root), canonical
+
+
+def _fingerprint_of(root: str, rel_path: str) -> dict | None:
+    """The target's identity at mint time, or `None` when it does not exist.
+
+    `None` is meaningful: on an overwrite token it is the expected-*absence*
+    sentinel and the publish step requires the target to still be absent.
+    """
+    root_fd = vault_fs.open_root(root)
+    try:
+        dir_fd, name = vault_fs.open_parent(root_fd, rel_path, create=False)
+    except FileNotFoundError:
+        return None  # the parent folder does not exist yet
+    finally:
+        os.close(root_fd)
+    try:
+        return vault_fs.fingerprint(
+            dir_fd, name, hash_up_to=settings.max_file_write_bytes
+        )
+    finally:
+        os.close(dir_fd)
+
+
+def _mint_preflight(path: str, *, need_write: bool) -> tuple | str:
+    """Shared front half of the three mint tools: permission, origin, path, FS.
+
+    Returns `(uid, root, rel, base)` or an error string. Every refusal happens
+    before a row is written, so a failed mint leaves nothing behind.
+    """
+    if need_write and (err := _require_write()):
+        return err
+    base = settings.public_base_url
+    if base is None:
+        return _NO_PUBLIC_ORIGIN
+    uid = current_user_id.get()
+    try:
+        root, rel = _vault_context(path, uid)
+    except ValueError as e:
+        return str(e)
+    except RuntimeError as e:  # cold vault-path cache in multi-user mode
+        return str(e)
+    try:
+        vault_fs.check_filesystem_support(root)
+    except vault_fs.UnsupportedFilesystem as e:
+        return str(e)
+    except (OSError, vault_fs.VaultFSError) as e:
+        return f"Vault root is not usable: {e}"
+    return uid, root, rel, base.rstrip("/")
+
+
+def _expiry_line(row) -> str:
+    return row.expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
+@_tracked("request_upload", ["path", "overwrite", "expires_in"])
+async def request_upload_impl(
+    path: str,
+    overwrite: bool = False,
+    expires_in: int | None = None,
+) -> str:
+    """Mint a one-shot link a human can drop a file onto."""
+    pre = _mint_preflight(path, need_write=True)
+    if isinstance(pre, str):
+        return pre
+    uid, root, rel, base = pre
+
+    try:
+        fingerprint = _fingerprint_of(root, rel)
+    except vault_fs.UnsafePath as e:
+        return str(e)
+    if fingerprint is not None and not overwrite:
+        return (
+            f"File already exists: {rel}. Pass overwrite=True to replace it "
+            "(the link will then refuse to publish if the file changes before "
+            "the upload). Nothing was minted."
+        )
+
+    async with async_session() as session:
+        token, row = await transfer.mint_token(
+            session,
+            "upload",
+            rel,
+            overwrite=overwrite,
+            identity=_transfer_identity(),
+            vault_root=root,
+            # On a no-overwrite token the publish is a kernel-linearizable
+            # hard link, so there is nothing to compare against; the
+            # fingerprint only means anything when we intend to replace.
+            expected_fingerprint=fingerprint if overwrite else None,
+            expires_in=expires_in,
+        )
+
+    return (
+        f"Upload link for `{rel}` (expires {_expiry_line(row)}):\n\n"
+        f"{base}/transfer/upload#{token}\n\n"
+        f"upload_id: {row.public_id}\n"
+        f"max_bytes: {settings.max_file_write_bytes:,}\n"
+        f"overwrite: {overwrite}\n\n"
+        "Give the URL to the person you are helping and ask them to open it — "
+        "it is a page with a file picker. Treat it as a secret: anyone holding "
+        "it can write this one path once, until it expires. From a shell you "
+        "can upload directly instead:\n\n"
+        f'  curl -H "Authorization: Bearer <the part after the #>" '
+        f'-T <file> {base}/transfer/upload\n\n'
+        f"Then call `check_upload(\"{row.public_id}\")` to confirm the bytes "
+        "landed and get their sha256. Do not paste the token into a query "
+        "string — that would put it in access logs."
+    )
+
+
+@_tracked("check_upload", ["upload_id"])
+async def check_upload_impl(upload_id: str) -> str:
+    """Report the state of an upload link this identity minted."""
+    identity = _transfer_identity()
+    async with async_session() as session:
+        row = await transfer.lookup_by_public_id(
+            session, upload_id, identity=identity, direction="upload"
+        )
+    if row is None:
+        # Also the answer for another identity's upload_id: an agent must not
+        # be able to probe for handles it did not mint.
+        return f"not found: no upload link with id {upload_id} was minted by this identity."
+
+    if row.state == "completed":
+        when = row.completed_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+        return (
+            f"completed: {row.path}\n"
+            f"size: {row.size:,} bytes\n"
+            f"sha256: {row.sha256}\n"
+            f"mime: {row.mime}\n"
+            f"completed_at: {when}"
+        )
+    if row.expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+        return (
+            f"expired: the link for {row.path} was never used and can no longer "
+            "be redeemed. Call `request_upload` again for a fresh one."
+        )
+    if row.state == "consumed":
+        return (
+            f"expired: the upload of {row.path} was cut short (it stalled or ran "
+            "past its deadline) and the link is spent. Call `request_upload` "
+            "again for a fresh one."
+        )
+    if row.state == "claimed":
+        return (
+            f"uploading: someone is sending {row.path} right now. Check again in "
+            "a moment. If this persists for more than a few minutes the transfer "
+            "died mid-flight — mint a new link with `request_upload`; this one "
+            "will not complete."
+        )
+    return (
+        f"pending: nothing has been uploaded to {row.path} yet. The link is "
+        f"valid until {_expiry_line(row)}."
+    )
+
+
+@_tracked("request_download", ["path", "expires_in"])
+async def request_download_impl(path: str, expires_in: int | None = None) -> str:
+    """Mint a link a human can download one vault file from."""
+    pre = _mint_preflight(path, need_write=False)
+    if isinstance(pre, str):
+        return pre
+    uid, root, rel, base = pre
+
+    try:
+        fingerprint = _fingerprint_of(root, rel)
+    except vault_fs.UnsafePath as e:
+        # Covers both a symlink and a directory: neither is a file we will
+        # hand out, and the message says which.
+        return str(e)
+    if fingerprint is None:
+        return f"File not found: {rel}. Nothing was minted."
+
+    try:
+        head = _head_bytes(root, rel)
+    except OSError as e:
+        return f"Could not read {rel}: {e}. Nothing was minted."
+    _kind, mime = classify_bytes(head, PurePosixPath(rel).name)
+
+    async with async_session() as session:
+        token, row = await transfer.mint_token(
+            session,
+            "download",
+            rel,
+            overwrite=False,
+            identity=_transfer_identity(),
+            vault_root=root,
+            expected_fingerprint=fingerprint,
+            expires_in=expires_in,
+        )
+
+    return (
+        f"Download link for `{rel}` (expires {_expiry_line(row)}):\n\n"
+        f"{base}/transfer/download#{token}\n\n"
+        f"size: {fingerprint['size']:,} bytes\n"
+        f"mime: {mime}\n\n"
+        "Give the URL to the person you are helping — it is a page with a save "
+        "button, and it keeps working until it expires. Treat it as a secret: "
+        "anyone holding it can read this one file. From a shell:\n\n"
+        f'  curl -H "Authorization: Bearer <the part after the #>" '
+        f'-o <file> {base}/transfer/download/file\n\n'
+        "The link is bound to the file as it is right now; if it is edited or "
+        "replaced the link stops working and you should mint a new one."
+    )
+
+
+def _head_bytes(root: str, rel_path: str, count: int = 8192) -> bytes:
+    """First bytes of a vault file, read through anchored descriptors."""
+    root_fd = vault_fs.open_root(root)
+    try:
+        dir_fd, name = vault_fs.open_parent(root_fd, rel_path, create=False)
+    finally:
+        os.close(root_fd)
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW, dir_fd=dir_fd)
+    finally:
+        os.close(dir_fd)
+    try:
+        return os.read(fd, count)
+    finally:
+        os.close(fd)
+
+
+def _url_host(url) -> str:
+    """What `import_from_url` logs in place of the URL.
+
+    A URL is caller-supplied and can carry a credential in its query string, so
+    only the host goes to `usage_logs` — enough to audit where the server was
+    made to connect, not enough to replay it.
+    """
+    try:
+        return urlsplit(str(url)).hostname or "<no host>"
+    except ValueError:
+        return "<unparsable>"
+
+
+@_tracked(
+    "import_from_url", ["url", "path", "overwrite"], transforms={"url": _url_host}
+)
+async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> str:
+    """Fetch a public URL straight into the vault, under the outbound policy."""
+    pre = _mint_preflight(path, need_write=True)
+    if isinstance(pre, str):
+        return pre
+    _uid, root, rel, _base = pre
+
+    try:
+        fingerprint = _fingerprint_of(root, rel)
+    except vault_fs.UnsafePath as e:
+        return str(e)
+    if fingerprint is not None and not overwrite:
+        return (
+            f"File already exists: {rel}. Pass overwrite=True to replace it. "
+            "Nothing was fetched."
+        )
+
+    # The four fields `stream_to_vault` reads. Not a token row: an import is
+    # authenticated by the caller's own MCP identity, so there is no capability
+    # to mint and nothing to re-validate mid-stream.
+    row = SimpleNamespace(
+        vault_root=root,
+        path=rel,
+        overwrite=overwrite,
+        expected_fingerprint=fingerprint if overwrite else None,
+    )
+    cap = settings.max_file_write_bytes
+
+    try:
+        async with transfer.fetch_url_guarded(url, max_bytes=cap) as fetched:
+            written = await transfer.stream_to_vault(
+                row,
+                fetched.chunks,
+                max_bytes=cap,
+                deadline=time.monotonic() + transfer.DEFAULT_FETCH_DEADLINE,
+                idle_timeout=30.0,
+            )
+            final_url = fetched.final_url
+    except transfer.SSRFError as e:
+        return f"Refused to fetch that URL: {e}"
+    except transfer.TooLarge as e:
+        return f"{e}. Nothing was written."
+    except transfer.Timeout as e:
+        return f"{e}. Nothing was written."
+    except vault_fs.Conflict as e:
+        return f"{e}. Nothing was written."
+    except vault_fs.UnsafePath as e:
+        return f"{e}. Nothing was written."
+    except OSError as e:
+        return f"Could not write {rel}: {e}"
+
+    return (
+        f"Imported {written['size']:,} bytes to {rel}\n"
+        f"sha256: {written['sha256']}\n"
+        f"mime: {written['mime']}\n"
+        f"source: {final_url}"
+    )
+
+
+@_tracked("delete_file", ["path", "permanent"])
+async def delete_file_impl(path: str, permanent: bool = False) -> str:
+    """Delete a non-markdown vault file, soft by default."""
+    if err := _require_write():
+        return err
+    if path.lower().endswith(".md"):
+        return (
+            f"{path} is a markdown note. Use `delete_note` for notes — it is the "
+            "tool that knows about the index and about backlinks. `delete_file` "
+            "handles everything else."
+        )
+    uid = current_user_id.get()
+    try:
+        root, rel = _vault_context(path, uid)
+    except (ValueError, RuntimeError) as e:
+        return str(e)
+    try:
+        vault_fs.check_filesystem_support(root)
+    except vault_fs.UnsupportedFilesystem as e:
+        return str(e)
+    except (OSError, vault_fs.VaultFSError) as e:
+        return f"Vault root is not usable: {e}"
+
+    root_fd = vault_fs.open_root(root)
+    try:
+        if permanent:
+            vault_fs.remove(root_fd, rel)
+            return f"Permanently deleted {rel}"
+        dest = vault_fs.soft_delete(root_fd, rel)
+    except FileNotFoundError:
+        return f"File not found: {rel}"
+    except vault_fs.UnsafePath as e:
+        # A symlink or a directory. Neither is something to delete on the
+        # strength of a path an agent chose.
+        return str(e)
+    except vault_fs.Conflict as e:
+        return f"{e}. Nothing was deleted."
+    except vault_fs.VaultFSError as e:
+        return str(e)
+    finally:
+        os.close(root_fd)
+    return (
+        f"Moved {rel} to {dest}. It is out of the vault's visible tree but still "
+        "on disk; pass permanent=True to unlink instead."
+    )

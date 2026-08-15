@@ -29,13 +29,13 @@
 
 ## 5. MCP tools (`src/mcp_server/tools.py` + `server.py`)
 
-- [ ] 5.1 `request_upload_impl(path, overwrite=False, expires_in=None)`: `_require_write`; `public_base_url` check; `validate_visible_path`; no-clobber pre-check / fingerprint capture; mint; return `upload_id`, `upload_url` (`…/transfer/upload#<token>`), `expires_at`, `max_bytes` + one line telling the agent to hand the URL to the human (or `curl -H "Authorization: Bearer <token>" -T file <base>/transfer/upload`) and then call `check_upload`. Docstring: neutral peer framing; "treat as a secret; single-use; expires".
-- [ ] 5.2 `check_upload_impl(upload_id)`: identity/user-scoped lookup → `pending|uploading|completed{...}|expired|not found`; docstring: mint again if `uploading` persists.
-- [ ] 5.3 `request_download_impl(path, expires_in=None)`: read identity suffices; file must exist, be visible, not a symlink/directory; fingerprint; mint; return `download_url` (`…/transfer/download#<token>`), `expires_at`, `size`, `mime`, plus the `curl` form.
-- [ ] 5.4 `import_from_url_impl(url, path, overwrite=False)`: `_require_write`; path guards + no-clobber/fingerprint; `fetch_url_guarded` → `stream_to_vault`; return `{path,size,sha256,mime,final_url}`; errors name the violated rule.
-- [ ] 5.5 `delete_file_impl(path, permanent=False)`: `_require_write`; refuse `.md` (point to `delete_note`), directories, symlinks; anchored soft-delete / remove.
-- [ ] 5.6 Register the five tools in `server.py` with docstrings symmetric to `read_file`/`write_file`/`list_files`; `_tracked` param allow-lists log `upload_id`, `path`, `expires_in`, `overwrite`, import URL *host* — never a token or a URL containing one.
-- [ ] 5.7 Tool tests: permission gating; path guards; no-clobber; `public_base_url` unset error; identity scoping for `check_upload`; `delete_file` soft/permanent/refusals; `import_from_url` happy path via the local server fixture and one guarded rejection; usage-log params never contain a token.
+- [x] 5.1 `request_upload_impl(path, overwrite=False, expires_in=None)`: `_require_write`; `public_base_url` check; `validate_visible_path`; no-clobber pre-check / fingerprint capture; mint; return `upload_id`, `upload_url` (`…/transfer/upload#<token>`), `expires_at`, `max_bytes` + one line telling the agent to hand the URL to the human (or `curl -H "Authorization: Bearer <token>" -T file <base>/transfer/upload`) and then call `check_upload`. Docstring: neutral peer framing; "treat as a secret; single-use; expires".
+- [x] 5.2 `check_upload_impl(upload_id)`: identity/user-scoped lookup → `pending|uploading|completed{...}|expired|not found`; docstring: mint again if `uploading` persists.
+- [x] 5.3 `request_download_impl(path, expires_in=None)`: read identity suffices; file must exist, be visible, not a symlink/directory; fingerprint; mint; return `download_url` (`…/transfer/download#<token>`), `expires_at`, `size`, `mime`, plus the `curl` form.
+- [x] 5.4 `import_from_url_impl(url, path, overwrite=False)`: `_require_write`; path guards + no-clobber/fingerprint; `fetch_url_guarded` → `stream_to_vault`; return `{path,size,sha256,mime,final_url}`; errors name the violated rule.
+- [x] 5.5 `delete_file_impl(path, permanent=False)`: `_require_write`; refuse `.md` (point to `delete_note`), directories, symlinks; anchored soft-delete / remove.
+- [x] 5.6 Register the five tools in `server.py` with docstrings symmetric to `read_file`/`write_file`/`list_files`; `_tracked` param allow-lists log `upload_id`, `path`, `expires_in`, `overwrite`, import URL *host* — never a token or a URL containing one.
+- [x] 5.7 Tool tests: permission gating; path guards; no-clobber; `public_base_url` unset error; identity scoping for `check_upload`; `delete_file` soft/permanent/refusals; `import_from_url` happy path via the local server fixture and one guarded rejection; usage-log params never contain a token.
 
 ## 6. Docs & deploy config
 
