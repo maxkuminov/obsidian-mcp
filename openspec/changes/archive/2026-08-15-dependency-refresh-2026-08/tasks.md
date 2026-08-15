@@ -32,9 +32,9 @@
 
 ## 5. Verification & ship
 
-- [ ] 5.1 `openspec validate dependency-refresh-2026-08 --strict` passes.
-- [ ] 5.2 `openspec-verifier` subagent audit against this change; adversarial Codex pass on the write path (transport limit ↔ `write_file` cap; `edit_note`/`set_frontmatter` caps), framed per `CLAUDE.md`. Iterate until no BLOCKER/MAJOR.
-- [ ] 5.3 Pre-deploy: capture live results for three fixed queries via `semantic_search`, `find_related`, `keyword_search` (save to scratch).
-- [ ] 5.4 `make deploy`; `alembic check` against the live DB (read-only) confirms 1.19 reports no phantom diff; `make status`.
-- [ ] 5.5 Post-deploy end-to-end against the live server, recording which tools were called: re-issue the three queries and diff against 5.3; `write_file` (base64, ~100 KB PNG, unique path `_scratch/deps-refresh-<ts>.png`) → `read_file` → `list_files`; remove the file from the host vault path (no `delete_file` tool exists — note as follow-up) and confirm with `list_files`. `make logs` shows no `Request body too large`.
+- [x] 5.1 `openspec validate dependency-refresh-2026-08 --strict` passes.
+- [x] 5.2 `openspec-verifier` subagent audit against this change; adversarial Codex pass on the write path (transport limit ↔ `write_file` cap; `edit_note`/`set_frontmatter` caps), framed per `CLAUDE.md`. Iterate until no BLOCKER/MAJOR.
+- [x] 5.3 Pre-deploy: capture live results for three fixed queries via `semantic_search`, `find_related`, `keyword_search` (save to scratch).
+- [x] 5.4 `make deploy`; `alembic check` against the live DB (read-only) confirms 1.19 reports no phantom diff; `make status`.
+- [x] 5.5 Post-deploy end-to-end against the live server, recording which tools were called: re-issue the three queries and diff against 5.3; `write_file` (base64, ~100 KB PNG, unique path `_scratch/deps-refresh-<ts>.png`) → `read_file` → `list_files`; remove the file from the host vault path (no `delete_file` tool exists — note as follow-up) and confirm with `list_files`. `make logs` shows no `Request body too large`.
 - [ ] 5.6 Archive the change (`openspec archive -y`), open PR closing #46, merge, push.
