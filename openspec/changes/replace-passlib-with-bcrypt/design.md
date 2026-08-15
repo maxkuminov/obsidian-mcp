@@ -32,6 +32,12 @@ re-hash-on-login.
 3. **Pin `bcrypt==5.0.0`** explicitly (no floating).
 4. **One route-level test uses the real hasher** (register/login round trip
    through the app) so the monkeypatch-only gap is closed.
+5. **Preserve passlib's two edge-case behaviours explicitly:** reject
+   NUL-containing passwords (`hash_password` raises, `verify_password` returns
+   False before bcrypt is called — raw `bcrypt` 5.x accepts them, and the old C
+   bcrypt truncated at the first NUL, so silently accepting them would cut a
+   password's entropy short), and fail closed on a malformed stored hash with a
+   single identifier-free `logger.warning` rather than a 500 on the login route.
 
 ## Risks / Trade-offs
 

@@ -27,8 +27,25 @@ here.** Password policy is unaffected (minimum 8 characters, no maximum).
 Truncation is deliberately on bytes, not characters: slicing the encoding can
 split a multi-byte character and yield invalid UTF-8, which is fine because
 bcrypt hashes bytes and we never decode them back.
+
+**NUL bytes are rejected**, as passlib rejected them. The C bcrypt of the
+`$2b$` era treated an embedded NUL as end-of-string, so `"secret\\0anything"`
+and `"secret"` hashed identically — a password whose entropy silently stops at
+its first NUL. Raw `bcrypt` 5.x no longer enforces this, so the check lives
+here: `hash_password` raises and `verify_password` returns False before bcrypt
+is ever called. This is the same policy the previous implementation had, so no
+stored hash can have been produced from a NUL-containing password.
+
+**A malformed stored hash fails closed.** A `password_hash` column that is not
+a well-formed bcrypt hash makes `checkpw` raise; we log one warning (no user
+identifier, no hash bytes) and return False. It can never match anything, and a
+failed login is a better answer than a 500 on the login route.
 """
+import logging
+
 import bcrypt
+
+logger = logging.getLogger(__name__)
 
 # bcrypt's own default is also 12; stated explicitly so the cost factor is a
 # decision recorded here rather than whatever a future release picks.
@@ -44,7 +61,13 @@ def _prepare(plain: str) -> bytes:
 
 
 def hash_password(plain: str) -> str:
-    """Return a `$2b$12$…` modular-crypt hash of `plain`."""
+    """Return a `$2b$12$…` modular-crypt hash of `plain`.
+
+    Raises `ValueError` if `plain` contains a NUL byte (passlib's policy —
+    see the module docstring).
+    """
+    if "\x00" in plain:
+        raise ValueError("password must not contain NUL bytes")
     return bcrypt.hashpw(_prepare(plain), bcrypt.gensalt(rounds=_BCRYPT_ROUNDS)).decode("ascii")
 
 
@@ -52,11 +75,16 @@ def verify_password(plain: str, hashed: str) -> bool:
     """Check `plain` against a stored bcrypt hash.
 
     `checkpw` accepts the `$2a$` / `$2b$` / `$2y$` prefixes, so hashes from any
-    era of this application verify. A stored value that is not a well-formed
-    bcrypt hash returns False rather than raising: it can never match anything,
-    and a 500 on the login route would be a worse answer than a failed login.
+    era of this application verify. Missing, non-string, or malformed stored
+    values and NUL-containing candidates all return False rather than raising.
     """
+    if hashed is None or not isinstance(hashed, str):
+        return False
+    if "\x00" in plain:
+        # No hash we could have produced came from such a password.
+        return False
     try:
         return bcrypt.checkpw(_prepare(plain), hashed.encode("utf-8"))
     except (ValueError, TypeError):
+        logger.warning("password_hash for a user is not a well-formed bcrypt hash; failing closed")
         return False

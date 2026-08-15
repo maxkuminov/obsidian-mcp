@@ -16,6 +16,7 @@ import pytest
 from starlette.requests import Request
 
 from src.auth import routes as auth_routes
+from src.limiter import limiter
 from src.services import vault as vault_service
 
 PASSWORD = "correct horse battery staple"
@@ -26,6 +27,21 @@ USERNAME = "routeadmin"
 # process-wide store. Handing every request its own address keeps the tests
 # independent of each other and of collection order.
 _client_ips = itertools.count(1)
+
+
+@pytest.fixture(autouse=True)
+def _clean_rate_limiter():
+    """Empty slowapi's process-wide bucket store around every test here.
+
+    `limiter` is a module-level singleton shared by the whole test session, so
+    hits recorded here would otherwise outlive the test that made them and
+    could push an unrelated test over `5/minute`. Distinct client IPs already
+    keep these tests apart; this closes the leak in the other direction, so
+    nothing this module does can trip a limit somewhere else.
+    """
+    limiter.reset()
+    yield
+    limiter.reset()
 
 
 def _make_request(path: str) -> Request:

@@ -83,6 +83,7 @@ in the report which tools were actually called.
 
 ## Key Decisions
 - API keys use `omcp_` prefix, stored as SHA-256 hashes
+- Panel/OAuth passwords: direct `bcrypt` (`$2b$`, cost 12); both hash and verify truncate the UTF-8 encoding at 72 bytes and reject NUL bytes — passlib's historical semantics — so existing hashes stay valid; don't "fix" the truncation.
 - Vault mounted read-write at /obsidian in container
 - Read responses are capped in characters (`MAX_READ_RESPONSE_CHARS`, default
   40,000) independently of the byte caps on disk I/O — see "Three kinds of size

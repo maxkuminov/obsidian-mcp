@@ -7,6 +7,8 @@ table: if a refactor of `src/auth/passwords.py` ever stops verifying them, every
 existing account is locked out, and that is what these tests are here to catch.
 Hashes are not secrets — the plaintexts are throwaway test values.
 """
+import logging
+
 import bcrypt
 import pytest
 
@@ -143,6 +145,76 @@ def test_non_ascii_round_trip(plain):
 def test_malformed_stored_hash_fails_closed(stored):
     """A junk `password_hash` column must fail the login, not 500 it."""
     assert verify_password("anything", stored) is False
+
+
+def test_malformed_stored_hash_logs_a_warning(caplog):
+    """Failing closed silently would hide a corrupted column indefinitely."""
+    with caplog.at_level(logging.WARNING, logger="src.auth.passwords"):
+        assert verify_password("anything", "not-a-hash") is False
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "not a well-formed bcrypt hash" in warnings[0].message
+
+
+def test_malformed_hash_warning_leaks_no_secrets(caplog):
+    """The log line is read by whoever tails production; keep it identifier-free."""
+    with caplog.at_level(logging.WARNING, logger="src.auth.passwords"):
+        verify_password("s3cret-plaintext", "$2b$12$corrupted-column-value")
+
+    logged = caplog.text
+    assert "s3cret-plaintext" not in logged
+    assert "corrupted-column-value" not in logged
+
+
+def test_none_stored_hash_fails_closed():
+    """A NULL `password_hash` (SSO-only or half-created row) must not raise."""
+    assert verify_password("anything", None) is False
+
+
+@pytest.mark.parametrize("stored", [b"$2b$12$" + b"a" * 53, 12345, [], {}])
+def test_non_string_stored_hash_fails_closed(stored):
+    assert verify_password("anything", stored) is False
+
+
+# --- NUL bytes ------------------------------------------------------------
+#
+# passlib raised on a password containing a NUL; raw bcrypt 5.x accepts it.
+# The old C bcrypt treated NUL as end-of-string, so "secret\0anything" and
+# "secret" were the same password — entropy silently truncated. The policy is
+# preserved here, which also means no stored hash was ever made from one.
+
+
+def test_hash_rejects_nul_bytes():
+    with pytest.raises(ValueError, match="NUL"):
+        hash_password("pass\x00word")
+
+
+@pytest.mark.parametrize(
+    "plain",
+    ["\x00leading", "trailing\x00", "middle\x00nul", "\x00"],
+    ids=["leading", "trailing", "middle", "only-nul"],
+)
+def test_hash_rejects_nul_anywhere(plain):
+    with pytest.raises(ValueError):
+        hash_password(plain)
+
+
+def test_verify_rejects_nul_containing_candidate():
+    """No hash we produce can match one, so it is False everywhere."""
+    assert verify_password("pass\x00word", LEGACY_SHORT_HASH) is False
+
+
+def test_verify_of_legitimate_hash_with_nul_candidate_is_false():
+    """The prefix of a real password, plus a NUL, must not authenticate.
+
+    This is the attack the check exists to stop: under the old C bcrypt
+    semantics `"correct horse battery staple\\0…"` truncates at the NUL, so a
+    candidate that merely *starts* like the password could match.
+    """
+    hashed = hash_password(LEGACY_SHORT_PLAIN)
+    assert verify_password(LEGACY_SHORT_PLAIN + "\x00extra", hashed) is False
+    assert verify_password(LEGACY_SHORT_PLAIN, hashed) is True
 
 
 # --- passlib is gone ------------------------------------------------------
