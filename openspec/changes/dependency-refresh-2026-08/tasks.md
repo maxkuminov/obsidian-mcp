@@ -21,9 +21,9 @@
 
 ## 4. Low-risk production bumps
 
-- [ ] 4.1 `requirements.txt`: `fastapi==0.141.1`, `sqlalchemy[asyncio]==2.0.52`, `alembic==1.19.1`, `pgvector==0.5.0`, `pydantic-settings==2.15.0`, `python-multipart==0.0.32`, `slowapi==0.1.10`. Full suite green; `pip check` clean; `pip-audit -r requirements.txt` clean.
-- [ ] 4.2 Fresh venv from `requirements.txt` only: `import numpy`, `import src.main` succeed.
-- [ ] 4.3 Opt-in real-Postgres integration test `tests/integration/test_pgvector_search.py`, gated on `TEST_DATABASE_URL` (skip when unset): start a throwaway `pgvector/pgvector:pg16` container (document the exact `docker run` in the test module docstring and in `requirements-dev.txt`/README), run alembic migrations against it, insert a handful of notes + known 1024-dim vectors, and assert for the `semantic_search` and `find_related` query paths: similarity values within tolerance, ordering, per-note dedupe after overfetch, and that results are usable as plain lists. Run it once with pgvector 0.5.0 and record the outcome in the PR.
+- [x] 4.1 `requirements.txt`: `fastapi==0.141.1`, `sqlalchemy[asyncio]==2.0.52`, `alembic==1.19.1`, `pgvector==0.5.0`, `pydantic-settings==2.15.0`, `python-multipart==0.0.32`, `slowapi==0.1.10`. Full suite green; `pip check` clean; `pip-audit -r requirements.txt` clean.
+- [x] 4.2 Fresh venv from `requirements.txt` only: `import numpy`, `import src.main` succeed.
+- [x] 4.3 Opt-in real-Postgres integration test `tests/integration/test_pgvector_search.py`, gated on `TEST_DATABASE_URL` (skip when unset): start a throwaway `pgvector/pgvector:pg16` container (document the exact `docker run` in the test module docstring and in `requirements-dev.txt`/README), run alembic migrations against it, insert a handful of notes + known 1024-dim vectors, and assert for the `semantic_search` and `find_related` query paths: similarity values within tolerance, ordering, per-note dedupe after overfetch, and that results are usable as plain lists. Run it once with pgvector 0.5.0 and record the outcome in the PR.
 
 ## 5. Verification & ship
 
