@@ -292,19 +292,32 @@ class RecordingGate:
     target: Path | None = None
     entered: int = 0
     seen_on_exit: list[bool] = field(default_factory=list)
+    completions: list[tuple[dict, bool]] = field(default_factory=list)
+    target_at_completion: list[bool] = field(default_factory=list)
+    fail_on_exit: bool = False
 
     def __call__(self):
         return self
 
     async def __aenter__(self):
         self.entered += 1
-        return self.allow
+
+        async def record(result: dict, published: bool) -> None:
+            self.completions.append((result, published))
+            if self.target is not None:
+                # `complete` runs with the file already in place and the
+                # transaction still open — that is the invariant the route
+                # depends on to commit completion under the publish locks.
+                self.target_at_completion.append(self.target.exists())
+
+        return transfer.GateHandle(ok=self.allow, session=self, on_complete=record)
 
     async def __aexit__(self, *exc):
         if self.target is not None:
-            # The whole point of the context-manager shape: the transaction is
-            # still open here, with the file already published.
             self.seen_on_exit.append(self.target.exists())
+        if self.fail_on_exit and exc[0] is None:
+            # Stands in for a commit that fails after the bytes have landed.
+            raise RuntimeError("commit failed")
         return False
 
 
@@ -312,7 +325,7 @@ async def test_gate_stays_open_across_the_publish(vault):
     target = vault / "Attachments" / "a.bin"
     gate = RecordingGate(allow=True, target=target)
     row = FakeRow(str(vault), "Attachments/a.bin")
-    await stream_to_vault(
+    result = await stream_to_vault(
         row,
         chunks_of(b"payload"),
         max_bytes=100,
@@ -322,6 +335,84 @@ async def test_gate_stays_open_across_the_publish(vault):
     assert gate.entered == 1
     assert gate.seen_on_exit == [True]
     assert target.read_bytes() == b"payload"
+    # Completion is recorded inside the context, after the publish, with the
+    # service's own numbers — not reconstructed by the caller afterwards.
+    assert gate.completions == [(result, True)]
+    assert gate.target_at_completion == [True]
+
+
+async def test_the_destination_is_resolved_at_publish_time_not_at_open_time(vault):
+    """Renaming the destination folder mid-stream must not redirect the publish.
+
+    A directory descriptor opened before the stream keeps pointing at the same
+    directory after it is renamed — including into `.trash` or out of the vault
+    — so publishing through it would write somewhere the token never named.
+    Bytes are staged under `.transfer-tmp/` and the destination parent is
+    re-walked from the root inside the gate.
+    """
+    moved = vault / "Moved-Away"
+
+    class RenamingGate(RecordingGate):
+        async def __aenter__(self):
+            # Fires between the last byte and the publish, i.e. exactly in the
+            # window a rename would have to hit.
+            os.rename(vault / "Attachments", moved)
+            return await super().__aenter__()
+
+    gate = RenamingGate(allow=True)
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    await stream_to_vault(
+        row,
+        chunks_of(b"payload"),
+        max_bytes=100,
+        deadline=deadline_in(30),
+        before_publish=gate,
+    )
+    # Published at the path the token committed to, as it resolves now.
+    assert (vault / "Attachments" / "a.bin").read_bytes() == b"payload"
+    assert not (moved / "a.bin").exists()
+    assert temps_under(vault) == []
+
+
+async def test_bytes_are_staged_outside_the_destination_folder(vault):
+    """A crashed upload leaves nothing in the folder the agent can see."""
+    seen: list[list[str]] = []
+
+    class PeekingGate(RecordingGate):
+        async def __aenter__(self):
+            seen.append(sorted(p.name for p in (vault / "Attachments").iterdir()))
+            return await super().__aenter__()
+
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    await stream_to_vault(
+        row,
+        chunks_of(b"payload"),
+        max_bytes=100,
+        deadline=deadline_in(30),
+        before_publish=PeekingGate(allow=True),
+    )
+    assert seen == [[]], "the temp file was staged in the destination folder"
+    assert (vault / vault_fs.STAGING_DIR).is_dir()
+    assert list((vault / vault_fs.STAGING_DIR).iterdir()) == []
+
+
+async def test_a_commit_failure_after_publication_is_its_own_error(vault):
+    """The one failure a caller must not treat as "nothing happened"."""
+    target = vault / "Attachments" / "a.bin"
+    gate = RecordingGate(allow=True, target=target, fail_on_exit=True)
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    with pytest.raises(transfer.PostPublishFailure):
+        await stream_to_vault(
+            row,
+            chunks_of(b"payload"),
+            max_bytes=100,
+            deadline=deadline_in(30),
+            before_publish=gate,
+        )
+    # The bytes are there; only the bookkeeping failed. Releasing the claim on
+    # this would make a token replayable over a written path.
+    assert target.read_bytes() == b"payload"
+    assert temps_under(vault) == []
 
 
 async def test_gate_refusal_publishes_nothing(vault):
@@ -514,6 +605,54 @@ def test_trailing_dot_is_normalised():
 def test_idna_host_is_encoded():
     parts = canonicalise("https://bücher.example/a", allow_http=False)
     assert parts.host == "xn--bcher-kva.example"
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "svc.prod。internal",  # IDEOGRAPHIC FULL STOP
+        "svc.prod．internal",  # FULLWIDTH FULL STOP
+        "svc.prod｡internal",  # HALFWIDTH IDEOGRAPHIC FULL STOP
+        "svc。prod。internal",
+        "ｉｎｔｅｒｎａｌ",  # fullwidth "internal"
+        "db。local",
+        "x．home．arpa",
+    ],
+)
+def test_alternative_full_stops_cannot_smuggle_a_forbidden_name(host):
+    """UTS-46 folds these to `.`; the checks must run *after* that folding.
+
+    The stdlib `idna` codec is IDNA 2003 and only ever splits on U+002E, so
+    running the suffix/single-label checks before normalisation let
+    `svc.prod。internal` through and then resolved it as `svc.prod.internal`.
+    """
+    with pytest.raises(SSRFError):
+        canonicalise(f"https://{host}/a", allow_http=False)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "２１３０７０６４３３",  # fullwidth 2130706433
+        "０ｘ７ｆ０００００１",  # fullwidth 0x7f000001
+    ],
+)
+def test_fullwidth_numeric_hosts_are_refused(host):
+    """Fullwidth digits fold to ASCII digits, i.e. to a packed IPv4 spelling."""
+    with pytest.raises(SSRFError):
+        canonicalise(f"https://{host}/a", allow_http=False)
+
+
+def test_fullwidth_public_name_is_folded_not_rejected():
+    parts = canonicalise("https://ｅｘａｍｐｌｅ.com/a", allow_http=False)
+    assert parts.host == "example.com"
+    assert parts.url == "https://example.com/a"
+
+
+@pytest.mark.parametrize("host", ["under_score.example", "-lead.example", "a..b.example"])
+def test_hosts_that_are_not_ldh_are_refused(host):
+    with pytest.raises(SSRFError):
+        canonicalise(f"https://{host}/a", allow_http=False)
 
 
 def test_ip_literal_is_canonicalised():
@@ -889,7 +1028,9 @@ async def test_more_than_five_redirects_is_rejected(local_http):
 
 
 async def test_deadline_covers_the_whole_fetch(local_http):
-    with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+    # The service's own error, not `asyncio.timeout`'s builtin: a caller
+    # should not have to know which layer ran out of time.
+    with pytest.raises(Timeout, match="deadline"):
         async with fetch_url_guarded(
             f"{local_http}/slow",
             allow_http=True,

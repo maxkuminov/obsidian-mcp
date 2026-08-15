@@ -505,6 +505,60 @@ def test_soft_delete_refuses_a_directory(root_fd, vault):
     assert (vault / "Attachments").is_dir()
 
 
+def test_soft_delete_does_not_unlink_a_replacement(root_fd, vault, monkeypatch):
+    """A file that replaces the source between link and unlink must survive.
+
+    `link` + `unlink` is two syscalls. Without an inode check the second one
+    removes whatever is at the name *now* — so a writer landing in between has
+    its file deleted with no trash copy of it, which is a silent destructive
+    delete. The check makes that a `Conflict` instead.
+    """
+    source = vault / "Attachments" / "a.png"
+    source.write_bytes(b"original")
+
+    real_link = os.link
+
+    def swapping_link(*args, **kwargs):
+        real_link(*args, **kwargs)
+        # The window: the trash now holds `original`, and someone replaces the
+        # source name with a different inode.
+        replacement = vault / "Attachments" / "a.png.new"
+        replacement.write_bytes(b"replacement")
+        os.replace(replacement, source)
+
+    monkeypatch.setattr(os, "link", swapping_link)
+    with pytest.raises(Conflict):
+        soft_delete(root_fd, "Attachments/a.png")
+    monkeypatch.undo()
+
+    # The replacement is untouched, and the trash link we made was cleaned up
+    # rather than left as a half-finished delete.
+    assert source.read_bytes() == b"replacement"
+    trash = vault / ".trash"
+    assert not trash.exists() or list(trash.iterdir()) == []
+
+
+def test_soft_delete_succeeds_when_the_source_vanished_after_the_link(
+    root_fd, vault, monkeypatch
+):
+    """Someone else deleted it; our trash copy is still the promised copy."""
+    source = vault / "Attachments" / "a.png"
+    source.write_bytes(b"original")
+
+    real_link = os.link
+
+    def vanishing_link(*args, **kwargs):
+        real_link(*args, **kwargs)
+        source.unlink()
+
+    monkeypatch.setattr(os, "link", vanishing_link)
+    dest = soft_delete(root_fd, "Attachments/a.png")
+    monkeypatch.undo()
+
+    assert (vault / dest).read_bytes() == b"original"
+    assert not source.exists()
+
+
 def test_soft_delete_missing_file(root_fd):
     with pytest.raises(FileNotFoundError):
         soft_delete(root_fd, "Attachments/nope.png")
@@ -559,6 +613,28 @@ def test_probe_filesystem_maps_link_refusals(root_fd, vault, monkeypatch, code):
     with pytest.raises(UnsupportedFilesystem):
         probe_filesystem(root_fd)
     # Even on the failure path the probe leaves nothing behind.
+    assert _temps(vault) == []
+
+
+def test_probe_filesystem_catches_a_cross_device_trash(root_fd, vault, monkeypatch):
+    """A `.trash` on a separate mount passes the in-root link and fails this one.
+
+    That combination is the dangerous one: `publish` keeps working, so nothing
+    looks wrong until the first `delete_file` cannot link into the trash — by
+    which point a naive implementation has already unlinked the original.
+    """
+    real_link = vault_fs.os.link
+    calls = []
+
+    def refuse_second(*args, **kwargs):
+        calls.append(kwargs.get("dst_dir_fd"))
+        if len(calls) == 1:
+            return real_link(*args, **kwargs)
+        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+
+    monkeypatch.setattr(vault_fs.os, "link", refuse_second)
+    with pytest.raises(UnsupportedFilesystem, match=r"\.trash"):
+        probe_filesystem(root_fd)
     assert _temps(vault) == []
 
 

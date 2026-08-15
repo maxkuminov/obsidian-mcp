@@ -34,9 +34,11 @@ import hashlib
 import ipaddress
 import logging
 import os
+import re
 import secrets
 import socket
 import time
+import unicodedata
 import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -45,6 +47,7 @@ from typing import AsyncContextManager, AsyncIterator, Awaitable, Callable, Iter
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
+import idna
 from sqlalchemy import delete, select, update
 
 from src.config import settings
@@ -76,6 +79,17 @@ class PrePublishAborted(TransferError):
     """The locked pre-publication re-validation refused; nothing was published."""
 
 
+class PostPublishFailure(TransferError):
+    """The bytes landed but the transaction recording that did not commit.
+
+    Deliberately a distinct type: it is the one failure after which a caller
+    must **not** release the claim. Releasing would make a token replayable
+    over a path that already holds the uploaded file — and from here we cannot
+    prove which of the two states the database is in, so `claimed` (terminal
+    until the TTL passes) is the only safe answer.
+    """
+
+
 class SSRFError(TransferError):
     """A URL, hop, or resolved address violated the outbound-fetch policy.
 
@@ -90,6 +104,7 @@ class SSRFError(TransferError):
 # ════════════════════════════════════════════════════════════════════════════
 
 TOKEN_BYTES = 32  # 256 bits, matching the api_keys convention
+PUBLIC_ID_BYTES = 16  # 128 bits — an unguessable handle, not a capability
 MIN_EXPIRES_IN = 60
 MAX_EXPIRES_IN = 3600
 PRUNE_AFTER = datetime.timedelta(days=1)
@@ -126,6 +141,18 @@ def hash_token(token: str) -> str:
 
 def new_token() -> str:
     return secrets.token_urlsafe(TOKEN_BYTES)
+
+
+def new_public_id() -> str:
+    """The non-secret handle `request_upload` returns and `check_upload` takes.
+
+    Opaque rather than the row id: `transfer_tokens.id` is sequential, so an
+    `upload_id` built on it tells any holder how many transfers the server has
+    ever minted and lets them guess neighbours. It is *not* a capability —
+    `check_upload` still scopes every lookup to the calling identity — so 128
+    bits is ample.
+    """
+    return secrets.token_urlsafe(PUBLIC_ID_BYTES)
 
 
 def clamp_expires_in(expires_in: int | None) -> int:
@@ -180,6 +207,7 @@ async def mint_token(
     ttl = clamp_expires_in(expires_in)
     token = new_token()
     row = TransferToken(
+        public_id=new_public_id(),
         token_hash=hash_token(token),
         direction=direction,
         state=STATE_PENDING,
@@ -478,13 +506,34 @@ def upload_semaphore() -> asyncio.Semaphore:
     return sem
 
 
-# The pre-publication gate. `before_publish()` returns an **async context
-# manager** whose `__aenter__` yields "identity and root are still valid" and
-# which stays open across `publish` — that is the point: the locks it holds
-# must not be released until the bytes are in place. tasks.md types it as a
-# plain awaitable; the context-manager shape is the deviation that actually
-# delivers the property the same task asks for two clauses later.
-PrePublishGate = Callable[[], AsyncContextManager[bool]]
+@dataclass
+class GateHandle:
+    """What `before_publish()` yields: the verdict, plus a way to record.
+
+    `ok` answers "is the minting identity still valid" from rows the gate holds
+    `FOR UPDATE`. `complete` is called by `stream_to_vault` **immediately after
+    the publish and still inside the context**, so the completion row and the
+    usage-log row are written by the same transaction that holds those locks —
+    which is the only way "revoked after the check, published anyway" can be
+    impossible. `session` is the gate's own session, exposed so a caller that
+    needs to add more rows can use the same transaction.
+
+    tasks.md types the gate as `Callable[[], Awaitable[bool]]` and then asks
+    for a context that stays open across `publish`; a bool-returning awaitable
+    cannot do that, and a context yielding a bare bool cannot record the
+    result. This shape delivers both properties the task actually asks for.
+    """
+
+    ok: bool
+    session: object | None = None
+    on_complete: "Callable[[dict, bool], Awaitable[None]] | None" = None
+
+    async def complete(self, result: dict, *, published: bool) -> None:
+        if self.on_complete is not None:
+            await self.on_complete(result, published)
+
+
+PrePublishGate = Callable[[], AsyncContextManager[GateHandle]]
 
 
 def _write_all(fd: int, data: bytes) -> None:
@@ -587,6 +636,31 @@ async def stream_to_vault(
         )
 
 
+def _publish_into_current_parent(root_fd: int, staging_fd: int, tmp_name: str, row):
+    """Resolve the destination parent *now* and link the staged file into it.
+
+    The fresh `open_dir_beneath` walk is the point. A descriptor opened before
+    a minutes-long stream keeps pointing at the same directory even after that
+    directory is renamed or moved — including into `.trash` or out of the vault
+    entirely — so publishing through it would follow the move and write
+    somewhere the token never named. Re-walking from the root descriptor under
+    the caller's lock means the bytes land at the path the token committed to,
+    as that path resolves at publication time, or not at all.
+    """
+    dst_fd, name = vault_fs.open_parent(root_fd, row.path, create=True)
+    try:
+        return vault_fs.publish(
+            staging_fd,
+            tmp_name,
+            name,
+            overwrite=bool(row.overwrite),
+            expected_fingerprint=row.expected_fingerprint,
+            dst_dir_fd=dst_fd,
+        )
+    finally:
+        os.close(dst_fd)
+
+
 async def _stream_locked(
     row,
     chunks: AsyncIterator[bytes],
@@ -597,14 +671,20 @@ async def _stream_locked(
     before_publish: PrePublishGate | None,
 ) -> dict:
     root_fd = vault_fs.open_root(row.vault_root)
-    try:
-        dir_fd, name = vault_fs.open_parent(root_fd, row.path, create=True)
-    finally:
-        os.close(root_fd)
-
+    staging_fd: int | None = None
     tmp_name: str | None = None
     try:
-        fd, tmp_name = vault_fs.create_temp(dir_fd)
+        # Walk the destination once up front so a `..`, a symlinked ancestor or
+        # a non-directory costs a syscall rather than a whole upload. The
+        # descriptor is closed immediately — the authoritative walk is the one
+        # inside the gate.
+        probe_fd, name = vault_fs.open_parent(root_fd, row.path, create=True)
+        os.close(probe_fd)
+
+        staging_fd = vault_fs.open_dir_beneath(
+            root_fd, vault_fs.STAGING_DIR, create=True
+        )
+        fd, tmp_name = vault_fs.create_temp(staging_fd)
         try:
             size, digest, head = await _drain(
                 chunks,
@@ -617,36 +697,47 @@ async def _stream_locked(
             os.close(fd)
 
         _kind, mime = classify_bytes(head, name)
+        result = {"size": size, "sha256": digest, "mime": mime}
 
         if before_publish is None:
-            vault_fs.publish(
-                dir_fd,
-                tmp_name,
-                name,
-                overwrite=bool(row.overwrite),
-                expected_fingerprint=row.expected_fingerprint,
-            )
-        else:
-            async with before_publish() as still_valid:
-                if not still_valid:
+            _publish_into_current_parent(root_fd, staging_fd, tmp_name, row)
+            tmp_name = None  # publish owns cleanup from here
+            return result
+
+        published = False
+        try:
+            async with before_publish() as gate:
+                if not gate.ok:
                     raise PrePublishAborted(
                         "The minting identity or vault root is no longer valid"
                     )
-                vault_fs.publish(
-                    dir_fd,
-                    tmp_name,
-                    name,
-                    overwrite=bool(row.overwrite),
-                    expected_fingerprint=row.expected_fingerprint,
+                outcome = _publish_into_current_parent(
+                    root_fd, staging_fd, tmp_name, row
                 )
-        tmp_name = None  # publish owns cleanup from here
-        return {"size": size, "sha256": digest, "mime": mime}
+                tmp_name = None
+                published = outcome.published
+                # Inside the context, so completion commits with the locks.
+                await gate.complete(result, published=published)
+        except PrePublishAborted:
+            raise
+        except BaseException as exc:
+            if published:
+                # The file is in place; whatever failed did so while recording
+                # that. A distinct type, because the caller must not treat this
+                # like the pre-publication failures and release the claim.
+                raise PostPublishFailure(
+                    f"Published {row.path} but could not record the completion: {exc}"
+                ) from exc
+            raise
+        return result
     except BaseException:
-        if tmp_name is not None:
-            vault_fs.discard_temp(dir_fd, tmp_name)
+        if tmp_name is not None and staging_fd is not None:
+            vault_fs.discard_temp(staging_fd, tmp_name)
         raise
     finally:
-        os.close(dir_fd)
+        if staging_fd is not None:
+            os.close(staging_fd)
+        os.close(root_fd)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -664,6 +755,12 @@ DEFAULT_PORTS = {"https": 443, "http": 80}
 
 FORBIDDEN_HOSTS = frozenset({"localhost"})
 FORBIDDEN_SUFFIXES = (".localhost", ".local", ".internal", ".home.arpa")
+
+# What a canonical ASCII host may look like once IDNA has run: LDH labels of
+# 1–63 characters. Anything else is either an encoding trick or a name no
+# resolver would accept anyway.
+_ASCII_HOST_RE = re.compile(r"(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?"
+                            r"(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*")
 
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 MAX_REDIRECTS = 5
@@ -805,6 +902,36 @@ def _parse_ip(text: str) -> IPAddress | None:
         return None
 
 
+# The three code points a resolver treats as a label separator besides U+002E.
+# UTS-46 maps all of them to "."; IDNA 2003 (the stdlib codec) does not, which
+# is exactly how `svc.prod。internal` used to sail past the suffix check and
+# then resolve as `svc.prod.internal`.
+_LABEL_SEPARATORS = "。．｡"
+_SEPARATOR_MAP = str.maketrans({c: "." for c in _LABEL_SEPARATORS})
+
+
+def _canonical_host(host: str) -> str:
+    """Fold a URL host to canonical ASCII **before** any policy check runs.
+
+    Every check downstream — forbidden suffix, single label, ambiguous numeric,
+    IP literal — is a string comparison, and a string comparison is only as
+    good as the normalisation in front of it. Fullwidth letters, fullwidth
+    digits and the alternative full stops all survive `str.lower()` untouched
+    and are folded by the resolver later, so the checks have to run on the form
+    the resolver will see, not the form the caller typed.
+    """
+    host = unicodedata.normalize("NFKC", host.strip()).translate(_SEPARATOR_MAP)
+    host = host.rstrip(".").lower()
+    if not host:
+        raise SSRFError("URL has no host")
+    if host.isascii():
+        return host
+    try:
+        return idna.encode(host, uts46=True, transitional=False).decode("ascii").lower()
+    except (idna.IDNAError, UnicodeError, ValueError) as exc:
+        raise SSRFError(f"Host {host!r} is not IDNA-encodable: {exc}") from None
+
+
 def _looks_numeric(host: str) -> bool:
     """Would a resolver read this name as a packed/short IPv4 spelling?
 
@@ -853,9 +980,9 @@ def canonicalise(url: str, *, allow_http: bool) -> UrlParts:
     if "%" in parts.netloc:
         raise SSRFError("IPv6 zone identifiers are not allowed")
 
-    host = host.rstrip(".").lower()
-    if not host:
-        raise SSRFError("URL has no host")
+    # Normalise *first*, then check. Every rule below is a comparison against
+    # the canonical ASCII form the resolver would use.
+    host = _canonical_host(host)
 
     port = DEFAULT_PORTS[scheme] if port is None else port
     if port not in SCHEME_PORTS[scheme]:
@@ -875,10 +1002,8 @@ def canonicalise(url: str, *, allow_http: bool) -> UrlParts:
                 f"Single-label host {host!r} is not allowed (it can only resolve "
                 "inside the container network)"
             )
-        try:
-            host = host.encode("idna").decode("ascii")
-        except UnicodeError as exc:
-            raise SSRFError(f"Host {host!r} is not IDNA-encodable: {exc}") from None
+        if not _ASCII_HOST_RE.fullmatch(host):
+            raise SSRFError(f"Host {host!r} contains characters a host name may not")
     else:
         host = literal.compressed
 
@@ -998,77 +1123,109 @@ async def fetch_url_guarded(
     allow_http = settings.import_allow_http if allow_http is None else allow_http
     current = url
 
-    async with asyncio.timeout(deadline):
-        for hop in range(max_redirects + 1):
-            parts = canonicalise(current, allow_http=allow_http)
-            address = await resolve_and_check(parts, resolver=resolver, policy=policy)
+    try:
+        async with asyncio.timeout(deadline):
+            async for item in _fetch_hops(
+                current,
+                allow_http=allow_http,
+                max_bytes=max_bytes,
+                deadline=deadline,
+                resolver=resolver,
+                policy=policy,
+                max_redirects=max_redirects,
+            ):
+                yield item
+    except TimeoutError:
+        # `asyncio.timeout` speaks in builtins; every other failure in this
+        # module is a `TransferError`, and a caller should not have to know
+        # which layer raised. Cleanup has already run — the client is closed by
+        # `_fetch_hops`'s own `finally` before this is reached.
+        raise Timeout(
+            f"Fetch of {url!r} exceeded its {deadline:g}s deadline"
+        ) from None
 
-            transport = PinnedTransport(
-                address=address, host_header=parts.host, retries=0
+
+async def _fetch_hops(
+    current: str,
+    *,
+    allow_http: bool,
+    max_bytes: int,
+    deadline: float,
+    resolver,
+    policy,
+    max_redirects: int,
+) -> AsyncIterator[FetchResult]:
+    """The redirect loop. Split out so the deadline wrapper stays legible."""
+    for hop in range(max_redirects + 1):
+        parts = canonicalise(current, allow_http=allow_http)
+        address = await resolve_and_check(parts, resolver=resolver, policy=policy)
+
+        transport = PinnedTransport(
+            address=address, host_header=parts.host, retries=0
+        )
+        client = httpx.AsyncClient(
+            transport=transport,
+            trust_env=False,
+            http2=False,
+            follow_redirects=False,
+            timeout=httpx.Timeout(deadline),
+        )
+        response: httpx.Response | None = None
+        redirect_to: str | None = None
+        try:
+            request = client.build_request(
+                "GET", parts.url, headers={"Accept-Encoding": "identity"}
             )
-            client = httpx.AsyncClient(
-                transport=transport,
-                trust_env=False,
-                http2=False,
-                follow_redirects=False,
-                timeout=httpx.Timeout(deadline),
-            )
-            response: httpx.Response | None = None
-            redirect_to: str | None = None
             try:
-                request = client.build_request(
-                    "GET", parts.url, headers={"Accept-Encoding": "identity"}
+                response = await client.send(request, stream=True)
+            except httpx.HTTPError as exc:
+                raise SSRFError(f"Fetch failed: {exc}") from None
+
+            if response.status_code in REDIRECT_STATUSES:
+                location = response.headers.get("location")
+                if not location:
+                    raise SSRFError(
+                        f"Redirect {response.status_code} without a Location header"
+                    )
+                if hop >= max_redirects:
+                    raise SSRFError(
+                        f"More than {max_redirects} redirects"
+                    )
+                redirect_to = urljoin(parts.url, location)
+                continue
+
+            if response.status_code != 200:
+                raise SSRFError(
+                    f"Expected HTTP 200, got {response.status_code}"
                 )
+            if response.headers.get("content-encoding"):
+                raise SSRFError(
+                    "Response is content-encoded; only identity encoding is "
+                    "accepted so the byte cap counts real bytes"
+                )
+            declared = response.headers.get("content-length")
+            if declared is not None:
                 try:
-                    response = await client.send(request, stream=True)
-                except httpx.HTTPError as exc:
-                    raise SSRFError(f"Fetch failed: {exc}") from None
-
-                if response.status_code in REDIRECT_STATUSES:
-                    location = response.headers.get("location")
-                    if not location:
-                        raise SSRFError(
-                            f"Redirect {response.status_code} without a Location header"
+                    if int(declared) > max_bytes:
+                        raise TooLarge(
+                            f"Remote file declares {int(declared):,} bytes, over "
+                            f"the {max_bytes:,}-byte limit"
                         )
-                    if hop >= max_redirects:
-                        raise SSRFError(
-                            f"More than {max_redirects} redirects"
-                        )
-                    redirect_to = urljoin(parts.url, location)
-                    continue
+                except ValueError:
+                    raise SSRFError("Malformed Content-Length in response") from None
 
-                if response.status_code != 200:
-                    raise SSRFError(
-                        f"Expected HTTP 200, got {response.status_code}"
-                    )
-                if response.headers.get("content-encoding"):
-                    raise SSRFError(
-                        "Response is content-encoded; only identity encoding is "
-                        "accepted so the byte cap counts real bytes"
-                    )
-                declared = response.headers.get("content-length")
-                if declared is not None:
-                    try:
-                        if int(declared) > max_bytes:
-                            raise TooLarge(
-                                f"Remote file declares {int(declared):,} bytes, over "
-                                f"the {max_bytes:,}-byte limit"
-                            )
-                    except ValueError:
-                        raise SSRFError("Malformed Content-Length in response") from None
-
-                yield FetchResult(
-                    chunks=response.aiter_bytes(),
-                    final_url=parts.url,
-                    content_type=response.headers.get("content-type"),
-                )
-                return
-            finally:
-                if response is not None:
-                    with contextlib.suppress(Exception):
-                        await response.aclose()
-                await client.aclose()
-                if redirect_to is not None:
-                    current = redirect_to
+            yield FetchResult(
+                chunks=response.aiter_bytes(),
+                final_url=parts.url,
+                content_type=response.headers.get("content-type"),
+            )
+            return
+        finally:
+            if response is not None:
+                with contextlib.suppress(Exception):
+                    await response.aclose()
+            await client.aclose()
+            if redirect_to is not None:
+                current = redirect_to
 
     raise SSRFError(f"More than {max_redirects} redirects")  # pragma: no cover

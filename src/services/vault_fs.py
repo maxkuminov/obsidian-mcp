@@ -59,6 +59,19 @@ _TRASH_ATTEMPTS = 1000
 _O_COMMON = os.O_CLOEXEC | os.O_NOFOLLOW
 _O_DIR = os.O_RDONLY | os.O_DIRECTORY | _O_COMMON
 
+# Where in-flight uploads are staged. A dot-directory directly under the vault
+# root, so it is invisible to the indexer and to every dot-dir-guarded tool,
+# and — being inside the root — always on the same device as any destination,
+# which is what makes the final `link`/`replace` possible.
+#
+# Staging here rather than in the destination folder is deliberate: an upload
+# may stream for minutes, and a directory descriptor opened before the stream
+# keeps pointing at the same directory even if that directory is renamed or
+# moved. Publishing through it would follow the move. The destination parent is
+# therefore resolved fresh, under the caller's lock, at publish time.
+STAGING_DIR = ".transfer-tmp"
+TRASH_DIR = ".trash"
+
 
 class VaultFSError(Exception):
     """Base class for anchored-filesystem failures."""
@@ -308,8 +321,16 @@ def publish(
     *,
     overwrite: bool,
     expected_fingerprint: Fingerprint | None,
+    dst_dir_fd: int | None = None,
 ) -> Published:
-    """Move `tmp_name` into place as `final_name` within `dir_fd`.
+    """Move `tmp_name` into place as `final_name`, atomically.
+
+    `dir_fd` anchors the *source* (the staging directory holding the temp
+    file); `dst_dir_fd` anchors the destination and defaults to `dir_fd` for
+    the same-directory case. Splitting them is what lets a caller stage bytes
+    somewhere stable for minutes and only then resolve — and re-resolve — the
+    destination directory. Both must be on the same device, which holding both
+    inside the vault root guarantees.
 
     `overwrite=False` → hard-link no-clobber (kernel-linearizable).
     `overwrite=True` with `expected_fingerprint=None` → the target was absent
@@ -322,6 +343,8 @@ def publish(
     `UnsafePath` when it is a symlink. The temp file is unlinked in `finally`
     either way.
     """
+    if dst_dir_fd is None:
+        dst_dir_fd = dir_fd
     published = False
     try:
         # Inside the try, not before it: `publish` owns the temp file from the
@@ -330,10 +353,10 @@ def publish(
         if "/" in final_name or final_name in ("", ".", ".."):
             raise UnsafePath(f"Illegal final component: {final_name!r}")
         if not overwrite or expected_fingerprint is None:
-            _link_no_clobber(dir_fd, tmp_name, final_name)
+            _link_no_clobber(dir_fd, tmp_name, final_name, dst_dir_fd=dst_dir_fd)
             published = True
         else:
-            current = _lstat(dir_fd, final_name)
+            current = _lstat(dst_dir_fd, final_name)
             if current is None:
                 raise Conflict(
                     f"Target disappeared since the token was minted: {final_name}"
@@ -352,7 +375,7 @@ def publish(
                 )
             if expected_fingerprint.get("sha256") is not None:
                 digest = _hash_regular(
-                    dir_fd,
+                    dst_dir_fd,
                     final_name,
                     expect_ino=current.st_ino,
                     expect_dev=current.st_dev,
@@ -365,7 +388,7 @@ def publish(
             # Check-then-act: a writer landing here still gets overwritten.
             # Declared optimistic conflict detection, not linearizable
             # replacement — see the module docstring and D5.
-            os.replace(tmp_name, final_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.replace(tmp_name, final_name, src_dir_fd=dir_fd, dst_dir_fd=dst_dir_fd)
             published = True
     finally:
         temp_removed = _unlink_quietly(dir_fd, tmp_name, published=published)
@@ -373,9 +396,11 @@ def publish(
     return Published(name=final_name, published=published, temp_removed=temp_removed)
 
 
-def _link_no_clobber(dir_fd: int, src: str, dst: str) -> None:
+def _link_no_clobber(dir_fd: int, src: str, dst: str, *, dst_dir_fd: int | None = None) -> None:
+    if dst_dir_fd is None:
+        dst_dir_fd = dir_fd
     try:
-        os.link(src, dst, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+        os.link(src, dst, src_dir_fd=dir_fd, dst_dir_fd=dst_dir_fd, follow_symlinks=False)
     except FileExistsError:
         # Covers a plain file, a directory, *and* a symlink at the target: the
         # kernel refuses all three identically, which is exactly the promise.
@@ -436,7 +461,7 @@ def remove(root_fd: int, rel_path: str | Path) -> None:
         os.close(dir_fd)
 
 
-def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = ".trash") -> str:
+def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) -> str:
     """Link a regular file into `trash_dir` under a timestamped name, then unlink it.
 
     Returns the trash-relative path that was created. Never clobbers an
@@ -444,6 +469,21 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = ".trash") -
     suffix, so two files with the same basename deleted in the same second both
     survive. `.trash` lives inside the vault root, so it is same-device by
     construction and the link cannot fail `EXDEV` on a sane filesystem.
+
+    **The unlink is inode-verified.** `link` + `unlink` is two syscalls, and a
+    writer that replaces the source name in between would otherwise have its
+    replacement unlinked with no trash copy of it — a silent destructive
+    delete, which is the one thing this module exists to prevent. So after the
+    link we reopen the source name `O_NOFOLLOW` and only unlink it if it is
+    still the inode we just linked; if it is not, the *new* file is left alone,
+    the trash link we made is removed, and the caller gets a `Conflict`.
+
+    That check is optimistic, not linearizable: `renameat2(RENAME_NOREPLACE)`
+    is what would close the window properly and Python exposes no binding for
+    it. The window is now a few microseconds between an `fstat` and an
+    `unlink` rather than the whole link-then-unlink pair, and — this is the
+    part that matters — losing the race can no longer destroy data that was
+    never copied.
     """
     src_fd, name = _open_parent(root_fd, rel_path, create=False)
     trash_fd: int | None = None
@@ -475,7 +515,9 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = ".trash") -
                         f"{trash_dir}/ (see probe_filesystem)"
                     ) from exc
                 raise
-            os.unlink(name, dir_fd=src_fd)
+            _unlink_if_same_inode(
+                src_fd, name, trash_fd, candidate, rel_path=rel_path, trash_dir=trash_dir
+            )
             return f"{trash_dir}/{candidate}"
         raise Conflict(
             f"Could not find a free name in {trash_dir}/ for {name}"
@@ -484,6 +526,47 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = ".trash") -
         os.close(src_fd)
         if trash_fd is not None:
             os.close(trash_fd)
+
+
+def _unlink_if_same_inode(
+    src_fd: int,
+    name: str,
+    trash_fd: int,
+    candidate: str,
+    *,
+    rel_path,
+    trash_dir: str,
+) -> None:
+    """Unlink `name` only if it is still the inode now sitting in the trash."""
+    linked = os.stat(candidate, dir_fd=trash_fd, follow_symlinks=False)
+    try:
+        probe = os.open(name, os.O_RDONLY | _O_COMMON, dir_fd=src_fd)
+    except FileNotFoundError:
+        # Someone else removed the source after we copied it. The trash entry
+        # is the copy we promised; there is nothing left to unlink.
+        return
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+            # The name became a symlink under us — never follow it, and never
+            # unlink it blind.
+            _unlink_quietly(trash_fd, candidate, published=False)
+            raise Conflict(
+                f"Source was replaced by a symlink while being trashed: {rel_path}"
+            ) from None
+        raise
+    try:
+        current = os.fstat(probe)
+    finally:
+        os.close(probe)
+
+    if (current.st_dev, current.st_ino) != (linked.st_dev, linked.st_ino):
+        # A different file lives at that name now. Unlinking it would destroy
+        # content nothing has a copy of.
+        _unlink_quietly(trash_fd, candidate, published=False)
+        raise Conflict(
+            f"Source was replaced while being moved to {trash_dir}/: {rel_path}"
+        )
+    os.unlink(name, dir_fd=src_fd)
 
 
 def _open_parent(root_fd: int, rel_path: str | Path, *, create: bool) -> tuple[int, str]:
@@ -506,38 +589,50 @@ def open_parent(root_fd: int, rel_path: str | Path, *, create: bool = False) -> 
 # ── startup probe ───────────────────────────────────────────────────────────
 
 
-def probe_filesystem(root_fd: int) -> None:
+def _probe_link(src_dir_fd: int, name: str, dst_dir_fd: int, link_name: str, what: str) -> None:
+    try:
+        os.link(
+            name,
+            link_name,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        if exc.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV, errno.ENOSYS):
+            raise UnsupportedFilesystem(
+                f"The vault filesystem does not support hard links {what} "
+                f"({errno.errorcode.get(exc.errno, exc.errno)}). Transfer "
+                "uploads and delete_file rely on them for atomic no-clobber "
+                "publication and are disabled."
+            ) from exc
+        raise
+    _unlink_quietly(dst_dir_fd, link_name, published=False)
+
+
+def probe_filesystem(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
     """Verify the vault filesystem supports the operations this module needs.
 
-    Links and unlinks a temp file at the root. Raises `UnsupportedFilesystem`
-    when hard links are refused (`EPERM`/`EOPNOTSUPP`) or would cross a device
-    (`EXDEV`) — the two cases in which no-clobber publication and soft-delete
-    silently stop being what they claim. Called once at startup so a bad mount
-    is a clear error at boot instead of a surprise mid-upload.
+    Two links, not one: within the root (which is what `publish` needs) **and**
+    from the root into `trash_dir` (which is what `soft_delete` needs). A vault
+    whose `.trash` is a separate mount passes the first and fails the second
+    with `EXDEV` — and would then silently lose every soft-deleted file, so it
+    has to be caught here rather than at the first delete.
+
+    Raises `UnsupportedFilesystem` when links are refused (`EPERM`/
+    `EOPNOTSUPP`) or would cross a device (`EXDEV`). Cached per root by
+    `check_filesystem_support`.
     """
     fd, tmp_name = create_temp(root_fd)
     os.close(fd)
-    link_name = f"{tmp_name}-probe"
+    trash_fd: int | None = None
     try:
-        try:
-            os.link(
-                tmp_name,
-                link_name,
-                src_dir_fd=root_fd,
-                dst_dir_fd=root_fd,
-                follow_symlinks=False,
-            )
-        except OSError as exc:
-            if exc.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV, errno.ENOSYS):
-                raise UnsupportedFilesystem(
-                    "The vault filesystem does not support hard links "
-                    f"({errno.errorcode.get(exc.errno, exc.errno)}). Transfer "
-                    "uploads and delete_file rely on them for atomic "
-                    "no-clobber publication and are disabled."
-                ) from exc
-            raise
-        _unlink_quietly(root_fd, link_name, published=False)
+        _probe_link(root_fd, tmp_name, root_fd, f"{tmp_name}-probe", "within the vault root")
+        trash_fd = open_dir_beneath(root_fd, trash_dir, create=True)
+        _probe_link(root_fd, tmp_name, trash_fd, f"{tmp_name}-probe", f"into {trash_dir}/")
     finally:
+        if trash_fd is not None:
+            os.close(trash_fd)
         _unlink_quietly(root_fd, tmp_name, published=False)
 
 

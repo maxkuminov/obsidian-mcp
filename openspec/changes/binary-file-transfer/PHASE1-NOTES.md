@@ -70,11 +70,12 @@ open_parent(root_fd: int, rel_path: str | Path, *, create: bool = False) -> tupl
 create_temp(dir_fd: int) -> tuple[int, str]              # (fd, ".tmp-<32hex>"), 0600
 fingerprint(dir_fd: int, name: str, *, hash_up_to: int | None) -> dict | None
 publish(dir_fd, tmp_name, final_name, *, overwrite: bool,
-        expected_fingerprint: dict | None) -> Published  # (name, published, temp_removed)
+        expected_fingerprint: dict | None,
+        dst_dir_fd: int | None = None) -> Published      # (name, published, temp_removed)
 discard_temp(dir_fd: int, name: str) -> bool             # never raises
 remove(root_fd: int, rel_path) -> None                   # permanent unlink
 soft_delete(root_fd, rel_path, trash_dir=".trash") -> str  # returns ".trash/<created name>"
-probe_filesystem(root_fd: int) -> None                   # raises UnsupportedFilesystem
+probe_filesystem(root_fd, trash_dir=".trash") -> None     # raises UnsupportedFilesystem
 check_filesystem_support(root: Path | str) -> None       # cached wrapper
 reset_filesystem_probe_cache() -> None
 ```
@@ -96,6 +97,10 @@ Contracts worth knowing before you use them:
 - **`Published.published`** is what decides completion. A failing trailing
   temp unlink after a successful `link`/`replace` sets `temp_removed=False`,
   is logged, and must **not** release the claim.
+- **`publish` takes separate source and destination descriptors.** `dir_fd`
+  anchors the staged temp file, `dst_dir_fd` the destination directory
+  (defaulting to `dir_fd`). Both must be on the same device — holding both
+  inside the vault root guarantees it.
 - **`probe_filesystem` is not wired into startup yet** — that is Phase 2's
   `src/main.py` lifespan work. Call `check_filesystem_support(root)` once at
   startup (it caches per root) and have the transfer tools surface
@@ -281,6 +286,74 @@ Results at the end of Phase 1:
   `TEST_DATABASE_URL`)
 
 ---
+
+---
+
+## Phase-1 audit fixes (folded in during Phase 2)
+
+A headless Codex review of Phase 1 returned FAIL. All six findings are fixed on
+this branch, each with a regression test.
+
+1. **BLOCKER — `soft_delete` could destroy a replacement (`vault_fs.py`).**
+   `link` then `unlink` is two syscalls; a writer that replaced the source name
+   in between had its file unlinked with no trash copy of it. The unlink is now
+   **inode-verified**: after the link, the source name is reopened
+   `O_NOFOLLOW`, `fstat`ed, and unlinked only if it is still the inode that was
+   linked. Otherwise the trash link is removed and the caller gets a `Conflict`.
+   Still optimistic (`renameat2(RENAME_NOREPLACE)` has no Python binding) but
+   losing the race can no longer delete uncopied data.
+   Tests: `test_soft_delete_does_not_unlink_a_replacement`,
+   `test_soft_delete_succeeds_when_the_source_vanished_after_the_link`.
+
+2. **MAJOR — the gate could not record inside the locked transaction
+   (`transfer.py`).** `before_publish()` now yields a **`GateHandle`**
+   (`ok: bool`, `session`, `async complete(result, *, published)`) instead of a
+   bare bool. `stream_to_vault` calls `gate.complete(result, published=…)`
+   immediately after `publish` and still inside the context, so the completion
+   row and the usage-log row are written by the transaction holding the
+   `FOR UPDATE` locks. A failure after the bytes landed raises the new
+   **`PostPublishFailure`**, which callers must never treat as "nothing
+   happened" (the route leaves the claim in place).
+   Tests: `test_gate_stays_open_across_the_publish` (extended),
+   `test_a_commit_failure_after_publication_is_its_own_error`.
+
+3. **MAJOR — SSRF checks ran before IDNA normalisation (`transfer.py`).**
+   `svc.prod。internal` (U+3002) passed the suffix check and then resolved as
+   `svc.prod.internal`. `canonicalise` now folds the host to canonical ASCII
+   **first** — NFKC, the three alternative full stops, then
+   `idna.encode(uts46=True)` — and every structural, suffix and numeric check
+   runs against that form, followed by an explicit LDH shape check. `idna` is
+   now a direct dependency in `requirements.txt`.
+   Tests: `test_alternative_full_stops_cannot_smuggle_a_forbidden_name`,
+   `test_fullwidth_numeric_hosts_are_refused`,
+   `test_fullwidth_public_name_is_folded_not_rejected`,
+   `test_hosts_that_are_not_ldh_are_refused`.
+
+4. **MAJOR — the destination fd was opened before the stream (`transfer.py`).**
+   Renaming the destination directory mid-stream redirected the publish through
+   the stale descriptor. Bytes are now staged in **`<root>/.transfer-tmp/`**
+   (`vault_fs.STAGING_DIR`), and the destination parent is re-walked from the
+   root descriptor **inside the gate** before `publish(src_dir_fd=staging,
+   dst_dir_fd=destination)`. Same device by construction. A cheap up-front walk
+   still rejects `..`/symlinks/non-directories before any bytes are read.
+   Tests: `test_the_destination_is_resolved_at_publish_time_not_at_open_time`,
+   `test_bytes_are_staged_outside_the_destination_folder`.
+
+5. **MINOR — the probe missed a cross-device `.trash`.** `probe_filesystem`
+   now links root→root *and* root→`.trash` (creating `.trash` through the root
+   fd), so a separate-mount trash is caught at probe time rather than at the
+   first `delete_file`.
+   Test: `test_probe_filesystem_catches_a_cross_device_trash`.
+
+6. **MINOR — the fetch deadline surfaced a builtin.** `fetch_url_guarded`
+   translates `asyncio.timeout`'s `TimeoutError` into the service's own
+   `Timeout` after cleanup; the redirect loop moved into `_fetch_hops` so the
+   wrapper stays legible.
+   Test: `test_deadline_covers_the_whole_fetch` (now asserts `Timeout`).
+
+Also added by Phase 2 per supervisor decision: `TransferToken.public_id`
+(`secrets.token_urlsafe(16)`, unique, set by `mint_token`, added to migration
+012 in place) — the opaque `upload_id` the tools return.
 
 ## Open questions for Phase 2
 
