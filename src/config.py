@@ -6,6 +6,17 @@ from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
 
 
+# Maximum size of a single note, in bytes. Lives here (rather than in
+# `src/mcp_server/tools.py`, which imports it) so the derived transport limit
+# below can reference it without a circular import.
+MAX_NOTE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+# Headroom for the JSON-RPC envelope around a tool call's content argument:
+# method name, tool name, request id, the other arguments. See
+# `Settings.mcp_max_request_body_bytes`.
+_MCP_ENVELOPE_ALLOWANCE_BYTES = 1024 * 1024  # 1 MiB
+
+
 class _FieldFilteredSource(PydanticBaseSettingsSource):
     """Wraps a settings source and drops keys that are not `Settings` fields.
 
@@ -116,6 +127,47 @@ class Settings(BaseSettings):
     # higher ceiling (25 MB). Env: MAX_FILE_READ_BYTES / MAX_FILE_WRITE_BYTES.
     max_file_read_bytes: int = Field(10 * 1024 * 1024, ge=1)
     max_file_write_bytes: int = Field(25 * 1024 * 1024, ge=1)
+
+    @property
+    def mcp_max_request_body_bytes(self) -> int:
+        """Maximum MCP streamable-HTTP request body, derived from the write caps.
+
+        `max(2 × MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB`
+        (61 MiB with the defaults). Passed to `FastMCP(max_request_body_size=)`;
+        the SDK would otherwise apply its own 4 MiB default, which silently
+        rejects a `write_file` well below our documented 25 MB cap.
+
+        There is deliberately no separate env knob: the transport limit must
+        track the tool caps, so that every *supported* write is decided by the
+        tool (with an actionable message) and the transport only ever bounds
+        unsupported shapes.
+
+        The guarantee is qualified. For a canonical `tools/call` envelope —
+        JSON-RPC framing plus all non-content arguments encoding to at most
+        1 MiB − 2 bytes — these shapes always reach the tool:
+
+        - `write_file(encoding="base64")` with decoded content up to
+          `max_file_write_bytes`: base64 length is exactly `4·⌈n/3⌉ ≤ 2n + 2`
+          for n ≥ 1, so it fits in `2 × cap` with the envelope allowance to spare.
+        - Any note write (`create_note`, `edit_note`, `set_frontmatter`) whose
+          content arguments are at most `MAX_NOTE_BYTES` of UTF-8 before JSON
+          escaping: escaping expands a byte at most 6× (a control character
+          becomes the six-character `\\u00XX`; BMP escapes under `ensure_ascii`
+          are 2× per byte, astral surrogate pairs 3×), so `6 × MAX_NOTE_BYTES`
+          covers the worst case. `MAX_NOTE_BYTES` is in the formula so this
+          holds however small an operator sets `MAX_FILE_WRITE_BYTES`.
+        - `write_file(encoding="text")` whose JSON-escaped content fits the
+          limit; realistic prose in any script (≤ 2×) does with the defaults.
+
+        Everything else is bounded by the transport with a bare HTTP 413 and is
+        unsupported: text-mode content whose escaping exceeds the limit (use
+        base64 — always safe), an envelope over 1 MiB, or arguments that are
+        large but discarded.
+        """
+        return (
+            max(2 * self.max_file_write_bytes, 6 * MAX_NOTE_BYTES)
+            + _MCP_ENVELOPE_ALLOWANCE_BYTES
+        )
 
     # Cap on how much note/file text a single read_note / read_file call may
     # return to the model. The byte caps above stop the server from reading a

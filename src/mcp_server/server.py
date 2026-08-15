@@ -29,6 +29,11 @@ mcp = FastMCP(
     "obsidian-vault",
     stateless_http=True,
     streamable_http_path="/",
+    # Derived from the write caps rather than the SDK's 4 MiB default, which
+    # would reject a `write_file` far below our documented 25 MB cap. See
+    # `Settings.mcp_max_request_body_bytes` for the arithmetic and the
+    # (qualified) guarantee it provides.
+    max_request_body_size=settings.mcp_max_request_body_bytes,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=not settings.mcp_sandbox_mode,
         allowed_hosts=settings.allowed_hosts,
@@ -495,6 +500,12 @@ async def write_file(
     No-clobber by default: writing over an existing file requires
     `overwrite=True`. Dot-directories and path traversal are rejected; invalid
     base64 errors without writing anything.
+
+    The MCP transport also bounds the whole request body (sized so a base64
+    write at the cap always gets through). Base64 is therefore the always-safe
+    encoding: `encoding="text"` content whose JSON escaping inflates past that
+    bound is rejected by the transport with a bare HTTP 413 before this tool
+    runs — send such content as base64 instead.
 
     Args:
         path: Vault-relative destination path (e.g. "Outputs/report.pdf").

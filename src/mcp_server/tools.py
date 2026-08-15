@@ -16,7 +16,7 @@ from mcp.server.fastmcp import Image
 from sqlalchemy import text
 
 from src.auth.session import current_user_id
-from src.config import settings
+from src.config import MAX_NOTE_BYTES, settings
 from src.database import async_session
 from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
 from src.models.db import UsageLog
@@ -495,7 +495,17 @@ def _require_write() -> str | None:
     return None
 
 
-MAX_NOTE_BYTES = 10 * 1024 * 1024  # 10 MB
+def _note_size_error(content: str) -> str | None:
+    """Refuse a note write whose *result* would exceed `MAX_NOTE_BYTES`.
+
+    Every note write tool applies this to the content it is about to write, so
+    a supported write is always decided here — with an actionable message —
+    rather than by the MCP transport's body limit, which sits well above it.
+    """
+    size = len(content.encode("utf-8"))
+    if size > MAX_NOTE_BYTES:
+        return f"Content too large ({size} bytes, max {MAX_NOTE_BYTES})"
+    return None
 
 
 @_tracked("create_note", ["path"])
@@ -503,9 +513,8 @@ async def create_note_impl(path: str, content: str) -> str:
     """Create a new note in the vault."""
     if err := _require_write():
         return err
-    encoded = content.encode("utf-8")
-    if len(encoded) > MAX_NOTE_BYTES:
-        return f"Content too large ({len(encoded)} bytes, max {MAX_NOTE_BYTES})"
+    if err := _note_size_error(content):
+        return err
     if not path.endswith(".md"):
         path += ".md"
     uid = current_user_id.get()
@@ -934,6 +943,13 @@ async def edit_note_impl(
     else:
         new_content = content
 
+    # Bound the *result*, before the diff and before the atomic write, so an
+    # over-cap edit is refused by the tool in every mode (including dry_run)
+    # and nothing is written. Must stay ahead of the `expected=` write below,
+    # which is what detects a concurrent read-modify-write conflict.
+    if err := _note_size_error(new_content):
+        return err
+
     if dry_run:
         if new_content == existing:
             return f"No changes for {path}"
@@ -1325,6 +1341,11 @@ async def set_frontmatter_impl(
     new_raw = serialize_frontmatter(fm, body)
     if new_raw == raw:
         return f"No changes for {path}"
+
+    # Bound the result before writing (see `edit_note_impl`). A remove-only
+    # call can only shrink the note, but the check is uniform.
+    if err := _note_size_error(new_raw):
+        return err
 
     try:
         write_file(path, new_raw, user_id=uid, expected=raw_bytes)
