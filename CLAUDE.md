@@ -200,6 +200,37 @@ Consequences that are easy to undo by accident:
   `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault is under the cap;
   those are the next knobs, not `ef_search`.
 
+## Search benchmarks (opt-in integration)
+
+`tests/integration/test_search_recall.py` and `test_keyword_plan.py` run only
+when `PGVECTOR_TEST_ADMIN_URL` names a throwaway Postgres **server** (the
+harness creates and drops its own database per module — see
+`tests/integration/_harness.py`):
+
+```sh
+docker run --rm -d --name pgvector-search-test -e POSTGRES_PASSWORD=test \
+    -p 55433:5432 pgvector/pgvector:pg16
+PGVECTOR_TEST_ADMIN_URL=postgresql+asyncpg://postgres:test@localhost:55433/postgres \
+    pytest -q tests/integration/
+docker rm -f pgvector-search-test
+```
+
+Two things about these fixtures are load-bearing and non-obvious:
+
+- **The filtered slice must be a large fraction of the corpus.** A filter
+  matching a few percent makes the planner estimate a tiny join and pick a seq
+  scan + sort — the HNSW nested-loop plan the recall bug lives in never
+  appears, and every assertion passes against a plan production does not use.
+- **The keyword corpus needs `VACUUM`, not just `ANALYZE`.** A GIN index's cost
+  estimate comes from its metapage stats, which only VACUUM writes. Without it
+  `gincostestimate` assumes the whole index must be scanned (cost 621 vs 4.15
+  here) and the planner hint looks broken. Production gets this from
+  autovacuum; a freshly-seeded test database does not.
+
+Recorded numbers on that corpus: rare-term keyword query 228 buffers with the
+hint vs 29,071 sequential; common-term 57,799 either way (seq scan is the right
+plan there, so it is recorded, not asserted).
+
 ## Per-phase search timing
 
 `usage_logs.params` carries `embed_ms` + `db_ms` + `exact_fallback` for
