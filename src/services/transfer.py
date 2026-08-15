@@ -788,7 +788,30 @@ async def stream_to_vault(
         )
 
 
-def _publish_into_current_parent(root_fd: int, staging_fd: int, tmp_name: str, row):
+def _close_quietly(fd: int, what: str) -> None:
+    """Close a descriptor; a failing close never fails the operation.
+
+    Closes on the publish path are pure bookkeeping — the bytes are already
+    where they are — so a `close` that returns `EIO` must not be able to
+    reverse the verdict on an upload. It is logged and dropped.
+
+    Note this is *not* used for the staged temp file's own descriptor, which is
+    closed before publication and where a failure genuinely means the data may
+    not have reached the disk.
+    """
+    try:
+        os.close(fd)
+    except OSError as exc:
+        logger.warning("Could not close the %s descriptor: %s", what, exc)
+
+
+def _publish_into_current_parent(
+    root_fd: int,
+    staging_fd: int,
+    tmp_name: str,
+    row,
+    on_published: Callable[[object], None] | None = None,
+):
     """Resolve the destination parent *now* and link the staged file into it.
 
     The fresh `open_dir_beneath` walk is the point. A descriptor opened before
@@ -798,10 +821,16 @@ def _publish_into_current_parent(root_fd: int, staging_fd: int, tmp_name: str, r
     somewhere the token never named. Re-walking from the root descriptor under
     the caller's lock means the bytes land at the path the token committed to,
     as that path resolves at publication time, or not at all.
+
+    `on_published` is called with the outcome the *instant* `publish` returns
+    having placed the bytes, before this function does anything else — closing
+    the destination descriptor included. Nothing after a successful publish may
+    be able to make the caller believe nothing was published; see
+    `_stream_locked`.
     """
     dst_fd, name = vault_fs.open_parent(root_fd, row.path, create=True)
     try:
-        return vault_fs.publish(
+        outcome = vault_fs.publish(
             staging_fd,
             tmp_name,
             name,
@@ -809,8 +838,15 @@ def _publish_into_current_parent(root_fd: int, staging_fd: int, tmp_name: str, r
             expected_fingerprint=row.expected_fingerprint,
             dst_dir_fd=dst_fd,
         )
+        if on_published is not None and outcome.published:
+            on_published(outcome)
+        return outcome
     finally:
-        os.close(dst_fd)
+        # Never `os.close` bare here: a close that fails *after* publication
+        # would discard the return value and surface as a generic `OSError`,
+        # which the upload route reads as "nothing was published" and answers
+        # by releasing the claim — over a path that already holds the file.
+        _close_quietly(dst_fd, f"publish destination for {row.path}")
 
 
 async def _stream_locked(
@@ -851,32 +887,43 @@ async def _stream_locked(
         _kind, mime = classify_bytes(head, name)
         result = {"size": size, "sha256": digest, "mime": mime}
 
-        if before_publish is None:
-            _publish_into_current_parent(root_fd, staging_fd, tmp_name, row)
-            tmp_name = None  # publish owns cleanup from here
-            return result
+        # `publish` succeeding is the point of no return, and it is recorded
+        # through this callback rather than from the return value: the return
+        # value only becomes visible once `_publish_into_current_parent` has
+        # finished unwinding, and anything that raises on the way out — a
+        # failing descriptor close, most plausibly — would otherwise leave
+        # `published` false for a file that is already on disk.
+        state = {"published": False}
 
-        published = False
+        def _record(_outcome) -> None:
+            state["published"] = True
+
         try:
-            async with before_publish() as gate:
-                if not gate.ok:
-                    raise PrePublishAborted(
-                        "The minting identity or vault root is no longer valid"
-                    )
-                outcome = _publish_into_current_parent(
-                    root_fd, staging_fd, tmp_name, row
+            if before_publish is None:
+                _publish_into_current_parent(
+                    root_fd, staging_fd, tmp_name, row, _record
                 )
-                tmp_name = None
-                published = outcome.published
-                # Inside the context, so completion commits with the locks.
-                await gate.complete(result, published=published)
+                tmp_name = None  # publish owns cleanup from here
+            else:
+                async with before_publish() as gate:
+                    if not gate.ok:
+                        raise PrePublishAborted(
+                            "The minting identity or vault root is no longer valid"
+                        )
+                    _publish_into_current_parent(
+                        root_fd, staging_fd, tmp_name, row, _record
+                    )
+                    tmp_name = None
+                    # Inside the context, so completion commits with the locks.
+                    await gate.complete(result, published=state["published"])
         except PrePublishAborted:
+            # Always pre-publication: the gate refuses before `publish` runs.
             raise
         except BaseException as exc:
-            if published:
-                # The file is in place; whatever failed did so while recording
-                # that. A distinct type, because the caller must not treat this
-                # like the pre-publication failures and release the claim.
+            if state["published"]:
+                # The file is in place; whatever failed did so afterwards. A
+                # distinct type, because the caller must not treat this like
+                # the pre-publication failures and release the claim.
                 raise PostPublishFailure(
                     f"Published {row.path} but could not record the completion: {exc}"
                 ) from exc
@@ -887,9 +934,13 @@ async def _stream_locked(
             vault_fs.discard_temp(staging_fd, tmp_name)
         raise
     finally:
+        # Quietly, and in a `finally` that runs after the publication verdict
+        # has already been decided: a descriptor we are done with cannot be
+        # allowed to turn a published upload into a generic `OSError` on the
+        # way out, which the route would answer by releasing the claim.
         if staging_fd is not None:
-            os.close(staging_fd)
-        os.close(root_fd)
+            _close_quietly(staging_fd, "upload staging directory")
+        _close_quietly(root_fd, "vault root")
 
 
 # ════════════════════════════════════════════════════════════════════════════

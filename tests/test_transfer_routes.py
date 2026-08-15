@@ -441,6 +441,83 @@ async def test_upload_round_trip(client, harness, vault):
     assert harness.token not in str(log.params)
 
 
+def arm_close_faults(monkeypatch, *, limit: int = 3) -> dict:
+    """Make the first `limit` `os.close` calls *after* publication fail.
+
+    Exactly three descriptors are closed once the bytes are in place — the
+    destination parent, the staging directory, the vault root — and none of
+    them can change whether the file exists. Arming only after `publish`
+    returns, and capping the failures, keeps the window to those three.
+    """
+    import errno
+
+    state = {"armed": False, "failures": 0}
+    real_close = os.close
+    real_publish = vault_fs.publish
+
+    def arming_publish(*args, **kwargs):
+        outcome = real_publish(*args, **kwargs)
+        if outcome.published:
+            state["armed"] = True
+        return outcome
+
+    def faulty_close(fd):
+        if state["armed"] and state["failures"] < limit:
+            state["failures"] += 1
+            real_close(fd)
+            raise OSError(errno.EIO, "Input/output error")
+        return real_close(fd)
+
+    monkeypatch.setattr(vault_fs, "publish", arming_publish)
+    monkeypatch.setattr(os, "close", faulty_close)
+    return state
+
+
+async def test_a_failing_close_after_publication_keeps_the_token_completed(
+    client, harness, vault, monkeypatch
+):
+    """The route must never see a post-publication failure as pre-publication.
+
+    A bare `os.close` on the publish path used to be able to raise `EIO` after
+    the file had landed. That reached the route's catch-all, which treats every
+    non-`PostPublishFailure` error as demonstrably pre-publication and releases
+    the claim — handing back a replayable token over a path that already holds
+    the uploaded file. The token must end `completed` (or at worst `claimed`);
+    `pending` is the wrong answer.
+    """
+    state = arm_close_faults(monkeypatch)
+    response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+    monkeypatch.undo()
+
+    assert state["failures"] == 3, "the injected close failures never fired"
+    assert response.status_code == 200, response.text
+    assert (vault / "Attachments" / "shot.png").read_bytes() == PNG
+    assert harness.row.state == "completed"
+    assert harness.released == 0
+    assert harness.row.state != "pending"
+
+
+async def test_a_failing_close_plus_a_failing_commit_still_strands_the_claim(
+    client, harness, vault, monkeypatch
+):
+    """Stacked failures still resolve to `claimed`, never `pending`."""
+
+    async def exploding(session, row, size, sha256, mime, *, commit=True):
+        raise RuntimeError("database went away")
+
+    monkeypatch.setattr(transfer, "complete_upload", exploding)
+    arm_close_faults(monkeypatch)
+
+    with pytest.raises(transfer.PostPublishFailure):
+        await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+    monkeypatch.undo()
+
+    assert (vault / "Attachments" / "shot.png").read_bytes() == PNG
+    assert harness.released == 0
+    assert harness.consumed == 0
+    assert harness.row.state == "claimed"
+
+
 async def test_upload_creates_missing_parent_folders(client, harness, vault):
     harness.row.path = "Inbox/2026/scan.png"
     response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)

@@ -195,18 +195,24 @@
    `os.stat(final, dir_fd, follow_symlinks=False)` (symlink → refuse;
    fingerprint mismatch → conflict) then `os.replace(src_dir_fd, dst_dir_fd)`;
    `remove(dir_fd, name)` / `soft_delete(...)` with `lstat` symlink refusal and
-   an **atomic move** into `.trash/`: a unique `<ts>-<basename>-<8 hex>` name is
-   reserved with `O_CREAT|O_EXCL|O_NOFOLLOW` and the source is `rename`d onto
-   that placeholder, so nothing is ever unlinked and a file that replaced the
-   source mid-delete is moved to the trash rather than destroyed. Temp files are unlinked in `finally`, and publication is tracked
+   an **atomic move** into `.trash/`: one `renameat2(RENAME_NOREPLACE)` (via
+   `rename_noreplace`, `ctypes` → the glibc wrapper) onto a
+   `<ts>-<basename>-<8 hex>` name, with `EEXIST` retried under a fresh suffix.
+   Nothing is ever unlinked, nothing is pre-created, an existing trash entry can
+   never be clobbered, and a file that replaced the source mid-delete is moved
+   to the trash rather than destroyed. `EINVAL`/`ENOSYS`/`EXDEV` →
+   `UnsupportedFilesystem`; there is deliberately no fallback to a replacing
+   `os.rename`. Temp files are unlinked in `finally`, and publication is tracked
    separately from cleanup: once `link`/`replace` has succeeded the upload
-   is complete even if the trailing temp unlink fails (logged, never releases
-   the claim). The filesystem prerequisites are probed **separately, on first
-   use per root, and only on paths that write**: `probe_publication` links a
-   temp file within the vault root (what an upload needs) and `probe_trash`
-   renames one into `.trash` (what a soft delete needs); `EPERM`/`EOPNOTSUPP`/
-   `EXDEV` → a stable "unsupported filesystem" error naming the probe, and
-   nothing is written. A read path — `request_download`, `check_upload`,
+   is complete even if the trailing temp unlink or any descriptor close fails
+   (logged, never releases the claim). The filesystem prerequisites are probed
+   **separately, on first use per root, and only on paths that write**:
+   `probe_publication` links a temp file within the vault root (what an upload
+   needs) and `probe_trash` moves one into `.trash` with the *same*
+   `RENAME_NOREPLACE` primitive the delete uses (a plain `rename` probe would
+   pass on a filesystem that rejects the flag and then fail every delete);
+   `EPERM`/`EOPNOTSUPP`/`EXDEV`/`EINVAL`/`ENOSYS` → a stable "unsupported
+   filesystem" error naming the probe, and nothing is written. A read path — `request_download`, `check_upload`,
    `GET /transfer/download/file` — runs **no** probe, because a probe writes.
    The publication probe's first run per root also sweeps
    `.transfer-tmp/.tmp-*` files older than 24 h, which is where a crashed

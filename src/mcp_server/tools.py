@@ -2021,6 +2021,18 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
             "was revoked, downgraded, or repointed while the fetch was in "
             "flight). Nothing was written."
         )
+    except transfer.PostPublishFailure as e:
+        # The one outcome where "failed" would be a lie. The bytes are at
+        # `rel`; only the bookkeeping around them did not finish. An agent told
+        # "could not write" retries, and a retry of an import that already
+        # landed is either a redundant fetch or — with overwrite — a second
+        # write over the first. Say what is actually true instead.
+        return (
+            f"Imported the file to {rel}, but the server could not finish "
+            f"recording the import: {e}\n"
+            "The file IS in place. Do not retry blindly — check it with "
+            "`read_file` or `list_files` first."
+        )
     except vault_fs.Conflict as e:
         return f"{e}. Nothing was written."
     except vault_fs.UnsafePath as e:

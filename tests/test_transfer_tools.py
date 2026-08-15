@@ -594,6 +594,86 @@ async def test_import_publishes_nothing_when_the_gate_refuses(
     assert not staging.exists() or list(staging.iterdir()) == []
 
 
+def _arm_close_faults(monkeypatch, *, limit: int = 3) -> dict:
+    """Make the first `limit` `os.close` calls *after* publication fail.
+
+    Exactly three descriptors are closed once the bytes are in place — the
+    destination parent, the staging directory, the vault root — and none of
+    them can change whether the file exists.
+    """
+    import errno
+
+    state = {"armed": False, "failures": 0}
+    real_close = os.close
+    real_publish = vault_fs.publish
+
+    def arming_publish(*args, **kwargs):
+        outcome = real_publish(*args, **kwargs)
+        if outcome.published:
+            state["armed"] = True
+        return outcome
+
+    def faulty_close(fd):
+        if state["armed"] and state["failures"] < limit:
+            state["failures"] += 1
+            real_close(fd)
+            raise OSError(errno.EIO, "Input/output error")
+        return real_close(fd)
+
+    monkeypatch.setattr(vault_fs, "publish", arming_publish)
+    monkeypatch.setattr(os, "close", faulty_close)
+    return state
+
+
+async def test_import_survives_a_failing_close_after_publication(
+    vault, readwrite, canned_fetch, publish_gate, monkeypatch
+):
+    """A close that fails once the bytes have landed is not an import failure.
+
+    Before the fix, an `OSError` from a descriptor close on the publish path
+    reached `import_from_url`'s `except OSError` and returned "Could not write
+    …" for a file that was sitting at the requested path. An agent reads that
+    as "nothing happened" and retries.
+    """
+    state = _arm_close_faults(monkeypatch)
+    result = await tools.import_from_url_impl(
+        "https://example.com/a.png", "Attachments/a.png"
+    )
+    monkeypatch.undo()
+
+    assert state["failures"] == 3, "the injected close failures never fired"
+    assert "Imported" in result
+    assert "Could not write" not in result
+    assert (vault / "Attachments" / "a.png").read_bytes() == PNG
+
+
+async def test_import_reports_a_post_publish_failure_as_written(
+    vault, readwrite, canned_fetch, publish_gate, monkeypatch
+):
+    """When the bookkeeping genuinely fails, the message still says "in place".
+
+    `PostPublishFailure` used to escape the tool entirely (it is not an
+    `OSError`), surfacing as an unhandled exception. Either way the agent had
+    no way to learn that the file exists.
+    """
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def failing_gate(session, identity, *, vault_root, need_write=True):
+        yield transfer.GateHandle(ok=True)
+        raise RuntimeError("commit failed")
+
+    monkeypatch.setattr(transfer, "lock_identity_for_publish", failing_gate)
+    result = await tools.import_from_url_impl(
+        "https://example.com/a.png", "Attachments/a.png"
+    )
+    monkeypatch.undo()
+
+    assert "IS in place" in result
+    assert "Nothing was written" not in result
+    assert (vault / "Attachments" / "a.png").read_bytes() == PNG
+
+
 async def test_import_logs_only_the_url_host(vault, readwrite, usage_log):
     await tools.import_from_url_impl(
         "https://example.com/secret-path?token=SUPERSECRET", "Attachments/a.png"

@@ -74,9 +74,10 @@ publish(dir_fd, tmp_name, final_name, *, overwrite: bool,
         dst_dir_fd: int | None = None) -> Published      # (name, published, temp_removed)
 discard_temp(dir_fd: int, name: str) -> bool             # never raises
 remove(root_fd: int, rel_path) -> None                   # permanent unlink
+rename_noreplace(src_dir_fd, src_name, dst_dir_fd, dst_name) -> None  # renameat2(RENAME_NOREPLACE)
 soft_delete(root_fd, rel_path, trash_dir=".trash") -> str  # returns ".trash/<created name>"
 probe_publication(root_fd) -> None                       # link within the root
-probe_trash(root_fd, trash_dir=".trash") -> None          # rename into .trash
+probe_trash(root_fd, trash_dir=".trash") -> None          # rename_noreplace into .trash
 prune_stale_staging(root_fd, *, max_age_seconds=86400) -> int
 check_publication_support(root: Path | str) -> None      # cached; also prunes on first use
 check_trash_support(root: Path | str) -> None            # cached
@@ -306,8 +307,9 @@ this branch, each with a regression test.
    **inode-verified**: after the link, the source name is reopened
    `O_NOFOLLOW`, `fstat`ed, and unlinked only if it is still the inode that was
    linked. Otherwise the trash link is removed and the caller gets a `Conflict`.
-   Still optimistic (`renameat2(RENAME_NOREPLACE)` has no Python binding) but
-   losing the race can no longer delete uncopied data.
+   Still optimistic — this note believed `renameat2(RENAME_NOREPLACE)` had no
+   Python binding, which is only true of the *stdlib*; Phase-3 fix 1 reaches it
+   through `ctypes` — but losing the race can no longer delete uncopied data.
    Tests: `test_soft_delete_does_not_unlink_a_replacement`,
    `test_soft_delete_succeeds_when_the_source_vanished_after_the_link`.
 
@@ -366,12 +368,15 @@ A headless Codex review of the finished change returned FAIL. All ten findings
 are fixed on this branch, each with a regression test. Where they change
 behaviour recorded above, this section wins.
 
-1. **BLOCKER — `soft_delete` was still not atomic (`vault_fs.py`).** The
-   Phase-1 fix made the unlink inode-verified, which narrowed the window but
-   did not close it, and it turned a lost race into a `Conflict` with a
-   half-finished delete to clean up. It is now **one `rename`**: a unique
-   `<ts>-<basename>-<8 hex>` name is reserved in `.trash` with
-   `O_CREAT|O_EXCL|O_NOFOLLOW` and the source is renamed onto that placeholder.
+1. **BLOCKER — `soft_delete` was still not atomic (`vault_fs.py`).**
+   *(Half superseded by Phase-3 fix 1 below: the `O_EXCL` placeholder is gone
+   and the move is `renameat2(RENAME_NOREPLACE)`. The "never unlink, move
+   whichever inode is at the source" half stands.)*
+   The Phase-1 fix made the unlink inode-verified, which narrowed the window
+   but did not close it, and it turned a lost race into a `Conflict` with a
+   half-finished delete to clean up. It became **one `rename`**: a unique
+   `<ts>-<basename>-<8 hex>` name reserved in `.trash` with
+   `O_CREAT|O_EXCL|O_NOFOLLOW`, with the source renamed onto that placeholder.
    Nothing is ever unlinked, so a concurrent replacement is *moved to the
    trash* rather than destroyed, and no verification step is needed.
    `_unlink_if_same_inode` is gone. The `lstat` symlink/directory refusal still
@@ -379,7 +384,7 @@ behaviour recorded above, this section wins.
    Tests: `test_soft_delete_moves_a_replacement_rather_than_destroying_it`,
    `test_soft_delete_reports_a_source_that_vanished_before_the_move`,
    `test_concurrent_soft_deletes_of_the_same_basename_get_distinct_names`,
-   `test_soft_delete_maps_a_cross_device_trash`.
+   `test_soft_delete_maps_an_unusable_trash`.
 
 2. **MAJOR — `delete_file`'s `.md` refusal read the caller's string
    (`tools.py`).** `path.lower().endswith(".md")` let `note.md/.`, `note.md/`
@@ -452,6 +457,81 @@ behaviour recorded above, this section wins.
 
 10. **NIT — `test_body_is_not_read_before_the_claim` counted nothing.** It now
     asserts `consumed == 0`, which is the property the test is named for.
+
+## Phase-3 audit fixes
+
+A second headless Codex review returned two findings. Where they change
+behaviour recorded above, this section wins.
+
+1. **BLOCKER — the `O_EXCL` placeholder was still clobber-able
+   (`vault_fs.py`).** Phase-2 fixed the *source* end of the soft delete and
+   left the *destination* end open. `os.rename` **replaces**: between the
+   placeholder being reserved and the rename landing on it, a writer with
+   access to `.trash` could take that pathname over and have its file silently
+   destroyed — and the error path would then unlink that writer's file while
+   cleaning up "our" placeholder. Reserving a name does not own it.
+
+   New primitive `rename_noreplace(src_dir_fd, src_name, dst_dir_fd, dst_name)`
+   calls `renameat2(2)` with `RENAME_NOREPLACE` through `ctypes` (the glibc
+   wrapper, present since 2.28; a `syscall()` fallback keyed by
+   `platform.machine()` covers older glibc, and an unlisted architecture is
+   treated as "unavailable" rather than guessed at). Errno mapping lives in one
+   place: `EEXIST` → `FileExistsError`, which `_rename_into_trash` retries
+   under a fresh random suffix (bounded, `_TRASH_ATTEMPTS`);
+   `EINVAL`/`ENOSYS`/`EOPNOTSUPP`/`EXDEV` → `UnsupportedFilesystem`, with **no**
+   fallback to a replacing rename; `EISDIR`/`ENOTDIR` → `UnsafePath`. The
+   placeholder reservation (`_reserve_trash_name`) is gone entirely — there is
+   nothing to create, and therefore nothing to clean up on the error paths.
+
+   `probe_trash` now goes through the same `_rename_into_trash` helper, so a
+   filesystem that renames happily but rejects the flag is caught at first use
+   instead of failing every delete. `_renameat2_raw` is the single seam the
+   tests drive.
+
+   Tests: `test_soft_delete_never_replaces_a_name_somebody_else_holds`,
+   `test_rename_noreplace_refuses_an_existing_destination`,
+   `test_rename_noreplace_moves_across_directories`,
+   `test_soft_delete_moves_a_replacement_rather_than_destroying_it`,
+   `test_rename_noreplace_maps_unsupported_errnos`,
+   `test_rename_noreplace_maps_kind_errnos`,
+   `test_rename_noreplace_propagates_unrelated_errnos`,
+   `test_rename_noreplace_without_the_syscall_is_unsupported`,
+   `test_renameat2_is_available_on_this_platform`,
+   `test_soft_delete_uses_a_no_replace_rename`,
+   `test_soft_delete_maps_an_unusable_trash`,
+   `test_probe_trash_catches_an_unusable_trash`,
+   `test_probe_trash_uses_a_no_replace_rename`.
+
+2. **MAJOR — publication was recorded *after* cleanup could fail
+   (`transfer.py`, `tools.py`).** `_publish_into_current_parent` closed the
+   destination descriptor in a `finally` before its return value reached
+   `_stream_locked`, and `_stream_locked` closed the staging and root
+   descriptors bare in its own `finally`. Any of those three raising `EIO`
+   after the bytes had landed discarded the `Published` outcome and surfaced as
+   a generic `OSError` — which the upload route's catch-all treats as
+   *demonstrably pre-publication* and answers by releasing the claim, handing
+   back a replayable token over a path that already holds the file. On the
+   import side the same error returned "Could not write …" for a file that had
+   been written, which an agent acts on by retrying.
+
+   `_publish_into_current_parent` now takes an `on_published` callback and
+   fires it the instant `publish()` returns with `published=True`, before it
+   closes anything. Every close on the publish path goes through the new
+   `_close_quietly` (logged, never raised) — deliberately *not* the staged temp
+   file's own descriptor, where a failing close genuinely means the data may
+   not have reached the disk and must fail pre-publication. Both the gated and
+   the gateless branch now share one `try` whose handler converts anything
+   raised after publication into `PostPublishFailure`. `import_from_url` grew
+   an explicit `PostPublishFailure` handler (it is not an `OSError`, so it used
+   to escape the tool entirely) that tells the agent the file **is** in place.
+
+   Tests: `test_a_failing_close_after_publication_does_not_hide_the_publish`,
+   `test_a_failing_close_after_publication_never_raises_a_bare_oserror`,
+   `test_a_failing_close_after_a_gateless_publish_still_succeeds`,
+   `test_a_failing_close_after_publication_keeps_the_token_completed`,
+   `test_a_failing_close_plus_a_failing_commit_still_strands_the_claim`,
+   `test_import_survives_a_failing_close_after_publication`,
+   `test_import_reports_a_post_publish_failure_as_written`.
 
 ## Open questions for Phase 2
 

@@ -17,6 +17,14 @@ across more than one component at a time.
 does not expose it. Per-component ``O_NOFOLLOW`` from an anchored root fd gives
 the same guarantee for our purposes.
 
+One syscall the stdlib does not expose *is* reached for directly, through
+``ctypes``: ``renameat2(RENAME_NOREPLACE)`` (see ``rename_noreplace``). It is
+the only way to move a file to a name we do not already own without a
+check-then-act window, and the soft delete is built on it — ``os.rename``
+replaces, and every scheme for reserving the destination first leaves a window
+in which somebody else's file can be sitting at that pathname when the rename
+lands on it.
+
 Publication is deliberately split in two:
 
 * **no-clobber** (`overwrite=False`) is ``link()``, which the kernel makes
@@ -33,10 +41,12 @@ The helper is written so `vault._atomic_write` can adopt it later (follow-up).
 """
 from __future__ import annotations
 
+import ctypes
 import errno
 import hashlib
 import logging
 import os
+import platform
 import secrets
 import stat
 import time
@@ -55,8 +65,9 @@ _HASH_CHUNK = 1024 * 1024
 _TEMP_ATTEMPTS = 8
 
 # How many trash names to try before giving up. Each candidate carries 32 bits
-# of randomness and is claimed with `O_EXCL`, so one attempt effectively always
-# wins; the retry exists so a hostile pre-creation loop cannot wedge a delete.
+# of randomness and is claimed by the `RENAME_NOREPLACE` rename itself, so one
+# attempt effectively always wins; the retry exists so a hostile pre-creation
+# loop cannot wedge a delete.
 _TRASH_ATTEMPTS = 8
 
 # How stale an abandoned `.transfer-tmp/.tmp-*` file must be before the
@@ -452,6 +463,161 @@ def discard_temp(dir_fd: int, name: str) -> bool:
     return _unlink_quietly(dir_fd, name, published=False)
 
 
+# ── non-replacing rename ────────────────────────────────────────────────────
+
+# `renameat2(2)`'s RENAME_NOREPLACE (`<linux/fs.h>`): fail with `EEXIST` rather
+# than replacing an existing destination. This is the one primitive that makes
+# a *move into a name we do not already own* safe, and Python's stdlib does not
+# expose it — `os.rename` always replaces.
+RENAME_NOREPLACE = 1
+
+# `syscall(2)` numbers, used only when glibc is too old (< 2.28) to export the
+# `renameat2` wrapper. An architecture that is not listed is treated as "no
+# renameat2" rather than guessed at: a wrong number calls a *different*
+# syscall, which is far worse than refusing.
+_SYS_RENAMEAT2 = {
+    "x86_64": 316,
+    "aarch64": 38,
+    "armv7l": 382,
+    "armv8l": 382,
+    "i686": 353,
+    "i386": 353,
+    "ppc64le": 357,
+    "s390x": 347,
+}
+
+_renameat2_cache: tuple | None = None
+
+
+def _resolve_renameat2():
+    """Find a callable `renameat2`, or `None` if this platform has none.
+
+    Preferred: the glibc wrapper (present since 2.28; the deployment image is
+    Debian bookworm's python:3.12-slim, glibc 2.36). Fallback: the raw syscall,
+    for the pre-2.28 case only.
+    """
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:  # pragma: no cover - no libc to bind against
+        return None
+    try:
+        fn = libc.renameat2
+    except AttributeError:  # pragma: no cover - glibc < 2.28
+        pass
+    else:
+        fn.argtypes = [
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_int,
+            ctypes.c_char_p,
+            ctypes.c_uint,
+        ]
+        fn.restype = ctypes.c_int
+        return fn
+
+    number = _SYS_RENAMEAT2.get(platform.machine())  # pragma: no cover
+    if number is None:  # pragma: no cover
+        return None
+    raw = libc.syscall  # pragma: no cover
+    raw.restype = ctypes.c_long  # pragma: no cover
+
+    def _via_syscall(src_dir_fd, src, dst_dir_fd, dst, flags):  # pragma: no cover
+        return raw(
+            ctypes.c_long(number),
+            ctypes.c_int(src_dir_fd),
+            ctypes.c_char_p(src),
+            ctypes.c_int(dst_dir_fd),
+            ctypes.c_char_p(dst),
+            ctypes.c_uint(flags),
+        )
+
+    return _via_syscall  # pragma: no cover
+
+
+def _renameat2_fn():
+    """Cached `_resolve_renameat2`; the lookup is per-process, not per-call."""
+    global _renameat2_cache
+    if _renameat2_cache is None:
+        _renameat2_cache = (_resolve_renameat2(),)
+    return _renameat2_cache[0]
+
+
+def _renameat2_raw(
+    src_dir_fd: int, src_name: str, dst_dir_fd: int, dst_name: str, flags: int
+) -> int:
+    """Call `renameat2`; return 0 on success or the `errno` it failed with.
+
+    Deliberately the *only* place the syscall is touched, and deliberately
+    returns an errno rather than raising: everything above it is errno mapping,
+    which is the part worth testing, and a test can drive every branch by
+    monkeypatching this one function instead of hunting for an exotic mount.
+    """
+    fn = _renameat2_fn()
+    if fn is None:  # pragma: no cover - modern Linux always has it
+        return errno.ENOSYS
+    ctypes.set_errno(0)
+    rc = fn(
+        src_dir_fd,
+        os.fsencode(src_name),
+        dst_dir_fd,
+        os.fsencode(dst_name),
+        flags,
+    )
+    if rc == 0:
+        return 0
+    return ctypes.get_errno() or errno.EIO
+
+
+def rename_noreplace(
+    src_dir_fd: int, src_name: str, dst_dir_fd: int, dst_name: str
+) -> None:
+    """Move `src_name` to `dst_name`, **never** replacing what is already there.
+
+    One syscall, and the kernel makes it atomic against both endpoints:
+
+    * the destination is created or the call fails `EEXIST` — nothing at
+      `dst_name` can be clobbered, whoever put it there and whenever;
+    * whatever inode currently sits at `src_name` is what moves, so a file that
+      replaced the source a microsecond ago is relocated intact rather than
+      lost.
+
+    That pair is why the soft delete needs no placeholder to reserve its
+    destination. Reserving a name with `O_EXCL` and then `os.rename`-ing onto
+    it looks equivalent and is not: `rename` replaces, so between the
+    reservation and the rename anything may take that pathname over and be
+    silently destroyed — and the error path would then unlink *that* file while
+    cleaning up "its own" placeholder. There is nothing to reserve and nothing
+    to clean up here.
+
+    Raises `FileExistsError` (EEXIST — the caller retries with another name),
+    `FileNotFoundError` (ENOENT), `UnsupportedFilesystem` (EINVAL/ENOSYS/
+    EOPNOTSUPP/EXDEV — the kernel or filesystem cannot do a non-replacing
+    rename here), `UnsafePath` (EISDIR/ENOTDIR — the two names are not the same
+    kind of object), and plain `OSError` for anything else.
+    """
+    code = _renameat2_raw(
+        src_dir_fd, src_name, dst_dir_fd, dst_name, RENAME_NOREPLACE
+    )
+    if code == 0:
+        return
+    if code in (errno.EEXIST, errno.ENOTEMPTY):
+        raise FileExistsError(code, os.strerror(code), dst_name)
+    if code == errno.ENOENT:
+        raise FileNotFoundError(code, os.strerror(code), src_name)
+    if code in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.EXDEV):
+        raise UnsupportedFilesystem(
+            f"renameat2(RENAME_NOREPLACE) is not available for this rename "
+            f"({errno.errorcode.get(code, code)}); a non-replacing move is "
+            "required and there is no safe fallback"
+        )
+    if code in (errno.EISDIR, errno.ENOTDIR):
+        raise UnsafePath(
+            f"Refusing a rename between mismatched kinds: {src_name} → "
+            f"{dst_name} ({errno.errorcode.get(code, code)})"
+        )
+    raise OSError(code, os.strerror(code), src_name, None, dst_name)
+
+
 # ── deletion ────────────────────────────────────────────────────────────────
 
 
@@ -472,29 +638,31 @@ def remove(root_fd: int, rel_path: str | Path) -> None:
         os.close(dir_fd)
 
 
-def _reserve_trash_name(trash_fd: int, base: str) -> str:
-    """Claim an unused `<base>-<8 hex>` name in the trash with `O_EXCL`.
+def _rename_into_trash(
+    src_dir_fd: int, name: str, trash_fd: int, base: str
+) -> str:
+    """Move `name` into the trash under a fresh `<base>-<8 hex>`; return it.
 
-    The placeholder is a real (empty, 0600) file, not just a name we intend to
-    use: `rename` needs a destination it may replace, and one we created
-    ourselves under `O_EXCL` is provably not somebody else's data. The random
-    suffix is what makes two same-second, same-basename deletes land on
-    different names — a `-1`, `-2` counter would need a check-then-act loop to
-    find the free number, and this needs none.
+    The name is claimed *by the move itself* — `RENAME_NOREPLACE` either
+    creates it or fails `EEXIST` — so there is no reserved placeholder, no
+    window in which the destination pathname exists without our data in it,
+    and nothing to unlink if a later step fails.
+
+    The random suffix is what makes two same-second, same-basename deletes land
+    on different names; the retry is for the `EEXIST` case, which in practice
+    means somebody is pre-creating names to try to wedge the delete.
     """
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_COMMON
     last: OSError | None = None
     for _ in range(_TRASH_ATTEMPTS):
         candidate = f"{base}-{secrets.token_hex(4)}"
         try:
-            fd = os.open(candidate, flags, 0o600, dir_fd=trash_fd)
-        except FileExistsError as exc:  # pragma: no cover - 32-bit collision
+            rename_noreplace(src_dir_fd, name, trash_fd, candidate)
+        except FileExistsError as exc:
             last = exc
             continue
-        os.close(fd)
         return candidate
     raise Conflict(
-        f"Could not reserve a name in the trash for {base}"
+        f"Could not find a free name in the trash for {base}"
     ) from last
 
 
@@ -504,16 +672,20 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) 
     Returns the trash-relative path that was created:
     `<trash_dir>/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>`.
 
-    **The move is one `rename`, and nothing is ever unlinked.** A unique
-    destination name is first reserved in the trash with
-    `O_CREAT|O_EXCL|O_NOFOLLOW` — so it cannot be an existing entry and cannot
-    be a symlink — and the source is then `rename`d onto that placeholder. The
-    kernel makes that single step atomic, which is the whole point: the earlier
-    `link` + `unlink` pair could unlink a *different* inode than the one it had
-    copied, silently destroying a file that replaced the source in between.
-    There is no such window here. `rename` moves whatever inode currently sits
-    at the source name, so a concurrent replacement is moved to the trash
-    rather than lost, and no verification step is needed to make that safe.
+    **The move is one `renameat2(RENAME_NOREPLACE)`, and nothing is ever
+    unlinked or pre-created.** The kernel either creates the trash name or
+    fails `EEXIST`, and it moves whatever inode currently sits at the source.
+    Both halves matter and both are why the earlier shapes were wrong:
+
+    * `link` + `unlink` could unlink a *different* inode than the one it had
+      copied, silently destroying a file that replaced the source in between;
+    * `O_EXCL` placeholder + `os.rename` fixed that end but not the other —
+      `rename` **replaces**, so between reserving the placeholder and renaming
+      onto it a writer could take that trash pathname over and have it
+      destroyed, and the error path would unlink that writer's file while
+      tidying up "our" placeholder. With `RENAME_NOREPLACE` there is no
+      placeholder, no reservation window, and no cleanup to get wrong: a name
+      that is already taken costs one `EEXIST` and a fresh random suffix.
 
     The `lstat` refusal of symlinks and non-regular files still runs first, and
     is deliberately *not* re-checked: a symlink swapped in after the `lstat` is
@@ -522,8 +694,9 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) 
     the caller already asked to remove that name.
 
     `.trash` lives inside the vault root, so the rename is same-device by
-    construction; `EXDEV` means the trash is a separate mount and raises
-    `UnsupportedFilesystem` (`probe_trash` catches that up front).
+    construction; `EXDEV` (separate mount) and `EINVAL`/`ENOSYS` (a filesystem
+    or kernel without `RENAME_NOREPLACE`) raise `UnsupportedFilesystem`, which
+    `probe_trash` catches up front rather than at the first delete.
     """
     src_fd, name = _open_parent(root_fd, rel_path, create=False)
     trash_fd: int | None = None
@@ -535,28 +708,23 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) 
 
         trash_fd = open_dir_beneath(root_fd, trash_dir, create=True)
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        reserved = _reserve_trash_name(trash_fd, f"{stamp}-{name}")
         try:
-            os.rename(name, reserved, src_dir_fd=src_fd, dst_dir_fd=trash_fd)
+            created = _rename_into_trash(src_fd, name, trash_fd, f"{stamp}-{name}")
         except FileNotFoundError:
             # Somebody else removed the source between the `lstat` and here.
-            # Nothing was moved, so the placeholder must not be left behind
-            # pretending a copy exists.
-            _unlink_quietly(trash_fd, reserved, published=False)
+            # Nothing was created in the trash, so there is nothing to undo.
             raise FileNotFoundError(f"File not found: {rel_path}") from None
-        except OSError as exc:
-            _unlink_quietly(trash_fd, reserved, published=False)
-            if exc.errno == errno.EXDEV:
-                raise UnsupportedFilesystem(
-                    f"{trash_dir}/ is on a different filesystem than the vault "
-                    "root, so a soft delete cannot be atomic (see probe_trash)"
-                ) from exc
-            if exc.errno in (errno.EISDIR, errno.ENOTDIR):
-                # The name became a directory after the `lstat`. Never take a
-                # directory with us.
-                raise UnsafePath(f"Not a regular file: {rel_path}") from None
-            raise
-        return f"{trash_dir}/{reserved}"
+        except UnsupportedFilesystem as exc:
+            raise UnsupportedFilesystem(
+                f"{trash_dir}/ cannot receive a non-replacing rename from the "
+                f"vault ({exc}), so a soft delete cannot be atomic "
+                "(see probe_trash)"
+            ) from exc
+        except UnsafePath:
+            # The name became a directory after the `lstat`. Never take a
+            # directory with us.
+            raise UnsafePath(f"Not a regular file: {rel_path}") from None
+        return f"{trash_dir}/{created}"
     finally:
         os.close(src_fd)
         if trash_fd is not None:
@@ -633,21 +801,35 @@ def probe_trash(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
     all, so it has to be caught here rather than at the first delete.
 
     Note it probes `rename`, not `link`: `soft_delete` moves the file with one
-    `rename`, so a filesystem that refuses hard links but renames fine is
+    rename, so a filesystem that refuses hard links but renames fine is
     perfectly able to soft-delete and must not be refused.
+
+    It probes the **exact** primitive the delete uses —
+    `renameat2(RENAME_NOREPLACE)` via `_rename_into_trash`, not a plain
+    `os.rename`. A kernel or filesystem that renames happily but rejects the
+    `RENAME_NOREPLACE` flag (`EINVAL`/`ENOSYS`) would otherwise pass this probe
+    and fail every delete, which is precisely the failure mode the probe
+    exists to move to startup.
     """
     fd, tmp_name = create_temp(root_fd)
     os.close(fd)
     trash_fd: int | None = None
-    moved = False
+    created: str | None = None
     try:
         trash_fd = open_dir_beneath(root_fd, trash_dir, create=True)
-        probe_name = f"{tmp_name}-probe"
         try:
-            os.rename(tmp_name, probe_name, src_dir_fd=root_fd, dst_dir_fd=trash_fd)
-            moved = True
+            created = _rename_into_trash(
+                root_fd, tmp_name, trash_fd, f"{tmp_name}-probe"
+            )
+        except UnsupportedFilesystem as exc:
+            raise UnsupportedFilesystem(
+                f"The vault filesystem cannot move files into {trash_dir}/ "
+                f"with a non-replacing rename ({exc}). `delete_file`'s soft "
+                "delete relies on it and is disabled; pass permanent=True to "
+                "unlink instead."
+            ) from exc
         except OSError as exc:
-            if exc.errno in (errno.EXDEV, errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS):
+            if exc.errno in (errno.EPERM, errno.EACCES):
                 raise UnsupportedFilesystem(
                     f"The vault filesystem cannot move files into {trash_dir}/ "
                     f"({errno.errorcode.get(exc.errno, exc.errno)}). "
@@ -655,11 +837,11 @@ def probe_trash(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
                     "is disabled; pass permanent=True to unlink instead."
                 ) from exc
             raise
-        _unlink_quietly(trash_fd, probe_name, published=False)
+        _unlink_quietly(trash_fd, created, published=False)
     finally:
         if trash_fd is not None:
             os.close(trash_fd)
-        if not moved:
+        if created is None:
             _unlink_quietly(root_fd, tmp_name, published=False)
 
 

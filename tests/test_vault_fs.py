@@ -518,25 +518,25 @@ def test_soft_delete_moves_a_replacement_rather_than_destroying_it(
 
     `link` + `unlink` was two syscalls, and the second one removed whatever
     was at the name *then* — a writer landing in between had its file deleted
-    with no trash copy of it, a silent destructive delete. `rename` moves
+    with no trash copy of it, a silent destructive delete. A rename moves
     whichever inode is at the source when it runs, so the replacement lands in
     the trash intact and nothing is ever unlinked.
     """
     source = vault / "Attachments" / "a.png"
     source.write_bytes(b"original")
 
-    real_reserve = vault_fs._reserve_trash_name
+    real_rename = vault_fs.rename_noreplace
 
-    def racing_reserve(trash_fd, base):
-        reserved = real_reserve(trash_fd, base)
-        # The window: the destination is claimed, and someone now replaces the
-        # source name with a different inode.
+    def racing_rename(src_dir_fd, src_name, dst_dir_fd, dst_name):
+        # The window: someone replaces the source name with a different inode
+        # after the `lstat` said it was a plain file, and immediately before
+        # the move runs.
         replacement = vault / "Attachments" / "a.png.new"
         replacement.write_bytes(b"replacement")
         os.replace(replacement, source)
-        return reserved
+        return real_rename(src_dir_fd, src_name, dst_dir_fd, dst_name)
 
-    monkeypatch.setattr(vault_fs, "_reserve_trash_name", racing_reserve)
+    monkeypatch.setattr(vault_fs, "rename_noreplace", racing_rename)
     dest = soft_delete(root_fd, "Attachments/a.png")
     monkeypatch.undo()
 
@@ -554,21 +554,147 @@ def test_soft_delete_reports_a_source_that_vanished_before_the_move(
     source = vault / "Attachments" / "a.png"
     source.write_bytes(b"original")
 
-    real_reserve = vault_fs._reserve_trash_name
+    real_rename = vault_fs.rename_noreplace
 
-    def vanishing_reserve(trash_fd, base):
-        reserved = real_reserve(trash_fd, base)
+    def vanishing_rename(src_dir_fd, src_name, dst_dir_fd, dst_name):
         source.unlink()
-        return reserved
+        return real_rename(src_dir_fd, src_name, dst_dir_fd, dst_name)
 
-    monkeypatch.setattr(vault_fs, "_reserve_trash_name", vanishing_reserve)
+    monkeypatch.setattr(vault_fs, "rename_noreplace", vanishing_rename)
     with pytest.raises(FileNotFoundError):
         soft_delete(root_fd, "Attachments/a.png")
     monkeypatch.undo()
 
-    # The reserved placeholder is cleaned up: an empty file in `.trash` would
-    # claim a copy exists when none does.
+    # Nothing is left in the trash — and with no placeholder there is nothing
+    # that *could* be left: an empty file there would claim a copy exists when
+    # none does, and the old design had to remember to unlink it.
     assert list((vault / ".trash").iterdir()) == []
+
+
+def test_soft_delete_never_replaces_a_name_somebody_else_holds(
+    root_fd, vault, monkeypatch
+):
+    """The BLOCKER this primitive exists for.
+
+    The old shape reserved the trash name with `O_EXCL` and then `os.rename`d
+    onto it — and `rename` *replaces*. Anything that took that pathname over in
+    between was silently destroyed, and the error path would have unlinked it
+    too while tidying up "our" placeholder. `RENAME_NOREPLACE` cannot: the
+    kernel refuses `EEXIST` and the delete simply picks another suffix.
+    """
+    source = vault / "Attachments" / "a.png"
+    source.write_bytes(b"original")
+    trash = vault / ".trash"
+    trash.mkdir()
+    taken: list[str] = []
+
+    real_rename = vault_fs.rename_noreplace
+
+    def contended_rename(src_dir_fd, src_name, dst_dir_fd, dst_name):
+        if not taken:
+            taken.append(dst_name)
+            # A different writer gets to this exact name first.
+            (trash / dst_name).write_bytes(b"someone else's file")
+        return real_rename(src_dir_fd, src_name, dst_dir_fd, dst_name)
+
+    monkeypatch.setattr(vault_fs, "rename_noreplace", contended_rename)
+    dest = soft_delete(root_fd, "Attachments/a.png")
+    monkeypatch.undo()
+
+    created = dest.split("/", 1)[1]
+    assert created != taken[0], "the delete reused the contended name"
+    # Neither file was lost: the squatter's bytes are untouched and ours landed
+    # somewhere else.
+    assert (trash / taken[0]).read_bytes() == b"someone else's file"
+    assert (vault / dest).read_bytes() == b"original"
+    assert sorted(p.name for p in trash.iterdir()) == sorted([taken[0], created])
+
+
+def test_rename_noreplace_refuses_an_existing_destination(root_fd, vault):
+    """The primitive itself, with no `soft_delete` around it."""
+    (vault / "Attachments" / "a.png").write_bytes(b"source")
+    (vault / "Attachments" / "b.png").write_bytes(b"incumbent")
+    dir_fd = open_dir_beneath(root_fd, "Attachments")
+    try:
+        with pytest.raises(FileExistsError):
+            vault_fs.rename_noreplace(dir_fd, "a.png", dir_fd, "b.png")
+    finally:
+        os.close(dir_fd)
+    assert (vault / "Attachments" / "a.png").read_bytes() == b"source"
+    assert (vault / "Attachments" / "b.png").read_bytes() == b"incumbent"
+
+
+def test_rename_noreplace_moves_across_directories(root_fd, vault):
+    (vault / "Attachments" / "a.png").write_bytes(b"source")
+    (vault / "dest").mkdir()
+    src_fd = open_dir_beneath(root_fd, "Attachments")
+    dst_fd = open_dir_beneath(root_fd, "dest")
+    try:
+        vault_fs.rename_noreplace(src_fd, "a.png", dst_fd, "moved.png")
+    finally:
+        os.close(src_fd)
+        os.close(dst_fd)
+    assert not (vault / "Attachments" / "a.png").exists()
+    assert (vault / "dest" / "moved.png").read_bytes() == b"source"
+
+
+def test_renameat2_is_available_on_this_platform():
+    """A missing `renameat2` would disable every soft delete, loudly.
+
+    Asserted rather than skipped around: the deployment is Linux/x86_64 on
+    `python:3.12-slim` (glibc 2.36), where the wrapper has existed since 2.28.
+    If this ever fails, the answer is a real port, not a silent fallback to a
+    replacing rename.
+    """
+    assert vault_fs._renameat2_fn() is not None
+
+
+@pytest.mark.parametrize(
+    "code", [errno.EINVAL, errno.ENOSYS, errno.EXDEV, errno.EOPNOTSUPP]
+)
+def test_rename_noreplace_maps_unsupported_errnos(root_fd, vault, monkeypatch, code):
+    """A kernel or filesystem without RENAME_NOREPLACE is a refusal, not a fallback."""
+    monkeypatch.setattr(
+        vault_fs, "_renameat2_raw", lambda *a, **k: code
+    )
+    with pytest.raises(UnsupportedFilesystem):
+        vault_fs.rename_noreplace(root_fd, "a", root_fd, "b")
+
+
+@pytest.mark.parametrize("code", [errno.EISDIR, errno.ENOTDIR])
+def test_rename_noreplace_maps_kind_errnos(root_fd, monkeypatch, code):
+    monkeypatch.setattr(vault_fs, "_renameat2_raw", lambda *a, **k: code)
+    with pytest.raises(UnsafePath):
+        vault_fs.rename_noreplace(root_fd, "a", root_fd, "b")
+
+
+def test_rename_noreplace_propagates_unrelated_errnos(root_fd, monkeypatch):
+    monkeypatch.setattr(vault_fs, "_renameat2_raw", lambda *a, **k: errno.EIO)
+    with pytest.raises(OSError) as exc:
+        vault_fs.rename_noreplace(root_fd, "a", root_fd, "b")
+    assert not isinstance(exc.value, (UnsupportedFilesystem, UnsafePath))
+
+
+def test_rename_noreplace_without_the_syscall_is_unsupported(root_fd, monkeypatch):
+    """Symbol missing (glibc < 2.28 on an unlisted arch) → refuse, never replace."""
+    monkeypatch.setattr(vault_fs, "_renameat2_fn", lambda: None)
+    with pytest.raises(UnsupportedFilesystem):
+        vault_fs.rename_noreplace(root_fd, "a", root_fd, "b")
+
+
+def test_soft_delete_uses_a_no_replace_rename(root_fd, vault, monkeypatch):
+    (vault / "Attachments" / "a.png").write_bytes(b"bytes")
+    flags: list[int] = []
+    real_raw = vault_fs._renameat2_raw
+
+    def spy(src_dir_fd, src_name, dst_dir_fd, dst_name, flag):
+        flags.append(flag)
+        return real_raw(src_dir_fd, src_name, dst_dir_fd, dst_name, flag)
+
+    monkeypatch.setattr(vault_fs, "_renameat2_raw", spy)
+    soft_delete(root_fd, "Attachments/a.png")
+    monkeypatch.undo()
+    assert flags == [vault_fs.RENAME_NOREPLACE]
 
 
 def test_concurrent_soft_deletes_of_the_same_basename_get_distinct_names(
@@ -596,14 +722,17 @@ def test_soft_delete_missing_file(root_fd):
         soft_delete(root_fd, "Attachments/nope.png")
 
 
-def test_soft_delete_maps_a_cross_device_trash(root_fd, vault, monkeypatch):
-    """`.trash` on another mount cannot be reached by an atomic rename."""
+@pytest.mark.parametrize("code", [errno.EXDEV, errno.EINVAL, errno.ENOSYS])
+def test_soft_delete_maps_an_unusable_trash(root_fd, vault, monkeypatch, code):
+    """`.trash` on another mount, or a filesystem without RENAME_NOREPLACE.
+
+    Both refuse the delete outright. Neither may degrade to a replacing
+    `os.rename`, which is exactly what would make the trash name clobberable
+    again.
+    """
     (vault / "Attachments" / "a.png").write_bytes(b"bytes")
 
-    def refuse(*args, **kwargs):
-        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
-
-    monkeypatch.setattr(vault_fs.os, "rename", refuse)
+    monkeypatch.setattr(vault_fs, "_renameat2_raw", lambda *a, **k: code)
     with pytest.raises(UnsupportedFilesystem):
         soft_delete(root_fd, "Attachments/a.png")
     monkeypatch.undo()
@@ -676,21 +805,39 @@ def test_probe_trash_passes_and_leaves_nothing(root_fd, vault):
     assert list((vault / ".trash").iterdir()) == []
 
 
-def test_probe_trash_catches_a_cross_device_trash(root_fd, vault, monkeypatch):
-    """A `.trash` on a separate mount cannot receive an atomic rename.
+@pytest.mark.parametrize("code", [errno.EXDEV, errno.EINVAL, errno.ENOSYS])
+def test_probe_trash_catches_an_unusable_trash(root_fd, vault, monkeypatch, code):
+    """A `.trash` on a separate mount, or one that cannot do RENAME_NOREPLACE.
 
     That combination is the dangerous one: `publish` keeps working, so nothing
     looks wrong until the first `delete_file` cannot move anything into the
     trash — and a naive implementation would have unlinked the original by then.
+    `EINVAL`/`ENOSYS` are here because the probe must exercise the *flag*: a
+    filesystem that renames fine but rejects `RENAME_NOREPLACE` would otherwise
+    pass and then fail every single delete.
     """
-    def refuse(*args, **kwargs):
-        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
-
-    monkeypatch.setattr(vault_fs.os, "rename", refuse)
+    monkeypatch.setattr(vault_fs, "_renameat2_raw", lambda *a, **k: code)
     with pytest.raises(UnsupportedFilesystem, match=r"\.trash"):
         probe_trash(root_fd)
     monkeypatch.undo()
     assert _temps(vault) == []
+
+
+def test_probe_trash_uses_a_no_replace_rename(root_fd, vault, monkeypatch):
+    """The probe must exercise the same primitive the delete does."""
+    flags: list[int] = []
+    real_raw = vault_fs._renameat2_raw
+
+    def spy(src_dir_fd, src_name, dst_dir_fd, dst_name, flag):
+        flags.append(flag)
+        return real_raw(src_dir_fd, src_name, dst_dir_fd, dst_name, flag)
+
+    monkeypatch.setattr(vault_fs, "_renameat2_raw", spy)
+    probe_trash(root_fd)
+    monkeypatch.undo()
+    assert flags == [vault_fs.RENAME_NOREPLACE]
+    assert _temps(vault) == []
+    assert list((vault / ".trash").iterdir()) == []
 
 
 def test_probe_trash_tolerates_a_filesystem_without_hard_links(

@@ -415,6 +415,126 @@ async def test_a_commit_failure_after_publication_is_its_own_error(vault):
     assert temps_under(vault) == []
 
 
+def arm_close_faults(monkeypatch, *, limit: int = 3) -> dict:
+    """Make the first `limit` `os.close` calls *after* publication fail.
+
+    Three descriptors are closed once the bytes are in place — the destination
+    parent, the staging directory, and the vault root — and none of them is
+    load-bearing: the file is already at its path. The question this asks is
+    whether any of those closes can still convince the caller that nothing was
+    published, which is the failure that makes an upload token replayable over
+    a written path and makes an import report a write it actually performed as
+    a failure.
+
+    Patching `os.close` wholesale is deliberate: the test should not have to
+    know which fd is which, and arming only after `publish` returns plus a hard
+    cap of `limit` failures keeps the window to exactly those three calls. The
+    descriptor is really closed before the error is raised, so nothing leaks.
+    """
+    import errno as _errno
+
+    state = {"armed": False, "failures": 0}
+    real_close = os.close
+    real_publish = vault_fs.publish
+
+    def arming_publish(*args, **kwargs):
+        outcome = real_publish(*args, **kwargs)
+        if outcome.published:
+            state["armed"] = True
+        return outcome
+
+    def faulty_close(fd):
+        if state["armed"] and state["failures"] < limit:
+            state["failures"] += 1
+            real_close(fd)
+            raise OSError(_errno.EIO, "Input/output error")
+        return real_close(fd)
+
+    monkeypatch.setattr(vault_fs, "publish", arming_publish)
+    monkeypatch.setattr(os, "close", faulty_close)
+    return state
+
+
+async def test_a_failing_close_after_publication_does_not_hide_the_publish(
+    vault, monkeypatch
+):
+    """MAJOR regression: publication is recorded before any cleanup runs.
+
+    `_publish_into_current_parent` used to close the destination descriptor in
+    a `finally` *before* its return value reached the caller, so an `EIO` there
+    discarded the `Published` outcome and surfaced as a bare `OSError` — which
+    the upload route reads as "demonstrably pre-publication" and answers by
+    releasing the claim, over a path that already holds the file.
+    """
+    target = vault / "Attachments" / "a.bin"
+    gate = RecordingGate(allow=True, target=target)
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    state = arm_close_faults(monkeypatch)
+
+    result = await stream_to_vault(
+        row,
+        chunks_of(b"payload"),
+        max_bytes=100,
+        deadline=deadline_in(30),
+        before_publish=gate,
+    )
+    monkeypatch.undo()
+
+    assert state["failures"] == 3, "the injected close failures never fired"
+    # The call succeeded, the completion was recorded as published, and the
+    # file is where the token said it would be.
+    assert result["size"] == len(b"payload")
+    assert gate.completions == [(result, True)]
+    assert target.read_bytes() == b"payload"
+    assert temps_under(vault) == []
+
+
+async def test_a_failing_close_after_publication_never_raises_a_bare_oserror(
+    vault, monkeypatch
+):
+    """Even when the *gate* also fails, the error names the publication.
+
+    The contract the upload route leans on is that `PostPublishFailure` is the
+    only exception raised once the bytes are in place. A close failure stacked
+    on a commit failure must not downgrade it to a generic `OSError`.
+    """
+    target = vault / "Attachments" / "a.bin"
+    gate = RecordingGate(allow=True, target=target, fail_on_exit=True)
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    arm_close_faults(monkeypatch)
+
+    with pytest.raises(transfer.PostPublishFailure):
+        await stream_to_vault(
+            row,
+            chunks_of(b"payload"),
+            max_bytes=100,
+            deadline=deadline_in(30),
+            before_publish=gate,
+        )
+    monkeypatch.undo()
+    assert target.read_bytes() == b"payload"
+
+
+async def test_a_failing_close_after_a_gateless_publish_still_succeeds(
+    vault, monkeypatch
+):
+    """The no-gate path (a direct `stream_to_vault`) gets the same treatment."""
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    arm_close_faults(monkeypatch)
+
+    result = await stream_to_vault(
+        row,
+        chunks_of(b"payload"),
+        max_bytes=100,
+        deadline=deadline_in(30),
+    )
+    monkeypatch.undo()
+
+    assert result["size"] == len(b"payload")
+    assert (vault / "Attachments" / "a.bin").read_bytes() == b"payload"
+    assert temps_under(vault) == []
+
+
 async def test_gate_refusal_publishes_nothing(vault):
     gate = RecordingGate(allow=False)
     row = FakeRow(str(vault), "Attachments/a.bin")
