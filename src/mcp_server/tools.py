@@ -746,6 +746,39 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
     return "\n".join(lines)
 
 
+def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int | None,
+                      limit: int):
+    """The vector statement `find_related` runs, and its overfetch.
+
+    Factored out of `find_related_impl` so the recall benchmark in
+    `tests/integration/test_search_recall.py` can EXPLAIN and re-run *this*
+    statement rather than a hand-copied lookalike — a benchmark that measures a
+    query production does not issue measures nothing.
+    """
+    from sqlalchemy import select
+    from src.models.db import NoteEmbedding, NoteMetadata
+
+    # Pull more than `limit` so we can dedupe by note. Same overfetch as
+    # semantic_search so both vector paths share one recall contract.
+    overfetch = max(limit * 5, 50)
+    distance = NoteEmbedding.embedding.cosine_distance(avg_embedding)
+    stmt = (
+        select(
+            NoteEmbedding.note_id,
+            NoteEmbedding.chunk_text,
+            NoteMetadata.file_path,
+            NoteMetadata.title,
+            NoteMetadata.tags,
+            distance.label("distance"),
+        )
+        .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
+        .where(NoteEmbedding.note_id != source_id)
+    )
+    if user_id is not None:
+        stmt = stmt.where(NoteMetadata.user_id == user_id)
+    return stmt.order_by(distance).limit(overfetch)
+
+
 @_tracked("find_related", ["path", "limit"])
 async def find_related_impl(path: str, limit: int = 10) -> str:
     """Semantic neighbors via averaged chunk embeddings."""
@@ -779,8 +812,12 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
                 "the indexer is still catching up. Try again in a few minutes."
             )
 
-        avg = np.mean([np.asarray(c, dtype=float) for c in chunks], axis=0)
-        avg_list = avg.tolist()
+        # The query vector: the mean of this note's own chunk vectors. NumPy is
+        # still the right tool here (pgvector returns plain lists); what moved
+        # to the database is the *scoring*, below.
+        avg_list = np.mean(
+            [np.asarray(c, dtype=float) for c in chunks], axis=0
+        ).tolist()
 
         vector_start = time.monotonic()
         # Same HNSW tuning as semantic_search — see embeddings.py for the
@@ -792,26 +829,7 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         await session.execute(text("SET LOCAL random_page_cost = 1.1"))
         await session.execute(text("SET LOCAL hnsw.iterative_scan = 'relaxed_order'"))
 
-        # Pull more than `limit` so we can dedupe by note. Same overfetch as
-        # semantic_search so both vector paths share one recall contract.
-        overfetch = max(limit * 5, 50)
-        distance = NoteEmbedding.embedding.cosine_distance(avg_list)
-        stmt = (
-            select(
-                NoteEmbedding.note_id,
-                NoteEmbedding.chunk_text,
-                NoteEmbedding.embedding,
-                NoteMetadata.file_path,
-                NoteMetadata.title,
-                NoteMetadata.tags,
-                distance.label("distance"),
-            )
-            .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
-            .where(NoteEmbedding.note_id != source.id)
-        )
-        if uid is not None:
-            stmt = stmt.where(NoteMetadata.user_id == uid)
-        stmt = stmt.order_by(distance).limit(overfetch)
+        stmt = find_related_stmt(source.id, avg_list, uid, limit)
         rows = (await session.execute(stmt)).all()
 
         # Zero-row exact fallback, as in semantic_search: an empty result from
@@ -819,6 +837,11 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         # statement as an exact sequential scan before believing it.
         exact_fallback = False
         if not rows:
+            # Transaction-scoped, like every other SET LOCAL here: it applies
+            # to the re-run below and dies with this transaction. The session
+            # closes immediately after the re-sort, so nothing else in this
+            # call can inherit the exact plan — do not append further
+            # statements to this block without re-reading that.
             await session.execute(text("SET LOCAL enable_indexscan = off"))
             rows = (await session.execute(stmt)).all()
             exact_fallback = True
@@ -832,29 +855,33 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
     if not rows:
         return f"No related notes for `{path}`"
 
-    # Dedupe by note_id, keeping the highest-similarity chunk.
-    avg_norm = float(np.linalg.norm(avg)) or 1.0
+    # Dedupe by note_id, keeping the nearest chunk — ranked by the *same*
+    # cosine distance the database ordered by, never by a distance recomputed
+    # here. pgvector compares float32 vectors; NumPy would recompute in
+    # float64 from the round-tripped values and order near-ties differently,
+    # so a recomputed ranking could invert two rows relative to the ORDER BY
+    # that selected them (and relative to the recall baseline). `similarity`
+    # is the cosine similarity that distance encodes: `1 - distance`.
     best: dict[int, dict] = {}
     for r in rows:
-        emb = np.asarray(r.embedding, dtype=float)
-        sim = float(np.dot(emb, avg) / ((np.linalg.norm(emb) or 1.0) * avg_norm))
+        dist = float(r.distance)
         prev = best.get(r.note_id)
-        if prev is None or sim > prev["similarity"]:
+        if prev is None or dist < prev["distance"]:
             best[r.note_id] = {
                 "path": r.file_path,
                 "title": r.title,
                 "tags": r.tags,
-                "similarity": sim,
+                "distance": dist,
                 "chunk": r.chunk_text,
             }
 
-    ranked = sorted(best.values(), key=lambda x: x["similarity"], reverse=True)[:limit]
+    ranked = sorted(best.values(), key=lambda x: x["distance"])[:limit]
     lines = [f"Top {len(ranked)} related notes for `{path}`:\n"]
     for r in ranked:
         tags_str = f" [{', '.join(r['tags'])}]" if r["tags"] else ""
         snippet = r["chunk"].replace("\n", " ")[:200]
         lines.append(
-            f"- **{r['title']}** (`{r['path']}`){tags_str} — sim: {r['similarity']:.3f}"
+            f"- **{r['title']}** (`{r['path']}`){tags_str} — sim: {1 - r['distance']:.3f}"
         )
         lines.append(f"  > {snippet}…")
     return "\n".join(lines)

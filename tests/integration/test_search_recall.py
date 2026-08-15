@@ -30,7 +30,15 @@ So the module asserts, in order:
   4. distances come back monotone,
   5. a filtered query that returns nothing is re-run as an exact scan and
      records `exact_fallback` (see that test for why the *recovery* half of
-     the fallback is asserted offline instead).
+     the fallback is asserted offline instead),
+  6. the same for `find_related` — the *production* tool, scored against an
+     exact baseline built from the statement the tool itself issues.
+
+Every assertion here runs against production code paths. A test that issued
+`SET LOCAL hnsw.iterative_scan` itself and then observed its own setting would
+prove only that Postgres remembers what it was told; the settings the services
+issue are pinned offline in `tests/test_vector_iterative_scan.py`, and their
+*effect* is what this module measures.
 
 Recall is a benchmark SLO, not a per-query guarantee: HNSW is approximate and
 ANN results move between index builds, which is exactly why (3) repeats across
@@ -77,6 +85,23 @@ A_NOTES_PER_QUERY = 300
 B_NOTES = 1500
 CHUNKS_PER_B_NOTE = 2
 
+# `find_related` takes no query vector: it averages a source note's own chunks.
+# Each hub therefore gets a *ladder* of neighbours at deliberately separated
+# cosines, so "the ten nearest notes" is a fact about the corpus rather than a
+# coin flip. Without it the benchmark is unrunnable in the honest sense: every
+# `B/` note is a uniform-random direction, the ten nearest sit inside a band
+#0.006 wide, and which ten an approximate scan returns is noise — measured at
+# 0.8–1.0 recall across index rebuilds of the *same* corpus. Real embeddings
+# are not uniform in 1,024 dimensions; a note's genuine neighbours stand out.
+# 0.03 between rungs is ~5× the width of that noise band.
+FIND_RELATED_HUBS = 3
+SATELLITES_PER_HUB = 15
+SATELLITE_TOP_COSINE = 0.95
+SATELLITE_COSINE_STEP = 0.03
+# Tight enough that a note's own chunks are nearer to each other than the gap
+# between rungs, so per-note dedupe cannot reorder the ladder.
+CHUNK_JITTER = 0.001
+
 EF_SEARCH = 80
 HNSW_INDEX = "ix_note_embeddings_embedding_hnsw"
 
@@ -93,6 +118,22 @@ def _random_unit(rng: random.Random) -> list[float]:
 
 def _near(rng: random.Random, base: list[float], jitter: float) -> list[float]:
     return _normalize([b + rng.gauss(0.0, jitter) for b in base])
+
+
+def _at_cosine(rng: random.Random, base: list[float], cosine: float) -> list[float]:
+    """A unit vector at *exactly* `cosine` from `base`.
+
+    `_near` cannot do this: at 1,024 dimensions a per-component jitter of any
+    useful size has a norm of `jitter × 32`, which swamps the unit base — two
+    vectors built with `_near(base, 0.3)` are, in practice, independent random
+    directions. Rotating `base` towards a random orthogonal direction places a
+    vector at a distance we choose instead of one the dimensionality chooses.
+    """
+    orthogonal = _random_unit(rng)
+    dot = sum(a * b for a, b in zip(orthogonal, base))
+    orthogonal = _normalize([a - dot * b for a, b in zip(orthogonal, base)])
+    sine = math.sqrt(max(0.0, 1.0 - cosine * cosine))
+    return _normalize([cosine * b + sine * o for b, o in zip(base, orthogonal)])
 
 
 async def _build_hnsw_index(session) -> None:
@@ -137,9 +178,10 @@ async def corpus(sessionmaker, queries):
     """Deterministic corpus, inserted in a fixed order.
 
     `A/` notes cluster tightly around each query vector so they own the
-    `ef_search` window; `B/`, the tag/frontmatter variants, and the second
-    user's notes sit further out, which is precisely the shape that makes a
-    non-iterative filtered scan come back empty.
+    `ef_search` window; `B/` sits further out, which is precisely the shape
+    that makes a non-iterative filtered scan come back empty. `alice` owns the
+    `A/` crowd and `bob` owns all of `B/`, so the user scope selects the same
+    set as the folder/tag/frontmatter filters and lands on the same plan.
     """
     rng = random.Random(SEED + 1)
 
@@ -180,12 +222,25 @@ async def corpus(sessionmaker, queries):
                 pending.append((
                     f"A/q{qi}-{i:04d}.md",
                     [_near(rng, queries[qi], 0.05)],
-                    {"tags": ["draft"], "frontmatter": {"status": "done"}},
+                    {
+                        "tags": ["draft"],
+                        "frontmatter": {"status": "done"},
+                        "user_id": users["alice"],
+                    },
                 ))
         # B/: the filtered target. Random directions, so far from every query
         # vector. Two chunks each, so per-note dedupe is exercised on the path
-        # under test. Every filter shape selects exactly this set; half of it
-        # additionally belongs to the second user.
+        # under test. Every filter shape selects exactly this set — including
+        # the user scope, which is why the crowd belongs to `alice` and all of
+        # `B/` to `bob` rather than the two being interleaved.
+        #
+        # That split is load-bearing for the *plan*, not just for tidiness. A
+        # user scope matching a quarter of the corpus (the earlier shape: bob
+        # owned every second `B/` note, `A/` belonged to nobody) makes the
+        # planner estimate a small enough join to prefer a seq scan + sort over
+        # the nested-loop-over-HNSW — measured, not guessed. The user-scope
+        # recall case then scored an exact plan and passed for free, which is
+        # the same trap the `B/`-is-half-the-corpus sizing above avoids.
         for i in range(B_NOTES):
             base = _random_unit(rng)
             pending.append((
@@ -194,9 +249,37 @@ async def corpus(sessionmaker, queries):
                 {
                     "tags": ["reference", f"b{i % 3}"],
                     "frontmatter": {"status": "open"},
-                    "user_id": users["bob"] if i % 2 == 0 else None,
+                    "user_id": users["bob"],
                 },
             ))
+        # `B/hub-*` and their satellites: the `find_related` benchmark's
+        # subject. Same folder, tags, frontmatter and owner as the rest of
+        # `B/`, so every filter shape still selects one set — only their
+        # *geometry* is different, and only relative to their own hub.
+        for h in range(FIND_RELATED_HUBS):
+            base = _random_unit(rng)
+            pending.append((
+                f"B/hub-{h}.md",
+                [_near(rng, base, CHUNK_JITTER) for _ in range(CHUNKS_PER_B_NOTE)],
+                {
+                    "tags": ["reference", f"b{h % 3}"],
+                    "frontmatter": {"status": "open"},
+                    "user_id": users["bob"],
+                },
+            ))
+            for s in range(SATELLITES_PER_HUB):
+                rung = _at_cosine(
+                    rng, base, SATELLITE_TOP_COSINE - SATELLITE_COSINE_STEP * s
+                )
+                pending.append((
+                    f"B/hub-{h}-sat-{s:02d}.md",
+                    [_near(rng, rung, CHUNK_JITTER) for _ in range(CHUNKS_PER_B_NOTE)],
+                    {
+                        "tags": ["reference", f"b{s % 3}"],
+                        "frontmatter": {"status": "open"},
+                        "user_id": users["bob"],
+                    },
+                ))
         # `D/`: one note with metadata but no embedded chunks — the indexer
         # produces these for empty or fully-code-fenced notes. It is the one
         # shape that makes a filtered vector query return zero rows on *every*
@@ -312,12 +395,7 @@ async def _explain(sessionmaker, vec, limit=10, *, mode, **filters):
     overfetch = max(limit * 5, 50)
     async with sessionmaker() as session:
         await _apply_mode(session, mode)
-        stmt = _build_stmt(vec, overfetch, **filters)
-        compiled = stmt.compile(
-            dialect=session.bind.dialect, compile_kwargs={"literal_binds": True}
-        )
-        rows = (await session.execute(text(f"EXPLAIN {compiled}"))).fetchall()
-    return "\n".join(r[0] for r in rows)
+        return await _harness.explain(session, _build_stmt(vec, overfetch, **filters))
 
 
 def _recall(returned, baseline) -> float:
@@ -349,9 +427,23 @@ FILTER_CASES = {
 
 # ── 1. the fixture is exercising the index at all ───────────────────────────
 async def test_filtered_query_uses_the_hnsw_index(sessionmaker, corpus, queries):
-    """Without this, every assertion below passes vacuously on a seq scan."""
-    plan = await _explain(sessionmaker, queries[0], mode="iterative", folder="B/")
-    assert HNSW_INDEX in plan, plan
+    """Without this, every assertion below passes vacuously on a seq scan.
+
+    Asserted for *every* filter shape the recall SLO covers, not just one.
+    The shapes do not share a plan: they differ in what the planner thinks
+    they select, and a shape that lands on seq scan + sort answers exactly
+    (recall 1.0 by construction) while proving nothing about the approximate
+    plan production runs. One shape did exactly that before this test was
+    widened.
+    """
+    cases = dict(FILTER_CASES)
+    cases["user_scope"] = {"user_id": corpus["bob"]}
+    missing = []
+    for case, filters in sorted(cases.items()):
+        plan = await _explain(sessionmaker, queries[0], mode="iterative", **filters)
+        if HNSW_INDEX not in plan:
+            missing.append(f"[{case}]\n{plan}")
+    assert not missing, "\n\n".join(missing)
 
 
 async def test_exact_baseline_does_not_use_the_hnsw_index(sessionmaker, corpus, queries):
@@ -508,35 +600,177 @@ async def test_unfiltered_search_does_not_pay_for_a_fallback(
 
 
 # ── 6. find_related ─────────────────────────────────────────────────────────
-async def test_find_related_returns_neighbours_under_scope(
-    sessionmaker, corpus
-):
-    """`find_related`'s query is always filtered (`note_id != source`, plus the
-    user scope), so it is exposed to the same post-filter candidate loss."""
-    out = await tools.find_related_impl("B/note-0000.md", limit=10)
-    assert "No related notes" not in out, out
-    assert "has not been embedded yet" not in out, out
-    # Similarity is printed descending; the dedupe keeps one row per note.
-    sims = [
-        float(line.rsplit("sim: ", 1)[1])
-        for line in out.splitlines()
-        if "sim: " in line
-    ]
-    assert sims == sorted(sims, reverse=True), sims
-    assert len(sims) == len(set(
-        line for line in out.splitlines() if line.startswith("- **")
-    ))
+# `find_related` gets the same treatment as `semantic_search`: the *production*
+# entry point is called, and its output is scored against an exact baseline
+# taken at the same overfetch with the same dedupe. It is the harder of the two
+# to fake convincingly — it embeds nothing, so there is no query vector to hand
+# it; the vector is the mean of the source note's own chunks, computed inside
+# the tool. The baseline below therefore reconstructs that mean the same way
+# and re-runs `tools.find_related_stmt`, the statement the tool itself issues.
+FIND_RELATED_SOURCES = [f"B/hub-{h}.md" for h in range(FIND_RELATED_HUBS)]
+FIND_RELATED_LIMIT = 10
 
 
-async def test_find_related_issues_the_iterative_scan_setting(sessionmaker, corpus):
-    """A fresh pooled connection must carry the setting for its transaction —
-    the guard against an older backend accepting it as a placeholder GUC."""
+async def _find_related_query_vector(sessionmaker, path: str, user_id: int):
+    """`(source_id, mean chunk vector)` — exactly what the tool computes.
+
+    `find_related_impl` averages the source note's chunk embeddings with
+    `numpy.mean` and passes `.tolist()` to pgvector; anything else here would
+    make the baseline answer a different question from the tool.
+    """
+    import numpy as np
+
     async with sessionmaker() as session:
+        source = (await session.execute(
+            select(NoteMetadata).where(
+                NoteMetadata.file_path == path, NoteMetadata.user_id == user_id
+            )
+        )).scalar_one()
+        chunks = (await session.execute(
+            select(NoteEmbedding.embedding).where(
+                NoteEmbedding.note_id == source.id
+            )
+        )).scalars().all()
+    assert chunks, path
+    avg = np.mean([np.asarray(c, dtype=float) for c in chunks], axis=0)
+    return source.id, avg.tolist()
+
+
+async def _find_related_baseline(sessionmaker, source_id, avg, user_id):
+    """The exact filtered sequential answer, same statement, same dedupe.
+
+    Its own session — `SET LOCAL enable_indexscan = off` is transaction-scoped,
+    and sharing a transaction with the measured run would make both sides the
+    same plan and the comparison vacuous.
+    """
+    async with sessionmaker() as session:
+        await session.execute(text("SET LOCAL enable_indexscan = off"))
+        await session.execute(text("SET LOCAL enable_bitmapscan = off"))
+        stmt = tools.find_related_stmt(source_id, avg, user_id, FIND_RELATED_LIMIT)
+        rows = (await session.execute(stmt)).all()
+
+    seen, out = set(), []
+    for r in sorted(rows, key=lambda r: r.distance):
+        if r.note_id in seen:
+            continue
+        seen.add(r.note_id)
+        out.append((r.file_path, float(r.distance)))
+        if len(out) >= FIND_RELATED_LIMIT:
+            break
+    return out
+
+
+def _parse_find_related(out: str) -> list[tuple[str, float]]:
+    """`(path, distance)` per result line, from the tool's rendered output.
+
+    The tool prints `sim: 1 - distance`, so the distance is recovered exactly
+    at the printed precision — which is all the recall comparison needs, since
+    ties are already counted as equivalent within 1e-9... except that rounding
+    to three decimals is coarser than that. Distances are therefore compared
+    with the printed tolerance in `_recall_printed` below.
+    """
+    results = []
+    for line in out.splitlines():
+        if not line.startswith("- **") or "sim: " not in line:
+            continue
+        path = line.split("(`", 1)[1].split("`)", 1)[0]
+        results.append((path, 1.0 - float(line.rsplit("sim: ", 1)[1])))
+    return results
+
+
+def _recall_printed(returned, baseline) -> float:
+    """`_recall`, with the tolerance the tool's 3-decimal output allows."""
+    if not baseline:
+        return 1.0
+    returned_paths = {p for p, _ in returned}
+    returned_dists = [d for _, d in returned]
+    covered = 0
+    for path, dist in baseline:
+        if path in returned_paths or any(
+            abs(dist - rd) < 1e-3 for rd in returned_dists
+        ):
+            covered += 1
+    return covered / len(baseline)
+
+
+@pytest.mark.parametrize("rebuild", [0, 1, 2], indirect=True)
+async def test_find_related_recall_meets_the_baseline(sessionmaker, corpus, rebuild):
+    """The production tool, scored against an exact baseline, per rebuild.
+
+    `find_related`'s query is always filtered (`note_id != source`, plus the
+    user scope), so it is exposed to exactly the post-filter candidate loss
+    that made folder-filtered `semantic_search` come back empty.
+    """
+    uid = corpus["bob"]
+    async with sessionmaker() as session:
+        owned = set((await session.execute(
+            select(NoteMetadata.file_path).where(NoteMetadata.user_id == uid)
+        )).scalars().all())
+
+    token = tools.current_user_id.set(uid)
+    try:
+        failures = []
+        for path in FIND_RELATED_SOURCES:
+            source_id, avg = await _find_related_query_vector(sessionmaker, path, uid)
+            baseline = await _find_related_baseline(sessionmaker, source_id, avg, uid)
+            # Fixture integrity: the exact answer must be this hub's ladder, in
+            # rung order. If the surrounding corpus ever crowds into it, the
+            # ten nearest become a near-tie lottery again and the recall number
+            # below stops meaning anything — it would drift with the index
+            # build rather than with the code.
+            stem = path.removesuffix(".md")
+            assert [p for p, _ in baseline] == [
+                f"{stem}-sat-{s:02d}.md" for s in range(FIND_RELATED_LIMIT)
+            ], baseline
+
+            out = await tools.find_related_impl(path, limit=FIND_RELATED_LIMIT)
+            assert "has not been embedded yet" not in out, out
+            got = _parse_find_related(out)
+
+            if not got:
+                failures.append(f"{path}: empty, baseline had {len(baseline)}")
+                continue
+            # Scope: a wrong-but-plausible neighbour from another user is the
+            # failure this filter exists to prevent, and it would not show up
+            # as a recall miss — the baseline is scoped too.
+            stray = {p for p, _ in got} - owned
+            assert not stray, f"{path} returned notes outside the user scope: {stray}"
+            assert path not in {p for p, _ in got}, f"{path} returned itself"
+            assert len({p for p, _ in got}) == len(got), got
+            dists = [d for _, d in got]
+            assert dists == sorted(dists), f"{path}: not monotone: {dists}"
+
+            recall = _recall_printed(got, baseline)
+            # Benchmark output — visible with `-s`, and the thing to look at
+            # first when this test starts arguing with you.
+            print(f"find_related recall rebuild={rebuild} {path}: {recall:.2f} "
+                  f"(returned {len(got)} of {len(baseline)}, "
+                  f"nearest {got[0][1]:.4f}, cutoff {got[-1][1]:.4f})")
+            if recall < 0.9:
+                failures.append(
+                    f"{path}: recall {recall:.2f} < 0.90 "
+                    f"(got {len(got)}, baseline {len(baseline)})"
+                )
+        assert not failures, f"rebuild {rebuild}:\n" + "\n".join(failures)
+    finally:
+        tools.current_user_id.reset(token)
+
+
+async def test_find_related_statement_uses_the_hnsw_index(sessionmaker, corpus):
+    """Without this the recall assertions above could be scoring a seq scan —
+    a plan production does not run, and one the bug cannot appear in."""
+    uid = corpus["bob"]
+    source_id, avg = await _find_related_query_vector(
+        sessionmaker, FIND_RELATED_SOURCES[0], uid
+    )
+    stmt = tools.find_related_stmt(source_id, avg, uid, FIND_RELATED_LIMIT)
+    async with sessionmaker() as session:
+        # The three settings `find_related_impl` issues, in its order.
+        await session.execute(text(f"SET LOCAL hnsw.ef_search = {EF_SEARCH}"))
+        await session.execute(text("SET LOCAL random_page_cost = 1.1"))
         await session.execute(text("SET LOCAL hnsw.iterative_scan = 'relaxed_order'"))
-        value = (
-            await session.execute(text("SHOW hnsw.iterative_scan"))
-        ).scalar_one()
-    assert value == "relaxed_order"
+        plan = await _harness.explain(session, stmt)
+    assert HNSW_INDEX in plan, plan
 
 
 async def test_pgvector_is_new_enough_for_iterative_scan(sessionmaker):

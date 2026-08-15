@@ -31,6 +31,8 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 import pytest
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.sql.expression import ClauseElement, Executable
 
 PGVECTOR_TEST_ADMIN_URL = os.environ.get("PGVECTOR_TEST_ADMIN_URL")
 
@@ -45,6 +47,36 @@ requires_pgvector = pytest.mark.skipif(
     not PGVECTOR_TEST_ADMIN_URL,
     reason="set PGVECTOR_TEST_ADMIN_URL to run pgvector integration tests",
 )
+
+
+class Explain(Executable, ClauseElement):
+    """`EXPLAIN <statement>`, with the statement's parameters bound normally.
+
+    The obvious alternative — compiling with `literal_binds` and interpolating
+    into `text("EXPLAIN …")` — cannot render every type the production
+    statements carry: a `frontmatter @> :jsonb` filter has no literal renderer
+    and raises `CompileError`. Silently skipping that shape would leave the one
+    filter whose plan nobody had ever looked at unasserted, which is the exact
+    failure mode these EXPLAIN assertions exist to prevent. Going through the
+    driver instead lets JSONB, `vector`, and arrays bind the way they do in
+    production.
+    """
+
+    inherit_cache = False
+
+    def __init__(self, statement):
+        self.statement = statement
+
+
+@compiles(Explain, "postgresql")
+def _compile_explain(element, compiler, **kw):  # pragma: no cover - via tests
+    return "EXPLAIN " + compiler.process(element.statement, **kw)
+
+
+async def explain(session, statement) -> str:
+    """The plan for `statement`, as one string, on `session`'s transaction."""
+    rows = (await session.execute(Explain(statement))).fetchall()
+    return "\n".join(row[0] for row in rows)
 
 
 def _with_database(url: str, dbname: str) -> str:

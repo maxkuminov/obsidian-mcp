@@ -789,6 +789,27 @@ def _probe_vector() -> list[float]:
     return [1.0] + [0.0] * (dim - 1)
 
 
+# The planner hint the search path uses. Named so the probe and the test that
+# EXPLAINs it cannot drift apart from each other.
+PROBE_PLANNER_SETTING = "SET LOCAL random_page_cost = 1.1"
+
+
+def probe_statement():
+    """The HNSW probe statement, exactly as `_prewarm_once` issues it.
+
+    Factored out so `tests/integration/test_prewarm_probe.py` can EXPLAIN the
+    statement production runs (under `PROBE_PLANNER_SETTING`) instead of a
+    hand-copied lookalike: the whole point of the probe is that it walks the
+    HNSW index, and only the plan of *this* statement can show that.
+    """
+    return (
+        select(literal(1))
+        .select_from(NoteEmbedding)
+        .order_by(NoteEmbedding.embedding.cosine_distance(_probe_vector()))
+        .limit(1)
+    )
+
+
 async def _prewarm_once() -> tuple[float | None, float | None]:
     """The body of the pre-warm. Returns `(embed_ms, probe_ms)`, either None
     when that half was skipped. Raises freely — the caller contains it."""
@@ -817,13 +838,8 @@ async def _prewarm_once() -> tuple[float | None, float | None]:
         # Same planner hint the search path uses, so the probe walks the index
         # and pulls the pages a real search would need — a seq scan here would
         # warm the heap instead, which is not what goes cold.
-        await session.execute(text("SET LOCAL random_page_cost = 1.1"))
-        stmt = (
-            select(literal(1))
-            .select_from(NoteEmbedding)
-            .order_by(NoteEmbedding.embedding.cosine_distance(_probe_vector()))
-            .limit(1)
-        )
+        await session.execute(text(PROBE_PLANNER_SETTING))
+        stmt = probe_statement()
         start = time.monotonic()
         await session.execute(stmt)
         probe_ms = (time.monotonic() - start) * 1000

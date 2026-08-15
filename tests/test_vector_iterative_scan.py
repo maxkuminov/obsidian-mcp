@@ -16,7 +16,9 @@ run fully offline (the real behaviour needs a live pgvector and is covered by
     `relaxed_order` does not promise a globally sorted stream, and the dedupe
     keeps the first chunk it sees per note),
   * a filtered query that comes back empty is re-run as an exact scan
-    (`enable_indexscan = off`) rather than believed.
+    (`enable_indexscan = off`) rather than believed,
+  * `find_related` ranks and reports the cosine distance the *database*
+    computed, never one recomputed in NumPy from the round-tripped vectors.
 """
 
 import os
@@ -252,13 +254,20 @@ async def test_semantic_search_returns_a_plain_list(holder):
 # find_related
 # --------------------------------------------------------------------------- #
 class _RelatedRow:
-    def __init__(self, note_id, path, embedding, distance):
+    """A row of `find_related_stmt`, which selects no embedding column.
+
+    It deliberately has no `embedding` attribute: the ranking must come from
+    the distance the database computed, so a service that reached for the raw
+    vector to recompute one would fail here rather than silently disagree with
+    its own ORDER BY.
+    """
+
+    def __init__(self, note_id, path, distance, chunk="chunk"):
         self.note_id = note_id
         self.file_path = path
         self.title = path.removesuffix(".md")
         self.tags = []
-        self.chunk_text = f"{path} chunk"
-        self.embedding = embedding
+        self.chunk_text = f"{path} {chunk}"
         self.distance = distance
 
 
@@ -302,7 +311,7 @@ async def test_find_related_issues_the_iterative_scan_setting(monkeypatch, holde
     session = _FindRelatedSession(
         _Note(1, "src.md"),
         [[1.0, 0.0, 0.0]],
-        [[_RelatedRow(2, "b.md", [1.0, 0.0, 0.0], 0.1)]],
+        [[_RelatedRow(2, "b.md", 0.1)]],
     )
     _install_find_related_session(monkeypatch, session)
 
@@ -325,7 +334,7 @@ async def test_find_related_overfetch_matches_semantic_search(
     session = _FindRelatedSession(
         _Note(1, "src.md"),
         [[1.0, 0.0, 0.0]],
-        [[_RelatedRow(2, "b.md", [1.0, 0.0, 0.0], 0.1)]],
+        [[_RelatedRow(2, "b.md", 0.1)]],
     )
     _install_find_related_session(monkeypatch, session)
 
@@ -347,7 +356,7 @@ async def test_find_related_zero_rows_falls_back_to_exact_scan(monkeypatch, hold
     session = _FindRelatedSession(
         _Note(1, "src.md"),
         [[1.0, 0.0, 0.0]],
-        [[], [_RelatedRow(2, "b.md", [1.0, 0.0, 0.0], 0.1)]],
+        [[], [_RelatedRow(2, "b.md", 0.1)]],
     )
     logged = _install_find_related_session(monkeypatch, session)
 
@@ -366,14 +375,77 @@ async def test_find_related_orders_by_distance(monkeypatch, holder):
         _Note(1, "src.md"),
         [[1.0, 0.0, 0.0]],
         [[
-            _RelatedRow(3, "far.md", [0.0, 1.0, 0.0], 0.95),
-            _RelatedRow(2, "near.md", [1.0, 0.0, 0.0], 0.05),
+            _RelatedRow(3, "far.md", 0.95),
+            _RelatedRow(2, "near.md", 0.05),
         ]],
     )
     _install_find_related_session(monkeypatch, session)
 
     out = await tools.find_related_impl("src.md", limit=10)
     assert out.index("near.md") < out.index("far.md"), out
+
+
+@pytest.mark.asyncio
+async def test_find_related_similarity_is_one_minus_the_sql_distance(
+    monkeypatch, holder
+):
+    """The printed number must be the database's own cosine distance, inverted.
+
+    pgvector computes `<=>` over float32; recomputing a similarity in NumPy
+    from the round-tripped vectors gives a slightly different value, and near
+    the cutoff a slightly different *order* — which is how the displayed
+    ranking drifts away from the ORDER BY that chose the rows (and away from
+    the recall baseline the benchmark measures against).
+    """
+    session = _FindRelatedSession(
+        _Note(1, "src.md"),
+        [[1.0, 0.0, 0.0]],
+        [[_RelatedRow(2, "b.md", 0.25), _RelatedRow(3, "c.md", 0.75)]],
+    )
+    _install_find_related_session(monkeypatch, session)
+
+    out = await tools.find_related_impl("src.md", limit=10)
+
+    sims = [float(line.rsplit("sim: ", 1)[1]) for line in out.splitlines()
+            if "sim: " in line]
+    assert sims == [0.75, 0.25], out
+
+
+@pytest.mark.asyncio
+async def test_find_related_keeps_the_nearest_chunk_of_a_note(monkeypatch, holder):
+    """Per-note dedupe keeps the minimum-distance chunk, and the note is ranked
+    at that distance — not at whichever chunk happened to arrive first."""
+    session = _FindRelatedSession(
+        _Note(1, "src.md"),
+        [[1.0, 0.0, 0.0]],
+        [[
+            # Deliberately out of order, as `relaxed_order` may emit them.
+            _RelatedRow(2, "b.md", 0.60, chunk="far-chunk"),
+            _RelatedRow(3, "c.md", 0.40),
+            _RelatedRow(2, "b.md", 0.10, chunk="near-chunk"),
+        ]],
+    )
+    _install_find_related_session(monkeypatch, session)
+
+    out = await tools.find_related_impl("src.md", limit=10)
+
+    result_lines = [line for line in out.splitlines() if "sim: " in line]
+    assert [line.split("(`", 1)[1].split("`)", 1)[0] for line in result_lines] == [
+        "b.md", "c.md",
+    ], out
+    assert "near-chunk" in out and "far-chunk" not in out, out
+    assert [float(line.rsplit("sim: ", 1)[1]) for line in result_lines] == [
+        0.90, 0.60,
+    ], out
+
+
+def test_find_related_statement_selects_no_embedding_column():
+    """Ranking comes from the SQL distance, so the raw vectors are dead weight
+    on the wire — an overfetch of 50 chunks × 1024 float32s per call."""
+    stmt = tools.find_related_stmt(1, [1.0, 0.0, 0.0], None, 10)
+    labels = [c.key for c in stmt.selected_columns]
+    assert "embedding" not in labels, labels
+    assert "distance" in labels, labels
 
 
 # --------------------------------------------------------------------------- #

@@ -319,6 +319,11 @@ async def semantic_search(
     filtered = bool(folder or tags or frontmatter or user_id is not None)
     exact_fallback = False
     if filtered and not rows:
+        # Transaction-scoped, like the three SET LOCALs above: it applies to
+        # the re-run on the next line and dies with this transaction. The sole
+        # caller (`search_notes_impl`) closes the session as soon as this
+        # function returns, so nothing else can inherit the exact plan — do not
+        # append further statements after the re-run without re-reading that.
         await session.execute(text("SET LOCAL enable_indexscan = off"))
         rows = (await session.execute(stmt)).fetchall()
         exact_fallback = True
