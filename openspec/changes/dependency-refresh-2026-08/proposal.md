@@ -20,26 +20,27 @@ security-maintained.
 
 - Bump `mcp[cli]` 1.28.1 → 1.29.0.
 - **New requirement (file-access):** the streamable-HTTP transport's request
-  body limit is derived from `MAX_FILE_WRITE_BYTES` —
-  `2 × MAX_FILE_WRITE_BYTES + 1 MiB` — instead of the SDK's 4 MiB default. This
-  guarantees a base64-mode `write_file` at the cap always reaches the tool
-  (base64 is 4·⌈n/3⌉ < 2n), and gives text-mode writes 2× headroom for JSON
-  escaping (`ensure_ascii` clients expand non-ASCII UTF-8 up to 2×; astral
-  and control characters expand further and are an accepted, documented
-  limitation that surfaces as HTTP 413).
+  body limit is derived from the write caps —
+  `max(2 × MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB` (61 MiB with
+  defaults) — instead of the SDK's 4 MiB default. For a canonical envelope this
+  guarantees that a base64-mode `write_file` at the cap and any note write of
+  up to `MAX_NOTE_BYTES` (even under worst-case 6× JSON escaping) always reach
+  the tool. Text-mode `write_file` content whose JSON escaping exceeds the
+  limit, envelopes over 1 MiB, and large-but-discarded arguments are named as
+  unsupported shapes bounded by the transport (HTTP 413); base64 is the
+  always-safe encoding.
 - **New requirement (vault-write):** every note write tool bounds the
   *resulting* note at `MAX_NOTE_BYTES` (10 MiB) with a tool-level error and no
-  write. `create_note` already does; `edit_note` and `set_frontmatter` gain the
-  same check, so every write path has a tool-level cap strictly below the
-  transport limit and no legitimate write can be rejected only by the
-  transport. (Notes above `MAX_NOTE_BYTES` are already unreadable by
-  `read_note`, so nothing that could be read is lost.)
+  write, in every `edit_note` mode and both `set_frontmatter` directions.
+  `create_note` already does; `edit_note` and `set_frontmatter` gain the same
+  check, so every supported write is decided by the tool with an actionable
+  message. (Notes above `MAX_NOTE_BYTES` are already unreadable by `read_note`,
+  so nothing that could be read is lost.)
 - **Explicit compatibility statement:** the transport limit applies to *every*
   MCP POST. Under 1.28.1 bodies were unbounded; after this change any body
-  above ≈51 MiB (default caps) is rejected with a bare HTTP 413. The largest
-  legitimate payload is a 25 MiB `write_file` (≈35 MB base64) — 5× the largest
-  writable note — so no supported caller is affected; the bound is a
-  resource-safety improvement.
+  above ≈61 MiB (default caps) is rejected with a bare HTTP 413. No supported
+  call shape can produce one, so the bound is a resource-safety improvement,
+  tested and documented rather than hidden.
 - Declare `numpy` as a direct dependency (imported by `src/services/embeddings.py`
   and `src/mcp_server/tools.py`; today present only transitively via `pgvector`).
 - Move `pip-audit` from `requirements.txt` to `requirements-dev.txt`; delete
@@ -73,14 +74,14 @@ _None._
 
 ### Modified Capabilities
 
-- `file-access`: adds the derived transport body limit requirement (a
-  base64-mode `write_file` at the cap always passes the transport; oversized
-  bodies — including chunked bodies without `Content-Length`, on both the
-  canonical `/mcp/` path and the bearer root fallback — are bounded; the limit
-  tracks `MAX_FILE_WRITE_BYTES`).
-- `vault-write`: adds the requirement that `create_note`, `edit_note`, and
-  `set_frontmatter` refuse to produce a note larger than `MAX_NOTE_BYTES`,
-  with a tool-level error and no write.
+- `file-access`: adds the derived transport body limit requirement (qualified
+  guarantee for canonical envelopes: base64 `write_file` at the cap and any
+  note write ≤ `MAX_NOTE_BYTES` reach the tool; oversized bodies — including
+  chunked bodies without `Content-Length`, on both `/mcp/` and the bearer root
+  fallback — are bounded; the limit tracks both caps).
+- `vault-write`: adds the requirement that `create_note`, `edit_note` (all
+  modes), and `set_frontmatter` (updates and remove) refuse to produce a note
+  larger than `MAX_NOTE_BYTES`, with a tool-level error and no write.
 
 ## Impact
 
@@ -91,17 +92,19 @@ _None._
 - `src/mcp_server/tools.py` — `MAX_NOTE_BYTES` check on the resulting content
   in `edit_note_impl` and `set_frontmatter_impl` (before write, after the
   edit is computed; `dry_run` reports it too).
-- `tests/` — transport-limit tests through the mounted app with a real
-  readwrite identity asserting a *successful* max-size `write_file` and exact
-  bytes on disk, cap+1 → tool error and no file, oversized/chunked → 413 on
-  both routes; settings tests (dotenv extras ignored, constructor typo still
+- `tests/` — transport-limit tests run in an import-isolated subprocess (the
+  FastMCP instance is built at import time) through the mounted app in sandbox
+  mode with `current_permission` set to readwrite, asserting a *successful*
+  max-size `write_file` and exact bytes on disk, cap+1 → tool error and no
+  file, a worst-case-escaped `MAX_NOTE_BYTES` note under a tiny file cap still
+  reaching the tool, oversized/chunked → 413 on both routes; settings tests (dotenv extras ignored, constructor typo still
   raises); note-cap tests for `edit_note`/`set_frontmatter`; an opt-in
   real-Postgres integration test (`TEST_DATABASE_URL`, throwaway
   `pgvector/pgvector:pg16` container) asserting `semantic_search` /
   `find_related` similarity, ordering and dedupe on pgvector 0.5 rows.
 - Docker image: `pip-audit`, `requests`, `urllib3` leave the runtime image;
   `numpy` becomes explicit. Memory: a max-size request costs ≈4× body
-  (≈200 MiB) transiently; the container's 2 GiB limit accommodates several
+  (≈250 MiB) transiently; the container's 2 GiB limit accommodates several
   concurrent worst-case writes, which is far beyond this single-operator
   deployment's real concurrency — accepted and documented.
 - No DB migration. `alembic check` run once after the 1.19 bump.
