@@ -17,6 +17,11 @@ mcp[cli]==1.28.1
 
 # Embeddings & search
 httpx==0.28.1
+# Direct dependency: imported by src/services/embeddings.py and
+# src/mcp_server/tools.py (find_related's cosine similarity). Previously only
+# present transitively via pgvector, which stops requiring numpy in 0.5.0.
+# Pinned to the version already running in the production image.
+numpy==2.5.1
 
 # YAML parsing
 pyyaml==6.0.3
@@ -37,11 +42,5 @@ bcrypt<4.1
 # Rate limiting (Phase 8)
 slowapi==0.1.9
 
-# Dev/audit
-pip-audit  # dev/audit
-
 # File watching (Phase 6)
 # watchfiles==1.0.5
-
-# Transitive pin for CVE-2026-44431 / CVE-2026-44432 in urllib3 < 2.7.0
-urllib3>=2.7.0

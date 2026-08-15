@@ -1,8 +1,8 @@
 ## 1. Prerequisites (each step: `pytest -q` green before the next)
 
-- [ ] 1.1 Add `numpy==2.5.1` to `requirements.txt` (the version currently in the production image) with a comment naming the two direct import sites.
-- [ ] 1.2 Move `pip-audit` from `requirements.txt` to `requirements-dev.txt`; delete the `urllib3>=2.7.0` pin and its comment from `requirements.txt`. Confirm `make audit` still runs (`Makefile:191`).
-- [ ] 1.3 Dev bumps in `requirements-dev.txt`: `pytest==9.1.1`, `pytest-asyncio==1.4.0`, `respx==0.23.1`.
+- [x] 1.1 Add `numpy==2.5.1` to `requirements.txt` (the version currently in the production image) with a comment naming the two direct import sites.
+- [x] 1.2 Move `pip-audit` from `requirements.txt` to `requirements-dev.txt`; delete the `urllib3>=2.7.0` pin and its comment from `requirements.txt`. Confirm `make audit` still runs (`Makefile:191`).
+- [x] 1.3 Dev bumps in `requirements-dev.txt`: `pytest==9.1.1`, `pytest-asyncio==1.4.0`, `respx==0.23.1`.
 
 ## 2. Settings: filtered dotenv source
 
