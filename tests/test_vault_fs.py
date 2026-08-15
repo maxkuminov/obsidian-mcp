@@ -610,6 +610,130 @@ def test_soft_delete_never_replaces_a_name_somebody_else_holds(
     assert sorted(p.name for p in trash.iterdir()) == sorted([taken[0], created])
 
 
+def _swap_in_a_directory(source: Path) -> None:
+    """Replace the file at `source` with a directory that has files under it."""
+    source.unlink()
+    source.mkdir()
+    (source / "keep.txt").write_bytes(b"not yours to delete")
+    (source / "nested").mkdir()
+    (source / "nested" / "deep.txt").write_bytes(b"nor this")
+
+
+def test_soft_delete_refuses_a_directory_swapped_in_after_the_check(
+    root_fd, vault, monkeypatch
+):
+    """The other edge of "the rename moves whatever is at the source".
+
+    That property is what stops a replacement file being destroyed — and it is
+    also what would carry a whole directory into `.trash` when one appears at
+    the name between the pre-check `lstat` and the rename, reported back as a
+    successful single-file delete. The post-move `lstat` catches it and the
+    rollback puts the subtree back.
+    """
+    source = vault / "Attachments" / "a.png"
+    source.write_bytes(b"original")
+
+    real_rename = vault_fs.rename_noreplace
+    swapped: list[str] = []
+
+    def swapping_rename(src_dir_fd, src_name, dst_dir_fd, dst_name):
+        if not swapped:
+            swapped.append(dst_name)
+            _swap_in_a_directory(source)
+        return real_rename(src_dir_fd, src_name, dst_dir_fd, dst_name)
+
+    monkeypatch.setattr(vault_fs, "rename_noreplace", swapping_rename)
+    with pytest.raises(UnsafePath) as exc:
+        soft_delete(root_fd, "Attachments/a.png")
+    monkeypatch.undo()
+
+    assert "director" in str(exc.value)
+    assert source.is_dir()
+    assert (source / "keep.txt").read_bytes() == b"not yours to delete"
+    assert (source / "nested" / "deep.txt").read_bytes() == b"nor this"
+    assert list((vault / ".trash").iterdir()) == []
+
+
+def test_soft_delete_reports_a_directory_it_could_not_put_back(
+    root_fd, vault, monkeypatch
+):
+    """Rollback loses the source name: refuse, and say where the subtree is.
+
+    The rollback is `RENAME_NOREPLACE` too, so it will not clobber whatever
+    took the name over. That leaves the directory in the trash — acceptable
+    only because the error names the exact location, so nothing is lost
+    silently. What is never acceptable is reporting success.
+    """
+    source = vault / "Attachments" / "a.png"
+    source.write_bytes(b"original")
+
+    real_rename = vault_fs.rename_noreplace
+    calls: list[str] = []
+
+    def contended_rename(src_dir_fd, src_name, dst_dir_fd, dst_name):
+        first = not calls
+        calls.append(dst_name)
+        if not first:
+            return real_rename(src_dir_fd, src_name, dst_dir_fd, dst_name)
+        _swap_in_a_directory(source)
+        result = real_rename(src_dir_fd, src_name, dst_dir_fd, dst_name)
+        # Somebody claims the source name before the rollback can use it.
+        source.write_bytes(b"squatter")
+        return result
+
+    monkeypatch.setattr(vault_fs, "rename_noreplace", contended_rename)
+    with pytest.raises(UnsafePath) as exc:
+        soft_delete(root_fd, "Attachments/a.png")
+    monkeypatch.undo()
+
+    moved = calls[0]
+    message = str(exc.value)
+    assert ".trash/" + moved in message, message
+    assert (vault / ".trash" / moved / "keep.txt").read_bytes() == b"not yours to delete"
+    assert source.read_bytes() == b"squatter"
+
+
+def test_a_failing_close_does_not_undo_a_completed_soft_delete(
+    root_fd, vault, monkeypatch
+):
+    """The move is done; a `close` returning EIO is bookkeeping, not a verdict.
+
+    Bare closes in the `finally` would both fail the delete that had already
+    happened — an agent retries a delete of a file that is gone — and skip the
+    second descriptor, leaking it. Both must be attempted, and the success must
+    survive.
+    """
+    (vault / "Attachments" / "a.png").write_bytes(b"bytes")
+
+    real_close = os.close
+    real_rename = vault_fs.rename_noreplace
+    armed: list[bool] = []
+    attempted: list[int] = []
+
+    def arming_rename(*args):
+        result = real_rename(*args)
+        armed.append(True)
+        return result
+
+    def failing_close(fd):
+        if not armed:
+            return real_close(fd)
+        attempted.append(fd)
+        # Really close it, then fail: the fault is injected without leaking the
+        # descriptor out of the test.
+        real_close(fd)
+        raise OSError(errno.EIO, "simulated close failure")
+
+    monkeypatch.setattr(vault_fs, "rename_noreplace", arming_rename)
+    monkeypatch.setattr(os, "close", failing_close)
+    dest = soft_delete(root_fd, "Attachments/a.png")
+    monkeypatch.undo()
+
+    assert (vault / dest).read_bytes() == b"bytes"
+    assert not (vault / "Attachments" / "a.png").exists()
+    assert len(set(attempted)) == 2, "a failing close skipped the other descriptor"
+
+
 def test_rename_noreplace_refuses_an_existing_destination(root_fd, vault):
     """The primitive itself, with no `soft_delete` around it."""
     (vault / "Attachments" / "a.png").write_bytes(b"source")
@@ -964,10 +1088,12 @@ def test_failed_walks_do_not_leak_descriptors(root_fd, vault):
     assert _open_fd_count() <= before + 2
 
 
-def test_renameat2_syscall_table_matches_kernel_headers():
-    """The raw-syscall fallback must never point at a *different* syscall:
-    on arm64 ``__NR_renameat`` is 38 (a replacing rename) and
-    ``__NR_renameat2`` is 276 (asm-generic). Pin the numbers we ship."""
+def test_renameat2_syscall_table_pins_reviewed_constants():
+    """Pin the syscall numbers that were checked against the Linux syscall
+    tables during review — this test is the record of that check, not a fresh
+    one against the running kernel's headers. The fallback must never point at
+    a *different* syscall: on arm64 ``__NR_renameat`` is 38 (a replacing
+    rename) and ``__NR_renameat2`` is 276 (asm-generic)."""
     from src.services import vault_fs
 
     assert vault_fs._SYS_RENAMEAT2["x86_64"] == 316

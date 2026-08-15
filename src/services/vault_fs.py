@@ -666,6 +666,67 @@ def _rename_into_trash(
     ) from last
 
 
+def _refuse_a_moved_directory(
+    src_dir_fd: int,
+    name: str,
+    trash_fd: int,
+    created: str,
+    rel_path: str | Path,
+    trash_dir: str,
+) -> None:
+    """Undo the move when the thing that moved turned out to be a directory.
+
+    The pre-check `lstat` refuses directories, but the rename that follows it
+    moves *whichever inode sits at the source when it runs* — the very property
+    that keeps a swapped-in replacement from being destroyed. It cuts both
+    ways: put a directory at that name between the check and the rename and the
+    whole subtree lands in the trash, reported as a successful file delete. A
+    symlink may ride along (it is inert in the trash and was never followed); a
+    directory may not, because it carries files nobody asked to delete.
+
+    The rollback is itself `RENAME_NOREPLACE`, so putting the directory back
+    can never clobber whatever now holds the source name. If it cannot go back
+    — the name is occupied again — the directory stays in the trash and the
+    error says exactly where it is. Either way the caller is told no, and
+    nothing is lost silently.
+    """
+    st = _lstat(trash_fd, created)
+    if st is None or not stat.S_ISDIR(st.st_mode):
+        return
+    try:
+        rename_noreplace(trash_fd, created, src_dir_fd, name)
+    except (OSError, VaultFSError) as exc:
+        raise UnsafePath(
+            f"Refused: {rel_path} became a directory after the check, and it "
+            f"could not be moved back ({exc}). The directory is at "
+            f"{trash_dir}/{created} — restore it from there; nothing was "
+            "removed."
+        ) from exc
+    raise UnsafePath(
+        f"Refused: {rel_path} became a directory after the check. It was moved "
+        "back and nothing was deleted."
+    )
+
+
+def close_quietly(fd: int, what: str) -> None:
+    """Close a descriptor; a failing close never reverses a settled verdict.
+
+    These run once the rename has already succeeded or already failed, so a
+    `close` returning `EIO` is pure bookkeeping. Left bare it would turn a
+    completed soft delete into a reported failure — an agent then retries a
+    delete that already happened — and, raising out of a `finally`, skip the
+    sibling close and leak that descriptor. Logged at debug and dropped.
+
+    Not for a descriptor whose close is part of the write itself: a staged
+    upload's own fd must fail loudly, because a failure there means the data
+    may never have reached the disk.
+    """
+    try:
+        os.close(fd)
+    except OSError as exc:
+        logger.debug("Could not close the %s descriptor: %s", what, exc)
+
+
 def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) -> str:
     """Move a regular file into `trash_dir` under a timestamped name, atomically.
 
@@ -688,10 +749,17 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) 
       that is already taken costs one `EEXIST` and a fresh random suffix.
 
     The `lstat` refusal of symlinks and non-regular files still runs first, and
-    is deliberately *not* re-checked: a symlink swapped in after the `lstat` is
-    moved into the trash intact — never followed, never dereferenced, nothing
-    outside the vault touched — which is a harmless outcome for an operation
-    the caller already asked to remove that name.
+    for a **symlink** it is deliberately *not* re-checked: one swapped in after
+    the `lstat` is moved into the trash intact — never followed, never
+    dereferenced, nothing outside the vault touched — which is a harmless
+    outcome for an operation the caller already asked to remove that name.
+
+    A **directory** swapped in is not harmless, so that one *is* re-checked
+    after the fact: the moved name is `lstat`ed in the trash and, if it is a
+    directory, put back with a second `RENAME_NOREPLACE` and the delete is
+    refused (`_refuse_a_moved_directory`). A subtree carries files nobody asked
+    to delete, and "moved 40 notes to .trash" reported as a file delete is the
+    kind of success an agent never questions.
 
     `.trash` lives inside the vault root, so the rename is same-device by
     construction; `EXDEV` (separate mount) and `EINVAL`/`ENOSYS` (a filesystem
@@ -724,11 +792,16 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) 
             # The name became a directory after the `lstat`. Never take a
             # directory with us.
             raise UnsafePath(f"Not a regular file: {rel_path}") from None
+        _refuse_a_moved_directory(
+            src_fd, name, trash_fd, created, rel_path, trash_dir
+        )
         return f"{trash_dir}/{created}"
     finally:
-        os.close(src_fd)
+        # The verdict is settled by here; a failing close must not change it,
+        # nor stop the sibling descriptor from being closed.
+        close_quietly(src_fd, f"source directory for {rel_path}")
         if trash_fd is not None:
-            os.close(trash_fd)
+            close_quietly(trash_fd, f"{trash_dir} directory")
 
 
 def _open_parent(root_fd: int, rel_path: str | Path, *, create: bool) -> tuple[int, str]:

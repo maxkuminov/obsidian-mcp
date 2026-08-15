@@ -380,7 +380,11 @@ behaviour recorded above, this section wins.
    Nothing is ever unlinked, so a concurrent replacement is *moved to the
    trash* rather than destroyed, and no verification step is needed.
    `_unlink_if_same_inode` is gone. The `lstat` symlink/directory refusal still
-   runs first; a symlink swapped in after it is moved intact, never followed.
+   runs first; a symlink swapped in after it is moved intact, never followed,
+   while a *directory* swapped in is caught by a post-move `lstat` and put back
+   with a second `RENAME_NOREPLACE` (`_refuse_a_moved_directory`) — and closes
+   on the settled path go through `close_quietly`, so a failing close cannot
+   turn a completed delete into a reported failure or leak the sibling fd.
    Tests: `test_soft_delete_moves_a_replacement_rather_than_destroying_it`,
    `test_soft_delete_reports_a_source_that_vanished_before_the_move`,
    `test_concurrent_soft_deletes_of_the_same_basename_get_distinct_names`,

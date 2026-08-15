@@ -2100,7 +2100,9 @@ async def delete_file_impl(path: str, permanent: bool = False) -> str:
     except vault_fs.VaultFSError as e:
         return str(e)
     finally:
-        os.close(root_fd)
+        # Bare, this close raising `EIO` would discard the return value of a
+        # delete that already happened and surface as a generic OSError.
+        vault_fs.close_quietly(root_fd, f"vault root for {rel}")
     return (
         f"Moved {rel} to {dest}. It is out of the vault's visible tree but still "
         "on disk; pass permanent=True to unlink instead."
