@@ -406,6 +406,16 @@ def _unlink_quietly(dir_fd: int, name: str, *, published: bool) -> bool:
         return False
 
 
+def discard_temp(dir_fd: int, name: str) -> bool:
+    """Remove a temp file that never got published; never raises.
+
+    The abandon path of a failed upload. It must not be able to turn one
+    failure (a 413, a disconnect) into a second, noisier one, so an unlink that
+    itself fails is logged and swallowed.
+    """
+    return _unlink_quietly(dir_fd, name, published=False)
+
+
 # ── deletion ────────────────────────────────────────────────────────────────
 
 
