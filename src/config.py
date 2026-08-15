@@ -1,8 +1,81 @@
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
 from pydantic import Field, field_validator, model_validator
-from pydantic_settings import BaseSettings, NoDecode
+from pydantic.fields import FieldInfo
+from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
+
+
+# Maximum size of a single note, in bytes. Lives here (rather than in
+# `src/mcp_server/tools.py`, which imports it) so the derived transport limit
+# below can reference it without a circular import.
+MAX_NOTE_BYTES = 10 * 1024 * 1024  # 10 MB
+
+# Aggregate bound on the preflight of `move_note(rewrite_links=True)`. That
+# preflight holds, for every backlink source, both the original bytes and the
+# rewritten content in memory before a single byte is mutated — the price of
+# never half-applying a move. Each source is individually bounded by
+# `MAX_NOTE_BYTES`, but the *number* of sources is not: a heavily linked target
+# with hundreds of near-cap backlinks would otherwise buffer gigabytes. This
+# caps the sum (originals plus rewrites) and aborts the move before any
+# mutation when it would be exceeded.
+MAX_MOVE_REWRITE_BYTES = 256 * 1024 * 1024  # 256 MiB
+
+# Headroom for the JSON-RPC envelope around a tool call's content argument:
+# method name, tool name, request id, the other arguments. See
+# `Settings.mcp_max_request_body_bytes`.
+_MCP_ENVELOPE_ALLOWANCE_BYTES = 1024 * 1024  # 1 MiB
+
+
+class _FieldFilteredSource(PydanticBaseSettingsSource):
+    """Wraps a settings source and drops keys that are not `Settings` fields.
+
+    Used for the **dotenv source only**. The repo-root `.env` is shared with
+    `docker-compose.yml` and legitimately carries compose-only keys
+    (`VAULT_HOST_PATH`, `BACKUPS_HOST_PATH`) that are not settings; with
+    pydantic-settings' `extra="forbid"` they make `Settings()` — and therefore
+    a single-file `pytest` run from a checkout — fail at import.
+
+    Filtering the source instead of relaxing `extra` on the model keeps
+    `Settings(databse_url=...)` (a misspelled constructor kwarg) a hard error,
+    and leaves process environment variables untouched (pydantic-settings never
+    applies `extra` checks to those, which is why the container is unaffected).
+
+    Field entries arrive keyed by field name regardless of `env_prefix` (only
+    unknown extras keep their raw, prefixed name), so matching on field names
+    and aliases is prefix-safe. Matching is case-insensitive.
+    """
+
+    def __init__(self, inner: PydanticBaseSettingsSource):
+        super().__init__(inner.settings_cls)
+        self._inner = inner
+
+    def _set_current_state(self, state: dict[str, Any]) -> None:
+        super()._set_current_state(state)
+        self._inner._set_current_state(state)
+
+    def _set_settings_sources_data(self, states: dict[str, dict[str, Any]]) -> None:
+        super()._set_settings_sources_data(states)
+        self._inner._set_settings_sources_data(states)
+
+    def _allowed_keys(self) -> set[str]:
+        allowed: set[str] = set()
+        for name, field in self.settings_cls.model_fields.items():
+            allowed.add(name.lower())
+            for alias in (field.alias, field.validation_alias, field.serialization_alias):
+                if isinstance(alias, str):
+                    allowed.add(alias.lower())
+        return allowed
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return self._inner.get_field_value(field, field_name)
+
+    def __call__(self) -> dict[str, Any]:
+        allowed = self._allowed_keys()
+        return {k: v for k, v in self._inner().items() if k.lower() in allowed}
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}({self._inner!r})"
 
 
 class Settings(BaseSettings):
@@ -65,6 +138,47 @@ class Settings(BaseSettings):
     max_file_read_bytes: int = Field(10 * 1024 * 1024, ge=1)
     max_file_write_bytes: int = Field(25 * 1024 * 1024, ge=1)
 
+    @property
+    def mcp_max_request_body_bytes(self) -> int:
+        """Maximum MCP streamable-HTTP request body, derived from the write caps.
+
+        `max(2 × MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB`
+        (61 MiB with the defaults). Passed to `FastMCP(max_request_body_size=)`;
+        the SDK would otherwise apply its own 4 MiB default, which silently
+        rejects a `write_file` well below our documented 25 MB cap.
+
+        There is deliberately no separate env knob: the transport limit must
+        track the tool caps, so that every *supported* write is decided by the
+        tool (with an actionable message) and the transport only ever bounds
+        unsupported shapes.
+
+        The guarantee is qualified. For a canonical `tools/call` envelope —
+        JSON-RPC framing plus all non-content arguments encoding to at most
+        1 MiB − 2 bytes — these shapes always reach the tool:
+
+        - `write_file(encoding="base64")` with decoded content up to
+          `max_file_write_bytes`: base64 length is exactly `4·⌈n/3⌉ ≤ 2n + 2`
+          for n ≥ 1, so it fits in `2 × cap` with the envelope allowance to spare.
+        - Any note write (`create_note`, `edit_note`, `set_frontmatter`) whose
+          content arguments are at most `MAX_NOTE_BYTES` of UTF-8 before JSON
+          escaping: escaping expands a byte at most 6× (a control character
+          becomes the six-character `\\u00XX`; BMP escapes under `ensure_ascii`
+          are 2× per byte, astral surrogate pairs 3×), so `6 × MAX_NOTE_BYTES`
+          covers the worst case. `MAX_NOTE_BYTES` is in the formula so this
+          holds however small an operator sets `MAX_FILE_WRITE_BYTES`.
+        - `write_file(encoding="text")` whose JSON-escaped content fits the
+          limit; realistic prose in any script (≤ 2×) does with the defaults.
+
+        Everything else is bounded by the transport with a bare HTTP 413 and is
+        unsupported: text-mode content whose escaping exceeds the limit (use
+        base64 — always safe), an envelope over 1 MiB, or arguments that are
+        large but discarded.
+        """
+        return (
+            max(2 * self.max_file_write_bytes, 6 * MAX_NOTE_BYTES)
+            + _MCP_ENVELOPE_ALLOWANCE_BYTES
+        )
+
     # Cap on how much note/file text a single read_note / read_file call may
     # return to the model. The byte caps above stop the server from reading a
     # huge file into memory; this one stops a legitimately-read file from
@@ -83,7 +197,34 @@ class Settings(BaseSettings):
     # production — tools register but cannot run.
     mcp_sandbox_mode: bool = False
 
+    # `extra` stays at pydantic-settings' default ("forbid") so a misspelled
+    # constructor kwarg or an unknown init value is still a hard error; only the
+    # dotenv source is filtered (see `settings_customise_sources` below).
     model_config = {"env_file": ".env"}
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        """Default source order, with the dotenv source filtered to known fields.
+
+        The repo-root `.env` doubles as the compose env file and carries
+        compose-only keys (`VAULT_HOST_PATH`, `BACKUPS_HOST_PATH`) that are not
+        `Settings` fields. Under `extra="forbid"` those abort `Settings()` at
+        import time. Dropping them from the dotenv source only keeps every other
+        surface strict.
+        """
+        return (
+            init_settings,
+            env_settings,
+            _FieldFilteredSource(dotenv_settings),
+            file_secret_settings,
+        )
 
     @field_validator("fts_configs", mode="before")
     @classmethod

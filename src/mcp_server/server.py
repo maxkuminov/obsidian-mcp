@@ -29,6 +29,11 @@ mcp = FastMCP(
     "obsidian-vault",
     stateless_http=True,
     streamable_http_path="/",
+    # Derived from the write caps rather than the SDK's 4 MiB default, which
+    # would reject a `write_file` far below our documented 25 MB cap. See
+    # `Settings.mcp_max_request_body_bytes` for the arithmetic and the
+    # (qualified) guarantee it provides.
+    max_request_body_size=settings.mcp_max_request_body_bytes,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=not settings.mcp_sandbox_mode,
         allowed_hosts=settings.allowed_hosts,
@@ -362,6 +367,12 @@ async def move_note(
     `[[Old|alias]]` → `[[New|alias]]`, `[[Old#anchor]]` → `[[New#anchor]]`,
     `![[Old]]` → `![[New]]`, and path-style `[[folder/Old]]` → `[[new/folder/New]]`.
     Aliases and anchors are preserved; only the title portion is rewritten.
+    All rewrites are computed before anything changes: if one would push a
+    source note past the 10 MiB note limit the whole move is refused, naming
+    that source, so the link graph never disagrees with the vault bytes.
+    That preflight is also bounded in aggregate: if the originals plus rewrites
+    for all backlink sources would exceed 256 MiB in memory the move is refused
+    before anything changes, naming the note count and the limit.
 
     Writes are atomic. See `get_vault_guide` for vault folder conventions.
 
@@ -495,6 +506,12 @@ async def write_file(
     No-clobber by default: writing over an existing file requires
     `overwrite=True`. Dot-directories and path traversal are rejected; invalid
     base64 errors without writing anything.
+
+    The MCP transport also bounds the whole request body (sized so a base64
+    write at the cap always gets through). Base64 is therefore the always-safe
+    encoding: `encoding="text"` content whose JSON escaping inflates past that
+    bound is rejected by the transport with a bare HTTP 413 before this tool
+    runs — send such content as base64 instead.
 
     Args:
         path: Vault-relative destination path (e.g. "Outputs/report.pdf").

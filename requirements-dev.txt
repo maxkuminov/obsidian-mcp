@@ -1,6 +1,25 @@
 # Test deps — installed in the container or local virtualenv for dev work.
 # Production image (`requirements.txt`) does not include these.
 -r requirements.txt
-pytest==8.4.0
-pytest-asyncio==1.0.0
-respx==0.22.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+respx==0.23.1
+
+# Host-side dependency audit (`make audit`). Lives here, not in
+# requirements.txt: it is never used at runtime and dragged requests/urllib3
+# into the production image.
+pip-audit
+
+# The opt-in pgvector integration test (tests/integration/test_pgvector_search.py)
+# needs a real Postgres with the vector extension. Start a throwaway one with:
+#   docker run --rm -d --name pgvector-test -e POSTGRES_PASSWORD=test \
+#       -p 55432:5432 pgvector/pgvector:pg16
+#   PGVECTOR_TEST_ADMIN_URL=postgresql+asyncpg://postgres:test@localhost:55432/postgres \
+#       pytest -q tests/integration/test_pgvector_search.py
+#   docker rm -f pgvector-test
+# The test is skipped when PGVECTOR_TEST_ADMIN_URL is unset. That URL names a
+# *server*: the fixture creates its own `test_pgvector_<uuid>` database there,
+# migrates and uses that, and drops it in teardown — it never migrates or
+# truncates the database in the URL. A URL whose database is `obsidian_mcp`
+# (the production name) is refused outright. It is deliberately NOT the
+# `TEST_DATABASE_URL` that tests/test_fts_integration.py uses in place.

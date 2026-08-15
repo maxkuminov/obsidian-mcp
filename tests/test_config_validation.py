@@ -67,3 +67,42 @@ def test_base_url_must_match_public_hostname():
             base_url="https://other.example.com",
             _env_file=None,
         )
+
+
+# ── Filtered dotenv source ──────────────────────────────────────────────────
+# The repo-root `.env` doubles as the compose env file and carries compose-only
+# keys. They must not abort `Settings()` (which happens at import of
+# `src.config`, so it breaks collection of any single test file), while
+# `extra="forbid"` must stay in force everywhere else.
+
+
+def test_dotenv_compose_only_keys_are_ignored(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "DATABASE_URL=postgresql+asyncpg://u:p@localhost/db\n"
+        "SECRET_KEY=not-a-placeholder\n"
+        "EMBEDDING_MODEL=from-dotenv\n"
+        "VAULT_HOST_PATH=/x\n"
+        "BACKUPS_HOST_PATH=/y/backups\n"
+    )
+    settings = Settings(_env_file=str(env_file))
+    # The compose-only keys are dropped rather than rejected...
+    assert not hasattr(settings, "vault_host_path")
+    # ...and real settings from the same file are still applied.
+    assert settings.embedding_model == "from-dotenv"
+
+
+def test_misspelled_constructor_kwarg_still_raises():
+    with pytest.raises(ValidationError) as exc:
+        Settings(databse_url="postgresql+asyncpg://u:p@localhost/db", _env_file=None)
+    assert "databse_url" in str(exc.value)
+
+
+def test_unknown_dotenv_key_does_not_leak_into_settings(tmp_path):
+    env_file = tmp_path / ".env"
+    env_file.write_text(
+        "SECRET_KEY=not-a-placeholder\n"
+        "SOME_COMPOSE_ONLY_KEY=whatever\n"
+    )
+    settings = Settings(_env_file=str(env_file))
+    assert "some_compose_only_key" not in settings.model_dump()

@@ -16,7 +16,7 @@ from mcp.server.fastmcp import Image
 from sqlalchemy import text
 
 from src.auth.session import current_user_id
-from src.config import settings
+from src.config import MAX_MOVE_REWRITE_BYTES, MAX_NOTE_BYTES, settings
 from src.database import async_session
 from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
 from src.models.db import UsageLog
@@ -495,7 +495,26 @@ def _require_write() -> str | None:
     return None
 
 
-MAX_NOTE_BYTES = 10 * 1024 * 1024  # 10 MB
+def _note_size_error_for(size: int) -> str | None:
+    """`_note_size_error` for a caller that already knows the encoded length.
+
+    Split out so a path that must encode the content anyway (the `move_note`
+    preflight, which also sums the encoded lengths) can reuse that one encode
+    instead of paying for a second one inside the check.
+    """
+    if size > MAX_NOTE_BYTES:
+        return f"Content too large ({size} bytes, max {MAX_NOTE_BYTES})"
+    return None
+
+
+def _note_size_error(content: str) -> str | None:
+    """Refuse a note write whose *result* would exceed `MAX_NOTE_BYTES`.
+
+    Every note write tool applies this to the content it is about to write, so
+    a supported write is always decided here — with an actionable message —
+    rather than by the MCP transport's body limit, which sits well above it.
+    """
+    return _note_size_error_for(len(content.encode("utf-8")))
 
 
 @_tracked("create_note", ["path"])
@@ -503,9 +522,8 @@ async def create_note_impl(path: str, content: str) -> str:
     """Create a new note in the vault."""
     if err := _require_write():
         return err
-    encoded = content.encode("utf-8")
-    if len(encoded) > MAX_NOTE_BYTES:
-        return f"Content too large ({len(encoded)} bytes, max {MAX_NOTE_BYTES})"
+    if err := _note_size_error(content):
+        return err
     if not path.endswith(".md"):
         path += ".md"
     uid = current_user_id.get()
@@ -934,6 +952,13 @@ async def edit_note_impl(
     else:
         new_content = content
 
+    # Bound the *result*, before the diff and before the atomic write, so an
+    # over-cap edit is refused by the tool in every mode (including dry_run)
+    # and nothing is written. Must stay ahead of the `expected=` write below,
+    # which is what detects a concurrent read-modify-write conflict.
+    if err := _note_size_error(new_content):
+        return err
+
     if dry_run:
         if new_content == existing:
             return f"No changes for {path}"
@@ -1127,6 +1152,78 @@ async def move_note_impl(
                 rewrite_sources.extend(r.file_path for r in src_rows)
                 rewrite_sources = list(dict.fromkeys(rewrite_sources))
 
+    # ── Phase 1: preflight ──────────────────────────────────────────────────
+    # Compute every rewritten body *before* anything is mutated. If one would
+    # exceed the note cap the whole move aborts: the alternative (move, update
+    # note_links, then skip the over-cap source) leaves the graph asserting a
+    # link the vault bytes do not contain, and an agent acting on that graph
+    # never sees the discrepancy.
+    #
+    # Memory: `read_bytes` bounds each source at MAX_NOTE_BYTES, but the number
+    # of sources is unbounded — a target with hundreds of near-cap backlinks
+    # would buffer gigabytes before a single byte is mutated. So the originals
+    # and the rewrites are summed as they accumulate and the move aborts (still
+    # before any mutation) once that total would exceed MAX_MOVE_REWRITE_BYTES.
+    planned_rewrites: list[tuple[str, bytes, str, int]] = []
+    rewrite_bytes_held = 0
+    failed_rewrite_sources: list[str] = []
+    if rewrite_links and pre_move_index is not None:
+        for original_src_path in rewrite_sources:
+            # A moved note may link to itself: it is still at its old path now,
+            # so read it there, but emit link targets relative to where it is
+            # about to land.
+            out_path = (
+                to_rel if original_src_path == from_rel else original_src_path
+            )
+            try:
+                src_file = validate_visible_path(original_src_path, user_id=uid)
+                if not src_file.is_file():
+                    continue
+                original_bytes = read_bytes(
+                    original_src_path, user_id=uid, max_bytes=MAX_NOTE_BYTES
+                )
+                content = original_bytes.decode("utf-8")
+                new_content, n = _rewrite_links_in_text(
+                    content,
+                    from_rel,
+                    to_rel,
+                    original_src_path,
+                    pre_move_index,
+                    output_source_path=out_path,
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to rewrite links in %s: %s", original_src_path, e
+                )
+                failed_rewrite_sources.append(original_src_path)
+                continue
+            if n == 0:
+                continue
+            # A rewrite can only grow a note (the new path is usually longer
+            # than the old one), so it is a note write like any other and gets
+            # the same cap — enforced here, where refusing costs nothing. The
+            # one encode also feeds the aggregate below.
+            new_size = len(new_content.encode("utf-8"))
+            if err := _note_size_error_for(new_size):
+                return (
+                    f"Move aborted: rewriting links in {original_src_path} would "
+                    f"exceed the note size limit ({err}). Nothing was moved, "
+                    "rewritten or reindexed."
+                )
+            rewrite_bytes_held += len(original_bytes) + new_size
+            if rewrite_bytes_held > MAX_MOVE_REWRITE_BYTES:
+                return (
+                    f"Move aborted: rewriting links across "
+                    f"{len(planned_rewrites) + 1} notes would need "
+                    f"{rewrite_bytes_held} bytes in memory (limit "
+                    f"{MAX_MOVE_REWRITE_BYTES} bytes, "
+                    f"{MAX_MOVE_REWRITE_BYTES // (1024 * 1024)} MiB). Nothing "
+                    "was moved, rewritten or reindexed. Move without "
+                    "rewrite_links and update links in batches instead."
+                )
+            planned_rewrites.append((out_path, original_bytes, new_content, n))
+
+    # ── Phase 2: commit ─────────────────────────────────────────────────────
     try:
         move_no_clobber(src_full, dst_full)
     except FileExistsError:
@@ -1172,39 +1269,16 @@ async def move_note_impl(
 
     rewrites_done = 0
     files_modified = 0
-    failed_rewrite_sources: list[str] = []
-    if rewrite_links and pre_move_index is not None:
-        for original_src_path in rewrite_sources:
-            try:
-                # A moved note may link to itself. Read it at its new location,
-                # but resolve its old link text in the pre-move location.
-                src_path = (
-                    to_rel if original_src_path == from_rel else original_src_path
-                )
-                src_file = validate_visible_path(src_path, user_id=uid)
-                if not src_file.is_file():
-                    continue
-                original_bytes = read_bytes(
-                    src_path, user_id=uid, max_bytes=MAX_NOTE_BYTES
-                )
-                content = original_bytes.decode("utf-8")
-                new_content, n = _rewrite_links_in_text(
-                    content,
-                    from_rel,
-                    to_rel,
-                    original_src_path,
-                    pre_move_index,
-                    output_source_path=src_path,
-                )
-                if n > 0:
-                    write_file(
-                        src_path, new_content, user_id=uid, expected=original_bytes
-                    )
-                    rewrites_done += n
-                    files_modified += 1
-            except Exception as e:
-                logger.warning("Failed to rewrite links in %s: %s", src_path, e)
-                failed_rewrite_sources.append(src_path)
+    for write_path, original_bytes, new_content, n in planned_rewrites:
+        try:
+            write_file(
+                write_path, new_content, user_id=uid, expected=original_bytes
+            )
+            rewrites_done += n
+            files_modified += 1
+        except Exception as e:
+            logger.warning("Failed to rewrite links in %s: %s", write_path, e)
+            failed_rewrite_sources.append(write_path)
 
     parts = [f"Moved {from_rel} → {to_rel}"]
     if db_failed:
@@ -1325,6 +1399,11 @@ async def set_frontmatter_impl(
     new_raw = serialize_frontmatter(fm, body)
     if new_raw == raw:
         return f"No changes for {path}"
+
+    # Bound the result before writing (see `edit_note_impl`). A remove-only
+    # call can only shrink the note, but the check is uniform.
+    if err := _note_size_error(new_raw):
+        return err
 
     try:
         write_file(path, new_raw, user_id=uid, expected=raw_bytes)

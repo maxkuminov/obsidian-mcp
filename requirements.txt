@@ -1,28 +1,37 @@
 # Core
-fastapi==0.135.1
+fastapi==0.141.1
 uvicorn[standard]==0.42.0
-# 0.0.30 fixes CVE-2026-53539 (fixable HIGH flagged by the trivy deploy gate).
-python-multipart==0.0.31
+# CVE-2026-53539 (fixable HIGH flagged by the Trivy deploy gate) was fixed in
+# 0.0.30 and remains fixed here.
+python-multipart==0.0.32
 
 # Database
-sqlalchemy[asyncio]==2.0.48
+sqlalchemy[asyncio]==2.0.52
 asyncpg==0.31.0
-alembic==1.18.4
-pgvector==0.4.2
+alembic==1.19.1
+pgvector==0.5.0
 
 # MCP
-# 1.28.1 fixes CVE-2026-52869, CVE-2026-52870, and CVE-2026-59950
-# (fixable HIGH findings enforced by the Trivy deploy gate).
-mcp[cli]==1.28.1
+# CVE-2026-52869, CVE-2026-52870 and CVE-2026-59950 (fixable HIGH findings
+# enforced by the Trivy deploy gate) were fixed in 1.28.1 and remain fixed here.
+# 1.29.0 is the last v1 minor and a drop-in; it adds a streamable-HTTP request
+# body limit (4 MiB by default) which we size explicitly from the write caps —
+# see `Settings.mcp_max_request_body_bytes`.
+mcp[cli]==1.29.0
 
 # Embeddings & search
 httpx==0.28.1
+# Direct dependency: imported by src/services/embeddings.py and
+# src/mcp_server/tools.py (find_related's cosine similarity). Previously only
+# present transitively via pgvector, which stops requiring numpy in 0.5.0.
+# Pinned to the version already running in the production image.
+numpy==2.5.1
 
 # YAML parsing
 pyyaml==6.0.3
 
 # Settings
-pydantic-settings==2.14.2
+pydantic-settings==2.15.0
 
 # Templates
 jinja2==3.1.6
@@ -35,13 +44,7 @@ passlib[bcrypt]==1.7.4
 bcrypt<4.1
 
 # Rate limiting (Phase 8)
-slowapi==0.1.9
-
-# Dev/audit
-pip-audit  # dev/audit
+slowapi==0.1.10
 
 # File watching (Phase 6)
 # watchfiles==1.0.5
-
-# Transitive pin for CVE-2026-44431 / CVE-2026-44432 in urllib3 < 2.7.0
-urllib3>=2.7.0
