@@ -128,12 +128,22 @@ def test_migration_creates_hnsw_index_at_default_dim(monkeypatch):
 class _FakeSession:
     def __init__(self):
         self.executed: list[str] = []
+        self.closed = False
 
     async def execute(self, clause, *_a, **_k):
         self.executed.append(str(clause))
 
     async def commit(self):
         pass
+
+    async def close(self):
+        self.closed = True
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_a):
+        return None
 
 
 class _FakeRequest:
@@ -147,11 +157,21 @@ async def _call_reset(monkeypatch, dim):
     # Don't spawn the background reindex (it would touch DB/embeddings).
     monkeypatch.setattr(routes, "_spawn", lambda coro: coro.close())
 
-    sess = _FakeSession()
+    # The route now runs its destructive statements on a *fresh* session taken
+    # only after it holds the indexer pass lock — see the pre-warm change.
+    # The request's own session is closed before the wait, so the statements
+    # to assert on land on this one.
+    destructive = _FakeSession()
+    monkeypatch.setattr(routes, "async_session", lambda: destructive)
+
+    request_session = _FakeSession()
     resp = await routes.reset_embeddings(
-        request=_FakeRequest(), session=sess, user=object()
+        request=_FakeRequest(), session=request_session, user=object()
     )
-    return sess.executed, resp
+    assert request_session.closed, (
+        "the request session must be released before waiting on the pass lock"
+    )
+    return destructive.executed, resp
 
 
 def test_reset_skips_hnsw_index_when_dim_over_2000(monkeypatch):

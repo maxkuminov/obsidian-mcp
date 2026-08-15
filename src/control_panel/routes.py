@@ -1,6 +1,7 @@
 import logging
 import os
 import secrets
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -16,7 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.session import _SingleUserSentinel, get_current_user
 from src.config import settings
 from src.csrf import generate_csrf_token, verify_csrf
-from src.database import get_session
+from src.database import async_session, get_session
 from src.mcp_server.auth import hash_key
 from src.models.db import (
     APIKey,
@@ -28,6 +29,7 @@ from src.models.db import (
     User,
     UsageLog,
 )
+from src.services.indexer import invalidate_hnsw_index_cache
 from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
@@ -890,6 +892,36 @@ def _spawn(coro):
     task.add_done_callback(_background_tasks.discard)
 
 
+# Indexer pause flag, also surfaced via the reset progress endpoint.
+indexer_paused: bool = False
+
+
+@asynccontextmanager
+async def _pass_lock_without_a_connection(session: AsyncSession):
+    """Hold the indexer pass lock for the destructive statements, without
+    pinning a pool connection while waiting for it.
+
+    The pre-warm added to the periodic tick runs *inside* `index_pass_lock`,
+    which means a reset that ran concurrently could drop the HNSW index out
+    from under a probe. So the destructive panel actions take the lock too.
+
+    Ending this request's own transaction first is not tidiness. `get_session`
+    has already checked out one of five pooled connections; blocking on the
+    lock while holding it means a handful of concurrent resets exhaust the
+    pool, and the lock *holder* — an index pass that needs a connection of its
+    own to finish — then deadlocks against the waiters. Close first, wait, and
+    only take a connection once the lock is ours.
+
+    The wait is bounded by the current index pass, not by the pre-warm's 15 s
+    timeout; the danger-zone page already warns the action can take a while.
+    """
+    from src.services.indexer import index_pass_lock
+
+    await session.close()
+    async with index_pass_lock:
+        yield
+
+
 @router.post("/settings/reindex")
 async def trigger_reindex(
     request: Request,
@@ -921,21 +953,35 @@ async def trigger_reembed(
     user=Depends(require_admin_panel),
 ):
     """Clear all embeddings and re-embed from scratch. Requires a valid signed token."""
+    global indexer_paused
     try:
         _reembed_serializer().loads(token, max_age=60)
     except (BadSignature, SignatureExpired):
         raise HTTPException(status_code=400, detail="Invalid or expired confirmation token")
 
-    from src.models.db import NoteEmbedding
-    from sqlalchemy import delete
-    await session.execute(delete(NoteEmbedding))
-    await session.commit()
+    from src.models.db import NoteEmbedding, NoteMetadata
+    from sqlalchemy import delete, update
+
+    indexer_paused = True
+    try:
+        async with _pass_lock_without_a_connection(session):
+            async with async_session() as fresh:
+                await fresh.execute(delete(NoteEmbedding))
+                # Deleting the vectors is not enough: `embed_vault` selects
+                # notes whose `embedded_content_hash` differs from
+                # `content_hash`, so leaving the hashes stamped meant the
+                # reindex spawned below re-embedded *nothing* and the vault
+                # silently stayed unsearchable. Same transaction as the DELETE,
+                # so the two can never disagree.
+                await fresh.execute(
+                    update(NoteMetadata).values(embedded_content_hash=None)
+                )
+                await fresh.commit()
+    finally:
+        indexer_paused = False
+
     _spawn(_reindex_background())
     return RedirectResponse("/admin/settings", status_code=303)
-
-
-# Indexer pause flag, also surfaced via the reset progress endpoint.
-indexer_paused: bool = False
 
 
 @router.post("/settings/reset-embeddings")
@@ -954,39 +1000,49 @@ async def reset_embeddings(
     from sqlalchemy import delete
     from src.models.db import NoteEmbedding, NoteMetadata
 
+    dim = int(settings.embedding_dimensions)
+    # pgvector caps HNSW-indexable vectors at 2000 dims; above that, CREATE
+    # INDEX ... USING hnsw hard-errors. Skip the index so the reset still
+    # completes; semantic_search falls back to a sequential scan. See issue #6.
+    hnsw = dim <= 2000
+
     indexer_paused = True
     try:
-        dim = int(settings.embedding_dimensions)
-        await session.execute(text("SET LOCAL statement_timeout = '5min'"))
-        await session.execute(
-            text("DROP INDEX IF EXISTS ix_note_embeddings_embedding_hnsw")
-        )
-        await session.execute(delete(NoteEmbedding))
-        await session.execute(
-            text(f"ALTER TABLE note_embeddings ALTER COLUMN embedding TYPE vector({dim})")
-        )
-        await session.execute(
-            text("UPDATE notes_metadata SET embedded_content_hash = NULL")
-        )
-        # pgvector caps HNSW-indexable vectors at 2000 dims; above that, CREATE
-        # INDEX ... USING hnsw hard-errors. Skip the index so the reset still
-        # completes; semantic_search falls back to a sequential scan. See issue #6.
-        hnsw = dim <= 2000
-        if hnsw:
-            await session.execute(
-                text(
-                    "CREATE INDEX ix_note_embeddings_embedding_hnsw "
-                    "ON note_embeddings USING hnsw (embedding vector_cosine_ops) "
-                    "WITH (m = 16, ef_construction = 64)"
+        async with _pass_lock_without_a_connection(session):
+            async with async_session() as fresh:
+                await fresh.execute(text("SET LOCAL statement_timeout = '5min'"))
+                await fresh.execute(
+                    text("DROP INDEX IF EXISTS ix_note_embeddings_embedding_hnsw")
                 )
-            )
-        else:
-            logger.warning(
-                "Skipping HNSW index: embedding_dimensions=%d exceeds pgvector's "
-                "2000-dim HNSW limit; semantic_search will use a sequential scan.",
-                dim,
-            )
-        await session.commit()
+                await fresh.execute(delete(NoteEmbedding))
+                await fresh.execute(
+                    text(
+                        f"ALTER TABLE note_embeddings "
+                        f"ALTER COLUMN embedding TYPE vector({dim})"
+                    )
+                )
+                await fresh.execute(
+                    text("UPDATE notes_metadata SET embedded_content_hash = NULL")
+                )
+                if hnsw:
+                    await fresh.execute(
+                        text(
+                            "CREATE INDEX ix_note_embeddings_embedding_hnsw "
+                            "ON note_embeddings USING hnsw (embedding vector_cosine_ops) "
+                            "WITH (m = 16, ef_construction = 64)"
+                        )
+                    )
+                else:
+                    logger.warning(
+                        "Skipping HNSW index: embedding_dimensions=%d exceeds "
+                        "pgvector's 2000-dim HNSW limit; semantic_search will "
+                        "use a sequential scan.",
+                        dim,
+                    )
+                await fresh.commit()
+        # The pre-warm caches whether an HNSW index exists; this route is the
+        # one place that changes the answer.
+        invalidate_hnsw_index_cache()
     finally:
         indexer_paused = False
 

@@ -112,7 +112,26 @@ in the report which tools were actually called.
   sets `hnsw.ef_search=80` per query and dedupes per note in Python
   after a 5x overfetch. See "Filtered vector search" below — the
   `SET LOCAL`s are load-bearing for *correctness*, not just speed.
-- Indexer runs on startup then every 5 minutes, hash-based change detection
+- Indexer runs on startup then every 5 minutes, hash-based change detection.
+  Each periodic tick ends with `prewarm_search_caches()` **inside**
+  `index_pass_lock`: one `get_embedding("warmup")` (Ollama only — a remote API
+  has no warm state) and one HNSW probe with a deterministic non-zero unit
+  vector, the whole thing under a single 15 s `asyncio.wait_for`. It exists
+  because `semantic_search` is bimodal (≈0.47 s warm, ≈17.5 s cold: 14 s of
+  Ollama reloading bge-m3, 3 s of HNSW pages missing from a 128 MB shared
+  `shared_buffers`) and the median gap between calls has grown to ~28 min.
+  It logs and swallows ordinary failures (the indexer's `consecutive_failures`
+  must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
+  still stops the loop.
+- **Because the pre-warm holds `index_pass_lock`, the panel's destructive
+  actions take it too.** `reset_embeddings` and `trigger_reembed` set
+  `indexer_paused`, then `await session.close()` on the request's own session
+  **before** waiting for the lock — a waiter that keeps its pooled connection
+  deadlocks against a lock holder that needs one — and only then open a fresh
+  session inside the lock (`_pass_lock_without_a_connection`). `trigger_reembed`
+  also NULLs `notes_metadata.embedded_content_hash` in the same transaction as
+  the `DELETE`: `embed_vault` selects on hash mismatch, so deleting vectors
+  alone meant the reindex it spawns re-embedded nothing.
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
