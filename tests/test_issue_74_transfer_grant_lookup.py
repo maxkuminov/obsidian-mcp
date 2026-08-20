@@ -78,6 +78,11 @@ def test_oauth_lookup_keys_on_the_grant_family_not_the_token_row():
     assert "presenting_token.id = 9" in sql
     assert "minting_token.id = transfer_tokens.oauth_token_id" in sql
     assert "presenting_token.grant_id = minting_token.grant_id" in sql
+    # Defence in depth on top of the family. One `grant_id` belongs to one
+    # `(client_id, user_id)` by invariant, not by constraint, and this
+    # predicate *is* the access control — so the client is compared too, and
+    # a family that somehow spanned two clients still cannot leak across them.
+    assert "presenting_token.client_id = minting_token.client_id" in sql
 
 
 def test_oauth_lookup_keeps_every_other_scoping_predicate():

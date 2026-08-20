@@ -606,6 +606,20 @@ def _minted_by_principal(identity: Identity):
     no null-equality trap here; if the presenting token's row has since been
     deleted the `EXISTS` is simply false and the answer is "not found", which
     is the fail-closed direction.
+
+    **`client_id` is compared as well as `grant_id`.** A grant belongs to
+    exactly one `(client_id, user_id)` — the invariant `src/oauth/grants.py`
+    establishes at every write site — so post-014 the extra equality can never
+    change the answer. It is here because the invariant is *asserted* rather
+    than enforced by a constraint, and because this predicate is the access
+    control: if a family ever did span two clients, the failure would be one
+    client reading another's handles, which is the one thing this must not do.
+
+    What it does **not** fix, because no predicate here can: 014's backfill
+    groups pre-014 rows by `(client_id, user_id)`, which #64 accepted as
+    approximate. Two consents by the same user *for the same client* made
+    before 014 therefore share one family, and this predicate holds for both.
+    See the "same-client, pre-014" limitation in CLAUDE.md.
     """
     if identity.oauth_token_id is None:
         return and_(
@@ -618,7 +632,13 @@ def _minted_by_principal(identity: Identity):
         TransferToken.key_id.is_(None),
         select(literal(1))
         .select_from(minting)
-        .join(presenting, presenting.grant_id == minting.grant_id)
+        .join(
+            presenting,
+            and_(
+                presenting.grant_id == minting.grant_id,
+                presenting.client_id == minting.client_id,
+            ),
+        )
         .where(
             minting.id == TransferToken.oauth_token_id,
             presenting.id == identity.oauth_token_id,

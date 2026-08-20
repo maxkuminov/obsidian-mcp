@@ -77,7 +77,8 @@ the operator agreed to at mint time, for no case that is currently wrong.
   the same user for the same client. Two consents are two things the operator
   revokes independently; one must not read the other's handles. This is the
   existing "Cross-identity lookup" scenario, re-stated in terms that survive a
-  rotation.
+  rotation. Exact for every grant issued after migration 014; see D4a for the
+  pre-014 backfill's one approximation.
 - **A different user.** The `user_id` comparison stays. The family invariant
   (one `grant_id` ⇒ one `(client_id, user_id)`) already implies it for the
   OAuth path, but it is the *only* check on the API-key path — a key reassigned
@@ -86,6 +87,28 @@ the operator agreed to at mint time, for no case that is currently wrong.
 - **The other credential kind.** An OAuth caller never matches a key-minted row
   (`key_id IS NULL` is required) and a key caller never matches an OAuth-minted
   one (`oauth_token_id IS NULL`).
+
+## D4a. Accepted limitation: pre-014 families are approximate
+
+Migration 014 backfills `grant_id` one value per distinct `(client_id,
+user_id)`, which #64 accepted as approximate — nothing in the pre-014 schema
+recorded which consent a row descended from, so there was nothing better to
+group by. Two consents made by the same user **for the same client** before 014
+therefore share one backfilled family, and this change makes a token from
+either able to read `check_upload` status — path, size, sha256, mime — for a
+handle minted by the other.
+
+Accepted, not fixed. It is the same user and the same client software, the
+exposure is read-only status on a handle that authorises nothing, and it is
+bounded: every grant issued after 014 is exact, and pre-014 families can only
+shrink as their tokens age out (`cleanup_expired_tokens` deletes 7 days past
+expiry). Fixing it would mean inventing a consent boundary the database never
+recorded.
+
+The one thing that *is* defended is the cross-**client** case, which the
+backfill cannot produce and the invariant forbids: the `EXISTS` compares
+`client_id` as well as `grant_id`, so a family that somehow spanned two clients
+still cannot leak between them.
 
 ## D5. Testing
 

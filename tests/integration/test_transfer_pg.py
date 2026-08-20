@@ -857,6 +857,65 @@ async def test_a_second_consent_by_the_same_user_is_a_different_principal(clean)
     assert found is None
 
 
+async def test_a_grant_id_shared_across_clients_still_cannot_cross(clean):
+    """The `client_id` half of the family predicate, exercised directly.
+
+    "One `grant_id` belongs to exactly one `(client_id, user_id)`" is an
+    invariant every write site upholds, not a constraint the database
+    enforces, and 014's backfill groups by exactly those two columns — so
+    post-014 this row cannot arise. The predicate compares `client_id` anyway,
+    because it *is* the access control here: if a family ever did span two
+    clients, the failure would be one client reading another's handles.
+    """
+    async with clean() as session:
+        user, _, oauth = await _seed_identity(session)
+        _token, row = await _mint_oauth_upload(session, user, oauth)
+
+        second_client = OAuthClient(
+            user_id=user.id,
+            client_id=uuid.uuid4().hex,
+            client_secret_hash="y" * 64,
+            client_name="c2",
+            redirect_uris=["https://elsewhere.example/cb"],
+            scope="readwrite",
+        )
+        session.add(second_client)
+        await session.flush()
+        impostor = OAuthToken(
+            user_id=user.id,
+            token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+            token_type="access",
+            client_id=second_client.client_id,
+            scope="readwrite",
+            # The shape the invariant forbids: another client's token wearing
+            # this family's id.
+            grant_id=oauth.grant_id,
+            expires_at=_now() + datetime.timedelta(hours=1),
+            revoked=False,
+        )
+        session.add(impostor)
+        await session.commit()
+
+        assert (
+            await _lookup(
+                session,
+                row,
+                transfer.Identity(oauth_token_id=impostor.id, user_id=user.id),
+            )
+            is None
+        ), "a second client sharing the grant id must not read its handles"
+        # And the legitimate sibling of the same client still resolves, so the
+        # refusal above is the `client_id` comparison and not a broken family.
+        sibling = await _rotate(session, oauth, expire_old=False)
+        assert (
+            await _lookup(
+                session,
+                row,
+                transfer.Identity(oauth_token_id=sibling.id, user_id=user.id),
+            )
+        ).id == row.id
+
+
 async def test_another_users_grant_never_sees_the_handle(clean):
     async with clean() as session:
         user, _, oauth = await _seed_identity(session)

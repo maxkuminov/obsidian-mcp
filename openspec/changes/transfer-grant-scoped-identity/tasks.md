@@ -8,6 +8,9 @@
       branch keeps the exact `key_id` / both-null comparison.
 - [x] 1.2 Rewrite `lookup_by_public_id` to use them, keeping `public_id`,
       `direction` and `user_id` unchanged and applying no state filter.
+- [x] 1.2a Compare `client_id` alongside `grant_id` in the `EXISTS` — the
+      one-family-per-`(client_id, user_id)` rule is an invariant, not a
+      constraint, and this predicate is the access control.
 - [x] 1.3 Document the widening *and* the two things that did not widen
       (a different grant; redemption) in the function docstring.
 - [x] 1.4 Update the comment in `check_upload_impl` that describes what the
@@ -44,3 +47,9 @@
       credential row" subsection under **File transfer**, and the two places
       that said the lookup scopes to the credential row.
 - [x] 4.2 Spec deltas + `openspec validate --strict`.
+- [x] 4.3 Record the accepted limitation — 014's backfill groups pre-existing
+      rows by `(client_id, user_id)`, so two pre-014 consents by the same user
+      for the same client share a family — in design.md (D4a), CLAUDE.md and
+      the principal requirement.
+- [x] 4.4 Rebase onto `origin/main` after the wave-1 archive and re-diff the
+      MODIFIED `check_upload` block against the archived baseline.

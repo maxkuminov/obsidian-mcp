@@ -2,7 +2,7 @@
 
 ### Requirement: A transfer handle is scoped to the minting principal
 
-The identity-scoped lookup behind `check_upload` SHALL resolve a `public_id` only for the **principal** that minted it, where the principal of an API key is that `api_keys` row and the principal of an OAuth access token is its **grant family** (`oauth_tokens.grant_id`), and SHALL additionally require the calling `user_id` to equal the row's. A handle SHALL therefore remain visible to its minting agent across any number of refresh rotations within one grant, and SHALL remain invisible to every other principal — a different API key, a different client, or a second `/authorize` approval by the same user for the same client. When the presenting credential row cannot be resolved, the lookup SHALL find nothing.
+The identity-scoped lookup behind `check_upload` SHALL resolve a `public_id` only for the **principal** that minted it, where the principal of an API key is that `api_keys` row and the principal of an OAuth access token is its **grant family** (`oauth_tokens.grant_id`), and SHALL additionally require the calling `user_id` to equal the row's. A handle SHALL therefore remain visible to its minting agent across any number of refresh rotations within one grant, and SHALL remain invisible to every other principal — a different API key, a different client, or a second `/authorize` approval by the same user for the same client. When the presenting credential row cannot be resolved, the lookup SHALL find nothing. The family comparison SHALL include the credentials' `client_id` as well as their `grant_id`, so that two clients can never share a principal. Grant separation is exact for every grant issued after migration 014; for rows whose `grant_id` came from 014's backfill it is approximate in one direction, because that backfill groups by `(client_id, user_id)` — two pre-014 consents by the same user for the same client share one family, and a token of either MAY therefore read the other's handle status. That is an accepted limitation, not a permitted widening: it grants read-only status on a handle that authorises nothing, and no other pair of principals SHALL be conflated.
 
 Redemption SHALL NOT be widened in the same way: the `/transfer/*` routes and the publish gate SHALL keep re-validating the exact credential row recorded on the token. This is safe because a capability's expiry is already clamped to that credential's own expiry, so the minting credential outlives every link it minted unless it is revoked — and a revocation SHALL kill the link.
 
@@ -15,6 +15,11 @@ Redemption SHALL NOT be widened in the same way: the `/transfer/*` routes and th
 
 - **WHEN** the same user approves the same client a second time, producing a second grant family, and a token of that family presents the first family's handle
 - **THEN** the lookup SHALL find nothing
+
+#### Scenario: Two clients never share a principal
+
+- **WHEN** a token registered to a different `client_id` presents a handle whose minting token carries the same `grant_id`
+- **THEN** the lookup SHALL find nothing, and a token of the minting client's own family SHALL still resolve it
 
 #### Scenario: Another user, another key
 

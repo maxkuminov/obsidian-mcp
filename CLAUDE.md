@@ -743,6 +743,21 @@ What deliberately did **not** widen:
 - **The API-key path is untouched.** A key does not rotate; a second key of the
   same user is a different principal.
 
+The `EXISTS` compares `client_id` as well as `grant_id`. One `grant_id` belongs
+to exactly one `(client_id, user_id)` by invariant, not by constraint, and this
+predicate is the access control — so a family that somehow spanned two clients
+still cannot leak between them.
+
+**Accepted limitation — pre-014 families are approximate.** 014's backfill
+groups pre-existing rows by `(client_id, user_id)`, which #64 accepted as the
+best available guess (nothing in the old schema recorded which consent a row
+came from). Two consents by the same user *for the same client* made before 014
+therefore share one family, so a token from either can read `check_upload`
+status — path, size, sha256, mime — for a handle minted by the other. Same
+user, same client, read-only status on a handle that authorises nothing, and it
+shrinks as those tokens age out; every grant issued after 014 is exact. Not
+worth inventing a consent boundary the database never recorded.
+
 ### A link never outlives the credential that minted it
 
 Redemption re-checks the credential (`_credential_ok`), so `transfer_tokens.expires_at` alone was never the effective lifetime: an OAuth access token lives one hour, and `expires_in=3600` on that path is therefore *always* divergent (#73). `transfer.plan_mint_window` computes `min(requested TTL, credential expiry)` and the row stores that, so the tool result, `/transfer/*/info` and both pages all show a deadline enforcement agrees with — clamping once instead of teaching three surfaces the same arithmetic. **`mint_token` calls it itself, in its own transaction, immediately before the INSERT, and takes no window parameter** — it *returns* the window so the tools can report a clamp. Do not add one back: a caller-supplied deadline is a caller-supplied security boundary, and a stale window (computed before a revocation, or by a path that forgot) is exactly the divergence this exists to remove. The same call re-validates the credential with `_credential_ok`, the redemption predicate, so a key revoked, downgraded, deactivated or reassigned between the tool's permission check and the INSERT mints nothing rather than a row whose only future is the 404. **That re-validation is an unlocked `SELECT`, and deliberately so:** a revocation committing between it and the INSERT yields a capability every redemption rejects and `check_upload` reports as `revoked` — fail-closed, the same optimistic level declared elsewhere here, and the locked re-check that actually matters is the publish gate.
