@@ -302,18 +302,27 @@ async def authorize_get(
 
     scope_parts = scope.split()
     offline_access_requested = "offline_access" in scope_parts
-    # Preselect whichever radio matches what the client actually asked for.
-    # Without this, the "Read only" option is checked unconditionally, so a
-    # client requesting scope=readwrite (e.g. because the user picked
-    # read-write access in the client's own connector settings) still gets
-    # a read-only grant unless the user manually re-clicks the other radio.
-    requested_write = "readwrite" in scope_parts and client_can_write
+    # What the client asked for, straight from the (validated) query param —
+    # *display only*. It is deliberately NOT gated on `client_can_write`: the
+    # consent screen tells the user what was requested, and a client asking
+    # for more than it is registered for is exactly the mismatch worth
+    # showing. `write_unavailable` is that case.
+    #
+    # It must never drive the preselected radio. The checked radio is the
+    # value the form submits, so binding it to a client-controlled query
+    # param would let one unchanged Approve click grant readwrite to any
+    # self-registered client (`/register` is unauthenticated) — see #63.
+    # "Read only" stays preselected unconditionally in the template; write
+    # requires a deliberate click.
+    requested_write = "readwrite" in scope_parts
+    write_unavailable = requested_write and not client_can_write
 
     response = templates.TemplateResponse(request, "authorize.html", {
         "client_name": client.client_name,
         "scope": scope,
         "client_can_write": client_can_write,
         "requested_write": requested_write,
+        "write_unavailable": write_unavailable,
         "read_scope": "read offline_access" if offline_access_requested else "read",
         "readwrite_scope": "readwrite offline_access" if offline_access_requested else "readwrite",
         "client_id": client_id,

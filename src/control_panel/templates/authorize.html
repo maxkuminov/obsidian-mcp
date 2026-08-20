@@ -111,6 +111,15 @@
 
         .request-box strong { color: #d8dce8; font-weight: 500; }
 
+        .request-note {
+            margin-top: 8px;
+            font-size: 11.5px;
+            color: #6e7e9c;
+            line-height: 1.45;
+        }
+
+        .request-note.warn { color: #c9a227; }
+
         .scope-label {
             font-size: 10px;
             font-weight: 600;
@@ -135,6 +144,20 @@
         .scope-option:hover {
             border-color: #223050;
             background: rgba(139,111,223,0.04);
+        }
+
+        /* Mark the level that is actually selected. Kept in its own rule
+           blocks (never grouped with a selector that must keep working): a
+           browser without `:has()` treats the whole selector list as invalid
+           and drops the rule, falling back to the native radio dot — which
+           `accent-color` below styles and which stays the baseline signal. */
+        .scope-option:has(input[type="radio"]:checked) {
+            border-color: #5a45a8;
+            background: rgba(139,111,223,0.10);
+        }
+
+        .scope-option:has(input[type="radio"]:checked) .scope-option-title {
+            color: #e0d9f8;
         }
 
         .scope-option input[type="radio"] {
@@ -220,7 +243,15 @@
 
         <div class="card-body">
             <div class="request-box">
-                <strong>{{ client_name }}</strong> is requesting access to your Obsidian vault.
+                <strong>{{ client_name }}</strong> is requesting
+                <strong>{% if requested_write %}Read + Write{% else %}Read only{% endif %}</strong>
+                access to your Obsidian vault.
+                {% if write_unavailable %}
+                <div class="request-note warn">Read + Write is not available to this client — it is registered for read-only access.</div>
+                {% endif %}
+                {% if client_can_write %}
+                <div class="request-note">Read only is preselected. Read + Write is granted only if you select it below.</div>
+                {% endif %}
             </div>
 
             <form method="post" action="/authorize">
@@ -233,8 +264,14 @@
 
                 <div class="scope-label">Grant access level</div>
 
+                {# "Read only" is checked unconditionally, and the write radio
+                   never is. The checked radio is what the form submits, so a
+                   preselect driven by the client-controlled `scope` query
+                   param would make one unchanged Approve click grant vault-wide
+                   write to any self-registered client (#63). What the client
+                   asked for is surfaced in the request box above instead. #}
                 <label class="scope-option">
-                    <input type="radio" name="scope" value="{{ read_scope }}" {% if not requested_write %}checked{% endif %}>
+                    <input type="radio" name="scope" value="{{ read_scope }}" checked>
                     <div>
                         <div class="scope-option-title">Read only</div>
                         <div class="scope-option-desc">Search and read notes. Cannot create or edit.</div>
@@ -243,7 +280,7 @@
 
                 {% if client_can_write %}
                 <label class="scope-option">
-                    <input type="radio" name="scope" value="{{ readwrite_scope }}" {% if requested_write %}checked{% endif %}>
+                    <input type="radio" name="scope" value="{{ readwrite_scope }}">
                     <div>
                         <div class="scope-option-title">Read + Write</div>
                         <div class="scope-option-desc">Full access: search, read, create, and edit notes.</div>
