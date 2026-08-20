@@ -97,3 +97,83 @@ interval. The re-check must not answer "note not found" for a leaf that is now
 a link: the obvious next move after "not found" is `create_note`, and a
 no-clobber create over a link publishes through it. So `_leaf_state_error`
 distinguishes absent / symlink / non-regular and says which.
+
+## D8. Pin the root, then resolve — not the other way round
+
+The first implementation resolved the root to a pathname, computed containment
+against it, and only then `open`ed that pathname. Every check therefore rested
+on a name that the `open` re-walked: rename the resolved root away, leave a
+symlink at its name, and the descriptor the whole call anchors to is a
+directory containment never saw.
+
+Opening first inverts the dependency — the root is an inode before any
+pathname work happens. The pathname work still happens (resolution is what
+lets in-vault symlinked ancestors keep working, D1), so it is *checked against*
+the pinned inode: `_require_same_directory` compares `fstat(root_fd)` with
+`stat(vault.resolve())` and refuses on a mismatch. A substitution after that
+point cannot hurt: `resolved_parent` would then resolve outside
+`vault_resolved` and fail the containment check.
+
+## D9. Publish the inode, not the name
+
+`link(tmp, name)` publishes *whatever `tmp` refers to when the call runs*. A
+peer with write access to the destination directory could unlink or rename over
+`.tmp-…` after the `fsync` and have its own inode published as the note — the
+staging file's exclusive `O_CREAT|O_EXCL|O_NOFOLLOW` creation says nothing
+about what the name means later.
+
+The staging descriptor is the one handle no rename can take away, so the
+no-clobber publish goes through it: `linkat(AT_FDCWD, "/proc/self/fd/<fd>",
+dir_fd, name, AT_SYMLINK_FOLLOW)`. Two properties follow:
+
+- what is published is provably the inode we wrote, whatever the staging name
+  now says;
+- it **fails closed**. Detaching our inode from every name drops its link count
+  to zero, and `linkat` on a zero-link inode is `ENOENT` unless the caller holds
+  `CAP_DAC_READ_SEARCH`. An attacker can therefore prevent the write, never
+  substitute it. (Verified experimentally, both directions: unlink and
+  rename-over both produce `ENOENT`.)
+
+`/proc` is required, which the Linux-only declared semantics already assume; if
+it is absent we raise `UnsupportedFilesystem` rather than fall back to the
+by-name form the review rejected.
+
+The **overwrite** publish cannot use this: `renameat` has no by-descriptor form
+(`RENAME_EXCHANGE` does not help — it still names the source). It is preceded
+by an identity check instead, which narrows the window to the single rename
+syscall rather than leaving it open across the whole fsync-to-publish interval.
+
+The mirror hazard is real and handled: `_discard_temp` runs on every path, so
+unlinking the staging name blindly would answer an attempted substitution by
+*deleting the substitute* — the same destructive-write class, aimed at a
+different file. It unlinks only while the name still refers to our inode.
+
+## D10. What the overwrite window actually costs
+
+Stated rather than implied, because "narrowed" is not "closed": an adversary
+who can write to the **destination directory itself** can still win the
+`renameat` race on an overwrite. That adversary can equally well open the note
+and rewrite it — no race required. It is therefore outside the threat #59
+addresses, which is redirection through an **ancestor** or the **root**, where
+the attacker never had access to the destination at all. The no-clobber publish
+has no such window in any case.
+
+## D11. `move_note` verifies what moved, and refuses links too
+
+`renameat2` relocates whichever inode sits at the source when it runs. That is
+the property that stops a file which replaced the source from being destroyed
+(D3) — and it means the regular-file check performed before the preflight does
+not bind the commit. A directory or a symlink dropped at the source in between
+is what actually moves, and the tool would report "Moved" and key
+`notes_metadata` to it.
+
+So the destination is `lstat`ed through its parent descriptor after the rename
+and a non-regular result is rolled back with a second `RENAME_NOREPLACE`, the
+same shape `vault_fs._refuse_a_moved_directory` uses. The database is never
+touched: the tool returns first. If the rollback loses the source name, the
+error says where the object is so it can be recovered by hand.
+
+`soft_delete` deliberately lets a **symlink** ride into `.trash` — a link is
+inert there and was never followed. A move is different: a link published at
+the destination becomes what the index points at, and the caller is told a note
+moved that no longer exists. So `move_note` refuses both kinds.

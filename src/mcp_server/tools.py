@@ -638,6 +638,52 @@ def _leaf_state_error(target, path: str, *, missing: str | None = None) -> str |
     return None
 
 
+def _refuse_a_moved_non_file(
+    src_target, dst_target, from_path: str, to_rel: str
+) -> str | None:
+    """Undo a move whose source turned out not to be a regular file.
+
+    Mirrors `vault_fs._refuse_a_moved_directory`, for the same reason and with
+    the same primitive: the rollback is itself `RENAME_NOREPLACE`, so putting
+    the thing back can never clobber whatever now holds the source name. It
+    covers symlinks as well as directories — `soft_delete` lets a symlink ride
+    into `.trash` because a link is inert there, but a link published at a move
+    destination becomes what `notes_metadata` points at, and the tool would
+    have reported a successful move of a note that no longer exists.
+
+    Returns an error message, or `None` when the destination is a regular file
+    and the move stands. Never updates the database: the caller returns first.
+    """
+    info = dst_target.lstat()
+    if info is not None and stat.S_ISREG(info.st_mode):
+        return None
+    if info is None:
+        return (
+            f"Move refused: {from_path} disappeared from {to_rel} immediately "
+            "after it was moved there. Nothing was reindexed; re-read the note "
+            "before retrying."
+        )
+    kind = (
+        "a directory"
+        if stat.S_ISDIR(info.st_mode)
+        else "a symbolic link"
+        if stat.S_ISLNK(info.st_mode)
+        else "not a regular file"
+    )
+    try:
+        move_file_no_clobber(dst_target, src_target)
+    except Exception as exc:
+        return (
+            f"Move refused: {from_path} was replaced by {kind} after it was "
+            f"checked, and it could not be moved back ({exc}). It is now at "
+            f"{to_rel} — restore it from there. Nothing was reindexed."
+        )
+    return (
+        f"Move refused: {from_path} was replaced by {kind} after it was "
+        "checked. It was moved back and nothing was reindexed."
+    )
+
+
 def _note_size_error_for(size: int) -> str | None:
     """`_note_size_error` for a caller that already knows the encoded length.
 
@@ -1539,6 +1585,17 @@ async def move_note_impl(
             return f"Move failed: {e}"
         except OSError as e:
             return f"Move failed: {e}"
+
+        # `renameat2` moves whichever inode sits at the source when it runs —
+        # the property that keeps a file which replaced the source from being
+        # destroyed. It cuts both ways: the regular-file check above ran before
+        # the preflight, so a directory or a symlink put at `from_path` in
+        # between is what actually moved. Reporting that as "Moved" would put a
+        # subtree, or a link, at the destination and then key the index to it.
+        if err := _refuse_a_moved_non_file(
+            src_target, dst_target, from_path, to_rel
+        ):
+            return err
 
         db_failed = False
         try:

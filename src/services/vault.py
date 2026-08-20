@@ -23,6 +23,14 @@ inside the directory the caller named:
 - the leaf can be swapped for a symlink between the guard's `lstat` and the
   read or write. `O_NOFOLLOW` turns that into `ELOOP`, which the tools report;
   the link is never followed and nothing outside the named directory is touched.
+- an adversary who can write to the **destination directory itself** can still
+  win the `renameat` race on an overwrite publish. That adversary can also just
+  edit the note directly, so it is outside the threat #59 addresses —
+  redirection through an *ancestor* or the *root*, where the attacker never had
+  access to the destination at all. The window is narrowed to that one syscall
+  by an identity check (`_require_staged_name`), and the no-clobber publish
+  removes it entirely by publishing the staged **inode** through
+  `/proc/self/fd` rather than the staged name.
 - a read-modify-write overwrite (`edit_note`, `set_frontmatter`, `move_note`'s
   link rewrites) is optimistic, not linearizable: `expected=` compares the
   current bytes immediately before the rename, and a writer that lands inside
@@ -37,8 +45,9 @@ inside the directory the caller named:
   delete or `move_note`'s own publication, which are one
   `renameat2(RENAME_NOREPLACE)`.
 
-Both are declared limits of optimistic concurrency, not open holes: the write
-always lands on the path the caller named, in the directory that was validated.
+These are declared limits of optimistic concurrency, not open holes: the
+write always lands on the path the caller named, in the directory that was
+validated.
 """
 
 import errno
@@ -512,29 +521,46 @@ def open_mutable(relative_path: str, user_id: int | None = None) -> MutableTarge
     component, or a parent that is not a usable directory.
     """
     parts = _mutable_parts(relative_path)
-    vault = _vault_root(user_id)
-    vault_resolved = vault.resolve()
-
     name = parts[-1]
-    resolved_parent = vault.joinpath(*parts[:-1]).resolve()
-    try:
-        parent_rel = resolved_parent.relative_to(vault_resolved)
-    except ValueError:
-        raise ValueError(f"Path traversal denied: {relative_path}") from None
+    vault = _vault_root(user_id)
 
-    target_path = resolved_parent / name
-    if is_hidden_path(parent_rel / name):
-        raise ValueError(f"Hidden path denied: {relative_path}")
-
+    # **The root descriptor is opened first, and never reopened by name.**
+    # Resolving the root to a pathname and only then `open`ing that pathname
+    # left the whole guard resting on a name: between the two, the resolved
+    # root could be renamed away and a symlink left at its name, and the
+    # descriptor everything below is anchored to would be a directory the
+    # containment check never saw. Pinning first inverts that — from here on
+    # the root is an inode, and the pathname work below is checked against it.
     try:
-        root_fd = vault_fs.open_root(vault_resolved)
+        root_fd = vault_fs.open_root(vault)
     except (OSError, vault_fs.VaultFSError) as exc:
         raise ValueError(f"Vault root is not usable: {exc}") from None
 
-    parent_rel_posix = parent_rel.as_posix()
-    if parent_rel_posix == ".":
-        parent_rel_posix = ""
     try:
+        vault_resolved = vault.resolve()
+        # `vault_resolved` is used for the containment check and for `rel`, so
+        # it has to describe the directory we just pinned. If the root's
+        # pathname was repointed between the open and the resolve, it does not
+        # — refuse rather than compute a relative path against one root and
+        # walk it from another.
+        _require_same_directory(
+            root_fd, vault_resolved, f"the vault root ({vault})"
+        )
+
+        resolved_parent = vault.joinpath(*parts[:-1]).resolve()
+        try:
+            parent_rel = resolved_parent.relative_to(vault_resolved)
+        except ValueError:
+            raise ValueError(f"Path traversal denied: {relative_path}") from None
+
+        target_path = resolved_parent / name
+        if is_hidden_path(parent_rel / name):
+            raise ValueError(f"Hidden path denied: {relative_path}")
+
+        parent_rel_posix = parent_rel.as_posix()
+        if parent_rel_posix == ".":
+            parent_rel_posix = ""
+
         dir_fd: int | None
         try:
             dir_fd = vault_fs.open_dir_beneath(
@@ -547,6 +573,7 @@ def open_mutable(relative_path: str, user_id: int | None = None) -> MutableTarge
             dir_fd = None
         except vault_fs.UnsafePath as exc:
             raise ValueError(str(exc)) from None
+
         target = MutableTarget(
             path=target_path,
             rel=(parent_rel / name).as_posix(),
@@ -560,15 +587,36 @@ def open_mutable(relative_path: str, user_id: int | None = None) -> MutableTarge
         vault_fs.close_quietly(root_fd, "vault root")
         raise
 
-    info = target.lstat()
-    if info is not None and stat.S_ISLNK(info.st_mode):
+    # Inside its own guard: an `lstat` that raises `EIO` would otherwise leak
+    # both descriptors, and the message below reads the link while the target
+    # is still anchored — never by pathname after the fds are gone.
+    try:
+        info = target.lstat()
+        if info is not None and stat.S_ISLNK(info.st_mode):
+            label = _link_target_label(target, vault_resolved)
+            raise ValueError(
+                f"{relative_path} is a symbolic link to {label} — mutating "
+                "tools act only on the named file; operate on the target "
+                "instead."
+            )
+    except BaseException:
         target.close()
-        raise ValueError(
-            f"{relative_path} is a symbolic link to "
-            f"{_link_target_label(target_path, vault_resolved)} — mutating "
-            "tools act only on the named file; operate on the target instead."
-        )
+        raise
     return target
+
+
+def _require_same_directory(dir_fd: int, path: Path, what: str) -> None:
+    """Refuse unless `path` still names the directory `dir_fd` is open on."""
+    try:
+        by_name = os.stat(path)
+    except OSError as exc:
+        raise ValueError(f"Vault root is not usable: {exc}") from None
+    anchored = os.fstat(dir_fd)
+    if (by_name.st_dev, by_name.st_ino) != (anchored.st_dev, anchored.st_ino):
+        raise ValueError(
+            f"Refusing to continue: {what} changed while the path was being "
+            "validated. Retry the operation."
+        )
 
 
 def validate_mutable_path(relative_path: str, user_id: int | None = None) -> Path:
@@ -592,16 +640,34 @@ def validate_mutable_path(relative_path: str, user_id: int | None = None) -> Pat
         return target.path
 
 
-def _link_target_label(link: Path, vault_resolved: Path) -> str:
+def _link_target_label(target: "MutableTarget", vault_resolved: Path) -> str:
     """Name a symlink's ultimate target for an error message.
 
     Vault-relative POSIX when the target lands inside the vault (dangling links
     included — the caller still learns which note the alias was meant to name),
     otherwise the literal string `outside the vault`.
+
+    **The link itself is read through the parent descriptor**, not by pathname.
+    Naming a target requires resolving one, and a resolution done after the
+    descriptors are gone can describe a link that no longer exists — the
+    message would then send the agent at a note that was never involved, which
+    is worse than admitting we do not know. So `readlink` is anchored; only the
+    *display* resolution of what it points at is by pathname, and if the link
+    cannot be read at all the message says so instead of guessing.
     """
+    dir_fd = target.parent_fd
+    if dir_fd is None:  # pragma: no cover - the leaf cannot exist without one
+        return "a target that could not be read (the link changed)"
     try:
-        destination = Path(os.path.realpath(link))
-        return destination.relative_to(vault_resolved).as_posix()
+        literal = os.readlink(target.name, dir_fd=dir_fd)
+    except OSError:
+        return "a target that could not be read (the link changed)"
+    destination = Path(literal)
+    if not destination.is_absolute():
+        destination = target.path.parent / destination
+    try:
+        resolved = Path(os.path.realpath(destination))
+        return resolved.relative_to(vault_resolved).as_posix()
     except (ValueError, OSError):
         return "outside the vault"
 
@@ -729,7 +795,8 @@ def _atomic_write_at(
 
     1. the temp file is created exclusively and `O_NOFOLLOW` (see
        `_create_temp_exclusively`), so staging cannot be redirected through a
-       planted symlink;
+       planted symlink. Its descriptor stays open until publication: it is the
+       only handle on the staged bytes that no rename or unlink can take away;
     2. the payload is written and **`fsync`ed before publication**. A crash
        between the two leaves the destination untouched; without the `fsync` a
        crash just after the rename could leave the destination published but
@@ -738,25 +805,38 @@ def _atomic_write_at(
     3. `expected` (when given) is compared against the current bytes read
        through the same descriptor — optimistic conflict detection, immediately
        before publication;
-    4. publication is `renameat` for an overwrite and `linkat` for a
-       no-clobber write. `link` either creates the name or fails `EEXIST`:
-       kernel-linearizable, so nothing can be destroyed by a no-clobber
-       publish. A filesystem that cannot hard-link inside the vault raises
-       `UnsupportedFilesystem` rather than degrading to a replacing rename.
+    4. publication. **The no-clobber path publishes the staged *inode*, not the
+       staged name**: `linkat` through `/proc/self/fd/<fd>`. Publishing by name
+       (`link(tmp, name)`) trusted `.tmp-…` to still mean what we wrote — a
+       peer in the destination directory could unlink or rename over it after
+       the `fsync` and have *its* inode published as the note. Going through
+       the descriptor removes the name from the decision entirely, and it also
+       fails closed: detaching our inode drops its link count to zero, and
+       `linkat` on a zero-link inode is `ENOENT` (only `CAP_DAC_READ_SEARCH`
+       lifts that), so an attacker can prevent the write but never substitute
+       it. The overwrite path is `renameat`, which is inherently by name, so it
+       is preceded by an identity check — `fstat(fd)` against the temp name —
+       narrowing the window to that single syscall.
+
+    **What that last window means, precisely.** An adversary who can write to
+    the *destination directory itself* can still win the rename race on an
+    overwrite. That adversary can also just edit the note directly, so it is
+    outside the threat #59 addresses: redirection through an **ancestor** or
+    the **root**, where the attacker never had access to the destination at
+    all. Stated rather than implied.
     """
     payload = data if data is not None else (text or "").encode("utf-8")
     dir_fd = target.dir_fd
     name = target.name
     fd, tmp = _create_temp_exclusively(dir_fd, name)
+    staged = os.fstat(fd)
     try:
-        try:
-            with os.fdopen(fd, "wb", closefd=False) as stream:
-                stream.write(payload)
-                stream.flush()
-            os.fchmod(fd, _default_file_mode())
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+        os.fchmod(fd, _default_file_mode())
+        os.fsync(fd)
+
         if expected is not None:
             try:
                 current = _read_fd_bytes(dir_fd, name)
@@ -764,46 +844,127 @@ def _atomic_write_at(
                 raise RuntimeError(f"File changed while editing: {name}") from None
             if current != expected:
                 raise RuntimeError(f"File changed while editing: {name}")
+
         if overwrite:
+            _require_staged_name(dir_fd, tmp, staged)
             os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         else:
-            # A hard link publishes the completed temp inode only when the
-            # destination does not exist. Unlike exists()+replace(), this is an
-            # atomic no-clobber operation on the same filesystem.
-            try:
-                os.link(
-                    tmp,
-                    name,
-                    src_dir_fd=dir_fd,
-                    dst_dir_fd=dir_fd,
-                    follow_symlinks=False,
-                )
-            except FileExistsError:
-                raise
-            except OSError as exc:
-                if getattr(exc, "errno", None) in (
-                    errno.EPERM,
-                    errno.EOPNOTSUPP,
-                    errno.EXDEV,
-                ):
-                    raise vault_fs.UnsupportedFilesystem(
-                        "The vault filesystem does not support hard links, "
-                        "which the no-clobber write depends on; refusing "
-                        "rather than replacing an existing file."
-                    ) from exc
-                raise
+            _link_staged_inode(fd, dir_fd, name)
     finally:
-        # The temp is a regular file we created ourselves in a directory we
-        # hold open, so an unconditional unlink is safe on every path: a
-        # successful `replace` already consumed it, `link` did not, and a
-        # failure leaves it behind. `_discard_temp` never raises — once the
-        # publication has happened, a failing unlink is janitorial and must not
-        # turn a completed write into a reported failure.
-        _discard_temp(dir_fd, tmp)
+        # The temp is ours and lives in a directory we hold open, so it can be
+        # removed on every path: a successful `replace` already consumed it,
+        # the inode publish did not, and a failure leaves it behind. It is
+        # removed only if the name *still refers to the inode we staged* —
+        # unlinking by name alone would destroy whatever a peer had put there.
+        # `_discard_temp` never raises: once publication has happened, a failed
+        # unlink is janitorial and must not turn a completed write into a
+        # reported failure.
+        _discard_temp(dir_fd, tmp, staged)
+        os.close(fd)
     return target.path
 
 
-def _discard_temp(dir_fd: int, tmp: str) -> None:
+def _staged_identity_matches(dir_fd: int, tmp: str, staged: os.stat_result) -> bool:
+    """Whether `tmp` still names the inode we staged."""
+    try:
+        current = os.stat(tmp, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (current.st_dev, current.st_ino) == (staged.st_dev, staged.st_ino)
+
+
+def _require_staged_name(dir_fd: int, tmp: str, staged: os.stat_result) -> None:
+    """Refuse unless the temp name still refers to the bytes we just wrote.
+
+    `renameat` moves whatever is at the source name when it runs, so an
+    overwrite publish cannot be made to carry an inode the way `linkat` can.
+    Checking here does not close the race — it narrows it to the one syscall —
+    and it turns the common case of a peer replacing our staging file from
+    "their content published as the note" into a refusal.
+    """
+    if not _staged_identity_matches(dir_fd, tmp, staged):
+        raise vault_fs.Conflict(
+            "The staged copy was replaced before it could be published; "
+            "nothing was written. Retry the operation."
+        )
+
+
+# Whether `/proc/self/fd` is usable for publishing a staged inode. Cached: it
+# is a property of the container, not of the call.
+_proc_fd_available_cache: bool | None = None
+
+
+def _proc_fd_available() -> bool:
+    global _proc_fd_available_cache
+    if _proc_fd_available_cache is None:
+        _proc_fd_available_cache = os.path.isdir("/proc/self/fd")
+    return _proc_fd_available_cache
+
+
+def _link_staged_inode(fd: int, dir_fd: int, name: str) -> None:
+    """Publish the inode behind `fd` as `name`, no-clobber.
+
+    `linkat(AT_FDCWD, "/proc/self/fd/<fd>", dir_fd, name, AT_SYMLINK_FOLLOW)`.
+    The magic link resolves to the open file description, so what gets
+    published is the inode we wrote — not whatever the staging *name* happens
+    to refer to by the time we publish. Linux-only, which the declared
+    filesystem semantics already require; without `/proc` there is no way to
+    publish an inode by descriptor and we refuse rather than fall back to the
+    by-name form the review rejected.
+
+    `EEXIST` is the ordinary no-clobber refusal and propagates as
+    `FileExistsError`. `ENOENT` means our staged inode was detached from every
+    name (a peer unlinked or renamed over `.tmp-…`), which drops its link count
+    to zero and makes `linkat` refuse — the fail-closed half of this design.
+    """
+    if not _proc_fd_available():
+        raise vault_fs.UnsupportedFilesystem(
+            "/proc is not available, so a staged file cannot be published by "
+            "descriptor; refusing rather than publishing by name."
+        )
+    try:
+        os.link(
+            f"/proc/self/fd/{fd}",
+            name,
+            dst_dir_fd=dir_fd,
+            follow_symlinks=True,
+        )
+    except FileExistsError:
+        raise
+    except FileNotFoundError as exc:
+        raise vault_fs.Conflict(
+            "The staged copy was detached before it could be published; "
+            "nothing was written. Retry the operation."
+        ) from exc
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (
+            errno.EPERM,
+            errno.EOPNOTSUPP,
+            errno.EXDEV,
+        ):
+            raise vault_fs.UnsupportedFilesystem(
+                "The vault filesystem does not support hard links, which the "
+                "no-clobber write depends on; refusing rather than replacing "
+                "an existing file."
+            ) from exc
+        raise
+
+
+def _discard_temp(dir_fd: int, tmp: str, staged: os.stat_result | None = None) -> None:
+    """Remove our staged temp file — and never anybody else's.
+
+    With `staged`, the name is unlinked only while it still refers to that
+    inode. A peer that took the staging name over keeps its file: we would
+    otherwise answer an attempted substitution by deleting the substitute,
+    which is the same destructive-write class this module exists to prevent.
+    """
+    if staged is not None and not _staged_identity_matches(dir_fd, tmp, staged):
+        logger.warning(
+            "Temp name %s no longer refers to the file we staged; leaving it "
+            "in place rather than unlinking a file we did not create.",
+            tmp,
+        )
+        return
     try:
         os.unlink(tmp, dir_fd=dir_fd)
     except FileNotFoundError:

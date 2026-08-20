@@ -760,3 +760,256 @@ async def test_a_second_delete_of_the_same_name_gets_a_distinct_trash_entry(vaul
         assert "Soft-deleted" in await tools.delete_note_impl("note.md")
 
     assert len(list((vault / ".trash").iterdir())) == 2
+
+
+# ── the root is pinned before it is resolved (Codex BLOCKER 1) ──────────────
+
+
+async def test_swapping_the_root_between_resolution_and_the_open_is_refused(
+    vault, monkeypatch, tmp_path_factory
+):
+    """Containment was computed against a *pathname*, then that pathname was
+    reopened. A root renamed away in between anchored a directory the guard
+    never checked. The root descriptor is opened first now, and the resolution
+    that follows has to agree with it.
+    """
+    roots = tmp_path_factory.mktemp("roots")
+    real_root = roots / "real"
+    decoy_root = roots / "decoy"
+    real_root.mkdir()
+    decoy_root.mkdir()
+    (real_root / "note.md").write_text("real\n", encoding="utf-8")
+    (decoy_root / "note.md").write_text("decoy\n", encoding="utf-8")
+    link = roots / "vault"
+    link.symlink_to(real_root)
+    monkeypatch.setattr(vault_service.settings, "vault_path", str(link))
+
+    # Fire once, in the window between pinning the root and resolving it.
+    real_resolve = vault_service.Path.resolve
+    fired: list[bool] = []
+
+    def resolve_then_swap(self, *args, **kwargs):
+        result = real_resolve(self, *args, **kwargs)
+        if not fired and str(self) == str(link):
+            fired.append(True)
+            os.rename(real_root, roots / "real-moved")
+            os.symlink(decoy_root, real_root)
+        return result
+
+    monkeypatch.setattr(vault_service.Path, "resolve", resolve_then_swap)
+
+    result = await tools.edit_note_impl("note.md", "after\n")
+
+    assert fired, "the race never ran"
+    assert "changed while the path was being validated" in result, result
+    # Neither copy was touched.
+    assert (roots / "real-moved" / "note.md").read_text(encoding="utf-8") == "real\n"
+    assert (decoy_root / "note.md").read_text(encoding="utf-8") == "decoy\n"
+
+
+# ── the staged inode, not the staged name (Codex BLOCKER 2) ─────────────────
+
+
+def _replace_the_staging_file(monkeypatch, decoy: bytes):
+    """Swap a different inode under the `.tmp-…` name after it is fsynced.
+
+    A peer with write access to the destination directory could otherwise have
+    *its* bytes published as the note: the publish named the staging file, and
+    by then the name no longer meant what we wrote.
+    """
+    real_fsync = os.fsync
+    fired: list[str] = []
+
+    def fsync_then_swap(fd):
+        result = real_fsync(fd)
+        if fired:
+            return result
+        # Find our staging name through the fd's own directory.
+        link = os.readlink(f"/proc/self/fd/{fd}")
+        tmp = Path(link)
+        fired.append(tmp.name)
+        os.unlink(tmp)
+        tmp.write_bytes(decoy)
+        return result
+
+    monkeypatch.setattr(vault_service.os, "fsync", fsync_then_swap)
+    return fired
+
+
+async def test_a_swapped_staging_file_is_never_published_by_create(
+    vault, monkeypatch
+):
+    fired = _replace_the_staging_file(monkeypatch, b"DECOY")
+
+    result = await tools.create_note_impl("note.md", "ours\n")
+
+    assert fired, "the race never ran"
+    # Either the note was never created, or it holds exactly our bytes — never
+    # the decoy's. (Detaching our inode drops its link count to zero, which is
+    # what makes `linkat` refuse.)
+    assert "DECOY" not in result
+    if (vault / "note.md").exists():
+        assert (vault / "note.md").read_bytes() == b"ours\n"
+    else:
+        assert "staged copy" in result, result
+
+
+def test_a_swapped_staging_file_is_never_published_by_a_raw_write(
+    vault, monkeypatch
+):
+    _replace_the_staging_file(monkeypatch, b"DECOY")
+
+    with pytest.raises(vault_fs.VaultFSError, match="staged copy"):
+        vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+
+    assert not (vault / "blob.bin").exists()
+
+
+async def test_a_swapped_staging_file_is_refused_by_an_overwrite(
+    vault, monkeypatch
+):
+    """`renameat` is inherently by name, so this one is a check — but it must
+    refuse rather than publish the substitute."""
+    note = vault / "note.md"
+    note.write_text("before\n", encoding="utf-8")
+    fired = _replace_the_staging_file(monkeypatch, b"DECOY")
+
+    result = await tools.edit_note_impl("note.md", "after\n")
+
+    assert fired
+    assert "staged copy" in result, result
+    assert note.read_text(encoding="utf-8") == "before\n"
+
+
+def test_the_temp_sweep_never_unlinks_a_file_it_did_not_stage(vault, monkeypatch):
+    """The mirror hazard: answering a substitution by deleting the substitute.
+
+    `_discard_temp` runs on every path, so unlinking the staging name blindly
+    would destroy whatever a peer had put there — the same destructive-write
+    class, just aimed at a different file.
+    """
+    fired = _replace_the_staging_file(monkeypatch, b"someone else's file")
+
+    with pytest.raises(vault_fs.VaultFSError):
+        vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+
+    leftovers = [p for p in vault.iterdir() if p.name.startswith(".tmp-")]
+    assert len(leftovers) == 1, leftovers
+    assert leftovers[0].name == fired[0]
+    assert leftovers[0].read_bytes() == b"someone else's file"
+
+
+def test_publishing_by_descriptor_refuses_without_proc(vault, monkeypatch):
+    """No `/proc` means no way to publish an inode — refuse, never fall back to
+    publishing whatever the staging *name* points at."""
+    monkeypatch.setattr(vault_service, "_proc_fd_available_cache", False)
+
+    with pytest.raises(vault_fs.UnsupportedFilesystem, match="/proc"):
+        vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+
+    assert not (vault / "blob.bin").exists()
+
+
+# ── move_note verifies what actually moved (Codex BLOCKER 3) ────────────────
+
+
+def _no_db(monkeypatch) -> list:
+    """`async_session` that records nothing may be executed against it."""
+    executed: list = []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def execute(self, statement):
+            executed.append(statement)
+
+            class Empty:
+                def all(self):
+                    return []
+
+            return Empty()
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(tools, "async_session", FakeSession)
+    return executed
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink"])
+async def test_a_source_replaced_by_a_non_file_is_moved_back(
+    vault, monkeypatch, kind
+):
+    """`renameat2` relocates whatever inode is at the source when it runs.
+
+    The regular-file check happens before the preflight, so a directory or a
+    link dropped in afterwards is what moves — and "Moved" would then key the
+    index to a subtree or an alias.
+    """
+    source = vault / "source.md"
+    source.write_text("note\n", encoding="utf-8")
+    (vault / "elsewhere.md").write_text("elsewhere\n", encoding="utf-8")
+    executed = _no_db(monkeypatch)
+
+    real = vault_fs.rename_noreplace
+    fired: list[bool] = []
+
+    def swap_then_rename(src_dir_fd, src_name, dst_dir_fd, dst_name):
+        if not fired:
+            fired.append(True)
+            os.unlink(source)
+            if kind == "directory":
+                source.mkdir()
+                (source / "inner.md").write_text("inner\n", encoding="utf-8")
+            else:
+                source.symlink_to(vault / "elsewhere.md")
+        return real(src_dir_fd, src_name, dst_dir_fd, dst_name)
+
+    monkeypatch.setattr(vault_fs, "rename_noreplace", swap_then_rename)
+
+    result = await tools.move_note_impl("source.md", "moved.md")
+
+    assert fired
+    assert "Move refused" in result, result
+    assert "moved back" in result, result
+    # Put back where it was, and the destination is clean.
+    assert not (vault / "moved.md").exists()
+    if kind == "directory":
+        assert (source / "inner.md").read_text(encoding="utf-8") == "inner\n"
+    else:
+        assert source.is_symlink()
+        assert (vault / "elsewhere.md").read_text(encoding="utf-8") == "elsewhere\n"
+    # And the index was never told about it.
+    assert executed == []
+
+
+async def test_a_failed_rollback_names_the_recovery_location(vault, monkeypatch):
+    source = vault / "source.md"
+    source.write_text("note\n", encoding="utf-8")
+    executed = _no_db(monkeypatch)
+
+    real = vault_fs.rename_noreplace
+    calls: list[int] = []
+
+    def swap_then_rename(src_dir_fd, src_name, dst_dir_fd, dst_name):
+        calls.append(1)
+        if len(calls) == 1:
+            os.unlink(source)
+            source.mkdir()
+            return real(src_dir_fd, src_name, dst_dir_fd, dst_name)
+        # The rollback: somebody took the source name over in the meantime.
+        raise FileExistsError(17, "File exists", dst_name)
+
+    monkeypatch.setattr(vault_fs, "rename_noreplace", swap_then_rename)
+
+    result = await tools.move_note_impl("source.md", "moved.md")
+
+    assert "Move refused" in result, result
+    assert "could not be moved back" in result, result
+    assert "moved.md" in result, result  # where to recover it from
+    assert (vault / "moved.md").is_dir()
+    assert executed == []

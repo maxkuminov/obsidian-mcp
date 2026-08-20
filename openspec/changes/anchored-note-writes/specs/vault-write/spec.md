@@ -47,6 +47,12 @@ A missing parent directory SHALL NOT be created during validation. It SHALL be c
 - **THEN** the move SHALL be aborted before any mutation: the note stays at its original path, no source is rewritten, and `notes_metadata`/`note_links` are unchanged
 - **AND** the error SHALL name the limit and suggest moving without `rewrite_links`
 
+#### Scenario: The vault root is substituted between resolution and anchoring
+
+- **WHEN** the directory the configured vault root resolves to is renamed away and replaced by a link to another directory while a path is being validated
+- **THEN** the operation SHALL be refused
+- **AND** neither the original directory's copy of the note nor the substituted directory's copy SHALL be modified
+
 #### Scenario: A backlink source needing no rewrite holds nothing open
 
 - **WHEN** `move_note(rewrite_links=True)` considers a backlink source that is missing, unreadable, or contains no link this move rewrites
@@ -87,6 +93,13 @@ The system SHALL perform all file writes from MCP write tools via a temporary fi
 - **THEN** any reader observing the destination path SHALL see either the
   full prior content or the full new content, never a partial mix
 
+#### Scenario: The staging file is replaced before publication
+
+- **WHEN** another process detaches the staged temporary file from its name — by unlinking it or renaming a different file over it — after the payload has been flushed and before publication
+- **THEN** the substituted file's contents SHALL NOT be published at the destination
+- **AND** the destination SHALL hold either its prior content or the content this call staged, never a third party's
+- **AND** the substituted file SHALL be left in place rather than unlinked by the cleanup
+
 #### Scenario: Staging happens in the destination directory
 
 - **WHEN** any note or file write stages its payload
@@ -111,9 +124,16 @@ The system SHALL perform all file writes from MCP write tools via a temporary fi
 
 #### Scenario: The source is replaced during a move
 
-- **WHEN** another actor replaces the file at `from_path` with a different file after validation but before `move_note` commits
+- **WHEN** another actor replaces the file at `from_path` with a different *regular file* after validation but before `move_note` commits
 - **THEN** whichever file is at `from_path` when the move executes SHALL be relocated intact
 - **AND** no file SHALL be unlinked that was not the one moved
+
+#### Scenario: The source is replaced by a directory or a link during a move
+
+- **WHEN** another actor replaces the file at `from_path` with a directory or a symbolic link after validation but before `move_note` commits
+- **THEN** `move_note` SHALL detect that what arrived at the destination is not a regular file, SHALL move it back with a non-replacing rename, and SHALL report the move as refused
+- **AND** SHALL NOT update `notes_metadata` or `note_links`
+- **AND** if the rollback cannot be performed, the error SHALL name the location the object now occupies so it can be recovered
 
 #### Scenario: Hard links unavailable
 

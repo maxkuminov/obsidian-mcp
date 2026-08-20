@@ -12,6 +12,7 @@ Reads are deliberately unchanged — an alias reading as its target is what a
 user expects from an alias.
 """
 import base64
+import os
 from pathlib import Path
 
 import pytest
@@ -749,3 +750,79 @@ async def test_the_tools_refuse_an_alias_under_a_per_user_root(
     finally:
         current_user_id.reset(user_token)
         vault_service.clear_user_vault_cache()
+
+
+# ── the link is read while still anchored (Codex MINOR 1) ───────────────────
+
+
+def test_an_unreadable_link_is_not_given_a_guessed_target(vault, monkeypatch):
+    """Naming a target requires resolving one, and a resolution done after the
+    descriptors are gone can describe a link that no longer exists — sending
+    the agent at a note that was never involved. If the link cannot be read
+    through the parent fd, the message says so instead of guessing.
+    """
+    (vault / "important.md").write_text("real", encoding="utf-8")
+    (vault / "alias.md").symlink_to(vault / "important.md")
+
+    real_readlink = vault_service.os.readlink
+
+    def refuse(path, *args, **kwargs):
+        if path == "alias.md":
+            raise OSError(5, "I/O error")
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(vault_service.os, "readlink", refuse)
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_mutable_path("alias.md")
+
+    message = str(excinfo.value)
+    assert "the link changed" in message
+    assert "important.md" not in message
+
+
+def test_the_link_target_is_read_through_the_parent_descriptor(vault, monkeypatch):
+    """The `readlink` that produces the message is anchored, not by pathname."""
+    (vault / "important.md").write_text("real", encoding="utf-8")
+    (vault / "alias.md").symlink_to(vault / "important.md")
+
+    seen: list = []
+    real_readlink = vault_service.os.readlink
+
+    def recording(path, *args, **kwargs):
+        seen.append((path, kwargs.get("dir_fd")))
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(vault_service.os, "readlink", recording)
+
+    with pytest.raises(ValueError, match="is a symbolic link to important.md"):
+        validate_mutable_path("alias.md")
+
+    assert seen, "readlink was never called"
+    name, dir_fd = seen[0]
+    assert name == "alias.md"  # a bare component…
+    assert isinstance(dir_fd, int)  # …resolved against the parent fd
+
+
+def test_open_mutable_closes_its_descriptors_when_the_leaf_check_raises(
+    vault, monkeypatch
+):
+    """An `lstat` that raises (EIO) must not leak the root and parent fds."""
+    (vault / "note.md").write_text("body", encoding="utf-8")
+    before = len(os.listdir("/proc/self/fd"))
+
+    real_stat = vault_service.os.stat
+
+    def boom(name, *args, **kwargs):
+        # Only the anchored leaf `lstat`, not the root identity check.
+        if kwargs.get("dir_fd") is not None and kwargs.get("follow_symlinks") is False:
+            raise OSError(5, "I/O error")
+        return real_stat(name, *args, **kwargs)
+
+    monkeypatch.setattr(vault_service.os, "stat", boom)
+
+    for _ in range(3):
+        with pytest.raises(OSError):
+            vault_service.open_mutable("note.md")
+
+    assert len(os.listdir("/proc/self/fd")) == before

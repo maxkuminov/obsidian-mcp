@@ -42,3 +42,13 @@
 - [x] 6.5 `src/mcp_server/server.py` and `README.md` state the new `.trash` name form and the `UnsupportedFilesystem` refusal
 - [x] 6.6 Correct the claim that `write_file(overwrite=True)` is guarded by `expected=` (CLAUDE.md and the `vault` module docstring) — it is an unconditional replace
 - [x] 6.7 Note on `validate_mutable_path` that it has no production caller and why it is kept
+
+## 7. Adversarial-review follow-ups
+
+- [x] 7.1 Pin the vault-root descriptor **before** resolving it, and check with `_require_same_directory` that `vault.resolve()` still names the pinned inode — the containment check and `rel` are computed against the pathname and must describe the directory that was anchored
+- [x] 7.2 Publish the no-clobber write by **descriptor**, not by staging name: `linkat` through `/proc/self/fd/<fd>`, holding the staging fd open until publication; `UnsupportedFilesystem` when `/proc` is absent, never a fall back to the by-name form
+- [x] 7.3 Guard the overwrite publish with an `fstat(fd)`-vs-`stat(tmp)` identity check (`renameat` is inherently by name, so this narrows rather than closes), and make `_discard_temp` unlink the staging name only while it still refers to our inode
+- [x] 7.4 `move_note` `lstat`s the destination after the rename and rolls back a directory or symlink with a second `RENAME_NOREPLACE`, leaving the database untouched and naming the recovery location if the rollback fails
+- [x] 7.5 Read the symlink through the parent descriptor for the refusal message; say "the link changed" rather than naming a possibly-wrong target when it cannot be read
+- [x] 7.6 Wrap the closing leaf `lstat` in `open_mutable` so an `EIO` cannot leak the root and parent descriptors
+- [x] 7.7 Document — in the `vault` module docstring, CLAUDE.md and the design note — that an adversary holding the *destination directory* can still win the overwrite rename, and why that is outside the ancestor/root threat #59 addresses
