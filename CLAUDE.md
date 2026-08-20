@@ -17,7 +17,7 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
 - `src/main.py` — FastAPI app, lifespan, MCP mount
 - `src/config.py` — pydantic-settings
 - `src/database.py` — async SQLAlchemy engine/session
-- `src/models/db.py` — ORM models (api_keys, usage_logs, notes_metadata, note_embeddings, note_links, transfer_tokens)
+- `src/models/db.py` — ORM models (api_keys, usage_logs, notes_metadata, note_embeddings, note_links, transfer_tokens, oauth_clients/codes/tokens)
 - `src/mcp_server/` — MCP server, tools, auth middleware
 - `src/services/` — vault ops, search, embeddings, indexer, transfer, anchored FS
 - `src/transfer/` — public `/transfer/*` capability-redemption routes
@@ -152,7 +152,8 @@ lost the constraint is unknown. Its rules, all load-bearing:
   statement / per lock acquisition**, not a budget for the transaction. 013
   `RESET`s both at the end of `upgrade()`: `SET LOCAL` lasts for the
   transaction, and `alembic/env.py` runs *every* pending revision in one, so a
-  future 014 would otherwise inherit them.
+  later revision would otherwise inherit them. 014 does the same for the same
+  reason.
 - **Lock order is child-first.** The five other tables are backfilled and set
   NOT NULL before `oauth_clients` is locked, matching the app's own direction
   (`src/oauth/routes.py` locks `oauth_codes` `FOR UPDATE`, then reads
@@ -184,6 +185,66 @@ violating-row / NULL-method / missing-column / wrong-default / wrong-type /
 Idempotence is exercised by `alembic stamp 012` then `upgrade head`, not by a
 second `upgrade head` — the latter is a no-op at the alembic level and proves
 nothing about the migration body.
+
+The same module also gates **014**'s backfill, which `alembic check` is blind to
+in a different way: it sees the column, its NOT NULL and its index, and nothing
+about *which rows got which grant*. So the 014 cases assert the grouping
+directly — one family per `(client_id, user_id)`, never a family spanning two
+users, never a user's rows split across two families — plus stamp-back
+idempotence (which must not re-stamp existing `grant_id`s) and the downgrade.
+
+## OAuth grant families
+
+A `/authorize` approval is **one grant**; the token endpoint mints an
+access/refresh pair from it and every rotation mints another pair.
+`oauth_tokens.grant_id` (migration 014, NOT NULL, indexed) is what ties them
+together, and it is the *only* way a family is ever resolved — the decision in
+#64 was explicit that a second "find the family" path is how the bug comes
+back. `src/oauth/grants.py` owns the primitives.
+
+Why it exists: without it the panel could only offer per-row controls, and both
+were near no-ops. Revoking the access row left the refresh token to mint a
+fresh, identically-scoped pair on the client's next 401 retry (access tokens
+live one hour). Downgrading the access row silently reverted, because
+`_handle_refresh` copies the **refresh** token's scope. The revoked row then
+vanished from the page, so the operator saw a blank space that read as success.
+
+- **Invariant: one `grant_id` ⇒ one `(client_id, user_id)`.** Established at
+  every write site and by 014's group key. Family writes therefore do **not**
+  re-filter by `user_id` — under a broken invariant that predicate would turn a
+  complete revocation into a partial one, which is the failure the whole thing
+  exists to remove. `_assert_oauth_token_owner` still guards the token the
+  operator names, and because a family cannot span users that covers it.
+- **`lock_grant` is correctness, not tuning.** Under READ COMMITTED an
+  `UPDATE … WHERE grant_id = :g` takes its snapshot at statement start, so rows
+  a concurrent `_handle_refresh` *inserts* afterwards are invisible to it: the
+  panel reports "revoked" and the client keeps the pair it just rotated into.
+  Row locks cannot close that — the rows do not exist yet. Both sides take
+  `pg_advisory_xact_lock` on the grant **before** touching any family row, so
+  the order is total and nothing deadlocks; `_handle_refresh` does one unlocked
+  `grant_id` lookup first because it cannot lock what it has not identified.
+- **Revocation kills in-flight access tokens; rotation does not.** Letting the
+  replaced access token run to its expiry is right for rotation and wrong for
+  revocation — an hour of surviving write access after the operator clicked
+  Revoke is exactly the defect.
+- **`/revoke` (RFC 7009) is family-scoped too**, which §2.1 explicitly permits.
+  Anything narrower reproduces the near no-op for any client presenting its
+  access token.
+- **The registered scope caps every path.** `src/oauth/scope.py` holds the one
+  definition (`clamp_scope`, `client_can_write`, `token_has_write`); the OAuth
+  routes, `src/mcp_server/auth.py` and the panel all use it. The panel refuses
+  `readwrite` for a client not registered for it *and* clamps what it writes,
+  and `_handle_refresh` re-clamps on every rotation — otherwise a scope raised
+  above the registration survives forever (#67).
+- **`authorize_post` refuses a client bound to a different user** (#68). Fixed
+  at the source rather than by unioning the panel listing, which would hand the
+  other user the owner's cascading Delete. Single-user mode cannot trigger it.
+- **The panel lists revoked and expired rows, dimmed**, with one "Revoke
+  access" control and one scope select *per grant*. Live tokens are always
+  shown; dead ones are capped per grant with the remainder counted, because a
+  client refreshing hourly leaves hundreds in a 30-day window. Status also
+  reads the owner's `User.is_active` ("Owner inactive"), which
+  `APIKeyMiddleware` already enforces and the page used to badge green (#76).
 
 ## Key Decisions
 - API keys use `omcp_` prefix, stored as SHA-256 hashes

@@ -13,6 +13,7 @@ from src.auth.session import UNSET_VAULT_ROOT, current_user_id, current_vault_ro
 from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthToken, User
+from src.oauth.scope import token_has_write
 from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
@@ -279,9 +280,12 @@ class APIKeyMiddleware:
                         await response(scope, receive, send)
                         return
 
-                    # Map OAuth scope to permission - scopes are space-separated (OAuth 2.0 convention)
-                    scope_parts = set(oauth_token.scope.split())
-                    permission = "readwrite" if "readwrite" in scope_parts else "read"
+                    # Map OAuth scope to permission. Scopes are space-separated
+                    # sets (OAuth 2.0 convention), so this is a membership test
+                    # -- and it is the *same* helper the control panel uses to
+                    # decide what to display, so the badge and the enforcement
+                    # cannot disagree (issue #65).
+                    permission = "readwrite" if token_has_write(oauth_token.scope) else "read"
 
                     scope["state"] = scope.get("state", {})
                     scope["state"]["api_key_id"] = None

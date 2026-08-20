@@ -341,7 +341,7 @@ def insert_null_rows(url: str):
 def test_fresh_database_is_clean_and_enforced():
     """(a) An empty database migrated to head needs no further operations."""
     with throwaway_db("schema_fresh") as url:
-        assert alembic_version(url) == "013"
+        assert alembic_version(url) == "014"
         # No marker: 010 created this constraint and 013 recognised it as
         # already correct. That distinction is what downgrade() reads.
         assert_reconciled(url, marker_expected=False)
@@ -678,7 +678,7 @@ def test_rerunning_013_changes_nothing():
         assert alembic_version(url) == "012"
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
-        assert alembic_version(url) == "013"
+        assert alembic_version(url) == "014"
         assert (constraint_row(url), not_null_flags(url)) == before
         assert_reconciled(url, marker_expected=False)
 
@@ -709,3 +709,201 @@ def test_downgrade_drops_the_constraint_013_created():
         assert alembic_version(url) == "012"
         assert constraint_row(url) is None
         assert all(not_null_flags(url).values())
+
+
+# --------------------------------------------------------------------------
+# migration 014: oauth_tokens.grant_id (issue #64)
+# --------------------------------------------------------------------------
+#
+# `alembic check` sees the column, its nullability and its index, so
+# `assert_reconciled` above already covers the declarative half on every path.
+# What it cannot see is the *backfill*, and the backfill is where a migration
+# could invent a grant — splitting one family into two, so a revocation misses
+# half of it — or destroy one, by merging two users into a single family, so
+# revoking one user's grant kills another's. Those are the cases here.
+
+
+def insert_user(url, user_id: int, username: str):
+    sql(
+        url,
+        "INSERT INTO users (id, username, password_hash, is_admin, is_active, "
+        "session_version) VALUES ($1, $2, 'x', false, true, 1)",
+        user_id,
+        username,
+    )
+
+
+def insert_token(
+    url,
+    token_hash,
+    client_id,
+    *,
+    user_id=None,
+    token_type="access",
+    revoked=False,
+    scope="read",
+):
+    sql(
+        url,
+        "INSERT INTO oauth_tokens (token_hash, token_type, client_id, scope, "
+        "user_id, expires_at, revoked) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        token_hash,
+        token_type,
+        client_id,
+        scope,
+        user_id,
+        FUTURE,
+        revoked,
+    )
+
+
+def grant_ids(url) -> dict[str, str]:
+    rows = fetch(url, "SELECT token_hash, grant_id FROM oauth_tokens")
+    return {row["token_hash"]: row["grant_id"] for row in rows}
+
+
+def seed_pre_014_tokens(url):
+    """Two users, two clients, revoked and live rows, and a NULL-user row."""
+    insert_user(url, 1, "alice")
+    insert_user(url, 2, "bob")
+    insert_client(url, "client-a", "none", None)
+    insert_client(url, "client-b", "none", None)
+
+    # Alice's grant on client-a: a live pair plus a rotated-away refresh token.
+    insert_token(url, "a" * 64, "client-a", user_id=1, token_type="access")
+    insert_token(url, "b" * 64, "client-a", user_id=1, token_type="refresh")
+    insert_token(url, "c" * 64, "client-a", user_id=1, token_type="refresh", revoked=True)
+    # Bob authorized the same client — a different grant entirely.
+    insert_token(url, "d" * 64, "client-a", user_id=2, token_type="access")
+    # Alice on a second client.
+    insert_token(url, "e" * 64, "client-b", user_id=1, token_type="access")
+    # Single-user-mode row: user_id IS NULL. `NULL = NULL` is NULL, so an `=`
+    # join in the backfill would leave this one unmatched and the SET NOT NULL
+    # would fail — which is why it uses IS NOT DISTINCT FROM.
+    insert_token(url, "f" * 64, "client-b", user_id=None, token_type="access")
+
+
+EXPECTED_FAMILIES = 4  # (a,alice) (a,bob) (b,alice) (b,NULL)
+
+
+def test_grant_id_is_not_null_and_indexed_on_a_fresh_database():
+    with throwaway_db("schema_grant_fresh") as url:
+        attnotnull, coltype, _ = column_shape(url, "oauth_tokens", "grant_id")
+        assert attnotnull is True, (
+            "grant_id must be NOT NULL — the decision in #64 was explicit that "
+            "a nullable grant_id with a fallback 'find the family' path is how "
+            "the bug comes back"
+        )
+        assert coltype == "character varying(64)"
+        # The name is what autogenerate expects for `index=True`; anything else
+        # leaves `alembic check` permanently dirty.
+        assert fetchval(
+            url,
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'oauth_tokens' "
+            "AND indexname = 'ix_oauth_tokens_grant_id'",
+        ) is not None
+
+
+def test_backfill_gives_one_grant_per_client_and_user():
+    """The decided approximation, stated precisely.
+
+    Pre-014 rows carry no family, so one is assigned per distinct
+    `(client_id, user_id)`. Concurrent sessions of the same connector collapse
+    into one family — over-revoking, never under-revoking — and every grant
+    issued after the migration is exact.
+    """
+    with throwaway_db("schema_grant_backfill", revision="012") as url:
+        seed_pre_014_tokens(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        ids = grant_ids(url)
+        assert all(ids.values()), "no row may be left without a family"
+
+        alice_client_a = {ids["a" * 64], ids["b" * 64], ids["c" * 64]}
+        assert len(alice_client_a) == 1, (
+            "one user's rows on one client are one family — including the "
+            "revoked one, which is what lets the panel show revocation history"
+        )
+        assert len(set(ids.values())) == EXPECTED_FAMILIES
+
+
+def test_backfill_never_merges_two_users_into_one_family():
+    """The invariant every family operation leans on.
+
+    `src/oauth/grants.py` resolves a family as `grant_id == g` and deliberately
+    does *not* re-filter by `user_id` — a user predicate there would give
+    incomplete revocation a way back in. That is only safe because a family
+    cannot span users, which is what this asserts.
+    """
+    with throwaway_db("schema_grant_no_merge", revision="012") as url:
+        seed_pre_014_tokens(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        rows = fetch(
+            url,
+            "SELECT grant_id, count(DISTINCT coalesce(user_id, -1)) AS users "
+            "FROM oauth_tokens GROUP BY grant_id",
+        )
+        assert rows
+        assert all(row["users"] == 1 for row in rows), rows
+
+
+def test_backfill_does_not_split_a_users_rows_across_families():
+    """The other direction: a split family is a revocation that misses half."""
+    with throwaway_db("schema_grant_no_split", revision="012") as url:
+        seed_pre_014_tokens(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        rows = fetch(
+            url,
+            "SELECT client_id, coalesce(user_id, -1) AS uid, "
+            "       count(DISTINCT grant_id) AS families "
+            "FROM oauth_tokens GROUP BY client_id, user_id",
+        )
+        assert rows
+        assert all(row["families"] == 1 for row in rows), rows
+
+
+def test_rerunning_014_does_not_re_stamp_existing_grants():
+    """Idempotence that actually re-executes the body.
+
+    A second `upgrade head` is a no-op at the alembic level. Stamping back to
+    013 forces 014 to run again against a database that already satisfies it —
+    and re-partitioning live grants there would silently break every revocation
+    and downgrade issued before the re-run.
+    """
+    with throwaway_db("schema_grant_idempotent", revision="012") as url:
+        seed_pre_014_tokens(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        before = grant_ids(url)
+
+        _harness.run_alembic(url, "stamp", "013", dimensions=DIM)
+        assert alembic_version(url) == "013"
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == "014"
+        assert grant_ids(url) == before
+        assert column_shape(url, "oauth_tokens", "grant_id")[0] is True
+
+
+def test_downgrade_014_removes_the_column_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_grant_downgrade", revision="012") as url:
+        seed_pre_014_tokens(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        _harness.run_alembic(url, "downgrade", "013", dimensions=DIM)
+        assert alembic_version(url) == "013"
+        assert column_shape(url, "oauth_tokens", "grant_id") is None
+        assert fetchval(
+            url,
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'oauth_tokens' "
+            "AND indexname = 'ix_oauth_tokens_grant_id'",
+        ) is None
+
+        # Re-upgrading re-derives the same approximation from (client_id, user_id).
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert len(set(grant_ids(url).values())) == EXPECTED_FAMILIES
+        assert_reconciled(url, marker_expected=False)

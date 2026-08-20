@@ -16,16 +16,24 @@ from src.config import settings
 from src.database import async_session
 from src.limiter import limiter
 from src.models.db import OAuthClient, OAuthCode, OAuthToken
+from src.oauth.grants import lock_grant, new_grant_id, revoke_grant_family
+from src.oauth.scope import VALID_SCOPES, clamp_scope
+# Aliased on import so `authorize_get` can keep its long-standing local name
+# `client_can_write` (the consent template reads that key) without shadowing
+# the helper.
+from src.oauth.scope import client_can_write as _client_can_write
 
 router = APIRouter(tags=["oauth"])
 templates = Jinja2Templates(
     directory=os.path.join(os.path.dirname(__file__), "..", "control_panel", "templates")
 )
 
-# Valid OAuth scopes. ChatGPT requests ``offline_access`` when the provider
-# advertises refresh-token support. It does not change vault permissions; it
-# only makes the already-issued refresh token explicit in the grant.
-VALID_SCOPES = {"read", "readwrite", "offline_access"}
+# Valid OAuth scopes live in `src/oauth/scope.py` alongside the helpers that
+# interpret them, so the panel and the ASGI auth middleware can import them
+# without reaching into this module (issue #67). ChatGPT requests
+# ``offline_access`` when the provider advertises refresh-token support; it does
+# not change vault permissions, it only makes the already-issued refresh token
+# explicit in the grant.
 DEFAULT_CLIENT_SCOPE = "read readwrite offline_access"
 TOKEN_ENDPOINT_AUTH_METHODS = {"none", "client_secret_post"}
 _PKCE_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
@@ -81,20 +89,26 @@ def _validate_scope(scope: str) -> str:
     return " ".join(parts & VALID_SCOPES) or "read"
 
 
-def _clamp_scope(requested: str, registered: str) -> str:
-    """Restrict a requested scope to what the client registered for.
+# The clamp now lives in `src/oauth/scope.py` so the control panel can apply
+# the same cap without importing this module. Kept under its historical private
+# name because it is referenced throughout this file and by the #21 regression
+# tests; there is exactly one implementation behind both names.
+_clamp_scope = clamp_scope
 
-    Both inputs are already validated scope strings. The user can only ever
-    be granted the intersection of what they asked for at consent time and
-    what the client is registered to hold. `readwrite` implies `read`, so a
-    client registered for `readwrite` may still be granted plain `read`.
+
+def _client_belongs_to_another_user(client_row, session_user_id: int | None) -> bool:
+    """Is this client owned by a *different* user than the one consenting?
+
+    Both `None` cases mean "no conflict", and they mean it for different
+    reasons: an unbound client (`user_id IS NULL`) is about to be claimed by
+    its first authorizer, and a `None` session identity only happens in
+    single-user mode, where there are no other users to conflict with.
     """
-    requested_parts = set(requested.split())
-    registered_parts = set(registered.split())
-    if "readwrite" in registered_parts:
-        registered_parts.add("read")
-    granted = requested_parts & registered_parts
-    return " ".join(sorted(granted)) or "read"
+    return (
+        session_user_id is not None
+        and client_row.user_id is not None
+        and client_row.user_id != session_user_id
+    )
 
 
 def _state_serializer() -> URLSafeTimedSerializer:
@@ -298,7 +312,7 @@ async def authorize_get(
 
     # The registered scope caps what the user can grant; surface it so the
     # consent screen only offers access levels the client can actually hold.
-    client_can_write = "readwrite" in client.scope.split()
+    client_can_write = _client_can_write(client.scope)
 
     scope_parts = scope.split()
     offline_access_requested = "offline_access" in scope_parts
@@ -419,6 +433,32 @@ async def authorize_post(
             url = _append_query(redirect_uri, error="access_denied", state=client_state)
             return RedirectResponse(url, status_code=302)
 
+        # Refuse cross-user reuse of a client somebody else already owns
+        # (issue #68). A client binds to its *first* authorizing user below and
+        # never rebinds, so without this a second user's approval mints live
+        # tokens under a client they do not own: `oauth_page` filters clients by
+        # `OAuthClient.user_id`, so their own grant is invisible and unrevokable
+        # in their panel, while the owner's "Delete this client and revoke all
+        # its tokens" cascades through it and silently kills their session.
+        #
+        # Fail closed at the source rather than unioning the panel listing: an
+        # unlistable live grant and a delete button that reaches into another
+        # user's grants are both consequences of letting the reuse happen.
+        # Single-user mode never reaches this — `session_user_id` stays None and
+        # `client_row.user_id` stays NULL.
+        if _client_belongs_to_another_user(client_row, session_user_id):
+            return JSONResponse(
+                {
+                    "error": "access_denied",
+                    "error_description": (
+                        "This OAuth client is registered to a different user. "
+                        "Register the connector again from your own account "
+                        "instead of reusing an existing client_id."
+                    ),
+                },
+                status_code=403,
+            )
+
         code = secrets.token_hex(32)
 
         # Bind the OAuth client to its first-authorizing user. RFC 7591
@@ -523,8 +563,28 @@ async def _handle_auth_code(form):
         if not secrets.compare_digest(expected_challenge, oauth_code.code_challenge):
             return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
 
+        # The client must still belong to the user this code was minted for
+        # (issue #68). `authorize_post` refuses a client another user owns, but
+        # it claims an *unbound* client in the same transaction as the code —
+        # so two users consenting to the same unbound client at the same moment
+        # both get a code and only one claim wins. Re-checking here means the
+        # loser's code cannot be exchanged for tokens under a client they do not
+        # own. A code minted in single-user mode carries a NULL `user_id` and is
+        # unaffected, including on a database whose clients were later claimed
+        # by the multi-user bootstrap.
+        if _client_belongs_to_another_user(client, oauth_code.user_id):
+            return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
         # Mark code as used
         oauth_code.used = True
+
+        # Last clamp before anything is persisted (issue #67). `authorize_post`
+        # already clamped what it wrote onto the code, so this is normally a
+        # no-op — but it is the only thing standing between a code minted under
+        # one registration and a token minted under a narrower one, and the cost
+        # of a set intersection here is nothing next to a write grant nobody
+        # registered for.
+        granted_scope = _clamp_scope(oauth_code.scope, client.scope)
 
         # Mint tokens. In multi-user mode the issued tokens inherit the
         # `user_id` stamped on the auth code at /authorize time; in single-
@@ -532,11 +592,21 @@ async def _handle_auth_code(form):
         access_token = secrets.token_hex(32)
         refresh_token = secrets.token_hex(32)
 
+        # One consent event, one grant family (issue #64). The authorization
+        # code is consumed into exactly one grant — it is single-use and this
+        # transaction just marked it used — so minting the id here, rather than
+        # at /authorize, keeps `oauth_codes` unchanged and still gives both
+        # tokens the same family. Every later rotation inherits it, which is
+        # what lets the panel revoke or downgrade the pair as one unit instead
+        # of a row whose sibling immediately undoes the change.
+        grant_id = new_grant_id()
+
         session.add(OAuthToken(
             token_hash=_hash(access_token),
             token_type="access",
             client_id=client_id,
-            scope=oauth_code.scope,
+            scope=granted_scope,
+            grant_id=grant_id,
             expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
             user_id=oauth_code.user_id,
         ))
@@ -544,7 +614,8 @@ async def _handle_auth_code(form):
             token_hash=_hash(refresh_token),
             token_type="refresh",
             client_id=client_id,
-            scope=oauth_code.scope,
+            scope=granted_scope,
+            grant_id=grant_id,
             expires_at=datetime.now(timezone.utc) + timedelta(days=30),
             user_id=oauth_code.user_id,
         ))
@@ -555,7 +626,7 @@ async def _handle_auth_code(form):
         "token_type": "Bearer",
         "expires_in": 3600,
         "refresh_token": refresh_token,
-        "scope": oauth_code.scope,
+        "scope": granted_scope,
     })
 
 
@@ -573,6 +644,32 @@ async def _handle_refresh(form):
             # clients can refresh without a client secret (or, for ChatGPT
             # compatibility, a repeated client_id).
             token_hash = _hash(refresh_token)
+
+            # Take the grant-family lock *first*, before any row in the family
+            # is read or written. Rotation inserts two brand-new rows, and a
+            # concurrent panel revocation cannot see rows that did not exist
+            # when its UPDATE took its snapshot — so without this the operator
+            # revokes every row there is and the client keeps the pair it
+            # rotated into a moment later. Locking the family, not the row,
+            # is what closes that: see `src/oauth/grants.py`.
+            #
+            # The lookup that finds the family deliberately does not filter on
+            # `revoked` — a revoked token still names its family, and the
+            # authoritative locking select below is what decides whether this
+            # refresh is allowed. Ordering matters more than precision here:
+            # both sides take this one lock before any row lock, so the
+            # acquisition order is total and cannot deadlock.
+            grant_query = select(OAuthToken.grant_id).where(
+                OAuthToken.token_hash == token_hash,
+                OAuthToken.token_type == "refresh",
+            )
+            if client_id:
+                grant_query = grant_query.where(OAuthToken.client_id == client_id)
+            grant_id = (await session.execute(grant_query)).scalar_one_or_none()
+            if grant_id is None:
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+            await lock_grant(session, grant_id)
+
             token_query = select(OAuthToken).where(
                 OAuthToken.token_hash == token_hash,
                 OAuthToken.token_type == "refresh",
@@ -609,6 +706,15 @@ async def _handle_refresh(form):
             if old_token.expires_at < datetime.now(timezone.utc):
                 return JSONResponse({"error": "invalid_grant", "error_description": "refresh token expired"}, status_code=400)
 
+            # Re-clamp against the client's *current* registration (issue #67).
+            # Rotation used to copy `old_token.scope` verbatim, so any scope a
+            # token had acquired above what its client was registered for
+            # survived every rotation indefinitely — the panel could grant
+            # `readwrite` to a client registered `read` and nothing ever took it
+            # back. Clamping here also means narrowing a client's registration
+            # takes effect on the next refresh instead of never.
+            granted_scope = _clamp_scope(old_token.scope, client.scope)
+
             # Mint new token pair FIRST, then revoke old token — all in one transaction
             new_access = secrets.token_hex(32)
             new_refresh = secrets.token_hex(32)
@@ -617,7 +723,11 @@ async def _handle_refresh(form):
                 token_hash=_hash(new_access),
                 token_type="access",
                 client_id=client_id,
-                scope=old_token.scope,
+                scope=granted_scope,
+                # Rotation stays inside the family it rotated (issue #64), so a
+                # revocation or downgrade applied to the grant still covers the
+                # pair the client is about to start using.
+                grant_id=old_token.grant_id,
                 expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
                 user_id=old_token.user_id,
             ))
@@ -625,7 +735,8 @@ async def _handle_refresh(form):
                 token_hash=_hash(new_refresh),
                 token_type="refresh",
                 client_id=client_id,
-                scope=old_token.scope,
+                scope=granted_scope,
+                grant_id=old_token.grant_id,
                 expires_at=datetime.now(timezone.utc) + timedelta(days=30),
                 user_id=old_token.user_id,
             ))
@@ -643,7 +754,11 @@ async def _handle_refresh(form):
         "token_type": "Bearer",
         "expires_in": 3600,
         "refresh_token": new_refresh,
-        "scope": old_token.scope,
+        # The clamped scope, not the old token's — RFC 6749 §5.1 requires the
+        # response to state the granted scope whenever it differs from what was
+        # asked for, and a client told `readwrite` while holding `read` would
+        # keep retrying writes that 403.
+        "scope": granted_scope,
     })
 
 
@@ -664,7 +779,20 @@ async def revoke_token(request: Request):
             )
             oauth_token = result.scalar_one_or_none()
             if oauth_token:
-                oauth_token.revoked = True
+                # Revoke the whole grant family, not just the row presented.
+                #
+                # RFC 7009 §2.1 explicitly permits this ("the authorization
+                # server ... MAY revoke the respective refresh token as well"),
+                # and it is the only behaviour that means anything here: a
+                # client presenting its access token and being told "revoked"
+                # while its refresh token quietly mints a replacement pair is
+                # the same near-no-op the panel had (issue #64). Presenting the
+                # refresh token was already the working case; now both are.
+                #
+                # Nothing is leaked by the widening — the caller already holds a
+                # credential from this family, and RFC 7009 requires a 200
+                # either way, so the response says no more than it did before.
+                await revoke_grant_family(session, oauth_token.grant_id)
                 await session.commit()
 
     # RFC 7009: always return 200

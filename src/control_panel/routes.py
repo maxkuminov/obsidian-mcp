@@ -29,6 +29,8 @@ from src.models.db import (
     User,
     UsageLog,
 )
+from src.oauth.grants import revoke_grant_family, set_grant_family_scope
+from src.oauth.scope import clamp_scope, client_can_write, token_has_write
 from src.services.indexer import invalidate_hnsw_index_cache
 from src.services.vault import warm_user_vault_cache
 
@@ -544,6 +546,121 @@ async def delete_key_form(
 # --- OAuth ----------------------------------------------------------------
 
 
+# How many dead (revoked or expired) tokens to render per grant. Revocation
+# history is the point — a Revoke that made the row vanish read as success even
+# when it was a no-op (issue #64) — but a client that refreshes hourly leaves
+# hundreds of rotated-away refresh tokens in a 30-day window, and a page that
+# renders all of them buries the live pair the operator came to look at. Older
+# rows are counted and reported, never silently dropped.
+GRANT_HISTORY_LIMIT = 5
+
+# Upper bound on token rows read per client, so one chatty client cannot make
+# this page unbounded. Deliberately far above `GRANT_HISTORY_LIMIT` times any
+# plausible number of grants: rows past it are not grouped at all, and losing a
+# whole grant would be worse than losing some of its history.
+CLIENT_TOKEN_SCAN_LIMIT = 1000
+
+
+def _token_status(token, now: datetime, owner_active: bool) -> str:
+    """The status of one token row, strictest reason first.
+
+    `owner_active` is the part the panel used to ignore (issue #76):
+    `APIKeyMiddleware` additionally requires the owning `User.is_active` and
+    401s with `reason=inactive_user` otherwise, so a deactivated user's tokens
+    were already dead while this page rendered them green. The error direction
+    matters — this can over-report deadness, never liveness, so no working
+    credential is ever shown as revoked.
+    """
+    if token.revoked:
+        return "revoked"
+    if token.expires_at <= now:
+        return "expired"
+    if not owner_active:
+        return "owner_inactive"
+    return "active"
+
+
+async def _owner_active_map(session: AsyncSession, user_ids: set[int]) -> dict[int, bool]:
+    """`{user_id: is_active}` for the owners of the tokens on this page.
+
+    A `user_id` missing from the result — a deleted user, whose tokens the FK
+    cascade should have taken with it — is read as inactive by the caller,
+    which is the same direction the middleware fails in.
+    """
+    if not user_ids:
+        return {}
+    result = await session.execute(
+        select(User.id, User.is_active).where(User.id.in_(user_ids))
+    )
+    return {row[0]: bool(row[1]) for row in result.all()}
+
+
+def _grant_view(grant_id: str, family: list, now: datetime, active_by_owner: dict[int, bool]) -> dict:
+    """One grant family as the template consumes it.
+
+    `family` is every token row sharing `grant_id`, newest first. A *live*
+    token is one that is neither revoked nor expired; whether its owner is
+    still active changes the badge but not liveness, because reactivating the
+    user brings the same token back rather than minting a new one.
+    """
+    live: list[tuple] = []
+    dead: list[dict] = []
+    for t in family:
+        owner_active = t.user_id is None or active_by_owner.get(t.user_id) is True
+        status = _token_status(t, now, owner_active)
+        row = {
+            "id": t.id,
+            "token_type": t.token_type,
+            "scope": t.scope,
+            "status": status,
+            "expires_at": t.expires_at.isoformat(),
+            "created_at": t.created_at.isoformat(),
+        }
+        if status in ("active", "owner_inactive"):
+            live.append((t, row))
+        else:
+            dead.append(row)
+
+    # Every still-usable token is always rendered; only history is capped.
+    shown = [row for _, row in live] + dead[:GRANT_HISTORY_LIMIT]
+    hidden = max(0, len(dead) - GRANT_HISTORY_LIMIT)
+
+    # One scope control and one "Revoke access" per grant, addressed through a
+    # representative live token. Acting on a single row was the whole defect:
+    # `_handle_refresh` copies the *refresh* token's scope, so a downgrade
+    # applied to the access row silently restored itself on the next rotation,
+    # and a Revoke on the access row bought at most its one-hour lifetime. The
+    # handlers behind these forms resolve the family and write all of it.
+    if live:
+        representative, representative_row = live[0]
+        token_id = representative.id
+        status = representative_row["status"]
+        scope = representative_row["scope"]
+    else:
+        # Nothing left to act on, so no controls are offered. The rows are
+        # still listed: a revocation that leaves a blank space reads as
+        # success even when it did nothing.
+        token_id = None
+        status = "revoked" if all(t.revoked for t in family) else "expired"
+        scope = family[0].scope
+
+    return {
+        "grant_id": grant_id,
+        "token_id": token_id,
+        "scope": scope,
+        # Membership, not equality: "offline_access readwrite" is a write grant
+        # and `== "readwrite"` says it is not. Derived here, from the token's
+        # own scope, through the same helper `src/mcp_server/auth.py` enforces
+        # with — the two agreeing is the property that actually matters (#65).
+        "has_write": token_has_write(scope),
+        "status": status,
+        "created_at": min(t.created_at for t in family).isoformat(),
+        "last_seen_at": max(t.created_at for t in family).isoformat(),
+        "tokens": shown,
+        "hidden_count": hidden,
+    }
+
+
 @router.get("/oauth", response_class=HTMLResponse)
 async def oauth_page(
     request: Request,
@@ -556,46 +673,60 @@ async def oauth_page(
     if uid is not None:
         q = q.where(OAuthClient.user_id == uid)
     result = await session.execute(q)
-    clients = []
-    for c in result.scalars().all():
-        # Tokens inherit their client's scope, but we also scope tokens by
-        # user_id directly for defense in depth: an unbound/legacy client
-        # could have tokens stamped with a user_id that diverges from the
-        # client's. Filter both ways.
+    client_rows = list(result.scalars().all())
+
+    # Tokens inherit their client's scope, but we also scope tokens by
+    # user_id directly for defense in depth: an unbound/legacy client
+    # could have tokens stamped with a user_id that diverges from the
+    # client's. Filter both ways.
+    #
+    # Revoked and expired rows are *included* now. Filtering them out is what
+    # made a per-row Revoke read as success: the row simply disappeared, the
+    # sibling refresh token minted a replacement pair within the hour, and the
+    # page showed a fresh access+refresh pair as if nothing had happened. It
+    # also left the template's `revoked` branches as unreachable dead code.
+    tokens_by_client: dict[str, list] = {}
+    owner_ids: set[int] = set()
+    for c in client_rows:
         token_q = (
             select(OAuthToken)
-            .where(
-                OAuthToken.client_id == c.client_id,
-                OAuthToken.revoked == False,
-                OAuthToken.expires_at > now,
-            )
-            .order_by(OAuthToken.created_at.desc())
+            .where(OAuthToken.client_id == c.client_id)
+            .order_by(OAuthToken.created_at.desc(), OAuthToken.id.desc())
+            .limit(CLIENT_TOKEN_SCAN_LIMIT)
         )
         if uid is not None:
             token_q = token_q.where(OAuthToken.user_id == uid)
-        token_result = await session.execute(token_q)
-        tokens = []
-        for t in token_result.scalars().all():
-            tokens.append({
-                "id": t.id,
-                "token_type": t.token_type,
-                "scope": t.scope,
-                # t.scope is a space-separated set (e.g. "offline_access
-                # readwrite"), not always exactly "read" or "readwrite" -
-                # the template needs membership, not string equality, or
-                # a readwrite token showing an offline_access marker
-                # renders as if it were read-only.
-                "has_write": "readwrite" in t.scope.split(),
-                "revoked": t.revoked,
-                "expired": False,
-                "expires_at": t.expires_at.isoformat(),
-                "created_at": t.created_at.isoformat(),
-            })
+        rows = list((await session.execute(token_q)).scalars().all())
+        tokens_by_client[c.client_id] = rows
+        owner_ids.update(t.user_id for t in rows if t.user_id is not None)
+
+    active_by_owner = await _owner_active_map(session, owner_ids)
+
+    clients = []
+    for c in client_rows:
+        # Group into grant families. `grant_id` is NOT NULL (migration 014) and
+        # is the *only* way a family is ever resolved — the decision in #64 was
+        # explicit that a second "find the family" path is how the bug returns.
+        grouped: dict[str, list] = {}
+        for t in tokens_by_client[c.client_id]:
+            grouped.setdefault(t.grant_id, []).append(t)
+
+        grants = [
+            _grant_view(grant_id, family, now, active_by_owner)
+            for grant_id, family in grouped.items()
+        ]
+        grants.sort(key=lambda g: g["last_seen_at"], reverse=True)
+
         clients.append({
             "client_id": c.client_id,
             "client_name": c.client_name,
             "created_at": c.created_at.isoformat(),
-            "tokens": tokens,
+            # The registered scope caps everything this client's grants may
+            # hold, so the panel must not offer an option above it (issue #67).
+            # Same helper the consent screen and the token endpoint use.
+            "can_write": client_can_write(c.scope),
+            "scope": c.scope,
+            "grants": grants,
         })
     return templates.TemplateResponse(request, "oauth.html", _panel_context(request, user, {
         "active": "oauth", "clients": clients,
@@ -644,8 +775,20 @@ async def revoke_oauth_token(
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
+    """Revoke the whole grant family, not the single row that was clicked.
+
+    Flipping one row was close to a durable no-op (issue #64): the sibling
+    refresh token was untouched, `_handle_refresh` resolves on
+    `token_hash` + `token_type` + `revoked` alone, and the client's ordinary
+    401-then-refresh cycle minted a fresh, identically-scoped pair — within the
+    hour for an access token, automatically, with no sign of it in the panel.
+
+    `token_id` is now a handle on the grant, not the unit of work. Ownership is
+    still asserted on the row the operator named; the family cannot span users
+    (see `src/oauth/grants.py`), so that check covers everything this touches.
+    """
     token = await _assert_oauth_token_owner(session, token_id, user)
-    token.revoked = True
+    await revoke_grant_family(session, token.grant_id)
     await session.commit()
     return RedirectResponse("/admin/oauth", status_code=303)
 
@@ -657,16 +800,44 @@ async def update_oauth_token_scope(
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
+    """Set one scope on every live token in the grant. Never above the client's.
+
+    Two defects meet here. Writing a single row let the change revert on the
+    next rotation, because `_handle_refresh` copies the *refresh* token's scope
+    (issue #64). And nothing clamped the submitted value against
+    `OAuthClient.scope`, so the panel could hand `readwrite` to a client that
+    registered read-only — permanently, since rotation re-minted from the
+    token's own scope forever after (issue #67).
+
+    The registration is a statement about that software, so a request above it
+    is refused outright rather than quietly clamped: an operator who picked
+    `readwrite` should not be told nothing happened when the select snaps back.
+    The clamp still runs afterwards as the belt to that braces — no path may
+    write a scope the client is not registered for.
+    """
     if scope not in ("read", "readwrite"):
         return RedirectResponse("/admin/oauth", status_code=303)
     token = await _assert_oauth_token_owner(session, token_id, user)
-    if not token.revoked:
-        # Preserve the offline_access marker (informational only - see
-        # DEFAULT_CLIENT_SCOPE comment in src/oauth/routes.py) instead of
-        # dropping it whenever an admin flips read/readwrite here.
-        has_offline = "offline_access" in token.scope.split()
-        token.scope = f"{scope} offline_access" if has_offline else scope
-        await session.commit()
+    if token.revoked:
+        return RedirectResponse("/admin/oauth", status_code=303)
+
+    client = (
+        await session.execute(
+            select(OAuthClient).where(OAuthClient.client_id == token.client_id)
+        )
+    ).scalar_one_or_none()
+    if client is None:
+        raise HTTPException(404, "Client not found")
+    if scope == "readwrite" and not client_can_write(client.scope):
+        return RedirectResponse("/admin/oauth", status_code=303)
+
+    # Preserve the offline_access marker (informational only - see
+    # DEFAULT_CLIENT_SCOPE comment in src/oauth/routes.py) instead of
+    # dropping it whenever an admin flips read/readwrite here.
+    has_offline = "offline_access" in token.scope.split()
+    desired = f"{scope} offline_access" if has_offline else scope
+    await set_grant_family_scope(session, token.grant_id, clamp_scope(desired, client.scope))
+    await session.commit()
     return RedirectResponse("/admin/oauth", status_code=303)
 
 
