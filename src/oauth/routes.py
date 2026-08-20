@@ -10,6 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import select
+from sqlalchemy import update as sa_update
 
 from src.auth.session import get_active_session_user
 from src.config import settings
@@ -99,6 +100,43 @@ def _validate_scope(scope: str) -> str:
 # name because it is referenced throughout this file and by the #21 regression
 # tests; there is exactly one implementation behind both names.
 _clamp_scope = clamp_scope
+
+
+def _client_authenticated(client, client_secret) -> bool:
+    """Does `client_secret` satisfy this client's registered auth method?
+
+    One definition for all three endpoints that authenticate a client
+    (`/token` for both grant types, and `/revoke`). A public PKCE client
+    registers `token_endpoint_auth_method = "none"` and carries no secret, so
+    it authenticates trivially — for those, possession of the token *is* the
+    credential, which is the model RFC 6749 §2.1 describes and the reason the
+    revocation endpoint can still act on a public client's request.
+
+    Any method other than the two we register is a refusal, not a fallback.
+    """
+    auth_method = getattr(client, "token_endpoint_auth_method", "client_secret_post")
+    if auth_method == "client_secret_post":
+        return bool(
+            client_secret
+            and client.client_secret_hash
+            and secrets.compare_digest(client.client_secret_hash, _hash(client_secret))
+        )
+    return auth_method == "none"
+
+
+def _cross_user_client_error() -> JSONResponse:
+    """The refusal both consent paths give for someone else's client."""
+    return JSONResponse(
+        {
+            "error": "access_denied",
+            "error_description": (
+                "This OAuth client is registered to a different user. "
+                "Register the connector again from your own account "
+                "instead of reusing an existing client_id."
+            ),
+        },
+        status_code=403,
+    )
 
 
 def _client_belongs_to_another_user(client_row, session_user_id: int | None) -> bool:
@@ -488,17 +526,7 @@ async def authorize_post(
             )
 
         if _client_belongs_to_another_user(client_row, session_user_id):
-            return JSONResponse(
-                {
-                    "error": "access_denied",
-                    "error_description": (
-                        "This OAuth client is registered to a different user. "
-                        "Register the connector again from your own account "
-                        "instead of reusing an existing client_id."
-                    ),
-                },
-                status_code=403,
-            )
+            return _cross_user_client_error()
 
         code = secrets.token_hex(32)
 
@@ -506,8 +534,40 @@ async def authorize_post(
         # dynamic registration is unauthenticated, so we can't bind at
         # registration time — first /authorize wins. Subsequent authorizes
         # for the same client leave `user_id` alone.
+        #
+        # Conditional, because `client_row.user_id is None` was read from this
+        # transaction's snapshot: two users consenting to the same unbound
+        # client at once both saw NULL, and an unconditional ORM assignment let
+        # the second one overwrite the first one's claim. `WHERE user_id IS
+        # NULL ... RETURNING` makes the database arbitrate — under READ
+        # COMMITTED the loser blocks on the row lock, re-evaluates the
+        # predicate against the winner's committed row, and matches nothing.
         if session_user_id is not None and client_row.user_id is None:
-            client_row.user_id = session_user_id
+            claimed = (
+                await session.execute(
+                    sa_update(OAuthClient)
+                    .where(
+                        OAuthClient.client_id == client_id,
+                        OAuthClient.user_id.is_(None),
+                    )
+                    .values(user_id=session_user_id)
+                    .returning(OAuthClient.client_id)
+                )
+            ).scalar_one_or_none()
+            if claimed is None:
+                # Somebody else got there first. Re-read in a fresh statement
+                # (a new snapshot, so the winner's commit is visible) and
+                # refuse unless the winner happens to be this same user, which
+                # is the ordinary case of one person opening two tabs.
+                owner = (
+                    await session.execute(
+                        select(OAuthClient.user_id).where(
+                            OAuthClient.client_id == client_id
+                        )
+                    )
+                ).scalar_one_or_none()
+                if owner != session_user_id:
+                    return _cross_user_client_error()
 
         oauth_code = OAuthCode(
             code_hash=_hash(code),
@@ -587,15 +647,7 @@ async def _handle_auth_code(form):
         if not client:
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
-        auth_method = getattr(
-            client, "token_endpoint_auth_method", "client_secret_post"
-        )
-        if auth_method == "client_secret_post":
-            if not client_secret or not client.client_secret_hash or not secrets.compare_digest(
-                client.client_secret_hash, _hash(client_secret)
-            ):
-                return JSONResponse({"error": "invalid_client"}, status_code=401)
-        elif auth_method != "none":
+        if not _client_authenticated(client, client_secret):
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
         client_id = oauth_code.client_id
@@ -776,15 +828,7 @@ async def _handle_refresh(form):
             if not client:
                 return JSONResponse({"error": "invalid_client"}, status_code=401)
 
-            auth_method = getattr(
-                client, "token_endpoint_auth_method", "client_secret_post"
-            )
-            if auth_method == "client_secret_post":
-                if not client_secret or not client.client_secret_hash or not secrets.compare_digest(
-                    client.client_secret_hash, _hash(client_secret)
-                ):
-                    return JSONResponse({"error": "invalid_client"}, status_code=401)
-            elif auth_method != "none":
+            if not _client_authenticated(client, client_secret):
                 return JSONResponse({"error": "invalid_client"}, status_code=401)
 
             client_id = old_token.client_id
@@ -892,6 +936,8 @@ async def _handle_refresh(form):
 async def revoke_token(request: Request):
     form = await request.form()
     token = form.get("token")
+    client_id = form.get("client_id")
+    client_secret = form.get("client_secret")
 
     if token:
         token_hash = _hash(token)
@@ -901,6 +947,38 @@ async def revoke_token(request: Request):
             )
             oauth_token = result.scalar_one_or_none()
             if oauth_token:
+                # RFC 7009 §2.1: the client authenticates. This endpoint used
+                # to do neither authentication nor an ownership check, so any
+                # holder of any token value — a leaked one, one belonging to a
+                # different client — could revoke a whole grant. Widening
+                # revocation to the family (below) made that worse, not better.
+                result = await session.execute(
+                    select(OAuthClient).where(
+                        OAuthClient.client_id == oauth_token.client_id
+                    )
+                )
+                client = result.scalar_one_or_none()
+
+                # §2.2: "If the server responds with HTTP 200 for a token that
+                # is not valid *for the requesting client*, that is not an
+                # error" — an unknown, foreign or unauthenticated token is
+                # indistinguishable from an already-revoked one. So a caller
+                # naming a different client is answered 200 and nothing
+                # happens, rather than being told whose token it is.
+                #
+                # A missing `client_id` is tolerated the same way `/token`
+                # tolerates it (some ChatGPT connector builds omit it): the
+                # client is then identified by the token itself, and a
+                # confidential client still has to present its secret.
+                if client is None:
+                    return JSONResponse({})
+                if client_id and client_id != oauth_token.client_id:
+                    return JSONResponse({})
+                if not _client_authenticated(client, client_secret):
+                    # The one case that is a real error rather than a no-op:
+                    # the right client was named and failed to authenticate.
+                    return JSONResponse({"error": "invalid_client"}, status_code=401)
+
                 # Revoke the whole grant family, not just the row presented.
                 #
                 # RFC 7009 §2.1 explicitly permits this ("the authorization
@@ -911,9 +989,9 @@ async def revoke_token(request: Request):
                 # the same near-no-op the panel had (issue #64). Presenting the
                 # refresh token was already the working case; now both are.
                 #
-                # Nothing is leaked by the widening — the caller already holds a
-                # credential from this family, and RFC 7009 requires a 200
-                # either way, so the response says no more than it did before.
+                # The family cannot span clients or users (see
+                # `src/oauth/grants.py`), so an authenticated client revoking
+                # its own token reaches nothing that is not its own.
                 await revoke_grant_family(session, oauth_token.grant_id)
                 await session.commit()
 

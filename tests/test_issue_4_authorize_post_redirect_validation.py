@@ -38,6 +38,7 @@ try:
 
     import pytest
     from fastapi.responses import JSONResponse, RedirectResponse
+    from sqlalchemy.sql.dml import Update
 
     from src.oauth import routes
 finally:
@@ -79,7 +80,19 @@ class _FakeSession:
     async def __aexit__(self, *exc):
         return False
 
-    async def execute(self, _stmt):
+    async def execute(self, stmt, *_a, **_kw):
+        # The first-authorizer claim is a conditional `UPDATE oauth_clients ...
+        # WHERE user_id IS NULL RETURNING client_id` rather than an ORM
+        # attribute assignment, so two concurrent consents for the same unbound
+        # client are arbitrated by the database instead of by whichever
+        # transaction's snapshot was read last. Interpreting it here keeps the
+        # fake honest: the claim applies only when the row really is unowned,
+        # and returns nothing when it is not.
+        if isinstance(stmt, Update):
+            if self._client is not None and self._client.user_id is None:
+                self._client.user_id = dict(stmt.compile().params).get("user_id")
+                return _FakeResult(self._client.client_id)
+            return _FakeResult(None)
         return _FakeResult(self._client)
 
     def add(self, obj):

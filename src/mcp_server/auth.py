@@ -12,7 +12,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from src.auth.session import UNSET_VAULT_ROOT, current_user_id, current_vault_root
 from src.config import settings
 from src.database import async_session
-from src.models.db import APIKey, OAuthToken, User
+from src.models.db import APIKey, OAuthClient, OAuthToken, User
 from src.oauth.scope import has_vault_scope, token_has_write
 from src.services.vault import warm_user_vault_cache
 
@@ -261,6 +261,32 @@ class APIKeyMiddleware:
                             logger.warning(
                                 "auth_failure",
                                 extra={"reason": "inactive_user", "key_id": oauth_token.id},
+                            )
+                            response = JSONResponse(
+                                {"error": "Invalid or revoked token"},
+                                status_code=401,
+                                headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                            )
+                            await response(scope, receive, send)
+                            return
+
+                    # The grant's owner must still be the client's owner. A
+                    # cross-user grant can no longer be created, but one made
+                    # before the consent and rotation paths refused it stays
+                    # live for the access token's full hour and is invisible in
+                    # either user's panel. An unbound client (NULL owner) is
+                    # not a conflict — it has simply never been claimed.
+                    if oauth_token.user_id is not None:
+                        result = await session.execute(
+                            select(OAuthClient.user_id).where(
+                                OAuthClient.client_id == oauth_token.client_id
+                            )
+                        )
+                        client_owner = result.scalar_one_or_none()
+                        if client_owner is not None and client_owner != oauth_token.user_id:
+                            logger.warning(
+                                "auth_failure",
+                                extra={"reason": "cross_user_grant", "key_id": oauth_token.id},
                             )
                             response = JSONResponse(
                                 {"error": "Invalid or revoked token"},
