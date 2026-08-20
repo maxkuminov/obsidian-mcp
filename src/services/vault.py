@@ -28,9 +28,18 @@ inside the directory the caller named:
   edit the note directly, so it is outside the threat #59 addresses —
   redirection through an *ancestor* or the *root*, where the attacker never had
   access to the destination at all. The window is narrowed to that one syscall
-  by an identity check (`_require_staged_name`), and the no-clobber publish
-  removes it entirely by publishing the staged **inode** through
-  `/proc/self/fd` rather than the staged name.
+  by an identity check (`_require_staged_name`). The no-clobber publish has no
+  such window at all: it stages into an unnamed `O_TMPFILE` inode and publishes
+  it through `/proc/self/fd`, so there is no staging name to substitute and
+  none to clean up.
+- **the anchored walk itself is not atomic.** `vault_fs.open_dir_beneath` opens
+  one component at a time, and an ancestor renamed *out of the vault* between
+  two of those opens yields a parent descriptor outside the pinned root. This
+  is inherited, not introduced: the transfer routes and `delete_file` have
+  always walked this way. The fix is `openat2(RESOLVE_BENEATH |
+  RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)` through `ctypes`, which makes
+  the kernel enforce containment for the whole path in one call; it belongs to
+  `vault_fs` and is its own change, tracked separately.
 - a read-modify-write overwrite (`edit_note`, `set_frontmatter`, `move_note`'s
   link rewrites) is optimistic, not linearizable: `expected=` compares the
   current bytes immediately before the rename, and a writer that lands inside
@@ -743,13 +752,18 @@ def _temp_candidate(name: str) -> str:
 
 
 def _create_temp_exclusively(dir_fd: int, name: str) -> tuple[int, str]:
-    """Create a temp file for `name` inside `dir_fd`; return `(fd, tmp_name)`.
+    """Create a *named* temp file for `name` inside `dir_fd`; return `(fd, tmp)`.
 
-    `O_CREAT|O_EXCL|O_NOFOLLOW` means the name we write through cannot
-    pre-exist and cannot be a symlink: a process that guessed the temp name and
-    planted `.tmp-note.md-…  ->  /some/decoy` would otherwise have had our
-    write truncate the decoy. `O_EXCL` reports that as `EEXIST` (a symlink at
-    the final component fails the same way), so we simply take another name.
+    Only the **overwrite** path needs this: `renameat` has no by-descriptor
+    form, so its source must have a name. `O_CREAT|O_EXCL|O_NOFOLLOW` means the
+    name we write through cannot pre-exist and cannot be a symlink — a process
+    that guessed the temp name and planted `.tmp-note.md-…  ->  /some/decoy`
+    would otherwise have had our write truncate the decoy. `O_EXCL` reports
+    that as `EEXIST` (a symlink at the final component fails the same way), so
+    we simply take another name.
+
+    The no-clobber path uses `_create_nameless_temp` instead and never puts a
+    name in the directory at all.
     """
     flags = (
         os.O_WRONLY
@@ -774,6 +788,45 @@ def _create_temp_exclusively(dir_fd: int, name: str) -> tuple[int, str]:
     ) from last
 
 
+def _create_nameless_temp(dir_fd: int) -> int:
+    """Stage a no-clobber write in an **unnamed** inode inside `dir_fd`.
+
+    `O_TMPFILE` gives a file with no directory entry at all — nothing for
+    another process to observe, replace or race, and nothing for us to clean up
+    afterwards. That last part is the point: a named staging file has to be
+    unlinked, and an unlink is by *name*, so it can only be guarded by an
+    identity check followed by the removal — check-then-act, which could delete
+    a substitute planted in between. With no name there is no such step; the
+    inode is freed by closing the descriptor.
+
+    **`O_EXCL` must not be set.** With `O_TMPFILE` it means "this file can never
+    be linked into the filesystem", which makes the publish below impossible
+    (`ENOENT`) — the opposite of its usual meaning, and an easy thing to add by
+    reflex.
+
+    Publication is `_link_staged_inode`. A filesystem without `O_TMPFILE`
+    (`EOPNOTSUPP`, or `EISDIR`/`EINVAL` on kernels that report it that way)
+    raises `UnsupportedFilesystem`: ext4/xfs both support it, and the
+    alternative is reintroducing the staging name this exists to remove.
+    """
+    flags = os.O_TMPFILE | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(".", flags, 0o600, dir_fd=dir_fd)
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (
+            errno.EOPNOTSUPP,
+            errno.EISDIR,
+            errno.ENOSYS,
+            errno.EINVAL,
+        ):
+            raise vault_fs.UnsupportedFilesystem(
+                "The vault filesystem does not support O_TMPFILE, which the "
+                "no-clobber write stages into so that no temporary name is "
+                "ever exposed. Refusing rather than staging under a name."
+            ) from exc
+        raise
+
+
 def _atomic_write_at(
     target: MutableTarget,
     *,
@@ -785,18 +838,33 @@ def _atomic_write_at(
     """Write `text` (UTF-8) or `data` (raw bytes) to `target`, atomically.
 
     Shared core for `write_file_at` (notes) and `write_bytes_at` (raw files).
-    **Every syscall runs against `target.dir_fd`** — the temp create, the
-    `expected=` read, and the publication — so the destination directory is the
+    **Every syscall runs against `target.dir_fd`** — the staging, the
+    `expected=` read and the publication — so the destination directory is the
     one validation opened, whatever happens to its pathname meanwhile. Missing
     parent directories are created (through the same anchored walk) on first
     use of the descriptor.
 
+    The two publication modes stage differently, and that difference is the
+    whole reason this function has a branch:
+
+    * **no-clobber** (`create_note`, `write_file` by default) stages into an
+      `O_TMPFILE` inode that never has a directory entry, and publishes it with
+      `linkat` through `/proc/self/fd/<fd>`. Nothing in the directory can be
+      observed, replaced or raced, and there is nothing to clean up — the inode
+      is freed when the descriptor closes. `link` either creates the name or
+      fails `EEXIST`, so nothing can be destroyed by a no-clobber publish.
+    * **overwrite** (`edit_note`, `set_frontmatter`,
+      `write_file(overwrite=True)`) needs `renameat`, which has no
+      by-descriptor form, so its source must have a name. That name is created
+      `O_CREAT|O_EXCL|O_NOFOLLOW`, and `_require_staged_name` checks
+      immediately before the rename that it still refers to the inode we wrote
+      — narrowing the substitution window to the single rename syscall rather
+      than leaving it open from the `fsync`.
+
     Ordering, and why each step is where it is:
 
-    1. the temp file is created exclusively and `O_NOFOLLOW` (see
-       `_create_temp_exclusively`), so staging cannot be redirected through a
-       planted symlink. Its descriptor stays open until publication: it is the
-       only handle on the staged bytes that no rename or unlink can take away;
+    1. staging (above); the descriptor is then held until publication, as the
+       only handle on the bytes that no rename or unlink can take away;
     2. the payload is written and **`fsync`ed before publication**. A crash
        between the two leaves the destination untouched; without the `fsync` a
        crash just after the rename could leave the destination published but
@@ -804,33 +872,31 @@ def _atomic_write_at(
        make impossible;
     3. `expected` (when given) is compared against the current bytes read
        through the same descriptor — optimistic conflict detection, immediately
-       before publication;
-    4. publication. **The no-clobber path publishes the staged *inode*, not the
-       staged name**: `linkat` through `/proc/self/fd/<fd>`. Publishing by name
-       (`link(tmp, name)`) trusted `.tmp-…` to still mean what we wrote — a
-       peer in the destination directory could unlink or rename over it after
-       the `fsync` and have *its* inode published as the note. Going through
-       the descriptor removes the name from the decision entirely, and it also
-       fails closed: detaching our inode drops its link count to zero, and
-       `linkat` on a zero-link inode is `ENOENT` (only `CAP_DAC_READ_SEARCH`
-       lifts that), so an attacker can prevent the write but never substitute
-       it. The overwrite path is `renameat`, which is inherently by name, so it
-       is preceded by an identity check — `fstat(fd)` against the temp name —
-       narrowing the window to that single syscall.
+       before publication.
 
-    **What that last window means, precisely.** An adversary who can write to
-    the *destination directory itself* can still win the rename race on an
-    overwrite. That adversary can also just edit the note directly, so it is
-    outside the threat #59 addresses: redirection through an **ancestor** or
-    the **root**, where the attacker never had access to the destination at
-    all. Stated rather than implied.
+    **What the overwrite window means, precisely.** An adversary who can write
+    to the *destination directory itself* can still win the rename race. That
+    adversary can also just edit the note directly, so it is outside the threat
+    #59 addresses: redirection through an **ancestor** or the **root**, where
+    the attacker never had access to the destination at all. Stated rather than
+    implied.
     """
     payload = data if data is not None else (text or "").encode("utf-8")
     dir_fd = target.dir_fd
     name = target.name
-    fd, tmp = _create_temp_exclusively(dir_fd, name)
-    staged = os.fstat(fd)
+
+    tmp: str | None = None
+    if overwrite:
+        fd, tmp = _create_temp_exclusively(dir_fd, name)
+    else:
+        fd = _create_nameless_temp(dir_fd)
+    # The `try` opens on the very next line after the descriptor exists: an
+    # `EIO` from the `fstat` below would otherwise leak both the descriptor
+    # and, on the overwrite path, the staging name.
+    staged: os.stat_result | None = None
+    published = False
     try:
+        staged = os.fstat(fd)
         with os.fdopen(fd, "wb", closefd=False) as stream:
             stream.write(payload)
             stream.flush()
@@ -845,22 +911,24 @@ def _atomic_write_at(
             if current != expected:
                 raise RuntimeError(f"File changed while editing: {name}")
 
-        if overwrite:
+        if tmp is not None:
             _require_staged_name(dir_fd, tmp, staged)
             os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         else:
             _link_staged_inode(fd, dir_fd, name)
+        published = True
     finally:
-        # The temp is ours and lives in a directory we hold open, so it can be
-        # removed on every path: a successful `replace` already consumed it,
-        # the inode publish did not, and a failure leaves it behind. It is
-        # removed only if the name *still refers to the inode we staged* —
-        # unlinking by name alone would destroy whatever a peer had put there.
-        # `_discard_temp` never raises: once publication has happened, a failed
-        # unlink is janitorial and must not turn a completed write into a
-        # reported failure.
-        _discard_temp(dir_fd, tmp, staged)
-        os.close(fd)
+        if tmp is not None:
+            _discard_temp(dir_fd, tmp, staged=staged)
+        # Quiet only once publication has settled: a bare close raising `EIO`
+        # here would discard a write that already happened and surface as a
+        # generic OSError, which the tools report as a failure — the trap
+        # `transfer._close_quietly` exists for. Before publication a close
+        # error is real and must not be swallowed.
+        if published:
+            vault_fs.close_quietly(fd, f"staged copy of {name}")
+        else:
+            os.close(fd)
     return target.path
 
 
@@ -906,16 +974,23 @@ def _link_staged_inode(fd: int, dir_fd: int, name: str) -> None:
 
     `linkat(AT_FDCWD, "/proc/self/fd/<fd>", dir_fd, name, AT_SYMLINK_FOLLOW)`.
     The magic link resolves to the open file description, so what gets
-    published is the inode we wrote — not whatever the staging *name* happens
-    to refer to by the time we publish. Linux-only, which the declared
-    filesystem semantics already require; without `/proc` there is no way to
-    publish an inode by descriptor and we refuse rather than fall back to the
-    by-name form the review rejected.
+    published is the inode we wrote. `fd` is an `O_TMPFILE` staging descriptor
+    with no directory entry at all, so there is nothing a peer could have
+    substituted and nothing to check.
 
-    `EEXIST` is the ordinary no-clobber refusal and propagates as
-    `FileExistsError`. `ENOENT` means our staged inode was detached from every
-    name (a peer unlinked or renamed over `.tmp-…`), which drops its link count
-    to zero and makes `linkat` refuse — the fail-closed half of this design.
+    Two kernel details worth recording, because both look like blockers and
+    neither is: the `AT_EMPTY_PATH` form of this call needs
+    `CAP_DAC_READ_SEARCH`, which an ordinary container does not have, while the
+    `/proc` magic link does not; and the "cannot link a zero-link inode" rule
+    applies to an inode whose names have all been *removed*, not to one created
+    `O_TMPFILE`. Verified on the deployment's kernel with `CapEff=0`.
+
+    Linux-only, which the declared filesystem semantics already require;
+    without `/proc` there is no way to publish an inode by descriptor and we
+    refuse rather than fall back to publishing whatever a staging *name* points
+    at. `EEXIST` is the ordinary no-clobber refusal — a plain file, a directory
+    and a symlink at the destination all produce it — and propagates as
+    `FileExistsError`.
     """
     if not _proc_fd_available():
         raise vault_fs.UnsupportedFilesystem(
@@ -933,8 +1008,8 @@ def _link_staged_inode(fd: int, dir_fd: int, name: str) -> None:
         raise
     except FileNotFoundError as exc:
         raise vault_fs.Conflict(
-            "The staged copy was detached before it could be published; "
-            "nothing was written. Retry the operation."
+            "The staged copy could not be published; nothing was written. "
+            "Retry the operation."
         ) from exc
     except OSError as exc:
         if getattr(exc, "errno", None) in (
@@ -950,13 +1025,23 @@ def _link_staged_inode(fd: int, dir_fd: int, name: str) -> None:
         raise
 
 
-def _discard_temp(dir_fd: int, tmp: str, staged: os.stat_result | None = None) -> None:
-    """Remove our staged temp file — and never anybody else's.
+def _discard_temp(
+    dir_fd: int, tmp: str, staged: os.stat_result | None = None
+) -> None:
+    """Remove the **overwrite** path's staging name — and never anybody else's.
 
-    With `staged`, the name is unlinked only while it still refers to that
-    inode. A peer that took the staging name over keeps its file: we would
-    otherwise answer an attempted substitution by deleting the substitute,
-    which is the same destructive-write class this module exists to prevent.
+    Reached on two kinds of path: a successful `renameat` (which consumed the
+    name, so this is a no-op) and a failure after staging. In the failure case
+    the name is unlinked only while it still refers to the inode we staged; if
+    it does not, the file is **left in place and logged**. Answering an
+    attempted substitution by deleting the substitute is the same
+    destructive-write class this module exists to prevent, just aimed at a
+    different file, so the failure direction is to leave litter rather than
+    remove something we cannot prove is ours.
+
+    The no-clobber path never calls this: it stages into an unnamed
+    `O_TMPFILE` inode, so there is no name to remove and no check to race.
+    That asymmetry is deliberate — see `_atomic_write_at`.
     """
     if staged is not None and not _staged_identity_matches(dir_fd, tmp, staged):
         logger.warning(

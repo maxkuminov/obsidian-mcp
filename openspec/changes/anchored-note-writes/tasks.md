@@ -52,3 +52,13 @@
 - [x] 7.5 Read the symlink through the parent descriptor for the refusal message; say "the link changed" rather than naming a possibly-wrong target when it cannot be read
 - [x] 7.6 Wrap the closing leaf `lstat` in `open_mutable` so an `EIO` cannot leak the root and parent descriptors
 - [x] 7.7 Document — in the `vault` module docstring, CLAUDE.md and the design note — that an adversary holding the *destination directory* can still win the overwrite rename, and why that is outside the ancestor/root threat #59 addresses
+
+## 8. Adversarial-review round 2
+
+- [x] 8.1 Stage the no-clobber write in an unnamed `O_TMPFILE` inode, so there is no staging name to substitute and none to clean up; `UnsupportedFilesystem` when the filesystem refuses it. **Not** `O_EXCL` — with `O_TMPFILE` that forbids linking and makes the publish impossible
+- [x] 8.2 Overwrite path keeps its name (`renameat` has no by-descriptor form): identity check before the rename, and on cleanup leave-and-log rather than unlink when the name no longer refers to our inode
+- [x] 8.3 Enter the `try` immediately after the staging descriptor exists, and close it quietly once publication has settled (`vault_fs.close_quietly`) so a failing close cannot turn a completed write into a reported failure
+- [x] 8.4 `_pin_source_inode` (`O_PATH|O_NOFOLLOW`) before the move; `_verify_the_moved_inode` rolls back only our own inode, reports rather than raises on every post-rename failure, and never updates the database on a refusal
+- [x] 8.5 Remove the descriptor-budget floor; abort the whole move on `EMFILE`/`ENFILE` during the preflight; serialise moves-with-rewrites process-wide with `_MOVE_REWRITE_LOCK`
+- [x] 8.6 Acquire `move_note`'s source and destination targets inside one guard, so a non-`ValueError` failure on the destination closes the source
+- [x] 8.7 Document the inherited non-atomic walk (`open_dir_beneath`, one component at a time) as the remaining redirection window, naming `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS)` as the fix — design D15, `vault` module docstring, CLAUDE.md residual list

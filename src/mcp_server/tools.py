@@ -1,5 +1,7 @@
+import asyncio
 import base64
 import binascii
+import errno
 import inspect
 import logging
 import mimetypes
@@ -638,31 +640,96 @@ def _leaf_state_error(target, path: str, *, missing: str | None = None) -> str |
     return None
 
 
-def _refuse_a_moved_non_file(
-    src_target, dst_target, from_path: str, to_rel: str
-) -> str | None:
-    """Undo a move whose source turned out not to be a regular file.
+def _pin_source_inode(target) -> tuple[int, int] | None:
+    """`(dev, ino)` of the source, pinned through an `O_PATH|O_NOFOLLOW` fd.
 
-    Mirrors `vault_fs._refuse_a_moved_directory`, for the same reason and with
-    the same primitive: the rollback is itself `RENAME_NOREPLACE`, so putting
-    the thing back can never clobber whatever now holds the source name. It
-    covers symlinks as well as directories — `soft_delete` lets a symlink ride
-    into `.trash` because a link is inert there, but a link published at a move
-    destination becomes what `notes_metadata` points at, and the tool would
-    have reported a successful move of a note that no longer exists.
+    Taken *before* the rename. `O_PATH` opens the directory entry without
+    opening the file — it works for a symlink or a directory as happily as for
+    a regular file and never has side effects — which is what makes it usable
+    as a witness here: whatever is at the source when the rename runs is what
+    moves, so the only way to talk about "the thing we moved" afterwards is to
+    have identified it beforehand.
 
-    Returns an error message, or `None` when the destination is a regular file
-    and the move stands. Never updates the database: the caller returns first.
+    `None` when the source cannot be pinned; the caller then treats the
+    post-rename state as unverifiable rather than guessing.
     """
-    info = dst_target.lstat()
-    if info is not None and stat.S_ISREG(info.st_mode):
+    parent_fd = target.parent_fd
+    if parent_fd is None:
         return None
+    flags = os.O_PATH | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    try:
+        fd = os.open(target.name, flags, dir_fd=parent_fd)
+    except OSError:
+        return None
+    try:
+        info = os.stat(fd)
+        return (info.st_dev, info.st_ino)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _verify_the_moved_inode(
+    src_target, dst_target, moved: tuple[int, int] | None, from_path: str, to_rel: str
+) -> str | None:
+    """Check that what arrived at the destination is our source, and a file.
+
+    `renameat2` relocates whichever inode sits at the source when it runs —
+    the property that stops a file which replaced the source from being
+    destroyed — so the regular-file check made before the preflight does not
+    bind the commit. Three outcomes, and the distinction between the last two
+    is the point:
+
+    * the destination is **our** inode and a regular file → the move stands;
+    * the destination is **our** inode but a directory or a symlink → somebody
+      swapped the source after the check and we relocated that instead. Roll
+      back with a second `RENAME_NOREPLACE` (the shape
+      `vault_fs._refuse_a_moved_directory` uses, so the rollback can never
+      clobber whatever now holds the source name) and refuse;
+    * the destination is **not** our inode, or cannot be identified → something
+      landed there after our rename. Do **not** roll back: moving it away would
+      relocate a third party's file on the strength of a name. Report where
+      things are and let the caller look.
+
+    Returns an error message, or `None` when the move stands. Never touches the
+    database — the caller returns first — and never raises: every failure has
+    to become an explicit result, because by this point the file has already
+    been published somewhere and a traceback would leave the caller with no
+    idea where.
+    """
+    try:
+        info = dst_target.lstat()
+    except OSError as exc:
+        return (
+            f"Move published but unverifiable: {from_path} was moved to "
+            f"{to_rel} and the result could not be inspected ({exc}). Nothing "
+            "was reindexed; check both paths before retrying."
+        )
     if info is None:
         return (
-            f"Move refused: {from_path} disappeared from {to_rel} immediately "
-            "after it was moved there. Nothing was reindexed; re-read the note "
-            "before retrying."
+            f"Move published but {to_rel} is already gone: something removed "
+            f"or replaced it immediately after {from_path} was moved there. "
+            "Nothing was reindexed; check both paths before retrying."
         )
+
+    arrived = (info.st_dev, info.st_ino)
+    if moved is not None and arrived != moved:
+        return (
+            f"Move published but {to_rel} is not the file that was moved: "
+            "something else took that name immediately afterwards. Nothing was "
+            "reindexed and nothing was moved back — check both paths before "
+            "retrying."
+        )
+    if moved is None:
+        return (
+            f"Move published but unverifiable: {from_path} could not be "
+            f"identified before it was moved to {to_rel}. Nothing was "
+            "reindexed; check both paths before retrying."
+        )
+    if stat.S_ISREG(info.st_mode):
+        return None
+
     kind = (
         "a directory"
         if stat.S_ISDIR(info.st_mode)
@@ -1391,25 +1458,58 @@ async def move_note_impl(
     if err := _require_write():
         return err
 
+    uid = current_user_id.get()
+    # A move that rewrites links pins one descriptor per planned rewrite for
+    # the whole preflight-plus-rewrite span. Two such moves running at once can
+    # jointly exhaust the process table even though each is inside its own
+    # budget, so they are serialised — the bound has to hold for the process,
+    # not per call. Moves without rewrites pin two descriptors and are not
+    # serialised.
+    async with _move_rewrite_gate(rewrite_links):
+        return await _move_note_locked(from_path, to_path, rewrite_links, uid)
+
+
+# Process-wide, so the descriptor budget is a bound on the *process* and not
+# merely on each call: two moves that are each inside their own budget can
+# still exhaust the table between them. Held for the whole preflight-plus-
+# rewrite span, which is exactly the span descriptors are pinned for.
+_MOVE_REWRITE_LOCK = asyncio.Lock()
+
+
+@asynccontextmanager
+async def _move_rewrite_gate(rewrite_links: bool):
+    """Serialise moves that rewrite links; let plain moves through."""
+    if not rewrite_links:
+        yield
+        return
+    async with _MOVE_REWRITE_LOCK:
+        yield
+
+
+async def _move_note_locked(
+    from_path: str, to_path: str, rewrite_links: bool, uid: int | None
+) -> str:
+    """`move_note`'s body, under the descriptor gate. See `move_note_impl`."""
     from sqlalchemy import select, update
     from src.models.db import NoteLink, NoteMetadata
     from src.services.links import build_vault_index
 
-    uid = current_user_id.get()
     # Every target below is resolved and opened exactly once and closed in the
     # `finally`. The descriptors are what the move and the rewrites act on, so
-    # renaming a parent directory mid-call cannot redirect either.
+    # renaming a parent directory mid-call cannot redirect either. Both
+    # endpoints are acquired inside the same guard: a non-`ValueError` failure
+    # opening the destination would otherwise strand the source's descriptors.
     targets: list = []
     try:
-        src_target = open_mutable(from_path, user_id=uid)
-        targets.append(src_target)
-        dst_target = open_mutable(to_path, user_id=uid)
-        targets.append(dst_target)
-    except ValueError as e:
-        for opened in targets:
-            opened.close()
-        return str(e)
-    try:
+        try:
+            src_target = open_mutable(from_path, user_id=uid)
+            targets.append(src_target)
+            dst_target = open_mutable(to_path, user_id=uid)
+            targets.append(dst_target)
+        except ValueError as e:
+            return str(e)
+        except OSError as e:
+            return f"Could not open {from_path} or {to_path}: {e}"
         if err := _leaf_state_error(
             src_target,
             from_path,
@@ -1521,6 +1621,28 @@ async def move_note_impl(
                         pre_move_index,
                         output_source_path=out_path,
                     )
+                except OSError as e:
+                    if getattr(e, "errno", None) in (errno.EMFILE, errno.ENFILE):
+                        # Not a per-source failure. Running out of descriptors
+                        # says the *plan* is too big for this process, and
+                        # carrying on would move the note and silently drop
+                        # every remaining rewrite — while the exhaustion takes
+                        # concurrent requests down too. Abort before any
+                        # mutation, which is still free at this point.
+                        drop(read_target)
+                        return (
+                            "Move aborted: ran out of file descriptors while "
+                            f"planning the link rewrites ({e}). Nothing was "
+                            "moved, rewritten or reindexed. Move without "
+                            "rewrite_links and update links in batches, or "
+                            "raise the process's RLIMIT_NOFILE."
+                        )
+                    logger.warning(
+                        "Failed to rewrite links in %s: %s", original_src_path, e
+                    )
+                    failed_rewrite_sources.append(original_src_path)
+                    drop(read_target)
+                    continue
                 except Exception as e:
                     logger.warning(
                         "Failed to rewrite links in %s: %s", original_src_path, e
@@ -1573,6 +1695,10 @@ async def move_note_impl(
                 )
 
         # ── Phase 2: commit ─────────────────────────────────────────────────────
+        # Identify the source *before* the rename: `renameat2` moves whichever
+        # inode is there when it runs, so this is the only chance to know what
+        # we actually moved.
+        moved_inode = _pin_source_inode(src_target)
         try:
             move_file_no_clobber(src_target, dst_target)
         except FileExistsError:
@@ -1586,14 +1712,11 @@ async def move_note_impl(
         except OSError as e:
             return f"Move failed: {e}"
 
-        # `renameat2` moves whichever inode sits at the source when it runs —
-        # the property that keeps a file which replaced the source from being
-        # destroyed. It cuts both ways: the regular-file check above ran before
-        # the preflight, so a directory or a symlink put at `from_path` in
-        # between is what actually moved. Reporting that as "Moved" would put a
-        # subtree, or a link, at the destination and then key the index to it.
-        if err := _refuse_a_moved_non_file(
-            src_target, dst_target, from_path, to_rel
+        # What actually arrived at the destination: our inode, and a regular
+        # file? Anything else is refused, and only our own inode is ever moved
+        # back — see `_verify_the_moved_inode`.
+        if err := _verify_the_moved_inode(
+            src_target, dst_target, moved_inode, from_path, to_rel
         ):
             return err
 

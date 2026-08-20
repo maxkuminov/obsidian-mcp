@@ -16,9 +16,12 @@ The sabotage is hung off `open_mutable` so it runs at the one moment the design
 cares about: validation has produced its verdict and the tool has not yet acted
 on it.
 """
+import asyncio
 import base64
 import errno
 import os
+import stat
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
@@ -583,9 +586,11 @@ def test_the_descriptor_budget_tracks_the_process_limit(monkeypatch):
     )
     assert config.max_move_rewrite_sources() == 1024 - config.MOVE_REWRITE_FD_RESERVE
 
-    # A limit so small the reserve would swallow it still allows a small move.
+    # A limit so small the reserve swallows it refuses outright. There is no
+    # floor: a floor would guarantee the exhaustion the cap exists to prevent
+    # on exactly the processes that cannot afford it.
     monkeypatch.setattr(config.resource, "getrlimit", lambda _: (128, 128))
-    assert config.max_move_rewrite_sources() == config._MIN_MOVE_REWRITE_FDS
+    assert config.max_move_rewrite_sources() == 0
 
     monkeypatch.setattr(
         config.resource,
@@ -675,29 +680,14 @@ async def test_a_refused_write_creates_no_directories(vault):
 async def test_a_source_replaced_mid_move_is_relocated_intact(vault, monkeypatch):
     """`RENAME_NOREPLACE` moves whichever inode is at the source when it runs.
 
-    `link` + `unlink` — the shape this replaced — would have published the
-    inode it linked and then unlinked the *replacement*, destroying it.
+    Two properties at once. The kernel one: `link` + `unlink` — the shape this
+    replaced — would have published the inode it linked and then unlinked the
+    *replacement*, destroying it. And the tool one: the inode is pinned before
+    the rename, so a move that did not carry the note is reported as such
+    rather than as a successful move whose index entry points at a stranger.
     """
     (vault / "source.md").write_text("original\n", encoding="utf-8")
-
-    class FakeSession:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args):
-            return None
-
-        async def execute(self, statement):
-            class Empty:
-                def all(self):
-                    return []
-
-            return Empty()
-
-        async def commit(self):
-            return None
-
-    monkeypatch.setattr(tools, "async_session", FakeSession)
+    executed = _no_db(monkeypatch)
 
     real = vault_fs.rename_noreplace
     swapped: list[bool] = []
@@ -715,10 +705,19 @@ async def test_a_source_replaced_mid_move_is_relocated_intact(vault, monkeypatch
     result = await tools.move_note_impl("source.md", "destination.md")
 
     assert swapped
-    assert "Moved" in result, result
-    # The replacement moved intact; nothing was unlinked behind its back.
+    # The kernel half still holds: the replacement was relocated intact —
+    # `link` + `unlink` would have published the inode it linked and then
+    # unlinked the replacement, destroying it.
     assert (vault / "destination.md").read_text(encoding="utf-8") == "replacement\n"
     assert not (vault / "source.md").exists()
+    # But the tool does not call that a move: the inode pinned before the
+    # rename is not the one that arrived, so it refuses to say "Moved" and
+    # refuses to key the index to a file that is not the note.
+    assert "Move published but" in result, result
+    assert "not the file that was moved" in result, result
+    # And nothing was moved back — relocating a third party's file on the
+    # strength of a name is the mistake this avoids.
+    assert executed == []
 
 
 @pytest.mark.parametrize(
@@ -807,15 +806,35 @@ async def test_swapping_the_root_between_resolution_and_the_open_is_refused(
     assert (decoy_root / "note.md").read_text(encoding="utf-8") == "decoy\n"
 
 
-# ── the staged inode, not the staged name (Codex BLOCKER 2) ─────────────────
+# ── the staged inode, not the staged name (Codex BLOCKER 2 / round-2 #1) ────
+
+
+def _staging_names_seen(monkeypatch) -> list[str]:
+    """Record what the staging descriptor is called, at the moment of `fsync`.
+
+    `readlink("/proc/self/fd/N")` is the only way to ask "does this descriptor
+    have a directory entry?". For an `O_TMPFILE` inode the kernel answers with
+    a synthetic `#<inode> (deleted)` path — there is no name, which is exactly
+    the property the no-clobber path is supposed to have.
+    """
+    seen: list[str] = []
+    real_fsync = os.fsync
+
+    def record(fd):
+        seen.append(os.readlink(f"/proc/self/fd/{fd}"))
+        return real_fsync(fd)
+
+    monkeypatch.setattr(vault_service.os, "fsync", record)
+    return seen
 
 
 def _replace_the_staging_file(monkeypatch, decoy: bytes):
-    """Swap a different inode under the `.tmp-…` name after it is fsynced.
+    """Swap a different inode under the staging name after it is fsynced.
 
-    A peer with write access to the destination directory could otherwise have
-    *its* bytes published as the note: the publish named the staging file, and
-    by then the name no longer meant what we wrote.
+    Only reachable on the **overwrite** path: `renameat` has no by-descriptor
+    form, so its source must have a name, and a peer with write access to the
+    destination directory could otherwise have *its* bytes published as the
+    note.
     """
     real_fsync = os.fsync
     fired: list[str] = []
@@ -824,9 +843,9 @@ def _replace_the_staging_file(monkeypatch, decoy: bytes):
         result = real_fsync(fd)
         if fired:
             return result
-        # Find our staging name through the fd's own directory.
-        link = os.readlink(f"/proc/self/fd/{fd}")
-        tmp = Path(link)
+        tmp = Path(os.readlink(f"/proc/self/fd/{fd}"))
+        if tmp.name.endswith("(deleted)") or not tmp.exists():
+            return result  # nameless staging: nothing to swap
         fired.append(tmp.name)
         os.unlink(tmp)
         tmp.write_bytes(decoy)
@@ -836,33 +855,68 @@ def _replace_the_staging_file(monkeypatch, decoy: bytes):
     return fired
 
 
-async def test_a_swapped_staging_file_is_never_published_by_create(
-    vault, monkeypatch
-):
-    fired = _replace_the_staging_file(monkeypatch, b"DECOY")
+@pytest.mark.parametrize(
+    "write",
+    [
+        pytest.param(
+            lambda: tools.create_note_impl("note.md", "ours\n"), id="create_note"
+        ),
+        pytest.param(
+            lambda: tools.write_file_impl(
+                "blob.bin", base64.b64encode(b"ours").decode()
+            ),
+            id="write_file",
+        ),
+    ],
+)
+async def test_a_no_clobber_write_never_exposes_a_staging_name(vault, monkeypatch, write):
+    """There is nothing to substitute, because there is nothing to name.
 
-    result = await tools.create_note_impl("note.md", "ours\n")
+    A named staging file has to be unlinked afterwards, and an unlink is by
+    name — so it can only be guarded by an identity check followed by the
+    removal, which is check-then-act and could delete a substitute planted in
+    between. `O_TMPFILE` removes the step rather than guarding it.
+    """
+    seen = _staging_names_seen(monkeypatch)
 
-    assert fired, "the race never ran"
-    # Either the note was never created, or it holds exactly our bytes — never
-    # the decoy's. (Detaching our inode drops its link count to zero, which is
-    # what makes `linkat` refuse.)
-    assert "DECOY" not in result
-    if (vault / "note.md").exists():
-        assert (vault / "note.md").read_bytes() == b"ours\n"
-    else:
-        assert "staged copy" in result, result
+    result = await write()
+
+    assert seen, "nothing was staged"
+    # The kernel's answer for an inode with no directory entry.
+    assert seen[0].endswith("(deleted)"), seen
+    assert "Created note" in result or "Wrote" in result, result
+    # Published, and no litter left behind under any name.
+    published = [p.name for p in vault.iterdir()]
+    assert published in (["note.md"], ["blob.bin"]), published
 
 
-def test_a_swapped_staging_file_is_never_published_by_a_raw_write(
-    vault, monkeypatch
-):
-    _replace_the_staging_file(monkeypatch, b"DECOY")
+def test_a_nameless_staging_inode_is_still_published_no_clobber(vault):
+    """The `O_TMPFILE` inode is published by descriptor, and refuses to clobber."""
+    vault_service.write_bytes("blob.bin", b"first", overwrite=False)
+    assert (vault / "blob.bin").read_bytes() == b"first"
 
-    with pytest.raises(vault_fs.VaultFSError, match="staged copy"):
+    with pytest.raises(FileExistsError):
+        vault_service.write_bytes("blob.bin", b"second", overwrite=False)
+    assert (vault / "blob.bin").read_bytes() == b"first"
+    assert [p.name for p in vault.iterdir()] == ["blob.bin"]
+
+
+def test_a_no_clobber_write_refuses_without_o_tmpfile(vault, monkeypatch):
+    """No `O_TMPFILE` means no nameless staging — refuse rather than expose a
+    staging name whose cleanup cannot be made race-free."""
+    real_open = os.open
+
+    def refuse_tmpfile(path, flags, *args, **kwargs):
+        if flags & getattr(os, "O_TMPFILE", 0) == getattr(os, "O_TMPFILE", 0):
+            raise OSError(errno.EOPNOTSUPP, "operation not supported")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(vault_service.os, "open", refuse_tmpfile)
+
+    with pytest.raises(vault_fs.UnsupportedFilesystem, match="O_TMPFILE"):
         vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
 
-    assert not (vault / "blob.bin").exists()
+    assert list(vault.iterdir()) == []
 
 
 async def test_a_swapped_staging_file_is_refused_by_an_overwrite(
@@ -876,38 +930,103 @@ async def test_a_swapped_staging_file_is_refused_by_an_overwrite(
 
     result = await tools.edit_note_impl("note.md", "after\n")
 
-    assert fired
+    assert fired, "the race never ran"
     assert "staged copy" in result, result
     assert note.read_text(encoding="utf-8") == "before\n"
 
 
-def test_the_temp_sweep_never_unlinks_a_file_it_did_not_stage(vault, monkeypatch):
+def test_the_overwrite_cleanup_never_unlinks_a_file_it_did_not_stage(
+    vault, monkeypatch
+):
     """The mirror hazard: answering a substitution by deleting the substitute.
 
-    `_discard_temp` runs on every path, so unlinking the staging name blindly
-    would destroy whatever a peer had put there — the same destructive-write
-    class, just aimed at a different file.
+    `_discard_temp` runs on every overwrite path, so unlinking the staging name
+    blindly would destroy whatever a peer had put there — the same
+    destructive-write class, just aimed at a different file. The failure
+    direction is to leave litter, not to remove something unprovable.
     """
+    (vault / "note.md").write_text("before\n", encoding="utf-8")
     fired = _replace_the_staging_file(monkeypatch, b"someone else's file")
 
     with pytest.raises(vault_fs.VaultFSError):
-        vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+        vault_service.write_file("note.md", "ours", overwrite=True)
 
+    assert fired
     leftovers = [p for p in vault.iterdir() if p.name.startswith(".tmp-")]
     assert len(leftovers) == 1, leftovers
     assert leftovers[0].name == fired[0]
     assert leftovers[0].read_bytes() == b"someone else's file"
+    assert (vault / "note.md").read_text(encoding="utf-8") == "before\n"
 
 
 def test_publishing_by_descriptor_refuses_without_proc(vault, monkeypatch):
     """No `/proc` means no way to publish an inode — refuse, never fall back to
-    publishing whatever the staging *name* points at."""
+    publishing whatever a staging *name* points at."""
     monkeypatch.setattr(vault_service, "_proc_fd_available_cache", False)
 
     with pytest.raises(vault_fs.UnsupportedFilesystem, match="/proc"):
         vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
 
     assert not (vault / "blob.bin").exists()
+
+
+def test_an_fstat_failure_leaks_neither_descriptor_nor_staging_name(
+    vault, monkeypatch
+):
+    """The `try` opens immediately after the descriptor exists (round-2 #4)."""
+    (vault / "note.md").write_text("before\n", encoding="utf-8")
+    before = _open_fds()
+    real_fstat = os.fstat
+
+    def boom(fd):
+        info = real_fstat(fd)
+        # Only the staging fd. `open_mutable` fstats *directory* descriptors to
+        # confirm the root it pinned, and failing those would refuse the call
+        # before anything is staged — the test would then pass for the wrong
+        # reason, which is how it was written the first time.
+        if stat.S_ISDIR(info.st_mode):
+            return info
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(vault_service.os, "fstat", boom)
+
+    for _ in range(3):
+        with pytest.raises(OSError):
+            vault_service.write_file("note.md", "after\n", overwrite=True)
+
+    monkeypatch.setattr(vault_service.os, "fstat", real_fstat)
+    assert _open_fds() == before
+    assert [p.name for p in vault.iterdir()] == ["note.md"]
+    assert (vault / "note.md").read_text(encoding="utf-8") == "before\n"
+
+
+def test_a_failing_close_after_publication_is_not_a_failed_write(
+    vault, monkeypatch
+):
+    """A bare close raising EIO would discard a write that already happened —
+    the trap `transfer._close_quietly` exists for."""
+    real_close = os.close
+    published: list[bool] = []
+
+    def close_hook(fd):
+        if published:
+            real_close(fd)
+            raise OSError(errno.EIO, "I/O error")
+        return real_close(fd)
+
+    real_link = vault_service._link_staged_inode
+
+    def link_hook(*args, **kwargs):
+        result = real_link(*args, **kwargs)
+        published.append(True)
+        return result
+
+    monkeypatch.setattr(vault_service, "_link_staged_inode", link_hook)
+    monkeypatch.setattr(vault_service.os, "close", close_hook)
+
+    vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+
+    assert (vault / "blob.bin").read_bytes() == b"ours"
 
 
 # ── move_note verifies what actually moved (Codex BLOCKER 3) ────────────────
@@ -1013,3 +1132,223 @@ async def test_a_failed_rollback_names_the_recovery_location(vault, monkeypatch)
     assert "moved.md" in result, result  # where to recover it from
     assert (vault / "moved.md").is_dir()
     assert executed == []
+
+
+# ── round 2: the move verifier identifies what it moved (Codex #2) ──────────
+
+
+async def test_a_destination_taken_over_after_the_move_is_not_rolled_back(
+    vault, monkeypatch
+):
+    """Only our own inode is ever moved back.
+
+    Rolling back on "the destination is not a regular file" alone would
+    relocate a third party's file on the strength of a name — the same
+    act-on-a-name mistake, one level up. If what is at the destination is not
+    the inode we pinned before the rename, we say so and touch nothing.
+    """
+    (vault / "source.md").write_text("note\n", encoding="utf-8")
+    executed = _no_db(monkeypatch)
+
+    real = vault_fs.rename_noreplace
+    fired: list[bool] = []
+
+    def steal_the_destination(src_dir_fd, src_name, dst_dir_fd, dst_name):
+        result = real(src_dir_fd, src_name, dst_dir_fd, dst_name)
+        if not fired:
+            fired.append(True)
+            # Somebody replaces the destination straight after our rename.
+            os.unlink(vault / dst_name)
+            (vault / dst_name).mkdir()
+            (vault / dst_name / "theirs.md").write_text("theirs\n", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(vault_fs, "rename_noreplace", steal_the_destination)
+    # Pinned to something the destination can never be, so the branch under
+    # test is reached deterministically: unlink-then-mkdir can reuse the very
+    # inode number we just freed, which would make the identities compare equal
+    # for reasons that have nothing to do with the rule.
+    monkeypatch.setattr(tools, "_pin_source_inode", lambda target: (-1, -1))
+
+    result = await tools.move_note_impl("source.md", "moved.md")
+
+    assert fired
+    assert "not the file that was moved" in result, result
+    assert "nothing was moved back" in result, result
+    # Their directory is exactly where they put it.
+    assert (vault / "moved.md" / "theirs.md").read_text(encoding="utf-8") == "theirs\n"
+    assert executed == []
+
+
+async def test_an_unverifiable_destination_is_reported_not_raised(
+    vault, monkeypatch
+):
+    """Every post-rename failure becomes an explicit result: by then the file
+    has been published somewhere, and a traceback leaves the caller with no
+    idea where."""
+    (vault / "source.md").write_text("note\n", encoding="utf-8")
+    executed = _no_db(monkeypatch)
+
+    # Only *after* the rename: `open_mutable` lstats too, and failing there
+    # would refuse the call long before the interesting branch.
+    real_lstat = vault_service.MutableTarget.lstat
+    real_rename = vault_fs.rename_noreplace
+    moved: list[bool] = []
+
+    def note_the_move(*args, **kwargs):
+        result = real_rename(*args, **kwargs)
+        moved.append(True)
+        return result
+
+    def unverifiable(self):
+        if moved:
+            raise OSError(errno.EIO, "I/O error")
+        return real_lstat(self)
+
+    monkeypatch.setattr(vault_fs, "rename_noreplace", note_the_move)
+    monkeypatch.setattr(
+        vault_service.MutableTarget, "lstat", unverifiable, raising=True
+    )
+
+    result = await tools.move_note_impl("source.md", "moved.md")
+
+    assert "unverifiable" in result, result
+    assert "moved.md" in result, result
+    assert executed == []
+
+
+async def test_an_unpinnable_source_is_reported_rather_than_assumed(
+    vault, monkeypatch
+):
+    (vault / "source.md").write_text("note\n", encoding="utf-8")
+    executed = _no_db(monkeypatch)
+    monkeypatch.setattr(tools, "_pin_source_inode", lambda target: None)
+
+    result = await tools.move_note_impl("source.md", "moved.md")
+
+    assert "could not be identified" in result, result
+    assert executed == []
+
+
+# ── round 2: the descriptor budget (Codex #3) ───────────────────────────────
+
+
+@needs_proc
+async def test_running_out_of_descriptors_aborts_the_whole_move(
+    vault, monkeypatch
+):
+    """EMFILE mid-preflight is not a per-source rewrite failure.
+
+    Treating it as one moved the note and silently dropped every remaining
+    rewrite, leaving `note_links` asserting links the vault bytes do not have —
+    while the exhaustion took concurrent requests down as well.
+    """
+    (vault / "target.md").write_text("body\n", encoding="utf-8")
+    sources = [f"src{i}.md" for i in range(6)]
+    for name in sources:
+        (vault / name).write_text("See [[target]]\n", encoding="utf-8")
+
+    rows = [
+        _Row(file_path="target.md", id=1),
+        *[_Row(file_path=name, id=i + 2) for i, name in enumerate(sources)],
+    ]
+    _fake_move_session(
+        monkeypatch, rows, [_Row(file_path=name) for name in sources]
+    )
+
+    real_open_mutable = tools.open_mutable
+    opened: list[str] = []
+
+    def exhaust_after_three(relative_path, user_id=None):
+        if relative_path in sources:
+            opened.append(relative_path)
+            if len(opened) > 2:
+                raise OSError(errno.EMFILE, "Too many open files")
+        return real_open_mutable(relative_path, user_id=user_id)
+
+    monkeypatch.setattr(tools, "open_mutable", exhaust_after_three)
+
+    result = await tools.move_note_impl(
+        "target.md", "moved.md", rewrite_links=True
+    )
+
+    assert "Move aborted" in result, result
+    assert "file descriptors" in result, result
+    # Nothing moved, nothing rewritten.
+    assert (vault / "target.md").read_text(encoding="utf-8") == "body\n"
+    assert not (vault / "moved.md").exists()
+    for name in sources:
+        assert (vault / name).read_text(encoding="utf-8") == "See [[target]]\n"
+
+
+async def test_moves_with_rewrites_are_serialised_process_wide(
+    vault, monkeypatch
+):
+    """Each move can be inside its own budget and still exhaust the table
+    between them, so the bound has to hold for the process."""
+    for i in (1, 2):
+        (vault / f"t{i}.md").write_text("body\n", encoding="utf-8")
+    _fake_move_session(monkeypatch, [], [])
+
+    overlap = [0]
+    peak = [0]
+    real_gate = tools._move_rewrite_gate
+
+    @asynccontextmanager
+    async def counting_gate(rewrite_links: bool):
+        async with real_gate(rewrite_links):
+            overlap[0] += 1
+            peak[0] = max(peak[0], overlap[0])
+            try:
+                await asyncio.sleep(0)  # yield, so an unlocked gate would overlap
+                yield
+            finally:
+                overlap[0] -= 1
+
+    monkeypatch.setattr(tools, "_move_rewrite_gate", counting_gate)
+
+    await asyncio.gather(
+        tools.move_note_impl("t1.md", "m1.md", rewrite_links=True),
+        tools.move_note_impl("t2.md", "m2.md", rewrite_links=True),
+    )
+
+    assert peak[0] == 1, peak[0]
+    assert (vault / "m1.md").exists() and (vault / "m2.md").exists()
+
+
+async def test_a_move_without_rewrites_is_not_serialised(vault, monkeypatch):
+    """Two descriptors, no preflight — the gate would only add contention."""
+    async with tools._MOVE_REWRITE_LOCK:
+        (vault / "note.md").write_text("body\n", encoding="utf-8")
+        _fake_move_session(monkeypatch, [], [])
+        result = await asyncio.wait_for(
+            tools.move_note_impl("note.md", "moved.md"), timeout=5
+        )
+    assert "Moved" in result, result
+
+
+# ── round 2: both endpoints acquired inside one guard (Codex #5) ────────────
+
+
+@needs_proc
+async def test_a_failure_opening_the_destination_closes_the_source(
+    vault, monkeypatch
+):
+    """A non-`ValueError` failure on the second `open_mutable` must not strand
+    the first one's descriptors."""
+    (vault / "source.md").write_text("body\n", encoding="utf-8")
+    real_open_mutable = tools.open_mutable
+
+    def fail_on_destination(relative_path, user_id=None):
+        if relative_path == "dest.md":
+            raise OSError(errno.EMFILE, "Too many open files")
+        return real_open_mutable(relative_path, user_id=user_id)
+
+    monkeypatch.setattr(tools, "open_mutable", fail_on_destination)
+
+    before = _open_fds()
+    for _ in range(3):
+        result = await tools.move_note_impl("source.md", "dest.md")
+        assert "Could not open" in result, result
+    assert _open_fds() == before
+    assert (vault / "source.md").read_text(encoding="utf-8") == "body\n"

@@ -36,8 +36,14 @@ MAX_MOVE_REWRITE_BYTES = 256 * 1024 * 1024  # 256 MiB
 # mutation once the plan would consume more than the running limit leaves
 # spare. Derived from `RLIMIT_NOFILE` rather than pinned to a number: a
 # container with a million descriptors should not be held to a laptop's 1024.
+#
+# **There is no floor.** An earlier version would not refuse below 64 planned
+# rewrites whatever the limit said, on the theory that a small move should
+# always be allowed. That inverts the purpose: on a process whose limit really
+# is tiny, the floor guarantees the exhaustion the cap exists to prevent. If
+# the budget says zero, the honest answer is to refuse and let the operator
+# raise `RLIMIT_NOFILE`.
 MOVE_REWRITE_FD_RESERVE = 256  # descriptors left for the rest of the process
-_MIN_MOVE_REWRITE_FDS = 64  # never refuse a small move, whatever the limit
 
 
 def max_move_rewrite_sources() -> int:
@@ -49,7 +55,7 @@ def max_move_rewrite_sources() -> int:
     soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft in (resource.RLIM_INFINITY, -1):
         return sys.maxsize
-    return max(_MIN_MOVE_REWRITE_FDS, soft - MOVE_REWRITE_FD_RESERVE)
+    return max(0, soft - MOVE_REWRITE_FD_RESERVE)
 
 
 # Headroom for the JSON-RPC envelope around a tool call's content argument:

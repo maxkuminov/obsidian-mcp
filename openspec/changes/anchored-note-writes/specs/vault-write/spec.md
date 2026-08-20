@@ -93,12 +93,25 @@ The system SHALL perform all file writes from MCP write tools via a temporary fi
 - **THEN** any reader observing the destination path SHALL see either the
   full prior content or the full new content, never a partial mix
 
-#### Scenario: The staging file is replaced before publication
+#### Scenario: A no-clobber write exposes no staging name
 
-- **WHEN** another process detaches the staged temporary file from its name — by unlinking it or renaming a different file over it — after the payload has been flushed and before publication
+- **WHEN** `create_note` or `write_file` (without `overwrite`) stages its payload
+- **THEN** no directory entry for the staged content SHALL exist at any point before publication
+- **AND** the staged content SHALL be published by descriptor, so that no name a third party could take over is consulted
+- **AND** no cleanup of a staging name SHALL be required or performed
+
+#### Scenario: The staging file of an overwrite is replaced before publication
+
+- **WHEN** another process detaches an overwrite's staged temporary file from its name — by unlinking it or renaming a different file over it — after the payload has been flushed and before publication
 - **THEN** the substituted file's contents SHALL NOT be published at the destination
 - **AND** the destination SHALL hold either its prior content or the content this call staged, never a third party's
 - **AND** the substituted file SHALL be left in place rather than unlinked by the cleanup
+
+#### Scenario: The filesystem cannot stage without a name
+
+- **WHEN** the vault filesystem does not support staging an unnamed file
+- **THEN** a no-clobber write SHALL be refused with an error naming the unsupported capability
+- **AND** SHALL NOT fall back to staging under a name
 
 #### Scenario: Staging happens in the destination directory
 
@@ -131,9 +144,27 @@ The system SHALL perform all file writes from MCP write tools via a temporary fi
 #### Scenario: The source is replaced by a directory or a link during a move
 
 - **WHEN** another actor replaces the file at `from_path` with a directory or a symbolic link after validation but before `move_note` commits
-- **THEN** `move_note` SHALL detect that what arrived at the destination is not a regular file, SHALL move it back with a non-replacing rename, and SHALL report the move as refused
+- **THEN** `move_note` SHALL detect that what arrived at the destination is the object it moved and is not a regular file, SHALL move it back with a non-replacing rename, and SHALL report the move as refused
 - **AND** SHALL NOT update `notes_metadata` or `note_links`
 - **AND** if the rollback cannot be performed, the error SHALL name the location the object now occupies so it can be recovered
+
+#### Scenario: Something else takes the destination immediately after the move
+
+- **WHEN** the file at the destination after the rename is not the object `move_note` moved — because a third party replaced it, or because the moved object could not be identified beforehand
+- **THEN** `move_note` SHALL report the outcome, naming the destination, rather than raising
+- **AND** SHALL NOT move anything back, because relocating that object would act on a name rather than on an identified file
+- **AND** SHALL NOT update `notes_metadata` or `note_links`
+
+#### Scenario: A move exhausts the process descriptor table
+
+- **WHEN** `move_note(rewrite_links=True)` runs out of file descriptors while planning its rewrites
+- **THEN** the whole move SHALL be aborted before any mutation, rather than recorded as a failure of the individual source
+- **AND** the error SHALL say that descriptors ran out and suggest moving without `rewrite_links`
+
+#### Scenario: Two link-rewriting moves run concurrently
+
+- **WHEN** two `move_note(rewrite_links=True)` calls are in flight at the same time
+- **THEN** their preflight-and-rewrite spans SHALL NOT overlap, so that the descriptor bound holds for the process and not merely for each call
 
 #### Scenario: Hard links unavailable
 

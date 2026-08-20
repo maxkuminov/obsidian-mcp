@@ -124,15 +124,12 @@ about what the name means later.
 
 The staging descriptor is the one handle no rename can take away, so the
 no-clobber publish goes through it: `linkat(AT_FDCWD, "/proc/self/fd/<fd>",
-dir_fd, name, AT_SYMLINK_FOLLOW)`. Two properties follow:
+dir_fd, name, AT_SYMLINK_FOLLOW)`. What is published is provably the inode we
+wrote, whatever the staging name now says.
 
-- what is published is provably the inode we wrote, whatever the staging name
-  now says;
-- it **fails closed**. Detaching our inode from every name drops its link count
-  to zero, and `linkat` on a zero-link inode is `ENOENT` unless the caller holds
-  `CAP_DAC_READ_SEARCH`. An attacker can therefore prevent the write, never
-  substitute it. (Verified experimentally, both directions: unlink and
-  rename-over both produce `ENOENT`.)
+**Round 2 went further and removed the staging name too** — see D12. Publishing
+the right inode still left a name to clean up afterwards, and cleaning up a
+name means an identity check followed by an unlink, which is check-then-act.
 
 `/proc` is required, which the Linux-only declared semantics already assume; if
 it is absent we raise `UnsupportedFilesystem` rather than fall back to the
@@ -177,3 +174,107 @@ error says where the object is so it can be recovered by hand.
 inert there and was never followed. A move is different: a link published at
 the destination becomes what the index points at, and the caller is told a note
 moved that no longer exists. So `move_note` refuses both kinds.
+
+## D12. The no-clobber path stages an unnamed inode (`O_TMPFILE`)
+
+Publishing the inode (D9) fixed *what* gets published. It did not remove the
+staging **name**, and a name has to be cleaned up: `_discard_temp` checked that
+the name still referred to our inode and then unlinked it. That is
+check-then-act — a substitute planted between the check and the unlink is what
+gets deleted. Guarding the check harder does not help; the step itself is the
+problem.
+
+So the no-clobber path stages with `O_TMPFILE|O_RDWR` into `dir_fd`. The inode
+has no directory entry at all: nothing to observe, nothing to substitute,
+nothing to clean up. Closing the descriptor frees it. Publication is the D9
+`linkat`, unchanged.
+
+Three things about this are easy to get wrong and are worth recording:
+
+- **`O_EXCL` must not be set.** With `O_TMPFILE` it means "this file may never
+  be linked into the filesystem" — the publish then fails `ENOENT`. It is the
+  opposite of the usual meaning and exactly the flag one adds by reflex. The
+  review that requested this change specified `O_TMPFILE|O_RDWR|O_EXCL`; the
+  first implementation attempt failed for precisely this reason.
+- **`AT_EMPTY_PATH` is not usable, but the `/proc` magic link is.** The
+  `linkat(fd, "", …, AT_EMPTY_PATH)` form requires `CAP_DAC_READ_SEARCH`, which
+  an ordinary container does not have. The magic link does not. Both were
+  measured on the deployment's kernel with `CapEff=0`: `AT_EMPTY_PATH` → ENOENT,
+  `/proc/self/fd/<fd>` → success.
+- **"You cannot link a zero-link inode" applies to a *deleted* inode, not to an
+  `O_TMPFILE` one.** A regular file whose names have all been removed is
+  deleted and `linkat` refuses it; a file created `O_TMPFILE` is a different
+  state and links fine. D9's earlier claim conflated the two — it is right
+  about the deleted case, which is why the *overwrite* path's staging name
+  cannot be resurrected once a peer unlinks it.
+
+The **overwrite** path keeps its name, because `renameat` has no by-descriptor
+form. Its cleanup keeps the identity check, and the failure direction is
+inverted: when the name no longer refers to our inode the file is **left in
+place and logged**, never unlinked. Leaving litter is the acceptable outcome;
+deleting a stranger's file is not.
+
+## D13. The move verifier needs a witness, not just a type check
+
+D11 checked that the destination was a regular file after the rename. That is
+not enough: it cannot tell "the thing we moved turned out to be a directory"
+from "somebody else's file landed on that name a microsecond later", and it
+would have rolled the second one back — relocating a third party's file on the
+strength of a name, which is the act-on-a-name mistake one level up.
+
+So the source is identified *before* the rename, with an `O_PATH|O_NOFOLLOW`
+descriptor (`O_PATH` opens the directory entry without opening the file, so it
+works for a symlink or a directory and has no side effects). After the rename
+the destination is `lstat`ed through its parent fd and compared:
+
+| destination | action |
+| --- | --- |
+| our inode, regular file | the move stands |
+| our inode, directory or symlink | roll back, refuse |
+| not our inode, or unidentifiable | report, roll back **nothing** |
+
+Every post-rename failure becomes an explicit result rather than an exception.
+By that point the file has been published *somewhere*; a traceback would leave
+the caller unable to find it, and the database update must be skipped in every
+one of these cases.
+
+## D14. The descriptor budget is a process bound, so it needs a process lock
+
+Two things were wrong with the first version of the budget.
+
+**The floor.** `max(64, soft - reserve)` refused to go below 64 planned
+rewrites "so a small move always works". That inverts the purpose: on a process
+whose limit really is small, the floor guarantees the exhaustion the cap exists
+to prevent. Removed — if the budget computes to zero, refusing and letting the
+operator raise `RLIMIT_NOFILE` is the honest answer.
+
+**Per-call, not per-process.** Two moves that are each inside their own budget
+can exhaust the table between them. `_MOVE_REWRITE_LOCK` serialises moves that
+rewrite links, held across preflight *and* the rewrites — exactly the span
+descriptors are pinned for. Moves without rewrites pin two descriptors and go
+straight through.
+
+And an actual `EMFILE`/`ENFILE` during the preflight now aborts the whole move
+before any mutation instead of being recorded as a per-source rewrite failure.
+Running out of descriptors is a statement about the plan, not about one source;
+treating it as the latter moved the note and silently dropped every remaining
+rewrite, leaving `note_links` asserting links the vault bytes do not contain.
+
+## D15. The remaining window: the walk is not atomic (inherited)
+
+`vault_fs.open_dir_beneath` opens one component at a time. An ancestor renamed
+**out of the vault** between two of those opens yields a parent descriptor
+outside the pinned root — the containment the root descriptor establishes is
+checked per component, not for the path as a whole.
+
+This is inherited rather than introduced: the transfer routes and `delete_file`
+have walked this way since D6, and #59 did not change the walk. It is recorded
+here, in the `vault` module docstring and in CLAUDE.md's residual list because
+it is now the *last* redirection window in the write path, and because the
+sections around it claim redirection is closed.
+
+The fix is `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS)` reached through `ctypes` — Python's stdlib does not
+expose it — which makes the kernel enforce containment for the entire path in a
+single call, so there is no window between components at all. That belongs to
+`vault_fs`, changes every caller of the walk, and is tracked as its own change.
