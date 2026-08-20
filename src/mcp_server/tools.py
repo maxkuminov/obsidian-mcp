@@ -103,6 +103,58 @@ def _truncate_params(params: dict) -> dict:
     }
 
 
+_NO_VAULT_MESSAGE = (
+    "Error: no vault is assigned to this account, so no vault tool can run. "
+    "Ask an administrator to assign a vault path to your user in the control "
+    "panel."
+)
+
+# Marker written into `usage_logs.params` for a call refused by the gate. It
+# carries no new information — the user id and tool name are already columns.
+_NO_VAULT_MARKER = "no_vault_assigned"
+
+
+def _vault_admission_error() -> str | None:
+    """Refuse the call when the caller has no resolvable vault root.
+
+    Unassigning `users.vault_path` used to revoke only the *disk*-touching
+    tools: `semantic_search`, `keyword_search`, `list_notes`, `get_recent` and
+    every graph tool are served entirely from `notes_metadata` /
+    `note_embeddings`, never call `_vault_root`, and those rows are never
+    deleted (the indexer skips users with a NULL `vault_path`, so nothing ever
+    prunes them). The result was an indefinite, fully queryable mirror of the
+    content the user last held — file paths, titles, tags, frontmatter and
+    chunk excerpts — reachable with an unchanged API key, while the panel told
+    the operator "vault tools error" (issue #66).
+
+    So the gate lives here, in the decorator every tool shares, rather than in
+    the individual tools: resolve the root **once, before the body runs**, and
+    fail the whole call if it cannot be resolved. Every `_tracked` tool reads
+    or writes vault content or vault metadata, so there is nothing to exempt —
+    `get_vault_guide` reads the vault's `CLAUDE.md`, `check_upload` reports a
+    vault path. Fail closed and keep the list at zero.
+
+    Single-user mode is untouched: `current_user_id` is None there (the
+    sentinel's `id` is None and sandbox mode never sets it), and `_vault_root`
+    answers from `settings.vault_path` without consulting the cache.
+
+    Preserving the index rows is deliberate — a reassignment of the same path
+    should not have to re-embed the vault from scratch.
+    """
+    uid = current_user_id.get()
+    try:
+        _vault_root(uid)
+    except RuntimeError:
+        # Unassigned, deactivated, or a cold cache. All three mean the same
+        # thing to the caller and all three must refuse: a cold cache is not
+        # permission to serve stale rows.
+        logger.warning(
+            "tool_refused_no_vault", extra={"user_id": uid}
+        )
+        return _NO_VAULT_MESSAGE
+    return None
+
+
 def _tracked(tool_name: str, param_keys: list[str], transforms: dict | None = None):
     """Decorator that times the call and logs it to usage_logs.
 
@@ -127,7 +179,16 @@ def _tracked(tool_name: str, param_keys: list[str], transforms: dict | None = No
             # the same task starts from empty rather than inheriting them.
             token = timing.begin()
             try:
-                result = await fn(*args, **kwargs)
+                # Admission gate: a caller with no resolvable vault root never
+                # reaches the tool body, including the DB-only ones. The
+                # refusal is still logged, like any other tool error.
+                refusal = _vault_admission_error()
+                if refusal is not None:
+                    result = refusal
+                    extra = {"error": _NO_VAULT_MARKER}
+                else:
+                    result = await fn(*args, **kwargs)
+                    extra = {}
                 duration_ms = int((time.monotonic() - start) * 1000)
                 params = {}
                 # Resolve logged params by NAME via the wrapped signature so
@@ -146,6 +207,7 @@ def _tracked(tool_name: str, param_keys: list[str], transforms: dict | None = No
                 except TypeError:
                     params = {}
                 logged = _truncate_params(params)
+                logged.update(extra)
                 # Whatever the service measured. Absent for tools that measure
                 # nothing, so `params` keeps its current shape for them.
                 logged.update(timing.current() or {})
@@ -153,6 +215,12 @@ def _tracked(tool_name: str, param_keys: list[str], transforms: dict | None = No
                 return result
             finally:
                 timing.clear(token)
+
+        # Structural marker. `tests/test_issue_66_*` asserts that every tool
+        # registered on the MCP server delegates to something carrying it, so
+        # "the admission gate is inherited by construction" is checked rather
+        # than asserted.
+        wrapper.__tracked_tool__ = tool_name
         return wrapper
     return decorator
 

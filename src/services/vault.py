@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 import yaml
 from sqlalchemy import select
 
+from src.auth.session import _UnsetVaultRoot, current_vault_root
 from src.config import settings
 
 logger = logging.getLogger(__name__)
@@ -22,16 +23,27 @@ logger = logging.getLogger(__name__)
 # `clear_user_vault_cache(user_id=...)` when the admin edits a user. Single-user
 # mode never touches this cache because `_vault_root()` is called with
 # `user_id=None` everywhere.
+#
+# The single-user form of `warm_user_vault_cache` is *authoritative*: it writes
+# the current value or removes the entry, and returns what it read. It is not an
+# add-only warm. The bulk form still is — which is why the value it returns is
+# also bound to the request (`current_vault_root`) rather than trusted from this
+# dict: see `_vault_root`.
 _user_vault_cache: dict[int, Path] = {}
 
 
-async def warm_user_vault_cache(session, user_id: int | None = None) -> None:
+async def warm_user_vault_cache(session, user_id: int | None = None) -> Path | None:
     """Populate `_user_vault_cache` for one user (or every active user).
 
     Called by the indexer at the start of each multi-user pass, by the API-key
     middleware after authenticating a user, and (in phase 4) by panel routes
     before they hit vault tools. In single-user mode the cache is unused so
     callers can skip the warmup; nothing breaks if they don't.
+
+    The **single-user form returns the freshly read root, or None** when the
+    user has no usable assignment. `APIKeyMiddleware` binds that answer to the
+    request via `current_vault_root`, which is what makes admission immune to
+    the bulk warm racing it — see `_vault_root`. The bulk form returns None.
     """
     from src.models.db import User
 
@@ -44,9 +56,21 @@ async def warm_user_vault_cache(session, user_id: int | None = None) -> None:
             )
         )
         row = result.first()
-        if row is not None:
-            _user_vault_cache[row.id] = Path(row.vault_path)
-        return
+        if row is None:
+            # No usable assignment any more: unassigned, deactivated, or the
+            # row is gone. **Evict** rather than leaving the previous value in
+            # place. This warm runs on every authenticated MCP request, and
+            # `_vault_root` is now the admission gate every tool passes through
+            # (`_tracked`), so a stale entry would keep a revoked assignment
+            # queryable until the process restarts — issue #66. Callers that
+            # mutate `users.vault_path` still call `clear_user_vault_cache`;
+            # this makes the refusal independent of them, and of the fact that
+            # each worker process holds its own cache.
+            _user_vault_cache.pop(user_id, None)
+            return None
+        root = Path(row.vault_path)
+        _user_vault_cache[row.id] = root
+        return root
 
     result = await session.execute(
         select(User.id, User.vault_path).where(
@@ -56,6 +80,7 @@ async def warm_user_vault_cache(session, user_id: int | None = None) -> None:
     )
     for row in result.all():
         _user_vault_cache[row.id] = Path(row.vault_path)
+    return None
 
 
 def clear_user_vault_cache(user_id: int | None = None) -> None:
@@ -71,18 +96,71 @@ def clear_user_vault_cache(user_id: int | None = None) -> None:
         _user_vault_cache.pop(user_id, None)
 
 
+UNOWNED_IN_MULTI_USER_ERROR = (
+    "No vault root: multi-user mode is enabled and this credential is not "
+    "bound to a user."
+)
+
+
+def vault_unassigned_error(user_id: int) -> str:
+    """The one wording for "this user has no usable vault assignment".
+
+    Shared by `_vault_root` and the panel's vault browser so the operator and
+    the agent are told the same thing.
+    """
+    return (
+        f"Vault path for user_id={user_id} is not assigned. The user has no "
+        "`vault_path`, or is inactive."
+    )
+
+
 def _vault_root(user_id: int | None = None) -> Path:
     """Return the vault root for the given user.
 
     Single-user mode / `user_id is None` → `settings.vault_path` (legacy
-    behavior). Multi-user mode → cached `users.vault_path` lookup. The cache
+    behavior). **In multi-user mode `user_id is None` raises instead** — see
+    the ownerless-credential note below. Multi-user mode → cached
+    `users.vault_path` lookup. The cache
     must have been warmed for this user (auth middleware / indexer / panel
     routes do this before invoking tools); a miss raises a clear RuntimeError
     rather than silently falling back to the global path or silently blocking
     the event loop on a sync DB call.
+
+    This is also the admission gate for every MCP tool: `_tracked` calls it
+    once before the tool body runs and refuses the call when it raises, so a
+    user with no vault assignment cannot reach the database-backed tools
+    either (issue #66). Keep it a pure cache lookup — the per-request warm in
+    `APIKeyMiddleware` is what makes it correct, and a DB query here would be
+    a query on every tool call.
+
+    **The authenticated request's own snapshot wins over the shared dict.**
+    `_user_vault_cache` is process-global and the indexer's bulk warm writes to
+    it, so a bulk `SELECT` issued *before* an admin cleared `vault_path` can
+    land *after* the per-request warm evicted the entry and re-admit a user
+    whose assignment was already revoked — mid-call, with a write tool in
+    flight. `current_vault_root` is bound once per authenticated request by
+    `APIKeyMiddleware` and no other task can overwrite it, so consulting it
+    first makes admission fail closed under that interleaving. It is keyed by
+    user id: a snapshot for a different user (nested contexts, a panel route
+    resolving somebody else's root) falls through to the dict rather than
+    answering for the wrong vault.
     """
     if user_id is None:
+        if settings.multi_user_mode:
+            # An ownerless credential in multi-user mode. `APIKeyMiddleware`
+            # already refuses those (see `ownerless_credential`), so reaching
+            # here means some other path resolved a root with no user — and
+            # falling back to `settings.vault_path` would hand it the *global*
+            # vault, which in multi-user mode belongs to nobody in particular
+            # and is exactly the write nobody authorised. Fail closed.
+            raise RuntimeError(UNOWNED_IN_MULTI_USER_ERROR)
         return Path(settings.vault_path)
+    snapshot = current_vault_root.get()
+    if not isinstance(snapshot, _UnsetVaultRoot) and snapshot[0] == user_id:
+        root = snapshot[1]
+        if root is None:
+            raise RuntimeError(vault_unassigned_error(user_id))
+        return root
     cached = _user_vault_cache.get(user_id)
     if cached is None:
         raise RuntimeError(

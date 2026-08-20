@@ -1,5 +1,6 @@
 from contextvars import ContextVar
 from dataclasses import dataclass
+from pathlib import Path
 
 from fastapi import Depends, HTTPException, Request, status
 from sqlalchemy import select
@@ -10,6 +11,32 @@ from src.database import get_session
 from src.models.db import User
 
 current_user_id: ContextVar[int | None] = ContextVar("current_user_id", default=None)
+
+
+class _UnsetVaultRoot:
+    """Sentinel: this context carries no authenticated vault snapshot."""
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "<unset vault root>"
+
+
+UNSET_VAULT_ROOT = _UnsetVaultRoot()
+
+# The authenticated request's *own* answer to "where is this user's vault, right
+# now" — `(user_id, Path)` when assigned, `(user_id, None)` when the user has no
+# usable assignment, and `UNSET_VAULT_ROOT` outside a request (indexer, panel,
+# tests).
+#
+# It exists because the process-level cache in `src/services/vault.py` is shared
+# with the indexer's bulk warm, and a bulk `SELECT` that started *before* an
+# admin cleared `vault_path` can land *after* the per-request warm evicted the
+# entry — re-admitting a user whose assignment was already revoked, mid-call.
+# A snapshot bound to this request cannot be overwritten by another task, so
+# `_vault_root` prefers it whenever it is set. See "The vault assignment is the
+# admission gate for every tool" in CLAUDE.md.
+current_vault_root: ContextVar[tuple[int, Path | None] | _UnsetVaultRoot] = ContextVar(
+    "current_vault_root", default=UNSET_VAULT_ROOT
+)
 
 
 @dataclass

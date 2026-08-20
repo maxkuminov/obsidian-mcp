@@ -9,7 +9,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from src.auth.session import current_user_id
+from src.auth.session import UNSET_VAULT_ROOT, current_user_id, current_vault_root
 from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthToken, User
@@ -90,6 +90,13 @@ class APIKeyMiddleware:
         token_key = current_api_key_id.set(None)
         token_oauth = current_oauth_token_id.set(None)
         token_user = current_user_id.set(None)
+        # Bound below from the authenticated user's *own* freshly read
+        # `vault_path`. It stays unset for single-user keys (no user row) so
+        # `_vault_root(None)` keeps answering from settings. Resetting it in
+        # `finally` alongside the others keeps the snapshot request-scoped —
+        # that is what stops the indexer's bulk warm from re-admitting a user
+        # whose assignment was revoked mid-request (issue #66).
+        token_vault = current_vault_root.set(UNSET_VAULT_ROOT)
 
         try:
             if token.startswith("omcp_"):
@@ -107,6 +114,34 @@ class APIKeyMiddleware:
 
                     if api_key is None:
                         logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": _redacted_prefix(token)})
+                        response = JSONResponse(
+                            {"error": "Invalid or revoked key"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
+                        await response(scope, receive, send)
+                        return
+
+                    if api_key.user_id is None and settings.multi_user_mode:
+                        # An ownerless key in multi-user mode. These exist: a
+                        # key minted while multi-user was off keeps
+                        # `user_id = NULL`, and the bootstrap backfill in
+                        # `src/auth/routes.py` only claims those rows when
+                        # `users` is *empty* — flip the flag after users
+                        # exist and the NULLs are never adopted. Such a key
+                        # used to be treated as single-user by every layer:
+                        # the warm was skipped and `_vault_root(None)`
+                        # returned the global `settings.vault_path`, so an
+                        # ownerless readwrite key could edit the whole vault.
+                        # Refuse it here, with the same body as any other
+                        # rejected key.
+                        logger.warning(
+                            "auth_failure",
+                            extra={
+                                "reason": "ownerless_credential",
+                                "key_id": api_key.id,
+                            },
+                        )
                         response = JSONResponse(
                             {"error": "Invalid or revoked key"},
                             status_code=401,
@@ -162,11 +197,18 @@ class APIKeyMiddleware:
                     current_api_key_id.set(api_key.id)
                     current_user_id.set(api_key.user_id)
                     # In single-user mode `api_key.user_id` is None so this
-                    # is a no-op. In multi-user mode, warm the vault-path
-                    # cache so sync `_vault_root(user_id)` calls inside the
-                    # request handler don't hit a cold cache.
+                    # is skipped entirely. In multi-user mode, read the user's
+                    # `vault_path` now and bind the answer to this request:
+                    # it both warms the shared cache (so sync
+                    # `_vault_root(user_id)` calls don't hit a cold one) and
+                    # gives `_vault_root` a snapshot no other task can
+                    # overwrite. A None here means "unassigned", and every
+                    # tool call in this request is refused (issue #66).
                     if api_key.user_id is not None:
-                        await warm_user_vault_cache(session, api_key.user_id)
+                        current_vault_root.set((
+                            api_key.user_id,
+                            await warm_user_vault_cache(session, api_key.user_id),
+                        ))
             else:
                 # OAuth token auth
                 token_hash = hash_key(token)
@@ -191,6 +233,24 @@ class APIKeyMiddleware:
                         await response(scope, receive, send)
                         return
 
+
+                    if oauth_token.user_id is None and settings.multi_user_mode:
+                        # Same as the API-key branch above: an ownerless token
+                        # in multi-user mode would resolve the global vault.
+                        logger.warning(
+                            "auth_failure",
+                            extra={
+                                "reason": "ownerless_credential",
+                                "key_id": oauth_token.id,
+                            },
+                        )
+                        response = JSONResponse(
+                            {"error": "Invalid or revoked token"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
+                        await response(scope, receive, send)
+                        return
 
                     if oauth_token.user_id is not None:
                         result = await session.execute(
@@ -233,7 +293,10 @@ class APIKeyMiddleware:
                     current_oauth_token_id.set(oauth_token.id)
                     current_user_id.set(oauth_token.user_id)
                     if oauth_token.user_id is not None:
-                        await warm_user_vault_cache(session, oauth_token.user_id)
+                        current_vault_root.set((
+                            oauth_token.user_id,
+                            await warm_user_vault_cache(session, oauth_token.user_id),
+                        ))
 
             await self.app(scope, receive, send)
         finally:
@@ -241,3 +304,4 @@ class APIKeyMiddleware:
             current_api_key_id.reset(token_key)
             current_oauth_token_id.reset(token_oauth)
             current_user_id.reset(token_user)
+            current_vault_root.reset(token_vault)

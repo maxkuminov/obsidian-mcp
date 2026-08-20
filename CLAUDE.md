@@ -389,6 +389,75 @@ lives in a service module only to avoid an import cycle (`tools` imports
 return types are unchanged — a direct call outside a tracked tool finds no
 holder and records nothing. No migration: `params` is JSONB.
 
+## The vault assignment is the admission gate for every tool
+
+`_tracked` in `src/mcp_server/tools.py` resolves `_vault_root(current_user_id)`
+**once, before the tool body runs**, and fails the call with a tool error when
+it raises. That is the whole enforcement of "this user has no vault", and it
+lives in the shared decorator on purpose.
+
+Per-tool checks were the bug (#66). The tools that leaked — `semantic_search`,
+`keyword_search`, `list_notes`, `get_recent` and every graph tool — are exactly
+the ones with no reason to call `_vault_root`: they are served from
+`notes_metadata` / `note_embeddings` filtered by `user_id` alone. Unassigning
+`users.vault_path` stopped only the disk-touching tools, while the indexer's
+`_active_user_ids()` (which filters `vault_path IS NOT NULL`) meant the user's
+rows were never pruned either. An unchanged API key kept returning paths,
+titles, tags, frontmatter and chunk excerpts indefinitely, while the panel had
+told the operator "vault tools error".
+
+- **Nothing is exempt.** Every `_tracked` tool reads or writes vault content or
+  vault metadata — `get_vault_guide` returns the vault's own `CLAUDE.md`,
+  `check_upload` reports a published vault path and digest. Keep the exemption
+  list at zero; a new tool inherits the gate by being registered.
+- **The index rows are preserved.** Deleting `notes_metadata` on the NULL
+  transition was the weaker fix: it forces a full re-embed on reassignment and
+  leaves the credential itself unaddressed.
+- **`_vault_root` must stay a pure cache lookup.** What makes that correct is
+  `APIKeyMiddleware` calling `warm_user_vault_cache(session, user_id)` on
+  *every* authenticated MCP request. Do not add a DB query to the gate.
+- **The single-user form of that warm is authoritative — it evicts**, and it
+  returns the root it read. It used to be a silent no-op for a NULL
+  `vault_path`, so a previously cached root survived; the panel's
+  `clear_user_vault_cache` only clears the worker that served the POST.
+- **`_vault_root` prefers the request's own snapshot over the shared dict, and
+  that is the part that fails closed.** `_user_vault_cache` is process-global
+  and the indexer's bulk warm is add-only, so a bulk `SELECT` issued *before*
+  the admin cleared `vault_path` can land *after* the per-request warm evicted
+  the entry and put the revoked root back — mid-request, with a write tool in
+  flight. Eviction cannot order a query that was already running. So the
+  middleware binds `current_vault_root = (user_id, Path | None)` (a ContextVar
+  beside `current_user_id` in `src/auth/session.py`) and the gate reads that;
+  no other task can write this request's context. **Do not "simplify" the gate
+  back to the dict** — the bulk warm's add-only behaviour is safe only because
+  the snapshot outranks it. The snapshot is keyed by user id (another user's
+  snapshot falls through to the dict) and is never consulted for
+  `user_id is None`.
+- **A cold cache refuses too**, with the same message — it is not permission to
+  serve stale rows — and the refusal is written to `usage_logs` with
+  `params["error"] = "no_vault_assigned"` and no other new field.
+- Single-user and sandbox mode are untouched: `current_user_id` is None there
+  and `_vault_root(None)` answers from `settings.vault_path`.
+- **In multi-user mode, `user_id is None` is a refusal, not the global vault.**
+  An ownerless credential — `api_keys.user_id` / `oauth_tokens.user_id` NULL —
+  is the *single-user* shape, and it survives a configuration cycle: a key
+  minted while multi-user was off keeps its NULL, and the bootstrap backfill in
+  `src/auth/routes.py` only claims NULL rows while `users` is empty, so
+  flipping the flag after users exist never adopts it. Every layer then treated
+  that key as single-user and handed it `settings.vault_path` — an ownerless
+  *readwrite* key could edit the whole vault. `APIKeyMiddleware` now 401s such
+  a credential (`reason=ownerless_credential`, same body as any other rejected
+  key, on both the API-key and OAuth branches) and `_vault_root(None)` raises
+  when `settings.multi_user_mode`. Two layers on purpose: the middleware is the
+  gate, `_vault_root` is the one that cannot be bypassed by a future caller.
+- **The panel's vault browser uses what the warm returned, not a re-read of the
+  dict.** `vault_page` warmed the cache and then called `_vault_root(user.id)`,
+  which reopens the same window: a stale bulk warm landing in between served an
+  unassigned user's vault. It now takes the `Path | None` from
+  `warm_user_vault_cache` directly and renders the `vault_error` empty state on
+  None. Any new caller that warms-then-resolves has the same bug — use the
+  return value.
+
 ## Graph tools
 - `get_backlinks(path, limit)` — notes that link TO `path` (resolved links only).
 - `get_links(path)` — outgoing links from `path`, both resolved and dangling.
