@@ -9,7 +9,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from src.auth.session import UNSET_VAULT_ROOT, current_user_id, current_vault_root
+from src.auth.session import (
+    UNSET_VAULT_ROOT,
+    current_actor,
+    current_user_id,
+    current_vault_root,
+)
 from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthClient, OAuthToken, User
@@ -98,6 +103,10 @@ class APIKeyMiddleware:
         # that is what stops the indexer's bulk warm from re-admitting a user
         # whose assignment was revoked mid-request (issue #66).
         token_vault = current_vault_root.set(UNSET_VAULT_ROOT)
+        # Denormalised attribution for `usage_logs` (issue #77). Bound below
+        # from the credential row this request authenticated with, and reset
+        # with the rest so it can never label another request's log line.
+        token_actor = current_actor.set(None)
 
         try:
             if token.startswith("omcp_"):
@@ -197,6 +206,11 @@ class APIKeyMiddleware:
                     current_permission.set(api_key.permission)
                     current_api_key_id.set(api_key.id)
                     current_user_id.set(api_key.user_id)
+                    # The key row is already loaded, so the actor label costs
+                    # no extra query -- and once written to `usage_logs` it
+                    # survives the row's deletion, which the panel performs
+                    # after NULLing `usage_logs.key_id` (issue #77).
+                    current_actor.set(("api_key", api_key.name, api_key.key_prefix))
                     # In single-user mode `api_key.user_id` is None so this
                     # is skipped entirely. In multi-user mode, read the user's
                     # `vault_path` now and bind the answer to this request:
@@ -215,14 +229,37 @@ class APIKeyMiddleware:
                 token_hash = hash_key(token)
 
                 async with async_session() as session:
+                    # One statement, three consumers: the token itself, the
+                    # client's owner for the cross-user check below, and the
+                    # client's name for the denormalised `usage_logs` actor
+                    # label (issue #77). Reading the name in a *second* query
+                    # would add a round trip to every OAuth request, including
+                    # the single-user path that previously issued none -- and
+                    # the join is over the FK `oauth_tokens.client_id` already
+                    # is. `outerjoin`, not `join`: the FK makes a token without
+                    # a client row impossible, and if that ever stopped holding
+                    # an inner join would silently turn the token into a 401,
+                    # which is a different decision than the one made here.
                     result = await session.execute(
-                        select(OAuthToken).where(
+                        select(
+                            OAuthToken,
+                            OAuthClient.user_id.label("client_owner"),
+                            OAuthClient.client_name,
+                        )
+                        .outerjoin(
+                            OAuthClient,
+                            OAuthClient.client_id == OAuthToken.client_id,
+                        )
+                        .where(
                             OAuthToken.token_hash == token_hash,
                             OAuthToken.token_type == "access",
                             OAuthToken.revoked == False,
                         )
                     )
-                    oauth_token = result.scalar_one_or_none()
+                    row = result.first()
+                    oauth_token, client_owner, client_name = (
+                        row if row is not None else (None, None, None)
+                    )
 
                     if oauth_token is None:
                         logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": _redacted_prefix(token)})
@@ -277,12 +314,6 @@ class APIKeyMiddleware:
                     # either user's panel. An unbound client (NULL owner) is
                     # not a conflict — it has simply never been claimed.
                     if oauth_token.user_id is not None:
-                        result = await session.execute(
-                            select(OAuthClient.user_id).where(
-                                OAuthClient.client_id == oauth_token.client_id
-                            )
-                        )
-                        client_owner = result.scalar_one_or_none()
                         if client_owner is not None and client_owner != oauth_token.user_id:
                             logger.warning(
                                 "auth_failure",
@@ -343,6 +374,7 @@ class APIKeyMiddleware:
                     current_api_key_id.set(None)
                     current_oauth_token_id.set(oauth_token.id)
                     current_user_id.set(oauth_token.user_id)
+                    current_actor.set(("oauth", client_name, oauth_token.client_id))
                     if oauth_token.user_id is not None:
                         current_vault_root.set((
                             oauth_token.user_id,
@@ -356,3 +388,4 @@ class APIKeyMiddleware:
             current_oauth_token_id.reset(token_oauth)
             current_user_id.reset(token_user)
             current_vault_root.reset(token_vault)
+            current_actor.reset(token_actor)

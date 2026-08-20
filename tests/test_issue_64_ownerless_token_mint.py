@@ -315,9 +315,14 @@ class _MiddlewareSession:
         if sql.startswith("UPDATE"):
             return _EmptyResult()
         if "FROM oauth_tokens" in sql:
-            return _RowsResult([self.token])
-        if "FROM oauth_clients" in sql:
-            return _ScalarResult(self.client_owner)
+            # One statement joins `oauth_clients`, so the middleware reads
+            # `(token, client_owner, client_name)` with `.first()`: the owner
+            # for the cross-user check, the name for the denormalised
+            # `usage_logs` actor label (issue #77). There is no second
+            # `oauth_clients` query on any path.
+            return _RowsResult(
+                [(self.token, self.client_owner, "Ownerless Test Client")]
+            )
         if "vault_path" in sql:
             return _RowsResult([])
         return _ScalarResult(self.user_active)

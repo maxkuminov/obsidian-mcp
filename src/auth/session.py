@@ -38,6 +38,25 @@ current_vault_root: ContextVar[tuple[int, Path | None] | _UnsetVaultRoot] = Cont
     "current_vault_root", default=UNSET_VAULT_ROOT
 )
 
+# The actor label denormalised onto every `usage_logs` row this request writes:
+# `(kind, label, ref)` — `("api_key", <key name>, <omcp_ prefix>)` or
+# `("oauth", <client_name>, <client_id>)`. `APIKeyMiddleware` binds it from the
+# credential row it has already loaded, so the label costs no extra query and
+# nothing later has to go looking for it.
+#
+# It exists because both credential tables are allowed to disappear while their
+# history stays. `usage_logs.oauth_token_id` is `ON DELETE SET NULL`, so
+# deleting an OAuth client cascades its tokens and unattributes every line that
+# client produced; `usage_logs.key_id` has no `ON DELETE` at all, so the panel
+# explicitly NULLs it before deleting an API key. Resolving the actor by LEFT
+# JOIN at read time therefore turned all of that history into "unknown" — the
+# evidence an operator opens `/admin/usage` to read, destroyed by the button
+# they pressed to stop the client (issue #77). A label written at call time
+# cannot be taken away by a later delete.
+current_actor: ContextVar[tuple[str, str | None, str | None] | None] = ContextVar(
+    "current_actor", default=None
+)
+
 
 @dataclass
 class _SingleUserSentinel:

@@ -178,9 +178,15 @@ def test_inactive_user_oauth_token_is_rejected(monkeypatch):
         def scalar_one_or_none(self):
             return self.value
 
+        def first(self):
+            return self.value
+
     class _Session:
         def __init__(self):
-            self.results = iter((oauth_token, False))
+            # The token lookup joins `oauth_clients`, so it is read with
+            # `.first()` and yields `(token, client_owner, client_name)`; the
+            # `User.is_active` check that follows is still a scalar.
+            self.results = iter(((oauth_token, 42, "Test Client"), False))
 
         async def __aenter__(self):
             return self

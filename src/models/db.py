@@ -70,6 +70,13 @@ class APIKey(Base):
     user: Mapped["User | None"] = relationship(back_populates="api_keys")
 
 
+# Migration 015's ownership marker for the three denormalised actor columns on
+# `usage_logs`, mirrored here so `alembic check` compares it. Must stay byte
+# identical to `MARKER` in `alembic/versions/015_usage_log_actor.py`; a
+# mismatch shows up as a pending `alter_column(comment=...)`.
+_ACTOR_COLUMN_MARKER = "denormalised actor, written at call time (015_usage_log_actor)"
+
+
 class UsageLog(Base):
     __tablename__ = "usage_logs"
 
@@ -85,6 +92,45 @@ class UsageLog(Base):
     params: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
     response_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Denormalised attribution (issue #77, migration 015). The FK columns above
+    # are *both* allowed to lose their target while the log row stays:
+    # `oauth_token_id` is ON DELETE SET NULL, so deleting an OAuth client
+    # cascades its tokens and unattributes every line that client produced, and
+    # `key_id` has no ON DELETE at all, so the panel NULLs it by hand before
+    # deleting an API key. Resolving the actor by LEFT JOIN at read time
+    # therefore rendered exactly that history as "unknown" — the evidence an
+    # operator opens /admin/usage to read, destroyed by the button they pressed
+    # to stop the client.
+    #
+    # Written at call time from the credential the request authenticated with,
+    # so it is a fact about what happened rather than a lookup that a later
+    # delete can invalidate. Nullable: rows written before 015 whose credential
+    # was already gone have nothing to backfill from, and they render
+    # "unknown (credential deleted)". Never read for authorization — this is
+    # display and audit only.
+    #
+    # `actor_kind` is 'api_key' | 'oauth'; `actor_label` is the key's name or
+    # the OAuth `client_name`; `actor_ref` is the key's `omcp_` prefix or the
+    # `client_id`. Name and identifier stay separate columns on purpose: joined
+    # into one string the row stops being a record — a key named "audit (prod)"
+    # is not recoverable from "audit (prod) (omcp_a1b2c3)".
+    #
+    # The comment is migration 015's ownership marker, not decoration: its
+    # `downgrade()` drops only columns carrying it, and its upgrade completes
+    # only a set carrying it, so a hand-made `varchar(255)` of unknown
+    # provenance is never adopted and rendered to an operator as an audit
+    # trail. Declaring it here is what makes `alembic check` compare it — the
+    # marker cannot silently drift from the migration that keys on it. Keep the
+    # three strings identical to `MARKER` in `015_usage_log_actor.py`.
+    actor_kind: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, comment=_ACTOR_COLUMN_MARKER
+    )
+    actor_label: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment=_ACTOR_COLUMN_MARKER
+    )
+    actor_ref: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_ACTOR_COLUMN_MARKER
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
