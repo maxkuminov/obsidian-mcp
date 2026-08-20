@@ -369,18 +369,38 @@ async def keys_page(
     user=Depends(require_user_panel),
 ):
     uid = _scope_user_id(user)
-    q = select(APIKey).order_by(APIKey.created_at.desc())
+    # Join the owner. A key's *effective* liveness is what `APIKeyMiddleware`
+    # enforces, and that is stricter than `api_keys.is_active` alone:
+    # `src/mcp_server/auth.py` also selects `User.is_active` for the key's
+    # `user_id` and 401s (reason=inactive_user) unless it is exactly True.
+    # Deactivating a user leaves their keys' own `is_active` untouched, so
+    # without this join the panel badged dead credentials green (#76). The
+    # outer join keeps single-user keys (`user_id IS NULL`), which the
+    # middleware exempts from the owner check entirely.
+    q = (
+        select(APIKey, User.username, User.is_active)
+        .select_from(APIKey)
+        .outerjoin(User, User.id == APIKey.user_id)
+        .order_by(APIKey.created_at.desc())
+    )
     if uid is not None:
         q = q.where(APIKey.user_id == uid)
     result = await session.execute(q)
     keys = []
-    for k in result.scalars().all():
+    for k, owner_username, owner_is_active in result.all():
+        # A key whose `user_id` has no row (owner_is_active is None) is dead
+        # too — the middleware's `is True` test fails for it just the same,
+        # so it must not read as live here.
+        owner_ok = k.user_id is None or owner_is_active is True
         keys.append({
             "id": k.id,
             "name": k.name,
             "key_prefix": k.key_prefix,
             "permission": k.permission,
             "is_active": k.is_active,
+            "owner_is_active": owner_ok,
+            "effective_active": bool(k.is_active) and owner_ok,
+            "owner_username": owner_username,
             "created_at": k.created_at.isoformat(),
             "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
             "user_id": k.user_id,

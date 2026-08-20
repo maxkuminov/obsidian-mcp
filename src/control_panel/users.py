@@ -115,11 +115,25 @@ async def list_users(
     user: User | _SingleUserSentinel = Depends(require_admin_panel),
 ):
     # Aggregate per-user counts (api_keys + notes) in one query each.
+    #
+    # Keys are counted twice: total, and the `is_active` subset. Revocation
+    # sets `is_active = False` without deleting the row (routes.py's
+    # `revoke_key`), and `src/mcp_server/auth.py` authenticates only active
+    # rows — so a bare `count(*)` told an auditing admin "bob — API Keys: 4"
+    # when all four were revoked, and the panel had no surface anywhere on
+    # which to discover that (#76). Rendering "N active / M total" states
+    # both numbers instead of picking one and leaving the ambiguity.
     key_counts = dict(
-        (row.user_id, int(row.cnt))
+        (row.user_id, (int(row.active), int(row.total)))
         for row in (
             await session.execute(
-                select(APIKey.user_id, func.count(APIKey.id).label("cnt"))
+                select(
+                    APIKey.user_id,
+                    func.count(APIKey.id).label("total"),
+                    func.count(APIKey.id)
+                    .filter(APIKey.is_active.is_(True))
+                    .label("active"),
+                )
                 .group_by(APIKey.user_id)
             )
         ).all()
@@ -145,7 +159,8 @@ async def list_users(
             "vault_path": u.vault_path,
             "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
             "created_at": u.created_at.isoformat(),
-            "api_keys": key_counts.get(u.id, 0),
+            "api_keys_active": key_counts.get(u.id, (0, 0))[0],
+            "api_keys_total": key_counts.get(u.id, (0, 0))[1],
             "notes": note_counts.get(u.id, 0),
         })
 
