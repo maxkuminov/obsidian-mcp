@@ -32,6 +32,7 @@ from src.oauth import routes as oauth
 from src.oauth.scope import clamp_scope, has_vault_scope, vault_level
 
 from _oauth_grant_fakes import (
+    SeqSession,
     FakeClient,
     FakeSession,
     FakeToken,
@@ -91,36 +92,8 @@ class _RegistrationRequest:
         return self._body
 
 
-class _SeqSession:
-    def __init__(self, results=()):
-        self._results = iter(results)
-        self.added = []
-        self.committed = False
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_exc):
-        return False
-
-    async def execute(self, _stmt, *_a, **_kw):
-        value = next(self._results)
-
-        class _R:
-            def scalar_one_or_none(self_inner):
-                return value
-
-        return _R()
-
-    def add(self, obj):
-        self.added.append(obj)
-
-    async def commit(self):
-        self.committed = True
-
-
 def _register(scope, monkeypatch):
-    session = _SeqSession()
+    session = SeqSession()
     monkeypatch.setattr(oauth, "async_session", lambda: session)
     response = asyncio.run(
         oauth.register_client.__wrapped__(
@@ -264,7 +237,7 @@ def _exchange(client_scope, code_scope, monkeypatch):
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
         used=False,
     )
-    session = _SeqSession([code, client])
+    session = SeqSession([code, client])
     monkeypatch.setattr(oauth, "async_session", lambda: session)
     response = asyncio.run(
         oauth._handle_auth_code(

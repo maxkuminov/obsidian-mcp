@@ -42,6 +42,20 @@ GRANT_ID_BYTES = 24
 # lock this application might take later.
 _ADVISORY_NAMESPACE = 0x0A17  # "oauth grant"
 
+# The single-user -> multi-user bootstrap claims every ownerless row for the
+# first admin with `UPDATE ... WHERE user_id IS NULL` (`register_submit` in
+# `src/auth/routes.py`), and it already holds this key for that transaction.
+# The token endpoint takes it too, because that UPDATE's snapshot is taken when
+# the statement starts: a mint committing afterwards inserts a *new* NULL-owner
+# token the claim can no longer see, and it survives as a token belonging to
+# nobody. Sharing one key makes the two mutually exclusive.
+#
+# **The value is a wire constant, not an implementation detail.** During a
+# rolling deploy an old process holds it under the literal below while a new
+# one imports it from here; changing it would silently un-serialize exactly the
+# window this exists to close.
+USER_BOOTSTRAP_LOCK_KEY = 7283910429
+
 
 def new_grant_id() -> str:
     """A fresh grant identifier for one consent event."""
@@ -58,6 +72,30 @@ def grant_lock_key(grant_id: str) -> int:
         _ADVISORY_NAMESPACE.to_bytes(2, "big") + grant_id.encode()
     ).digest()
     return int.from_bytes(digest[:8], "big", signed=True)
+
+
+async def lock_user_bootstrap(session) -> None:
+    """Hold off the ownerless-row claim for this transaction, and vice versa.
+
+    Taken by both token-minting handlers and by `register_submit`'s claim, so
+    a token cannot be inserted with `user_id IS NULL` in the window between the
+    claim's UPDATE and its COMMIT. Without it the bootstrap reports success,
+    the claim covers every row it could see, and the pair a client rotated into
+    a moment later belongs to no user at all.
+
+    **Lock order is this lock first, then any per-grant lock.** `_handle_refresh`
+    takes both; the panel's family operations take only the grant lock and
+    never this one; the bootstrap takes only this one. So no path holds a grant
+    lock while asking for this, and there is no cycle.
+
+    Taken unconditionally rather than only under `multi_user_mode`: the flag can
+    change between processes during a deploy, and a global lock on a path that
+    runs once per consent and once per hourly refresh costs nothing.
+    """
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:key)"),
+        {"key": USER_BOOTSTRAP_LOCK_KEY},
+    )
 
 
 async def lock_grant(session, grant_id: str) -> None:

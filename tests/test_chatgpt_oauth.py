@@ -41,7 +41,12 @@ class _Session:
     async def __aexit__(self, *_exc):
         return False
 
-    async def execute(self, _query):
+    async def execute(self, query, params=None):
+        # The token handlers now take a transaction-scoped advisory lock before
+        # they read anything (see src/oauth/grants.py). It consumes no canned
+        # result, so skip it rather than letting it shift the sequence.
+        if "pg_advisory_xact_lock" in str(query):
+            return _Result(None)
         return _Result(next(self.results))
 
     def add(self, value):

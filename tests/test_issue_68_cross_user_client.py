@@ -28,6 +28,8 @@ from fastapi.responses import RedirectResponse
 
 from src.oauth import routes as oauth
 
+from _oauth_grant_fakes import SeqSession
+
 REGISTERED_URI = "https://client.example.com/callback"
 
 
@@ -192,34 +194,6 @@ def test_denial_still_redirects_rather_than_403ing():
 # --- the exchange re-checks, closing the unbound-client race --------------
 
 
-class _SeqSession:
-    def __init__(self, results):
-        self._results = iter(results)
-        self.added = []
-        self.committed = False
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_exc):
-        return False
-
-    async def execute(self, _stmt, *_a, **_kw):
-        value = next(self._results)
-
-        class _R:
-            def scalar_one_or_none(self_inner):
-                return value
-
-        return _R()
-
-    def add(self, obj):
-        self.added.append(obj)
-
-    async def commit(self):
-        self.committed = True
-
-
 def _exchange(client_user_id, code_user_id):
     from datetime import datetime, timedelta, timezone
 
@@ -246,7 +220,7 @@ def _exchange(client_user_id, code_user_id):
         used=False,
         user_id=code_user_id,
     )
-    session = _SeqSession([code, client])
+    session = SeqSession([code, client])
     monkeypatch = pytest.MonkeyPatch()
     try:
         monkeypatch.setattr(oauth, "async_session", lambda: session)

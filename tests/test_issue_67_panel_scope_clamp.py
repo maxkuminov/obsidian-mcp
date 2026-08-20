@@ -27,6 +27,7 @@ from src.oauth import routes as oauth
 from src.oauth.scope import clamp_scope, client_can_write, token_has_write
 
 from _oauth_grant_fakes import (
+    SeqSession,
     FakeClient,
     FakeRequest,
     FakeSession,
@@ -192,36 +193,6 @@ def test_refresh_keeps_a_legitimate_readwrite_grant(monkeypatch):
 # --- the authorization-code exchange clamps too --------------------------
 
 
-class _SeqSession:
-    """Returns canned rows in call order -- enough for `_handle_auth_code`."""
-
-    def __init__(self, results):
-        self._results = iter(results)
-        self.added = []
-        self.committed = False
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *_exc):
-        return False
-
-    async def execute(self, _stmt, *_a, **_kw):
-        value = next(self._results)
-
-        class _R:
-            def scalar_one_or_none(self_inner):
-                return value
-
-        return _R()
-
-    def add(self, obj):
-        self.added.append(obj)
-
-    async def commit(self):
-        self.committed = True
-
-
 def test_auth_code_exchange_clamps_against_the_registration(monkeypatch):
     """The last write path, closed for the same reason as the other two.
 
@@ -255,7 +226,7 @@ def test_auth_code_exchange_clamps_against_the_registration(monkeypatch):
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
         used=False,
     )
-    session = _SeqSession([code, client])
+    session = SeqSession([code, client])
     monkeypatch.setattr(oauth, "async_session", lambda: session)
 
     response = asyncio.run(

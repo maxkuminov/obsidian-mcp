@@ -21,6 +21,7 @@ import datetime
 from sqlalchemy.sql.dml import Update
 
 from src.models.db import OAuthClient, OAuthToken, User
+from src.oauth.grants import USER_BOOTSTRAP_LOCK_KEY
 
 UTC = datetime.timezone.utc
 
@@ -156,6 +157,31 @@ def _params(stmt) -> dict:
         return {}
 
 
+def _is_advisory_lock(stmt) -> bool:
+    """Is this the textual `pg_advisory_xact_lock` statement, specifically?"""
+    return "pg_advisory_xact_lock" in str(stmt)
+
+
+def _window_value(clause):
+    return None if clause is None else clause.value
+
+
+def _apply_window(stmt, rows: list) -> list:
+    """Honour LIMIT/OFFSET, so a fake cannot hide a truncation bug.
+
+    The panel's per-client scan is bounded, and a bound applied at the wrong
+    point can push a live grant off the page entirely with no control to
+    revoke it. A fake that ignored LIMIT would render that page complete.
+    """
+    offset = _window_value(getattr(stmt, "_offset_clause", None))
+    limit = _window_value(getattr(stmt, "_limit_clause", None))
+    if offset:
+        rows = rows[offset:]
+    if limit is not None:
+        rows = rows[:limit]
+    return rows
+
+
 class FakeSession:
     """Interprets the handful of statement shapes the OAuth surfaces issue.
 
@@ -172,7 +198,15 @@ class FakeSession:
         self.rolled_back = 0
         self.deleted: list = []
         self.added: list = []
-        self.locked_grants: list[int] = []
+        # Every advisory lock the handler took, in acquisition order. Order is
+        # itself the property under test -- the bootstrap lock must precede the
+        # grant lock, and both must precede any family read or write.
+        self.advisory_locks: list[int] = []
+
+    @property
+    def locked_grants(self) -> list[int]:
+        """Advisory locks other than the constant bootstrap key."""
+        return [key for key in self.advisory_locks if key != USER_BOOTSTRAP_LOCK_KEY]
 
     # -- async session surface ---------------------------------------------
 
@@ -198,12 +232,18 @@ class FakeSession:
         self.deleted.append(obj)
 
     async def execute(self, stmt, params=None):
-        # `lock_grant` issues a textual `pg_advisory_xact_lock`. Recording it
-        # is how the tests prove the family lock is actually taken before the
-        # family is written -- the ordering that stops a concurrent refresh
-        # from surviving a revocation.
-        if params is not None and "key" in params:
-            self.locked_grants.append(params["key"])
+        # `lock_grant` and `lock_user_bootstrap` issue a textual
+        # `pg_advisory_xact_lock`. Recording it is how the tests prove the
+        # locks are actually taken, and in which order -- the ordering that
+        # stops a concurrent refresh from surviving a revocation, and a
+        # concurrent mint from escaping the bootstrap's claim.
+        #
+        # Matched on the *statement text*, not merely on the presence of a
+        # `key` parameter: a handler that passed `{"key": ...}` to some other
+        # query would otherwise be recorded as holding a lock it never took.
+        if _is_advisory_lock(stmt):
+            assert params and "key" in params, "advisory lock issued without a key"
+            self.advisory_locks.append(params["key"])
             return _Result([])
 
         if isinstance(stmt, Update):
@@ -223,6 +263,7 @@ class FakeSession:
         if entity is OAuthToken:
             rows = self._filter_tokens(stmt, bound)
             rows.sort(key=lambda t: (t.created_at, t.id), reverse=True)
+            rows = _apply_window(stmt, rows)
             # `select(OAuthToken.grant_id)` (the refresh handler's family
             # lookup) wants the column, not the row.
             if getattr(stmt.column_descriptions[0].get("expr", None), "key", None) == "grant_id":
@@ -313,3 +354,41 @@ class FakeRequest:
                 "server": ("testserver", 443),
             }
         )
+
+
+class SeqSession:
+    """Returns canned rows in call order -- enough for `_handle_auth_code`.
+
+    Advisory locks are recorded rather than consumed from the result sequence,
+    so a handler that starts taking one does not silently shift every
+    subsequent canned row by one.
+    """
+
+    def __init__(self, results=()):
+        self._results = iter(results)
+        self.added: list = []
+        self.committed = False
+        self.advisory_locks: list[int] = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def execute(self, stmt, params=None, *_a, **_kw):
+        if _is_advisory_lock(stmt):
+            assert params and "key" in params, "advisory lock issued without a key"
+            self.advisory_locks.append(params["key"])
+            return _Result([])
+        value = next(self._results)
+        return _Result([value] if value is not None else [])
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.committed = True
+
+    async def rollback(self):
+        pass

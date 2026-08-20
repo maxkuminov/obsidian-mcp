@@ -16,7 +16,12 @@ from src.config import settings
 from src.database import async_session
 from src.limiter import limiter
 from src.models.db import OAuthClient, OAuthCode, OAuthToken
-from src.oauth.grants import lock_grant, new_grant_id, revoke_grant_family
+from src.oauth.grants import (
+    lock_grant,
+    lock_user_bootstrap,
+    new_grant_id,
+    revoke_grant_family,
+)
 from src.oauth.scope import VALID_SCOPES, clamp_scope, has_vault_scope
 # Aliased on import so `authorize_get` can keep its long-standing local name
 # `client_can_write` (the consent template reads that key) without shadowing
@@ -549,6 +554,15 @@ async def _handle_auth_code(form):
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     async with async_session() as session:
+        # Serialize against the single-user -> multi-user bootstrap before
+        # anything is read or written. Its claim is
+        # `UPDATE ... WHERE user_id IS NULL`, whose snapshot is taken when the
+        # statement starts, so a mint committing afterwards would insert a pair
+        # the claim can no longer see and those tokens would belong to nobody.
+        # Taken before any per-grant lock, which is the fixed order both token
+        # handlers use — see `src/oauth/grants.py`.
+        await lock_user_bootstrap(session)
+
         # Resolve the authorization code first. Some ChatGPT connector builds
         # omit client_id at the public-client token exchange. PKCE still binds
         # the request to the initiating client, and the code tells us which
@@ -598,6 +612,21 @@ async def _handle_auth_code(form):
         expected_challenge = _base64url_sha256(code_verifier)
         if not secrets.compare_digest(expected_challenge, oauth_code.code_challenge):
             return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
+
+        # In multi-user mode every token must have an owner. A code stamped
+        # with a NULL `user_id` predates the flag flip (or escaped the
+        # bootstrap's claim), and minting from it produces a credential the
+        # ownership checks cannot reason about — `_assert_oauth_token_owner`,
+        # the panel's per-user filters and the vault-root lookup all key off
+        # `user_id`. Refuse rather than create one.
+        if settings.multi_user_mode and oauth_code.user_id is None:
+            return JSONResponse(
+                {
+                    "error": "invalid_grant",
+                    "error_description": "Authorization code has no owner; re-authorize.",
+                },
+                status_code=400,
+            )
 
         # The client must still belong to the user this code was minted for
         # (issue #68). `authorize_post` refuses a client another user owns, but
@@ -697,7 +726,12 @@ async def _handle_refresh(form):
             # compatibility, a repeated client_id).
             token_hash = _hash(refresh_token)
 
-            # Take the grant-family lock *first*, before any row in the family
+            # Bootstrap lock before the grant lock — the fixed order both token
+            # handlers use, and the reason there is no cycle with the panel
+            # (which takes only the grant lock). See `src/oauth/grants.py`.
+            await lock_user_bootstrap(session)
+
+            # Take the grant-family lock *before* any row in the family
             # is read or written. Rotation inserts two brand-new rows, and a
             # concurrent panel revocation cannot see rows that did not exist
             # when its UPDATE took its snapshot — so without this the operator
@@ -757,6 +791,28 @@ async def _handle_refresh(form):
 
             if old_token.expires_at < datetime.now(timezone.utc):
                 return JSONResponse({"error": "invalid_grant", "error_description": "refresh token expired"}, status_code=400)
+
+            # In multi-user mode a token with no owner cannot be rotated: the
+            # replacement would inherit the NULL and stay outside every
+            # ownership check. Such a row can only be a pre-flag-flip leftover
+            # the bootstrap did not claim.
+            if settings.multi_user_mode and old_token.user_id is None:
+                return JSONResponse(
+                    {
+                        "error": "invalid_grant",
+                        "error_description": "Token has no owner; re-authorize.",
+                    },
+                    status_code=400,
+                )
+
+            # The grant's owner must still be the client's owner (issue #68).
+            # `authorize_post` and `_handle_auth_code` both refuse to create
+            # such a pairing now, but a legacy row — or one created by the
+            # first-claim race before it was closed — would otherwise rotate
+            # forever, keeping a live cross-user grant alive indefinitely and
+            # invisible in either user's panel.
+            if _client_belongs_to_another_user(client, old_token.user_id):
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
             # Re-clamp against the client's *current* registration (issue #67).
             # Rotation used to copy `old_token.scope` verbatim, so any scope a
