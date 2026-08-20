@@ -546,15 +546,50 @@ credential and then opens the Usage page to see what it did was shown
 - **The label is bound by `APIKeyMiddleware`, not looked up by `_log_usage`.**
   `current_actor` (a ContextVar beside `current_user_id` / `current_vault_root`
   in `src/auth/session.py`) is set from the credential row the middleware has
-  already loaded — the API-key branch has the `APIKey`, and the OAuth branch's
-  `oauth_clients` lookup for the cross-user check now selects
-  `(user_id, client_name)`. So the label costs no query, and it is read
-  *before* the tool runs rather than seconds later when the credential may be
-  gone. `_actor_columns()` returns `{}` when the ContextVar is unset, so a
-  writer outside a request keeps the pre-015 row shape.
+  already loaded, and it is read *before* the tool runs rather than seconds
+  later when the credential may be gone. The API-key branch has the `APIKey`;
+  the OAuth branch gets `client_name` from **the token lookup itself**, which
+  `outerjoin`s `oauth_clients` and returns `(token, client_owner,
+  client_name)` — one statement feeding the cross-user check and the label, so
+  an ownerless OAuth request still issues exactly one query, as it did before.
+  Do not add a second `oauth_clients` select; that is a round trip on the
+  hottest path in the server. `_actor_columns()` returns `{}` when the
+  ContextVar is unset, so a writer outside a request keeps the pre-015 row
+  shape.
+- **A dangling FK must not take the row down with it.** A tool call can outlive
+  its own credential — the operator deletes the key or the client while a slow
+  call is running — and the insert then names a row that is gone. `_log_usage`
+  catches **only** `foreign_key_violation` (SQLSTATE 23503), rolls back and
+  retries **once** with `key_id`/`oauth_token_id` cleared and `actor_*` kept;
+  that is the same end state the panel's own key delete produces, so the reader
+  already handles it. `user_id` is dropped only when it is the constraint that
+  failed, because the panel scopes a non-admin's page by `user_id`. The error
+  arrives wrapped twice and the layers carry different things: SQLAlchemy's
+  `.orig` is the asyncpg *dialect's* error (SQLSTATE, no constraint name),
+  whose `__cause__` is asyncpg's own (constraint name). `_error_chain` walks
+  both and falls back to the message text — reading `orig.constraint_name`
+  alone finds nothing and silently degrades every recovery to "assume it was
+  `user_id`". An unresolvable name deliberately clears all three: losing the
+  scoping beats losing the row. The broad `except` stays last: usage logging
+  must never fail a call that already did its work.
 - **It is a snapshot, not a view.** 015's backfill is guarded on
   `actor_kind IS NULL` and so is any re-run. Re-deriving the label from the
-  credential's present state would rewrite history on every rename.
+  credential's present state would rewrite history on every rename. A row
+  carrying a label beside a NULL `actor_kind` is therefore an *error*, not
+  something to fix up: the guard would relabel it from whatever credential it
+  points at now, overwriting an attribution 015 did not write.
+- **The three columns are one owned unit, and the COMMENT marker is what owns
+  them.** 015 creates all three and stamps each with
+  `denormalised actor, written at call time (015_usage_log_actor)`; on a
+  re-run it completes only a set that is all present, exactly typed, nullable,
+  default-free **and marked**, and refuses anything else (a partial set, a
+  `NOT NULL` column, a foreign one) naming what it found. `downgrade()` drops
+  only marked columns, all-or-nothing. Type and width are a coincidence anyone
+  could reproduce; the marker is the only evidence that *this* scheme wrote the
+  values, which is the whole basis for showing them to an operator as an audit
+  trail. The same string is declared on the model columns
+  (`UsageLog._ACTOR_COLUMN_MARKER`) so `alembic check` compares it — keep the
+  two byte-identical or the check goes dirty.
 - **Nothing is invented.** 015 labels a row from the credential its own FK
   points at, or leaves it NULL — no guess-by-`user_id`, because two of a
   user's keys are different actors. A NULL row renders

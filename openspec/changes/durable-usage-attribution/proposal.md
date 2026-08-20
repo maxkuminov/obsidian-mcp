@@ -39,9 +39,23 @@ changes.
 - **Written at call time.** `APIKeyMiddleware` binds `current_actor` (a
   ContextVar beside `current_user_id` / `current_vault_root` in
   `src/auth/session.py`) from the credential row it has already loaded, so the
-  label costs no extra query, and `_log_usage` writes it with the row. A label
-  written at call time cannot be taken away by a later delete — and it is a
-  snapshot, so renaming a key does not retroactively rename its history.
+  label costs no extra query — the OAuth branch's token lookup `outerjoin`s
+  `oauth_clients` and returns `(token, client_owner, client_name)` in one
+  statement — and `_log_usage` writes it with the row. A label written at call
+  time cannot be taken away by a later delete, and it is a snapshot, so
+  renaming a key does not retroactively rename its history.
+- **The row survives a credential deleted mid-call.** A slow call can outlive
+  the credential it authenticated with, and the insert then raises
+  `foreign_key_violation` — which a blanket `except` used to swallow, dropping
+  the audit line for exactly the credential under investigation. `_log_usage`
+  retries once with the credential FKs cleared and the label kept, dropping
+  `user_id` only when that was the constraint that failed.
+- **The three columns are one marked, owned unit.** 015 stamps each with a
+  COMMENT marker, completes only a set that is all present, exactly typed,
+  nullable, default-free and marked, and refuses every other combination
+  (partial set, `NOT NULL`, foreign). `downgrade()` drops only marked columns,
+  all-or-nothing. The marker is mirrored on the model so `alembic check`
+  compares it.
 - **Backfilled, never invented.** 015 labels every existing row whose
   credential still resolves, using the same join the panel performs. Rows whose
   credential is already gone stay NULL; there is no guess-by-`user_id`
@@ -69,16 +83,19 @@ required to survive exactly that, and a test pins it.
 ## Impact
 
 - `alembic/versions/015_usage_log_actor.py` — new
-- `src/models/db.py` — `UsageLog.actor_kind` / `actor_label` / `actor_ref`
+- `src/models/db.py` — `UsageLog.actor_kind` / `actor_label` / `actor_ref`,
+  each carrying 015's ownership marker as its column comment
 - `src/auth/session.py` — `current_actor` ContextVar
 - `src/mcp_server/auth.py` — bind the label on both auth branches; the OAuth
-  client lookup now returns `(user_id, client_name)` from one row
-- `src/mcp_server/tools.py` — `_actor_columns()` on the `_log_usage` write
+  token lookup joins `oauth_clients` so no path gains a query
+- `src/mcp_server/tools.py` — `_actor_columns()` on the `_log_usage` write, and
+  the foreign-key-violation retry around it
 - `src/control_panel/routes.py` — `_usage_actor()`, the `/admin/usage` select,
   `delete_oauth_client` docstring
 - `src/control_panel/templates/usage.html`, `oauth.html` — rendered copy
-- `tests/test_issue_77_usage_attribution.py` — new; seven cases added to
-  `tests/integration/test_schema_check.py`
+- `tests/test_issue_77_usage_attribution.py` and
+  `tests/integration/test_usage_log_fk_recovery.py` — new; fourteen cases added
+  to `tests/integration/test_schema_check.py`
 
 Carries a migration, so `make test-schema` is a required gate and `make
 db-check` must report "No new upgrade operations detected" after deploy.

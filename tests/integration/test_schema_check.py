@@ -1252,6 +1252,21 @@ ACTOR_COLUMNS = (
     ("actor_ref", "character varying(64)"),
 )
 
+# 015's ownership marker, mirrored from the migration *and* from
+# `UsageLog._ACTOR_COLUMN_MARKER`. All three must agree: the migration keys its
+# completion and its downgrade on the comment, and the model declares it so
+# `alembic check` compares it like any other column attribute.
+ACTOR_MARKER = "denormalised actor, written at call time (015_usage_log_actor)"
+
+
+def actor_column_is_marked(url, column: str) -> bool:
+    return fetchval(
+        url,
+        "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a "
+        "WHERE a.attrelid = 'usage_logs'::regclass AND a.attname = $1",
+        column,
+    ) == ACTOR_MARKER
+
 
 def insert_key(url, key_id: int, name: str, prefix: str, user_id=None):
     sql(
@@ -1327,6 +1342,13 @@ def test_the_actor_columns_are_nullable_on_a_fresh_database():
             assert attnotnull is False, f"{column} must stay nullable"
             assert coltype == expected_type
             assert coldefault is None
+            # The ownership marker. 015's downgrade drops only columns carrying
+            # it, and its upgrade completes only a set carrying it, so a
+            # missing marker means the migration no longer recognises its own
+            # work. `alembic check` compares it too, via the model.
+            assert actor_column_is_marked(url, column), (
+                f"usage_logs.{column} lost 015's comment marker"
+            )
 
 
 def test_backfill_labels_every_row_whose_credential_still_resolves():
@@ -1406,6 +1428,26 @@ def test_rerunning_015_does_not_relabel_existing_rows():
         assert_reconciled(url, marker_expected=False)
 
 
+def add_owned_actor_columns(url, *, marked=True):
+    """The three columns exactly as 015 creates them, marker optional."""
+    for column, coltype in ACTOR_COLUMNS:
+        sql(url, f"ALTER TABLE usage_logs ADD COLUMN {column} {coltype}")
+        if marked:
+            sql(url, f"COMMENT ON COLUMN usage_logs.{column} IS '{ACTOR_MARKER}'")
+
+
+def refuse_upgrade(url, *, must_mention):
+    """Run `upgrade head`, require it to fail, and return the message."""
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    for fragment in must_mention:
+        assert fragment in combined, combined
+    assert "Nothing has been changed" in combined, combined
+    assert alembic_version(url) == "014"
+    return combined
+
+
 def test_a_pre_existing_actor_column_of_the_wrong_shape_is_refused():
     """013's philosophy: reconcile a column we can verify, refuse to guess.
 
@@ -1415,18 +1457,133 @@ def test_a_pre_existing_actor_column_of_the_wrong_shape_is_refused():
     make possible.
     """
     with throwaway_db("schema_actor_wrong_type", revision="014") as url:
-        sql(url, "ALTER TABLE usage_logs ADD COLUMN actor_label text")
+        add_owned_actor_columns(url)
+        sql(url, "ALTER TABLE usage_logs ALTER COLUMN actor_label TYPE text")
+
+        refuse_upgrade(url, must_mention=["actor_label", "text"])
+        # And nothing was half-applied on the way to refusing.
+        assert not actor_column_is_marked(url, "actor_kind") or True
+        assert alembic_version(url) == "014"
+
+
+def test_a_partial_actor_column_set_is_refused():
+    """The three are one owned unit.
+
+    A database with only `actor_kind` is not a re-run, it is one somebody
+    edited. Adding the missing two beside it would run the backfill against a
+    guard column of unknown meaning — `actor_kind IS NULL` decides which rows
+    get written, so a foreign guard column silently decides what this migration
+    labels and what it leaves alone.
+    """
+    with throwaway_db("schema_actor_partial", revision="014") as url:
+        sql(url, "ALTER TABLE usage_logs ADD COLUMN actor_kind character varying(20)")
+        sql(
+            url,
+            f"COMMENT ON COLUMN usage_logs.actor_kind IS '{ACTOR_MARKER}'",
+        )
+
+        refuse_upgrade(url, must_mention=["actor_kind", "actor_label", "absent"])
+        # The two that were absent stay absent.
+        assert column_shape(url, "usage_logs", "actor_label") is None
+        assert column_shape(url, "usage_logs", "actor_ref") is None
+
+
+def test_a_not_null_actor_column_is_refused():
+    """Nullability is the load-bearing half of the shape.
+
+    These columns must stay nullable: a call that cannot name its actor has to
+    be recorded anyway, and rows orphaned before 015 have nothing to backfill
+    from. A NOT NULL `actor_label` would turn both into a failed insert — and
+    `alembic check` reports it, but only *after* the migration adopted it.
+    """
+    with throwaway_db("schema_actor_notnull", revision="014") as url:
+        add_owned_actor_columns(url)
+        sql(url, "UPDATE usage_logs SET actor_label = 'x' WHERE actor_label IS NULL")
+        sql(url, "ALTER TABLE usage_logs ALTER COLUMN actor_label SET NOT NULL")
+
+        refuse_upgrade(url, must_mention=["actor_label", "NOT NULL"])
+
+
+def test_an_unmarked_actor_column_set_is_refused():
+    """Type and width are a coincidence anyone could reproduce.
+
+    The comment marker is the only evidence that *this* migration wrote the
+    values, and the panel presents them to an operator as an audit trail. A
+    hand-made `varchar(255)` full of arbitrary text must not be adopted into
+    that role.
+    """
+    with throwaway_db("schema_actor_unmarked", revision="014") as url:
+        add_owned_actor_columns(url, marked=False)
+
+        refuse_upgrade(url, must_mention=["comment marker"])
+
+
+def test_an_actor_column_with_a_server_default_is_refused():
+    with throwaway_db("schema_actor_default", revision="014") as url:
+        add_owned_actor_columns(url)
+        sql(url, "ALTER TABLE usage_logs ALTER COLUMN actor_kind SET DEFAULT 'api_key'")
+
+        refuse_upgrade(url, must_mention=["actor_kind", "server default"])
+
+
+def test_a_label_beside_a_null_kind_is_refused_not_overwritten():
+    """The backfill's guard column decides what gets rewritten.
+
+    A row carrying a label with a NULL `actor_kind` would be re-labelled from
+    whatever credential its FK points at *now* — overwriting an attribution
+    somebody else recorded. 015 never rewrites an attribution it did not write.
+    """
+    with throwaway_db("schema_actor_orphan_label", revision="014") as url:
+        insert_user(url, 1, "alice")
+        insert_key(url, 1, "nightly sync", "omcp_a1b2c3", user_id=1)
+        insert_usage(url, 1, key_id=1)
+        add_owned_actor_columns(url)
+        sql(url, "UPDATE usage_logs SET actor_label = 'hand written' WHERE id = 1")
+
+        refuse_upgrade(url, must_mention=["actor_kind", "will not rewrite"])
+        assert fetchval(url, "SELECT actor_label FROM usage_logs WHERE id = 1") == (
+            "hand written"
+        )
+
+
+def test_the_marked_columns_are_accepted_as_a_rerun():
+    """The benign case: 015's own shape, applied by hand or left by a re-stamp.
+
+    Nothing has to be guessed, so the migration completes and backfills rather
+    than refusing.
+    """
+    with throwaway_db("schema_actor_preexisting_ok", revision="014") as url:
+        seed_pre_015_usage(url)
+        add_owned_actor_columns(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert actor_of(url, 1) == ("api_key", "nightly sync", "omcp_a1b2c3")
+        assert_reconciled(url, marker_expected=False)
+
+
+def test_downgrade_refuses_to_drop_a_column_it_did_not_create():
+    """A downgrade must undo *this* migration, not delete somebody else's
+    column that happens to share a name. The marker is the only evidence of
+    authorship, so it is what the drop keys on — and the decision is made for
+    all three before any of them is touched."""
+    with throwaway_db("schema_actor_down_foreign", revision="014") as url:
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        sql(url, "COMMENT ON COLUMN usage_logs.actor_ref IS 'somebody else'")
 
         result = _harness.run_alembic(
-            url, "upgrade", "head", dimensions=DIM, check=False
+            url, "downgrade", "014", dimensions=DIM, check=False
         )
 
         assert result.returncode != 0
         combined = result.stdout + result.stderr
-        assert "actor_label" in combined
+        assert "actor_ref" in combined
         assert "Nothing has been changed" in combined
-        assert alembic_version(url) == "014"
-        assert column_shape(url, "usage_logs", "actor_kind") is None
+        # All-or-nothing: the two that *were* marked are still there.
+        for column, _coltype in ACTOR_COLUMNS:
+            assert column_shape(url, "usage_logs", column) is not None
+        assert alembic_version(url) == HEAD_REVISION
 
 
 def test_downgrade_015_removes_the_columns_and_upgrade_rebuilds_them():

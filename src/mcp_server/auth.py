@@ -206,6 +206,11 @@ class APIKeyMiddleware:
                     current_permission.set(api_key.permission)
                     current_api_key_id.set(api_key.id)
                     current_user_id.set(api_key.user_id)
+                    # The key row is already loaded, so the actor label costs
+                    # no extra query -- and once written to `usage_logs` it
+                    # survives the row's deletion, which the panel performs
+                    # after NULLing `usage_logs.key_id` (issue #77).
+                    current_actor.set(("api_key", api_key.name, api_key.key_prefix))
                     # In single-user mode `api_key.user_id` is None so this
                     # is skipped entirely. In multi-user mode, read the user's
                     # `vault_path` now and bind the answer to this request:
@@ -214,11 +219,6 @@ class APIKeyMiddleware:
                     # gives `_vault_root` a snapshot no other task can
                     # overwrite. A None here means "unassigned", and every
                     # tool call in this request is refused (issue #66).
-                    # The key row is already loaded, so the actor label costs
-                    # no extra query -- and once written to `usage_logs` it
-                    # survives the row's deletion, which the panel performs
-                    # after NULLing `usage_logs.key_id` (issue #77).
-                    current_actor.set(("api_key", api_key.name, api_key.key_prefix))
                     if api_key.user_id is not None:
                         current_vault_root.set((
                             api_key.user_id,
@@ -229,14 +229,37 @@ class APIKeyMiddleware:
                 token_hash = hash_key(token)
 
                 async with async_session() as session:
+                    # One statement, three consumers: the token itself, the
+                    # client's owner for the cross-user check below, and the
+                    # client's name for the denormalised `usage_logs` actor
+                    # label (issue #77). Reading the name in a *second* query
+                    # would add a round trip to every OAuth request, including
+                    # the single-user path that previously issued none -- and
+                    # the join is over the FK `oauth_tokens.client_id` already
+                    # is. `outerjoin`, not `join`: the FK makes a token without
+                    # a client row impossible, and if that ever stopped holding
+                    # an inner join would silently turn the token into a 401,
+                    # which is a different decision than the one made here.
                     result = await session.execute(
-                        select(OAuthToken).where(
+                        select(
+                            OAuthToken,
+                            OAuthClient.user_id.label("client_owner"),
+                            OAuthClient.client_name,
+                        )
+                        .outerjoin(
+                            OAuthClient,
+                            OAuthClient.client_id == OAuthToken.client_id,
+                        )
+                        .where(
                             OAuthToken.token_hash == token_hash,
                             OAuthToken.token_type == "access",
                             OAuthToken.revoked == False,
                         )
                     )
-                    oauth_token = result.scalar_one_or_none()
+                    row = result.first()
+                    oauth_token, client_owner, client_name = (
+                        row if row is not None else (None, None, None)
+                    )
 
                     if oauth_token is None:
                         logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": _redacted_prefix(token)})
@@ -283,24 +306,6 @@ class APIKeyMiddleware:
                             )
                             await response(scope, receive, send)
                             return
-
-                    # One lookup, two consumers. `client_name` becomes the
-                    # actor label denormalised onto `usage_logs` below (issue
-                    # #77): deleting the client cascades its tokens and SET
-                    # NULLs `usage_logs.oauth_token_id`, so a label resolved by
-                    # join at read time is exactly the history that delete
-                    # destroys. The row is read unconditionally — the
-                    # cross-user check below still runs only for an owned
-                    # token, as it did before.
-                    client_row = (
-                        await session.execute(
-                            select(OAuthClient.user_id, OAuthClient.client_name).where(
-                                OAuthClient.client_id == oauth_token.client_id
-                            )
-                        )
-                    ).first()
-                    client_owner = client_row[0] if client_row is not None else None
-                    client_name = client_row[1] if client_row is not None else None
 
                     # The grant's owner must still be the client's owner. A
                     # cross-user grant can no longer be created, but one made

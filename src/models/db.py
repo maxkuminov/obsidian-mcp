@@ -70,6 +70,13 @@ class APIKey(Base):
     user: Mapped["User | None"] = relationship(back_populates="api_keys")
 
 
+# Migration 015's ownership marker for the three denormalised actor columns on
+# `usage_logs`, mirrored here so `alembic check` compares it. Must stay byte
+# identical to `MARKER` in `alembic/versions/015_usage_log_actor.py`; a
+# mismatch shows up as a pending `alter_column(comment=...)`.
+_ACTOR_COLUMN_MARKER = "denormalised actor, written at call time (015_usage_log_actor)"
+
+
 class UsageLog(Base):
     __tablename__ = "usage_logs"
 
@@ -107,9 +114,23 @@ class UsageLog(Base):
     # `client_id`. Name and identifier stay separate columns on purpose: joined
     # into one string the row stops being a record — a key named "audit (prod)"
     # is not recoverable from "audit (prod) (omcp_a1b2c3)".
-    actor_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    actor_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    actor_ref: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    #
+    # The comment is migration 015's ownership marker, not decoration: its
+    # `downgrade()` drops only columns carrying it, and its upgrade completes
+    # only a set carrying it, so a hand-made `varchar(255)` of unknown
+    # provenance is never adopted and rendered to an operator as an audit
+    # trail. Declaring it here is what makes `alembic check` compare it — the
+    # marker cannot silently drift from the migration that keys on it. Keep the
+    # three strings identical to `MARKER` in `015_usage_log_actor.py`.
+    actor_kind: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, comment=_ACTOR_COLUMN_MARKER
+    )
+    actor_label: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment=_ACTOR_COLUMN_MARKER
+    )
+    actor_ref: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_ACTOR_COLUMN_MARKER
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )

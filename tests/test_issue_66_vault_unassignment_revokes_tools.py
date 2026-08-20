@@ -651,12 +651,13 @@ class _OAuthMiddlewareSession(_MiddlewareSession):
         if "vault_path" in sql:
             return _RowsResult([self.vault_row] if self.vault_row else [])
         if "FROM oauth_tokens" in sql:
-            return _RowsResult([self.api_key])
-        if "FROM oauth_clients" in sql:
-            # `(user_id, client_name)`, read with `.first()`: one row feeds
-            # both the cross-user check and the denormalised `usage_logs`
-            # actor label (issue #77).
-            return _RowsResult([(self.client_owner, "Snapshot Test Client")])
+            # One statement joins `oauth_clients`, so the middleware reads
+            # `(token, client_owner, client_name)` with `.first()` — the owner
+            # for the cross-user check, the name for the denormalised
+            # `usage_logs` actor label (issue #77).
+            return _RowsResult(
+                [(self.api_key, self.client_owner, "Snapshot Test Client")]
+            )
         return _ScalarResult(self.user_active)
 
 

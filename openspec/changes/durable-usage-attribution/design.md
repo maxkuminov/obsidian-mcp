@@ -29,9 +29,17 @@ would have.
 query per tool call, and it reads the credential *after* the tool body ran —
 seconds later, in a window where the credential can already be gone. The
 middleware, by contrast, has the credential row in hand: the API-key branch
-already loaded `APIKey`, and the OAuth branch already queried `oauth_clients`
-for the cross-user ownership check. Widening that select from
-`OAuthClient.user_id` to `(user_id, client_name)` makes the label free.
+already loaded `APIKey`, and the OAuth branch already resolves the token.
+
+The first draft got the OAuth half half-right: it widened the *cross-user
+check*'s `oauth_clients` select to `(user_id, client_name)` and ran it
+unconditionally — which added a round trip to the single-user and ownerless
+paths, where that check is skipped and no client query happened at all. The
+label now rides on the token lookup itself, which `outerjoin`s `oauth_clients`,
+so every path issues exactly the statements it did before. `outerjoin` rather
+than `join`: the FK makes a token without a client row impossible, and if that
+ever stopped holding, an inner join would silently convert the token into a
+401 — a different decision, made by accident.
 
 The value travels in a ContextVar (`current_actor`) beside `current_user_id`
 and `current_vault_root`, set and reset in the same `try`/`finally`, so it can
@@ -55,6 +63,38 @@ thing that stops working.
 "OAuth" the panel used to print. Once the client row is gone the `client_id` is
 the only stable handle the operator has for correlating with anything else.
 
+## Denormalising the label is pointless if the row is discarded
+
+The credential can also disappear *during* the call. A revoke-then-delete, or
+an OAuth client delete, committing while a slow tool call is in flight leaves
+`_log_usage` inserting a row that names a credential that no longer exists;
+PostgreSQL raises `foreign_key_violation` and the blanket `except` around the
+commit dropped the whole audit line — the call an operator investigating that
+credential most wants to see, and the one whose durable attribution these
+columns already carry.
+
+So the write is retried **once**, and narrowly:
+
+- **Only SQLSTATE 23503.** Any other failure is not fixed by clearing columns,
+  so retrying it is a second chance to fail rather than a recovery.
+- **Credential FKs cleared, label kept.** That is the same end state the
+  panel's own key delete produces, so the reader already handles it.
+- **`user_id` only when it was the violated constraint.** The panel scopes a
+  non-admin's page by `user_id`; clearing it needlessly hides the row from the
+  one person entitled to see it. When the constraint cannot be identified at
+  all, all three go — losing the scoping beats losing the row.
+- **The exception is wrapped twice, and the layers carry different things.**
+  Measured, not assumed: SQLAlchemy's `.orig` is the asyncpg *dialect's* error
+  and carries `sqlstate`; its `__cause__` is asyncpg's own error and is the
+  only layer with `constraint_name`. The first draft read `orig.constraint_name`
+  alone, found nothing, and would have silently degraded every recovery to the
+  fail-safe branch — dropping `user_id` from every recovered row, forever, with
+  every test still green. `tests/integration/test_usage_log_fk_recovery.py`
+  pins the shape against a real database precisely because no fake would have
+  found it.
+- **The broad `except` stays last.** Usage logging must never fail a tool call
+  that has already done its work.
+
 ## What the migration must not do
 
 - **Invent a label.** A row is labelled from the credential its own FK points
@@ -66,9 +106,29 @@ the only stable handle the operator has for correlating with anything else.
   idempotence under `alembic stamp 014 → upgrade head`, this is what keeps the
   label a snapshot: re-deriving it from the credential's present state would
   silently rewrite history every time a key is renamed.
-- **Adopt a column it did not create.** A pre-existing `actor_*` of another
-  type holds values written by something else; 013's philosophy applies —
-  verify or refuse, never guess.
+- **Adopt a column it did not create.** 013's philosophy — verify or refuse,
+  never guess — and the first draft applied it too weakly, checking only the
+  varchar width, column by column. Three holes followed, and the columns are
+  now one **owned unit** stamped with a COMMENT marker:
+  - a *partial* set (only `actor_kind`) was silently completed, running the
+    backfill against a guard column of unknown meaning — `actor_kind IS NULL`
+    is what decides which rows get written;
+  - `NOT NULL` and a server default passed, though neither is what 015 creates
+    and nullability is the load-bearing half (a call that cannot name its actor
+    must still be recorded);
+  - matching type and width is a coincidence anyone could reproduce, so a
+    hand-made `varchar(255)` of arbitrary text was adopted and rendered to an
+    operator as an audit trail. The marker is the only evidence of authorship.
+
+  The marker is declared on the model too, so `alembic check` compares it like
+  any other column attribute — it cannot drift from the migration that keys on
+  it without the schema gate going dirty.
+- **Drop a column it did not create.** `downgrade()` removes only marked
+  columns, and removes none of them if any is unmarked, so the decision is made
+  for all three before any is touched.
+- **Relabel a row somebody else wrote.** A row carrying a label beside a NULL
+  `actor_kind` would be re-derived from the credential it currently points at.
+  That is an error naming the rows, not a fix-up.
 - **Become NOT NULL.** A call that cannot name its actor must still be
   recorded, and rows orphaned before 015 have nothing to backfill from. These
   columns are display and audit only; nothing authorizes against them.

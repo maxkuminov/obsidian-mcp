@@ -1017,15 +1017,28 @@ def _usage_actor(row) -> tuple[str | None, str | None]:
     have an actor, and saying so is the difference between a gap in the data
     and a gap in the audit trail.
     """
-    if row.actor_kind:
+    # The gate is `actor_label`, not `actor_kind`. A kind with no label names
+    # nothing an operator can read, so treating it as "recorded" would suppress
+    # a join that could still have answered. The writer never produces that
+    # combination -- `api_keys.name` and `oauth_clients.client_name` are both
+    # NOT NULL -- so preferring the join there costs nothing and fails safe.
+    if row.actor_label:
         if row.actor_kind == "api_key":
             # Same two lines the join produced: name, then the omcp_ prefix.
-            return (row.actor_label or "(unnamed key)", row.actor_ref)
-        # For OAuth the second line used to be the literal string "OAuth".
-        # The client_id is strictly more useful — it is what identifies the
-        # connector once its row is gone — so it is shown alongside the kind.
-        detail = f"OAuth · {row.actor_ref}" if row.actor_ref else "OAuth"
-        return (row.actor_label or "(unnamed client)", detail)
+            return (row.actor_label, row.actor_ref)
+        if row.actor_kind == "oauth":
+            # For OAuth the second line used to be the literal string "OAuth".
+            # The client_id is strictly more useful — it is what identifies the
+            # connector once its row is gone — so it is shown alongside it.
+            return (
+                row.actor_label,
+                f"OAuth · {row.actor_ref}" if row.actor_ref else "OAuth",
+            )
+        # A kind this version does not know about — a row written by a newer
+        # build, or by hand. Show the label and whatever reference it carries,
+        # and do not assert a credential type. Falling through to the OAuth
+        # branch (the previous shape) would have labelled an API key "OAuth".
+        return (row.actor_label, row.actor_ref)
     if row.api_key_name:
         return (row.api_key_name, row.api_key_prefix)
     if row.oauth_client_name:

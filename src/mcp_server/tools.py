@@ -113,22 +113,139 @@ def _actor_columns() -> dict:
     }
 
 
-async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: int):
-    try:
-        async with async_session() as session:
-            session.add(UsageLog(
-                key_id=current_api_key_id.get(),
-                oauth_token_id=current_oauth_token_id.get(),
-                user_id=current_user_id.get(),
-                tool=tool,
-                params=params,
-                duration_ms=duration_ms,
-                response_size=response_size,
-                **_actor_columns(),
-            ))
+# PostgreSQL SQLSTATE for foreign_key_violation — the only insert failure
+# `_log_usage` can recover from, and the only one it tries to.
+_FK_VIOLATION_SQLSTATE = "23503"
+
+# `usage_logs.user_id`'s constraint, from migration 009. The violated FK is
+# resolved by name so that a dangling *credential* does not also cost the row
+# its owner: the panel scopes a non-admin's usage page by `user_id`, so
+# clearing it needlessly would hide the row from the one person entitled to
+# see it.
+_USER_FK_CONSTRAINT = "fk_usage_logs_user_id"
+
+
+# The failure arrives wrapped twice. SQLAlchemy raises `IntegrityError`, whose
+# `.orig` is the *dialect's* DBAPI-shaped `IntegrityError`, whose `__cause__` is
+# asyncpg's own `ForeignKeyViolationError`. Measured on the deployed stack:
+# `sqlstate` is present on the middle layer, `constraint_name` only on the
+# innermost one. Both are walked rather than assumed, because which layer
+# carries what is a driver detail we do not control.
+_FK_CONSTRAINT_IN_MESSAGE = re.compile(r'foreign key constraint "([^"]+)"')
+
+
+def _error_chain(exc: Exception):
+    seen = []
+    node = getattr(exc, "orig", None)
+    while node is not None and node not in seen:
+        seen.append(node)
+        node = getattr(node, "__cause__", None)
+    return seen
+
+
+def _is_fk_violation(exc: Exception) -> bool:
+    for node in _error_chain(exc):
+        if getattr(node, "sqlstate", None) == _FK_VIOLATION_SQLSTATE:
+            return True
+        if getattr(node, "pgcode", None) == _FK_VIOLATION_SQLSTATE:
+            return True
+        # asyncpg raises `ForeignKeyViolationError`. A driver that carries no
+        # SQLSTATE at all is still recognisable by class name.
+        if "ForeignKeyViolation" in type(node).__name__:
+            return True
+    return False
+
+
+def _fk_constraint_name(exc: Exception) -> str | None:
+    chain = _error_chain(exc)
+    for node in chain:
+        name = getattr(node, "constraint_name", None)
+        if name:
+            return name
+    # Last resort: the layers still carry the message, which names it.
+    for node in (*chain, exc):
+        match = _FK_CONSTRAINT_IN_MESSAGE.search(str(node))
+        if match:
+            return match.group(1)
+    return None
+
+
+def _violated_user_fk(exc: Exception) -> bool:
+    """Was `usage_logs.user_id` the FK that failed?
+
+    Unresolvable — no constraint name anywhere in the chain — counts as yes.
+    Clearing a column that did not have to be cleared costs the row its
+    per-user scoping; *not* clearing the one that did costs the row entirely.
+    """
+    name = _fk_constraint_name(exc)
+    if not name:
+        return True
+    return name == _USER_FK_CONSTRAINT or "user_id" in name
+
+
+async def _insert_usage(values: dict) -> None:
+    async with async_session() as session:
+        try:
+            session.add(UsageLog(**values))
             await session.commit()
+        except Exception:
+            # Discard the failed transaction before the session goes back to
+            # the pool. `async_session()`'s exit would do it too; doing it here
+            # keeps the retry in `_log_usage` independent of that detail.
+            await session.rollback()
+            raise
+
+
+async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: int):
+    """Write one `usage_logs` row, and do not lose it to a dangling credential.
+
+    A tool call can outlive its own credential: an operator revokes and deletes
+    a key, or deletes an OAuth client, while a slow call is still running. The
+    insert then names a row that no longer exists, PostgreSQL raises
+    `foreign_key_violation`, and a blanket `except` drops the whole audit line
+    — precisely the call an operator investigating that credential most wants
+    to see, and precisely the one whose durable attribution `actor_*` already
+    carries (issue #77). Denormalising the label is pointless if the row it
+    rides on is the thing that gets discarded.
+
+    So an FK violation is retried **once**, with the credential FKs cleared and
+    the actor columns kept. That is the same end state the panel's own key
+    delete produces (`UPDATE usage_logs SET key_id = NULL`, then the delete),
+    so it is a shape the reader already handles. `user_id` is dropped only when
+    it is the constraint that failed — see `_violated_user_fk`.
+
+    The broad `except` stays as the last resort: usage logging must never fail
+    a tool call that has already done its work.
+    """
+    values = dict(
+        key_id=current_api_key_id.get(),
+        oauth_token_id=current_oauth_token_id.get(),
+        user_id=current_user_id.get(),
+        tool=tool,
+        params=params,
+        duration_ms=duration_ms,
+        response_size=response_size,
+        **_actor_columns(),
+    )
+    try:
+        await _insert_usage(values)
+        return
     except Exception as e:
-        logger.warning(f"Failed to log usage for {tool}: {e}")
+        if not _is_fk_violation(e):
+            logger.warning(f"Failed to log usage for {tool}: {e}")
+            return
+        retry = dict(values, key_id=None, oauth_token_id=None)
+        if _violated_user_fk(e):
+            retry["user_id"] = None
+        logger.warning(
+            "usage_log_credential_gone",
+            extra={"tool": tool, "cleared_user_id": retry["user_id"] is None},
+        )
+
+    try:
+        await _insert_usage(retry)
+    except Exception as e:
+        logger.warning(f"Failed to log usage for {tool} after clearing FKs: {e}")
 
 
 _MAX_PARAM_LEN = 200  # truncate long string params (e.g. note content)
