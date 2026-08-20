@@ -21,6 +21,7 @@ keeps).
 """
 import asyncio
 import os
+from datetime import datetime, timedelta, timezone
 
 import pydantic_settings
 
@@ -51,7 +52,8 @@ TEMPLATES_DIR = os.path.join(os.path.dirname(routes.__file__), "templates")
 class _KeyRow:
     """Stand-in for an APIKey ORM row."""
 
-    def __init__(self, id, user_id, is_active=True, name="k", permission="read"):
+    def __init__(self, id, user_id, is_active=True, name="k", permission="read",
+                 expires_at=None):
         self.id = id
         self.name = name
         self.key_prefix = "omcp_abcdef"
@@ -60,6 +62,7 @@ class _KeyRow:
         self.user_id = user_id
         self.created_at = _FixedTime()
         self.last_used_at = None
+        self.expires_at = expires_at
 
 
 class _FixedTime:
@@ -162,6 +165,93 @@ def test_revoked_key_is_never_effectively_active(monkeypatch):
     assert ctx["keys"][0]["effective_active"] is False
 
 
+# --- expiry: the third half of the middleware's predicate ------------------
+
+
+def test_expired_key_is_not_effectively_active(monkeypatch):
+    """`auth.py` 401s (reason=key_expired) on `expires_at < now`. The panel
+    must apply that too, or it badges a dead key green the day anything
+    starts setting the column."""
+    past = datetime.now(timezone.utc) - timedelta(hours=1)
+    rows = [(_KeyRow(id=1, user_id=2, expires_at=past), "bob", True)]
+    ctx, _ = _keys_context(rows, monkeypatch)
+    key = ctx["keys"][0]
+    assert key["is_active"] is True
+    assert key["owner_is_active"] is True
+    assert key["is_expired"] is True
+    assert key["effective_active"] is False
+
+
+def test_unexpired_key_stays_active(monkeypatch):
+    future = datetime.now(timezone.utc) + timedelta(days=30)
+    rows = [(_KeyRow(id=1, user_id=2, expires_at=future), "bob", True)]
+    ctx, _ = _keys_context(rows, monkeypatch)
+    assert ctx["keys"][0]["is_expired"] is False
+    assert ctx["keys"][0]["effective_active"] is True
+
+
+def test_null_expires_at_never_expires(monkeypatch):
+    rows = [(_KeyRow(id=1, user_id=2, expires_at=None), "bob", True)]
+    ctx, _ = _keys_context(rows, monkeypatch)
+    assert ctx["keys"][0]["is_expired"] is False
+    assert ctx["keys"][0]["effective_active"] is True
+
+
+def test_the_boundary_instant_matches_the_middleware(monkeypatch):
+    """The middleware rejects on `expires_at < now`, so a key whose
+    `expires_at` is exactly now is still accepted. The panel must draw the
+    boundary on the same side rather than inventing a `>=` of its own."""
+    fixed = datetime(2026, 8, 20, 12, 0, 0, tzinfo=timezone.utc)
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed
+
+    monkeypatch.setattr(routes, "datetime", _FrozenDatetime)
+    rows = [(_KeyRow(id=1, user_id=2, expires_at=fixed), "bob", True)]
+    ctx, _ = _keys_context(rows, monkeypatch)
+    assert ctx["keys"][0]["is_expired"] is False, (
+        "at exactly expires_at the middleware still authenticates the key"
+    )
+    assert ctx["keys"][0]["effective_active"] is True
+
+    # One microsecond later it is expired on both sides.
+    rows = [(
+        _KeyRow(id=1, user_id=2, expires_at=fixed - timedelta(microseconds=1)),
+        "bob",
+        True,
+    )]
+    ctx, _ = _keys_context(rows, monkeypatch)
+    assert ctx["keys"][0]["is_expired"] is True
+
+
+def test_middleware_still_uses_the_comparison_this_mirrors():
+    """If auth.py's boundary ever moves, this pairing must be revisited —
+    fail here rather than let the two surfaces drift apart silently."""
+    import inspect
+
+    from src.mcp_server import auth
+
+    src = inspect.getsource(auth)
+    assert "api_key.expires_at < datetime.now(timezone.utc)" in src
+
+
+def test_expired_key_renders_its_own_badge():
+    html = _render_keys_page(
+        [_key_ctx(is_expired=True, effective_active=False)]
+    )
+    assert _status_badge(html) == "Expired"
+    assert 'class="badge badge-green"' not in html
+
+
+def test_revoked_beats_expired_in_the_badge():
+    html = _render_keys_page(
+        [_key_ctx(is_active=False, is_expired=True, effective_active=False)]
+    )
+    assert _status_badge(html) == "Revoked"
+
+
 def test_keys_query_outer_joins_the_owner(monkeypatch):
     """The join must be an OUTER join — an inner one would drop every
     single-user key (`user_id IS NULL`) off the page entirely."""
@@ -200,6 +290,8 @@ def _key_ctx(**overrides) -> dict:
         "permission": "read",
         "is_active": True,
         "owner_is_active": True,
+        "is_expired": False,
+        "expires_at": None,
         "effective_active": True,
         "owner_username": "bob",
         "created_at": "2026-08-20T00:00:00+00:00",
@@ -210,7 +302,7 @@ def _key_ctx(**overrides) -> dict:
 
 
 def _status_badge(html: str) -> str:
-    for label in ("Active", "Revoked", "Owner inactive"):
+    for label in ("Active", "Revoked", "Expired", "Owner inactive"):
         if f">{label}<" in html:
             return label
     return "NONE"

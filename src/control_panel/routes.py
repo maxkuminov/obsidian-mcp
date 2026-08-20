@@ -403,12 +403,23 @@ async def keys_page(
     if uid is not None:
         q = q.where(APIKey.user_id == uid)
     result = await session.execute(q)
+    # One `now` for the whole page: rows compared against different instants
+    # could render two keys with the same `expires_at` differently.
+    now = datetime.now(timezone.utc)
     keys = []
     for k, owner_username, owner_is_active in result.all():
         # A key whose `user_id` has no row (owner_is_active is None) is dead
         # too — the middleware's `is True` test fails for it just the same,
         # so it must not read as live here.
         owner_ok = k.user_id is None or owner_is_active is True
+        # Expiry, phrased exactly as `APIKeyMiddleware` phrases it:
+        # `if api_key.expires_at and api_key.expires_at < now: 401`. So a key
+        # is *not* expired at exactly `expires_at` — the boundary instant is
+        # still live — and this comparison must keep matching that one rather
+        # than a plausible-looking `>=` of its own. Nothing in the codebase
+        # sets `expires_at` today, but the panel must not be the surface that
+        # goes stale the day something does.
+        expired = k.expires_at is not None and k.expires_at < now
         keys.append({
             "id": k.id,
             "name": k.name,
@@ -416,7 +427,9 @@ async def keys_page(
             "permission": k.permission,
             "is_active": k.is_active,
             "owner_is_active": owner_ok,
-            "effective_active": bool(k.is_active) and owner_ok,
+            "is_expired": expired,
+            "expires_at": k.expires_at.isoformat() if k.expires_at else None,
+            "effective_active": bool(k.is_active) and owner_ok and not expired,
             "owner_username": owner_username,
             "created_at": k.created_at.isoformat(),
             "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
