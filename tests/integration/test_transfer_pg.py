@@ -39,6 +39,7 @@ from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.models.db import APIKey, OAuthClient, OAuthToken, TransferToken, UsageLog, User
+from src.oauth.grants import new_grant_id, revoke_grant_family
 from src.services import transfer
 
 PGVECTOR_TEST_ADMIN_URL = os.environ.get("PGVECTOR_TEST_ADMIN_URL")
@@ -213,12 +214,16 @@ async def _seed_identity(session, *, permission="readwrite", vault_path="/obsidi
     session.add(client)
     await session.flush()
 
+    # `grant_id` is NOT NULL since migration 014: an access token belongs to
+    # the consent it descends from, and `lookup_by_public_id` scopes an OAuth
+    # handle to that family rather than to this one row (#74).
     oauth = OAuthToken(
         user_id=user.id,
         token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
         token_type="access",
         client_id=client.client_id,
         scope="readwrite",
+        grant_id=new_grant_id(),
         expires_at=_now() + datetime.timedelta(hours=1),
         revoked=False,
     )
@@ -226,6 +231,54 @@ async def _seed_identity(session, *, permission="readwrite", vault_path="/obsidi
     await session.flush()
     await session.commit()
     return user, key, oauth
+
+
+async def _rotate(session, oauth, *, expire_old=True):
+    """What `_handle_refresh` does: a new access-token row in the same family.
+
+    Same user, same client, same consent — a different `oauth_tokens.id`. The
+    replaced access token is left live to its own expiry by rotation (only the
+    refresh token is revoked), so `expire_old` models the far more common case
+    where the agent comes back after the old hour has run out.
+    """
+    fresh = OAuthToken(
+        user_id=oauth.user_id,
+        token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+        token_type="access",
+        client_id=oauth.client_id,
+        scope=oauth.scope,
+        grant_id=oauth.grant_id,
+        expires_at=_now() + datetime.timedelta(hours=1),
+        revoked=False,
+    )
+    session.add(fresh)
+    if expire_old:
+        oauth.expires_at = _now() - datetime.timedelta(seconds=1)
+    await session.commit()
+    await session.refresh(fresh)
+    return fresh
+
+
+async def _second_consent(session, oauth):
+    """Another `/authorize` approval by the same user for the same client.
+
+    A different grant family, which the operator can revoke independently of
+    the first — so its tokens must not see the first one's handles.
+    """
+    other = OAuthToken(
+        user_id=oauth.user_id,
+        token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+        token_type="access",
+        client_id=oauth.client_id,
+        scope=oauth.scope,
+        grant_id=new_grant_id(),
+        expires_at=_now() + datetime.timedelta(hours=1),
+        revoked=False,
+    )
+    session.add(other)
+    await session.commit()
+    await session.refresh(other)
+    return other
 
 
 async def _add_token(session, *, key=None, oauth=None, user=None, direction="upload",
@@ -710,6 +763,324 @@ async def test_single_user_root_compares_against_settings(clean, monkeypatch):
         assert await transfer.resolve_root_ok(session, row) is False
 
 
+# ── 3.1 handle scoping: the principal, not the credential row ───────────────
+#
+# `check_upload` is the only transfer read that is not gated by a capability,
+# so `lookup_by_public_id`'s WHERE clause *is* its access control. It has to
+# answer two questions at once, and a fake session can express neither: an
+# OAuth handle belongs to the whole grant family behind the presented token
+# (#74 — otherwise the hourly refresh made the agent's own completed upload
+# read as somebody else's handle), and a handle from any *other* principal is
+# still invisible. Both are one correlated `EXISTS` over real rows.
+
+
+async def _mint_oauth_upload(session, user, oauth, path="Attachments/a.png"):
+    token, row, _window = await transfer.mint_token(
+        session,
+        "upload",
+        path,
+        overwrite=False,
+        identity=transfer.Identity(oauth_token_id=oauth.id, user_id=user.id),
+        vault_root="/obsidian",
+        expected_fingerprint=None,
+    )
+    return token, row
+
+
+async def _lookup(session, row, identity, direction="upload"):
+    return await transfer.lookup_by_public_id(
+        session, row.public_id, identity=identity, direction=direction
+    )
+
+
+async def test_an_oauth_handle_survives_refresh_rotation(clean):
+    """The #74 scenario, in its assumption-free form: a *completed* upload.
+
+    Minted at 14:50 and uploaded at 14:55; the access token expires at 15:50
+    and the client refreshes; at 15:55 the agent calls `check_upload` to get
+    the sha256 that `request_upload`'s own result told it to fetch. The row is
+    right there, `completed`, with the digest — and the old lookup answered
+    "no upload link with id … was minted by this identity".
+    """
+    async with clean() as session:
+        user, _, oauth = await _seed_identity(session)
+        token, row = await _mint_oauth_upload(session, user, oauth)
+        claimed = await transfer.claim_upload(session, token)
+        assert claimed is not None
+        await transfer.complete_upload(
+            session, claimed, size=3, sha256="d" * 64, mime="image/png"
+        )
+
+        fresh = await _rotate(session, oauth)
+        assert fresh.id != oauth.id and fresh.grant_id == oauth.grant_id
+
+        found = await _lookup(
+            session,
+            row,
+            transfer.Identity(oauth_token_id=fresh.id, user_id=user.id),
+        )
+    assert found is not None, "the agent's own handle after one rotation"
+    assert found.id == row.id
+    assert found.state == "completed"
+    assert found.sha256 == "d" * 64
+
+
+async def test_an_oauth_handle_survives_several_rotations(clean):
+    """The family is the principal, so the number of hops does not matter."""
+    async with clean() as session:
+        user, _, oauth = await _seed_identity(session)
+        _token, row = await _mint_oauth_upload(session, user, oauth)
+        current = oauth
+        for _ in range(3):
+            current = await _rotate(session, current)
+        found = await _lookup(
+            session,
+            row,
+            transfer.Identity(oauth_token_id=current.id, user_id=user.id),
+        )
+    assert found is not None and found.id == row.id
+
+
+async def test_a_second_consent_by_the_same_user_is_a_different_principal(clean):
+    """Same user, same client software — but a grant the operator revokes alone."""
+    async with clean() as session:
+        user, _, oauth = await _seed_identity(session)
+        _token, row = await _mint_oauth_upload(session, user, oauth)
+        other = await _second_consent(session, oauth)
+        assert other.grant_id != oauth.grant_id
+
+        found = await _lookup(
+            session,
+            row,
+            transfer.Identity(oauth_token_id=other.id, user_id=user.id),
+        )
+    assert found is None
+
+
+async def test_a_grant_id_shared_across_clients_still_cannot_cross(clean):
+    """The `client_id` half of the family predicate, exercised directly.
+
+    "One `grant_id` belongs to exactly one `(client_id, user_id)`" is an
+    invariant every write site upholds, not a constraint the database
+    enforces, and 014's backfill groups by exactly those two columns — so
+    post-014 this row cannot arise. The predicate compares `client_id` anyway,
+    because it *is* the access control here: if a family ever did span two
+    clients, the failure would be one client reading another's handles.
+    """
+    async with clean() as session:
+        user, _, oauth = await _seed_identity(session)
+        _token, row = await _mint_oauth_upload(session, user, oauth)
+
+        second_client = OAuthClient(
+            user_id=user.id,
+            client_id=uuid.uuid4().hex,
+            client_secret_hash="y" * 64,
+            client_name="c2",
+            redirect_uris=["https://elsewhere.example/cb"],
+            scope="readwrite",
+        )
+        session.add(second_client)
+        await session.flush()
+        impostor = OAuthToken(
+            user_id=user.id,
+            token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+            token_type="access",
+            client_id=second_client.client_id,
+            scope="readwrite",
+            # The shape the invariant forbids: another client's token wearing
+            # this family's id.
+            grant_id=oauth.grant_id,
+            expires_at=_now() + datetime.timedelta(hours=1),
+            revoked=False,
+        )
+        session.add(impostor)
+        await session.commit()
+
+        assert (
+            await _lookup(
+                session,
+                row,
+                transfer.Identity(oauth_token_id=impostor.id, user_id=user.id),
+            )
+            is None
+        ), "a second client sharing the grant id must not read its handles"
+        # And the legitimate sibling of the same client still resolves, so the
+        # refusal above is the `client_id` comparison and not a broken family.
+        sibling = await _rotate(session, oauth, expire_old=False)
+        assert (
+            await _lookup(
+                session,
+                row,
+                transfer.Identity(oauth_token_id=sibling.id, user_id=user.id),
+            )
+        ).id == row.id
+
+
+async def test_another_users_grant_never_sees_the_handle(clean):
+    async with clean() as session:
+        user, _, oauth = await _seed_identity(session)
+        _token, row = await _mint_oauth_upload(session, user, oauth)
+        other_user, other_key, other_oauth = await _seed_identity(session)
+
+        assert (
+            await _lookup(
+                session,
+                row,
+                transfer.Identity(
+                    oauth_token_id=other_oauth.id, user_id=other_user.id
+                ),
+            )
+            is None
+        )
+        # And the same grant presented under the wrong user id — the defence
+        # in depth on top of the family invariant.
+        assert (
+            await _lookup(
+                session,
+                row,
+                transfer.Identity(oauth_token_id=oauth.id, user_id=other_user.id),
+            )
+            is None
+        )
+        assert (
+            await _lookup(
+                session,
+                row,
+                transfer.Identity(key_id=other_key.id, user_id=other_user.id),
+            )
+            is None
+        )
+
+
+async def test_the_two_credential_kinds_do_not_see_each_other(clean):
+    """An API key is its own principal; nothing about it becomes a family."""
+    async with clean() as session:
+        user, key, oauth = await _seed_identity(session)
+        _token, oauth_row = await _mint_oauth_upload(session, user, oauth)
+        _key_token, key_row = await _mint(session, user, key)
+
+        assert (
+            await _lookup(
+                session,
+                oauth_row,
+                transfer.Identity(key_id=key.id, user_id=user.id),
+            )
+            is None
+        )
+        assert (
+            await _lookup(
+                session,
+                key_row,
+                transfer.Identity(oauth_token_id=oauth.id, user_id=user.id),
+            )
+            is None
+        )
+        # Each still finds its own.
+        assert (
+            await _lookup(
+                session, key_row, transfer.Identity(key_id=key.id, user_id=user.id)
+            )
+        ).id == key_row.id
+
+
+async def test_a_second_api_key_of_the_same_user_is_a_different_principal(clean):
+    async with clean() as session:
+        user, key, _ = await _seed_identity(session)
+        _token, row = await _mint(session, user, key)
+        second = APIKey(
+            user_id=user.id,
+            name="k2",
+            key_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+            key_prefix="omcp_test",
+            permission="readwrite",
+            is_active=True,
+        )
+        session.add(second)
+        await session.commit()
+
+        assert (
+            await _lookup(
+                session, row, transfer.Identity(key_id=second.id, user_id=user.id)
+            )
+            is None
+        )
+
+
+async def test_a_vanished_presenting_token_is_not_found(clean):
+    """No row, no family, no answer — the fail-closed direction.
+
+    The *minting* token is what `transfer_tokens.oauth_token_id` cascades
+    from, so deleting a rotated sibling leaves the transfer row in place and
+    only removes the presenting side of the `EXISTS`.
+    """
+    async with clean() as session:
+        user, _, oauth = await _seed_identity(session)
+        _token, row = await _mint_oauth_upload(session, user, oauth)
+        fresh = await _rotate(session, oauth)
+        vanished_id = fresh.id
+        await session.delete(fresh)
+        await session.commit()
+
+        surviving = (
+            await session.execute(select(func.count()).select_from(TransferToken))
+        ).scalar_one()
+        assert surviving == 1, "only the presenting sibling was deleted"
+        assert (
+            await _lookup(
+                session,
+                row,
+                transfer.Identity(oauth_token_id=vanished_id, user_id=user.id),
+            )
+            is None
+        )
+
+
+async def test_direction_still_scopes_the_handle(clean):
+    """An upload handle is not a download handle, family or not."""
+    async with clean() as session:
+        user, _, oauth = await _seed_identity(session)
+        _token, row = await _mint_oauth_upload(session, user, oauth)
+        fresh = await _rotate(session, oauth)
+        identity = transfer.Identity(oauth_token_id=fresh.id, user_id=user.id)
+        assert await _lookup(session, row, identity, direction="download") is None
+        assert await _lookup(session, row, identity, direction="upload") is not None
+
+
+async def test_redemption_stays_bound_to_the_minting_token(clean):
+    """The deliberate asymmetry: the *lookup* widened, redemption did not.
+
+    `resolve_identity_ok` still loads the exact credential row the capability
+    was minted under, and that costs nothing because `plan_mint_window` clamps
+    a capability's expiry to that credential's own: the minting access token
+    outlives every link it minted unless it is revoked, and a revocation
+    *should* kill the link. Widening redemption to "any live token of the
+    family" would bind an already-minted capability to credentials that did
+    not exist when it was minted.
+    """
+    async with clean() as session:
+        user, _, oauth = await _seed_identity(session)
+        _token, row = await _mint_oauth_upload(session, user, oauth)
+        # (1) The clamp. This is the whole reason the narrow binding is safe.
+        assert row.expires_at <= oauth.expires_at
+
+        # (2) A proactive refresh inside the old token's hour. Rotation revokes
+        #     only the refresh token, so the minting access token is untouched
+        #     and the link really is still redeemable — which is what the
+        #     widened lookup now lets `check_upload` report.
+        fresh = await _rotate(session, oauth, expire_old=False)
+        identity = transfer.Identity(oauth_token_id=fresh.id, user_id=user.id)
+        assert await transfer.resolve_identity_ok(session, row, need_write=True) is True
+        assert (await _lookup(session, row, identity)).id == row.id
+
+        # (3) Revoking the grant kills the family, minting token included. The
+        #     handle is still the agent's own — so it is found, and reported
+        #     dead, rather than disowned.
+        await revoke_grant_family(session, oauth.grant_id)
+        await session.commit()
+        assert await transfer.resolve_identity_ok(session, row, need_write=True) is False
+        assert (await _lookup(session, row, identity)).id == row.id
+
+
 # ── 3.1 the pre-publication lock ────────────────────────────────────────────
 
 
@@ -1023,6 +1394,7 @@ async def _ownerless_credentials(session):
         token_type="access",
         client_id=client.client_id,
         scope="readwrite",
+        grant_id=new_grant_id(),
         expires_at=_now() + datetime.timedelta(hours=1),
         revoked=False,
     )

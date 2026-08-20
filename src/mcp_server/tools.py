@@ -2385,13 +2385,19 @@ async def check_upload_impl(upload_id: str) -> str:
             "`upload_id` from `request_upload` (22 characters), not the upload "
             "URL and not the token after the `#`."
         )
+    # The identity is the request's credential as `APIKeyMiddleware` resolved
+    # it. `lookup_by_public_id` is what turns it into a *principal*: an API key
+    # is one, an OAuth access token is one hour of one, so the OAuth path
+    # matches the whole grant family behind the presented token. Without that,
+    # the hourly refresh made this tool answer "not minted by this identity"
+    # about the agent's own completed upload (#74).
     identity = _transfer_identity()
     async with async_session() as session:
         row = await transfer.lookup_by_public_id(
             session, upload_id, identity=identity, direction="upload"
         )
         # **The liveness re-check runs inside the session**, before it closes.
-        # `lookup_by_public_id` matches on public_id/direction/identity and
+        # `lookup_by_public_id` matches on public_id/direction/principal and
         # applies no state filter, but the redemption route decides usability
         # from a strictly larger predicate: `PUT /transfer/upload` also
         # requires `resolve_identity_ok(need_write=True)` and
