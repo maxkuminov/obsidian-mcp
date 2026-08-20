@@ -63,6 +63,17 @@
       the snapshot binds as `(user_id, None)`, the tool refuses, and the
       snapshot does not outlive the request
 - [x] 5.14 Assert the *rendered* option text from `user_edit.html`
+- [x] 5.15 Repeat the stale-bulk-warm middleware race through the **OAuth**
+      branch, asserting the scope really mapped to `readwrite` so the refusal
+      is the gate's doing and not a permission error in disguise
+- [x] 5.16 Assert `current_vault_root` is back to `UNSET_VAULT_ROOT` after a
+      downstream exception and after a `CancelledError` (client disconnect),
+      on both auth branches — read *inside* the middleware's own context, since
+      reading it after `asyncio.run` is vacuous on a copied context
+- [x] 5.17 Assert the refusal persists a real `UsageLog` row — identity, tool,
+      exact allow-listed params plus the marker, response size, and a commit —
+      not merely that `_log_usage` was called; plus a success control with no
+      marker
 
 ## 7. Ownerless credentials (multi-user mode)
 

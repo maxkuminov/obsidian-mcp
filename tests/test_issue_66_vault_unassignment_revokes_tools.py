@@ -527,6 +527,11 @@ def test_api_key_middleware_binds_the_snapshot_and_the_tool_refuses(cold_cache):
                 receive,
                 send,
             )
+            # Read the ContextVar back *here*, inside the same context the
+            # middleware ran in. Asserting it after `asyncio.run` returns would
+            # be vacuous: the task gets a copied context, so nothing the
+            # middleware set was ever visible out there in the first place.
+            captured["after"] = current_vault_root.get()
         finally:
             mcp_auth.async_session = original_session
             tools._log_usage = original_log
@@ -538,7 +543,7 @@ def test_api_key_middleware_binds_the_snapshot_and_the_tool_refuses(cold_cache):
     assert captured["snapshot"] == (UNASSIGNED_UID, None)
     assert captured["result"] == tools._NO_VAULT_MESSAGE
     # And the snapshot does not outlive the request.
-    assert current_vault_root.get() is UNSET_VAULT_ROOT
+    assert captured["after"] is UNSET_VAULT_ROOT
 
 
 # --- panel copy --------------------------------------------------------------
@@ -637,8 +642,16 @@ class _OAuthMiddlewareSession(_MiddlewareSession):
         return _ScalarResult(self.user_active)
 
 
-def _run_middleware(credential, *, token_value, downstream=None, oauth=False):
-    """Drive `APIKeyMiddleware` with a faked session; return the sent messages."""
+def _run_middleware(credential, *, token_value, downstream=None, oauth=False,
+                    after=None, expect_exc=None):
+    """Drive `APIKeyMiddleware` with a faked session; return the sent messages.
+
+    `after`, if given, is filled with the ContextVar state read *inside* the
+    middleware's own context once the call returns — reading it after
+    `asyncio.run` would be vacuous, since the task runs on a copied context.
+    `expect_exc` names an exception the downstream app is expected to raise;
+    it is caught so the `after` snapshot can still be taken.
+    """
     sent = []
 
     async def _send(message):
@@ -663,16 +676,30 @@ def _run_middleware(credential, *, token_value, downstream=None, oauth=False):
             )
         try:
             app = mcp_auth.APIKeyMiddleware(downstream or _ok)
-            await app(
-                {
-                    "type": "http",
-                    "method": "POST",
-                    "path": "/mcp/",
-                    "headers": [(b"authorization", f"Bearer {token_value}".encode())],
-                },
-                _receive,
-                _send,
-            )
+            raised = None
+            try:
+                await app(
+                    {
+                        "type": "http",
+                        "method": "POST",
+                        "path": "/mcp/",
+                        "headers": [
+                            (b"authorization", f"Bearer {token_value}".encode())
+                        ],
+                    },
+                    _receive,
+                    _send,
+                )
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                raised = exc
+            if after is not None:
+                after["vault_root"] = current_vault_root.get()
+                after["user_id"] = current_user_id.get()
+                after["raised"] = raised
+            if raised is not None and not (
+                expect_exc is not None and isinstance(raised, expect_exc)
+            ):
+                raise raised
         finally:
             mcp_auth.async_session = original
 
@@ -840,3 +867,268 @@ def test_admission_gate_issues_no_database_statements(cold_cache, tmp_path):
 
     assert ran.get("yes") is True
     assert result == "served"
+
+
+# --- the OAuth branch loses (and closes) the same race -----------------------
+
+
+def _stale_bulk_warm_downstream(captured, tool_call):
+    """A downstream ASGI app that replays the race and then calls a tool.
+
+    The middleware's own warm already evicted the entry (the user's row is
+    NULL). Here the indexer's *older* bulk query lands, putting the revoked
+    root back into the shared dict, and only then does the request reach a
+    tool.
+    """
+
+    async def downstream(scope, receive, send):
+        assert UNASSIGNED_UID not in vault._user_vault_cache
+        stale_row = SimpleNamespace(id=UNASSIGNED_UID, vault_path=str(STALE_ROOT))
+        await vault.warm_user_vault_cache(_FakeSession(_RowsResult([stale_row])))
+        assert vault._user_vault_cache[UNASSIGNED_UID] == STALE_ROOT
+
+        captured["user_id"] = current_user_id.get()
+        captured["permission"] = mcp_auth.current_permission.get()
+        captured["snapshot"] = current_vault_root.get()
+        captured["result"] = await tool_call()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    return downstream
+
+
+def _oauth_token(user_id=UNASSIGNED_UID, scope="readwrite"):
+    from datetime import datetime, timedelta, timezone
+
+    from src.models.db import OAuthToken
+
+    return OAuthToken(
+        id=21,
+        token_hash="x",
+        token_type="access",
+        scope=scope,
+        user_id=user_id,
+        revoked=False,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+
+def test_oauth_middleware_binds_the_snapshot_and_the_tool_refuses(cold_cache):
+    """The API-key branch is not the only way in. An OAuth access token for a
+    user whose `vault_path` was cleared must be refused at the tool too, with
+    a stale bulk warm landing mid-request."""
+    vault._user_vault_cache[UNASSIGNED_UID] = STALE_ROOT
+    captured = {}
+    after = {}
+
+    original_log = tools._log_usage
+
+    async def fake_log_usage(*a, **kw):
+        return None
+
+    tools._log_usage = fake_log_usage
+    try:
+        sent = _run_middleware(
+            _oauth_token(),
+            token_value="oauth_live",
+            oauth=True,
+            downstream=_stale_bulk_warm_downstream(
+                captured, lambda: tools.get_backlinks_impl("Projects/Alpha.md")
+            ),
+            after=after,
+        )
+    finally:
+        tools._log_usage = original_log
+
+    assert sent and sent[0]["status"] == 200, "the token was not authenticated"
+    assert captured["user_id"] == UNASSIGNED_UID
+    # The scope really did map to a write permission — the refusal is the
+    # gate's doing, not a permission error in disguise.
+    assert captured["permission"] == "readwrite"
+    assert captured["snapshot"] == (UNASSIGNED_UID, None)
+    assert captured["result"] == tools._NO_VAULT_MESSAGE
+    # ...and the stale root the bulk warm restored was ignored, not consumed.
+    assert vault._user_vault_cache[UNASSIGNED_UID] == STALE_ROOT
+    assert after["vault_root"] is UNSET_VAULT_ROOT
+
+
+# --- the snapshot is reset on every exit path --------------------------------
+
+
+@pytest.mark.parametrize("oauth", [False, True], ids=["api_key", "oauth"])
+def test_snapshot_is_reset_after_a_downstream_exception(cold_cache, oauth):
+    """`current_vault_root` is reset in the middleware's `finally`. If an
+    exception could strand it, the next request handled on this context would
+    inherit a stale — possibly *permissive* — snapshot."""
+    from src.models.db import APIKey
+
+    credential = (
+        _oauth_token()
+        if oauth
+        else APIKey(
+            id=31,
+            key_hash="x",
+            permission="readwrite",
+            user_id=UNASSIGNED_UID,
+            expires_at=None,
+            is_active=True,
+        )
+    )
+    after = {}
+
+    async def boom(scope, receive, send):
+        # The snapshot is bound at this point...
+        assert current_vault_root.get() == (UNASSIGNED_UID, None)
+        raise RuntimeError("downstream exploded")
+
+    _run_middleware(
+        credential,
+        token_value="oauth_x" if oauth else "omcp_x",
+        oauth=oauth,
+        downstream=boom,
+        after=after,
+        expect_exc=RuntimeError,
+    )
+
+    assert isinstance(after["raised"], RuntimeError)
+    # ...and cleared here, even though the request died.
+    assert after["vault_root"] is UNSET_VAULT_ROOT
+    assert after["user_id"] is None
+
+
+@pytest.mark.parametrize("oauth", [False, True], ids=["api_key", "oauth"])
+def test_snapshot_is_reset_after_a_client_disconnect(cold_cache, oauth):
+    """A cancelled request (client disconnect / server shutdown) unwinds
+    through `CancelledError`, which is a BaseException — a `finally` catches
+    it, an `except Exception` would not."""
+    from src.models.db import APIKey
+
+    credential = (
+        _oauth_token()
+        if oauth
+        else APIKey(
+            id=32,
+            key_hash="x",
+            permission="readwrite",
+            user_id=UNASSIGNED_UID,
+            expires_at=None,
+            is_active=True,
+        )
+    )
+    after = {}
+
+    async def disconnect(scope, receive, send):
+        assert current_vault_root.get() == (UNASSIGNED_UID, None)
+        raise asyncio.CancelledError()
+
+    _run_middleware(
+        credential,
+        token_value="oauth_x" if oauth else "omcp_x",
+        oauth=oauth,
+        downstream=disconnect,
+        after=after,
+        expect_exc=asyncio.CancelledError,
+    )
+
+    assert isinstance(after["raised"], asyncio.CancelledError)
+    assert after["vault_root"] is UNSET_VAULT_ROOT
+    assert after["user_id"] is None
+
+
+# --- the refusal really lands in usage_logs ----------------------------------
+
+
+class _RecordingSession:
+    """Captures what `_log_usage` adds and whether it committed."""
+
+    def __init__(self):
+        self.added = []
+        self.commits = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        self.commits += 1
+
+
+def test_refused_call_persists_a_usage_log_row(as_unassigned_user):
+    """Not "`_log_usage` was called" — the actual `UsageLog` object it builds,
+    with the identity, the tool, the exact allow-listed params plus the error
+    marker, and a commit.
+
+    `_log_usage` swallows its own exceptions, so a row that failed to build
+    would look like silence. Asserting on the captured object is what makes
+    this test see that.
+    """
+    from src.models.db import UsageLog
+
+    recording = _RecordingSession()
+    original = tools.async_session
+    key_token = mcp_auth.current_api_key_id.set(77)
+    oauth_token_ctx = mcp_auth.current_oauth_token_id.set(None)
+    tools.async_session = lambda: recording
+    try:
+        result = asyncio.run(
+            tools.list_notes_impl(folder="Private", limit=50, tags=["salary"])
+        )
+    finally:
+        tools.async_session = original
+        mcp_auth.current_oauth_token_id.reset(oauth_token_ctx)
+        mcp_auth.current_api_key_id.reset(key_token)
+
+    assert result == tools._NO_VAULT_MESSAGE
+    assert recording.commits == 1, "the usage log was not committed"
+    assert len(recording.added) == 1
+    row = recording.added[0]
+    assert isinstance(row, UsageLog)
+
+    assert row.tool == "list_notes"
+    assert row.user_id == UNASSIGNED_UID
+    assert row.key_id == 77
+    assert row.oauth_token_id is None
+    assert row.response_size == len(tools._NO_VAULT_MESSAGE)
+    assert isinstance(row.duration_ms, int) and row.duration_ms >= 0
+
+    # Exactly the tool's allow-list plus the marker — a refusal must not become
+    # a new disclosure channel, and the marker must actually be persisted.
+    assert row.params == {
+        "folder": "Private",
+        "limit": 50,
+        "tags": ["salary"],
+        "frontmatter": None,
+        "error": tools._NO_VAULT_MARKER,
+    }
+
+
+def test_successful_call_persists_no_error_marker(as_unassigned_user, tmp_path):
+    """The control: the same path with a vault assigned writes the same row
+    shape *without* the marker, so the marker means what it says."""
+    from src.models.db import UsageLog
+
+    @tools._tracked("fake_tool", ["q"])
+    async def fake_tool(q: str) -> str:
+        return "served"
+
+    recording = _RecordingSession()
+    original = tools.async_session
+    tools.async_session = lambda: recording
+    vault._user_vault_cache[UNASSIGNED_UID] = tmp_path
+    try:
+        result = asyncio.run(fake_tool("hello"))
+    finally:
+        tools.async_session = original
+
+    assert result == "served"
+    assert recording.commits == 1
+    row = recording.added[0]
+    assert isinstance(row, UsageLog)
+    assert row.tool == "fake_tool"
+    assert row.params == {"q": "hello"}
+    assert "error" not in row.params
