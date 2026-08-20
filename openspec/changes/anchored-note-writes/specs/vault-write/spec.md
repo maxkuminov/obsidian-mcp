@@ -34,6 +34,25 @@ A missing parent directory SHALL NOT be created during validation. It SHALL be c
 - **AND** SHALL NOT report the note as missing
 - **AND** SHALL NOT follow the link or modify anything
 
+#### Scenario: A creating tool refused by the swapped leaf says why
+
+- **WHEN** `create_note`, `write_file`, or the destination of `move_note` names a path that is absent at validation and holds a symbolic link by the time the tool publishes
+- **THEN** the tool SHALL return an error identifying the path as a symbolic link, rather than a bare "already exists" message
+- **AND** `write_file(overwrite=True)` SHALL NOT replace the link and report a successful write
+- **AND** the link and the file it points at SHALL both be unchanged
+
+#### Scenario: A move that would pin more descriptors than the process can spare
+
+- **WHEN** `move_note(rewrite_links=True)` plans more link rewrites than the running process can hold open parent descriptors for
+- **THEN** the move SHALL be aborted before any mutation: the note stays at its original path, no source is rewritten, and `notes_metadata`/`note_links` are unchanged
+- **AND** the error SHALL name the limit and suggest moving without `rewrite_links`
+
+#### Scenario: A backlink source needing no rewrite holds nothing open
+
+- **WHEN** `move_note(rewrite_links=True)` considers a backlink source that is missing, unreadable, or contains no link this move rewrites
+- **THEN** that source's descriptor SHALL be released immediately
+- **AND** the descriptors held at any point SHALL be bounded by the number of rewrites actually planned, not by the number of sources considered
+
 #### Scenario: A refused write creates no directories
 
 - **WHEN** a note write names a path whose parent directory does not exist and the call is then refused before writing (for example because the resulting note would exceed the size cap)

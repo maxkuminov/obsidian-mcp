@@ -1,3 +1,5 @@
+import resource
+import sys
 from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
@@ -20,6 +22,35 @@ MAX_NOTE_BYTES = 10 * 1024 * 1024  # 10 MB
 # caps the sum (originals plus rewrites) and aborts the move before any
 # mutation when it would be exceeded.
 MAX_MOVE_REWRITE_BYTES = 256 * 1024 * 1024  # 256 MiB
+
+# Descriptors the same preflight may pin, for the same reason. Each planned
+# rewrite holds one open parent descriptor from its phase-1 read until its
+# phase-3 write — that single descriptor is what makes the read and the write
+# provably refer to the same directory (#59), and the preflight has to finish
+# before the move commits so an over-cap rewrite can still abort it. Sources
+# that turn out to need no rewrite are released immediately, but a genuinely
+# hub-like note can still plan hundreds.
+#
+# Unbounded, that exhausts the *process* descriptor table, which breaks every
+# concurrent request rather than just this call. So the move aborts before any
+# mutation once the plan would consume more than the running limit leaves
+# spare. Derived from `RLIMIT_NOFILE` rather than pinned to a number: a
+# container with a million descriptors should not be held to a laptop's 1024.
+MOVE_REWRITE_FD_RESERVE = 256  # descriptors left for the rest of the process
+_MIN_MOVE_REWRITE_FDS = 64  # never refuse a small move, whatever the limit
+
+
+def max_move_rewrite_sources() -> int:
+    """How many planned link rewrites one `move_note` may hold open at once.
+
+    Read at call time, not import time: the limit is a property of the running
+    process, and a test (or an operator) may raise it.
+    """
+    soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft in (resource.RLIM_INFINITY, -1):
+        return sys.maxsize
+    return max(_MIN_MOVE_REWRITE_FDS, soft - MOVE_REWRITE_FD_RESERVE)
+
 
 # Headroom for the JSON-RPC envelope around a tool call's content argument:
 # method name, tool name, request id, the other arguments. See

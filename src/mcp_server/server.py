@@ -408,14 +408,21 @@ async def delete_note(path: str, permanent: bool = False) -> str:
     """Delete a note from the vault. Requires a readwrite API key.
 
     By default this is a soft-delete: the file is moved to
-    `.trash/<YYYYMMDD-HHMMSS>-<basename>` inside the vault root. The indexer
-    skips dot-prefixed directories, so search and embeddings drop the note
-    automatically on the next reindex pass (≤ 5 minutes). Soft-deleted files
-    accumulate in `.trash/` — emptying that directory is the user's
+    `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` inside the vault root, by a
+    single non-replacing rename, so an existing trash entry is never
+    overwritten and two deletes in the same second land on distinct names. The
+    indexer skips dot-prefixed directories, so search and embeddings drop the
+    note automatically on the next reindex pass (≤ 5 minutes). Soft-deleted
+    files accumulate in `.trash/` — emptying that directory is the user's
     responsibility.
 
-    With `permanent=True`, the file is `os.unlink`-ed directly with no
-    recovery path inside this server. Existing backups are the rollback story.
+    A vault filesystem that cannot perform that non-replacing rename into
+    `.trash/` makes the soft delete refuse with an error naming the limitation
+    rather than fall back to a rename that could overwrite; pass
+    `permanent=True` to unlink instead.
+
+    With `permanent=True`, the file is unlinked directly with no recovery path
+    inside this server. Existing backups are the rollback story.
 
     A path whose final component is a symlink is refused, naming its target, so
     a delete never removes a note other than the one named; symlinked folders

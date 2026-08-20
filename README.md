@@ -208,8 +208,10 @@ The server exposes 20 MCP tools across six concerns.
   `[[Old#anchor]]`, `![[Old]]`, and `[[folder/Old]]` references in
   source notes
 - `delete_note(path, permanent=False)`, soft-delete to
-  `.trash/<YYYYMMDD-HHMMSS>-<basename>` by default. `permanent=True`
-  does a hard `os.unlink`.
+  `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` by default, via a single
+  non-replacing rename, so it never overwrites an existing trash entry
+  (a filesystem that cannot do that rename makes the soft delete refuse
+  with a named error rather than fall back). `permanent=True` unlinks.
 - `set_frontmatter(path, updates, remove?)`, structured YAML
   mutation. Body is byte-identical when only frontmatter changes.
 

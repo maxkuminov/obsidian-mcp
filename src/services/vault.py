@@ -23,12 +23,19 @@ inside the directory the caller named:
 - the leaf can be swapped for a symlink between the guard's `lstat` and the
   read or write. `O_NOFOLLOW` turns that into `ELOOP`, which the tools report;
   the link is never followed and nothing outside the named directory is touched.
-- an overwrite (`edit_note`, `set_frontmatter`, `write_file(overwrite=True)`) is
-  optimistic, not linearizable: `expected=` compares immediately before the
-  rename, and a writer that lands inside that window is still overwritten. The
-  no-clobber publish (`create_note`, `write_file` by default) has no such
-  window — it is `link()`, which the kernel makes atomic — and neither does the
-  soft delete or `move_note`, which are one `renameat2(RENAME_NOREPLACE)`.
+- a read-modify-write overwrite (`edit_note`, `set_frontmatter`, `move_note`'s
+  link rewrites) is optimistic, not linearizable: `expected=` compares the
+  current bytes immediately before the rename, and a writer that lands inside
+  that window is still overwritten.
+- `write_file(overwrite=True)` — the raw byte tool — has no conflict detection
+  at all and is an unconditional replace: it takes whole-file content from the
+  caller, so there is no prior read to compare against and `expected=` is never
+  passed. `request_upload(overwrite=True)` is the path that binds to the
+  incumbent's fingerprint.
+- the no-clobber publish (`create_note`, `write_file` by default) has no window
+  — it is `link()`, which the kernel makes atomic — and neither does the soft
+  delete or `move_note`'s own publication, which are one
+  `renameat2(RENAME_NOREPLACE)`.
 
 Both are declared limits of optimistic concurrency, not open holes: the write
 always lands on the path the caller named, in the directory that was validated.
@@ -567,11 +574,19 @@ def open_mutable(relative_path: str, user_id: int | None = None) -> MutableTarge
 def validate_mutable_path(relative_path: str, user_id: int | None = None) -> Path:
     """`open_mutable`, discarding the descriptors and keeping only the path.
 
-    The single-shot form, for callers that need the guard's verdict but make no
-    read-modify-write of their own — and for the `write_file` / `write_bytes`
-    string conveniences, which open their own target. A tool that makes more
-    than one syscall against the returned `Path` has reopened the window
-    `open_mutable` closes; take the target instead.
+    The single-shot form, for a caller that needs the guard's *verdict* and
+    nothing else. A tool that makes more than one syscall against the returned
+    `Path` has reopened the window `open_mutable` closes; take the target
+    instead.
+
+    **Nothing in `src/` calls this** — every production mutation path now goes
+    through `open_mutable` (including `write_file` / `write_bytes`, which open
+    and close their own target). It is kept because the boundary it draws is
+    the thing worth naming: a path-shaped answer is only ever safe when it is
+    the *whole* answer. If a new caller appears here, that is the signal to
+    check whether it should be holding a target instead. The symlink-guard
+    tests exercise it directly for the same reason: the guard's verdict is
+    testable without an anchored write.
     """
     with open_mutable(relative_path, user_id=user_id) as target:
         return target.path

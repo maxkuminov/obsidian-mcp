@@ -434,17 +434,8 @@ async def test_the_tools_do_not_leak_descriptors(vault, call):
     assert _open_fds() == before
 
 
-@needs_proc
-async def test_a_move_with_many_rewrite_sources_does_not_leak(vault, monkeypatch):
-    (vault / "target.md").write_text("body\n", encoding="utf-8")
-    sources = [f"src{i}.md" for i in range(20)]
-    for name in sources:
-        (vault / name).write_text("See [[target]]\n", encoding="utf-8")
-
-    rows = [
-        _Row(file_path="target.md", id=1),
-        *[_Row(file_path=name, id=i + 2) for i, name in enumerate(sources)],
-    ]
+def _fake_move_session(monkeypatch, rows, backlinks):
+    """`async_session` stand-in: the vault index, then the backlink sources."""
 
     class FakeSession:
         calls = 0
@@ -457,9 +448,7 @@ async def test_a_move_with_many_rewrite_sources_does_not_leak(vault, monkeypatch
 
         async def execute(self, statement):
             FakeSession.calls += 1
-            payload = rows if FakeSession.calls == 1 else [
-                _Row(file_path=name) for name in sources
-            ]
+            payload = rows if FakeSession.calls == 1 else backlinks
 
             class Result:
                 def all(self_inner):
@@ -472,6 +461,163 @@ async def test_a_move_with_many_rewrite_sources_does_not_leak(vault, monkeypatch
 
     monkeypatch.setattr(tools, "async_session", FakeSession)
 
+
+def _peak_fd_recorder(monkeypatch):
+    """Sample the fd count at every target open and every rewrite write.
+
+    A post-call check only proves nothing *leaked*; it says nothing about how
+    many descriptors were pinned at once, which is what exhausts the table
+    mid-move. These two hooks straddle the window: one fires as each source is
+    opened in the preflight, the other as each planned rewrite is published.
+    """
+    peak = [0]
+    real_open = tools.open_mutable
+    real_write = tools.write_file_at
+
+    def sample():
+        peak[0] = max(peak[0], _open_fds())
+
+    def open_hook(*args, **kwargs):
+        target = real_open(*args, **kwargs)
+        sample()
+        return target
+
+    def write_hook(*args, **kwargs):
+        sample()
+        return real_write(*args, **kwargs)
+
+    monkeypatch.setattr(tools, "open_mutable", open_hook)
+    monkeypatch.setattr(tools, "write_file_at", write_hook)
+    return peak
+
+
+@needs_proc
+async def test_a_move_releases_sources_that_need_no_rewrite(vault, monkeypatch):
+    """The `continue` paths must not pin a descriptor.
+
+    A hub note's backlink set is whatever the graph says; most of those notes
+    may hold no link that this move actually rewrites. Keeping a target open
+    for each of them pinned one fd per *source* — hundreds — for the whole
+    call, when only the *planned* rewrites need one.
+    """
+    (vault / "target.md").write_text("body\n", encoding="utf-8")
+    linking = [f"src{i}.md" for i in range(5)]
+    inert = [f"inert{i}.md" for i in range(120)]
+    for name in linking:
+        (vault / name).write_text("See [[target]]\n", encoding="utf-8")
+    for name in inert:
+        # Listed as a backlink source by the (stale) graph, but its body holds
+        # nothing this move rewrites — the `n == 0` continue.
+        (vault / name).write_text("no links here\n", encoding="utf-8")
+
+    every = linking + inert
+    rows = [
+        _Row(file_path="target.md", id=1),
+        *[_Row(file_path=name, id=i + 2) for i, name in enumerate(every)],
+    ]
+    _fake_move_session(
+        monkeypatch, rows, [_Row(file_path=name) for name in every]
+    )
+    peak = _peak_fd_recorder(monkeypatch)
+
+    before = _open_fds()
+    result = await tools.move_note_impl(
+        "target.md", "moved.md", rewrite_links=True
+    )
+
+    assert "Moved" in result, result
+    assert "rewrote 5 link(s)" in result, result
+    assert _open_fds() == before
+    # Bounded by the notes actually being rewritten, not by the 125 sources
+    # considered. The slack covers the two move endpoints and their roots.
+    assert peak[0] - before <= len(linking) + 6, peak[0] - before
+
+
+async def test_a_move_aborts_when_the_plan_exceeds_the_descriptor_budget(
+    vault, monkeypatch
+):
+    """A hub note's move must not exhaust the *process* descriptor table.
+
+    Anchoring costs one open parent fd per planned rewrite, held from the
+    preflight read to the post-move write. EMFILE half way through the loop
+    would move the note and silently drop the remaining rewrites — and take
+    every concurrent request down with it — so the budget is checked in the
+    preflight, where refusing costs nothing.
+    """
+    (vault / "target.md").write_text("body\n", encoding="utf-8")
+    sources = [f"src{i}.md" for i in range(4)]
+    for name in sources:
+        (vault / name).write_text("See [[target]]\n", encoding="utf-8")
+
+    rows = [
+        _Row(file_path="target.md", id=1),
+        *[_Row(file_path=name, id=i + 2) for i, name in enumerate(sources)],
+    ]
+    _fake_move_session(
+        monkeypatch, rows, [_Row(file_path=name) for name in sources]
+    )
+    monkeypatch.setattr(tools, "max_move_rewrite_sources", lambda: 2)
+
+    result = await tools.move_note_impl(
+        "target.md", "moved.md", rewrite_links=True
+    )
+
+    assert "Move aborted" in result, result
+    assert "file descriptors" in result, result
+    # Nothing moved, nothing rewritten.
+    assert (vault / "target.md").read_text(encoding="utf-8") == "body\n"
+    assert not (vault / "moved.md").exists()
+    for name in sources:
+        assert (vault / name).read_text(encoding="utf-8") == "See [[target]]\n"
+
+
+def test_the_descriptor_budget_tracks_the_process_limit(monkeypatch):
+    """Derived from `RLIMIT_NOFILE`, not pinned: a container with a million
+    descriptors must not be held to a laptop's 1024."""
+    import resource
+
+    from src import config
+
+    monkeypatch.setattr(
+        config.resource, "getrlimit", lambda _: (1024, 1024)
+    )
+    assert config.max_move_rewrite_sources() == 1024 - config.MOVE_REWRITE_FD_RESERVE
+
+    # A limit so small the reserve would swallow it still allows a small move.
+    monkeypatch.setattr(config.resource, "getrlimit", lambda _: (128, 128))
+    assert config.max_move_rewrite_sources() == config._MIN_MOVE_REWRITE_FDS
+
+    monkeypatch.setattr(
+        config.resource,
+        "getrlimit",
+        lambda _: (resource.RLIM_INFINITY, resource.RLIM_INFINITY),
+    )
+    assert config.max_move_rewrite_sources() > 10**6
+
+
+@needs_proc
+async def test_a_move_with_many_rewrite_sources_does_not_leak(vault, monkeypatch):
+    """Each planned rewrite holds exactly one descriptor, released at its write.
+
+    One fd per planned rewrite is inherent: the preflight read and the
+    post-move write must go through the same descriptor, and the preflight has
+    to finish before the move commits so an over-cap rewrite can abort it. What
+    must not happen is two fds per source, or descriptors surviving the loop.
+    """
+    (vault / "target.md").write_text("body\n", encoding="utf-8")
+    sources = [f"src{i}.md" for i in range(20)]
+    for name in sources:
+        (vault / name).write_text("See [[target]]\n", encoding="utf-8")
+
+    rows = [
+        _Row(file_path="target.md", id=1),
+        *[_Row(file_path=name, id=i + 2) for i, name in enumerate(sources)],
+    ]
+    _fake_move_session(
+        monkeypatch, rows, [_Row(file_path=name) for name in sources]
+    )
+    peak = _peak_fd_recorder(monkeypatch)
+
     before = _open_fds()
     result = await tools.move_note_impl(
         "target.md", "moved.md", rewrite_links=True
@@ -479,6 +625,8 @@ async def test_a_move_with_many_rewrite_sources_does_not_leak(vault, monkeypatch
     assert "Moved" in result, result
     assert "rewrote 20 link(s)" in result, result
     assert _open_fds() == before
+    # One per planned rewrite, not two (`release_root`), plus the endpoints.
+    assert peak[0] - before <= len(sources) + 6, peak[0] - before
 
 
 class _Row:

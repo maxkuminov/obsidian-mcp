@@ -554,47 +554,102 @@ async def test_repointing_a_symlinked_vault_root_mid_write_cannot_redirect_it(
     assert (decoy_root / "note.md").read_text(encoding="utf-8") == "before\n"
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        pytest.param(
-            lambda: tools.edit_note_impl("note.md", "after\n"), id="edit_note"
+# `existing` says whether `note.md` is there when the tool validates: the
+# read-modify-write tools need it to be, the creating ones need it not to be
+# (a link present at validation is refused outright, which is the #54 case).
+_SWAPPED_LEAF_CASES = {
+    "edit_note": (lambda: tools.edit_note_impl("note.md", "after\n"), True),
+    "edit_note_append": (
+        lambda: tools.edit_note_impl("note.md", "tail", append=True),
+        True,
+    ),
+    "edit_note_find": (
+        lambda: tools.edit_note_impl("note.md", "after", find="before"),
+        True,
+    ),
+    "set_frontmatter": (
+        lambda: tools.set_frontmatter_impl("note.md", updates={"a": 1}),
+        True,
+    ),
+    "delete_note": (lambda: tools.delete_note_impl("note.md"), True),
+    "delete_note_permanent": (
+        lambda: tools.delete_note_impl("note.md", permanent=True),
+        True,
+    ),
+    "move_note_source": (
+        lambda: tools.move_note_impl("note.md", "moved.md"),
+        True,
+    ),
+    "create_note": (lambda: tools.create_note_impl("note.md", "body\n"), False),
+    "write_file_overwrite": (
+        lambda: tools.write_file_impl(
+            "note.md", base64.b64encode(b"clobber").decode(), overwrite=True
         ),
-        pytest.param(
-            lambda: tools.set_frontmatter_impl("note.md", updates={"a": 1}),
-            id="set_frontmatter",
+        False,
+    ),
+    "write_file_no_clobber": (
+        lambda: tools.write_file_impl(
+            "note.md", base64.b64encode(b"clobber").decode()
         ),
-    ],
-)
+        False,
+    ),
+    "move_note_destination": (
+        lambda: tools.move_note_impl("mover.md", "note.md"),
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize("tool", sorted(_SWAPPED_LEAF_CASES))
 async def test_a_leaf_swapped_for_a_link_after_validation_is_reported(
-    writable, monkeypatch, mutate
+    writable, monkeypatch, tool
 ):
     """The residual TOCTOU the design accepts: the leaf becomes a symlink
-    between validation and the read.
+    between validation and the act.
 
-    The re-check through the parent descriptor names it as a link (and never as
-    a missing note — an agent's next move after 'not found' is to create it,
-    which would write through the link). Nothing is mutated either way."""
+    Every mutating tool must *name* it. Two wrong answers this pins against:
+    reporting "not found" (an agent's next move is to create it, over the
+    link), and reporting success — `write_file(overwrite=True)` replaces the
+    link rather than following it, which is safe for the target but silently
+    consumes an alias the caller still believes in.
+
+    Nothing is mutated on any path, and the link's target is never touched.
+    """
+    mutate, existing = _SWAPPED_LEAF_CASES[tool]
     note = writable / "note.md"
-    note.write_text("before\n", encoding="utf-8")
+    if existing:
+        note.write_text("before\n", encoding="utf-8")
+    (writable / "mover.md").write_text("mover\n", encoding="utf-8")
     (writable / "elsewhere.md").write_text("elsewhere\n", encoding="utf-8")
 
     original = vault_service.open_mutable
+    swapped: list[bool] = []
 
     def swap_after_validating(relative_path, user_id=None):
         target = original(relative_path, user_id=user_id)
-        note.unlink()
-        note.symlink_to(writable / "elsewhere.md")
+        # Only for the path this case is about: `move_note` validates two, and
+        # the destination case must be sabotaged on the destination.
+        if relative_path == "note.md" and not swapped:
+            swapped.append(True)
+            if existing:
+                note.unlink()
+            note.symlink_to(writable / "elsewhere.md")
         return target
 
     monkeypatch.setattr(tools, "open_mutable", swap_after_validating)
 
     result = await mutate()
 
+    assert swapped, "the race never ran"
     assert "symbolic link" in result, result
     assert "not found" not in result.lower(), result
-    assert (writable / "elsewhere.md").read_text(encoding="utf-8") == "elsewhere\n"
+    assert "wrote" not in result.lower(), result
+    # The link is still a link, and what it points at is untouched.
     assert (writable / "note.md").is_symlink()
+    assert (writable / "elsewhere.md").read_text(encoding="utf-8") == "elsewhere\n"
+    assert (writable / "mover.md").read_text(encoding="utf-8") == "mover\n"
+    assert not (writable / "moved.md").exists()
+    assert not (writable / ".trash").exists()
 
 
 # ── an in-vault `..` is refused, but says why ───────────────────────────────

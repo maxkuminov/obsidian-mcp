@@ -28,7 +28,17 @@
 
 - [x] 5.1 `tests/test_anchored_note_writes.py`: the parent-rename race against every mutating tool, the vault-root variant, the trash anchoring, the `fsync`-before-publish ordering, staging location, crash-mid-write, and the two `UnsupportedFilesystem` refusals
 - [x] 5.2 Update `tests/test_vault_mutation_safety.py` and `tests/test_symlink_mutation_guard.py` where they hooked the old path-based internals, keeping the property each pinned
-- [x] 5.3 Confirm the new tests fail against the pre-change tree (14 of 17 do; the other 3 pin unchanged guarantees)
+- [x] 5.3 Confirm the new tests fail against the pre-change tree. Measured against `6252109` with the final test files: **19 of the 33** cases in `test_anchored_note_writes.py` fail, and **33 of 106** across that file plus `test_symlink_mutation_guard.py` (which includes all 11 swapped-leaf cases). The rest pin guarantees this change preserves rather than introduces, which is why they pass either way. Four of the swapped-leaf cases — `create_note`, `write_file` in both modes, and `move_note`'s destination — also fail against the *first* implementation of this change, which is the gap the review found.
 - [x] 5.4 Module docstring in `src/services/vault.py` stating the remaining residual; `vault_fs` docstring updated to record the adoption
 - [x] 5.5 CLAUDE.md: rewrite "The accepted residual, precisely", the `*_at` paragraph, the `delete_note` trash format and the "Follow-ups" note
 - [x] 5.6 `openspec validate anchored-note-writes --strict` passes; full suite green
+
+## 6. Review follow-ups
+
+- [x] 6.1 `_leaf_state_error` grows an optional `missing`, so the *creating* tools can use it: `write_file` checks before writing (an `overwrite=True` publish replaces the link and would have reported "Wrote N bytes"), and `create_note` / `write_file` / `move_note`'s destination decode the no-clobber `EEXIST` through it — `link`/`renameat2` refuse a file, a directory and a symlink identically
+- [x] 6.2 `move_note` releases a backlink source's descriptor on every path that plans no rewrite, and releases each planned one as soon as its write is published
+- [x] 6.3 `config.max_move_rewrite_sources()` derives a descriptor budget from `RLIMIT_NOFILE`; the preflight aborts before any mutation rather than letting one move exhaust the process table mid-loop
+- [x] 6.4 `tests/test_symlink_mutation_guard.py` parametrises the swapped-leaf case over all eleven applicable tool/mode combinations; the fd tests assert *peak*, not just post-call
+- [x] 6.5 `src/mcp_server/server.py` and `README.md` state the new `.trash` name form and the `UnsupportedFilesystem` refusal
+- [x] 6.6 Correct the claim that `write_file(overwrite=True)` is guarded by `expected=` (CLAUDE.md and the `vault` module docstring) — it is an unconditional replace
+- [x] 6.7 Note on `validate_mutable_path` that it has no production caller and why it is kept

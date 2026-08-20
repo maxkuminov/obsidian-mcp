@@ -20,7 +20,12 @@ from mcp.server.fastmcp import Image
 from sqlalchemy import text
 
 from src.auth.session import current_user_id
-from src.config import MAX_MOVE_REWRITE_BYTES, MAX_NOTE_BYTES, settings
+from src.config import (
+    MAX_MOVE_REWRITE_BYTES,
+    MAX_NOTE_BYTES,
+    max_move_rewrite_sources,
+    settings,
+)
 from src.database import async_session
 from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
 from src.models.db import UsageLog
@@ -603,14 +608,22 @@ def _require_write() -> str | None:
     return None
 
 
-def _leaf_state_error(target, path: str, *, missing: str) -> str | None:
-    """Refuse a note whose leaf is absent, a link, or not a regular file.
+def _leaf_state_error(target, path: str, *, missing: str | None = None) -> str | None:
+    """Refuse a leaf that is a link, not a regular file, or (optionally) absent.
 
     `open_mutable` already refused a symlinked leaf; this re-checks through the
     parent descriptor immediately before the tool acts, so a leaf swapped for a
     link in the interval is *named* as such. Reporting it as a missing note
     would be worse than unhelpful: the obvious next move an agent makes is to
     create it, which writes through the link.
+
+    `missing` is the message for an absent leaf. Omitting it means absence is
+    fine — that is the creating tools (`create_note`, `write_file`), which need
+    the link and non-regular refusals but must still write when nothing is
+    there. Returning `None` therefore means "an ordinary regular file, or
+    nothing", which is also what makes this usable as the `or`-fallback on a
+    no-clobber `FileExistsError`: a link that appeared is named, a real file
+    keeps the tool's own "already exists" wording.
     """
     info = target.lstat()
     if info is None:
@@ -669,7 +682,12 @@ async def create_note_impl(path: str, content: str) -> str:
             write_file_at(target, content, overwrite=False)
             return f"Created note: {path}"
         except FileExistsError:
-            return f"Note already exists: {path}. Use edit_note to modify it."
+            # No-clobber `link` refuses a plain file, a directory *and* a
+            # symlink identically, so the bare "already exists" would hide a
+            # leaf that turned into a link after validation.
+            return _leaf_state_error(target, path) or (
+                f"Note already exists: {path}. Use edit_note to modify it."
+            )
         except (ValueError, vault_fs.VaultFSError) as e:
             return str(e)
         except OSError as e:
@@ -1396,6 +1414,24 @@ async def move_note_impl(
         planned_rewrites: list[tuple[str, object, bytes, str, int]] = []
         rewrite_bytes_held = 0
         failed_rewrite_sources: list[str] = []
+
+        def drop(candidate) -> None:
+            """Close a per-source target we are not going to keep.
+
+            A backlink source only has to stay open if its rewrite is actually
+            *planned*: the point of holding it is that the phase-1 read and the
+            phase-3 write go through one descriptor. Every other exit — not a
+            file, nothing to rewrite, a failed read — has no phase 3, so
+            holding the descriptor would pin one fd per source for the whole
+            call and a hub note with hundreds of backlinks would exhaust the
+            table. `targets` keeps the entry as a backstop; `close()` is
+            idempotent, and the two move endpoints are never dropped here
+            because the move itself still needs them.
+            """
+            if candidate is None or candidate is src_target or candidate is dst_target:
+                return
+            candidate.close()
+
         if rewrite_links and pre_move_index is not None:
             for original_src_path in rewrite_sources:
                 # A moved note may link to itself: it is still at its old path now,
@@ -1403,6 +1439,7 @@ async def move_note_impl(
                 # about to land — and write it at its new location.
                 moved_note = original_src_path == from_rel
                 out_path = to_rel if moved_note else original_src_path
+                read_target = None
                 try:
                     # Each source is resolved and opened once here and mutated
                     # through that descriptor in phase 3. Re-passing the string to
@@ -1417,6 +1454,7 @@ async def move_note_impl(
                         targets.append(read_target)
                         write_target = read_target
                     if not read_target.is_file():
+                        drop(read_target)
                         continue
                     if not moved_note:
                         # Pinned from here until phase 3 writes it. The number
@@ -1442,8 +1480,10 @@ async def move_note_impl(
                         "Failed to rewrite links in %s: %s", original_src_path, e
                     )
                     failed_rewrite_sources.append(original_src_path)
+                    drop(read_target)
                     continue
                 if n == 0:
+                    drop(read_target)
                     continue
                 # A rewrite can only grow a note (the new path is usually longer
                 # than the old one), so it is a note write like any other and gets
@@ -1467,6 +1507,21 @@ async def move_note_impl(
                         "was moved, rewritten or reindexed. Move without "
                         "rewrite_links and update links in batches instead."
                     )
+                # Descriptors, for the same reason as the bytes above: each
+                # planned rewrite pins one open parent fd from here until its
+                # phase-3 write. Unbounded, one hub note's move exhausts the
+                # *process* table and breaks every concurrent request — so the
+                # move aborts here, before any mutation, rather than hitting
+                # EMFILE half way through the rewrites.
+                fd_budget = max_move_rewrite_sources()
+                if len(planned_rewrites) + 1 > fd_budget:
+                    return (
+                        f"Move aborted: rewriting links across more than "
+                        f"{fd_budget} notes would hold more open file "
+                        "descriptors than this process can spare. Nothing was "
+                        "moved, rewritten or reindexed. Move without "
+                        "rewrite_links and update links in batches instead."
+                    )
                 planned_rewrites.append(
                     (out_path, write_target, original_bytes, new_content, n)
                 )
@@ -1475,7 +1530,9 @@ async def move_note_impl(
         try:
             move_file_no_clobber(src_target, dst_target)
         except FileExistsError:
-            return f"Destination already exists: {to_path}"
+            return _leaf_state_error(dst_target, to_path) or (
+                f"Destination already exists: {to_path}"
+            )
         except FileNotFoundError:
             return f"Source note not found: {from_path}"
         except (ValueError, vault_fs.VaultFSError) as e:
@@ -1529,6 +1586,12 @@ async def move_note_impl(
             except Exception as e:
                 logger.warning("Failed to rewrite links in %s: %s", write_path, e)
                 failed_rewrite_sources.append(write_path)
+            finally:
+                # Its descriptor has done both jobs now. Closing here — rather
+                # than in the outer `finally` — keeps the peak at the number of
+                # *planned* rewrites still awaiting their write, not the number
+                # of sources the move started with.
+                drop(write_target)
 
         parts = [f"Moved {from_rel} → {to_rel}"]
         if db_failed:
@@ -1820,6 +1883,19 @@ async def write_file_impl(
         return str(e)
 
     with target:
+        # Absence is fine — this tool creates — but a leaf that became a link
+        # or a directory after validation is not. `overwrite=True` publishes
+        # with `renameat`, which replaces the *link* rather than following it:
+        # safe for the file it pointed at, but it silently consumes an alias
+        # the caller still believes in and reports "Wrote N bytes" for it.
+        #
+        # Ahead of the decode and the size check for the same reason the
+        # validation guard is: a path problem outranks a payload problem, and
+        # reporting the size limit would send the caller off to shrink content
+        # that was never why the write is refused.
+        if err := _leaf_state_error(target, path):
+            return err
+
         if encoding == "base64":
             try:
                 data = base64.b64decode(content, validate=True)
@@ -1840,7 +1916,7 @@ async def write_file_impl(
         try:
             write_bytes_at(target, data, overwrite=overwrite)
         except FileExistsError:
-            return (
+            return _leaf_state_error(target, path) or (
                 f"File already exists: {path}. Pass overwrite=True to replace it."
             )
         except (ValueError, vault_fs.VaultFSError) as e:
