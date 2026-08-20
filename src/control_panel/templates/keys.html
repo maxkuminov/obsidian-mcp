@@ -70,10 +70,14 @@
                     <td>
                         {% if not key.is_active %}
                         <span class="badge badge-red">Revoked</span>
+                        {% elif not key.owner_is_active %}
+                        {# Owner before expiry: `auth.py` checks the owner's
+                           is_active first and 401s there, so a key that is
+                           both should name the reason the middleware would
+                           actually give. #}
+                        <span class="badge badge-yellow" title="The key itself is live, but its owner is deactivated — the MCP server rejects it with 401 inactive_user.">Owner inactive</span>
                         {% elif key.is_expired %}
                         <span class="badge badge-red" title="Past its expires_at — the MCP server rejects it with 401 key_expired.">Expired</span>
-                        {% elif not key.owner_is_active %}
-                        <span class="badge badge-yellow" title="The key itself is live, but its owner is deactivated — the MCP server rejects it with 401 inactive_user.">Owner inactive</span>
                         {% else %}
                         <span class="badge badge-green">Active</span>
                         {% endif %}

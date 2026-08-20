@@ -245,6 +245,30 @@ def test_expired_key_renders_its_own_badge():
     assert 'class="badge badge-green"' not in html
 
 
+def test_owner_inactive_beats_expired_in_the_badge():
+    """A key that is both expired and owner-inactive: `auth.py` checks the
+    owner's `is_active` first and 401s there, so the badge must name the
+    reason the middleware would actually give."""
+    html = _render_keys_page([
+        _key_ctx(owner_is_active=False, is_expired=True, effective_active=False)
+    ])
+    assert _status_badge(html) == "Owner inactive"
+    assert 'class="badge badge-green"' not in html
+
+
+def test_middleware_checks_the_owner_before_expiry():
+    """The ordering this badge mirrors. If auth.py ever checks expiry first,
+    this fails and the template should follow it."""
+    import inspect
+
+    from src.mcp_server import auth
+
+    src = inspect.getsource(auth)
+    owner_at = src.index('"reason": "inactive_user"')
+    expiry_at = src.index("api_key.expires_at < datetime.now(timezone.utc)")
+    assert owner_at < expiry_at
+
+
 def test_revoked_beats_expired_in_the_badge():
     html = _render_keys_page(
         [_key_ctx(is_active=False, is_expired=True, effective_active=False)]
