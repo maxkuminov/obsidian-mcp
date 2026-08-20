@@ -341,8 +341,30 @@ class MutableTarget:
     def root_fd(self) -> int:
         """The vault-root descriptor this target's parent was walked from."""
         if self._root_fd is None:
-            raise RuntimeError(f"MutableTarget for {self.rel} is closed")
+            raise RuntimeError(
+                f"MutableTarget for {self.rel} has no root descriptor "
+                "(closed, or released by release_root)"
+            )
         return self._root_fd
+
+    def release_root(self) -> None:
+        """Drop the root descriptor, keeping the parent one.
+
+        Only two things need the root after validation: creating a missing
+        parent, and resolving `.trash` for the soft delete. A caller that holds
+        *many* targets at once — `move_note` pins one per link-rewrite source
+        from the preflight read until the post-move write — halves the
+        descriptors it ties up by releasing the roots it will not use. Refuses
+        when the parent is not open yet, which would leave the target unusable.
+        """
+        if self._dir_fd is None:
+            raise RuntimeError(
+                f"Cannot release the root of {self.rel}: its parent directory "
+                "is not open, so the target would become unusable"
+            )
+        if self._root_fd is not None:
+            vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
+            self._root_fd = None
 
     @property
     def dir_fd(self) -> int:
@@ -711,7 +733,6 @@ def _atomic_write_at(
     dir_fd = target.dir_fd
     name = target.name
     fd, tmp = _create_temp_exclusively(dir_fd, name)
-    published = False
     try:
         try:
             with os.fdopen(fd, "wb", closefd=False) as stream:
@@ -730,7 +751,6 @@ def _atomic_write_at(
                 raise RuntimeError(f"File changed while editing: {name}")
         if overwrite:
             os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-            published = True
         else:
             # A hard link publishes the completed temp inode only when the
             # destination does not exist. Unlike exists()+replace(), this is an
@@ -757,19 +777,14 @@ def _atomic_write_at(
                         "rather than replacing an existing file."
                     ) from exc
                 raise
-            published = True
-    except BaseException:
-        if not published:
-            # The temp is a regular file we created ourselves in a directory we
-            # hold open, so an unconditional unlink is safe.
-            _discard_temp(dir_fd, tmp)
-        raise
     finally:
-        if published:
-            # `replace` consumed it; `link` did not. Either way a failing
-            # unlink here is janitorial — the write has already happened and
-            # must not be reported as a failure.
-            _discard_temp(dir_fd, tmp)
+        # The temp is a regular file we created ourselves in a directory we
+        # hold open, so an unconditional unlink is safe on every path: a
+        # successful `replace` already consumed it, `link` did not, and a
+        # failure leaves it behind. `_discard_temp` never raises — once the
+        # publication has happened, a failing unlink is janitorial and must not
+        # turn a completed write into a reported failure.
+        _discard_temp(dir_fd, tmp)
     return target.path
 
 

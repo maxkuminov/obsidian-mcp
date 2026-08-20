@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 import src.mcp_server.tools as tools
+from src.config import MAX_NOTE_BYTES
 from src.mcp_server.auth import current_permission
 from src.services import vault as vault_service
 from src.services import vault_fs
@@ -374,6 +375,117 @@ async def test_soft_delete_refuses_when_rename_noreplace_is_unsupported(
     assert (vault / "note.md").read_text(encoding="utf-8") == "keep me\n"
 
 
+# ── descriptors are not leaked ──────────────────────────────────────────────
+
+
+def _open_fds() -> int:
+    return len(os.listdir("/proc/self/fd"))
+
+
+needs_proc = pytest.mark.skipif(
+    not os.path.exists("/proc/self/fd"), reason="needs /proc"
+)
+
+
+@needs_proc
+@pytest.mark.parametrize(
+    "call",
+    [
+        pytest.param(
+            lambda i: tools.create_note_impl(f"n{i}.md", "body\n"), id="create_note"
+        ),
+        pytest.param(
+            lambda i: tools.edit_note_impl("kept.md", f"body {i}\n"), id="edit_note"
+        ),
+        pytest.param(
+            lambda i: tools.set_frontmatter_impl("kept.md", updates={"n": i}),
+            id="set_frontmatter",
+        ),
+        pytest.param(
+            lambda i: tools.delete_note_impl(f"n{i}.md"), id="delete_note"
+        ),
+        pytest.param(
+            lambda i: tools.write_file_impl(
+                f"n{i}.bin", base64.b64encode(b"x").decode()
+            ),
+            id="write_file",
+        ),
+        pytest.param(
+            lambda i: tools.create_note_impl("alias.md", "clobber"), id="refused"
+        ),
+    ],
+)
+async def test_the_tools_do_not_leak_descriptors(vault, call):
+    """Anchoring pins fds; every exit path — success and refusal — must close.
+
+    A leak here is invisible until the server has been up for a week and then
+    every tool starts failing with EMFILE at once.
+    """
+    (vault / "kept.md").write_text("body\n", encoding="utf-8")
+    (vault / "important.md").write_text("real\n", encoding="utf-8")
+    (vault / "alias.md").symlink_to(vault / "important.md")
+    for i in range(3):
+        (vault / f"n{i}.md").write_text("body\n", encoding="utf-8")
+
+    await call(0)  # warm any one-off caches (the trash probe, the umask read)
+    before = _open_fds()
+    for i in range(1, 3):
+        await call(i)
+    assert _open_fds() == before
+
+
+@needs_proc
+async def test_a_move_with_many_rewrite_sources_does_not_leak(vault, monkeypatch):
+    (vault / "target.md").write_text("body\n", encoding="utf-8")
+    sources = [f"src{i}.md" for i in range(20)]
+    for name in sources:
+        (vault / name).write_text("See [[target]]\n", encoding="utf-8")
+
+    rows = [
+        _Row(file_path="target.md", id=1),
+        *[_Row(file_path=name, id=i + 2) for i, name in enumerate(sources)],
+    ]
+
+    class FakeSession:
+        calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def execute(self, statement):
+            FakeSession.calls += 1
+            payload = rows if FakeSession.calls == 1 else [
+                _Row(file_path=name) for name in sources
+            ]
+
+            class Result:
+                def all(self_inner):
+                    return payload if FakeSession.calls <= 2 else []
+
+            return Result()
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(tools, "async_session", FakeSession)
+
+    before = _open_fds()
+    result = await tools.move_note_impl(
+        "target.md", "moved.md", rewrite_links=True
+    )
+    assert "Moved" in result, result
+    assert "rewrote 20 link(s)" in result, result
+    assert _open_fds() == before
+
+
+class _Row:
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
 # ── unchanged guarantees ────────────────────────────────────────────────────
 
 
@@ -396,6 +508,102 @@ async def test_soft_delete_keeps_a_symlinked_folder_working(vault):
     trashed = list((vault / ".trash").iterdir())
     assert len(trashed) == 1
     assert trashed[0].read_text(encoding="utf-8") == "body\n"
+
+
+async def test_a_refused_write_creates_no_directories(vault):
+    """Parent creation is deferred to the write, so a refusal leaves no tree.
+
+    Creating the parent during validation would have `create_note` litter the
+    vault with empty folders for every over-cap body an agent tries.
+    """
+    result = await tools.create_note_impl(
+        "New/Folder/note.md", "x" * (MAX_NOTE_BYTES + 1)
+    )
+
+    assert "max" in result.lower(), result
+    assert not (vault / "New").exists()
+
+
+async def test_a_source_replaced_mid_move_is_relocated_intact(vault, monkeypatch):
+    """`RENAME_NOREPLACE` moves whichever inode is at the source when it runs.
+
+    `link` + `unlink` — the shape this replaced — would have published the
+    inode it linked and then unlinked the *replacement*, destroying it.
+    """
+    (vault / "source.md").write_text("original\n", encoding="utf-8")
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def execute(self, statement):
+            class Empty:
+                def all(self):
+                    return []
+
+            return Empty()
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(tools, "async_session", FakeSession)
+
+    real = vault_fs.rename_noreplace
+    swapped: list[bool] = []
+
+    def replace_source_first(src_dir_fd, src_name, dst_dir_fd, dst_name):
+        if not swapped:
+            swapped.append(True)
+            replacement = vault / "replacement"
+            replacement.write_text("replacement\n", encoding="utf-8")
+            os.replace(replacement, vault / "source.md")
+        return real(src_dir_fd, src_name, dst_dir_fd, dst_name)
+
+    monkeypatch.setattr(vault_fs, "rename_noreplace", replace_source_first)
+
+    result = await tools.move_note_impl("source.md", "destination.md")
+
+    assert swapped
+    assert "Moved" in result, result
+    # The replacement moved intact; nothing was unlinked behind its back.
+    assert (vault / "destination.md").read_text(encoding="utf-8") == "replacement\n"
+    assert not (vault / "source.md").exists()
+
+
+@pytest.mark.parametrize(
+    "call, expected",
+    [
+        pytest.param(
+            lambda: tools.edit_note_impl("gone.md", "x"),
+            "Use create_note",
+            id="edit_note",
+        ),
+        pytest.param(
+            lambda: tools.set_frontmatter_impl("gone.md", updates={"a": 1}),
+            "Note not found",
+            id="set_frontmatter",
+        ),
+        pytest.param(
+            lambda: tools.delete_note_impl("gone.md"),
+            "Note not found",
+            id="delete_note",
+        ),
+        pytest.param(
+            lambda: tools.move_note_impl("gone.md", "there.md"),
+            "Source note not found",
+            id="move_note",
+        ),
+    ],
+)
+async def test_a_genuinely_missing_note_still_reports_missing(vault, call, expected):
+    """The leaf re-check distinguishes absent from symlinked; absent keeps its
+    original, actionable message."""
+    result = await call()
+
+    assert expected in result, result
 
 
 async def test_a_second_delete_of_the_same_name_gets_a_distinct_trash_entry(vault):

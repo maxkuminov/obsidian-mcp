@@ -1418,6 +1418,13 @@ async def move_note_impl(
                         write_target = read_target
                     if not read_target.is_file():
                         continue
+                    if not moved_note:
+                        # Pinned from here until phase 3 writes it. The number
+                        # of backlink sources is unbounded, so drop the root
+                        # descriptor — a rewrite never creates a directory and
+                        # never touches `.trash` — and hold one fd per source
+                        # instead of two.
+                        read_target.release_root()
                     original_bytes = read_bytes_at(
                         read_target, max_bytes=MAX_NOTE_BYTES, label=original_src_path
                     )
