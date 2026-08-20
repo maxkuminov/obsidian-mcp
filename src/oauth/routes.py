@@ -300,12 +300,20 @@ async def authorize_get(
     # consent screen only offers access levels the client can actually hold.
     client_can_write = "readwrite" in client.scope.split()
 
-    offline_access_requested = "offline_access" in scope.split()
+    scope_parts = scope.split()
+    offline_access_requested = "offline_access" in scope_parts
+    # Preselect whichever radio matches what the client actually asked for.
+    # Without this, the "Read only" option is checked unconditionally, so a
+    # client requesting scope=readwrite (e.g. because the user picked
+    # read-write access in the client's own connector settings) still gets
+    # a read-only grant unless the user manually re-clicks the other radio.
+    requested_write = "readwrite" in scope_parts and client_can_write
 
     response = templates.TemplateResponse(request, "authorize.html", {
         "client_name": client.client_name,
         "scope": scope,
         "client_can_write": client_can_write,
+        "requested_write": requested_write,
         "read_scope": "read offline_access" if offline_access_requested else "read",
         "readwrite_scope": "readwrite offline_access" if offline_access_requested else "readwrite",
         "client_id": client_id,
