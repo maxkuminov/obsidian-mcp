@@ -124,6 +124,11 @@ The OAuth page SHALL derive each grant's status from revocation, expiry and the 
 - **THEN** its token rows SHALL still be listed with a "Revoked" status
 - **AND** no revocation or scope control SHALL be offered for that grant
 
+#### Scenario: Periodic cleanup does not erase a revocation
+- **WHEN** the periodic token cleanup runs after a grant has been revoked
+- **THEN** a revoked token SHALL only be deleted once its `expires_at` is more than the retention window in the past
+- **AND** a token revoked while still within its lifetime SHALL therefore remain listed for at least that window after it was revoked
+
 #### Scenario: One grant, one set of controls
 - **WHEN** a grant's access and refresh tokens are both live
 - **THEN** the page SHALL render exactly one revocation control and exactly one scope control for that grant

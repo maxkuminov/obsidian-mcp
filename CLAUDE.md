@@ -245,6 +245,16 @@ vanished from the page, so the operator saw a blank space that read as success.
   client refreshing hourly leaves hundreds in a 30-day window. Status also
   reads the owner's `User.is_active` ("Owner inactive"), which
   `APIKeyMiddleware` already enforces and the page used to badge green (#76).
+- **`cleanup_expired_tokens` retains on `expires_at`, never `created_at`.** Its
+  revoked branch used to have no age condition at all, so the indexer deleted
+  every revoked token within five minutes — the same blank space the listing
+  exists to prevent, just delayed. Revocation time is not stored, but a token
+  can only be revoked while it exists (`R <= expires_at`), so a 7-day window
+  measured from `expires_at` *guarantees* a revoked row stays visible for at
+  least 7 days after revocation. `created_at` inverts that: a refresh token
+  minted 30 days ago and revoked a minute ago would be purged at once. Once
+  age-gated the revoked branch is a strict subset of the expiry branch, which
+  is why the predicate is a single comparison rather than an `or_`.
 
 ## Key Decisions
 - API keys use `omcp_` prefix, stored as SHA-256 hashes

@@ -33,6 +33,7 @@
 - [x] 5.1 `oauth_page` groups tokens into grants, includes revoked/expired rows, caps history per grant and bounds the per-client scan
 - [x] 5.2 Derive effective status including the owner's `User.is_active`; add the "Owner inactive" badge
 - [x] 5.3 Rewrite `oauth.html` for one block per grant: one "Revoke access" control, one scope select, dimmed history rows, "+ N earlier" line
+- [x] 5.4 Age-gate the revoked branch of `cleanup_expired_tokens` on `expires_at` (it had no age condition at all, so the indexer deleted every revocation's evidence within 5 minutes); document why `expires_at` and not `created_at`
 
 ## 6. Tests
 
@@ -42,10 +43,11 @@
 - [x] 6.4 `tests/test_issue_67_panel_scope_clamp.py` — panel refusal, option gating, rotation re-clamp, helper unit tests
 - [x] 6.5 `tests/test_issue_68_cross_user_client.py` — refusal, no rebinding, owner/unbound/single-user paths, deny path
 - [x] 6.6 Seven new cases in `tests/integration/test_schema_check.py` for 014's backfill, NOT NULL, index name, idempotence and downgrade; update the head-revision assertions to `014`
+- [x] 6.7 `tests/test_issue_64_token_cleanup_retention.py` — structural comparison of the emitted WHERE clause plus a small real evaluator, so the retention window is pinned by behaviour and not by reading one bind parameter
 
 ## 7. Gates
 
-- [x] 7.1 `pytest --ignore=tests/integration` green (995 passed, 5 skipped; baseline 940/5)
+- [x] 7.1 `pytest --ignore=tests/integration` green (1006 passed, 5 skipped; baseline 940/5)
 - [x] 7.2 `make test-schema` green (20 passed) — includes `alembic check` clean on every path
 - [x] 7.3 `openspec validate oauth-grant-families --strict`
 - [ ] 7.4 Adversarial Codex pass (orchestrator-run)
