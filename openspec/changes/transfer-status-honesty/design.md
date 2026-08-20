@@ -85,6 +85,16 @@ same token. `_refuse_if_past_deadline` runs as the last thing before
 `vault_fs.publish`, inside the locks, which is the only point where "still in
 time" and "about to write" are the same instant.
 
+**Accepted limitation: the deadline is honoured to within the publish latency,
+not to the syscall.** The check runs before `vault_fs.publish`'s own
+authoritative `open_parent` walk and, on an overwrite, the incumbent's
+fingerprint re-hash (bounded by `MAX_FILE_WRITE_BYTES`), so the bytes can land a
+few milliseconds after the instant we checked. A literal no-write-after-deadline
+guarantee would need a pre-mutation callback threaded inside `vault_fs.publish`,
+and that coupling was judged not worth it: the write is the consented,
+fingerprint-verified one, so a publish late by publish latency is not a
+destructive write on anything unintended.
+
 It raises the existing `Timeout`, deliberately. The route maps that to
 `consume`, and consuming is what the state machine says about a request that
 ran past its deadline: a retry must mint afresh rather than replay a link whose

@@ -1065,6 +1065,15 @@ def _refuse_if_past_deadline(deadline: float | datetime.datetime) -> None:
     the bytes are in place: `state["published"]` is still false, so the
     surrounding handler re-raises this untouched.
 
+    **Honoured to within the publish latency, not to the syscall.** This runs
+    before `vault_fs.publish`'s own authoritative `open_parent` walk and, on an
+    overwrite, the incumbent's fingerprint re-hash (bounded by
+    `MAX_FILE_WRITE_BYTES`), so the bytes can land a few milliseconds past the
+    instant checked here. Accepted: closing that would mean a pre-mutation
+    callback threaded inside `publish`, and the write that lands late is the
+    consented, fingerprint-verified one — not a destructive write on anything
+    unintended.
+
     For an upload `deadline` is `upload_stream_deadline(row)` measured against
     `now_utc()`; taking it from the parameter rather than re-deriving it from
     `row` keeps this working for `import_from_url`, whose row has no expiry and
