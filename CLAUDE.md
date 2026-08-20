@@ -230,11 +230,14 @@ vanished from the page, so the operator saw a blank space that read as success.
 - **`/revoke` (RFC 7009) is family-scoped too**, which §2.1 explicitly permits.
   Anything narrower reproduces the near no-op for any client presenting its
   access token. It **authenticates the client** per its registered method and
-  requires a submitted `client_id` to match the token's — without that, any
-  holder of any token value ended a 30-day grant. §2.2 governs the other
-  direction: a foreign or unknown token is answered 200 with nothing done, so
-  the endpoint is not an oracle for who owns a token value. The only real
-  error is naming the right client and failing to authenticate as it.
+  requires `client_id` to be **present and exactly equal** to the token's —
+  without that, any holder of any token value ended a 30-day grant. Absence is
+  not a match: a public client has no secret to check, so "omit `client_id`"
+  would be a universal bypass proving nothing, and unlike `/token` there is no
+  PKCE verifier binding the request to the initiating client. §2.2 governs the
+  other direction: a foreign, unnamed or unknown token is answered 200 with
+  nothing done, so the endpoint is not an oracle for who owns a token value.
+  The only real error is naming the right client and failing to authenticate.
 - **No token is minted without an owner, and the mint paths serialize with the
   multi-user bootstrap.** `register_submit` claims ownerless rows with
   `UPDATE ... WHERE user_id IS NULL`, whose snapshot is taken at statement
@@ -263,8 +266,12 @@ vanished from the page, so the operator saw a blank space that read as success.
   other user the owner's cascading Delete. Single-user mode cannot trigger it.
 - **The panel lists revoked and expired rows, dimmed**, with one "Revoke
   access" control and one scope select *per grant*. Status also reads the
-  owner's `User.is_active` ("Owner inactive"), which `APIKeyMiddleware` already
-  enforces and the page used to badge green (#76).
+  owner's `User.is_active` ("Owner inactive") **and `has_vault_scope`** ("No
+  vault scope"), both of which `APIKeyMiddleware` already enforces and the page
+  used to badge green (#76). A no-vault-scope grant counts as dead: offering a
+  Revoke and a scope select for a credential the middleware 401s is the same
+  over-reporting of liveness, and that select could only ever write a scope the
+  client is not registered for.
 - **Live rows are queried unbounded; only history is capped.** One `LIMIT` over
   all of a client's tokens applied *before* grants were identified let a chatty
   grant's rotations push another grant's live refresh token off the page —
@@ -284,8 +291,16 @@ vanished from the page, so the operator saw a blank space that read as success.
   on a column somebody else added, `WHERE grant_id IS NULL` becomes a patch
   that hands a NULL row beside a stamped sibling a *fresh* id — splitting one
   grant in two, so revoking either leaves the other alive. It therefore refuses
-  a wrong type, an index name squatting on another column, any NULL row, and
-  any id spanning more than one `(client_id, user_id)`.
+  a wrong type, any NULL row, any id spanning more than one
+  `(client_id, user_id)`, and an index of its name that is not *exactly* its
+  index. That last check reads `pg_index` — table, `indisvalid`,
+  `indpred IS NULL`, `indexprs IS NULL`, and exactly one key column equal to
+  `grant_id`'s attnum. "Which column is it on?" is not enough: a partial index
+  covers a subset of rows, an expression index cannot serve an equality lookup,
+  a multi-column index leads with the wrong key, and an INVALID leftover from a
+  failed `CREATE INDEX CONCURRENTLY` serves nothing — `CREATE INDEX IF NOT
+  EXISTS` keeps all of them, and autogenerate compares index *names*, so the
+  check would look installed while staying dirty forever.
 - **`cleanup_expired_tokens` retains on `expires_at`, never `created_at`.** Its
   revoked branch used to have no age condition at all, so the indexer deleted
   every revoked token within five minutes — the same blank space the listing

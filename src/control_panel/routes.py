@@ -34,7 +34,12 @@ from src.oauth.grants import (
     revoke_grant_family,
     set_grant_family_scope,
 )
-from src.oauth.scope import clamp_scope, client_can_write, token_has_write
+from src.oauth.scope import (
+    clamp_scope,
+    client_can_write,
+    has_vault_scope,
+    token_has_write,
+)
 from src.services.indexer import invalidate_hnsw_index_cache
 from src.services.vault import warm_user_vault_cache
 
@@ -583,6 +588,14 @@ def _token_status(token, now: datetime, owner_active: bool) -> str:
         return "revoked"
     if token.expires_at <= now:
         return "expired"
+    if not has_vault_scope(token.scope):
+        # `offline_access` says the grant may carry a refresh token, not that
+        # it may read a note, so `src/mcp_server/auth.py` 401s this token
+        # (`reason=no_vault_scope`). No path can mint one any more, but a
+        # client registered `scope="offline_access"` before that could already
+        # hold one — and the panel showed it "Active" with a working scope
+        # control, which is the same over-reporting of liveness #76 was about.
+        return "no_vault_scope"
     if not owner_active:
         return "owner_inactive"
     return "active"
@@ -627,6 +640,11 @@ def _grant_view(grant_id: str, family: list, now: datetime, active_by_owner: dic
         if status in ("active", "owner_inactive"):
             live.append((t, row))
         else:
+            # `no_vault_scope` counts as dead, deliberately: the middleware
+            # rejects it, so treating it as live would offer a Revoke and a
+            # scope select for a credential that cannot authenticate — and the
+            # scope select would try to write a scope its client is not
+            # registered for, which `update_oauth_token_scope` refuses anyway.
             dead.append(row)
 
     # Every still-usable token is always rendered; only history is capped.
@@ -649,7 +667,12 @@ def _grant_view(grant_id: str, family: list, now: datetime, active_by_owner: dic
         # still listed: a revocation that leaves a blank space reads as
         # success even when it did nothing.
         token_id = None
-        status = "revoked" if all(t.revoked for t in family) else "expired"
+        if all(t.revoked for t in family):
+            status = "revoked"
+        elif not has_vault_scope(family[0].scope):
+            status = "no_vault_scope"
+        else:
+            status = "expired"
         scope = family[0].scope
 
     # A family is normally uniform — every row descends from one consent and

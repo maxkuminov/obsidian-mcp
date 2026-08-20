@@ -139,15 +139,35 @@ def test_public_client_may_still_revoke(monkeypatch):
     assert all(t.revoked for t in tokens)
 
 
-def test_public_client_may_omit_client_id(monkeypatch):
-    """Same tolerance `/token` already grants some ChatGPT connector builds."""
+def test_omitting_client_id_revokes_nothing(monkeypatch):
+    """Absence must not be treated as a match.
+
+    A public client has no secret, so `_client_authenticated` passes trivially.
+    If a missing `client_id` also counted as "the right client", then posting
+    somebody else's token value with no client field at all ended their entire
+    grant — a universal bypass that proved nothing. Unlike `/token`, where PKCE
+    binds the request to the initiating client, nothing else here identifies
+    the caller.
+    """
     tokens = family()
     session = FakeSession(clients=[public_client()], tokens=tokens)
 
     response = revoke(session, monkeypatch, token=ACCESS_VALUE)
 
+    assert response.status_code == 200, "still a uniform 200 (RFC 7009 §2.2)"
+    assert response.body == b"{}"
+    assert not any(t.revoked for t in tokens), "no mutation without a named client"
+    assert session.committed == 0
+
+
+def test_an_empty_client_id_is_not_a_match(monkeypatch):
+    tokens = family()
+    session = FakeSession(clients=[public_client()], tokens=tokens)
+
+    response = revoke(session, monkeypatch, token=ACCESS_VALUE, client_id="")
+
     assert response.status_code == 200
-    assert all(t.revoked for t in tokens)
+    assert not any(t.revoked for t in tokens)
 
 
 # --- naming a different client is a no-op with a 200 ---------------------
@@ -195,6 +215,7 @@ def test_a_missing_token_parameter_returns_200(monkeypatch):
         ({"token": ACCESS_VALUE, "client_id": "client123"}, 401),
         # Everything else the RFC calls indistinguishable.
         ({"token": ACCESS_VALUE, "client_id": "other"}, 200),
+        ({"token": ACCESS_VALUE}, 200),
         ({"token": "unknown"}, 200),
     ],
 )

@@ -282,7 +282,11 @@ def test_rfc_revocation_endpoint_kills_the_whole_family(monkeypatch):
     monkeypatch.setattr(oauth, "async_session", lambda: session)
 
     response = asyncio.run(
-        oauth.revoke_token.__wrapped__(_FormRequest({"token": "access-secret"}))
+        oauth.revoke_token.__wrapped__(
+            # `client_id` must be present and match — its absence is not a
+            # match. See tests/test_issue_64_revocation_endpoint_auth.py.
+            _FormRequest({"token": "access-secret", "client_id": "client123"})
+        )
     )
 
     assert response.status_code == 200

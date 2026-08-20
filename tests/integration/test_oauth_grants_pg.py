@@ -506,3 +506,30 @@ async def test_naming_another_client_is_a_200_that_does_nothing(clean):
 
     assert response.status_code == 200
     assert await live_count(sessionmaker) == 2
+
+
+async def test_omitting_client_id_revokes_nothing_even_for_a_public_client(clean):
+    """Absence is not a match, over real rows.
+
+    A public client carries no secret, so `_client_authenticated` passes
+    trivially. Had a missing `client_id` also counted as naming the right
+    client, posting somebody else's token value with no client field at all
+    would have ended their 30-day grant while proving nothing — and unlike
+    `/token`, no PKCE verifier binds this request to anyone.
+    """
+    sessionmaker = clean
+    await seed_client(sessionmaker)  # public: token_endpoint_auth_method='none'
+    refresh_value = await seed_grant(sessionmaker)
+
+    response = await oauth.revoke_token.__wrapped__(_FormReq({"token": refresh_value}))
+
+    assert response.status_code == 200, "still a uniform 200 (RFC 7009 §2.2)"
+    assert await live_count(sessionmaker) == 2, "nothing may be revoked"
+
+    # Naming the client is all it takes for the same public client to succeed,
+    # so the refusal above is about identification, not about public clients.
+    allowed = await oauth.revoke_token.__wrapped__(
+        _FormReq({"token": refresh_value, "client_id": "c1"})
+    )
+    assert allowed.status_code == 200
+    assert await live_count(sessionmaker) == 0

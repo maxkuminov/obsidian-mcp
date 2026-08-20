@@ -963,16 +963,24 @@ async def revoke_token(request: Request):
                 # is not valid *for the requesting client*, that is not an
                 # error" — an unknown, foreign or unauthenticated token is
                 # indistinguishable from an already-revoked one. So a caller
-                # naming a different client is answered 200 and nothing
-                # happens, rather than being told whose token it is.
+                # who does not identify himself as this token's client is
+                # answered 200 and nothing happens, rather than being told
+                # whose token it is.
                 #
-                # A missing `client_id` is tolerated the same way `/token`
-                # tolerates it (some ChatGPT connector builds omit it): the
-                # client is then identified by the token itself, and a
-                # confidential client still has to present its secret.
+                # `client_id` must be **present and exactly equal**. Treating
+                # its absence as a match was a hole, not a tolerance: a public
+                # client authenticates trivially (no secret to check), so
+                # "omit client_id" was a universal bypass — anyone holding A's
+                # token could end A's whole grant without naming a client at
+                # all, and for a public client without proving anything. Unlike
+                # `/token`, where PKCE still binds the request to the
+                # initiating client and the code identifies it, nothing else
+                # here identifies the caller. There is no ChatGPT-compatibility
+                # cost either: revocation is optional for a client, and RFC
+                # 7009 §2.1 requires it to authenticate when it does revoke.
                 if client is None:
                     return JSONResponse({})
-                if client_id and client_id != oauth_token.client_id:
+                if not client_id or client_id != oauth_token.client_id:
                     return JSONResponse({})
                 if not _client_authenticated(client, client_secret):
                     # The one case that is a real error rather than a no-op:

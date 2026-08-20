@@ -328,6 +328,88 @@ def test_panel_scope_change_is_refused_for_an_offline_only_client():
         )
 
 
+# --- the panel does not badge such a token "Active" -----------------------
+
+
+def _render_panel(clients, tokens):
+    from _oauth_grant_fakes import FakeRequest
+
+    from src.control_panel import routes as panel_routes
+
+    session = FakeSession(clients=clients, tokens=tokens)
+    response = asyncio.run(
+        panel_routes.oauth_page(
+            request=FakeRequest(), session=session, user=SingleUserSentinel()
+        )
+    )
+    return response.body.decode()
+
+
+def test_panel_shows_no_vault_scope_instead_of_active():
+    """The panel must not over-report liveness (the #76 direction).
+
+    `src/mcp_server/auth.py` 401s this token, so rendering it green — with a
+    working scope dropdown next to it — told the operator a dead credential
+    was live and offered a control that could only ever be refused.
+    """
+    tokens = [
+        FakeToken(grant_id="g1", token_type="access", scope=OFFLINE_ONLY),
+        FakeToken(grant_id="g1", token_type="refresh", scope=OFFLINE_ONLY),
+    ]
+
+    html = _render_panel([FakeClient(scope=OFFLINE_ONLY)], tokens)
+
+    assert "No vault scope" in html
+    assert 'class="badge badge-green"' not in html
+    # No scope control and no Revoke: the credential authenticates nowhere,
+    # and the select could only write a scope the client is not registered for.
+    assert "<option" not in html
+    assert "/revoke" not in html
+
+
+def test_the_grant_status_itself_is_no_vault_scope():
+    """Asserted on the route's own view, not just the rendered string."""
+    import pytest as _pytest
+
+    from _oauth_grant_fakes import FakeRequest
+    from src.control_panel import routes as panel_routes
+
+    tokens = [FakeToken(grant_id="g1", token_type="access", scope=OFFLINE_ONLY)]
+    session = FakeSession(clients=[FakeClient(scope=OFFLINE_ONLY)], tokens=tokens)
+    captured = {}
+    real = panel_routes.templates.TemplateResponse
+
+    def _capture(request, name, context, *a, **kw):
+        captured.update(context)
+        return real(request, name, context, *a, **kw)
+
+    mp = _pytest.MonkeyPatch()
+    try:
+        mp.setattr(panel_routes.templates, "TemplateResponse", _capture)
+        asyncio.run(
+            panel_routes.oauth_page(
+                request=FakeRequest(), session=session, user=SingleUserSentinel()
+            )
+        )
+    finally:
+        mp.undo()
+
+    grant = captured["clients"][0]["grants"][0]
+    assert grant["status"] == "no_vault_scope"
+    assert grant["token_id"] is None, "nothing to act on"
+    assert grant["has_write"] is False
+
+
+def test_a_normal_grant_is_still_active():
+    """The guard must not swallow the ordinary case."""
+    tokens = [FakeToken(grant_id="g1", token_type="access", scope="read")]
+
+    html = _render_panel([FakeClient(scope="read")], tokens)
+
+    assert "No vault scope" not in html
+    assert 'class="badge badge-green"' in html
+
+
 # --- and the enforcement boundary rejects a legacy token ------------------
 
 

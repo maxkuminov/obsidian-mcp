@@ -66,6 +66,11 @@
                         <span class="badge badge-yellow">Owner inactive</span>
                         {% elif grant.status == 'expired' %}
                         <span class="badge badge-yellow">Expired</span>
+                        {% elif grant.status == 'no_vault_scope' %}
+                        {# `offline_access` alone grants nothing, and the middleware
+                           401s it. Showing "Active" with a working scope control was
+                           the same over-reporting of liveness #76 was about. #}
+                        <span class="badge badge-red" title="This grant carries no vault scope ('read' or 'readwrite'), so it cannot authenticate. Re-register the client with a vault scope and reconnect.">No vault scope</span>
                         {% else %}
                         <span class="badge badge-red">Revoked</span>
                         {% endif %}
@@ -126,7 +131,7 @@
                         {# Revoked and expired rows stay listed, dimmed. Removing them is what
                            made a revocation that did nothing look like one that worked. #}
                         {% for token in grant.tokens %}
-                        <tr {% if token.status in ('revoked', 'expired') %}style="opacity:0.5;"{% endif %}>
+                        <tr {% if token.status in ('revoked', 'expired', 'no_vault_scope') %}style="opacity:0.5;"{% endif %}>
                             <td>
                                 {% if token.token_type == 'access' %}
                                 <span class="badge badge-purple">{{ token.token_type }}</span>
@@ -140,6 +145,8 @@
                                 <span class="badge badge-red">Revoked</span>
                                 {% elif token.status == 'expired' %}
                                 <span class="badge badge-yellow">Expired</span>
+                                {% elif token.status == 'no_vault_scope' %}
+                                <span class="badge badge-red">No vault scope</span>
                                 {% elif token.status == 'owner_inactive' %}
                                 <span class="badge badge-yellow">Owner inactive</span>
                                 {% else %}

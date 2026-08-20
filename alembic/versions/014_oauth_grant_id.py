@@ -125,18 +125,53 @@ def _column_shape(bind):
     ).first()
 
 
-def _index_column(bind):
-    """The column our index name is defined on, or None if the name is free."""
+def _existing_index(bind):
+    """Everything we need to judge a pre-existing index of our name.
+
+    `(relname_of_table, indisvalid, is_partial, has_expressions, key_attnums)`,
+    or None when the name is free.
+
+    The first version of this asked only "which column is it on?" and matched
+    with `attnum = ANY(indkey)`. That accepts an impostor several ways over: a
+    *partial* index (`WHERE token_type = 'access'`) covers a subset of rows, an
+    *expression* index (`lower(grant_id)`) cannot serve an equality lookup on
+    the column, a *multi-column* index leads with the wrong key, one on another
+    table entirely shares nothing but the name, and an INVALID leftover from a
+    failed `CREATE INDEX CONCURRENTLY` is not usable at all. Every one of those
+    would be kept by `CREATE INDEX IF NOT EXISTS` and leave `alembic check`
+    permanently dirty while looking installed — autogenerate compares index
+    *names*.
+
+    `indkey` is an int2vector; `string_to_array(indkey::text, ' ')` is the
+    portable way to read it as an array. A zero entry means an expression
+    column, which `indexprs IS NOT NULL` already catches.
+    """
     return bind.execute(
         sa.text(
-            "SELECT a.attname FROM pg_index i "
+            "SELECT t.relname AS table_name, "
+            "       i.indisvalid, "
+            "       (i.indpred IS NOT NULL) AS is_partial, "
+            "       (i.indexprs IS NOT NULL) AS has_expressions, "
+            "       string_to_array(i.indkey::text, ' ')::int[] AS key_attnums "
+            "FROM pg_index i "
             "JOIN pg_class c ON c.oid = i.indexrelid "
-            "JOIN pg_attribute a ON a.attrelid = i.indrelid "
-            "                   AND a.attnum = ANY(i.indkey) "
+            "JOIN pg_class t ON t.oid = i.indrelid "
             "WHERE c.relname = :index"
         ),
         {"index": INDEX},
-    ).scalar_one_or_none()
+    ).first()
+
+
+def _column_attnum(bind) -> int:
+    """`pg_attribute.attnum` for `grant_id` — what `indkey` holds."""
+    return bind.execute(
+        sa.text(
+            "SELECT attnum FROM pg_attribute "
+            "WHERE attrelid = CAST(:table AS regclass) AND attname = :column "
+            "  AND attnum > 0 AND NOT attisdropped"
+        ),
+        {"table": TABLE, "column": COLUMN},
+    ).scalar_one()
 
 
 def _require_pre_existing_column_is_ours(bind, shape) -> None:
@@ -156,13 +191,38 @@ def _require_pre_existing_column_is_ours(bind, shape) -> None:
             "Nothing has been changed."
         )
 
-    index_column = _index_column(bind)
-    if index_column not in (None, COLUMN):
-        raise RuntimeError(
-            f"index {INDEX} already exists on column {index_column!r}, not "
-            f"{COLUMN!r}. `alembic check` would stay dirty forever. Drop or "
-            "rename it by hand, then re-run. Nothing has been changed."
-        )
+    existing = _existing_index(bind)
+    if existing is not None:
+        table_name, indisvalid, is_partial, has_expressions, key_attnums = existing
+        expected = [_column_attnum(bind)]
+        problem = None
+        if table_name != TABLE:
+            problem = f"it indexes table {table_name!r}, not {TABLE!r}"
+        elif not indisvalid:
+            problem = (
+                "it is INVALID (a failed CREATE INDEX CONCURRENTLY leaves one "
+                "behind); it cannot serve a lookup"
+            )
+        elif is_partial:
+            problem = (
+                "it is a partial index (has a WHERE clause), so it covers only "
+                "some rows"
+            )
+        elif has_expressions:
+            problem = "it indexes an expression, not the bare column"
+        elif list(key_attnums) != expected:
+            problem = (
+                f"its key columns are attnums {list(key_attnums)}, not exactly "
+                f"[{expected[0]}] ({COLUMN})"
+            )
+        if problem is not None:
+            raise RuntimeError(
+                f"index {INDEX} already exists but {problem}. "
+                "`CREATE INDEX IF NOT EXISTS` would keep it and `alembic check` "
+                "would stay dirty forever, because autogenerate compares index "
+                "names. Drop or rename it by hand, then re-run. Nothing has "
+                "been changed."
+            )
 
 
 def _assert_no_partial_stamping(bind) -> None:

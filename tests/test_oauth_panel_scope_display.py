@@ -113,7 +113,6 @@ def test_oauth_page_and_middleware_agree_on_every_scope_string():
         "readwrite",
         "offline_access read",
         "offline_access readwrite",
-        "",
     ):
         middleware_permission = "readwrite" if token_has_write(scope) else "read"
         html = render_oauth_page(
@@ -121,6 +120,17 @@ def test_oauth_page_and_middleware_agree_on_every_scope_string():
             tokens=[FakeToken(grant_id="g1", scope=scope)],
         )
         assert selected_option(html) == middleware_permission, scope
+
+    # A scope with no vault permission at all is not "read" on either side:
+    # the middleware 401s it and the page offers no scope control for it.
+    # Feeding it to `selected_option` would assert a permission neither layer
+    # grants — see tests/test_issue_67_offline_access_only_client.py.
+    for scope in ("", "offline_access"):
+        html = render_oauth_page(
+            clients=[FakeClient()],
+            tokens=[FakeToken(grant_id="g1", scope=scope)],
+        )
+        assert "<option" not in html, scope
 
     # And the middleware really is built on that helper, not a private copy.
     source = mcp_auth.__file__

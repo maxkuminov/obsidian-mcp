@@ -1030,19 +1030,88 @@ def test_a_pre_existing_column_of_the_wrong_type_is_refused():
         assert column_shape(url, "oauth_tokens", "grant_id")[1] == "text"
 
 
-def test_a_squatting_index_name_is_refused():
-    """`CREATE INDEX IF NOT EXISTS` would silently keep the wrong index.
+# Every shape a `CREATE INDEX IF NOT EXISTS` would happily keep while
+# `alembic check` — which compares index *names* — reports the index installed.
+# "Which column is it on?" accepts most of these: a partial index covers a
+# subset of rows, an expression index cannot serve an equality lookup on the
+# column, a multi-column index leads with the wrong key, and an INVALID
+# leftover from a failed CREATE INDEX CONCURRENTLY is not usable at all.
+INDEX_IMPOSTORS = (
+    (
+        "wrong column",
+        "CREATE INDEX ix_oauth_tokens_grant_id ON oauth_tokens (token_type)",
+        "key columns are attnums",
+    ),
+    (
+        "partial",
+        "CREATE INDEX ix_oauth_tokens_grant_id ON oauth_tokens (grant_id) "
+        "WHERE token_type = 'access'",
+        "partial index",
+    ),
+    (
+        "expression",
+        "CREATE INDEX ix_oauth_tokens_grant_id ON oauth_tokens (lower(grant_id))",
+        "indexes an expression",
+    ),
+    (
+        "multi-column, right column second",
+        "CREATE INDEX ix_oauth_tokens_grant_id ON oauth_tokens (token_type, grant_id)",
+        "key columns are attnums",
+    ),
+    (
+        "multi-column, right column first",
+        "CREATE INDEX ix_oauth_tokens_grant_id ON oauth_tokens (grant_id, token_type)",
+        "key columns are attnums",
+    ),
+    (
+        "on another table",
+        "CREATE INDEX ix_oauth_tokens_grant_id ON oauth_codes (client_id)",
+        "indexes table",
+    ),
+)
 
-    `alembic check` compares index *names*, so an index of our name on another
-    column leaves the check permanently dirty while looking installed.
-    """
-    with throwaway_db("schema_grant_index_squat", revision="012") as url:
+
+@pytest.mark.parametrize(
+    "label, ddl, message",
+    INDEX_IMPOSTORS,
+    ids=[case[0] for case in INDEX_IMPOSTORS],
+)
+def test_a_squatting_index_name_is_refused(label, ddl, message):
+    """Anything under our name that is not exactly our index is refused."""
+    with throwaway_db(f"schema_grant_index_{abs(hash(label)) % 10**8}", revision="012") as url:
         seed_pre_014_tokens(url)
         add_bare_grant_id_column(url)
         sql(url, "UPDATE oauth_tokens SET grant_id = 'g-' || id::text")
+        sql(url, ddl)
+
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+
+        assert result.returncode != 0, label
+        combined = result.stdout + result.stderr
+        assert "ix_oauth_tokens_grant_id already exists" in combined, label
+        assert message in combined, combined[-2000:]
+        assert alembic_version(url) == "012"
+
+
+def test_an_invalid_index_of_our_name_is_refused():
+    """A failed `CREATE INDEX CONCURRENTLY` leaves an INVALID index behind.
+
+    It has the right name, the right table and the right key column, and it
+    cannot serve a single lookup. Only `pg_index.indisvalid` distinguishes it.
+    """
+    with throwaway_db("schema_grant_index_invalid", revision="012") as url:
+        seed_pre_014_tokens(url)
+        add_bare_grant_id_column(url)
+        sql(url, "UPDATE oauth_tokens SET grant_id = 'g-' || id::text")
+        sql(url, "CREATE INDEX ix_oauth_tokens_grant_id ON oauth_tokens (grant_id)")
+        # Postgres offers no supported way to invalidate an index, so mark it
+        # directly — the catalog state is what the migration reads.
         sql(
             url,
-            "CREATE INDEX ix_oauth_tokens_grant_id ON oauth_tokens (token_type)",
+            "UPDATE pg_index SET indisvalid = false WHERE indexrelid = "
+            "'ix_oauth_tokens_grant_id'::regclass",
         )
 
         result = _harness.run_alembic(
@@ -1050,8 +1119,26 @@ def test_a_squatting_index_name_is_refused():
         )
 
         assert result.returncode != 0
-        assert "already exists on column" in result.stdout + result.stderr
+        assert "INVALID" in result.stdout + result.stderr
         assert alembic_version(url) == "012"
+
+
+def test_the_genuine_index_is_accepted():
+    """The whole point of the checks above is not to reject our own index."""
+    with throwaway_db("schema_grant_index_ok", revision="012") as url:
+        seed_pre_014_tokens(url)
+        add_bare_grant_id_column(url)
+        sql(
+            url,
+            "UPDATE oauth_tokens SET grant_id = "
+            "  'hand-' || client_id || '-' || coalesce(user_id::text, 'null')",
+        )
+        sql(url, "CREATE INDEX ix_oauth_tokens_grant_id ON oauth_tokens (grant_id)")
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == "014"
+        assert_reconciled(url, marker_expected=False)
 
 
 def test_a_complete_pre_existing_column_is_accepted():

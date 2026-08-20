@@ -21,6 +21,12 @@ Two things close it, and both are pinned here:
 The lock order (bootstrap key first, then the per-grant key) is asserted
 because it is what keeps the panel's family operations — which take only the
 grant lock — from closing a cycle with the token endpoint.
+
+The last section covers the *other* end: a token that already exists with no
+owner must not authenticate. That gate lives in `APIKeyMiddleware`
+(`reason=ownerless_credential`) and is pinned here too, because the mint-side
+refusals above are only half of the property — they stop new ones, not the
+ones a configuration cycle left behind.
 """
 import asyncio
 import json
@@ -247,3 +253,185 @@ def test_the_lock_is_taken_before_anything_is_written(monkeypatch, handler):
 
     assert session.advisory_locks, "no lock taken at all"
     assert session.advisory_locks[0] == USER_BOOTSTRAP_LOCK_KEY
+
+
+# --- the other end: an existing ownerless token must not authenticate -----
+
+
+class _EmptyResult:
+    rowcount = 0
+
+
+class _RowsResult:
+    def __init__(self, rows):
+        self._rows = list(rows)
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return list(self._rows)
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+    def scalar_one_or_none(self):
+        return self._rows[0] if self._rows else None
+
+
+class _ScalarResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar_one_or_none(self):
+        return self._value
+
+    def scalars(self):
+        return self
+
+    def all(self):
+        return [self._value]
+
+
+class _MiddlewareSession:
+    """Answers the statements `APIKeyMiddleware` issues on the OAuth branch."""
+
+    def __init__(self, token, *, client_owner=None, user_active=True):
+        self.token = token
+        self.client_owner = client_owner
+        self.user_active = user_active
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def commit(self):
+        pass
+
+    async def execute(self, stmt, *_a, **_kw):
+        sql = str(stmt)
+        if sql.startswith("UPDATE"):
+            return _EmptyResult()
+        if "FROM oauth_tokens" in sql:
+            return _RowsResult([self.token])
+        if "FROM oauth_clients" in sql:
+            return _ScalarResult(self.client_owner)
+        if "vault_path" in sql:
+            return _RowsResult([])
+        return _ScalarResult(self.user_active)
+
+
+def _drive_middleware(token, *, multi_user, client_owner=None):
+    """Run the real middleware over one bearer token; return (sent, called)."""
+    import src.mcp_server.auth as mcp_auth
+
+    sent = []
+    called = []
+
+    async def _send(message):
+        sent.append(message)
+
+    async def _receive():  # pragma: no cover - never awaited
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def _downstream(scope, receive, send):
+        called.append(True)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def run():
+        mp = pytest.MonkeyPatch()
+        try:
+            mp.setattr(
+                mcp_auth,
+                "async_session",
+                lambda: _MiddlewareSession(token, client_owner=client_owner),
+            )
+            mp.setattr(mcp_auth.settings, "multi_user_mode", multi_user, raising=False)
+            app = mcp_auth.APIKeyMiddleware(_downstream)
+            await app(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/mcp/",
+                    "headers": [(b"authorization", b"Bearer live-token")],
+                },
+                _receive,
+                _send,
+            )
+        finally:
+            mp.undo()
+
+    asyncio.run(run())
+    return sent, called
+
+
+def _live_token(user_id, *, client_id="client123", scope="readwrite"):
+    return OAuthToken(
+        id=91,
+        token_hash=oauth._hash("live-token"),
+        token_type="access",
+        client_id=client_id,
+        scope=scope,
+        grant_id="g1",
+        user_id=user_id,
+        revoked=False,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+
+
+def test_an_ownerless_token_is_refused_by_the_middleware_in_multi_user_mode():
+    """The Codex BLOCKER, pinned end to end.
+
+    A token minted while multi-user mode was off keeps `user_id IS NULL`, and
+    the bootstrap backfill only claims NULL rows while `users` is empty — so
+    flipping the flag after users exist never adopts it. Every layer then read
+    that token as the single-user identity and handed it the global vault. Here
+    the client is bound to user A, which is exactly the shape that makes the
+    token's NULL owner indefensible.
+    """
+    sent, called = _drive_middleware(
+        _live_token(None), multi_user=True, client_owner=1
+    )
+
+    assert sent, "the middleware sent nothing at all"
+    assert sent[0]["status"] == 401
+    assert called == [], "the downstream app must never run"
+    assert b"Invalid or revoked token" in sent[1]["body"]
+
+
+def test_the_same_token_is_accepted_in_single_user_mode():
+    """`user_id IS NULL` *is* the identity there; the refusal must be scoped."""
+    sent, called = _drive_middleware(
+        _live_token(None), multi_user=False, client_owner=None
+    )
+
+    assert sent[0]["status"] == 200
+    assert called == [True]
+
+
+def test_an_owned_token_still_authenticates_in_multi_user_mode():
+    sent, called = _drive_middleware(_live_token(1), multi_user=True, client_owner=1)
+
+    assert sent[0]["status"] == 200
+    assert called == [True]
+
+
+def test_an_owned_token_under_another_users_client_is_refused():
+    """The cross-user grant check, at the boundary rather than at mint."""
+    sent, called = _drive_middleware(_live_token(2), multi_user=True, client_owner=1)
+
+    assert sent[0]["status"] == 401
+    assert called == []
+
+
+def test_a_token_with_no_vault_scope_is_refused():
+    """`offline_access` alone authenticates nowhere."""
+    sent, called = _drive_middleware(
+        _live_token(1, scope="offline_access"), multi_user=True, client_owner=1
+    )
+
+    assert sent[0]["status"] == 401
+    assert called == []

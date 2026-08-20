@@ -168,9 +168,22 @@ def _single_column(stmt) -> str | None:
     return getattr(descriptions[0].get("expr"), "key", None)
 
 
+# The one statement `lock_grant` / `lock_user_bootstrap` issue, whitespace
+# normalized. Matching the *whole* statement rather than searching for the
+# function name is the point: a substring test counts a decoy — the name
+# appearing in a SQL comment, in a CTE that also does something else, or in a
+# `text()` a future caller writes — as a lock that was never taken, so a test
+# asserting "the lock came first" would pass on a handler that never locked.
+ADVISORY_LOCK_SQL = "SELECT pg_advisory_xact_lock(:key)"
+
+
+def _normalized_sql(stmt) -> str:
+    return " ".join(str(stmt).split())
+
+
 def _is_advisory_lock(stmt) -> bool:
-    """Is this the textual `pg_advisory_xact_lock` statement, specifically?"""
-    return "pg_advisory_xact_lock" in str(stmt)
+    """Is this *exactly* the advisory-lock statement, and nothing else?"""
+    return _normalized_sql(stmt) == ADVISORY_LOCK_SQL
 
 
 def _window_value(clause):
@@ -310,15 +323,67 @@ class FakeSession:
         ("scope_1", "scope"),
     )
 
+    def _matches_bound_params(self, token, bound: dict) -> bool:
+        """The equality predicates, for a row already past a compound clause."""
+        return all(
+            getattr(token, attribute) == bound[param]
+            for param, attribute in self._TOKEN_PREDICATES
+            if param in bound
+        )
+
     def _filter_tokens(self, stmt, bound: dict) -> list:
         rows = list(self.tokens)
-        rendered = str(stmt)
+        rendered = _normalized_sql(stmt)
+        cutoff = bound.get("expires_at_1")
+
+        # `oauth_page`'s history query is a *disjunction* —
+        # `revoked OR expires_at <= now` — and evaluating its two halves as
+        # separate ANDed filters (which is what a per-predicate loop does)
+        # would drop every revoked-but-unexpired row, i.e. exactly the
+        # revocation the operator just performed. Recognise the group and
+        # evaluate it as one.
+        # No surrounding parens in the pattern: SQLAlchemy adds them only when
+        # the disjunction is ANDed with something else (as `oauth_page` does,
+        # with `client_id`), and omits them when it is the whole WHERE clause.
+        dead_group = (
+            "oauth_tokens.revoked = true OR oauth_tokens.expires_at <= "
+            ":expires_at_1"
+        )
+        if dead_group in rendered:
+            assert cutoff is not None
+            return [
+                t for t in rows
+                if (t.revoked or t.expires_at <= cutoff)
+                and self._matches_bound_params(t, bound)
+            ]
+
         # `revoked == False` / `== True` compile to SQL literals rather than
         # bind params, so they have to be read off the rendered statement.
         if "oauth_tokens.revoked = false" in rendered:
             rows = [t for t in rows if not t.revoked]
         if "oauth_tokens.revoked = true" in rendered:
             rows = [t for t in rows if t.revoked]
+
+        # Both expiry directions. `oauth_page` splits its listing with
+        # `expires_at > now` and `expires_at <= now`, and a fake that ignored
+        # them returned every row to both queries — so the split the panel
+        # depends on (live rows unbounded, history capped) was never exercised,
+        # and an expired token would have rendered as live.
+        if cutoff is not None:
+            for operator, keep in (
+                (">=", lambda t: t.expires_at >= cutoff),
+                ("<=", lambda t: t.expires_at <= cutoff),
+                (">", lambda t: t.expires_at > cutoff),
+                ("<", lambda t: t.expires_at < cutoff),
+            ):
+                if f"oauth_tokens.expires_at {operator} :expires_at_1" in rendered:
+                    rows = [t for t in rows if keep(t)]
+                    break
+            else:  # pragma: no cover - a shape the fake does not model
+                raise AssertionError(
+                    f"unrecognised expires_at comparison in: {rendered}"
+                )
+
         for param, attribute in self._TOKEN_PREDICATES:
             if param in bound:
                 rows = [t for t in rows if getattr(t, attribute) == bound[param]]

@@ -57,10 +57,18 @@
 - [x] 8.8 MINOR — `clamp_scope` fails closed on an empty intersection (section 3 above)
 - [x] 8.9 MINOR — fakes match the literal `pg_advisory_xact_lock` and honour LIMIT/OFFSET; `tests/integration/test_oauth_grants_pg.py` adds real-Postgres coverage of revoke-vs-refresh ordering (deterministically gated, not a `gather` and a hope), concurrent first consent, and client-authenticated `/revoke`
 
+## 9. Adversarial round 2 (Codex: 1 BLOCKER, 2 MAJOR, 1 MINOR)
+
+- [x] 9.0 Rebase onto `origin/main` (three merged slices; `src/mcp_server/auth.py` and `src/services/vault.py` overlapped). The round-2 BLOCKER — an ownerless OAuth token accepted in multi-user mode — is what main's `ownerless_credential` check rejects; pinned in this branch's suite too, end to end through the middleware
+- [x] 9.1 MAJOR — `/revoke` requires `client_id` present **and** equal; absence was a universal bypass because a public client authenticates trivially
+- [x] 9.2 MAJOR — `_token_status` includes `has_vault_scope`, rendering a distinct "No vault scope" state with no scope or revoke control
+- [x] 9.3 MINOR — 014's index check reads `pg_index` (table, `indisvalid`, `indpred`, `indexprs`, exact key attnums); partial / expression / multi-column / wrong-table / INVALID impostors all refused
+- [x] 9.4 MINOR — the fake matches only the exact normalized lock statement and interprets both `expires_at` directions (and the history disjunction as a disjunction); `tests/test_oauth_grant_fakes_fidelity.py` pins both, verified by mutation
+
 ## 7. Gates
 
-- [x] 7.1 `pytest --ignore=tests/integration` green (1063 passed, 5 skipped; baseline 940/5)
-- [x] 7.2 `make test-schema` green (27 passed) — includes `alembic check` clean on every path
+- [x] 7.1 `pytest --ignore=tests/integration` green (1213 passed, 5 skipped, post-rebase)
+- [x] 7.2 `make test-schema` green (34 passed) — includes `alembic check` clean on every path
 - [x] 7.3 `openspec validate oauth-grant-families --strict`
-- [x] 7.4 Adversarial Codex round 1 findings addressed (section 8); re-run is orchestrator's
+- [x] 7.4 Adversarial Codex rounds 1 and 2 addressed (sections 8 and 9); re-run is orchestrator's
 - [ ] 7.5 Deploy + `make db-check` (orchestrator-run)
