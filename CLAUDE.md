@@ -229,6 +229,18 @@ nothing about the migration body.
   It logs and swallows ordinary failures (the indexer's `consecutive_failures`
   must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
   still stops the loop.
+- **The dashboard's "Last run" is an in-process heartbeat, not
+  `max(notes_metadata.indexed_at)`.** `indexer.last_index_run_at` /
+  `last_index_run_ok` are stamped at the end of the startup pass and of every
+  periodic tick (`False` in the `except Exception` branch; `CancelledError` is
+  a `BaseException` so shutdown is not recorded as a failure). `indexed_at`
+  only moves for notes a pass actually upserted or moved, so a pass over an
+  unchanged vault writes it nowhere and a healthy indexer looked stalled for
+  days on an idle vault — an invitation to reach for the Danger zone and
+  re-embed the whole vault for nothing (#78). `max(indexed_at)` is still shown,
+  under its own label "Last change detected". No migration and no per-tick
+  write: it answers "is *this process's* loop alive", which is a property of
+  the process, and it resets to `None` on restart until the startup pass lands.
 - **Because the pre-warm holds `index_pass_lock`, the panel's destructive
   actions take it too.** `reset_embeddings` and `trigger_reembed` set
   `indexer_paused`, then `await session.close()` on the request's own session
@@ -344,6 +356,14 @@ plan there, so it is recorded, not asserted).
 no embedding call). A single whole-call `duration_ms` could not separate the
 two independent cold paths — provider eviction and HNSW page cache — so the
 last regression had to be diagnosed with hand-run probes against the live DB.
+
+**`usage_logs.tool` must hold the name the tool is registered under.**
+`_tracked`'s first argument is that name, and FastMCP takes it from the
+function name in `server.py` — so `search_notes_impl` is logged as
+`keyword_search`, not `search_notes`, which named a tool no client is ever
+offered and made `WHERE tool = 'keyword_search'` return nothing (#78). Rows
+written before that fix keep the old spelling, which is why `_usage_detail` in
+`src/control_panel/routes.py` still lists it alongside the current one.
 
 The holder is a `ContextVar` in `src/services/timing.py`, **owned by
 `_tracked`**: fresh dict at call start, cleared in `finally`. The ContextVar

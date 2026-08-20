@@ -157,7 +157,11 @@ def _tracked(tool_name: str, param_keys: list[str], transforms: dict | None = No
     return decorator
 
 
-@_tracked("search_notes", ["query", "folder", "limit", "tags", "frontmatter"])
+# The tool this impl backs is registered as `keyword_search` (server.py takes
+# the function name), so that is what `usage_logs.tool` must record — the old
+# "search_notes" named a tool no client was ever offered, which made the audit
+# trail unsearchable in both directions (#78).
+@_tracked("keyword_search", ["query", "folder", "limit", "tags", "frontmatter"])
 async def search_notes_impl(
     query: str,
     folder: str | None = None,

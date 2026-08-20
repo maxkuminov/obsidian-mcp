@@ -321,6 +321,8 @@ async def dashboard(
     def _usage_detail(tool: str, params: dict | None) -> str | None:
         if not params:
             return None
+        # "search_notes" is the legacy spelling `keyword_search` was logged
+        # under before #78; historical rows keep it, so it stays here.
         if tool in ("search_notes", "keyword_search", "semantic_search"):
             return params.get("query")
         if tool in ("read_note", "create_note", "edit_note"):
@@ -338,7 +340,19 @@ async def dashboard(
     ]
 
     graph = await _graph_stats(session, uid)
+    # Imported at call time so the values are read fresh each request (module
+    # attributes, not a snapshot taken at import).
+    from src.services import indexer as _indexer
     from src.services.indexer import link_backfill_in_progress
+
+    # "Last run" is the indexer's own heartbeat, not `max(indexed_at)`.
+    # `notes_metadata.indexed_at` only moves for notes a pass actually
+    # upserted or moved, so on an idle vault a perfectly healthy indexer
+    # looked stalled for days (#78). It is process-wide (the loop is), so it
+    # is not scoped by `uid` the way the note aggregates are — that is a fact
+    # about the server, and every panel user sees the same one.
+    last_run_at = _indexer.last_index_run_at
+    last_run_ok = _indexer.last_index_run_ok
 
     return templates.TemplateResponse(request, "dashboard.html", _panel_context(request, user, {
         "active": "dashboard",
@@ -353,6 +367,9 @@ async def dashboard(
         "reindexed_24h": reindexed_24h,
         "last_indexed_iso": last_indexed_at.isoformat() if last_indexed_at else None,
         "last_indexed_rel": _humanize_delta(last_indexed_at),
+        "last_run_iso": last_run_at.isoformat() if last_run_at else None,
+        "last_run_rel": _humanize_delta(last_run_at),
+        "last_run_ok": last_run_ok,
         "index_interval": settings.index_interval_seconds,
         "graph": graph,
         "graph_backfill_running": link_backfill_in_progress,
