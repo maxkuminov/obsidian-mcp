@@ -680,7 +680,7 @@ may do at mint time, and the route acts on nothing else.**
 
 **Tools** (`src/mcp_server/tools.py`, registered in `server.py`):
 - `request_upload(path, overwrite=False, expires_in=None)` — readwrite. Mints a single-use upload capability; returns `upload_id` (opaque `public_id`, never the row id), a `…/transfer/upload#<token>` URL, `expires_at` and `max_bytes`.
-- `check_upload(upload_id)` — `pending` | `uploading` | `unknown` | `revoked` | `completed{path,size,sha256,mime,completed_at}` | `expired`, scoped to the exact minting credential *and* user. Another identity's handle is `not found`. See "check_upload answers for the vault, not for the row" below.
+- `check_upload(upload_id)` — `pending` | `uploading` | `unknown` | `revoked` | `completed{path,size,sha256,mime,completed_at}` | `expired`, scoped to the minting **principal** *and* user — the API key itself, or, for OAuth, the whole grant family behind the presented access token. Another principal's handle is `not found`. See "check_upload answers for the vault, not for the row" below.
 - `request_download(path, expires_in=None)` — read is enough. Multi-use within its TTL; bound to the file's exact bytes at mint.
 - `import_from_url(url, path, overwrite=False)` — readwrite. Server-side fetch under the SSRF policy, straight through the same capped, anchored publish.
 - `delete_file(path, permanent=False)` — readwrite. See "File-access tools".
@@ -704,9 +704,44 @@ Three rules, each of which was violated by reading `state` and `expires_at` and 
 
 - **A claimed token is answered before expiry, and never as "never used".** `claimed` past its TTL is reached by exactly one path — `PostPublishFailure` — and that path runs *after* the bytes are in the vault. The expiry branch used to fire first and say the link "was never used", about a file sitting at the path; with a ten-minute TTL that was the answer an agent was most likely to see (#75). Inside `min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)` the answer is `uploading` and it names that deadline; past it, `unknown` — the bytes may be there, go `list_files`/`read_file` the path before re-minting, the same thing `import_from_url` says for the same outcome. `consumed` is the one mid-flight end state that *is* provably empty (the timeout paths raise before `publish`), and it says so.
 - **One deadline, and one clock.** The arithmetic lives once, in `transfer.upload_stream_deadline`, which returns an *absolute UTC instant*; `routes._upload_deadline` returns that instant unchanged and the route hands it to `stream_to_vault`, which measures it through `transfer._deadline_remaining` against `transfer.now_utc()` — the same function `check_upload` compares with. Both halves are load-bearing. A second copy of the arithmetic would drift. Converting to `time.monotonic()` at claim time (which is what the route used to do) keeps the arithmetic shared but splits the *clock*: a realtime step then moves the tool and not the route, and the tool reports a stream live that the route has already killed. The accepted trade-off is that a backward realtime step extends an upload — two surfaces that agree beats two that disagree, because the disagreement is what an agent relays to a human. `import_from_url` still passes a monotonic float: its fetch budget is private and no surface reports on it. **Nothing under `src/transfer/` may define its own "now".**
-- **Liveness is re-checked, inside the open session.** `lookup_by_public_id` filters on public_id/direction/identity only, while `PUT /transfer/upload` also requires `resolve_identity_ok(need_write=True)` and `resolve_root_ok`. So after an OAuth scope downgrade or a vault reassignment the tool asserted "pending" about a link every redemption would 404 (#71). Both predicates now run for `pending`/`claimed` rows and produce a `revoked` answer naming the cause. **`completed` rows are deliberately not re-checked** — that transfer already happened, and a later revocation must not turn a true report of a landed file into a false "revoked". For a `claimed` row the dead reason is *appended* to the ambiguity, never substituted for it: revocation does not un-publish bytes.
+- **Liveness is re-checked, inside the open session.** `lookup_by_public_id` filters on public_id/direction/principal only, while `PUT /transfer/upload` also requires `resolve_identity_ok(need_write=True)` and `resolve_root_ok`. So after an OAuth scope downgrade or a vault reassignment the tool asserted "pending" about a link every redemption would 404 (#71). Both predicates now run for `pending`/`claimed` rows and produce a `revoked` answer naming the cause. **`completed` rows are deliberately not re-checked** — that transfer already happened, and a later revocation must not turn a true report of a landed file into a false "revoked". For a `claimed` row the dead reason is *appended* to the ambiguity, never substituted for it: revocation does not un-publish bytes.
 
 Precision here is the design, not an exception to it — this side is authenticated and identity-scoped. None of the branches may put a token or any other secret into `usage_logs`; the `upload_id` shape check still runs before `_tracked` sees the argument.
+
+### The handle belongs to the principal, not to the credential row
+
+`lookup_by_public_id` scoped an OAuth-minted transfer to the exact
+`oauth_tokens.id` that minted it. An access token lives one hour and rotation
+mints a **new row** for the same user, the same client and the same consent, so
+an hour later the agent's own `check_upload` answered "no upload link with id …
+was minted by this identity" — the message reserved for a genuinely foreign
+handle — about a `completed` upload whose sha256 `request_upload` had told it
+to come back for (#74).
+
+The scope is the stable principal instead. An API key *is* one; an OAuth access
+token is one hour of one, and the principal behind it is the **grant family**
+(`oauth_tokens.grant_id`, migration 014). The lookup is one statement with a
+correlated `EXISTS` joining the *minting* token to the *presenting* token on
+`grant_id` — no column on `transfer_tokens`, no migration, and nothing to keep
+in sync: `grant_id` never changes after insert, and the row cascades away with
+its minting token anyway. The `user_id` comparison stays on top of it.
+
+What deliberately did **not** widen:
+
+- **A different grant is still `not found`** — another client, or a second
+  `/authorize` approval by the same user for the same client. Two consents are
+  two things the operator can revoke independently.
+- **Redemption stays bound to the minting credential row.** `resolve_identity_ok`
+  and the publish gate still load the exact `oauth_tokens` row named on the
+  token. That cannot make `check_upload` lie, because `plan_mint_window` clamps
+  every capability's expiry to that credential's own (see below): the minting
+  access token outlives every link it minted unless it is revoked, and a
+  revocation *should* kill the link. Widening redemption to "any live token of
+  the family" would bind an already-minted capability to credentials that did
+  not exist when it was minted — strictly more than the operator agreed to, for
+  no case that is currently wrong.
+- **The API-key path is untouched.** A key does not rotate; a second key of the
+  same user is a different principal.
 
 ### A link never outlives the credential that minted it
 

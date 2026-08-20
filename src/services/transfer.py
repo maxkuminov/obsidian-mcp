@@ -48,10 +48,12 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 
 import httpx
 import idna
-from sqlalchemy import delete, select, update
+from sqlalchemy import and_, delete, literal, select, update
+from sqlalchemy.orm import aliased
 
 from src.config import settings
 from src.models.db import APIKey, OAuthToken, TransferToken, User
+from src.oauth.scope import token_has_write
 from src.services import vault_fs
 from src.services.vault import classify_bytes
 
@@ -573,29 +575,105 @@ async def lookup_token(session, token: str, *, direction: str) -> TransferToken 
     return result.scalar_one_or_none()
 
 
+def _same(column, value):
+    """`column = value`, or `column IS NULL` when `value` is `None`.
+
+    `column == None` renders as `= NULL`, which is never true — and would
+    silently turn "single-user API key" into "matches nothing".
+    """
+    return column.is_(None) if value is None else column == value
+
+
+def _minted_by_principal(identity: Identity):
+    """WHERE fragment: was this row minted by the principal now asking?
+
+    Two different questions, because the two credential kinds have different
+    lifetimes:
+
+    - An **API key** *is* the principal. It does not rotate, so the row must
+      name this exact key and carry no OAuth credential.
+    - An **OAuth access token** is one hour of one principal. The principal is
+      the grant family behind it (`oauth_tokens.grant_id`, migration 014):
+      every row minted from one `/authorize` approval shares it and every
+      rotation inherits it. So the row's *minting* token and the *presenting*
+      token merely have to be siblings in that family. Pinning the row id
+      instead is issue #74 — after the hourly refresh the agent's own upload
+      handle came back "not minted by this identity".
+
+    The family predicate is a correlated `EXISTS` rather than a join on the
+    outer select, so the lookup stays a single statement returning at most the
+    one `public_id` row. `grant_id` is NOT NULL on `oauth_tokens`, so there is
+    no null-equality trap here; if the presenting token's row has since been
+    deleted the `EXISTS` is simply false and the answer is "not found", which
+    is the fail-closed direction.
+    """
+    if identity.oauth_token_id is None:
+        return and_(
+            _same(TransferToken.key_id, identity.key_id),
+            TransferToken.oauth_token_id.is_(None),
+        )
+    minting = aliased(OAuthToken, name="minting_token")
+    presenting = aliased(OAuthToken, name="presenting_token")
+    return and_(
+        TransferToken.key_id.is_(None),
+        select(literal(1))
+        .select_from(minting)
+        .join(presenting, presenting.grant_id == minting.grant_id)
+        .where(
+            minting.id == TransferToken.oauth_token_id,
+            presenting.id == identity.oauth_token_id,
+        )
+        .exists(),
+    )
+
+
 async def lookup_by_public_id(
     session, public_id: str, *, identity: Identity, direction: str
 ) -> TransferToken | None:
-    """A transfer row by its public handle, **scoped to the calling identity**.
+    """A transfer row by its public handle, **scoped to the calling principal**.
 
-    `check_upload` is the only read that is not gated by a capability, so the
-    scoping is the access control: the credential must be the exact one that
-    minted the row, and the user must match too. A handle minted by another key
-    — or by the same key after it was reassigned to another user — is simply
-    not found. No state filter: reporting `expired` and `completed` is the
-    whole job.
+    `check_upload` is the only read that is not gated by a capability, so this
+    scoping is the access control. What it scopes *to* is the stable principal
+    behind the request, not the credential row the request happened to arrive
+    on:
+
+    - **API key** — the key row itself, unchanged. A key is the principal: it
+      does not rotate, and nothing else stands behind it.
+    - **OAuth** — the *grant family* (`oauth_tokens.grant_id`, migration 014).
+      An access token rotates roughly hourly, and rotation mints a brand-new
+      `oauth_tokens` row for the same user, the same client and the same
+      consent. Matching on the row id therefore made the agent's own handle
+      stop being its own after a routine refresh: `check_upload` answered "no
+      upload link with id … was minted by this identity" about a *completed*
+      upload it had minted an hour earlier, which is the one message reserved
+      for someone else's handle (issue #74). One consent is one principal, so
+      the family is what the handle belongs to.
+
+    The `user_id` comparison is kept on top of both. A grant family already
+    belongs to exactly one `(client_id, user_id)` — the invariant
+    `src/oauth/grants.py` establishes and 014's backfill preserves — so this is
+    defence in depth for the OAuth path; on the API-key path it is the check
+    that stops a key reassigned to another user from carrying its old handles
+    across.
+
+    What is deliberately *not* widened: a token from a **different** grant is
+    still not found, even for the same user and the same client software. A
+    second `/authorize` approval is a second consent, and the operator may
+    revoke either one independently. Nor does this touch redemption — the
+    `/transfer/*` routes still re-validate the exact credential row that
+    minted the capability (see `resolve_identity_ok`). That asymmetry is
+    intentional and costs nothing, because `plan_mint_window` clamps every
+    capability's expiry to the minting credential's own: the minting access
+    token outlives the link it minted unless it is revoked, and a revocation
+    *should* kill the link.
+
+    No state filter: reporting `expired` and `completed` is the whole job.
     """
-    def same(column, value):
-        # `column == None` renders as `= NULL`, which is never true — and would
-        # silently turn "single-user API key" into "matches nothing".
-        return column.is_(None) if value is None else column == value
-
     stmt = select(TransferToken).where(
         TransferToken.public_id == public_id,
         TransferToken.direction == direction,
-        same(TransferToken.key_id, identity.key_id),
-        same(TransferToken.oauth_token_id, identity.oauth_token_id),
-        same(TransferToken.user_id, identity.user_id),
+        _same(TransferToken.user_id, identity.user_id),
+        _minted_by_principal(identity),
     )
     result = await session.execute(stmt.execution_options(populate_existing=True))
     return result.scalar_one_or_none()
@@ -646,7 +724,7 @@ def _credential_ok(cred, *, need_write: bool, row: TransferToken) -> bool:
             return False
         if cred.expires_at is None or cred.expires_at <= now:
             return False
-        if need_write and "readwrite" not in (cred.scope or "").split():
+        if need_write and not token_has_write(cred.scope):
             return False
     else:  # pragma: no cover - defensive
         return False
