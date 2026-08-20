@@ -1,195 +1,301 @@
-"""Regression test: the admin panel's OAuth token scope dropdown must
-reflect a token's actual granted permission, not just an exact string
-match against "read" / "readwrite".
+"""The admin panel's OAuth scope dropdown must reflect the *granted* permission.
 
-`OAuthToken.scope` is a space-separated set (e.g. "offline_access
-readwrite" - offline_access is requested by every DCR-registered client
-per DEFAULT_CLIENT_SCOPE in src/oauth/routes.py). oauth.html's <select>
-previously compared `token.scope == 'read'` / `== 'readwrite'` directly:
-neither literal ever matches a scope string that also carries
-offline_access, so NEITHER <option> got `selected` and the browser fell
-back to showing the first one, "read" - misrepresenting an actual
-readwrite grant as read-only in the UI. The real permission (checked by
-src/mcp_server/auth.py via `"readwrite" in scope_parts`) was correct the
-whole time; only the display was wrong.
+`OAuthToken.scope` is a space-separated set (e.g. "offline_access readwrite" --
+offline_access is requested by every DCR-registered client per
+DEFAULT_CLIENT_SCOPE in src/oauth/routes.py). oauth.html's <select> originally
+compared `token.scope == 'read'` / `== 'readwrite'` directly: neither literal
+ever matches a scope string that also carries offline_access, so NEITHER
+<option> got `selected`, the browser fell back to the first one, and a real
+readwrite grant rendered as read-only. #62 fixed that by computing a
+membership-based `has_write` in `oauth_page`.
 
-Fix: compute `has_write` (a membership check) in oauth_page and drive the
-template's `selected` attributes off that instead of raw string equality.
-Also verified: update_oauth_token_scope preserves the offline_access
-marker instead of silently dropping it when an admin flips read/readwrite
-via the panel.
+**These tests exercise the route, not a hand-built context** -- that is issue
+#65 gap 1. The original fixture supplied both `scope` and `has_write` to the
+template, so setting `has_write=False` unconditionally in `oauth_page` left
+every assertion green: the route half of the fix was untested. Here the fake
+session yields `OAuthToken`-shaped rows and `oauth_page` derives everything,
+so a regression in the derivation fails these tests.
+
+Gap 2 (an assertion that only exercised Python's `in`) is replaced by calls
+into the production helper `src.oauth.scope.token_has_write`, which is now also
+what `src/mcp_server/auth.py` maps a token to a permission with -- those two
+agreeing is the property that actually matters.
 """
 import asyncio
-import os
+import re
 
-import pydantic_settings
+import pytest
 
-_orig_init = pydantic_settings.BaseSettings.__init__
+from src.control_panel import routes
+from src.mcp_server import auth as mcp_auth
+from src.oauth.scope import token_has_write
 
-
-def _no_env_file_init(self, *args, **kwargs):
-    kwargs.setdefault("_env_file", None)
-    _orig_init(self, *args, **kwargs)
-
-
-pydantic_settings.BaseSettings.__init__ = _no_env_file_init
-try:
-    from starlette.templating import Jinja2Templates
-
-    from src.control_panel import routes
-finally:
-    pydantic_settings.BaseSettings.__init__ = _orig_init
-
-
-TEMPLATES_DIR = os.path.join(
-    os.path.dirname(routes.__file__), "templates"
+from _oauth_grant_fakes import (
+    FakeClient,
+    FakeRequest,
+    FakeSession,
+    FakeToken,
+    FakeUser,
+    SingleUserSentinel,
+    in_hours,
 )
 
 
-def _render_oauth_page(tokens: list[dict]) -> str:
-    templates = Jinja2Templates(directory=TEMPLATES_DIR)
-    response = templates.TemplateResponse(
-        request=None,  # oauth.html never touches `request` directly
-        name="oauth.html",
-        context={
-            "active": "oauth",
-            "is_admin": True,
-            "multi_user_mode": False,
-            "username": "admin",
-            "csrf_token": "test-csrf-token",
-            "clients": [
-                {
-                    "client_id": "client123",
-                    "client_name": "Claude",
-                    "created_at": "2026-08-20T00:00:00Z",
-                    "tokens": tokens,
-                }
-            ],
-        },
+def render_oauth_page(*, clients, tokens, users=(), user=None) -> str:
+    """Run the real `oauth_page` over fake rows and return the rendered HTML."""
+    session = FakeSession(clients=clients, tokens=tokens, users=users)
+    response = asyncio.run(
+        routes.oauth_page(
+            request=FakeRequest(),
+            session=session,
+            user=user or SingleUserSentinel(),
+        )
     )
     return response.body.decode()
 
 
-def _base_token(**overrides) -> dict:
-    token = {
-        "id": 1,
-        "token_type": "access",
-        "scope": "offline_access readwrite",
-        "has_write": True,
-        "revoked": False,
-        "expired": False,
-        "expires_at": "2026-09-01T00:00:00Z",
-        "created_at": "2026-08-20T00:00:00Z",
-    }
-    token.update(overrides)
-    return token
-
-
-def _selected_option(html: str) -> str:
-    """Return the value= of whichever <option> in the scope <select> is selected."""
-    import re
-
+def selected_option(html: str) -> str:
+    """The value= of whichever <option> in the scope <select> is selected."""
+    found = []
     for value in ("read", "readwrite"):
-        m = re.search(
-            rf'<option value="{value}"\s*[^>]*>',
-            html,
-        )
-        assert m, f"couldn't find <option value=\"{value}\"> at all"
+        m = re.search(rf'<option value="{value}"\s*[^>]*>', html)
+        if m is None:
+            continue
+        found.append(value)
         if "selected" in m.group(0):
             return value
+    assert found, "no scope <option> rendered at all"
     return "NONE-SELECTED"
 
 
-def test_readwrite_token_with_offline_access_shows_readwrite_selected():
-    """The exact scenario that fooled the panel before this fix: a real
-    readwrite grant that also carries offline_access."""
-    html = _render_oauth_page([_base_token(scope="offline_access readwrite", has_write=True)])
-    assert _selected_option(html) == "readwrite"
+def rendered_options(html: str) -> set[str]:
+    return set(re.findall(r'<option value="(read|readwrite)"', html))
 
 
-def test_read_token_with_offline_access_shows_read_selected():
-    html = _render_oauth_page([_base_token(scope="offline_access read", has_write=False)])
-    assert _selected_option(html) == "read"
+# --- oauth_page derives has_write from the token's own scope (gap 1) -------
 
 
-def test_bare_readwrite_token_shows_readwrite_selected():
-    html = _render_oauth_page([_base_token(scope="readwrite", has_write=True)])
-    assert _selected_option(html) == "readwrite"
+@pytest.mark.parametrize(
+    "scope, expected",
+    [
+        ("offline_access readwrite", "readwrite"),
+        ("offline_access read", "read"),
+        ("readwrite", "readwrite"),
+        ("read", "read"),
+        # Order within the set must not matter.
+        ("readwrite offline_access", "readwrite"),
+    ],
+)
+def test_oauth_page_derives_selected_scope_from_token_scope(scope, expected):
+    """The route -- not the fixture -- decides which option is selected.
+
+    Nothing here supplies `has_write`; `oauth_page` computes it from `scope`.
+    Hard-coding `has_write=False` in the route (issue #65's demonstration of
+    the gap) flips every `readwrite` case to `read` and fails.
+    """
+    html = render_oauth_page(
+        clients=[FakeClient()],
+        tokens=[FakeToken(grant_id="g1", scope=scope)],
+    )
+    assert selected_option(html) == expected
 
 
-# --- oauth_page's has_write computation (the actual fix) ------------------
+def test_oauth_page_and_middleware_agree_on_every_scope_string():
+    """The panel badge and the enforced permission come from one helper.
+
+    Before this, `oauth_page` and `src/mcp_server/auth.py` each carried their
+    own membership check. They agreed by coincidence, which is not a property
+    anything could test; now there is a single definition and this pins both
+    ends of it.
+    """
+    for scope in (
+        "read",
+        "readwrite",
+        "offline_access read",
+        "offline_access readwrite",
+    ):
+        middleware_permission = "readwrite" if token_has_write(scope) else "read"
+        html = render_oauth_page(
+            clients=[FakeClient()],
+            tokens=[FakeToken(grant_id="g1", scope=scope)],
+        )
+        assert selected_option(html) == middleware_permission, scope
+
+    # A scope with no vault permission at all is not "read" on either side:
+    # the middleware 401s it and the page offers no scope control for it.
+    # Feeding it to `selected_option` would assert a permission neither layer
+    # grants — see tests/test_issue_67_offline_access_only_client.py.
+    for scope in ("", "offline_access"):
+        html = render_oauth_page(
+            clients=[FakeClient()],
+            tokens=[FakeToken(grant_id="g1", scope=scope)],
+        )
+        assert "<option" not in html, scope
+
+    # And the middleware really is built on that helper, not a private copy.
+    source = mcp_auth.__file__
+    with open(source) as fh:
+        body = fh.read()
+    assert "token_has_write(oauth_token.scope)" in body
 
 
-def test_has_write_is_membership_not_equality():
-    assert ("readwrite" in "offline_access readwrite".split()) is True
-    assert ("readwrite" in "offline_access read".split()) is False
-    assert ("readwrite" in "read".split()) is False
-    assert ("readwrite" in "readwrite".split()) is True
+# --- the helper itself (gap 2: was a tautology over Python builtins) -------
+
+
+def test_token_has_write_is_membership_not_equality():
+    """Calls production code. The assertion it replaces could not fail."""
+    assert token_has_write("offline_access readwrite") is True
+    assert token_has_write("readwrite offline_access") is True
+    assert token_has_write("readwrite") is True
+    assert token_has_write("offline_access read") is False
+    assert token_has_write("read") is False
+    assert token_has_write("") is False
+    assert token_has_write(None) is False
+    # The trap the display bug fell into: a set is not its longest member.
+    assert ("offline_access readwrite" == "readwrite") is False
 
 
 # --- update_oauth_token_scope preserves offline_access ---------------------
 
 
-class _FakeToken:
-    def __init__(self, scope, revoked=False, user_id=None):
-        self.id = 1
-        self.scope = scope
-        self.revoked = revoked
-        self.user_id = user_id
-
-
-class _FakeSession:
-    def __init__(self, token):
-        self._token = token
-        self.committed = False
-
-    async def execute(self, _stmt):
-        class _Result:
-            def __init__(self, obj):
-                self._obj = obj
-
-            def scalar_one_or_none(self):
-                return self._obj
-
-        return _Result(self._token)
-
-    async def commit(self):
-        self.committed = True
-
-
-class _SingleUserSentinel:
-    id = None
-    is_admin = True
+def _update_scope(tokens, clients, scope, token_id=None):
+    session = FakeSession(clients=clients, tokens=tokens)
+    asyncio.run(
+        routes.update_oauth_token_scope(
+            token_id=token_id if token_id is not None else tokens[0].id,
+            scope=scope,
+            session=session,
+            user=SingleUserSentinel(),
+        )
+    )
+    return session
 
 
 def test_update_scope_preserves_offline_access_marker():
-    token = _FakeToken(scope="offline_access readwrite")
-    session = _FakeSession(token)
+    token = FakeToken(grant_id="g1", scope="offline_access readwrite")
+    session = _update_scope([token], [FakeClient()], "read")
 
-    asyncio.run(
-        routes.update_oauth_token_scope(
-            token_id=1,
-            scope="read",
-            session=session,
-            user=_SingleUserSentinel(),
-        )
-    )
-
-    assert token.scope == "read offline_access"
-    assert session.committed is True
+    assert set(token.scope.split()) == {"read", "offline_access"}
+    assert session.committed == 1
 
 
 def test_update_scope_without_offline_access_stays_bare():
-    token = _FakeToken(scope="readwrite")
-    session = _FakeSession(token)
-
-    asyncio.run(
-        routes.update_oauth_token_scope(
-            token_id=1,
-            scope="read",
-            session=session,
-            user=_SingleUserSentinel(),
-        )
-    )
+    token = FakeToken(grant_id="g1", scope="readwrite")
+    _update_scope([token], [FakeClient()], "read")
 
     assert token.scope == "read"
+
+
+# --- revoked and expired rows stay visible (issue #64) --------------------
+
+
+def test_revoked_tokens_are_listed_so_a_revocation_is_visible():
+    """Filtering revoked rows out made a no-op Revoke look like it worked."""
+    html = render_oauth_page(
+        clients=[FakeClient()],
+        tokens=[
+            FakeToken(grant_id="g1", token_type="access", revoked=True),
+            FakeToken(grant_id="g1", token_type="refresh", revoked=True),
+        ],
+    )
+    assert "Revoked" in html
+    # A fully revoked grant offers no controls to act on.
+    assert "/revoke" not in html
+    assert "<option" not in html
+
+
+def test_expired_token_renders_expired_not_active():
+    html = render_oauth_page(
+        clients=[FakeClient()],
+        tokens=[FakeToken(grant_id="g1", expires_at=in_hours(-1))],
+    )
+    assert "Expired" in html
+    assert 'class="badge badge-green"' not in html
+
+
+# --- one control per grant, not one per row (issue #64) -------------------
+
+
+def test_a_grant_renders_exactly_one_revoke_control_and_one_scope_select():
+    """Two rows, one grant, one of each control.
+
+    Per-row controls are what misled the operator: two independently editable
+    scope selects for one grant, and a Revoke on the access row that the
+    sibling refresh token undid within the hour.
+    """
+    html = render_oauth_page(
+        clients=[FakeClient()],
+        tokens=[
+            FakeToken(grant_id="g1", token_type="access", scope="readwrite"),
+            FakeToken(grant_id="g1", token_type="refresh", scope="readwrite"),
+        ],
+    )
+    assert html.count("/revoke") == 1
+    assert html.count("<select") == 1
+
+
+def test_two_grants_for_one_client_get_separate_controls():
+    html = render_oauth_page(
+        clients=[FakeClient()],
+        tokens=[
+            FakeToken(grant_id="g1", token_type="access"),
+            FakeToken(grant_id="g1", token_type="refresh"),
+            FakeToken(grant_id="g2", token_type="access"),
+            FakeToken(grant_id="g2", token_type="refresh"),
+        ],
+    )
+    assert html.count("/revoke") == 2
+    assert html.count("<select") == 2
+
+
+# --- issue #76: the owner's is_active is part of "Active" ----------------
+
+
+def test_deactivated_owner_makes_the_grant_badge_owner_inactive():
+    """`APIKeyMiddleware` 401s these tokens; the panel used to badge them green."""
+    html = render_oauth_page(
+        clients=[FakeClient(user_id=7)],
+        tokens=[FakeToken(grant_id="g1", user_id=7)],
+        users=[FakeUser(id=7, is_active=False)],
+    )
+    assert "Owner inactive" in html
+    assert 'class="badge badge-green"' not in html
+
+
+def test_active_owner_still_badges_active():
+    html = render_oauth_page(
+        clients=[FakeClient(user_id=7)],
+        tokens=[FakeToken(grant_id="g1", user_id=7)],
+        users=[FakeUser(id=7, is_active=True)],
+    )
+    assert "Owner inactive" not in html
+    assert 'class="badge badge-green"' in html
+
+
+def test_single_user_tokens_have_no_owner_to_check():
+    """`user_id IS NULL` is single-user mode; the middleware skips the check."""
+    html = render_oauth_page(
+        clients=[FakeClient()],
+        tokens=[FakeToken(grant_id="g1", user_id=None)],
+    )
+    assert "Owner inactive" not in html
+    assert 'class="badge badge-green"' in html
+
+
+# --- issue #67: the readwrite option is gated on the client's registration -
+
+
+def test_read_only_client_never_renders_the_readwrite_option():
+    html = render_oauth_page(
+        clients=[FakeClient(scope="read")],
+        tokens=[FakeToken(grant_id="g1", scope="read")],
+    )
+    assert rendered_options(html) == {"read"}
+
+
+def test_readwrite_client_renders_both_options():
+    html = render_oauth_page(
+        clients=[FakeClient(scope="read readwrite offline_access")],
+        tokens=[FakeToken(grant_id="g1", scope="read")],
+    )
+    assert rendered_options(html) == {"read", "readwrite"}

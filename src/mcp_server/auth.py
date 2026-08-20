@@ -12,7 +12,8 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from src.auth.session import UNSET_VAULT_ROOT, current_user_id, current_vault_root
 from src.config import settings
 from src.database import async_session
-from src.models.db import APIKey, OAuthToken, User
+from src.models.db import APIKey, OAuthClient, OAuthToken, User
+from src.oauth.scope import has_vault_scope, token_has_write
 from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
@@ -269,6 +270,32 @@ class APIKeyMiddleware:
                             await response(scope, receive, send)
                             return
 
+                    # The grant's owner must still be the client's owner. A
+                    # cross-user grant can no longer be created, but one made
+                    # before the consent and rotation paths refused it stays
+                    # live for the access token's full hour and is invisible in
+                    # either user's panel. An unbound client (NULL owner) is
+                    # not a conflict — it has simply never been claimed.
+                    if oauth_token.user_id is not None:
+                        result = await session.execute(
+                            select(OAuthClient.user_id).where(
+                                OAuthClient.client_id == oauth_token.client_id
+                            )
+                        )
+                        client_owner = result.scalar_one_or_none()
+                        if client_owner is not None and client_owner != oauth_token.user_id:
+                            logger.warning(
+                                "auth_failure",
+                                extra={"reason": "cross_user_grant", "key_id": oauth_token.id},
+                            )
+                            response = JSONResponse(
+                                {"error": "Invalid or revoked token"},
+                                status_code=401,
+                                headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                            )
+                            await response(scope, receive, send)
+                            return
+
                     if oauth_token.expires_at < datetime.now(timezone.utc):
                         logger.warning("auth_failure", extra={"reason": "key_expired", "key_id": oauth_token.id})
                         response = JSONResponse(
@@ -279,9 +306,33 @@ class APIKeyMiddleware:
                         await response(scope, receive, send)
                         return
 
-                    # Map OAuth scope to permission - scopes are space-separated (OAuth 2.0 convention)
-                    scope_parts = set(oauth_token.scope.split())
-                    permission = "readwrite" if "readwrite" in scope_parts else "read"
+                    # A token that names no vault scope grants nothing. Falling
+                    # through to `read` here is the same conflation
+                    # `clamp_scope` used to make: `offline_access` says the
+                    # grant may carry a refresh token, not that it may read a
+                    # note. No path can mint such a token any more, but a
+                    # client registered `scope="offline_access"` before this
+                    # could already hold one, and this is the boundary that
+                    # decides what it may do.
+                    if not has_vault_scope(oauth_token.scope):
+                        logger.warning(
+                            "auth_failure",
+                            extra={"reason": "no_vault_scope", "key_id": oauth_token.id},
+                        )
+                        response = JSONResponse(
+                            {"error": "Invalid or revoked token"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
+                        await response(scope, receive, send)
+                        return
+
+                    # Map OAuth scope to permission. Scopes are space-separated
+                    # sets (OAuth 2.0 convention), so this is a membership test
+                    # -- and it is the *same* helper the control panel uses to
+                    # decide what to display, so the badge and the enforcement
+                    # cannot disagree (issue #65).
+                    permission = "readwrite" if token_has_write(oauth_token.scope) else "read"
 
                     scope["state"] = scope.get("state", {})
                     scope["state"]["api_key_id"] = None

@@ -8,6 +8,14 @@
 
 <div class="page-body">
 
+    {% if flash_error %}
+    {# Why the last scope change did nothing. The select submits on `onchange`,
+       so without this the option simply snaps back and reads as a browser bug. #}
+    <div class="card anim-1" style="margin-bottom:16px;padding:12px 16px;border-left:3px solid var(--error);">
+        <div style="font-size:13px;color:var(--text-2);">{{ flash_error }}</div>
+    </div>
+    {% endif %}
+
     {% if not clients %}
     <div class="card anim-1" style="text-align:center;padding:48px 24px;">
         <svg width="36" height="36" viewBox="0 0 36 36" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" style="margin:0 auto 14px;opacity:0.25;">
@@ -30,6 +38,9 @@
                     <div class="mono" style="font-size:10px;color:var(--text-3);margin-top:3px;">{{ client.client_id }}</div>
                 </div>
                 <div style="display:flex;align-items:center;gap:14px;">
+                    {# The registered scope is the ceiling on every grant below. Showing it
+                       explains why the readwrite option is absent for a read-only client. #}
+                    <span class="mono" style="font-size:10px;color:var(--text-3);">registered: {{ client.scope }}</span>
                     <span style="font-size:11px;color:var(--text-3);">Registered <time datetime="{{ client.created_at }}" data-localize="date">{{ client.created_at }}</time></span>
                     <form method="POST" action="/admin/oauth/{{ client.client_id }}/delete" style="display:inline;">
                         {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
@@ -38,72 +49,137 @@
                 </div>
             </div>
 
-            {% if client.tokens %}
-            <div class="table-scroll">
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>Type</th>
-                        <th>Scope</th>
-                        <th>Status</th>
-                        <th>Expires</th>
-                        <th>Created</th>
-                        <th></th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {% for token in client.tokens %}
-                    <tr>
-                        <td>
-                            {% if token.token_type == 'access' %}
-                            <span class="badge badge-purple">{{ token.token_type }}</span>
-                            {% else %}
-                            <span class="badge badge-gray">{{ token.token_type }}</span>
-                            {% endif %}
-                        </td>
-                        <td>
-                            {% if token.revoked %}
-                            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ token.scope }}</span>
-                            {% else %}
-                            <form method="POST" action="/admin/oauth/token/{{ token.id }}/scope" style="display:inline;">
-                                {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                                <select name="scope" onchange="this.form.submit()" class="field-select" style="width:auto;padding:3px 28px 3px 8px;font-size:11px;">
-                                    <option value="read"      {% if not token.has_write %}selected{% endif %}>read</option>
-                                    <option value="readwrite" {% if token.has_write     %}selected{% endif %}>readwrite</option>
-                                </select>
-                            </form>
-                            {% endif %}
-                        </td>
-                        <td>
-                            {% if token.revoked %}
-                            <span class="badge badge-red">Revoked</span>
-                            {% elif token.expired %}
-                            <span class="badge badge-yellow">Expired</span>
-                            {% else %}
-                            <span class="badge badge-green">Active</span>
-                            {% endif %}
-                        </td>
-                        <td class="mono" style="font-size:11px;color:var(--text-3);">
-                            <time datetime="{{ token.expires_at }}" data-localize>{{ token.expires_at }}</time>
-                        </td>
-                        <td class="mono" style="font-size:11px;color:var(--text-3);">
-                            <time datetime="{{ token.created_at }}" data-localize>{{ token.created_at }}</time>
-                        </td>
-                        <td>
-                            {% if not token.revoked and not token.expired %}
-                            <form method="POST" action="/admin/oauth/token/{{ token.id }}/revoke" style="display:inline;">
-                                {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                                <button type="submit" class="btn btn-link" style="font-size:11px;">Revoke</button>
-                            </form>
-                            {% endif %}
-                        </td>
-                    </tr>
-                    {% endfor %}
-                </tbody>
-            </table>
+            {% if client.grants %}
+            {% for grant in client.grants %}
+            {# One block per grant — the unit the user actually approved. A token row is an
+               implementation detail nobody was asked about, and giving each one its own
+               Revoke and its own scope select is what made both controls near no-ops. #}
+            <div style="padding:14px 22px;border-top:1px solid var(--border);">
+                <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <span style="font-size:12px;color:var(--text-2);">Access</span>
+                        {% if grant.status == 'active' %}
+                        <span class="badge badge-green">Active</span>
+                        {% elif grant.status == 'owner_inactive' %}
+                        {# The middleware also requires the owning User.is_active and 401s
+                           otherwise, so these tokens are already dead server-side. #}
+                        <span class="badge badge-yellow">Owner inactive</span>
+                        {% elif grant.status == 'expired' %}
+                        <span class="badge badge-yellow">Expired</span>
+                        {% elif grant.status == 'no_vault_scope' %}
+                        {# `offline_access` alone grants nothing, and the middleware
+                           401s it. Showing "Active" with a working scope control was
+                           the same over-reporting of liveness #76 was about. #}
+                        <span class="badge badge-red" title="This grant carries no vault scope ('read' or 'readwrite'), so it cannot authenticate. Re-register the client with a vault scope and reconnect.">No vault scope</span>
+                        {% else %}
+                        <span class="badge badge-red">Revoked</span>
+                        {% endif %}
+                    </div>
+
+                    <div style="display:flex;align-items:center;gap:8px;">
+                        <span style="font-size:12px;color:var(--text-2);">Scope</span>
+                        {% if grant.mixed_scope %}
+                        {# Migration 014 can merge two pre-014 sessions of one client
+                           and user into a single family, and they may disagree. The
+                           badge shows the strongest permission any live token holds,
+                           so it never under-reports; saving the select writes one
+                           scope across the whole family and clears this. #}
+                        <span class="badge badge-yellow" title="Live tokens in this grant carry different scopes: {{ grant.live_scopes | join(', ') }}. Saving a scope below applies one value to all of them.">mixed</span>
+                        {% endif %}
+                        {% if grant.token_id %}
+                        <form method="POST" action="/admin/oauth/token/{{ grant.token_id }}/scope" style="display:inline;">
+                            {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+                            <select name="scope" onchange="this.form.submit()" class="field-select" style="width:auto;padding:3px 28px 3px 8px;font-size:11px;">
+                                <option value="read"      {% if not grant.has_write %}selected{% endif %}>read</option>
+                                {# Only offered when the client is registered for it. The panel
+                                   must not raise a grant above what the client was registered
+                                   to hold; the handler refuses it regardless. #}
+                                {% if client.can_write %}
+                                <option value="readwrite" {% if grant.has_write     %}selected{% endif %}>readwrite</option>
+                                {% endif %}
+                            </select>
+                        </form>
+                        {% else %}
+                        <span class="mono" style="font-size:11px;color:var(--text-3);">{{ grant.scope }}</span>
+                        {% endif %}
+                    </div>
+
+                    <span style="font-size:11px;color:var(--text-3);">Granted <time datetime="{{ grant.created_at }}" data-localize="date">{{ grant.created_at }}</time></span>
+
+                    <div style="margin-left:auto;">
+                        {% if grant.token_id %}
+                        <form method="POST" action="/admin/oauth/token/{{ grant.token_id }}/revoke" style="display:inline;">
+                            {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+                            <button type="submit" class="btn btn-danger" style="font-size:11px;padding:4px 12px;" onclick="return confirm('Revoke this grant? Every access and refresh token issued from it stops working immediately and the app must be reconnected.')">Revoke access</button>
+                        </form>
+                        {% endif %}
+                    </div>
+                </div>
+
+                <div class="table-scroll" style="margin-top:10px;">
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Type</th>
+                            <th>Scope</th>
+                            <th>Status</th>
+                            <th>Expires</th>
+                            <th>Created</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {# Revoked and expired rows stay listed, dimmed. Removing them is what
+                           made a revocation that did nothing look like one that worked. #}
+                        {% for token in grant.tokens %}
+                        <tr {% if token.status in ('revoked', 'expired', 'no_vault_scope') %}style="opacity:0.5;"{% endif %}>
+                            <td>
+                                {% if token.token_type == 'access' %}
+                                <span class="badge badge-purple">{{ token.token_type }}</span>
+                                {% else %}
+                                <span class="badge badge-gray">{{ token.token_type }}</span>
+                                {% endif %}
+                            </td>
+                            <td class="mono" style="font-size:11px;color:var(--text-3);">{{ token.scope }}</td>
+                            <td>
+                                {% if token.status == 'revoked' %}
+                                <span class="badge badge-red">Revoked</span>
+                                {% elif token.status == 'expired' %}
+                                <span class="badge badge-yellow">Expired</span>
+                                {% elif token.status == 'no_vault_scope' %}
+                                <span class="badge badge-red">No vault scope</span>
+                                {% elif token.status == 'owner_inactive' %}
+                                <span class="badge badge-yellow">Owner inactive</span>
+                                {% else %}
+                                <span class="badge badge-green">Active</span>
+                                {% endif %}
+                            </td>
+                            <td class="mono" style="font-size:11px;color:var(--text-3);">
+                                <time datetime="{{ token.expires_at }}" data-localize>{{ token.expires_at }}</time>
+                            </td>
+                            <td class="mono" style="font-size:11px;color:var(--text-3);">
+                                <time datetime="{{ token.created_at }}" data-localize>{{ token.created_at }}</time>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                </div>
+                {% if grant.hidden_count %}
+                <div style="padding:6px 2px 0;font-size:11px;color:var(--text-3);">
+                    {# "inactive" rather than "revoked or expired": a token can also be
+                       listed here for carrying no vault scope, and naming only two of the
+                       three reasons invites the reader to rule the third one out. #}
+                    + {{ grant.hidden_count }} earlier inactive token{{ '' if grant.hidden_count == 1 else 's' }} from this grant{% if grant.history_truncated %}, and older ones beyond the history window{% endif %}.
+                </div>
+                {% elif grant.history_truncated %}
+                {# Only history is ever truncated — live tokens are read unbounded,
+                   so no grant the operator can act on is ever missing from this page. #}
+                <div style="padding:6px 2px 0;font-size:11px;color:var(--text-3);">Older tokens beyond the history window are not shown.</div>
+                {% endif %}
             </div>
+            {% endfor %}
             {% else %}
-            <div style="padding:20px 22px;font-size:13px;color:var(--text-3);">No active tokens for this client.</div>
+            <div style="padding:20px 22px;font-size:13px;color:var(--text-3);">No tokens for this client.</div>
             {% endif %}
         </div>
         {% endfor %}

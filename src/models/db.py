@@ -327,6 +327,14 @@ class OAuthToken(Base):
         String(64), ForeignKey("oauth_clients.client_id", ondelete="CASCADE"), nullable=False
     )
     scope: Mapped[str] = mapped_column(String(50), nullable=False)
+    # The grant family this token belongs to (migration 014, issue #64). Every
+    # row minted from one `/authorize` approval shares it, and every rotation
+    # inherits it, so revocation and scope changes can act on the unit the
+    # operator actually consented to instead of a single row whose sibling
+    # refresh token would immediately undo the change. NOT NULL: the decision
+    # in #64 was explicit that a nullable grant_id with a fallback "find the
+    # family" path is how this bug comes back.
+    grant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime.datetime] = mapped_column(

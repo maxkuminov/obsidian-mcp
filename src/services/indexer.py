@@ -720,7 +720,47 @@ async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
 
 
 async def cleanup_expired_tokens():
-    """Delete expired/revoked OAuth codes and tokens older than 7 days."""
+    """Delete OAuth codes and tokens that are more than 7 days dead.
+
+    The token half used to read ``expires_at < cutoff OR revoked``, and that
+    second disjunct carried **no age condition at all** despite this
+    docstring's "older than 7 days" — every revoked token was deleted on the
+    next pass, i.e. within `INDEX_INTERVAL_SECONDS` (5 minutes by default).
+
+    That is wrong now that the panel lists revoked tokens as a grant's
+    revocation history (issue #64). Filtering revoked rows *out of the page*
+    is what made a Revoke that did nothing read as success — the row simply
+    disappeared. Deleting them out of the table five minutes later reproduces
+    the same blank space, just with a delay.
+
+    **The 7-day window is measured from `expires_at`, not `created_at`, and
+    that choice is load-bearing.** Revocation time is not stored anywhere, so
+    the window has to be derived from a column we do have:
+
+    * A token can only be revoked while it exists, so its revocation time R
+      satisfies ``R <= expires_at`` for every revocation the panel or the token
+      endpoint performs. Deleting only when ``expires_at < now - 7d`` therefore
+      *guarantees* ``R < now - 7d`` — every revoked row is visible for at least
+      seven days after it was revoked.
+    * `created_at` gives no such guarantee and gets it backwards: a refresh
+      token minted 30 days ago and revoked one minute ago is already 30 days
+      past `created_at`, so it would be purged immediately — precisely the case
+      the operator most needs to see.
+
+    Age-gating the revoked branch makes it a strict subset of the expiry
+    branch, so the correct implementation is the single predicate below rather
+    than a redundant `or_`. Revoked tokens are still deleted; they are deleted
+    seven days after they would have expired anyway, which is the same
+    retention their unrevoked siblings get. The auth-code half is unchanged: a
+    used code is spent immediately and has no history value.
+
+    Edge case, stated rather than hidden: a family revocation also flips
+    `revoked` on tokens that had *already* expired, so for those R can exceed
+    `expires_at`. Such a row is deleted on the ordinary expiry schedule and can
+    therefore disappear sooner than seven days after that flip — but it was
+    already dead and already displayed as "Expired" before the revocation
+    touched it, so no revocation the operator performed becomes invisible.
+    """
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
 
     async with async_session() as session:
@@ -735,14 +775,12 @@ async def cleanup_expired_tokens():
         )
         codes_deleted = result.rowcount
 
-        # Clean up expired/revoked tokens
+        # Clean up tokens more than 7 days past their expiry — revoked ones
+        # included, and on the same schedule. See the docstring: an unqualified
+        # `OR revoked` deleted a revocation's evidence within five minutes of
+        # the operator creating it.
         result = await session.execute(
-            delete(OAuthToken).where(
-                or_(
-                    OAuthToken.expires_at < cutoff,
-                    OAuthToken.revoked == True,
-                )
-            )
+            delete(OAuthToken).where(OAuthToken.expires_at < cutoff)
         )
         tokens_deleted = result.rowcount
 

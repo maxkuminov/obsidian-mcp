@@ -169,5 +169,10 @@ def test_clamp_scope_helper():
     assert routes._clamp_scope("readwrite", "readwrite") == "readwrite"
     # readwrite registration implies read availability
     assert routes._clamp_scope("read", "readwrite") == "read"
-    # empty intersection falls back to safe default
-    assert routes._clamp_scope("", "read") == "read"
+    # No vault scope on either side is a *refusal*, not a fallback to `read`.
+    # The old `or "read"` conflated the legitimate readwrite->read downgrade
+    # above with "this client is registered for nothing", so a DCR client
+    # registered `scope="offline_access"` was handed read access to the whole
+    # vault. Every caller now turns an empty result into an error.
+    assert routes._clamp_scope("", "read") == ""
+    assert routes._clamp_scope("read", "offline_access") == ""

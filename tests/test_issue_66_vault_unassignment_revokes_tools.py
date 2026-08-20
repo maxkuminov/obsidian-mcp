@@ -629,7 +629,20 @@ def test_tools_refuse_an_ownerless_caller_in_multi_user_mode(
 
 class _OAuthMiddlewareSession(_MiddlewareSession):
     """Same as `_MiddlewareSession`, for the OAuth branch: the first select
-    hits `oauth_tokens` rather than `api_keys`."""
+    hits `oauth_tokens` rather than `api_keys`.
+
+    `client_owner` answers the middleware's cross-user check, which reads
+    `OAuthClient.user_id` for the token's client. These fixtures build tokens
+    with no `client_id`, i.e. no such client row, so the honest default is
+    None — "unbound or absent", which is not a conflict. It has to be
+    dispatched explicitly rather than falling through to `user_active`, or
+    every one of these tokens would look like a grant whose client belongs to
+    somebody called `True`.
+    """
+
+    def __init__(self, api_key, user_active=True, vault_row=None, client_owner=None):
+        super().__init__(api_key, user_active=user_active, vault_row=vault_row)
+        self.client_owner = client_owner
 
     async def execute(self, stmt):
         sql = str(stmt)
@@ -639,6 +652,8 @@ class _OAuthMiddlewareSession(_MiddlewareSession):
             return _RowsResult([self.vault_row] if self.vault_row else [])
         if "FROM oauth_tokens" in sql:
             return _RowsResult([self.api_key])
+        if "FROM oauth_clients" in sql:
+            return _ScalarResult(self.client_owner)
         return _ScalarResult(self.user_active)
 
 

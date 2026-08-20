@@ -28,6 +28,7 @@ from src.csrf import generate_csrf_token, verify_csrf
 from src.database import get_session
 from src.limiter import limiter
 from src.models.db import APIKey, NoteMetadata, OAuthClient, OAuthCode, OAuthToken, UsageLog, User
+from src.oauth.grants import USER_BOOTSTRAP_LOCK_KEY
 from src.services.vault import validate_vault_root_path, warm_user_vault_cache
 
 router = APIRouter(tags=["auth"], dependencies=[Depends(verify_csrf)])
@@ -41,7 +42,11 @@ templates = Jinja2Templates(
 # Advisory-lock key for the bootstrap-registration critical section. Any
 # distinct 32-bit int works; this is just a constant the lock function
 # expects. Two concurrent /admin/register POSTs will serialize on this key.
-_BOOTSTRAP_LOCK_KEY = 7283910429
+# Shared with the OAuth token-minting handlers, which take the same key so a
+# mint cannot insert a new ownerless token in the window between this
+# transaction's `WHERE user_id IS NULL` claim and its COMMIT. The value is
+# unchanged; only its definition moved, so a rolling deploy still serializes.
+_BOOTSTRAP_LOCK_KEY = USER_BOOTSTRAP_LOCK_KEY
 
 
 # --- Helpers --------------------------------------------------------------
