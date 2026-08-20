@@ -259,17 +259,16 @@ async def download_info(request: Request, token: str | None = Depends(_bearer)) 
 
 
 def _upload_deadline(row) -> float:
-    """`min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)`, as monotonic.
+    """The stream deadline as a monotonic instant.
 
-    Two bounds for two different things: the capability's own TTL, and how long
-    one claimed stream may hold a slot. The stricter one wins.
+    The wall-clock arithmetic — `min(expires_at, claimed_at +
+    TRANSFER_MAX_UPLOAD_SECONDS)` — is `transfer.upload_stream_deadline`, not a
+    copy here, because `check_upload` reports against the same boundary: past
+    it, a still-claimed token's outcome is unknown rather than pending. Two
+    copies would drift and the status tool would contradict the route.
     """
     now = _now()
-    claimed = _aware(row.claimed_at) if row.claimed_at else now
-    hard = min(
-        _aware(row.expires_at),
-        claimed + datetime.timedelta(seconds=settings.transfer_max_upload_seconds),
-    )
+    hard = transfer.upload_stream_deadline(row)
     return time.monotonic() + max(0.0, (hard - now).total_seconds())
 
 

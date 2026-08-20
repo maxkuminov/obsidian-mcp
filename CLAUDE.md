@@ -519,7 +519,7 @@ may do at mint time, and the route acts on nothing else.**
 
 **Tools** (`src/mcp_server/tools.py`, registered in `server.py`):
 - `request_upload(path, overwrite=False, expires_in=None)` — readwrite. Mints a single-use upload capability; returns `upload_id` (opaque `public_id`, never the row id), a `…/transfer/upload#<token>` URL, `expires_at` and `max_bytes`.
-- `check_upload(upload_id)` — `pending` | `uploading` | `completed{path,size,sha256,mime,completed_at}` | `expired`, scoped to the exact minting credential *and* user. Another identity's handle is `not found`.
+- `check_upload(upload_id)` — `pending` | `uploading` | `unknown` | `revoked` | `completed{path,size,sha256,mime,completed_at}` | `expired`, scoped to the exact minting credential *and* user. Another identity's handle is `not found`. See "check_upload answers for the vault, not for the row" below.
 - `request_download(path, expires_in=None)` — read is enough. Multi-use within its TTL; bound to the file's exact bytes at mint.
 - `import_from_url(url, path, overwrite=False)` — readwrite. Server-side fetch under the SSRF policy, straight through the same capped, anchored publish.
 - `delete_file(path, permanent=False)` — readwrite. See "File-access tools".
@@ -535,6 +535,26 @@ The token travels in the URL **fragment**, which browsers never send, so Traefik
 - Handled pre-publication failures (413, 409, disconnect, dead identity) **release** the claim: nothing was published, so the human may retry the same link.
 - Deadline or idle timeout **consumes** it: the request died mid-stream and a retry should mint afresh.
 - A failure *after* publication — `PostPublishFailure` — leaves it **`claimed`**, forever. Never release there: from that state we cannot prove nothing landed, and a replayable token over an already-written path is the worse failure.
+
+### `check_upload` answers for the vault, not for the row
+
+Three rules, each of which was violated by reading `state` and `expires_at` and nothing else:
+
+- **A claimed token is answered before expiry, and never as "never used".** `claimed` past its TTL is reached by exactly one path — `PostPublishFailure` — and that path runs *after* the bytes are in the vault. The expiry branch used to fire first and say the link "was never used", about a file sitting at the path; with a ten-minute TTL that was the answer an agent was most likely to see (#75). Inside `min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)` the answer is `uploading` and it names that deadline; past it, `unknown` — the bytes may be there, go `list_files`/`read_file` the path before re-minting, the same thing `import_from_url` says for the same outcome. `consumed` is the one mid-flight end state that *is* provably empty (the timeout paths raise before `publish`), and it says so.
+- **The deadline arithmetic lives once**, in `transfer.upload_stream_deadline`; `routes._upload_deadline` converts it to monotonic. Two copies would drift silently — the tool would keep saying `uploading` about a stream the route had already killed.
+- **Liveness is re-checked, inside the open session.** `lookup_by_public_id` filters on public_id/direction/identity only, while `PUT /transfer/upload` also requires `resolve_identity_ok(need_write=True)` and `resolve_root_ok`. So after an OAuth scope downgrade or a vault reassignment the tool asserted "pending" about a link every redemption would 404 (#71). Both predicates now run for `pending`/`claimed` rows and produce a `revoked` answer naming the cause. **`completed` rows are deliberately not re-checked** — that transfer already happened, and a later revocation must not turn a true report of a landed file into a false "revoked". For a `claimed` row the dead reason is *appended* to the ambiguity, never substituted for it: revocation does not un-publish bytes.
+
+Precision here is the design, not an exception to it — this side is authenticated and identity-scoped. None of the branches may put a token or any other secret into `usage_logs`; the `upload_id` shape check still runs before `_tracked` sees the argument.
+
+### A link never outlives the credential that minted it
+
+Redemption re-checks the credential (`_credential_ok`), so `transfer_tokens.expires_at` alone was never the effective lifetime: an OAuth access token lives one hour, and `expires_in=3600` on that path is therefore *always* divergent (#73). `transfer.plan_mint_window` computes `min(requested TTL, credential expiry)` and the row stores that, so the tool result, `/transfer/*/info` and both pages all show a deadline enforcement agrees with — clamping once instead of teaching three surfaces the same arithmetic. `mint_token` computes the window itself when a caller does not pass one, so a new mint path cannot skip the clamp.
+
+Two details are load-bearing. A null `expires_at` means "never expires" for an `APIKey` and "already dead" for an `OAuthToken` (`_credential_ok` refuses the latter outright), so `credential_expires_at` maps them differently — getting that backwards mints links against dead tokens. And under `MIN_MINT_TTL_SECONDS` (30 s) of runway — or with no credential row behind the call at all — the mint is **refused** rather than shortened: an error tells the agent to re-authenticate, whereas a two-second link tells it to hand a human a URL that will 404. The threshold sits below the 60 s floor `expires_in` already clamps to, so it only ever fires because the credential is nearly spent.
+
+### The consent page states the mode
+
+`transfer_upload.html` shows Destination, **Mode**, Maximum size and Link expires. Mode is `overwrite` from the info payload — "Replaces the existing file at `<path>`" versus "Creates a new file" — and an overwrite link gets a destructive button label and destructive status copy. That page press is the consent step for the only session-less write path in the app; until this, a link that replaces a file rendered identically to one that creates one (#72). The flag was already on the wire; the fix is display plus the matching spec requirement. The page stays self-contained and nonce-guarded — no new asset, nothing path-specific rendered server-side, everything into the DOM through `textContent`.
 
 ### Uniform 404
 Unknown, expired, consumed, claimed, revoked credential, downgraded permission, inactive user, reassigned vault root — one status, one body. `_not_found()` is the only way for a bearer-protected endpoint to say no. Precise status comes from the *authenticated* side, via `check_upload`. The uniformity is of the *response*; the branches do different amounts of work and none of this is constant-time, so do not claim timing indistinguishability for it.

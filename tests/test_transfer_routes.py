@@ -281,6 +281,26 @@ async def test_pages_never_carry_the_token_or_the_bound_path(client, harness, pa
 # ── 4.1 / 4.3 the uniform 404 matrix ────────────────────────────────────────
 
 
+async def test_the_upload_page_states_the_mode_it_will_act_in(client, harness):
+    """The consent step must distinguish a replace from a create.
+
+    This page press is the only session-less write path in the app, and the
+    human pressing it is the consent authority for a destructive write. Until
+    the Mode row existed, an `overwrite=True` link rendered identically to one
+    that creates a new file.
+    """
+    body = (await client.get("/transfer/upload")).text
+    assert 'id="mode"' in body
+    assert "Replaces the existing file at" in body
+    assert "Creates a new file" in body
+    # Destructive links get destructive copy and a destructive button label.
+    assert "This will REPLACE the existing file at" in body
+    assert "Replace file" in body
+    # Still self-contained: the mode is decided from the JSON, not a new asset.
+    assert "http://" not in body.replace("http://www.w3.org", "")
+    assert "cdn" not in body.lower()
+
+
 async def test_info_returns_the_bound_metadata(client, harness):
     response = await client.get("/transfer/upload/info", headers=auth(harness))
     assert response.status_code == 200
@@ -288,6 +308,14 @@ async def test_info_returns_the_bound_metadata(client, harness):
     assert body["path"] == harness.row.path
     assert body["max_bytes"] == settings.max_file_write_bytes
     assert body["expires_at"].startswith(str(_now().year))
+    # The page renders the Mode row from this field.
+    assert body["overwrite"] is False
+
+
+async def test_info_reports_an_overwrite_token_as_such(client, harness):
+    harness.row.overwrite = True
+    response = await client.get("/transfer/upload/info", headers=auth(harness))
+    assert response.json()["overwrite"] is True
 
 
 async def test_download_info_reports_the_minted_size(client, harness):

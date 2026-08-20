@@ -1932,8 +1932,30 @@ def _mint_preflight(path: str, *, need_write: bool) -> tuple | str:
     return uid, root, rel, base.rstrip("/")
 
 
+def _utc_stamp(value) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+
+
 def _expiry_line(row) -> str:
-    return row.expires_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
+    return _utc_stamp(row.expires_at)
+
+
+def _clamp_note(window) -> str:
+    """Say so when the credential, not the caller, chose the deadline.
+
+    The clamp is invisible otherwise — `expires_at` is simply earlier than
+    asked — and an agent that quoted the TTL it requested would go on believing
+    the link lives that long. Naming the cause is what makes the fix
+    (re-authenticate, then mint) reachable.
+    """
+    if window is None or not window.clamped:
+        return ""
+    return (
+        "NOTE: this link expires when the credential you are authenticated "
+        "with does, which is sooner than the lifetime you asked for. "
+        "Re-authenticate (or use a longer-lived API key) and mint again if you "
+        "need the full window.\n\n"
+    )
 
 
 @_tracked("request_upload", ["path", "overwrite", "expires_in"])
@@ -1959,24 +1981,34 @@ async def request_upload_impl(
             "the upload). Nothing was minted."
         )
 
+    identity = _transfer_identity()
     async with async_session() as session:
+        try:
+            # Redemption re-checks the credential, so the link cannot outlive
+            # it. Deciding that here means every surface downstream shows the
+            # deadline the routes will actually honour.
+            window = await transfer.plan_mint_window(session, identity, expires_in)
+        except transfer.CredentialTooShortLived as e:
+            return f"{e} Nothing was minted."
         token, row = await transfer.mint_token(
             session,
             "upload",
             rel,
             overwrite=overwrite,
-            identity=_transfer_identity(),
+            identity=identity,
             vault_root=root,
             # On a no-overwrite token the publish is a kernel-linearizable
             # hard link, so there is nothing to compare against; the
             # fingerprint only means anything when we intend to replace.
             expected_fingerprint=fingerprint if overwrite else None,
             expires_in=expires_in,
+            window=window,
         )
 
     return (
         f"Upload link for `{rel}` (expires {_expiry_line(row)}):\n\n"
         f"{base}/transfer/upload#{token}\n\n"
+        f"{_clamp_note(window)}"
         f"upload_id: {row.public_id}\n"
         f"max_bytes: {settings.max_file_write_bytes:,}\n"
         f"overwrite: {overwrite}\n\n"
@@ -2023,37 +2055,105 @@ async def check_upload_impl(upload_id: str) -> str:
         row = await transfer.lookup_by_public_id(
             session, upload_id, identity=identity, direction="upload"
         )
+        # **The liveness re-check runs inside the session**, before it closes.
+        # `lookup_by_public_id` matches on public_id/direction/identity and
+        # applies no state filter, but the redemption route decides usability
+        # from a strictly larger predicate: `PUT /transfer/upload` also
+        # requires `resolve_identity_ok(need_write=True)` and
+        # `resolve_root_ok`. Reporting a row's own `state` alone therefore told
+        # the agent a link was live after an OAuth scope downgrade or a vault
+        # reassignment had already made every redemption a uniform 404 — the
+        # agent's own status tool contradicting the page the human is looking
+        # at. Only `pending`/`claimed` rows need it: a `completed` row records
+        # something that already happened and no later revocation unhappens it.
+        dead: list[str] = []
+        if row is not None and row.state in (
+            transfer.STATE_PENDING,
+            transfer.STATE_CLAIMED,
+        ):
+            if not await transfer.resolve_identity_ok(session, row, need_write=True):
+                dead.append(
+                    "the credential that minted it no longer has write access "
+                    "(revoked, downgraded, or expired)"
+                )
+            if not await transfer.resolve_root_ok(session, row):
+                dead.append("the vault root it was minted against has changed")
     if row is None:
         # Also the answer for another identity's upload_id: an agent must not
         # be able to probe for handles it did not mint.
         return f"not found: no upload link with id {upload_id} was minted by this identity."
 
+    # Precise status is allowed here and only here: this side is authenticated
+    # and identity-scoped, which is exactly where the transfer design puts
+    # detail rather than the uniform 404 the public routes must return.
+    dead_note = ""
+    if dead:
+        dead_note = (
+            "\nThis link can no longer be redeemed in any case: "
+            + " and ".join(dead)
+            + "."
+        )
+
     if row.state == "completed":
-        when = row.completed_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ")
         return (
             f"completed: {row.path}\n"
             f"size: {row.size:,} bytes\n"
             f"sha256: {row.sha256}\n"
             f"mime: {row.mime}\n"
-            f"completed_at: {when}"
+            f"completed_at: {_utc_stamp(row.completed_at)}"
         )
+
+    # **Claimed is answered before expiry, and never as "never used".** A claim
+    # means a stream started, and the one failure the design deliberately
+    # strands in `claimed` — `PostPublishFailure` — happens *after* the bytes
+    # are in the vault. The old order tested `expires_at` first, so the state
+    # an agent is most likely to observe (the TTL is ten minutes) answered
+    # "the link was never used", about a file that is sitting at the path.
+    if row.state == "claimed":
+        started = _utc_stamp(row.claimed_at) if row.claimed_at else "an unknown time"
+        deadline = transfer.upload_stream_deadline(row)
+        if datetime.now(timezone.utc) < deadline:
+            return (
+                f"uploading: someone is sending {row.path} right now (started "
+                f"{started}). The stream has until {_utc_stamp(deadline)}; check "
+                "again after that and this tool will say whether the bytes "
+                "landed." + dead_note
+            )
+        return (
+            f"unknown: an upload of {row.path} started ({started}) and the "
+            "server never recorded how it finished. The bytes may already be "
+            "in the vault — a publish can succeed and still fail to record its "
+            f"completion. Check `{row.path}` with `list_files` or `read_file` "
+            "before you mint another link or tell anyone the file did not "
+            "arrive. Do not assume nothing landed." + dead_note
+        )
+
+    # `consumed` is hoisted above the expiry test for the same reason
+    # `claimed` is: a consumed token *was* used — a stream started and was cut
+    # short — so once its TTL passed, the expiry branch answered "was never
+    # used" about it too. Unlike `claimed` this one is provably empty: the
+    # deadline and idle-timeout paths raise from inside the stream, always
+    # before `publish`. So it can say what happened *and* that nothing landed.
+    if row.state == "consumed":
+        return (
+            f"expired: the upload of {row.path} was cut short (it stalled or ran "
+            "past its deadline) and the link is spent. Nothing was published: "
+            "the deadline and idle-timeout paths abort before the bytes reach "
+            "the vault. Call `request_upload` again for a fresh one."
+        )
+    # Only a `pending` row reaches here, which is the one state for which
+    # "never used" is true.
     if row.expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc):
         return (
             f"expired: the link for {row.path} was never used and can no longer "
             "be redeemed. Call `request_upload` again for a fresh one."
         )
-    if row.state == "consumed":
+    if dead:
         return (
-            f"expired: the upload of {row.path} was cut short (it stalled or ran "
-            "past its deadline) and the link is spent. Call `request_upload` "
-            "again for a fresh one."
-        )
-    if row.state == "claimed":
-        return (
-            f"uploading: someone is sending {row.path} right now. Check again in "
-            "a moment. If this persists for more than a few minutes the transfer "
-            "died mid-flight — mint a new link with `request_upload`; this one "
-            "will not complete."
+            f"revoked: the link for {row.path} is no longer redeemable — "
+            + " and ".join(dead)
+            + ". Nothing has been uploaded through it. Mint a new link with "
+            "`request_upload` from a credential that still has write access."
         )
     return (
         f"pending: nothing has been uploaded to {row.path} yet. The link is "
@@ -2084,21 +2184,28 @@ async def request_download_impl(path: str, expires_in: int | None = None) -> str
         return f"Could not read {rel}: {e}. Nothing was minted."
     _kind, mime = classify_bytes(head, PurePosixPath(rel).name)
 
+    identity = _transfer_identity()
     async with async_session() as session:
+        try:
+            window = await transfer.plan_mint_window(session, identity, expires_in)
+        except transfer.CredentialTooShortLived as e:
+            return f"{e} Nothing was minted."
         token, row = await transfer.mint_token(
             session,
             "download",
             rel,
             overwrite=False,
-            identity=_transfer_identity(),
+            identity=identity,
             vault_root=root,
             expected_fingerprint=fingerprint,
             expires_in=expires_in,
+            window=window,
         )
 
     return (
         f"Download link for `{rel}` (expires {_expiry_line(row)}):\n\n"
         f"{base}/transfer/download#{token}\n\n"
+        f"{_clamp_note(window)}"
         f"size: {fingerprint['size']:,} bytes\n"
         f"mime: {mime}\n\n"
         "Give the URL to the person you are helping — it is a page with a save "

@@ -28,7 +28,7 @@ from src.mcp_server.auth import (  # noqa: E402
     current_api_key_id,
     current_permission,
 )
-from src.models.db import TransferToken  # noqa: E402
+from src.models.db import APIKey, OAuthToken, TransferToken  # noqa: E402
 from src.services import transfer, vault_fs  # noqa: E402
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\x00\rIHDR" + bytes(range(64))
@@ -41,11 +41,30 @@ PUB_ID = transfer.new_public_id()
 # ── harness ─────────────────────────────────────────────────────────────────
 
 
+class FakeResult:
+    """Enough of a SQLAlchemy result for the one row the mint path reads."""
+
+    def __init__(self, value):
+        self._value = value
+
+    def scalar_one_or_none(self):
+        return self._value
+
+    def scalars(self):
+        return self
+
+    def first(self):
+        return self._value
+
+
 class FakeSession:
     """Records what the mint tools write; hands back the row they built."""
 
-    def __init__(self, store):
+    def __init__(self, store, credential=None):
         self.store = store
+        # `plan_mint_window` loads the minting credential to clamp the TTL to
+        # its own expiry, so the fake has to have one to hand back.
+        self.credential = credential
 
     async def __aenter__(self):
         return self
@@ -57,13 +76,28 @@ class FakeSession:
         self.store.append(obj)
 
     async def execute(self, *args, **kwargs):
-        return None  # the opportunistic prune
+        # Both the credential lookup and the opportunistic prune land here.
+        return FakeResult(self.credential["row"] if self.credential else None)
 
     async def commit(self):
         return None
 
     async def refresh(self, obj):
         return None
+
+
+def _api_key(**kwargs) -> APIKey:
+    defaults = dict(
+        id=11,
+        name="k",
+        key_hash="k" * 64,
+        key_prefix="omcp_test",
+        permission="readwrite",
+        is_active=True,
+        expires_at=None,
+    )
+    defaults.update(kwargs)
+    return APIKey(**defaults)
 
 
 @pytest.fixture(autouse=True)
@@ -79,10 +113,16 @@ def usage_log(monkeypatch):
 
 
 @pytest.fixture
-def minted(monkeypatch):
+def credential():
+    """The credential the mint clamp reads. Tests age it to force the clamp."""
+    return {"row": _api_key()}
+
+
+@pytest.fixture
+def minted(monkeypatch, credential):
     """A fake session for the mint path; returns the rows that were added."""
     rows: list[TransferToken] = []
-    monkeypatch.setattr(tools, "async_session", lambda: FakeSession(rows))
+    monkeypatch.setattr(tools, "async_session", lambda: FakeSession(rows, credential))
     return rows
 
 
@@ -263,25 +303,49 @@ class _Found:
 
     def __init__(self, row):
         self.row = row
+        self.closed = False
 
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, *exc):
+        self.closed = True
         return False
 
 
 @pytest.fixture
 def looked_up(monkeypatch):
-    """Install a canned `lookup_by_public_id` and record what it was asked."""
-    state = {"row": None, "calls": []}
+    """Canned `lookup_by_public_id` plus the two liveness predicates.
+
+    The predicates themselves are exercised against a real database in
+    `tests/integration/test_transfer_pg.py`; what belongs here is that
+    `check_upload` *asks* them, asks for write, asks while the session is still
+    open, and reports what they say instead of the row's bare state.
+    """
+    state = {
+        "row": None,
+        "calls": [],
+        "identity_ok": True,
+        "root_ok": True,
+        "checks": [],
+    }
 
     async def lookup(session, public_id, *, identity, direction):
         state["calls"].append((public_id, identity, direction))
         return state["row"]
 
+    async def identity_ok(session, row, *, need_write):
+        state["checks"].append(("identity", need_write, row.state, session.closed))
+        return state["identity_ok"]
+
+    async def root_ok(session, row):
+        state["checks"].append(("root", None, row.state, session.closed))
+        return state["root_ok"]
+
     monkeypatch.setattr(tools, "async_session", lambda: _Found(None))
     monkeypatch.setattr(transfer, "lookup_by_public_id", lookup)
+    monkeypatch.setattr(transfer, "resolve_identity_ok", identity_ok)
+    monkeypatch.setattr(transfer, "resolve_root_ok", root_ok)
     return state
 
 
@@ -310,13 +374,25 @@ async def test_check_upload_reports_pending(vault, readwrite, looked_up):
     assert "Attachments/shot.png" in result
 
 
-async def test_check_upload_reports_uploading_with_the_stuck_advice(
+async def test_check_upload_reports_uploading_with_the_stream_deadline(
     vault, readwrite, looked_up
 ):
-    looked_up["row"] = _row(state="claimed")
+    """In flight, the lead is "still uploading" — and it names the deadline.
+
+    The old copy told the agent the transfer "will not complete", an assertion
+    about the vault it cannot make: a claim that outlives its stream is exactly
+    the `PostPublishFailure` shape, where the bytes *are* published.
+    """
+    import datetime
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    looked_up["row"] = _row(
+        state="claimed", claimed_at=now - datetime.timedelta(seconds=5)
+    )
     result = await tools.check_upload_impl(PUB_ID)
     assert result.startswith("uploading")
-    assert "mint a new link" in result
+    assert "never" not in result
+    assert "will not complete" not in result
 
 
 async def test_check_upload_reports_completed_with_the_hash(vault, readwrite, looked_up):
@@ -849,3 +925,291 @@ async def test_request_upload_refuses_a_symlinked_ancestor(vault, readwrite, min
     result = await tools.request_upload_impl("Attachments/linked/shot.png")
     assert "symlink" in result
     assert minted == []
+
+
+# ── #73 a link never outlives the credential that minted it ─────────────────
+
+
+def _in(seconds: int):
+    import datetime
+
+    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        seconds=seconds
+    )
+
+
+async def test_mint_clamps_the_link_to_the_credential_expiry(
+    vault, readwrite, minted, credential
+):
+    """`min(requested TTL, credential expiry)` — the deadline redemption honours.
+
+    Without the clamp the tool advertised `expires_in` verbatim while
+    `_credential_ok` would refuse every redemption after the credential died,
+    so the human met the uniform 404 well inside the window they were quoted.
+    """
+    import datetime
+
+    cutoff = _in(120)
+    credential["row"] = _api_key(expires_at=cutoff)
+    result = await tools.request_upload_impl("Attachments/shot.png", expires_in=3600)
+
+    (row,) = minted
+    assert row.expires_at == cutoff
+    # The advertised deadline is the clamped one, not the requested one.
+    assert cutoff.strftime("%Y-%m-%d %H:%M:%SZ") in result
+    assert (
+        row.expires_at
+        < datetime.datetime.now(datetime.timezone.utc)
+        + datetime.timedelta(seconds=3600)
+    )
+
+
+async def test_a_clamped_mint_says_so_and_why(vault, readwrite, minted, credential):
+    credential["row"] = _api_key(expires_at=_in(120))
+    result = await tools.request_upload_impl("Attachments/shot.png", expires_in=3600)
+    assert "NOTE:" in result
+    assert "credential" in result
+    assert "Re-authenticate" in result
+
+
+async def test_an_unclamped_mint_stays_quiet(vault, readwrite, minted, credential):
+    """The note must not fire for a credential that outlives the TTL."""
+    credential["row"] = _api_key(expires_at=None)
+    result = await tools.request_upload_impl("Attachments/shot.png", expires_in=600)
+    assert "NOTE:" not in result
+    (row,) = minted
+    assert 595 <= (row.expires_at - _in(0)).total_seconds() <= 605
+
+
+async def test_request_download_clamps_to_the_credential_too(
+    vault, readonly, minted, credential
+):
+    (vault / "Attachments" / "spec.pdf").write_bytes(b"%PDF-1.4\n" + PNG)
+    cutoff = _in(90)
+    credential["row"] = _api_key(permission="read", expires_at=cutoff)
+    result = await tools.request_download_impl("Attachments/spec.pdf", expires_in=3600)
+    (row,) = minted
+    assert row.expires_at == cutoff
+    assert "NOTE:" in result
+
+
+@pytest.mark.parametrize("remaining", [10, 0, -60])
+async def test_a_credential_about_to_die_mints_nothing(
+    vault, readwrite, minted, credential, remaining
+):
+    """Under 30 s of runway is refused: the human could not open it in time."""
+    credential["row"] = _api_key(expires_at=_in(remaining))
+    result = await tools.request_upload_impl("Attachments/shot.png")
+    assert "Nothing was minted" in result
+    assert "30 seconds" in result
+    assert "Re-authenticate" in result
+    assert minted == []
+
+
+async def test_an_oauth_token_with_no_expiry_mints_nothing(
+    vault, readwrite, minted, credential
+):
+    """A null `expires_at` on an access token is already unusable, not immortal.
+
+    `_credential_ok` refuses such a token outright, so treating the null as
+    "never expires" would mint links that can only 404.
+    """
+    from src.mcp_server.auth import current_oauth_token_id
+
+    credential["row"] = OAuthToken(
+        id=5,
+        token_hash="o" * 64,
+        token_type="access",
+        client_id="c",
+        scope="readwrite",
+        expires_at=None,
+        revoked=False,
+    )
+    reset_key = current_api_key_id.set(None)
+    reset_oauth = current_oauth_token_id.set(5)
+    try:
+        result = await tools.request_upload_impl("Attachments/shot.png")
+    finally:
+        current_oauth_token_id.reset(reset_oauth)
+        current_api_key_id.reset(reset_key)
+    assert "Nothing was minted" in result
+    assert minted == []
+
+
+async def test_a_call_with_no_credential_at_all_mints_nothing(
+    vault, readwrite, minted, credential
+):
+    """Nothing to re-validate means nothing redeemable — refuse rather than lie."""
+    credential["row"] = None
+    result = await tools.request_upload_impl("Attachments/shot.png")
+    assert "Nothing was minted" in result
+    assert minted == []
+
+
+# ── #75 a claimed token is never reported as unused ─────────────────────────
+
+
+async def test_check_upload_never_says_never_used_for_a_claimed_token(
+    vault, readwrite, looked_up
+):
+    """The state an agent is most likely to observe used to be a flat falsehood.
+
+    `PostPublishFailure` strands a token in `claimed` *after* the bytes are in
+    the vault, and the TTL is ten minutes, so the expiry branch — which fired
+    first and said "was never used" — was the answer for a file sitting at the
+    path.
+    """
+    import datetime
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    looked_up["row"] = _row(
+        state="claimed",
+        claimed_at=now - datetime.timedelta(hours=1),
+        expires_at=now - datetime.timedelta(minutes=50),
+    )
+    result = await tools.check_upload_impl(PUB_ID)
+    assert result.startswith("unknown")
+    assert "never used" not in result
+    assert "list_files" in result and "read_file" in result
+    assert "Attachments/shot.png" in result
+
+
+async def test_check_upload_reads_the_stream_deadline_not_the_ttl(
+    vault, readwrite, looked_up, monkeypatch
+):
+    """Past `claimed_at + TRANSFER_MAX_UPLOAD_SECONDS` the outcome is unknown.
+
+    Even with hours of TTL left: the route abandons the stream at that bound,
+    so a still-claimed row past it is not "in flight".
+    """
+    import datetime
+
+    monkeypatch.setattr(transfer.settings, "transfer_max_upload_seconds", 60)
+    now = datetime.datetime.now(datetime.timezone.utc)
+    looked_up["row"] = _row(
+        state="claimed",
+        claimed_at=now - datetime.timedelta(seconds=120),
+        expires_at=now + datetime.timedelta(hours=1),
+    )
+    result = await tools.check_upload_impl(PUB_ID)
+    assert result.startswith("unknown")
+
+
+async def test_the_route_and_check_upload_share_one_stream_deadline():
+    """One helper, so the status tool cannot drift from the route enforcing it."""
+    import datetime
+    import time
+
+    from src.transfer import routes as transfer_routes
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    row = _row(
+        state="claimed",
+        claimed_at=now - datetime.timedelta(seconds=30),
+        expires_at=now + datetime.timedelta(seconds=200),
+    )
+    from_route = transfer_routes._upload_deadline(row) - time.monotonic()
+    from_tool = (transfer.upload_stream_deadline(row) - now).total_seconds()
+    assert abs(from_route - from_tool) < 1.0
+
+
+async def test_a_consumed_link_says_nothing_was_published(vault, readwrite, looked_up):
+    """The one mid-flight end state that *is* provably empty says so."""
+    looked_up["row"] = _row(state="consumed")
+    result = await tools.check_upload_impl(PUB_ID)
+    assert result.startswith("expired")
+    assert "Nothing was published" in result
+
+
+async def test_an_expired_consumed_link_is_not_reported_as_unused(
+    vault, readwrite, looked_up
+):
+    """"Never used" is reachable only for `pending` — a consumed link was used."""
+    import datetime
+
+    looked_up["row"] = _row(
+        state="consumed",
+        expires_at=datetime.datetime.now(datetime.timezone.utc)
+        - datetime.timedelta(minutes=5),
+    )
+    result = await tools.check_upload_impl(PUB_ID)
+    assert "never used" not in result
+    assert "cut short" in result
+
+
+# ── #71 liveness is re-checked, not assumed from the row's state ────────────
+
+
+async def test_check_upload_reports_a_downgraded_credential_instead_of_pending(
+    vault, readwrite, looked_up
+):
+    looked_up["row"] = _row()
+    looked_up["identity_ok"] = False
+    result = await tools.check_upload_impl(PUB_ID)
+    assert result.startswith("revoked")
+    assert "write access" in result
+    assert "pending" not in result
+
+
+async def test_check_upload_reports_a_reassigned_vault_root(vault, readwrite, looked_up):
+    looked_up["row"] = _row()
+    looked_up["root_ok"] = False
+    result = await tools.check_upload_impl(PUB_ID)
+    assert result.startswith("revoked")
+    assert "vault root" in result
+
+
+async def test_the_liveness_check_asks_for_write_inside_the_open_session(
+    vault, readwrite, looked_up
+):
+    """`need_write=True` is the route's predicate; the session must still be open."""
+    looked_up["row"] = _row()
+    await tools.check_upload_impl(PUB_ID)
+    assert ("identity", True, "pending", False) in looked_up["checks"]
+    assert ("root", None, "pending", False) in looked_up["checks"]
+
+
+async def test_a_completed_row_is_not_re_checked(vault, readwrite, looked_up):
+    """A completed transfer already happened; no later revocation unhappens it."""
+    import datetime
+
+    looked_up["row"] = _row(
+        state="completed",
+        size=1,
+        sha256="b" * 64,
+        mime="image/png",
+        completed_at=datetime.datetime.now(datetime.timezone.utc),
+    )
+    looked_up["identity_ok"] = False
+    result = await tools.check_upload_impl(PUB_ID)
+    assert result.startswith("completed")
+    assert looked_up["checks"] == []
+
+
+async def test_a_dead_claimed_link_still_reports_the_upload_outcome_first(
+    vault, readwrite, looked_up
+):
+    """Revocation does not un-publish bytes, so ambiguity still leads."""
+    import datetime
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    looked_up["row"] = _row(
+        state="claimed",
+        claimed_at=now - datetime.timedelta(hours=1),
+        expires_at=now - datetime.timedelta(minutes=50),
+    )
+    looked_up["identity_ok"] = False
+    result = await tools.check_upload_impl(PUB_ID)
+    assert result.startswith("unknown")
+    assert "no longer be redeemed" in result
+
+
+async def test_check_upload_still_logs_only_the_handle_after_the_liveness_check(
+    vault, readwrite, looked_up, usage_log
+):
+    """Nothing the new branches add may put a capability into `usage_logs`."""
+    looked_up["row"] = _row()
+    looked_up["identity_ok"] = False
+    await tools.check_upload_impl(PUB_ID)
+    entry = next(e for e in usage_log if e["tool"] == "check_upload")
+    assert entry["params"] == {"upload_id": PUB_ID}

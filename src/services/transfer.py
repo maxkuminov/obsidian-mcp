@@ -90,6 +90,19 @@ class PostPublishFailure(TransferError):
     """
 
 
+class CredentialTooShortLived(TransferError):
+    """The minting credential dies too soon to back a usable capability.
+
+    Redemption re-checks the *credential*, not just the token
+    (`_credential_ok`), so a link can never outlive the key or access token
+    that minted it. When that leaves less runway than `MIN_MINT_TTL_SECONDS`
+    the honest answer is to mint nothing: a link that is already dead — or
+    dead before a human can plausibly open it — is worse than an error,
+    because the error tells the agent to re-authenticate and the link does
+    not.
+    """
+
+
 class SSRFError(TransferError):
     """A URL, hop, or resolved address violated the outbound-fetch policy.
 
@@ -107,6 +120,10 @@ TOKEN_BYTES = 32  # 256 bits, matching the api_keys convention
 PUBLIC_ID_BYTES = 16  # 128 bits — an unguessable handle, not a capability
 MIN_EXPIRES_IN = 60
 MAX_EXPIRES_IN = 3600
+# The least runway a mint will hand out. Below this the link would expire
+# before the human it is meant for could open it, so `mint_token` refuses
+# instead of advertising a deadline nobody can meet.
+MIN_MINT_TTL_SECONDS = 30
 PRUNE_AFTER = datetime.timedelta(days=1)
 
 DIRECTIONS = ("upload", "download")
@@ -201,6 +218,97 @@ def _now() -> datetime.datetime:
     return datetime.datetime.now(datetime.timezone.utc)
 
 
+def _as_aware(value: datetime.datetime) -> datetime.datetime:
+    """A UTC-aware copy of a database timestamp.
+
+    Postgres `timestamptz` comes back aware through asyncpg, but a row built
+    in a test — or by a future backend — may not be, and a naive/aware compare
+    raises rather than returning a wrong answer. Normalising here keeps the
+    expiry arithmetic total.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value
+
+
+def credential_expires_at(cred) -> datetime.datetime | None:
+    """When the credential itself dies, or `None` if it never does.
+
+    Mirrors the expiry half of `_credential_ok`: an `APIKey` may have a null
+    `expires_at` and live forever, an `OAuthToken` may not — a null there is
+    already unusable, so it reads as "expired at the epoch" rather than
+    "immortal". Getting that backwards would mint links against dead tokens.
+    """
+    if isinstance(cred, APIKey):
+        return _as_aware(cred.expires_at) if cred.expires_at is not None else None
+    if isinstance(cred, OAuthToken):
+        if cred.expires_at is None:
+            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        return _as_aware(cred.expires_at)
+    raise CredentialTooShortLived(  # pragma: no cover - defensive
+        "The credential backing this request cannot be re-validated"
+    )
+
+
+@dataclass(frozen=True)
+class MintWindow:
+    """The deadline a mint may actually promise, and what shortened it."""
+
+    expires_at: datetime.datetime
+    requested_expires_at: datetime.datetime
+    credential_expires_at: datetime.datetime | None
+
+    @property
+    def clamped(self) -> bool:
+        """Did the credential cut the requested TTL short?"""
+        return self.expires_at < self.requested_expires_at
+
+
+async def plan_mint_window(session, identity: Identity, expires_in: int | None) -> MintWindow:
+    """`min(requested TTL, credential expiry)` — the only deadline worth showing.
+
+    Redemption requires the *minting credential* to still be unexpired, so
+    `transfer_tokens.expires_at` alone was never the effective lifetime. On the
+    OAuth path — how the Claude.ai connector authenticates — an access token
+    lives one hour, so any `expires_in` above its remaining life advertised a
+    deadline the routes would refuse to honour, and the human met the uniform
+    404 well inside the window the agent had quoted them.
+
+    Clamping here (rather than only reporting) is what makes every downstream
+    surface honest for free: the tool result, `/transfer/*/info` and both pages
+    all read `row.expires_at`.
+
+    Raises `CredentialTooShortLived` when less than `MIN_MINT_TTL_SECONDS`
+    would remain.
+    """
+    cred = await _load_credential(session, identity)
+    if cred is None:
+        # No credential to re-validate means no redemption can ever succeed
+        # (`resolve_identity_ok` returns False for exactly this), so minting
+        # would only produce a link that 404s.
+        raise CredentialTooShortLived(
+            "This request carries no credential the transfer routes could "
+            "re-validate, so any link minted for it would be refused"
+        )
+
+    now = _now()
+    requested = now + datetime.timedelta(seconds=clamp_expires_in(expires_in))
+    cred_expiry = credential_expires_at(cred)
+    effective = requested if cred_expiry is None else min(requested, cred_expiry)
+    if (effective - now).total_seconds() < MIN_MINT_TTL_SECONDS:
+        raise CredentialTooShortLived(
+            "The credential you are authenticated with expires in under "
+            f"{MIN_MINT_TTL_SECONDS} seconds, so no usable link can be minted "
+            "from it. Re-authenticate (or use a longer-lived API key) and try "
+            "again."
+        )
+    return MintWindow(
+        expires_at=effective,
+        requested_expires_at=requested,
+        credential_expires_at=cred_expiry,
+    )
+
+
 async def mint_token(
     session,
     direction: str,
@@ -211,6 +319,7 @@ async def mint_token(
     vault_root: str,
     expected_fingerprint: dict | None,
     expires_in: int | None = None,
+    window: MintWindow | None = None,
 ) -> tuple[str, TransferToken]:
     """Create one transfer capability; return `(token, row)`.
 
@@ -218,11 +327,19 @@ async def mint_token(
     hash is persisted. Every constraint the redemption route will enforce —
     direction, path, root, identity, overwrite, fingerprint, expiry — is fixed
     here, because the route has no session to derive any of it from.
+
+    The expiry is `min(requested TTL, minting credential's own expiry)` — see
+    `plan_mint_window`. Pass `window` when the caller needs to know whether the
+    credential shortened it; omit it and this computes the same window itself.
     """
     if direction not in DIRECTIONS:
         raise ValueError(f"Unknown transfer direction: {direction!r}")
 
-    ttl = clamp_expires_in(expires_in)
+    # Computed here when the caller did not, so no mint path can forget the
+    # credential clamp: a token that outlives its credential is a link that
+    # 404s at a time we advertised as valid.
+    if window is None:
+        window = await plan_mint_window(session, identity, expires_in)
     token = new_token()
     row = TransferToken(
         public_id=new_public_id(),
@@ -236,7 +353,7 @@ async def mint_token(
         key_id=identity.key_id,
         oauth_token_id=identity.oauth_token_id,
         user_id=identity.user_id,
-        expires_at=_now() + datetime.timedelta(seconds=ttl),
+        expires_at=window.expires_at,
     )
     session.add(row)
 
@@ -248,6 +365,30 @@ async def mint_token(
     await session.commit()
     await session.refresh(row)
     return token, row
+
+
+def upload_stream_deadline(row) -> datetime.datetime:
+    """`min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)`, absolute UTC.
+
+    Two bounds for two different things: the capability's own TTL, and how long
+    one claimed stream may hold a slot. The stricter one wins.
+
+    It lives here, rather than in the route that enforces it, because
+    `check_upload` has to answer the same question from the other side — is
+    this claimed token still plausibly in flight, or is its stream already
+    over? — and a second copy of the arithmetic would eventually disagree with
+    the one the route runs, which is how a status tool starts lying.
+
+    A claimed row always carries `claimed_at`; the `None` fallback is for a row
+    that has not been claimed at all, where "the stream started now" is the
+    most generous reading.
+    """
+    now = _now()
+    claimed = _as_aware(row.claimed_at) if row.claimed_at else now
+    return min(
+        _as_aware(row.expires_at),
+        claimed + datetime.timedelta(seconds=settings.transfer_max_upload_seconds),
+    )
 
 
 async def claim_upload(session, token: str) -> TransferToken | None:
@@ -415,11 +556,18 @@ def _credential_ok(cred, *, need_write: bool, row: TransferToken) -> bool:
     return cred.user_id == row.user_id
 
 
-async def _load_credential(session, row: TransferToken, *, lock: bool = False):
-    if row.key_id is not None:
-        stmt = select(APIKey).where(APIKey.id == row.key_id)
-    elif row.oauth_token_id is not None:
-        stmt = select(OAuthToken).where(OAuthToken.id == row.oauth_token_id)
+async def _load_credential(session, ref: TransferToken | Identity, *, lock: bool = False):
+    """The credential row behind a token — or behind a bare `Identity`.
+
+    Both carry `key_id` / `oauth_token_id`, and both need the same lookup: the
+    redemption re-check reads it off the token, the mint clamp off the identity
+    that is asking. One function so the two cannot disagree about which
+    credential backs a transfer.
+    """
+    if ref.key_id is not None:
+        stmt = select(APIKey).where(APIKey.id == ref.key_id)
+    elif ref.oauth_token_id is not None:
+        stmt = select(OAuthToken).where(OAuthToken.id == ref.oauth_token_id)
     else:
         # A token with no credential cannot be re-validated and is therefore
         # never usable. Mint always sets one.
