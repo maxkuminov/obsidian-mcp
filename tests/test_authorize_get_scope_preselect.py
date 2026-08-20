@@ -59,9 +59,9 @@ READ_ONLY = "read offline_access"
 
 
 class _FakeClient:
-    def __init__(self, scope, redirect_uris=(REGISTERED_URI,)):
+    def __init__(self, scope, redirect_uris=(REGISTERED_URI,), client_name="Test Client"):
         self.client_id = "client123"
-        self.client_name = "Test Client"
+        self.client_name = client_name
         self.scope = scope
         self.redirect_uris = list(redirect_uris)
 
@@ -88,8 +88,8 @@ class _FakeSession:
         return _FakeResult(self._client)
 
 
-def _get(client, *, requested_scope=None):
-    """Render the consent screen for `client`.
+def _request(client, *, requested_scope=None):
+    """Issue the /authorize GET for `client` and return the raw response.
 
     `requested_scope=None` omits the query parameter entirely, so FastAPI
     supplies the `Query("read")` default — the path an ordinary client that
@@ -115,11 +115,31 @@ def _get(client, *, requested_scope=None):
         if requested_scope is not None:
             params["scope"] = requested_scope
 
-        response = TestClient(app).get("/authorize", params=params)
-        assert response.status_code == 200
-        return response.text
+        return TestClient(app).get("/authorize", params=params)
     finally:
         monkeypatch.undo()
+
+
+def _get(client, *, requested_scope=None):
+    """The rendered consent screen. Asserts the request was served."""
+    response = _request(client, requested_scope=requested_scope)
+    assert response.status_code == 200
+    return response.text
+
+
+def _input_tags(html: str) -> list[str]:
+    return re.findall(r"<input\b[^>]*>", html)
+
+
+def _has_checked_attr(tag: str) -> bool:
+    """True if `tag` carries the `checked` *attribute*.
+
+    Quoted attribute values are blanked first: a reflected hostile input can
+    put the word `checked` inside a `value="..."`, and a substring test would
+    read that as a preselected control.
+    """
+    bare = re.sub(r'"[^"]*"', '""', tag)
+    return re.search(r"\bchecked\b", bare) is not None
 
 
 def _radio_checked(html: str, value: str) -> bool:
@@ -127,18 +147,27 @@ def _radio_checked(html: str, value: str) -> bool:
     marker = f'value="{value}"'
     idx = html.index(marker)
     tag_end = html.index(">", idx)
-    return "checked" in html[idx:tag_end]
+    return _has_checked_attr(html[html.rindex("<", 0, idx) : tag_end])
 
 
 def _checked_radio_values(html: str) -> list[str]:
     """Every scope radio that renders `checked`, by submitted value."""
     checked = []
-    for tag in re.findall(r"<input\b[^>]*\btype=\"radio\"[^>]*>", html):
-        if "checked" not in tag:
+    for tag in _input_tags(html):
+        if 'type="radio"' not in tag or not _has_checked_attr(tag):
             continue
         value = re.search(r'value="([^"]*)"', tag)
         checked.append(value.group(1) if value else "")
     return checked
+
+
+def _checked_inputs(html: str) -> list[str]:
+    """Every `<input>` on the page carrying `checked`, of any type or name."""
+    return [tag for tag in _input_tags(html) if _has_checked_attr(tag)]
+
+
+def _scope_controls(html: str) -> list[str]:
+    return [tag for tag in _input_tags(html) if 'name="scope"' in tag]
 
 
 def _text(html: str) -> str:
@@ -214,14 +243,19 @@ def test_readonly_client_is_told_write_is_not_available():
     assert _radio_checked(html, "read") is True
     assert "Test Client is requesting Read + Write access" in text
     assert "not available to this client" in text
+    # The "read only is preselected" line explains a choice; there isn't one
+    # here, so it would only add noise to a screen with a single option.
+    assert "granted only if you select it" not in text
 
 
 def test_write_capable_client_is_not_told_write_is_unavailable():
     """The unavailable notice is about the *registered* scope, so it must not
     fire for a client that can hold write."""
     html = _get(_FakeClient(scope=WRITE_CAPABLE), requested_scope="readwrite")
+    text = _text(html)
 
-    assert "not available to this client" not in _text(html)
+    assert "not available to this client" not in text
+    assert "granted only if you select it" in text
 
 
 # --- the selected level is visibly marked ----------------------------------
@@ -247,3 +281,85 @@ def test_selected_scope_option_is_visibly_highlighted():
         # unparseable, so the fallback only degrades gracefully while the
         # `:has()` rules keep to themselves.
         assert "," not in selector
+
+
+# --- the browser must not restore an earlier selection ---------------------
+
+
+def test_scope_radios_opt_out_of_browser_state_restore():
+    """Firefox restores a control's *dynamic* checked state across page loads
+    (session history, reload, back/forward) in preference to the markup
+    default, unless the control opts out. Without `autocomplete="off"` a user
+    who once picked "Read + Write" gets that radio re-checked on a later visit
+    to the same /authorize URL — a client may reuse its state and PKCE
+    challenge — so an unchanged Approve posts readwrite even after the earlier
+    grant was revoked or downgraded. That is the #63 one-click write grant
+    re-entering through the browser instead of the query param, so the
+    fail-safe preselect is only fail-safe with the opt-out present."""
+    for requested in ("read", "readwrite", None):
+        html = _get(_FakeClient(scope=WRITE_CAPABLE), requested_scope=requested)
+
+        form = re.search(r"<form\b[^>]*>", html)
+        assert form is not None
+        assert 'autocomplete="off"' in form.group(0), requested
+
+        controls = _scope_controls(html)
+        assert len(controls) == 2, requested
+        for tag in controls:
+            assert 'autocomplete="off"' in tag, (requested, tag)
+
+
+def test_read_only_clients_scope_radio_also_opts_out():
+    html = _get(_FakeClient(scope=READ_ONLY), requested_scope="read")
+
+    controls = _scope_controls(html)
+    assert len(controls) == 1
+    assert 'autocomplete="off"' in controls[0]
+
+
+# --- hostile input ---------------------------------------------------------
+
+
+def test_hostile_client_name_is_escaped_and_cannot_add_a_control():
+    """`client_name` is attacker-chosen — /register is unauthenticated — and
+    it is the one client-controlled string the consent screen renders. It must
+    reach the page as text, never as markup: an injected pre-checked control
+    would be submitted by an unchanged Approve exactly like the write radio."""
+    hostile = '<script>alert("xss")</script>"><input type="radio" name="scope" value="readwrite" checked>'
+    html = _get(_FakeClient(scope=WRITE_CAPABLE, client_name=hostile), requested_scope="read")
+
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+    assert _checked_radio_values(html) == ["read"]
+    assert len(_checked_inputs(html)) == 1
+    assert 'name="scope"' in _checked_inputs(html)[0]
+    assert len(_scope_controls(html)) == 2
+
+
+def test_hostile_scope_query_is_rejected_before_anything_renders():
+    """A `scope` crafted to break out of the attribute it used to drive is
+    refused by `_validate_scope` with `invalid_scope`, so no consent page —
+    and no control — is produced from it at all.
+
+    `_validate_scope`'s message does echo the offending token, but into an
+    `application/json` error body, not into markup: what is pinned here is
+    that the hostile scope never reaches the template and cannot contribute a
+    rendered, let alone pre-checked, control."""
+    response = _request(
+        _FakeClient(scope=WRITE_CAPABLE),
+        requested_scope='readwrite"><input type="radio" name="scope" checked',
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_scope"
+    assert response.headers["content-type"].startswith("application/json")
+    assert "<form" not in response.text
+    assert _scope_controls(response.text) == []
+    assert _checked_inputs(response.text) == []
+
+
+def test_unknown_scope_token_is_rejected():
+    response = _request(_FakeClient(scope=WRITE_CAPABLE), requested_scope="admin")
+
+    assert response.status_code == 400
+    assert response.json()["error"] == "invalid_scope"

@@ -15,6 +15,12 @@
 - [x] 3.1 `authorize.html`: `.scope-option:has(input[type="radio"]:checked)` border/background rule, in its own block
 - [x] 3.2 `authorize.html`: matching `.scope-option-title` rule, also standalone; comment recording that a browser without `:has()` falls back to the native `accent-color` radio dot
 
+## 3b. Browser state restore (adversarial review, MAJOR)
+
+- [x] 3b.1 `autocomplete="off"` on the consent `<form>` and on every `name="scope"` radio, with a template comment recording that Firefox otherwise restores an earlier "Read + Write" selection over the markup default
+- [x] 3b.2 design.md section on why the markup default alone is not fail-safe
+- [x] 3b.3 Spec: browser-restore clause on the preselect requirement plus its scenario
+
 ## 4. Tests that pin it (#63, #65 gap 3)
 
 - [x] 4.1 Rewrite `tests/test_authorize_get_scope_preselect.py` to drive `/authorize` through `TestClient` on a bare app so query defaults resolve the way FastAPI resolves them
@@ -24,6 +30,9 @@
 - [x] 4.5 `test_only_the_read_radio_is_ever_checked` — whole-form property, so a future third level cannot ship pre-checked
 - [x] 4.6 `test_readonly_client_is_told_write_is_not_available` and its negative complement
 - [x] 4.7 `test_selected_scope_option_is_visibly_highlighted` — asserts the `:has()` rules exist *and* are not grouped with other selectors
+- [x] 4.8a `test_scope_radios_opt_out_of_browser_state_restore` / `test_read_only_clients_scope_radio_also_opts_out` — the attribute on the form and on every scope radio
+- [x] 4.8b `test_hostile_client_name_is_escaped_and_cannot_add_a_control` — attacker-chosen `client_name` reaches the page as text, and exactly one control on the whole page is checked
+- [x] 4.8c `test_hostile_scope_query_is_rejected_before_anything_renders` / `test_unknown_scope_token_is_rejected` — `invalid_scope`, JSON body, no form and no control
 - [x] 4.8 Verify by stashing `src/`: every behavioural test in the module fails against the pre-change tree
 - [x] 4.9 Full suite green (`pytest -q --ignore=tests/integration`)
 

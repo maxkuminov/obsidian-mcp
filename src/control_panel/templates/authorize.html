@@ -254,7 +254,20 @@
                 {% endif %}
             </div>
 
-            <form method="post" action="/authorize">
+            {# `autocomplete="off"` on the form *and* on each radio is
+               load-bearing, not tidiness. Firefox restores a control's
+               dynamic checked state across page loads (session history,
+               reload, back/forward) in preference to the markup default,
+               so a user who once picked "Read + Write" would find that
+               radio re-checked on a later visit to the same /authorize
+               URL — a client may reuse its state/PKCE — and an unchanged
+               Approve would post readwrite after the earlier grant had
+               been revoked or downgraded. That is the #63 single-click
+               write grant re-entering through the browser rather than
+               through the query param. The per-input attribute is the
+               one that actually governs restore; the form-level one
+               covers controls added later. #}
+            <form method="post" action="/authorize" autocomplete="off">
                 <input type="hidden" name="client_id"             value="{{ client_id }}">
                 <input type="hidden" name="redirect_uri"          value="{{ redirect_uri }}">
                 <input type="hidden" name="code_challenge"        value="{{ code_challenge }}">
@@ -271,7 +284,7 @@
                    write to any self-registered client (#63). What the client
                    asked for is surfaced in the request box above instead. #}
                 <label class="scope-option">
-                    <input type="radio" name="scope" value="{{ read_scope }}" checked>
+                    <input type="radio" name="scope" value="{{ read_scope }}" autocomplete="off" checked>
                     <div>
                         <div class="scope-option-title">Read only</div>
                         <div class="scope-option-desc">Search and read notes. Cannot create or edit.</div>
@@ -280,7 +293,7 @@
 
                 {% if client_can_write %}
                 <label class="scope-option">
-                    <input type="radio" name="scope" value="{{ readwrite_scope }}">
+                    <input type="radio" name="scope" value="{{ readwrite_scope }}" autocomplete="off">
                     <div>
                         <div class="scope-option-title">Read + Write</div>
                         <div class="scope-option-desc">Full access: search, read, create, and edit notes.</div>

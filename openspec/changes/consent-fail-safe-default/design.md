@@ -40,6 +40,26 @@ The value is still derived from `scope` **after** `_validate_scope`, so it can
 only ever be one of the three known scope tokens; the template renders fixed
 prose from a boolean and never echoes the raw parameter.
 
+### The preselect is only fail-safe with `autocomplete="off"`
+
+A markup default is not the last word on what a radio is checked. Firefox
+restores a control's *dynamic* checked state across page loads — session
+history, reload, back/forward — in preference to the markup, unless the
+control opts out. So a user who once selected "Read + Write" would find that
+radio re-checked the next time the same `/authorize` URL was visited (a client
+is free to reuse its `state` and PKCE challenge), and an unchanged **Approve**
+would post `readwrite` — after the earlier grant had been revoked or
+downgraded, which is precisely the state in which nobody intends to re-grant
+it. That is the #63 one-click write grant re-entering through the browser
+instead of through the query param, so hardcoding `checked` closes only half
+the hole on its own.
+
+`autocomplete="off"` therefore goes on **both** the `<form>` and each
+`name="scope"` radio. The per-control attribute is the one that actually
+governs restoration; the form-level one is the blanket that covers any control
+added later without someone remembering this note. It is asserted on both, for
+the write-capable client (two radios) and the read-only client (one).
+
 ### `:has()` rules stand alone
 
 CSS drops an entire rule when any selector in its selector list fails to
