@@ -331,7 +331,9 @@ async def _mint(session, user, key, **kwargs):
     kwargs.setdefault("overwrite", False)
     kwargs.setdefault("expected_fingerprint", None)
     kwargs.setdefault("expires_in", None)
-    return await transfer.mint_token(
+    # `mint_token` also returns the `MintWindow` it computed (the credential
+    # clamp); the lifecycle tests care about the token and the row.
+    token, row, _window = await transfer.mint_token(
         session,
         kwargs.pop("direction"),
         kwargs.pop("path", "Attachments/a.png"),
@@ -339,6 +341,7 @@ async def _mint(session, user, key, **kwargs):
         vault_root="/obsidian",
         **kwargs,
     )
+    return token, row
 
 
 async def test_mint_stores_only_a_hash(clean):
@@ -607,7 +610,7 @@ async def test_identity_not_ok_for_an_inactive_user(clean):
 async def test_oauth_predicates(clean):
     async with clean() as session:
         user, _, oauth = await _seed_identity(session)
-        _, row = await transfer.mint_token(
+        _, row, _window = await transfer.mint_token(
             session,
             "upload",
             "Attachments/a.png",
@@ -693,7 +696,7 @@ async def test_single_user_root_compares_against_settings(clean, monkeypatch):
         session.add(key)
         await session.commit()
         monkeypatch.setattr(transfer.settings, "vault_path", "/obsidian")
-        _, row = await transfer.mint_token(
+        _, row, _window = await transfer.mint_token(
             session,
             "upload",
             "a.png",
@@ -865,7 +868,7 @@ async def _mint_upload(session, vault_root, *, path="Attachments/shot.png", perm
     user, key, _ = await _seed_identity(
         session, permission=permission, vault_path=str(vault_root)
     )
-    token, row = await transfer.mint_token(
+    token, row, _window = await transfer.mint_token(
         session,
         "upload",
         path,
@@ -878,6 +881,113 @@ async def _mint_upload(session, vault_root, *, path="Attachments/shot.png", perm
 
 
 PAYLOAD = b"\x89PNG\r\n\x1a\n" + b"payload-bytes " * 64
+
+
+async def test_info_reports_the_credential_clamped_expiry(clean, vault_root, wired):
+    """The deadline the human is shown is the one redemption will honour.
+
+    The whole point of clamping at mint rather than reporting two deadlines:
+    `/transfer/upload/info` reads `transfer_tokens.expires_at` and knows
+    nothing about credentials, so it is honest for free — but only if the
+    column really holds `min(requested TTL, credential expiry)`. This mints
+    with a 3600 s request against an OAuth access token with ~90 s left, the
+    shape that used to be *always* divergent, and reads the deadline back off
+    the wire.
+    """
+    async with clean() as session:
+        user, _key, oauth = await _seed_identity(session, vault_path=str(vault_root))
+        cutoff = _now() + datetime.timedelta(seconds=90)
+        oauth.expires_at = cutoff
+        await session.commit()
+
+        token, row, window = await transfer.mint_token(
+            session,
+            "upload",
+            "Attachments/shot.png",
+            overwrite=False,
+            identity=transfer.Identity(oauth_token_id=oauth.id, user_id=user.id),
+            vault_root=str(vault_root),
+            expected_fingerprint=None,
+            expires_in=3600,
+        )
+    assert window.clamped is True
+    assert row.expires_at == cutoff
+
+    async with _client("203.0.113.31") as client:
+        response = await client.get(
+            "/transfer/upload/info", headers={"Authorization": f"Bearer {token}"}
+        )
+    assert response.status_code == 200, response.text
+    assert datetime.datetime.fromisoformat(response.json()["expires_at"]) == cutoff
+
+
+async def test_a_nearly_expired_credential_mints_nothing(clean, vault_root):
+    """Under 30 s of runway: no row, so nothing exists to be shown or redeemed."""
+    async with clean() as session:
+        user, _key, oauth = await _seed_identity(session, vault_path=str(vault_root))
+        oauth.expires_at = _now() + datetime.timedelta(seconds=5)
+        await session.commit()
+
+        with pytest.raises(transfer.CredentialTooShortLived):
+            await transfer.mint_token(
+                session,
+                "upload",
+                "Attachments/shot.png",
+                overwrite=False,
+                identity=transfer.Identity(oauth_token_id=oauth.id, user_id=user.id),
+                vault_root=str(vault_root),
+                expected_fingerprint=None,
+            )
+        await session.rollback()
+
+    async with clean() as session:
+        count = (
+            await session.execute(select(func.count()).select_from(TransferToken))
+        ).scalar_one()
+    assert count == 0
+
+
+async def test_a_scope_downgrade_before_the_insert_mints_nothing(clean, vault_root):
+    """`mint_token` re-validates with the redemption predicate, in its own txn.
+
+    A capability minted against a credential that has already lost `readwrite`
+    could only ever 404, so the mint refuses rather than writing the row.
+    """
+    async with clean() as session:
+        user, _key, oauth = await _seed_identity(session, vault_path=str(vault_root))
+        oauth.scope = "read offline_access"
+        await session.commit()
+        # Plain ints: the ORM objects expire on the rollback below, and reading
+        # an expired attribute would emit lazy IO outside the greenlet.
+        identity = transfer.Identity(oauth_token_id=oauth.id, user_id=user.id)
+
+        with pytest.raises(transfer.CredentialNotUsable):
+            await transfer.mint_token(
+                session,
+                "upload",
+                "Attachments/shot.png",
+                overwrite=False,
+                identity=identity,
+                vault_root=str(vault_root),
+                expected_fingerprint=None,
+            )
+        await session.rollback()
+
+        # A *download* needs no write, so the same credential still mints one.
+        _t, row, _w = await transfer.mint_token(
+            session,
+            "download",
+            "Attachments/shot.png",
+            overwrite=False,
+            identity=identity,
+            vault_root=str(vault_root),
+            expected_fingerprint=None,
+        )
+        assert row.direction == "download"
+
+    async with clean() as session:
+        rows = (await session.execute(select(TransferToken))).scalars().all()
+    assert [r.direction for r in rows] == ["download"]
 
 
 async def test_route_upload_round_trip(clean, vault_root, wired):
@@ -1172,7 +1282,7 @@ async def test_download_round_trip_through_the_route(clean, vault_root, wired):
 
     async with clean() as session:
         user, key, _ = await _seed_identity(session, vault_path=str(vault_root))
-        token, _row = await transfer.mint_token(
+        token, _row, _window = await transfer.mint_token(
             session,
             "download",
             "Attachments/spec.pdf",

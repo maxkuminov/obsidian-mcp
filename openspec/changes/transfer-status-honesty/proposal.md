@@ -33,16 +33,26 @@ on them without anybody reading the database.
   deadline), past it `unknown`, with the same "the file may already be there,
   check it" advice `import_from_url` gives.
 - The stream deadline `min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)`
-  moves into `transfer.upload_stream_deadline`, which the route's
-  `_upload_deadline` now calls, so the status tool cannot drift from the route
-  that enforces it.
+  moves into `transfer.upload_stream_deadline`, and both surfaces are put in
+  **one clock domain**: the route hands `stream_to_vault` that absolute UTC
+  instant instead of converting it to `time.monotonic()` at claim time, so a
+  realtime clock step can no longer make the route and the status tool describe
+  different instants. `transfer.now_utc()` is the single source of "now" for
+  both. `import_from_url` keeps a monotonic fetch budget — it is private and
+  nothing reports on it.
 - `check_upload` re-checks `resolve_identity_ok(need_write=True)` and
   `resolve_root_ok` inside the still-open session for `pending`/`claimed` rows
   and reports a distinct dead state; `completed` rows are not re-checked.
 - Mint clamps `expires_at` to `min(requested TTL, credential expiry)` in
-  `transfer.plan_mint_window`, called from `mint_token` itself so no mint path
-  can forget it. Under 30 s of runway — or no credential at all — refuses the
-  mint. The tool result says when and why the TTL was shortened.
+  `transfer.plan_mint_window`, called by `mint_token` **itself**, in its own
+  transaction, immediately before the INSERT. There is deliberately no
+  parameter for the window — a caller-supplied deadline is a caller-supplied
+  security boundary, and a stale one reinstates the bug — so `mint_token`
+  returns the window it computed instead. It also re-validates the credential
+  with `_credential_ok`, the redemption predicate, so a key revoked or
+  downgraded between the tool's permission check and the INSERT mints nothing.
+  Under 30 s of runway — or no credential at all — refuses the mint. The tool
+  result says when and why the TTL was shortened.
 - The upload page gains a **Mode** row and destructive labelling for
   `overwrite=True`, driven from the `overwrite` field already in the info
   payload.
@@ -51,6 +61,16 @@ on them without anybody reading the database.
 
 ### New Capabilities
 
+**A note on what the MODIFIED `check_upload` requirement drops.** The old text
+required the docstring to "tell the agent to mint a new token if `uploading`
+persists". That is deliberately gone: it is the advice that produced the wrong
+action. A claim that outlives its stream may be a `PostPublishFailure`, where
+the file is already in the vault, so "mint a new one" is exactly what an agent
+must *not* do before checking the path — and with an `overwrite=True` token it
+would write over what already landed. The replacement requires the tool to name
+the stream deadline and to answer definitively (`completed` or `unknown`)
+afterwards, which is the same guidance made conditional on the truth.
+
 ### Modified Capabilities
 - `file-transfer`: `check_upload`'s reported states and liveness re-check;
   token expiry clamped to the minting credential; the upload consent page must
@@ -58,13 +78,18 @@ on them without anybody reading the database.
 
 ## Impact
 
-- `src/services/transfer.py` — `MIN_MINT_TTL_SECONDS`, `CredentialTooShortLived`,
-  `credential_expires_at`, `MintWindow`, `plan_mint_window`,
-  `upload_stream_deadline`; `mint_token` takes an optional `window`;
-  `_load_credential` accepts an `Identity` as well as a token row.
+- `src/services/transfer.py` — `now_utc`, `_deadline_remaining`,
+  `MIN_MINT_TTL_SECONDS`, `CredentialNotUsable` /
+  `CredentialTooShortLived`, `credential_expires_at`, `MintWindow`,
+  `plan_mint_window`, `upload_stream_deadline`; `mint_token` returns
+  `(token, row, window)` and takes no window; `_drain` measures its deadline
+  through `_deadline_remaining`; `_load_credential` accepts an `Identity` as
+  well as a token row.
 - `src/mcp_server/tools.py` — transfer region only: `_utc_stamp`, `_clamp_note`,
   the two mint tools, `check_upload_impl`.
-- `src/transfer/routes.py` — `_upload_deadline` delegates to the shared helper.
+- `src/transfer/routes.py` — `_upload_deadline` returns the shared absolute
+  instant; the local `_now` and the `time` import are gone, so nothing here
+  defines a second source of "now".
 - `src/control_panel/templates/transfer_upload.html` — Mode row, destructive
   button and copy.
 - `src/mcp_server/server.py` — `check_upload` / `request_upload` docstrings (the

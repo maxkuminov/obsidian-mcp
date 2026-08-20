@@ -678,7 +678,9 @@ async def request_download(path: str, expires_in: int | None = None) -> str:
     Args:
         path: Vault-relative path of the file to share.
         expires_in: Seconds until the link dies. Clamped to 60–3600; defaults
-            to `TRANSFER_TOKEN_TTL_SECONDS` (600).
+            to `TRANSFER_TOKEN_TTL_SECONDS` (600). A link can never outlive the
+            credential you are calling with, so the deadline in the result may
+            be earlier than you asked for — it says so when that happens.
     """
     return await request_download_impl(path, expires_in=expires_in)
 

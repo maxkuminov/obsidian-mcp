@@ -1981,29 +1981,26 @@ async def request_upload_impl(
             "the upload). Nothing was minted."
         )
 
-    identity = _transfer_identity()
     async with async_session() as session:
         try:
-            # Redemption re-checks the credential, so the link cannot outlive
-            # it. Deciding that here means every surface downstream shows the
-            # deadline the routes will actually honour.
-            window = await transfer.plan_mint_window(session, identity, expires_in)
-        except transfer.CredentialTooShortLived as e:
+            # `mint_token` reads the credential and decides the deadline itself,
+            # in this transaction, immediately before the INSERT — this tool
+            # cannot hand it a window, only receive the one it computed.
+            token, row, window = await transfer.mint_token(
+                session,
+                "upload",
+                rel,
+                overwrite=overwrite,
+                identity=_transfer_identity(),
+                vault_root=root,
+                # On a no-overwrite token the publish is a kernel-linearizable
+                # hard link, so there is nothing to compare against; the
+                # fingerprint only means anything when we intend to replace.
+                expected_fingerprint=fingerprint if overwrite else None,
+                expires_in=expires_in,
+            )
+        except transfer.CredentialNotUsable as e:
             return f"{e} Nothing was minted."
-        token, row = await transfer.mint_token(
-            session,
-            "upload",
-            rel,
-            overwrite=overwrite,
-            identity=identity,
-            vault_root=root,
-            # On a no-overwrite token the publish is a kernel-linearizable
-            # hard link, so there is nothing to compare against; the
-            # fingerprint only means anything when we intend to replace.
-            expected_fingerprint=fingerprint if overwrite else None,
-            expires_in=expires_in,
-            window=window,
-        )
 
     return (
         f"Upload link for `{rel}` (expires {_expiry_line(row)}):\n\n"
@@ -2094,7 +2091,7 @@ async def check_upload_impl(upload_id: str) -> str:
             + "."
         )
 
-    if row.state == "completed":
+    if row.state == transfer.STATE_COMPLETED:
         return (
             f"completed: {row.path}\n"
             f"size: {row.size:,} bytes\n"
@@ -2109,10 +2106,14 @@ async def check_upload_impl(upload_id: str) -> str:
     # are in the vault. The old order tested `expires_at` first, so the state
     # an agent is most likely to observe (the TTL is ten minutes) answered
     # "the link was never used", about a file that is sitting at the path.
-    if row.state == "claimed":
+    if row.state == transfer.STATE_CLAIMED:
         started = _utc_stamp(row.claimed_at) if row.claimed_at else "an unknown time"
+        # The same absolute instant the upload route enforces the stream
+        # against, compared with the same clock (`transfer.now_utc`). Reading a
+        # different clock here is how the two surfaces disagreed about whether
+        # a stream was still live.
         deadline = transfer.upload_stream_deadline(row)
-        if datetime.now(timezone.utc) < deadline:
+        if transfer.now_utc() < deadline:
             return (
                 f"uploading: someone is sending {row.path} right now (started "
                 f"{started}). The stream has until {_utc_stamp(deadline)}; check "
@@ -2134,7 +2135,7 @@ async def check_upload_impl(upload_id: str) -> str:
     # used" about it too. Unlike `claimed` this one is provably empty: the
     # deadline and idle-timeout paths raise from inside the stream, always
     # before `publish`. So it can say what happened *and* that nothing landed.
-    if row.state == "consumed":
+    if row.state == transfer.STATE_CONSUMED:
         return (
             f"expired: the upload of {row.path} was cut short (it stalled or ran "
             "past its deadline) and the link is spent. Nothing was published: "
@@ -2143,7 +2144,7 @@ async def check_upload_impl(upload_id: str) -> str:
         )
     # Only a `pending` row reaches here, which is the one state for which
     # "never used" is true.
-    if row.expires_at.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+    if row.expires_at.astimezone(timezone.utc) <= transfer.now_utc():
         return (
             f"expired: the link for {row.path} was never used and can no longer "
             "be redeemed. Call `request_upload` again for a fresh one."
@@ -2184,23 +2185,20 @@ async def request_download_impl(path: str, expires_in: int | None = None) -> str
         return f"Could not read {rel}: {e}. Nothing was minted."
     _kind, mime = classify_bytes(head, PurePosixPath(rel).name)
 
-    identity = _transfer_identity()
     async with async_session() as session:
         try:
-            window = await transfer.plan_mint_window(session, identity, expires_in)
-        except transfer.CredentialTooShortLived as e:
+            token, row, window = await transfer.mint_token(
+                session,
+                "download",
+                rel,
+                overwrite=False,
+                identity=_transfer_identity(),
+                vault_root=root,
+                expected_fingerprint=fingerprint,
+                expires_in=expires_in,
+            )
+        except transfer.CredentialNotUsable as e:
             return f"{e} Nothing was minted."
-        token, row = await transfer.mint_token(
-            session,
-            "download",
-            rel,
-            overwrite=False,
-            identity=identity,
-            vault_root=root,
-            expected_fingerprint=fingerprint,
-            expires_in=expires_in,
-            window=window,
-        )
 
     return (
         f"Download link for `{rel}` (expires {_expiry_line(row)}):\n\n"

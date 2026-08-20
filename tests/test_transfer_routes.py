@@ -293,9 +293,28 @@ async def test_the_upload_page_states_the_mode_it_will_act_in(client, harness):
     assert 'id="mode"' in body
     assert "Replaces the existing file at" in body
     assert "Creates a new file" in body
-    # Destructive links get destructive copy and a destructive button label.
-    assert "This will REPLACE the existing file at" in body
-    assert "Replace file" in body
+
+    # The path reaches the DOM through `textContent`, never `innerHTML` — the
+    # JSON→DOM step is the page's only injection surface, and the mode row is
+    # the second place the bound path is rendered.
+    assert '$("path").textContent = info.path;' in body
+    assert '$("mode").textContent = overwrite' in body
+    # `.innerHTML` never appears as a property access anywhere on the page
+    # (the bare word survives only in the comment saying not to use it).
+    assert ".innerHTML" not in body
+
+    # The destructive copy and button label live *inside* the `overwrite`
+    # branch: a create-a-new-file link that shouted REPLACE would train the
+    # human to ignore the warning on the link that means it.
+    branch = body.index("if (overwrite) {")
+    otherwise = body.index("} else {", branch)
+    for destructive in (
+        '$("send").textContent = "Replace file";',
+        '"This will REPLACE the existing file at "',
+    ):
+        assert branch < body.index(destructive) < otherwise
+    assert body.index('"Choose a file, then press Upload.') > otherwise
+
     # Still self-contained: the mode is decided from the JSON, not a new asset.
     assert "http://" not in body.replace("http://www.w3.org", "")
     assert "cdn" not in body.lower()

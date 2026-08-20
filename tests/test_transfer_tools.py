@@ -386,13 +386,16 @@ async def test_check_upload_reports_uploading_with_the_stream_deadline(
     import datetime
 
     now = datetime.datetime.now(datetime.timezone.utc)
-    looked_up["row"] = _row(
-        state="claimed", claimed_at=now - datetime.timedelta(seconds=5)
-    )
+    row = _row(state="claimed", claimed_at=now - datetime.timedelta(seconds=5))
+    looked_up["row"] = row
     result = await tools.check_upload_impl(PUB_ID)
     assert result.startswith("uploading")
     assert "never" not in result
     assert "will not complete" not in result
+    # The deadline is named, not merely alluded to: it is what tells the agent
+    # when to ask again, and asking again is what resolves the ambiguity.
+    deadline = transfer.upload_stream_deadline(row)
+    assert deadline.strftime("%Y-%m-%d %H:%M:%SZ") in result
 
 
 async def test_check_upload_reports_completed_with_the_hash(vault, readwrite, looked_up):
@@ -993,17 +996,62 @@ async def test_request_download_clamps_to_the_credential_too(
     assert "NOTE:" in result
 
 
-@pytest.mark.parametrize("remaining", [10, 0, -60])
 async def test_a_credential_about_to_die_mints_nothing(
-    vault, readwrite, minted, credential, remaining
+    vault, readwrite, minted, credential
 ):
     """Under 30 s of runway is refused: the human could not open it in time."""
-    credential["row"] = _api_key(expires_at=_in(remaining))
+    credential["row"] = _api_key(expires_at=_in(10))
     result = await tools.request_upload_impl("Attachments/shot.png")
     assert "Nothing was minted" in result
     assert "30 seconds" in result
     assert "Re-authenticate" in result
     assert minted == []
+
+
+@pytest.mark.parametrize(
+    "cred",
+    [
+        pytest.param(dict(expires_at=None, is_active=False), id="deactivated"),
+        pytest.param(dict(expires_at=None, permission="read"), id="downgraded"),
+        pytest.param(dict(expires_at="past"), id="already-expired"),
+        pytest.param(dict(expires_at=None, user_id=99), id="reassigned"),
+    ],
+)
+async def test_a_credential_invalidated_before_the_insert_mints_nothing(
+    vault, readwrite, minted, credential, cred
+):
+    """`mint_token` re-validates with `_credential_ok`, the redemption predicate.
+
+    The tool's permission check happens at its start; the INSERT happens after
+    a filesystem probe and a fingerprint hash. A key revoked, downgraded,
+    deactivated or reassigned inside that window would otherwise be written
+    into a row whose only possible future is the uniform 404. **The mint
+    refuses** — no row, and an error that names re-authentication.
+    """
+    kwargs = dict(cred)
+    if kwargs.get("expires_at") == "past":
+        kwargs["expires_at"] = _in(-60)
+    credential["row"] = _api_key(**kwargs)
+    result = await tools.request_upload_impl("Attachments/shot.png")
+    assert "Nothing was minted" in result
+    assert "Re-authenticate" in result
+    assert minted == []
+
+
+def test_mint_token_accepts_no_externally_computed_expiry():
+    """No public signature lets a caller decide a capability's deadline.
+
+    The clamp is a security boundary: `mint_token` loads the credential and
+    computes the window itself, in its own transaction, immediately before the
+    INSERT. A `window=` / `expires_at=` / `not_after=` parameter would let a
+    stale or forged value past it — which is the bug, not the fix.
+    """
+    import inspect
+
+    params = set(inspect.signature(transfer.mint_token).parameters)
+    assert params & {"window", "expires_at", "not_after", "deadline"} == set()
+    # It returns the window it computed, so the tools can report a clamp.
+    assert "MintWindow" in str(inspect.signature(transfer.mint_token).return_annotation)
 
 
 async def test_an_oauth_token_with_no_expiry_mints_nothing(
@@ -1043,6 +1091,10 @@ async def test_a_call_with_no_credential_at_all_mints_nothing(
     credential["row"] = None
     result = await tools.request_upload_impl("Attachments/shot.png")
     assert "Nothing was minted" in result
+    assert "Re-authenticate" in result
+    # The tool appends " Nothing was minted." to the message, so the message
+    # itself has to end with a full stop or the result reads as one run-on.
+    assert "refused. Re-authenticate and try again. Nothing was minted." in result
     assert minted == []
 
 
@@ -1096,9 +1148,8 @@ async def test_check_upload_reads_the_stream_deadline_not_the_ttl(
 
 
 async def test_the_route_and_check_upload_share_one_stream_deadline():
-    """One helper, so the status tool cannot drift from the route enforcing it."""
+    """One helper *and* one clock: the route hands the stream that same instant."""
     import datetime
-    import time
 
     from src.transfer import routes as transfer_routes
 
@@ -1108,9 +1159,49 @@ async def test_the_route_and_check_upload_share_one_stream_deadline():
         claimed_at=now - datetime.timedelta(seconds=30),
         expires_at=now + datetime.timedelta(seconds=200),
     )
-    from_route = transfer_routes._upload_deadline(row) - time.monotonic()
-    from_tool = (transfer.upload_stream_deadline(row) - now).total_seconds()
-    assert abs(from_route - from_tool) < 1.0
+    # Not "within a second of" — the identical absolute instant. The route used
+    # to convert to `time.monotonic()`, which froze it into a second clock.
+    assert transfer_routes._upload_deadline(row) == transfer.upload_stream_deadline(row)
+    assert isinstance(transfer_routes._upload_deadline(row), datetime.datetime)
+
+
+@pytest.mark.parametrize("step_seconds", [3600, -3600])
+async def test_a_realtime_clock_step_moves_both_surfaces_together(
+    vault, readwrite, looked_up, monkeypatch, step_seconds
+):
+    """A clock step must never make the route and the status tool disagree.
+
+    The route enforced a `time.monotonic()` instant frozen at claim time while
+    `check_upload` compared wall clocks, so a realtime step moved one and not
+    the other: the tool would report a stream live that the route had already
+    abandoned, or the reverse. Both now measure the same absolute instant
+    against `transfer.now_utc`.
+    """
+    import datetime
+
+    from src.transfer import routes as transfer_routes
+
+    real_now = datetime.datetime.now(datetime.timezone.utc)
+    row = _row(
+        state="claimed",
+        claimed_at=real_now - datetime.timedelta(seconds=5),
+        expires_at=real_now + datetime.timedelta(seconds=300),
+    )
+    looked_up["row"] = row
+    deadline = transfer_routes._upload_deadline(row)
+
+    # Before the step, both surfaces say the stream is live.
+    assert (await tools.check_upload_impl(PUB_ID)).startswith("uploading")
+    assert transfer._deadline_remaining(deadline) > 0
+
+    stepped = real_now + datetime.timedelta(seconds=step_seconds)
+    monkeypatch.setattr(transfer, "now_utc", lambda: stepped)
+
+    expired = step_seconds > 0
+    assert (await tools.check_upload_impl(PUB_ID)).startswith(
+        "unknown" if expired else "uploading"
+    )
+    assert (transfer._deadline_remaining(deadline) <= 0) is expired
 
 
 async def test_a_consumed_link_says_nothing_was_published(vault, readwrite, looked_up):

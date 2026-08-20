@@ -90,7 +90,17 @@ class PostPublishFailure(TransferError):
     """
 
 
-class CredentialTooShortLived(TransferError):
+class CredentialNotUsable(TransferError):
+    """The credential asking for a capability cannot back one.
+
+    Raised at mint, before any row exists, so a refusal leaves nothing behind.
+    The tools turn it into a tool-level error telling the agent to
+    re-authenticate — which is actionable, unlike the link it would otherwise
+    have been handed, whose only possible future is the uniform 404.
+    """
+
+
+class CredentialTooShortLived(CredentialNotUsable):
     """The minting credential dies too soon to back a usable capability.
 
     Redemption re-checks the *credential*, not just the token
@@ -214,8 +224,44 @@ def canonical_vault_root(path: str | Path) -> str:
     return str(Path(path))
 
 
-def _now() -> datetime.datetime:
+def now_utc() -> datetime.datetime:
+    """Wall-clock UTC — **the single clock domain for every transfer deadline**.
+
+    Token expiry, the stream deadline the upload route enforces, and the
+    classification `check_upload` reports all read this one function. They used
+    to disagree: the route converted the absolute deadline to `time.monotonic()`
+    once at claim time while the status tool compared wall clocks, so a
+    realtime step made the two surfaces describe different instants — the tool
+    calling a stream live that the route had already abandoned, or the reverse.
+    A clock step now moves both together.
+
+    Patch this (not `datetime.datetime.now`) to simulate a clock step.
+    """
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _now() -> datetime.datetime:
+    return now_utc()
+
+
+def _deadline_remaining(deadline: float | datetime.datetime) -> float:
+    """Seconds left on a deadline, in the clock domain it was expressed in.
+
+    A `datetime` is an absolute UTC instant derived from the token row —
+    `upload_stream_deadline` — and is measured against `now_utc()`, the same
+    clock `check_upload` classifies with. A `float` is a `time.monotonic()`
+    instant, which is what `import_from_url` passes: its fetch deadline is a
+    private duration nothing else ever compares against, so it keeps the
+    monotonic guarantee rather than inheriting the clock-step exposure.
+
+    The trade-off of the wall-clock form is deliberate: a backward realtime
+    step extends the stream. Two surfaces that agree about *which instant* the
+    deadline is beats two that disagree but are individually monotonic, because
+    the disagreement is the thing an agent relays to a human.
+    """
+    if isinstance(deadline, datetime.datetime):
+        return (_as_aware(deadline) - now_utc()).total_seconds()
+    return deadline - time.monotonic()
 
 
 def _as_aware(value: datetime.datetime) -> datetime.datetime:
@@ -264,7 +310,9 @@ class MintWindow:
         return self.expires_at < self.requested_expires_at
 
 
-async def plan_mint_window(session, identity: Identity, expires_in: int | None) -> MintWindow:
+async def plan_mint_window(
+    session, identity: Identity, expires_in: int | None, *, need_write: bool
+) -> MintWindow:
     """`min(requested TTL, credential expiry)` — the only deadline worth showing.
 
     Redemption requires the *minting credential* to still be unexpired, so
@@ -278,17 +326,38 @@ async def plan_mint_window(session, identity: Identity, expires_in: int | None) 
     surface honest for free: the tool result, `/transfer/*/info` and both pages
     all read `row.expires_at`.
 
-    Raises `CredentialTooShortLived` when less than `MIN_MINT_TTL_SECONDS`
-    would remain.
+    **Called by `mint_token` itself, immediately before the INSERT and in the
+    same transaction.** It is not a parameter and there is no way to hand
+    `mint_token` a window computed elsewhere: an expiry decided by the caller
+    is an expiry the caller can get wrong or stale, and the clamp is a security
+    boundary, not a display detail.
+
+    The credential is also re-validated with `_credential_ok` — the exact
+    predicate redemption uses — so a key revoked, downgraded, deactivated or
+    reassigned between the tool's permission check and this INSERT mints
+    nothing rather than a row that can only 404.
+
+    Raises `CredentialNotUsable` (`CredentialTooShortLived` for the runway
+    case).
     """
     cred = await _load_credential(session, identity)
     if cred is None:
         # No credential to re-validate means no redemption can ever succeed
         # (`resolve_identity_ok` returns False for exactly this), so minting
         # would only produce a link that 404s.
-        raise CredentialTooShortLived(
+        raise CredentialNotUsable(
             "This request carries no credential the transfer routes could "
-            "re-validate, so any link minted for it would be refused"
+            "re-validate, so any link minted for it would be refused. "
+            "Re-authenticate and try again."
+        )
+    # `Identity` carries the `user_id` `_credential_ok` compares against, which
+    # is the only field of a token row it reads — so the mint check and the
+    # redemption check are literally the same function, and cannot drift.
+    if not _credential_ok(cred, need_write=need_write, row=identity):
+        raise CredentialNotUsable(
+            "The credential you are authenticated with is not valid for this "
+            "operation any more (revoked, downgraded, deactivated, expired, or "
+            "reassigned to another user). Re-authenticate and try again."
         )
 
     now = _now()
@@ -319,27 +388,36 @@ async def mint_token(
     vault_root: str,
     expected_fingerprint: dict | None,
     expires_in: int | None = None,
-    window: MintWindow | None = None,
-) -> tuple[str, TransferToken]:
-    """Create one transfer capability; return `(token, row)`.
+) -> tuple[str, TransferToken, MintWindow]:
+    """Create one transfer capability; return `(token, row, window)`.
 
     The plaintext token is returned exactly once, to the minting tool. Only its
     hash is persisted. Every constraint the redemption route will enforce —
     direction, path, root, identity, overwrite, fingerprint, expiry — is fixed
     here, because the route has no session to derive any of it from.
 
-    The expiry is `min(requested TTL, minting credential's own expiry)` — see
-    `plan_mint_window`. Pass `window` when the caller needs to know whether the
-    credential shortened it; omit it and this computes the same window itself.
+    The expiry is `min(requested TTL, minting credential's own expiry)`, and it
+    is computed **here**, by `plan_mint_window`, immediately before the INSERT
+    and inside this transaction. There is deliberately no parameter for it: a
+    caller-supplied window is a caller-supplied security boundary, and a stale
+    one (computed before a revocation, or by a code path that forgot) would
+    reinstate exactly the divergence this exists to remove. The window is
+    *returned* instead, so the mint tools can say when the credential shortened
+    the link.
+
+    Raises `CredentialNotUsable` before writing anything when the credential
+    cannot back a capability at all.
     """
     if direction not in DIRECTIONS:
         raise ValueError(f"Unknown transfer direction: {direction!r}")
 
-    # Computed here when the caller did not, so no mint path can forget the
-    # credential clamp: a token that outlives its credential is a link that
-    # 404s at a time we advertised as valid.
-    if window is None:
-        window = await plan_mint_window(session, identity, expires_in)
+    # Read the credential and decide the deadline here, in this transaction,
+    # immediately before the INSERT: a token that outlives its credential is a
+    # link that 404s at a time we advertised as valid, and a window computed
+    # anywhere else could be stale by the time the row lands.
+    window = await plan_mint_window(
+        session, identity, expires_in, need_write=direction == "upload"
+    )
     token = new_token()
     row = TransferToken(
         public_id=new_public_id(),
@@ -364,7 +442,7 @@ async def mint_token(
     )
     await session.commit()
     await session.refresh(row)
-    return token, row
+    return token, row, window
 
 
 def upload_stream_deadline(row) -> datetime.datetime:
@@ -840,17 +918,24 @@ async def _drain(
     fd: int,
     *,
     max_bytes: int,
-    deadline: float,
+    deadline: float | datetime.datetime,
     idle_timeout: float,
 ) -> tuple[int, str, bytes]:
-    """Copy `chunks` to `fd`, counting, hashing and bounding as they arrive."""
+    """Copy `chunks` to `fd`, counting, hashing and bounding as they arrive.
+
+    Every deadline test goes through `_deadline_remaining`, so an upload's
+    deadline is checked against the same wall clock `check_upload` classifies
+    with. The *idle* timeout stays a duration measured by the event loop's
+    monotonic clock — it bounds a gap between chunks, which nothing else
+    reports on, so it has no surface to disagree with.
+    """
     digest = hashlib.sha256()
     total = 0
     head = bytearray()
     iterator = chunks.__aiter__()
 
     while True:
-        remaining = deadline - time.monotonic()
+        remaining = _deadline_remaining(deadline)
         if remaining <= 0:
             raise Timeout("Upload exceeded its deadline")
         try:
@@ -860,7 +945,7 @@ async def _drain(
         except StopAsyncIteration:
             break
         except (asyncio.TimeoutError, TimeoutError):
-            if time.monotonic() >= deadline:
+            if _deadline_remaining(deadline) <= 0:
                 raise Timeout("Upload exceeded its deadline") from None
             raise Timeout(
                 f"Upload stalled for more than {idle_timeout:g}s"
@@ -879,7 +964,7 @@ async def _drain(
         digest.update(chunk)
         _write_all(fd, chunk)
 
-    if time.monotonic() > deadline:
+    if _deadline_remaining(deadline) < 0:
         raise Timeout("Upload exceeded its deadline")
     return total, digest.hexdigest(), bytes(head)
 
@@ -890,7 +975,7 @@ async def stream_to_vault(
     *,
     max_bytes: int,
     content_length: int | None = None,
-    deadline: float,
+    deadline: float | datetime.datetime,
     idle_timeout: float = 30.0,
     before_publish: PrePublishGate | None = None,
 ) -> dict:
@@ -901,9 +986,11 @@ async def stream_to_vault(
     `TransferToken` (upload route) or the ad-hoc descriptor `import_from_url`
     builds, which is why this takes a duck-typed row rather than the ORM class.
 
-    `deadline` is a `time.monotonic()` value, not a duration: the caller
-    computes `min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)` and
-    this enforces it across the whole stream.
+    `deadline` is an instant, not a duration. The upload route passes the
+    absolute UTC instant `upload_stream_deadline(row)` returns, so the stream is
+    enforced against the very instant `check_upload` reports; `import_from_url`
+    passes a `time.monotonic()` float, because its fetch budget is private and
+    keeps the monotonic guarantee. See `_deadline_remaining`.
 
     Returns `{"size", "sha256", "mime"}`. Raises `TooLarge`, `Timeout`,
     `PrePublishAborted`, or `vault_fs.Conflict` / `vault_fs.UnsafePath` — and
@@ -1002,7 +1089,7 @@ async def _stream_locked(
     chunks: AsyncIterator[bytes],
     *,
     max_bytes: int,
-    deadline: float,
+    deadline: float | datetime.datetime,
     idle_timeout: float,
     before_publish: PrePublishGate | None,
 ) -> dict:

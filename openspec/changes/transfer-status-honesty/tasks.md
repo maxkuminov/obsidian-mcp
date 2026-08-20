@@ -3,10 +3,16 @@
 - [x] 1.1 Add `transfer.upload_stream_deadline(row)` returning the absolute UTC
       `min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)`, with a
       `_as_aware` normaliser for database timestamps
-- [x] 1.2 Rewrite `routes._upload_deadline` to convert that helper's instant to
-      monotonic instead of recomputing the arithmetic
-- [x] 1.3 Test that the route's deadline and the tool's agree
-      (`test_the_route_and_check_upload_share_one_stream_deadline`)
+- [x] 1.2 Put the route and the tool in **one clock domain**: add
+      `transfer.now_utc` and `_deadline_remaining`, have `_drain` measure the
+      deadline through it, and make `routes._upload_deadline` return the shared
+      absolute instant instead of a `time.monotonic()` value
+- [x] 1.3 Delete the route module's local `_now` and its `time` import so
+      nothing under `src/transfer/` defines a second source of "now"
+- [x] 1.4 Tests: `test_the_route_and_check_upload_share_one_stream_deadline`
+      (identical instant, not "within a second"),
+      `test_a_realtime_clock_step_moves_both_surfaces_together` (forward and
+      backward steps)
 
 ## 2. `check_upload` reports a claimed token honestly (#75)
 
@@ -45,22 +51,33 @@
 
 ## 4. The credential's expiry clamps the link (#73)
 
-- [x] 4.1 Add `MIN_MINT_TTL_SECONDS`, `CredentialTooShortLived`,
-      `credential_expires_at`, `MintWindow` and `plan_mint_window` to
-      `transfer.py`; let `_load_credential` take an `Identity` as well as a row
-- [x] 4.2 `mint_token` accepts an optional `window` and computes one itself when
-      it is absent, so no mint path can skip the clamp
-- [x] 4.3 `request_upload` / `request_download` plan the window inside their
-      session, refuse with a re-authenticate message when it raises, and pass it
-      to `mint_token`
-- [x] 4.4 `_clamp_note` states in the tool result when the credential shortened
+- [x] 4.1 Add `MIN_MINT_TTL_SECONDS`, `CredentialNotUsable` /
+      `CredentialTooShortLived`, `credential_expires_at`, `MintWindow` and
+      `plan_mint_window` to `transfer.py`; let `_load_credential` take an
+      `Identity` as well as a row
+- [x] 4.2 `mint_token` takes **no** window parameter: it calls
+      `plan_mint_window` itself, in its own transaction immediately before the
+      INSERT, and returns `(token, row, window)` so the tools can report a clamp
+- [x] 4.3 `plan_mint_window` also re-validates the credential with
+      `_credential_ok` (the redemption predicate, `need_write` from the
+      direction), so a revocation/downgrade landing between the tool's
+      permission check and the INSERT mints nothing
+- [x] 4.4 `request_upload` / `request_download` unpack the window and turn
+      `CredentialNotUsable` into a re-authenticate tool error
+- [x] 4.5 `_clamp_note` states in the tool result when the credential shortened
       the TTL
-- [x] 4.5 Tests: `test_mint_clamps_the_link_to_the_credential_expiry`,
+- [x] 4.6 Tests: `test_mint_clamps_the_link_to_the_credential_expiry`,
       `test_a_clamped_mint_says_so_and_why`, `test_an_unclamped_mint_stays_quiet`,
       `test_request_download_clamps_to_the_credential_too`,
       `test_a_credential_about_to_die_mints_nothing`,
+      `test_a_credential_invalidated_before_the_insert_mints_nothing`,
+      `test_mint_token_accepts_no_externally_computed_expiry`,
       `test_an_oauth_token_with_no_expiry_mints_nothing`,
       `test_a_call_with_no_credential_at_all_mints_nothing`
+- [x] 4.7 Postgres integration: `test_info_reports_the_credential_clamped_expiry`
+      (real mint, real route, clamped deadline on the wire),
+      `test_a_nearly_expired_credential_mints_nothing`,
+      `test_a_scope_downgrade_before_the_insert_mints_nothing`
 
 ## 5. The consent page states the mode (#72)
 
@@ -68,15 +85,18 @@
       `info.overwrite`
 - [x] 5.2 Destructive button label, status copy and in-flight/result wording for
       an overwrite link; page stays self-contained and nonce-guarded
-- [x] 5.3 Tests: `test_the_upload_page_states_the_mode_it_will_act_in`,
-      `test_info_reports_an_overwrite_token_as_such`, and `overwrite` asserted in
-      `test_info_returns_the_bound_metadata`
+- [x] 5.3 Tests: `test_the_upload_page_states_the_mode_it_will_act_in` (mode row,
+      `textContent` not `innerHTML`, destructive copy inside the `overwrite`
+      branch), `test_info_reports_an_overwrite_token_as_such`, and `overwrite`
+      asserted in `test_info_returns_the_bound_metadata`
 
 ## 6. Documentation and spec
 
 - [x] 6.1 Spec deltas for the three modified `file-transfer` requirements
-- [x] 6.2 Update the `check_upload` and `request_upload` tool docstrings in
-      `server.py` — they carried the same falsehood the tool did
+- [x] 6.2 Update the `check_upload`, `request_upload` and `request_download`
+      tool docstrings in `server.py` — they carried the same falsehood the tool
+      did, and said nothing about the credential clamp
 - [x] 6.3 Update the "File transfer" section of `CLAUDE.md`
 - [x] 6.4 `openspec validate transfer-status-honesty --strict` passes
-- [x] 6.5 Full unit suite green
+- [x] 6.5 Full unit suite green, and `tests/integration/test_transfer_pg.py`
+      green against a throwaway `pgvector/pgvector:pg16`
