@@ -33,6 +33,16 @@ previously warmed, and MUST NOT delete the caller's `notes_metadata`,
 - **THEN** the call SHALL be refused with the same tool error rather than
   raising an unhandled exception
 
+#### Scenario: Operator-facing label matches the enforcement
+- **WHEN** an administrator opens the vault-path selector on the user edit page
+- **THEN** the unassigned option SHALL state that every MCP tool refuses and
+  that the index is kept for reassignment
+
+#### Scenario: Every registered tool is covered
+- **WHEN** the set of tools registered on the MCP server is enumerated
+- **THEN** each one SHALL delegate to an implementation carrying the shared
+  admission gate, so a tool added later inherits it by being registered
+
 #### Scenario: The index survives the refusal
 - **WHEN** the account's vault path is assigned again to the same directory
 - **THEN** the previously indexed rows SHALL still be present, so tool calls
@@ -80,3 +90,28 @@ call in every worker process without depending on an explicit cache-clear call.
 #### Scenario: Deactivated user
 - **WHEN** the refresh finds the user inactive or absent
 - **THEN** the cached entry SHALL be removed
+
+### Requirement: A concurrent cache refresh cannot re-admit a revoked caller
+The vault root that admits a tool call SHALL be the value read while
+authenticating that request, and a concurrent or stale refresh of the shared
+process-level cache SHALL NOT be able to override it. The snapshot SHALL be
+scoped to the request and to the user it was read for, and SHALL NOT be
+consulted in single-user mode.
+
+#### Scenario: Stale bulk refresh lands after the revocation
+- **WHEN** a bulk cache refresh whose database snapshot predates the
+  revocation completes *after* the request's own refresh observed the cleared
+  assignment, and the request then calls a tool
+- **THEN** the call SHALL be refused, even though the shared cache once again
+  holds the previous vault root
+
+#### Scenario: Snapshot does not answer for another user
+- **WHEN** a vault root is resolved for a user other than the one the request
+  authenticated as
+- **THEN** the request snapshot SHALL be ignored and the shared cache
+  consulted instead
+
+#### Scenario: Snapshot does not outlive the request
+- **WHEN** the authenticated request completes
+- **THEN** the snapshot SHALL be cleared, leaving later work in that process
+  with no request-scoped vault root

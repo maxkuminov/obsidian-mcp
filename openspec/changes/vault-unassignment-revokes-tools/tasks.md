@@ -25,6 +25,12 @@
 - [x] 3.2 Leave the bulk form add-only (documented in design.md) and keep
       `_vault_root` a pure cache lookup — no DB query per tool call
 - [x] 3.3 Record in `_vault_root`'s docstring that it is now the admission gate
+- [x] 3.4 Add `current_vault_root` / `UNSET_VAULT_ROOT` to `src/auth/session.py`
+      and bind the per-request root in `APIKeyMiddleware` (both the API-key and
+      OAuth branches), resetting it in the same `finally` as the other
+      ContextVars
+- [x] 3.5 Make `_vault_root` prefer the request snapshot over the shared dict,
+      keyed by user id, and never consult it for `user_id is None`
 
 ## 4. Panel copy
 
@@ -46,6 +52,17 @@
 - [x] 5.8 A cold cache refuses rather than raising
 - [x] 5.9 Full suite green; new tests verified to fail against the pre-change
       code
+- [x] 5.10 The refusal matrix enumerates every tool registered on the MCP
+      server by introspecting `mcp._tool_manager`, not a hand list
+- [x] 5.11 Structural test: every registered tool delegates to a
+      `_tracked`-wrapped impl (via the `__tracked_tool__` marker)
+- [x] 5.12 Deterministic ordered-race test: a stale bulk warm landing after the
+      per-request eviction still leaves the call refused — with a negative
+      control proving the bulk warm really does repopulate the shared dict
+- [x] 5.13 End-to-end test through `APIKeyMiddleware`: the key authenticates,
+      the snapshot binds as `(user_id, None)`, the tool refuses, and the
+      snapshot does not outlive the request
+- [x] 5.14 Assert the *rendered* option text from `user_edit.html`
 
 ## 6. Documentation
 

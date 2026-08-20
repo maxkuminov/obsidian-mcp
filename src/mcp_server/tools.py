@@ -215,6 +215,12 @@ def _tracked(tool_name: str, param_keys: list[str], transforms: dict | None = No
                 return result
             finally:
                 timing.clear(token)
+
+        # Structural marker. `tests/test_issue_66_*` asserts that every tool
+        # registered on the MCP server delegates to something carrying it, so
+        # "the admission gate is inherited by construction" is checked rather
+        # than asserted.
+        wrapper.__tracked_tool__ = tool_name
         return wrapper
     return decorator
 

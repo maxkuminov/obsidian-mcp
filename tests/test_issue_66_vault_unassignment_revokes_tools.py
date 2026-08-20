@@ -13,6 +13,14 @@ The fix puts the admission gate in `_tracked`, the decorator every MCP tool
 shares: resolve the caller's vault root once, before the tool body runs, and
 refuse the whole call when it cannot be resolved.
 
+The second half of the fix is *which* root the gate reads. `_user_vault_cache`
+is process-global and the indexer's bulk warm writes to it, so a bulk `SELECT`
+issued before an admin cleared `vault_path` can land after the per-request warm
+evicted the entry — re-admitting a revoked user mid-call. `APIKeyMiddleware`
+therefore binds the root it read to the request (`current_vault_root`), and the
+gate prefers that snapshot; `test_stale_bulk_warm_cannot_readmit_*` pins the
+ordered interleaving.
+
 These tests exercise the real tool impls with an empty vault cache. A refusal
 happens *before* the body, so no DB, network or embedding access occurs — if
 the gate regressed, the tools would try to open a database connection and the
@@ -22,6 +30,8 @@ tests would fail loudly rather than silently pass.
 import asyncio
 import os
 import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 
 # `src.mcp_server.tools` pulls in `src.config`, whose module-level `Settings()`
 # reads `./.env`. Provide minimal defaults and chdir to a dir without a `.env`
@@ -30,16 +40,25 @@ import tempfile
 os.environ.setdefault("SECRET_KEY", "test")
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
 os.environ.setdefault("VAULT_PATH", "/tmp/test-vault")
+_TEMPLATES = Path(__file__).resolve().parent.parent / "src" / "control_panel" / "templates"
 os.chdir(tempfile.gettempdir())
 
 import pytest  # noqa: E402
 
+import src.mcp_server.auth as mcp_auth  # noqa: E402
 import src.mcp_server.tools as tools  # noqa: E402
 import src.services.vault as vault  # noqa: E402
-from src.auth.session import _SingleUserSentinel, current_user_id  # noqa: E402
+from src.auth.session import (  # noqa: E402
+    UNSET_VAULT_ROOT,
+    _SingleUserSentinel,
+    current_user_id,
+    current_vault_root,
+)
+from src.mcp_server.server import mcp  # noqa: E402
 
 
 UNASSIGNED_UID = 4242
+STALE_ROOT = Path("/vaults/alpha")
 
 
 @pytest.fixture
@@ -62,9 +81,11 @@ def cold_cache():
 @pytest.fixture
 def as_unassigned_user(cold_cache):
     token = current_user_id.set(UNASSIGNED_UID)
+    root_token = current_vault_root.set(UNSET_VAULT_ROOT)
     try:
         yield UNASSIGNED_UID
     finally:
+        current_vault_root.reset(root_token)
         current_user_id.reset(token)
 
 
@@ -89,38 +110,82 @@ def _run_capturing_log(coro_fn, *args, **kwargs):
     return result, captured.get("params"), captured.get("tool")
 
 
-# --- (a) DB-backed and graph tools refuse ------------------------------------
+# --- (a) every registered tool refuses ---------------------------------------
 
 
-@pytest.mark.parametrize(
-    "name, call",
-    [
-        # DB-only: never touched `_vault_root` before this fix.
-        ("semantic_search", lambda: tools.semantic_search_impl("salary negotiation")),
-        ("keyword_search", lambda: tools.search_notes_impl("salary negotiation")),
-        ("list_notes", lambda: tools.list_notes_impl()),
-        ("get_recent", lambda: tools.get_recent_impl()),
-        ("get_tags", lambda: tools.get_tags_impl()),
-        # Graph tools: same position.
-        ("get_backlinks", lambda: tools.get_backlinks_impl("Projects/Alpha.md")),
-        ("get_links", lambda: tools.get_links_impl("Projects/Alpha.md")),
-        ("get_neighborhood", lambda: tools.get_neighborhood_impl("Projects/Alpha.md")),
-        ("find_orphans", lambda: tools.find_orphans_impl()),
-        ("find_related", lambda: tools.find_related_impl("Projects/Alpha.md")),
-        # Disk-touching tools already errored, but must keep doing so through
-        # the shared gate rather than by accident deeper down.
-        ("read_note", lambda: tools.read_note_impl("Projects/Alpha.md")),
-        ("get_vault_guide", lambda: tools.get_vault_guide_impl()),
-        ("list_files", lambda: tools.list_files_impl()),
-    ],
-)
-def test_unassigned_user_is_refused_by_every_tool(as_unassigned_user, name, call):
-    result, params, _ = _run_capturing_log(call)
-    assert isinstance(result, str), f"{name} returned {type(result)!r}"
-    assert result == tools._NO_VAULT_MESSAGE, f"{name} did not refuse: {result[:200]!r}"
+def _registered_tools():
+    """Every tool the MCP server actually exposes, by introspection.
+
+    A hand-maintained list is the shape of bug #66 itself: the tools that
+    leaked were the ones nobody thought to add to a list. Enumerating the
+    server's own registry means a tool added later is covered on the day it is
+    registered, or this test fails.
+    """
+    return sorted(mcp._tool_manager.list_tools(), key=lambda t: t.name)
+
+
+def _dummy_args(fn):
+    """Plausible values for a tool's required parameters.
+
+    The values are never used — the gate refuses before the body runs — but the
+    call must be well-formed enough to reach the wrapper.
+    """
+    import inspect
+
+    kwargs = {}
+    for name, param in inspect.signature(fn).parameters.items():
+        if param.default is not inspect.Parameter.empty:
+            continue
+        annotation = str(param.annotation)
+        if "int" in annotation:
+            kwargs[name] = 1
+        elif "bool" in annotation:
+            kwargs[name] = False
+        elif "list" in annotation:
+            kwargs[name] = []
+        elif "dict" in annotation:
+            kwargs[name] = {}
+        else:
+            kwargs[name] = "Projects/Alpha.md"
+    return kwargs
+
+
+def test_the_registry_is_not_empty():
+    """Guard the guard: an introspection matrix that finds zero tools would
+    pass vacuously."""
+    assert len(_registered_tools()) >= 25
+
+
+@pytest.mark.parametrize("tool", _registered_tools(), ids=lambda t: t.name)
+def test_unassigned_user_is_refused_by_every_registered_tool(as_unassigned_user, tool):
+    """No exemptions. `get_vault_guide` returns the vault's own CLAUDE.md and
+    `check_upload` reports a published vault path, so every registered tool
+    reads or writes vault content or vault metadata."""
+    result, params, _ = _run_capturing_log(lambda: tool.fn(**_dummy_args(tool.fn)))
+    assert isinstance(result, str), f"{tool.name} returned {type(result)!r}"
+    assert result == tools._NO_VAULT_MESSAGE, (
+        f"{tool.name} did not refuse: {result[:200]!r}"
+    )
     # The refusal must not name a path, a note or an excerpt.
     assert "Projects/Alpha.md" not in result
-    assert params is not None, f"{name} refusal was not logged"
+    assert params is not None, f"{tool.name} refusal was not logged"
+
+
+def test_every_registered_tool_delegates_to_a_tracked_impl():
+    """design.md claims the gate is "enforced by construction" — a new tool
+    inherits it by being registered. That is only true while every registered
+    tool delegates to a `_tracked`-wrapped impl, so check it structurally
+    rather than trusting the parametrized matrix above to be re-read."""
+    import src.mcp_server.server as server
+
+    unwrapped = []
+    for tool in _registered_tools():
+        referenced = [
+            getattr(server, name, None) for name in tool.fn.__code__.co_names
+        ]
+        if not any(hasattr(obj, "__tracked_tool__") for obj in referenced):
+            unwrapped.append(tool.name)
+    assert unwrapped == [], f"tools not delegating to a _tracked impl: {unwrapped}"
 
 
 def test_semantic_search_refusal_leaks_no_chunk_text(as_unassigned_user):
@@ -161,6 +226,17 @@ def test_single_user_mode_passes_the_gate(cold_cache):
     assert "error" not in params
 
 
+def test_single_user_mode_ignores_a_snapshot_for_another_user(cold_cache):
+    """A bound snapshot must never reach `_vault_root(None)`: single-user mode
+    answers from settings, full stop."""
+    token = current_vault_root.set((UNASSIGNED_UID, None))
+    try:
+        assert current_user_id.get() is None
+        assert vault._vault_root(None) == Path(vault.settings.vault_path)
+    finally:
+        current_vault_root.reset(token)
+
+
 def test_warm_cache_makes_an_assigned_user_pass(as_unassigned_user, tmp_path):
     """Sanity check on the other side of the gate: with the user's root in the
     cache the body runs. Guards against a gate that refuses everyone."""
@@ -176,6 +252,19 @@ def test_warm_cache_makes_an_assigned_user_pass(as_unassigned_user, tmp_path):
     assert ran.get("yes") is True
     assert result == "served"
     assert "error" not in params
+
+
+def test_snapshot_for_a_different_user_falls_through_to_the_cache(
+    as_unassigned_user, tmp_path
+):
+    """The snapshot is keyed by user id. A context carrying somebody else's
+    snapshot must not answer for this user — in either direction."""
+    vault._user_vault_cache[UNASSIGNED_UID] = tmp_path
+    token = current_vault_root.set((UNASSIGNED_UID + 1, None))
+    try:
+        assert vault._vault_root(UNASSIGNED_UID) == tmp_path
+    finally:
+        current_vault_root.reset(token)
 
 
 # --- (c) the refusal is logged ----------------------------------------------
@@ -198,29 +287,58 @@ def test_refusal_is_logged_with_an_error_marker(as_unassigned_user):
 # --- cache semantics: the refusal must not depend on cache warmth ------------
 
 
+class _EmptyResult:
+    def first(self):
+        return None
+
+    def all(self):
+        return []
+
+
+class _RowsResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+    def all(self):
+        return list(self._rows)
+
+
+class _FakeSession:
+    """A session whose `execute` always answers with `result`."""
+
+    def __init__(self, result):
+        self._result = result
+
+    async def execute(self, stmt):
+        return self._result
+
+
 def test_warm_user_vault_cache_evicts_when_the_row_is_gone(cold_cache):
     """`warm_user_vault_cache` runs on every authenticated MCP request. It used
     to be a silent no-op for a NULL `vault_path`, which left a previously
-    cached root in place — so a mid-session unassignment stayed invisible in
-    any worker process that did not handle the panel request. It must now
-    *evict*, making the gate independent of the panel's
-    `clear_user_vault_cache` call and of the worker that served it."""
-    from pathlib import Path
-
-    class _EmptyResult:
-        def first(self):
-            return None
-
-    class _FakeSession:
-        async def execute(self, stmt):
-            return _EmptyResult()
-
-    vault._user_vault_cache[UNASSIGNED_UID] = Path("/vaults/alpha")
-    asyncio.run(vault.warm_user_vault_cache(_FakeSession(), UNASSIGNED_UID))
+    cached root in place. It must now *evict*, and report the None so the
+    caller can bind it to the request."""
+    vault._user_vault_cache[UNASSIGNED_UID] = STALE_ROOT
+    got = asyncio.run(
+        vault.warm_user_vault_cache(_FakeSession(_EmptyResult()), UNASSIGNED_UID)
+    )
+    assert got is None
     assert UNASSIGNED_UID not in vault._user_vault_cache
 
     with pytest.raises(RuntimeError):
         vault._vault_root(UNASSIGNED_UID)
+
+
+def test_warm_user_vault_cache_returns_the_assigned_root(cold_cache):
+    row = SimpleNamespace(id=UNASSIGNED_UID, vault_path=str(STALE_ROOT))
+    got = asyncio.run(
+        vault.warm_user_vault_cache(_FakeSession(_RowsResult([row])), UNASSIGNED_UID)
+    )
+    assert got == STALE_ROOT
+    assert vault._user_vault_cache[UNASSIGNED_UID] == STALE_ROOT
 
 
 def test_gate_refuses_on_a_cold_cache_rather_than_raising(as_unassigned_user):
@@ -231,3 +349,230 @@ def test_gate_refuses_on_a_cold_cache_rather_than_raising(as_unassigned_user):
     result, params, _ = _run_capturing_log(lambda: tools.get_backlinks_impl("A.md"))
     assert result == tools._NO_VAULT_MESSAGE
     assert params["error"] == tools._NO_VAULT_MARKER
+
+
+# --- the ordered race: a stale bulk warm must not re-admit -------------------
+
+
+def _replay_the_race():
+    """Drive the exact interleaving, in order, on one thread.
+
+    1. user 4242 holds /vaults/alpha; the indexer's bulk `SELECT` is issued
+       (snapshot taken — it still sees the old row);
+    2. the admin commits `vault_path = NULL`;
+    3. an MCP request authenticates: the per-request warm reads NULL, evicts
+       the cache entry and hands the None to the middleware;
+    4. the *older* bulk query finally returns and re-inserts /vaults/alpha into
+       the shared dict;
+    5. the request, still in flight, calls a tool.
+
+    Returns the value `_vault_root` produced at step 5 — or the RuntimeError.
+    """
+    vault._user_vault_cache[UNASSIGNED_UID] = STALE_ROOT
+    stale_row = SimpleNamespace(id=UNASSIGNED_UID, vault_path=str(STALE_ROOT))
+
+    fresh = asyncio.run(
+        vault.warm_user_vault_cache(_FakeSession(_EmptyResult()), UNASSIGNED_UID)
+    )
+    assert fresh is None
+    assert UNASSIGNED_UID not in vault._user_vault_cache
+
+    # The stale bulk result lands afterwards. The bulk form is add-only by
+    # design (see design.md), so it *does* put the revoked root back.
+    asyncio.run(vault.warm_user_vault_cache(_FakeSession(_RowsResult([stale_row]))))
+    assert vault._user_vault_cache[UNASSIGNED_UID] == STALE_ROOT
+    return fresh
+
+
+def test_stale_bulk_warm_really_does_repopulate_the_shared_dict(
+    as_unassigned_user,
+):
+    """The negative control that makes the next test meaningful: without a
+    request-scoped snapshot, the shared dict alone would re-admit the revoked
+    user, and a write tool would then target the vault they no longer hold."""
+    _replay_the_race()
+    assert vault._vault_root(UNASSIGNED_UID) == STALE_ROOT
+
+
+def test_stale_bulk_warm_cannot_readmit_a_revoked_user(as_unassigned_user):
+    """With the middleware's own answer bound to the request, the late bulk
+    result cannot re-admit: the gate reads the snapshot, not the dict."""
+    fresh = _replay_the_race()
+    token = current_vault_root.set((UNASSIGNED_UID, fresh))
+    try:
+        with pytest.raises(RuntimeError):
+            vault._vault_root(UNASSIGNED_UID)
+        result, params, _ = _run_capturing_log(
+            lambda: tools.edit_note_impl("Projects/Alpha.md", "clobbered")
+        )
+        assert result == tools._NO_VAULT_MESSAGE
+        assert params["error"] == tools._NO_VAULT_MARKER
+    finally:
+        current_vault_root.reset(token)
+
+
+# --- end to end through APIKeyMiddleware ------------------------------------
+
+
+class _MiddlewareSession:
+    """Answers the four statements `APIKeyMiddleware` issues on the API-key
+    path, dispatching on the rendered SQL so the test does not depend on
+    call order."""
+
+    def __init__(self, api_key, user_active=True, vault_row=None):
+        self.api_key = api_key
+        self.user_active = user_active
+        self.vault_row = vault_row
+        self.committed = False
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def commit(self):
+        self.committed = True
+
+    async def execute(self, stmt):
+        sql = str(stmt)
+        if sql.startswith("UPDATE"):
+            return _EmptyResult()
+        if "vault_path" in sql:
+            return _RowsResult([self.vault_row] if self.vault_row else [])
+        if "FROM api_keys" in sql:
+            return _RowsResult([self.api_key])
+        # select(User.is_active)
+        return _ScalarResult(self.user_active)
+
+
+class _ScalarResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar_one_or_none(self):
+        return self._value
+
+
+def _patch_rows_result_scalar():
+    """`_RowsResult` also has to answer `.scalar_one_or_none()` for the
+    api_keys lookup."""
+    _RowsResult.scalar_one_or_none = lambda self: (
+        self._rows[0] if self._rows else None
+    )
+
+
+_patch_rows_result_scalar()
+
+
+def test_api_key_middleware_binds_the_snapshot_and_the_tool_refuses(cold_cache):
+    """R3 end to end: an unchanged, still-active API key belonging to a user
+    whose `vault_path` was cleared authenticates fine, and the tool call it
+    carries is refused — even though a stale bulk warm repopulates the shared
+    cache while the request is in flight."""
+    from src.models.db import APIKey
+
+    api_key = APIKey(
+        id=7,
+        key_hash="x",
+        permission="readwrite",
+        user_id=UNASSIGNED_UID,
+        expires_at=None,
+        is_active=True,
+    )
+    vault._user_vault_cache[UNASSIGNED_UID] = STALE_ROOT
+    stale_row = SimpleNamespace(id=UNASSIGNED_UID, vault_path=str(STALE_ROOT))
+
+    captured = {}
+
+    async def downstream(scope, receive, send):
+        # The user's row is already NULL, so the middleware's warm evicted the
+        # entry. Now the indexer's older bulk query lands mid-request.
+        assert UNASSIGNED_UID not in vault._user_vault_cache
+        await vault.warm_user_vault_cache(_FakeSession(_RowsResult([stale_row])))
+        assert vault._user_vault_cache[UNASSIGNED_UID] == STALE_ROOT
+
+        captured["user_id"] = current_user_id.get()
+        captured["snapshot"] = current_vault_root.get()
+        captured["result"] = await tools.semantic_search_impl("salary negotiation")
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def receive():  # pragma: no cover - never awaited
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    sent = []
+
+    async def send(message):
+        sent.append(message)
+
+    async def run():
+        original_session = mcp_auth.async_session
+        original_log = tools._log_usage
+
+        async def fake_log_usage(*a, **kw):
+            return None
+
+        mcp_auth.async_session = lambda: _MiddlewareSession(api_key, vault_row=None)
+        tools._log_usage = fake_log_usage
+        try:
+            app = mcp_auth.APIKeyMiddleware(downstream)
+            await app(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/mcp/",
+                    "headers": [(b"authorization", b"Bearer omcp_testkey")],
+                },
+                receive,
+                send,
+            )
+        finally:
+            mcp_auth.async_session = original_session
+            tools._log_usage = original_log
+
+    asyncio.run(run())
+
+    assert sent and sent[0]["status"] == 200, "the request was not authenticated"
+    assert captured["user_id"] == UNASSIGNED_UID
+    assert captured["snapshot"] == (UNASSIGNED_UID, None)
+    assert captured["result"] == tools._NO_VAULT_MESSAGE
+    # And the snapshot does not outlive the request.
+    assert current_vault_root.get() is UNSET_VAULT_ROOT
+
+
+# --- panel copy --------------------------------------------------------------
+
+
+def test_unassigned_option_states_what_the_code_does():
+    """The option label asserted an enforcement outcome the code did not
+    deliver. Assert the *rendered* text, not the source line, so a template
+    refactor cannot quietly restore the old promise."""
+    from jinja2 import ChainableUndefined, ChoiceLoader, DictLoader, Environment, FileSystemLoader
+
+    env = Environment(
+        loader=ChoiceLoader([
+            # Stub the layout: this test is about one option in one template.
+            DictLoader({"base.html": "{% block title %}{% endblock %}{% block content %}{% endblock %}"}),
+            FileSystemLoader(str(_TEMPLATES)),
+        ]),
+        undefined=ChainableUndefined,
+        autoescape=True,
+    )
+    rendered = env.get_template("user_edit.html").render(
+        target=SimpleNamespace(
+            id=1,
+            username="bob",
+            vault_path="/vaults/alpha",
+            is_admin=False,
+            is_active=True,
+        ),
+        available_vaults=["/vaults/alpha"],
+        csrf_token="t",
+        is_self=False,
+    )
+    assert (
+        '<option value="">(unassigned — every MCP tool refuses; '
+        "index kept for reassignment)</option>"
+    ) in rendered
+    assert "vault tools error" not in rendered

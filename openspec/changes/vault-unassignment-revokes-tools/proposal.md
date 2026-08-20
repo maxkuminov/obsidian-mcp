@@ -35,9 +35,17 @@ happening. (Issue #66, severity high.)
   allow-listed params as a successful call. No new field carries user content.
 - **`warm_user_vault_cache(session, user_id)` becomes authoritative.** It was
   a silent no-op when the user had no usable row, leaving a previously cached
-  root in place; it now evicts. That warm runs on every authenticated MCP
-  request, so a mid-session unassignment is refused from the next call in
-  *every* worker process, not only the one that served the panel request.
+  root in place; it now evicts and returns what it read. That warm runs on
+  every authenticated MCP request, so a mid-session unassignment is refused
+  from the next call in *every* worker process, not only the one that served
+  the panel request.
+- **The authenticated request keeps its own answer.** `APIKeyMiddleware` binds
+  the root it read to `current_vault_root` (a ContextVar beside
+  `current_user_id`), and `_vault_root` prefers that snapshot. Without it,
+  admission is still not fail-closed under concurrency: the indexer's bulk warm
+  is add-only, so a bulk `SELECT` issued before the revocation can land after
+  the per-request warm evicted the entry and re-admit the caller mid-request,
+  with a write tool in flight. See design.md.
 - **Single-user mode is untouched.** `current_user_id` is None there and
   `_vault_root(None)` answers from `settings.vault_path` without consulting
   the cache.
@@ -55,10 +63,13 @@ happening. (Issue #66, severity high.)
 ## Impact
 
 - `src/mcp_server/tools.py` — `_tracked` gate, `_vault_admission_error()`,
-  `_NO_VAULT_MESSAGE`, `_NO_VAULT_MARKER`
-- `src/services/vault.py` — `warm_user_vault_cache` evicts; `_vault_root`
-  docstring records that it is now the admission gate and must stay a cache
-  lookup
+  `_NO_VAULT_MESSAGE`, `_NO_VAULT_MARKER`, `__tracked_tool__` marker
+- `src/services/vault.py` — `warm_user_vault_cache` evicts and returns the
+  root; `_vault_root` prefers the request snapshot and records that it is now
+  the admission gate and must stay a cache lookup
+- `src/auth/session.py` — `current_vault_root` ContextVar + `UNSET_VAULT_ROOT`
+- `src/mcp_server/auth.py` — binds and resets the snapshot on both the API-key
+  and OAuth branches
 - `src/control_panel/templates/user_edit.html` — option label
 - `tests/test_issue_66_vault_unassignment_revokes_tools.py` — new
 - No database schema changes, no new dependencies, no migration

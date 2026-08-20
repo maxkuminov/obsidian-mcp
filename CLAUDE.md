@@ -416,12 +416,23 @@ told the operator "vault tools error".
 - **`_vault_root` must stay a pure cache lookup.** What makes that correct is
   `APIKeyMiddleware` calling `warm_user_vault_cache(session, user_id)` on
   *every* authenticated MCP request. Do not add a DB query to the gate.
-- **The single-user form of that warm is authoritative — it evicts.** It used
-  to be a silent no-op for a NULL `vault_path`, so a previously cached root
-  survived; the panel's `clear_user_vault_cache` only clears the worker that
-  served the POST. Eviction is what makes a mid-session unassignment visible
-  from the next call in every process. The bulk form stays add-only (it would
-  otherwise drop a just-warmed entry for a user created after its query).
+- **The single-user form of that warm is authoritative — it evicts**, and it
+  returns the root it read. It used to be a silent no-op for a NULL
+  `vault_path`, so a previously cached root survived; the panel's
+  `clear_user_vault_cache` only clears the worker that served the POST.
+- **`_vault_root` prefers the request's own snapshot over the shared dict, and
+  that is the part that fails closed.** `_user_vault_cache` is process-global
+  and the indexer's bulk warm is add-only, so a bulk `SELECT` issued *before*
+  the admin cleared `vault_path` can land *after* the per-request warm evicted
+  the entry and put the revoked root back — mid-request, with a write tool in
+  flight. Eviction cannot order a query that was already running. So the
+  middleware binds `current_vault_root = (user_id, Path | None)` (a ContextVar
+  beside `current_user_id` in `src/auth/session.py`) and the gate reads that;
+  no other task can write this request's context. **Do not "simplify" the gate
+  back to the dict** — the bulk warm's add-only behaviour is safe only because
+  the snapshot outranks it. The snapshot is keyed by user id (another user's
+  snapshot falls through to the dict) and is never consulted for
+  `user_id is None`.
 - **A cold cache refuses too**, with the same message — it is not permission to
   serve stale rows — and the refusal is written to `usage_logs` with
   `params["error"] = "no_vault_assigned"` and no other new field.

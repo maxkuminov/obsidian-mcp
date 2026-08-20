@@ -38,6 +38,57 @@ vault root, so gating them is not a judgement call.
 `_tracked` decorates nothing but MCP tool impls, so the gate has no other
 blast radius.
 
+## The shared dict is not enough — the request keeps its own answer
+
+An earlier draft of this change stopped at "make the per-request warm evict".
+Adversarial review found that admission was still not fail-closed under
+concurrency, and it is worth writing down exactly why, because the fix looks
+redundant otherwise.
+
+`_user_vault_cache` is process-global, and *two* writers touch it: the
+per-request warm in `APIKeyMiddleware` and the indexer's bulk warm, which is
+add-only. Ordered interleaving:
+
+1. the indexer's bulk `SELECT` is issued; its snapshot still shows user 42 at
+   `/vaults/a`;
+2. the admin commits `vault_path = NULL` for user 42;
+3. an MCP request authenticates: its warm reads NULL and **evicts** 42;
+4. the older bulk query finally returns and **re-inserts** `/vaults/a`;
+5. the request, still in flight, reaches `_tracked` — which reads the restored
+   root and admits the call. `edit_note` then writes into a vault the caller no
+   longer holds.
+
+Eviction cannot fix this on its own: the losing writer is a query that was
+already in flight, so there is no ordering the dict can enforce after the fact.
+
+So `APIKeyMiddleware` binds the root **it** read to the request —
+`current_vault_root = (user_id, Path | None)`, a ContextVar next to
+`current_user_id` in `src/auth/session.py` — and `_vault_root` prefers that
+snapshot whenever it is set for the user being resolved. A ContextVar bound in
+this request's context cannot be written by the indexer task, so step 4 is
+inert. The shared dict remains the fallback for non-request contexts (the
+indexer itself, panel routes, tests).
+
+Two constraints held:
+
+- **`user_id is None` never consults the snapshot.** Single-user and sandbox
+  mode answer from `settings.vault_path` before the snapshot is read at all.
+- **The snapshot is keyed by user id.** A context carrying another user's
+  snapshot falls through to the dict rather than answering for the wrong vault.
+
+The alternative Codex offered — a version counter with compare-and-set on the
+dict — would also close the race, but it makes every reader depend on a
+monotonic source the DB does not currently provide, and it still leaves the
+shared dict as the authority for a decision that is per-request. The snapshot
+is smaller and the failure mode of a bug in it is a spurious refusal.
+
+`test_stale_bulk_warm_really_does_repopulate_the_shared_dict` pins step 4 as a
+real effect (the negative control), and
+`test_stale_bulk_warm_cannot_readmit_a_revoked_user` plus
+`test_api_key_middleware_binds_the_snapshot_and_the_tool_refuses` pin the
+refusal — the latter through the real middleware, with the stale bulk warm
+landing mid-request.
+
 ## Cost: the hot path stays a dict lookup
 
 `_vault_root(uid)` is a `dict.get`. It must stay one — a DB round trip per tool
@@ -62,11 +113,14 @@ unassignment is visible from the next tool call in every process, whether or
 not `clear_user_vault_cache` was called.
 
 The bulk form (`warm_user_vault_cache(session)` with no user id, used by the
-indexer) is deliberately left add-only. Making it authoritative would mean
-dropping entries that a concurrent per-request warm had just written for a user
-created after the bulk query ran — a spurious refusal for a legitimate caller.
-It is not needed: every consumer of `_vault_root(user_id)` (MCP tools, the
-panel's vault browser, the auth routes) warms that user individually first.
+indexer) is deliberately left add-only — but **that is only safe because of the
+request-scoped snapshot above**, not on its own. Making it authoritative would
+mean dropping entries that a concurrent per-request warm had just written for a
+user created after the bulk query ran, and it would still not fix the ordered
+race, whose losing writer is a query already in flight. Eviction in the
+per-request warm is therefore defence in depth for non-request contexts (the
+indexer, panel routes, a process with no snapshot bound); the snapshot is what
+makes admission itself fail closed.
 
 ## Cold cache is a refusal, not a 500
 
