@@ -616,7 +616,9 @@ async def request_upload(
         path: Vault-relative destination (e.g. "Attachments/photo.png").
         overwrite: If True, allow replacing an existing file at `path`.
         expires_in: Seconds until the link dies. Clamped to 60–3600; defaults
-            to `TRANSFER_TOKEN_TTL_SECONDS` (600).
+            to `TRANSFER_TOKEN_TTL_SECONDS` (600). A link can never outlive the
+            credential you are calling with, so the deadline in the result may
+            be earlier than you asked for — it says so when that happens.
     """
     return await request_upload_impl(path, overwrite=overwrite, expires_in=expires_in)
 
@@ -627,15 +629,20 @@ async def check_upload(upload_id: str) -> str:
 
     Returns one of `pending` (nothing sent yet), `uploading` (bytes are in
     flight), `completed` (with the path, size, sha256 and MIME type of what
-    landed), or `expired`. Use it to confirm a transfer really finished before
-    you tell the user it did, and to get the sha256 if they want to verify it.
+    landed), `unknown` (a stream started and the server never recorded how it
+    ended), `revoked` (the link is dead because the credential or vault root
+    changed under it), or `expired`. Use it to confirm a transfer really
+    finished before you tell the user it did, and to get the sha256 if they
+    want to verify it.
 
     Only links minted by this same API key or OAuth token are visible; anyone
     else's `upload_id` reads as `not found`.
 
-    If it says `uploading` for more than a couple of minutes, the transfer died
-    mid-flight. That link will never complete — mint a new one with
-    `request_upload`.
+    `uploading` names the deadline the stream has. Check again after it: past
+    that point the answer becomes either `completed` or `unknown`. **`unknown`
+    does not mean nothing arrived** — a publish can succeed and still fail to
+    record its completion — so read or list the path before minting another
+    link or telling anyone the file did not arrive.
 
     Pass the `upload_id` itself — the short handle from `request_upload`, not
     the upload URL and not the token after the `#`. Anything else is refused
@@ -671,7 +678,9 @@ async def request_download(path: str, expires_in: int | None = None) -> str:
     Args:
         path: Vault-relative path of the file to share.
         expires_in: Seconds until the link dies. Clamped to 60–3600; defaults
-            to `TRANSFER_TOKEN_TTL_SECONDS` (600).
+            to `TRANSFER_TOKEN_TTL_SECONDS` (600). A link can never outlive the
+            credential you are calling with, so the deadline in the result may
+            be earlier than you asked for — it says so when that happens.
     """
     return await request_download_impl(path, expires_in=expires_in)
 

@@ -32,6 +32,10 @@
   button { font: inherit; padding: .55rem 1.1rem; border: 0; border-radius: 8px;
            background: #2f6feb; color: #fff; cursor: pointer; }
   button[disabled] { background: #9bb4e4; cursor: default; }
+  button.destructive { background: #b3261e; }
+  button.destructive[disabled] { background: #dda29e; }
+  .warn { color: #b3261e; font-weight: 600; }
+  dd.warn { font-family: inherit; }
   progress { width: 100%; margin-top: 1rem; }
   #status { margin-top: 1rem; white-space: pre-wrap; }
   .err { color: #b3261e; }
@@ -48,6 +52,7 @@
   <h1>Upload a file to the vault</h1>
   <dl>
     <dt>Destination</dt><dd id="path">…</dd>
+    <dt>Mode</dt><dd id="mode">…</dd>
     <dt>Maximum size</dt><dd id="max">…</dd>
     <dt>Link expires</dt><dd id="expires">…</dd>
   </dl>
@@ -64,6 +69,7 @@
   var token = location.hash.replace(/^#/, "");
   var $ = function (id) { return document.getElementById(id); };
   var status = $("status");
+  var overwrite = false;
 
   function say(text, cls) {
     status.textContent = text;          // textContent, never innerHTML
@@ -91,11 +97,28 @@
     })
     .then(function (info) {
       $("path").textContent = info.path;
+      // The consent step for the only session-less write path in the app. A
+      // link that replaces an existing file looked identical to one that
+      // creates a new file, so the person pressing the button could not tell
+      // a destructive upload from a harmless one. `overwrite` has always been
+      // on the wire; this is where it becomes visible.
+      overwrite = info.overwrite === true;
+      $("mode").textContent = overwrite
+        ? "Replaces the existing file at " + info.path
+        : "Creates a new file";
+      $("mode").className = overwrite ? "warn" : "";
       $("max").textContent = bytes(info.max_bytes);
       $("expires").textContent = new Date(info.expires_at).toLocaleString();
       $("file").disabled = false;
       $("send").disabled = false;
-      say("Choose a file, then press Upload. The link works once.");
+      if (overwrite) {
+        $("send").textContent = "Replace file";
+        $("send").className = "destructive";
+        say("This will REPLACE the existing file at " + info.path +
+            ". The current contents will be gone.", "warn");
+      } else {
+        say("Choose a file, then press Upload. The link works once.");
+      }
     })
     .catch(function (e) { say(e.message, "err"); });
 
@@ -105,7 +128,9 @@
     $("send").disabled = true;
     $("file").disabled = true;
     $("bar").hidden = false;
-    say("Uploading…");
+    say(overwrite
+      ? "Uploading — replacing " + $("path").textContent + "…"
+      : "Uploading…", overwrite ? "warn" : "");
     fetch("/transfer/upload", { method: "PUT", headers: auth, body: file })
       .then(function (r) {
         return r.json().catch(function () { return {}; }).then(function (body) {
@@ -115,7 +140,8 @@
       .then(function (res) {
         $("bar").hidden = true;
         if (res.ok) {
-          say("Uploaded " + bytes(res.body.size) + " to " + res.body.path +
+          say((overwrite ? "Replaced " : "Uploaded ") + res.body.path +
+              " with " + bytes(res.body.size) +
               "\nsha256 " + res.body.sha256, "ok");
           return;
         }

@@ -281,6 +281,45 @@ async def test_pages_never_carry_the_token_or_the_bound_path(client, harness, pa
 # ── 4.1 / 4.3 the uniform 404 matrix ────────────────────────────────────────
 
 
+async def test_the_upload_page_states_the_mode_it_will_act_in(client, harness):
+    """The consent step must distinguish a replace from a create.
+
+    This page press is the only session-less write path in the app, and the
+    human pressing it is the consent authority for a destructive write. Until
+    the Mode row existed, an `overwrite=True` link rendered identically to one
+    that creates a new file.
+    """
+    body = (await client.get("/transfer/upload")).text
+    assert 'id="mode"' in body
+    assert "Replaces the existing file at" in body
+    assert "Creates a new file" in body
+
+    # The path reaches the DOM through `textContent`, never `innerHTML` — the
+    # JSON→DOM step is the page's only injection surface, and the mode row is
+    # the second place the bound path is rendered.
+    assert '$("path").textContent = info.path;' in body
+    assert '$("mode").textContent = overwrite' in body
+    # `.innerHTML` never appears as a property access anywhere on the page
+    # (the bare word survives only in the comment saying not to use it).
+    assert ".innerHTML" not in body
+
+    # The destructive copy and button label live *inside* the `overwrite`
+    # branch: a create-a-new-file link that shouted REPLACE would train the
+    # human to ignore the warning on the link that means it.
+    branch = body.index("if (overwrite) {")
+    otherwise = body.index("} else {", branch)
+    for destructive in (
+        '$("send").textContent = "Replace file";',
+        '"This will REPLACE the existing file at "',
+    ):
+        assert branch < body.index(destructive) < otherwise
+    assert body.index('"Choose a file, then press Upload.') > otherwise
+
+    # Still self-contained: the mode is decided from the JSON, not a new asset.
+    assert "http://" not in body.replace("http://www.w3.org", "")
+    assert "cdn" not in body.lower()
+
+
 async def test_info_returns_the_bound_metadata(client, harness):
     response = await client.get("/transfer/upload/info", headers=auth(harness))
     assert response.status_code == 200
@@ -288,6 +327,14 @@ async def test_info_returns_the_bound_metadata(client, harness):
     assert body["path"] == harness.row.path
     assert body["max_bytes"] == settings.max_file_write_bytes
     assert body["expires_at"].startswith(str(_now().year))
+    # The page renders the Mode row from this field.
+    assert body["overwrite"] is False
+
+
+async def test_info_reports_an_overwrite_token_as_such(client, harness):
+    harness.row.overwrite = True
+    response = await client.get("/transfer/upload/info", headers=auth(harness))
+    assert response.json()["overwrite"] is True
 
 
 async def test_download_info_reports_the_minted_size(client, harness):
@@ -693,6 +740,69 @@ async def test_the_deadline_consumes_the_token(client, harness, vault, monkeypat
     assert harness.released == 0
     assert harness.row.state == "consumed"
     assert temp_files(vault / "Attachments") == []
+
+
+async def test_a_gate_delayed_past_the_deadline_publishes_nothing(
+    client, harness, vault, monkeypatch
+):
+    """The deadline is re-checked inside the locked gate, not only in `_drain`.
+
+    `_drain` bounds the *body*, but the gate runs afterwards and can wait
+    arbitrarily long on `SELECT … FOR UPDATE` — behind another publisher, or a
+    migration. A body that finished a moment inside the deadline would
+    otherwise publish (an overwrite included) long after the capability
+    expired, while `check_upload` was already answering `unknown` for it.
+
+    The clock is stepped from inside `lock_for_publish`, i.e. exactly between
+    drain completion and the publish. The refusal must be the existing
+    `Timeout`, because the state machine says a request that ran past its
+    deadline *consumes* its token: a retry mints afresh rather than replaying a
+    link whose window is gone.
+    """
+    stub = transfer.lock_for_publish
+    stepped = _now() + datetime.timedelta(hours=1)
+
+    async def slow_lock(session, token_id):
+        monkeypatch.setattr(transfer, "now_utc", lambda: stepped)
+        return await stub(session, token_id)
+
+    monkeypatch.setattr(transfer, "lock_for_publish", slow_lock)
+
+    response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+
+    assert response.status_code == 408
+    assert not (vault / "Attachments" / "shot.png").exists()
+    assert temp_files(vault / "Attachments") == []
+    assert harness.completed == []
+    assert harness.consumed == 1
+    assert harness.released == 0
+    assert harness.row.state == "consumed"
+
+
+async def test_a_gate_delayed_past_the_deadline_leaves_an_overwrite_target_alone(
+    client, harness, vault, monkeypatch
+):
+    """The destructive case: the incumbent must survive untouched."""
+    target = vault / "Attachments" / "shot.png"
+    target.write_bytes(b"the original bytes")
+    harness.row.overwrite = True
+    harness.row.expected_fingerprint = None  # not read: we never reach publish
+
+    stub = transfer.lock_for_publish
+    stepped = _now() + datetime.timedelta(hours=1)
+
+    async def slow_lock(session, token_id):
+        monkeypatch.setattr(transfer, "now_utc", lambda: stepped)
+        return await stub(session, token_id)
+
+    monkeypatch.setattr(transfer, "lock_for_publish", slow_lock)
+
+    response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+
+    assert response.status_code == 408
+    assert target.read_bytes() == b"the original bytes"
+    assert temp_files(vault / "Attachments") == []
+    assert harness.row.state == "consumed"
 
 
 async def test_an_idle_stall_consumes_the_token(client, harness, monkeypatch):

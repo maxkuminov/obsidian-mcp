@@ -90,6 +90,29 @@ class PostPublishFailure(TransferError):
     """
 
 
+class CredentialNotUsable(TransferError):
+    """The credential asking for a capability cannot back one.
+
+    Raised at mint, before any row exists, so a refusal leaves nothing behind.
+    The tools turn it into a tool-level error telling the agent to
+    re-authenticate — which is actionable, unlike the link it would otherwise
+    have been handed, whose only possible future is the uniform 404.
+    """
+
+
+class CredentialTooShortLived(CredentialNotUsable):
+    """The minting credential dies too soon to back a usable capability.
+
+    Redemption re-checks the *credential*, not just the token
+    (`_credential_ok`), so a link can never outlive the key or access token
+    that minted it. When that leaves less runway than `MIN_MINT_TTL_SECONDS`
+    the honest answer is to mint nothing: a link that is already dead — or
+    dead before a human can plausibly open it — is worse than an error,
+    because the error tells the agent to re-authenticate and the link does
+    not.
+    """
+
+
 class SSRFError(TransferError):
     """A URL, hop, or resolved address violated the outbound-fetch policy.
 
@@ -107,6 +130,10 @@ TOKEN_BYTES = 32  # 256 bits, matching the api_keys convention
 PUBLIC_ID_BYTES = 16  # 128 bits — an unguessable handle, not a capability
 MIN_EXPIRES_IN = 60
 MAX_EXPIRES_IN = 3600
+# The least runway a mint will hand out. Below this the link would expire
+# before the human it is meant for could open it, so `mint_token` refuses
+# instead of advertising a deadline nobody can meet.
+MIN_MINT_TTL_SECONDS = 30
 PRUNE_AFTER = datetime.timedelta(days=1)
 
 DIRECTIONS = ("upload", "download")
@@ -197,8 +224,158 @@ def canonical_vault_root(path: str | Path) -> str:
     return str(Path(path))
 
 
-def _now() -> datetime.datetime:
+def now_utc() -> datetime.datetime:
+    """Wall-clock UTC — **the single clock domain for every transfer deadline**.
+
+    Token expiry, the stream deadline the upload route enforces, and the
+    classification `check_upload` reports all read this one function. They used
+    to disagree: the route converted the absolute deadline to `time.monotonic()`
+    once at claim time while the status tool compared wall clocks, so a
+    realtime step made the two surfaces describe different instants — the tool
+    calling a stream live that the route had already abandoned, or the reverse.
+    A clock step now moves both together.
+
+    Patch this (not `datetime.datetime.now`) to simulate a clock step.
+    """
     return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _now() -> datetime.datetime:
+    return now_utc()
+
+
+def _deadline_remaining(deadline: float | datetime.datetime) -> float:
+    """Seconds left on a deadline, in the clock domain it was expressed in.
+
+    A `datetime` is an absolute UTC instant derived from the token row —
+    `upload_stream_deadline` — and is measured against `now_utc()`, the same
+    clock `check_upload` classifies with. A `float` is a `time.monotonic()`
+    instant, which is what `import_from_url` passes: its fetch deadline is a
+    private duration nothing else ever compares against, so it keeps the
+    monotonic guarantee rather than inheriting the clock-step exposure.
+
+    The trade-off of the wall-clock form is deliberate: a backward realtime
+    step extends the stream. Two surfaces that agree about *which instant* the
+    deadline is beats two that disagree but are individually monotonic, because
+    the disagreement is the thing an agent relays to a human.
+    """
+    if isinstance(deadline, datetime.datetime):
+        return (_as_aware(deadline) - now_utc()).total_seconds()
+    return deadline - time.monotonic()
+
+
+def _as_aware(value: datetime.datetime) -> datetime.datetime:
+    """A UTC-aware copy of a database timestamp.
+
+    Postgres `timestamptz` comes back aware through asyncpg, but a row built
+    in a test — or by a future backend — may not be, and a naive/aware compare
+    raises rather than returning a wrong answer. Normalising here keeps the
+    expiry arithmetic total.
+    """
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value
+
+
+def credential_expires_at(cred) -> datetime.datetime | None:
+    """When the credential itself dies, or `None` if it never does.
+
+    Mirrors the expiry half of `_credential_ok`: an `APIKey` may have a null
+    `expires_at` and live forever, an `OAuthToken` may not — a null there is
+    already unusable, so it reads as "expired at the epoch" rather than
+    "immortal". Getting that backwards would mint links against dead tokens.
+    """
+    if isinstance(cred, APIKey):
+        return _as_aware(cred.expires_at) if cred.expires_at is not None else None
+    if isinstance(cred, OAuthToken):
+        if cred.expires_at is None:
+            return datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+        return _as_aware(cred.expires_at)
+    raise CredentialTooShortLived(  # pragma: no cover - defensive
+        "The credential backing this request cannot be re-validated"
+    )
+
+
+@dataclass(frozen=True)
+class MintWindow:
+    """The deadline a mint may actually promise, and what shortened it."""
+
+    expires_at: datetime.datetime
+    requested_expires_at: datetime.datetime
+    credential_expires_at: datetime.datetime | None
+
+    @property
+    def clamped(self) -> bool:
+        """Did the credential cut the requested TTL short?"""
+        return self.expires_at < self.requested_expires_at
+
+
+async def plan_mint_window(
+    session, identity: Identity, expires_in: int | None, *, need_write: bool
+) -> MintWindow:
+    """`min(requested TTL, credential expiry)` — the only deadline worth showing.
+
+    Redemption requires the *minting credential* to still be unexpired, so
+    `transfer_tokens.expires_at` alone was never the effective lifetime. On the
+    OAuth path — how the Claude.ai connector authenticates — an access token
+    lives one hour, so any `expires_in` above its remaining life advertised a
+    deadline the routes would refuse to honour, and the human met the uniform
+    404 well inside the window the agent had quoted them.
+
+    Clamping here (rather than only reporting) is what makes every downstream
+    surface honest for free: the tool result, `/transfer/*/info` and both pages
+    all read `row.expires_at`.
+
+    **Called by `mint_token` itself, immediately before the INSERT and in the
+    same transaction.** It is not a parameter and there is no way to hand
+    `mint_token` a window computed elsewhere: an expiry decided by the caller
+    is an expiry the caller can get wrong or stale, and the clamp is a security
+    boundary, not a display detail.
+
+    The credential is also re-validated with `_credential_ok` — the exact
+    predicate redemption uses — so a key revoked, downgraded, deactivated or
+    reassigned between the tool's permission check and this INSERT mints
+    nothing rather than a row that can only 404.
+
+    Raises `CredentialNotUsable` (`CredentialTooShortLived` for the runway
+    case).
+    """
+    cred = await _load_credential(session, identity)
+    if cred is None:
+        # No credential to re-validate means no redemption can ever succeed
+        # (`resolve_identity_ok` returns False for exactly this), so minting
+        # would only produce a link that 404s.
+        raise CredentialNotUsable(
+            "This request carries no credential the transfer routes could "
+            "re-validate, so any link minted for it would be refused. "
+            "Re-authenticate and try again."
+        )
+    # `Identity` carries the `user_id` `_credential_ok` compares against, which
+    # is the only field of a token row it reads — so the mint check and the
+    # redemption check are literally the same function, and cannot drift.
+    if not _credential_ok(cred, need_write=need_write, row=identity):
+        raise CredentialNotUsable(
+            "The credential you are authenticated with is not valid for this "
+            "operation any more (revoked, downgraded, deactivated, expired, or "
+            "reassigned to another user). Re-authenticate and try again."
+        )
+
+    now = _now()
+    requested = now + datetime.timedelta(seconds=clamp_expires_in(expires_in))
+    cred_expiry = credential_expires_at(cred)
+    effective = requested if cred_expiry is None else min(requested, cred_expiry)
+    if (effective - now).total_seconds() < MIN_MINT_TTL_SECONDS:
+        raise CredentialTooShortLived(
+            "The credential you are authenticated with expires in under "
+            f"{MIN_MINT_TTL_SECONDS} seconds, so no usable link can be minted "
+            "from it. Re-authenticate (or use a longer-lived API key) and try "
+            "again."
+        )
+    return MintWindow(
+        expires_at=effective,
+        requested_expires_at=requested,
+        credential_expires_at=cred_expiry,
+    )
 
 
 async def mint_token(
@@ -211,18 +388,36 @@ async def mint_token(
     vault_root: str,
     expected_fingerprint: dict | None,
     expires_in: int | None = None,
-) -> tuple[str, TransferToken]:
-    """Create one transfer capability; return `(token, row)`.
+) -> tuple[str, TransferToken, MintWindow]:
+    """Create one transfer capability; return `(token, row, window)`.
 
     The plaintext token is returned exactly once, to the minting tool. Only its
     hash is persisted. Every constraint the redemption route will enforce —
     direction, path, root, identity, overwrite, fingerprint, expiry — is fixed
     here, because the route has no session to derive any of it from.
+
+    The expiry is `min(requested TTL, minting credential's own expiry)`, and it
+    is computed **here**, by `plan_mint_window`, immediately before the INSERT
+    and inside this transaction. There is deliberately no parameter for it: a
+    caller-supplied window is a caller-supplied security boundary, and a stale
+    one (computed before a revocation, or by a code path that forgot) would
+    reinstate exactly the divergence this exists to remove. The window is
+    *returned* instead, so the mint tools can say when the credential shortened
+    the link.
+
+    Raises `CredentialNotUsable` before writing anything when the credential
+    cannot back a capability at all.
     """
     if direction not in DIRECTIONS:
         raise ValueError(f"Unknown transfer direction: {direction!r}")
 
-    ttl = clamp_expires_in(expires_in)
+    # Read the credential and decide the deadline here, in this transaction,
+    # immediately before the INSERT: a token that outlives its credential is a
+    # link that 404s at a time we advertised as valid, and a window computed
+    # anywhere else could be stale by the time the row lands.
+    window = await plan_mint_window(
+        session, identity, expires_in, need_write=direction == "upload"
+    )
     token = new_token()
     row = TransferToken(
         public_id=new_public_id(),
@@ -236,7 +431,7 @@ async def mint_token(
         key_id=identity.key_id,
         oauth_token_id=identity.oauth_token_id,
         user_id=identity.user_id,
-        expires_at=_now() + datetime.timedelta(seconds=ttl),
+        expires_at=window.expires_at,
     )
     session.add(row)
 
@@ -247,7 +442,31 @@ async def mint_token(
     )
     await session.commit()
     await session.refresh(row)
-    return token, row
+    return token, row, window
+
+
+def upload_stream_deadline(row) -> datetime.datetime:
+    """`min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)`, absolute UTC.
+
+    Two bounds for two different things: the capability's own TTL, and how long
+    one claimed stream may hold a slot. The stricter one wins.
+
+    It lives here, rather than in the route that enforces it, because
+    `check_upload` has to answer the same question from the other side — is
+    this claimed token still plausibly in flight, or is its stream already
+    over? — and a second copy of the arithmetic would eventually disagree with
+    the one the route runs, which is how a status tool starts lying.
+
+    A claimed row always carries `claimed_at`; the `None` fallback is for a row
+    that has not been claimed at all, where "the stream started now" is the
+    most generous reading.
+    """
+    now = _now()
+    claimed = _as_aware(row.claimed_at) if row.claimed_at else now
+    return min(
+        _as_aware(row.expires_at),
+        claimed + datetime.timedelta(seconds=settings.transfer_max_upload_seconds),
+    )
 
 
 async def claim_upload(session, token: str) -> TransferToken | None:
@@ -390,10 +609,31 @@ async def lookup_upload(session, token: str) -> TransferToken | None:
     return await lookup_token(session, token, direction="upload")
 
 
+def _ownerless_in_multi_user(*user_ids) -> bool:
+    """Is a `user_id IS NULL` being treated as an identity while multi-user is on?
+
+    In single-user mode a null owner is normal — there are no users, and the
+    vault root is the globally configured one. In multi-user mode it is a
+    *stale* row: a key or token minted before the operator flipped the switch,
+    which now belongs to nobody. `None == None` quietly passed the ownership
+    comparison and `resolve_root_ok` / `locked_rows_ok` then authorised
+    `settings.vault_path` outright, so an ownerless capability minted before
+    the switch could still replace a file in whichever vault that setting names
+    — after the MCP middleware had already started rejecting the same key.
+
+    Fail closed: in multi-user mode an ownerless identity is nobody, and the
+    routes answer with the uniform 404.
+    """
+    return settings.multi_user_mode and any(uid is None for uid in user_ids)
+
+
 def _credential_ok(cred, *, need_write: bool, row: TransferToken) -> bool:
     """Exact predicates from D4 — kept in one place so the pre-publication
     re-check and the entry check cannot drift apart."""
     now = _now()
+    # Before anything else: an ownerless row is not an identity here.
+    if _ownerless_in_multi_user(getattr(row, "user_id", None), cred.user_id):
+        return False
     if isinstance(cred, APIKey):
         if not cred.is_active:
             return False
@@ -415,11 +655,18 @@ def _credential_ok(cred, *, need_write: bool, row: TransferToken) -> bool:
     return cred.user_id == row.user_id
 
 
-async def _load_credential(session, row: TransferToken, *, lock: bool = False):
-    if row.key_id is not None:
-        stmt = select(APIKey).where(APIKey.id == row.key_id)
-    elif row.oauth_token_id is not None:
-        stmt = select(OAuthToken).where(OAuthToken.id == row.oauth_token_id)
+async def _load_credential(session, ref: TransferToken | Identity, *, lock: bool = False):
+    """The credential row behind a token — or behind a bare `Identity`.
+
+    Both carry `key_id` / `oauth_token_id`, and both need the same lookup: the
+    redemption re-check reads it off the token, the mint clamp off the identity
+    that is asking. One function so the two cannot disagree about which
+    credential backs a transfer.
+    """
+    if ref.key_id is not None:
+        stmt = select(APIKey).where(APIKey.id == ref.key_id)
+    elif ref.oauth_token_id is not None:
+        stmt = select(OAuthToken).where(OAuthToken.id == ref.oauth_token_id)
     else:
         # A token with no credential cannot be re-validated and is therefore
         # never usable. Mint always sets one.
@@ -460,6 +707,12 @@ async def resolve_root_ok(session, row: TransferToken) -> bool:
     turn a reassignment into a 500.
     """
     if row.user_id is None:
+        # Defence in depth — `_credential_ok` already refuses this row in
+        # multi-user mode, and this is the other half of the pair, so neither
+        # check alone is the only thing standing between a stale ownerless
+        # capability and the globally configured vault.
+        if _ownerless_in_multi_user(row.user_id):
+            return False
         return canonical_vault_root(settings.vault_path) == row.vault_root
     result = await session.execute(
         select(User.vault_path, User.is_active).where(User.id == row.user_id)
@@ -525,6 +778,9 @@ def locked_rows_ok(locked: LockedRows, *, need_write: bool) -> bool:
             return False
         if canonical_vault_root(locked.user.vault_path) != locked.token.vault_root:
             return False
+    elif _ownerless_in_multi_user(locked.token.user_id):
+        # Same defensive pair as `resolve_root_ok`, on the locked rows.
+        return False
     elif canonical_vault_root(settings.vault_path) != locked.token.vault_root:
         return False
     return True
@@ -692,17 +948,24 @@ async def _drain(
     fd: int,
     *,
     max_bytes: int,
-    deadline: float,
+    deadline: float | datetime.datetime,
     idle_timeout: float,
 ) -> tuple[int, str, bytes]:
-    """Copy `chunks` to `fd`, counting, hashing and bounding as they arrive."""
+    """Copy `chunks` to `fd`, counting, hashing and bounding as they arrive.
+
+    Every deadline test goes through `_deadline_remaining`, so an upload's
+    deadline is checked against the same wall clock `check_upload` classifies
+    with. The *idle* timeout stays a duration measured by the event loop's
+    monotonic clock — it bounds a gap between chunks, which nothing else
+    reports on, so it has no surface to disagree with.
+    """
     digest = hashlib.sha256()
     total = 0
     head = bytearray()
     iterator = chunks.__aiter__()
 
     while True:
-        remaining = deadline - time.monotonic()
+        remaining = _deadline_remaining(deadline)
         if remaining <= 0:
             raise Timeout("Upload exceeded its deadline")
         try:
@@ -712,7 +975,7 @@ async def _drain(
         except StopAsyncIteration:
             break
         except (asyncio.TimeoutError, TimeoutError):
-            if time.monotonic() >= deadline:
+            if _deadline_remaining(deadline) <= 0:
                 raise Timeout("Upload exceeded its deadline") from None
             raise Timeout(
                 f"Upload stalled for more than {idle_timeout:g}s"
@@ -731,7 +994,7 @@ async def _drain(
         digest.update(chunk)
         _write_all(fd, chunk)
 
-    if time.monotonic() > deadline:
+    if _deadline_remaining(deadline) < 0:
         raise Timeout("Upload exceeded its deadline")
     return total, digest.hexdigest(), bytes(head)
 
@@ -742,7 +1005,7 @@ async def stream_to_vault(
     *,
     max_bytes: int,
     content_length: int | None = None,
-    deadline: float,
+    deadline: float | datetime.datetime,
     idle_timeout: float = 30.0,
     before_publish: PrePublishGate | None = None,
 ) -> dict:
@@ -753,9 +1016,11 @@ async def stream_to_vault(
     `TransferToken` (upload route) or the ad-hoc descriptor `import_from_url`
     builds, which is why this takes a duck-typed row rather than the ORM class.
 
-    `deadline` is a `time.monotonic()` value, not a duration: the caller
-    computes `min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)` and
-    this enforces it across the whole stream.
+    `deadline` is an instant, not a duration. The upload route passes the
+    absolute UTC instant `upload_stream_deadline(row)` returns, so the stream is
+    enforced against the very instant `check_upload` reports; `import_from_url`
+    passes a `time.monotonic()` float, because its fetch budget is private and
+    keeps the monotonic guarantee. See `_deadline_remaining`.
 
     Returns `{"size", "sha256", "mime"}`. Raises `TooLarge`, `Timeout`,
     `PrePublishAborted`, or `vault_fs.Conflict` / `vault_fs.UnsafePath` — and
@@ -786,6 +1051,36 @@ async def stream_to_vault(
             idle_timeout=idle_timeout,
             before_publish=before_publish,
         )
+
+
+def _refuse_if_past_deadline(deadline: float | datetime.datetime) -> None:
+    """Raise `Timeout` when the stream deadline has already passed.
+
+    Deliberately the *existing* `Timeout` and not a new type: the upload route
+    maps it to `consume`, and consuming is what the state machine says about a
+    request that ran past its deadline — a retry must mint afresh rather than
+    replay a link whose window is gone. It is also unambiguously
+    pre-publication, so raising it here preserves the contract that
+    `PostPublishFailure` is the only exception `stream_to_vault` raises once
+    the bytes are in place: `state["published"]` is still false, so the
+    surrounding handler re-raises this untouched.
+
+    **Honoured to within the publish latency, not to the syscall.** This runs
+    before `vault_fs.publish`'s own authoritative `open_parent` walk and, on an
+    overwrite, the incumbent's fingerprint re-hash (bounded by
+    `MAX_FILE_WRITE_BYTES`), so the bytes can land a few milliseconds past the
+    instant checked here. Accepted: closing that would mean a pre-mutation
+    callback threaded inside `publish`, and the write that lands late is the
+    consented, fingerprint-verified one — not a destructive write on anything
+    unintended.
+
+    For an upload `deadline` is `upload_stream_deadline(row)` measured against
+    `now_utc()`; taking it from the parameter rather than re-deriving it from
+    `row` keeps this working for `import_from_url`, whose row has no expiry and
+    whose monotonic fetch budget deserves the same treatment.
+    """
+    if _deadline_remaining(deadline) <= 0:
+        raise Timeout("Upload exceeded its deadline before it could be published")
 
 
 def _close_quietly(fd: int, what: str) -> None:
@@ -854,7 +1149,7 @@ async def _stream_locked(
     chunks: AsyncIterator[bytes],
     *,
     max_bytes: int,
-    deadline: float,
+    deadline: float | datetime.datetime,
     idle_timeout: float,
     before_publish: PrePublishGate | None,
 ) -> dict:
@@ -900,6 +1195,7 @@ async def _stream_locked(
 
         try:
             if before_publish is None:
+                _refuse_if_past_deadline(deadline)
                 _publish_into_current_parent(
                     root_fd, staging_fd, tmp_name, row, _record
                 )
@@ -910,6 +1206,18 @@ async def _stream_locked(
                         raise PrePublishAborted(
                             "The minting identity or vault root is no longer valid"
                         )
+                    # **Last thing before the bytes move, inside the locks.**
+                    # `_drain` checks the deadline while reading the body, but
+                    # the gate can take arbitrarily long after that: it waits
+                    # on `SELECT … FOR UPDATE` behind another writer or a
+                    # migration. A body that finished a second inside the
+                    # deadline could therefore publish — an overwrite
+                    # included — minutes after the capability's advertised
+                    # expiry, while `check_upload` was already reporting
+                    # `unknown` for it. Re-checking here, holding the locks,
+                    # is the only place where "still in time" and "about to
+                    # write" are the same instant.
+                    _refuse_if_past_deadline(deadline)
                     _publish_into_current_parent(
                         root_fd, staging_fd, tmp_name, row, _record
                     )

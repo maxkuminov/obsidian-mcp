@@ -39,7 +39,6 @@ import mimetypes
 import os
 import secrets
 import stat
-import time
 import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path, PurePosixPath
@@ -111,10 +110,6 @@ def _aware(value: datetime.datetime) -> datetime.datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=datetime.timezone.utc)
     return value
-
-
-def _now() -> datetime.datetime:
-    return datetime.datetime.now(datetime.timezone.utc)
 
 
 def _path_ok(vault_root: str, rel_path: str) -> bool:
@@ -258,19 +253,21 @@ async def download_info(request: Request, token: str | None = Depends(_bearer)) 
 # ── upload ──────────────────────────────────────────────────────────────────
 
 
-def _upload_deadline(row) -> float:
-    """`min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)`, as monotonic.
+def _upload_deadline(row) -> datetime.datetime:
+    """The stream deadline, as the **absolute UTC instant** the tool reports.
 
-    Two bounds for two different things: the capability's own TTL, and how long
-    one claimed stream may hold a slot. The stricter one wins.
+    Both the arithmetic (`min(expires_at, claimed_at +
+    TRANSFER_MAX_UPLOAD_SECONDS)`) and the clock it is measured against are
+    shared with `check_upload`, and both halves are load-bearing. A copy of the
+    arithmetic would drift. Converting to `time.monotonic()` here — which is
+    what this used to do — kept the arithmetic shared but split the *clock*: the
+    route froze the deadline into the monotonic domain at claim time while the
+    status tool kept comparing wall clocks, so a realtime step made the two
+    describe different instants, and the tool would call a stream live that the
+    route had already killed. `transfer._deadline_remaining` measures this
+    against `transfer.now_utc()`, the one clock both surfaces read.
     """
-    now = _now()
-    claimed = _aware(row.claimed_at) if row.claimed_at else now
-    hard = min(
-        _aware(row.expires_at),
-        claimed + datetime.timedelta(seconds=settings.transfer_max_upload_seconds),
-    )
-    return time.monotonic() + max(0.0, (hard - now).total_seconds())
+    return transfer.upload_stream_deadline(row)
 
 
 def _content_length(request: Request) -> int | None:
