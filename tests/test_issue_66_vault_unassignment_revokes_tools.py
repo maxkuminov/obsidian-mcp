@@ -653,7 +653,10 @@ class _OAuthMiddlewareSession(_MiddlewareSession):
         if "FROM oauth_tokens" in sql:
             return _RowsResult([self.api_key])
         if "FROM oauth_clients" in sql:
-            return _ScalarResult(self.client_owner)
+            # `(user_id, client_name)`, read with `.first()`: one row feeds
+            # both the cross-user check and the denormalised `usage_logs`
+            # actor label (issue #77).
+            return _RowsResult([(self.client_owner, "Snapshot Test Client")])
         return _ScalarResult(self.user_active)
 
 

@@ -848,6 +848,29 @@ async def delete_oauth_client(
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
+    """Delete the client row and let the cascades run. Attribution survives.
+
+    The button used to be labelled "Delete this client and revoke all its
+    tokens?", which described something weaker and more reassuring than what
+    happens (issue #77). The delete cascades `oauth_tokens`, `oauth_codes` and
+    — through `transfer_tokens.oauth_token_id` — any outstanding transfer
+    capabilities minted under those tokens. All of that is *wanted*: it is what
+    makes the delete a real stop, and it is stronger than flipping `revoked` on
+    each token, which #64 established is not durable while the client row still
+    exists to be refreshed against.
+
+    What was not wanted is the fourth cascade. `usage_logs.oauth_token_id` is
+    ON DELETE SET NULL, so every historical line the client produced lost its
+    actor, and `/admin/usage` — which resolved the actor by joining back
+    through `oauth_tokens` — rendered them "unknown". An operator stopping a
+    suspect connector destroyed the evidence they were about to read.
+
+    That is fixed at the source rather than here: `usage_logs` now carries the
+    actor label denormalised at call time (`actor_kind` / `actor_label` /
+    `actor_ref`, migration 015), so this delete no longer touches attribution
+    at all and the confirm text can honestly promise the history stays. Do not
+    "fix" this by swapping the delete for a revoke — see #64 and #77.
+    """
     client = await _assert_oauth_client_owner(session, client_id, user)
     await session.delete(client)
     await session.commit()
@@ -976,6 +999,40 @@ async def update_oauth_token_scope(
 # --- Usage ----------------------------------------------------------------
 
 
+def _usage_actor(row) -> tuple[str | None, str | None]:
+    """`(name, detail)` for one usage row — denormalised label first.
+
+    The LEFT JOINs through `api_keys` and `oauth_tokens` -> `oauth_clients` are
+    still there, but they are now the *fallback*, not the source. They go NULL
+    precisely when the operator most needs the answer: deleting an OAuth client
+    cascades its tokens and `usage_logs.oauth_token_id` is ON DELETE SET NULL,
+    and the panel NULLs `usage_logs.key_id` by hand before deleting an API key
+    (that column has no ON DELETE). Either way every historical line of the
+    credential being investigated rendered as "unknown" (issue #77).
+
+    So `actor_*` — written at call time, immune to a later delete — wins, and
+    the join only answers for rows written before migration 015. `(None, None)`
+    means both are gone, which the template renders as
+    "unknown (credential deleted)" rather than a bare "unknown": the row did
+    have an actor, and saying so is the difference between a gap in the data
+    and a gap in the audit trail.
+    """
+    if row.actor_kind:
+        if row.actor_kind == "api_key":
+            # Same two lines the join produced: name, then the omcp_ prefix.
+            return (row.actor_label or "(unnamed key)", row.actor_ref)
+        # For OAuth the second line used to be the literal string "OAuth".
+        # The client_id is strictly more useful — it is what identifies the
+        # connector once its row is gone — so it is shown alongside the kind.
+        detail = f"OAuth · {row.actor_ref}" if row.actor_ref else "OAuth"
+        return (row.actor_label or "(unnamed client)", detail)
+    if row.api_key_name:
+        return (row.api_key_name, row.api_key_prefix)
+    if row.oauth_client_name:
+        return (row.oauth_client_name, "OAuth")
+    return (None, None)
+
+
 @router.get("/usage", response_class=HTMLResponse)
 async def usage_page(
     request: Request,
@@ -992,6 +1049,9 @@ async def usage_page(
                     ul.tool,
                     ul.duration_ms,
                     ul.created_at,
+                    ul.actor_kind,
+                    ul.actor_label,
+                    ul.actor_ref,
                     ak.name        AS api_key_name,
                     ak.key_prefix  AS api_key_prefix,
                     oc.client_name AS oauth_client_name
@@ -1011,6 +1071,9 @@ async def usage_page(
                     ul.tool,
                     ul.duration_ms,
                     ul.created_at,
+                    ul.actor_kind,
+                    ul.actor_label,
+                    ul.actor_ref,
                     ak.name        AS api_key_name,
                     ak.key_prefix  AS api_key_prefix,
                     oc.client_name AS oauth_client_name
@@ -1026,15 +1089,7 @@ async def usage_page(
         )
     logs = []
     for r in result.fetchall():
-        if r.api_key_name:
-            actor_name = r.api_key_name
-            actor_detail = r.api_key_prefix
-        elif r.oauth_client_name:
-            actor_name = r.oauth_client_name
-            actor_detail = "OAuth"
-        else:
-            actor_name = None
-            actor_detail = None
+        actor_name, actor_detail = _usage_actor(r)
         logs.append({
             "tool": r.tool,
             "duration_ms": r.duration_ms,

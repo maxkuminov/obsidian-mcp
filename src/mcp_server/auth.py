@@ -9,7 +9,12 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from src.auth.session import UNSET_VAULT_ROOT, current_user_id, current_vault_root
+from src.auth.session import (
+    UNSET_VAULT_ROOT,
+    current_actor,
+    current_user_id,
+    current_vault_root,
+)
 from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthClient, OAuthToken, User
@@ -98,6 +103,10 @@ class APIKeyMiddleware:
         # that is what stops the indexer's bulk warm from re-admitting a user
         # whose assignment was revoked mid-request (issue #66).
         token_vault = current_vault_root.set(UNSET_VAULT_ROOT)
+        # Denormalised attribution for `usage_logs` (issue #77). Bound below
+        # from the credential row this request authenticated with, and reset
+        # with the rest so it can never label another request's log line.
+        token_actor = current_actor.set(None)
 
         try:
             if token.startswith("omcp_"):
@@ -205,6 +214,11 @@ class APIKeyMiddleware:
                     # gives `_vault_root` a snapshot no other task can
                     # overwrite. A None here means "unassigned", and every
                     # tool call in this request is refused (issue #66).
+                    # The key row is already loaded, so the actor label costs
+                    # no extra query -- and once written to `usage_logs` it
+                    # survives the row's deletion, which the panel performs
+                    # after NULLing `usage_logs.key_id` (issue #77).
+                    current_actor.set(("api_key", api_key.name, api_key.key_prefix))
                     if api_key.user_id is not None:
                         current_vault_root.set((
                             api_key.user_id,
@@ -270,6 +284,24 @@ class APIKeyMiddleware:
                             await response(scope, receive, send)
                             return
 
+                    # One lookup, two consumers. `client_name` becomes the
+                    # actor label denormalised onto `usage_logs` below (issue
+                    # #77): deleting the client cascades its tokens and SET
+                    # NULLs `usage_logs.oauth_token_id`, so a label resolved by
+                    # join at read time is exactly the history that delete
+                    # destroys. The row is read unconditionally — the
+                    # cross-user check below still runs only for an owned
+                    # token, as it did before.
+                    client_row = (
+                        await session.execute(
+                            select(OAuthClient.user_id, OAuthClient.client_name).where(
+                                OAuthClient.client_id == oauth_token.client_id
+                            )
+                        )
+                    ).first()
+                    client_owner = client_row[0] if client_row is not None else None
+                    client_name = client_row[1] if client_row is not None else None
+
                     # The grant's owner must still be the client's owner. A
                     # cross-user grant can no longer be created, but one made
                     # before the consent and rotation paths refused it stays
@@ -277,12 +309,6 @@ class APIKeyMiddleware:
                     # either user's panel. An unbound client (NULL owner) is
                     # not a conflict — it has simply never been claimed.
                     if oauth_token.user_id is not None:
-                        result = await session.execute(
-                            select(OAuthClient.user_id).where(
-                                OAuthClient.client_id == oauth_token.client_id
-                            )
-                        )
-                        client_owner = result.scalar_one_or_none()
                         if client_owner is not None and client_owner != oauth_token.user_id:
                             logger.warning(
                                 "auth_failure",
@@ -343,6 +369,7 @@ class APIKeyMiddleware:
                     current_api_key_id.set(None)
                     current_oauth_token_id.set(oauth_token.id)
                     current_user_id.set(oauth_token.user_id)
+                    current_actor.set(("oauth", client_name, oauth_token.client_id))
                     if oauth_token.user_id is not None:
                         current_vault_root.set((
                             oauth_token.user_id,
@@ -356,3 +383,4 @@ class APIKeyMiddleware:
             current_oauth_token_id.reset(token_oauth)
             current_user_id.reset(token_user)
             current_vault_root.reset(token_vault)
+            current_actor.reset(token_actor)

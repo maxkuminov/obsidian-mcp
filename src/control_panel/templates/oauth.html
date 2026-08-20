@@ -44,7 +44,7 @@
                     <span style="font-size:11px;color:var(--text-3);">Registered <time datetime="{{ client.created_at }}" data-localize="date">{{ client.created_at }}</time></span>
                     <form method="POST" action="/admin/oauth/{{ client.client_id }}/delete" style="display:inline;">
                         {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                        <button type="submit" class="btn btn-danger" style="font-size:11px;padding:4px 12px;" onclick="return confirm('Delete this client and revoke all its tokens?')">Delete</button>
+                        <button type="submit" class="btn btn-danger" style="font-size:11px;padding:4px 12px;" onclick="return confirm('Delete this client?\n\nIts access and refresh tokens are deleted, so it can no longer call this server, and any outstanding upload or download links minted under those tokens stop working.\n\nIts usage history stays on the Usage page, still labelled with this client name.')">Delete</button>
                     </form>
                 </div>
             </div>

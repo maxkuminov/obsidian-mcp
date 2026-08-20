@@ -46,7 +46,12 @@
                                 <div class="mono" style="font-size:10px;color:var(--text-3);">{{ log.actor_detail }}</div>
                             {% endif %}
                         {% else %}
-                            <div class="mono" style="font-size:11px;color:var(--text-3);">unknown</div>
+                            {# Both the denormalised label and the join are empty, which
+                               means the row predates migration 015 *and* its credential
+                               was deleted before 015 could copy the label across. Say
+                               that, rather than a bare "unknown" that reads like the
+                               server failed to record who called. #}
+                            <div class="mono" style="font-size:11px;color:var(--text-3);">unknown (credential deleted)</div>
                         {% endif %}
                     </td>
                     <td style="color:var(--primary-text);font-size:13px;font-weight:500;">{{ log.tool }}</td>

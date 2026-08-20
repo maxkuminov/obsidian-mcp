@@ -317,7 +317,10 @@ class _MiddlewareSession:
         if "FROM oauth_tokens" in sql:
             return _RowsResult([self.token])
         if "FROM oauth_clients" in sql:
-            return _ScalarResult(self.client_owner)
+            # `(user_id, client_name)`, read with `.first()`: the middleware
+            # takes the owner for the cross-user check and the name for the
+            # denormalised `usage_logs` actor label (issue #77) from one row.
+            return _RowsResult([(self.client_owner, "Ownerless Test Client")])
         if "vault_path" in sql:
             return _RowsResult([])
         return _ScalarResult(self.user_active)

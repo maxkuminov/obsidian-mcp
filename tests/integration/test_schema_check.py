@@ -56,6 +56,11 @@ pytestmark = [] if REQUIRED else [_harness.requires_pgvector]
 
 DIM = 64  # irrelevant here; keeps the migration cheap.
 
+# The current head. Every case that migrates forward asserts it, so adding a
+# revision without teaching this module about it fails loudly rather than
+# leaving the new migration unexercised.
+HEAD_REVISION = "015"
+
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
 
@@ -341,7 +346,7 @@ def insert_null_rows(url: str):
 def test_fresh_database_is_clean_and_enforced():
     """(a) An empty database migrated to head needs no further operations."""
     with throwaway_db("schema_fresh") as url:
-        assert alembic_version(url) == "014"
+        assert alembic_version(url) == HEAD_REVISION
         # No marker: 010 created this constraint and 013 recognised it as
         # already correct. That distinction is what downgrade() reads.
         assert_reconciled(url, marker_expected=False)
@@ -678,7 +683,7 @@ def test_rerunning_013_changes_nothing():
         assert alembic_version(url) == "012"
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
-        assert alembic_version(url) == "014"
+        assert alembic_version(url) == HEAD_REVISION
         assert (constraint_row(url), not_null_flags(url)) == before
         assert_reconciled(url, marker_expected=False)
 
@@ -884,7 +889,7 @@ def test_rerunning_014_does_not_re_stamp_existing_grants():
         assert alembic_version(url) == "013"
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
-        assert alembic_version(url) == "014"
+        assert alembic_version(url) == HEAD_REVISION
         assert grant_ids(url) == before
         assert column_shape(url, "oauth_tokens", "grant_id")[0] is True
 
@@ -1156,7 +1161,7 @@ def test_an_index_of_our_name_in_another_schema_is_ignored():
 
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
-        assert alembic_version(url) == "014"
+        assert alembic_version(url) == HEAD_REVISION
         assert_reconciled(url, marker_expected=False)
         # Ours was created in the table's own schema, and the decoy is untouched.
         assert fetchval(
@@ -1185,7 +1190,7 @@ def test_the_genuine_index_is_accepted():
 
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
-        assert alembic_version(url) == "014"
+        assert alembic_version(url) == HEAD_REVISION
         assert_reconciled(url, marker_expected=False)
 
 
@@ -1209,7 +1214,7 @@ def test_a_complete_pre_existing_column_is_accepted():
 
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
-        assert alembic_version(url) == "014"
+        assert alembic_version(url) == HEAD_REVISION
         assert grant_ids(url) == before, "existing ids must be left alone"
         assert column_shape(url, "oauth_tokens", "grant_id")[0] is True
         assert_reconciled(url, marker_expected=False)
@@ -1222,5 +1227,223 @@ def test_an_empty_table_with_a_nullable_column_completes():
 
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
 
-        assert alembic_version(url) == "014"
+        assert alembic_version(url) == HEAD_REVISION
         assert column_shape(url, "oauth_tokens", "grant_id")[0] is True
+
+
+# --------------------------------------------------------------------------
+# migration 015: denormalised actor on usage_logs (issue #77)
+# --------------------------------------------------------------------------
+#
+# `alembic check` sees the three columns and their nullability, so
+# `assert_reconciled` already covers the declarative half everywhere. What it
+# cannot see is whether the *backfill* preserves the thing the columns exist
+# for: attribution that outlives the credential. Both credential paths destroy
+# the join on purpose — deleting an OAuth client cascades its tokens and
+# `usage_logs.oauth_token_id` is ON DELETE SET NULL, and the panel NULLs
+# `usage_logs.key_id` by hand because that column has no ON DELETE at all — so
+# the cases below run those exact sequences against a real database and read
+# the label back afterwards.
+
+
+ACTOR_COLUMNS = (
+    ("actor_kind", "character varying(20)"),
+    ("actor_label", "character varying(255)"),
+    ("actor_ref", "character varying(64)"),
+)
+
+
+def insert_key(url, key_id: int, name: str, prefix: str, user_id=None):
+    sql(
+        url,
+        "INSERT INTO api_keys (id, name, key_hash, key_prefix, permission, "
+        "is_active, user_id) VALUES ($1, $2, $3, $4, 'read', true, $5)",
+        key_id,
+        name,
+        f"hash-{key_id}",
+        prefix,
+        user_id,
+    )
+
+
+def insert_usage(url, usage_id: int, *, key_id=None, oauth_token_id=None, tool="read_note"):
+    sql(
+        url,
+        "INSERT INTO usage_logs (id, key_id, oauth_token_id, tool) "
+        "VALUES ($1, $2, $3, $4)",
+        usage_id,
+        key_id,
+        oauth_token_id,
+        tool,
+    )
+
+
+def actor_of(url, usage_id: int):
+    """`(actor_kind, actor_label, actor_ref)` for one usage row."""
+    row = fetch(
+        url,
+        "SELECT actor_kind, actor_label, actor_ref FROM usage_logs WHERE id = $1",
+        usage_id,
+    )[0]
+    return row["actor_kind"], row["actor_label"], row["actor_ref"]
+
+
+def seed_pre_015_usage(url):
+    """One API-key actor, one OAuth actor, and one already-orphaned row.
+
+    The third is the row this bug has *already* claimed on the live database:
+    its credential was deleted before the label column existed, so there is
+    nothing to recover and the migration must not invent anything for it.
+    """
+    insert_user(url, 1, "alice")
+    insert_key(url, 1, "nightly sync", "omcp_a1b2c3", user_id=1)
+    insert_client(url, "client-abc", "none", None)
+    # Seeded at 014, where `grant_id` is already NOT NULL, so it is supplied
+    # here rather than going through `insert_token` (which predates it).
+    sql(
+        url,
+        "INSERT INTO oauth_tokens (token_hash, token_type, client_id, scope, "
+        "user_id, grant_id, expires_at, revoked) "
+        "VALUES ($1, 'access', 'client-abc', 'read', 1, 'grant-1', $2, false)",
+        "a" * 64,
+        FUTURE,
+    )
+    token_id = fetchval(url, "SELECT id FROM oauth_tokens WHERE token_hash = $1", "a" * 64)
+
+    insert_usage(url, 1, key_id=1)
+    insert_usage(url, 2, oauth_token_id=token_id)
+    insert_usage(url, 3)  # credential already gone
+    return token_id
+
+
+def test_the_actor_columns_are_nullable_on_a_fresh_database():
+    """Nullable on purpose: a call that cannot name its actor must still be
+    recorded. These columns are display and audit, never authorization."""
+    with throwaway_db("schema_actor_fresh") as url:
+        for column, expected_type in ACTOR_COLUMNS:
+            shape = column_shape(url, "usage_logs", column)
+            assert shape is not None, f"usage_logs.{column} is missing"
+            attnotnull, coltype, coldefault = shape
+            assert attnotnull is False, f"{column} must stay nullable"
+            assert coltype == expected_type
+            assert coldefault is None
+
+
+def test_backfill_labels_every_row_whose_credential_still_resolves():
+    with throwaway_db("schema_actor_backfill", revision="014") as url:
+        seed_pre_015_usage(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert actor_of(url, 1) == ("api_key", "nightly sync", "omcp_a1b2c3")
+        assert actor_of(url, 2) == ("oauth", "test client", "client-abc")
+        # Nothing is invented for a row whose credential is already gone. A
+        # guess-by-user_id fallback would be worse than an admitted gap: two of
+        # a user's keys are different actors, and the whole value of the column
+        # is that an operator can trust it while deciding whether a connector
+        # misbehaved.
+        assert actor_of(url, 3) == (None, None, None)
+
+
+def test_the_label_survives_the_panel_deleting_an_api_key():
+    """`delete_key_form`'s exact sequence, run against a real database.
+
+    `usage_logs.key_id` has no `ON DELETE`, so the panel NULLs it first and
+    then deletes the key. Before 015 that erased the actor. The label is
+    written by `_log_usage` now and backfilled here, so it must be untouched by
+    both statements.
+    """
+    with throwaway_db("schema_actor_key_delete", revision="014") as url:
+        seed_pre_015_usage(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        sql(url, "UPDATE usage_logs SET key_id = NULL WHERE key_id = 1")
+        sql(url, "DELETE FROM api_keys WHERE id = 1")
+
+        assert fetchval(url, "SELECT count(*) FROM api_keys") == 0
+        assert fetchval(url, "SELECT key_id FROM usage_logs WHERE id = 1") is None
+        assert actor_of(url, 1) == ("api_key", "nightly sync", "omcp_a1b2c3")
+
+
+def test_the_label_survives_deleting_the_oauth_client():
+    """The scenario in the issue, end to end.
+
+    An operator suspects a connector, clicks Delete, then opens the Usage page
+    to review what it did. The delete cascades `oauth_tokens` and SET NULLs
+    `usage_logs.oauth_token_id`, so the join the page used to rely on is gone —
+    and the row must still name the client.
+    """
+    with throwaway_db("schema_actor_client_delete", revision="014") as url:
+        seed_pre_015_usage(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        sql(url, "DELETE FROM oauth_clients WHERE client_id = 'client-abc'")
+
+        assert fetchval(url, "SELECT count(*) FROM oauth_tokens") == 0
+        assert fetchval(url, "SELECT oauth_token_id FROM usage_logs WHERE id = 2") is None
+        assert actor_of(url, 2) == ("oauth", "test client", "client-abc")
+
+
+def test_rerunning_015_does_not_relabel_existing_rows():
+    """Idempotence that re-executes the body, and history that stays history.
+
+    Stamping back to 014 forces 015 to run again. The guard is
+    `actor_kind IS NULL`, so a renamed key must not retroactively rename every
+    call it ever made — the label is a snapshot of the credential at call time,
+    not a view of its present state.
+    """
+    with throwaway_db("schema_actor_idempotent", revision="014") as url:
+        seed_pre_015_usage(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        sql(url, "UPDATE api_keys SET name = 'renamed later' WHERE id = 1")
+        _harness.run_alembic(url, "stamp", "014", dimensions=DIM)
+        assert alembic_version(url) == "014"
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert actor_of(url, 1) == ("api_key", "nightly sync", "omcp_a1b2c3")
+        assert_reconciled(url, marker_expected=False)
+
+
+def test_a_pre_existing_actor_column_of_the_wrong_shape_is_refused():
+    """013's philosophy: reconcile a column we can verify, refuse to guess.
+
+    A `text` column under our name holds labels this migration did not write.
+    Adopting it means presenting an attribution of unknown provenance as if the
+    server had recorded it, which is exactly the trust these columns exist to
+    make possible.
+    """
+    with throwaway_db("schema_actor_wrong_type", revision="014") as url:
+        sql(url, "ALTER TABLE usage_logs ADD COLUMN actor_label text")
+
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "actor_label" in combined
+        assert "Nothing has been changed" in combined
+        assert alembic_version(url) == "014"
+        assert column_shape(url, "usage_logs", "actor_kind") is None
+
+
+def test_downgrade_015_removes_the_columns_and_upgrade_rebuilds_them():
+    with throwaway_db("schema_actor_downgrade", revision="014") as url:
+        seed_pre_015_usage(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert actor_of(url, 1)[0] == "api_key"
+
+        _harness.run_alembic(url, "downgrade", "014", dimensions=DIM)
+        assert alembic_version(url) == "014"
+        for column, _ in ACTOR_COLUMNS:
+            assert column_shape(url, "usage_logs", column) is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        # Re-derived from the credentials that still exist. A row whose
+        # credential was deleted while the columns were absent is not
+        # recoverable — downgrading really does destroy that history.
+        assert actor_of(url, 1) == ("api_key", "nightly sync", "omcp_a1b2c3")
+        assert_reconciled(url, marker_expected=False)

@@ -21,7 +21,7 @@ from urllib.parse import urlsplit
 from mcp.server.fastmcp import Image
 from sqlalchemy import text
 
-from src.auth.session import current_user_id
+from src.auth.session import current_actor, current_user_id
 from src.config import (
     MAX_MOVE_REWRITE_BYTES,
     MAX_NOTE_BYTES,
@@ -78,6 +78,41 @@ _NO_CLAUDE_MD_MESSAGE = (
 )
 
 
+# Widths of the denormalised actor columns on `usage_logs` (see `UsageLog`).
+# The values are truncated to them rather than left to overflow: an over-long
+# label raises inside `_log_usage`, whose `except` swallows it, so the failure
+# mode would be the silent loss of the whole usage row — the opposite of what
+# these columns exist for.
+_ACTOR_LABEL_MAX = 255
+_ACTOR_REF_MAX = 64
+
+
+def _actor_columns() -> dict:
+    """The denormalised actor for this request, or `{}` when there is none.
+
+    `APIKeyMiddleware` binds `current_actor` from the credential row it already
+    loaded, so this is a ContextVar read, not a join. Writing the label with
+    the row is the whole point of issue #77: `usage_logs.oauth_token_id` is
+    ON DELETE SET NULL and `usage_logs.key_id` is NULLed by the panel before an
+    API key is deleted, so an actor resolved by join at read time disappears
+    exactly when an operator most wants it — after they revoked the credential
+    they are investigating.
+
+    `{}` (rather than three explicit NULLs) so a caller with no request context
+    — the transfer routes, the tests, sandbox mode — leaves the columns at
+    their database default and the row keeps the shape it had before 015.
+    """
+    actor = current_actor.get()
+    if actor is None:
+        return {}
+    kind, label, ref = actor
+    return {
+        "actor_kind": kind,
+        "actor_label": label[:_ACTOR_LABEL_MAX] if label else None,
+        "actor_ref": ref[:_ACTOR_REF_MAX] if ref else None,
+    }
+
+
 async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: int):
     try:
         async with async_session() as session:
@@ -89,6 +124,7 @@ async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: i
                 params=params,
                 duration_ms=duration_ms,
                 response_size=response_size,
+                **_actor_columns(),
             ))
             await session.commit()
     except Exception as e:
