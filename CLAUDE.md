@@ -250,6 +250,17 @@ nothing about the migration body.
   also NULLs `notes_metadata.embedded_content_hash` in the same transaction as
   the `DELETE`: `embed_vault` selects on hash mismatch, so deleting vectors
   alone meant the reindex it spawns re-embedded nothing.
+- **Every panel handler that can change `users.is_admin` / `users.is_active`
+  takes `_lock_admin_guard(session)` before counting the remaining admins**
+  (`src/control_panel/users.py` — `edit_user_submit` and `delete_user`, one
+  shared `pg_advisory_xact_lock` key). The last-admin guard is a count
+  followed by a write; without the lock two admins demoting each other
+  concurrently both read "one other admin remains", both pass, and the panel
+  is left with zero admins and no way back in through the UI. The lock is
+  transaction-scoped, so **never commit between taking it and writing the
+  flags** — that is what makes the check-then-act atomic. A new handler that
+  flips either flag must take it too, and use the *same* constant: two keys
+  do not exclude each other.
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
