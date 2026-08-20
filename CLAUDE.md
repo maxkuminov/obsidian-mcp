@@ -229,7 +229,29 @@ vanished from the page, so the operator saw a blank space that read as success.
   Revoke is exactly the defect.
 - **`/revoke` (RFC 7009) is family-scoped too**, which §2.1 explicitly permits.
   Anything narrower reproduces the near no-op for any client presenting its
-  access token.
+  access token. It **authenticates the client** per its registered method and
+  requires a submitted `client_id` to match the token's — without that, any
+  holder of any token value ended a 30-day grant. §2.2 governs the other
+  direction: a foreign or unknown token is answered 200 with nothing done, so
+  the endpoint is not an oracle for who owns a token value. The only real
+  error is naming the right client and failing to authenticate as it.
+- **No token is minted without an owner, and the mint paths serialize with the
+  multi-user bootstrap.** `register_submit` claims ownerless rows with
+  `UPDATE ... WHERE user_id IS NULL`, whose snapshot is taken at statement
+  start, so a mint committing afterwards left tokens belonging to nobody. Both
+  token handlers take the *same* advisory key the bootstrap already held
+  (`USER_BOOTSTRAP_LOCK_KEY` — a wire constant: changing it un-serializes the
+  window during a rolling deploy) and, under `multi_user_mode`, refuse to mint
+  a NULL-owner token at all. Lock order is bootstrap-then-grant on the only
+  path that takes both; the panel takes the grant lock and never the bootstrap
+  key, so there is no cycle.
+- **The first-authorizer claim is `UPDATE ... WHERE user_id IS NULL
+  RETURNING`**, not an ORM assignment on a row read from this transaction's
+  snapshot — two users consenting to the same unbound client both saw NULL and
+  the second write silently re-bound it. `_handle_refresh` and
+  `src/mcp_server/auth.py` additionally refuse a grant whose owner is not the
+  client's, so a legacy or race-created cross-user grant cannot rotate or
+  authenticate.
 - **The registered scope caps every path.** `src/oauth/scope.py` holds the one
   definition (`clamp_scope`, `client_can_write`, `token_has_write`); the OAuth
   routes, `src/mcp_server/auth.py` and the panel all use it. The panel refuses
@@ -240,11 +262,30 @@ vanished from the page, so the operator saw a blank space that read as success.
   at the source rather than by unioning the panel listing, which would hand the
   other user the owner's cascading Delete. Single-user mode cannot trigger it.
 - **The panel lists revoked and expired rows, dimmed**, with one "Revoke
-  access" control and one scope select *per grant*. Live tokens are always
-  shown; dead ones are capped per grant with the remainder counted, because a
-  client refreshing hourly leaves hundreds in a 30-day window. Status also
-  reads the owner's `User.is_active` ("Owner inactive"), which
-  `APIKeyMiddleware` already enforces and the page used to badge green (#76).
+  access" control and one scope select *per grant*. Status also reads the
+  owner's `User.is_active` ("Owner inactive"), which `APIKeyMiddleware` already
+  enforces and the page used to badge green (#76).
+- **Live rows are queried unbounded; only history is capped.** One `LIMIT` over
+  all of a client's tokens applied *before* grants were identified let a chatty
+  grant's rotations push another grant's live refresh token off the page —
+  a working credential with no control to revoke it. Losing the tail of the
+  history costs a row nobody can act on; losing a live row costs a revocation.
+  When the history query hits its cap the page says so rather than printing a
+  total it did not count.
+- **A grant's permission is `any(token_has_write(...))` over its live rows.**
+  014's backfill can legitimately merge two pre-014 sessions of one client and
+  user, one `read` and one `readwrite`; reading the newest row alone showed
+  "read" while an older live access token still held write. Such a family is
+  marked "mixed", and saving the select writes one clamped scope across all of
+  it — which is what makes it uniform again. `offline_access` is read the same
+  way, so a write cannot strip the marker from a sibling that carried it.
+- **014 verifies a pre-existing `grant_id` column rather than patching it.**
+  The backfill is a partition only because the migration created the column;
+  on a column somebody else added, `WHERE grant_id IS NULL` becomes a patch
+  that hands a NULL row beside a stamped sibling a *fresh* id — splitting one
+  grant in two, so revoking either leaves the other alive. It therefore refuses
+  a wrong type, an index name squatting on another column, any NULL row, and
+  any id spanning more than one `(client_id, user_id)`.
 - **`cleanup_expired_tokens` retains on `expires_at`, never `created_at`.** Its
   revoked branch used to have no age condition at all, so the indexer deleted
   every revoked token within five minutes — the same blank space the listing

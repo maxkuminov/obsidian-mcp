@@ -45,10 +45,22 @@
 - [x] 6.6 Seven new cases in `tests/integration/test_schema_check.py` for 014's backfill, NOT NULL, index name, idempotence and downgrade; update the head-revision assertions to `014`
 - [x] 6.7 `tests/test_issue_64_token_cleanup_retention.py` — structural comparison of the emitted WHERE clause plus a small real evaluator, so the retention window is pinned by behaviour and not by reading one bind parameter
 
+## 8. Adversarial round 1 (Codex FAIL: 1 BLOCKER, 6 MAJOR, 2 MINOR)
+
+- [x] 8.1 BLOCKER — bootstrap vs mint race: both token handlers take the bootstrap advisory lock (key shared from `src/oauth/grants.py`; value unchanged for rolling deploys) and refuse to mint a NULL-owner token under `multi_user_mode`
+- [x] 8.2 MAJOR — `/revoke` authenticates the client per its registered method and requires a submitted `client_id` to match the token's; a foreign or unknown token stays a uniform 200 (RFC 7009 §2.2)
+- [x] 8.3 MAJOR — the first-authorizer claim is `UPDATE ... WHERE user_id IS NULL RETURNING`, with a fresh-snapshot re-read and a refusal when the winner is another user
+- [x] 8.4 MAJOR — `_handle_refresh` rejects a grant whose owner is not the client's; `src/mcp_server/auth.py` rejects the same mismatch for access tokens
+- [x] 8.5 MAJOR — `oauth_page` reads live rows unbounded and caps only history, so no live grant can be pushed off the page
+- [x] 8.6 MAJOR — a mixed-scope family reports `any(token_has_write(...))`, is marked "mixed", and a scope write makes it uniform across the family
+- [x] 8.7 MAJOR — 014 verifies a pre-existing `grant_id` column instead of patching it: refuses a wrong type, a squatting index name, any NULL row, or any id spanning two owners
+- [x] 8.8 MINOR — `clamp_scope` fails closed on an empty intersection (section 3 above)
+- [x] 8.9 MINOR — fakes match the literal `pg_advisory_xact_lock` and honour LIMIT/OFFSET; `tests/integration/test_oauth_grants_pg.py` adds real-Postgres coverage of revoke-vs-refresh ordering (deterministically gated, not a `gather` and a hope), concurrent first consent, and client-authenticated `/revoke`
+
 ## 7. Gates
 
-- [x] 7.1 `pytest --ignore=tests/integration` green (1006 passed, 5 skipped; baseline 940/5)
-- [x] 7.2 `make test-schema` green (20 passed) — includes `alembic check` clean on every path
+- [x] 7.1 `pytest --ignore=tests/integration` green (1063 passed, 5 skipped; baseline 940/5)
+- [x] 7.2 `make test-schema` green (27 passed) — includes `alembic check` clean on every path
 - [x] 7.3 `openspec validate oauth-grant-families --strict`
-- [ ] 7.4 Adversarial Codex pass (orchestrator-run)
+- [x] 7.4 Adversarial Codex round 1 findings addressed (section 8); re-run is orchestrator's
 - [ ] 7.5 Deploy + `make db-check` (orchestrator-run)
