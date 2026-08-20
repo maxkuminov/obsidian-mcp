@@ -469,24 +469,25 @@ def repoint_after_read(monkeypatch):
     write — the moment the tool has the old bytes in hand and has not yet
     published the new ones.
 
-    Hooked on `_read_path_bytes`, the one read primitive every path shares, so
-    the test does not encode *how* a tool reads. It fires once: the compare in
-    `_atomic_write` reads again, and swapping twice would prove nothing.
+    Hooked on `_read_fd_bytes`, the one read primitive every *mutation* path
+    shares, so the test does not encode *how* a tool reads. It fires once: the
+    compare in `_atomic_write_at` reads again, and swapping twice would prove
+    nothing.
     """
 
     def install(link: Path, new_target: Path):
-        original = vault_service._read_path_bytes
+        original = vault_service._read_fd_bytes
         fired: list[bool] = []
 
-        def swapping(path, max_bytes=None):
-            data = original(path, max_bytes=max_bytes)
+        def swapping(dir_fd, name, max_bytes=None):
+            data = original(dir_fd, name, max_bytes=max_bytes)
             if not fired:
                 fired.append(True)
                 link.unlink()
                 link.symlink_to(new_target)
             return data
 
-        monkeypatch.setattr(vault_service, "_read_path_bytes", swapping)
+        monkeypatch.setattr(vault_service, "_read_fd_bytes", swapping)
 
     return install
 
@@ -569,26 +570,31 @@ async def test_a_leaf_swapped_for_a_link_after_validation_is_reported(
     writable, monkeypatch, mutate
 ):
     """The residual TOCTOU the design accepts: the leaf becomes a symlink
-    between the `lstat` and the read. `O_NOFOLLOW` turns that into an ELOOP
-    `OSError` — the tool must report it, not raise through the MCP layer."""
+    between validation and the read.
+
+    The re-check through the parent descriptor names it as a link (and never as
+    a missing note — an agent's next move after 'not found' is to create it,
+    which would write through the link). Nothing is mutated either way."""
     note = writable / "note.md"
     note.write_text("before\n", encoding="utf-8")
     (writable / "elsewhere.md").write_text("elsewhere\n", encoding="utf-8")
 
-    original = vault_service.validate_mutable_path
+    original = vault_service.open_mutable
 
     def swap_after_validating(relative_path, user_id=None):
-        resolved = original(relative_path, user_id=user_id)
+        target = original(relative_path, user_id=user_id)
         note.unlink()
         note.symlink_to(writable / "elsewhere.md")
-        return resolved
+        return target
 
-    monkeypatch.setattr(tools, "validate_mutable_path", swap_after_validating)
+    monkeypatch.setattr(tools, "open_mutable", swap_after_validating)
 
     result = await mutate()
 
-    assert "Failed to read note.md" in result, result
+    assert "symbolic link" in result, result
+    assert "not found" not in result.lower(), result
     assert (writable / "elsewhere.md").read_text(encoding="utf-8") == "elsewhere\n"
+    assert (writable / "note.md").is_symlink()
 
 
 # ── an in-vault `..` is refused, but says why ───────────────────────────────

@@ -6,6 +6,7 @@ import mimetypes
 import os
 import posixpath
 import re
+import stat
 import time
 from collections import Counter
 from contextlib import asynccontextmanager
@@ -34,11 +35,12 @@ from src.services.vault import (
     extract_section,
     is_hidden_path,
     list_dir,
+    move_file_no_clobber,
+    open_mutable,
     outline_sections,
     read_bytes,
     read_bytes_at,
     read_file,
-    validate_mutable_path,
     validate_visible_path,
     write_bytes_at,
     write_file_at,
@@ -601,6 +603,28 @@ def _require_write() -> str | None:
     return None
 
 
+def _leaf_state_error(target, path: str, *, missing: str) -> str | None:
+    """Refuse a note whose leaf is absent, a link, or not a regular file.
+
+    `open_mutable` already refused a symlinked leaf; this re-checks through the
+    parent descriptor immediately before the tool acts, so a leaf swapped for a
+    link in the interval is *named* as such. Reporting it as a missing note
+    would be worse than unhelpful: the obvious next move an agent makes is to
+    create it, which writes through the link.
+    """
+    info = target.lstat()
+    if info is None:
+        return missing
+    if stat.S_ISLNK(info.st_mode):
+        return (
+            f"{path} became a symbolic link after it was validated — mutating "
+            "tools act only on the named file. Nothing was changed."
+        )
+    if not stat.S_ISREG(info.st_mode):
+        return f"{path} is not a regular file. Nothing was changed."
+    return None
+
+
 def _note_size_error_for(size: int) -> str | None:
     """`_note_size_error` for a caller that already knows the encoded length.
 
@@ -635,20 +659,21 @@ async def create_note_impl(path: str, content: str) -> str:
     # that the path is a symlink, not that its content is too big — the second
     # message sends it off to trim content that was never the problem.
     try:
-        full_path = validate_mutable_path(path, user_id=uid)
+        target = open_mutable(path, user_id=uid)
     except ValueError as e:
         return str(e)
-    if err := _note_size_error(content):
-        return err
-    try:
-        write_file_at(full_path, content, overwrite=False)
-        return f"Created note: {path}"
-    except FileExistsError:
-        return f"Note already exists: {path}. Use edit_note to modify it."
-    except ValueError as e:
-        return str(e)
-    except OSError as e:
-        return f"Failed to write {path}: {e}"
+    with target:
+        if err := _note_size_error(content):
+            return err
+        try:
+            write_file_at(target, content, overwrite=False)
+            return f"Created note: {path}"
+        except FileExistsError:
+            return f"Note already exists: {path}. Use edit_note to modify it."
+        except (ValueError, vault_fs.VaultFSError) as e:
+            return str(e)
+        except OSError as e:
+            return f"Failed to write {path}: {e}"
 
 
 @_tracked("get_backlinks", ["path", "limit"])
@@ -1072,94 +1097,101 @@ async def edit_note_impl(
         )
 
     uid = current_user_id.get()
+    from src.services.vault import replace_section
+
     try:
-        from src.services.vault import replace_section
-        # Resolved before the read, so every mode — `dry_run` included —
-        # refuses an alias rather than diffing (and then reporting on) a note
-        # the caller did not name. Everything below acts on this Path: the
-        # caller's string is never re-resolved, so an ancestor symlink
-        # repointed between the read and the write cannot redirect the write.
-        full_path = validate_mutable_path(path, user_id=uid)
+        # Resolved and *opened* before the read, so every mode — `dry_run`
+        # included — refuses an alias rather than diffing (and then reporting
+        # on) a note the caller did not name. Everything below acts on this
+        # target's parent descriptor: no pathname is resolved again, so neither
+        # an ancestor repointed nor the parent directory renamed between the
+        # read and the write can redirect the write.
+        target = open_mutable(path, user_id=uid)
     except ValueError as e:
         return str(e)
-    if not full_path.exists():
-        return f"Note not found: {path}. Use create_note to create it."
-
-    try:
-        existing_bytes = read_bytes_at(
-            full_path, max_bytes=MAX_NOTE_BYTES, label=path
-        )
-        existing = existing_bytes.decode("utf-8")
-    except Exception as e:
-        # Includes OSError: an ELOOP from the `O_NOFOLLOW` read means the leaf
-        # became a symlink after validation. That is a refusal, not a crash.
-        return f"Failed to read {path}: {e}"
-
-    new_content: str | None = None
-    success_message: str = f"Updated note: {path}"
-
-    if section is not None:
-        new_content, err = replace_section(existing, section, content)
-        if err is not None:
+    with target:
+        if err := _leaf_state_error(
+            target,
+            path,
+            missing=f"Note not found: {path}. Use create_note to create it.",
+        ):
             return err
-    elif find is not None:
-        if find == "":
-            return (
-                "edit_note: find must be a non-empty string. "
-                "An empty find would match every position and corrupt the note."
+
+        try:
+            existing_bytes = read_bytes_at(
+                target, max_bytes=MAX_NOTE_BYTES, label=path
             )
-        count = existing.count(find)
-        if count == 0:
-            preview = existing[:500]
-            return (
-                f"Find text not found in {path}. "
-                f"First 500 chars of note:\n---\n{preview}\n---"
-            )
-        if count > 1 and not replace_all:
-            return (
-                f"Find text matches {count} locations in {path}. "
-                "Provide more surrounding context to match a unique section, "
-                "or set replace_all=True."
-            )
-        if replace_all:
-            new_content = existing.replace(find, content)
-            success_message = (
-                f"Replaced {count} occurrence(s) in {path}"
-            )
+            existing = existing_bytes.decode("utf-8")
+        except Exception as e:
+            # Includes OSError: an ELOOP from the `O_NOFOLLOW` read means the leaf
+            # became a symlink after validation. That is a refusal, not a crash.
+            return f"Failed to read {path}: {e}"
+
+        new_content: str | None = None
+        success_message: str = f"Updated note: {path}"
+
+        if section is not None:
+            new_content, err = replace_section(existing, section, content)
+            if err is not None:
+                return err
+        elif find is not None:
+            if find == "":
+                return (
+                    "edit_note: find must be a non-empty string. "
+                    "An empty find would match every position and corrupt the note."
+                )
+            count = existing.count(find)
+            if count == 0:
+                preview = existing[:500]
+                return (
+                    f"Find text not found in {path}. "
+                    f"First 500 chars of note:\n---\n{preview}\n---"
+                )
+            if count > 1 and not replace_all:
+                return (
+                    f"Find text matches {count} locations in {path}. "
+                    "Provide more surrounding context to match a unique section, "
+                    "or set replace_all=True."
+                )
+            if replace_all:
+                new_content = existing.replace(find, content)
+                success_message = (
+                    f"Replaced {count} occurrence(s) in {path}"
+                )
+            else:
+                new_content = existing.replace(find, content, 1)
+        elif append:
+            new_content = existing + "\n" + content
         else:
-            new_content = existing.replace(find, content, 1)
-    elif append:
-        new_content = existing + "\n" + content
-    else:
-        new_content = content
+            new_content = content
 
-    # Bound the *result*, before the diff and before the atomic write, so an
-    # over-cap edit is refused by the tool in every mode (including dry_run)
-    # and nothing is written. Must stay ahead of the `expected=` write below,
-    # which is what detects a concurrent read-modify-write conflict.
-    if err := _note_size_error(new_content):
-        return err
+        # Bound the *result*, before the diff and before the atomic write, so an
+        # over-cap edit is refused by the tool in every mode (including dry_run)
+        # and nothing is written. Must stay ahead of the `expected=` write below,
+        # which is what detects a concurrent read-modify-write conflict.
+        if err := _note_size_error(new_content):
+            return err
 
-    if dry_run:
-        if new_content == existing:
-            return f"No changes for {path}"
-        import difflib
-        diff = "".join(difflib.unified_diff(
-            existing.splitlines(keepends=True),
-            new_content.splitlines(keepends=True),
-            fromfile=path,
-            tofile=path,
-            lineterm="",
-        ))
-        return diff or f"No changes for {path}"
+        if dry_run:
+            if new_content == existing:
+                return f"No changes for {path}"
+            import difflib
+            diff = "".join(difflib.unified_diff(
+                existing.splitlines(keepends=True),
+                new_content.splitlines(keepends=True),
+                fromfile=path,
+                tofile=path,
+                lineterm="",
+            ))
+            return diff or f"No changes for {path}"
 
-    try:
-        write_file_at(full_path, new_content, expected=existing_bytes)
-    except (ValueError, RuntimeError) as e:
-        return str(e)
-    except OSError as e:
-        return f"Failed to write {path}: {e}"
-    return success_message
+        try:
+            write_file_at(target, new_content, expected=existing_bytes)
+        except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
+            return str(e)
+        except OSError as e:
+            return f"Failed to write {path}: {e}"
+        return success_message
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1298,195 +1330,213 @@ async def move_note_impl(
     from sqlalchemy import select, update
     from src.models.db import NoteLink, NoteMetadata
     from src.services.links import build_vault_index
-    from src.services.vault import _vault_root, move_no_clobber
 
     uid = current_user_id.get()
+    # Every target below is resolved and opened exactly once and closed in the
+    # `finally`. The descriptors are what the move and the rewrites act on, so
+    # renaming a parent directory mid-call cannot redirect either.
+    targets: list = []
     try:
-        src_full = validate_mutable_path(from_path, user_id=uid)
-        dst_full = validate_mutable_path(to_path, user_id=uid)
+        src_target = open_mutable(from_path, user_id=uid)
+        targets.append(src_target)
+        dst_target = open_mutable(to_path, user_id=uid)
+        targets.append(dst_target)
     except ValueError as e:
+        for opened in targets:
+            opened.close()
         return str(e)
-    if not src_full.is_file():
-        return f"Source note not found: {from_path}"
-    vault = _vault_root(uid).resolve()
-    # Both paths are already `resolved_parent / name`, so this is the path the
-    # indexer stores for a note reached through a symlinked folder — the DB
-    # rows below, and the backlink lookup keyed on `from_rel`, line up with it.
-    from_rel = src_full.relative_to(vault).as_posix()
-    to_rel = dst_full.relative_to(vault).as_posix()
+    try:
+        if err := _leaf_state_error(
+            src_target,
+            from_path,
+            missing=f"Source note not found: {from_path}",
+        ):
+            return err
+        # Both targets carry `resolved_parent / name`, so `rel` is the path the
+        # indexer stores for a note reached through a symlinked folder — the DB
+        # rows below, and the backlink lookup keyed on `from_rel`, line up with it.
+        from_rel = src_target.rel
+        to_rel = dst_target.rel
 
-    pre_move_index: dict | None = None
-    rewrite_sources: list[str] = [from_rel] if rewrite_links else []
-    if rewrite_links:
-        async with async_session() as session:
-            rows_stmt = select(NoteMetadata.file_path, NoteMetadata.id).where(
-                _note_owner_predicate(uid)
-            )
-            rows = (await session.execute(rows_stmt)).all()
-            pre_move_index = build_vault_index([(r.file_path, r.id) for r in rows])
-            _ensure_move_source_in_index(pre_move_index, from_rel)
-            target_id = pre_move_index["paths"].get(from_rel)
-            if target_id is not None:
-                src_q = (
-                    select(NoteMetadata.file_path)
-                    .join(NoteLink, NoteLink.source_note_id == NoteMetadata.id)
-                    .where(NoteLink.target_note_id == target_id)
-                    .distinct()
+        pre_move_index: dict | None = None
+        rewrite_sources: list[str] = [from_rel] if rewrite_links else []
+        if rewrite_links:
+            async with async_session() as session:
+                rows_stmt = select(NoteMetadata.file_path, NoteMetadata.id).where(
+                    _note_owner_predicate(uid)
                 )
-                src_q = src_q.where(_note_owner_predicate(uid))
-                src_rows = (await session.execute(src_q)).all()
-                rewrite_sources.extend(r.file_path for r in src_rows)
-                rewrite_sources = list(dict.fromkeys(rewrite_sources))
-
-    # ── Phase 1: preflight ──────────────────────────────────────────────────
-    # Compute every rewritten body *before* anything is mutated. If one would
-    # exceed the note cap the whole move aborts: the alternative (move, update
-    # note_links, then skip the over-cap source) leaves the graph asserting a
-    # link the vault bytes do not contain, and an agent acting on that graph
-    # never sees the discrepancy.
-    #
-    # Memory: `read_bytes_at` bounds each source at MAX_NOTE_BYTES, but the number
-    # of sources is unbounded — a target with hundreds of near-cap backlinks
-    # would buffer gigabytes before a single byte is mutated. So the originals
-    # and the rewrites are summed as they accumulate and the move aborts (still
-    # before any mutation) once that total would exceed MAX_MOVE_REWRITE_BYTES.
-    planned_rewrites: list[tuple[str, Path, bytes, str, int]] = []
-    rewrite_bytes_held = 0
-    failed_rewrite_sources: list[str] = []
-    if rewrite_links and pre_move_index is not None:
-        for original_src_path in rewrite_sources:
-            # A moved note may link to itself: it is still at its old path now,
-            # so read it there, but emit link targets relative to where it is
-            # about to land — and write it at its new location.
-            moved_note = original_src_path == from_rel
-            out_path = to_rel if moved_note else original_src_path
-            try:
-                # Each source is resolved once here and mutated through that
-                # Path in phase 3. Re-passing the string to `write_file` would
-                # resolve it a second time, after the move, so an ancestor
-                # symlink repointed in between would send the rewritten body
-                # somewhere the preflight never checked.
-                if moved_note:
-                    read_target, write_target = src_full, dst_full
-                else:
-                    read_target = validate_mutable_path(
-                        original_src_path, user_id=uid
+                rows = (await session.execute(rows_stmt)).all()
+                pre_move_index = build_vault_index([(r.file_path, r.id) for r in rows])
+                _ensure_move_source_in_index(pre_move_index, from_rel)
+                target_id = pre_move_index["paths"].get(from_rel)
+                if target_id is not None:
+                    src_q = (
+                        select(NoteMetadata.file_path)
+                        .join(NoteLink, NoteLink.source_note_id == NoteMetadata.id)
+                        .where(NoteLink.target_note_id == target_id)
+                        .distinct()
                     )
-                    write_target = read_target
-                if not read_target.is_file():
+                    src_q = src_q.where(_note_owner_predicate(uid))
+                    src_rows = (await session.execute(src_q)).all()
+                    rewrite_sources.extend(r.file_path for r in src_rows)
+                    rewrite_sources = list(dict.fromkeys(rewrite_sources))
+
+        # ── Phase 1: preflight ──────────────────────────────────────────────────
+        # Compute every rewritten body *before* anything is mutated. If one would
+        # exceed the note cap the whole move aborts: the alternative (move, update
+        # note_links, then skip the over-cap source) leaves the graph asserting a
+        # link the vault bytes do not contain, and an agent acting on that graph
+        # never sees the discrepancy.
+        #
+        # Memory: `read_bytes_at` bounds each source at MAX_NOTE_BYTES, but the number
+        # of sources is unbounded — a target with hundreds of near-cap backlinks
+        # would buffer gigabytes before a single byte is mutated. So the originals
+        # and the rewrites are summed as they accumulate and the move aborts (still
+        # before any mutation) once that total would exceed MAX_MOVE_REWRITE_BYTES.
+        planned_rewrites: list[tuple[str, object, bytes, str, int]] = []
+        rewrite_bytes_held = 0
+        failed_rewrite_sources: list[str] = []
+        if rewrite_links and pre_move_index is not None:
+            for original_src_path in rewrite_sources:
+                # A moved note may link to itself: it is still at its old path now,
+                # so read it there, but emit link targets relative to where it is
+                # about to land — and write it at its new location.
+                moved_note = original_src_path == from_rel
+                out_path = to_rel if moved_note else original_src_path
+                try:
+                    # Each source is resolved and opened once here and mutated
+                    # through that descriptor in phase 3. Re-passing the string to
+                    # `write_file` would resolve it a second time, after the move,
+                    # so an ancestor repointed — or the parent renamed — in between
+                    # would send the rewritten body somewhere the preflight never
+                    # checked.
+                    if moved_note:
+                        read_target, write_target = src_target, dst_target
+                    else:
+                        read_target = open_mutable(original_src_path, user_id=uid)
+                        targets.append(read_target)
+                        write_target = read_target
+                    if not read_target.is_file():
+                        continue
+                    original_bytes = read_bytes_at(
+                        read_target, max_bytes=MAX_NOTE_BYTES, label=original_src_path
+                    )
+                    content = original_bytes.decode("utf-8")
+                    new_content, n = _rewrite_links_in_text(
+                        content,
+                        from_rel,
+                        to_rel,
+                        original_src_path,
+                        pre_move_index,
+                        output_source_path=out_path,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to rewrite links in %s: %s", original_src_path, e
+                    )
+                    failed_rewrite_sources.append(original_src_path)
                     continue
-                original_bytes = read_bytes_at(
-                    read_target, max_bytes=MAX_NOTE_BYTES, label=original_src_path
+                if n == 0:
+                    continue
+                # A rewrite can only grow a note (the new path is usually longer
+                # than the old one), so it is a note write like any other and gets
+                # the same cap — enforced here, where refusing costs nothing. The
+                # one encode also feeds the aggregate below.
+                new_size = len(new_content.encode("utf-8"))
+                if err := _note_size_error_for(new_size):
+                    return (
+                        f"Move aborted: rewriting links in {original_src_path} would "
+                        f"exceed the note size limit ({err}). Nothing was moved, "
+                        "rewritten or reindexed."
+                    )
+                rewrite_bytes_held += len(original_bytes) + new_size
+                if rewrite_bytes_held > MAX_MOVE_REWRITE_BYTES:
+                    return (
+                        f"Move aborted: rewriting links across "
+                        f"{len(planned_rewrites) + 1} notes would need "
+                        f"{rewrite_bytes_held} bytes in memory (limit "
+                        f"{MAX_MOVE_REWRITE_BYTES} bytes, "
+                        f"{MAX_MOVE_REWRITE_BYTES // (1024 * 1024)} MiB). Nothing "
+                        "was moved, rewritten or reindexed. Move without "
+                        "rewrite_links and update links in batches instead."
+                    )
+                planned_rewrites.append(
+                    (out_path, write_target, original_bytes, new_content, n)
                 )
-                content = original_bytes.decode("utf-8")
-                new_content, n = _rewrite_links_in_text(
-                    content,
-                    from_rel,
-                    to_rel,
-                    original_src_path,
-                    pre_move_index,
-                    output_source_path=out_path,
-                )
-            except Exception as e:
-                logger.warning(
-                    "Failed to rewrite links in %s: %s", original_src_path, e
-                )
-                failed_rewrite_sources.append(original_src_path)
-                continue
-            if n == 0:
-                continue
-            # A rewrite can only grow a note (the new path is usually longer
-            # than the old one), so it is a note write like any other and gets
-            # the same cap — enforced here, where refusing costs nothing. The
-            # one encode also feeds the aggregate below.
-            new_size = len(new_content.encode("utf-8"))
-            if err := _note_size_error_for(new_size):
-                return (
-                    f"Move aborted: rewriting links in {original_src_path} would "
-                    f"exceed the note size limit ({err}). Nothing was moved, "
-                    "rewritten or reindexed."
-                )
-            rewrite_bytes_held += len(original_bytes) + new_size
-            if rewrite_bytes_held > MAX_MOVE_REWRITE_BYTES:
-                return (
-                    f"Move aborted: rewriting links across "
-                    f"{len(planned_rewrites) + 1} notes would need "
-                    f"{rewrite_bytes_held} bytes in memory (limit "
-                    f"{MAX_MOVE_REWRITE_BYTES} bytes, "
-                    f"{MAX_MOVE_REWRITE_BYTES // (1024 * 1024)} MiB). Nothing "
-                    "was moved, rewritten or reindexed. Move without "
-                    "rewrite_links and update links in batches instead."
-                )
-            planned_rewrites.append(
-                (out_path, write_target, original_bytes, new_content, n)
-            )
 
-    # ── Phase 2: commit ─────────────────────────────────────────────────────
-    try:
-        move_no_clobber(src_full, dst_full)
-    except FileExistsError:
-        return f"Destination already exists: {to_path}"
-    except OSError as e:
-        return f"Move failed: {e}"
-
-    db_failed = False
-    try:
-        async with async_session() as session:
-            nm_update = (
-                update(NoteMetadata)
-                .where(
-                    NoteMetadata.file_path == from_rel,
-                    _note_owner_predicate(uid),
-                )
-                .values(file_path=to_rel)
-            )
-            await session.execute(nm_update)
-
-            # Scope the NoteLink.target_path update to this user's link rows
-            # by joining through their source notes. In single-user mode the
-            # subquery selects every notes_metadata row (user_id IS NULL) so
-            # the legacy behavior is preserved.
-            user_note_ids = select(NoteMetadata.id).where(
-                _note_owner_predicate(uid)
-            )
-            link_update = (
-                update(NoteLink)
-                .where(
-                    NoteLink.target_path == from_rel,
-                    NoteLink.source_note_id.in_(user_note_ids),
-                )
-                .values(target_path=to_rel)
-            )
-            await session.execute(link_update)
-            await session.commit()
-    except Exception as e:
-        logger.warning(
-            "DB update failed after FS move %s → %s: %s", from_rel, to_rel, e
-        )
-        db_failed = True
-
-    rewrites_done = 0
-    files_modified = 0
-    for write_path, write_target, original_bytes, new_content, n in planned_rewrites:
+        # ── Phase 2: commit ─────────────────────────────────────────────────────
         try:
-            write_file_at(write_target, new_content, expected=original_bytes)
-            rewrites_done += n
-            files_modified += 1
-        except Exception as e:
-            logger.warning("Failed to rewrite links in %s: %s", write_path, e)
-            failed_rewrite_sources.append(write_path)
+            move_file_no_clobber(src_target, dst_target)
+        except FileExistsError:
+            return f"Destination already exists: {to_path}"
+        except FileNotFoundError:
+            return f"Source note not found: {from_path}"
+        except (ValueError, vault_fs.VaultFSError) as e:
+            return f"Move failed: {e}"
+        except OSError as e:
+            return f"Move failed: {e}"
 
-    parts = [f"Moved {from_rel} → {to_rel}"]
-    if db_failed:
-        parts.append("(warning: DB update failed; reindex will reconcile)")
-    if rewrite_links:
-        parts.append(
-            f"rewrote {rewrites_done} link(s) across {files_modified} note(s)"
-        )
-        warning = _rewrite_failure_warning(failed_rewrite_sources)
-        if warning is not None:
-            parts.append(f"(warning: {warning})")
-    return " — ".join(parts) if len(parts) > 1 else parts[0]
+        db_failed = False
+        try:
+            async with async_session() as session:
+                nm_update = (
+                    update(NoteMetadata)
+                    .where(
+                        NoteMetadata.file_path == from_rel,
+                        _note_owner_predicate(uid),
+                    )
+                    .values(file_path=to_rel)
+                )
+                await session.execute(nm_update)
+
+                # Scope the NoteLink.target_path update to this user's link rows
+                # by joining through their source notes. In single-user mode the
+                # subquery selects every notes_metadata row (user_id IS NULL) so
+                # the legacy behavior is preserved.
+                user_note_ids = select(NoteMetadata.id).where(
+                    _note_owner_predicate(uid)
+                )
+                link_update = (
+                    update(NoteLink)
+                    .where(
+                        NoteLink.target_path == from_rel,
+                        NoteLink.source_note_id.in_(user_note_ids),
+                    )
+                    .values(target_path=to_rel)
+                )
+                await session.execute(link_update)
+                await session.commit()
+        except Exception as e:
+            logger.warning(
+                "DB update failed after FS move %s → %s: %s", from_rel, to_rel, e
+            )
+            db_failed = True
+
+        rewrites_done = 0
+        files_modified = 0
+        for write_path, write_target, original_bytes, new_content, n in planned_rewrites:
+            try:
+                write_file_at(write_target, new_content, expected=original_bytes)
+                rewrites_done += n
+                files_modified += 1
+            except Exception as e:
+                logger.warning("Failed to rewrite links in %s: %s", write_path, e)
+                failed_rewrite_sources.append(write_path)
+
+        parts = [f"Moved {from_rel} → {to_rel}"]
+        if db_failed:
+            parts.append("(warning: DB update failed; reindex will reconcile)")
+        if rewrite_links:
+            parts.append(
+                f"rewrote {rewrites_done} link(s) across {files_modified} note(s)"
+            )
+            warning = _rewrite_failure_warning(failed_rewrite_sources)
+            if warning is not None:
+                parts.append(f"(warning: {warning})")
+        return " — ".join(parts) if len(parts) > 1 else parts[0]
+    finally:
+        for opened in targets:
+            opened.close()
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1500,43 +1550,58 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
     if err := _require_write():
         return err
 
-    from src.services.vault import _vault_root, move_no_clobber, validate_mutable_path
-
     uid = current_user_id.get()
     try:
-        full_path = validate_mutable_path(path, user_id=uid)
+        target = open_mutable(path, user_id=uid)
     except ValueError as e:
         return str(e)
-    if not full_path.is_file():
-        return f"Note not found: {path}"
+    with target:
+        if err := _leaf_state_error(
+            target, path, missing=f"Note not found: {path}"
+        ):
+            return err
 
-    if permanent:
-        try:
-            os.unlink(full_path)
-        except OSError as e:
-            return f"Permanent delete failed: {e}"
-        return f"Permanently deleted: {path}"
+        if permanent:
+            try:
+                os.unlink(target.name, dir_fd=target.dir_fd)
+            except OSError as e:
+                return f"Permanent delete failed: {e}"
+            return f"Permanently deleted: {path}"
 
-    vault = _vault_root(uid)
-    trash = vault / ".trash"
-    trash.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    base = f"{timestamp}-{full_path.name}"
-    counter = 0
-    while True:
-        suffix = "" if counter == 0 else f"-{counter}"
-        dest = trash / f"{timestamp}{suffix}-{full_path.name}"
+        # Only the soft delete needs the trash to be usable, and it must be
+        # probed *after* the not-found check: the probe creates `.trash`, and a
+        # delete of a note that does not exist must not.
         try:
-            move_no_clobber(full_path, dest)
-            break
-        except FileExistsError:
-            # Another delete may publish this name after we choose it. Retry
-            # rather than replacing existing trash content.
-            counter += 1
+            vault_fs.check_trash_support(target.root, root_fd=target.root_fd)
+        except vault_fs.UnsupportedFilesystem as e:
+            return str(e)
+        except (OSError, vault_fs.VaultFSError) as e:
+            return f"Vault root is not usable: {e}"
+
+        # One `renameat2(RENAME_NOREPLACE)` from the note's own parent
+        # descriptor into `.trash`, walked from the same resolved root: the
+        # trash name is created or refused (never overwritten), and whichever
+        # inode sits at the source when the call runs is what moves.
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+        try:
+            dest = vault_fs.soft_delete_at(
+                target.dir_fd,
+                target.name,
+                target.root_fd,
+                stamp=stamp,
+                label=target.rel,
+            )
+        except FileNotFoundError:
+            return f"Note not found: {path}"
+        except vault_fs.UnsafePath as e:
+            return str(e)
+        except vault_fs.Conflict as e:
+            return f"{e}. Nothing was deleted."
+        except vault_fs.VaultFSError as e:
+            return str(e)
         except OSError as e:
             return f"Soft-delete failed: {e}"
-    rel = dest.relative_to(vault).as_posix()
-    return f"Soft-deleted: {path} → {rel}"
+        return f"Soft-deleted: {path} → {dest}"
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1561,60 +1626,64 @@ async def set_frontmatter_impl(
 
     uid = current_user_id.get()
     try:
-        # One resolution for the whole read-modify-write (see `edit_note_impl`).
-        full_path = validate_mutable_path(path, user_id=uid)
+        # One resolution — and one open parent descriptor — for the whole
+        # read-modify-write (see `edit_note_impl`).
+        target = open_mutable(path, user_id=uid)
     except ValueError as e:
         return str(e)
-    if not full_path.is_file():
-        return f"Note not found: {path}"
+    with target:
+        if err := _leaf_state_error(
+            target, path, missing=f"Note not found: {path}"
+        ):
+            return err
 
-    if not updates and not remove:
-        return f"No changes for {path} (empty updates and remove)"
+        if not updates and not remove:
+            return f"No changes for {path} (empty updates and remove)"
 
-    try:
-        raw_bytes = read_bytes_at(full_path, max_bytes=MAX_NOTE_BYTES, label=path)
-        raw = raw_bytes.decode("utf-8")
-    except Exception as e:
-        # OSError included — an ELOOP here means the leaf was swapped for a
-        # link after validation; report it rather than raising.
-        return f"Failed to read {path}: {e}"
+        try:
+            raw_bytes = read_bytes_at(target, max_bytes=MAX_NOTE_BYTES, label=path)
+            raw = raw_bytes.decode("utf-8")
+        except Exception as e:
+            # OSError included — an ELOOP here means the leaf was swapped for a
+            # link after validation; report it rather than raising.
+            return f"Failed to read {path}: {e}"
 
-    fm, body = parse_frontmatter(raw)
+        fm, body = parse_frontmatter(raw)
 
-    set_keys: list[str] = []
-    for k, v in updates.items():
-        fm[k] = v
-        set_keys.append(k)
-    removed_keys: list[str] = []
-    for k in remove:
-        if k in fm:
-            del fm[k]
-            removed_keys.append(k)
+        set_keys: list[str] = []
+        for k, v in updates.items():
+            fm[k] = v
+            set_keys.append(k)
+        removed_keys: list[str] = []
+        for k in remove:
+            if k in fm:
+                del fm[k]
+                removed_keys.append(k)
 
-    new_raw = serialize_frontmatter(fm, body)
-    if new_raw == raw:
-        return f"No changes for {path}"
+        new_raw = serialize_frontmatter(fm, body)
+        if new_raw == raw:
+            return f"No changes for {path}"
 
-    # Bound the result before writing (see `edit_note_impl`). A remove-only
-    # call can only shrink the note, but the check is uniform.
-    if err := _note_size_error(new_raw):
-        return err
+        # Bound the result before writing (see `edit_note_impl`). A remove-only
+        # call can only shrink the note, but the check is uniform.
+        if err := _note_size_error(new_raw):
+            return err
 
-    try:
-        write_file_at(full_path, new_raw, expected=raw_bytes)
-    except (ValueError, RuntimeError) as e:
-        return str(e)
-    except OSError as e:
-        return f"Failed to write {path}: {e}"
+        try:
+            write_file_at(target, new_raw, expected=raw_bytes)
+        except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
+            return str(e)
+        except OSError as e:
+            return f"Failed to write {path}: {e}"
 
-    summary: list[str] = []
-    if set_keys:
-        summary.append(f"set: {', '.join(set_keys)}")
-    if removed_keys:
-        summary.append(f"removed: {', '.join(removed_keys)}")
-    if not summary:
-        summary.append("no key changes (whitespace-only)")
-    return f"Updated frontmatter in {path} ({'; '.join(summary)})"
+        summary: list[str] = []
+        if set_keys:
+            summary.append(f"set: {', '.join(set_keys)}")
+        if removed_keys:
+            summary.append(f"removed: {', '.join(removed_keys)}")
+        if not summary:
+            summary.append("no key changes (whitespace-only)")
+        return f"Updated frontmatter in {path} ({'; '.join(summary)})"
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1739,33 +1808,39 @@ async def write_file_impl(
     # as `create_note_impl`: a symlinked destination is a path problem, and
     # saying so beats sending the caller away to shrink its payload.
     try:
-        full_path = validate_mutable_path(path, user_id=uid)
+        target = open_mutable(path, user_id=uid)
     except ValueError as e:
         return str(e)
 
-    if encoding == "base64":
+    with target:
+        if encoding == "base64":
+            try:
+                data = base64.b64decode(content, validate=True)
+            except (binascii.Error, ValueError):
+                return (
+                    "Invalid base64 content: could not decode. "
+                    "No file was written."
+                )
+        else:
+            data = content.encode("utf-8")
+
+        if len(data) > settings.max_file_write_bytes:
+            return (
+                f"Content too large ({len(data):,} bytes, "
+                f"max {settings.max_file_write_bytes:,}). No file was written."
+            )
+
         try:
-            data = base64.b64decode(content, validate=True)
-        except (binascii.Error, ValueError):
-            return "Invalid base64 content: could not decode. No file was written."
-    else:
-        data = content.encode("utf-8")
-
-    if len(data) > settings.max_file_write_bytes:
-        return (
-            f"Content too large ({len(data):,} bytes, "
-            f"max {settings.max_file_write_bytes:,}). No file was written."
-        )
-
-    try:
-        write_bytes_at(full_path, data, overwrite=overwrite)
-    except FileExistsError:
-        return f"File already exists: {path}. Pass overwrite=True to replace it."
-    except ValueError as e:
-        return str(e)
-    except OSError as e:
-        return f"Failed to write {path}: {e}"
-    return f"Wrote {len(data):,} bytes to {path}"
+            write_bytes_at(target, data, overwrite=overwrite)
+        except FileExistsError:
+            return (
+                f"File already exists: {path}. Pass overwrite=True to replace it."
+            )
+        except (ValueError, vault_fs.VaultFSError) as e:
+            return str(e)
+        except OSError as e:
+            return f"Failed to write {path}: {e}"
+        return f"Wrote {len(data):,} bytes to {path}"
 
 
 @_tracked("list_files", ["folder", "pattern", "recursive", "limit"])
