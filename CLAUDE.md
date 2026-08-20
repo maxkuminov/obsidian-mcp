@@ -389,6 +389,45 @@ lives in a service module only to avoid an import cycle (`tools` imports
 return types are unchanged — a direct call outside a tracked tool finds no
 holder and records nothing. No migration: `params` is JSONB.
 
+## The vault assignment is the admission gate for every tool
+
+`_tracked` in `src/mcp_server/tools.py` resolves `_vault_root(current_user_id)`
+**once, before the tool body runs**, and fails the call with a tool error when
+it raises. That is the whole enforcement of "this user has no vault", and it
+lives in the shared decorator on purpose.
+
+Per-tool checks were the bug (#66). The tools that leaked — `semantic_search`,
+`keyword_search`, `list_notes`, `get_recent` and every graph tool — are exactly
+the ones with no reason to call `_vault_root`: they are served from
+`notes_metadata` / `note_embeddings` filtered by `user_id` alone. Unassigning
+`users.vault_path` stopped only the disk-touching tools, while the indexer's
+`_active_user_ids()` (which filters `vault_path IS NOT NULL`) meant the user's
+rows were never pruned either. An unchanged API key kept returning paths,
+titles, tags, frontmatter and chunk excerpts indefinitely, while the panel had
+told the operator "vault tools error".
+
+- **Nothing is exempt.** Every `_tracked` tool reads or writes vault content or
+  vault metadata — `get_vault_guide` returns the vault's own `CLAUDE.md`,
+  `check_upload` reports a published vault path and digest. Keep the exemption
+  list at zero; a new tool inherits the gate by being registered.
+- **The index rows are preserved.** Deleting `notes_metadata` on the NULL
+  transition was the weaker fix: it forces a full re-embed on reassignment and
+  leaves the credential itself unaddressed.
+- **`_vault_root` must stay a pure cache lookup.** What makes that correct is
+  `APIKeyMiddleware` calling `warm_user_vault_cache(session, user_id)` on
+  *every* authenticated MCP request. Do not add a DB query to the gate.
+- **The single-user form of that warm is authoritative — it evicts.** It used
+  to be a silent no-op for a NULL `vault_path`, so a previously cached root
+  survived; the panel's `clear_user_vault_cache` only clears the worker that
+  served the POST. Eviction is what makes a mid-session unassignment visible
+  from the next call in every process. The bulk form stays add-only (it would
+  otherwise drop a just-warmed entry for a user created after its query).
+- **A cold cache refuses too**, with the same message — it is not permission to
+  serve stale rows — and the refusal is written to `usage_logs` with
+  `params["error"] = "no_vault_assigned"` and no other new field.
+- Single-user and sandbox mode are untouched: `current_user_id` is None there
+  and `_vault_root(None)` answers from `settings.vault_path`.
+
 ## Graph tools
 - `get_backlinks(path, limit)` — notes that link TO `path` (resolved links only).
 - `get_links(path)` — outgoing links from `path`, both resolved and dangling.

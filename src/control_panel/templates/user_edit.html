@@ -31,7 +31,7 @@
                     <div class="field">
                         <label class="field-label">Vault Path</label>
                         <select name="vault_path" class="field-select" id="vault-select">
-                            <option value="">(unassigned — vault tools error)</option>
+                            <option value="">(unassigned — every MCP tool refuses; index kept for reassignment)</option>
                             {% for v in available_vaults %}
                             <option value="{{ v }}" {% if v == target.vault_path %}selected{% endif %}>{{ v }}</option>
                             {% endfor %}

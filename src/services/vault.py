@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 # `clear_user_vault_cache(user_id=...)` when the admin edits a user. Single-user
 # mode never touches this cache because `_vault_root()` is called with
 # `user_id=None` everywhere.
+#
+# The single-user form of `warm_user_vault_cache` is *authoritative*: it writes
+# the current value or removes the entry. It is not an add-only warm.
 _user_vault_cache: dict[int, Path] = {}
 
 
@@ -44,8 +47,19 @@ async def warm_user_vault_cache(session, user_id: int | None = None) -> None:
             )
         )
         row = result.first()
-        if row is not None:
-            _user_vault_cache[row.id] = Path(row.vault_path)
+        if row is None:
+            # No usable assignment any more: unassigned, deactivated, or the
+            # row is gone. **Evict** rather than leaving the previous value in
+            # place. This warm runs on every authenticated MCP request, and
+            # `_vault_root` is now the admission gate every tool passes through
+            # (`_tracked`), so a stale entry would keep a revoked assignment
+            # queryable until the process restarts — issue #66. Callers that
+            # mutate `users.vault_path` still call `clear_user_vault_cache`;
+            # this makes the refusal independent of them, and of the fact that
+            # each worker process holds its own cache.
+            _user_vault_cache.pop(user_id, None)
+            return
+        _user_vault_cache[row.id] = Path(row.vault_path)
         return
 
     result = await session.execute(
@@ -80,6 +94,13 @@ def _vault_root(user_id: int | None = None) -> Path:
     routes do this before invoking tools); a miss raises a clear RuntimeError
     rather than silently falling back to the global path or silently blocking
     the event loop on a sync DB call.
+
+    This is also the admission gate for every MCP tool: `_tracked` calls it
+    once before the tool body runs and refuses the call when it raises, so a
+    user with no vault assignment cannot reach the database-backed tools
+    either (issue #66). Keep it a pure cache lookup — the per-request warm in
+    `APIKeyMiddleware` is what makes it correct, and a DB query here would be
+    a query on every tool call.
     """
     if user_id is None:
         return Path(settings.vault_path)
