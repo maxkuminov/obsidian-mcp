@@ -13,7 +13,7 @@ from src.auth.session import UNSET_VAULT_ROOT, current_user_id, current_vault_ro
 from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthToken, User
-from src.oauth.scope import token_has_write
+from src.oauth.scope import has_vault_scope, token_has_write
 from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
@@ -274,6 +274,27 @@ class APIKeyMiddleware:
                         logger.warning("auth_failure", extra={"reason": "key_expired", "key_id": oauth_token.id})
                         response = JSONResponse(
                             {"error": "Token expired"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
+                        await response(scope, receive, send)
+                        return
+
+                    # A token that names no vault scope grants nothing. Falling
+                    # through to `read` here is the same conflation
+                    # `clamp_scope` used to make: `offline_access` says the
+                    # grant may carry a refresh token, not that it may read a
+                    # note. No path can mint such a token any more, but a
+                    # client registered `scope="offline_access"` before this
+                    # could already hold one, and this is the boundary that
+                    # decides what it may do.
+                    if not has_vault_scope(oauth_token.scope):
+                        logger.warning(
+                            "auth_failure",
+                            extra={"reason": "no_vault_scope", "key_id": oauth_token.id},
+                        )
+                        response = JSONResponse(
+                            {"error": "Invalid or revoked token"},
                             status_code=401,
                             headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
                         )

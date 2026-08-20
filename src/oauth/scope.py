@@ -30,6 +30,14 @@ built on it.
 VALID_SCOPES = frozenset({"read", "readwrite", "offline_access"})
 
 WRITE_SCOPE = "readwrite"
+READ_SCOPE = "read"
+
+# The scopes that actually grant access to the vault, strongest first.
+# ``offline_access`` is deliberately absent: it says the grant may carry a
+# refresh token, not that it may read a single note. Treating it as a vault
+# scope is what let a client registered for ``offline_access`` alone end up
+# with read access nobody granted.
+VAULT_SCOPES = (WRITE_SCOPE, READ_SCOPE)
 
 
 def scope_set(scope: str | None) -> set[str]:
@@ -58,21 +66,61 @@ def token_has_write(token_scope: str | None) -> bool:
     return WRITE_SCOPE in scope_set(token_scope)
 
 
+def vault_level(scope: str | None) -> str | None:
+    """The vault permission a scope string carries: ``readwrite``, ``read``, or None.
+
+    None means *no vault access at all*. That is a real state, not a
+    degenerate one: a DCR client may register ``scope="offline_access"``, and
+    a scope string that names only ``offline_access`` grants nothing.
+    """
+    parts = scope_set(scope)
+    for name in VAULT_SCOPES:
+        if name in parts:
+            return name
+    return None
+
+
+def has_vault_scope(scope: str | None) -> bool:
+    """Does this scope string grant *any* access to the vault?"""
+    return vault_level(scope) is not None
+
+
 def clamp_scope(requested: str, registered: str) -> str:
     """Restrict a requested scope to what the client registered for.
 
-    Both inputs are already validated scope strings. The user can only ever
-    be granted the intersection of what they asked for and what the client is
-    registered to hold. ``readwrite`` implies ``read``, so a client registered
-    for ``readwrite`` may still be granted plain ``read``.
+    The granted vault permission is the **weaker** of what was asked for and
+    what the client is registered to hold — ``readwrite`` outranks ``read``,
+    so a client registered read-only that asks for ``readwrite`` gets ``read``
+    (issue #21), and a client registered ``readwrite`` that asks for ``read``
+    gets ``read``. ``offline_access`` rides along only when both sides carry
+    it; it is a marker, never a permission.
+
+    **An empty result means "grant nothing", and every caller MUST refuse
+    rather than write it.** This used to fall back to ``"read"`` whenever the
+    intersection came out empty, which quietly conflated two different things:
+    the legitimate readwrite→read downgrade above, and a client that is
+    registered for *no vault scope at all*. A DCR registration of
+    ``scope="offline_access"`` therefore received read access to the whole
+    vault that its registration never granted. The downgrade is now expressed
+    directly, so the fallback can be what it should always have been —
+    nothing.
 
     The result is sorted and joined, so it is a canonical rendering of the
-    granted set -- callers must never compare it with ``==`` against a
+    granted set; callers must never compare it with ``==`` against a
     hand-written ordering.
     """
-    requested_parts = scope_set(requested)
-    registered_parts = scope_set(registered)
-    if WRITE_SCOPE in registered_parts:
-        registered_parts.add("read")
-    granted = requested_parts & registered_parts
-    return " ".join(sorted(granted)) or "read"
+    requested_level = vault_level(requested)
+    registered_level = vault_level(registered)
+    if requested_level is None or registered_level is None:
+        return ""
+
+    # The weaker of the two. `read` beats `readwrite` here precisely because
+    # "weaker" is what a clamp means.
+    granted = {
+        READ_SCOPE
+        if READ_SCOPE in (requested_level, registered_level)
+        else WRITE_SCOPE
+    }
+    if "offline_access" in scope_set(requested) & scope_set(registered):
+        granted.add("offline_access")
+    return " ".join(sorted(granted))

@@ -728,8 +728,17 @@ async def oauth_page(
             "scope": c.scope,
             "grants": grants,
         })
+
+    # Why the last scope change did nothing, if it did nothing. The select
+    # posts on `onchange`, so a bare redirect reads as the browser undoing the
+    # operator's click. Absent in single-user mode, which has no session.
+    try:
+        flash_error = request.session.pop("flash_oauth_error", None)
+    except (AssertionError, AttributeError):
+        flash_error = None
+
     return templates.TemplateResponse(request, "oauth.html", _panel_context(request, user, {
-        "active": "oauth", "clients": clients,
+        "active": "oauth", "clients": clients, "flash_error": flash_error,
     }))
 
 
@@ -793,9 +802,27 @@ async def revoke_oauth_token(
     return RedirectResponse("/admin/oauth", status_code=303)
 
 
+def _flash_oauth_error(request: Request | None, message: str) -> None:
+    """Say why a scope change did nothing, instead of snapping the select back.
+
+    The select posts on `onchange`, so a silent redirect looks like the browser
+    reverting the operator's click for no reason. Session flashes are absent in
+    single-user mode (no `SessionMiddleware`), which is the same
+    `AssertionError` dance `create_key_form` does — the refusal still holds
+    there, it just goes unexplained.
+    """
+    if request is None:
+        return
+    try:
+        request.session["flash_oauth_error"] = message
+    except (AssertionError, AttributeError):
+        pass
+
+
 @router.post("/oauth/token/{token_id}/scope")
 async def update_oauth_token_scope(
     token_id: int,
+    request: Request = None,
     scope: str = Form(...),
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
@@ -829,6 +856,12 @@ async def update_oauth_token_scope(
     if client is None:
         raise HTTPException(404, "Client not found")
     if scope == "readwrite" and not client_can_write(client.scope):
+        _flash_oauth_error(
+            request,
+            f"'{client.client_name}' is registered for '{client.scope}', so its "
+            "grants cannot be raised to readwrite. Re-register the client if it "
+            "genuinely needs write access.",
+        )
         return RedirectResponse("/admin/oauth", status_code=303)
 
     # Preserve the offline_access marker (informational only - see
@@ -836,7 +869,23 @@ async def update_oauth_token_scope(
     # dropping it whenever an admin flips read/readwrite here.
     has_offline = "offline_access" in token.scope.split()
     desired = f"{scope} offline_access" if has_offline else scope
-    await set_grant_family_scope(session, token.grant_id, clamp_scope(desired, client.scope))
+    granted = clamp_scope(desired, client.scope)
+    if not granted:
+        # The registration names no vault scope at all (`offline_access` alone
+        # is not one). `clamp_scope` used to answer `read` here, so this
+        # control could hand a client read access to the whole vault that its
+        # registration never granted. Writing an *empty* scope would be worse
+        # still — `src/mcp_server/auth.py` maps anything without `readwrite`
+        # to `read`, so an empty scope string reads as read access.
+        _flash_oauth_error(
+            request,
+            f"'{client.client_name}' is registered for '{client.scope}', which "
+            "grants no vault access, so its tokens cannot be given a scope. "
+            "Re-register the client with 'read' or 'readwrite'.",
+        )
+        return RedirectResponse("/admin/oauth", status_code=303)
+
+    await set_grant_family_scope(session, token.grant_id, granted)
     await session.commit()
     return RedirectResponse("/admin/oauth", status_code=303)
 

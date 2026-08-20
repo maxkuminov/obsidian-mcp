@@ -8,6 +8,14 @@
 
 <div class="page-body">
 
+    {% if flash_error %}
+    {# Why the last scope change did nothing. The select submits on `onchange`,
+       so without this the option simply snaps back and reads as a browser bug. #}
+    <div class="card anim-1" style="margin-bottom:16px;padding:12px 16px;border-left:3px solid var(--error);">
+        <div style="font-size:13px;color:var(--text-2);">{{ flash_error }}</div>
+    </div>
+    {% endif %}
+
     {% if not clients %}
     <div class="card anim-1" style="text-align:center;padding:48px 24px;">
         <svg width="36" height="36" viewBox="0 0 36 36" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" style="margin:0 auto 14px;opacity:0.25;">

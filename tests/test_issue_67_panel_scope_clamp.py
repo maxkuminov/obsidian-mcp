@@ -294,9 +294,13 @@ def test_clamp_scope_never_widens():
     assert clamp_scope("readwrite", "readwrite") == "readwrite"
     # readwrite registration implies read availability
     assert clamp_scope("read", "readwrite") == "read"
-    # empty intersection falls back to the safe default
-    assert clamp_scope("", "read") == "read"
+    # A client registered read-only that asks for readwrite is downgraded,
+    # not refused — that is what a clamp means (issue #21).
     assert clamp_scope("readwrite offline_access", "read") == "read"
+    # But "no vault scope on either side" is a refusal, never a fallback.
+    assert clamp_scope("", "read") == ""
+    assert clamp_scope("read", "offline_access") == ""
+    assert clamp_scope("offline_access", "offline_access") == ""
 
 
 def test_no_surface_keeps_a_private_copy_of_the_membership_test():

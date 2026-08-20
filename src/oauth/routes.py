@@ -17,7 +17,7 @@ from src.database import async_session
 from src.limiter import limiter
 from src.models.db import OAuthClient, OAuthCode, OAuthToken
 from src.oauth.grants import lock_grant, new_grant_id, revoke_grant_family
-from src.oauth.scope import VALID_SCOPES, clamp_scope
+from src.oauth.scope import VALID_SCOPES, clamp_scope, has_vault_scope
 # Aliased on import so `authorize_get` can keep its long-standing local name
 # `client_can_write` (the consent template reads that key) without shadowing
 # the helper.
@@ -203,6 +203,25 @@ async def register_client(request: Request):
         scope = _validate_scope(raw_scope)
     except ValueError as exc:
         return JSONResponse({"error": "invalid_scope", "error_description": str(exc)}, status_code=400)
+
+    # A registration naming neither `read` nor `readwrite` grants nothing --
+    # `offline_access` says the grant may carry a refresh token, not that it
+    # may read a note. Such a client could be registered and could reach the
+    # consent screen, and every downstream clamp now (correctly) resolves it
+    # to an empty grant, so the whole flow would dead-end at the token
+    # endpoint. Refusing here says so at the only point where the developer
+    # registering the client is still in the loop.
+    if not has_vault_scope(scope):
+        return JSONResponse(
+            {
+                "error": "invalid_scope",
+                "error_description": (
+                    "scope must include 'read' or 'readwrite'; "
+                    "'offline_access' alone grants no access"
+                ),
+            },
+            status_code=400,
+        )
 
     token_endpoint_auth_method = body.get(
         "token_endpoint_auth_method", "client_secret_post"
@@ -446,6 +465,23 @@ async def authorize_post(
         # user's grants are both consequences of letting the reuse happen.
         # Single-user mode never reaches this — `session_user_id` stays None and
         # `client_row.user_id` stays NULL.
+        # An empty clamp means the registration grants no vault access at all
+        # (e.g. `scope="offline_access"`), so there is nothing to consent to.
+        # `clamp_scope` used to answer `read` here, handing such a client the
+        # whole vault read-only — a permission its registration never named.
+        # Refuse instead of minting a code for a grant that means nothing.
+        if not scope:
+            return JSONResponse(
+                {
+                    "error": "invalid_scope",
+                    "error_description": (
+                        "This client is not registered for any vault access. "
+                        "Register it with 'read' or 'readwrite'."
+                    ),
+                },
+                status_code=400,
+            )
+
         if _client_belongs_to_another_user(client_row, session_user_id):
             return JSONResponse(
                 {
@@ -575,16 +611,32 @@ async def _handle_auth_code(form):
         if _client_belongs_to_another_user(client, oauth_code.user_id):
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
-        # Mark code as used
-        oauth_code.used = True
-
         # Last clamp before anything is persisted (issue #67). `authorize_post`
         # already clamped what it wrote onto the code, so this is normally a
         # no-op — but it is the only thing standing between a code minted under
-        # one registration and a token minted under a narrower one, and the cost
-        # of a set intersection here is nothing next to a write grant nobody
-        # registered for.
+        # one registration and a token minted under a narrower one, and the
+        # cost is nothing next to a write grant nobody registered for.
+        #
+        # It runs *before* the code is marked used: an empty clamp means the
+        # registration grants no vault access, which is not something a retry
+        # can fix, and burning the code would only make the failure harder to
+        # read. `clamp_scope` answering `read` here is exactly the hole this
+        # closes — a client registered `offline_access` alone would have been
+        # handed a read token over the entire vault.
         granted_scope = _clamp_scope(oauth_code.scope, client.scope)
+        if not granted_scope:
+            return JSONResponse(
+                {
+                    "error": "invalid_scope",
+                    "error_description": (
+                        "This client is not registered for any vault access."
+                    ),
+                },
+                status_code=400,
+            )
+
+        # Mark code as used
+        oauth_code.used = True
 
         # Mint tokens. In multi-user mode the issued tokens inherit the
         # `user_id` stamped on the auth code at /authorize time; in single-
@@ -714,6 +766,20 @@ async def _handle_refresh(form):
             # back. Clamping here also means narrowing a client's registration
             # takes effect on the next refresh instead of never.
             granted_scope = _clamp_scope(old_token.scope, client.scope)
+            if not granted_scope:
+                # The registration grants no vault access any more, so there is
+                # nothing to rotate into. Nothing is committed, so the old
+                # refresh token is left exactly as it was — the thing to fix is
+                # the client's registration, not this token.
+                return JSONResponse(
+                    {
+                        "error": "invalid_scope",
+                        "error_description": (
+                            "This client is not registered for any vault access."
+                        ),
+                    },
+                    status_code=400,
+                )
 
             # Mint new token pair FIRST, then revoke old token — all in one transaction
             new_access = secrets.token_hex(32)
