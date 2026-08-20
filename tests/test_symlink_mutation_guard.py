@@ -12,6 +12,7 @@ Reads are deliberately unchanged — an alias reading as its target is what a
 user expects from an alias.
 """
 import base64
+import os
 from pathlib import Path
 
 import pytest
@@ -469,24 +470,25 @@ def repoint_after_read(monkeypatch):
     write — the moment the tool has the old bytes in hand and has not yet
     published the new ones.
 
-    Hooked on `_read_path_bytes`, the one read primitive every path shares, so
-    the test does not encode *how* a tool reads. It fires once: the compare in
-    `_atomic_write` reads again, and swapping twice would prove nothing.
+    Hooked on `_read_fd_bytes`, the one read primitive every *mutation* path
+    shares, so the test does not encode *how* a tool reads. It fires once: the
+    compare in `_atomic_write_at` reads again, and swapping twice would prove
+    nothing.
     """
 
     def install(link: Path, new_target: Path):
-        original = vault_service._read_path_bytes
+        original = vault_service._read_fd_bytes
         fired: list[bool] = []
 
-        def swapping(path, max_bytes=None):
-            data = original(path, max_bytes=max_bytes)
+        def swapping(dir_fd, name, max_bytes=None):
+            data = original(dir_fd, name, max_bytes=max_bytes)
             if not fired:
                 fired.append(True)
                 link.unlink()
                 link.symlink_to(new_target)
             return data
 
-        monkeypatch.setattr(vault_service, "_read_path_bytes", swapping)
+        monkeypatch.setattr(vault_service, "_read_fd_bytes", swapping)
 
     return install
 
@@ -553,42 +555,102 @@ async def test_repointing_a_symlinked_vault_root_mid_write_cannot_redirect_it(
     assert (decoy_root / "note.md").read_text(encoding="utf-8") == "before\n"
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        pytest.param(
-            lambda: tools.edit_note_impl("note.md", "after\n"), id="edit_note"
+# `existing` says whether `note.md` is there when the tool validates: the
+# read-modify-write tools need it to be, the creating ones need it not to be
+# (a link present at validation is refused outright, which is the #54 case).
+_SWAPPED_LEAF_CASES = {
+    "edit_note": (lambda: tools.edit_note_impl("note.md", "after\n"), True),
+    "edit_note_append": (
+        lambda: tools.edit_note_impl("note.md", "tail", append=True),
+        True,
+    ),
+    "edit_note_find": (
+        lambda: tools.edit_note_impl("note.md", "after", find="before"),
+        True,
+    ),
+    "set_frontmatter": (
+        lambda: tools.set_frontmatter_impl("note.md", updates={"a": 1}),
+        True,
+    ),
+    "delete_note": (lambda: tools.delete_note_impl("note.md"), True),
+    "delete_note_permanent": (
+        lambda: tools.delete_note_impl("note.md", permanent=True),
+        True,
+    ),
+    "move_note_source": (
+        lambda: tools.move_note_impl("note.md", "moved.md"),
+        True,
+    ),
+    "create_note": (lambda: tools.create_note_impl("note.md", "body\n"), False),
+    "write_file_overwrite": (
+        lambda: tools.write_file_impl(
+            "note.md", base64.b64encode(b"clobber").decode(), overwrite=True
         ),
-        pytest.param(
-            lambda: tools.set_frontmatter_impl("note.md", updates={"a": 1}),
-            id="set_frontmatter",
+        False,
+    ),
+    "write_file_no_clobber": (
+        lambda: tools.write_file_impl(
+            "note.md", base64.b64encode(b"clobber").decode()
         ),
-    ],
-)
+        False,
+    ),
+    "move_note_destination": (
+        lambda: tools.move_note_impl("mover.md", "note.md"),
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize("tool", sorted(_SWAPPED_LEAF_CASES))
 async def test_a_leaf_swapped_for_a_link_after_validation_is_reported(
-    writable, monkeypatch, mutate
+    writable, monkeypatch, tool
 ):
     """The residual TOCTOU the design accepts: the leaf becomes a symlink
-    between the `lstat` and the read. `O_NOFOLLOW` turns that into an ELOOP
-    `OSError` — the tool must report it, not raise through the MCP layer."""
+    between validation and the act.
+
+    Every mutating tool must *name* it. Two wrong answers this pins against:
+    reporting "not found" (an agent's next move is to create it, over the
+    link), and reporting success — `write_file(overwrite=True)` replaces the
+    link rather than following it, which is safe for the target but silently
+    consumes an alias the caller still believes in.
+
+    Nothing is mutated on any path, and the link's target is never touched.
+    """
+    mutate, existing = _SWAPPED_LEAF_CASES[tool]
     note = writable / "note.md"
-    note.write_text("before\n", encoding="utf-8")
+    if existing:
+        note.write_text("before\n", encoding="utf-8")
+    (writable / "mover.md").write_text("mover\n", encoding="utf-8")
     (writable / "elsewhere.md").write_text("elsewhere\n", encoding="utf-8")
 
-    original = vault_service.validate_mutable_path
+    original = vault_service.open_mutable
+    swapped: list[bool] = []
 
     def swap_after_validating(relative_path, user_id=None):
-        resolved = original(relative_path, user_id=user_id)
-        note.unlink()
-        note.symlink_to(writable / "elsewhere.md")
-        return resolved
+        target = original(relative_path, user_id=user_id)
+        # Only for the path this case is about: `move_note` validates two, and
+        # the destination case must be sabotaged on the destination.
+        if relative_path == "note.md" and not swapped:
+            swapped.append(True)
+            if existing:
+                note.unlink()
+            note.symlink_to(writable / "elsewhere.md")
+        return target
 
-    monkeypatch.setattr(tools, "validate_mutable_path", swap_after_validating)
+    monkeypatch.setattr(tools, "open_mutable", swap_after_validating)
 
     result = await mutate()
 
-    assert "Failed to read note.md" in result, result
+    assert swapped, "the race never ran"
+    assert "symbolic link" in result, result
+    assert "not found" not in result.lower(), result
+    assert "wrote" not in result.lower(), result
+    # The link is still a link, and what it points at is untouched.
+    assert (writable / "note.md").is_symlink()
     assert (writable / "elsewhere.md").read_text(encoding="utf-8") == "elsewhere\n"
+    assert (writable / "mover.md").read_text(encoding="utf-8") == "mover\n"
+    assert not (writable / "moved.md").exists()
+    assert not (writable / ".trash").exists()
 
 
 # ── an in-vault `..` is refused, but says why ───────────────────────────────
@@ -688,3 +750,79 @@ async def test_the_tools_refuse_an_alias_under_a_per_user_root(
     finally:
         current_user_id.reset(user_token)
         vault_service.clear_user_vault_cache()
+
+
+# ── the link is read while still anchored (Codex MINOR 1) ───────────────────
+
+
+def test_an_unreadable_link_is_not_given_a_guessed_target(vault, monkeypatch):
+    """Naming a target requires resolving one, and a resolution done after the
+    descriptors are gone can describe a link that no longer exists — sending
+    the agent at a note that was never involved. If the link cannot be read
+    through the parent fd, the message says so instead of guessing.
+    """
+    (vault / "important.md").write_text("real", encoding="utf-8")
+    (vault / "alias.md").symlink_to(vault / "important.md")
+
+    real_readlink = vault_service.os.readlink
+
+    def refuse(path, *args, **kwargs):
+        if path == "alias.md":
+            raise OSError(5, "I/O error")
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(vault_service.os, "readlink", refuse)
+
+    with pytest.raises(ValueError) as excinfo:
+        validate_mutable_path("alias.md")
+
+    message = str(excinfo.value)
+    assert "the link changed" in message
+    assert "important.md" not in message
+
+
+def test_the_link_target_is_read_through_the_parent_descriptor(vault, monkeypatch):
+    """The `readlink` that produces the message is anchored, not by pathname."""
+    (vault / "important.md").write_text("real", encoding="utf-8")
+    (vault / "alias.md").symlink_to(vault / "important.md")
+
+    seen: list = []
+    real_readlink = vault_service.os.readlink
+
+    def recording(path, *args, **kwargs):
+        seen.append((path, kwargs.get("dir_fd")))
+        return real_readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(vault_service.os, "readlink", recording)
+
+    with pytest.raises(ValueError, match="is a symbolic link to important.md"):
+        validate_mutable_path("alias.md")
+
+    assert seen, "readlink was never called"
+    name, dir_fd = seen[0]
+    assert name == "alias.md"  # a bare component…
+    assert isinstance(dir_fd, int)  # …resolved against the parent fd
+
+
+def test_open_mutable_closes_its_descriptors_when_the_leaf_check_raises(
+    vault, monkeypatch
+):
+    """An `lstat` that raises (EIO) must not leak the root and parent fds."""
+    (vault / "note.md").write_text("body", encoding="utf-8")
+    before = len(os.listdir("/proc/self/fd"))
+
+    real_stat = vault_service.os.stat
+
+    def boom(name, *args, **kwargs):
+        # Only the anchored leaf `lstat`, not the root identity check.
+        if kwargs.get("dir_fd") is not None and kwargs.get("follow_symlinks") is False:
+            raise OSError(5, "I/O error")
+        return real_stat(name, *args, **kwargs)
+
+    monkeypatch.setattr(vault_service.os, "stat", boom)
+
+    for _ in range(3):
+        with pytest.raises(OSError):
+            vault_service.open_mutable("note.md")
+
+    assert len(os.listdir("/proc/self/fd")) == before

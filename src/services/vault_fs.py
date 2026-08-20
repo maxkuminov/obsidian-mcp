@@ -1,11 +1,12 @@
-"""Descriptor-anchored filesystem primitives for the transfer paths (design D6).
+"""Descriptor-anchored filesystem primitives (design D6, extended by #59).
 
-Everything else in `src/services/vault.py` is *path-based*: it resolves a
-pathname and then operates by name. Between the resolve and the operation an
-attacker who can create a symlink anywhere in the chain gets a TOCTOU window.
-That is tolerable for the note tools, which are reachable only through an
-authenticated MCP session; it is not tolerable for `/transfer/*`, which is a
-public route family redeemed with a bearer capability.
+A *path-based* helper resolves a pathname and then operates by name. Between
+the resolve and the operation, anyone who can create a symlink — or rename a
+directory and leave a link at its name — gets a TOCTOU window. That was never
+acceptable for `/transfer/*`, a public route family redeemed with a bearer
+capability, and #59 established it is not acceptable for the note write tools
+either: `src/services/vault.py` now anchors every mutation here too, through
+`MutableTarget` / `open_mutable`.
 
 So every operation here is anchored to an open directory descriptor and walks
 one component at a time with ``O_NOFOLLOW``. A symlink anywhere in the chain —
@@ -37,7 +38,13 @@ Publication is deliberately split in two:
   implied, and `tests/test_vault_fs.py` has a barrier test that demonstrates
   the window rather than pretending it is closed.
 
-The helper is written so `vault._atomic_write` can adopt it later (follow-up).
+`vault._atomic_write_at` has adopted these primitives (#59): it stages and
+publishes against the parent descriptor `open_mutable` opened, `move_note`
+publishes with `rename_noreplace`, and `delete_note` soft-deletes through
+`soft_delete_at`. `vault` keeps its own staging (a `.tmp-<name>-…` file in the
+destination directory rather than `.transfer-tmp/`) because a note write
+completes in one call — there is no minutes-long stream to survive, and staging
+beside the destination keeps the publish a same-directory rename.
 """
 from __future__ import annotations
 
@@ -767,17 +774,50 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) 
     `probe_trash` catches up front rather than at the first delete.
     """
     src_fd, name = _open_parent(root_fd, rel_path, create=False)
+    try:
+        return soft_delete_at(
+            src_fd, name, root_fd, trash_dir=trash_dir, label=rel_path
+        )
+    finally:
+        close_quietly(src_fd, f"source directory for {rel_path}")
+
+
+def soft_delete_at(
+    src_dir_fd: int,
+    name: str,
+    root_fd: int,
+    *,
+    trash_dir: str = TRASH_DIR,
+    stamp: str | None = None,
+    label: str | Path | None = None,
+) -> str:
+    """`soft_delete` against a parent descriptor the caller already holds.
+
+    Same guarantees, same failure modes; the only difference is that the walk
+    from the root to the file's parent has already happened. That matters for
+    the note tools: `vault.open_mutable` resolves and opens the parent exactly
+    once for the whole call, and re-deriving it here from a pathname would
+    reopen the very window the anchoring exists to close.
+
+    `stamp` overrides the trash-name timestamp (`delete_note` stamps in UTC);
+    `label` is the vault-relative path used in error messages, defaulting to
+    `name`. The caller owns `src_dir_fd` and `root_fd` — neither is closed here.
+    """
+    rel_path = name if label is None else label
     trash_fd: int | None = None
     try:
-        st = _lstat(src_fd, name)
+        st = _lstat(src_dir_fd, name)
         if st is None:
             raise FileNotFoundError(f"File not found: {rel_path}")
         _require_regular(st, str(rel_path))
 
         trash_fd = open_dir_beneath(root_fd, trash_dir, create=True)
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        if stamp is None:
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         try:
-            created = _rename_into_trash(src_fd, name, trash_fd, f"{stamp}-{name}")
+            created = _rename_into_trash(
+                src_dir_fd, name, trash_fd, f"{stamp}-{name}"
+            )
         except FileNotFoundError:
             # Somebody else removed the source between the `lstat` and here.
             # Nothing was created in the trash, so there is nothing to undo.
@@ -793,13 +833,12 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) 
             # directory with us.
             raise UnsafePath(f"Not a regular file: {rel_path}") from None
         _refuse_a_moved_directory(
-            src_fd, name, trash_fd, created, rel_path, trash_dir
+            src_dir_fd, name, trash_fd, created, rel_path, trash_dir
         )
         return f"{trash_dir}/{created}"
     finally:
-        # The verdict is settled by here; a failing close must not change it,
-        # nor stop the sibling descriptor from being closed.
-        close_quietly(src_fd, f"source directory for {rel_path}")
+        # The verdict is settled by here; a failing close must not change it.
+        # `src_dir_fd` belongs to the caller and is deliberately left open.
         if trash_fd is not None:
             close_quietly(trash_fd, f"{trash_dir} directory")
 
@@ -968,17 +1007,23 @@ def prune_stale_staging(
 _probe_cache: dict[tuple[str, str], UnsupportedFilesystem | None] = {}
 
 
-def _cached_probe(root: Path | str, kind: str, probe) -> None:
+def _cached_probe(root: Path | str, kind: str, probe, root_fd: int | None = None) -> None:
     key = (str(root), kind)
     if key not in _probe_cache:
-        root_fd = open_root(root)
+        # A caller that already holds an anchored root descriptor passes it:
+        # re-opening the root *by name* would walk the pathname again, and the
+        # probe writes, so a root symlink repointed since the caller anchored
+        # would have the probe create `.trash` in somebody else's directory.
+        owned = root_fd is None
+        fd = open_root(root) if owned else root_fd
         try:
-            probe(root_fd)
+            probe(fd)
             _probe_cache[key] = None
         except UnsupportedFilesystem as exc:
             _probe_cache[key] = exc
         finally:
-            os.close(root_fd)
+            if owned:
+                os.close(fd)
     cached = _probe_cache[key]
     if cached is not None:
         raise cached
@@ -1002,9 +1047,15 @@ def check_publication_support(root: Path | str) -> None:
             os.close(root_fd)
 
 
-def check_trash_support(root: Path | str) -> None:
-    """Cached `probe_trash` for one vault root; raises when unsupported."""
-    _cached_probe(root, "trash", probe_trash)
+def check_trash_support(root: Path | str, *, root_fd: int | None = None) -> None:
+    """Cached `probe_trash` for one vault root; raises when unsupported.
+
+    `root_fd`, when given, is the descriptor the probe runs against instead of
+    re-opening `root` by name — `delete_note` holds one from validation and the
+    probe must not be able to write into a directory the root's pathname has
+    since been repointed at. The caller keeps ownership of it.
+    """
+    _cached_probe(root, "trash", probe_trash, root_fd)
 
 
 def reset_filesystem_probe_cache() -> None:

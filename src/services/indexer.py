@@ -98,8 +98,8 @@ def discover_markdown_files(vault: Path) -> dict[str, Path]:
     - dot-directories are skipped (`.obsidian`, `.git`, `.trash`, …);
     - `Path.rglob` does **not** descend directory symlinks, so a note under a
       symlinked folder is discovered once, at its real path (`Real/A.md`), never
-      at the alias (`Shared/A.md`). `validate_mutable_path` returns that same
-      real path, which is why `move_note` keys its DB updates on it.
+      at the alias (`Shared/A.md`). `open_mutable` reports that same real path as
+      the target's `rel`, which is why `move_note` keys its DB updates on it.
     """
     files: dict[str, Path] = {}
     for p in vault.rglob("*.md"):

@@ -1,10 +1,70 @@
+"""Vault filesystem service: note/file reads, and every mutation entry point.
+
+**Reads follow symlinks; mutations do not, and mutations are anchored.**
+
+A read (`read_file`, `read_bytes`, `list_dir`) resolves the pathname and acts on
+what it finds — an alias reading as its target is what a user expects from an
+alias, and a read cannot destroy anything.
+
+A mutation goes through `open_mutable`, which resolves the parent once, opens it
+as a descriptor, refuses a symlinked final component, and hands back a
+`MutableTarget`. Every syscall the mutation then makes — the temp create, the
+`expected=` read, the publish, the soft delete — runs against that descriptor.
+Nothing re-resolves a pathname, so neither a repointed ancestor symlink nor a
+renamed parent directory can redirect a write mid-call. See `MutableTarget`.
+
+**The residual, precisely.** With #59 closed there is no window left in which a
+mutation can be sent to a directory the guard did not open: the parent is
+resolved and opened before the first byte moves, and a directory descriptor
+keeps naming the same directory however its pathname is renamed or relinked
+afterwards. What remains is not redirection but *substitution at the leaf*,
+inside the directory the caller named:
+
+- the leaf can be swapped for a symlink between the guard's `lstat` and the
+  read or write. `O_NOFOLLOW` turns that into `ELOOP`, which the tools report;
+  the link is never followed and nothing outside the named directory is touched.
+- an adversary who can write to the **destination directory itself** can still
+  win the `renameat` race on an overwrite publish. That adversary can also just
+  edit the note directly, so it is outside the threat #59 addresses —
+  redirection through an *ancestor* or the *root*, where the attacker never had
+  access to the destination at all. The window is narrowed to that one syscall
+  by an identity check (`_require_staged_name`). The no-clobber publish has no
+  such window at all: it stages into an unnamed `O_TMPFILE` inode and publishes
+  it through `/proc/self/fd`, so there is no staging name to substitute and
+  none to clean up.
+- **the anchored walk itself is not atomic.** `vault_fs.open_dir_beneath` opens
+  one component at a time, and an ancestor renamed *out of the vault* between
+  two of those opens yields a parent descriptor outside the pinned root. This
+  is inherited, not introduced: the transfer routes and `delete_file` have
+  always walked this way. The fix is `openat2(RESOLVE_BENEATH |
+  RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)` through `ctypes`, which makes
+  the kernel enforce containment for the whole path in one call; it belongs to
+  `vault_fs` and is its own change, tracked separately.
+- a read-modify-write overwrite (`edit_note`, `set_frontmatter`, `move_note`'s
+  link rewrites) is optimistic, not linearizable: `expected=` compares the
+  current bytes immediately before the rename, and a writer that lands inside
+  that window is still overwritten.
+- `write_file(overwrite=True)` — the raw byte tool — has no conflict detection
+  at all and is an unconditional replace: it takes whole-file content from the
+  caller, so there is no prior read to compare against and `expected=` is never
+  passed. `request_upload(overwrite=True)` is the path that binds to the
+  incumbent's fingerprint.
+- the no-clobber publish (`create_note`, `write_file` by default) has no window
+  — it is `link()`, which the kernel makes atomic — and neither does the soft
+  delete or `move_note`'s own publication, which are one
+  `renameat2(RENAME_NOREPLACE)`.
+
+These are declared limits of optimistic concurrency, not open holes: the
+write always lands on the path the caller named, in the directory that was
+validated.
+"""
+
 import errno
 import logging
 import mimetypes
 import os
 import posixpath
 import re
-import shutil
 import stat
 import uuid
 from pathlib import Path, PurePosixPath
@@ -14,6 +74,7 @@ from sqlalchemy import select
 
 from src.auth.session import _UnsetVaultRoot, current_vault_root
 from src.config import settings
+from src.services import vault_fs
 
 logger = logging.getLogger(__name__)
 
@@ -244,45 +305,162 @@ def validate_visible_path(relative_path: str, user_id: int | None = None) -> Pat
     return resolved
 
 
-def validate_mutable_path(relative_path: str, user_id: int | None = None) -> Path:
-    """Validate a path a tool is about to **mutate**, refusing a symlinked leaf.
+class MutableTarget:
+    """A validated mutation target, **anchored to an open parent descriptor**.
 
-    `validate_path` returns `(vault / rel).resolve()`, which follows symlinks —
-    so an in-vault alias `alias.md -> important.md` made every write tool act on
-    `important.md` while reporting success for `alias.md`. That is a destructive
-    write on a path nobody named. Reads may keep following links (an alias
-    reading as its target is what a user expects); mutations may not.
+    `validate_mutable_path` resolves the parent once and hands back
+    `resolved_parent / name`. That closes the static-alias vector (#54) but not
+    the live one (#59): every syscall a write then makes — `mkdir`, the temp
+    create, the `expected=` read, the publish — hands that *pathname* back to
+    the kernel, which walks it again. A concurrent process that renames the
+    resolved parent and drops a symlink at its name, or repoints a symlinked
+    vault root, between two of those syscalls redirects the write to a
+    directory nobody validated. `expected=` cannot catch it: the decoy may hold
+    byte-identical bytes.
 
-    The rule (see `openspec/specs/vault-write`):
+    So the parent is walked **once**, from an open root descriptor, one
+    `O_NOFOLLOW` component at a time, and the descriptor is what the rest of
+    the call uses. A directory descriptor keeps pointing at the same directory
+    across a rename of that directory, and no pathname is ever re-resolved, so
+    there is nothing left for a mid-call rename or relink to redirect.
 
-    - the *parent* directory is resolved and must stay inside the vault, so
-      symlinked directories inside the vault (shared attachment folders, a
-      common Obsidian setup) keep working while an escaping one is still
-      rejected by the containment check;
-    - the final component is taken **as named** and `os.lstat`-ed: if it is a
-      symbolic link — including a dangling one — the operation is refused with
-      an error naming the link's canonical vault-relative target;
-    - the returned path is `resolved_parent / name`, i.e. the real directory
-      entry the indexer sees. Callers that record vault-relative paths in the
-      database (`move_note`) derive them from this path, so they match what the
-      indexer stores for notes under a symlinked directory.
+    Fields:
 
-    Resolving the parent once, here, also means an allowed symlinked ancestor is
-    never re-traversed during the mutation: repointing it afterwards cannot
-    redirect the write — **provided the caller mutates the returned `Path` and
-    never re-passes its own string**. That is why the `*_at` helpers below
-    exist; see their docstrings. The residual TOCTOU — the leaf swapped for a
-    link between this `lstat` and the write — is the same optimistic level as
-    every other note write today, and closes when these paths migrate to the
-    anchored `vault_fs` helpers.
+    - `path` — `resolved_parent / name`, for error messages, `relative_to` and
+      the database rows. Never handed back to a syscall on a mutation path.
+    - `rel` — the vault-relative POSIX path of `path`; what the indexer stores.
+    - `name` — the final component, taken exactly as the caller named it.
+    - `root` — the resolved vault root.
+    - `dir_fd` — the parent directory descriptor.
 
-    Raises `ValueError` for traversal, a hidden (dot-directory) path, a
-    non-file-shaped path, an in-vault `..` segment, or a symlinked final
-    component.
+    The caller owns the descriptors and must `close()` (or use `with`). A
+    target whose parent does not exist yet has no `dir_fd` until
+    `ensure_parent()` creates it — deferred so a call refused for an unrelated
+    reason (an over-cap body) leaves no directories behind.
     """
-    vault = _vault_root(user_id)
-    vault_resolved = vault.resolve()
 
+    __slots__ = ("path", "rel", "name", "root", "parent_rel", "_dir_fd", "_root_fd")
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        rel: str,
+        name: str,
+        root: Path,
+        parent_rel: str,
+        dir_fd: int | None,
+        root_fd: int,
+    ) -> None:
+        self.path = path
+        self.rel = rel
+        self.name = name
+        self.root = root
+        self.parent_rel = parent_rel
+        self._dir_fd = dir_fd
+        self._root_fd: int | None = root_fd
+
+    # ── descriptors ─────────────────────────────────────────────────────────
+
+    @property
+    def root_fd(self) -> int:
+        """The vault-root descriptor this target's parent was walked from."""
+        if self._root_fd is None:
+            raise RuntimeError(
+                f"MutableTarget for {self.rel} has no root descriptor "
+                "(closed, or released by release_root)"
+            )
+        return self._root_fd
+
+    def release_root(self) -> None:
+        """Drop the root descriptor, keeping the parent one.
+
+        Only two things need the root after validation: creating a missing
+        parent, and resolving `.trash` for the soft delete. A caller that holds
+        *many* targets at once — `move_note` pins one per link-rewrite source
+        from the preflight read until the post-move write — halves the
+        descriptors it ties up by releasing the roots it will not use. Refuses
+        when the parent is not open yet, which would leave the target unusable.
+        """
+        if self._dir_fd is None:
+            raise RuntimeError(
+                f"Cannot release the root of {self.rel}: its parent directory "
+                "is not open, so the target would become unusable"
+            )
+        if self._root_fd is not None:
+            vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
+            self._root_fd = None
+
+    @property
+    def dir_fd(self) -> int:
+        """The parent directory descriptor, created on demand if it is missing.
+
+        Reading it is what a mutation does, so a missing parent is created here
+        rather than left for a pathname-based `mkdir` to walk to.
+        """
+        self.ensure_parent()
+        return self._dir_fd  # type: ignore[return-value]
+
+    @property
+    def parent_fd(self) -> int | None:
+        """The parent descriptor if it is already open, **without creating it**.
+
+        What reads use. `dir_fd` creates a missing parent because a write is
+        entitled to; a read is not, and a read helper that quietly `mkdir`s is
+        how an absent note turns into a new empty directory tree.
+        """
+        return self._dir_fd
+
+    def ensure_parent(self) -> None:
+        """Open — creating if needed — the parent directory descriptor."""
+        if self._dir_fd is not None:
+            return
+        try:
+            self._dir_fd = vault_fs.open_dir_beneath(
+                self.root_fd, self.parent_rel, create=True
+            )
+        except vault_fs.UnsafePath as exc:
+            raise ValueError(str(exc)) from None
+
+    def close(self) -> None:
+        if self._dir_fd is not None:
+            vault_fs.close_quietly(self._dir_fd, f"parent directory for {self.rel}")
+            self._dir_fd = None
+        if self._root_fd is not None:
+            vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
+            self._root_fd = None
+
+    def __enter__(self) -> "MutableTarget":
+        return self
+
+    def __exit__(self, *exc_info) -> None:
+        self.close()
+
+    # ── anchored stats ──────────────────────────────────────────────────────
+
+    def lstat(self) -> os.stat_result | None:
+        """`lstat` the final component through the parent fd, or None if absent.
+
+        Never follows a link — the leaf is taken as named, exactly as the
+        validation `lstat` did.
+        """
+        if self._dir_fd is None:
+            return None
+        try:
+            return os.stat(self.name, dir_fd=self._dir_fd, follow_symlinks=False)
+        except (FileNotFoundError, NotADirectoryError):
+            return None
+
+    def exists(self) -> bool:
+        return self.lstat() is not None
+
+    def is_file(self) -> bool:
+        info = self.lstat()
+        return info is not None and stat.S_ISREG(info.st_mode)
+
+
+def _mutable_parts(relative_path: str) -> list[str]:
+    """Lexical half of the mutable-path guard: components, or a `ValueError`."""
     raw = str(relative_path).replace(os.sep, "/")
     if "\x00" in raw:
         raise ValueError(f"Path traversal denied: {relative_path}")
@@ -310,41 +488,195 @@ def validate_mutable_path(relative_path: str, user_id: int | None = None) -> Pat
         )
     if not parts:
         raise ValueError(f"Not a file path: {relative_path!r}")
+    return parts
 
+
+def open_mutable(relative_path: str, user_id: int | None = None) -> MutableTarget:
+    """Validate a path a tool is about to **mutate** and anchor it to a fd.
+
+    `validate_path` returns `(vault / rel).resolve()`, which follows symlinks —
+    so an in-vault alias `alias.md -> important.md` made every write tool act on
+    `important.md` while reporting success for `alias.md`. That is a destructive
+    write on a path nobody named. Reads may keep following links (an alias
+    reading as its target is what a user expects); mutations may not.
+
+    The rule (see `openspec/specs/vault-write`):
+
+    - the *parent* directory is resolved and must stay inside the vault, so
+      symlinked directories inside the vault (shared attachment folders, a
+      common Obsidian setup) keep working while an escaping one is still
+      rejected by the containment check;
+    - the resolved parent is then **re-opened by descriptor**, one
+      `O_NOFOLLOW` component at a time from the vault root. `resolve()` output
+      holds no symlinks by construction, so this walk succeeds for exactly the
+      paths the containment check accepted — and refuses if a component became
+      a link in between. That is how the anchored walk stays strict while
+      symlinked ancestors keep working: they are resolved away *before* the
+      walk, never traversed by it;
+    - the final component is taken **as named** and `lstat`ed through that
+      descriptor: if it is a symbolic link — including a dangling one — the
+      operation is refused with an error naming the link's canonical
+      vault-relative target;
+    - `path` is `resolved_parent / name`, i.e. the real directory entry the
+      indexer sees. Callers that record vault-relative paths in the database
+      (`move_note`) use `rel`, so they match what the indexer stores for notes
+      under a symlinked directory.
+
+    Every subsequent syscall of the mutation runs against `dir_fd`, so nothing
+    after this point re-resolves a pathname.
+
+    Raises `ValueError` for traversal, a hidden (dot-directory) path, a
+    non-file-shaped path, an in-vault `..` segment, a symlinked final
+    component, or a parent that is not a usable directory.
+    """
+    parts = _mutable_parts(relative_path)
     name = parts[-1]
-    resolved_parent = vault.joinpath(*parts[:-1]).resolve()
-    try:
-        parent_rel = resolved_parent.relative_to(vault_resolved)
-    except ValueError:
-        raise ValueError(f"Path traversal denied: {relative_path}") from None
+    vault = _vault_root(user_id)
 
-    target = resolved_parent / name
-    if is_hidden_path(parent_rel / name):
-        raise ValueError(f"Hidden path denied: {relative_path}")
+    # **The root descriptor is opened first, and never reopened by name.**
+    # Resolving the root to a pathname and only then `open`ing that pathname
+    # left the whole guard resting on a name: between the two, the resolved
+    # root could be renamed away and a symlink left at its name, and the
+    # descriptor everything below is anchored to would be a directory the
+    # containment check never saw. Pinning first inverts that — from here on
+    # the root is an inode, and the pathname work below is checked against it.
+    try:
+        root_fd = vault_fs.open_root(vault)
+    except (OSError, vault_fs.VaultFSError) as exc:
+        raise ValueError(f"Vault root is not usable: {exc}") from None
 
     try:
-        info = os.lstat(target)
-    except (FileNotFoundError, NotADirectoryError):
-        info = None
-    if info is not None and stat.S_ISLNK(info.st_mode):
-        raise ValueError(
-            f"{relative_path} is a symbolic link to "
-            f"{_link_target_label(target, vault_resolved)} — mutating tools act "
-            "only on the named file; operate on the target instead."
+        vault_resolved = vault.resolve()
+        # `vault_resolved` is used for the containment check and for `rel`, so
+        # it has to describe the directory we just pinned. If the root's
+        # pathname was repointed between the open and the resolve, it does not
+        # — refuse rather than compute a relative path against one root and
+        # walk it from another.
+        _require_same_directory(
+            root_fd, vault_resolved, f"the vault root ({vault})"
         )
+
+        resolved_parent = vault.joinpath(*parts[:-1]).resolve()
+        try:
+            parent_rel = resolved_parent.relative_to(vault_resolved)
+        except ValueError:
+            raise ValueError(f"Path traversal denied: {relative_path}") from None
+
+        target_path = resolved_parent / name
+        if is_hidden_path(parent_rel / name):
+            raise ValueError(f"Hidden path denied: {relative_path}")
+
+        parent_rel_posix = parent_rel.as_posix()
+        if parent_rel_posix == ".":
+            parent_rel_posix = ""
+
+        dir_fd: int | None
+        try:
+            dir_fd = vault_fs.open_dir_beneath(
+                root_fd, parent_rel_posix, create=False
+            )
+        except FileNotFoundError:
+            # The parent does not exist yet. Creating it here would leave
+            # directories behind for a call about to be refused for an
+            # unrelated reason, so it is deferred to `ensure_parent()`.
+            dir_fd = None
+        except vault_fs.UnsafePath as exc:
+            raise ValueError(str(exc)) from None
+
+        target = MutableTarget(
+            path=target_path,
+            rel=(parent_rel / name).as_posix(),
+            name=name,
+            root=vault_resolved,
+            parent_rel=parent_rel_posix,
+            dir_fd=dir_fd,
+            root_fd=root_fd,
+        )
+    except BaseException:
+        vault_fs.close_quietly(root_fd, "vault root")
+        raise
+
+    # Inside its own guard: an `lstat` that raises `EIO` would otherwise leak
+    # both descriptors, and the message below reads the link while the target
+    # is still anchored — never by pathname after the fds are gone.
+    try:
+        info = target.lstat()
+        if info is not None and stat.S_ISLNK(info.st_mode):
+            label = _link_target_label(target, vault_resolved)
+            raise ValueError(
+                f"{relative_path} is a symbolic link to {label} — mutating "
+                "tools act only on the named file; operate on the target "
+                "instead."
+            )
+    except BaseException:
+        target.close()
+        raise
     return target
 
 
-def _link_target_label(link: Path, vault_resolved: Path) -> str:
+def _require_same_directory(dir_fd: int, path: Path, what: str) -> None:
+    """Refuse unless `path` still names the directory `dir_fd` is open on."""
+    try:
+        by_name = os.stat(path)
+    except OSError as exc:
+        raise ValueError(f"Vault root is not usable: {exc}") from None
+    anchored = os.fstat(dir_fd)
+    if (by_name.st_dev, by_name.st_ino) != (anchored.st_dev, anchored.st_ino):
+        raise ValueError(
+            f"Refusing to continue: {what} changed while the path was being "
+            "validated. Retry the operation."
+        )
+
+
+def validate_mutable_path(relative_path: str, user_id: int | None = None) -> Path:
+    """`open_mutable`, discarding the descriptors and keeping only the path.
+
+    The single-shot form, for a caller that needs the guard's *verdict* and
+    nothing else. A tool that makes more than one syscall against the returned
+    `Path` has reopened the window `open_mutable` closes; take the target
+    instead.
+
+    **Nothing in `src/` calls this** — every production mutation path now goes
+    through `open_mutable` (including `write_file` / `write_bytes`, which open
+    and close their own target). It is kept because the boundary it draws is
+    the thing worth naming: a path-shaped answer is only ever safe when it is
+    the *whole* answer. If a new caller appears here, that is the signal to
+    check whether it should be holding a target instead. The symlink-guard
+    tests exercise it directly for the same reason: the guard's verdict is
+    testable without an anchored write.
+    """
+    with open_mutable(relative_path, user_id=user_id) as target:
+        return target.path
+
+
+def _link_target_label(target: "MutableTarget", vault_resolved: Path) -> str:
     """Name a symlink's ultimate target for an error message.
 
     Vault-relative POSIX when the target lands inside the vault (dangling links
     included — the caller still learns which note the alias was meant to name),
     otherwise the literal string `outside the vault`.
+
+    **The link itself is read through the parent descriptor**, not by pathname.
+    Naming a target requires resolving one, and a resolution done after the
+    descriptors are gone can describe a link that no longer exists — the
+    message would then send the agent at a note that was never involved, which
+    is worse than admitting we do not know. So `readlink` is anchored; only the
+    *display* resolution of what it points at is by pathname, and if the link
+    cannot be read at all the message says so instead of guessing.
     """
+    dir_fd = target.parent_fd
+    if dir_fd is None:  # pragma: no cover - the leaf cannot exist without one
+        return "a target that could not be read (the link changed)"
     try:
-        destination = Path(os.path.realpath(link))
-        return destination.relative_to(vault_resolved).as_posix()
+        literal = os.readlink(target.name, dir_fd=dir_fd)
+    except OSError:
+        return "a target that could not be read (the link changed)"
+    destination = Path(literal)
+    if not destination.is_absolute():
+        destination = target.path.parent / destination
+    try:
+        resolved = Path(os.path.realpath(destination))
+        return resolved.relative_to(vault_resolved).as_posix()
     except (ValueError, OSError):
         return "outside the vault"
 
@@ -369,7 +701,7 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
     }
 
 
-# How many `.tmp-…` names `_atomic_write` tries before giving up. A collision
+# How many `.tmp-…` names `_atomic_write_at` tries before giving up. A collision
 # is astronomically unlikely; the retry exists so a process that pre-creates
 # the name (a symlink decoy, or a leftover from a crash) cannot wedge a write.
 _TEMP_ATTEMPTS = 3
@@ -381,7 +713,7 @@ _default_file_mode_cache: int | None = None
 def _default_file_mode() -> int:
     """The mode a plain `open(..., "w")` would give a new file: 0o666 & ~umask.
 
-    `_atomic_write` creates its temp file at 0o600 so the content is never
+    `_atomic_write_at` creates its temp file at 0o600 so the content is never
     readable by anyone else while it is being written, then relaxes it to this
     before publication. Without that, every note the server rewrote would
     silently drop from the umask default (0o644 on the container) to 0o600 and
@@ -408,22 +740,30 @@ def _default_file_mode() -> int:
     return _default_file_mode_cache
 
 
-def _temp_candidate(path: Path) -> Path:
-    """A fresh same-directory temp name for `path`.
+def _temp_candidate(name: str) -> str:
+    """A fresh temp *name* for `name`, to be created in the same directory.
 
-    Factored out so a test can make the name predictable and pre-create it.
+    A bare component, never a path: everything downstream of validation is
+    resolved against a directory descriptor, so there is nothing here for the
+    kernel to walk. Factored out so a test can make the name predictable and
+    pre-create it.
     """
-    return path.with_name(f".tmp-{path.name}-{os.getpid()}-{uuid.uuid4().hex[:8]}")
+    return f".tmp-{name}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
-def _create_temp_exclusively(path: Path) -> tuple[int, Path]:
-    """Create a same-directory temp file for `path`; return `(fd, tmp)`.
+def _create_temp_exclusively(dir_fd: int, name: str) -> tuple[int, str]:
+    """Create a *named* temp file for `name` inside `dir_fd`; return `(fd, tmp)`.
 
-    `O_CREAT|O_EXCL|O_NOFOLLOW` means the name we write through cannot
-    pre-exist and cannot be a symlink: a process that guessed the temp name and
-    planted `.tmp-note.md-…  ->  /some/decoy` would otherwise have had our
-    write truncate the decoy. `O_EXCL` reports that as `EEXIST` (a symlink at
-    the final component fails the same way), so we simply take another name.
+    Only the **overwrite** path needs this: `renameat` has no by-descriptor
+    form, so its source must have a name. `O_CREAT|O_EXCL|O_NOFOLLOW` means the
+    name we write through cannot pre-exist and cannot be a symlink — a process
+    that guessed the temp name and planted `.tmp-note.md-…  ->  /some/decoy`
+    would otherwise have had our write truncate the decoy. `O_EXCL` reports
+    that as `EEXIST` (a symlink at the final component fails the same way), so
+    we simply take another name.
+
+    The no-clobber path uses `_create_nameless_temp` instead and never puts a
+    name in the directory at all.
     """
     flags = (
         os.O_WRONLY
@@ -434,9 +774,9 @@ def _create_temp_exclusively(path: Path) -> tuple[int, Path]:
     )
     last: OSError | None = None
     for _ in range(_TEMP_ATTEMPTS):
-        tmp = _temp_candidate(path)
+        tmp = _temp_candidate(name)
         try:
-            return os.open(tmp, flags, 0o600), tmp
+            return os.open(tmp, flags, 0o600, dir_fd=dir_fd), tmp
         except FileExistsError as exc:
             last = exc
         except OSError as exc:  # ELOOP on platforms that prefer it for symlinks
@@ -444,179 +784,427 @@ def _create_temp_exclusively(path: Path) -> tuple[int, Path]:
                 raise
             last = exc
     raise RuntimeError(
-        f"Could not create a temporary file next to {path.name}"
+        f"Could not create a temporary file next to {name}"
     ) from last
 
 
-def _atomic_write(
-    path: Path,
+def _create_nameless_temp(dir_fd: int) -> int:
+    """Stage a no-clobber write in an **unnamed** inode inside `dir_fd`.
+
+    `O_TMPFILE` gives a file with no directory entry at all — nothing for
+    another process to observe, replace or race, and nothing for us to clean up
+    afterwards. That last part is the point: a named staging file has to be
+    unlinked, and an unlink is by *name*, so it can only be guarded by an
+    identity check followed by the removal — check-then-act, which could delete
+    a substitute planted in between. With no name there is no such step; the
+    inode is freed by closing the descriptor.
+
+    **`O_EXCL` must not be set.** With `O_TMPFILE` it means "this file can never
+    be linked into the filesystem", which makes the publish below impossible
+    (`ENOENT`) — the opposite of its usual meaning, and an easy thing to add by
+    reflex.
+
+    Publication is `_link_staged_inode`. A filesystem without `O_TMPFILE`
+    (`EOPNOTSUPP`, or `EISDIR`/`EINVAL` on kernels that report it that way)
+    raises `UnsupportedFilesystem`: ext4/xfs both support it, and the
+    alternative is reintroducing the staging name this exists to remove.
+    """
+    flags = os.O_TMPFILE | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(".", flags, 0o600, dir_fd=dir_fd)
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (
+            errno.EOPNOTSUPP,
+            errno.EISDIR,
+            errno.ENOSYS,
+            errno.EINVAL,
+        ):
+            raise vault_fs.UnsupportedFilesystem(
+                "The vault filesystem does not support O_TMPFILE, which the "
+                "no-clobber write stages into so that no temporary name is "
+                "ever exposed. Refusing rather than staging under a name."
+            ) from exc
+        raise
+
+
+def _atomic_write_at(
+    target: MutableTarget,
     *,
     text: str | None = None,
     data: bytes | None = None,
     overwrite: bool = True,
     expected: bytes | None = None,
 ) -> Path:
-    """Write `text` (UTF-8) or `data` (raw bytes) to `path` atomically.
+    """Write `text` (UTF-8) or `data` (raw bytes) to `target`, atomically.
 
-    Shared core for `write_file` (notes) and `write_bytes` (raw files): writes
-    a tmp file in the same directory then `os.replace`s it into place. A crash
-    between the tmp-file write and the rename leaves the destination untouched.
-    `os.replace` is atomic on POSIX same-FS renames. No-clobber publication
-    uses a hard link from the same-directory temp file. Creates missing parent
-    directories.
+    Shared core for `write_file_at` (notes) and `write_bytes_at` (raw files).
+    **Every syscall runs against `target.dir_fd`** — the staging, the
+    `expected=` read and the publication — so the destination directory is the
+    one validation opened, whatever happens to its pathname meanwhile. Missing
+    parent directories are created (through the same anchored walk) on first
+    use of the descriptor.
 
-    The temp file is created exclusively and `O_NOFOLLOW` (see
-    `_create_temp_exclusively`), so the staging step cannot be redirected
-    through a planted symlink.
+    The two publication modes stage differently, and that difference is the
+    whole reason this function has a branch:
+
+    * **no-clobber** (`create_note`, `write_file` by default) stages into an
+      `O_TMPFILE` inode that never has a directory entry, and publishes it with
+      `linkat` through `/proc/self/fd/<fd>`. Nothing in the directory can be
+      observed, replaced or raced, and there is nothing to clean up — the inode
+      is freed when the descriptor closes. `link` either creates the name or
+      fails `EEXIST`, so nothing can be destroyed by a no-clobber publish.
+    * **overwrite** (`edit_note`, `set_frontmatter`,
+      `write_file(overwrite=True)`) needs `renameat`, which has no
+      by-descriptor form, so its source must have a name. That name is created
+      `O_CREAT|O_EXCL|O_NOFOLLOW`, and `_require_staged_name` checks
+      immediately before the rename that it still refers to the inode we wrote
+      — narrowing the substitution window to the single rename syscall rather
+      than leaving it open from the `fsync`.
+
+    Ordering, and why each step is where it is:
+
+    1. staging (above); the descriptor is then held until publication, as the
+       only handle on the bytes that no rename or unlink can take away;
+    2. the payload is written and **`fsync`ed before publication**. A crash
+       between the two leaves the destination untouched; without the `fsync` a
+       crash just after the rename could leave the destination published but
+       its data blocks unwritten, which is the truncation this is supposed to
+       make impossible;
+    3. `expected` (when given) is compared against the current bytes read
+       through the same descriptor — optimistic conflict detection, immediately
+       before publication.
+
+    **What the overwrite window means, precisely.** An adversary who can write
+    to the *destination directory itself* can still win the rename race. That
+    adversary can also just edit the note directly, so it is outside the threat
+    #59 addresses: redirection through an **ancestor** or the **root**, where
+    the attacker never had access to the destination at all. Stated rather than
+    implied.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
     payload = data if data is not None else (text or "").encode("utf-8")
-    fd, tmp = _create_temp_exclusively(path)
+    dir_fd = target.dir_fd
+    name = target.name
+
+    tmp: str | None = None
+    if overwrite:
+        fd, tmp = _create_temp_exclusively(dir_fd, name)
+    else:
+        fd = _create_nameless_temp(dir_fd)
+    # The `try` opens on the very next line after the descriptor exists: an
+    # `EIO` from the `fstat` below would otherwise leak both the descriptor
+    # and, on the overwrite path, the staging name.
+    staged: os.stat_result | None = None
+    published = False
     try:
-        try:
-            with os.fdopen(fd, "wb", closefd=False) as stream:
-                stream.write(payload)
-            os.fchmod(fd, _default_file_mode())
-        finally:
+        staged = os.fstat(fd)
+        with os.fdopen(fd, "wb", closefd=False) as stream:
+            stream.write(payload)
+            stream.flush()
+        os.fchmod(fd, _default_file_mode())
+        os.fsync(fd)
+
+        if expected is not None:
+            try:
+                current = _read_fd_bytes(dir_fd, name)
+            except FileNotFoundError:
+                raise RuntimeError(f"File changed while editing: {name}") from None
+            if current != expected:
+                raise RuntimeError(f"File changed while editing: {name}")
+
+        if tmp is not None:
+            _require_staged_name(dir_fd, tmp, staged)
+            os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+        else:
+            _link_staged_inode(fd, dir_fd, name)
+        published = True
+    finally:
+        if tmp is not None:
+            _discard_temp(dir_fd, tmp, staged=staged)
+        # Quiet only once publication has settled: a bare close raising `EIO`
+        # here would discard a write that already happened and surface as a
+        # generic OSError, which the tools report as a failure — the trap
+        # `transfer._close_quietly` exists for. Before publication a close
+        # error is real and must not be swallowed.
+        if published:
+            vault_fs.close_quietly(fd, f"staged copy of {name}")
+        else:
             os.close(fd)
-        try:
-            if expected is not None:
-                try:
-                    current = _read_path_bytes(path)
-                except FileNotFoundError:
-                    raise RuntimeError(f"File changed while editing: {path.name}")
-                if current != expected:
-                    raise RuntimeError(f"File changed while editing: {path.name}")
-            if overwrite:
-                os.replace(tmp, path)
-            else:
-                # A hard link publishes the completed temp inode only when the
-                # destination does not exist. Unlike exists()+replace(), this
-                # is an atomic no-clobber operation on the same filesystem.
-                os.link(tmp, path)
-                tmp.unlink()
-        except OSError as e:
-            if getattr(e, "errno", None) == 18:  # EXDEV
-                # Temp and destination deliberately share a directory, so an
-                # EXDEV indicates an unusual/non-POSIX filesystem. Never turn
-                # a promised no-clobber write into an overwriting move.
-                if not overwrite:
-                    raise
-                logger.warning("Cross-FS rename for %s; using shutil.move", path.name)
-                shutil.move(str(tmp), str(path))
-            else:
-                raise
-    except Exception:
-        # The temp is a regular file we created ourselves, so an unconditional
-        # unlink is safe and also clears a name `exists()` would miss.
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+    return target.path
+
+
+def _staged_identity_matches(dir_fd: int, tmp: str, staged: os.stat_result) -> bool:
+    """Whether `tmp` still names the inode we staged."""
+    try:
+        current = os.stat(tmp, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (current.st_dev, current.st_ino) == (staged.st_dev, staged.st_ino)
+
+
+def _require_staged_name(dir_fd: int, tmp: str, staged: os.stat_result) -> None:
+    """Refuse unless the temp name still refers to the bytes we just wrote.
+
+    `renameat` moves whatever is at the source name when it runs, so an
+    overwrite publish cannot be made to carry an inode the way `linkat` can.
+    Checking here does not close the race — it narrows it to the one syscall —
+    and it turns the common case of a peer replacing our staging file from
+    "their content published as the note" into a refusal.
+    """
+    if not _staged_identity_matches(dir_fd, tmp, staged):
+        raise vault_fs.Conflict(
+            "The staged copy was replaced before it could be published; "
+            "nothing was written. Retry the operation."
+        )
+
+
+# Whether `/proc/self/fd` is usable for publishing a staged inode. Cached: it
+# is a property of the container, not of the call.
+_proc_fd_available_cache: bool | None = None
+
+
+def _proc_fd_available() -> bool:
+    global _proc_fd_available_cache
+    if _proc_fd_available_cache is None:
+        _proc_fd_available_cache = os.path.isdir("/proc/self/fd")
+    return _proc_fd_available_cache
+
+
+def _link_staged_inode(fd: int, dir_fd: int, name: str) -> None:
+    """Publish the inode behind `fd` as `name`, no-clobber.
+
+    `linkat(AT_FDCWD, "/proc/self/fd/<fd>", dir_fd, name, AT_SYMLINK_FOLLOW)`.
+    The magic link resolves to the open file description, so what gets
+    published is the inode we wrote. `fd` is an `O_TMPFILE` staging descriptor
+    with no directory entry at all, so there is nothing a peer could have
+    substituted and nothing to check.
+
+    Two kernel details worth recording, because both look like blockers and
+    neither is: the `AT_EMPTY_PATH` form of this call needs
+    `CAP_DAC_READ_SEARCH`, which an ordinary container does not have, while the
+    `/proc` magic link does not; and the "cannot link a zero-link inode" rule
+    applies to an inode whose names have all been *removed*, not to one created
+    `O_TMPFILE`. Verified on the deployment's kernel with `CapEff=0`.
+
+    Linux-only, which the declared filesystem semantics already require;
+    without `/proc` there is no way to publish an inode by descriptor and we
+    refuse rather than fall back to publishing whatever a staging *name* points
+    at. `EEXIST` is the ordinary no-clobber refusal — a plain file, a directory
+    and a symlink at the destination all produce it — and propagates as
+    `FileExistsError`.
+    """
+    if not _proc_fd_available():
+        raise vault_fs.UnsupportedFilesystem(
+            "/proc is not available, so a staged file cannot be published by "
+            "descriptor; refusing rather than publishing by name."
+        )
+    try:
+        os.link(
+            f"/proc/self/fd/{fd}",
+            name,
+            dst_dir_fd=dir_fd,
+            follow_symlinks=True,
+        )
+    except FileExistsError:
         raise
-    return path
+    except FileNotFoundError as exc:
+        raise vault_fs.Conflict(
+            "The staged copy could not be published; nothing was written. "
+            "Retry the operation."
+        ) from exc
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (
+            errno.EPERM,
+            errno.EOPNOTSUPP,
+            errno.EXDEV,
+        ):
+            raise vault_fs.UnsupportedFilesystem(
+                "The vault filesystem does not support hard links, which the "
+                "no-clobber write depends on; refusing rather than replacing "
+                "an existing file."
+            ) from exc
+        raise
+
+
+def _discard_temp(
+    dir_fd: int, tmp: str, staged: os.stat_result | None = None
+) -> None:
+    """Remove the **overwrite** path's staging name — and never anybody else's.
+
+    Reached on two kinds of path: a successful `renameat` (which consumed the
+    name, so this is a no-op) and a failure after staging. In the failure case
+    the name is unlinked only while it still refers to the inode we staged; if
+    it does not, the file is **left in place and logged**. Answering an
+    attempted substitution by deleting the substitute is the same
+    destructive-write class this module exists to prevent, just aimed at a
+    different file, so the failure direction is to leave litter rather than
+    remove something we cannot prove is ours.
+
+    The no-clobber path never calls this: it stages into an unnamed
+    `O_TMPFILE` inode, so there is no name to remove and no check to race.
+    That asymmetry is deliberate — see `_atomic_write_at`.
+    """
+    if staged is not None and not _staged_identity_matches(dir_fd, tmp, staged):
+        logger.warning(
+            "Temp name %s no longer refers to the file we staged; leaving it "
+            "in place rather than unlinking a file we did not create.",
+            tmp,
+        )
+        return
+    try:
+        os.unlink(tmp, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        logger.warning("Could not remove temporary file %s: %s", tmp, exc)
+
+
+def _bound_read(fd: int, label: str, max_bytes: int | None) -> bytes:
+    """Read and bound an already-open regular file. Closes nothing."""
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"Not a regular file: {label}")
+    if max_bytes is not None and info.st_size > max_bytes:
+        raise ValueError(
+            f"File too large: {label} is {info.st_size:,} bytes "
+            f"(max {max_bytes:,})"
+        )
+    with os.fdopen(fd, "rb", closefd=False) as stream:
+        payload = stream.read(None if max_bytes is None else max_bytes + 1)
+    if max_bytes is not None and len(payload) > max_bytes:
+        raise ValueError(f"File too large: {label} exceeds {max_bytes:,} bytes")
+    return payload
+
+
+def _read_fd_bytes(dir_fd: int, name: str, max_bytes: int | None = None) -> bytes:
+    """Read `name` inside `dir_fd` through one `O_NOFOLLOW` descriptor.
+
+    The anchored counterpart of `_read_path_bytes`, and the read primitive
+    every *mutation* uses: the read and the write that follows it refer to the
+    same directory descriptor, so nothing between them can redirect either.
+    `O_NOFOLLOW` turns a leaf swapped for a symlink into an `ELOOP` `OSError`
+    rather than a silent read of the link's target.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(name, flags, dir_fd=dir_fd)
+    try:
+        return _bound_read(fd, name, max_bytes)
+    finally:
+        os.close(fd)
 
 
 def _read_path_bytes(path: Path, max_bytes: int | None = None) -> bytes:
-    """Read and bound a regular file through one descriptor.
+    """Read and bound a regular file named by pathname, through one descriptor.
 
-    The size check and read refer to the same opened inode. ``O_NOFOLLOW``
-    prevents a final-component symlink swap on platforms that provide it.
+    The **read-only** primitive: `read_bytes` follows symlinks by design, so it
+    has no anchored parent to work from. Mutation paths must use
+    `_read_fd_bytes` instead — see `MutableTarget`.
     """
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
     try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise ValueError(f"Not a regular file: {path.name}")
-        if max_bytes is not None and info.st_size > max_bytes:
-            raise ValueError(
-                f"File too large: {path.name} is {info.st_size:,} bytes "
-                f"(max {max_bytes:,})"
-            )
-        with os.fdopen(fd, "rb", closefd=False) as stream:
-            data = stream.read(None if max_bytes is None else max_bytes + 1)
-        if max_bytes is not None and len(data) > max_bytes:
-            raise ValueError(
-                f"File too large: {path.name} exceeds {max_bytes:,} bytes"
-            )
-        return data
+        return _bound_read(fd, path.name, max_bytes)
     finally:
         os.close(fd)
 
 
 # ────────────────────────────────────────────────────────────────────────────
-# Resolve once, then act on the Path — the `*_at` helpers
+# Resolve once, then act on the descriptor — the `*_at` helpers
 # ────────────────────────────────────────────────────────────────────────────
 #
-# `validate_mutable_path` resolves the parent exactly once and hands back the
-# real directory entry. That guarantee only holds if the caller then *uses*
-# that Path. A tool that validates a string, keeps the Path for a guard, and
-# then calls `read_bytes(path_str)` / `write_file(path_str)` re-resolves the
-# caller's string a second and a third time: an ancestor symlink repointed
-# between the read and the write redirects the write to a note nobody named,
-# and the `expected=` compare-and-swap does not catch it (the decoy can hold
-# byte-identical content).
+# `open_mutable` resolves the parent exactly once, opens it, and hands back a
+# `MutableTarget`. That guarantee only holds if the caller then *uses* the
+# target. A tool that validates a string, keeps the verdict, and then calls
+# `read_bytes(path_str)` / `write_file(path_str)` re-resolves the caller's
+# string a second and a third time; even a tool that keeps the resolved `Path`
+# hands that pathname back to the kernel on every syscall, and a parent
+# directory renamed out from under it (a symlink dropped at its name) redirects
+# the write to a directory nobody validated. The `expected=` compare-and-swap
+# does not catch it — the decoy can hold byte-identical content.
 #
 # So every read-modify-write inside one tool call goes through the helpers
-# below, which take an ALREADY-VALIDATED absolute Path and never touch the
-# vault root or the caller's string again. The string-taking `read_bytes` /
-# `write_file` / `write_bytes` wrappers remain for single-shot callers and are
-# now thin: validate, then delegate.
+# below, which take an ALREADY-VALIDATED `MutableTarget` and operate purely
+# against its parent descriptor. The string-taking `read_bytes` / `write_file`
+# / `write_bytes` wrappers remain for single-shot callers and are thin:
+# validate, delegate, close.
 
 
 def write_file_at(
-    path: Path,
+    target: MutableTarget,
     content: str,
     *,
     overwrite: bool = True,
     expected: bytes | None = None,
 ) -> Path:
-    """Atomically write a note to an already-validated absolute `path`.
+    """Atomically write a note to an already-validated `MutableTarget`.
 
-    `path` MUST come from `validate_mutable_path` (or be another path the
-    caller has already proven safe) — no traversal, visibility or symlink
-    check happens here.
+    `target` MUST come from `open_mutable` — no traversal, visibility or
+    symlink check happens here.
     """
-    return _atomic_write(
-        path, text=content, overwrite=overwrite, expected=expected
+    return _atomic_write_at(
+        target, text=content, overwrite=overwrite, expected=expected
     )
 
 
 def write_bytes_at(
-    path: Path,
+    target: MutableTarget,
     data: bytes,
     overwrite: bool = False,
 ) -> Path:
-    """Atomically write raw bytes to an already-validated absolute `path`.
+    """Atomically write raw bytes to an already-validated `MutableTarget`.
 
     Same contract as `write_file_at`. Raises `FileExistsError` when the target
     exists and `overwrite` is False.
     """
-    return _atomic_write(path, data=data, overwrite=overwrite)
+    return _atomic_write_at(target, data=data, overwrite=overwrite)
 
 
 def read_bytes_at(
-    path: Path,
+    target: MutableTarget,
     max_bytes: int | None = None,
     *,
     label: str | None = None,
 ) -> bytes:
-    """Read an already-validated absolute `path` through one `O_NOFOLLOW` fd.
+    """Read a validated `MutableTarget` through one `O_NOFOLLOW` fd.
 
-    The counterpart to `write_file_at`: the read and the subsequent write refer
-    to the same resolved location, so nothing between them can redirect either.
-    `label` (a vault-relative path) replaces the bare filename in size errors so
-    the caller sees the path it passed. Raises `FileNotFoundError` when the file
-    is gone, `OSError` (ELOOP) when the leaf has been swapped for a symlink, and
-    `ValueError` for a non-regular file or an over-cap size.
+    The counterpart to `write_file_at`: the read and the subsequent write go
+    through the same parent descriptor, so nothing between them can redirect
+    either. `label` (a vault-relative path) replaces the bare filename in size
+    errors so the caller sees the path it passed. Raises `FileNotFoundError`
+    when the file is gone, `OSError` (ELOOP) when the leaf has been swapped for
+    a symlink, and `ValueError` for a non-regular file or an over-cap size.
     """
+    dir_fd = target.parent_fd
+    if dir_fd is None:
+        # No parent directory, so no file — and a read must not create one.
+        raise FileNotFoundError(f"File not found: {label or target.rel}")
     try:
-        return _read_path_bytes(path, max_bytes=max_bytes)
+        return _read_fd_bytes(dir_fd, target.name, max_bytes=max_bytes)
     except ValueError as exc:
         if label is None:
             raise
-        raise ValueError(str(exc).replace(path.name, label, 1)) from exc
+        raise ValueError(str(exc).replace(target.name, label, 1)) from exc
+
+
+def move_file_no_clobber(source: MutableTarget, destination: MutableTarget) -> None:
+    """Move one regular file between two validated targets, never replacing.
+
+    One `renameat2(RENAME_NOREPLACE)` against the two parent descriptors. The
+    kernel gives both halves at once and both are load-bearing:
+
+    * the destination is *created or refused* — `EEXIST` rather than a silent
+      overwrite, whoever put a file there and whenever;
+    * whichever inode sits at the source when the call runs is what moves, so a
+      writer that replaced the source a microsecond earlier is relocated intact
+      rather than destroyed.
+
+    `link` + `unlink` — the shape this replaces — has the first half and not
+    the second: it can unlink a *different* inode than the one it linked. See
+    `vault_fs.rename_noreplace`; a filesystem that cannot do the non-replacing
+    form raises `UnsupportedFilesystem` and there is no safe fallback.
+    """
+    vault_fs.rename_noreplace(
+        source.dir_fd, source.name, destination.dir_fd, destination.name
+    )
 
 
 def write_file(
@@ -627,20 +1215,21 @@ def write_file(
     overwrite: bool = True,
     expected: bytes | None = None,
 ) -> Path:
-    """Write content to a note atomically (tmp file in same dir + os.replace).
+    """Write content to a note atomically (tmp file in same dir + `renameat`).
 
-    Validation goes through `validate_mutable_path`, so a symlinked final
-    component is refused rather than silently retargeted, and `_atomic_write`
-    receives `resolved_parent / name` — a real directory for its temp file.
+    Validation goes through `open_mutable`, so a symlinked final component is
+    refused rather than silently retargeted and the write runs against the
+    parent descriptor that validation opened.
 
     Single-shot convenience only. A tool that already validated the path (or
-    that reads before it writes) must use `write_file_at` instead: re-passing
-    the string here resolves it again.
+    that reads before it writes) must use `write_file_at` on its own
+    `MutableTarget` instead: re-passing the string here validates and anchors
+    a second time, which is exactly the window `open_mutable` closes.
     """
-    path = validate_mutable_path(relative_path, user_id=user_id)
-    return write_file_at(
-        path, content, overwrite=overwrite, expected=expected
-    )
+    with open_mutable(relative_path, user_id=user_id) as target:
+        return write_file_at(
+            target, content, overwrite=overwrite, expected=expected
+        )
 
 
 def read_bytes(
@@ -659,12 +1248,17 @@ def read_bytes(
 
     Reads follow symlinks by design (`validate_visible_path` resolves), so this
     is *not* the helper for the read half of a read-modify-write — use
-    `read_bytes_at` on the validated mutable path for that.
+    `read_bytes_at` on the validated `MutableTarget` for that.
     """
     path = validate_visible_path(relative_path, user_id=user_id)
     if not path.is_file():
         raise FileNotFoundError(f"File not found: {relative_path}")
-    return read_bytes_at(path, max_bytes=max_bytes, label=relative_path)
+    try:
+        return _read_path_bytes(path, max_bytes=max_bytes)
+    except ValueError as exc:
+        raise ValueError(
+            str(exc).replace(path.name, relative_path, 1)
+        ) from exc
 
 
 def write_bytes(
@@ -683,59 +1277,13 @@ def write_bytes(
     (`validate_mutable_path`) — writing through an alias would clobber the
     target under a path the caller never named.
     """
-    path = validate_mutable_path(relative_path, user_id=user_id)
-    try:
-        return write_bytes_at(path, data, overwrite=overwrite)
-    except FileExistsError:
-        raise FileExistsError(f"File already exists: {relative_path}") from None
-
-
-def move_no_clobber(source: Path, destination: Path) -> None:
-    """Move one regular file without ever replacing ``destination``.
-
-    On the normal same-filesystem vault layout, link+unlink is an atomic
-    no-clobber publication. The EXDEV fallback uses exclusive creation and
-    copies the bytes before unlinking the source; it preserves no-clobber but
-    cannot make the cross-filesystem move itself atomic.
-    """
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.link(source, destination, follow_symlinks=False)
-        source.unlink()
-        return
-    except OSError as exc:
-        if getattr(exc, "errno", None) != 18:  # EXDEV
-            raise
-
-    src_fd = os.open(
-        source,
-        os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0),
-    )
-    dst_fd: int | None = None
-    try:
-        dst_fd = os.open(
-            destination,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0),
-            0o600,
-        )
-        with os.fdopen(src_fd, "rb", closefd=False) as src, os.fdopen(
-            dst_fd, "wb", closefd=False
-        ) as dst:
-            shutil.copyfileobj(src, dst)
-            dst.flush()
-            os.fsync(dst_fd)
-        source.unlink()
-    except Exception:
-        if dst_fd is not None:
-            try:
-                destination.unlink()
-            except OSError:
-                pass
-        raise
-    finally:
-        os.close(src_fd)
-        if dst_fd is not None:
-            os.close(dst_fd)
+    with open_mutable(relative_path, user_id=user_id) as target:
+        try:
+            return write_bytes_at(target, data, overwrite=overwrite)
+        except FileExistsError:
+            raise FileExistsError(
+                f"File already exists: {relative_path}"
+            ) from None
 
 
 # ────────────────────────────────────────────────────────────────────────────

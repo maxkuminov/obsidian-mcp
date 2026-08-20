@@ -9,6 +9,7 @@ from sqlalchemy import select, update
 import src.mcp_server.tools as tools
 from src.mcp_server.auth import current_permission
 from src.services import vault as vault_service
+from src.services import vault_fs
 from src.models.db import NoteLink, NoteMetadata
 
 
@@ -25,49 +26,79 @@ def offline(monkeypatch, tmp_path):
     current_permission.reset(token)
 
 
-async def test_create_note_loses_race_without_clobber(offline, monkeypatch):
+def _race_the_publish(monkeypatch, contents: bytes):
+    """Create the destination inside `os.link`, just before the real call runs.
+
+    The publish is anchored now, so `destination` is a bare component resolved
+    against `dst_dir_fd` — writing to `Path(destination)` would land in the
+    process CWD and prove nothing.
+    """
     real_link = os.link
-    raced = False
+    raced: list[bool] = []
 
     def concurrent_link(source, destination, *args, **kwargs):
-        nonlocal raced
         if not raced:
-            raced = True
-            Path(destination).write_text("other writer", encoding="utf-8")
+            raced.append(True)
+            dst_dir_fd = kwargs.get("dst_dir_fd", kwargs.get("src_dir_fd"))
+            fd = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o644,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(fd, contents)
+            finally:
+                os.close(fd)
         return real_link(source, destination, *args, **kwargs)
 
     monkeypatch.setattr(vault_service.os, "link", concurrent_link)
+    return raced
+
+
+async def test_create_note_loses_race_without_clobber(offline, monkeypatch):
+    _race_the_publish(monkeypatch, b"other writer")
     result = await tools.create_note_impl("race.md", "ours")
     assert "already exists" in result.lower()
     assert (offline / "race.md").read_text() == "other writer"
 
 
 def test_raw_write_loses_race_without_clobber(offline, monkeypatch):
-    real_link = os.link
-
-    def concurrent_link(source, destination, *args, **kwargs):
-        Path(destination).write_bytes(b"other writer")
-        return real_link(source, destination, *args, **kwargs)
-
-    monkeypatch.setattr(vault_service.os, "link", concurrent_link)
+    _race_the_publish(monkeypatch, b"other writer")
     with pytest.raises(FileExistsError):
         vault_service.write_bytes("race.bin", b"ours", overwrite=False)
     assert (offline / "race.bin").read_bytes() == b"other writer"
 
 
-def test_move_loses_race_without_clobber(offline, monkeypatch):
+async def test_move_loses_race_without_clobber(offline, monkeypatch):
+    """`move_note` publishes with `RENAME_NOREPLACE`, so a destination that
+    appears after validation is preserved and the source stays put."""
     source = offline / "source.md"
-    destination = offline / "destination.md"
     source.write_text("source", encoding="utf-8")
-    real_link = os.link
+    destination = offline / "destination.md"
+    real = vault_fs.rename_noreplace
+    raced: list[bool] = []
 
-    def concurrent_link(src, dst, *args, **kwargs):
-        Path(dst).write_text("other writer", encoding="utf-8")
-        return real_link(src, dst, *args, **kwargs)
+    def concurrent(src_dir_fd, src_name, dst_dir_fd, dst_name):
+        if not raced:
+            raced.append(True)
+            fd = os.open(
+                dst_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o644,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(fd, b"other writer")
+            finally:
+                os.close(fd)
+        return real(src_dir_fd, src_name, dst_dir_fd, dst_name)
 
-    monkeypatch.setattr(vault_service.os, "link", concurrent_link)
-    with pytest.raises(FileExistsError):
-        vault_service.move_no_clobber(source, destination)
+    monkeypatch.setattr(vault_fs, "rename_noreplace", concurrent)
+    result = await tools.move_note_impl("source.md", "destination.md")
+
+    assert raced
+    assert "already exists" in result.lower(), result
     assert source.read_text() == "source"
     assert destination.read_text() == "other writer"
 
@@ -77,21 +108,30 @@ async def test_soft_delete_retries_concurrent_trash_collision(
 ):
     source = offline / "note.md"
     source.write_text("deleted note", encoding="utf-8")
-    real_link = os.link
-    collided_destination: Path | None = None
+    real = vault_fs.rename_noreplace
+    collided: list[str] = []
 
-    def concurrent_link(src, dst, *args, **kwargs):
-        nonlocal collided_destination
-        if collided_destination is None:
-            collided_destination = Path(dst)
-            collided_destination.write_text("other trash", encoding="utf-8")
-        return real_link(src, dst, *args, **kwargs)
+    def concurrent(src_dir_fd, src_name, dst_dir_fd, dst_name):
+        if not collided:
+            collided.append(dst_name)
+            fd = os.open(
+                dst_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o644,
+                dir_fd=dst_dir_fd,
+            )
+            try:
+                os.write(fd, b"other trash")
+            finally:
+                os.close(fd)
+        return real(src_dir_fd, src_name, dst_dir_fd, dst_name)
 
-    monkeypatch.setattr(vault_service.os, "link", concurrent_link)
+    monkeypatch.setattr(vault_fs, "rename_noreplace", concurrent)
     result = await tools.delete_note_impl("note.md")
 
-    assert "Soft-deleted" in result
-    assert collided_destination is not None
+    assert "Soft-deleted" in result, result
+    assert collided
+    collided_destination = offline / ".trash" / collided[0]
     assert collided_destination.read_text() == "other trash"
     trash_files = sorted((offline / ".trash").iterdir())
     assert len(trash_files) == 2
@@ -296,7 +336,7 @@ def test_bounded_read_uses_open_inode_when_path_is_swapped(offline, monkeypatch)
 def test_planted_temp_symlink_cannot_be_written_through(offline, monkeypatch):
     """A symlink squatting on the temp name never receives the write.
 
-    `_atomic_write` used to stage through `Path.write_bytes`, which follows a
+    `_atomic_write_at` used to stage through `Path.write_bytes`, which follows a
     symlink at the temp name: a process that guessed the name could point it at
     any file the server can write and have the note's bytes truncate it.
     Exclusive `O_CREAT|O_EXCL|O_NOFOLLOW` creation makes that name unusable, so
@@ -307,8 +347,8 @@ def test_planted_temp_symlink_cannot_be_written_through(offline, monkeypatch):
 
     names = iter(["planted", "second", "third"])
 
-    def next_candidate(path: Path) -> Path:
-        return path.with_name(f".tmp-{next(names)}")
+    def next_candidate(name: str) -> str:
+        return f".tmp-{next(names)}"
 
     monkeypatch.setattr(vault_service, "_temp_candidate", next_candidate)
     planted = offline / ".tmp-planted"
@@ -326,9 +366,7 @@ def test_planted_temp_symlink_cannot_be_written_through(offline, monkeypatch):
 def test_planted_temp_symlink_exhausting_every_candidate_fails_closed(
     offline, monkeypatch
 ):
-    monkeypatch.setattr(
-        vault_service, "_temp_candidate", lambda path: path.with_name(".tmp-fixed")
-    )
+    monkeypatch.setattr(vault_service, "_temp_candidate", lambda name: ".tmp-fixed")
     decoy = offline / "decoy.txt"
     decoy.write_text("do not clobber", encoding="utf-8")
     (offline / ".tmp-fixed").symlink_to(decoy)
