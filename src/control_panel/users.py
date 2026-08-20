@@ -134,6 +134,39 @@ async def _lock_admin_guard(session: AsyncSession) -> None:
     )
 
 
+async def _actor_still_privileged(
+    session: AsyncSession, user: User | _SingleUserSentinel
+) -> bool:
+    """Re-read the acting admin's own flags *inside* the critical section.
+
+    `require_admin_panel` authorised this request before the advisory lock
+    was even requested, and waiting for that lock is exactly the window in
+    which another admin's demotion or deactivation of *this* actor commits.
+    Trusting the `User` loaded by the dependency would let a just-demoted
+    account perform the privileged mutation it queued for — the guard would
+    serialize the writes correctly and still let the wrong one through.
+
+    Single-user mode has no `users` row to re-read (the sentinel's `id` is
+    None); there is also no second admin who could have demoted anyone, so
+    the sentinel is simply still privileged.
+    """
+    if not isinstance(user, User):
+        return True
+    row = (
+        await session.execute(
+            select(User.is_admin, User.is_active).where(User.id == user.id)
+        )
+    ).one_or_none()
+    # A deleted actor (row is None) is not privileged either.
+    return row is not None and row.is_admin is True and row.is_active is True
+
+
+_ACTOR_REVOKED_MSG = (
+    "Your account's admin access changed while that request was in flight — "
+    "nothing was saved. Sign in again."
+)
+
+
 # --- Routes ---------------------------------------------------------------
 
 
@@ -313,6 +346,9 @@ async def edit_user_submit(
     # decides on — including `target`'s own flags, which a concurrent edit
     # could otherwise change between this read and our write.
     await _lock_admin_guard(session)
+    if not await _actor_still_privileged(session, user):
+        await session.rollback()
+        return _back_to_list_with_error(_ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
     if target is None:
@@ -434,6 +470,9 @@ async def delete_user(
     # each remove the other's "remaining admin", so they must exclude each
     # other, not just their own kind.
     await _lock_admin_guard(session)
+    if not await _actor_still_privileged(session, user):
+        await session.rollback()
+        return _back_to_list_with_error(_ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
     if target is None:

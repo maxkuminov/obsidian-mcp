@@ -54,8 +54,19 @@ class _Result:
     def scalar_one_or_none(self):
         return self._value
 
+    def one_or_none(self):
+        return self._value
+
     def scalar(self):
         return self._value
+
+
+class _ActorRow:
+    """What `select(User.is_admin, User.is_active)` yields."""
+
+    def __init__(self, is_admin, is_active):
+        self.is_admin = is_admin
+        self.is_active = is_active
 
 
 class _FakeSession:
@@ -63,28 +74,47 @@ class _FakeSession:
     nothing anyone reads), the target row, then the remaining-active-admins
     count."""
 
-    def __init__(self, target: User, remaining_admins: int = 1):
+    def __init__(self, target: User, remaining_admins: int = 1,
+                 actor_after_lock=None):
         self._target = target
         self._remaining_admins = remaining_admins
+        # What the actor's row looks like *once the lock has been taken* —
+        # i.e. after any concurrent demotion has committed. `None` means
+        # "unchanged: still an active admin".
+        self._actor_after_lock = actor_after_lock
         self.committed = False
+        self.rolled_back = False
         self.deleted = None
         self.queries = 0
         self.statements: list[str] = []
         self.lock_keys: list[object] = []
 
     async def execute(self, stmt, *_a, **_k):
-        self.statements.append(str(stmt))
-        if "pg_advisory_xact_lock" in str(stmt):
+        sql = str(stmt)
+        self.statements.append(sql)
+        if "pg_advisory_xact_lock" in sql:
             params = _a[0] if _a else _k.get("params", {})
             self.lock_keys.append(params.get("key"))
             return _Result(None)
-        self.queries += 1
-        if self.queries == 1:
-            return _Result(self._target)
-        return _Result(self._remaining_admins)
+        # Must be a *prefix* test: `select(User)` names every column, so
+        # "users.is_admin, users.is_active" appears in the target query too.
+        if sql.startswith("SELECT users.is_admin, users.is_active"):
+            if self._actor_after_lock is False:  # the actor's row is gone
+                return _Result(None)
+            return _Result(
+                self._actor_after_lock
+                if self._actor_after_lock is not None
+                else _ActorRow(True, True)
+            )
+        if "count(" in sql.lower():
+            return _Result(self._remaining_admins)
+        return _Result(self._target)
 
     async def delete(self, obj):
         self.deleted = obj
+
+    async def rollback(self):
+        self.rolled_back = True
 
     async def commit(self):
         self.committed = True
@@ -105,8 +135,12 @@ def _user(**overrides) -> User:
 
 
 def _submit(actor: User, target: User, *, is_admin: str | None,
-            is_active: str | None, remaining_admins: int = 1):
-    session = _FakeSession(target, remaining_admins=remaining_admins)
+            is_active: str | None, remaining_admins: int = 1,
+            actor_after_lock=None):
+    session = _FakeSession(
+        target, remaining_admins=remaining_admins,
+        actor_after_lock=actor_after_lock,
+    )
     response = asyncio.run(
         users_mod.edit_user_submit(
             user_id=target.id,
@@ -237,8 +271,12 @@ def test_edit_takes_the_lock_before_reading_the_target_row():
     assert "pg_advisory_xact_lock" in session.statements[0]
 
 
-def _delete(actor: User, target: User, *, permanent=False, remaining_admins=1):
-    session = _FakeSession(target, remaining_admins=remaining_admins)
+def _delete(actor: User, target: User, *, permanent=False, remaining_admins=1,
+            actor_after_lock=None):
+    session = _FakeSession(
+        target, remaining_admins=remaining_admins,
+        actor_after_lock=actor_after_lock,
+    )
 
     class _Req:
         query_params = {"permanent": "true"} if permanent else {}
@@ -278,6 +316,116 @@ def test_delete_still_refuses_the_last_active_admin():
     assert bob.is_active is True
     assert "error=" in response.headers["location"]
     assert session.committed is False
+
+
+def test_edit_refuses_when_the_actor_was_demoted_while_waiting():
+    """`require_admin_panel` authorised this request before the lock was even
+    requested, and the wait for that lock is exactly when another admin's
+    demotion of *this* actor commits. Serializing the writes is not enough if
+    the loser then performs the mutation anyway."""
+    me = _user()
+    bob = _user(username="bob")
+    bob.id = 2
+    response, session = _submit(
+        me, bob, is_admin=None, is_active="on", remaining_admins=1,
+        actor_after_lock=_ActorRow(is_admin=False, is_active=True),
+    )
+    assert bob.is_admin is True, "a demoted actor still performed the mutation"
+    assert session.committed is False
+    assert session.rolled_back is True, "the advisory lock must be released"
+    assert "error=" in response.headers["location"]
+
+
+def test_edit_refuses_when_the_actor_was_deactivated_while_waiting():
+    me = _user()
+    bob = _user(username="bob")
+    bob.id = 2
+    response, session = _submit(
+        me, bob, is_admin=None, is_active="on", remaining_admins=1,
+        actor_after_lock=_ActorRow(is_admin=True, is_active=False),
+    )
+    assert bob.is_admin is True
+    assert session.committed is False
+    assert "error=" in response.headers["location"]
+
+
+def test_edit_refuses_when_the_actor_row_is_gone():
+    """A permanently deleted actor has no row at all — not privileged
+    either."""
+    me = _user()
+    bob = _user(username="bob")
+    bob.id = 2
+    response, session = _submit(
+        me, bob, is_admin=None, is_active="on", remaining_admins=1,
+        actor_after_lock=False,  # sentinel: `one_or_none()` finds nothing
+    )
+    assert bob.is_admin is True
+    assert session.committed is False
+    assert "error=" in response.headers["location"]
+
+
+def test_edit_actor_recheck_happens_after_the_lock():
+    """Re-reading before the lock would read the same stale row the
+    dependency did."""
+    me = _user()
+    bob = _user(username="bob")
+    bob.id = 2
+    _, session = _submit(me, bob, is_admin=None, is_active="on")
+    lock_at = _lock_index(session.statements)
+    actor_at = next(
+        i for i, sql in enumerate(session.statements)
+        if sql.startswith("SELECT users.is_admin, users.is_active")
+    )
+    assert lock_at < actor_at
+
+
+def test_delete_refuses_when_the_actor_was_demoted_while_waiting():
+    me = _user()
+    bob = _user(username="bob")
+    bob.id = 2
+    response, session = _delete(
+        me, bob, remaining_admins=1,
+        actor_after_lock=_ActorRow(is_admin=False, is_active=True),
+    )
+    assert bob.is_active is True, "a demoted actor still deleted a user"
+    assert session.committed is False
+    assert session.rolled_back is True
+    assert "error=" in response.headers["location"]
+
+
+def test_delete_actor_recheck_happens_after_the_lock():
+    me = _user()
+    bob = _user(username="bob")
+    bob.id = 2
+    _, session = _delete(me, bob)
+    lock_at = _lock_index(session.statements)
+    actor_at = next(
+        i for i, sql in enumerate(session.statements)
+        if sql.startswith("SELECT users.is_admin, users.is_active")
+    )
+    assert lock_at < actor_at
+
+
+def test_single_user_sentinel_is_not_re_read():
+    """The sentinel has no `users` row (its `id` is None), and there is no
+    second admin who could have demoted it."""
+    class _Sentinel:
+        id = None
+        username = "admin"
+        is_admin = True
+        is_active = True
+
+    bob = _user(username="bob")
+    bob.id = 2
+    response, session = _submit(
+        _Sentinel(), bob, is_admin=None, is_active="on", remaining_admins=1
+    )
+    assert session.committed is True
+    assert "error=" not in response.headers["location"]
+    assert not any(
+        sql.startswith("SELECT users.is_admin, users.is_active")
+        for sql in session.statements
+    )
 
 
 def test_delete_and_edit_share_one_lock_key():

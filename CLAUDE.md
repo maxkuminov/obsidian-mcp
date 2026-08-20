@@ -260,7 +260,13 @@ nothing about the migration body.
   transaction-scoped, so **never commit between taking it and writing the
   flags** — that is what makes the check-then-act atomic. A new handler that
   flips either flag must take it too, and use the *same* constant: two keys
-  do not exclude each other.
+  do not exclude each other. **Immediately after the lock, both handlers
+  re-read the acting admin's own `is_admin`/`is_active`
+  (`_actor_still_privileged`) and refuse unless both are exactly True** —
+  `require_admin_panel` authorised the request before the lock was requested,
+  and the wait for that lock is precisely the window in which another admin's
+  demotion of *this* actor commits; serializing the writes is no use if the
+  loser of the race then performs the mutation anyway.
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
