@@ -73,6 +73,14 @@
 
                     <div style="display:flex;align-items:center;gap:8px;">
                         <span style="font-size:12px;color:var(--text-2);">Scope</span>
+                        {% if grant.mixed_scope %}
+                        {# Migration 014 can merge two pre-014 sessions of one client
+                           and user into a single family, and they may disagree. The
+                           badge shows the strongest permission any live token holds,
+                           so it never under-reports; saving the select writes one
+                           scope across the whole family and clears this. #}
+                        <span class="badge badge-yellow" title="Live tokens in this grant carry different scopes: {{ grant.live_scopes | join(', ') }}. Saving a scope below applies one value to all of them.">mixed</span>
+                        {% endif %}
                         {% if grant.token_id %}
                         <form method="POST" action="/admin/oauth/token/{{ grant.token_id }}/scope" style="display:inline;">
                             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
@@ -150,7 +158,13 @@
                 </table>
                 </div>
                 {% if grant.hidden_count %}
-                <div style="padding:6px 2px 0;font-size:11px;color:var(--text-3);">+ {{ grant.hidden_count }} earlier token{{ '' if grant.hidden_count == 1 else 's' }} from this grant, all revoked or expired.</div>
+                <div style="padding:6px 2px 0;font-size:11px;color:var(--text-3);">
+                    + {{ grant.hidden_count }} earlier token{{ '' if grant.hidden_count == 1 else 's' }} from this grant, all revoked or expired{% if grant.history_truncated %}, and older ones beyond the history window{% endif %}.
+                </div>
+                {% elif grant.history_truncated %}
+                {# Only history is ever truncated — live tokens are read unbounded,
+                   so no grant the operator can act on is ever missing from this page. #}
+                <div style="padding:6px 2px 0;font-size:11px;color:var(--text-3);">Older tokens beyond the history window are not shown.</div>
                 {% endif %}
             </div>
             {% endfor %}

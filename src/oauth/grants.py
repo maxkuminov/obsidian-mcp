@@ -29,7 +29,7 @@ routes both use it, and #67 warned against the panel reaching into
 import hashlib
 import secrets
 
-from sqlalchemy import text, update
+from sqlalchemy import select, text, update
 
 from src.models.db import OAuthToken
 
@@ -142,6 +142,24 @@ async def revoke_grant_family(session, grant_id: str) -> int:
         .values(revoked=True)
     )
     return result.rowcount or 0
+
+
+async def live_family_scopes(session, grant_id: str) -> list[str]:
+    """The scope strings of every still-live token in a family.
+
+    A family is normally uniform, but 014's backfill can merge two pre-014
+    sessions of the same client and user — one `read`, one `readwrite`, or one
+    carrying `offline_access` and one not. Deciding anything from a single row
+    of such a family gets it wrong for the others, so the callers that write a
+    *uniform* scope read the whole set first.
+    """
+    result = await session.execute(
+        select(OAuthToken.scope).where(
+            OAuthToken.grant_id == grant_id,
+            OAuthToken.revoked == False,  # noqa: E712
+        )
+    )
+    return [row for row in result.scalars().all()]
 
 
 async def set_grant_family_scope(session, grant_id: str, scope: str) -> int:

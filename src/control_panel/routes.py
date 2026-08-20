@@ -11,7 +11,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from sqlalchemy import func, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.session import _SingleUserSentinel, get_current_user
@@ -29,7 +29,11 @@ from src.models.db import (
     User,
     UsageLog,
 )
-from src.oauth.grants import revoke_grant_family, set_grant_family_scope
+from src.oauth.grants import (
+    live_family_scopes,
+    revoke_grant_family,
+    set_grant_family_scope,
+)
 from src.oauth.scope import clamp_scope, client_can_write, token_has_write
 from src.services.indexer import invalidate_hnsw_index_cache
 from src.services.vault import warm_user_vault_cache
@@ -554,11 +558,15 @@ async def delete_key_form(
 # rows are counted and reported, never silently dropped.
 GRANT_HISTORY_LIMIT = 5
 
-# Upper bound on token rows read per client, so one chatty client cannot make
-# this page unbounded. Deliberately far above `GRANT_HISTORY_LIMIT` times any
-# plausible number of grants: rows past it are not grouped at all, and losing a
-# whole grant would be worse than losing some of its history.
-CLIENT_TOKEN_SCAN_LIMIT = 1000
+# Upper bound on *dead* token rows read per client. Live rows are deliberately
+# unbounded: a single bound over the whole table applied before grants were
+# identified could push a live grant's refresh token off the page entirely,
+# leaving a working credential with no control to revoke it. That is a strictly
+# worse failure than losing some history, and it is reachable — 501 rotations
+# of one chatty grant were enough. Dead rows are fetched newest-first, so what
+# a truncation loses is the oldest history, never a live grant and never a
+# recent revocation.
+CLIENT_DEAD_TOKEN_SCAN_LIMIT = 500
 
 
 def _token_status(token, now: datetime, owner_active: bool) -> str:
@@ -644,15 +652,28 @@ def _grant_view(grant_id: str, family: list, now: datetime, active_by_owner: dic
         status = "revoked" if all(t.revoked for t in family) else "expired"
         scope = family[0].scope
 
+    # A family is normally uniform — every row descends from one consent and
+    # rotation copies the scope — but migration 014's backfill can legitimately
+    # merge two pre-014 sessions of the same client and user, one `read` and
+    # one `readwrite`. Reading the permission off the newest live row alone
+    # would then show "read" while an older live access token still holds
+    # write. `any` is the fail-safe direction: it over-reports capability, so
+    # the operator is never told a grant is narrower than it is.
+    live_write = [token_has_write(t.scope) for t, _ in live]
+    has_write = any(live_write) if live_write else token_has_write(scope)
+    mixed_scope = bool(live_write) and any(live_write) and not all(live_write)
+
     return {
         "grant_id": grant_id,
         "token_id": token_id,
         "scope": scope,
         # Membership, not equality: "offline_access readwrite" is a write grant
-        # and `== "readwrite"` says it is not. Derived here, from the token's
-        # own scope, through the same helper `src/mcp_server/auth.py` enforces
+        # and `== "readwrite"` says it is not. Derived here, from the tokens'
+        # own scopes, through the same helper `src/mcp_server/auth.py` enforces
         # with — the two agreeing is the property that actually matters (#65).
-        "has_write": token_has_write(scope),
+        "has_write": has_write,
+        "mixed_scope": mixed_scope,
+        "live_scopes": sorted({t.scope for t, _ in live}),
         "status": status,
         "created_at": min(t.created_at for t in family).isoformat(),
         "last_seen_at": max(t.created_at for t in family).isoformat(),
@@ -686,17 +707,44 @@ async def oauth_page(
     # page showed a fresh access+refresh pair as if nothing had happened. It
     # also left the template's `revoked` branches as unreachable dead code.
     tokens_by_client: dict[str, list] = {}
+    truncated_clients: set[str] = set()
     owner_ids: set[int] = set()
     for c in client_rows:
-        token_q = (
-            select(OAuthToken)
-            .where(OAuthToken.client_id == c.client_id)
+        def _scoped(query):
+            query = query.where(OAuthToken.client_id == c.client_id)
+            return query if uid is None else query.where(OAuthToken.user_id == uid)
+
+        # Every *live* token, unbounded. A bound here would decide which grants
+        # the operator can act on, and a chatty grant's rotations would decide
+        # it for them.
+        live_q = _scoped(
+            select(OAuthToken).where(
+                OAuthToken.revoked == False,
+                OAuthToken.expires_at > now,
+            )
+        ).order_by(OAuthToken.created_at.desc(), OAuthToken.id.desc())
+        live_rows = list((await session.execute(live_q)).scalars().all())
+
+        # History, newest first and bounded. Losing the tail of this costs an
+        # old row nobody can act on; losing a live row costs a revocation.
+        dead_q = (
+            _scoped(
+                select(OAuthToken).where(
+                    or_(
+                        OAuthToken.revoked == True,
+                        OAuthToken.expires_at <= now,
+                    )
+                )
+            )
             .order_by(OAuthToken.created_at.desc(), OAuthToken.id.desc())
-            .limit(CLIENT_TOKEN_SCAN_LIMIT)
+            .limit(CLIENT_DEAD_TOKEN_SCAN_LIMIT)
         )
-        if uid is not None:
-            token_q = token_q.where(OAuthToken.user_id == uid)
-        rows = list((await session.execute(token_q)).scalars().all())
+        dead_rows = list((await session.execute(dead_q)).scalars().all())
+        if len(dead_rows) == CLIENT_DEAD_TOKEN_SCAN_LIMIT:
+            # Say so rather than printing a total we did not count.
+            truncated_clients.add(c.client_id)
+
+        rows = live_rows + dead_rows
         tokens_by_client[c.client_id] = rows
         owner_ids.update(t.user_id for t in rows if t.user_id is not None)
 
@@ -711,10 +759,15 @@ async def oauth_page(
         for t in tokens_by_client[c.client_id]:
             grouped.setdefault(t.grant_id, []).append(t)
 
-        grants = [
-            _grant_view(grant_id, family, now, active_by_owner)
-            for grant_id, family in grouped.items()
-        ]
+        history_truncated = c.client_id in truncated_clients
+        grants = []
+        for grant_id, family in grouped.items():
+            # `_grant_view` expects the family newest-first; the two queries
+            # were each ordered that way but concatenated live-then-dead.
+            family.sort(key=lambda t: (t.created_at, t.id), reverse=True)
+            view = _grant_view(grant_id, family, now, active_by_owner)
+            view["history_truncated"] = history_truncated
+            grants.append(view)
         grants.sort(key=lambda g: g["last_seen_at"], reverse=True)
 
         clients.append({
@@ -867,7 +920,14 @@ async def update_oauth_token_scope(
     # Preserve the offline_access marker (informational only - see
     # DEFAULT_CLIENT_SCOPE comment in src/oauth/routes.py) instead of
     # dropping it whenever an admin flips read/readwrite here.
-    has_offline = "offline_access" in token.scope.split()
+    #
+    # Read across the whole live family, not just the row the operator clicked:
+    # 014's backfill can merge two pre-014 sessions into one family, and one of
+    # them may carry the marker while the other does not. The write below is
+    # uniform either way, which is the point — a mixed family is exactly the
+    # case where deciding from one row leaves the others disagreeing.
+    live_scopes = await live_family_scopes(session, token.grant_id)
+    has_offline = any("offline_access" in s.split() for s in live_scopes)
     desired = f"{scope} offline_access" if has_offline else scope
     granted = clamp_scope(desired, client.scope)
     if not granted:

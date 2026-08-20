@@ -157,6 +157,17 @@ def _params(stmt) -> dict:
         return {}
 
 
+def _single_column(stmt) -> str | None:
+    """The attribute name when a select names exactly one ORM column."""
+    try:
+        descriptions = stmt.column_descriptions
+    except Exception:  # pragma: no cover
+        return None
+    if len(descriptions) != 1:
+        return None
+    return getattr(descriptions[0].get("expr"), "key", None)
+
+
 def _is_advisory_lock(stmt) -> bool:
     """Is this the textual `pg_advisory_xact_lock` statement, specifically?"""
     return "pg_advisory_xact_lock" in str(stmt)
@@ -264,10 +275,12 @@ class FakeSession:
             rows = self._filter_tokens(stmt, bound)
             rows.sort(key=lambda t: (t.created_at, t.id), reverse=True)
             rows = _apply_window(stmt, rows)
-            # `select(OAuthToken.grant_id)` (the refresh handler's family
-            # lookup) wants the column, not the row.
-            if getattr(stmt.column_descriptions[0].get("expr", None), "key", None) == "grant_id":
-                return _Result([t.grant_id for t in rows])
+            # A single-column select (`select(OAuthToken.grant_id)` for the
+            # refresh handler's family lookup, `select(OAuthToken.scope)` for
+            # the panel's uniform-scope write) wants the column, not the row.
+            column = _single_column(stmt)
+            if column is not None:
+                return _Result([getattr(t, column) for t in rows])
             return _Result(rows)
 
         if entity is User:
