@@ -166,7 +166,10 @@
                 </div>
                 {% if grant.hidden_count %}
                 <div style="padding:6px 2px 0;font-size:11px;color:var(--text-3);">
-                    + {{ grant.hidden_count }} earlier token{{ '' if grant.hidden_count == 1 else 's' }} from this grant, all revoked or expired{% if grant.history_truncated %}, and older ones beyond the history window{% endif %}.
+                    {# "inactive" rather than "revoked or expired": a token can also be
+                       listed here for carrying no vault scope, and naming only two of the
+                       three reasons invites the reader to rule the third one out. #}
+                    + {{ grant.hidden_count }} earlier inactive token{{ '' if grant.hidden_count == 1 else 's' }} from this grant{% if grant.history_truncated %}, and older ones beyond the history window{% endif %}.
                 </div>
                 {% elif grant.history_truncated %}
                 {# Only history is ever truncated — live tokens are read unbounded,

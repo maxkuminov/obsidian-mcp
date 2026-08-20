@@ -227,6 +227,15 @@ vanished from the page, so the operator saw a blank space that read as success.
   replaced access token run to its expiry is right for rotation and wrong for
   revocation — an hour of surviving write access after the operator clicked
   Revoke is exactly the defect.
+- **Revocation takes effect at the next authenticated request; a request
+  already in flight completes.** `APIKeyMiddleware` resolves the token once, at
+  the start of the request, so a tool call authenticated microseconds before a
+  revoke or downgrade commits still runs with the permission it was granted.
+  Closing that would mean holding the grant lock across tool execution —
+  arbitrary vault I/O, embedding calls, network fetches — trading a bounded,
+  sub-second staleness for unbounded lock contention on every request. Accepted
+  and documented, at the same optimistic level as `edit_note(expected=…)` and
+  the transfer fingerprint check.
 - **`/revoke` (RFC 7009) is family-scoped too**, which §2.1 explicitly permits.
   Anything narrower reproduces the near no-op for any client presenting its
   access token. It **authenticates the client** per its registered method and

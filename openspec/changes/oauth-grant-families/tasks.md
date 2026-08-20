@@ -65,10 +65,16 @@
 - [x] 9.3 MINOR — 014's index check reads `pg_index` (table, `indisvalid`, `indpred`, `indexprs`, exact key attnums); partial / expression / multi-column / wrong-table / INVALID impostors all refused
 - [x] 9.4 MINOR — the fake matches only the exact normalized lock statement and interprets both `expires_at` directions (and the history disjunction as a disjunction); `tests/test_oauth_grant_fakes_fidelity.py` pins both, verified by mutation
 
+## 10. Adversarial round 3 (Codex: 1 MAJOR accepted, 1 MINOR, 1 NIT)
+
+- [x] 10.1 MAJOR **accepted as a documented limitation** — a request authenticated just before a revoke/downgrade commits still runs its tool with the stale permission. Holding the grant lock across tool execution would trade bounded, sub-second staleness for unbounded contention on every request; recorded in design.md and the CLAUDE.md OAuth section
+- [x] 10.2 MINOR — 014's pre-existing-index lookup is schema-qualified: table resolved to an OID, index resolved by name **in that table's namespace**, more than one match fatal. A shadow-schema index of the same name no longer refuses a healthy database
+- [x] 10.3 NIT — the hidden-history line reads "earlier inactive token(s)" instead of naming only two of the three inactive reasons
+
 ## 7. Gates
 
-- [x] 7.1 `pytest --ignore=tests/integration` green (1213 passed, 5 skipped, post-rebase)
-- [x] 7.2 `make test-schema` green (34 passed) — includes `alembic check` clean on every path
+- [x] 7.1 `pytest --ignore=tests/integration` green (1242 passed, 5 skipped, post-rebase)
+- [x] 7.2 `make test-schema` green (35 passed) — includes `alembic check` clean on every path
 - [x] 7.3 `openspec validate oauth-grant-families --strict`
-- [x] 7.4 Adversarial Codex rounds 1 and 2 addressed (sections 8 and 9); re-run is orchestrator's
+- [x] 7.4 Adversarial Codex rounds 1-3 addressed (sections 8-10); round 3's MAJOR is an accepted, documented limitation
 - [ ] 7.5 Deploy + `make db-check` (orchestrator-run)

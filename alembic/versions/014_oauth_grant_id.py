@@ -125,41 +125,74 @@ def _column_shape(bind):
     ).first()
 
 
-def _existing_index(bind):
+def _table_oid(bind) -> int:
+    """The OID `oauth_tokens` resolves to, through the session's search_path.
+
+    Every other statement in this migration names the table unqualified, so
+    they all resolve the same way. Taking the OID once and keying the catalog
+    lookups off it is what keeps the checks talking about the same object the
+    DDL will touch.
+    """
+    return bind.execute(
+        sa.text("SELECT CAST(:table AS regclass)::oid"), {"table": TABLE}
+    ).scalar_one()
+
+
+def _existing_index(bind, table_oid: int):
     """Everything we need to judge a pre-existing index of our name.
 
-    `(relname_of_table, indisvalid, is_partial, has_expressions, key_attnums)`,
-    or None when the name is free.
+    `(indrelid, indisvalid, is_partial, has_expressions, key_attnums)`, or None
+    when the name is free **in the table's own schema**.
 
-    The first version of this asked only "which column is it on?" and matched
-    with `attnum = ANY(indkey)`. That accepts an impostor several ways over: a
-    *partial* index (`WHERE token_type = 'access'`) covers a subset of rows, an
-    *expression* index (`lower(grant_id)`) cannot serve an equality lookup on
-    the column, a *multi-column* index leads with the wrong key, one on another
-    table entirely shares nothing but the name, and an INVALID leftover from a
-    failed `CREATE INDEX CONCURRENTLY` is not usable at all. Every one of those
-    would be kept by `CREATE INDEX IF NOT EXISTS` and leave `alembic check`
-    permanently dirty while looking installed — autogenerate compares index
-    *names*.
+    Two rounds of narrowing got this here. The first version asked only "which
+    column is it on?" and matched with `attnum = ANY(indkey)`, which accepts an
+    impostor several ways over: a *partial* index (`WHERE token_type='access'`)
+    covers a subset of rows, an *expression* index (`lower(grant_id)`) cannot
+    serve an equality lookup on the column, a *multi-column* index leads with
+    the wrong key, and an INVALID leftover from a failed `CREATE INDEX
+    CONCURRENTLY` is not usable at all. Each would be kept by `CREATE INDEX IF
+    NOT EXISTS` and leave `alembic check` permanently dirty while looking
+    installed, because autogenerate compares index *names*.
+
+    The second was that the lookup matched `relname` across **every schema**.
+    An unrelated `shadow.ix_oauth_tokens_grant_id` is not our index and cannot
+    collide with anything we create — `CREATE INDEX` places the index in its
+    table's schema — yet it would be found and the migration would refuse a
+    database that is perfectly fine. So the index is resolved by OID in the
+    namespace of the table we just resolved, which is exactly the name
+    `CREATE INDEX IF NOT EXISTS` tests against.
+
+    More than one row is impossible (`pg_class` is unique on
+    `(relname, relnamespace)`) and is nevertheless treated as fatal rather than
+    silently taking the first: if that assumption ever stops holding, guessing
+    which object the DDL will hit is the wrong response.
 
     `indkey` is an int2vector; `string_to_array(indkey::text, ' ')` is the
     portable way to read it as an array. A zero entry means an expression
     column, which `indexprs IS NOT NULL` already catches.
     """
-    return bind.execute(
+    rows = bind.execute(
         sa.text(
-            "SELECT t.relname AS table_name, "
+            "SELECT i.indrelid, "
             "       i.indisvalid, "
             "       (i.indpred IS NOT NULL) AS is_partial, "
             "       (i.indexprs IS NOT NULL) AS has_expressions, "
             "       string_to_array(i.indkey::text, ' ')::int[] AS key_attnums "
             "FROM pg_index i "
             "JOIN pg_class c ON c.oid = i.indexrelid "
-            "JOIN pg_class t ON t.oid = i.indrelid "
-            "WHERE c.relname = :index"
+            "WHERE c.relname = :index "
+            "  AND c.relnamespace = ("
+            "        SELECT relnamespace FROM pg_class WHERE oid = :table_oid)"
         ),
-        {"index": INDEX},
-    ).first()
+        {"index": INDEX, "table_oid": table_oid},
+    ).all()
+    if len(rows) > 1:
+        raise RuntimeError(
+            f"{len(rows)} relations named {INDEX} in the schema of {TABLE}. "
+            "That should be impossible, and 014 will not guess which one "
+            "`CREATE INDEX IF NOT EXISTS` would match. Nothing has been changed."
+        )
+    return rows[0] if rows else None
 
 
 def _column_attnum(bind) -> int:
@@ -191,13 +224,17 @@ def _require_pre_existing_column_is_ours(bind, shape) -> None:
             "Nothing has been changed."
         )
 
-    existing = _existing_index(bind)
+    table_oid = _table_oid(bind)
+    existing = _existing_index(bind, table_oid)
     if existing is not None:
-        table_name, indisvalid, is_partial, has_expressions, key_attnums = existing
+        indrelid, indisvalid, is_partial, has_expressions, key_attnums = existing
         expected = [_column_attnum(bind)]
         problem = None
-        if table_name != TABLE:
-            problem = f"it indexes table {table_name!r}, not {TABLE!r}"
+        if indrelid != table_oid:
+            # Same schema, same name, different table — only reachable if the
+            # index was created on another relation and then that relation was
+            # renamed into this one's place.
+            problem = f"it indexes another relation, not {TABLE!r}"
         elif not indisvalid:
             problem = (
                 "it is INVALID (a failed CREATE INDEX CONCURRENTLY leaves one "

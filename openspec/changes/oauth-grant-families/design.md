@@ -126,3 +126,12 @@ chatty client cannot make the page unbounded.
   registration was narrowed after the grant now sees a narrower `scope` in the
   refresh response. That is the point, and RFC 6749 §5.1 requires the response
   to state the granted scope when it differs from what was requested.
+- **Revocation takes effect at the next authenticated request; an in-flight
+  request completes.** `APIKeyMiddleware` resolves the token once, at the start
+  of the request, so a tool call authenticated microseconds before a revoke or
+  downgrade commits still runs with the permission it was granted. Closing that
+  would mean holding the grant lock across tool execution — arbitrary vault I/O,
+  embedding calls, network fetches — which trades a bounded, sub-second
+  staleness for unbounded lock contention on every request. Accepted as a
+  documented limitation: it is the same optimistic level as `edit_note(expected=…)`
+  and the transfer fingerprint check, declared rather than implied.

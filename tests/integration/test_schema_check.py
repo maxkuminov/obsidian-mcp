@@ -1066,7 +1066,7 @@ INDEX_IMPOSTORS = (
     (
         "on another table",
         "CREATE INDEX ix_oauth_tokens_grant_id ON oauth_codes (client_id)",
-        "indexes table",
+        "indexes another relation",
     ),
 )
 
@@ -1121,6 +1121,54 @@ def test_an_invalid_index_of_our_name_is_refused():
         assert result.returncode != 0
         assert "INVALID" in result.stdout + result.stderr
         assert alembic_version(url) == "012"
+
+
+def test_an_index_of_our_name_in_another_schema_is_ignored():
+    """Namespace, not bare name: a shadow schema is not our schema.
+
+    `CREATE INDEX` places an index in its table's schema, so
+    `shadow.ix_oauth_tokens_grant_id` cannot collide with anything 014 creates
+    and says nothing about `oauth_tokens`. A lookup matching `relname` across
+    every schema found it anyway and refused a database that was perfectly
+    fine — the migration would have been unrunnable until an unrelated object
+    somebody else owns was dropped.
+    """
+    with throwaway_db("schema_grant_index_shadow", revision="012") as url:
+        seed_pre_014_tokens(url)
+        # The index check only runs on the pre-existing-column path, so the
+        # column has to be there for this case to reach it at all.
+        add_bare_grant_id_column(url)
+        sql(
+            url,
+            "UPDATE oauth_tokens SET grant_id = "
+            "  'hand-' || client_id || '-' || coalesce(user_id::text, 'null')",
+        )
+        sql(url, "CREATE SCHEMA shadow")
+        sql(url, "CREATE TABLE shadow.decoy (grant_id text, token_type text)")
+        # Same name, same column name, different schema — and partial, so the
+        # old bare-name lookup would have rejected it as an impostor rather
+        # than merely mis-identifying it.
+        sql(
+            url,
+            "CREATE INDEX ix_oauth_tokens_grant_id ON shadow.decoy (grant_id) "
+            "WHERE token_type = 'access'",
+        )
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == "014"
+        assert_reconciled(url, marker_expected=False)
+        # Ours was created in the table's own schema, and the decoy is untouched.
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM pg_indexes WHERE indexname = "
+            "'ix_oauth_tokens_grant_id'",
+        ) == 2
+        assert fetchval(
+            url,
+            "SELECT indexdef FROM pg_indexes WHERE indexname = "
+            "'ix_oauth_tokens_grant_id' AND schemaname = 'public'",
+        ) is not None
 
 
 def test_the_genuine_index_is_accepted():
