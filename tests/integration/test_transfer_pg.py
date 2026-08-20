@@ -990,6 +990,232 @@ async def test_a_scope_downgrade_before_the_insert_mints_nothing(clean, vault_ro
     assert [r.direction for r in rows] == ["download"]
 
 
+# ── ownerless capabilities are nobody once multi-user mode is on ───────────
+
+
+async def _ownerless_credentials(session):
+    """An API key and an OAuth access token with `user_id IS NULL`.
+
+    The shape a vault gets after running single-user for a while: rows minted
+    when there were no users at all.
+    """
+    key = APIKey(
+        user_id=None,
+        name="k",
+        key_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+        key_prefix="omcp_test",
+        permission="readwrite",
+        is_active=True,
+    )
+    client = OAuthClient(
+        user_id=None,
+        client_id=uuid.uuid4().hex,
+        client_secret_hash="x" * 64,
+        client_name="c",
+        redirect_uris=["https://example.com/cb"],
+        scope="readwrite",
+    )
+    session.add_all([key, client])
+    await session.flush()
+    oauth = OAuthToken(
+        user_id=None,
+        token_hash=uuid.uuid4().hex + uuid.uuid4().hex,
+        token_type="access",
+        client_id=client.client_id,
+        scope="readwrite",
+        expires_at=_now() + datetime.timedelta(hours=1),
+        revoked=False,
+    )
+    session.add(oauth)
+    await session.commit()
+    return key, oauth
+
+
+@pytest.mark.parametrize("direction", ["upload", "download"])
+@pytest.mark.parametrize("credential", ["api_key", "oauth"])
+async def test_an_ownerless_capability_dies_when_multi_user_is_enabled(
+    clean, vault_root, monkeypatch, direction, credential
+):
+    """`None == None` used to pass the ownership check, authorising a global root.
+
+    An ownerless key mints a capability in single-user mode; the operator then
+    enables multi-user. The MCP middleware starts rejecting the key, but the
+    already-minted capability was still redeemable — it compared
+    `settings.vault_path` against its stored root and published. Fail closed:
+    in multi-user mode an ownerless identity is nobody, and every predicate the
+    routes consult says so.
+    """
+    monkeypatch.setattr(transfer.settings, "vault_path", str(vault_root))
+    async with clean() as session:
+        key, oauth = await _ownerless_credentials(session)
+        identity = (
+            transfer.Identity(key_id=key.id)
+            if credential == "api_key"
+            else transfer.Identity(oauth_token_id=oauth.id)
+        )
+        _token, row, _window = await transfer.mint_token(
+            session,
+            direction,
+            "Attachments/shot.png",
+            overwrite=False,
+            identity=identity,
+            vault_root=str(vault_root),
+            expected_fingerprint=None,
+        )
+        assert row.user_id is None
+        need_write = direction == "upload"
+
+        # Single-user mode: still exactly as usable as it was.
+        assert await transfer.resolve_identity_ok(session, row, need_write=need_write)
+        assert await transfer.resolve_root_ok(session, row)
+
+        monkeypatch.setattr(transfer.settings, "multi_user_mode", True)
+
+        assert not await transfer.resolve_identity_ok(
+            session, row, need_write=need_write
+        )
+        # Both halves of the defensive pair, not just the credential one.
+        assert not await transfer.resolve_root_ok(session, row)
+        cred = key if credential == "api_key" else oauth
+        assert not transfer.locked_rows_ok(
+            transfer.LockedRows(token=row, credential=cred, user=None),
+            need_write=need_write,
+        )
+
+        # And nothing new can be minted from it either.
+        with pytest.raises(transfer.CredentialNotUsable):
+            await transfer.mint_token(
+                session,
+                direction,
+                "Attachments/other.png",
+                overwrite=False,
+                identity=identity,
+                vault_root=str(vault_root),
+                expected_fingerprint=None,
+            )
+        await session.rollback()
+
+
+async def test_an_ownerless_upload_token_gets_the_uniform_404(
+    clean, vault_root, wired, monkeypatch
+):
+    """End to end: the PUT refuses and the target is never written."""
+    monkeypatch.setattr(transfer.settings, "vault_path", str(vault_root))
+    async with clean() as session:
+        key, _oauth = await _ownerless_credentials(session)
+        token, row, _window = await transfer.mint_token(
+            session,
+            "upload",
+            "Attachments/shot.png",
+            overwrite=False,
+            identity=transfer.Identity(key_id=key.id),
+            vault_root=str(vault_root),
+            expected_fingerprint=None,
+        )
+        token_id = row.id
+
+    monkeypatch.setattr(transfer.settings, "multi_user_mode", True)
+    async with _client("203.0.113.40") as client:
+        response = await client.put(
+            "/transfer/upload",
+            headers={"Authorization": f"Bearer {token}"},
+            content=PAYLOAD,
+        )
+    assert response.status_code == 404
+    assert response.json() == {"error": "not found"}
+    assert not (vault_root / "Attachments" / "shot.png").exists()
+
+    async with wired() as session:
+        fresh = (
+            await session.execute(
+                select(TransferToken).where(TransferToken.id == token_id)
+            )
+        ).scalar_one()
+        # Refused before publication, so the claim goes back rather than
+        # stranding — the token is simply unusable while multi-user is on.
+        assert fresh.state == "pending"
+
+
+async def test_an_ownerless_download_token_gets_the_uniform_404(
+    clean, vault_root, wired, monkeypatch
+):
+    from src.services import vault_fs as _vault_fs
+
+    target = vault_root / "Attachments" / "spec.pdf"
+    target.write_bytes(b"%PDF-1.4\n" + b"body " * 100)
+    root_fd = _vault_fs.open_root(vault_root)
+    try:
+        dir_fd, name = _vault_fs.open_parent(root_fd, "Attachments/spec.pdf")
+        try:
+            fingerprint = _vault_fs.fingerprint(dir_fd, name, hash_up_to=10**9)
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(root_fd)
+
+    monkeypatch.setattr(transfer.settings, "vault_path", str(vault_root))
+    async with clean() as session:
+        _key, oauth = await _ownerless_credentials(session)
+        token, _row, _window = await transfer.mint_token(
+            session,
+            "download",
+            "Attachments/spec.pdf",
+            overwrite=False,
+            identity=transfer.Identity(oauth_token_id=oauth.id),
+            vault_root=str(vault_root),
+            expected_fingerprint=fingerprint,
+        )
+
+    headers = {"Authorization": f"Bearer {token}"}
+    monkeypatch.setattr(transfer.settings, "multi_user_mode", True)
+    async with _client("203.0.113.41") as client:
+        info = await client.get("/transfer/download/info", headers=headers)
+        got = await client.get("/transfer/download/file", headers=headers)
+    assert info.status_code == got.status_code == 404
+    assert got.json() == {"error": "not found"}
+
+
+async def test_a_gate_delayed_past_the_deadline_consumes_the_token(
+    clean, vault_root, wired, monkeypatch
+):
+    """The real gate, real locks: past the deadline nothing is published.
+
+    `_drain` bounds the body; the gate runs after it and can wait arbitrarily
+    long on `SELECT … FOR UPDATE`. The clock is stepped from inside
+    `lock_for_publish` — between drain completion and the publish — and the
+    request must end as a deadline overrun, which the state machine answers by
+    consuming the token.
+    """
+    async with clean() as session:
+        _user, _key, token, row = await _mint_upload(session, vault_root)
+        token_id = row.id
+
+    real_lock = transfer.lock_for_publish
+    stepped = _now() + datetime.timedelta(hours=1)
+
+    async def slow_lock(session, tid):
+        monkeypatch.setattr(transfer, "now_utc", lambda: stepped)
+        return await real_lock(session, tid)
+
+    monkeypatch.setattr(transfer, "lock_for_publish", slow_lock)
+
+    async with _client("203.0.113.42") as client:
+        response = await client.put(
+            "/transfer/upload",
+            headers={"Authorization": f"Bearer {token}"},
+            content=PAYLOAD,
+        )
+    assert response.status_code == 408
+    assert not (vault_root / "Attachments" / "shot.png").exists()
+    async with wired() as session:
+        fresh = (
+            await session.execute(
+                select(TransferToken).where(TransferToken.id == token_id)
+            )
+        ).scalar_one()
+    assert fresh.state == "consumed"
+
+
 async def test_route_upload_round_trip(clean, vault_root, wired):
     async with clean() as session:
         _user, key, token, row = await _mint_upload(session, vault_root)

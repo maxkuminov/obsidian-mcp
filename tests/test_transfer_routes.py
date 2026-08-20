@@ -742,6 +742,69 @@ async def test_the_deadline_consumes_the_token(client, harness, vault, monkeypat
     assert temp_files(vault / "Attachments") == []
 
 
+async def test_a_gate_delayed_past_the_deadline_publishes_nothing(
+    client, harness, vault, monkeypatch
+):
+    """The deadline is re-checked inside the locked gate, not only in `_drain`.
+
+    `_drain` bounds the *body*, but the gate runs afterwards and can wait
+    arbitrarily long on `SELECT … FOR UPDATE` — behind another publisher, or a
+    migration. A body that finished a moment inside the deadline would
+    otherwise publish (an overwrite included) long after the capability
+    expired, while `check_upload` was already answering `unknown` for it.
+
+    The clock is stepped from inside `lock_for_publish`, i.e. exactly between
+    drain completion and the publish. The refusal must be the existing
+    `Timeout`, because the state machine says a request that ran past its
+    deadline *consumes* its token: a retry mints afresh rather than replaying a
+    link whose window is gone.
+    """
+    stub = transfer.lock_for_publish
+    stepped = _now() + datetime.timedelta(hours=1)
+
+    async def slow_lock(session, token_id):
+        monkeypatch.setattr(transfer, "now_utc", lambda: stepped)
+        return await stub(session, token_id)
+
+    monkeypatch.setattr(transfer, "lock_for_publish", slow_lock)
+
+    response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+
+    assert response.status_code == 408
+    assert not (vault / "Attachments" / "shot.png").exists()
+    assert temp_files(vault / "Attachments") == []
+    assert harness.completed == []
+    assert harness.consumed == 1
+    assert harness.released == 0
+    assert harness.row.state == "consumed"
+
+
+async def test_a_gate_delayed_past_the_deadline_leaves_an_overwrite_target_alone(
+    client, harness, vault, monkeypatch
+):
+    """The destructive case: the incumbent must survive untouched."""
+    target = vault / "Attachments" / "shot.png"
+    target.write_bytes(b"the original bytes")
+    harness.row.overwrite = True
+    harness.row.expected_fingerprint = None  # not read: we never reach publish
+
+    stub = transfer.lock_for_publish
+    stepped = _now() + datetime.timedelta(hours=1)
+
+    async def slow_lock(session, token_id):
+        monkeypatch.setattr(transfer, "now_utc", lambda: stepped)
+        return await stub(session, token_id)
+
+    monkeypatch.setattr(transfer, "lock_for_publish", slow_lock)
+
+    response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+
+    assert response.status_code == 408
+    assert target.read_bytes() == b"the original bytes"
+    assert temp_files(vault / "Attachments") == []
+    assert harness.row.state == "consumed"
+
+
 async def test_an_idle_stall_consumes_the_token(client, harness, monkeypatch):
     """The idle timeout is 30 s in production; the route's mapping is what matters."""
 

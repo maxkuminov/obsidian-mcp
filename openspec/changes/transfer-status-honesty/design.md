@@ -74,6 +74,41 @@ null as unusable, so `credential_expires_at` maps a null OAuth expiry to the
 epoch — "already dead" — rather than to `None`, which means "immortal" and is
 correct only for an API key.
 
+### D4b. The deadline is re-checked inside the locked gate
+
+`_drain` bounds the *body*. The publish gate runs after it and can wait for an
+unbounded time on `SELECT … FOR UPDATE` — behind another publisher, a migration,
+or a long transaction. So a body that finished a second inside the deadline
+could publish, overwrite included, long after the capability's advertised
+expiry, at a moment when `check_upload` was already answering `unknown` for the
+same token. `_refuse_if_past_deadline` runs as the last thing before
+`vault_fs.publish`, inside the locks, which is the only point where "still in
+time" and "about to write" are the same instant.
+
+It raises the existing `Timeout`, deliberately. The route maps that to
+`consume`, and consuming is what the state machine says about a request that
+ran past its deadline: a retry must mint afresh rather than replay a link whose
+window is gone. It is also unambiguously pre-publication — `state["published"]`
+is still false — so the `PostPublishFailure`-is-the-only-post-publish-exception
+contract is untouched. It takes the deadline from the parameter rather than
+re-deriving it from `row`, so `import_from_url`'s monotonic budget gets the same
+treatment without needing a row shape it does not have.
+
+### D4c. An ownerless identity is nobody once multi-user mode is on
+
+`user_id IS NULL` means "single-user vault" on a credential and on a token. The
+ownership comparison in `_credential_ok` is `cred.user_id == row.user_id`, and
+`None == None` passes; `resolve_root_ok` and `locked_rows_ok` then authorised
+`settings.vault_path` outright. So a capability minted by an ownerless key
+*before* an operator enabled multi-user mode stayed redeemable afterwards —
+replacing a file in whatever vault that setting names — even once the MCP
+middleware had started rejecting the same key.
+
+`_ownerless_in_multi_user` is consulted in all three places rather than only in
+`_credential_ok`: the two root checks are the other half of a defensive pair, so
+neither is the only thing standing between a stale capability and the global
+root. Single-user mode is unchanged, byte for byte.
+
 ### D5. Refuse under 30 seconds
 
 An already-dead or two-second link is worse than an error: the error tells the
@@ -107,3 +142,12 @@ still through `textContent`.
   that was redeemable becomes unredeemable.
 - **`mint_token` now reads the credential row**, so any test double for its
   session must answer that lookup.
+- **Accepted limitation: the mint-time credential validation is an unlocked
+  `SELECT`.** A revoke, downgrade or reassignment that commits between
+  `plan_mint_window` reading the credential and the row's INSERT produces a
+  capability that every redemption rejects and that `check_upload` reports as
+  `revoked`. That is fail-closed and matches the optimistic level declared
+  everywhere else in this design — locking the credential across the mint would
+  hold a row lock across a filesystem probe and a fingerprint hash for no
+  security gain, since the *publish* gate is where the locked re-check that
+  matters already happens.

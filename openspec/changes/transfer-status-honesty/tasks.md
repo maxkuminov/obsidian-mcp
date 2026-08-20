@@ -90,6 +90,26 @@
       branch), `test_info_reports_an_overwrite_token_as_such`, and `overwrite`
       asserted in `test_info_returns_the_bound_metadata`
 
+## 5b. The publish gate re-checks the deadline, and ownerless identities fail closed
+
+- [x] 5b.1 `_refuse_if_past_deadline` runs inside the locked gate immediately
+      before `vault_fs.publish`, raising the existing `Timeout` so the route
+      consumes the token; contract that `PostPublishFailure` is the only
+      post-publication exception is preserved
+- [x] 5b.2 Tests: `test_a_gate_delayed_past_the_deadline_publishes_nothing`,
+      `test_a_gate_delayed_past_the_deadline_leaves_an_overwrite_target_alone`
+      (route level), `test_a_gate_delayed_past_the_deadline_consumes_the_token`
+      (Postgres, real locks)
+- [x] 5b.3 `_ownerless_in_multi_user` consulted by `_credential_ok`,
+      `resolve_root_ok` and `locked_rows_ok`; single-user mode unchanged
+- [x] 5b.4 Tests (Postgres):
+      `test_an_ownerless_capability_dies_when_multi_user_is_enabled`
+      (upload/download × API key/OAuth, covering mint, both predicates and
+      `locked_rows_ok`), `test_an_ownerless_upload_token_gets_the_uniform_404`,
+      `test_an_ownerless_download_token_gets_the_uniform_404`
+- [x] 5b.5 Document the accepted limitation that mint-time credential
+      validation is an unlocked `SELECT` (design.md + CLAUDE.md)
+
 ## 6. Documentation and spec
 
 - [x] 6.1 Spec deltas for the three modified `file-transfer` requirements

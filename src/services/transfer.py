@@ -609,10 +609,31 @@ async def lookup_upload(session, token: str) -> TransferToken | None:
     return await lookup_token(session, token, direction="upload")
 
 
+def _ownerless_in_multi_user(*user_ids) -> bool:
+    """Is a `user_id IS NULL` being treated as an identity while multi-user is on?
+
+    In single-user mode a null owner is normal — there are no users, and the
+    vault root is the globally configured one. In multi-user mode it is a
+    *stale* row: a key or token minted before the operator flipped the switch,
+    which now belongs to nobody. `None == None` quietly passed the ownership
+    comparison and `resolve_root_ok` / `locked_rows_ok` then authorised
+    `settings.vault_path` outright, so an ownerless capability minted before
+    the switch could still replace a file in whichever vault that setting names
+    — after the MCP middleware had already started rejecting the same key.
+
+    Fail closed: in multi-user mode an ownerless identity is nobody, and the
+    routes answer with the uniform 404.
+    """
+    return settings.multi_user_mode and any(uid is None for uid in user_ids)
+
+
 def _credential_ok(cred, *, need_write: bool, row: TransferToken) -> bool:
     """Exact predicates from D4 — kept in one place so the pre-publication
     re-check and the entry check cannot drift apart."""
     now = _now()
+    # Before anything else: an ownerless row is not an identity here.
+    if _ownerless_in_multi_user(getattr(row, "user_id", None), cred.user_id):
+        return False
     if isinstance(cred, APIKey):
         if not cred.is_active:
             return False
@@ -686,6 +707,12 @@ async def resolve_root_ok(session, row: TransferToken) -> bool:
     turn a reassignment into a 500.
     """
     if row.user_id is None:
+        # Defence in depth — `_credential_ok` already refuses this row in
+        # multi-user mode, and this is the other half of the pair, so neither
+        # check alone is the only thing standing between a stale ownerless
+        # capability and the globally configured vault.
+        if _ownerless_in_multi_user(row.user_id):
+            return False
         return canonical_vault_root(settings.vault_path) == row.vault_root
     result = await session.execute(
         select(User.vault_path, User.is_active).where(User.id == row.user_id)
@@ -751,6 +778,9 @@ def locked_rows_ok(locked: LockedRows, *, need_write: bool) -> bool:
             return False
         if canonical_vault_root(locked.user.vault_path) != locked.token.vault_root:
             return False
+    elif _ownerless_in_multi_user(locked.token.user_id):
+        # Same defensive pair as `resolve_root_ok`, on the locked rows.
+        return False
     elif canonical_vault_root(settings.vault_path) != locked.token.vault_root:
         return False
     return True
@@ -1023,6 +1053,27 @@ async def stream_to_vault(
         )
 
 
+def _refuse_if_past_deadline(deadline: float | datetime.datetime) -> None:
+    """Raise `Timeout` when the stream deadline has already passed.
+
+    Deliberately the *existing* `Timeout` and not a new type: the upload route
+    maps it to `consume`, and consuming is what the state machine says about a
+    request that ran past its deadline — a retry must mint afresh rather than
+    replay a link whose window is gone. It is also unambiguously
+    pre-publication, so raising it here preserves the contract that
+    `PostPublishFailure` is the only exception `stream_to_vault` raises once
+    the bytes are in place: `state["published"]` is still false, so the
+    surrounding handler re-raises this untouched.
+
+    For an upload `deadline` is `upload_stream_deadline(row)` measured against
+    `now_utc()`; taking it from the parameter rather than re-deriving it from
+    `row` keeps this working for `import_from_url`, whose row has no expiry and
+    whose monotonic fetch budget deserves the same treatment.
+    """
+    if _deadline_remaining(deadline) <= 0:
+        raise Timeout("Upload exceeded its deadline before it could be published")
+
+
 def _close_quietly(fd: int, what: str) -> None:
     """Close a descriptor; a failing close never fails the operation.
 
@@ -1135,6 +1186,7 @@ async def _stream_locked(
 
         try:
             if before_publish is None:
+                _refuse_if_past_deadline(deadline)
                 _publish_into_current_parent(
                     root_fd, staging_fd, tmp_name, row, _record
                 )
@@ -1145,6 +1197,18 @@ async def _stream_locked(
                         raise PrePublishAborted(
                             "The minting identity or vault root is no longer valid"
                         )
+                    # **Last thing before the bytes move, inside the locks.**
+                    # `_drain` checks the deadline while reading the body, but
+                    # the gate can take arbitrarily long after that: it waits
+                    # on `SELECT … FOR UPDATE` behind another writer or a
+                    # migration. A body that finished a second inside the
+                    # deadline could therefore publish — an overwrite
+                    # included — minutes after the capability's advertised
+                    # expiry, while `check_upload` was already reporting
+                    # `unknown` for it. Re-checking here, holding the locks,
+                    # is the only place where "still in time" and "about to
+                    # write" are the same instant.
+                    _refuse_if_past_deadline(deadline)
                     _publish_into_current_parent(
                         root_fd, staging_fd, tmp_name, row, _record
                     )

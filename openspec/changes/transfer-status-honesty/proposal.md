@@ -53,6 +53,18 @@ on them without anybody reading the database.
   downgraded between the tool's permission check and the INSERT mints nothing.
   Under 30 s of runway — or no credential at all — refuses the mint. The tool
   result says when and why the TTL was shortened.
+- The stream deadline is **re-checked inside the locked publish gate**,
+  immediately before `vault_fs.publish`. `_drain` bounds the body; the gate can
+  wait unboundedly on `SELECT … FOR UPDATE` afterwards, so a body that finished
+  just inside the deadline could publish (overwrite included) long after the
+  capability expired. It raises the existing `Timeout`, so the route consumes
+  the token per the state machine, and it is unambiguously pre-publication.
+- **An ownerless identity is nobody in multi-user mode.** `user_id IS NULL`
+  passed the ownership comparison (`None == None`) and the two vault-root checks
+  then authorised the globally configured `VAULT_PATH` without consulting
+  `MULTI_USER_MODE`, so a capability minted by an ownerless key before the
+  operator flipped the switch stayed redeemable after it. All three predicates
+  now fail closed; single-user mode is unchanged.
 - The upload page gains a **Mode** row and destructive labelling for
   `overwrite=True`, driven from the `overwrite` field already in the info
   payload.
@@ -73,15 +85,18 @@ afterwards, which is the same guidance made conditional on the truth.
 
 ### Modified Capabilities
 - `file-transfer`: `check_upload`'s reported states and liveness re-check;
-  token expiry clamped to the minting credential; the upload consent page must
-  state the mode.
+  token expiry clamped to the minting credential; the stream deadline re-checked
+  inside the publish gate; ownerless identities refused in multi-user mode; the
+  upload consent page must state the mode.
 
 ## Impact
 
 - `src/services/transfer.py` — `now_utc`, `_deadline_remaining`,
   `MIN_MINT_TTL_SECONDS`, `CredentialNotUsable` /
   `CredentialTooShortLived`, `credential_expires_at`, `MintWindow`,
-  `plan_mint_window`, `upload_stream_deadline`; `mint_token` returns
+  `plan_mint_window`, `upload_stream_deadline`, `_refuse_if_past_deadline`,
+  `_ownerless_in_multi_user` (consulted by `_credential_ok`, `resolve_root_ok`
+  and `locked_rows_ok`); `mint_token` returns
   `(token, row, window)` and takes no window; `_drain` measures its deadline
   through `_deadline_remaining`; `_load_credential` accepts an `Identity` as
   well as a token row.
