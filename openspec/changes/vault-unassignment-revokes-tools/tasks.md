@@ -64,7 +64,39 @@
       snapshot does not outlive the request
 - [x] 5.14 Assert the *rendered* option text from `user_edit.html`
 
+## 7. Ownerless credentials (multi-user mode)
+
+- [x] 7.1 `APIKeyMiddleware` 401s an API key with `user_id IS NULL` when
+      `settings.multi_user_mode`, logging `reason=ownerless_credential` and
+      returning the same body as any other rejected key
+- [x] 7.2 Same on the OAuth-token branch
+- [x] 7.3 `_vault_root(None)` raises in multi-user mode instead of returning
+      `settings.vault_path`
+- [x] 7.4 Confirm the bootstrap backfill in `src/auth/routes.py` is unaffected:
+      it runs in the panel POST `/admin/auth/register`, never through
+      `APIKeyMiddleware`, and only while `users` is empty
+- [x] 7.5 Single-user mode unchanged — an unbound credential still
+      authenticates and resolves `settings.vault_path`
+
+## 8. Panel vault browser
+
+- [x] 8.1 `vault_page` uses the `Path | None` returned by
+      `warm_user_vault_cache` instead of re-reading the shared cache through
+      `_vault_root`
+- [x] 8.2 None renders the existing `vault_error` empty state; `vault.html` is
+      not edited
+- [x] 8.3 Deterministic replay test: the warm returns None while a stale bulk
+      warm restores the revoked root, and the page still refuses
+
+## 9. Cost
+
+- [x] 9.1 Test asserting the admission gate opens no database session for an
+      assigned request (both DB entry points booby-trapped, and the gate is a
+      sync function)
+
 ## 6. Documentation
 
 - [x] 6.1 Record the gate in `CLAUDE.md` next to the multi-user vault behaviour
 - [x] 6.2 `openspec validate vault-unassignment-revokes-tools --strict` passes
+- [x] 6.3 CLAUDE.md records the ownerless-credential rule and the
+      warm-then-resolve hazard in the panel

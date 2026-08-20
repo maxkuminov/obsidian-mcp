@@ -438,6 +438,25 @@ told the operator "vault tools error".
   `params["error"] = "no_vault_assigned"` and no other new field.
 - Single-user and sandbox mode are untouched: `current_user_id` is None there
   and `_vault_root(None)` answers from `settings.vault_path`.
+- **In multi-user mode, `user_id is None` is a refusal, not the global vault.**
+  An ownerless credential — `api_keys.user_id` / `oauth_tokens.user_id` NULL —
+  is the *single-user* shape, and it survives a configuration cycle: a key
+  minted while multi-user was off keeps its NULL, and the bootstrap backfill in
+  `src/auth/routes.py` only claims NULL rows while `users` is empty, so
+  flipping the flag after users exist never adopts it. Every layer then treated
+  that key as single-user and handed it `settings.vault_path` — an ownerless
+  *readwrite* key could edit the whole vault. `APIKeyMiddleware` now 401s such
+  a credential (`reason=ownerless_credential`, same body as any other rejected
+  key, on both the API-key and OAuth branches) and `_vault_root(None)` raises
+  when `settings.multi_user_mode`. Two layers on purpose: the middleware is the
+  gate, `_vault_root` is the one that cannot be bypassed by a future caller.
+- **The panel's vault browser uses what the warm returned, not a re-read of the
+  dict.** `vault_page` warmed the cache and then called `_vault_root(user.id)`,
+  which reopens the same window: a stale bulk warm landing in between served an
+  unassigned user's vault. It now takes the `Path | None` from
+  `warm_user_vault_cache` directly and renders the `vault_error` empty state on
+  None. Any new caller that warms-then-resolves has the same bug — use the
+  return value.
 
 ## Graph tools
 - `get_backlinks(path, limit)` — notes that link TO `path` (resolved links only).

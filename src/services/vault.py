@@ -96,11 +96,31 @@ def clear_user_vault_cache(user_id: int | None = None) -> None:
         _user_vault_cache.pop(user_id, None)
 
 
+UNOWNED_IN_MULTI_USER_ERROR = (
+    "No vault root: multi-user mode is enabled and this credential is not "
+    "bound to a user."
+)
+
+
+def vault_unassigned_error(user_id: int) -> str:
+    """The one wording for "this user has no usable vault assignment".
+
+    Shared by `_vault_root` and the panel's vault browser so the operator and
+    the agent are told the same thing.
+    """
+    return (
+        f"Vault path for user_id={user_id} is not assigned. The user has no "
+        "`vault_path`, or is inactive."
+    )
+
+
 def _vault_root(user_id: int | None = None) -> Path:
     """Return the vault root for the given user.
 
     Single-user mode / `user_id is None` → `settings.vault_path` (legacy
-    behavior). Multi-user mode → cached `users.vault_path` lookup. The cache
+    behavior). **In multi-user mode `user_id is None` raises instead** — see
+    the ownerless-credential note below. Multi-user mode → cached
+    `users.vault_path` lookup. The cache
     must have been warmed for this user (auth middleware / indexer / panel
     routes do this before invoking tools); a miss raises a clear RuntimeError
     rather than silently falling back to the global path or silently blocking
@@ -126,15 +146,20 @@ def _vault_root(user_id: int | None = None) -> Path:
     answering for the wrong vault.
     """
     if user_id is None:
+        if settings.multi_user_mode:
+            # An ownerless credential in multi-user mode. `APIKeyMiddleware`
+            # already refuses those (see `ownerless_credential`), so reaching
+            # here means some other path resolved a root with no user — and
+            # falling back to `settings.vault_path` would hand it the *global*
+            # vault, which in multi-user mode belongs to nobody in particular
+            # and is exactly the write nobody authorised. Fail closed.
+            raise RuntimeError(UNOWNED_IN_MULTI_USER_ERROR)
         return Path(settings.vault_path)
     snapshot = current_vault_root.get()
     if not isinstance(snapshot, _UnsetVaultRoot) and snapshot[0] == user_id:
         root = snapshot[1]
         if root is None:
-            raise RuntimeError(
-                f"Vault path for user_id={user_id} is not assigned. The user "
-                "has no `vault_path`, or is inactive."
-            )
+            raise RuntimeError(vault_unassigned_error(user_id))
         return root
     cached = _user_vault_cache.get(user_id)
     if cached is None:

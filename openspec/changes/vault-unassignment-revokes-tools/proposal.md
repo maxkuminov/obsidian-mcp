@@ -54,6 +54,25 @@ happening. (Issue #66, severity high.)
 - **The option label is corrected** to state what the code now does:
   `(unassigned — every MCP tool refuses; index kept for reassignment)`.
 
+Two further holes, both found by adversarial review of this change:
+
+- **An ownerless credential in multi-user mode was treated as single-user.** A
+  key or token with `user_id IS NULL` is the single-user shape, and it survives
+  a configuration cycle — mint it with multi-user off, enable multi-user after
+  users already exist, and the bootstrap backfill (which only claims NULL rows
+  while `users` is empty) never adopts it. The middleware skipped the warm,
+  `current_user_id` stayed None, and `_vault_root(None)` returned the global
+  `settings.vault_path`: an ownerless *readwrite* key could edit the whole
+  vault. `APIKeyMiddleware` now 401s such a credential on both branches
+  (`reason=ownerless_credential`), and `_vault_root(None)` raises when
+  multi-user mode is on. The panel bootstrap is unaffected — it runs in a panel
+  POST, not through the MCP middleware.
+- **The panel's vault browser lost the same race as the tools.** `vault_page`
+  called `warm_user_vault_cache(...)` and then re-read the shared dict through
+  `_vault_root`, so a stale bulk warm landing in between served an unassigned
+  user's vault. It now uses the `Path | None` the warm returns and renders the
+  existing `vault_error` empty state on None.
+
 ## Capabilities
 
 ### Modified Capabilities
@@ -69,7 +88,11 @@ happening. (Issue #66, severity high.)
   the admission gate and must stay a cache lookup
 - `src/auth/session.py` — `current_vault_root` ContextVar + `UNSET_VAULT_ROOT`
 - `src/mcp_server/auth.py` — binds and resets the snapshot on both the API-key
-  and OAuth branches
+  and OAuth branches; rejects ownerless credentials in multi-user mode
+- `src/services/vault.py` — `_vault_root(None)` raises in multi-user mode;
+  `vault_unassigned_error()` shared with the panel
+- `src/control_panel/routes.py` — `vault_page` browses the root the warm
+  returned
 - `src/control_panel/templates/user_edit.html` — option label
 - `tests/test_issue_66_vault_unassignment_revokes_tools.py` — new
 - No database schema changes, no new dependencies, no migration

@@ -115,3 +115,50 @@ consulted in single-user mode.
 - **WHEN** the authenticated request completes
 - **THEN** the snapshot SHALL be cleared, leaving later work in that process
   with no request-scoped vault root
+
+### Requirement: An ownerless credential is refused in multi-user mode
+A credential that is not bound to a user SHALL be rejected at authentication whenever multi-user mode is enabled, and resolving a vault root with no user SHALL raise rather than falling back to the globally configured vault path.
+Single-user mode SHALL be unaffected, and the panel bootstrap flow — which
+claims unbound rows for the first administrator — SHALL keep working.
+
+#### Scenario: Key minted before multi-user was enabled
+- **WHEN** multi-user mode is enabled and a still-active API key whose owner is
+  unset is presented to the MCP endpoint
+- **THEN** the request SHALL be rejected as unauthenticated, with the same
+  response body as any other rejected key
+
+#### Scenario: OAuth token with no owner
+- **WHEN** the same situation arises for an OAuth access token
+- **THEN** the request SHALL be rejected as unauthenticated
+
+#### Scenario: No fallback to the configured vault path
+- **WHEN** a vault root is resolved with no user while multi-user mode is
+  enabled
+- **THEN** resolution SHALL fail, so no caller can reach the globally
+  configured vault by having no owner
+
+#### Scenario: Single-user mode still serves an unbound credential
+- **WHEN** multi-user mode is disabled and a credential with no owner is
+  presented
+- **THEN** the request SHALL authenticate and resolve the configured vault path
+  as before
+
+### Requirement: The panel vault browser uses the root it just read
+The control panel's vault browser SHALL browse the vault root returned by the
+refresh it performs for the signed-in user, not a subsequent re-read of the
+shared process cache, and SHALL render its empty state when that refresh
+reports no assignment.
+
+#### Scenario: Stale refresh lands between the read and the browse
+- **WHEN** a bulk cache refresh predating the revocation repopulates the shared
+  cache after the page's own refresh observed the cleared assignment
+- **THEN** the page SHALL render the no-vault empty state and list no folders
+  or notes
+
+### Requirement: The admission gate performs no database work
+Resolving the caller's vault root for admission SHALL NOT issue a database
+statement, so the check costs nothing on the hot path.
+
+#### Scenario: Assigned caller invokes a tool
+- **WHEN** an assigned caller's tool call passes the admission gate
+- **THEN** the gate SHALL have opened no database session

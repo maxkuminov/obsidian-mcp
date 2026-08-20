@@ -122,6 +122,34 @@ class APIKeyMiddleware:
                         await response(scope, receive, send)
                         return
 
+                    if api_key.user_id is None and settings.multi_user_mode:
+                        # An ownerless key in multi-user mode. These exist: a
+                        # key minted while multi-user was off keeps
+                        # `user_id = NULL`, and the bootstrap backfill in
+                        # `src/auth/routes.py` only claims those rows when
+                        # `users` is *empty* — flip the flag after users
+                        # exist and the NULLs are never adopted. Such a key
+                        # used to be treated as single-user by every layer:
+                        # the warm was skipped and `_vault_root(None)`
+                        # returned the global `settings.vault_path`, so an
+                        # ownerless readwrite key could edit the whole vault.
+                        # Refuse it here, with the same body as any other
+                        # rejected key.
+                        logger.warning(
+                            "auth_failure",
+                            extra={
+                                "reason": "ownerless_credential",
+                                "key_id": api_key.id,
+                            },
+                        )
+                        response = JSONResponse(
+                            {"error": "Invalid or revoked key"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
+                        await response(scope, receive, send)
+                        return
+
                     if api_key.user_id is not None:
                         result = await session.execute(
                             select(User.is_active).where(User.id == api_key.user_id)
@@ -205,6 +233,24 @@ class APIKeyMiddleware:
                         await response(scope, receive, send)
                         return
 
+
+                    if oauth_token.user_id is None and settings.multi_user_mode:
+                        # Same as the API-key branch above: an ownerless token
+                        # in multi-user mode would resolve the global vault.
+                        logger.warning(
+                            "auth_failure",
+                            extra={
+                                "reason": "ownerless_credential",
+                                "key_id": oauth_token.id,
+                            },
+                        )
+                        response = JSONResponse(
+                            {"error": "Invalid or revoked token"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
+                        await response(scope, receive, send)
+                        return
 
                     if oauth_token.user_id is not None:
                         result = await session.execute(

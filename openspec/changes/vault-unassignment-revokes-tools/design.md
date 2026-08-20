@@ -144,3 +144,65 @@ time. An in-flight call that passed the gate microseconds before the admin
 saved the unassignment completes. That is the same optimistic level as every
 other revocation in this server except the transfer publish gate, which holds
 `FOR UPDATE` locks across the filesystem write precisely because it can.
+
+
+## Ownerless credentials: `user_id is None` means two different things
+
+`user_id IS NULL` on an `api_keys` / `oauth_tokens` row is the *single-user*
+shape, and single-user mode is where `_vault_root(None)` returning
+`settings.vault_path` is correct. The problem is that the NULL outlives the
+configuration it belonged to:
+
+- a key minted while `MULTI_USER_MODE=false` keeps `user_id = NULL`;
+- the bootstrap backfill in `src/auth/routes.py` adopts every NULL row for the
+  first administrator, but it only runs while `users` is **empty** — it is
+  guarded by `_users_table_empty(session)` under an advisory lock;
+- so flipping the flag *after* users exist leaves those NULLs unclaimed
+  forever.
+
+Such a key then authenticated (the middleware only checks activity and expiry),
+skipped the warm (`if api_key.user_id is not None`), left `current_user_id` at
+None, and got the global vault from `_vault_root(None)` — including for
+`readwrite`, i.e. `edit_note` over the whole vault with no owner.
+
+Both layers are fixed, deliberately:
+
+- **`APIKeyMiddleware` 401s it** (both branches, `reason=ownerless_credential`,
+  the same response body as any other rejected credential — which check failed
+  is not disclosed). This is the gate.
+- **`_vault_root(None)` raises when `settings.multi_user_mode`.** This is the
+  invariant. The middleware can be bypassed by a future caller that resolves a
+  root outside a request; the resolver cannot.
+
+The bootstrap flow is unaffected: it is a panel `POST /admin/auth/register`
+handled by FastAPI, never routed through `APIKeyMiddleware`, and it does not
+resolve a vault root before the admin row exists. Single-user mode is
+unaffected in both layers — the checks are conditioned on
+`settings.multi_user_mode`.
+
+## Warm-then-resolve is the same bug in a second place
+
+`vault_page` did:
+
+```python
+await warm_user_vault_cache(session, user.id)
+vault = _vault_root(user.id)      # <- re-reads the shared dict
+```
+
+which reopens exactly the window the tool gate closes: the stale bulk warm can
+land between the two statements. The fix is the same idea as the ContextVar —
+**use the value the warm returned** — expressed in the simplest form available
+to a handler that already has it in hand:
+
+```python
+vault = await warm_user_vault_cache(session, user.id)
+if vault is None:
+    vault_error = vault_unassigned_error(user.id)
+```
+
+The message comes from `vault_unassigned_error()` so the panel and the agent
+are told the same thing. `vault.html` is untouched — the `vault_error` empty
+state it already renders is the refusal.
+
+Any future caller that warms and then resolves has this bug. The rule is in
+CLAUDE.md: use the return value.

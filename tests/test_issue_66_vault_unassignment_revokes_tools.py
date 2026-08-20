@@ -576,3 +576,267 @@ def test_unassigned_option_states_what_the_code_does():
         "index kept for reassignment)</option>"
     ) in rendered
     assert "vault tools error" not in rendered
+
+
+# --- ownerless credentials in multi-user mode --------------------------------
+#
+# A key or token whose `user_id` is NULL is the single-user shape. It survives
+# a configuration cycle: mint a key with multi-user off, then turn multi-user
+# on *after* users already exist, and the bootstrap backfill in
+# `src/auth/routes.py` — which only claims NULL rows while `users` is empty —
+# never adopts it. Every layer then treated that credential as single-user: the
+# middleware skipped the warm, `current_user_id` stayed None, and
+# `_vault_root(None)` handed back the global `settings.vault_path`. An
+# ownerless *readwrite* key could edit the whole vault.
+
+
+@pytest.fixture
+def multi_user_mode(monkeypatch):
+    monkeypatch.setattr(vault.settings, "multi_user_mode", True)
+    monkeypatch.setattr(mcp_auth.settings, "multi_user_mode", True)
+    yield
+
+
+def test_vault_root_refuses_an_ownerless_caller_in_multi_user_mode(multi_user_mode):
+    with pytest.raises(RuntimeError) as excinfo:
+        vault._vault_root(None)
+    assert "multi-user" in str(excinfo.value)
+
+
+def test_vault_root_still_serves_single_user_mode():
+    """The same call, with multi-user off, is the legacy path and must work."""
+    assert vault.settings.multi_user_mode is False
+    assert vault._vault_root(None) == Path(vault.settings.vault_path)
+
+
+def test_tools_refuse_an_ownerless_caller_in_multi_user_mode(
+    cold_cache, multi_user_mode
+):
+    """Belt and braces: even if such a credential reached a tool, the gate
+    refuses instead of resolving the global vault."""
+    assert current_user_id.get() is None
+    result, params, _ = _run_capturing_log(
+        lambda: tools.edit_note_impl("Projects/Alpha.md", "clobbered")
+    )
+    assert result == tools._NO_VAULT_MESSAGE
+    assert params["error"] == tools._NO_VAULT_MARKER
+
+
+class _OAuthMiddlewareSession(_MiddlewareSession):
+    """Same as `_MiddlewareSession`, for the OAuth branch: the first select
+    hits `oauth_tokens` rather than `api_keys`."""
+
+    async def execute(self, stmt):
+        sql = str(stmt)
+        if sql.startswith("UPDATE"):
+            return _EmptyResult()
+        if "vault_path" in sql:
+            return _RowsResult([self.vault_row] if self.vault_row else [])
+        if "FROM oauth_tokens" in sql:
+            return _RowsResult([self.api_key])
+        return _ScalarResult(self.user_active)
+
+
+def _run_middleware(credential, *, token_value, downstream=None, oauth=False):
+    """Drive `APIKeyMiddleware` with a faked session; return the sent messages."""
+    sent = []
+
+    async def _send(message):
+        sent.append(message)
+
+    async def _receive():  # pragma: no cover - never awaited
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def _ok(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    async def run():
+        original = mcp_auth.async_session
+        if oauth:
+            mcp_auth.async_session = lambda: _OAuthMiddlewareSession(
+                credential, vault_row=None
+            )
+        else:
+            mcp_auth.async_session = lambda: _MiddlewareSession(
+                credential, vault_row=None
+            )
+        try:
+            app = mcp_auth.APIKeyMiddleware(downstream or _ok)
+            await app(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/mcp/",
+                    "headers": [(b"authorization", f"Bearer {token_value}".encode())],
+                },
+                _receive,
+                _send,
+            )
+        finally:
+            mcp_auth.async_session = original
+
+    asyncio.run(run())
+    return sent
+
+
+def _body_of(sent):
+    return b"".join(
+        m.get("body", b"") for m in sent if m["type"] == "http.response.body"
+    )
+
+
+def test_middleware_rejects_an_ownerless_api_key_in_multi_user_mode(
+    cold_cache, multi_user_mode
+):
+    from src.models.db import APIKey
+
+    key = APIKey(
+        id=9,
+        key_hash="x",
+        permission="readwrite",
+        user_id=None,
+        expires_at=None,
+        is_active=True,
+    )
+    sent = _run_middleware(key, token_value="omcp_ownerless")
+    assert sent[0]["status"] == 401
+    # Same body as any other rejected key: which check failed is not disclosed.
+    assert b"Invalid or revoked key" in _body_of(sent)
+
+
+def test_middleware_rejects_an_ownerless_oauth_token_in_multi_user_mode(
+    cold_cache, multi_user_mode
+):
+    from datetime import datetime, timedelta, timezone
+
+    from src.models.db import OAuthToken
+
+    tok = OAuthToken(
+        id=11,
+        token_hash="x",
+        token_type="access",
+        scope="readwrite",
+        user_id=None,
+        revoked=False,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    sent = _run_middleware(tok, token_value="oauth_ownerless", oauth=True)
+    assert sent[0]["status"] == 401
+    assert b"Invalid or revoked token" in _body_of(sent)
+
+
+def test_middleware_accepts_an_ownerless_api_key_in_single_user_mode(cold_cache):
+    """Single-user mode is the whole point of a NULL `user_id`. Untouched."""
+    from src.models.db import APIKey
+
+    assert mcp_auth.settings.multi_user_mode is False
+    key = APIKey(
+        id=9,
+        key_hash="x",
+        permission="readwrite",
+        user_id=None,
+        expires_at=None,
+        is_active=True,
+    )
+    sent = _run_middleware(key, token_value="omcp_legacy")
+    assert sent[0]["status"] == 200
+
+
+# --- the panel vault browser loses the same race -----------------------------
+
+
+def test_panel_vault_browser_refuses_when_the_warm_reports_unassigned(
+    cold_cache, multi_user_mode
+):
+    """`vault_page` warmed the cache and then re-read the shared dict, so the
+    same stale bulk warm that could re-admit a tool call could hand the panel
+    an unassigned user's vault. It must use what the warm returned."""
+    from starlette.requests import Request
+
+    import src.control_panel.routes as panel
+
+    captured = {}
+
+    class _FakeTemplates:
+        def TemplateResponse(self, request, name, ctx):
+            captured["name"] = name
+            captured["ctx"] = ctx
+            return "rendered"
+
+    async def fake_warm(session, user_id):
+        # The request's own read says NULL, so it evicts...
+        vault._user_vault_cache.pop(user_id, None)
+        # ...and the indexer's older bulk query lands right here, putting the
+        # revoked root back into the shared dict.
+        vault._user_vault_cache[user_id] = STALE_ROOT
+        return None
+
+    original_templates = panel.templates
+    original_warm = panel.warm_user_vault_cache
+    panel.templates = _FakeTemplates()
+    panel.warm_user_vault_cache = fake_warm
+    try:
+        request = Request({
+            "type": "http",
+            "method": "GET",
+            "path": "/admin/vault",
+            "query_string": b"",
+            "headers": [],
+        })
+        user = SimpleNamespace(
+            id=UNASSIGNED_UID, is_admin=False, username="bob", is_active=True
+        )
+        result = asyncio.run(panel.vault_page(request, session=None, user=user))
+    finally:
+        panel.templates = original_templates
+        panel.warm_user_vault_cache = original_warm
+
+    assert result == "rendered"
+    assert captured["name"] == "vault.html"
+    ctx = captured["ctx"]
+    assert ctx["vault_error"], "the page did not refuse"
+    assert str(UNASSIGNED_UID) in ctx["vault_error"]
+    assert ctx["notes"] == [] and ctx["folders"] == []
+    # And it did not browse the stale root the bulk warm restored.
+    assert vault._user_vault_cache[UNASSIGNED_UID] == STALE_ROOT
+
+
+# --- the gate costs no database round trip -----------------------------------
+
+
+def test_admission_gate_issues_no_database_statements(cold_cache, tmp_path):
+    """The gate runs on every tool call, so it must stay a cache/ContextVar
+    read. Both database entry points reachable from it are booby-trapped: a
+    single statement would raise."""
+    import inspect
+
+    # A synchronous function cannot await a DB round trip in the first place.
+    assert not inspect.iscoroutinefunction(tools._vault_admission_error)
+
+    ran = {}
+
+    @tools._tracked("fake_tool", [])
+    async def fake_tool() -> str:
+        ran["yes"] = True
+        return "served"
+
+    def _boom(*a, **kw):
+        raise AssertionError("the admission gate opened a database session")
+
+    original_session = tools.async_session
+    original_warm = vault.warm_user_vault_cache
+    uid_token = current_user_id.set(UNASSIGNED_UID)
+    root_token = current_vault_root.set((UNASSIGNED_UID, tmp_path))
+    tools.async_session = _boom
+    vault.warm_user_vault_cache = _boom
+    try:
+        result, _, _ = _run_capturing_log(lambda: fake_tool())
+    finally:
+        tools.async_session = original_session
+        vault.warm_user_vault_cache = original_warm
+        current_vault_root.reset(root_token)
+        current_user_id.reset(uid_token)
+
+    assert ran.get("yes") is True
+    assert result == "served"

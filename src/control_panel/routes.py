@@ -783,22 +783,32 @@ async def vault_page(
     folder = request.query_params.get("folder", "")
     selected_note = request.query_params.get("note")
 
+    from src.services.vault import _vault_root, vault_unassigned_error
+
     # Resolve the per-user vault root. In single-user mode `user.id` is None
     # and `_vault_root(None)` returns `settings.vault_path` — the legacy
-    # behavior. In multi-user mode, this requires the cache to be warmed
-    # for the user; login already does that, but we re-warm here so a
-    # session that survived a process restart (no warm yet) still works.
-    if user.id is not None:
-        await warm_user_vault_cache(session, user.id)
+    # behavior.
+    #
+    # In multi-user mode we use the root the warm *itself* read, not a re-read
+    # of the shared `_user_vault_cache`. The indexer's bulk warm writes to that
+    # dict too and is add-only, so a bulk SELECT taken before the admin cleared
+    # `vault_path` can land between the warm and the lookup and hand this page
+    # the vault the user no longer holds — the same race `current_vault_root`
+    # closes for tool calls (issue #66). A None here is the refusal, rendered
+    # as the friendly empty state rather than a 500.
+    vault = None
+    vault_error = None
+    if user.id is None:
+        try:
+            vault = _vault_root(None)
+        except RuntimeError as e:
+            vault_error = str(e)
+    else:
+        vault = await warm_user_vault_cache(session, user.id)
+        if vault is None:
+            vault_error = vault_unassigned_error(user.id)
 
-    from src.services.vault import _vault_root
-
-    # `_vault_root` raises RuntimeError if the user has no `vault_path`
-    # assigned in multi-user mode. Surface that as a friendly empty state
-    # rather than a 500.
-    try:
-        vault = _vault_root(user.id)
-    except RuntimeError as e:
+    if vault_error is not None:
         return templates.TemplateResponse(request, "vault.html", _panel_context(request, user, {
             "active": "vault",
             "current_folder": "",
@@ -809,7 +819,7 @@ async def vault_page(
             "note_content": None,
             "note_title": None,
             "note_tags": [],
-            "vault_error": str(e),
+            "vault_error": vault_error,
         }))
 
     if folder:
