@@ -321,6 +321,8 @@ async def dashboard(
     def _usage_detail(tool: str, params: dict | None) -> str | None:
         if not params:
             return None
+        # "search_notes" is the legacy spelling `keyword_search` was logged
+        # under before #78; historical rows keep it, so it stays here.
         if tool in ("search_notes", "keyword_search", "semantic_search"):
             return params.get("query")
         if tool in ("read_note", "create_note", "edit_note"):
@@ -338,7 +340,19 @@ async def dashboard(
     ]
 
     graph = await _graph_stats(session, uid)
+    # Imported at call time so the values are read fresh each request (module
+    # attributes, not a snapshot taken at import).
+    from src.services import indexer as _indexer
     from src.services.indexer import link_backfill_in_progress
+
+    # "Last run" is the indexer's own heartbeat, not `max(indexed_at)`.
+    # `notes_metadata.indexed_at` only moves for notes a pass actually
+    # upserted or moved, so on an idle vault a perfectly healthy indexer
+    # looked stalled for days (#78). It is process-wide (the loop is), so it
+    # is not scoped by `uid` the way the note aggregates are — that is a fact
+    # about the server, and every panel user sees the same one.
+    last_run_at = _indexer.last_index_run_at
+    last_run_ok = _indexer.last_index_run_ok
 
     return templates.TemplateResponse(request, "dashboard.html", _panel_context(request, user, {
         "active": "dashboard",
@@ -353,6 +367,9 @@ async def dashboard(
         "reindexed_24h": reindexed_24h,
         "last_indexed_iso": last_indexed_at.isoformat() if last_indexed_at else None,
         "last_indexed_rel": _humanize_delta(last_indexed_at),
+        "last_run_iso": last_run_at.isoformat() if last_run_at else None,
+        "last_run_rel": _humanize_delta(last_run_at),
+        "last_run_ok": last_run_ok,
         "index_interval": settings.index_interval_seconds,
         "graph": graph,
         "graph_backfill_running": link_backfill_in_progress,
@@ -369,18 +386,51 @@ async def keys_page(
     user=Depends(require_user_panel),
 ):
     uid = _scope_user_id(user)
-    q = select(APIKey).order_by(APIKey.created_at.desc())
+    # Join the owner. A key's *effective* liveness is what `APIKeyMiddleware`
+    # enforces, and that is stricter than `api_keys.is_active` alone:
+    # `src/mcp_server/auth.py` also selects `User.is_active` for the key's
+    # `user_id` and 401s (reason=inactive_user) unless it is exactly True.
+    # Deactivating a user leaves their keys' own `is_active` untouched, so
+    # without this join the panel badged dead credentials green (#76). The
+    # outer join keeps single-user keys (`user_id IS NULL`), which the
+    # middleware exempts from the owner check entirely.
+    q = (
+        select(APIKey, User.username, User.is_active)
+        .select_from(APIKey)
+        .outerjoin(User, User.id == APIKey.user_id)
+        .order_by(APIKey.created_at.desc())
+    )
     if uid is not None:
         q = q.where(APIKey.user_id == uid)
     result = await session.execute(q)
+    # One `now` for the whole page: rows compared against different instants
+    # could render two keys with the same `expires_at` differently.
+    now = datetime.now(timezone.utc)
     keys = []
-    for k in result.scalars().all():
+    for k, owner_username, owner_is_active in result.all():
+        # A key whose `user_id` has no row (owner_is_active is None) is dead
+        # too — the middleware's `is True` test fails for it just the same,
+        # so it must not read as live here.
+        owner_ok = k.user_id is None or owner_is_active is True
+        # Expiry, phrased exactly as `APIKeyMiddleware` phrases it:
+        # `if api_key.expires_at and api_key.expires_at < now: 401`. So a key
+        # is *not* expired at exactly `expires_at` — the boundary instant is
+        # still live — and this comparison must keep matching that one rather
+        # than a plausible-looking `>=` of its own. Nothing in the codebase
+        # sets `expires_at` today, but the panel must not be the surface that
+        # goes stale the day something does.
+        expired = k.expires_at is not None and k.expires_at < now
         keys.append({
             "id": k.id,
             "name": k.name,
             "key_prefix": k.key_prefix,
             "permission": k.permission,
             "is_active": k.is_active,
+            "owner_is_active": owner_ok,
+            "is_expired": expired,
+            "expires_at": k.expires_at.isoformat() if k.expires_at else None,
+            "effective_active": bool(k.is_active) and owner_ok and not expired,
+            "owner_username": owner_username,
             "created_at": k.created_at.isoformat(),
             "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
             "user_id": k.user_id,

@@ -229,6 +229,18 @@ nothing about the migration body.
   It logs and swallows ordinary failures (the indexer's `consecutive_failures`
   must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
   still stops the loop.
+- **The dashboard's "Last run" is an in-process heartbeat, not
+  `max(notes_metadata.indexed_at)`.** `indexer.last_index_run_at` /
+  `last_index_run_ok` are stamped at the end of the startup pass and of every
+  periodic tick (`False` in the `except Exception` branch; `CancelledError` is
+  a `BaseException` so shutdown is not recorded as a failure). `indexed_at`
+  only moves for notes a pass actually upserted or moved, so a pass over an
+  unchanged vault writes it nowhere and a healthy indexer looked stalled for
+  days on an idle vault — an invitation to reach for the Danger zone and
+  re-embed the whole vault for nothing (#78). `max(indexed_at)` is still shown,
+  under its own label "Last change detected". No migration and no per-tick
+  write: it answers "is *this process's* loop alive", which is a property of
+  the process, and it resets to `None` on restart until the startup pass lands.
 - **Because the pre-warm holds `index_pass_lock`, the panel's destructive
   actions take it too.** `reset_embeddings` and `trigger_reembed` set
   `indexer_paused`, then `await session.close()` on the request's own session
@@ -238,6 +250,23 @@ nothing about the migration body.
   also NULLs `notes_metadata.embedded_content_hash` in the same transaction as
   the `DELETE`: `embed_vault` selects on hash mismatch, so deleting vectors
   alone meant the reindex it spawns re-embedded nothing.
+- **Every panel handler that can change `users.is_admin` / `users.is_active`
+  takes `_lock_admin_guard(session)` before counting the remaining admins**
+  (`src/control_panel/users.py` — `edit_user_submit` and `delete_user`, one
+  shared `pg_advisory_xact_lock` key). The last-admin guard is a count
+  followed by a write; without the lock two admins demoting each other
+  concurrently both read "one other admin remains", both pass, and the panel
+  is left with zero admins and no way back in through the UI. The lock is
+  transaction-scoped, so **never commit between taking it and writing the
+  flags** — that is what makes the check-then-act atomic. A new handler that
+  flips either flag must take it too, and use the *same* constant: two keys
+  do not exclude each other. **Immediately after the lock, both handlers
+  re-read the acting admin's own `is_admin`/`is_active`
+  (`_actor_still_privileged`) and refuse unless both are exactly True** —
+  `require_admin_panel` authorised the request before the lock was requested,
+  and the wait for that lock is precisely the window in which another admin's
+  demotion of *this* actor commits; serializing the writes is no use if the
+  loser of the race then performs the mutation anyway.
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
@@ -344,6 +373,14 @@ plan there, so it is recorded, not asserted).
 no embedding call). A single whole-call `duration_ms` could not separate the
 two independent cold paths — provider eviction and HNSW page cache — so the
 last regression had to be diagnosed with hand-run probes against the live DB.
+
+**`usage_logs.tool` must hold the name the tool is registered under.**
+`_tracked`'s first argument is that name, and FastMCP takes it from the
+function name in `server.py` — so `search_notes_impl` is logged as
+`keyword_search`, not `search_notes`, which named a tool no client is ever
+offered and made `WHERE tool = 'keyword_search'` return nothing (#78). Rows
+written before that fix keep the old spelling, which is why `_usage_detail` in
+`src/control_panel/routes.py` still lists it alongside the current one.
 
 The holder is a `ContextVar` in `src/services/timing.py`, **owned by
 `_tracked`**: fresh dict at call start, cleared in `finally`. The ContextVar

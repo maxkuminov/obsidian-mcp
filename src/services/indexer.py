@@ -27,6 +27,28 @@ from src.services.vault import (
 # progress" while the one-shot backfill is running.
 link_backfill_in_progress: bool = False
 
+# In-process heartbeat for the indexer: when a pass last *finished*, and
+# whether it finished cleanly. The dashboard used to infer this from
+# `max(notes_metadata.indexed_at)`, but that column only moves for notes a
+# pass actually upserted or moved — a pass over an unchanged vault writes it
+# nowhere. So a healthy indexer on an idle vault reported a last run of days
+# ago, which is an invitation to reach for the Danger zone and re-embed the
+# whole vault for nothing (#78).
+#
+# Deliberately in-process, not a table: it answers "is this process's loop
+# alive", which is exactly a property of this process, and it costs no write
+# per tick. It resets to None on restart — the startup pass sets it moments
+# later, so the window where the dashboard reads "Never" is the window in
+# which the first pass has genuinely not finished yet.
+last_index_run_at: datetime | None = None
+last_index_run_ok: bool | None = None
+
+
+def _record_index_run(ok: bool) -> None:
+    global last_index_run_at, last_index_run_ok
+    last_index_run_at = datetime.now(timezone.utc)
+    last_index_run_ok = ok
+
 # Serializes full index/embed passes so the periodic loop and a
 # panel-triggered on-demand reindex can never run index_vault/embed_vault
 # concurrently for the same scope. Two overlapping passes share no DB lock and
@@ -911,16 +933,28 @@ async def prewarm_search_caches() -> None:
         )
 
 
-async def _index_pass_once(user_id: int | None) -> None:
-    """One full index + embed pass for a single user (or single-user mode)."""
+async def _index_pass_once(user_id: int | None) -> bool:
+    """One full index + embed pass for a single user (or single-user mode).
+
+    Returns True only if both stages completed. Failures are swallowed per
+    stage so one user's broken vault cannot stop every other user's pass, but
+    the caller has to *know* they happened: a tick that logged two failures
+    must not stamp the heartbeat as a healthy run (#78). Swallowing and
+    returning True is exactly the "reports fine, is not" defect the heartbeat
+    exists to remove.
+    """
+    ok = True
     try:
         await index_vault(user_id=user_id)
     except Exception as e:
+        ok = False
         logger.error(f"Index failed (user_id={user_id}): {e}")
     try:
         await embed_vault(user_id=user_id)
     except Exception as e:
+        ok = False
         logger.error(f"Embedding failed (user_id={user_id}): {e}")
+    return ok
 
 
 async def run_indexer_loop():
@@ -932,6 +966,7 @@ async def run_indexer_loop():
     """
     # Hold `index_pass_lock` for the initial pass too, so a panel-triggered
     # `_reindex_background` fired during startup is serialized against it.
+    startup_ok = True
     async with index_pass_lock:
         if settings.multi_user_mode:
             # Initial pass per user.
@@ -940,6 +975,7 @@ async def run_indexer_loop():
                 try:
                     await index_vault(user_id=uid)
                 except Exception as e:
+                    startup_ok = False
                     logger.error(f"Initial index failed (user_id={uid}): {e}")
             try:
                 # Link backfill still uses the global "table empty" guard but
@@ -949,27 +985,37 @@ async def run_indexer_loop():
                 for uid in user_ids:
                     await link_backfill_pass(user_id=uid)
             except Exception as e:
+                startup_ok = False
                 logger.error(f"Link backfill failed: {e}")
             for uid in user_ids:
                 try:
                     await embed_vault(user_id=uid)
                 except Exception as e:
+                    startup_ok = False
                     logger.error(f"Initial embedding failed (user_id={uid}): {e}")
         else:
             try:
                 await index_vault()
             except Exception as e:
+                startup_ok = False
                 logger.error(f"Initial index failed: {e}")
 
             try:
                 await link_backfill_pass()
             except Exception as e:
+                startup_ok = False
                 logger.error(f"Link backfill failed: {e}")
 
             try:
                 await embed_vault()
             except Exception as e:
+                startup_ok = False
                 logger.error(f"Initial embedding failed: {e}")
+
+    # The startup pass counts as a run: it does the same work a tick does, and
+    # without it the dashboard would read "Never" for a whole interval after
+    # every restart.
+    _record_index_run(startup_ok)
 
     consecutive_failures = 0
     logger.info(
@@ -986,12 +1032,16 @@ async def run_indexer_loop():
             # Hold `index_pass_lock` for the whole index/embed pass so a
             # concurrent panel-triggered `_reindex_background` cannot run a
             # second index_vault/embed_vault over the same scope.
+            tick_ok = True
             async with index_pass_lock:
                 if settings.multi_user_mode:
                     # Re-fetch the user list every cycle so newly-added or
                     # newly-deactivated users are picked up without a restart.
+                    # One user's failure does not abort the others, but it
+                    # does make the whole tick a failed run.
                     for uid in await _active_user_ids():
-                        await _index_pass_once(uid)
+                        if not await _index_pass_once(uid):
+                            tick_ok = False
                 else:
                     await index_vault()
                     await embed_vault()
@@ -1002,8 +1052,19 @@ async def run_indexer_loop():
                 await prewarm_search_caches()
             await cleanup_expired_tokens()
             consecutive_failures = 0
+            # Heartbeat: the tick completed. Recorded whether or not the pass
+            # found anything to index — that is the whole point (#78) — but
+            # `tick_ok` is False if any per-user pass swallowed an exception,
+            # so a multi-user tick that failed for every user is not stamped
+            # healthy just because the loop itself survived.
+            _record_index_run(tick_ok)
         except Exception as e:
             consecutive_failures += 1
+            # A tick that raised still *ran*; the dashboard says so and marks
+            # it failed rather than showing a stale-looking success.
+            # `CancelledError` is a BaseException and does not land here, so
+            # lifespan shutdown is not recorded as a failed pass.
+            _record_index_run(False)
             logger.error(f"Periodic task failed ({consecutive_failures} consecutive): {e}")
             if consecutive_failures >= 5:
                 logger.critical("Indexer has failed 5+ consecutive times — manual intervention required")

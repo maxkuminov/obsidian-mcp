@@ -17,6 +17,17 @@
 </div>
 
 <div class="page-body">
+
+    {% if vault_error %}
+    <div class="alert alert-warning anim-1">
+        <strong>No vault is assigned to your account.</strong>
+        This page is empty because of that, not because your vault is —
+        nothing below reflects any real folder. Note and search tools over
+        MCP fail for the same reason. Ask an admin to assign a vault path to
+        your account (Users → your account → Vault Path).
+    </div>
+    {% endif %}
+
     <div class="vault-grid">
 
         <!-- File tree -->

@@ -30,7 +30,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -105,6 +105,68 @@ def _list_available_vaults() -> list[str]:
 _USERNAME_RE = __import__("re").compile(r"^[a-z0-9_]{1,64}$")
 
 
+# Every handler that can change a `users.is_admin` / `users.is_active` flag
+# takes this one advisory lock before it counts the remaining active admins.
+# The count and the write are otherwise two statements in separate
+# transactions with nothing between them: two admins demoting each other at
+# the same moment both read "1 other active admin remains", both pass the
+# guard, and the panel ends up with zero admins and no way back in through
+# the UI. The lock is transaction-scoped (`pg_advisory_xact_lock`), so it is
+# released by the commit or the rollback — there is no unlock path to forget,
+# and a crashed backend cannot strand it.
+#
+# The value is arbitrary but must never change: it is the *name* of the
+# critical section, and two builds using different constants would not
+# exclude each other during a rolling restart.
+_ADMIN_GUARD_LOCK_KEY = 7_842_119_530_461_007
+
+
+async def _lock_admin_guard(session: AsyncSession) -> None:
+    """Enter the "who may be an admin" critical section.
+
+    Must be taken *before* reading the admin count and released only by the
+    same transaction that writes the flags — i.e. never commit between this
+    and the write.
+    """
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:key)"),
+        {"key": _ADMIN_GUARD_LOCK_KEY},
+    )
+
+
+async def _actor_still_privileged(
+    session: AsyncSession, user: User | _SingleUserSentinel
+) -> bool:
+    """Re-read the acting admin's own flags *inside* the critical section.
+
+    `require_admin_panel` authorised this request before the advisory lock
+    was even requested, and waiting for that lock is exactly the window in
+    which another admin's demotion or deactivation of *this* actor commits.
+    Trusting the `User` loaded by the dependency would let a just-demoted
+    account perform the privileged mutation it queued for — the guard would
+    serialize the writes correctly and still let the wrong one through.
+
+    Single-user mode has no `users` row to re-read (the sentinel's `id` is
+    None); there is also no second admin who could have demoted anyone, so
+    the sentinel is simply still privileged.
+    """
+    if not isinstance(user, User):
+        return True
+    row = (
+        await session.execute(
+            select(User.is_admin, User.is_active).where(User.id == user.id)
+        )
+    ).one_or_none()
+    # A deleted actor (row is None) is not privileged either.
+    return row is not None and row.is_admin is True and row.is_active is True
+
+
+_ACTOR_REVOKED_MSG = (
+    "Your account's admin access changed while that request was in flight — "
+    "nothing was saved. Sign in again."
+)
+
+
 # --- Routes ---------------------------------------------------------------
 
 
@@ -115,11 +177,25 @@ async def list_users(
     user: User | _SingleUserSentinel = Depends(require_admin_panel),
 ):
     # Aggregate per-user counts (api_keys + notes) in one query each.
+    #
+    # Keys are counted twice: total, and the `is_active` subset. Revocation
+    # sets `is_active = False` without deleting the row (routes.py's
+    # `revoke_key`), and `src/mcp_server/auth.py` authenticates only active
+    # rows — so a bare `count(*)` told an auditing admin "bob — API Keys: 4"
+    # when all four were revoked, and the panel had no surface anywhere on
+    # which to discover that (#76). Rendering "N active / M total" states
+    # both numbers instead of picking one and leaving the ambiguity.
     key_counts = dict(
-        (row.user_id, int(row.cnt))
+        (row.user_id, (int(row.active), int(row.total)))
         for row in (
             await session.execute(
-                select(APIKey.user_id, func.count(APIKey.id).label("cnt"))
+                select(
+                    APIKey.user_id,
+                    func.count(APIKey.id).label("total"),
+                    func.count(APIKey.id)
+                    .filter(APIKey.is_active.is_(True))
+                    .label("active"),
+                )
                 .group_by(APIKey.user_id)
             )
         ).all()
@@ -145,7 +221,8 @@ async def list_users(
             "vault_path": u.vault_path,
             "last_login_at": u.last_login_at.isoformat() if u.last_login_at else None,
             "created_at": u.created_at.isoformat(),
-            "api_keys": key_counts.get(u.id, 0),
+            "api_keys_active": key_counts.get(u.id, (0, 0))[0],
+            "api_keys_total": key_counts.get(u.id, (0, 0))[1],
             "notes": note_counts.get(u.id, 0),
         })
 
@@ -252,8 +329,11 @@ async def edit_user_submit(
     user_id: int,
     vault_path: str = Form(""),
     vault_path_custom: str = Form(""),
-    is_admin: str = Form(""),
-    is_active: str = Form(""),
+    # `None` means the field was **absent** from the submission; "" means it
+    # was present and empty. A disabled checkbox sends nothing at all, so
+    # only `None` may be read as "unchanged" — see the self-edit block below.
+    is_admin: str | None = Form(None),
+    is_active: str | None = Form(None),
     session: AsyncSession = Depends(get_session),
     user: User | _SingleUserSentinel = Depends(require_admin_panel),
 ):
@@ -262,13 +342,56 @@ async def edit_user_submit(
     # the actual path in `vault_path_custom`. Reconcile here.
     if vault_path == "__custom__":
         vault_path = vault_path_custom
+    # Enter the admin critical section before reading anything the guard
+    # decides on — including `target`'s own flags, which a concurrent edit
+    # could otherwise change between this read and our write.
+    await _lock_admin_guard(session)
+    if not await _actor_still_privileged(session, user):
+        await session.rollback()
+        return _back_to_list_with_error(_ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
     if target is None:
         raise HTTPException(404, "User not found")
 
-    new_admin = is_admin == "on" or is_admin == "true" or is_admin == "1"
-    new_active = is_active == "on" or is_active == "true" or is_active == "1"
+    def _checked(raw: str | None) -> bool:
+        return raw in ("on", "true", "1")
+
+    new_admin = _checked(is_admin)
+    new_active = _checked(is_active)
+
+    is_self = isinstance(user, User) and user.id == target.id
+
+    # A self-edit can never change your own role or active flag (#69).
+    # user_edit.html states that as an unconditional promise and renders
+    # both checkboxes `disabled`; the handler is what makes the promise
+    # true, and it must hold for a hand-crafted POST too — the previous
+    # rule ("unless you are the last active admin") let an admin with a
+    # colleague demote or deactivate themselves out of the panel in one
+    # click, with the alert actively encouraging the belief that the
+    # toggle was inert.
+    #
+    # A `disabled` checkbox is not submitted at all, so an **absent** field
+    # (`None`) on a self-edit means "unchanged", never "unchecked" — reading
+    # it as unchecked would demote the operator on every save. Anything the
+    # caller actually *sent* is an intent, and one that would strip the role
+    # or the active flag is refused outright rather than silently ignored:
+    # that includes a present-but-empty `is_admin=` (a hand-built POST, or a
+    # form that lost its value), which must not slip through the same door as
+    # a genuinely absent field.
+    if is_self:
+        if is_admin is not None and target.is_admin and not new_admin:
+            return _back_with_error(
+                user_id,
+                "You can't remove your own admin role. Ask another admin to do it.",
+            )
+        if is_active is not None and target.is_active and not new_active:
+            return _back_with_error(
+                user_id,
+                "You can't deactivate your own account. Ask another admin to do it.",
+            )
+        new_admin = target.is_admin
+        new_active = target.is_active
 
     # Defense: never let the last active admin be demoted or deactivated.
     # This covers both "max demotes himself" and "max demotes bob" — the
@@ -284,7 +407,9 @@ async def edit_user_submit(
             )
         )).scalar() or 0
         if remaining_admins == 0:
-            if isinstance(user, User) and target.id == user.id:
+            # Unreachable for a self-edit since the block above pins your own
+            # flags; kept as a backstop if that guard is ever relaxed.
+            if is_self:
                 return _back_with_error(
                     user_id,
                     "Refusing to remove the last admin (yourself). Promote another user to admin first.",
@@ -341,6 +466,13 @@ async def delete_user(
     """
     permanent = request.query_params.get("permanent") == "true"
 
+    # Same critical section as `edit_user_submit` — a delete and an edit can
+    # each remove the other's "remaining admin", so they must exclude each
+    # other, not just their own kind.
+    await _lock_admin_guard(session)
+    if not await _actor_still_privileged(session, user):
+        await session.rollback()
+        return _back_to_list_with_error(_ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
     if target is None:

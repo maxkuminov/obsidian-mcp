@@ -6,8 +6,10 @@
     <div>
         <h1 class="page-title">Dashboard</h1>
         <div style="font-size:13px;color:var(--text-3);margin-top:8px;">
-            Last indexed
-            <span style="color:var(--text-2);font-weight:500;">{{ last_indexed_rel }}</span>
+            Indexer last ran
+            <span style="color:var(--text-2);font-weight:500;">{{ last_run_rel }}</span>
+            {% if last_run_ok is false %}<span class="badge badge-yellow" style="margin-left:6px;">last pass failed</span>{% endif %}
+            <span style="opacity:0.75;">· last change detected {{ last_indexed_rel }}</span>
         </div>
     </div>
     <div class="page-actions">
@@ -100,7 +102,7 @@
         <div class="card anim-3">
             <div class="card-header">
                 <span class="card-title">Indexer</span>
-                <span class="mono" style="font-size:11px;color:var(--text-3);">{{ last_indexed_rel }}</span>
+                <span class="mono" style="font-size:11px;color:var(--text-3);">{{ last_run_rel }}</span>
             </div>
             <div class="card-body">
                 <div style="display:flex;align-items:flex-end;gap:12px;padding:4px 0 22px;flex-wrap:wrap;">
@@ -111,7 +113,14 @@
                     </div>
                 </div>
                 <div class="kv" style="padding:12px 0;border-top:1px solid var(--border);">
-                    <span class="kv-k">Last run</span>
+                    <span class="kv-k" title="When the indexer last completed a pass, whether or not anything had changed.">Last run</span>
+                    <span class="kv-v mono" style="font-size:12px;">
+                        {% if last_run_iso %}<time datetime="{{ last_run_iso }}" data-localize>{{ last_run_iso }}</time>{% else %}Never{% endif %}
+                        {% if last_run_ok is false %}<span class="badge badge-yellow" style="margin-left:6px;">failed</span>{% endif %}
+                    </span>
+                </div>
+                <div class="kv" style="padding:12px 0;border-top:1px solid var(--border);">
+                    <span class="kv-k" title="The newest indexed_at on any note — i.e. the last time a pass found a change to write. Older than 'Last run' just means the vault has been quiet.">Last change detected</span>
                     <span class="kv-v mono" style="font-size:12px;">
                         {% if last_indexed_iso %}<time datetime="{{ last_indexed_iso }}" data-localize>{{ last_indexed_iso }}</time>{% else %}Never{% endif %}
                     </span>

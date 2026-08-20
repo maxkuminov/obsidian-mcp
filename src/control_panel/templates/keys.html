@@ -41,6 +41,7 @@
             <thead>
                 <tr>
                     <th>Name</th>
+                    {% if multi_user_mode %}<th>Owner</th>{% endif %}
                     <th>Prefix</th>
                     <th>Permission</th>
                     <th>Status</th>
@@ -53,6 +54,11 @@
                 {% for key in keys %}
                 <tr>
                     <td style="color:var(--text);font-weight:500;">{{ key.name }}</td>
+                    {% if multi_user_mode %}
+                    <td style="font-size:12px;color:var(--text-2);">
+                        {% if key.owner_username %}{{ key.owner_username }}{% else %}<span style="color:var(--text-3);">—</span>{% endif %}
+                    </td>
+                    {% endif %}
                     <td class="mono" style="color:var(--text-2);">{{ key.key_prefix }}···</td>
                     <td>
                         {% if key.permission == 'readwrite' %}
@@ -62,10 +68,18 @@
                         {% endif %}
                     </td>
                     <td>
-                        {% if key.is_active %}
-                        <span class="badge badge-green">Active</span>
-                        {% else %}
+                        {% if not key.is_active %}
                         <span class="badge badge-red">Revoked</span>
+                        {% elif not key.owner_is_active %}
+                        {# Owner before expiry: `auth.py` checks the owner's
+                           is_active first and 401s there, so a key that is
+                           both should name the reason the middleware would
+                           actually give. #}
+                        <span class="badge badge-yellow" title="The key itself is live, but its owner is deactivated — the MCP server rejects it with 401 inactive_user.">Owner inactive</span>
+                        {% elif key.is_expired %}
+                        <span class="badge badge-red" title="Past its expires_at — the MCP server rejects it with 401 key_expired.">Expired</span>
+                        {% else %}
+                        <span class="badge badge-green">Active</span>
                         {% endif %}
                     </td>
                     <td class="mono" style="font-size:11px;color:var(--text-2);">
@@ -91,7 +105,7 @@
                 {% endfor %}
                 {% if not keys %}
                 <tr>
-                    <td colspan="7" style="text-align:center;padding:32px;color:var(--text-3);">No API keys yet.</td>
+                    <td colspan="{{ 8 if multi_user_mode else 7 }}" style="text-align:center;padding:32px;color:var(--text-3);">No API keys yet.</td>
                 </tr>
                 {% endif %}
             </tbody>

@@ -213,7 +213,7 @@ async def test_no_leakage_into_a_later_call_in_the_same_task(monkeypatch, captur
     await tools.search_notes_impl("needle")
 
     first = captured.params_for("semantic_search")
-    second = captured.params_for("search_notes")
+    second = captured.params_for("keyword_search")
     assert first["embed_ms"] >= 0
     assert "embed_ms" not in second
     assert "db_ms" not in second
@@ -242,7 +242,7 @@ async def test_holder_is_cleared_even_when_the_tool_raises(monkeypatch, captured
     monkeypatch.setattr(tools, "async_session", lambda: _FTSSession())
     monkeypatch.setattr("src.services.search.combined_tsquery", lambda _q: "tsq")
     await tools.search_notes_impl("needle")
-    assert "db_ms" not in captured.params_for("search_notes")
+    assert "db_ms" not in captured.params_for("keyword_search")
 
 
 @pytest.mark.asyncio
