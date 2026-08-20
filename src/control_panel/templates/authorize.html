@@ -234,7 +234,7 @@
                 <div class="scope-label">Grant access level</div>
 
                 <label class="scope-option">
-                    <input type="radio" name="scope" value="{{ read_scope }}" checked>
+                    <input type="radio" name="scope" value="{{ read_scope }}" {% if not requested_write %}checked{% endif %}>
                     <div>
                         <div class="scope-option-title">Read only</div>
                         <div class="scope-option-desc">Search and read notes. Cannot create or edit.</div>
@@ -243,7 +243,7 @@
 
                 {% if client_can_write %}
                 <label class="scope-option">
-                    <input type="radio" name="scope" value="{{ readwrite_scope }}">
+                    <input type="radio" name="scope" value="{{ readwrite_scope }}" {% if requested_write %}checked{% endif %}>
                     <div>
                         <div class="scope-option-title">Read + Write</div>
                         <div class="scope-option-desc">Full access: search, read, create, and edit notes.</div>
