@@ -58,6 +58,24 @@ inserted between the backfill and `SET NOT NULL`. The explicit post-check is
 belt-and-braces: it raises with a count rather than letting `SET NOT NULL`
 report a generic constraint failure.
 
+**Split a family.** The backfill is a *partition* of rows that have no grant,
+and that is only true when this migration created the column — then every row
+is NULL and the grouping covers all of them. If the column **pre-exists**,
+`WHERE grant_id IS NULL` stops being a partition and becomes a patch: a NULL
+row beside a stamped sibling would get a **fresh** id, turning one grant into
+two, so revoking either would leave the other alive. That is the exact defect
+014 exists to remove, reintroduced by the migration.
+
+There is no safe repair for that state — the right id for a NULL row is
+whatever its siblings carry, and "sibling" is only definable through the
+grouping we would be inventing. So, in 013's spirit, a pre-existing column is
+*verified, not adopted*: it must be `character varying(64)`, our index name
+must be free or already on it, no row may be NULL, and no existing `grant_id`
+may span more than one `(client_id, user_id)` — that last one because every
+family operation resolves a family by `grant_id` alone, so adopting a
+cross-owner id would let one user's Revoke reach another's grant. Any of those
+raises, names the offending rows, and the whole transaction rolls back.
+
 Lock footprint is one table, and a child one at that (`oauth_tokens` references
 both `oauth_clients` and `users`), so this migration cannot close a wait cycle
 with 013's parent-then-child order or with the app's own
@@ -89,16 +107,129 @@ INDEX = "ix_oauth_tokens_grant_id"
 # `secrets.token_urlsafe(24)` (32 chars); the backfill writes a uuid (36).
 COLUMN_TYPE = sa.String(64)
 
+# How PostgreSQL prints that type. A pre-existing column of any other shape is
+# refused rather than adopted -- see `_require_pre_existing_column_is_ours`.
+EXPECTED_TYPE = "character varying(64)"
 
-def _column_exists(bind) -> bool:
+
+def _column_shape(bind):
+    """`(attnotnull, formatted_type)` for `grant_id`, or None if absent."""
     return bind.execute(
         sa.text(
-            "SELECT 1 FROM pg_attribute "
-            "WHERE attrelid = CAST(:table AS regclass) AND attname = :column "
-            "  AND attnum > 0 AND NOT attisdropped"
+            "SELECT a.attnotnull, format_type(a.atttypid, a.atttypmod) "
+            "FROM pg_attribute a "
+            "WHERE a.attrelid = CAST(:table AS regclass) AND a.attname = :column "
+            "  AND a.attnum > 0 AND NOT a.attisdropped"
         ),
         {"table": TABLE, "column": COLUMN},
-    ).scalar_one_or_none() is not None
+    ).first()
+
+
+def _index_column(bind):
+    """The column our index name is defined on, or None if the name is free."""
+    return bind.execute(
+        sa.text(
+            "SELECT a.attname FROM pg_index i "
+            "JOIN pg_class c ON c.oid = i.indexrelid "
+            "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+            "                   AND a.attnum = ANY(i.indkey) "
+            "WHERE c.relname = :index"
+        ),
+        {"index": INDEX},
+    ).scalar_one_or_none()
+
+
+def _require_pre_existing_column_is_ours(bind, shape) -> None:
+    """A `grant_id` this migration did not create must already be 014's shape.
+
+    Same philosophy as 013: reconcile a database that has the shape, refuse to
+    guess for one that does not. A `text` or `varchar(32)` column under our
+    name is not something we can widen and then trust, because we would be
+    trusting values we did not write.
+    """
+    _, formatted_type = shape
+    if formatted_type != EXPECTED_TYPE:
+        raise RuntimeError(
+            f"{TABLE}.{COLUMN} already exists as {formatted_type}, not "
+            f"{EXPECTED_TYPE}. 014 reconciles a column it created; it will not "
+            "adopt one of a different shape. Inspect it by hand, then re-run. "
+            "Nothing has been changed."
+        )
+
+    index_column = _index_column(bind)
+    if index_column not in (None, COLUMN):
+        raise RuntimeError(
+            f"index {INDEX} already exists on column {index_column!r}, not "
+            f"{COLUMN!r}. `alembic check` would stay dirty forever. Drop or "
+            "rename it by hand, then re-run. Nothing has been changed."
+        )
+
+
+def _assert_no_partial_stamping(bind) -> None:
+    """A pre-existing column with NULLs is a *split family* waiting to happen.
+
+    This is the case the first draft got wrong. If some rows carry a
+    `grant_id` and their siblings do not, backfilling only the NULLs assigns
+    those siblings a **fresh** id -- so one grant becomes two, and revoking
+    either one leaves the other alive. That is precisely the defect 014 exists
+    to remove, reintroduced by the migration itself.
+
+    There is no safe repair: the correct id for a NULL row is whatever its
+    siblings carry, but "sibling" is only definable through the grouping we
+    would be inventing. So refuse, name the rows, and let a human decide.
+    """
+    offenders = bind.execute(
+        sa.text(
+            f"SELECT id FROM {TABLE} WHERE {COLUMN} IS NULL ORDER BY id LIMIT 20"
+        )
+    ).scalars().all()
+    if not offenders:
+        return
+    total = bind.execute(
+        sa.text(f"SELECT count(*) FROM {TABLE} WHERE {COLUMN} IS NULL")
+    ).scalar_one()
+    raise RuntimeError(
+        f"{TABLE}.{COLUMN} already exists but {total} row(s) are NULL "
+        f"(ids: {', '.join(str(i) for i in offenders)}"
+        f"{', ...' if total > len(offenders) else ''}). 014 will not backfill "
+        "them: a NULL beside a stamped sibling means assigning a fresh id and "
+        "splitting one grant into two, so a revocation would miss half of it. "
+        "Decide the correct grant_id for these rows by hand, or drop the "
+        "column and let 014 create it. Nothing has been changed."
+    )
+
+
+def _assert_no_grant_spans_two_owners(bind) -> None:
+    """One `grant_id` must mean one `(client_id, user_id)`.
+
+    That invariant is what lets every family operation resolve a family as
+    `grant_id == g` with no `user_id` predicate (see `src/oauth/grants.py`).
+    A pre-existing column could carry ids that violate it -- and adopting them
+    would make a single panel Revoke reach into another user's grant.
+
+    Sentinel-free: `count(DISTINCT user_id)` ignores NULLs, so the third
+    disjunct is what catches a mix of NULL and non-NULL owners.
+    """
+    offenders = bind.execute(
+        sa.text(
+            f"SELECT {COLUMN} FROM {TABLE} "
+            f"WHERE {COLUMN} IS NOT NULL "
+            f"GROUP BY {COLUMN} "
+            "HAVING count(DISTINCT client_id) > 1 "
+            "    OR count(DISTINCT user_id) > 1 "
+            "    OR (count(user_id) > 0 AND count(user_id) < count(*)) "
+            f"ORDER BY {COLUMN} LIMIT 20"
+        )
+    ).scalars().all()
+    if offenders:
+        raise RuntimeError(
+            f"{len(offenders)} pre-existing {COLUMN} value(s) span more than one "
+            f"(client_id, user_id): {', '.join(repr(g) for g in offenders)}. "
+            "A grant family must belong to exactly one client and one user -- "
+            "revocation and scope changes resolve a family by grant_id alone, "
+            "so adopting these would let one user's Revoke reach another's "
+            "grant. Fix them by hand, then re-run. Nothing has been changed."
+        )
 
 
 def upgrade() -> None:
@@ -111,11 +242,21 @@ def upgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '10s'")
     op.execute("SET LOCAL statement_timeout = '60s'")
 
-    if not _column_exists(bind):
+    shape = _column_shape(bind)
+    if shape is None:
         # Nullable for the length of this transaction only. ADD COLUMN takes
         # ACCESS EXCLUSIVE and holds it to COMMIT, so the nullable window is
-        # never observable by another session.
+        # never observable by another session, and every row is NULL at this
+        # point by construction -- which is what makes the backfill below a
+        # partition rather than a patch.
         op.add_column(TABLE, sa.Column(COLUMN, COLUMN_TYPE, nullable=True))
+    else:
+        # The column pre-exists: this is a re-run, or somebody added it. 014
+        # will complete a column it can *verify*, and refuse one it would have
+        # to guess about. See each helper for what it refuses and why.
+        _require_pre_existing_column_is_ours(bind, shape)
+        _assert_no_partial_stamping(bind)
+        _assert_no_grant_spans_two_owners(bind)
 
     # One id per (client_id, user_id) over the rows that do not have one yet.
     #

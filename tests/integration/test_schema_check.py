@@ -907,3 +907,185 @@ def test_downgrade_014_removes_the_column_and_upgrade_rebuilds_it():
         _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
         assert len(set(grant_ids(url).values())) == EXPECTED_FAMILIES
         assert_reconciled(url, marker_expected=False)
+
+
+# --------------------------------------------------------------------------
+# 014 refuses a pre-existing column it cannot verify
+# --------------------------------------------------------------------------
+#
+# The backfill is a *partition* only because 014 created the column, so every
+# row is NULL and the grouping covers all of them. On a column somebody else
+# added, `WHERE grant_id IS NULL` becomes a patch: a NULL row beside a stamped
+# sibling gets a fresh id, one grant becomes two, and revoking either leaves
+# the other alive — the exact defect 014 exists to remove, reintroduced by the
+# migration. There is no safe repair, so it refuses, in 013's spirit.
+
+
+def add_bare_grant_id_column(url, coltype="varchar(64)"):
+    sql(url, f"ALTER TABLE oauth_tokens ADD COLUMN grant_id {coltype}")
+
+
+def test_partially_stamped_column_is_refused_not_backfilled():
+    """The case that would split a live pair across two families."""
+    with throwaway_db("schema_grant_partial", revision="012") as url:
+        seed_pre_014_tokens(url)
+        add_bare_grant_id_column(url)
+        # Alice's access token is stamped; its refresh sibling is not.
+        sql(
+            url,
+            "UPDATE oauth_tokens SET grant_id = 'preexisting-1' WHERE token_hash = $1",
+            "a" * 64,
+        )
+
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "are NULL" in combined
+        assert "splitting one grant into two" in combined
+
+        # Nothing changed: still at 012, the stamped row keeps its value, the
+        # siblings are still NULL, and no index was created.
+        assert alembic_version(url) == "012"
+        ids = grant_ids(url)
+        assert ids["a" * 64] == "preexisting-1"
+        assert ids["b" * 64] is None
+        assert column_shape(url, "oauth_tokens", "grant_id")[0] is False
+        assert fetchval(
+            url,
+            "SELECT indexdef FROM pg_indexes WHERE tablename = 'oauth_tokens' "
+            "AND indexname = 'ix_oauth_tokens_grant_id'",
+        ) is None
+
+
+def test_a_pre_existing_grant_spanning_two_users_is_refused():
+    """Adopting it would let one user's Revoke reach another user's grant.
+
+    Every family operation resolves a family as `grant_id == g`, with no
+    `user_id` predicate — deliberately, because a `user_id` predicate is how
+    incomplete revocation comes back. That is only safe while the invariant
+    holds, so a migration must never import values that break it.
+    """
+    with throwaway_db("schema_grant_cross_user", revision="012") as url:
+        seed_pre_014_tokens(url)
+        add_bare_grant_id_column(url)
+        # One id shared by alice's row and bob's row on the same client.
+        sql(url, "UPDATE oauth_tokens SET grant_id = 'shared'")
+
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "'shared'" in combined
+        assert "more than one" in combined
+
+        assert alembic_version(url) == "012"
+        assert set(grant_ids(url).values()) == {"shared"}
+
+
+def test_a_pre_existing_grant_mixing_null_and_real_owners_is_refused():
+    """`count(DISTINCT user_id)` skips NULLs, so this needs its own disjunct."""
+    with throwaway_db("schema_grant_null_owner_mix", revision="012") as url:
+        seed_pre_014_tokens(url)
+        add_bare_grant_id_column(url)
+        # Alice's client-b row and the single-user (NULL owner) client-b row.
+        sql(
+            url,
+            "UPDATE oauth_tokens SET grant_id = 'mixed' WHERE token_hash = ANY($1)",
+            ["e" * 64, "f" * 64],
+        )
+        sql(
+            url,
+            "UPDATE oauth_tokens SET grant_id = 'rest' WHERE grant_id IS NULL",
+        )
+
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+
+        assert result.returncode != 0
+        assert "'mixed'" in result.stdout + result.stderr
+        assert alembic_version(url) == "012"
+
+
+def test_a_pre_existing_column_of_the_wrong_type_is_refused():
+    """014 completes a column it can verify; it does not adopt a stranger."""
+    with throwaway_db("schema_grant_wrong_type", revision="012") as url:
+        seed_pre_014_tokens(url)
+        add_bare_grant_id_column(url, coltype="text")
+        sql(url, "UPDATE oauth_tokens SET grant_id = 'g-' || id::text")
+
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+
+        assert result.returncode != 0
+        combined = result.stdout + result.stderr
+        assert "already exists as text" in combined
+        assert alembic_version(url) == "012"
+        assert column_shape(url, "oauth_tokens", "grant_id")[1] == "text"
+
+
+def test_a_squatting_index_name_is_refused():
+    """`CREATE INDEX IF NOT EXISTS` would silently keep the wrong index.
+
+    `alembic check` compares index *names*, so an index of our name on another
+    column leaves the check permanently dirty while looking installed.
+    """
+    with throwaway_db("schema_grant_index_squat", revision="012") as url:
+        seed_pre_014_tokens(url)
+        add_bare_grant_id_column(url)
+        sql(url, "UPDATE oauth_tokens SET grant_id = 'g-' || id::text")
+        sql(
+            url,
+            "CREATE INDEX ix_oauth_tokens_grant_id ON oauth_tokens (token_type)",
+        )
+
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+
+        assert result.returncode != 0
+        assert "already exists on column" in result.stdout + result.stderr
+        assert alembic_version(url) == "012"
+
+
+def test_a_complete_pre_existing_column_is_accepted():
+    """The benign case: someone applied 014's shape by hand, consistently.
+
+    Nothing has to be guessed here — every row has an id and no id spans two
+    owners — so the migration completes rather than refusing, and leaves the
+    existing values alone.
+    """
+    with throwaway_db("schema_grant_preexisting_ok", revision="012") as url:
+        seed_pre_014_tokens(url)
+        add_bare_grant_id_column(url)
+        # One id per (client_id, user_id), exactly what 014 would have derived.
+        sql(
+            url,
+            "UPDATE oauth_tokens SET grant_id = "
+            "  'hand-' || client_id || '-' || coalesce(user_id::text, 'null')",
+        )
+        before = grant_ids(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == "014"
+        assert grant_ids(url) == before, "existing ids must be left alone"
+        assert column_shape(url, "oauth_tokens", "grant_id")[0] is True
+        assert_reconciled(url, marker_expected=False)
+
+
+def test_an_empty_table_with_a_nullable_column_completes():
+    """Nothing to guess, so nothing to refuse."""
+    with throwaway_db("schema_grant_empty_preexisting", revision="012") as url:
+        add_bare_grant_id_column(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == "014"
+        assert column_shape(url, "oauth_tokens", "grant_id")[0] is True
