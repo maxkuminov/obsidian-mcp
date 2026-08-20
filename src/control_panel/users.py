@@ -267,8 +267,42 @@ async def edit_user_submit(
     if target is None:
         raise HTTPException(404, "User not found")
 
-    new_admin = is_admin == "on" or is_admin == "true" or is_admin == "1"
-    new_active = is_active == "on" or is_active == "true" or is_active == "1"
+    def _checked(raw: str) -> bool:
+        return raw in ("on", "true", "1")
+
+    new_admin = _checked(is_admin)
+    new_active = _checked(is_active)
+
+    is_self = isinstance(user, User) and user.id == target.id
+
+    # A self-edit can never change your own role or active flag (#69).
+    # user_edit.html states that as an unconditional promise and renders
+    # both checkboxes `disabled`; the handler is what makes the promise
+    # true, and it must hold for a hand-crafted POST too — the previous
+    # rule ("unless you are the last active admin") let an admin with a
+    # colleague demote or deactivate themselves out of the panel in one
+    # click, with the alert actively encouraging the belief that the
+    # toggle was inert.
+    #
+    # A `disabled` checkbox is not submitted at all, so an *absent* field
+    # on a self-edit means "unchanged", never "unchecked" — reading it as
+    # unchecked would demote the operator on every save. A field that is
+    # present and asks to strip the role or the active flag is refused
+    # outright rather than silently ignored, so a scripted caller gets a
+    # reason instead of a no-op.
+    if is_self:
+        if is_admin != "" and target.is_admin and not new_admin:
+            return _back_with_error(
+                user_id,
+                "You can't remove your own admin role. Ask another admin to do it.",
+            )
+        if is_active != "" and target.is_active and not new_active:
+            return _back_with_error(
+                user_id,
+                "You can't deactivate your own account. Ask another admin to do it.",
+            )
+        new_admin = target.is_admin
+        new_active = target.is_active
 
     # Defense: never let the last active admin be demoted or deactivated.
     # This covers both "max demotes himself" and "max demotes bob" — the
@@ -284,7 +318,9 @@ async def edit_user_submit(
             )
         )).scalar() or 0
         if remaining_admins == 0:
-            if isinstance(user, User) and target.id == user.id:
+            # Unreachable for a self-edit since the block above pins your own
+            # flags; kept as a backstop if that guard is ever relaxed.
+            if is_self:
                 return _back_with_error(
                     user_id,
                     "Refusing to remove the last admin (yourself). Promote another user to admin first.",

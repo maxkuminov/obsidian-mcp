@@ -49,6 +49,7 @@
                     </div>
                     <div class="field" style="display:flex;align-items:center;gap:10px;">
                         <input type="checkbox" name="is_admin" id="is_admin" {% if target.is_admin %}checked{% endif %}
+                               {% if is_self %}disabled{% endif %}
                                style="width:18px;height:18px;accent-color:var(--primary);">
                         <label for="is_admin" style="font-size:14px;color:var(--text);cursor:pointer;">
                             Admin
@@ -59,6 +60,7 @@
                     </div>
                     <div class="field" style="display:flex;align-items:center;gap:10px;">
                         <input type="checkbox" name="is_active" id="is_active" {% if target.is_active %}checked{% endif %}
+                               {% if is_self %}disabled{% endif %}
                                style="width:18px;height:18px;accent-color:var(--primary);">
                         <label for="is_active" style="font-size:14px;color:var(--text);cursor:pointer;">
                             Active
@@ -69,7 +71,10 @@
                     </div>
                     {% if is_self %}
                     <div class="alert alert-warning" style="margin-top:8px;font-size:12px;">
-                        This is your own account — you can't remove your own admin role or deactivate yourself here.
+                        This is your own account — you can't remove your own admin role or
+                        deactivate yourself here. Both toggles are locked, and the server
+                        refuses the change even if the form is bypassed. Another admin can
+                        do it from this page.
                     </div>
                     {% endif %}
                     <div style="display:flex;gap:10px;margin-top:18px;">
