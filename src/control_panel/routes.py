@@ -530,6 +530,12 @@ async def oauth_page(
                 "id": t.id,
                 "token_type": t.token_type,
                 "scope": t.scope,
+                # t.scope is a space-separated set (e.g. "offline_access
+                # readwrite"), not always exactly "read" or "readwrite" -
+                # the template needs membership, not string equality, or
+                # a readwrite token showing an offline_access marker
+                # renders as if it were read-only.
+                "has_write": "readwrite" in t.scope.split(),
                 "revoked": t.revoked,
                 "expired": False,
                 "expires_at": t.expires_at.isoformat(),
@@ -605,7 +611,11 @@ async def update_oauth_token_scope(
         return RedirectResponse("/admin/oauth", status_code=303)
     token = await _assert_oauth_token_owner(session, token_id, user)
     if not token.revoked:
-        token.scope = scope
+        # Preserve the offline_access marker (informational only - see
+        # DEFAULT_CLIENT_SCOPE comment in src/oauth/routes.py) instead of
+        # dropping it whenever an admin flips read/readwrite here.
+        has_offline = "offline_access" in token.scope.split()
+        token.scope = f"{scope} offline_access" if has_offline else scope
         await session.commit()
     return RedirectResponse("/admin/oauth", status_code=303)
 

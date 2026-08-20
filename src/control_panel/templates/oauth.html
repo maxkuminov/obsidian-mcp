@@ -68,8 +68,8 @@
                             <form method="POST" action="/admin/oauth/token/{{ token.id }}/scope" style="display:inline;">
                                 {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                                 <select name="scope" onchange="this.form.submit()" class="field-select" style="width:auto;padding:3px 28px 3px 8px;font-size:11px;">
-                                    <option value="read"      {% if token.scope == 'read'      %}selected{% endif %}>read</option>
-                                    <option value="readwrite" {% if token.scope == 'readwrite' %}selected{% endif %}>readwrite</option>
+                                    <option value="read"      {% if not token.has_write %}selected{% endif %}>read</option>
+                                    <option value="readwrite" {% if token.has_write     %}selected{% endif %}>readwrite</option>
                                 </select>
                             </form>
                             {% endif %}
