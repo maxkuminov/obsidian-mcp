@@ -933,16 +933,28 @@ async def prewarm_search_caches() -> None:
         )
 
 
-async def _index_pass_once(user_id: int | None) -> None:
-    """One full index + embed pass for a single user (or single-user mode)."""
+async def _index_pass_once(user_id: int | None) -> bool:
+    """One full index + embed pass for a single user (or single-user mode).
+
+    Returns True only if both stages completed. Failures are swallowed per
+    stage so one user's broken vault cannot stop every other user's pass, but
+    the caller has to *know* they happened: a tick that logged two failures
+    must not stamp the heartbeat as a healthy run (#78). Swallowing and
+    returning True is exactly the "reports fine, is not" defect the heartbeat
+    exists to remove.
+    """
+    ok = True
     try:
         await index_vault(user_id=user_id)
     except Exception as e:
+        ok = False
         logger.error(f"Index failed (user_id={user_id}): {e}")
     try:
         await embed_vault(user_id=user_id)
     except Exception as e:
+        ok = False
         logger.error(f"Embedding failed (user_id={user_id}): {e}")
+    return ok
 
 
 async def run_indexer_loop():
@@ -1020,12 +1032,16 @@ async def run_indexer_loop():
             # Hold `index_pass_lock` for the whole index/embed pass so a
             # concurrent panel-triggered `_reindex_background` cannot run a
             # second index_vault/embed_vault over the same scope.
+            tick_ok = True
             async with index_pass_lock:
                 if settings.multi_user_mode:
                     # Re-fetch the user list every cycle so newly-added or
                     # newly-deactivated users are picked up without a restart.
+                    # One user's failure does not abort the others, but it
+                    # does make the whole tick a failed run.
                     for uid in await _active_user_ids():
-                        await _index_pass_once(uid)
+                        if not await _index_pass_once(uid):
+                            tick_ok = False
                 else:
                     await index_vault()
                     await embed_vault()
@@ -1037,8 +1053,11 @@ async def run_indexer_loop():
             await cleanup_expired_tokens()
             consecutive_failures = 0
             # Heartbeat: the tick completed. Recorded whether or not the pass
-            # found anything to index — that is the whole point (#78).
-            _record_index_run(True)
+            # found anything to index — that is the whole point (#78) — but
+            # `tick_ok` is False if any per-user pass swallowed an exception,
+            # so a multi-user tick that failed for every user is not stamped
+            # healthy just because the loop itself survived.
+            _record_index_run(tick_ok)
         except Exception as e:
             consecutive_failures += 1
             # A tick that raised still *ran*; the dashboard says so and marks

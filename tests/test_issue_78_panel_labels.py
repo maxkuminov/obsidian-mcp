@@ -145,6 +145,84 @@ def test_a_failing_tick_is_recorded_as_a_failed_run(monkeypatch):
     assert indexer.last_index_run_ok is False
 
 
+def test_multi_user_tick_with_a_failing_user_is_not_a_healthy_run(monkeypatch):
+    """`_index_pass_once` swallows per-user exceptions so one broken vault
+    cannot stop the others — but the tick must not then be stamped `ok=True`.
+    Swallow-and-report-healthy is the same "reports fine, is not" defect the
+    heartbeat exists to remove."""
+    monkeypatch.setattr(indexer, "last_index_run_at", None)
+    monkeypatch.setattr(indexer, "last_index_run_ok", None)
+    monkeypatch.setattr(indexer.settings, "multi_user_mode", True)
+    monkeypatch.setattr(indexer.settings, "index_interval_seconds", 0)
+    monkeypatch.setattr(indexer, "_is_paused", lambda: False)
+
+    seen = []
+    phase = {"startup": True}
+
+    async def _users(*_a, **_k):
+        return [1, 2, 3]
+
+    async def _index(user_id=None, **_k):
+        if phase["startup"]:
+            return None
+        seen.append(user_id)
+        if user_id == 2:
+            raise RuntimeError("user 2's vault is gone")
+        return None
+
+    async def _noop(*_a, **_k):
+        return None
+
+    monkeypatch.setattr(indexer, "_active_user_ids", _users)
+    monkeypatch.setattr(indexer, "index_vault", _index)
+    monkeypatch.setattr(indexer, "embed_vault", _noop)
+    monkeypatch.setattr(indexer, "link_backfill_pass", _noop)
+    monkeypatch.setattr(indexer, "prewarm_search_caches", _noop)
+    monkeypatch.setattr(indexer, "cleanup_expired_tokens", _noop)
+
+    sleeps = {"n": 0}
+
+    async def _sleep(*_a, **_k):
+        # First sleep starts the first periodic tick; the second means that
+        # tick finished — and, crucially, that it has already recorded its
+        # heartbeat, which is what this test reads.
+        sleeps["n"] += 1
+        phase["startup"] = False
+        if sleeps["n"] >= 2:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(indexer.asyncio, "sleep", _sleep)
+
+    try:
+        asyncio.run(indexer.run_indexer_loop())
+    except asyncio.CancelledError:
+        pass
+
+    assert seen == [1, 2, 3], "one user's failure must not abort the others"
+    assert indexer.last_index_run_ok is False, (
+        "a tick that swallowed a per-user failure was stamped healthy"
+    )
+
+
+def test_index_pass_once_reports_each_stage(monkeypatch):
+    async def _ok(*_a, **_k):
+        return None
+
+    async def _fail(*_a, **_k):
+        raise RuntimeError("nope")
+
+    monkeypatch.setattr(indexer, "index_vault", _ok)
+    monkeypatch.setattr(indexer, "embed_vault", _ok)
+    assert asyncio.run(indexer._index_pass_once(1)) is True
+
+    monkeypatch.setattr(indexer, "index_vault", _fail)
+    assert asyncio.run(indexer._index_pass_once(1)) is False
+
+    monkeypatch.setattr(indexer, "index_vault", _ok)
+    monkeypatch.setattr(indexer, "embed_vault", _fail)
+    assert asyncio.run(indexer._index_pass_once(1)) is False
+
+
 def test_startup_pass_records_a_run(monkeypatch):
     """Otherwise the dashboard reads "Never" for a whole interval after every
     restart — the same false alarm from the other direction."""
