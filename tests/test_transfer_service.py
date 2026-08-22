@@ -22,6 +22,7 @@ import http.server
 import os
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -498,6 +499,87 @@ async def test_bytes_are_staged_outside_the_destination_folder(vault):
     assert seen == [[]], "the temp file was staged in the destination folder"
     assert (vault / vault_fs.STAGING_DIR).is_dir()
     assert list((vault / vault_fs.STAGING_DIR).iterdir()) == []
+
+
+async def test_the_staging_directory_is_private_while_the_gate_holds(vault):
+    """Ordering, not just the end state.
+
+    The staged file is relaxed to the umask default before the gate opens, and
+    the gate can wait unboundedly on `SELECT ... FOR UPDATE`. So the directory
+    must already be 0700 *at that moment* — a tightening that only happened
+    during cleanup would leave exactly the exposure #95 exists to remove, while
+    still passing an end-state assertion.
+    """
+    seen: dict = {}
+
+    class PeekingGate(RecordingGate):
+        async def __aenter__(self):
+            staging = vault / vault_fs.STAGING_DIR
+            seen["dir_mode"] = staging.stat().st_mode & 0o777
+            seen["file_modes"] = sorted(
+                p.stat().st_mode & 0o777 for p in staging.iterdir()
+            )
+            return await super().__aenter__()
+
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    await stream_to_vault(
+        row,
+        chunks_of(b"payload"),
+        max_bytes=100,
+        deadline=deadline_in(30),
+        before_publish=PeekingGate(allow=True),
+    )
+    assert seen["dir_mode"] == 0o700, "staged bytes were exposed while the gate held"
+    # Documents the ordering the 0700 exists to compensate for: by gate time the
+    # staged inode is already at the published mode.
+    assert seen["file_modes"] == [vault_fs.default_file_mode()]
+
+
+async def test_a_staging_directory_that_cannot_be_tightened_refuses_the_upload(
+    vault, monkeypatch
+):
+    """Fail closed when the isolation guarantee cannot be established.
+
+    A filesystem that accepts `fchmod` without applying it would otherwise
+    leave every call reporting success while the directory stayed readable.
+    """
+    staging = vault / vault_fs.STAGING_DIR
+    staging.mkdir()
+    os.chmod(staging, 0o755)
+    monkeypatch.setattr(os, "fchmod", lambda *args, **kwargs: None)
+
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    with pytest.raises(vault_fs.UnsupportedFilesystem, match="0700|700"):
+        await stream_to_vault(
+            row, chunks_of(b"payload"), max_bytes=100, deadline=deadline_in(30)
+        )
+    assert not (vault / "Attachments" / "a.bin").exists()
+
+
+async def test_a_foreign_owned_staging_directory_refuses_the_upload(
+    vault, monkeypatch
+):
+    """0700 means nothing if somebody else owns the directory."""
+    staging = vault / vault_fs.STAGING_DIR
+    staging.mkdir(mode=0o700)
+    real_fstat = os.fstat
+
+    def foreign(fd):
+        st = real_fstat(fd)
+        if stat.S_ISDIR(st.st_mode):
+            return os.stat_result(
+                (st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1)
+                + tuple(st)[5:]
+            )
+        return st
+
+    monkeypatch.setattr(os, "fstat", foreign)
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    with pytest.raises(vault_fs.UnsafePath, match="owned by uid"):
+        await stream_to_vault(
+            row, chunks_of(b"payload"), max_bytes=100, deadline=deadline_in(30)
+        )
+    assert not (vault / "Attachments" / "a.bin").exists()
 
 
 async def test_a_commit_failure_after_publication_is_its_own_error(vault):

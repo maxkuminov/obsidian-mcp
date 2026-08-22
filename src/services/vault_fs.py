@@ -221,7 +221,7 @@ def _open_child(parent_fd: int, part: str, *, create: bool, rel_dir) -> int:
 STAGING_DIR_MODE = 0o700
 
 
-def open_staging_dir(root_fd: int) -> int:
+def open_staging_dir(root_fd: int, *, create: bool = True) -> int:
     """Open `.transfer-tmp` beneath `root_fd`, enforcing owner-only access.
 
     Staged bytes are relaxed to `default_file_mode()` before publication, so
@@ -244,16 +244,38 @@ def open_staging_dir(root_fd: int) -> int:
     Destination directories are deliberately *not* treated this way — they
     hold published vault content and get the ordinary 0755 from `_open_child`.
     """
-    fd = open_dir_beneath(root_fd, STAGING_DIR, create=True)
+    fd = open_dir_beneath(root_fd, STAGING_DIR, create=create)
     try:
-        current = stat.S_IMODE(os.fstat(fd).st_mode)
-        if current != STAGING_DIR_MODE:
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid():
+            raise UnsafePath(
+                f"{STAGING_DIR} is owned by uid {st.st_uid}, not by this "
+                f"process (uid {os.geteuid()}); refusing to stage uploads in it"
+            )
+        if stat.S_IMODE(st.st_mode) != STAGING_DIR_MODE:
             os.fchmod(fd, STAGING_DIR_MODE)
             logger.info(
-                "Tightened %s from %o to %o", STAGING_DIR, current, STAGING_DIR_MODE
+                "Tightened %s from %o to %o",
+                STAGING_DIR,
+                stat.S_IMODE(st.st_mode),
+                STAGING_DIR_MODE,
             )
-    except OSError:
-        os.close(fd)
+            # Verify rather than trust. A filesystem that accepts `fchmod` and
+            # does not apply it (or applies it partially) would otherwise leave
+            # the isolation guarantee false while every call reported success —
+            # and that guarantee is the only thing protecting a staged upload,
+            # because the staged file itself is relaxed to the umask default
+            # before the publish gate. Same posture as the publication and
+            # trash probes: refuse the operation rather than degrade silently.
+            effective = stat.S_IMODE(os.fstat(fd).st_mode)
+            if effective != STAGING_DIR_MODE:
+                raise UnsupportedFilesystem(
+                    f"Could not restrict {STAGING_DIR} to {STAGING_DIR_MODE:o}; "
+                    f"it is {effective:o} after chmod. Uploads need a staging "
+                    f"directory no other user can read."
+                )
+    except BaseException:
+        close_quietly(fd, STAGING_DIR)
         raise
     return fd
 
@@ -1059,7 +1081,10 @@ def prune_stale_staging(
     able to fail an operation.
     """
     try:
-        staging_fd = open_dir_beneath(root_fd, STAGING_DIR, create=False)
+        # Tighten before listing, never `open_dir_beneath` directly: this is
+        # the one other opener of the directory, and on a deployment upgrading
+        # from a release that left it 0755 the prune runs first (#95).
+        staging_fd = open_staging_dir(root_fd, create=False)
     except (FileNotFoundError, VaultFSError, OSError):
         return 0
     removed = 0
