@@ -1107,7 +1107,10 @@ def prune_stale_staging(
             if _unlink_quietly(staging_fd, entry, published=False):
                 removed += 1
     finally:
-        os.close(staging_fd)
+        # Janitorial work must never fail the operation that triggered it, and
+        # a bare `os.close` can raise (EIO). `prune_stale_staging` is called
+        # from the publication probe, i.e. on the foreground upload path.
+        close_quietly(staging_fd, STAGING_DIR)
     if removed:
         logger.info("Pruned %d stale staged upload(s) from %s", removed, STAGING_DIR)
     return removed

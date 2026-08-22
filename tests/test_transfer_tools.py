@@ -657,6 +657,23 @@ async def test_import_publishes_through_the_locked_identity_gate(
     assert call["need_write"] is True
 
 
+async def test_import_reports_an_unusable_staging_directory_instead_of_raising(
+    vault, readwrite, canned_fetch, publish_gate, monkeypatch
+):
+    """`UnsupportedFilesystem` is not an `OSError`, so the tool's catch-all did
+    not cover it and the refusal escaped as a raw MCP tool exception (#95)."""
+    staging = vault / vault_fs.STAGING_DIR
+    staging.mkdir()
+    os.chmod(staging, 0o755)
+    monkeypatch.setattr(os, "fchmod", lambda *args, **kwargs: None)
+
+    result = await tools.import_from_url_impl(
+        "https://example.com/a.png", "Attachments/a.png"
+    )
+    assert "Nothing was written." in result
+    assert not (vault / "Attachments" / "a.png").exists()
+
+
 async def test_import_publishes_nothing_when_the_gate_refuses(
     vault, readwrite, canned_fetch, publish_gate
 ):

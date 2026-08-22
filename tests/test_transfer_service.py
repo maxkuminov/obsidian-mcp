@@ -556,6 +556,42 @@ async def test_a_staging_directory_that_cannot_be_tightened_refuses_the_upload(
     assert not (vault / "Attachments" / "a.bin").exists()
 
 
+@pytest.mark.parametrize("partial", [0o750, 0o710, 0o701])
+async def test_a_partially_applied_chmod_refuses_too(vault, monkeypatch, partial):
+    """The check is exact equality, not "narrower than it was".
+
+    A filesystem that clamps the mode to something still group- or
+    world-reachable must refuse; only a no-op chmod would be caught by a test
+    that just compares against the original 0755.
+    """
+    staging = vault / vault_fs.STAGING_DIR
+    staging.mkdir()
+    os.chmod(staging, 0o755)
+    real_fchmod = os.fchmod
+    monkeypatch.setattr(os, "fchmod", lambda fd, mode: real_fchmod(fd, partial))
+
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    with pytest.raises(vault_fs.UnsupportedFilesystem):
+        await stream_to_vault(
+            row, chunks_of(b"payload"), max_bytes=100, deadline=deadline_in(30)
+        )
+    assert not (vault / "Attachments" / "a.bin").exists()
+
+
+async def test_ownership_is_compared_against_the_effective_uid(vault, monkeypatch):
+    """`geteuid`, not `getuid` — the test environment has them equal, so
+    nothing else here would notice the difference."""
+    (vault / vault_fs.STAGING_DIR).mkdir(mode=0o700)
+    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    with pytest.raises(vault_fs.UnsafePath, match="owned by uid"):
+        await stream_to_vault(
+            row, chunks_of(b"payload"), max_bytes=100, deadline=deadline_in(30)
+        )
+    assert not (vault / "Attachments" / "a.bin").exists()
+
+
 async def test_a_foreign_owned_staging_directory_refuses_the_upload(
     vault, monkeypatch
 ):
