@@ -216,6 +216,48 @@ def _open_child(parent_fd: int, part: str, *, create: bool, rel_dir) -> int:
     return _open_dir_nofollow(parent_fd, part, rel_dir)
 
 
+# Owner-only: nothing but this process has any business in the staging
+# directory. See `open_staging_dir`.
+STAGING_DIR_MODE = 0o700
+
+
+def open_staging_dir(root_fd: int) -> int:
+    """Open `.transfer-tmp` beneath `root_fd`, enforcing owner-only access.
+
+    Staged bytes are relaxed to `default_file_mode()` before publication, so
+    the directory — not the file — is what keeps an in-flight upload private.
+    That matters because staging is the window in which the bytes exist but
+    the publish gate has not yet revalidated the credential: a body that is
+    about to be *refused* is on disk for the duration, and under a
+    group-writable umask a peer could also alter it after `_drain` computed
+    its digest, so the server would publish bytes that do not match the
+    sha256 it reports. 0700 removes both, whatever the staged file's own mode
+    and whatever the operator's umask.
+
+    The mode is enforced on every open, not just at creation: `mkdir` is
+    masked by the umask, and a `.transfer-tmp` left at 0755 by an older
+    release (or by a `mkdir -p` from anywhere else) must be corrected rather
+    than trusted. `fchmod` goes through the descriptor we just opened
+    `O_NOFOLLOW`, so it cannot be redirected to another directory by a
+    rename in between.
+
+    Destination directories are deliberately *not* treated this way — they
+    hold published vault content and get the ordinary 0755 from `_open_child`.
+    """
+    fd = open_dir_beneath(root_fd, STAGING_DIR, create=True)
+    try:
+        current = stat.S_IMODE(os.fstat(fd).st_mode)
+        if current != STAGING_DIR_MODE:
+            os.fchmod(fd, STAGING_DIR_MODE)
+            logger.info(
+                "Tightened %s from %o to %o", STAGING_DIR, current, STAGING_DIR_MODE
+            )
+    except OSError:
+        os.close(fd)
+        raise
+    return fd
+
+
 def _open_dir_nofollow(parent_fd: int, part: str, rel_dir) -> int:
     try:
         return os.open(part, _O_DIR, dir_fd=parent_fd)

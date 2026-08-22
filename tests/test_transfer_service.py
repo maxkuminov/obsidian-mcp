@@ -167,6 +167,87 @@ async def test_uploaded_file_keeps_the_umask_default_mode(vault):
     assert published == vault_fs.default_file_mode()
 
 
+async def test_the_staging_directory_is_owner_only(vault):
+    """Staged bytes are relaxed before publication, so the directory is the
+    thing keeping an in-flight upload private (#95)."""
+    row = FakeRow(str(vault), "Attachments/shot.png")
+    await stream_to_vault(
+        row, chunks_of(PNG), max_bytes=1_000_000, content_length=len(PNG),
+        deadline=deadline_in(30),
+    )
+    staging = vault / vault_fs.STAGING_DIR
+    assert staging.stat().st_mode & 0o777 == 0o700
+
+
+async def test_a_pre_existing_permissive_staging_directory_is_tightened(vault):
+    """An older release left `.transfer-tmp` at 0755; opening it must fix that
+    rather than trust it."""
+    staging = vault / vault_fs.STAGING_DIR
+    staging.mkdir(mode=0o755)
+    os.chmod(staging, 0o755)  # defeat the umask, so 0755 is really on disk
+    assert staging.stat().st_mode & 0o777 == 0o755
+
+    row = FakeRow(str(vault), "Attachments/shot.png")
+    await stream_to_vault(
+        row, chunks_of(PNG), max_bytes=1_000_000, content_length=len(PNG),
+        deadline=deadline_in(30),
+    )
+    assert staging.stat().st_mode & 0o777 == 0o700
+
+
+async def test_published_mode_follows_the_umask_rather_than_a_hardcoded_644(
+    vault, monkeypatch
+):
+    """The mode must be derived from the umask, not pinned to 0644 — which a
+    fix that hardcoded the common case would also have passed."""
+    monkeypatch.setattr(vault_fs, "_default_file_mode_cache", None)
+    previous = os.umask(0o077)
+    try:
+        row = FakeRow(str(vault), "Attachments/private.png")
+        await stream_to_vault(
+            row, chunks_of(PNG), max_bytes=1_000_000, content_length=len(PNG),
+            deadline=deadline_in(30),
+        )
+        assert (vault / "Attachments" / "private.png").stat().st_mode & 0o777 == 0o600
+    finally:
+        os.umask(previous)
+        vault_fs._default_file_mode_cache = None
+
+
+async def test_overwrite_resets_the_incumbent_mode_to_server_policy(vault):
+    """Declared policy, not an accident: publication swaps in the staged inode,
+    so an overwrite lands the umask default even over a restrictive incumbent.
+
+    The note path (`vault._atomic_write_at`) has always behaved this way; the
+    two publish paths agreeing is the point of #95. Preserving incumbent bits
+    instead would be a product decision affecting both.
+    """
+    target = vault / "Attachments" / "secret.png"
+    target.write_bytes(b"old")
+    os.chmod(target, 0o600)
+    before = target.stat()
+
+    row = FakeRow(
+        str(vault),
+        "Attachments/secret.png",
+        overwrite=True,
+        expected_fingerprint={
+            "dev": before.st_dev,
+            "inode": before.st_ino,
+            "size": before.st_size,
+            "mtime_ns": before.st_mtime_ns,
+            "ctime_ns": before.st_ctime_ns,
+            "sha256": hashlib.sha256(b"old").hexdigest(),
+        },
+    )
+    await stream_to_vault(
+        row, chunks_of(PNG), max_bytes=1_000_000, content_length=len(PNG),
+        deadline=deadline_in(30),
+    )
+    assert target.read_bytes() == PNG
+    assert target.stat().st_mode & 0o777 == vault_fs.default_file_mode()
+
+
 async def test_stream_creates_missing_parent_directories(vault):
     row = FakeRow(str(vault), "New/Deep/file.bin")
     await stream_to_vault(
