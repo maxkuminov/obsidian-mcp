@@ -706,40 +706,6 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
 # the name (a symlink decoy, or a leftover from a crash) cannot wedge a write.
 _TEMP_ATTEMPTS = 3
 
-# Mode a plain `open(..., "w")` produces, cached for the life of the process.
-_default_file_mode_cache: int | None = None
-
-
-def _default_file_mode() -> int:
-    """The mode a plain `open(..., "w")` would give a new file: 0o666 & ~umask.
-
-    `_atomic_write_at` creates its temp file at 0o600 so the content is never
-    readable by anyone else while it is being written, then relaxes it to this
-    before publication. Without that, every note the server rewrote would
-    silently drop from the umask default (0o644 on the container) to 0o600 and
-    become unreadable to anything else sharing the vault.
-
-    Read from `/proc/self/status` where available; the `os.umask` read-restore
-    dance is the portable fallback and is only reached once.
-    """
-    global _default_file_mode_cache
-    if _default_file_mode_cache is None:
-        mask: int | None = None
-        try:
-            with open("/proc/self/status", encoding="ascii") as status:
-                for line in status:
-                    if line.startswith("Umask:"):
-                        mask = int(line.split()[1], 8)
-                        break
-        except OSError:
-            mask = None
-        if mask is None:
-            mask = os.umask(0o022)
-            os.umask(mask)
-        _default_file_mode_cache = 0o666 & ~mask
-    return _default_file_mode_cache
-
-
 def _temp_candidate(name: str) -> str:
     """A fresh temp *name* for `name`, to be created in the same directory.
 
@@ -900,7 +866,7 @@ def _atomic_write_at(
         with os.fdopen(fd, "wb", closefd=False) as stream:
             stream.write(payload)
             stream.flush()
-        os.fchmod(fd, _default_file_mode())
+        os.fchmod(fd, vault_fs.default_file_mode())
         os.fsync(fd)
 
         if expected is not None:

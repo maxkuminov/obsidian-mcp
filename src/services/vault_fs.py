@@ -233,11 +233,56 @@ def _open_dir_nofollow(parent_fd: int, part: str, rel_dir) -> int:
 # ── temp files and fingerprints ─────────────────────────────────────────────
 
 
+# Mode a plain `open(..., "w")` produces, cached for the life of the process.
+_default_file_mode_cache: int | None = None
+
+
+def default_file_mode() -> int:
+    """The mode a plain `open(..., "w")` would give a new file: 0o666 & ~umask.
+
+    Every staging descriptor in this package is created at 0o600 so the
+    content is never readable by anyone else while it is being written, and
+    publication is a `linkat`/`rename` of that same inode — so the staging
+    mode *is* the published mode unless a writer relaxes it first. Without
+    that step a file the server wrote silently drops from the umask default
+    (0o644 on the container) to 0o600 and becomes unreadable to anything else
+    sharing the vault: another container, a backup agent, a sync client (#95).
+
+    Both writers call this immediately before publishing — `vault`'s
+    `_atomic_write_at` for notes and raw file writes, `transfer`'s
+    `stream_to_vault` for uploads and imports. It lives here because `vault`
+    and `transfer` both depend on this module and neither depends on the
+    other; a second copy is how the two paths drifted apart in the first place.
+
+    Read from `/proc/self/status` where available; the `os.umask` read-restore
+    dance is the portable fallback and is only reached once.
+    """
+    global _default_file_mode_cache
+    if _default_file_mode_cache is None:
+        mask: int | None = None
+        try:
+            with open("/proc/self/status", encoding="ascii") as status:
+                for line in status:
+                    if line.startswith("Umask:"):
+                        mask = int(line.split()[1], 8)
+                        break
+        except OSError:
+            mask = None
+        if mask is None:
+            mask = os.umask(0o022)
+            os.umask(mask)
+        _default_file_mode_cache = 0o666 & ~mask
+    return _default_file_mode_cache
+
+
 def create_temp(dir_fd: int) -> tuple[int, str]:
     """Create an exclusive `.tmp-<32 hex>` file in `dir_fd`; return (fd, name).
 
     Mode 0600 and `O_EXCL|O_NOFOLLOW`: the name cannot pre-exist, cannot be a
     symlink, and the content is never world-readable while it is being written.
+    That 0600 is for the *staging* window only — publication links this inode
+    into place, so the caller must relax the mode with `default_file_mode()`
+    before publishing or the file lands unreadable to everything else (#95).
     The `.tmp-` prefix keeps it invisible to the indexer and to every dot-dir
     guarded tool, so a crashed upload leaves nothing an agent can see.
     """

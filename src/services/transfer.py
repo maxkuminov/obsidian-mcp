@@ -1274,6 +1274,12 @@ async def _stream_locked(
                 deadline=deadline,
                 idle_timeout=idle_timeout,
             )
+            # Publication links this very inode into place, so the 0600 the
+            # staging file was created with would become the published mode.
+            # Relax it to what a plain write would have produced, exactly as
+            # `vault._atomic_write_at` does — an upload must not land less
+            # readable than the note beside it (#95).
+            os.fchmod(fd, vault_fs.default_file_mode())
         finally:
             os.close(fd)
 

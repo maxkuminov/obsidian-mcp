@@ -144,6 +144,29 @@ async def test_stream_writes_exact_bytes_hash_and_mime(vault):
     assert temps_under(vault) == []
 
 
+async def test_uploaded_file_keeps_the_umask_default_mode(vault):
+    """Staging at 0600 must not leak into the published upload's permissions.
+
+    Publication links the staging inode into place, so without the relax step
+    an upload lands 0600 while every note beside it is 0644 — unreadable to
+    anything sharing the vault under a different uid or group (#95).
+    """
+    row = FakeRow(str(vault), "Attachments/shot.png")
+    await stream_to_vault(
+        row,
+        chunks_of(PNG),
+        max_bytes=1_000_000,
+        content_length=len(PNG),
+        deadline=deadline_in(30),
+    )
+    reference = vault / "Attachments" / "reference.png"
+    reference.write_bytes(PNG)
+
+    published = (vault / "Attachments" / "shot.png").stat().st_mode & 0o777
+    assert published == reference.stat().st_mode & 0o777
+    assert published == vault_fs.default_file_mode()
+
+
 async def test_stream_creates_missing_parent_directories(vault):
     row = FakeRow(str(vault), "New/Deep/file.bin")
     await stream_to_vault(
