@@ -37,25 +37,71 @@ against the *source text* of `tools.py` — re-run it after editing.
 - [ ] 1.4 New `tests/test_issue_89_tool_names_in_copy.py`: pin the *property*,
       not the string, over the **two** producers of `read_note`'s truncation
       guidance and no wider — `_outline_text`'s `_summary` and the truncation
-      notice built in `read_note_impl`. Render each (a note with more headings
-      than the cap admits for the first; a truncated whole-note read for the
-      second), then extract *tool references* from the rendered text by this
-      rule and no other: a backtick-delimited span whose content is exactly an
-      identifier `[A-Za-z_][A-Za-z0-9_]*`, or such an identifier immediately
-      followed by `(`; the name is that identifier. Assert (a) each producer
-      yields a **non-empty** set, and (b) every extracted name appears in
-      `mcp._tool_manager.list_tools()` — the same registry introspection
-      `tests/test_issue_66_vault_unassignment_revokes_tools.py:124` already
-      uses (read that file for the idiom; it is not owned by this group and is
-      not edited), `list_tools()` being a plain synchronous call returning objects
-      with `.name`. Do **not** scan `tools.py` source-wide: `list_files`'s
-      truncation line emits a bare `` `pattern` ``, lexically identical to a
-      bare `` `keyword_search` `` and not a tool. Do **not** filter the
-      candidates against the registry before asserting — that is what makes an
-      unregistered name disappear and the test pass over an empty set. Two
-      failing inputs the test must have: reinstating `search_notes` in either
-      producer (extracted, not registered), and dropping the backticks around
-      the name (empty candidate set)
+      notice built in `read_note_impl`.
+
+      **Extraction rule**, this and no other: a backtick-delimited span whose
+      content is exactly an identifier `[A-Za-z_][A-Za-z0-9_]*`, or such an
+      identifier immediately followed by `(`; the name is that identifier. So
+      `` `keyword_search` `` and `` `read_note(path="…", offset=N)` `` each
+      yield a name, while `` `#7` ``, `` `## Title` `` and `` `section="#7"` ``
+      yield nothing.
+
+      **Render each producer so that its own search-guidance clause is the only
+      one present.** Producer 1: `_outline_text(content, cap)` over a note with
+      more headings than `cap` admits, with `cap` large enough that the summary
+      is emitted intact — not the degenerate-cap path, which truncates the
+      summary mid-string and can cut the name out of it. Producer 2: a truncated
+      read of an oversized **headingless** note, so `_outline_text` returns None,
+      producer 1's summary is not embedded in the notice, and the clause the
+      notice appends is the only guidance in the output. Neither fixture's
+      heading titles nor its body may contain the anchor word below.
+
+      **Split each rendered output into clauses** — producer 1 on newlines (its
+      summary is its own line), producer 2 on the blank-line separator (the
+      notice's parts are joined with a blank line).
+
+      **Locate the search-guidance clause by anchor, and assert exactly one
+      clause matches.** Zero or several is a failure, not a skip. The anchor is
+      the narrowing verb the guidance is built around — today "narrow", in both
+      producers, matched case-insensitively. Rewording the copy past the anchor
+      must break the test loudly; update the anchor deliberately rather than
+      loosening it.
+
+      Then assert (a) the **guidance clause's own** extracted set is non-empty;
+      (b) every name extracted from that clause is registered; and (c) every
+      name extracted from the **whole** rendered output is registered — that is
+      what covers the `` `read_note(…)` `` continuation reference. Run (c) once
+      more over a *with-headings* truncated read, the shape production actually
+      emits, in which producer 1's summary is embedded in producer 2's notice;
+      no clause is isolated there.
+
+      Registration is `mcp._tool_manager.list_tools()` — the same registry
+      introspection `tests/test_issue_66_vault_unassignment_revokes_tools.py:124`
+      already uses (read that file for the idiom; it is not owned by this group
+      and is not edited), `list_tools()` being a plain synchronous call
+      returning objects with `.name`.
+
+      **Why the non-empty check is on the clause and not the whole output:** on
+      the whole output it is vacuous. An ordinary truncated read also carries
+      `` `read_note(…)` `` continuation references, so dropping the backticks
+      from the guidance name still leaves a non-empty, fully registered set and
+      the test passes over the defect. The clause is the smallest span that
+      contains the guidance and nothing else.
+
+      **Three mutations the test must fail on. Check it against all three
+      before calling this task done:** (a) either producer's guidance name
+      replaced with an unregistered one — e.g. reinstating `search_notes` —
+      which is extracted from the clause and is not in the registry, so
+      assertion (b) fails; (b) the backticks dropped from around that name, so
+      the clause yields no candidate and assertion (a) fails; (c) the guidance
+      clause deleted outright, so no clause matches the anchor and the
+      exactly-one assertion fails.
+
+      Do **not** scan `tools.py` source-wide: `list_files`'s truncation line
+      emits a bare `` `pattern` ``, lexically identical to a bare
+      `` `keyword_search` `` and not a tool. Do **not** filter the candidates
+      against the registry before asserting — that is what makes an
+      unregistered name disappear and the test pass over an empty set.
 
 ## 2. The panel's user surfaces (#90, #91)
 
@@ -118,7 +164,11 @@ rejected alternative, not a stretch goal.
       the unchanged guard correctly permits because the actor remains active;
       the last-admin guard still fires on its one reachable non-self path, a
       `_SingleUserSentinel` actor (single-user mode, no `users` row, so it is
-      never counted) deleting the sole active `User` admin; a demoted actor
+      never counted) deleting the sole active `User` admin; the same guard does
+      **not** fire when the target is not an active admin, even on a table that
+      holds no active admin at all — a sentinel actor deleting an active
+      non-admin account succeeds, which is the false positive a broader
+      "zero admins remain" reading would have introduced; a demoted actor
       still gets
       `_ACTOR_REVOKED_MSG` rather than the self-delete message, proving the
       ordering; and the self-view template offers no enabled delete control

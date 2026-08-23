@@ -61,14 +61,20 @@ including when other active admins exist.** Another admin can still remove the
 account; the actor cannot remove themselves.
 
 The last-admin guard is left exactly as it is, and the two do not overlap. It
-refuses only when the post-operation state would hold no active admin, which is
-correct: one of two active admins deleting the *other* leaves an admin and is
-permitted, and that is the removal the new refusal tells the operator to ask
-for. What changes is that for an acting admin who is a `users` row the guard
-becomes unreachable — a self-target is refused first, and any other target
-leaves the actor, re-read as active and admin inside the same lock. Its one
-remaining path is the single-user sentinel, which holds no `users` row and is
-therefore never counted.
+refuses only when the target is *itself* an active admin and no other active
+admin exists — i.e. when the delete would take that count from one to zero —
+which is correct and is deliberately no broader: one of two active admins
+deleting the *other* leaves an admin and is permitted, and that is the removal
+the new refusal tells the operator to ask for; and deleting an account that is
+not an active admin is permitted even on a table that holds no active admin at
+all, because such a delete cannot remove one.
+
+What changes is that for an acting admin who is a `users` row the guard becomes
+unreachable — a self-target is refused first, and any other target leaves the
+actor, re-read as active and admin inside the same lock. Its one remaining path
+is the single-user sentinel, which holds no `users` row and is therefore never
+counted; the users page is reachable there by the ordinary sidebar link, which
+is gated on `is_admin` alone and so is visible to the sentinel.
 
 The refusal sits under the *existing* `_lock_admin_guard(session)` advisory
 lock and *after* the existing `_actor_still_privileged(session, user)` re-check.
@@ -189,7 +195,12 @@ here.
   and the assertion in `tests/test_read_response_cap.py` moves with it. A new
   test asserts the property rather than the string, over the two producers of
   that guidance: every tool reference in their *rendered* output is a name the
-  MCP server actually registers, and each producer yields at least one. The
+  MCP server actually registers, and each producer's **search-guidance clause**,
+  isolated from the rest of its output, yields at least one such name. The
+  isolation is what makes that second half bite — asked of the whole output it
+  is vacuous, because a truncated read also carries registered `read_note(…)`
+  continuation references that satisfy it while the guidance itself names
+  nothing. The
   scope is two producers rather than the module because `list_files` already
   emits a bare `` `pattern` `` — a source-wide scan cannot tell that from a
   bare `` `keyword_search` ``, and filtering the candidates against the
