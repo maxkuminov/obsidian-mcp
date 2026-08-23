@@ -64,7 +64,27 @@
                         title="Revoked keys are kept for the audit trail; only active ones can authenticate.">
                         {{ u.api_keys_active }} active / {{ u.api_keys_total }} total
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">{{ u.notes }}</td>
+                    {#
+                      An account with no vault assignment is refused by the
+                      admission gate in `_tracked` before any tool body runs,
+                      so a count here reads as capacity it does not have (#91).
+                      Its index rows are kept on purpose (#66) — that is what
+                      lets a reassignment to the same directory resume without
+                      re-embedding the whole vault — so the cell names the
+                      state and the reason instead of the number. Nothing is
+                      deleted to make the display true; the display was what
+                      was wrong.
+                    #}
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                        {% if u.vault_path %}
+                        {{ u.notes }}
+                        {% else %}
+                        <span style="color:var(--warning);">(not served)</span>
+                        <span style="color:var(--text-3);display:block;margin-top:2px;">
+                            every MCP tool refuses; index kept for reassignment
+                        </span>
+                        {% endif %}
+                    </td>
                     <td class="mono" style="font-size:11px;color:var(--text-2);">
                         {% if u.last_login_at %}<time datetime="{{ u.last_login_at }}" data-localize>{{ u.last_login_at }}</time>{% else %}—{% endif %}
                     </td>
