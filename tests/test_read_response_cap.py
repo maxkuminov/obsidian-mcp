@@ -185,7 +185,10 @@ async def test_headingless_oversized_note_still_truncates(vault, cap):
     _write(vault, "flat.md", "no headings here. " * 200)
     out = await tools.read_note_impl("flat.md")
     assert "[TRUNCATED]" in out
-    assert "search_notes" in out
+    # The notice offers a narrowing tool, and offers it by the name the tool is
+    # actually registered under (#89) — `search_notes` was never registered.
+    assert "keyword_search" in out
+    assert "search_notes" not in out
 
 
 # --- read_file -------------------------------------------------------------

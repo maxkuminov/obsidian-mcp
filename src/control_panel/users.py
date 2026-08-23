@@ -459,10 +459,36 @@ async def delete_user(
 ):
     """Soft-delete (set is_active=false) unless `?permanent=true`.
 
-    Refuses to delete the last active admin (defense against locking the
-    panel out entirely). The cascade FK on `users.id` handles cleanup of
-    api_keys / oauth_clients / oauth_tokens / notes_metadata on permanent
-    delete; usage_logs use SET NULL so historical analytics survive.
+    Refuses a self-targeted delete outright, and refuses to delete the last
+    active admin (defense against locking the panel out entirely). The
+    cascade FK on `users.id` handles cleanup of api_keys / oauth_clients /
+    oauth_tokens / notes_metadata on permanent delete; usage_logs use SET
+    NULL so historical analytics survive.
+
+    **The self-edit promise is about the account, not the form (#90).**
+    #69/#80 made it unconditional on the edit form above — the role and
+    active checkboxes render `disabled` and `edit_user_submit` refuses a
+    hand-built POST — and left this handler, reachable from the two forms
+    directly beneath them on the same page, still able to reach the same
+    `users.is_active` flag by another route whenever one other active admin
+    existed. An operator told the toggle is inert reasonably reads "Soft
+    delete: sets `is_active=false`. Data preserved" as a different, safer
+    control; it is not. So both delete forms refuse a self-target here, and
+    refuse it whether or not other active admins exist. Another admin can
+    still remove the account; the actor cannot remove their own.
+
+    The permanent form is the worse of the two and is one click further down
+    the same page: the cascade on `users.id` also destroys the actor's own
+    `api_keys`, `oauth_clients`, `oauth_tokens` and `notes_metadata`, so the
+    actor loses every credential that could undo it along with the account —
+    unrecoverable from the panel, because the account that could reverse it
+    is the one that was deleted.
+
+    The refusal sits under the *existing* `_lock_admin_guard` advisory lock
+    and after the existing `_actor_still_privileged` re-check, so an actor
+    demoted while queued for the lock is told *that* rather than told they
+    cannot delete themselves. It runs before the last-admin count, which is a
+    separate and deliberately weaker check and is left exactly as it is.
     """
     permanent = request.query_params.get("permanent") == "true"
 
@@ -478,11 +504,37 @@ async def delete_user(
     if target is None:
         raise HTTPException(404, "User not found")
 
-    # Last-admin guard for both soft and hard delete. If `target` is the
-    # *only* active admin (including the case where target is yourself),
-    # refuse — admin must promote someone else first. This is the only
-    # defense against locking the panel out entirely; self-deletion is
-    # otherwise allowed once another admin exists.
+    # An admin may not remove their own account by either form (#90), and
+    # this holds unconditionally — the presence of other active admins does
+    # not make it permissible. See the docstring: #69's promise is about the
+    # account, not the form it is made on.
+    #
+    # This must run *before* the last-admin count below, so that a
+    # self-target is answered with this message rather than the last-admin
+    # one, and before any row is written. Single-user mode has nothing to
+    # refuse: `require_admin_panel` yields a `_SingleUserSentinel`, which is
+    # not a `User` and carries no `id`, so no target can be the actor. That
+    # is the same `isinstance` test `edit_user_submit` uses.
+    if isinstance(user, User) and user.id == target.id:
+        return _back_to_list_with_error(
+            "You can't delete or deactivate your own account — neither the "
+            "soft delete nor the permanent one. Ask another admin to remove it."
+        )
+
+    # Last-admin guard for both soft and hard delete. Refuse exactly when the
+    # target is *itself* an active admin and no **other** active admin
+    # exists — i.e. when the delete would take that count from one to zero.
+    # Deliberately no broader: deleting an account that is not an active
+    # admin cannot remove one, so it proceeds even on a table that holds no
+    # active admin at all, and one of two active admins deleting the *other*
+    # leaves an admin and is permitted — that being the removal the
+    # self-delete refusal above tells the operator to ask for.
+    #
+    # For an acting admin who is a `users` row this is now unreachable: a
+    # self-target is refused above, and any other target leaves the actor,
+    # re-read as active and admin inside this same lock. Its one remaining
+    # path is the single-user sentinel, which holds no `users` row and is
+    # therefore never counted.
     if target.is_admin and target.is_active:
         remaining_admins = (await session.execute(
             select(func.count(User.id)).where(
