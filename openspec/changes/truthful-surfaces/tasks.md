@@ -108,7 +108,17 @@ against the *source text* of `tools.py` — re-run it after editing.
 
       1. **Unregistered name** — either producer's guidance name replaced with
          one no tool is registered under, e.g. reinstating `search_notes`. It
-         is extracted from the clause and is not in the registry: **(c)** fails.
+         is extracted from the clause, and `keyword_search` is no longer in
+         that set, so **(b)** fails first; (c) would also catch it. Order the
+         assertions (b) before (c): "does not name `keyword_search`" is the
+         more actionable message, and it is the common case.
+
+         **(c) and (d) are therefore unreachable by any single-name mutation,
+         so prove they are not dead assertions separately:** plant
+         `` `search_notes` `` *beside* a surviving `` `keyword_search` `` in
+         the clause — (a) and (b) pass, **(c)** fails; plant it *outside* the
+         clause, in the `read_note(…)` continuation line — every clause check
+         passes, **(d)** fails.
       2. **Registered but wrong** — `` `keyword_search` `` replaced with
          another registered tool, e.g. `` `delete_note` ``. The anchor still
          matches exactly once and the clause's set is non-empty and fully
