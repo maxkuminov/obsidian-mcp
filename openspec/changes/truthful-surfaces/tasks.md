@@ -68,9 +68,11 @@ against the *source text* of `tools.py` — re-run it after editing.
       loosening it.
 
       Then assert (a) the **guidance clause's own** extracted set is non-empty;
-      (b) every name extracted from that clause is registered; and (c) every
+      (b) that set **contains `keyword_search`** — membership, not equality, so
+      a second legitimately added registered reference beside it still passes;
+      (c) every name extracted from that clause is registered; and (d) every
       name extracted from the **whole** rendered output is registered — that is
-      what covers the `` `read_note(…)` `` continuation reference. Run (c) once
+      what covers the `` `read_note(…)` `` continuation reference. Run (d) once
       more over a *with-headings* truncated read, the shape production actually
       emits, in which producer 1's summary is embedded in producer 2's notice;
       no clause is isolated there.
@@ -88,14 +90,42 @@ against the *source text* of `tools.py` — re-run it after editing.
       the test passes over the defect. The clause is the smallest span that
       contains the guidance and nothing else.
 
-      **Three mutations the test must fail on. Check it against all three
-      before calling this task done:** (a) either producer's guidance name
-      replaced with an unregistered one — e.g. reinstating `search_notes` —
-      which is extracted from the clause and is not in the registry, so
-      assertion (b) fails; (b) the backticks dropped from around that name, so
-      the clause yields no candidate and assertion (a) fails; (c) the guidance
-      clause deleted outright, so no clause matches the anchor and the
-      exactly-one assertion fails.
+      **Why membership, and why it was not the first idea.** (a), (c) and (d)
+      encode one general property — "no agent-facing string names an
+      unregistered tool" — and that property is too weak to express what is
+      actually wanted here, which is that *this* guidance names *the search
+      tool*. Three review rounds of this test passed vacuously on that gap:
+      under (a) and (c) alone, rewriting the summary to end "or narrow with
+      `` `delete_note` ``" satisfies every assertion while pointing the agent
+      at a **destructive** tool, and adding a second registered reference makes
+      the dropped-backticks mutation vacuous again. The registry check stays as
+      the broad backstop; (b) is what pins the specific claim. This is an
+      altitude correction, recorded rather than smoothed over — the final form
+      of this test is not the form it was first written in.
+
+      **Five mutations the test must fail on. Check it against all five
+      before calling this task done:**
+
+      1. **Unregistered name** — either producer's guidance name replaced with
+         one no tool is registered under, e.g. reinstating `search_notes`. It
+         is extracted from the clause and is not in the registry: **(c)** fails.
+      2. **Registered but wrong** — `` `keyword_search` `` replaced with
+         another registered tool, e.g. `` `delete_note` ``. The anchor still
+         matches exactly once and the clause's set is non-empty and fully
+         registered, so (a), (c) and (d) all pass and the outline now points
+         the agent at a destructive tool: **(b)** is the only assertion that
+         catches it. This is the mutation the first three drafts passed.
+      3. **Second reference added, then `keyword_search` unbackticked** — a
+         second legitimately registered reference is added to the clause and
+         `` `keyword_search` `` then loses its backticks. The survivor keeps
+         the set non-empty and fully registered, so the other assertions go
+         vacuous: again **(b)** is the only one that catches it.
+      4. **Backticks dropped** — the backticks removed from around the guidance
+         name with nothing else in the clause, so it yields no candidate:
+         **(a)** fails.
+      5. **Clause deleted** — the guidance clause removed outright, so no
+         clause matches the anchor and the **exactly-one-clause** assertion
+         fails.
 
       Do **not** scan `tools.py` source-wide: `list_files`'s truncation line
       emits a bare `` `pattern` ``, lexically identical to a bare
