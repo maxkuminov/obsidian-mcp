@@ -27,14 +27,14 @@ as the historical spelling of pre-#78 `usage_logs` rows; changing either
 un-attributes real history. `test_issue_78_panel_labels.py` also asserts
 against the *source text* of `tools.py` — re-run it after editing.
 
-- [ ] 1.1 In `_outline_text`'s `_summary` (~line 472), replace
+- [x] 1.1 In `_outline_text`'s `_summary` (~line 472), replace
       `` `search_notes` `` with `` `keyword_search` ``
-- [ ] 1.2 In the `read_note` truncation notice (~line 601), replace
+- [x] 1.2 In the `read_note` truncation notice (~line 601), replace
       `` `search_notes` `` with `` `keyword_search` ``
-- [ ] 1.3 Update the assertion at `tests/test_read_response_cap.py:188` to the
+- [x] 1.3 Update the assertion at `tests/test_read_response_cap.py:188` to the
       new name, keeping what it was testing (that a truncated whole-note read
       offers a narrowing tool at all)
-- [ ] 1.4 New `tests/test_issue_89_tool_names_in_copy.py`: pin the *property*,
+- [x] 1.4 New `tests/test_issue_89_tool_names_in_copy.py`: pin the *property*,
       not the string, over the **two** producers of `read_note`'s truncation
       guidance and no wider — `_outline_text`'s `_summary` and the truncation
       notice built in `read_note_impl`.
@@ -175,7 +175,7 @@ kept for reassignment on purpose (#66), and deleting them costs the full
 re-embed that #66 exists to avoid. Do not add age-based pruning: it is a
 rejected alternative, not a stretch goal.
 
-- [ ] 2.1 In `delete_user`, after the actor re-check and after the existing
+- [x] 2.1 In `delete_user`, after the actor re-check and after the existing
       `target` load (and its 404), and **before** the `remaining_admins` count,
       refuse when `isinstance(user, User) and user.id == target.id`, for both
       the soft and the `?permanent=true` paths, with an error naming that
@@ -184,19 +184,19 @@ rejected alternative, not a stretch goal.
       where it is, untouched. (Comparing `user.id` against the `user_id` route
       parameter before the load is equivalent and also acceptable; what is not
       acceptable is naming `target.id` before `target` exists)
-- [ ] 2.2 Extend the `delete_user` docstring to say the promise is about the
+- [x] 2.2 Extend the `delete_user` docstring to say the promise is about the
       account, not the form (#69/#80 cover the edit form; this covers the two
       delete forms on the same page), and why permanent self-delete is the
       worse of the two (the `users.id` cascade takes the actor's `api_keys`,
       `oauth_clients`, `oauth_tokens` and `notes_metadata`)
-- [ ] 2.3 In `user_edit.html`, on a self-view (`is_self`), disable both delete
+- [x] 2.3 In `user_edit.html`, on a self-view (`is_self`), disable both delete
       submits and state the refusal in the same register as the existing
       role-lock copy. The markup is the explanation; task 2.1 is the enforcement
-- [ ] 2.4 In `users.html`, when `u.vault_path` is empty, render an explicit
+- [x] 2.4 In `users.html`, when `u.vault_path` is empty, render an explicit
       not-served state in the Notes cell instead of `u.notes`, naming the reason
       (every MCP tool refuses; the index is kept for reassignment) in the same
       register as the vault cell's `(unassigned)`
-- [ ] 2.5 New `tests/test_issue_90_self_delete_refused.py`: soft self-delete
+- [x] 2.5 New `tests/test_issue_90_self_delete_refused.py`: soft self-delete
       refused with other admins present; permanent self-delete refused with
       other admins present; `is_active` and the row itself both unchanged
       after each; deleting *another* user still works, soft and permanent —
@@ -212,7 +212,7 @@ rejected alternative, not a stretch goal.
       still gets
       `_ACTOR_REVOKED_MSG` rather than the self-delete message, proving the
       ordering; and the self-view template offers no enabled delete control
-- [ ] 2.6 New `tests/test_issue_91_users_list_not_served.py`: the users list
+- [x] 2.6 New `tests/test_issue_91_users_list_not_served.py`: the users list
       renders the not-served state for an unassigned account and the real count
       for an assigned one; and the unassigned account's `notes_metadata`,
       `note_embeddings` and `note_links` rows are still present after the page
@@ -228,14 +228,14 @@ nothing pins it. If the implementing agent finds a response that genuinely
 lacks the header, stop and report rather than patching — that contradicts the
 proposal and the proposal is what needs correcting first.
 
-- [ ] 3.1 New `tests/test_issue_92_oauth_error_headers.py`: drive real requests
+- [x] 3.1 New `tests/test_issue_92_oauth_error_headers.py`: drive real requests
       through the application (not a hand-built `JSONResponse`) that make
       `_validate_scope` reject a caller-supplied scope at `/register`,
       `GET /authorize` and `POST /authorize`, and assert each
       response is `application/json`, carries
       `X-Content-Type-Options: nosniff`, and echoes the offending token only
       inside the JSON body
-- [ ] 3.2 In the same module, assert the header is present on a *successful*
+- [x] 3.2 In the same module, assert the header is present on a *successful*
       OAuth JSON response too, so a regression that stamps errors only is
       still caught; and assert it on the successful **HTML** consent screen,
       which stays `text/html` — the requirement is nosniff on every one of
@@ -248,9 +248,9 @@ No migration rides with this change and nothing under `alembic/` is touched, so
 `make test-schema` and `make db-check` are not gates for it. They belong to the
 wave that picks up the deferred half of #91.
 
-- [ ] 4.1 `pytest --ignore=tests/integration` green
-- [ ] 4.2 `openspec validate truthful-surfaces --strict`
-- [ ] 4.3 `make audit`
+- [x] 4.1 `pytest --ignore=tests/integration` green
+- [x] 4.2 `openspec validate truthful-surfaces --strict`
+- [x] 4.3 `make audit`
 - [ ] 4.4 Deploy
 - [ ] 4.5 In place of the `user-representative` browser pass (there is no
       browser UI on the MCP side): exercise `read_note` against a
