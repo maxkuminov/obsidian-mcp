@@ -8,16 +8,25 @@ The parent descriptor SHALL be obtained from the *resolved* parent path by a **s
 
 A missing parent directory SHALL NOT be created during validation. It SHALL be created on first use of the descriptor by a write, so a call refused for an unrelated reason leaves no directories behind, and reads SHALL NOT create it at all. Each missing directory SHALL be created through a descriptor obtained by a fresh beneath-root lookup of the prefix that already exists, and the descriptor the write then acts through SHALL come from a fresh beneath-root lookup of the whole parent path performed after the creation, not from the creation itself.
 
-Directory creation keeps a bounded residual that SHALL be stated rather than claimed closed: there is no beneath-root form of directory creation, so a prefix renamed out of the vault between its lookup and the single creation issued through it yields an empty directory outside the root. No note, no note content and no file of any kind is created, read or modified outside the root by such a call — the descriptor the write acts through is one the kernel proved beneath the root — and the tool never reports success for a mutation that landed outside it.
+Directory creation keeps a bounded residual that SHALL be stated rather than claimed closed: there is no beneath-root form of directory creation, so a prefix renamed out of the vault between its lookup and the single creation issued through it yields an empty directory outside the root. The bound is at most one such directory per component **per creation descent**, and it is an empty directory in a place the renaming process already controls — never a note, never note content, and never something the tool reports success about. No descriptor a creation produced SHALL be returned to a caller or written through.
+
+What the lookup proves, and what it does not, SHALL be stated exactly. It proves that the directory it returned was beneath the vault root **at the moment it resolved**, so a mutation is never *redirected* into a directory that was never beneath the root, and never anchored to a descriptor whose containment the kernel did not check. It does not, and cannot, promise where that directory will be a moment later: a directory descriptor keeps naming the same directory however its pathname is subsequently renamed, which is exactly the property that keeps a mutation on the directory the caller named rather than on a substitute left at its name. A process that renames that directory out of the vault after the lookup and before the publish therefore carries the whole call with it, and the note lands there while the tool reports success for the path the caller named. That is a retained residual of descriptor anchoring — unchanged by this change and inherent to it — and it SHALL be recorded as such rather than specified as prevented.
 
 When the kernel or the container cannot perform a beneath-root lookup, the mutation SHALL be refused with an error naming the unsupported capability, and SHALL NOT fall back to a per-component walk.
 
 #### Scenario: An ancestor is renamed out of the vault while the parent is being resolved
 
 - **WHEN** a mutating note tool is resolving the parent of `A/B/note.md` and another process renames `<vault>/A` to a directory outside the vault root during that resolution
-- **THEN** the tool SHALL either anchor to a directory beneath the vault root or refuse
-- **AND** SHALL NOT create, read or modify anything outside the vault root
-- **AND** SHALL NOT report success for a mutation that landed outside the root
+- **THEN** the tool SHALL either anchor to a directory the kernel resolved beneath the vault root or refuse
+- **AND** SHALL NOT anchor to a descriptor produced by opening the path one component at a time, or to any directory whose containment the lookup did not establish
+- **AND** SHALL NOT be redirected into a directory that was never beneath the root
+
+#### Scenario: The anchored parent is renamed out of the vault after the lookup
+
+- **WHEN** the lookup has returned a descriptor the kernel proved beneath the vault root, and another process then renames that directory — or an ancestor of it — to a location outside the root before the tool publishes
+- **THEN** the mutation SHALL take effect in the directory that was resolved, wherever that directory has since been moved, and the tool MAY report success
+- **AND** this SHALL be recorded as a retained residual of anchoring a call to a directory descriptor, not specified as prevented — the same property that makes the mutation land in the directory the caller named rather than in a substitute left at its name
+- **AND** no other directory SHALL be written to: the call SHALL NOT be redirected into a directory the lookup did not resolve
 
 #### Scenario: A parent created on first use is re-looked-up before it is written through
 
@@ -29,9 +38,9 @@ When the kernel or the container cannot perform a beneath-root lookup, the mutat
 #### Scenario: An ancestor is renamed out of the vault while missing parents are created
 
 - **WHEN** `create_note("A/B/C/x.md", …)` is creating the missing directories and another process renames `<vault>/A` outside the root during that creation
-- **THEN** the note SHALL be written beneath the vault root or the call SHALL be refused
-- **AND** no note and no file content SHALL be created, read or modified outside the root
-- **AND** the tool SHALL NOT report success for a write that landed outside the root
+- **THEN** no note and no note content SHALL be written through any descriptor that creation produced: the write SHALL act through a descriptor obtained by a fresh beneath-root lookup performed after the creation, or the call SHALL be refused
+- **AND** what the race can leave outside the root SHALL be at most an empty directory per component, per creation descent — never a note and never note content
+- **AND** the residual SHALL be documented rather than reported as prevented
 
 #### Scenario: The beneath-root lookup is unavailable
 

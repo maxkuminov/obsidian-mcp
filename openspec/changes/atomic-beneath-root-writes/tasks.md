@@ -1,13 +1,20 @@
 # Tasks
 
-**These three groups are sequential, not parallel.** Group 1 changes how every
+**Groups 1 to 3 are sequential, not parallel.** Group 1 changes how every
 parent descriptor in the process is obtained, so groups 2 and 3 are written
 against its result; group 3 rewrites the staging and publish that group 2 adds
 flushes to. Do not fan them out into worktrees — the file scopes overlap
 almost completely (`vault_fs.py`, `transfer.py`) and the merge would be the
-whole diff. Land 1, verify, then 2, verify, then 3.
+whole diff. Land 1, verify, then 2, verify, then 3. **Group 4 is independent**
+— it adds a check rather than changing how anything is resolved, staged or
+published — but it touches the same two files, so run it after 3 rather than
+beside it.
 
-Order and dependency: **#87 → #97 → #92-item-1**.
+Order and dependency: **#87 → #97 → #92-item-1**, then group 4, which is
+independent of all three and which nothing in them depends on. No task depends
+on a later one: 2.5a puts the probe's flush coverage in the same group as the
+flushes it guards rather than in group 3, and 3.5 keeps those checks rather
+than introducing them.
 
 ## 1. #87 — the beneath-root lookup becomes one kernel-enforced call
 
@@ -56,9 +63,10 @@ Order and dependency: **#87 → #97 → #92-item-1**.
   from a *fresh* single beneath-root lookup of the whole parent performed after
   creation finishes; no descriptor the creation produced may be returned or
   written through. Record the residual this leaves in the docstring — one
-  empty directory outside the root if a prefix is renamed out inside a
-  one-syscall window, never a file, never something the tool reports success
-  about — and do **not** try to clean it up: an `rmdir` by name is the
+  empty directory per component **per creation descent**, if a prefix is
+  renamed out inside a one-syscall window; never a file, never something the
+  tool reports success about; and an upload performs two such descents while a
+  note write performs one — and do **not** try to clean it up: an `rmdir` by name is the
   delete-the-substitute hazard `_discard_temp` already refuses (D22)
 - [ ] 1.6 Confirm every caller inherits it without its own change:
   `_open_parent` / `open_parent` (transfer publish, `delete_file`),
@@ -95,12 +103,19 @@ Order and dependency: **#87 → #97 → #92-item-1**.
   precisely"** so the non-atomic-walk bullet is *replaced* — the lookup window
   is gone, and the creation-side residual (D22) takes its place, stated as
   precisely as the bullets around it. The proposal's claim and that section
-  must end up telling the same story: the lookup is closed, creation is
-  narrowed, nothing outside the root is written, read or destroyed
+  must end up telling the same story, and it must be the **narrowed** one: the
+  lookup is atomic, so nothing is ever redirected into a directory that was
+  never beneath the root and no descriptor a creation produced is ever written
+  through; creation keeps a bounded empty-directory residual per descent (D22);
+  and a lookup proves containment only at the instant it resolves, so a rename
+  landing before the publish carries the call with it (D26). Do **not** write
+  "nothing outside the root is ever written" unqualified — it is false, and it
+  was the claim review rejected
 
 ## 2. #97 — staged bytes and the publication are made durable
 
-*Scope: `src/services/transfer.py`, `src/services/vault.py`, tests.*
+*Scope: `src/services/transfer.py`, `src/services/vault.py`,
+`src/services/vault_fs.py` (2.5a only), tests.*
 
 Depends on group 1: the destination descriptor that gets flushed is the one
 group 1 now produces.
@@ -127,6 +142,14 @@ group 1 now produces.
   flush each created directory's parent as well, outward to the first
   directory that already existed — otherwise a crash can lose the new folder
   and take a `completed` upload with it
+- [ ] 2.5a Extend the **existing** `probe_publication` — in this group, not the
+  next — so it `fsync`s the temp file it already creates and `fsync`s a
+  directory descriptor. Without this, a tree that has landed groups 1 and 2 on
+  a filesystem that hard-links happily and rejects a directory `fsync` passes
+  the unchanged probe, mints a token, streams a whole body, publishes, and only
+  then strands the claim on the flush 2.4 just introduced — the failure has to
+  be detectable from the moment the flush exists, and group 2 is a shippable
+  head of the tree. Group 3 rewrites this probe and **keeps** both checks (3.5)
 - [ ] 2.6 `vault._atomic_write_at`: flush `target.dir_fd` after publication.
   A failure there is **logged and swallowed**, and the write reported as the
   success it is (D18) — the opposite direction from the transfer path, for the
@@ -189,14 +212,15 @@ Depends on group 2: the payload flush moves onto the unnamed descriptor.
   `_stream_locked`'s `except` branch for a staging file that usually has no
   name: closing the descriptor is the discard, and the only unlink left is the
   overwrite path's transient name
-- [ ] 3.5 `probe_publication` additionally exercises unnamed staging, the
-  by-descriptor publication, **a flush of the staged file and a flush of a
-  directory descriptor** — a filesystem that does `O_TMPFILE` and `linkat` but
-  refuses a directory `fsync` would otherwise pass the probe, take a token and
-  a whole body, publish, and only then strand the claim as a post-publication
-  failure. Also state in the docstring what the probe *cannot* answer for: it
-  links root→root and is cached per root, so a destination on a different
-  filesystem or mount is detected only at the operation itself (D23)
+- [ ] 3.5 `probe_publication` additionally exercises unnamed staging and the
+  by-descriptor publication, and **keeps the staged-file flush and the
+  directory flush that 2.5a added** — they must survive the conversion, because
+  a filesystem that does `O_TMPFILE` and `linkat` but refuses a directory
+  `fsync` would otherwise pass the rewritten probe, take a token and a whole
+  body, publish, and only then strand the claim as a post-publication failure.
+  Also state in the docstring what the probe *cannot* answer for: it links
+  root→root and is cached per root, so it cannot see a destination on a
+  different filesystem or mount (D23)
 - [ ] 3.6 Leave `prune_stale_staging` in place and update its docstring: it
   has pre-change litter to collect and a rolling deploy to survive, and it no
   longer has anything new to collect (D19). Leave `open_staging_dir`'s `0700`
@@ -214,30 +238,129 @@ Depends on group 2: the payload flush moves onto the unnamed descriptor.
   name at all" to cover the transfer path, and record the overwrite path's
   in-gate window
 
-## 4. Verification
+## 4. D23 — transfer publication refuses a destination on another mount
 
-- [ ] 4.0 File the D23 follow-up as its own issue before this change is
-  archived: transfer publication into a mount point beneath the vault root
-  fails `EXDEV` after the body is streamed, with a message blaming hard-link
-  support. Pre-existing, out of scope here, and unfixable without either
-  declaring the envelope or moving staging onto the destination's filesystem
-  (which reverses D20). The issue carries both options and their costs
-- [ ] 4.1 `openspec validate atomic-beneath-root-writes --strict` passes
-- [ ] 4.2 Full test suite green; `make audit` clean
-- [ ] 4.3 Confirm the new tests fail against the pre-change tree, per group,
+*Scope: `src/services/vault_fs.py` (a `statx` mount-id helper),
+`src/services/transfer.py`, `src/mcp_server/tools.py`, tests.*
+
+Depends on nothing in groups 1–3 and nothing in groups 1–3 depends on it: it
+adds a check, it does not change how any descriptor is obtained, staged or
+published. It is placed last because it is the one item here that is not #87,
+#97 or #92-item-1, and because the descriptors it compares should already be
+the ones group 1 produces.
+
+- [ ] 4.1 Bind `statx(2)` in `vault_fs` through the **glibc wrapper**. Unlike
+  `openat2` this one exists: checked in the running container, `statx` resolves
+  through `ctypes.CDLL(None)` and `openat2` raises `AttributeError`, so D24's
+  raw-syscall reasoning does **not** carry over. Expose `mount_id_of(fd)`
+  reading `STATX_MNT_ID` with `AT_EMPTY_PATH`, raising `UnsupportedFilesystem`
+  when the returned `stx_mask` does not carry the bit. `STATX_MNT_ID` is Linux
+  **5.8**, above `openat2`'s 5.6, so this raises the change's kernel floor —
+  say so in the docstring and in the `openat2` startup probe's message. Do
+  **not** require `STATX_MNT_ID_UNIQUE` (D23)
+- [ ] 4.2 `same_mount(fd_a, fd_b)` reads both ids and compares them **inside
+  the one call**. Never persist an id and compare it against a later reading: a
+  mount id can be reused once its mount is gone, and the only thing that makes
+  plain `STATX_MNT_ID` sufficient here is that no comparison ever spans time
+  (D23)
+- [ ] 4.3 Compare **mount identity, never `st_dev`.** Measured on the
+  deployment kernel: a bind mount of an ext4 directory beneath the vault root
+  gives `.transfer-tmp` and the destination the same `st_dev` (66306) and
+  different mount ids (653 vs 6036), while `link` and `rename` across it both
+  return `EXDEV`. An `st_dev` preflight passes and the publish fails after the
+  body has streamed — that was the first draft and review caught it
+- [ ] 4.4 Run the check at mint: in `request_upload` before the row is inserted
+  and a URL is handed out, and in `import_from_url` before the fetch begins.
+  Where the destination's parent does not exist yet, check the **deepest
+  existing ancestor** — a directory created beneath it is created on that
+  ancestor's mount. Refuse with an error naming the mount boundary and the
+  destination path, never one blaming hard-link support
+- [ ] 4.5 Run it again inside the publish gate, in
+  `_publish_into_current_parent` after the authoritative destination lookup and
+  **before** `publish`, so a mount established after the mint is refused rather
+  than published into. Raising before `publish` is what keeps the refusal
+  unambiguously pre-publication: `_stream_locked` then classifies it correctly,
+  the claim is released, and the human may retry the same link
+- [ ] 4.6 Update the docstring 3.5 added: the destination-mount case the probe
+  cannot see is now covered by this preflight, and what remains uncovered is a
+  capability difference between two directories on the *same* mount
+- [ ] 4.7 Tests, in a mount namespace with a same-filesystem bind mount beneath
+  the root: the mint refuses with the named error and inserts no token;
+  `import_from_url` refuses before it opens a connection; a mount established
+  between mint and redemption is refused in the gate, the destination keeps its
+  prior content and the claim is released to `pending`; a vault with no nested
+  mount behaves exactly as before; a `statx` stubbed to return no mount-id bit
+  refuses rather than falling back to `st_dev` or to the errno
+- [ ] 4.8 CLAUDE.md: record the envelope in the transfer section — publication
+  into a mount beneath the vault root is refused up front and never after the
+  body; reads, note writes, permanent deletes and same-side moves across one
+  are unaffected; the soft delete and the cross-boundary move are known
+  failures with issues open (5.0)
+
+## 5. Verification
+
+- [ ] 5.0 File the D23 follow-ups as **three separate issues** before this
+  change is archived. Group 4 handles transfer publication; these are the
+  nested-mount failures it deliberately does not. Each issue must stand on its
+  own for someone reading it cold — the reproduction, the reason the existing
+  probe misses it, and the options with their costs:
+  1. **Soft delete fails across a nested mount.** `delete_note` and
+     `delete_file(permanent=False)` move the file into `.trash` with one
+     `renameat2(RENAME_NOREPLACE)`, and `.trash` is opened beneath the *root*
+     descriptor (`vault_fs.soft_delete_at` → `open_dir_beneath(root_fd,
+     ".trash")`). A file on a mount beneath the vault root therefore fails
+     `EXDEV`, surfaced as `UnsupportedFilesystem` — "`.trash/` cannot receive a
+     non-replacing rename from the vault" — which names the wrong cause.
+     `probe_trash` cannot catch it: it creates its temp at the root and renames
+     into the root's `.trash`, root→root, so it passes on a vault where every
+     such delete fails. Reproduced on kernel 6.8 with an ext4 directory
+     bind-mounted beneath the root. Options: a per-mount `.trash`, or an early
+     refusal whose message names the mount boundary. A copy-and-unlink fallback
+     is **not** an option — it is exactly the `link`+`unlink` shape
+     `soft_delete`'s docstring exists to refuse, because it can unlink a
+     different inode than it copied. Workaround today: `permanent=True`
+  2. **`move_note` fails across a nested-mount boundary.** Same `renameat2`
+     through `vault_fs.rename_noreplace`, two mounts, the same
+     `UnsupportedFilesystem`. Moves that stay on one side work; reproduced the
+     same way. Options: refuse early with a message naming the boundary, or
+     stage a copy — which carries the same objection as (1) and additionally
+     breaks `move_note`'s "whichever inode is at the source when the call runs
+     is what moves" guarantee
+  3. **Destination-mount errno mapping is inconsistent between the two publish
+     modes.** `vault_fs._link_no_clobber` maps `EXDEV` to
+     `UnsupportedFilesystem` reading "the vault filesystem does not support
+     hard links" — false: the filesystem does, the mount boundary does not.
+     `vault_fs.publish`'s overwrite branch calls a bare `os.replace` with no
+     `EXDEV` mapping at all, so it escapes as a plain `OSError`, is classified
+     pre-publication (correctly — nothing was published) and reaches the upload
+     route's generic `except Exception`, giving the person a server error where
+     the other mode gives a 503. Group 4's preflight makes this rare rather
+     than gone, since the preflight is check-then-act, so both branches should
+     name the mount boundary
+- [ ] 5.1 `openspec validate atomic-beneath-root-writes --strict` passes
+- [ ] 5.2 Full test suite green; `make audit` clean
+- [ ] 5.3 Confirm the new tests fail against the pre-change tree, per group,
   and record which ones do not and why (they pin guarantees this change
   preserves rather than introduces)
-- [ ] 4.4 Adversarial Codex pass — this change is squarely in the destructive-
+- [ ] 5.4 Adversarial Codex pass — this change is squarely in the destructive-
   write class: framing must say that a false "nothing was published" hands
   back a replayable capability over an existing file, and that a containment
   guard which degrades silently is worse than one that refuses. Point it at
-  D20, D22 and D23 explicitly: each is a *declared* residual, and the question
-  to ask of them is whether the declaration is honest and bounded, not whether
-  the residual exists
-- [ ] 4.5 End-to-end exercise against the live server, naming the tools
+  D20, D22, D23 and **D26** explicitly: each is a *declared* residual, and the
+  question to ask of them is whether the declaration is honest and bounded, not
+  whether the residual exists. D26 in particular is the one review already
+  overturned once — the change must not claim anywhere that nothing is ever
+  written outside the root, only that nothing is ever *redirected* into a
+  directory that was never beneath it
+- [ ] 5.5 End-to-end exercise against the live server, naming the tools
   actually called: `request_upload` + a real `PUT /transfer/upload` (both
   no-clobber and overwrite), `check_upload`, `import_from_url`, `create_note`,
   `edit_note(append=True)`, `move_note`, `delete_note`, `write_file`,
   `delete_file`
-- [ ] 4.6 Deploy on a host whose kernel and seccomp profile allow `openat2`,
-  and confirm the startup probe logs nothing on the happy path
+- [ ] 5.6 Deploy on a host whose kernel and seccomp profile allow `openat2`,
+  and confirm the startup probe logs nothing on the happy path. Confirm the
+  mount preflight is a no-op there: the production vault at `/obsidian` is a
+  single mount throughout (measured — root and every child report the same
+  `STATX_MNT_ID`), and `statx` is not blocked by the container's seccomp
+  profile (measured in the running container). Both were checked before this
+  change was written; re-check on the host that actually runs it

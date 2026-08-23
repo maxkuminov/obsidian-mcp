@@ -26,10 +26,18 @@ bullet of CLAUDE.md's "The accepted residual, precisely".
 
 **This change closes the lookup and narrows — but does not remove — the
 creation side.** A descriptor a caller receives always comes from one atomic
-beneath-root lookup, so no mutation is ever anchored outside the root, and no
-file is ever created, read or modified outside it. Creating a missing
-directory has no beneath-root form, so it keeps a bounded residual: one empty
-directory, in a place the renaming process already controls (D22). That
+beneath-root lookup, so no operation is ever *redirected* into a directory
+that was never beneath the root, and nothing a creation produced is ever
+written through. Two things it does not close, and both are stated rather than
+implied. Creating a missing directory has no beneath-root form, so it keeps a
+bounded residual: one empty directory per component **per creation descent**,
+in a place the renaming process already controls — and an upload has two such
+descents (D22). And a lookup proves containment *at the instant it resolves*,
+not afterwards: a rename landing between the final lookup and the publish
+carries the whole call into wherever it moved the directory, because a
+descriptor keeps naming its directory across a rename. That second one is
+inherent to descriptor anchoring — it is the property #59 relies on — so it is
+*retained*, not introduced here, and it is recorded as such (D26). That
 CLAUDE.md bullet is therefore *rewritten*, not deleted.
 
 **The decision is `openat2(2)` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
@@ -177,6 +185,13 @@ whole multi-minute stream.
   body has been streamed. What the probe cannot answer for — a destination
   whose filesystem or mount differs from the root's — is stated rather than
   implied (D23).
+- Transfer publication gains a **mount-identity preflight**: the destination
+  parent must be on the same mount as the staging directory, checked with
+  `statx`'s `STATX_MNT_ID` (never `st_dev`, which a same-filesystem bind mount
+  defeats) at mint and again inside the publish gate, refusing before any body
+  is streamed. That is the whole of what this change does about nested mounts;
+  the soft delete and the cross-boundary `move_note` are enumerated honestly
+  and filed as their own issues (D23).
 - CLAUDE.md's "The accepted residual, precisely" has its non-atomic-walk
   bullet **rewritten**: the lookup window is gone, the creation-side residual
   (D22) takes its place, and the surrounding sections stop deferring to a
@@ -193,7 +208,8 @@ None.
 - `file-transfer`: the beneath-root lookup primitive shared by the transfer
   publish and `delete_file`; durability of staged bytes and of the
   publication; unnamed staging and by-descriptor publication; what the
-  publication probe covers.
+  publication probe covers; refusal of a destination on another mount before
+  any body is streamed.
 - `vault-write`: how a note mutation's parent descriptor is obtained;
   durability of the publishing rename or link.
 
@@ -205,7 +221,8 @@ None.
   `_link_staged_inode` and `_proc_fd_available` adopted from `vault.py`.
 - `src/services/transfer.py` — `_stream_locked` (payload flush, unnamed
   staging, discard path), `_publish_into_current_parent` (directory flush
-  after `on_published`).
+  after `on_published`, mount-identity preflight before the publish),
+  `plan_mint_window`'s callers / the mint path for the same preflight.
 - `src/services/vault.py` — `_atomic_write_at` (destination-directory flush,
   plus a flush of every directory `MutableTarget.ensure_parent` created,
   outward to the first pre-existing one — inherited by every caller of the
@@ -213,11 +230,14 @@ None.
   it created), `_link_staged_inode` / `_proc_fd_available` delegate to
   `vault_fs`.
 - `src/main.py` — the `openat2` startup probe in `lifespan`.
-- `src/mcp_server/tools.py`, `src/transfer/routes.py` — **no change**;
-  enumerated and confirmed only, because `_fingerprint_of`, `_head_bytes` and
-  `_open_bound_file` reach the layer through `open_parent` and inherit the new
-  lookup, and the download route's uniform 404 is deliberately left alone
-  (D21).
+- `src/mcp_server/tools.py` — `request_upload` and `import_from_url` run the
+  mount-identity preflight before a link is handed out or a fetch begins. The
+  read-side callers are **unchanged** and enumerated only: `_fingerprint_of`,
+  `_head_bytes` and `routes._open_bound_file` reach the layer through
+  `open_parent` and inherit the new lookup.
+- `src/transfer/routes.py` — **no change**; the download route's uniform 404 is
+  deliberately left alone (D21), and the upload route's existing
+  unsupported-filesystem 503 already carries a mount refusal that reaches it.
 - `tests/` — new cases for the ancestor-rename race, the unavailability
   refusals, the flush ordering and its two failure directions, and the
   staging-name absence; existing tests that hook the per-component walk or
@@ -248,10 +268,12 @@ the offending path.
 `RESOLVE_BENEATH` enforces, and a mount point beneath the root is still beneath
 the root — while setting it would refuse *lookups* through a mount point, and
 lookups are what reads, `delete_file`, the note tools and the transfer path all
-share. Note tools stage beside their destination, so they work across a nested
-mount today; the transfer publish does not and never has, for a reason that has
-nothing to do with this flag (D23). Setting `RESOLVE_NO_XDEV` would break the
-paths that work and would not fix the one that does not.
+share. Note *writes* stage beside their destination and so work across a
+nested mount today; the transfer publish does not and never has, and neither
+does a soft delete or a move that crosses the boundary — for reasons that have
+nothing to do with this flag, enumerated operation by operation in D23. Setting
+`RESOLVE_NO_XDEV` would break every path that works, including all the reads,
+and would fix none of the three that do not.
 
 The userspace alternative — walk as today, then verify afterwards that the
 final descriptor is beneath the root — was rejected because there is no atomic
@@ -447,53 +469,134 @@ does not) but removing it is not, and *cleaning up* is worse than leaving it:
 an `rmdir` by name, of a name the caller chose, is the same
 delete-the-substitute hazard `_discard_temp` and `soft_delete` already refuse.
 
-Which is why D15 is recorded as narrowed rather than closed. The claim this
-change is entitled to make is "no mutation is ever anchored outside the vault
-root, and nothing outside it is ever written, read or destroyed" — not
-"nothing outside it is ever created".
+**The bound is per creation descent, and one call can have more than one.** An
+upload walks its destination twice with creation enabled: a cheap up-front walk
+in `_stream_locked`, so that a `..`, a symlinked ancestor or a non-directory
+costs one syscall rather than a whole body, and the authoritative walk inside
+the publish gate. A coordinated race can therefore leave one escaped empty
+directory for each. A note write performs one descent.
 
-### D23. Nested mounts: the lookup supports them, the transfer publish never has
+Collapsing the up-front walk to a non-creating one would halve that, and was
+rejected. The `create=True` up front is also what makes a `mkdir` that cannot
+succeed — a read-only mount, a permission, a full disk — fail before 25 MB has
+been streamed rather than after, which is the same "refuse before any body
+moves" principle D23's preflight is built on. Trading it for one fewer empty
+directory, in a location the winner of the race already controls, is a bad
+trade. The honest answer is to state the bound per descent, which is what the
+requirement now does.
+
+Which is why D15 is recorded as narrowed rather than closed. The claim this
+change is entitled to make is: **every descriptor a call acts through comes
+from a lookup the kernel proved beneath the vault root at the moment it
+resolved, and nothing a creation produced is ever written through — so no
+operation is ever redirected into a directory that was never beneath the
+root.** It is *not* entitled to "nothing outside the root is ever created"
+(D22's empty directory), and it is *not* entitled to an unqualified "nothing
+outside the root is ever written" (D26's post-lookup rename interval).
+
+### D23. Nested mounts: what works, what does not, and what is refused early
 
 D16 declines `RESOLVE_NO_XDEV`, which keeps *lookups* working through a mount
-point beneath the vault root. That is worth keeping and it is all it means. It
-does not make a transfer into such a mount work, and it never did:
+point beneath the vault root. That is worth keeping and it is exactly all it
+means. It does not follow that operations *across* such a boundary work, and
+the first draft of this note asserted that deletes did. They do not.
 
-- transfer uploads stage in a **root-level** `.transfer-tmp` and publish from
-  there into the destination directory, with `os.link` (no-clobber) or
-  `os.replace` (overwrite);
-- `link(2)` and `rename(2)` both refuse to cross a mount — `EXDEV` — and
-  `link(2)` refuses it even when both mounts are of the *same* filesystem, so
-  a bind mount is no escape;
-- `probe_publication` links root→root, so it tests the root's filesystem
-  against itself and cannot see a destination on another one;
-- the failure therefore arrives after the whole body has been streamed, and
-  the error it currently produces says "the vault filesystem does not support
-  hard links", which is a false statement about the filesystem.
+Measured on the deployment kernel (6.8.0-138), with an ext4 directory
+bind-mounted at `<vault>/M` — the same filesystem, so `st_dev` is identical on
+both sides (66306):
 
-This is **pre-existing** — the staging directory, the link publish and the
-root-level probe all predate this change, and moving staging to `O_TMPFILE`
-neither introduces the problem nor worsens it: an unnamed inode allocated in
-`.transfer-tmp` lives on exactly the filesystem a named one did. It is
-recorded here because this change is what makes the claim "the lookup supports
-nested mounts" out loud, and that sentence sitting next to an unqualified
-publication requirement would read as a promise the code does not keep.
+| Operation | Across / on a nested mount | Why |
+| --- | --- | --- |
+| Lookup and read | works | `O_NOFOLLOW` constrains symlinks, not mount traversal, and `RESOLVE_BENEATH` treats a mount point beneath the root as beneath the root |
+| Note write on the mount (`create_note`, `edit_note`, `set_frontmatter`, `write_file`) | works | `vault._atomic_write_at` stages in the **destination's own** directory and publishes with a same-directory `linkat`/`renameat` |
+| Permanent unlink (`delete_note`/`delete_file` with `permanent=True`) | works | `unlinkat` through the parent descriptor crosses nothing |
+| `move_note` **within** the mount | works | both parent descriptors are on the same mount |
+| Soft delete (`delete_note`, `delete_file(permanent=False)`) | **`EXDEV`** | `.trash` is opened beneath the *root* descriptor and the move is one `renameat2` into it |
+| `move_note` **across** the boundary | **`EXDEV`** | same `rename_noreplace`, two mounts |
+| Transfer publication into the mount (upload and `import_from_url`) | **`EXDEV`** | staging is a root-level `.transfer-tmp`, publication is `link`/`replace` out of it |
 
-It is **not resolved here**, because both resolutions change something this
-change has no mandate to change:
+Every row was executed, not reasoned about, in a mount namespace with that bind
+mount in place.
 
-- declaring transfer publication into a nested mount unsupported, with a
-  destination-specific preflight (compare the destination parent's `st_dev`
-  with the staging directory's, at mint and again in the gate) that refuses
-  before a body is streamed, sets the deployment envelope;
-- staging the inode against the **destination** parent instead of the root
-  removes the limitation entirely — `O_TMPFILE` is invisible wherever it is
-  allocated — but forces the overwrite path's transient name into the
-  destination directory, which reverses D20's conclusion and puts a name the
-  vault's own tools can reach back into the publish path.
+Two of the failures have probes that cannot see them. `probe_trash` creates its
+temp file at the root and renames it into the root's `.trash` — root→root, so
+it passes on a vault whose every soft delete would fail. `probe_publication`
+links root→root for the same reason.
 
-Either is a decision for the change that takes it. Until then: the lookup
-supports nested mounts; note writes, reads and deletes work across one;
-transfer publication into one fails, late, with a misleading message.
+**The current transfer error differs by publish mode, and neither is good.**
+No-clobber goes through `_link_no_clobber`, which maps `EXDEV` to
+`UnsupportedFilesystem` reading "the vault filesystem does not support hard
+links" — a false statement about a filesystem that supports them perfectly
+well, just not across that boundary. Overwrite (with a fingerprint) goes
+through a bare `os.replace`, whose `EXDEV` has no mapping at all: it propagates
+as a plain `OSError`, `_stream_locked` classifies it as pre-publication —
+correctly, nothing was published — and the upload route's generic
+`except Exception` releases the claim and re-raises, so the person gets a
+server error rather than the 503 the other mode produces.
+
+None of this is introduced here. The staging directory, the link publish and
+the root-level probes all predate this change, and moving staging to
+`O_TMPFILE` neither introduces the problem nor worsens it: an unnamed inode
+allocated in `.transfer-tmp` lives on exactly the filesystem — and the mount —
+a named one did. It is recorded here because this change is what says "the
+lookup supports nested mounts" out loud, and that sentence sitting next to an
+unqualified publication requirement would read as a promise the code does not
+keep.
+
+**In scope: transfer publication refuses a destination on another mount before
+any body is streamed** — at mint (`request_upload`, or the start of
+`import_from_url`) and again inside the publish gate. That covers the one
+operation whose failure is both late and expensive: by the time it fails, the
+human's copy of the bytes is the only one left and it has already been sent.
+The mint-time half also stops a link being handed to a person that could only
+ever fail at redemption.
+
+**The preflight compares mount identity, not `st_dev`, and that distinction is
+the whole point.** A bind mount of an ext4 directory beneath the vault root has
+the *same* `st_dev` as `.transfer-tmp`, so an `st_dev` comparison passes and
+`linkat` still returns `EXDEV` after the body has streamed — which is what the
+first draft of this note proposed. Measured: `.transfer-tmp` and a
+bind-mounted `<vault>/M` both reported `st_dev` 66306 while `statx`'s
+`STATX_MNT_ID` reported 653 and 6036, and both `link` and `rename` across the
+boundary returned `EXDEV`.
+
+`STATX_MNT_ID` is Linux **5.8** — above `openat2`'s 5.6, so this change's
+kernel floor becomes 5.8 rather than 5.6 — and unlike `openat2` it is reachable
+through the ordinary glibc wrapper: checked inside the running container, glibc
+exposes `statx` and does not expose `openat2`, and the returned `stx_mask`
+carries the mount-id bit. `STATX_MNT_ID_UNIQUE` (Linux 6.8) exists and is
+deliberately *not* required. A mount id can be reused once its mount is gone,
+which would matter if one were recorded at mint and compared at publish — so
+neither is. Each of the two checks reads **both** sides and compares them
+within the same call; nothing is persisted, and reuse cannot mislead a
+comparison of two ids read microseconds apart. A kernel or container that
+cannot report a mount id refuses the publication rather than falling back to
+`st_dev` or letting the errno decide after the body has moved, for the same
+reason there is no fallback to a per-component walk.
+
+Where the destination parent does not exist yet — the ordinary case for an
+upload into a new folder — the check runs against the deepest existing ancestor,
+because a directory created beneath it is created on that ancestor's mount. A
+mount established beneath the root *after* the mint is what the in-gate check
+is for.
+
+**Out of scope, filed as their own issues: the soft delete and the
+cross-boundary `move_note`.** Both are real, both predate this change, and both
+have none of the transfer's urgency — they fail *before* anything is written,
+with a message that at least names `.trash` and the rename, and the operator
+has `permanent=True` or a two-step move to fall back on. Fixing them means a
+per-mount `.trash`, or a copy-and-unlink fallback — and a copy-and-unlink soft
+delete is precisely the `link`+`unlink` shape `soft_delete`'s docstring exists
+to refuse. That is a decision of its own. Filed with them: making the
+destination-mount errno mapping consistent, so an `EXDEV` that reaches the
+publish anyway names the mount boundary in both modes rather than blaming hard
+links in one and escaping as a bare `OSError` in the other.
+
+**Deliberately not done: nested mounts are not declared unsupported wholesale,
+and there is no boot-refusing probe for them.** Most of the vault works across
+one — every read, every note write, every permanent delete, every move that
+stays on one side — and refusing to start would remove working functionality to
+prevent three named failures, two of which are already clean refusals.
 
 ### D24. glibc has no `openat2` wrapper, so the raw syscall is the normal path
 
@@ -545,3 +648,40 @@ its canonical vault-relative target is about the **leaf** — the `os.lstat` of
 the final component that `open_mutable` performs through the parent
 descriptor, so the agent can operate on the real note — and that check is not
 this one, is not a path resolution, and is untouched here.
+
+### D26. A lookup proves containment when it resolves, not afterwards
+
+`openat2` with `RESOLVE_BENEATH` proves that the path it resolved stayed
+beneath the root *during that resolution*. It says nothing about the future,
+and it cannot: the descriptor it returns keeps naming the same directory
+however that directory's pathname is later renamed. Linux preserves open
+descriptors across rename, and this design **depends** on that — it is the
+entire reason #59 anchors to a descriptor, so that a mutation lands in the
+directory that was validated rather than in a substitute left at its name.
+
+The consequence has to be said out loud rather than left implied by an
+unqualified "nothing lands outside the root". Between the final lookup and the
+publish there is an interval — the transfer gate's destination walk to its
+`linkat`/`renameat`, a note tool's `open_mutable` to its publish — in which a
+process that can rename a vault ancestor can move the resolved directory out of
+the vault. The call then publishes into it, wherever it now is, and reports
+success. Nothing was *redirected*: the bytes went to the directory the caller
+named, which somebody else moved.
+
+So the first draft's claim — "no file is ever created, read or modified outside
+the root" — was false, and narrowing it is the fix rather than redesigning.
+Excluding renames through publication would need something the kernel does not
+offer: there is no "publish only if this descriptor is still beneath that root"
+operation, and re-verifying by walking `..` upward from the descriptor is the
+check-then-act one level up that D16 already rejects for the same reason. The
+adversary it would defend against must already hold rename rights on a vault
+ancestor, at which point the vault's contents are theirs to move regardless —
+the same boundary that puts D20's overwrite window outside the threat model.
+
+What the requirements therefore say is what a lookup actually proves — beneath
+the root **at the moment it resolved**, so nothing is ever redirected into a
+directory that was never beneath it, and no descriptor a creation produced is
+ever written through — and they record the post-lookup rename as a retained
+residual beside D20's and D22's. It is retained, not introduced: the
+per-component walk this change replaces had this interval too, underneath the
+larger window it did close.

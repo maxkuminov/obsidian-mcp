@@ -21,22 +21,34 @@ The startup probe SHALL be skipped only under `MCP_SANDBOX_MODE`, alongside the 
 
 Creating a missing directory MAY still be done one component at a time, because the syscall cannot create intermediate directories. Every such creation SHALL be issued through a descriptor obtained by a **fresh** beneath-root lookup of the prefix that already exists, performed from the root descriptor immediately before that one creation; no descriptor SHALL be carried across a creation and reused for the next one, and no descriptor produced by a creation SHALL be returned to a caller or written through. The descriptor a caller receives SHALL always come from a fresh single beneath-root lookup of the whole parent path performed **after** the creation completes, including where the creation is deferred to first use of a validated target's parent.
 
-**The creation side therefore keeps a bounded residual, and it SHALL be stated rather than claimed closed.** There is no beneath-root form of directory creation, so between the atomic lookup of a prefix and the single creation issued through it, that prefix can still be renamed out of the vault, and the directory created is then outside the root. What SHALL hold regardless: no file, and no file content, is created, read or modified outside the root by any such call; the descriptor every subsequent operation of the call acts through comes from a lookup the kernel proved to be beneath the root, so the payload lands beneath the root or the call is refused; and the residual costs at most one empty directory per component, in a directory the renaming process already controls.
+**The creation side therefore keeps a bounded residual, and it SHALL be stated rather than claimed closed.** There is no beneath-root form of directory creation, so between the atomic lookup of a prefix and the single creation issued through it, that prefix can still be renamed out of the vault, and the directory created is then outside the root. What SHALL hold regardless: no file and no file content is ever written through a descriptor a creation produced, because the descriptor every subsequent operation of the call acts through comes from a fresh lookup the kernel proved beneath the root; and the residual costs at most one **empty** directory per component **per creation descent**, in a directory the renaming process already controls.
+
+The bound is per creation descent, not per call, and the difference SHALL NOT be papered over: an upload walks its destination twice with creation enabled — once up front, so that a `..`, a symlinked ancestor or a non-directory costs one syscall rather than a whole body, and once authoritatively inside the publish gate — so a sufficiently coordinated race can leave one escaped empty directory for each. A note write performs one such descent. Neither descent may return or write through a descriptor it created, which is what keeps the cost at empty directories.
+
+**What a beneath-root lookup proves, and what it does not, SHALL be stated exactly.** It proves that the directory it returned was beneath the vault root **at the moment it resolved**: no operation is ever *redirected* into a directory that was never beneath the root, and no descriptor whose containment the kernel did not check is ever acted through. It does not, and cannot, promise where that directory will be a moment later. A directory descriptor keeps naming the same directory however its pathname is subsequently renamed — the property this whole design relies on to keep a publish on the directory that was validated rather than on a substitute left at its name — so a process that renames the resolved directory out of the vault after the lookup and before the link or rename carries the call with it, and the bytes land there. That interval exists after the transfer gate's final destination lookup and before publication, and after a note tool's lookup and before its publish. It SHALL be recorded as a retained residual of descriptor anchoring, inherent to it and unchanged by this change, rather than specified as prevented.
 
 #### Scenario: An ancestor is renamed out of the vault during the lookup
 
 - **WHEN** a path `A/B/note.md` is being resolved to a parent descriptor and another process renames `<vault>/A` to a directory outside the vault root while the resolution is in progress
-- **THEN** the lookup SHALL either return a descriptor for a directory beneath the vault root or fail
-- **AND** SHALL NOT return a descriptor for a directory outside the root
-- **AND** no file outside the vault root SHALL be created, read or modified by the call
+- **THEN** the lookup SHALL either return a descriptor the kernel resolved beneath the vault root or fail
+- **AND** SHALL NOT return a descriptor obtained by opening the path one component at a time, nor any descriptor whose containment the kernel did not establish
+- **AND** the call SHALL NOT be redirected into a directory that was never beneath the root
+
+#### Scenario: The resolved directory is renamed out of the vault after the lookup
+
+- **WHEN** a lookup has returned a descriptor the kernel proved beneath the vault root, and another process then renames that directory — or an ancestor of it — outside the root before the call publishes through it
+- **THEN** the operation SHALL take effect in the directory that was resolved, wherever it has since been moved, and MAY be reported as successful
+- **AND** this SHALL be recorded as a retained residual of anchoring an operation to a directory descriptor, not specified as prevented
+- **AND** no directory other than the one the lookup resolved SHALL be written to
 
 #### Scenario: An ancestor is renamed out of the vault during a directory creation
 
 - **WHEN** a write names `A/B/C/note.md` with `A` present and `B` absent, and another process renames `<vault>/A` outside the root while the missing directories are being created
 - **THEN** each creation SHALL have been issued through a descriptor obtained by a fresh beneath-root lookup of the prefix that already existed, not through a descriptor carried over from an earlier creation
-- **AND** the descriptor the write acts through SHALL come from a beneath-root lookup performed after the creation, so the note SHALL be written beneath the root or the call SHALL be refused
-- **AND** no file, and no file content, SHALL be created, read or modified outside the root
-- **AND** the residual — an empty directory created outside the root by the one creation that raced — SHALL be documented rather than reported as prevented
+- **AND** the descriptor the write acts through SHALL come from a beneath-root lookup performed after the creation, so no file content SHALL be written through a descriptor the creation produced
+- **AND** what the race can leave outside the root SHALL be at most one empty directory per component per creation descent — never a file and never file content
+- **AND** where a call performs more than one creation descent, as an upload does, the bound SHALL be stated per descent rather than per call
+- **AND** the residual SHALL be documented rather than reported as prevented
 
 #### Scenario: A deferred parent creation is followed by a fresh beneath-root lookup
 
@@ -47,7 +59,8 @@ Creating a missing directory MAY still be done one component at a time, because 
 #### Scenario: A symlinked component is still refused with the traversal error
 
 - **WHEN** any component of the path below the root is a symbolic link at lookup time
-- **THEN** the lookup SHALL raise the traversal error naming the component
+- **THEN** the lookup SHALL raise the traversal error naming the requested vault-relative path
+- **AND** any identification of which component was the link SHALL be best-effort and worded as such, never an authoritative statement about what the kernel refused
 - **AND** SHALL NOT follow the link, whether its target is inside or outside the vault
 
 #### Scenario: A containment refusal is not reported as an unsupported filesystem
@@ -182,11 +195,65 @@ A filesystem or container that cannot stage without a name, or cannot publish by
 - **THEN** the transfer SHALL be refused with an error naming the unsupported capability
 - **AND** SHALL NOT publish by staging name instead
 
+### Requirement: Transfer publication refuses a destination on another mount before any body is streamed
+
+Transfer publication SHALL establish that the destination parent directory is on the **same mount** as the staging directory before any request body or fetched body is read, and SHALL refuse the transfer with an error naming the mount boundary when it is not.
+
+The refusal has to happen before the bytes move because the failure is otherwise terminal and late. Uploads stage in a root-level staging directory and publish from there into the destination with a hard link (no-clobber) or a replacing rename (overwrite), and `link(2)` and `rename(2)` both refuse to cross a mount boundary with `EXDEV`. The publication probe links root→root and is cached per root, so it cannot see a destination on another mount; without this check the refusal arrives only after the whole body has been streamed.
+
+**The comparison SHALL be of mount identity, not of `st_dev`.** A bind mount of a directory of the *same* filesystem, mounted beneath the vault root, presents the same `st_dev` as the staging directory and still refuses a link or a rename across itself, so an `st_dev` comparison passes and the publish fails `EXDEV` after the body has streamed. Mount identity SHALL be read with `statx(2)`'s mount-id field.
+
+Both sides of a comparison SHALL be read within the same call and compared immediately. A mount id SHALL NOT be recorded at mint time and compared against a reading taken later, because a mount id may be reused once its mount is gone; the check is performed twice — each time against a freshly read pair — rather than once and remembered.
+
+Where the destination parent does not exist yet, the check SHALL be made against the deepest ancestor of the destination that does exist, since a directory created beneath it is created on that ancestor's mount. A mount established beneath the vault root after the first check is what the second check exists to catch.
+
+The check SHALL run at both points at which a publication is committed to: when the capability is minted (`request_upload`) or when the fetch is about to begin (`import_from_url`), so that a person is never handed a link that cannot be redeemed and no body is fetched that cannot land; and again inside the publish gate, after the authoritative destination lookup and before the link or rename, so that a mount appearing between the two is refused rather than published into.
+
+An environment that cannot report a mount id SHALL cause the publication to be refused with an error naming the missing capability. It SHALL NOT fall back to comparing `st_dev`, and SHALL NOT proceed on the assumption that the mounts match and let the errno decide after the body has streamed.
+
+This applies to transfer publication only. Note writes stage in the destination's own directory and publish with a same-directory rename or link, so they never cross a mount boundary and SHALL NOT be made to perform this check.
+
+#### Scenario: A same-filesystem bind mount is detected
+
+- **WHEN** the destination parent is a bind mount of a directory of the same filesystem as the staging directory, so the two report identical `st_dev`
+- **THEN** the transfer SHALL be refused
+- **AND** the refusal SHALL NOT depend on the two directories reporting different `st_dev`
+
+#### Scenario: The refusal happens before any body moves
+
+- **WHEN** a capability is minted for, or a fetch is about to begin against, a destination on a different mount from the staging directory
+- **THEN** the mint or the fetch SHALL be refused with an error naming the mount boundary
+- **AND** no body SHALL have been read, staged or published
+- **AND** no upload link SHALL be handed out that could only ever fail at publication
+
+#### Scenario: A mount appears between the mint and the publish
+
+- **WHEN** the destination parent is on the staging directory's mount at mint time and a separate mount has been established at or above it by the time the publish gate runs
+- **THEN** the publish SHALL be refused before the link or rename is attempted
+- **AND** the destination SHALL hold its prior content
+
+#### Scenario: The destination parent does not exist yet
+
+- **WHEN** the destination's parent directory does not exist at the time of the check
+- **THEN** the check SHALL be made against the deepest existing ancestor of the destination
+
+#### Scenario: Mount identity cannot be read
+
+- **WHEN** the kernel or the container cannot report a mount id for a directory descriptor
+- **THEN** the transfer SHALL be refused with an error naming the missing capability
+- **AND** SHALL NOT fall back to an `st_dev` comparison
+- **AND** SHALL NOT stream a body and let the publish errno decide
+
+#### Scenario: An ordinary single-mount vault is unaffected
+
+- **WHEN** the staging directory and the destination parent are on the same mount, as they are on a vault that contains no nested mount
+- **THEN** the check SHALL pass and the transfer SHALL proceed exactly as it does today
+
 ## MODIFIED Requirements
 
 ### Requirement: Upload endpoint claims first, streams within the cap, publishes atomically to the pre-committed path
 
-`GET /transfer/upload` SHALL serve a static self-contained HTML page (no external assets, nonce-based CSP) whose script reads the token from the URL fragment, calls `GET /transfer/upload/info` with the bearer header to display the bound path, the **mode** — whether the upload creates a new file or replaces the file already at that path, taken from the `overwrite` field of the info payload — the cap and the expiry, labelling the replace case destructively on both the action control and the status copy so the person pressing it knows the existing file will be lost, and sends the chosen file as the raw body of `PUT /transfer/upload` with the bearer header. `PUT /transfer/upload` SHALL: (1) atomically transition the token from `pending` to `claimed` in a committed statement conditioned on `state='pending' AND expires_at > now()`, returning 404 if no row transitions, before reading any body byte; (2) re-validate identity (exact predicates: active, unexpired, write-capable credential; active user), vault root, and path from the token row; (3) reject early on a `Content-Length` above `MAX_FILE_WRITE_BYTES`; (4) stream the body — under a `TRANSFER_MAX_CONCURRENT_UPLOADS` semaphore, a deadline of `min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)`, and a 30 s per-chunk idle timeout — into a file staged in the vault's staging directory through descriptor-anchored operations and holding **no directory entry**, counting bytes and aborting with HTTP 413 at cap+1; (5) compute `sha256` and MIME during the stream, relax the staged file's mode to the umask default, and **flush the staged bytes to durable storage** — all of this after the body ends and before the gate is opened, so the flush never runs under the gate's locks; (6) in a short transaction, lock (`SELECT … FOR UPDATE`) the token, credential, and user rows, re-validate identity and vault root from those locked rows, **re-check the stream deadline against the current time immediately before the publish and inside those locks** — a gate that waited past the deadline SHALL raise the deadline error and the token SHALL become `consumed`, exactly as an overrun during the body does, and nothing SHALL be written — hold the locks across the filesystem publish, and commit completion and the usage-log row in that transaction; then publish the staged inode **by descriptor** when the token was minted without `overwrite` (kernel-linearizable), or via fingerprint-checked replace when minted with `overwrite` (optimistic: `stat`+hash compare then `replace`; a writer landing inside that window is a documented limitation), returning 409 if the target appeared, changed, or is a symlink; **flush the destination directory once the publish has been recorded and before the completion is committed**; (7) move the token to `completed` with `size`, `sha256`, `mime`, `completed_at`, insert a `usage_logs` row (`tool="upload_file"`) attributed to the minting identity, and return JSON `{path, size, sha256, mime}`. On any handled failure before publication (413, 409, disconnect, malformed request) the staged bytes SHALL be discarded — releasing the unnamed inode, and unlinking any transient staging name only while it still refers to that inode — and the claim released to `pending`; on deadline or idle timeout the staged bytes SHALL be discarded and the token SHALL become `consumed`; a crash after publication SHALL leave the token `claimed` (never replayable). Publication SHALL be tracked separately from *all* trailing work: the fact that the publish succeeded SHALL be recorded before any subsequent step runs, and a failure in any of them — the destination-directory flush, the trailing discard, or the close of the destination, staging or root directory descriptor — SHALL NOT release the claim, SHALL NOT surface as a generic `OSError`, and SHALL NOT leave the token `pending`. The path SHALL never be taken from the request. An **unexpected** failure that is demonstrably before publication — an `OSError` while writing or flushing the staged body, an error opening the publish gate — SHALL also discard the staged bytes and release the claim; only a failure after the bytes are in place (`PostPublishFailure`) SHALL leave the token `claimed`.
+`GET /transfer/upload` SHALL serve a static self-contained HTML page (no external assets, nonce-based CSP) whose script reads the token from the URL fragment, calls `GET /transfer/upload/info` with the bearer header to display the bound path, the **mode** — whether the upload creates a new file or replaces the file already at that path, taken from the `overwrite` field of the info payload — the cap and the expiry, labelling the replace case destructively on both the action control and the status copy so the person pressing it knows the existing file will be lost, and sends the chosen file as the raw body of `PUT /transfer/upload` with the bearer header. `PUT /transfer/upload` SHALL: (1) atomically transition the token from `pending` to `claimed` in a committed statement conditioned on `state='pending' AND expires_at > now()`, returning 404 if no row transitions, before reading any body byte; (2) re-validate identity (exact predicates: active, unexpired, write-capable credential; active user), vault root, and path from the token row; (3) reject early on a `Content-Length` above `MAX_FILE_WRITE_BYTES`; (4) stream the body — under a `TRANSFER_MAX_CONCURRENT_UPLOADS` semaphore, a deadline of `min(expires_at, claimed_at + TRANSFER_MAX_UPLOAD_SECONDS)`, and a 30 s per-chunk idle timeout — into a file staged in the vault's staging directory through descriptor-anchored operations and holding **no directory entry**, counting bytes and aborting with HTTP 413 at cap+1; (5) compute `sha256` and MIME during the stream, relax the staged file's mode to the umask default, and **flush the staged bytes to durable storage** — all of this after the body ends and before the gate is opened, so the flush never runs under the gate's locks; (6) in a short transaction, lock (`SELECT … FOR UPDATE`) the token, credential, and user rows, re-validate identity and vault root from those locked rows, **re-check that the destination parent is on the same mount as the staging directory, and re-check the stream deadline against the current time immediately before the publish and inside those locks** — a gate that waited past the deadline SHALL raise the deadline error and the token SHALL become `consumed`, exactly as an overrun during the body does, and nothing SHALL be written — hold the locks across the filesystem publish, and commit completion and the usage-log row in that transaction; then publish the staged inode **by descriptor** when the token was minted without `overwrite` (kernel-linearizable), or via fingerprint-checked replace when minted with `overwrite` (optimistic: `stat`+hash compare then `replace`; a writer landing inside that window is a documented limitation), returning 409 if the target appeared, changed, or is a symlink; **flush the destination directory once the publish has been recorded and before the completion is committed**; (7) move the token to `completed` with `size`, `sha256`, `mime`, `completed_at`, insert a `usage_logs` row (`tool="upload_file"`) attributed to the minting identity, and return JSON `{path, size, sha256, mime}`. On any handled failure before publication (413, 409, disconnect, malformed request) the staged bytes SHALL be discarded — releasing the unnamed inode, and unlinking any transient staging name only while it still refers to that inode — and the claim released to `pending`; on deadline or idle timeout the staged bytes SHALL be discarded and the token SHALL become `consumed`; a crash after publication SHALL leave the token `claimed` (never replayable). Publication SHALL be tracked separately from *all* trailing work: the fact that the publish succeeded SHALL be recorded before any subsequent step runs, and a failure in any of them — the destination-directory flush, the trailing discard, or the close of the destination, staging or root directory descriptor — SHALL NOT release the claim, SHALL NOT surface as a generic `OSError`, and SHALL NOT leave the token `pending`. The path SHALL never be taken from the request. A destination that has come to sit on a different mount SHALL be refused before the link or rename is attempted, which is pre-publication and SHALL release the claim. An **unexpected** failure that is demonstrably before publication — an `OSError` while writing or flushing the staged body, an error opening the publish gate — SHALL also discard the staged bytes and release the claim; only a failure after the bytes are in place (`PostPublishFailure`) SHALL leave the token `claimed`.
 
 #### Scenario: A publish gate delayed past the deadline
 
@@ -259,7 +326,7 @@ The filesystem capability probes SHALL be split by the capability they test and 
 
 Availability of the beneath-root lookup SHALL NOT be tested by these probes: it is a property of the kernel and the container rather than of a vault root, it is identical for every root, and it is enforced by the read-only startup probe instead.
 
-**What the probe covers SHALL be stated honestly.** It answers for the vault root and is cached per root, so it answers for properties the root and the destination share. It SHALL NOT be described as catching every capability the publish needs: a destination directory whose filesystem or mount differs from the root's can refuse a primitive the root accepted, and such a failure is detected only at the operation itself. The probe's guarantee is therefore "an environment that fails at the root is refused before any body is streamed", not "an environment that passes will publish".
+**What the probe covers SHALL be stated honestly.** It answers for the vault root and is cached per root, so it answers for properties the root and the destination share. It SHALL NOT be described as catching every capability the publish needs: a destination directory whose filesystem or mount differs from the root's can refuse a primitive the root accepted, and the probe cannot see it. The one such difference that is known to occur — a destination on a different mount, which refuses the link and the rename the publish depends on — is covered by the separate mount-identity check that runs before any body is streamed, not by this probe. Anything else is detected at the operation itself. The probe's guarantee is therefore "an environment that fails at the root is refused before any body is streamed", not "an environment that passes will publish".
 
 #### Scenario: A read creates nothing
 
