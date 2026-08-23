@@ -74,89 +74,56 @@ yields a `_SingleUserSentinel`, which is not a `User` and carries no `id`, so
 there is no account for the target to *be*. The same `isinstance(user, User)`
 test `edit_user_submit` already uses expresses that.
 
-### 3. A reassigned vault leaves the previous vault's index serving (#91)
+### 3. The users list prints a note count no tool will serve (#91)
 
 `_active_user_ids()` filters `vault_path IS NOT NULL`, so an unassigned user's
-`notes_metadata` / `note_embeddings` / `note_links` rows are frozen. Since #66
-that is deliberate and correct: every tool is refused meanwhile — the admission
-gate is in `_tracked`, not in individual tools — so the rows are not a leak,
-and preserving them is what lets a reassignment resume without re-embedding
-~16.7k chunks. `mcp-request-routing` already pins that as "the account's vault
-path is assigned again to the same directory → the previously indexed rows
-SHALL still be present".
+`notes_metadata` / `note_embeddings` / `note_links` rows are frozen rather than
+removed. Since #66 that is deliberate and correct: every tool is refused
+meanwhile — the admission gate is in `_tracked`, not in individual tools — so
+the rows are not a leak, and preserving them is what lets a reassignment resume
+without re-embedding ~16.7k chunks. `mcp-request-routing` already pins that as
+"the account's vault path is assigned again to the same directory → the
+previously indexed rows SHALL still be present".
 
-**A different directory is a different question, and nothing answers it.**
-`notes_metadata.file_path` is vault-*relative*; no row, and no column anywhere,
-records which root the index was built from. So after an admin repoints a user
-at another vault, the metadata-only tools — `semantic_search`, `keyword_search`,
-`list_notes`, `get_recent` and every graph tool, all served from the database
-filtered by `user_id` alone — answer from the *previous* vault: its paths, its
-titles, its tags, its frontmatter, its chunk excerpts. `read_note` on one of
-those paths then either fails, or, worse, returns a genuinely different note
-that happens to occupy the same relative path in the new root. CLAUDE.md names
-"silently wrong search results" as one of the two expensive failures in this
-product, because an agent acts on them without a human ever seeing the query.
+**The panel does not say any of that where the operator is looking.**
+`users.html` renders `(unassigned)` in the Vault column and, three columns to
+the right on the same row, a live-looking note count for the same account —
+while `user_edit.html`'s own selector, one click away, reads "(unassigned —
+every MCP tool refuses; index kept for reassignment)". Two pages describe one
+account, and only one of them is true about what that account can serve.
 
-The next index pass over the new root does eventually reconcile most of this by
-relative path — `deleted_paths = existing − files` — but "eventually" is doing
-real work in that sentence, and one case never reconciles at all: a note whose
-relative path *and* content hash are identical in both roots is "no change", so
-its `note_links` rows are never re-extracted while the old targets they point at
-are deleted out from under them (`ON DELETE SET NULL`). The graph tools then
-report a permanently under-resolved neighbourhood for that note.
+That is the same over-reporting of liveness as #76 — a user shown "API Keys: 4"
+when all four were revoked, with no surface on which to discover it — and the
+same shape as the #64 blank space that read as success: a number that looks
+like capacity, for a credential that cannot serve a single row of it. What the
+operator does next is the expensive part. A count that reads as live invites
+re-running a search that was never going to answer, or reaching for the Danger
+zone to "fix" an index that is not the problem — the same misdiagnosis #78
+found on the dashboard, where a healthy indexer looked stalled and the
+suggested cure was a full re-embed. The actual fix is to assign a vault, and
+the page never says so.
 
-**Decision (a): record the root the index was built from, and discard the index
-when the assignment moves off it.** Migration 016 adds
-`users.indexed_vault_path` (nullable, `String(1024)`). `index_vault(user_id)`
-compares it with `users.vault_path` before scanning anything: equal — nothing
-happens, which is exactly the #66 case and stays free; different and the
-recorded root is non-NULL — delete the user's `notes_metadata` rows
-(`note_embeddings` and `note_links` cascade) and stamp the new root, in one
-transaction, before the new vault is read.
+**Decision: the users list stops printing a note count for an account whose
+tools are refused.** The count becomes an explicit not-served state naming the
+reason, in the same register as the vault cell's `(unassigned)`. This is
+template-only: the aggregate query is unchanged and the rows stay exactly where
+#66 put them. Making the display true by *deleting* the rows is the one thing
+this must not do — that is the full re-embed #66 exists to avoid, and the
+display is what was wrong, not the data.
 
-Two properties this buys that a comparison inside the panel handler could not:
-
-- **It survives the unassignment.** The transition an operator actually
-  performs is often `/old` → unassigned → `/new`, and `edit_user_submit` sees
-  `old_vault = None` on the second step. Only a value that outlives
-  `vault_path` distinguishes "reassigned to where the index came from" (keep,
-  per #66) from "reassigned somewhere else" (discard). That is the entire
-  reason the column exists rather than a comparison of two form values.
-- **The indexer stays the only writer of index contents.** Adding a second
-  place that deletes `notes_metadata` is how the two paths drift apart, which
-  is the argument #64 made for resolving a grant family exactly one way. Every
-  caller of `index_vault` — the startup pass, the periodic tick, and the
-  panel's `_reindex_background` — inherits the reconciliation by calling it, in
-  the same way every tool inherits the admission gate by being registered.
-
-**Accepted residual, stated precisely.** Because the reconciliation runs in the
-indexer, a reassignment is honoured at the *next* pass, not at the Save. The
-window is bounded by `INDEX_INTERVAL_SECONDS` (default 5 minutes) plus the
-duration of a pass already in flight, and during it the metadata-only tools
-still answer from the previous root. Closing it entirely would mean purging
-inside the panel's POST transaction — a second writer of the index, for a
-5-minute improvement — or refusing every tool for the whole interval, which
-breaks the disk-backed tools that are already correct against the new root. Not
-worth either. This is the same optimistic level declared for
-`edit_note(expected=…)` and the transfer fingerprint check, and the same
-"takes effect at the next authenticated request" shape as an OAuth revocation.
-
-**Decision (b): the users list stops printing a note count for an account whose
-tools are refused.** `users.html` renders `(unassigned)` in the Vault column
-and, three columns to the right on the same row, a live-looking note count for
-the same account — while `user_edit.html`'s own selector says "(unassigned —
-every MCP tool refuses; index kept for reassignment)". That is the same
-over-reporting of liveness as #76 (a user shown "API Keys: 4" when all four
-were revoked, with no surface on which to discover it) and the same shape as
-the #64 blank space that read as success: a number that looks like capacity,
-for a credential that cannot serve a single row of it. The count becomes an
-explicit "not served" state that says the index is kept for reassignment.
-
-**Explicitly rejected: age-based pruning.** It invents a retention policy
-nobody asked for, it deletes exactly the rows #66 preserves on purpose, and the
-cost of being wrong is the full re-embed that #66 exists to avoid. Reassignment
-to a different root is a real event with a real trigger; "this index is old" is
-not.
+**Deferred: the other half of #91.** A reassignment to a *different* root
+leaves the previous vault's index answering the metadata-only tools, and
+nothing in the schema can tell that case apart from the reassignment #66
+deliberately protects: `notes_metadata.file_path` is vault-relative, no column
+records which root the rows came from, and the transition an operator actually
+performs erases the evidence. Closing it needs a migration and a slice that
+deletes a user's entire index on a string comparison, so it belongs with the
+next wave's migration-carrying work — one `make test-schema` run and one
+adversarial pass over both, rather than a schema gate dragged along by a
+template change. The two halves were only ever adjacent because they came from
+one issue. The full analysis is preserved in `DEFERRED-91a.md` beside this
+proposal so the later drafter does not re-derive it; **#91 is therefore only
+half closed by this change**, and the archive should be read that way.
 
 ### 4. `nosniff` on the OAuth scope error body (#92, item 3)
 
@@ -209,18 +176,10 @@ here.
   `user_edit.html` states the refusal and disables both controls on a self-view,
   the way the role checkboxes already do — the handler is what makes the
   promise true, the markup is what stops the operator being surprised by it.
-- **`users.indexed_vault_path`** (migration 016, nullable `String(1024)`)
-  records the root the index describes. `index_vault` reconciles against it
-  before scanning: same root, nothing; different non-NULL root, discard the
-  user's index and stamp; NULL, stamp without discarding. 016 backfills
-  `indexed_vault_path = vault_path` for assigned users — a fact the indexer's
-  own scoping rule guarantees — and leaves it NULL for unassigned ones, which
-  is the one-time hole named in the spec: an account already unassigned when
-  016 runs gets one reassignment without reconciliation, because the previous
-  root was never recorded anywhere and cannot be invented.
-- **`users.html` renders "not served" instead of a count** when the account has
-  no vault assignment, naming the reason. Template-only; the aggregate query is
-  unchanged.
+- **`users.html` renders a not-served state instead of a count** when the
+  account has no vault assignment, naming the reason. Template-only; the
+  aggregate query is unchanged and no index row is deleted to make the display
+  true.
 - **A regression test pins `nosniff` on the OAuth scope rejections** at
   `/oauth/register`, `/oauth/authorize` (GET) and `/oauth/authorize` (POST). No
   source change.
@@ -230,12 +189,8 @@ here.
 ### Modified Capabilities
 - `note-read`: the guidance emitted with a truncated read names only tools the
   caller can actually call.
-- `index-integrity`: the index records which vault root it was built from, and
-  a reassignment away from that root discards it before the new root is read.
 - `mcp-request-routing`: the users list does not report a note count for an
   account whose tool calls the admission gate refuses.
-- `schema-integrity`: migration 016 owns `users.indexed_vault_path` and its
-  backfill.
 - `oauth-authorization-integrity`: OAuth error bodies that echo caller input
   are not content-sniffable.
 
@@ -250,16 +205,13 @@ here.
 - `src/mcp_server/tools.py` — two strings (#89)
 - `src/control_panel/users.py` — the self-delete refusal in `delete_user` (#90)
 - `src/control_panel/templates/user_edit.html` — self-view delete copy (#90)
-- `alembic/versions/016_indexed_vault_path.py` — new (#91)
-- `src/models/db.py` — `User.indexed_vault_path` (#91)
-- `src/services/indexer.py` — reconciliation at the head of `index_vault` (#91)
 - `src/control_panel/templates/users.html` — the note-count cell (#91)
 - `tests/` — `test_read_response_cap.py` updated; new
   `test_issue_89_tool_names_in_copy.py`,
   `test_issue_90_self_delete_refused.py`,
-  `test_issue_91_vault_reassignment_reconcile.py`,
-  `test_issue_92_oauth_error_headers.py`; new cases and a head-revision bump in
-  `tests/integration/test_schema_check.py`
+  `test_issue_91_users_list_not_served.py`,
+  `test_issue_92_oauth_error_headers.py`
 
-Carries a migration, so `make test-schema` is a required gate and `make
-db-check` must report "No new upgrade operations detected" after deploy.
+Nothing under `alembic/`, `src/models/db.py` or `src/services/` changes, so no
+schema gate applies: `make test-schema` and `make db-check` belong to the wave
+that picks up the deferred half of #91.
