@@ -251,9 +251,39 @@ wave that picks up the deferred half of #91.
 - [x] 4.1 `pytest --ignore=tests/integration` green
 - [x] 4.2 `openspec validate truthful-surfaces --strict`
 - [x] 4.3 `make audit`
-- [ ] 4.4 Deploy
-- [ ] 4.5 In place of the `user-representative` browser pass (there is no
+- [x] 4.4 Deploy
+- [x] 4.5 In place of the `user-representative` browser pass (there is no
       browser UI on the MCP side): exercise `read_note` against a
       known-oversized note on the live server and confirm the truncation notice
       names `keyword_search`, then call `keyword_search` as instructed and
       confirm it resolves. Name the tools actually called in the report
+
+
+## Deploy and live exercise (2026-08-23)
+
+Deployed to the live server: image built, scanned and pushed, database backed
+up to `backup_20260823_184308.sql.gz`, migrations run, container recreated and
+reporting healthy. `docker exec obsidian-mcp alembic check` → "No new upgrade
+operations detected." `pip-audit -r requirements.txt` → no known
+vulnerabilities. This change carried no migration.
+
+**4.5 — the tools actually called against the live server**, in place of the
+`user-representative` browser pass (there is no browser UI):
+
+- `list_notes` — selected a genuinely oversized note from the real vault.
+- `read_note(path=…, limit=700)` — forced truncation and exercised **both**
+  producers in one response. The outline summary rendered "Ordinals run
+  #1–#22; request one directly, or narrow with `keyword_search`", and the
+  truncation notice rendered "You can also narrow the search first with
+  `keyword_search` instead of reading the whole note." Neither says
+  `search_notes`.
+- `keyword_search(query="statin CAC", limit=3)` — returned three ranked
+  results, confirming the tool the guidance now names is one the caller can
+  actually call. That is the property #89 is about: before this, an agent that
+  followed the guidance got an unknown-tool error at the moment it most needed
+  a working next step.
+
+Not exercised live, deliberately: #90's self-delete refusal and #91's
+users-list rendering would require mutating the operator's own account on the
+production panel. Both are covered by 30 tests, including mutation checks that
+fail when the refusal is removed or moved outside the lock.
