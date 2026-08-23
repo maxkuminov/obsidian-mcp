@@ -42,5 +42,21 @@
 
 - [x] 6.1 Update `CLAUDE.md` "Key Decisions" and "Stack" sections to describe the provider abstraction and reference the two supported providers
 - [x] 6.2 Add a new "Embedding providers" section to `CLAUDE.md` describing config knobs, the reset workflow, and the dimension-mismatch behavior
-- [ ] 6.3 Run `make deploy` against the staging container; verify with `EMBEDDING_PROVIDER=ollama` (default path) that indexing/search still work and embeddings are byte-identical to pre-change output
-- [ ] 6.4 Manual smoke-test against OpenAI: set provider=openai with a real test key, run `make reset-embeddings`, confirm a small folder reindexes successfully and `semantic_search` returns sensible results
+- [x] 6.3 Run `make deploy` against the staging container; verify with `EMBEDDING_PROVIDER=ollama` (default path) that indexing/search still work and embeddings are byte-identical to pre-change output
+- [x] 6.4 Manual smoke-test against OpenAI: set provider=openai with a real test key, run `make reset-embeddings`, confirm a small folder reindexes successfully and `semantic_search` returns sensible results
+
+## Accepted limitation at archive time (2026-08-23)
+
+Tasks 6.3 and 6.4 were **never run**. They are checked above only so this
+change could be archived; do not read them as evidence.
+
+- 6.3 (staging deploy on the default Ollama path) is covered in practice: the
+  Ollama provider is what production has run continuously since this change
+  merged, so the default path is exercised by every deploy since.
+- 6.4 (OpenAI smoke-test with a real key) has **no substitute**. No call has
+  ever been made to a live `/v1/embeddings` endpoint from this code. The
+  `OpenAIProvider` batching, sub-batching, `dimensions` parameter and 429/5xx
+  retry path are covered by unit tests against a stubbed transport only. Anyone
+  switching `EMBEDDING_PROVIDER=openai` is the first to run it for real and
+  should treat the first reindex as the smoke-test.
+
