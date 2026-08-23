@@ -20,12 +20,8 @@ This completes the promise the self-edit lock makes: an administrator cannot rem
 #### Scenario: Deleting another account is unaffected
 
 - **WHEN** an administrator deletes a different account, soft or permanent
-- **THEN** the delete SHALL proceed as before
-
-#### Scenario: The last-admin guard still applies to other targets
-
-- **WHEN** an administrator deletes the only remaining active administrator other than themselves
-- **THEN** that request SHALL still be refused by the last-admin guard, with its own message
+- **THEN** this requirement SHALL NOT refuse it
+- **AND** the delete SHALL proceed as before, subject only to the zero-active-administrator guard below
 
 #### Scenario: Single-user mode has no account to refuse
 
@@ -37,8 +33,32 @@ This completes the promise the self-edit lock makes: an administrator cannot rem
 - **WHEN** an administrator opens the edit page for their own account
 - **THEN** both delete controls SHALL be disabled and the page SHALL state that the account cannot delete itself
 
+### Requirement: A delete MUST NOT leave the panel with zero active administrators
+The user-delete handler SHALL refuse a delete, soft or permanent, exactly when the state it would leave behind contains no active administrator, and SHALL NOT refuse it otherwise. The predicate is the count of active administrators other than the target: zero refuses, one or more proceeds. Refusing more broadly than that would forbid the removal the self-delete refusal above directs the operator to perform.
+
+An acting administrator that is a `users` row can no longer reach this guard. A self-target is refused by the requirement above, and for any other target the actor is itself an active administrator — re-read as such inside the same lock — so the count is at least one. The reachable case is the single-user sentinel, which is not a `users` row and is therefore never counted: with the sidebar link hidden but the route mounted, a sentinel actor deleting the only active administrator in the table would otherwise leave a database no multi-user deployment could be switched back on with.
+
+#### Scenario: One of two active administrators deletes the other
+
+- **WHEN** two active administrators exist and one deletes the other, soft or permanent
+- **THEN** the delete SHALL proceed, because the acting administrator remains an active administrator afterwards
+
+#### Scenario: The sole active administrator is the target
+
+- **WHEN** the acting administrator holds no `users` row — the single-user sentinel — and the target is the only active administrator in the table
+- **THEN** the request SHALL be refused with the last-admin message
+- **AND** the target's `is_active` SHALL remain true and the row SHALL still exist
+
+#### Scenario: A self-target never reaches this guard
+
+- **WHEN** an administrator targets their own account, whether or not they are the only active administrator
+- **THEN** the self-delete refusal SHALL answer first
+- **AND** the response SHALL carry the self-delete message rather than the last-admin message
+
 ### Requirement: The self-delete refusal SHALL run inside the existing admin critical section
-The refusal SHALL be evaluated after the shared admin advisory lock is taken and after the acting administrator's own privileges have been re-read inside that lock, and MUST NOT introduce a second lock key. One key is what makes a concurrent edit and a concurrent delete exclude each other; two keys would not.
+The refusal SHALL be evaluated after the shared admin advisory lock is taken, after the acting administrator's own privileges have been re-read inside that lock, before the active-administrator count is taken and before any row is written, and MUST NOT introduce a second lock key. One key is what makes a concurrent edit and a concurrent delete exclude each other; two keys would not.
+
+Placing it after the actor re-check keeps the diagnostics in the right order — an actor demoted while queued for the lock is told that, not told they cannot delete themselves — and placing it before the count is what makes the previous requirement's ordering scenario hold.
 
 #### Scenario: Ordering against a concurrent demotion
 

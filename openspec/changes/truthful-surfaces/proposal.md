@@ -60,6 +60,16 @@ refuses both self-deactivation and permanent self-delete, unconditionally —
 including when other active admins exist.** Another admin can still remove the
 account; the actor cannot remove themselves.
 
+The last-admin guard is left exactly as it is, and the two do not overlap. It
+refuses only when the post-operation state would hold no active admin, which is
+correct: one of two active admins deleting the *other* leaves an admin and is
+permitted, and that is the removal the new refusal tells the operator to ask
+for. What changes is that for an acting admin who is a `users` row the guard
+becomes unreachable — a self-target is refused first, and any other target
+leaves the actor, re-read as active and admin inside the same lock. Its one
+remaining path is the single-user sentinel, which holds no `users` row and is
+therefore never counted.
+
 The refusal sits under the *existing* `_lock_admin_guard(session)` advisory
 lock and *after* the existing `_actor_still_privileged(session, user)` re-check.
 No second lock key: CLAUDE.md is explicit that two keys do not exclude each
@@ -154,7 +164,15 @@ assumption:
 
 So the correct outcome is a spec requirement pinning the behaviour and a
 regression test that asserts it end-to-end on a real scope rejection — not a
-patch. Today exactly one test anywhere asserts this header
+patch. **The requirement is scoped to those three JSON error bodies, not to
+"OAuth responses that reflect caller input".** The successful consent screen
+reflects the client's registered name and the caller's own authorization
+parameters and is HTML on purpose; `oauth-authorization-integrity` already
+governs it by requiring that reflection be escaped ("Consent renders
+client-supplied text as text"), and a media-type rule written broadly enough to
+catch the scope errors would contradict it. `nosniff` itself is stamped on the
+consent screen too, and the test pins that; the media type is what does not
+generalise. Today exactly one test anywhere asserts this header
 (`tests/test_transfer_routes.py:960`, and that one passes it explicitly in the
 route), which is why "already correct" and "protected against regression" are
 different states. Nothing stops someone reordering the middleware stack, or
@@ -169,8 +187,14 @@ here.
 
 - **The truncation copy names `keyword_search`** in both agent-facing strings,
   and the assertion in `tests/test_read_response_cap.py` moves with it. A new
-  test asserts the property rather than the string: no agent-facing guidance in
-  `tools.py` names a tool that is not registered on the server.
+  test asserts the property rather than the string, over the two producers of
+  that guidance: every tool reference in their *rendered* output is a name the
+  MCP server actually registers, and each producer yields at least one. The
+  scope is two producers rather than the module because `list_files` already
+  emits a bare `` `pattern` `` — a source-wide scan cannot tell that from a
+  bare `` `keyword_search` ``, and filtering the candidates against the
+  registry to fix that would hide precisely the unregistered names the test
+  exists to catch.
 - **`delete_user` refuses a self-targeted delete**, soft or permanent, under
   the existing advisory lock and after the existing actor re-check.
   `user_edit.html` states the refusal and disables both controls on a self-view,
@@ -181,8 +205,10 @@ here.
   aggregate query is unchanged and no index row is deleted to make the display
   true.
 - **A regression test pins `nosniff` on the OAuth scope rejections** at
-  `/oauth/register`, `/oauth/authorize` (GET) and `/oauth/authorize` (POST). No
-  source change.
+  `/oauth/register`, `/oauth/authorize` (GET) and `/oauth/authorize` (POST),
+  and pins that those three are `application/json`. The header — but not the
+  media type — is pinned on the successful consent screen too, which stays
+  HTML. No source change.
 
 ## Capabilities
 
