@@ -114,6 +114,17 @@
             <span class="card-title" style="color:var(--error);">Danger zone</span>
         </div>
         <div class="card-body">
+            {% if is_self %}
+            <div class="alert alert-warning" style="margin-bottom:14px;font-size:12px;">
+                This is your own account — you can't deactivate or permanently
+                delete it here. Both controls are locked, and the server refuses
+                the request even if the form is bypassed. The permanent form is
+                the worse of the two: the cascade on <code class="mono">users.id</code>
+                would take your own api_keys / oauth_clients / oauth_tokens /
+                notes_metadata with it, leaving nothing to sign back in with and
+                undo it. Another admin can do it from this page.
+            </div>
+            {% endif %}
             <div class="kv">
                 <div>
                     <div class="kv-k">Deactivate user</div>
@@ -125,6 +136,7 @@
                 <form method="POST" action="/admin/users/{{ target.id }}/delete">
                     {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                     <button type="submit" class="btn btn-danger"
+                            {% if is_self %}disabled{% endif %}
                             onclick="return confirm('Deactivate {{ target.username }}? They will no longer be able to log in.')">
                         Deactivate
                     </button>
@@ -142,6 +154,7 @@
                 <form method="POST" action="/admin/users/{{ target.id }}/delete?permanent=true">
                     {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                     <button type="submit" class="btn btn-danger"
+                            {% if is_self %}disabled{% endif %}
                             onclick="return confirm('PERMANENTLY DELETE {{ target.username }} and all their data? This cannot be undone.')">
                         Permanently delete
                     </button>
