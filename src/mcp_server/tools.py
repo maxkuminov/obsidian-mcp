@@ -469,7 +469,7 @@ def _outline_text(content: str, cap: int) -> str | None:
             f"- … {omitted:,} more section(s) not shown (outline truncated "
             f"to stay within the response cap). Ordinals run #1–"
             f"#{len(sections)}; request one directly, or narrow with "
-            f"`search_notes`."
+            f"`keyword_search`."
         )
 
     def _entry(s: dict) -> str:
@@ -598,7 +598,7 @@ async def read_note_impl(
                 + outline
             )
         notice.append(
-            "You can also narrow the search first with `search_notes` instead of "
+            "You can also narrow the search first with `keyword_search` instead of "
             "reading the whole note."
         )
 
