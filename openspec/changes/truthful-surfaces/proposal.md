@@ -216,7 +216,7 @@ here.
   aggregate query is unchanged and no index row is deleted to make the display
   true.
 - **A regression test pins `nosniff` on the OAuth scope rejections** at
-  `/oauth/register`, `/oauth/authorize` (GET) and `/oauth/authorize` (POST),
+  `/register`, `/authorize` (GET) and `/authorize` (POST),
   and pins that those three are `application/json`. The header — but not the
   media type — is pinned on the successful consent screen too, which stays
   HTML. No source change.

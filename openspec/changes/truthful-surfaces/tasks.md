@@ -220,8 +220,8 @@ proposal and the proposal is what needs correcting first.
 
 - [ ] 3.1 New `tests/test_issue_92_oauth_error_headers.py`: drive real requests
       through the application (not a hand-built `JSONResponse`) that make
-      `_validate_scope` reject a caller-supplied scope at `/oauth/register`,
-      `GET /oauth/authorize` and `POST /oauth/authorize`, and assert each
+      `_validate_scope` reject a caller-supplied scope at `/register`,
+      `GET /authorize` and `POST /authorize`, and assert each
       response is `application/json`, carries
       `X-Content-Type-Options: nosniff`, and echoes the offending token only
       inside the JSON body
