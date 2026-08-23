@@ -386,4 +386,4 @@ def test_written_note_keeps_the_umask_default_mode(offline):
 
     published = (offline / "mode.md").stat().st_mode & 0o777
     assert published == reference.stat().st_mode & 0o777
-    assert published == vault_service._default_file_mode()
+    assert published == vault_fs.default_file_mode()

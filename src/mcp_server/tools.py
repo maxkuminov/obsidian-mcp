@@ -2830,6 +2830,11 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
         return f"{e}. Nothing was written."
     except vault_fs.UnsafePath as e:
         return f"{e}. Nothing was written."
+    except vault_fs.UnsupportedFilesystem as e:
+        # Not an OSError, so the clause below does not cover it. Reachable
+        # from the publish itself and, since #95, from the staging directory
+        # refusing to be made private.
+        return f"{e}. Nothing was written."
     except OSError as e:
         return f"Could not write {rel}: {e}"
 

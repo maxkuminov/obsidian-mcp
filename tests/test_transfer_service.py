@@ -22,6 +22,7 @@ import http.server
 import os
 import socket
 import ssl
+import stat
 import subprocess
 import sys
 import threading
@@ -142,6 +143,110 @@ async def test_stream_writes_exact_bytes_hash_and_mime(vault):
     }
     assert (vault / "Attachments" / "shot.png").read_bytes() == PNG
     assert temps_under(vault) == []
+
+
+async def test_uploaded_file_keeps_the_umask_default_mode(vault):
+    """Staging at 0600 must not leak into the published upload's permissions.
+
+    Publication links the staging inode into place, so without the relax step
+    an upload lands 0600 while every note beside it is 0644 — unreadable to
+    anything sharing the vault under a different uid or group (#95).
+    """
+    row = FakeRow(str(vault), "Attachments/shot.png")
+    await stream_to_vault(
+        row,
+        chunks_of(PNG),
+        max_bytes=1_000_000,
+        content_length=len(PNG),
+        deadline=deadline_in(30),
+    )
+    reference = vault / "Attachments" / "reference.png"
+    reference.write_bytes(PNG)
+
+    published = (vault / "Attachments" / "shot.png").stat().st_mode & 0o777
+    assert published == reference.stat().st_mode & 0o777
+    assert published == vault_fs.default_file_mode()
+
+
+async def test_the_staging_directory_is_owner_only(vault):
+    """Staged bytes are relaxed before publication, so the directory is the
+    thing keeping an in-flight upload private (#95)."""
+    row = FakeRow(str(vault), "Attachments/shot.png")
+    await stream_to_vault(
+        row, chunks_of(PNG), max_bytes=1_000_000, content_length=len(PNG),
+        deadline=deadline_in(30),
+    )
+    staging = vault / vault_fs.STAGING_DIR
+    assert staging.stat().st_mode & 0o777 == 0o700
+
+
+async def test_a_pre_existing_permissive_staging_directory_is_tightened(vault):
+    """An older release left `.transfer-tmp` at 0755; opening it must fix that
+    rather than trust it."""
+    staging = vault / vault_fs.STAGING_DIR
+    staging.mkdir(mode=0o755)
+    os.chmod(staging, 0o755)  # defeat the umask, so 0755 is really on disk
+    assert staging.stat().st_mode & 0o777 == 0o755
+
+    row = FakeRow(str(vault), "Attachments/shot.png")
+    await stream_to_vault(
+        row, chunks_of(PNG), max_bytes=1_000_000, content_length=len(PNG),
+        deadline=deadline_in(30),
+    )
+    assert staging.stat().st_mode & 0o777 == 0o700
+
+
+async def test_published_mode_follows_the_umask_rather_than_a_hardcoded_644(
+    vault, monkeypatch
+):
+    """The mode must be derived from the umask, not pinned to 0644 — which a
+    fix that hardcoded the common case would also have passed."""
+    monkeypatch.setattr(vault_fs, "_default_file_mode_cache", None)
+    previous = os.umask(0o077)
+    try:
+        row = FakeRow(str(vault), "Attachments/private.png")
+        await stream_to_vault(
+            row, chunks_of(PNG), max_bytes=1_000_000, content_length=len(PNG),
+            deadline=deadline_in(30),
+        )
+        assert (vault / "Attachments" / "private.png").stat().st_mode & 0o777 == 0o600
+    finally:
+        os.umask(previous)
+        vault_fs._default_file_mode_cache = None
+
+
+async def test_overwrite_resets_the_incumbent_mode_to_server_policy(vault):
+    """Declared policy, not an accident: publication swaps in the staged inode,
+    so an overwrite lands the umask default even over a restrictive incumbent.
+
+    The note path (`vault._atomic_write_at`) has always behaved this way; the
+    two publish paths agreeing is the point of #95. Preserving incumbent bits
+    instead would be a product decision affecting both.
+    """
+    target = vault / "Attachments" / "secret.png"
+    target.write_bytes(b"old")
+    os.chmod(target, 0o600)
+    before = target.stat()
+
+    row = FakeRow(
+        str(vault),
+        "Attachments/secret.png",
+        overwrite=True,
+        expected_fingerprint={
+            "dev": before.st_dev,
+            "inode": before.st_ino,
+            "size": before.st_size,
+            "mtime_ns": before.st_mtime_ns,
+            "ctime_ns": before.st_ctime_ns,
+            "sha256": hashlib.sha256(b"old").hexdigest(),
+        },
+    )
+    await stream_to_vault(
+        row, chunks_of(PNG), max_bytes=1_000_000, content_length=len(PNG),
+        deadline=deadline_in(30),
+    )
+    assert target.read_bytes() == PNG
+    assert target.stat().st_mode & 0o777 == vault_fs.default_file_mode()
 
 
 async def test_stream_creates_missing_parent_directories(vault):
@@ -394,6 +499,123 @@ async def test_bytes_are_staged_outside_the_destination_folder(vault):
     assert seen == [[]], "the temp file was staged in the destination folder"
     assert (vault / vault_fs.STAGING_DIR).is_dir()
     assert list((vault / vault_fs.STAGING_DIR).iterdir()) == []
+
+
+async def test_the_staging_directory_is_private_while_the_gate_holds(vault):
+    """Ordering, not just the end state.
+
+    The staged file is relaxed to the umask default before the gate opens, and
+    the gate can wait unboundedly on `SELECT ... FOR UPDATE`. So the directory
+    must already be 0700 *at that moment* — a tightening that only happened
+    during cleanup would leave exactly the exposure #95 exists to remove, while
+    still passing an end-state assertion.
+    """
+    seen: dict = {}
+
+    class PeekingGate(RecordingGate):
+        async def __aenter__(self):
+            staging = vault / vault_fs.STAGING_DIR
+            seen["dir_mode"] = staging.stat().st_mode & 0o777
+            seen["file_modes"] = sorted(
+                p.stat().st_mode & 0o777 for p in staging.iterdir()
+            )
+            return await super().__aenter__()
+
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    await stream_to_vault(
+        row,
+        chunks_of(b"payload"),
+        max_bytes=100,
+        deadline=deadline_in(30),
+        before_publish=PeekingGate(allow=True),
+    )
+    assert seen["dir_mode"] == 0o700, "staged bytes were exposed while the gate held"
+    # Documents the ordering the 0700 exists to compensate for: by gate time the
+    # staged inode is already at the published mode.
+    assert seen["file_modes"] == [vault_fs.default_file_mode()]
+
+
+async def test_a_staging_directory_that_cannot_be_tightened_refuses_the_upload(
+    vault, monkeypatch
+):
+    """Fail closed when the isolation guarantee cannot be established.
+
+    A filesystem that accepts `fchmod` without applying it would otherwise
+    leave every call reporting success while the directory stayed readable.
+    """
+    staging = vault / vault_fs.STAGING_DIR
+    staging.mkdir()
+    os.chmod(staging, 0o755)
+    monkeypatch.setattr(os, "fchmod", lambda *args, **kwargs: None)
+
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    with pytest.raises(vault_fs.UnsupportedFilesystem, match="0700|700"):
+        await stream_to_vault(
+            row, chunks_of(b"payload"), max_bytes=100, deadline=deadline_in(30)
+        )
+    assert not (vault / "Attachments" / "a.bin").exists()
+
+
+@pytest.mark.parametrize("partial", [0o750, 0o710, 0o701])
+async def test_a_partially_applied_chmod_refuses_too(vault, monkeypatch, partial):
+    """The check is exact equality, not "narrower than it was".
+
+    A filesystem that clamps the mode to something still group- or
+    world-reachable must refuse; only a no-op chmod would be caught by a test
+    that just compares against the original 0755.
+    """
+    staging = vault / vault_fs.STAGING_DIR
+    staging.mkdir()
+    os.chmod(staging, 0o755)
+    real_fchmod = os.fchmod
+    monkeypatch.setattr(os, "fchmod", lambda fd, mode: real_fchmod(fd, partial))
+
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    with pytest.raises(vault_fs.UnsupportedFilesystem):
+        await stream_to_vault(
+            row, chunks_of(b"payload"), max_bytes=100, deadline=deadline_in(30)
+        )
+    assert not (vault / "Attachments" / "a.bin").exists()
+
+
+async def test_ownership_is_compared_against_the_effective_uid(vault, monkeypatch):
+    """`geteuid`, not `getuid` — the test environment has them equal, so
+    nothing else here would notice the difference."""
+    (vault / vault_fs.STAGING_DIR).mkdir(mode=0o700)
+    monkeypatch.setattr(os, "geteuid", lambda: os.getuid() + 1)
+
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    with pytest.raises(vault_fs.UnsafePath, match="owned by uid"):
+        await stream_to_vault(
+            row, chunks_of(b"payload"), max_bytes=100, deadline=deadline_in(30)
+        )
+    assert not (vault / "Attachments" / "a.bin").exists()
+
+
+async def test_a_foreign_owned_staging_directory_refuses_the_upload(
+    vault, monkeypatch
+):
+    """0700 means nothing if somebody else owns the directory."""
+    staging = vault / vault_fs.STAGING_DIR
+    staging.mkdir(mode=0o700)
+    real_fstat = os.fstat
+
+    def foreign(fd):
+        st = real_fstat(fd)
+        if stat.S_ISDIR(st.st_mode):
+            return os.stat_result(
+                (st.st_mode, st.st_ino, st.st_dev, st.st_nlink, st.st_uid + 1)
+                + tuple(st)[5:]
+            )
+        return st
+
+    monkeypatch.setattr(os, "fstat", foreign)
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    with pytest.raises(vault_fs.UnsafePath, match="owned by uid"):
+        await stream_to_vault(
+            row, chunks_of(b"payload"), max_bytes=100, deadline=deadline_in(30)
+        )
+    assert not (vault / "Attachments" / "a.bin").exists()
 
 
 async def test_a_commit_failure_after_publication_is_its_own_error(vault):

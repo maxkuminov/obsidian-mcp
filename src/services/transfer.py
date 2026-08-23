@@ -1262,9 +1262,7 @@ async def _stream_locked(
         probe_fd, name = vault_fs.open_parent(root_fd, row.path, create=True)
         os.close(probe_fd)
 
-        staging_fd = vault_fs.open_dir_beneath(
-            root_fd, vault_fs.STAGING_DIR, create=True
-        )
+        staging_fd = vault_fs.open_staging_dir(root_fd)
         fd, tmp_name = vault_fs.create_temp(staging_fd)
         try:
             size, digest, head = await _drain(
@@ -1274,6 +1272,19 @@ async def _stream_locked(
                 deadline=deadline,
                 idle_timeout=idle_timeout,
             )
+            # Publication links this very inode into place, so the 0600 the
+            # staging file was created with would become the published mode.
+            # Relax it to what a plain write would have produced, exactly as
+            # `vault._atomic_write_at` does — an upload must not land less
+            # readable than the note beside it (#95).
+            #
+            # Relaxing it here rather than at publish time means the bytes are
+            # group/world-readable for as long as the gate takes, which can be
+            # minutes; `open_staging_dir` holds `.transfer-tmp` at 0700 so that
+            # window is not reachable. Keeping the descriptor open until publish
+            # would be the alternative and is worse: it pins an fd across an
+            # unbounded wait on `SELECT … FOR UPDATE`, per upload.
+            os.fchmod(fd, vault_fs.default_file_mode())
         finally:
             os.close(fd)
 

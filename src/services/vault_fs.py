@@ -216,6 +216,70 @@ def _open_child(parent_fd: int, part: str, *, create: bool, rel_dir) -> int:
     return _open_dir_nofollow(parent_fd, part, rel_dir)
 
 
+# Owner-only: nothing but this process has any business in the staging
+# directory. See `open_staging_dir`.
+STAGING_DIR_MODE = 0o700
+
+
+def open_staging_dir(root_fd: int, *, create: bool = True) -> int:
+    """Open `.transfer-tmp` beneath `root_fd`, enforcing owner-only access.
+
+    Staged bytes are relaxed to `default_file_mode()` before publication, so
+    the directory — not the file — is what keeps an in-flight upload private.
+    That matters because staging is the window in which the bytes exist but
+    the publish gate has not yet revalidated the credential: a body that is
+    about to be *refused* is on disk for the duration, and under a
+    group-writable umask a peer could also alter it after `_drain` computed
+    its digest, so the server would publish bytes that do not match the
+    sha256 it reports. 0700 removes both, whatever the staged file's own mode
+    and whatever the operator's umask.
+
+    The mode is enforced on every open, not just at creation: `mkdir` is
+    masked by the umask, and a `.transfer-tmp` left at 0755 by an older
+    release (or by a `mkdir -p` from anywhere else) must be corrected rather
+    than trusted. `fchmod` goes through the descriptor we just opened
+    `O_NOFOLLOW`, so it cannot be redirected to another directory by a
+    rename in between.
+
+    Destination directories are deliberately *not* treated this way — they
+    hold published vault content and get the ordinary 0755 from `_open_child`.
+    """
+    fd = open_dir_beneath(root_fd, STAGING_DIR, create=create)
+    try:
+        st = os.fstat(fd)
+        if st.st_uid != os.geteuid():
+            raise UnsafePath(
+                f"{STAGING_DIR} is owned by uid {st.st_uid}, not by this "
+                f"process (uid {os.geteuid()}); refusing to stage uploads in it"
+            )
+        if stat.S_IMODE(st.st_mode) != STAGING_DIR_MODE:
+            os.fchmod(fd, STAGING_DIR_MODE)
+            logger.info(
+                "Tightened %s from %o to %o",
+                STAGING_DIR,
+                stat.S_IMODE(st.st_mode),
+                STAGING_DIR_MODE,
+            )
+            # Verify rather than trust. A filesystem that accepts `fchmod` and
+            # does not apply it (or applies it partially) would otherwise leave
+            # the isolation guarantee false while every call reported success —
+            # and that guarantee is the only thing protecting a staged upload,
+            # because the staged file itself is relaxed to the umask default
+            # before the publish gate. Same posture as the publication and
+            # trash probes: refuse the operation rather than degrade silently.
+            effective = stat.S_IMODE(os.fstat(fd).st_mode)
+            if effective != STAGING_DIR_MODE:
+                raise UnsupportedFilesystem(
+                    f"Could not restrict {STAGING_DIR} to {STAGING_DIR_MODE:o}; "
+                    f"it is {effective:o} after chmod. Uploads need a staging "
+                    f"directory no other user can read."
+                )
+    except BaseException:
+        close_quietly(fd, STAGING_DIR)
+        raise
+    return fd
+
+
 def _open_dir_nofollow(parent_fd: int, part: str, rel_dir) -> int:
     try:
         return os.open(part, _O_DIR, dir_fd=parent_fd)
@@ -233,11 +297,56 @@ def _open_dir_nofollow(parent_fd: int, part: str, rel_dir) -> int:
 # ── temp files and fingerprints ─────────────────────────────────────────────
 
 
+# Mode a plain `open(..., "w")` produces, cached for the life of the process.
+_default_file_mode_cache: int | None = None
+
+
+def default_file_mode() -> int:
+    """The mode a plain `open(..., "w")` would give a new file: 0o666 & ~umask.
+
+    Every staging descriptor in this package is created at 0o600 so the
+    content is never readable by anyone else while it is being written, and
+    publication is a `linkat`/`rename` of that same inode — so the staging
+    mode *is* the published mode unless a writer relaxes it first. Without
+    that step a file the server wrote silently drops from the umask default
+    (0o644 on the container) to 0o600 and becomes unreadable to anything else
+    sharing the vault: another container, a backup agent, a sync client (#95).
+
+    Both writers call this immediately before publishing — `vault`'s
+    `_atomic_write_at` for notes and raw file writes, `transfer`'s
+    `stream_to_vault` for uploads and imports. It lives here because `vault`
+    and `transfer` both depend on this module and neither depends on the
+    other; a second copy is how the two paths drifted apart in the first place.
+
+    Read from `/proc/self/status` where available; the `os.umask` read-restore
+    dance is the portable fallback and is only reached once.
+    """
+    global _default_file_mode_cache
+    if _default_file_mode_cache is None:
+        mask: int | None = None
+        try:
+            with open("/proc/self/status", encoding="ascii") as status:
+                for line in status:
+                    if line.startswith("Umask:"):
+                        mask = int(line.split()[1], 8)
+                        break
+        except OSError:
+            mask = None
+        if mask is None:
+            mask = os.umask(0o022)
+            os.umask(mask)
+        _default_file_mode_cache = 0o666 & ~mask
+    return _default_file_mode_cache
+
+
 def create_temp(dir_fd: int) -> tuple[int, str]:
     """Create an exclusive `.tmp-<32 hex>` file in `dir_fd`; return (fd, name).
 
     Mode 0600 and `O_EXCL|O_NOFOLLOW`: the name cannot pre-exist, cannot be a
     symlink, and the content is never world-readable while it is being written.
+    That 0600 is for the *staging* window only — publication links this inode
+    into place, so the caller must relax the mode with `default_file_mode()`
+    before publishing or the file lands unreadable to everything else (#95).
     The `.tmp-` prefix keeps it invisible to the indexer and to every dot-dir
     guarded tool, so a crashed upload leaves nothing an agent can see.
     """
@@ -972,7 +1081,10 @@ def prune_stale_staging(
     able to fail an operation.
     """
     try:
-        staging_fd = open_dir_beneath(root_fd, STAGING_DIR, create=False)
+        # Tighten before listing, never `open_dir_beneath` directly: this is
+        # the one other opener of the directory, and on a deployment upgrading
+        # from a release that left it 0755 the prune runs first (#95).
+        staging_fd = open_staging_dir(root_fd, create=False)
     except (FileNotFoundError, VaultFSError, OSError):
         return 0
     removed = 0
@@ -995,7 +1107,10 @@ def prune_stale_staging(
             if _unlink_quietly(staging_fd, entry, published=False):
                 removed += 1
     finally:
-        os.close(staging_fd)
+        # Janitorial work must never fail the operation that triggered it, and
+        # a bare `os.close` can raise (EIO). `prune_stale_staging` is called
+        # from the publication probe, i.e. on the foreground upload path.
+        close_quietly(staging_fd, STAGING_DIR)
     if removed:
         logger.info("Pruned %d stale staged upload(s) from %s", removed, STAGING_DIR)
     return removed
