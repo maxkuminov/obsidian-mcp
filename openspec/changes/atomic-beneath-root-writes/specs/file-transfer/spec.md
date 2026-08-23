@@ -2,15 +2,26 @@
 
 ### Requirement: Every below-root directory descriptor comes from one kernel-enforced beneath-root lookup
 
-The anchored filesystem layer SHALL obtain every directory descriptor below the vault root with a **single** kernel-enforced beneath-root lookup — `openat2(2)` carrying `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` — and SHALL NOT produce that descriptor by opening one path component at a time, so that no rename of an intermediate directory *during* the lookup can yield a descriptor outside the root. This governs every caller of the layer: the transfer publish's up-front and in-gate destination walks, the staging-directory open, the trash open, `delete_file`, and every note mutation that anchors through it.
+The anchored filesystem layer SHALL obtain every directory descriptor below the vault root with a **single** kernel-enforced beneath-root lookup — `openat2(2)` carrying `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS` — and SHALL NOT produce that descriptor by opening one path component at a time, so that no rename of an intermediate directory *during* the lookup can yield a descriptor outside the root. This governs every caller of the layer, without exception: the transfer publish's up-front and in-gate destination walks, the staging-directory open, the trash open, `delete_file`, every note mutation that anchors through it, **and the read-side callers** — the mint-time fingerprint and MIME-sniff reads (`_fingerprint_of`, `_head_bytes`) and the download route's bound-file open (`_open_bound_file`), which reach the layer through the same `open_parent`.
 
 `RESOLVE_NO_XDEV` SHALL NOT be set: a mount point beneath the vault root is a supported deployment and is still beneath the root, and containment is what `RESOLVE_BENEATH` enforces. The lexical guard that refuses `..`, absolute paths and NUL bytes SHALL remain in front of the lookup, so those are refused with a message naming the offending path rather than by an errno.
 
-Errno mapping SHALL distinguish the three kinds of failure, because they tell an operator to do three different things: a symbolic-link or non-directory component SHALL raise the traversal error; an attempted escape of the root SHALL raise the traversal error as a **containment** refusal and SHALL NOT be reported as an unsupported filesystem; and an unavailable syscall (`ENOSYS`, `EPERM`, or an unrecognised `struct open_how` size) SHALL raise the unsupported-filesystem error naming `openat2`, the kernel version that introduced it, and the container seccomp profile as the two causes. A resolution the kernel reports as raced (`EAGAIN`) SHALL be retried a bounded number of times and then refused; it SHALL NOT be reported as success.
+Errno mapping SHALL distinguish four kinds of failure, because they tell an operator to do four different things.
+
+- **A refused path.** A symbolic-link or non-directory component (`ELOOP`, `ENOTDIR`) SHALL raise the traversal error, and an attempted escape of the root (`EXDEV`) SHALL raise the traversal error as a **containment** refusal; neither SHALL be reported as an unsupported filesystem. `ENOENT` SHALL raise the not-found error as it does today.
+- **A transient condition.** `EAGAIN` (the kernel could not prove containment because the path was being renamed concurrently) and `EINTR` (a signal interrupted the call) SHALL each be retried a **bounded** number of times and then refused. Neither SHALL be reported as success, and neither SHALL be allowed to escape as a generic `OSError`: the per-component walk it replaces used `os.open`, which retries `EINTR` transparently, so a raw syscall that does not retry would turn an ordinary signal into a false failure of `create_note`, `delete_file`, a transfer or a download.
+- **An unavailable syscall.** `ENOSYS` and `EPERM` SHALL raise the unsupported-filesystem error naming `openat2`, the kernel version that introduced it, and the container seccomp profile as the two causes.
+- **An ABI disagreement.** `EINVAL` (the kernel does not recognise the `struct open_how` size, or a flag or resolve bit the call passed) and `E2BIG` (the call passed extension data beyond the size this kernel knows) SHALL raise the unsupported-filesystem error naming `openat2` and the structure mismatch. They are not expected from a correct binding against any kernel that has the syscall — they are what a binding bug or a future ABI revision looks like — and treating them as anything softer than a refusal would let a lookup that never ran be mistaken for one that succeeded.
+
+The traversal error SHALL name the **requested vault-relative path**. It SHALL NOT be required to name the offending component: a single `openat2` reports `ELOOP` for the path as a whole and says nothing about which component caused it, and a diagnostic walk issued afterwards can report a different state than the one the kernel refused. Any component identification an implementation adds SHALL be best-effort and SHALL be worded as such, never as an authoritative statement about what the kernel saw. This is a different check from the one that names a **symlinked final component** with its canonical vault-relative target: that is the leaf `lstat` a mutating tool performs through the parent descriptor, it is unchanged by this requirement, and it SHALL keep naming the target.
 
 Availability SHALL be enforced twice: a **read-only** startup probe that creates nothing SHALL terminate the process with a message naming those causes when the syscall is unavailable, and the call site SHALL raise the unsupported-filesystem error if it encounters the same condition anyway. There SHALL be **no** fallback to a per-component walk on any path, under any condition.
 
-Creating a missing directory MAY still descend one component at a time, because the syscall cannot create intermediate directories; but no descriptor produced by that creation descent SHALL be returned to a caller or written through. The descriptor a caller receives SHALL always come from a fresh single beneath-root lookup performed **after** the creation completes, including where the creation is deferred to first use of a validated target's parent.
+The startup probe SHALL be skipped only under `MCP_SANDBOX_MODE`, alongside the startup guards that are already skipped there. That is the one configuration in which a call site can be reached with the syscall unavailable, and what each surface then answers SHALL follow the error contract it already has rather than a new one: a tool SHALL return the unsupported-filesystem error, `PUT /transfer/upload` SHALL answer its existing unsupported-filesystem status, and a **read** route SHALL answer the uniform 404 that every other refusal on a bearer-protected read produces. The download route SHALL NOT be made to distinguish an unavailable syscall from a missing file — that endpoint answering one status for every refusal is a deliberate property, and precision comes from the authenticated side.
+
+Creating a missing directory MAY still be done one component at a time, because the syscall cannot create intermediate directories. Every such creation SHALL be issued through a descriptor obtained by a **fresh** beneath-root lookup of the prefix that already exists, performed from the root descriptor immediately before that one creation; no descriptor SHALL be carried across a creation and reused for the next one, and no descriptor produced by a creation SHALL be returned to a caller or written through. The descriptor a caller receives SHALL always come from a fresh single beneath-root lookup of the whole parent path performed **after** the creation completes, including where the creation is deferred to first use of a validated target's parent.
+
+**The creation side therefore keeps a bounded residual, and it SHALL be stated rather than claimed closed.** There is no beneath-root form of directory creation, so between the atomic lookup of a prefix and the single creation issued through it, that prefix can still be renamed out of the vault, and the directory created is then outside the root. What SHALL hold regardless: no file, and no file content, is created, read or modified outside the root by any such call; the descriptor every subsequent operation of the call acts through comes from a lookup the kernel proved to be beneath the root, so the payload lands beneath the root or the call is refused; and the residual costs at most one empty directory per component, in a directory the renaming process already controls.
 
 #### Scenario: An ancestor is renamed out of the vault during the lookup
 
@@ -18,6 +29,14 @@ Creating a missing directory MAY still descend one component at a time, because 
 - **THEN** the lookup SHALL either return a descriptor for a directory beneath the vault root or fail
 - **AND** SHALL NOT return a descriptor for a directory outside the root
 - **AND** no file outside the vault root SHALL be created, read or modified by the call
+
+#### Scenario: An ancestor is renamed out of the vault during a directory creation
+
+- **WHEN** a write names `A/B/C/note.md` with `A` present and `B` absent, and another process renames `<vault>/A` outside the root while the missing directories are being created
+- **THEN** each creation SHALL have been issued through a descriptor obtained by a fresh beneath-root lookup of the prefix that already existed, not through a descriptor carried over from an earlier creation
+- **AND** the descriptor the write acts through SHALL come from a beneath-root lookup performed after the creation, so the note SHALL be written beneath the root or the call SHALL be refused
+- **AND** no file, and no file content, SHALL be created, read or modified outside the root
+- **AND** the residual — an empty directory created outside the root by the one creation that raced — SHALL be documented rather than reported as prevented
 
 #### Scenario: A deferred parent creation is followed by a fresh beneath-root lookup
 
@@ -60,6 +79,25 @@ Creating a missing directory MAY still descend one component at a time, because 
 - **THEN** the operation SHALL be refused with the unsupported-filesystem error
 - **AND** SHALL NOT fall back to opening the path one component at a time
 - **AND** nothing SHALL be written
+
+#### Scenario: A read path refuses without becoming a capability oracle
+
+- **WHEN** the syscall is unavailable in the one configuration that skips the startup probe, and a valid download token is redeemed
+- **THEN** the route SHALL answer the same uniform 404 it answers for a missing or replaced file
+- **AND** the mint-time fingerprint and MIME-sniff reads SHALL surface the unsupported-filesystem error to their authenticated caller
+- **AND** no path SHALL fall back to opening the path one component at a time
+
+#### Scenario: A signal interrupts the lookup
+
+- **WHEN** the syscall returns `EINTR` on its first attempt and would succeed on a retry
+- **THEN** the lookup SHALL retry and succeed
+- **AND** SHALL NOT fail the calling tool, transfer or download
+
+#### Scenario: A symlinked component is refused by path, not by component
+
+- **WHEN** a component below the root is a symbolic link at lookup time and is removed again before anything else can observe it
+- **THEN** the traversal error SHALL name the requested vault-relative path
+- **AND** SHALL NOT assert authoritatively which component the kernel refused
 
 ### Requirement: Staged transfer bytes and their publication are made durable
 
@@ -127,10 +165,16 @@ A filesystem or container that cannot stage without a name, or cannot publish by
 - **THEN** a name for the staged inode SHALL exist only between the publish gate's acquisition of its locks and the completion of its rename
 - **AND** that name SHALL be in the staging directory, not in the destination directory
 
-#### Scenario: The transient overwrite name is substituted
+#### Scenario: The transient overwrite name is substituted before the identity check
 
-- **WHEN** another process replaces the transient staging name with a different file after it is created and before the rename
+- **WHEN** another process replaces the transient staging name with a different file after it is created and before the identity check that immediately precedes the rename
 - **THEN** the upload SHALL be refused, the destination SHALL hold its prior content, and the substituted file SHALL be left in place rather than unlinked
+
+#### Scenario: The transient overwrite name is substituted after the identity check
+
+- **WHEN** the substitution lands in the interval between that identity check and the rename itself
+- **THEN** the refusal SHALL NOT be guaranteed — the identity check narrows the window to one syscall and does not close it — and this SHALL be recorded as an accepted residual rather than specified as prevented
+- **AND** reaching it SHALL require write access to the owner-only staging directory, which is the same access that permits editing the destination directly and is therefore outside the threat this change addresses
 
 #### Scenario: Unnamed staging or by-descriptor publication is unavailable
 
@@ -211,9 +255,11 @@ A filesystem or container that cannot stage without a name, or cannot publish by
 
 ### Requirement: Filesystem probes run only on write paths, and sweep stale staging
 
-The filesystem capability probes SHALL be split by the capability they test and SHALL run only where that capability is about to be used: a **publication** probe SHALL run on `request_upload`, `import_from_url` and `PUT /transfer/upload`, and a **trash** probe (`rename` of a temp file into `.trash/`) SHALL run only on a `delete_file` soft delete. The publication probe SHALL exercise every primitive the publish depends on — a hard link within the vault root, allocation of a file with no directory entry, and publication of such a file by descriptor — so that an environment missing any of them is refused at the probe rather than at the first upload. Each SHALL be cached per vault root. No read path — `request_download`, `check_upload`, `GET|HEAD /transfer/download/info`, `GET|HEAD /transfer/download/file` — SHALL run any probe, because a probe writes. On the first publication probe per root the server SHALL remove `.transfer-tmp/.tmp-*` files whose mtime is older than 24 hours, and SHALL NOT remove newer ones; that sweep SHALL be retained for staging files left by earlier releases even though the streaming path no longer creates named staging files.
+The filesystem capability probes SHALL be split by the capability they test and SHALL run only where that capability is about to be used: a **publication** probe SHALL run on `request_upload`, `import_from_url` and `PUT /transfer/upload`, and a **trash** probe (`rename` of a temp file into `.trash/`) SHALL run only on a `delete_file` soft delete. The publication probe SHALL exercise every primitive the publish depends on and can test from the vault root — a hard link within the vault root, allocation of a file with no directory entry, publication of such a file by descriptor, a flush of that file to durable storage, and a flush of a directory descriptor — so that an environment missing any of them is refused at the probe rather than after a body has been streamed. A filesystem that supports unnamed staging and by-descriptor publication but rejects a directory flush would otherwise pass the probe, accept a token and a body, publish the file, and only then strand the claim as a post-publication failure. Each SHALL be cached per vault root. No read path — `request_download`, `check_upload`, `GET|HEAD /transfer/download/info`, `GET|HEAD /transfer/download/file` — SHALL run any probe, because a probe writes. On the first publication probe per root the server SHALL remove `.transfer-tmp/.tmp-*` files whose mtime is older than 24 hours, and SHALL NOT remove newer ones; that sweep SHALL be retained for staging files left by earlier releases even though the streaming path no longer creates named staging files.
 
 Availability of the beneath-root lookup SHALL NOT be tested by these probes: it is a property of the kernel and the container rather than of a vault root, it is identical for every root, and it is enforced by the read-only startup probe instead.
+
+**What the probe covers SHALL be stated honestly.** It answers for the vault root and is cached per root, so it answers for properties the root and the destination share. It SHALL NOT be described as catching every capability the publish needs: a destination directory whose filesystem or mount differs from the root's can refuse a primitive the root accepted, and such a failure is detected only at the operation itself. The probe's guarantee is therefore "an environment that fails at the root is refused before any body is streamed", not "an environment that passes will publish".
 
 #### Scenario: A read creates nothing
 
@@ -230,3 +276,9 @@ Availability of the beneath-root lookup SHALL NOT be tested by these probes: it 
 - **WHEN** the publication probe runs against a root whose filesystem cannot allocate a file with no directory entry, or in a container where an open descriptor cannot be published by reference
 - **THEN** the probe SHALL raise the unsupported-filesystem error naming that capability
 - **AND** the transfer tools and routes for that root SHALL refuse rather than publish by staging name
+
+#### Scenario: A vault that cannot flush a directory is refused at the probe
+
+- **WHEN** the publication probe runs against a root whose filesystem refuses a flush of an open directory descriptor
+- **THEN** the probe SHALL raise the unsupported-filesystem error naming that capability
+- **AND** no upload token SHALL be minted for that root, so no body SHALL be streamed and published only to strand its claim on the first directory flush

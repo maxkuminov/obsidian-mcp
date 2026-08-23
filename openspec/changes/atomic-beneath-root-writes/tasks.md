@@ -12,39 +12,66 @@ Order and dependency: **#87 → #97 → #92-item-1**.
 ## 1. #87 — the beneath-root lookup becomes one kernel-enforced call
 
 *Scope: `src/services/vault_fs.py`, `src/main.py`, `src/services/vault.py`
-(docstring only), tests.*
+(docstring only), tests. `src/mcp_server/tools.py` and
+`src/transfer/routes.py` are read for 1.6 and not changed.*
 
 - [ ] 1.1 Bind `openat2(2)` through `ctypes` in `vault_fs`, following
-  `_resolve_renameat2` / `_renameat2_raw` exactly: the glibc symbol when it
-  exists, the raw `syscall()` with a per-architecture number table as the
-  pre-2.28 fallback, an architecture that is not in the table treated as "no
-  `openat2`" rather than guessed at, one cached resolution per process, and a
-  single `_openat2_raw` that returns an errno rather than raising so every
-  mapping branch is drivable from a test
+  `_renameat2_raw`'s *shape* but not its resolution order: **glibc exports no
+  `openat2` wrapper at any version** (D24), so the raw `syscall()` with a
+  per-architecture number table is the implementation, not a fallback. It is
+  `__NR_openat2 == 437` on every architecture that has it, an architecture
+  absent from the table is treated as "no `openat2`" rather than guessed at,
+  the resolution is cached once per process, and a single `_openat2_raw`
+  returns an errno rather than raising so every mapping branch is drivable
+  from a test. Do **not** carry `_resolve_renameat2`'s `pragma: no cover`
+  markers across — the branches they cover are unreachable there and are the
+  normal path here
 - [ ] 1.2 Define `struct open_how` (`flags`, `mode`, `resolve` — three
-  `__u64`s) as a `ctypes.Structure` and pass `sizeof` as the `size` argument;
-  map `E2BIG` (unknown structure size) to the same unavailability answer as
-  `ENOSYS`
+  `__u64`s) as a `ctypes.Structure` and pass `sizeof` as the `size` argument.
+  Map **both** `EINVAL` (a `size` smaller than any version the kernel knows,
+  or an unrecognised flag/`resolve` bit) and `E2BIG` (nonzero extension data
+  past the size this kernel knows) to the unavailability answer, naming the
+  ABI mismatch. Neither is reachable from a correct binding, which is exactly
+  why neither may escape as a generic `OSError` — see D24 for the measured
+  behaviour, and note the first draft had these two the wrong way round
 - [ ] 1.3 Rewrite `open_dir_beneath` to obtain the returned descriptor from a
   single `openat2(root_fd, rel_dir, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
   RESOLVE_NO_MAGICLINKS, O_RDONLY|O_DIRECTORY|O_CLOEXEC)`, keeping its name,
   signature, the `_split` pre-check and every existing error type. Do **not**
   set `RESOLVE_NO_XDEV` (D16)
-- [ ] 1.4 Errno mapping, with a test per branch: `ELOOP` → the existing
-  `UnsafePath` traversal message; `EXDEV` → `UnsafePath` naming the containment
-  violation, **not** `UnsupportedFilesystem` (D17); `ENOENT` →
-  `FileNotFoundError`; `ENOTDIR` → `UnsafePath`; `ENOSYS`/`EPERM`/`E2BIG` →
+- [ ] 1.4 Errno mapping, with a test per branch: `ELOOP` → `UnsafePath`
+  naming the **requested vault-relative path**, with any component
+  identification explicitly best-effort (D25); `EXDEV` → `UnsafePath` naming
+  the containment violation, **not** `UnsupportedFilesystem` (D17); `ENOENT` →
+  `FileNotFoundError`; `ENOTDIR` → `UnsafePath`; `ENOSYS`/`EPERM` →
   `UnsupportedFilesystem` naming `openat2`, the 5.6 kernel and the seccomp
-  profile; `EAGAIN` → bounded retry, then refuse
-- [ ] 1.5 Keep the per-component `mkdir` walk for `create=True`, and make the
-  descriptor the caller receives come from a *fresh* single beneath-root
-  lookup performed after creation finishes. No descriptor the creation walk
-  produces may be returned or written through
+  profile; `EINVAL`/`E2BIG` → `UnsupportedFilesystem` naming the `open_how`
+  ABI mismatch; `EAGAIN` **and `EINTR`** → bounded retry, then refuse — the
+  `os.open` walk retried `EINTR` transparently and a raw syscall does not, so
+  omitting it turns a signal into a false failure of a write (D17)
+- [ ] 1.5 Rewrite the `create=True` descent so **no descriptor is carried
+  across a creation**: for each missing component, re-acquire the
+  already-existing prefix with a fresh `openat2` from the root, issue the one
+  `mkdirat` through it, drop it. The descriptor the caller receives then comes
+  from a *fresh* single beneath-root lookup of the whole parent performed after
+  creation finishes; no descriptor the creation produced may be returned or
+  written through. Record the residual this leaves in the docstring — one
+  empty directory outside the root if a prefix is renamed out inside a
+  one-syscall window, never a file, never something the tool reports success
+  about — and do **not** try to clean it up: an `rmdir` by name is the
+  delete-the-substitute hazard `_discard_temp` already refuses (D22)
 - [ ] 1.6 Confirm every caller inherits it without its own change:
   `_open_parent` / `open_parent` (transfer publish, `delete_file`),
-  `open_staging_dir`, `probe_trash`'s trash open, and
-  `MutableTarget.ensure_parent` (the deferred-creation site). Grep for direct
-  `os.open(..., dir_fd=...)` descents that bypass the helper
+  `open_staging_dir`, `probe_trash`'s trash open,
+  `MutableTarget.ensure_parent` (the deferred-creation site), **and the
+  read-side callers the first draft omitted** — `tools._fingerprint_of` and
+  `tools._head_bytes` (mint-time fingerprint and MIME sniff) and
+  `routes._open_bound_file` (`GET|HEAD /transfer/download/file`). Grep for
+  direct `os.open(..., dir_fd=...)` descents that bypass the helper. Record
+  the error each of those three surfaces produces: the two tool-side readers
+  raise to an authenticated caller, the download route keeps its uniform 404
+  (`except (FileNotFoundError, VaultFSError, OSError)`) and must **not** grow
+  a distinguishable status — see D21
 - [ ] 1.7 `_check_openat2_support()` in `src/main.py`, called from `lifespan`
   beside `_check_pgvector_version`, skipped under `MCP_SANDBOX_MODE`:
   read-only (`openat2` of `"."` relative to a descriptor the process already
@@ -53,15 +80,23 @@ Order and dependency: **#87 → #97 → #92-item-1**.
   two causes
 - [ ] 1.8 Tests: an ancestor renamed out of the vault mid-lookup is refused
   rather than yielding an outside descriptor; a symlinked component still gets
-  the traversal error; `..` and absolute paths still refused by `_split` with
-  their own messages; a mount point beneath the root still resolves; the
-  deferred-creation path re-opens; `EAGAIN` retried then refused; each
-  unavailability errno produces the refusal and **no** per-component fallback;
-  the startup probe exits with the named message and creates nothing
+  the traversal error, naming the requested path; `..` and absolute paths still
+  refused by `_split` with their own messages *before* the syscall (the kernel
+  would accept `A/../A` under `RESOLVE_BENEATH` — D17); a mount point beneath
+  the root still resolves; the deferred-creation path re-acquires the prefix
+  per component and re-opens the parent afterwards; `EAGAIN` retried then
+  refused; **one `EINTR`-then-success sequence completes the write**; each
+  unavailability errno (`ENOSYS`, `EPERM`, `EINVAL`, `E2BIG`) produces the
+  refusal and **no** per-component fallback; the startup probe exits with the
+  named message and creates nothing; with the syscall unavailable and the
+  startup probe skipped, a download redemption still answers the uniform 404
 - [ ] 1.9 Update the `vault_fs` module docstring and `vault.py`'s "remaining
   residual" paragraph; **rewrite CLAUDE.md's "The accepted residual,
-  precisely"** so the non-atomic-walk bullet is gone and the list describes
-  what is actually left
+  precisely"** so the non-atomic-walk bullet is *replaced* — the lookup window
+  is gone, and the creation-side residual (D22) takes its place, stated as
+  precisely as the bullets around it. The proposal's claim and that section
+  must end up telling the same story: the lookup is closed, creation is
+  narrowed, nothing outside the root is written, read or destroyed
 
 ## 2. #97 — staged bytes and the publication are made durable
 
@@ -96,6 +131,17 @@ group 1 now produces.
   A failure there is **logged and swallowed**, and the write reported as the
   success it is (D18) — the opposite direction from the transfer path, for the
   `edit_note(append=True)`-retry reason
+- [ ] 2.6a Flush the newly created ancestors too. `MutableTarget.ensure_parent`
+  can create a whole chain, and flushing only the immediate parent leaves the
+  entry that names *it* unflushed — a crash then loses the folder and the note
+  the tool reported written. Have `ensure_parent` record which directories it
+  created and flush each created directory's parent outward to the first
+  pre-existing one, under the same logged-and-swallowed policy as 2.6
+- [ ] 2.6b Confirm the durability is inherited by **every** `_atomic_write_at`
+  caller, not just the note tools: `write_file_at`, `write_bytes_at`, and so
+  `write_file` in both its no-clobber and `overwrite=True` modes. The
+  requirement now names `write_file` explicitly because an implementation
+  could otherwise satisfy the tool list literally and skip it
 - [ ] 2.7 Confirm `import_from_url` is covered by 2.1–2.5 through the shared
   `stream_to_vault`, and that its gate's `complete()` no-op is unaffected
 - [ ] 2.8 Tests: the payload flush happens before the gate is entered and
@@ -104,7 +150,11 @@ group 1 now produces.
   directory flush leaves the file at the path, the token `claimed` (never
   `pending`), the response a post-publication failure, and `check_upload`
   answering `uploading`/`unknown` rather than `completed`; the note path's
-  directory flush failure does not turn a landed write into a reported failure
+  directory flush failure does not turn a landed write into a reported failure;
+  `create_note("New/Folder/x.md")` flushes `Folder`, `New` and the root entry
+  that names `New`, and a failure of any of those is logged rather than
+  reported; `write_file` gets the same flushes as `create_note` in both
+  overwrite modes
 - [ ] 2.9 CLAUDE.md: state the durability contract for both paths and the
   asymmetry in the failure direction, in the transfer and anchored-write
   sections
@@ -139,9 +189,14 @@ Depends on group 2: the payload flush moves onto the unnamed descriptor.
   `_stream_locked`'s `except` branch for a staging file that usually has no
   name: closing the descriptor is the discard, and the only unlink left is the
   overwrite path's transient name
-- [ ] 3.5 `probe_publication` additionally exercises unnamed staging and the
-  by-descriptor publication, so a filesystem or container that cannot do them
-  is refused at the probe rather than at the first upload
+- [ ] 3.5 `probe_publication` additionally exercises unnamed staging, the
+  by-descriptor publication, **a flush of the staged file and a flush of a
+  directory descriptor** — a filesystem that does `O_TMPFILE` and `linkat` but
+  refuses a directory `fsync` would otherwise pass the probe, take a token and
+  a whole body, publish, and only then strand the claim as a post-publication
+  failure. Also state in the docstring what the probe *cannot* answer for: it
+  links root→root and is cached per root, so a destination on a different
+  filesystem or mount is detected only at the operation itself (D23)
 - [ ] 3.6 Leave `prune_stale_staging` in place and update its docstring: it
   has pre-change litter to collect and a rolling deploy to survive, and it no
   longer has anything new to collect (D19). Leave `open_staging_dir`'s `0700`
@@ -150,15 +205,23 @@ Depends on group 2: the payload flush moves onto the unnamed descriptor.
 - [ ] 3.7 Tests: `.transfer-tmp` holds no entry for the staged bytes at any
   point while a body streams; a killed upload leaves nothing to sweep; the
   overwrite path's transient name exists only inside the gate and only in
-  `.transfer-tmp`; a substituted transient name refuses the publish and leaves
-  the substitute in place; `O_TMPFILE` and `/proc` unavailability each refuse
-  at the probe with a named error and never fall back
+  `.transfer-tmp`; a transient name substituted **before** the identity check
+  refuses the publish and leaves the substitute in place (the interval after
+  that check is the declared residual — D20 — and is not asserted);
+  `O_TMPFILE`, `/proc` and directory-`fsync` unavailability each refuse at the
+  probe with a named error and never fall back
 - [ ] 3.8 CLAUDE.md: extend "The no-clobber publish never exposes a staging
   name at all" to cover the transfer path, and record the overwrite path's
   in-gate window
 
 ## 4. Verification
 
+- [ ] 4.0 File the D23 follow-up as its own issue before this change is
+  archived: transfer publication into a mount point beneath the vault root
+  fails `EXDEV` after the body is streamed, with a message blaming hard-link
+  support. Pre-existing, out of scope here, and unfixable without either
+  declaring the envelope or moving staging onto the destination's filesystem
+  (which reverses D20). The issue carries both options and their costs
 - [ ] 4.1 `openspec validate atomic-beneath-root-writes --strict` passes
 - [ ] 4.2 Full test suite green; `make audit` clean
 - [ ] 4.3 Confirm the new tests fail against the pre-change tree, per group,
@@ -167,7 +230,10 @@ Depends on group 2: the payload flush moves onto the unnamed descriptor.
 - [ ] 4.4 Adversarial Codex pass — this change is squarely in the destructive-
   write class: framing must say that a false "nothing was published" hands
   back a replayable capability over an existing file, and that a containment
-  guard which degrades silently is worse than one that refuses
+  guard which degrades silently is worse than one that refuses. Point it at
+  D20, D22 and D23 explicitly: each is a *declared* residual, and the question
+  to ask of them is whether the declaration is honest and bounded, not whether
+  the residual exists
 - [ ] 4.5 End-to-end exercise against the live server, naming the tools
   actually called: `request_upload` + a real `PUT /transfer/upload` (both
   no-clobber and overwrite), `check_upload`, `import_from_url`, `create_note`,
