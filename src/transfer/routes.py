@@ -82,6 +82,27 @@ UNSUPPORTED_FS_BODY = {
     )
 }
 
+# A mount boundary is a *different* refusal and must not be collapsed into the
+# one above, which would tell the person their filesystem cannot do atomic
+# publication when it can — and would be flatly false for an `overwrite=True`
+# link, which does not use the no-clobber publish at all.
+#
+# **Path-free, deliberately.** This route is bearer-protected and unauthenticated
+# beyond the token, so it says *what kind* of thing refused and nothing about
+# where the vault keeps anything. The path, and the boundary's exact side, come
+# from the authenticated surfaces: the mint tools' error and `check_upload`.
+# Every unknown, expired, consumed or otherwise unusable token stays on the
+# uniform 404 — this is reached only for a token that was valid and whose
+# destination stopped being publishable after it was minted.
+MOUNT_BOUNDARY_BODY = {
+    "error": (
+        "The destination is on a different mount from the vault's staging "
+        "directory, or is itself a mount point, so this transfer cannot be "
+        "published there. The filesystem is fine; the mount layout is what "
+        "refuses."
+    )
+}
+
 
 def _not_found() -> JSONResponse:
     """The single refusal. Never add a reason: the reason is the oracle."""
@@ -306,6 +327,14 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
             # Publication only: the trash probe belongs to `delete_file`, and
             # this route never soft-deletes anything.
             vault_fs.check_publication_support(row.vault_root)
+        except vault_fs.MountBoundary as exc:
+            # Before the generic branch: `MountBoundary` subclasses
+            # `UnsupportedFilesystem` so every existing surface keeps answering
+            # it, which makes the ordering here load-bearing rather than
+            # cosmetic.
+            logger.error("Transfer refused at a mount boundary: %s", exc)
+            await transfer.release_claim(session, row)
+            return JSONResponse(dict(MOUNT_BOUNDARY_BODY), status_code=503)
         except vault_fs.UnsupportedFilesystem as exc:
             logger.error("Transfer refused: %s", exc)
             await transfer.release_claim(session, row)
@@ -397,6 +426,15 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
         except vault_fs.UnsafePath as exc:
             await transfer.release_claim(session, row)
             return JSONResponse({"error": str(exc)}, status_code=409)
+        except vault_fs.MountBoundary as exc:
+            # The in-gate check, or the residual `EXDEV`/`EBUSY` from the
+            # publish itself. Pre-publication either way, so the claim is
+            # released and the same link may be retried once the mount is gone.
+            # **Must stay above the `UnsupportedFilesystem` branch** — it is a
+            # subclass, and Python takes the first match.
+            logger.error("Transfer refused at a mount boundary: %s", exc)
+            await transfer.release_claim(session, row)
+            return JSONResponse(dict(MOUNT_BOUNDARY_BODY), status_code=503)
         except vault_fs.UnsupportedFilesystem:
             await transfer.release_claim(session, row)
             return JSONResponse(dict(UNSUPPORTED_FS_BODY), status_code=503)

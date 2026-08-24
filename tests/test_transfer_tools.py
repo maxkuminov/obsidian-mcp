@@ -11,6 +11,7 @@ The redemption side lives in `tests/test_transfer_routes.py`; the transaction
 boundaries live in `tests/integration/test_transfer_pg.py`.
 """
 
+import errno
 import os
 import re
 import tempfile
@@ -295,6 +296,34 @@ async def test_request_upload_reports_an_unsupported_filesystem(
     assert minted == []
 
 
+async def test_no_upload_token_is_minted_where_a_directory_cannot_be_flushed(
+    vault, readwrite, minted, monkeypatch
+):
+    """The probe is what keeps this failure off the post-publication path (#97).
+
+    A filesystem that hard-links happily and rejects a directory `fsync` would
+    otherwise mint a token, take a whole body, publish it, and only then strand
+    the claim — the one outcome the transfer path cannot undo. It is refused
+    before a link is ever handed to a human.
+    """
+    import stat as _stat
+
+    real = os.fsync
+
+    def refuse_directories(fd):
+        if _stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "not supported")
+        return real(fd)
+
+    monkeypatch.setattr(os, "fsync", refuse_directories)
+    vault_fs.reset_filesystem_probe_cache()
+
+    result = await tools.request_upload_impl("Attachments/shot.png")
+
+    assert "durable storage" in result, result
+    assert minted == [], "a token was minted against a vault that cannot flush"
+
+
 # ── 5.2 check_upload ────────────────────────────────────────────────────────
 
 
@@ -396,6 +425,42 @@ async def test_check_upload_reports_uploading_with_the_stream_deadline(
     # when to ask again, and asking again is what resolves the ambiguity.
     deadline = transfer.upload_stream_deadline(row)
     assert deadline.strftime("%Y-%m-%d %H:%M:%SZ") in result
+
+
+async def test_a_stranded_directory_flush_is_answered_uploading_then_unknown(
+    vault, readwrite, looked_up, monkeypatch
+):
+    """What #97's post-publication failure looks like from the agent's side.
+
+    A directory flush that fails after the bytes land leaves the token
+    `claimed`, forever. `completed{sha256}` is a claim about the vault and this
+    is exactly the state where the server cannot make it — so inside the stream
+    deadline the answer is `uploading`, past it `unknown`, and never
+    `completed`. "Go look at the path before re-minting" is the honest answer
+    for "the file is there and we cannot promise it survives a crash".
+    """
+    import datetime
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    row = _row(
+        state="claimed",
+        claimed_at=now - datetime.timedelta(seconds=5),
+        expires_at=now + datetime.timedelta(seconds=300),
+    )
+    looked_up["row"] = row
+
+    live = await tools.check_upload_impl(PUB_ID)
+    assert live.startswith("uploading")
+    assert "completed" not in live.split("\n")[0]
+
+    monkeypatch.setattr(
+        transfer, "now_utc", lambda: now + datetime.timedelta(hours=1)
+    )
+    later = await tools.check_upload_impl(PUB_ID)
+    assert later.startswith("unknown")
+    # The one instruction that resolves the ambiguity, and no sha256 to act on.
+    assert "read_file" in later or "list_files" in later
+    assert row.sha256 is None
 
 
 async def test_check_upload_reports_completed_with_the_hash(vault, readwrite, looked_up):

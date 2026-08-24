@@ -516,9 +516,7 @@ async def test_the_staging_directory_is_private_while_the_gate_holds(vault):
         async def __aenter__(self):
             staging = vault / vault_fs.STAGING_DIR
             seen["dir_mode"] = staging.stat().st_mode & 0o777
-            seen["file_modes"] = sorted(
-                p.stat().st_mode & 0o777 for p in staging.iterdir()
-            )
+            seen["entries"] = sorted(p.name for p in staging.iterdir())
             return await super().__aenter__()
 
     row = FakeRow(str(vault), "Attachments/a.bin")
@@ -530,9 +528,14 @@ async def test_the_staging_directory_is_private_while_the_gate_holds(vault):
         before_publish=PeekingGate(allow=True),
     )
     assert seen["dir_mode"] == 0o700, "staged bytes were exposed while the gate held"
-    # Documents the ordering the 0700 exists to compensate for: by gate time the
-    # staged inode is already at the published mode.
-    assert seen["file_modes"] == [vault_fs.default_file_mode()]
+    # Since #92 item 1 the staged bytes have no directory entry at all, so the
+    # 0700 is defence in depth here rather than the only thing protecting them —
+    # there is nothing in the directory to open by name. It still governs the
+    # transient overwrite name and the named-staging fallback. The relaxation to
+    # the published mode still happens before the gate, on the descriptor; that
+    # ordering is asserted through the published file's own mode elsewhere in
+    # this module.
+    assert seen["entries"] == [], seen
 
 
 async def test_a_staging_directory_that_cannot_be_tightened_refuses_the_upload(

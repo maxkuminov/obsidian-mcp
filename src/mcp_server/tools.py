@@ -37,6 +37,7 @@ from src.services.filters import apply_note_filters
 from src.services.search import full_text_search
 from src.services import transfer, vault_fs
 from src.services.vault import (
+    VaultRootMismatch,
     _vault_root,
     classify_bytes,
     extract_section,
@@ -1653,6 +1654,7 @@ async def _move_note_locked(
     # endpoints are acquired inside the same guard: a non-`ValueError` failure
     # opening the destination would otherwise strand the source's descriptors.
     targets: list = []
+    shared_root_fd: int | None = None
     try:
         try:
             src_target = open_mutable(from_path, user_id=uid)
@@ -1713,6 +1715,17 @@ async def _move_note_locked(
         planned_rewrites: list[tuple[str, object, bytes, str, int]] = []
         rewrite_bytes_held = 0
         failed_rewrite_sources: list[str] = []
+        # One vault-root descriptor for the whole rewrite phase, shared by every
+        # planned rewrite (`MutableTarget.share_root`). It is a `dup` of a root
+        # the kernel has already proved, never a fresh open of the root
+        # *pathname* — re-resolving the name is the substitution surface #59
+        # exists to close, and a `dup` resolves nothing.
+        #
+        # Each target still needs *a* root after its publish: since the chain
+        # rule (#97) a successful write flushes every directory above its
+        # parent, up to the root, and a target with no root descriptor cannot
+        # look those up. Releasing the root — the previous shape — silently
+        # reduced every backlink rewrite to a leaf-parent flush.
 
         def drop(candidate) -> None:
             """Close a per-source target we are not going to keep.
@@ -1732,6 +1745,14 @@ async def _move_note_locked(
             candidate.close()
 
         if rewrite_links and pre_move_index is not None:
+            try:
+                shared_root_fd = os.dup(src_target.root_fd)
+            except OSError as e:
+                return (
+                    "Move aborted: ran out of file descriptors before the link "
+                    f"rewrites could be planned ({e}). Nothing was moved, "
+                    "rewritten or reindexed."
+                )
             for original_src_path in rewrite_sources:
                 # A moved note may link to itself: it is still at its old path now,
                 # so read it there, but emit link targets relative to where it is
@@ -1756,12 +1777,16 @@ async def _move_note_locked(
                         drop(read_target)
                         continue
                     if not moved_note:
-                        # Pinned from here until phase 3 writes it. The number
-                        # of backlink sources is unbounded, so drop the root
-                        # descriptor — a rewrite never creates a directory and
-                        # never touches `.trash` — and hold one fd per source
-                        # instead of two.
-                        read_target.release_root()
+                        # Pinned from here until phase 3 writes it. The number of
+                        # backlink sources is unbounded, so this target hands
+                        # back its *own* root and borrows the phase's shared one:
+                        # one fd per source plus one for the phase, rather than
+                        # two per source. `share_root` verifies the shared
+                        # descriptor names the same inode this target's parent
+                        # was proved beneath before it swaps — a mismatch means
+                        # the vault root was repointed mid-call and is refused
+                        # below, while nothing has been mutated yet.
+                        read_target.share_root(shared_root_fd)
                     original_bytes = read_bytes_at(
                         read_target, max_bytes=MAX_NOTE_BYTES, label=original_src_path
                     )
@@ -1796,6 +1821,17 @@ async def _move_note_locked(
                     failed_rewrite_sources.append(original_src_path)
                     drop(read_target)
                     continue
+                except VaultRootMismatch as e:
+                    # Not a per-source failure: the vault root itself moved, so
+                    # every remaining target is suspect and the endpoints we
+                    # already validated may no longer describe the vault the
+                    # caller meant. Abort while that is still free — phase 2 has
+                    # not run, so nothing has been mutated.
+                    drop(read_target)
+                    return (
+                        f"Move aborted: {e} Nothing was moved, rewritten or "
+                        "reindexed."
+                    )
                 except Exception as e:
                     logger.warning(
                         "Failed to rewrite links in %s: %s", original_src_path, e
@@ -1834,6 +1870,9 @@ async def _move_note_locked(
                 # *process* table and breaks every concurrent request — so the
                 # move aborts here, before any mutation, rather than hitting
                 # EMFILE half way through the rewrites.
+                # `max_move_rewrite_sources()` already charges the phase's one
+                # shared root, so this compares planned rewrites against what is
+                # left for their parent descriptors.
                 fd_budget = max_move_rewrite_sources()
                 if len(planned_rewrites) + 1 > fd_budget:
                     return (
@@ -1940,6 +1979,10 @@ async def _move_note_locked(
     finally:
         for opened in targets:
             opened.close()
+        # After the targets: they borrowed this descriptor, and `close()` on a
+        # borrower deliberately leaves it alone.
+        if shared_root_fd is not None:
+            vault_fs.close_quietly(shared_root_fd, "shared vault root for rewrites")
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -1969,6 +2012,13 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
                 os.unlink(target.name, dir_fd=target.dir_fd)
             except OSError as e:
                 return f"Permanent delete failed: {e}"
+            # The unlink is a directory operation, and an entry that survives a
+            # crash resurrects a note the agent was told is gone (#97). Logged
+            # and swallowed: the note *is* unlinked, and a reported failure
+            # would invite a retry of a delete that already happened.
+            vault_fs.flush_dir_quietly(
+                target.dir_fd, f"parent directory of {target.rel}"
+            )
             return f"Permanently deleted: {path}"
 
         # Only the soft delete needs the trash to be usable, and it must be
@@ -2389,7 +2439,9 @@ def _fingerprint_of(root: str, rel_path: str) -> dict | None:
         os.close(dir_fd)
 
 
-def _mint_preflight(path: str, *, need_write: bool) -> tuple | str:
+def _mint_preflight(
+    path: str, *, need_write: bool, overwrite: bool = False
+) -> tuple | str:
     """Shared front half of the three mint tools: permission, origin, path, FS.
 
     Returns `(uid, root, rel, base)` or an error string. Every refusal happens
@@ -2400,6 +2452,12 @@ def _mint_preflight(path: str, *, need_write: bool) -> tuple | str:
     read-only identity's read tool writing to the vault — on a fresh vault, the
     first thing it ever did would be to create files. A download publishes
     nothing, so it needs no proof that publication works.
+
+    **So does the mount check**, for the same reason and one more: it is the
+    only check here that can spare a body. A destination on a mount beneath the
+    vault root refuses the link or rename that publishes it, and without this
+    the refusal arrives after the whole 25 MB has been streamed. A download is
+    a read and crosses nothing.
     """
     if need_write and (err := _require_write()):
         return err
@@ -2416,6 +2474,18 @@ def _mint_preflight(path: str, *, need_write: bool) -> tuple | str:
     if need_write:
         try:
             vault_fs.check_publication_support(root)
+            # And that the destination is on the staging directory's mount
+            # (D23). Publication is a `link`/`rename` out of a root-level
+            # staging directory, and both refuse to cross a mount boundary —
+            # which the publication probe cannot see, because it links
+            # root→root and is cached per root while this is a property of the
+            # *pair*. Here, before the row is inserted for `request_upload` and
+            # before the fetch begins for `import_from_url`, is the only place
+            # a boundary that is *already there* costs a syscall instead of a
+            # whole body. A boundary established afterwards is caught inside
+            # the publish gate — still pre-publication, but by then the body
+            # has streamed.
+            vault_fs.check_destination_mount(root, rel, overwrite=overwrite)
         except vault_fs.UnsupportedFilesystem as e:
             return str(e)
         except (OSError, vault_fs.VaultFSError) as e:
@@ -2456,7 +2526,7 @@ async def request_upload_impl(
     expires_in: int | None = None,
 ) -> str:
     """Mint a one-shot link a human can drop a file onto."""
-    pre = _mint_preflight(path, need_write=True)
+    pre = _mint_preflight(path, need_write=True, overwrite=overwrite)
     if isinstance(pre, str):
         return pre
     uid, root, rel, base = pre
@@ -2748,7 +2818,7 @@ def _url_host(url) -> str:
 )
 async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> str:
     """Fetch a public URL straight into the vault, under the outbound policy."""
-    pre = _mint_preflight(path, need_write=True)
+    pre = _mint_preflight(path, need_write=True, overwrite=overwrite)
     if isinstance(pre, str):
         return pre
     _uid, root, rel, _base = pre
