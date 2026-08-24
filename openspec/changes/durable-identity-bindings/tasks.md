@@ -796,11 +796,11 @@ path is unchanged.
 
 ## D. Gates (merged result, once)
 
-- [ ] D.1 `pytest --ignore=tests/integration` green
-- [ ] D.2 `make test-schema` green with `HEAD_REVISION = "017"` — required, this
+- [x] D.1 `pytest --ignore=tests/integration` green
+- [x] D.2 `make test-schema` green with `HEAD_REVISION = "017"` — required, this
       change carries two migrations
-- [ ] D.3 `openspec validate durable-identity-bindings --strict`
-- [ ] D.4 `make audit`
+- [x] D.3 `openspec validate durable-identity-bindings --strict`
+- [x] D.4 `make audit`
 - [ ] D.5 Adversarial Codex pass, framed as a defensive control review. Both
       triggers fire: two migrations, and a refusal on the write path. Give it
       the product framing — the consumer is an agent, the expensive failures

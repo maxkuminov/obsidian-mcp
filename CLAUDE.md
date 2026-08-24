@@ -610,10 +610,17 @@ credential and then opens the Usage page to see what it did was shown
   the label survives it, which
   `tests/integration/test_schema_check.py::test_the_label_survives_the_panel_deleting_an_api_key`
   runs as the real two-statement sequence.
-- **Transfer-route rows are not labelled.** `src/transfer/routes.py::_log_row`
-  builds its own `UsageLog` from the minting identity and has no request-scoped
-  actor to read, so those rows keep join-only attribution. Carrying the label
-  on `transfer_tokens` at mint is the fix; it is not done.
+- **Transfer rows carry the actor from mint** (migration 017, the 015 register:
+  marker-owned nullable columns on `transfer_tokens`, snapshot never re-derived,
+  orphan-label refusal before any backfill). `mint_token` splices in the actor
+  `APIKeyMiddleware` already bound — one shared reader,
+  `src.auth.session.actor_columns`, so mint and `_log_usage` cannot drift in
+  truncation — and `_log_row` copies it at redemption. The backfill labels
+  `transfer_tokens` only, from the row's own FK; it writes nothing to
+  `usage_logs`, because no usage row references the token that produced it.
+  The honest gap is rows written between 015 and 017: they keep join-only
+  attribution and render as unattributable when the joins miss. The label
+  authorises nothing — redemption still resolves the credential row.
 
 ## The vault assignment is the admission gate for every tool
 
