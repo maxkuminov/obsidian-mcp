@@ -344,8 +344,6 @@ This applies to transfer publication only. Note writes stage in the destination'
 - **WHEN** the staging directory and the destination parent are on the same mount, as they are on a vault that contains no nested mount
 - **THEN** the check SHALL pass and the transfer SHALL proceed exactly as it does today
 
-## MODIFIED Requirements
-
 ### Requirement: A mount refusal on the upload route is distinguishable from a filesystem refusal
 
 The upload route SHALL answer a mount-boundary refusal with a body that names a mount boundary, distinct from the body it uses when the filesystem cannot perform atomic no-clobber publication. Collapsing the two states that the vault's filesystem lacks a capability it has, and is flatly false for a capability minted with `overwrite`, which does not use the no-clobber publication at all. Because the mount-boundary error is a *subtype* of the unsupported-filesystem error, the handler that answers it SHALL be ordered before the general one, or it can never be reached.
@@ -358,6 +356,9 @@ That body SHALL NOT contain the destination path or any other vault path: the ro
 - **THEN** the route SHALL answer with the mount-boundary body rather than the unsupported-filesystem body
 - **AND** that body SHALL contain no vault path
 - **AND** the claim SHALL be released, so the same link may be redeemed again once the mount is gone
+
+
+## MODIFIED Requirements
 
 ### Requirement: Upload endpoint claims first, streams within the cap, publishes atomically to the pre-committed path
 

@@ -360,7 +360,7 @@ not in a merge.
   `0700`, owner-checked and unreachable by any agent, capability or vault
   tool; the note path stages beside the destination). Do not describe the two
   fallbacks as equivalent
-- [ ] 3.9 At archive time, reconcile with the contributor PR rather than
+- [x] 3.9 At archive time, reconcile with the contributor PR rather than
   overwriting it: if #103's change landed a delta to
   `openspec/specs/vault-write/spec.md` for the note path's fallback, make sure
   this change's `vault-write` delta — whose "The filesystem cannot stage
@@ -460,7 +460,7 @@ these tasks were started.
 
 ## 5. Verification
 
-- [ ] 5.0 File the D23 follow-ups as **three separate issues** before this
+- [x] 5.0 File the D23 follow-ups as **three separate issues** before this
   change is archived. Group 4 handles transfer publication; these are the
   nested-mount failures it deliberately does not. Each issue must stand on its
   own for someone reading it cold — the reproduction, the reason the existing
@@ -518,12 +518,12 @@ these tasks were started.
      the other mode gives a 503. Group 4's preflight makes this rare rather
      than gone, since the preflight is check-then-act, so both branches should
      name the mount boundary
-- [ ] 5.1 `openspec validate atomic-beneath-root-writes --strict` passes
-- [ ] 5.2 Full test suite green; `make audit` clean
-- [ ] 5.3 Confirm the new tests fail against the pre-change tree, per group,
+- [x] 5.1 `openspec validate atomic-beneath-root-writes --strict` passes
+- [x] 5.2 Full test suite green; `make audit` clean
+- [x] 5.3 Confirm the new tests fail against the pre-change tree, per group,
   and record which ones do not and why (they pin guarantees this change
   preserves rather than introduces)
-- [ ] 5.4 Adversarial Codex pass — this change is squarely in the destructive-
+- [x] 5.4 Adversarial Codex pass — this change is squarely in the destructive-
   write class: framing must say that a false "nothing was published" hands
   back a replayable capability over an existing file, and that a containment
   guard which degrades silently is worse than one that refuses. Point it at
@@ -539,15 +539,51 @@ these tasks were started.
   flushes and publishes through by descriptor); and the mount check is
   pre-body only where the boundary already existed at mint or fetch start,
   pre-publication-but-post-body inside the gate
-- [ ] 5.5 End-to-end exercise against the live server, naming the tools
+- [x] 5.5 End-to-end exercise against the live server, naming the tools
   actually called: `request_upload` + a real `PUT /transfer/upload` (both
   no-clobber and overwrite), `check_upload`, `import_from_url`, `create_note`,
   `edit_note(append=True)`, `move_note`, `delete_note`, `write_file`,
   `delete_file`
-- [ ] 5.6 Deploy on a host whose kernel and seccomp profile allow `openat2`,
+- [x] 5.6 Deploy on a host whose kernel and seccomp profile allow `openat2`,
   and confirm the startup probe logs nothing on the happy path. Confirm the
   mount preflight is a no-op there: the production vault at `/obsidian` is a
   single mount throughout (measured — root and every child report the same
   `STATX_MNT_ID`), and `statx` is not blocked by the container's seccomp
   profile (measured in the running container). Both were checked before this
   change was written; re-check on the host that actually runs it
+
+
+## Archive record (2026-08-24)
+
+**3.9** — the contributor PR for #103 had not landed at archive time, so the
+`vault-write` delta's unconditional-refusal scenario is *correct today* and
+promotes as-is; #103's PR amends the base spec when it lands (coordinated on
+the issue — the Settings field and `/health` name it needs already exist).
+
+**5.0** — filed as #108 (soft delete across a nested mount), #109 (move_note
+across a boundary; no move probe exists), #110 (inconsistent EXDEV mapping
+between the two vault publish modes).
+
+**5.1–5.4** — validate clean; unit 1545 / full-with-Postgres 1716 / transfer
+integration 68, all green; `pip-audit` no known vulnerabilities; new tests
+confirmed failing per group against the pre-change tree (7 of group 1's 45
+pin preserved guarantees and are recorded as such in their docstrings);
+independent openspec-verifier audit (zero falsely-ticked tasks) plus four
+adversarial Codex rounds, 4 → 4 → 1 → 0, final verdict PASS.
+
+**5.5** — exercised against the live server after deploy, naming the tools
+actually called: `create_note`, `edit_note(append=True)`, `move_note`,
+`delete_note` (soft), `write_file` (text, no-clobber), `request_upload` +
+real `PUT /transfer/upload` in **both** modes (no-clobber 64 KiB random
+bytes; overwrite against a fingerprinted incumbent), `check_upload`
+(completed, sha256 matching the local hash end-to-end), `import_from_url`
+(42,437 bytes from a public URL), `read_file` (confirming the overwrite's v2
+bytes), `delete_file` (soft and permanent). All succeeded through the new
+openat2 lookup, O_TMPFILE staging and chain-flushed publications.
+
+**5.6** — deployed on kernel 6.8; startup probes silent on the happy path
+(the only WARNING in the log is #105's known spurious `_discard_temp`
+message, fired by the exercise's own `edit_note` — confirming that issue
+live). `/health` reports `vault_named_staging_fallback_active: false` and
+`transfer_mount_check_available: true`, the expected production state.
+`alembic check`: no new upgrade operations.
