@@ -131,29 +131,29 @@ task in group 3 reads it.
 Depends on group 1: the destination descriptor that gets flushed is the one
 group 1 now produces.
 
-- [ ] 2.1 `stream_to_vault` / `_stream_locked`: flush the staged payload
+- [x] 2.1 `stream_to_vault` / `_stream_locked`: flush the staged payload
   immediately after `_drain` returns, beside the `os.fchmod` from #95, before
   the descriptor closes and before `before_publish()` is entered — never
   inside the gate, where it would hold `SELECT … FOR UPDATE` locks across up
   to 25 MB of I/O
-- [ ] 2.2 Run that flush off the event loop (`asyncio.to_thread`). Unlike
+- [x] 2.2 Run that flush off the event loop (`asyncio.to_thread`). Unlike
   `_drain`'s per-chunk `_write_all`, a single `fsync` can wait on the whole
   body reaching the device, and `TRANSFER_MAX_CONCURRENT_UPLOADS` of them
   inline would stall every other request in the process
-- [ ] 2.3 A failed payload flush stays pre-publication: nothing published, the
+- [x] 2.3 A failed payload flush stays pre-publication: nothing published, the
   staged bytes discarded, the claim released, `PostPublishFailure` **not**
   raised
-- [ ] 2.4 `_publish_into_current_parent`: flush the destination directory
+- [x] 2.4 `_publish_into_current_parent`: flush the destination directory
   after `on_published` has recorded the publication and before the function
   returns — the ordering is what guarantees a failure is classified
   post-publication and converted to `PostPublishFailure` by
   `_stream_locked`'s existing handler, rather than escaping as a bare `OSError`
   the route reads as "nothing was published"
-- [ ] 2.5 When the call created directories on the way to the destination,
+- [x] 2.5 When the call created directories on the way to the destination,
   flush each created directory's parent as well, outward to the first
   directory that already existed — otherwise a crash can lose the new folder
   and take a `completed` upload with it
-- [ ] 2.5a Extend the **existing** `probe_publication` — in this group, not the
+- [x] 2.5a Extend the **existing** `probe_publication` — in this group, not the
   next — so it `fsync`s the temp file it already creates and `fsync`s a
   directory descriptor. Without this, a tree that has landed groups 1 and 2 on
   a filesystem that hard-links happily and rejects a directory `fsync` passes
@@ -161,24 +161,24 @@ group 1 now produces.
   then strands the claim on the flush 2.4 just introduced — the failure has to
   be detectable from the moment the flush exists, and group 2 is a shippable
   head of the tree. Group 3 rewrites this probe and **keeps** both checks (3.5)
-- [ ] 2.6 `vault._atomic_write_at`: flush `target.dir_fd` after publication.
+- [x] 2.6 `vault._atomic_write_at`: flush `target.dir_fd` after publication.
   A failure there is **logged and swallowed**, and the write reported as the
   success it is (D18) — the opposite direction from the transfer path, for the
   `edit_note(append=True)`-retry reason
-- [ ] 2.6a Flush the newly created ancestors too. `MutableTarget.ensure_parent`
+- [x] 2.6a Flush the newly created ancestors too. `MutableTarget.ensure_parent`
   can create a whole chain, and flushing only the immediate parent leaves the
   entry that names *it* unflushed — a crash then loses the folder and the note
   the tool reported written. Have `ensure_parent` record which directories it
   created and flush each created directory's parent outward to the first
   pre-existing one, under the same logged-and-swallowed policy as 2.6
-- [ ] 2.6b Confirm the durability is inherited by **every** `_atomic_write_at`
+- [x] 2.6b Confirm the durability is inherited by **every** `_atomic_write_at`
   caller, not just the note tools: `write_file_at`, `write_bytes_at`, and so
   `write_file` in both its no-clobber and `overwrite=True` modes. The
   requirement now names `write_file` explicitly because an implementation
   could otherwise satisfy the tool list literally and skip it
-- [ ] 2.7 Confirm `import_from_url` is covered by 2.1–2.5 through the shared
+- [x] 2.7 Confirm `import_from_url` is covered by 2.1–2.5 through the shared
   `stream_to_vault`, and that its gate's `complete()` no-op is unaffected
-- [ ] 2.8 Tests: the payload flush happens before the gate is entered and
+- [x] 2.8 Tests: the payload flush happens before the gate is entered and
   after the body is fully drained; it does not block the event loop; a failing
   payload flush releases the claim and leaves nothing at the path; a failing
   directory flush leaves the file at the path, the token `claimed` (never
@@ -189,7 +189,7 @@ group 1 now produces.
   that names `New`, and a failure of any of those is logged rather than
   reported; `write_file` gets the same flushes as `create_note` in both
   overwrite modes
-- [ ] 2.9 CLAUDE.md: state the durability contract for both paths and the
+- [x] 2.9 CLAUDE.md: state the durability contract for both paths and the
   asymmetry in the failure direction, in the transfer and anchored-write
   sections
 

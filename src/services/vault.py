@@ -369,7 +369,16 @@ class MutableTarget:
     reason (an over-cap body) leaves no directories behind.
     """
 
-    __slots__ = ("path", "rel", "name", "root", "parent_rel", "_dir_fd", "_root_fd")
+    __slots__ = (
+        "path",
+        "rel",
+        "name",
+        "root",
+        "parent_rel",
+        "created",
+        "_dir_fd",
+        "_root_fd",
+    )
 
     def __init__(
         self,
@@ -387,6 +396,10 @@ class MutableTarget:
         self.name = name
         self.root = root
         self.parent_rel = parent_rel
+        # Directories `ensure_parent` created on the way to this target, if
+        # any. What #97's ancestor flush walks; empty for the ordinary write
+        # into a folder that was already there.
+        self.created: list[str] = []
         self._dir_fd = dir_fd
         self._root_fd: int | None = root_fd
 
@@ -453,12 +466,18 @@ class MutableTarget:
         residual that leaves — at most one empty directory per component, per
         creation descent — is stated in `open_dir_beneath`'s docstring and in
         this module's own.
+
+        Whatever it creates is recorded in `self.created`, so
+        `_flush_publication` can make those directory *entries* durable too
+        (#97): flushing the note's own parent while the entry that names that
+        parent is still only in the page cache means a crash loses the folder
+        and the note the tool reported writing.
         """
         if self._dir_fd is not None:
             return
         try:
             self._dir_fd = vault_fs.open_dir_beneath(
-                self.root_fd, self.parent_rel, create=True
+                self.root_fd, self.parent_rel, create=True, created=self.created
             )
         except vault_fs.UnsafePath as exc:
             raise ValueError(str(exc)) from None
@@ -834,6 +853,54 @@ def _create_nameless_temp(dir_fd: int) -> int:
         raise
 
 
+def _flush_publication(target: MutableTarget) -> None:
+    """Make a published note write durable — and never fail the write for it.
+
+    Two flushes, both after publication: the destination directory, so the
+    entry the `link`/`replace` created is durable and not only its contents;
+    and the parent of every directory `ensure_parent` created on the way,
+    outward to the first one that already existed, so `create_note` on a new
+    `New/Folder/x.md` cannot lose `New` in a crash and take the note with it.
+
+    **Every failure here is logged and swallowed, and the write is reported as
+    the success it is (D18).** This is deliberately the opposite direction from
+    the transfer path, where the same failure strands the token and surfaces as
+    `PostPublishFailure`. The asymmetry is retry safety: an upload's source
+    bytes are gone, so the ambiguity has to reach the human or it is lost,
+    while a note tool that reports a false failure gets *retried* — and
+    `edit_note(append=True)` retried after a write that actually landed appends
+    the same block twice. A false failure on this path manufactures a
+    destructive outcome; on the transfer path it merely wastes a link. The
+    payload was flushed before publication either way, so what is unconfirmed
+    is only the durability of a directory entry, and the previous content
+    survives regardless.
+    """
+    try:
+        vault_fs.flush_dir_fd(target.dir_fd)
+    except OSError as exc:
+        logger.warning(
+            "Published %s but could not flush its directory: %s. The write "
+            "stands; only its durability across a crash is unconfirmed.",
+            target.rel,
+            exc,
+        )
+    if not target.created:
+        return
+    try:
+        vault_fs.flush_created_ancestors(target.root_fd, target.created)
+    except (OSError, vault_fs.VaultFSError, RuntimeError) as exc:
+        # `RuntimeError` is `release_root` having dropped the root descriptor:
+        # there is then nothing to look the ancestors up from. Same direction —
+        # this cannot be allowed to fail a write that already landed.
+        logger.warning(
+            "Published %s but could not flush the directories it created "
+            "(%s): %s. The write stands.",
+            target.rel,
+            ", ".join(target.created),
+            exc,
+        )
+
+
 def _atomic_write_at(
     target: MutableTarget,
     *,
@@ -879,7 +946,14 @@ def _atomic_write_at(
        make impossible;
     3. `expected` (when given) is compared against the current bytes read
        through the same descriptor — optimistic conflict detection, immediately
-       before publication.
+       before publication;
+    4. the destination directory — and the parent of every directory this call
+       created — is **`fsync`ed after publication** (#97). The payload's flush
+       makes the contents durable and says nothing about the entry that names
+       them, so without this a crash can lose the write entirely. A failure of
+       *this* flush is logged and the write reported as the success it is; see
+       `_flush_publication` for why that is the opposite of what the transfer
+       path does with the same failure.
 
     **What the overwrite window means, precisely.** An adversary who can write
     to the *destination directory itself* can still win the rename race. That
@@ -924,6 +998,10 @@ def _atomic_write_at(
         else:
             _link_staged_inode(fd, dir_fd, name)
         published = True
+        # After publication, before returning: the directory entry the publish
+        # created is not durable just because the payload is. Never able to
+        # fail the write — see `_flush_publication` and D18.
+        _flush_publication(target)
     finally:
         if tmp is not None:
             _discard_temp(dir_fd, tmp, staged=staged)

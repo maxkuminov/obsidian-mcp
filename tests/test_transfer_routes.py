@@ -852,6 +852,87 @@ async def test_a_failure_after_publication_leaves_the_token_claimed(
     assert harness.row.state == "claimed"
 
 
+def _fail_directory_fsync(monkeypatch) -> list[int]:
+    """Fail every *directory* `fsync`; leave the payload flush working.
+
+    The post-publication half of #97. What it stands in for is a filesystem or
+    a device that will not make a directory entry durable — the file is at the
+    path, and whether it survives a crash is unknown.
+    """
+    import stat as _stat
+
+    failed: list[int] = []
+    real = os.fsync
+
+    def maybe_fail(fd):
+        if _stat.S_ISDIR(os.fstat(fd).st_mode):
+            failed.append(fd)
+            raise OSError(errno.EIO, "input/output error")
+        return real(fd)
+
+    monkeypatch.setattr(os, "fsync", maybe_fail)
+    return failed
+
+
+async def test_a_failing_directory_flush_strands_the_claim(
+    client, harness, vault, monkeypatch
+):
+    """The route's strand-or-release decision, driven end to end (#97).
+
+    The flush runs after `on_published` has recorded the publication, so
+    `stream_to_vault` converts it to `PostPublishFailure` and the route leaves
+    the token `claimed`. Were it to escape as a bare `OSError` — which it would
+    if the flush ran before the callback — the catch-all would read it as
+    "demonstrably pre-publication" and release the claim, handing back a
+    replayable token over a path that already holds the uploaded file.
+    """
+    # Prime the publication probe first. It now exercises a directory flush
+    # itself (#97 task 2.5a), so arming the fault before it would be refused at
+    # the probe — correct behaviour, but a different test. What is under test
+    # here is the environment that fails *later*, at the real destination.
+    vault_fs.check_publication_support(harness.row.vault_root)
+    failed = _fail_directory_fsync(monkeypatch)
+
+    with pytest.raises(transfer.PostPublishFailure):
+        await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+    monkeypatch.undo()
+
+    assert failed, "no directory flush was attempted"
+    # The bytes are in the vault — which is precisely why `pending` would lie.
+    assert (vault / "Attachments" / "shot.png").read_bytes() == PNG
+    assert harness.row.state == "claimed"
+    assert harness.released == 0
+    assert harness.consumed == 0
+    # And nothing was recorded `completed`: `check_upload` must not answer with
+    # a sha256 for a file whose durability we cannot vouch for.
+    assert harness.completed == []
+    assert temp_files(vault / vault_fs.STAGING_DIR) == []
+
+
+async def test_a_failing_payload_flush_releases_the_claim(
+    client, harness, vault, monkeypatch
+):
+    """The mirror image, and the reason the payload flush sits before the gate.
+
+    Nothing has been published, so stranding the capability for its whole TTL
+    would cost the human a re-mint over a transfer that never touched the vault.
+    """
+    def boom(fd):
+        raise OSError(errno.EIO, "input/output error")
+
+    monkeypatch.setattr(transfer, "_fsync_payload", boom)
+
+    with pytest.raises(OSError) as exc:
+        await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+
+    assert not isinstance(exc.value, transfer.PostPublishFailure)
+    assert harness.released == 1
+    assert harness.consumed == 0
+    assert harness.row.state == "pending"
+    assert not (vault / "Attachments" / "shot.png").exists()
+    assert temp_files(vault / vault_fs.STAGING_DIR) == []
+
+
 async def test_a_full_disk_mid_stream_releases_the_claim(
     client, harness, vault, monkeypatch
 ):

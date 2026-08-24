@@ -1041,6 +1041,35 @@ def _write_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _fsync_payload(fd: int) -> None:
+    """The blocking half of the staged-payload flush. Its own function so a
+    test can make it slow, make it fail, or ask which thread ran it."""
+    os.fsync(fd)
+
+
+async def _flush_staged_payload(fd: int) -> None:
+    """Make the staged bytes durable — **off the event loop, before the gate**.
+
+    Two placements matter and both are load-bearing (#97).
+
+    *Before the gate*, because `before_publish()` holds `SELECT … FOR UPDATE`
+    on the token, the credential and the user across the publish. A flush of up
+    to `MAX_FILE_WRITE_BYTES` is not something to do while every revocation,
+    downgrade and reassignment of that credential queues behind it.
+
+    *Off the loop*, because unlike `_drain`'s per-chunk `_write_all` — which
+    lands in the page cache and returns — a single `fsync` waits for the whole
+    body to reach the device. `TRANSFER_MAX_CONCURRENT_UPLOADS` of those inline
+    would stall every other request in the process, search and panel included.
+
+    A failure here is unambiguously **pre-publication**: nothing has been
+    linked into place, the caller's `except` discards the staged bytes, and the
+    upload route releases the claim so the human may retry the same link. It
+    must never be dressed up as `PostPublishFailure`.
+    """
+    await asyncio.to_thread(_fsync_payload, fd)
+
+
 async def _drain(
     chunks: AsyncIterator[bytes],
     fd: int,
@@ -1131,6 +1160,17 @@ async def stream_to_vault(
     the upload route release the claim rather than stranding the token. If you
     add a step between `publish` and the return, it must raise
     `PostPublishFailure` too.
+
+    **Durability (#97), and where its two flushes sit relative to that
+    contract.** The staged payload is flushed after the body is fully received
+    and *before* the gate opens, off the event loop
+    (`_flush_staged_payload`) — pre-publication, so a failure releases the
+    claim. The destination directory, and the parent of every directory this
+    call created, are flushed *after* the publication has been recorded
+    (`_publish_into_current_parent`) — post-publication, so a failure becomes
+    `PostPublishFailure` and the token strands. Without the pair, a crash can
+    leave a transfer recorded `completed` whose file is absent or truncated at
+    the path an agent was told to read back by `sha256`.
     """
     if content_length is not None and content_length > max_bytes:
         # Refuse before opening anything: a declared oversize body should cost
@@ -1204,6 +1244,7 @@ def _publish_into_current_parent(
     tmp_name: str,
     row,
     on_published: Callable[[object], None] | None = None,
+    created: list[str] | None = None,
 ):
     """Resolve the destination parent *now* and link the staged file into it.
 
@@ -1230,8 +1271,24 @@ def _publish_into_current_parent(
     the destination descriptor included. Nothing after a successful publish may
     be able to make the caller believe nothing was published; see
     `_stream_locked`.
+
+    **The directory flush runs after that callback and before this returns**
+    (#97), and the ordering is the whole of its failure classification. A
+    `fsync` that fails once `on_published` has recorded the publication is seen
+    by `_stream_locked` with `state["published"]` already true, so it becomes
+    `PostPublishFailure` — the token strands, the human is told to look at the
+    path. Flushing *before* the callback would let the same failure escape as a
+    bare `OSError`, which the upload route reads as "nothing was published" and
+    answers by handing back a replayable token over a path that already holds
+    the file.
+
+    `created` carries the directories this call made on the way here — from the
+    up-front walk in `_stream_locked` as well as from this one — because
+    flushing the destination alone leaves the entry that names *it* unflushed.
     """
-    dst_fd, name = vault_fs.open_parent(root_fd, row.path, create=True)
+    dst_fd, name = vault_fs.open_parent(
+        root_fd, row.path, create=True, created=created
+    )
     try:
         outcome = vault_fs.publish(
             staging_fd,
@@ -1243,6 +1300,10 @@ def _publish_into_current_parent(
         )
         if on_published is not None and outcome.published:
             on_published(outcome)
+        if outcome.published:
+            vault_fs.flush_dir_fd(dst_fd)
+            if created:
+                vault_fs.flush_created_ancestors(root_fd, created)
         return outcome
     finally:
         # Never `os.close` bare here: a close that fails *after* publication
@@ -1264,12 +1325,19 @@ async def _stream_locked(
     root_fd = vault_fs.open_root(row.vault_root)
     staging_fd: int | None = None
     tmp_name: str | None = None
+    # Every directory *this call* creates, from either descent. The up-front
+    # walk below usually makes them, so the publish-time walk finds them there
+    # and records nothing — collecting from both is what keeps the flush from
+    # silently covering nothing (#97).
+    created_dirs: list[str] = []
     try:
         # Walk the destination once up front so a `..`, a symlinked ancestor or
         # a non-directory costs a syscall rather than a whole upload. The
         # descriptor is closed immediately — the authoritative walk is the one
         # inside the gate.
-        probe_fd, name = vault_fs.open_parent(root_fd, row.path, create=True)
+        probe_fd, name = vault_fs.open_parent(
+            root_fd, row.path, create=True, created=created_dirs
+        )
         os.close(probe_fd)
 
         staging_fd = vault_fs.open_staging_dir(root_fd)
@@ -1295,6 +1363,12 @@ async def _stream_locked(
             # would be the alternative and is worse: it pins an fd across an
             # unbounded wait on `SELECT … FOR UPDATE`, per upload.
             os.fchmod(fd, vault_fs.default_file_mode())
+            # Durability, before the gate and off the loop — see
+            # `_flush_staged_payload`. The body is complete at this point and
+            # nothing has been published, so a failure here is a plain
+            # pre-publication error: the `except` below discards the staged
+            # bytes and the route releases the claim.
+            await _flush_staged_payload(fd)
         finally:
             os.close(fd)
 
@@ -1316,7 +1390,7 @@ async def _stream_locked(
             if before_publish is None:
                 _refuse_if_past_deadline(deadline)
                 _publish_into_current_parent(
-                    root_fd, staging_fd, tmp_name, row, _record
+                    root_fd, staging_fd, tmp_name, row, _record, created_dirs
                 )
                 tmp_name = None  # publish owns cleanup from here
             else:
@@ -1338,7 +1412,7 @@ async def _stream_locked(
                     # write" are the same instant.
                     _refuse_if_past_deadline(deadline)
                     _publish_into_current_parent(
-                        root_fd, staging_fd, tmp_name, row, _record
+                        root_fd, staging_fd, tmp_name, row, _record, created_dirs
                     )
                     tmp_name = None
                     # Inside the context, so completion commits with the locks.

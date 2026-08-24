@@ -297,7 +297,13 @@ def test_the_payload_is_fsynced_before_it_is_published(vault, monkeypatch):
     """Without the `fsync`, a crash just after the rename can publish a note
     whose data blocks never reached the disk — the truncation the atomic write
     exists to make impossible. The temp must also live in the destination
-    directory, so the publish is a same-directory rename."""
+    directory, so the publish is a same-directory rename.
+
+    The directory flush that follows publication is the other half (#97): the
+    payload's own flush makes the *contents* durable and says nothing about the
+    entry that names them, so both sides of the rename are asserted here in
+    order.
+    """
     (vault / "Folder").mkdir()
     order: list[str] = []
     staged: list[list[str]] = []
@@ -305,7 +311,7 @@ def test_the_payload_is_fsynced_before_it_is_published(vault, monkeypatch):
     real_replace = os.replace
 
     def recording_fsync(fd):
-        order.append("fsync")
+        order.append("fsync-dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync")
         staged.append(sorted(os.listdir(vault / "Folder")))
         return real_fsync(fd)
 
@@ -318,7 +324,7 @@ def test_the_payload_is_fsynced_before_it_is_published(vault, monkeypatch):
 
     vault_service.write_file("Folder/note.md", "body")
 
-    assert order == ["fsync", "publish"]
+    assert order == ["fsync", "publish", "fsync-dir"]
     # Staged next to the destination, not in `.transfer-tmp` or /tmp — a
     # cross-directory publish could not be an atomic rename.
     assert any(name.startswith(".tmp-") for name in staged[0]), staged[0]

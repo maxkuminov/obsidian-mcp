@@ -80,6 +80,7 @@ import platform
 import secrets
 import stat
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
@@ -421,7 +422,13 @@ def _lookup_dir(root_fd: int, parts: list[str], rel_dir) -> int:
     raise OSError(code, os.strerror(code), str(rel_dir))
 
 
-def open_dir_beneath(root_fd: int, rel_dir: str | Path, *, create: bool = False) -> int:
+def open_dir_beneath(
+    root_fd: int,
+    rel_dir: str | Path,
+    *,
+    create: bool = False,
+    created: list[str] | None = None,
+) -> int:
     """Open a directory below `root_fd` with one beneath-root lookup.
 
     Always returns a **new** descriptor (even for the root itself), so callers
@@ -463,6 +470,15 @@ def open_dir_beneath(root_fd: int, rel_dir: str | Path, *, create: bool = False)
     The process that wins the race already holds rename rights on the prefix's
     parent and write access wherever it moved it, so the empty directory lands
     somewhere it already controls.
+
+    **`created`**, when given, is appended with the vault-relative path of every
+    directory this call actually made, outermost first. It is how a caller
+    learns which directory *entries* its own write brought into existence and
+    therefore has to flush (#97): flushing the destination's parent alone
+    leaves the entry that names *it* unflushed, so a crash can lose the whole
+    new folder and with it a file the caller was told about. A component that
+    was already there — or that another creator won the race to — is not
+    listed: it is not this call's entry to make durable.
     """
     parts = _split(rel_dir)
     try:
@@ -470,11 +486,13 @@ def open_dir_beneath(root_fd: int, rel_dir: str | Path, *, create: bool = False)
     except FileNotFoundError:
         if not create:
             raise
-    _create_descent(root_fd, parts, rel_dir)
+    _create_descent(root_fd, parts, rel_dir, created)
     return _lookup_dir(root_fd, parts, rel_dir)
 
 
-def _create_descent(root_fd: int, parts: list[str], rel_dir) -> None:
+def _create_descent(
+    root_fd: int, parts: list[str], rel_dir, created: list[str] | None = None
+) -> None:
     """Create the missing components of `parts`, carrying no descriptor across.
 
     One `mkdirat` per component, each through a descriptor obtained by a fresh
@@ -488,6 +506,9 @@ def _create_descent(root_fd: int, parts: list[str], rel_dir) -> None:
     component: either way the authoritative answer is the post-creation lookup,
     not the `mkdir`, so it is passed over here and decided there. A symlink
     sitting at the name likewise gives `EEXIST` and is refused by that lookup.
+    It is also why `EEXIST` does **not** record the component in `created`: the
+    entry this call has to make durable is one this call wrote, and a directory
+    somebody else created is theirs to flush.
     """
     for depth in range(len(parts)):
         prefix_fd = _lookup_dir(root_fd, parts[:depth], rel_dir)
@@ -495,6 +516,9 @@ def _create_descent(root_fd: int, parts: list[str], rel_dir) -> None:
             os.mkdir(parts[depth], 0o755, dir_fd=prefix_fd)
         except FileExistsError:
             pass
+        else:
+            if created is not None:
+                created.append("/".join(parts[: depth + 1]))
         finally:
             close_quietly(prefix_fd, f"prefix of {str(rel_dir)!r}")
 
@@ -1264,21 +1288,89 @@ def soft_delete_at(
             close_quietly(trash_fd, f"{trash_dir} directory")
 
 
-def _open_parent(root_fd: int, rel_path: str | Path, *, create: bool) -> tuple[int, str]:
+def _open_parent(
+    root_fd: int,
+    rel_path: str | Path,
+    *,
+    create: bool,
+    created: list[str] | None = None,
+) -> tuple[int, str]:
     parts = _split(rel_path)
     if not parts:
         raise UnsafePath(f"Not a file path: {rel_path!r}")
     name = parts[-1]
-    dir_fd = open_dir_beneath(root_fd, "/".join(parts[:-1]), create=create)
+    dir_fd = open_dir_beneath(
+        root_fd, "/".join(parts[:-1]), create=create, created=created
+    )
     return dir_fd, name
 
 
-def open_parent(root_fd: int, rel_path: str | Path, *, create: bool = False) -> tuple[int, str]:
+def open_parent(
+    root_fd: int,
+    rel_path: str | Path,
+    *,
+    create: bool = False,
+    created: list[str] | None = None,
+) -> tuple[int, str]:
     """Public form of `_open_parent`: (directory fd, final component).
 
-    The caller owns the returned descriptor and must close it.
+    The caller owns the returned descriptor and must close it. `created` is
+    passed straight through to `open_dir_beneath` — see there for what it
+    records and why the durability flush needs it.
     """
-    return _open_parent(root_fd, rel_path, create=create)
+    return _open_parent(root_fd, rel_path, create=create, created=created)
+
+
+# ── durability ──────────────────────────────────────────────────────────────
+
+
+def flush_dir_fd(dir_fd: int) -> None:
+    """`fsync` an open **directory** descriptor.
+
+    Publication is a *directory* operation: the payload's own `fsync` makes the
+    contents durable and says nothing about the entry that names them. After a
+    crash the two are independent, so without this the vault can hold no entry
+    at all at a path an upload has already recorded `completed`, or — for a
+    note — lose a write the tool reported.
+
+    It deliberately does not decide what a failure means. The two write paths
+    take **opposite** directions on that (D18): the transfer path surfaces it as
+    a post-publication failure, because the source bytes are gone and the
+    ambiguity has to reach the human; the note path logs it and reports the
+    write as the success it is, because a false failure gets retried and a
+    retried `edit_note(append=True)` appends the same block twice.
+    """
+    os.fsync(dir_fd)
+
+
+def flush_created_ancestors(root_fd: int, created: Iterable[str]) -> None:
+    """`fsync` the parent of every directory a call created, innermost first.
+
+    `created` is what `open_dir_beneath(create=True)` / `open_parent` recorded:
+    the vault-relative paths of the directories *this* call brought into
+    existence, outermost first. Making `New/Folder/x.md` durable means flushing
+    `New/Folder` (the destination's own parent — the caller's job, it already
+    holds that descriptor), then `New` for the entry naming `Folder`, then the
+    root for the entry naming `New`. Stop there: the first pre-existing
+    directory's entry was already somebody else's to make durable.
+
+    Each parent is re-opened by a fresh beneath-root lookup rather than kept
+    from the descent — `_create_descent` carries no descriptor across, and this
+    must not become the exception that does.
+
+    Raises like `flush_dir_fd`; the caller decides what a failure means.
+    """
+    seen: set[str] = set()
+    for rel in reversed(list(created)):
+        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        if parent in seen:
+            continue
+        seen.add(parent)
+        fd = open_dir_beneath(root_fd, parent)
+        try:
+            flush_dir_fd(fd)
+        finally:
+            close_quietly(fd, f"created ancestor {parent or '.'!r}")
 
 
 # ── startup probe ───────────────────────────────────────────────────────────
@@ -1305,22 +1397,70 @@ def _probe_link(src_dir_fd: int, name: str, dst_dir_fd: int, link_name: str, wha
     _unlink_quietly(dst_dir_fd, link_name, published=False)
 
 
+# Errnos a `fsync` returns when the filesystem, the kernel or the container
+# will not do it *at all*, as opposed to failing this particular flush. They
+# are what a probe has to convert into a refusal; anything else (`EIO`,
+# `ENOSPC`) is a sick device and propagates as the `OSError` it is.
+_FLUSH_UNSUPPORTED = (
+    errno.EINVAL,
+    errno.ENOSYS,
+    errno.EOPNOTSUPP,
+    errno.EPERM,
+    errno.EACCES,
+    errno.EROFS,
+)
+
+
+def _probe_flush(fd: int, what: str) -> None:
+    """`fsync` a probe descriptor, mapping "cannot" to `UnsupportedFilesystem`."""
+    try:
+        os.fsync(fd)
+    except OSError as exc:
+        code = getattr(exc, "errno", None)
+        if code in _FLUSH_UNSUPPORTED:
+            raise UnsupportedFilesystem(
+                f"The vault filesystem cannot flush {what} to durable storage "
+                f"({errno.errorcode.get(code, code)}). Every publish flushes "
+                "the staged payload before publication and the destination "
+                "directory afterwards, so an upload or an import is refused "
+                "here rather than after a whole body has been streamed and "
+                "published."
+            ) from exc
+        raise
+
+
 def probe_publication(root_fd: int) -> None:
-    """Verify a no-clobber publish can work: hard links within the vault root.
+    """Verify a publish can work: hard links, and both flushes, in the root.
 
     **This probe writes** (a temp file and a link, both removed again), so it
     belongs only on paths that are about to write. A read — a download, a
     `check_upload` — must never call it: a read-only capability that creates
     files, however briefly, is a write the caller did not ask for.
 
+    It exercises every primitive the publish depends on and can test from the
+    root: the hard link, a **payload flush** and a **directory flush** (#97).
+    The two flushes are not decoration. A filesystem or container that links
+    happily and rejects `fsync` on a directory would otherwise pass this probe,
+    accept a token, take a whole 25 MB body, publish it — and only then strand
+    the claim on the post-publication flush, which is the one failure the
+    transfer path deliberately cannot undo. The point of a probe is that the
+    environment is refused *before* a body is streamed.
+
     Raises `UnsupportedFilesystem` when links are refused (`EPERM`/
-    `EOPNOTSUPP`/`ENOSYS`) or would cross a device (`EXDEV`).
+    `EOPNOTSUPP`/`ENOSYS`), would cross a device (`EXDEV`), or when either
+    flush is refused.
     """
     fd, tmp_name = create_temp(root_fd)
-    os.close(fd)
     try:
+        try:
+            _probe_flush(fd, "a staged file")
+        finally:
+            os.close(fd)
         _probe_link(root_fd, tmp_name, root_fd, f"{tmp_name}-probe", "within the vault root")
+        _probe_flush(root_fd, "a directory")
     finally:
+        # One `finally` around everything after the temp exists: a refused
+        # payload flush must not leave the probe's own file in the vault.
         _unlink_quietly(root_fd, tmp_name, published=False)
 
 
