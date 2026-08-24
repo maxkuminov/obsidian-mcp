@@ -945,6 +945,75 @@ def test_a_no_clobber_write_refuses_without_o_tmpfile(vault, monkeypatch):
     assert list(vault.iterdir()) == []
 
 
+def _refuse_o_tmpfile(monkeypatch):
+    real_open = os.open
+
+    def refuse(path, flags, *args, **kwargs):
+        if flags & getattr(os, "O_TMPFILE", 0) == getattr(os, "O_TMPFILE", 0):
+            raise OSError(errno.EOPNOTSUPP, "operation not supported")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(vault_service.os, "open", refuse)
+
+
+def test_the_named_staging_fallback_is_off_by_default(vault, monkeypatch):
+    """`VAULT_ALLOW_NAMED_STAGING_FALLBACK` defaults false: an O_TMPFILE
+    refusal still refuses, even with the fallback machinery present."""
+    _refuse_o_tmpfile(monkeypatch)
+    assert vault_service.settings.vault_allow_named_staging_fallback is False
+
+    with pytest.raises(vault_fs.UnsupportedFilesystem, match="O_TMPFILE"):
+        vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+
+    assert list(vault.iterdir()) == []
+    assert vault_fs.named_staging_fallback_active() is False
+
+
+def test_the_named_staging_fallback_still_refuses_to_clobber(
+    vault, monkeypatch, caplog
+):
+    """Opting into the fallback survives an O_TMPFILE refusal, still refuses
+    to clobber an existing file, leaves no staging name behind either way,
+    and warns loudly exactly once per process — not once per write.
+
+    The once-per-process state (`named_staging_fallback_active`) is shared
+    with the transfer path via `vault_fs` (D27), not kept per-module — see
+    `vault._link_staged_name` / `vault._discard_temp`, which delegate to
+    `vault_fs` for the same reason (#105).
+    """
+    _refuse_o_tmpfile(monkeypatch)
+    monkeypatch.setattr(
+        vault_service.settings, "vault_allow_named_staging_fallback", True
+    )
+    vault_fs.reset_named_staging_state()
+    assert vault_fs.named_staging_fallback_active() is False
+
+    with caplog.at_level("WARNING"):
+        vault_service.write_bytes("blob.bin", b"first", overwrite=False)
+
+    assert (vault / "blob.bin").read_bytes() == b"first"
+    assert [p.name for p in vault.iterdir()] == ["blob.bin"], "staging litter left"
+    assert vault_fs.named_staging_fallback_active() is True
+    assert (
+        sum("VAULT_ALLOW_NAMED_STAGING_FALLBACK" in r.message for r in caplog.records)
+        == 1
+    )
+
+    caplog.clear()
+    try:
+        with pytest.raises(FileExistsError):
+            vault_service.write_bytes("blob.bin", b"second", overwrite=False)
+
+        assert (vault / "blob.bin").read_bytes() == b"first"
+        assert [p.name for p in vault.iterdir()] == ["blob.bin"], "staging litter left"
+        # Already active — no second warning for the second write.
+        assert not any(
+            "VAULT_ALLOW_NAMED_STAGING_FALLBACK" in r.message for r in caplog.records
+        )
+    finally:
+        vault_fs.reset_named_staging_state()
+
+
 async def test_a_swapped_staging_file_is_refused_by_an_overwrite(
     vault, monkeypatch
 ):
