@@ -160,6 +160,21 @@ gate**, immediately before the fingerprint check and the rename — a window of
 two syscalls in a `0700` directory, instead of a name that exists for the
 whole multi-minute stream.
 
+**And it cannot be unconditional, because there are real mounts that refuse
+`O_TMPFILE`.** #103 reports it, verified rather than guessed: TrueNAS SCALE's
+NFS server rejects the operation outright (`EOPNOTSUPP`) — as root, on a second
+export, under NFSv4.1 and NFSv4.2, and still after a NAS upgrade — while the
+named staging the overwrite path uses works on the same mount. The note path
+already refuses there, and an accepted contributor change adds an opt-in
+`VAULT_ALLOW_NAMED_STAGING_FALLBACK` for it. If this item shipped without
+honouring the same flag, a vault whose *transfers work today* would gain a new
+refusal from a change whose stated purpose is convergence on a stronger
+primitive next door — the one deployment outcome that cannot be justified by
+"this is not a live exploit". So the probe selects the mode, the flag is the
+single operator decision for both write paths, and the fallback's reopened
+window is declared in the same register as the overwrite window above. D27
+records the decision, the threat comparison and the rejected alternative.
+
 ## What Changes
 
 - `vault_fs` gains `openat2` through `ctypes` and obtains every below-root
@@ -187,15 +202,25 @@ whole multi-minute stream.
 - `vault._atomic_write_at` flushes the destination directory after
   publication; a failure there is logged and the write reported as the success
   it is (D18).
-- Transfer staging becomes `O_TMPFILE` in `.transfer-tmp`. The no-clobber
-  publish becomes the by-descriptor `linkat`; the overwrite publish
-  materialises a transient staging name inside the gate. `_link_staged_inode`
-  and the `/proc` availability check move from `vault.py` into `vault_fs.py`
-  so both paths share one implementation rather than drifting.
+- Transfer staging becomes `O_TMPFILE` in `.transfer-tmp` **wherever the
+  publication probe proves it works**. The no-clobber publish becomes the
+  by-descriptor `linkat`; the overwrite publish materialises a transient
+  staging name inside the gate. `_link_staged_inode` and the `/proc`
+  availability check move from `vault.py` into `vault_fs.py` so both paths
+  share one implementation rather than drifting.
+  - Where the probe shows unnamed staging unavailable, the transfer path
+  refuses with an error naming `VAULT_ALLOW_NAMED_STAGING_FALLBACK`, or —
+  where that flag is set — keeps today's **named** `.transfer-tmp` staging
+  unchanged, with the same once-per-process warning on first exercise and the
+  same `/health` field the note path's fallback uses. One flag governs both
+  write paths; the probe records which mode a root uses and the mode never
+  flips per call (D27).
 - `probe_publication` additionally exercises unnamed staging, by-descriptor
   publication, a payload flush and a directory flush, so a filesystem or
   container that cannot do them is refused at the probe rather than after a
-  body has been streamed. What the probe cannot answer for — a destination
+  body has been streamed — and its cached per-root result records the staging
+  mode that root will use, which is what keeps the mode from being re-decided
+  per call (D27). What the probe cannot answer for — a destination
   whose filesystem or mount differs from the root's — is stated rather than
   implied (D23).
   - Transfer publication gains a **mount-identity check**: the destination
@@ -224,8 +249,9 @@ None.
 
 - `file-transfer`: the beneath-root lookup primitive shared by the transfer
   publish and `delete_file`; durability of staged bytes and of the
-  publication; unnamed staging and by-descriptor publication; what the
-  publication probe covers; refusal of a destination on another mount —
+  publication; unnamed staging and by-descriptor publication, and the
+  flag-gated named-staging fallback where a mount cannot do them; what the
+  publication probe covers and which staging mode it records; refusal of a destination on another mount —
   before any body where the boundary is already present at mint or fetch
   start, and pre-publication inside the gate where it appears afterwards.
 - `vault-write`: how a note mutation's parent descriptor is obtained;
@@ -241,6 +267,13 @@ None.
   staging, discard path), `_publish_into_current_parent` (directory flush
   after `on_published`, mount-identity re-check before the publish),
   `plan_mint_window`'s callers / the mint path for the same preflight.
+- `src/main.py` — the `/health` field reporting whether the named-staging
+  fallback has been exercised in this process (shared with the note path's
+  fallback, not a second field).
+- `src/config.py` — **only if this change ships before the contributor PR that
+  defines it**: `Settings.vault_allow_named_staging_fallback`
+  (`VAULT_ALLOW_NAMED_STAGING_FALLBACK`, default `false`), introduced under
+  exactly that name and default so the two never diverge (D27).
 - `src/services/vault.py` — `_atomic_write_at` (destination-directory flush,
   plus a flush of every directory `MutableTarget.ensure_parent` created,
   outward to the first pre-existing one — inherited by every caller of the
@@ -260,7 +293,9 @@ None.
   refusals, the flush ordering and its two failure directions, and the
   staging-name absence; existing tests that hook the per-component walk or
   the staging name are updated.
-- No database schema changes, no new dependencies, no configuration changes.
+- No database schema changes and no new dependencies. The only configuration
+  is the named-staging fallback flag, which this change **consumes** rather
+  than invents — see D27 for what happens if it ships first.
 - Behaviour change visible to operators: a kernel older than 5.6, or a
   container seccomp profile that blocks `openat2`, now stops the server at
   startup instead of running with a weaker guarantee.
@@ -372,7 +407,9 @@ Three things about the long-lived staging that look like blockers and are not:
   `.transfer-tmp/.tmp-*` older than 24 hours — the litter of a crashed upload.
   An unnamed inode is freed by the kernel when the last descriptor closes,
   which happens in `_stream_locked`'s `finally` for an abandoned upload and at
-  process death for a crash, so no *new* litter is produced. It must
+  process death for a crash, so no *new* litter is produced **in the unnamed
+  mode**. The named-staging fallback (D27) produces it exactly as the
+  pre-change path did, which is a second reason the prune stays. It must
   nonetheless stay: the live vault has pre-change files, a rolling deploy runs
   both versions at once, and the prune is the only thing that collects them.
   Removing it is a separate decision for a later release, once no pre-change
@@ -409,7 +446,9 @@ vault's own tools can write to.
 So the requirement is scoped honestly: the no-clobber publish gets "no
 directory entry exists at any point"; the overwrite publish gets "no directory
 entry exists outside the publish gate's own rename sequence, and never outside
-`.transfer-tmp`".
+`.transfer-tmp`". Both are scoped further by D27 — they describe the mode the
+probe selects where `O_TMPFILE` works, and the flagged fallback is the one
+declared departure from them.
 
 And the refusal is scoped honestly too. The identity check **narrows** the
 substitution window to the single `renameat`; it does not close it, exactly as
@@ -721,3 +760,86 @@ the root.** And they record the post-lookup rename as a retained residual
 beside D20's and D22's. It is retained, not introduced: the per-component
 walk this change replaces had this interval too, underneath the larger
 window it did close.
+
+### D27. `O_TMPFILE` is not universal, so the transfer path honours the note path's fallback flag
+
+D19 and D20 assume every deployment can allocate an unnamed inode. #103 shows
+one that cannot, with the verification done rather than asserted: on TrueNAS
+SCALE 25.10.5 and 25.10.6, over NFSv4.1 and NFSv4.2, `O_TMPFILE` returns
+`EOPNOTSUPP` — as root, on a second unrelated export, and on a client kernel
+whose local ext4 does it fine. It is the NFS server, it is standing behaviour,
+and named staging with a `link()` publish works on the same mount. So the note
+path's no-clobber writes (`create_note`, `write_file` without `overwrite`)
+already refuse there today, and an accepted contributor change adds an opt-in
+`VAULT_ALLOW_NAMED_STAGING_FALLBACK` (env, default `false`) that lets an
+operator take named staging back on that path.
+
+**Item 3 honours the same flag.** Where the publication probe proves unnamed
+staging and by-descriptor publication work on a root, transfers use them —
+that is the whole of item 3 and it is unchanged. Where the probe shows them
+unavailable and the flag is on, transfers keep today's named `.transfer-tmp`
+staging — the same exclusive, non-symlink-following `.tmp-*` creation through
+the staging descriptor, the same `link()` no-clobber publish, the same
+replacing rename for an overwrite — with two guards the pre-change path does
+not have. Today's transfer publish runs no staged-name identity check and its
+`finally` unlinks the staging name unconditionally; item 3 introduces the
+guarded form for the transient overwrite name, and the fallback inherits it
+rather than reverting past it: verify the name still refers to this call's
+inode immediately before the publish, and unlink it only while it still does,
+otherwise leave it and log. A name that lives for minutes needs those more
+than one that lives for two syscalls, and unlinking a substitute is the
+destructive write every other cleanup here refuses. Where the flag is off, the
+refusal is `UnsupportedFilesystem` and it *names the flag*, which is the note
+path's refusal shape. The probe is what selects the mode, once,
+cached per root, so the mode cannot flip between two uploads on one vault —
+otherwise the window each upload ran in would be unknowable after the fact.
+
+**The rejected alternative is hard-refusing on such a mount.** It is the
+stronger primitive, and the argument for it is real: the fallback reopens the
+very window `O_TMPFILE` staging exists to close. It was rejected because of
+what it costs and what it buys. It costs a deployment that has *working
+transfers today* — this item's own "Why" says out loud that the staging-name
+window is not a live exploit, that `.transfer-tmp` is unreachable by any agent,
+capability or vault tool, and that the residual adversary is a same-uid process
+that can rewrite the destination directly. Converting a working deployment into
+a refusal, in a change whose stated purpose is convergence on a stronger
+primitive next door, to defend a window the change itself describes as not
+exploitable, is a trade nobody would make deliberately. And it buys nothing an
+operator is not entitled to decide: the window is narrower than one this design
+already hands the operator on the overwrite path (D20), behind an explicit,
+default-off switch, announced once per process the first time it is actually
+taken, and visible in `/health`.
+
+**The two fallbacks are not equal, and saying so is part of the honesty.** The
+note path stages beside the destination, in an ordinary vault directory the
+vault's own tools can write to. The transfer path stages in `.transfer-tmp` —
+`0700`, owner-checked, dot-prefixed, skipped by the indexer and refused by
+every tool's hidden-path guard. Reaching a transfer staging name therefore
+requires a process running as this uid, which needs no race to rewrite the
+destination anyway; reaching a note staging name requires only the destination
+directory, which is the boundary #59 already places outside its threat model
+for the overwrite path. The transfer fallback's window is the narrower of the
+two. It is still a window, it is still declared, and the requirement scopes
+"no directory entry at any point" to the unnamed mode rather than pretending
+the fallback satisfies it.
+
+**One flag, not two.** The failure is one filesystem property met on two paths
+for one reason, so it gets one operator decision. Two knobs would permit a
+deployment with a working `create_note` and a refusing upload — a state nobody
+chose, and one that cannot be diagnosed from either symptom on its own. The
+flag's *definition* belongs to the note path's contributor change: the
+`Settings` field, the environment variable, the default. This change consumes
+it. **Ordering, because the two are in flight at once:** if the contributor PR
+lands first, group 3 reads the existing field and adds nothing to `config.py`;
+if group 3 lands first, it introduces the field under *exactly* that name and
+default and the contributor PR rebases onto it. Either way there is one
+setting, and the coordination happens on #103 rather than in a merge. The
+`/health` field is shared for the same reason, and reports the fallback as
+active only once a call has actually staged under a name — the same
+first-exercise rule, so it distinguishes an operator who enabled the flag
+defensively from a mount that is taking the path.
+
+One consequence for D19: the sweep of `.transfer-tmp/.tmp-*` older than 24
+hours stops having new work only in the unnamed mode. In fallback mode an
+abandoned or killed upload leaves a staged file exactly as the pre-change path
+did, so the prune keeps a live purpose beyond collecting pre-change litter.

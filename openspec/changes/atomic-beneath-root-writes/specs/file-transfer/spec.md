@@ -154,27 +154,27 @@ The directory flush SHALL happen after the publication has been recorded and bef
 - **WHEN** `import_from_url` fetches a body and publishes it
 - **THEN** the payload SHALL have been flushed before its gate is entered and the destination directory SHALL be flushed after publication, with the same failure classification as an upload
 
-### Requirement: Transfer staging holds no directory entry
+### Requirement: Transfer staging holds no directory entry wherever unnamed staging is available
 
-An upload's staged bytes SHALL be held for the whole of the streaming window in a file with **no directory entry**, so that nothing in the staging directory can be observed, replaced or raced, and so that abandoned bytes are reclaimed by the kernel rather than left for a sweep. Staging SHALL allocate the unnamed file in the staging directory beneath the vault root, which SHALL continue to exist and to be held owner-only, since the directory is what selects the filesystem the inode lives on.
+An upload's staged bytes SHALL be held for the whole of the streaming window in a file with **no directory entry** on every vault root whose publication probe establishes that unnamed staging and by-descriptor publication work there, so that nothing in the staging directory can be observed, replaced or raced, and so that abandoned bytes are reclaimed by the kernel rather than left for a sweep. Staging SHALL allocate the unnamed file in the staging directory beneath the vault root, which SHALL continue to exist and to be held owner-only, since the directory is what selects the filesystem the inode lives on.
 
 The no-clobber publish SHALL publish that inode **by descriptor**, so what lands at the destination is provably the inode this call wrote and no name is consulted. The overwrite publish SHALL NOT be required to be nameless, because a replacing rename has no by-descriptor form; instead it SHALL create a name for the staged inode only **inside the publish gate**, immediately before the fingerprint check and the rename, and only in the staging directory — never in the destination directory. That name SHALL be created no-clobber, retried under a fresh name if it is already taken, verified to still refer to the staged inode immediately before the rename, and on cleanup unlinked **only** while it still refers to that inode, otherwise left in place and logged.
 
-A filesystem or container that cannot stage without a name, or cannot publish by descriptor, SHALL cause the transfer to be refused with an error naming the missing capability, and SHALL NOT cause a fallback to publishing whatever a staging name refers to.
+This requirement governs the unnamed-staging mode and nothing else. Where the probe establishes that unnamed staging or by-descriptor publication is *unavailable*, the transfer SHALL be refused with an error naming both the missing capability and the operator flag; the named-staging fallback that flag permits is the **only** departure from this requirement, and it is governed by the requirement below. Absent that flag an implementation SHALL NOT publish whatever a staging name refers to.
 
 #### Scenario: Nothing is observable while a body streams
 
-- **WHEN** an upload body is streaming
+- **WHEN** an upload body is streaming on a root whose publication probe selected unnamed staging
 - **THEN** the staging directory SHALL contain no directory entry for the bytes being staged
 
 #### Scenario: An abandoned upload leaves nothing behind
 
-- **WHEN** an upload is abandoned mid-stream, or the process is killed while one is in flight
+- **WHEN** an upload on a root whose publication probe selected unnamed staging is abandoned mid-stream, or the process is killed while one is in flight
 - **THEN** the staged bytes SHALL be reclaimed without any file remaining in the staging directory for a later sweep to remove
 
 #### Scenario: The overwrite path's name exists only inside the gate
 
-- **WHEN** an overwrite upload publishes
+- **WHEN** an overwrite upload publishes on a root whose publication probe selected unnamed staging
 - **THEN** a name for the staged inode SHALL exist only between the publish gate's acquisition of its locks and the completion of its rename
 - **AND** that name SHALL be in the staging directory, not in the destination directory
 
@@ -192,8 +192,86 @@ A filesystem or container that cannot stage without a name, or cannot publish by
 #### Scenario: Unnamed staging or by-descriptor publication is unavailable
 
 - **WHEN** the vault filesystem cannot allocate a file without a directory entry, or the container cannot publish an open descriptor by reference
-- **THEN** the transfer SHALL be refused with an error naming the unsupported capability
-- **AND** SHALL NOT publish by staging name instead
+- **THEN** the transfer SHALL be refused with an error naming the unsupported capability and the operator flag that permits the named-staging fallback
+- **AND** SHALL NOT publish by staging name unless that flag is set, in which case the requirement below governs the whole of the departure
+
+### Requirement: Where unnamed staging is unavailable the transfer path stages under a name only behind the operator flag
+
+Transfer publication SHALL treat the absence of unnamed staging or of by-descriptor publication as a refusal by default, and SHALL stage under a name instead only where the operator has set `VAULT_ALLOW_NAMED_STAGING_FALLBACK` — the same single flag that governs the note path's fallback, default off. With the flag unset the refusal SHALL be the unsupported-filesystem error and SHALL name that flag, so an operator meeting it does not have to read the source to find the escape valve; this is the refusal shape the note path already uses, and the two SHALL be phrased alike.
+
+With the flag set, the transfer path SHALL keep the named `.transfer-tmp` staging it used before this change: an exclusively created, non-symlink-following `.tmp-*` file, made through the staging directory descriptor the beneath-root lookup returned, held owner-only for the staging window, published out of that directory by hard link (no-clobber) or replacing rename (overwrite). Everything outside the staging mode SHALL be untouched by the fallback — the payload flush, the directory flush, the publish gate and its lock order, the mount-identity check, the beneath-root lookup, the size caps and the token state machine are the same on both branches. The fallback changes where the bytes are staged and nothing else.
+
+Two guarantees the fallback SHALL carry that the pre-change path did **not**, because the unnamed mode's transient overwrite name is specified with them and a mode that keeps a name for minutes has more need of them, not less: the staged name SHALL be verified to still refer to the inode this call staged immediately before it is published, and the discard SHALL unlink it **only** while it still refers to that inode, otherwise leave it in place and log. The pre-change publish unlinks its staging name unconditionally; the fallback SHALL NOT reproduce that, for the reason that already governs every other cleanup here — answering a substitution by deleting the substitute is a destructive write aimed at a different file. The no-clobber publish SHALL remain no-clobber in either mode: a hard link that fails when the destination already exists, never a replacing rename.
+
+The window the fallback reopens SHALL be declared rather than implied, in the same register as the overwrite publish's in-gate window. A named staging file carries a directory entry for the whole streaming window, so the substitution the unnamed mode closes structurally is open again for that window, narrowed — not closed — by the identity check that precedes the publish. The threat difference between the two fallbacks SHALL be stated rather than rounded off: the transfer path stages in `.transfer-tmp`, an owner-only dot-directory beneath the vault root that the indexer skips and every tool's hidden-path guard refuses, so no agent, no capability and no vault tool can reach a staged name and the residual adversary is a process running as the same uid — which can rewrite the destination directly and needs no race. The note path's fallback stages beside the destination, in a directory the vault's own tools can write to. The transfer fallback's window is therefore **narrower** than the note path's, and the two SHALL NOT be documented as equivalent.
+
+The fallback SHALL be observable without reading the source. It SHALL log a warning exactly once per process, the first time a call actually stages under a name, and SHALL NOT log it when the flag is merely set or when the probe merely selects the mode — the distinction between "an operator enabled this defensively" and "this mount is taking the fallback" is the whole value of the warning. `/health` SHALL expose the same field the note path's fallback exposes, under the same name and with the same meaning, so one field answers for both write paths.
+
+An abandoned or killed upload in fallback mode SHALL leave its staged file for the existing 24-hour sweep of `.transfer-tmp/.tmp-*`, which is retained for exactly this reason as well as for pre-change litter.
+
+#### Scenario: The flag is off and the filesystem cannot stage without a name
+
+- **WHEN** the publication probe runs for a root whose filesystem rejects unnamed staging, or in a container where an open descriptor cannot be published by reference, and `VAULT_ALLOW_NAMED_STAGING_FALLBACK` is unset
+- **THEN** the probe SHALL raise the unsupported-filesystem error naming the missing capability **and** naming that flag
+- **AND** no upload token SHALL be minted and no body SHALL be staged or published for that root
+- **AND** the refusal SHALL NOT fall back to staging under a name
+
+#### Scenario: The flag is on and the filesystem cannot stage without a name
+
+- **WHEN** the same root is probed with `VAULT_ALLOW_NAMED_STAGING_FALLBACK` set
+- **THEN** the probe SHALL select named staging for that root rather than refusing, after establishing that the primitives the fallback needs — an exclusive, non-symlink-following creation in the staging directory, a hard link within the root, a flush of the staged file, and a flush of a directory descriptor — all work there
+- **AND** an upload on that root SHALL stage in `.transfer-tmp` under a name and publish out of it
+- **AND** a root whose probe selected named staging SHALL be refused if any of those primitives fails, rather than accepting a body it cannot publish
+
+#### Scenario: The fallback publish is still no-clobber
+
+- **WHEN** a no-clobber upload publishes in named-staging mode and a file already exists at the destination
+- **THEN** the publish SHALL fail on the destination already existing, exactly as the by-descriptor publication does
+- **AND** the existing file SHALL be unchanged
+- **AND** the claim SHALL be released, since nothing was published
+
+#### Scenario: The fallback announces itself once, on first exercise
+
+- **WHEN** `VAULT_ALLOW_NAMED_STAGING_FALLBACK` is set and the process then serves several uploads on a root whose probe selected named staging
+- **THEN** exactly one warning SHALL be logged for the whole process, at the first call that actually stages under a name
+- **AND** setting the flag, starting the process, and the probe selecting the mode SHALL each log nothing on their own
+
+#### Scenario: `/health` reports that the fallback is in use
+
+- **WHEN** a call has staged under a name in this process
+- **THEN** `/health` SHALL report the named-staging fallback as active, in the same field and with the same meaning as the note path's fallback uses
+- **AND** while nothing has staged under a name — including where the flag is set but every root supports unnamed staging — that field SHALL report it as inactive
+
+#### Scenario: A named staging file survives an abandoned upload
+
+- **WHEN** an upload in named-staging mode is abandoned mid-stream, or the process is killed while one is in flight
+- **THEN** the staged file MAY remain in `.transfer-tmp`
+- **AND** the existing sweep of `.transfer-tmp/.tmp-*` files older than 24 hours SHALL collect it
+
+#### Scenario: The staged name is substituted while the body streams
+
+- **WHEN** another process replaces the named staging file of an in-flight fallback upload before the publish
+- **THEN** a substitution observable at the identity check that immediately precedes the publish SHALL be refused, and the substituted file SHALL be left in place rather than unlinked
+- **AND** a substitution landing between that check and the publishing link or rename SHALL NOT be specified as prevented — the check narrows the window to one syscall exactly as it does in the unnamed mode's transient-name case, and closing it is not achievable
+- **AND** that residual is what the flag hands to the operator: reaching it needs write access to an owner-only directory beneath the vault root that no agent, capability or vault tool can reach, held by a process that could rewrite the destination directly
+
+### Requirement: One flag governs the named-staging fallback on both write paths
+
+The named-staging fallback SHALL be governed by exactly one operator flag for the note path and the transfer path together — `VAULT_ALLOW_NAMED_STAGING_FALLBACK`, default off — and an implementation SHALL NOT split it into a per-path knob. An operator meets the missing capability on both paths for one reason, a filesystem that cannot allocate an unnamed inode; two knobs would let a deployment run with a working `create_note` and a refusing upload, which is a state nobody chose and nobody can diagnose from either symptom alone.
+
+The flag's *definition* — the settings field, the environment variable it reads, and its default — belongs to the note path's fallback, and this capability consumes it without redefining it. Where the transfer fallback ships **before** that definition exists, this change SHALL introduce the field under exactly that name and exactly that default, so that whichever lands first, the other finds the flag it expects and the two never diverge into two settings.
+
+#### Scenario: One flag, both paths
+
+- **WHEN** an operator sets `VAULT_ALLOW_NAMED_STAGING_FALLBACK` on a deployment whose filesystem rejects unnamed staging
+- **THEN** both the note path's no-clobber writes and the transfer path's publications SHALL take their named-staging fallback
+- **AND** no second flag SHALL be required, offered or consulted to enable either one
+
+#### Scenario: The default is unchanged refusal
+
+- **WHEN** the flag is not set
+- **THEN** both paths SHALL refuse on a filesystem that cannot stage without a name, each with an error naming the flag
+- **AND** neither path SHALL stage under a name
 
 ### Requirement: Transfer publication refuses a destination on another mount, before the body where the boundary already exists and inside the publish gate where it appears later
 
@@ -324,7 +402,9 @@ This applies to transfer publication only. Note writes stage in the destination'
 
 ### Requirement: Filesystem probes run only on write paths, and sweep stale staging
 
-The filesystem capability probes SHALL be split by the capability they test and SHALL run only where that capability is about to be used: a **publication** probe SHALL run on `request_upload`, `import_from_url` and `PUT /transfer/upload`, and a **trash** probe (`rename` of a temp file into `.trash/`) SHALL run only on a `delete_file` soft delete. The publication probe SHALL exercise every primitive the publish depends on and can test from the vault root — a hard link within the vault root, allocation of a file with no directory entry, publication of such a file by descriptor, a flush of that file to durable storage, and a flush of a directory descriptor — so that an environment missing any of them is refused at the probe rather than after a body has been streamed. A filesystem that supports unnamed staging and by-descriptor publication but rejects a directory flush would otherwise pass the probe, accept a token and a body, publish the file, and only then strand the claim as a post-publication failure. Each SHALL be cached per vault root. No read path — `request_download`, `check_upload`, `GET|HEAD /transfer/download/info`, `GET|HEAD /transfer/download/file` — SHALL run any probe, because a probe writes. On the first publication probe per root the server SHALL remove `.transfer-tmp/.tmp-*` files whose mtime is older than 24 hours, and SHALL NOT remove newer ones; that sweep SHALL be retained for staging files left by earlier releases even though the streaming path no longer creates named staging files.
+The filesystem capability probes SHALL be split by the capability they test and SHALL run only where that capability is about to be used: a **publication** probe SHALL run on `request_upload`, `import_from_url` and `PUT /transfer/upload`, and a **trash** probe (`rename` of a temp file into `.trash/`) SHALL run only on a `delete_file` soft delete. The publication probe SHALL exercise every primitive the publish depends on and can test from the vault root — a hard link within the vault root, allocation of a file with no directory entry, publication of such a file by descriptor, a flush of that file to durable storage, and a flush of a directory descriptor — so that an environment missing any of them is refused at the probe rather than after a body has been streamed. Where unnamed staging is the primitive that fails and the operator flag permits the named-staging fallback, the probe SHALL exercise the primitives *that* mode depends on instead of refusing, and every other primitive in the list SHALL still be required of it. A filesystem that supports unnamed staging and by-descriptor publication but rejects a directory flush would otherwise pass the probe, accept a token and a body, publish the file, and only then strand the claim as a post-publication failure. Each SHALL be cached per vault root. No read path — `request_download`, `check_upload`, `GET|HEAD /transfer/download/info`, `GET|HEAD /transfer/download/file` — SHALL run any probe, because a probe writes. On the first publication probe per root the server SHALL remove `.transfer-tmp/.tmp-*` files whose mtime is older than 24 hours, and SHALL NOT remove newer ones; that sweep SHALL be retained for staging files left by earlier releases even though the streaming path no longer creates named staging files.
+
+**The publication probe is also what selects the staging mode, once per root.** Its cached result SHALL record which mode that root uses — unnamed staging with by-descriptor publication, or the named-staging fallback where unnamed staging is unavailable and the operator flag permits it — and every publication on that root SHALL use the recorded mode. The mode SHALL NOT be decided per call, per token or per body, and SHALL NOT flip for the life of the cached result: a root that stages one upload without a name and the next one under a name would make the window each upload ran in unknowable after the fact. `/health` SHALL read the fallback's activity from the process, not by re-probing, so consulting it creates nothing.
 
 Availability of the beneath-root lookup SHALL NOT be tested by these probes: it is a property of the kernel and the container rather than of a vault root, it is identical for every root, and it is enforced by the read-only startup probe instead.
 
@@ -342,9 +422,15 @@ Availability of the beneath-root lookup SHALL NOT be tested by these probes: it 
 
 #### Scenario: A vault that cannot stage without a name is refused at the probe
 
-- **WHEN** the publication probe runs against a root whose filesystem cannot allocate a file with no directory entry, or in a container where an open descriptor cannot be published by reference
-- **THEN** the probe SHALL raise the unsupported-filesystem error naming that capability
+- **WHEN** the publication probe runs against a root whose filesystem cannot allocate a file with no directory entry, or in a container where an open descriptor cannot be published by reference, and the named-staging fallback flag is unset
+- **THEN** the probe SHALL raise the unsupported-filesystem error naming that capability and naming the flag
 - **AND** the transfer tools and routes for that root SHALL refuse rather than publish by staging name
+
+#### Scenario: The probe records the staging mode and the mode does not change
+
+- **WHEN** the publication probe has run for a root and selected a staging mode, and further uploads are then served for that root
+- **THEN** every one of them SHALL stage in the mode the probe recorded
+- **AND** the mode SHALL NOT be re-decided per call, and the probe SHALL NOT run again for that root
 
 #### Scenario: A vault that cannot flush a directory is refused at the probe
 

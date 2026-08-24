@@ -13,8 +13,9 @@ beside it.
 Order and dependency: **#87 → #97 → #92-item-1**, then group 4, which is
 independent of all three and which nothing in them depends on. No task depends
 on a later one: 2.5a puts the probe's flush coverage in the same group as the
-flushes it guards rather than in group 3, and 3.5 keeps those checks rather
-than introducing them.
+flushes it guards rather than in group 3, 3.5 keeps those checks rather than
+introducing them, and 3.0 settles the named-staging fallback flag before any
+task in group 3 reads it.
 
 ## 1. #87 — the beneath-root lookup becomes one kernel-enforced call
 
@@ -195,12 +196,33 @@ group 1 now produces.
 ## 3. #92 item 1 — transfer staging has no directory entry
 
 *Scope: `src/services/vault_fs.py`, `src/services/transfer.py`,
-`src/services/vault.py`, tests. **Item 1 only** — the actor label on
-`transfer_tokens` (item 2) and the scope echo (item 3) are not in this
+`src/services/vault.py`, `src/main.py` (the `/health` field), `src/config.py`
+(**only** in the pre-PR case of 3.0), tests. **Item 1 only** — the actor label
+on `transfer_tokens` (item 2) and the scope echo (item 3) are not in this
 change.*
 
 Depends on group 2: the payload flush moves onto the unnamed descriptor.
 
+**Ordering note — the named-staging fallback flag is shared with a contributor
+PR that is in flight (#103).** `O_TMPFILE` is refused server-side by TrueNAS
+SCALE's NFS, so an accepted contributor change adds
+`VAULT_ALLOW_NAMED_STAGING_FALLBACK` (env, default `false`) for the *note*
+path. This group honours the same flag for the transfer path (D27), which
+means the two changes touch one setting and either may land first. 3.0 is the
+task that resolves that, and every later task in this group reads the flag
+through whatever 3.0 established — no task here depends on the contributor PR
+having landed, and none of them introduces a second knob. Coordinate on #103,
+not in a merge.
+
+- [ ] 3.0 Settle the fallback flag before anything reads it. If the
+  contributor PR (#103) has landed, consume the existing
+  `Settings.vault_allow_named_staging_fallback` and add **nothing** to
+  `src/config.py`. If it has not, introduce that field here under exactly that
+  name, exactly that environment variable (`VAULT_ALLOW_NAMED_STAGING_FALLBACK`)
+  and exactly that default (`false`), and say so on #103 so the PR rebases onto
+  it. Either way there is one setting and one knob for both write paths — no
+  `TRANSFER_*` variant, no per-path override, no "transfers only" escape
+  (D27). Nothing else in this group defines or renames it
 - [ ] 3.1 Move `_link_staged_inode` and `_proc_fd_available` from `vault.py`
   into `vault_fs.py` and have `vault.py` call them, so the two publish paths
   share one implementation. Keep every kernel note in the docstring:
@@ -209,44 +231,132 @@ Depends on group 2: the payload flush moves onto the unnamed descriptor.
   be set** with `O_TMPFILE` — it forbids linking and makes the publish `ENOENT`
 - [ ] 3.2 Add unnamed staging to `vault_fs` (`O_TMPFILE|O_RDWR` relative to the
   staging descriptor) and use it from `_stream_locked` in place of
-  `create_temp`; `UnsupportedFilesystem` when the filesystem refuses it, never
-  a fallback to a named staging file
-- [ ] 3.3 `publish` takes the staged descriptor rather than a staging name.
-  No-clobber → `linkat` through `/proc/self/fd/<fd>` into the destination
-  descriptor. Overwrite → materialise a transient name **in the staging
-  directory** from that same descriptor, no-clobber with a bounded `EEXIST`
-  retry, immediately before the fingerprint check and the `renameat`; verify
-  the name still refers to the staged inode before the rename; on cleanup
-  unlink it only while it still does, otherwise leave it and log
+  `create_temp` on every root whose probe selected the unnamed mode.
+  `UnsupportedFilesystem` when the filesystem refuses it **and the flag from
+  3.0 is off**, with the error naming that flag the way the note path's
+  refusal does — never an unflagged fallback to a named staging file
+- [ ] 3.2a The fallback branch (D27): where the probe selected named staging,
+  `_stream_locked` keeps the **pre-change** `create_temp` path in
+  `.transfer-tmp` exactly as it is — exclusive, `O_NOFOLLOW`, through the
+  staging descriptor the beneath-root lookup returned. Nothing outside the
+  staging mode changes: the payload flush, the directory flush, the publish
+  gate and its lock order, the size caps and the token state machine are the
+  same code on both branches. Do not grow a second streaming path; branch at
+  staging and at publication only
+- [ ] 3.3 `publish` takes the staged descriptor rather than a staging name in
+  the unnamed mode. No-clobber → `linkat` through `/proc/self/fd/<fd>` into
+  the destination descriptor. Overwrite → materialise a transient name **in
+  the staging directory** from that same descriptor, no-clobber with a bounded
+  `EEXIST` retry, immediately before the fingerprint check and the `renameat`;
+  verify the name still refers to the staged inode before the rename; on
+  cleanup unlink it only while it still does, otherwise leave it and log
+- [ ] 3.3a In the fallback mode `publish` keeps the pre-change by-name form —
+  `create_temp`'s `.tmp-*` in `.transfer-tmp`, `_link_no_clobber` for
+  no-clobber (still `EEXIST` on an existing destination, **never** degraded to
+  a replacing rename) and `os.replace` for overwrite — but with two guards the
+  pre-change path does not have, because 3.3 introduces them for the transient
+  overwrite name and a name that lives for minutes needs them more, not less:
+  verify the staged name still refers to this call's inode immediately before
+  the publish, and replace `_unlink_quietly`'s unconditional unlink with the
+  inode-guarded discard (unlink only while it still refers to our inode,
+  otherwise leave it and log). Do **not** carry the unconditional unlink into
+  the fallback. The staged name then exists for the whole streaming window
+  rather than two syscalls — that is the declared residual (D27), not a bug to
+  patch here
 - [ ] 3.4 Rework `Published.temp_removed`, `discard_temp` and
   `_stream_locked`'s `except` branch for a staging file that usually has no
-  name: closing the descriptor is the discard, and the only unlink left is the
-  overwrite path's transient name
+  name: in the unnamed mode closing the descriptor is the discard, and the
+  only unlink left is the overwrite path's transient name. In the fallback
+  mode the pre-change discard rules apply unchanged — unlink the staged name
+  only while it still refers to the inode this call staged, otherwise leave it
+  in place and log
 - [ ] 3.5 `probe_publication` additionally exercises unnamed staging and the
-  by-descriptor publication, and **keeps the staged-file flush and the
-  directory flush that 2.5a added** — they must survive the conversion, because
+  by-descriptor publication, **records which staging mode the root will use**
+  in its cached per-root result — unnamed, or the fallback where unnamed is
+  unavailable and 3.0's flag is on — so the mode is decided once and never per
+  call, and **keeps the staged-file flush and the directory flush that 2.5a
+  added** — they must survive the conversion, because
   a filesystem that does `O_TMPFILE` and `linkat` but refuses a directory
   `fsync` would otherwise pass the rewritten probe, take a token and a whole
   body, publish, and only then strand the claim as a post-publication failure.
   Also state in the docstring what the probe *cannot* answer for: it links
   root→root and is cached per root, so it cannot see a destination on a
   different filesystem or mount (D23)
+- [ ] 3.5a The probe's two unnamed-staging outcomes. Flag off → raise
+  `UnsupportedFilesystem` naming the missing capability **and** the flag, so
+  no token is minted and no body is streamed. Flag on → select the fallback
+  mode after establishing the primitives *it* needs (exclusive
+  non-symlink-following creation in `.transfer-tmp`, the hard link within the
+  root, the staged-file flush, the directory flush); a root that fails any of
+  those is still refused rather than accepting a body it cannot publish
+- [ ] 3.5b Make the fallback observable the way the note path's is: one
+  `WARNING` per process, logged the first time a call **actually stages under
+  a name** — not when the flag is set, not when the probe selects the mode —
+  and the same `/health` field the note path's fallback exposes, under the
+  same name and meaning, reporting inactive until that first exercise. One
+  field for both paths; `/health` reads process state and SHALL NOT re-probe
+  (a probe writes). If 3.0 found the contributor PR already landed, wire the
+  transfer path into its existing warning-once helper and its existing field
+  rather than adding a parallel pair
 - [ ] 3.6 Leave `prune_stale_staging` in place and update its docstring: it
-  has pre-change litter to collect and a rolling deploy to survive, and it no
-  longer has anything new to collect (D19). Leave `open_staging_dir`'s `0700`
+  has pre-change litter to collect and a rolling deploy to survive, it no
+  longer has anything new to collect **in the unnamed mode** (D19), and in the
+  fallback mode an abandoned or killed upload leaves a staged file exactly as
+  the pre-change path did, so the sweep keeps a live purpose there (D27). Leave `open_staging_dir`'s `0700`
   and owner check in place and record that they are now defence in depth plus
   the guard on the transient overwrite name
-- [ ] 3.7 Tests: `.transfer-tmp` holds no entry for the staged bytes at any
-  point while a body streams; a killed upload leaves nothing to sweep; the
-  overwrite path's transient name exists only inside the gate and only in
-  `.transfer-tmp`; a transient name substituted **before** the identity check
-  refuses the publish and leaves the substitute in place (the interval after
-  that check is the declared residual — D20 — and is not asserted);
-  `O_TMPFILE`, `/proc` and directory-`fsync` unavailability each refuse at the
-  probe with a named error and never fall back
+- [ ] 3.7 Tests, unnamed mode: `.transfer-tmp` holds no entry for the staged
+  bytes at any point while a body streams; a killed upload leaves nothing to
+  sweep; the overwrite path's transient name exists only inside the gate and
+  only in `.transfer-tmp`; a transient name substituted **before** the
+  identity check refuses the publish and leaves the substitute in place (the
+  interval after that check is the declared residual — D20 — and is not
+  asserted); directory-`fsync` unavailability refuses at the probe with a
+  named error and never falls back
+- [ ] 3.7a Tests, mode selection and the fallback (D27), with `O_TMPFILE` and
+  `/proc` unavailability simulated at the probe:
+  - the probe drives the mode: a root that supports unnamed staging stages
+    without a name, a root that does not (flag on) stages under one, and the
+    recorded mode is used by every subsequent upload on that root rather than
+    re-decided per call
+  - flag **off** on such a root: the refusal is the unsupported-filesystem
+    error, its message names `VAULT_ALLOW_NAMED_STAGING_FALLBACK`, no token is
+    minted, nothing is staged and nothing is published
+  - flag **on**: a no-clobber upload over an existing destination still fails
+    on `EEXIST` through the named `link()` publish, the existing file is
+    unchanged, and the claim is released; the publish never degrades to a
+    replacing rename
+  - flag on: the identity check precedes the publish in both publish modes, a
+    substitution observable at it refuses and leaves the substitute in place,
+    and no cleanup path unlinks a name that no longer refers to this call's
+    inode
+  - the warning fires **once per process, on first exercise** — asserted by
+    setting the flag and probing with no upload (silent), then serving two
+    uploads (exactly one warning)
+  - `/health` reports the fallback inactive until that first exercise and
+    active after it, in one field shared with the note path, and calling
+    `/health` creates no file in the vault
+  - an abandoned fallback upload leaves a `.tmp-*` file that the existing
+    24-hour sweep collects
 - [ ] 3.8 CLAUDE.md: extend "The no-clobber publish never exposes a staging
-  name at all" to cover the transfer path, and record the overwrite path's
-  in-gate window
+  name at all" to cover the transfer path, **scoped to the mode the probe
+  selects where `O_TMPFILE` works**, and record the overwrite path's in-gate
+  window. Add the fallback beside it (D27): one flag for both write paths,
+  default off, refusal naming the flag when it is off, warning once per
+  process on first exercise, `/health` field, and the reopened window stated
+  in the same register as the overwrite residual — including why the transfer
+  fallback's window is *narrower* than the note path's (`.transfer-tmp` is
+  `0700`, owner-checked and unreachable by any agent, capability or vault
+  tool; the note path stages beside the destination). Do not describe the two
+  fallbacks as equivalent
+- [ ] 3.9 At archive time, reconcile with the contributor PR rather than
+  overwriting it: if #103's change landed a delta to
+  `openspec/specs/vault-write/spec.md` for the note path's fallback, make sure
+  this change's `vault-write` delta — whose "The filesystem cannot stage
+  without a name" scenario still reads as an unconditional refusal — is
+  updated to match it before archiving, so promoting these deltas does not
+  silently revert the contributor's requirement. Spec-only reconciliation; no
+  code change belongs to this task
 
 ## 4. D23 — transfer publication refuses a destination on another mount
 
