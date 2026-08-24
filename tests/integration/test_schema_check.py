@@ -59,7 +59,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "015"
+HEAD_REVISION = "016"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -1604,3 +1604,454 @@ def test_downgrade_015_removes_the_columns_and_upgrade_rebuilds_them():
         # recoverable — downgrading really does destroy that history.
         assert actor_of(url, 1) == ("api_key", "nightly sync", "omcp_a1b2c3")
         assert_reconciled(url, marker_expected=False)
+
+
+# ==========================================================================
+# 016 — the index-provenance columns on `users` (issue #91, deferred half)
+# ==========================================================================
+#
+# `alembic check` sees these three columns, their type and their nullability,
+# and nothing about what they are *for*. What it cannot see is the property the
+# whole record depends on: **the two pathname columns must be able to record
+# any value the facts they mirror can take.** A provenance value the pass
+# observed and cannot store is a bug, never a truncation and never a NULL —
+# because the discard branch writes the record *and* the delete in **one**
+# transaction, so a value that will not go in raises, rolls the delete back,
+# and leaves the former vault's index served on every subsequent pass. That is
+# #91's own symptom produced by a column definition, and it is reachable
+# through two independent channels:
+#
+# - **length** — a short assignment may be a symbolic link to a canonical path
+#   of any length, and this system owns no bound on that (hence `text`);
+# - **byte content** — a POSIX pathname is arbitrary non-NUL bytes, Python
+#   decodes a non-UTF-8 component with `surrogateescape`, and the resulting
+#   lone surrogate cannot be UTF-8-encoded by the driver at all (hence the
+#   hexadecimal encoding, which `text` alone did *not* fix).
+#
+# Both are asserted below against a real database and a real directory whose
+# name carries a `\xff` byte — the defect is in what the kernel can hand back,
+# so a mocked `os.path.realpath` would prove nothing.
+#
+# The marker matters more here than on 015's display columns: this record is
+# the sole input to a decision that DELETEs a user's entire index, so adopting
+# a same-named column of unknown provenance is a mass delete on a value nobody
+# in this scheme wrote.
+
+
+PROVENANCE_COLUMNS = (
+    ("indexed_vault_assignment", "text"),
+    ("indexed_vault_realpath", "text"),
+    ("indexed_vault_handle", "character varying(320)"),
+)
+PROVENANCE_COLUMN_NAMES = tuple(name for name, _t in PROVENANCE_COLUMNS)
+
+# 016's ownership marker, mirrored from the migration *and* from
+# `src/models/db.py::_INDEXED_PROVENANCE_MARKER`. All three must agree: the
+# migration keys its completion and its downgrade on the comment, and the model
+# declares it so `alembic check` compares it like any other column attribute.
+PROVENANCE_MARKER = (
+    "provenance of this user's index, recorded by the index pass "
+    "(016_indexed_vault_provenance)"
+)
+
+# `users.vault_path` is `varchar(1024)`. The realpath column must not be
+# bounded by that — or by anything.
+VAULT_PATH_WIDTH = 1024
+
+
+def marker_literal() -> str:
+    """`PROVENANCE_MARKER` as a SQL string literal.
+
+    `COMMENT ON` takes no bind parameter — it is utility DDL — and 016's marker
+    contains an apostrophe ("this user's index"), so the quote has to be
+    doubled. The migration's own `_quote` does exactly this; a test that
+    interpolated the marker raw would fail on the marker rather than on the
+    thing it is asserting.
+    """
+    return "'" + PROVENANCE_MARKER.replace("'", "''") + "'"
+
+
+def provenance_column_is_marked(url, column: str) -> bool:
+    return fetchval(
+        url,
+        "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a "
+        "WHERE a.attrelid = 'users'::regclass AND a.attname = $1",
+        column,
+    ) == PROVENANCE_MARKER
+
+
+def provenance_of(url, user_id: int):
+    """The three recorded facts for one user, straight from the row."""
+    row = fetch(
+        url,
+        "SELECT indexed_vault_assignment, indexed_vault_realpath, "
+        "       indexed_vault_handle FROM users WHERE id = $1",
+        user_id,
+    )[0]
+    return (
+        row["indexed_vault_assignment"],
+        row["indexed_vault_realpath"],
+        row["indexed_vault_handle"],
+    )
+
+
+def add_owned_provenance_columns(url, *, marked=True):
+    """The three columns exactly as 016 creates them, marker optional."""
+    for column, coltype in PROVENANCE_COLUMNS:
+        sql(url, f"ALTER TABLE users ADD COLUMN {column} {coltype}")
+        if marked:
+            sql(url, f"COMMENT ON COLUMN users.{column} IS {marker_literal()}")
+
+
+def refuse_016(url, *, must_mention):
+    """Run `upgrade head`, require 016 to refuse, and return the message."""
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    for fragment in must_mention:
+        assert fragment in combined, combined
+    assert "Nothing has been changed" in combined, combined
+    assert alembic_version(url) == "015"
+    return combined
+
+
+def seed_pre_016_users(url):
+    """One assigned user with index rows, one unassigned user.
+
+    The assigned one is the whole point of "backfills nothing": stamping
+    `indexed_vault_assignment = vault_path` for them would assert that their
+    rows were built under the assignment they carry *now*, which is exactly the
+    reassignment lag the record exists to detect.
+    """
+    insert_user(url, 1, "assigned")
+    insert_user(url, 2, "unassigned")
+    sql(url, "UPDATE users SET vault_path = '/vaults/alice' WHERE id = 1")
+    sql(
+        url,
+        "INSERT INTO notes_metadata (id, user_id, file_path, title, content_hash) "
+        "VALUES (1, 1, 'Same.md', 'Same', 'hash-same'), "
+        "       (2, 1, 'OnlyA.md', 'OnlyA', 'hash-onlya')",
+    )
+    sql(
+        url,
+        "INSERT INTO note_links (source_note_id, target_note_id, target_path, kind) "
+        "VALUES (1, 2, 'OnlyA', 'wikilink')",
+    )
+
+
+def test_the_provenance_columns_are_nullable_and_marked_on_a_fresh_database():
+    """Nullable is load-bearing, not incidental.
+
+    NULL is the *provenance unknown* branch — the one that re-derives rather
+    than trusting or discarding — so a column that could not hold it would have
+    no way to say "nothing is known", which is the only true statement
+    available for every row at migration time.
+    """
+    with throwaway_db("schema_prov_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        for column, expected_type in PROVENANCE_COLUMNS:
+            shape = column_shape(url, "users", column)
+            assert shape is not None, f"users.{column} is missing"
+            attnotnull, coltype, coldefault = shape
+            assert attnotnull is False, f"{column} must stay nullable"
+            assert coltype == expected_type, f"{column} is {coltype}"
+            assert coldefault is None, f"{column} carries a server default"
+            assert provenance_column_is_marked(url, column), (
+                f"users.{column} lost 016's comment marker"
+            )
+        # `alembic check` clean at head — which is only true while the models'
+        # declared column comments are byte-identical to the migration's
+        # marker.
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_a_realpath_longer_than_the_assignment_column_round_trips():
+    """The round-4 blocker, at the column.
+
+    An assignment of any accepted length may resolve through a symbolic link to
+    a canonical path far longer than itself. With a bounded column that write
+    raises `string_data_right_truncation` *inside the discard transaction*,
+    rolling the delete back — so the former vault's index is served forever,
+    which is the precise state this record exists to end.
+
+    Asserting the stored value equals what was written is what stops a later
+    edit from quietly re-bounding this column.
+    """
+    with throwaway_db("schema_prov_long") as url:
+        insert_user(url, 1, "alice")
+        long_path = "/" + "/".join(f"segment{i:04d}" for i in range(200))
+        assert len(long_path) > VAULT_PATH_WIDTH, len(long_path)
+        encoded = os.fsencode(long_path).hex()
+
+        sql(
+            url,
+            "UPDATE users SET indexed_vault_realpath = $1 WHERE id = 1",
+            encoded,
+        )
+
+        stored = provenance_of(url, 1)[1]
+        assert stored == encoded, "the realpath column truncated or altered the value"
+        assert os.fsdecode(bytes.fromhex(stored)) == long_path
+        assert len(stored) > VAULT_PATH_WIDTH
+
+
+def test_a_non_utf8_realpath_round_trips_losslessly_only_when_encoded(tmp_path):
+    """The round-5 blocker, at the column, with a real directory.
+
+    `text` removed the *length* bound and left the *encoding* bound exactly
+    where it was, so the identical rollback-forever failure survived the
+    widening through the other channel. The two assertions here are a pair:
+    the encoded form goes in and comes back byte for byte, and the **raw**
+    surrogate-escaped string is refused by the driver — which is what keeps the
+    hexadecimal encoding load-bearing rather than decorative. If a future edit
+    ever made the raw write succeed, the second assertion would tell us the
+    reasoning had changed rather than letting the encoding quietly rot.
+    """
+    try:
+        raw_dir = os.path.join(os.fsencode(str(tmp_path)), b"vault-\xff-name")
+        os.mkdir(raw_dir)
+    except (OSError, ValueError) as e:  # pragma: no cover - filesystem dependent
+        pytest.skip(f"this filesystem refuses a non-UTF-8 directory name: {e}")
+
+    realpath = os.path.realpath(os.fsdecode(raw_dir))
+    # The surrogate escape is the whole point: without it this case degenerates
+    # into the ASCII one and asserts nothing.
+    assert any("\udc80" <= ch <= "\udcff" for ch in realpath), realpath
+    encoded = os.fsencode(realpath).hex()
+
+    with throwaway_db("schema_prov_nonutf8") as url:
+        insert_user(url, 1, "alice")
+
+        sql(url, "UPDATE users SET indexed_vault_realpath = $1 WHERE id = 1", encoded)
+
+        stored = provenance_of(url, 1)[1]
+        assert stored == encoded
+        assert stored == stored.lower(), "the encoding must be lowercase hexadecimal"
+        # Lossless, surrogates included.
+        assert os.fsdecode(bytes.fromhex(stored)) == realpath
+
+        # And the raw pathname is genuinely unstorable, which is the reason the
+        # encoding exists at all.
+        with pytest.raises(Exception) as excinfo:
+            sql(
+                url,
+                "UPDATE users SET indexed_vault_realpath = $1 WHERE id = 1",
+                realpath,
+            )
+        assert isinstance(excinfo.value, (UnicodeEncodeError, ValueError)) or (
+            "surrogates" in str(excinfo.value) or "encode" in str(excinfo.value)
+        ), repr(excinfo.value)
+        # The failed write changed nothing.
+        assert provenance_of(url, 1)[1] == encoded
+
+
+def test_016_backfills_nothing():
+    """The round-1 blocker, and the load-bearing decision of this migration.
+
+    "Assigned now" is not "indexed under what is assigned now". Deriving
+    `indexed_vault_assignment` from `users.vault_path` would stamp rows built
+    under vault A as belonging to B for any administrator who reassigned and
+    deployed before the next index pass — after which both recorded facts
+    agree, the pass takes its no-op branch, and the identical-path /
+    identical-hash link case that never heals becomes guaranteed rather than
+    merely possible.
+    """
+    with throwaway_db("schema_prov_backfill", revision="015") as url:
+        seed_pre_016_users(url)
+        before_notes = fetch(
+            url, "SELECT id, user_id, file_path, content_hash FROM notes_metadata ORDER BY id"
+        )
+        before_links = fetch(
+            url, "SELECT source_note_id, target_note_id, target_path FROM note_links"
+        )
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        # NULL for *every* row, including the assigned user's.
+        assert provenance_of(url, 1) == (None, None, None)
+        assert provenance_of(url, 2) == (None, None, None)
+        # And the index itself is untouched.
+        assert [dict(r) for r in fetch(
+            url, "SELECT id, user_id, file_path, content_hash FROM notes_metadata ORDER BY id"
+        )] == [dict(r) for r in before_notes]
+        assert [dict(r) for r in fetch(
+            url, "SELECT source_note_id, target_note_id, target_path FROM note_links"
+        )] == [dict(r) for r in before_links]
+        assert fetchval(url, "SELECT count(*) FROM note_embeddings") == 0
+
+
+def test_rerunning_016_does_not_overwrite_a_recorded_provenance():
+    """Idempotence that re-executes the body, and a record that stays a record.
+
+    Stamping back to 015 forces 016 to run again against a user whose recorded
+    assignment deliberately *differs* from their current `vault_path` — the
+    exact state a pending reassignment produces. A migration that "helpfully"
+    reconciled the two would destroy the only evidence that the rows predate
+    the reassignment.
+    """
+    with throwaway_db("schema_prov_idempotent") as url:
+        insert_user(url, 1, "alice")
+        sql(url, "UPDATE users SET vault_path = '/vaults/new' WHERE id = 1")
+        recorded = (
+            "/vaults/old",
+            os.fsencode("/data/old").hex(),
+            "1:a85530010b6f671e",
+        )
+        sql(
+            url,
+            "UPDATE users SET indexed_vault_assignment = $1, "
+            "indexed_vault_realpath = $2, indexed_vault_handle = $3 WHERE id = 1",
+            *recorded,
+        )
+
+        _harness.run_alembic(url, "stamp", "015", dimensions=DIM)
+        assert alembic_version(url) == "015"
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert provenance_of(url, 1) == recorded
+        for column, _ in PROVENANCE_COLUMNS:
+            assert provenance_column_is_marked(url, column)
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "wrong type",
+            "ALTER TABLE users ADD COLUMN indexed_vault_realpath varchar(1024)",
+            "is character varying(1024), not text",
+        ),
+        (
+            "NOT NULL",
+            "ALTER TABLE users ADD COLUMN indexed_vault_realpath text NOT NULL "
+            "DEFAULT ''",
+            "is NOT NULL",
+        ),
+        (
+            "server default",
+            "ALTER TABLE users ADD COLUMN indexed_vault_realpath text DEFAULT ''",
+            "carries a server default",
+        ),
+    ],
+)
+def test_a_foreign_provenance_column_is_refused(label, ddl, fragment):
+    """013's philosophy, with more at stake than 015's.
+
+    A same-named column of unknown provenance adopted as "the assignment those
+    rows were scanned under" is a **mass delete** on the strength of a value
+    nobody in this scheme wrote — the classification reads it and can conclude
+    *reassigned*, which drops the user's `notes_metadata` and cascades their
+    embeddings and links.
+    """
+    with throwaway_db(f"schema_prov_foreign_{label.replace(' ', '_')}", revision="015") as url:
+        # The other two in 016's own shape, so the refusal is about this one.
+        for column, coltype in PROVENANCE_COLUMNS:
+            if column == "indexed_vault_realpath":
+                continue
+            sql(url, f"ALTER TABLE users ADD COLUMN {column} {coltype}")
+            sql(url, f"COMMENT ON COLUMN users.{column} IS {marker_literal()}")
+        sql(url, ddl)
+
+        refuse_016(url, must_mention=[fragment, "indexed_vault_realpath"])
+
+        # The schema is unchanged: nothing was adopted and nothing was added.
+        assert column_shape(url, "users", "indexed_vault_realpath") is not None
+        assert provenance_column_is_marked(url, "indexed_vault_realpath") is False
+
+
+def test_an_unmarked_provenance_column_set_is_refused():
+    """Type and width are a coincidence anyone could reproduce.
+
+    The comment is the only evidence that *this* scheme wrote the values, which
+    is the whole basis for letting them decide whether to delete an index.
+    """
+    with throwaway_db("schema_prov_unmarked", revision="015") as url:
+        add_owned_provenance_columns(url, marked=False)
+        refuse_016(url, must_mention=["does not carry 016's comment marker"])
+
+
+@pytest.mark.parametrize("present", [1, 2])
+def test_a_partial_provenance_column_set_is_refused(present):
+    """A partial set is not a re-run; it is a database somebody edited.
+
+    Creating the missing ones beside a foreign `indexed_vault_assignment`
+    would leave the pass classifying against a value of unknown meaning — and
+    this classification deletes indexes.
+    """
+    with throwaway_db(f"schema_prov_partial_{present}", revision="015") as url:
+        for column, coltype in PROVENANCE_COLUMNS[:present]:
+            sql(url, f"ALTER TABLE users ADD COLUMN {column} {coltype}")
+            sql(url, f"COMMENT ON COLUMN users.{column} IS {marker_literal()}")
+
+        missing = PROVENANCE_COLUMN_NAMES[present:]
+        refuse_016(url, must_mention=["absent", missing[0]])
+
+        for column in missing:
+            assert column_shape(url, "users", column) is None
+
+
+def test_a_complete_marked_provenance_set_is_accepted_as_a_rerun():
+    with throwaway_db("schema_prov_rerun", revision="015") as url:
+        add_owned_provenance_columns(url, marked=True)
+        insert_user(url, 1, "alice")
+        sql(
+            url,
+            "UPDATE users SET indexed_vault_assignment = '/vaults/a', "
+            "indexed_vault_realpath = $1 WHERE id = 1",
+            os.fsencode("/data/a").hex(),
+        )
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert provenance_of(url, 1) == ("/vaults/a", os.fsencode("/data/a").hex(), None)
+
+
+def test_downgrade_016_drops_the_marked_set_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_prov_downgrade") as url:
+        insert_user(url, 1, "alice")
+        sql(
+            url,
+            "UPDATE users SET indexed_vault_assignment = '/vaults/a' WHERE id = 1",
+        )
+
+        _harness.run_alembic(url, "downgrade", "015", dimensions=DIM)
+        assert alembic_version(url) == "015"
+        for column, _ in PROVENANCE_COLUMNS:
+            assert column_shape(url, "users", column) is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        # Rebuilt NULL — which is the *provenance unknown* branch, so the next
+        # pass re-derives that user's index rather than trusting or discarding
+        # it. Downgrading costs a re-derive, never a re-embed.
+        assert provenance_of(url, 1) == (None, None, None)
+
+
+def test_downgrade_016_refuses_to_drop_a_set_it_did_not_create():
+    """All or nothing, and it decides before it touches anything.
+
+    An unmarked column under one of these names is left in place and reported,
+    rather than destroyed on the way past — and its two marked siblings survive
+    with it, because a downgrade that dropped two of three and then raised
+    would leave a half-set record, which the pass reads as "no record".
+    """
+    with throwaway_db("schema_prov_downgrade_foreign") as url:
+        sql(url, "COMMENT ON COLUMN users.indexed_vault_handle IS 'somebody else'")
+
+        result = _harness.run_alembic(
+            url, "downgrade", "015", dimensions=DIM, check=False
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, combined
+        assert "indexed_vault_handle" in combined, combined
+        assert "Nothing has been changed" in combined, combined
+
+        assert alembic_version(url) == HEAD_REVISION
+        for column, _ in PROVENANCE_COLUMNS:
+            assert column_shape(url, "users", column) is not None

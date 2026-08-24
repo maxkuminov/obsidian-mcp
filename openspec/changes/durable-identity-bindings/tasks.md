@@ -148,7 +148,7 @@ that is a design decision rather than an ownership one. **Do not edit
 `tests/test_symlink_mutation_guard.py`**: it must keep passing unchanged, which
 is how you know the anchored discovery finds what the old one found.
 
-- [ ] A.1 Add three columns to `src/models/db.py` — `User.indexed_vault_assignment`
+- [x] A.1 Add three columns to `src/models/db.py` — `User.indexed_vault_assignment`
       (nullable `Text`), `User.indexed_vault_realpath` (nullable `Text`) and
       `User.indexed_vault_handle` (nullable `String(320)`) —
       no server default, each `comment=_INDEXED_PROVENANCE_MARKER` where that
@@ -218,7 +218,7 @@ is how you know the anchored discovery finds what the old one found.
       while a missing pathname is not a state at all but a half-set record. Keep
       the marker string byte-identical to `MARKER` in the migration or
       `alembic check` goes dirty.
-- [ ] A.2 Write `alembic/versions/016_indexed_vault_provenance.py`
+- [x] A.2 Write `alembic/versions/016_indexed_vault_provenance.py`
       (`down_revision = "015"`). `SET LOCAL lock_timeout` /
       `statement_timeout` and `RESET` both at the end of `upgrade()` — `SET
       LOCAL` lasts for the transaction and `alembic/env.py` runs every pending
@@ -233,7 +233,7 @@ is how you know the anchored discovery finds what the old one found.
       Record the deploy-order argument too: 016 writes no provenance, so an old
       container's in-flight pass has nothing to contradict, and that — not any
       lock — is why the deploy is safe.
-- [ ] A.3 Treat pre-existing columns of any of the three names as an ownership
+- [x] A.3 Treat pre-existing columns of any of the three names as an ownership
       question, not a convenience, and treat the three as **one unit**: all
       absent → create and mark; all present, nullable, exactly `text` / `text` /
       `varchar(320)`, default-free **and** marked → accept as
@@ -243,9 +243,9 @@ is how you know the anchored discovery finds what the old one found.
       the record is the sole input to a decision that deletes a user's whole
       index, so adopting a foreign column is a mass delete on a value nobody in
       this scheme wrote.
-- [ ] A.4 `downgrade()` drops the columns **only** if they carry the marker,
+- [x] A.4 `downgrade()` drops the columns **only** if they carry the marker,
       all-or-nothing.
-- [ ] A.5 In `src/services/indexer.py`, add the classification at the head of
+- [x] A.5 In `src/services/indexer.py`, add the classification at the head of
       `index_vault(user_id)`, after `vault = _vault_root(user_id)` and
       **before** any discovery. Skip entirely when `user_id is None`. Pin the
       root (A.6a), observe the three facts (A.6), read the recorded three, and
@@ -275,7 +275,7 @@ is how you know the anchored discovery finds what the old one found.
       **Write the stamp as one UPDATE of all three columns**, NULL for anything
       not observed, so no later observation can be compared against a root the
       stamp did not describe.
-- [ ] A.6 Write the provenance helper **in this module, as a new function**:
+- [x] A.6 Write the provenance helper **in this module, as a new function**:
       the canonical assignment string, the `os.path.realpath` of the assigned
       root **encoded as `os.fsencode(...).hex()`** (A.1 — the raw string can
       carry a surrogate escape the driver cannot encode, and this is the one
@@ -306,7 +306,7 @@ is how you know the anchored discovery finds what the old one found.
       stable across a remount, and the measurement in the proposal shows the
       handle bytes are identical on the host and inside a bind-mounting
       container whose `mount_id` differs.
-- [ ] A.6a Pin the assigned root **once per pass**, before the facts are
+- [x] A.6a Pin the assigned root **once per pass**, before the facts are
       observed: `os.open(vault, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)`,
       closed in a `finally`. Take `os.fstat(root_fd)` and the handle from that
       descriptor, and bind the recorded realpath to it the way #59's
@@ -319,7 +319,7 @@ is how you know the anchored discovery finds what the old one found.
       does not buy: within one pass the facts observed, the files discovered and
       the bytes read all come from one inode — it does **not** prove the pinned
       directory is the one earlier rows came from, and nothing does.
-- [ ] A.6b Anchor discovery and every vault-file read to that descriptor. Add
+- [x] A.6b Anchor discovery and every vault-file read to that descriptor. Add
       `discover_markdown_files_at(root_fd)` — depth-first, `os.scandir(fd)` per
       directory, descending with `os.open(name, os.O_RDONLY | os.O_DIRECTORY |
       os.O_NOFOLLOW, dir_fd=parent_fd)` (an `ELOOP`/`ENOTDIR` is a symlinked or
@@ -337,7 +337,7 @@ is how you know the anchored discovery finds what the old one found.
       `link_backfill_pass` and `rebuild_tsvectors`: each pins its own root, for
       the same within-pass-consistency reason. When you are done, no
       `Path.read_text()` on a vault-derived path remains in the module.
-- [ ] A.6c **Gate `link_backfill_pass` and `rebuild_tsvectors` on settled
+- [x] A.6c **Gate `link_backfill_pass` and `rebuild_tsvectors` on settled
       provenance, per user — and leave `embed_vault` out of the gate.** Both
       gated passes write rows the provenance is a claim about — `note_links`,
       `content_tsvector` — with no verification that the bytes they read belong
@@ -366,7 +366,7 @@ is how you know the anchored discovery finds what the old one found.
       write a vector against a row whose recorded content the bytes actually
       hash to. If you find yourself removing A.7c, you must re-gate this pass in
       the same change.
-- [ ] A.7 Add the re-derive mode to `index_vault`: content-hash change
+- [x] A.7 Add the re-derive mode to `index_vault`: content-hash change
       detection disabled, so every discovered file is parsed and upserted
       regardless of its hash; the ordinary prune unchanged; and every note
       therefore counted as changed, so `_update_links_for_changed` deletes and
@@ -378,7 +378,7 @@ is how you know the anchored discovery finds what the old one found.
       selection re-embeds exactly the rest. Leave move detection enabled; under
       a full re-upsert plus a full link rebuild it can only preserve a valid
       row id and its valid embeddings.
-- [ ] A.7a **Account for skips, and withhold the record when there are any.**
+- [x] A.7a **Account for skips, and withhold the record when there are any.**
       Thread a per-pass skip list through the scan. A skip is: a directory the
       walk could not open (other than a symlinked one, which is a deliberate
       non-descent and not a skip); a file whose open, read, `fstat`, decode or
@@ -393,7 +393,7 @@ is how you know the anchored discovery finds what the old one found.
       deleting the skipped path's rows: that is a second deletion path for
       index contents, and it destroys a row that may be the right row for a
       file that was merely unreadable this second.
-- [ ] A.7b **The link rebuild reads no file.** Pass the scan's
+- [x] A.7b **The link rebuild reads no file.** Pass the scan's
       `path_to_content` buffer into `_update_links_for_changed` and extract
       from it instead of re-reading `vault / path` (`indexer.py:399-404`).
       That removes the disappear-between-scan-and-rebuild window rather than
@@ -404,7 +404,7 @@ is how you know the anchored discovery finds what the old one found.
       docstring: in re-derive mode the buffer holds the whole vault's parsed
       bodies for the duration of the pass, where an ordinary pass holds only
       the changed ones.
-- [ ] A.7c **`embed_vault` verifies the hash it is about to certify.**
+- [x] A.7c **`embed_vault` verifies the hash it is about to certify.**
       `embed_note` sets `note.embedded_content_hash = note.content_hash` — the
       *row's* hash, not a hash of the bytes just embedded — so a file that
       differs from its row at embedding time is embedded and then permanently
@@ -421,7 +421,7 @@ is how you know the anchored discovery finds what the old one found.
       wrong root the hashes disagree and the pass skips. Say that in the
       docstring, next to the check, so the coupling is visible at the site of any
       future removal.
-- [ ] A.8 `tests/integration/test_schema_check.py`: set `HEAD_REVISION = "016"`
+- [x] A.8 `tests/integration/test_schema_check.py`: set `HEAD_REVISION = "016"`
       (B moves it to `"017"`); a fresh database has all three columns nullable,
       exactly typed (`text` / `text` / `varchar(320)`), default-free and marked;
       a value longer than `users.vault_path`'s own width round-trips through
@@ -444,7 +444,7 @@ is how you know the anchored discovery finds what the old one found.
       columns is refused, with the schema unchanged; a complete marked set of
       three is accepted; downgrade to 015 drops a marked set and leaves a set
       with any column unmarked; `alembic check` clean at head.
-- [ ] A.9 New `tests/test_issue_91_indexed_root.py`, covering all six verdicts,
+- [x] A.9 New `tests/test_issue_91_indexed_root.py`, covering all six verdicts,
       both repair shapes, the hardening's one direction, and the declared
       non-goal:
       **assignment-level classification** — reassignment to a different vault at
