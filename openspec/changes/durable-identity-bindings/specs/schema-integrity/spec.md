@@ -1,7 +1,9 @@
 ## ADDED Requirements
 
 ### Requirement: Migration 016 owns the indexed-root identity columns as one marked unit
-Migration 016 SHALL add `users.indexed_vault_path` as a nullable `character varying(1024)` and `users.indexed_vault_fsid` as a nullable `character varying(64)`, both with no server default and each stamped with 016's ownership marker as its column comment. It SHALL leave both columns null for **every** existing row and SHALL perform no backfill of any kind. `downgrade()` SHALL drop the columns only if they carry the marker, all-or-nothing. After migrating to head, `alembic check` SHALL report no pending operations, and the same marker string SHALL be declared on the ORM columns so the check compares it.
+Migration 016 SHALL add `users.indexed_vault_path` as a nullable `character varying(1024)` and `users.indexed_vault_handle` as a nullable `character varying(320)`, both with no server default and each stamped with 016's ownership marker as its column comment. It SHALL leave both columns null for **every** existing row and SHALL perform no backfill of any kind. `downgrade()` SHALL drop the columns only if they carry the marker, all-or-nothing. After migrating to head, `alembic check` SHALL report no pending operations, and the same marker string SHALL be declared on the ORM columns so the check compares it.
+
+The width of `indexed_vault_handle` follows the kernel's own bound. A file handle is at most `MAX_HANDLE_SZ` (128) bytes of opaque payload, which is 256 hexadecimal characters, plus a handle type and a separator; 320 characters holds the largest handle any filesystem may return with room to spare, and the column stores text so that nothing is ever tempted to interpret it. On the ext4 and xfs filesystems this system declares support for, the payload is eight bytes.
 
 Not backfilling is the load-bearing decision, not an omission. Deriving `indexed_vault_path` from `users.vault_path` would assert that an assigned user's index was built from the root assigned *now*, which is exactly the reassignment lag the record exists to detect: an administrator who reassigns and deploys before the next index pass would have rows built from one vault stamped as belonging to another, after which both identity signals agree, the pass takes its no-op branch, and the identical-path/identical-content link case that never heals becomes guaranteed rather than merely possible. A null record means "provenance unknown", which is the only true statement available at migration time, and the pass repairs such a user by re-deriving the index rather than by discarding it — so introducing the columns costs no vault-wide re-embed.
 
@@ -12,7 +14,7 @@ The marker is load-bearing for a stronger reason here than on a display column. 
 #### Scenario: Fresh database
 
 - **WHEN** an empty database is migrated to head
-- **THEN** `users.indexed_vault_path` SHALL exist as nullable `character varying(1024)` and `users.indexed_vault_fsid` as nullable `character varying(64)`, both with no server default and both carrying 016's marker as their column comment
+- **THEN** `users.indexed_vault_path` SHALL exist as nullable `character varying(1024)` and `users.indexed_vault_handle` as nullable `character varying(320)`, both with no server default and both carrying 016's marker as their column comment
 - **AND** `alembic check` SHALL report no new upgrade operations
 
 #### Scenario: The migration backfills nothing
@@ -28,7 +30,7 @@ The marker is load-bearing for a stronger reason here than on a display column. 
 
 #### Scenario: A foreign column of the same name is refused
 
-- **WHEN** `users` already carries a column named `indexed_vault_path` or `indexed_vault_fsid` that is not exactly 016's column — a different type or width, `NOT NULL`, carrying a server default, or lacking the marker — and 016 runs
+- **WHEN** `users` already carries a column named `indexed_vault_path` or `indexed_vault_handle` that is not exactly 016's column — a different type or width, `NOT NULL`, carrying a server default, or lacking the marker — and 016 runs
 - **THEN** the migration SHALL fail naming what it found
 - **AND** SHALL NOT adopt the column and SHALL leave the schema unchanged
 

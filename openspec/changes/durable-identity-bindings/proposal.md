@@ -83,13 +83,29 @@ is not a comparison but a **record**: a value describing the root the rows were
 built from, independent of the current assignment and therefore surviving the
 unassignment.
 
+**What round 3 changed, so a reviewer can check the replacements rather than
+rediscover the originals.** Round 2 replaced a lexical root comparison with
+`realpath` + `st_dev:st_ino` and replaced a provenance backfill with a
+re-derive. Round 2's review accepted the direction and sharpened it three ways,
+all of them in the same two places — how strong the identity proof is, and
+whether a re-derive really finishes. This round: (1) the second signal becomes a
+**kernel file handle**, because an inode number is reusable and both round-2
+signals can agree about two different directories; (2) the root is **pinned as a
+descriptor** and the identity, the discovery and every read come from that
+descriptor, because deriving an identity from a pathname and then scanning the
+pathname is check-then-act; (3) **any per-file skip makes the re-derive
+incomplete and withholds the stamp**, because the existing scan `continue`s past
+unreadable files and the structural claim was therefore false for them. Nothing
+else about the shape moved.
+
 **Decision: 016 adds two columns, `users.indexed_vault_path` and
-`users.indexed_vault_fsid`, nullable, one marked unit, written only by the
+`users.indexed_vault_handle`, nullable, one marked unit, written only by the
 index pass — and 016 backfills neither.** The pair is the *identity of the
 directory the rows were actually scanned from*, read at the head of
-`index_vault(user_id)` before `discover_markdown_files` opens a single file, and
-compared against the same two facts observed for the assigned root now. Skipped
-entirely for `user_id is None` — single-user mode has no `users` row.
+`index_vault(user_id)` from a descriptor pinned before `discover_markdown_files`
+opens a single file, and compared against the same two facts observed for the
+assigned root now. Skipped entirely for `user_id is None` — single-user mode has
+no `users` row.
 
 **Identity is not a normalised pathname, and this is the part the first draft
 got wrong.** `transfer.canonical_vault_root` is `str(Path(path))` and nothing
@@ -101,37 +117,199 @@ foreign index is kept; and `/vaults/current` versus `/vaults/real-a` naming one
 directory yields *different* strings for the *same* one, so a good index is
 destroyed and re-embedded. So the record is two facts, not one:
 
-- `indexed_vault_path` — `os.path.realpath` of the root as it was scanned. This
-  resolves symlinks and normalises separators, `.` and `..`, so a trailing
-  separator or an aliasing symlink is never read as a reassignment.
-- `indexed_vault_fsid` — an **opaque** `"<st_dev>:<st_ino>"` token for that
-  directory's inode, observed at the same moment. Text, not integers: nobody
-  should do arithmetic on it, and it sidesteps the unsigned-64 question that
-  `bigint` columns would raise.
+- `indexed_vault_path` — `os.path.realpath` of the root as it was scanned,
+  proven at that moment to name the descriptor the pass pinned. This resolves
+  symlinks and normalises separators, `.` and `..`, so a trailing separator or
+  an aliasing symlink is never read as a reassignment.
+- `indexed_vault_handle` — the **kernel file handle** of that directory, taken
+  from the pinned descriptor with `name_to_handle_at(fd, "", AT_EMPTY_PATH)`
+  and stored as the opaque text `"<handle_type>:<hex of f_handle>"`. Compared
+  by byte equality, never parsed.
 
-Neither alone is identity. A realpath comparison cannot see a directory deleted
-and re-created at the same path; an inode tuple cannot be trusted on its own
-because `st_dev` is not guaranteed stable across a reboot for every device type
-and `st_ino` is reusable. So the pass reaches one of four verdicts, and **a keep
-requires both signals to agree**:
+**Why a file handle and not `st_dev:st_ino` — this is round 2's blocker, and
+the measurement settles it.** An inode number is *reusable*: delete the
+directory, create another at the same path, and the allocator can hand back the
+same number, at which point a realpath comparison and an inode comparison both
+agree about two different directories and a foreign index is kept on unanimous
+evidence. That is not hypothetical and it is not rare. Measured on this host
+(ext4, `rmdir` + `mkdir` in a loop): **the very first recreation reused the
+inode** — `dev=66306 ino=19944872` before and after — while the file handle
+changed from `a85530010b6f671e` to `a8553001fbe0f6ef`. The first four bytes are
+the inode number; the last four are the inode **generation counter**, which the
+kernel bumps precisely so that a reused inode is not mistaken for the old one.
+`name_to_handle_at` is the kernel's own answer to inode reuse, and asking it is
+a rule rather than a heuristic.
 
-| recorded vs. observed | verdict | what the pass does |
+Three further measurements, because they decide the rest of the design:
+
+- **The wrapper exists.** `ctypes.CDLL(None).name_to_handle_at` resolves on
+  glibc 2.39 (this host) and on 2.41 (`python:3.12-slim`, the deployment base);
+  glibc has exported it since 2.14. So unlike `openat2` — which the
+  `atomic-beneath-root-writes` change must reach through a raw `syscall(2)`
+  number table because glibc exports no wrapper *at any version* — this one
+  takes the wrapper-first shape `rename_noreplace` already uses, and needs no
+  architecture table. Verified by `getattr` on both, not assumed.
+- **No capability is required, and a bind mount does not disturb it.** In a
+  `--cap-drop ALL --user 1000:1000` container with the repository bind-mounted
+  at another path, the handle for that directory was byte-identical to the
+  handle read on the host — `2fb398003402e116` both times — while the kernel's
+  mount id differed (6307 in the container, 31 on the host); the design
+  therefore ignores the `mount_id` the call also returns. Only
+  `open_by_handle_at` needs `CAP_DAC_READ_SEARCH`, and **this design never
+  calls it**: a handle is an identity to compare, never a door to open. Stated
+  without overclaiming the measurement: `st_dev` was *not* observed to differ
+  there (a bind mount shares the superblock, so it is the same device number),
+  and the reason a reboot is now a clean keep is structural rather than
+  measured — on ext4 and xfs the handle is the inode number and the inode's
+  generation counter, both of which live on disk, so nothing about mounting or
+  restarting moves them. Round 2's fear that an unstable `st_dev` would charge
+  a discard on every restart disappears with `st_dev` itself.
+- **Some filesystems have no handles, and the failure is loud.**
+  `name_to_handle_at` returned `EOPNOTSUPP` for `/proc`, `/sys`, and for a
+  container's own overlayfs root. Some FUSE mounts do the same. That branch is
+  therefore real and is specified below rather than assumed away.
+
+**Where the filesystem gives no handle, the keep branch does not exist.** There
+is then no proof available, so the pass may not assert "same directory": it
+re-derives, **every pass**, and stamps nothing — a record that cannot license a
+keep is indistinguishable from no record, so writing one would only invite a
+later reader to treat it as evidence. The cost is declared rather than
+discovered: a re-derive is parse-and-upsert plus a full link rebuild over a
+vault an ordinary pass already reads and hashes in full, and it makes **zero
+embedding calls** for unchanged content — which is what makes "every pass"
+affordable at ~2,577 notes on a five-minute interval, where a discard would be
+tens of minutes of serial embedding. It is not free: it holds the pass's parsed
+bodies in memory and rewrites every `note_links` row each pass. So it is
+surfaced — **once per process per root, at warning level**, and named as the
+reason in every re-derive log line — rather than silently costing an operator
+CPU forever. Moving the vault onto a filesystem that supports handles is the
+fix, and the log says so.
+
+**Rejected: a UUID persisted inside the vault.** It is the obvious durable
+identity and it is wrong here for a reason that has nothing to do with
+correctness: it writes the server's bookkeeping into the user's own data. The
+vault is Max's single source of truth, synced by Obsidian across machines; a
+`.obsidian-mcp-root-id` file would be copied by every duplication of the vault
+(so two copies claim one identity — the exact failure mode a UUID is supposed
+to prevent), deleted by anyone tidying dotfiles, and would make a *read-only*
+vault mount un-identifiable. It also inverts the trust direction: the identity
+of a directory would be whatever a writer of that directory says it is. The
+kernel handle is not forgeable by vault content and costs one syscall.
+
+**Rejected: keep `st_dev:st_ino` as sufficient proof.** That is round 2's
+design and the measurement above is its counterexample: it certifies a
+recreated directory as the original on the first try. Rejected also as a
+*supplementary* proof — the pair is recorded nowhere and compared nowhere
+across time in this design. `st_dev`/`st_ino` survive in exactly one role, and
+it is not a match signal: at observation time the pass checks that
+`os.path.realpath(assigned)` still names the inode it pinned, which is #59's
+own `_require_same_directory` idiom (the pathname and the descriptor must
+describe one directory *right now*, because the recorded pathname is computed
+from the name). A disagreement there means the name is moving under the pass,
+and it routes to **indeterminate** — assert nothing, destroy nothing. Never to
+a keep.
+
+So the pass reaches one of six verdicts, and **a keep requires proof**:
+
+| observed vs. recorded | verdict | what the pass does |
 | --- | --- | --- |
-| realpath equal **and** fsid equal | same directory | nothing |
-| realpath differs **and** fsid differs | different directory | **discard**: delete the user's `notes_metadata` (embeddings and links cascade) and stamp, in one committed transaction, before any file under the new root is read |
-| anything else — no record at all, or exactly one of the two disagreeing | **provenance unresolved** | **re-derive** (below), then stamp at the end of the pass |
-| assigned root absent, not a directory, or not stattable | indeterminate | nothing at all: no delete, no stamp; the pass fails as it does today |
+| the assigned root cannot be opened as a directory, or its realpath no longer names the pinned inode | **indeterminate** | nothing at all: no delete, no stamp; the pass fails as it does today |
+| pinned, but the filesystem returns no handle | **provenance unresolved** | **re-derive**, and stamp nothing — there is no proof to record, so every pass re-derives. Logged once per process per root |
+| handle obtained, and no record at all | **provenance unresolved** | **re-derive**, then stamp at the end of the pass *if the pass was complete* |
+| handle obtained, realpath equal **and** handle equal | **same directory, proven** | nothing |
+| handle obtained, realpath differs **and** handle differs | **different directory** | **discard**: delete the user's `notes_metadata` (embeddings and links cascade) and stamp, in one committed transaction, before any file under the new root is read |
+| handle obtained, and exactly one of the two differs | **provenance unresolved** | **re-derive**, then stamp at the end of the pass *if the pass was complete* |
+
+Every input lands somewhere, and the interesting ones land where they should.
+A directory deleted and re-created at the same path: realpath equal, handle
+differs — **re-derive**, which is the round-2 blocker turned into the cheap safe
+branch rather than a wrong keep. A vault restored from a backup in place: same
+pathname, every inode new — **re-derive**, no re-embed, which is the outcome an
+operator restoring a vault would want and would not think to ask for. A
+bind-mounted alias of one directory: handle equal, realpath differs —
+**re-derive**, so no vault is re-embedded on account of an alias. A retargeted
+symlink under an unchanged assignment: both differ — **discard**. A reboot: both
+equal — **keep**, with no re-embed, because nothing in the handle moves.
 
 **Which error the design prefers, said plainly.** CLAUDE.md ranks silently wrong
 search results above expensive ones, so the design never resolves an ambiguity
-in favour of keeping. It also never resolves one in favour of the *destructive*
-branch: a discard costs a full re-embed, and firing it on an `st_dev` that
-shifted across a reboot would charge that on every restart. Ambiguity therefore
-goes to a third branch that asserts nothing and destroys nothing. The
-indeterminate row is the one place the design does nothing at all, and for a
-reason: you cannot re-derive from a directory you cannot read, and destroying an
-index because a bind mount was briefly unavailable buys nothing and costs the
-full re-embed.
+in favour of keeping — and after this round, *keeping is the only verdict that
+requires positive proof*. It also never resolves an ambiguity in favour of the
+*destructive* branch: a discard costs a full re-embed, so it fires only when
+both independent signals agree that the directory changed. Ambiguity goes to a
+branch that asserts nothing and destroys nothing. The indeterminate row is the
+one place the design does nothing at all, and for a reason: you cannot re-derive
+from a directory you cannot read, and destroying an index because a bind mount
+was briefly unavailable buys nothing and costs the full re-embed.
+
+**The root is pinned once, and everything the pass does runs beneath that
+descriptor.** Deriving an identity from a pathname and then scanning that
+pathname is check-then-act, and round 2 shipped exactly that: the reviewer's
+ABA is `/vault/current` pointing at A while the identity is read, retargeted to
+B before `discover_markdown_files`, and retargeted back to A before the next
+pass — leaving B's rows stamped as A and then permanently accepted by the keep
+branch. The fix is #59's, taken wholesale rather than reinvented: **open the
+assigned root once, derive the identity from that descriptor, and perform
+discovery and every file read beneath it.** `os.open(vault, O_RDONLY |
+O_DIRECTORY)` pins an inode; `os.fstat` and `name_to_handle_at(fd, "",
+AT_EMPTY_PATH)` describe the thing pinned rather than the thing named;
+`os.scandir(fd)` and `os.open(name, dir_fd=parent)` walk downward from it. A
+directory descriptor keeps naming the same directory however its pathname is
+later renamed or relinked, so the verdict, the scan and the stamp all describe
+one inode. There is no interval left in which the pathname can decide what gets
+scanned.
+
+Two properties of that walk are deliberate, because anchoring must not quietly
+change *what the index contains*:
+
+- **The symlink policy is unchanged.** `Path.rglob` does not descend directory
+  symlinks today, and the descriptor walk descends with
+  `O_DIRECTORY | O_NOFOLLOW` — the same rule, now enforced by the kernel per
+  descent rather than by a library's traversal habit. A symlinked *file* at a
+  discovered path is read as it is today. Anchoring is about *which directory
+  is scanned*, not about containment, and this change makes no containment
+  claim it did not already make: a symlinked leaf can still point outside the
+  root, exactly as before, and `open_mutable` remains the guard that matters
+  for writes.
+- **Stat and read describe one inode.** The scan currently calls
+  `full_path.read_text()` and then `full_path.stat()` — two independent
+  pathname resolutions, so `file_size` and `modified_at` can describe a
+  different file from the one whose bytes were hashed. Under the anchored form
+  the file is opened once through the parent descriptor and `os.fstat`ed on
+  that descriptor. Not the reason for the change; a free consequence of it,
+  and worth having.
+
+The walk holds one descriptor per level of depth, not per file — depth-first,
+each parent closed once its children are done — so it costs the process a
+handful of descriptors, not thousands. It is a *read* walk and it stays inside
+`src/services/indexer.py`; see the sequencing note in `tasks.md` for why it is
+deliberately not a `vault_fs` helper.
+
+**Every pass in the indexer that reads vault files is anchored the same way,
+because otherwise the stamp is a claim about one pass and the rows outlive it.**
+`index_vault` is the pass that stamps, but `embed_vault`, `link_backfill_pass`
+and `rebuild_tsvectors` also read `vault / file_path` by pathname and also write
+rows the stamp is a claim about — `note_embeddings`, `note_links` and
+`content_tsvector` respectively. A user whose notes contain no links has an
+empty `note_links` table forever, so `link_backfill_pass` runs on *every*
+startup and would happily write link rows read through a retargeted pathname
+into a state a previous pass had stamped. Anchoring all four is one helper used
+four times in one file, and it lets the structural claim be stated without an
+"as of" qualifier.
+
+**And the embedding pass verifies the hash it is about to certify.**
+`embed_note` sets `note.embedded_content_hash = note.content_hash` — the
+*metadata* row's hash, not a hash of the bytes it just embedded. So a file that
+differs from its row at embedding time is embedded and then marked as embedded
+*for the row's hash*, and nothing will ever re-embed it. That matters here
+because the re-derive branch keeps `note_embeddings` on precisely the argument
+that a matching `content_hash` proves the vector is the right one for that file
+— an inference that is only sound if every vector actually came from content
+hashing to what was stamped. So `embed_vault` re-hashes what it read and skips
+the note when it does not match the row it selected; the next pass, which will
+have refreshed the row, picks it up. One sha256 over bytes already in memory,
+and it is what makes the "keep the embeddings" argument load-bearing rather
+than merely plausible.
 
 **The re-derive, precisely — and why it is not a compromise.** For an unresolved
 root the pass runs over the assigned root with **content-hash change detection
@@ -144,6 +322,56 @@ after the pass, every surviving row and every link row was written by that pass
 from a file under the assigned root. That is a structural claim about who wrote
 the rows, not an enumeration of columns that has to be re-audited whenever a
 column is added.
+
+**A skip falsifies that claim, so a skip withholds the stamp — round 2's third
+blocker.** The claim above is only true if the pass actually visited every file.
+The scan does not: it `continue`s past a `UnicodeDecodeError` (`indexer.py:150`)
+and past any other read failure (`:153`), the tsvector loop `continue`s for a
+path it has no buffered body for (`:311`), and `_update_links_for_changed`
+re-reads each changed note from disk and `continue`s on
+`UnicodeDecodeError | FileNotFoundError | OSError` (`:403`). Each of those
+leaves the *ordinary prune* as the only thing acting on that path — and the
+prune keeps a row whose relative path exists under the new root, which is
+exactly the case a re-derive exists to repair. Vault A supplied `Same.md`; vault
+B holds a different `Same.md` with invalid UTF-8; the path is discovered, the
+read raises, the row and its links survive untouched, and round 2's design then
+tail-stamps B over them. A pass can complete "successfully" and leave a foreign
+row certified.
+
+**The rule is the simplest one that keeps the claim true: any per-file
+discovery, read, stat, parse or link-extraction skip makes the re-derive
+incomplete, and an incomplete re-derive is not stamped.** The pass still does
+all the work it can — an unreadable file does not abort the pass, and every
+readable file is still repaired — but it logs which paths kept it unstamped
+(the first twenty and a count, the same offender-report shape 013 and 015 use)
+and the next pass re-derives again.
+
+Three reasons this is the right rule rather than the conservative one.
+**It fails toward re-work, never toward wrongness.** The alternative shape the
+reviewer offered — transactionally delete the stale rows for a skipped path, as
+a fresh index would — is also correct, and it is strictly more machinery: a
+second deletion path for index contents, which is the thing #64 and this
+document's own panel-purge argument both refuse, and it destroys a row that may
+well be the *right* row (the file was merely unreadable this second). **It keeps
+provenance honest.** A permanently undecodable file leaves that user in
+re-derive mode indefinitely, and that is the cost, stated plainly: the pass
+never asserts an identity it could not establish. The alternative is stamping a
+claim the pass cannot prove, which is the whole defect being fixed — a foreign
+row silently laundered into a certified one. **And the cost is bounded and
+visible.** Re-derive mode is parse-and-upsert plus a link rebuild with zero
+embedding calls, on a vault an ordinary pass already reads in full; the log
+names the offending paths on every pass, so an operator who is paying for it is
+told which file to fix, by name, rather than left to notice a CPU bill.
+
+**And the link rebuild reads no file at all.** `_update_links_for_changed`
+currently re-reads each changed note from disk, which is both a second read of
+bytes the scan already parsed and a second window in which the file can vanish —
+a disappearance between the scan and the rebuild silently drops that note's
+links while the scan's row stands. The scan already buffers each changed note's
+parsed body in `path_to_content` for the tsvector loop, for exactly this reason
+(issue #18); the link rebuild takes the same buffer. That removes the window
+rather than classifying it, and a changed path absent from the buffer becomes a
+skip like any other — incomplete, unstamped, retried.
 
 `note_embeddings` are **not** deleted, and that is where the cost goes. An
 embedding is a pure function of chunk text and `notes_metadata.content_hash`
@@ -189,11 +417,12 @@ goes with it at the head of the pass — and a pass that then fails while scanni
 retries cleanly, because the next one finds both signals equal and simply
 indexes. On the re-derive branch the state is "every row was derived from this
 root", which is not true until the pass finishes, so the stamp is committed
-**after** the pass's last write and only if the pass raised nothing. A crash
-mid-repair leaves no stamp and the next pass repairs again — bounded,
-idempotent, and never a stamp over a half-repaired index. Head-stamping a
-re-derive would be exactly the false provenance this section is about, written
-by our own code instead of by the migration.
+**after** the pass's last write and only if the pass raised nothing **and
+skipped nothing**. A crash mid-repair leaves no stamp and the next pass repairs
+again — bounded, idempotent, and never a stamp over a half-repaired index; and
+after this round, never a stamp over an index the pass could not fully visit
+either. Head-stamping a re-derive would be exactly the false provenance this
+section is about, written by our own code instead of by the migration.
 
 **Deploy ordering, and what actually holds.** `make deploy` runs
 `docker compose run --rm obsidian-mcp alembic upgrade head` in a one-off
@@ -264,6 +493,24 @@ against a panel-side purge and which #64 argued for grant families; it cannot in
 fact quiesce a container it does not control, since `make deploy` migrates from
 a *separate* one-off container while the old app is still up; and it pays the
 same full re-embed as the option above.
+
+**Rejected: delete the skipped path's rows instead of withholding the record.**
+The reviewer offered this as the other way to keep the structural claim true,
+and it is correct — a fresh index would remove those rows. It is rejected for
+two reasons and neither is effort. It makes the reconciliation a *second*
+deletion path for index contents, keyed on a transient read failure, which is
+the shape this document already refuses for a panel-side purge and which #64
+argued against for grant families. And its failure direction is wrong: a file
+that could not be decoded *this second* is very often the right file for the row
+being deleted, so the rule would destroy valid rows — and, with them,
+embeddings — in exchange for a stamp nobody is waiting for. Withholding the
+stamp costs a repeat of a pass that makes no embedding calls.
+
+**Rejected: treat an unreadable file as a fatal pass error.** Simpler to state,
+and it converts one bad file into a total outage of index maintenance for that
+user: no new note is indexed, no deletion is pruned, and nothing is embedded
+until a human intervenes. The chosen rule does every repair it can and declines
+only to *certify*.
 
 **Rejected: infer provenance by overlapping the recorded relative paths with the
 files found under the assigned root.** A threshold on a heuristic — high overlap
@@ -512,20 +759,36 @@ describes a publication that has already happened.
 
 ## What Changes
 
-- **`users.indexed_vault_path` and `users.indexed_vault_fsid`** (migration 016,
-  nullable `varchar(1024)` and `varchar(64)`, no server defaults, one marked
-  unit): the realpath and the opaque `"<st_dev>:<st_ino>"` identity of the
-  directory a user's index was actually scanned from, written only by
-  `index_vault` and never by an operator-facing handler. **016 backfills
-  neither.**
-- **`index_vault` classifies the root before it scans.** Both signals equal →
-  no-op; both differ → delete the user's `notes_metadata` (embeddings and links
-  cascade) and stamp, in one committed transaction, before any file under the
-  new root is read; anything else, including no record at all → re-derive the
+- **`users.indexed_vault_path` and `users.indexed_vault_handle`** (migration
+  016, nullable `varchar(1024)` and `varchar(320)`, no server defaults, one
+  marked unit): the realpath and the opaque kernel **file handle**
+  (`"<handle_type>:<hex>"`, from `name_to_handle_at`) of the directory a user's
+  index was actually scanned from, written only by `index_vault` and never by an
+  operator-facing handler. **016 backfills neither.**
+- **The pass pins the assigned root as a descriptor**, derives both facts from
+  that descriptor, and performs discovery and every vault-file read beneath it —
+  in `index_vault`, `embed_vault`, `link_backfill_pass` and `rebuild_tsvectors`
+  alike — so no pathname resolution can redirect what is scanned after the
+  verdict is reached.
+- **`index_vault` classifies the root before it scans**, and a keep requires
+  proof. Realpath and handle both equal → no-op; both differ → delete the user's
+  `notes_metadata` (embeddings and links cascade) and stamp, in one committed
+  transaction, before any file under the new root is read; no handle available
+  from the filesystem → re-derive every pass and stamp nothing, logged once per
+  process per root; anything else, including no record at all → re-derive the
   index from the assigned root (change detection off, prune as usual, every link
-  row re-extracted and re-resolved, embeddings kept where the content hash still
-  matches) and stamp after the pass completes; assigned root unreadable →
+  row re-extracted and re-resolved from the scan's own buffer, embeddings kept
+  where the content hash still matches) and stamp after the pass completes;
+  assigned root unopenable, or its realpath no longer naming the pinned inode →
   nothing at all. Never for `user_id is None`.
+- **A re-derive that skipped any file is incomplete and is not stamped.** Any
+  per-file discovery, read, stat, parse or link-extraction skip withholds the
+  tail stamp; the pass logs the paths that kept it unstamped and the next pass
+  re-derives again.
+- **`embed_vault` verifies the hash it certifies**, re-hashing what it read
+  against the row it selected and skipping on mismatch, so
+  `embedded_content_hash` cannot certify a vector built from other bytes — which
+  is what the re-derive's retention of `note_embeddings` rests on.
 - **`transfer_tokens.actor_kind` / `actor_label` / `actor_ref`** (migration 017,
   nullable, marked): the denormalised actor, read from `current_actor` inside
   `mint_token` through the same single reader `_log_usage` uses, and copied onto
@@ -555,9 +818,12 @@ describes a publication that has already happened.
 
 ### Modified Capabilities
 - `index-integrity`: the index records the identity of the directory it was
-  scanned from; a pass reconciles against that identity before it scans,
-  discarding an index whose directory demonstrably moved and re-deriving one
-  whose provenance it cannot resolve.
+  scanned from — a real path plus a kernel file handle, both taken from a
+  descriptor the pass pins and then scans beneath; a pass reconciles against
+  that identity before it scans, keeping an index only on proof, discarding one
+  whose directory demonstrably moved, and re-deriving one whose provenance it
+  cannot resolve — recording the result only when the re-derive visited every
+  file.
 - `schema-integrity`: migrations 016 and 017, each owning its columns as a
   marked unit, with `alembic check` clean at head.
 - `file-transfer`: a transfer capability records the actor that minted it, and
@@ -588,13 +854,17 @@ stays about the admission gate.
 
 - `alembic/versions/016_indexed_vault_identity.py` — new
 - `alembic/versions/017_transfer_token_actor.py` — new (`down_revision = "016"`)
-- `src/models/db.py` — `User.indexed_vault_path` / `User.indexed_vault_fsid`
+- `src/models/db.py` — `User.indexed_vault_path` / `User.indexed_vault_handle`
   with 016's marker; `TransferToken.actor_kind` / `actor_label` / `actor_ref`
   with 017's marker
-- `src/services/indexer.py` — the root-identity helper (realpath + fsid, its own
-  function, **not** a change to `transfer.canonical_vault_root`), the
-  classification at the head of `index_vault`, the re-derive mode, and the
-  tail stamp
+- `src/services/indexer.py` — the `name_to_handle_at` binding (wrapper-first
+  `ctypes`, the `rename_noreplace` shape), the root-identity helper (pin,
+  realpath, handle — its own function, **not** a change to
+  `transfer.canonical_vault_root`), the descriptor-anchored discovery and read
+  helpers used by all four passes, the classification at the head of
+  `index_vault`, the re-derive mode with its completeness accounting, the link
+  rebuild reading from the scan buffer, `embed_vault`'s hash verification, and
+  the tail stamp
 - `src/auth/session.py` — the one shared reader of `current_actor`, extracted
   from `tools.py::_actor_columns` so mint and log cannot drift
 - `src/services/transfer.py` — `mint_token` records the actor; the pre-publish
