@@ -381,7 +381,7 @@ substitution scenario recognises where it actually lives.
 
 #### Where every prior round's attack lands under this design
 
-Four rounds of review produced thirteen findings. Each one has a home here, and
+Five rounds of review produced fourteen findings. Each one has a home here, and
 the point of this table is that the next reviewer can check the *dispositions*
 rather than re-derive the attacks. "Out of scope" appears three times and each
 time it names the non-goal above, which is a declared boundary with an argument,
