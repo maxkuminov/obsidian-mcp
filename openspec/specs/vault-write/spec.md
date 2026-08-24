@@ -5,16 +5,35 @@ TBD - created by archiving change vault-write-completion. Update Purpose after a
 ## Requirements
 ### Requirement: Atomic write invariant
 
-The system SHALL perform all file writes from MCP write tools via a temporary file created in the same directory as the destination, whose contents are flushed to durable storage before publication, followed by an atomic same-directory rename (overwrite) or hard link (no-clobber) relative to the destination's directory descriptor. The applicable tools are `create_note`, `edit_note`, `move_note`, `delete_note`, and `set_frontmatter`. Direct writes that could leave the destination truncated on crash SHALL NOT be used, and the temporary file SHALL be created with exclusive, non-symlink-following semantics so a pre-created name cannot be written through.
+The system SHALL perform all file writes from MCP write tools by staging the payload in the destination's own directory, flushing it to durable storage before publication, publishing it with an atomic same-directory rename (overwrite) or hard link (no-clobber) relative to the destination's directory descriptor, and flushing that directory once the publication has happened. The applicable tools are `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, and `write_file`. Payload and directory durability are properties of the shared atomic-write helper, so **every** caller of it inherits them, including `write_file` in both its no-clobber and its `overwrite=True` mode; an implementation SHALL NOT satisfy this requirement for the note tools while omitting the flush for a raw-byte write that goes through the same helper. Direct writes that could leave the destination truncated on crash SHALL NOT be used. Where staging carries a name — the overwrite path, whose replacing rename has no by-descriptor form — that name SHALL be created with exclusive, non-symlink-following semantics so a pre-created name cannot be written through; the no-clobber path SHALL have no name at all.
 
-#### Scenario: Crash mid-write does not truncate the destination
+The destination directory SHALL be flushed **after** the publishing rename or link, so that the directory entry the write created or replaced is durable and not only its contents. Flushing only the immediate parent leaves the entry that names *it* unflushed, so a crash can lose the whole new folder and with it a note the tool reported written. The directories to flush SHALL be the **complete ancestor chain** from the destination parent up to the vault root, innermost first — not only the directories the publishing call itself created. Per-call creation provenance is insufficient and SHALL NOT be relied on: a call that creates a directory and then aborts before publication flushes nothing, correctly, because it published nothing; the call that later succeeds finds that directory already present, records no creation of it, and would leave the entry naming it made durable by nobody. The obligation outlives the call that incurred it, and outlives the process, so no in-memory record of "who created what" can discharge it. The chain is bounded by path depth and a directory flush is metadata-only, so the conservative rule is also the cheap one. A failure of the destination-directory flush, or of any of those ancestor flushes, SHALL be logged and SHALL NOT turn a write that already landed into a reported failure: the payload was already durable, the previous content survives either way, and a note tool that reports a false failure is retried — `edit_note(append=True)` retried after a write that landed appends the same block twice. This is deliberately the opposite failure direction from the transfer path, where the source bytes are gone and the ambiguity must be surfaced instead.
 
-- **WHEN** the server process is killed between the tmp-file write and the
-  publication
+**Durability is a property of every publication, not only of the staged-payload helper — and of every *caller* of it, not only the ones a tool name makes obvious.** A note tool publishes in three ways and all three write a directory entry that a crash can lose, so the requirement names them rather than scoping itself to the shared atomic-write helper: the staged-payload `rename`/`link` above; `move_note`'s `renameat2`, which writes **two** entries — the destination's new one and the source's removal — so **both** parent directories SHALL be flushed after it lands, and so SHALL both parents of a rollback rename that puts a source back; and the soft delete's `renameat2` into the trash, which SHALL flush the source's parent **and** the trash directory. A permanent delete's `unlink` SHALL flush the parent directory it removed the entry from. The soft delete's flushes belong to the shared primitive the note and file tools both reach it through, so `delete_file`'s soft delete SHALL get them too. In each case a crash that makes only one of the two entries durable leaves the vault holding the note twice or not at all, or holding an entry for a note the tool reported deleted.
+
+**A link rewrite is one of those callers and SHALL NOT be exempt.** `move_note(rewrite_links=True)` publishes a rewritten body into every backlink source, through the same staged-payload helper, and each of those publications owes the same complete ancestor chain — a rewrite target may sit under directories an external writer created and never made durable, which is exactly the case the chain rule exists for. An implementation SHALL therefore keep a usable vault-root anchor available to every target it publishes through: without one the ancestor lookup is impossible and the flush silently degrades to the leaf's parent alone, which is a *quiet* exemption from this requirement rather than a visible one.
+
+That anchor SHALL be reconciled with the descriptor budget rather than allowed to defeat it. The rewrite phase holds one target per planned rewrite and the number of backlink sources is unbounded, so giving each target its own root descriptor doubles the per-source cost and halves how large a move the process can afford. Since every rewrite target resolves the same vault root, a **single shared root descriptor** for the phase SHALL be permitted, and it SHALL be adopted by a target only after verifying that it names the same root inode that target's parent was proved beneath — a mismatch means the vault root pathname was repointed mid-call, which SHALL abort the whole move before any mutation rather than being reported as one source failing to rewrite. Whatever descriptors the phase retains SHALL be charged against the documented budget.
+
+Every one of these flushes SHALL take the same failure direction as the write path's: **logged, and never turned into a reported failure**, for the same reason expressed for the operation at hand. The rename or the unlink has already happened; a tool that reports it as failed is retried, and a retried move or delete finds the source gone and either contradicts the vault or acts on whatever has since taken the name. Nothing is lost by absorbing the failure except a warning.
+
+#### Scenario: Crash mid-write of an overwrite does not truncate the destination
+
+- **WHEN** the server process is killed between the staging write and the
+  publication of an **overwrite** write, whose staging carries a name
 - **THEN** the destination file SHALL retain its prior content unchanged
 - **AND** the orphaned `.tmp-*` file SHALL be discoverable for cleanup by
   the next reindex (it lives in a dot-prefixed name, so the indexer
   ignores it)
+
+#### Scenario: Crash mid-write of a no-clobber write leaves nothing behind
+
+- **WHEN** the server process is killed between the staging write and the
+  publication of a **no-clobber** write, whose staging has no directory entry
+- **THEN** nothing SHALL exist at the destination path
+- **AND** no `.tmp-*` entry or any other directory entry SHALL be left in the
+  destination directory for a sweep or a reindex to find, because the unnamed
+  inode is reclaimed when the last descriptor closes
 
 #### Scenario: Crash immediately after publication does not publish empty content
 
@@ -23,6 +42,18 @@ The system SHALL perform all file writes from MCP write tools via a temporary fi
 - **THEN** the destination SHALL hold either the full prior content or the full
   new content, because the payload was flushed to durable storage before the
   rename was issued
+
+#### Scenario: The publishing rename is made durable
+
+- **WHEN** a note write publishes its payload
+- **THEN** the destination directory SHALL be flushed after the rename or link and before the tool returns
+
+#### Scenario: A failed directory flush does not report a landed write as failed
+
+- **WHEN** the destination directory's flush fails after the payload has been published
+- **THEN** the tool SHALL report the write as successful
+- **AND** the failure SHALL be logged
+- **AND** the tool SHALL NOT return an error that would invite the caller to retry the write
 
 #### Scenario: Successful write atomically replaces existing content
 
@@ -53,10 +84,60 @@ The system SHALL perform all file writes from MCP write tools via a temporary fi
 #### Scenario: Staging happens in the destination directory
 
 - **WHEN** any note or file write stages its payload
-- **THEN** the temporary file SHALL be created in the destination's own
+- **THEN** the staged inode SHALL be allocated in the destination's own
   directory, so publication is a same-directory operation
-- **AND** the temporary file SHALL be removed whether the write succeeds or
-  fails
+- **AND** where that staging carries a name — the overwrite path only — the
+  name SHALL be removed whether the write succeeds or fails, and only while it
+  still refers to the inode this call staged
+
+#### Scenario: A move's rename is made durable at both ends
+
+- **WHEN** `move_note` publishes its `renameat2` from one directory to another
+- **THEN** the destination's parent directory SHALL be flushed after the rename, and so SHALL the source's
+- **AND** every directory above each end, up to the vault root, SHALL be flushed as well — not only the ones this call created
+- **AND** a failure of any of those flushes SHALL be logged and SHALL NOT turn a move that already landed into a reported failure
+
+#### Scenario: A move that is rolled back is made durable too
+
+- **WHEN** a move is refused after its rename landed — the destination held the caller's inode but is a directory or a symbolic link — and the tool renames it back
+- **THEN** both parent directories SHALL be flushed after the rollback rename lands
+- **AND** the refusal SHALL still be reported to the caller, unchanged by whether those flushes succeeded
+
+#### Scenario: A soft delete's rename is made durable
+
+- **WHEN** a note or a file is soft-deleted by renaming it into the trash directory
+- **THEN** the source's parent directory SHALL be flushed after the rename, and so SHALL the trash directory
+- **AND** a failure of either flush SHALL be logged and the delete SHALL still be reported as the success it is
+- **AND** the same SHALL hold for the rollback rename that puts back a directory the soft delete refuses to take
+
+#### Scenario: A permanent delete's unlink is made durable
+
+- **WHEN** a note or a file is deleted permanently
+- **THEN** the parent directory the entry was removed from SHALL be flushed after the unlink
+- **AND** a failure of that flush SHALL be logged and SHALL NOT be reported as a failed delete, because the file is already unlinked and a retry would act on whatever now holds the name
+
+#### Scenario: A backlink rewrite is made durable to the same depth as any other write
+
+- **WHEN** `move_note(rewrite_links=True)` rewrites a backlink in a source note that lives several directories deep, and an outer directory on that source's path was created by another writer and never flushed
+- **THEN** the rewrite's publication SHALL flush every directory above that source's parent, up to the vault root, innermost first — exactly as a `create_note` into the same path would
+- **AND** the descriptor arrangement that makes the lookup possible SHALL NOT pin one root descriptor per rewritten source
+
+#### Scenario: The vault root is repointed while rewrites are being planned
+
+- **WHEN** a rewrite target cannot be shown to have been validated against the same vault root the move is anchored to
+- **THEN** the move SHALL be aborted before its rename runs, so nothing is moved, rewritten or reindexed
+- **AND** it SHALL NOT be reported as a single source failing to rewrite, because the root itself moved and every remaining target is equally suspect
+
+#### Scenario: A newly created folder is durable too
+
+- **WHEN** `create_note("New/Folder/x.md", …)` creates `New` and `Folder` and
+  then publishes the note
+- **THEN** every directory above the destination parent, up to the vault root,
+  SHALL be flushed as well — not only the ones this call created, because a
+  directory an aborted attempt created and never flushed is indistinguishable
+  from one this call found
+- **AND** a failure of any of those flushes SHALL be logged and SHALL NOT be
+  reported to the caller as a failed write
 
 ### Requirement: Write tools require a `readwrite` API key
 
@@ -662,9 +743,50 @@ Soft delete SHALL publish the deleted note into `.trash` without replacing an ex
 
 Every mutating note tool SHALL open the validated parent directory as a descriptor before it acts, and SHALL perform every subsequent filesystem operation of that call — temporary-file creation, the pre-publication read, publication, permanent deletion, and the soft-delete rename — relative to that descriptor. The applicable tools are `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, and `write_file`. After validation, no pathname SHALL be resolved again by the kernel for that call.
 
-The parent descriptor SHALL be obtained by walking the *resolved* parent path from an open vault-root descriptor, one component at a time, refusing to follow a symbolic link at any component. Symbolic-link directory components that resolve inside the vault therefore remain permitted (they are resolved before the walk); a component that is a symbolic link at walk time SHALL be refused.
+The parent descriptor SHALL be obtained from the *resolved* parent path by a **single kernel-enforced beneath-root lookup** from an open vault-root descriptor, which refuses to follow a symbolic link at any component and refuses any resolution that would leave the root. It SHALL NOT be obtained by opening one component at a time: an ancestor renamed out of the vault between two such opens yields a parent descriptor outside the root, and every mutation anchored to it then lands outside the vault while the tool reports success for the path the caller named. Symbolic-link directory components that resolve inside the vault therefore remain permitted (they are resolved before the lookup); a component that is a symbolic link at lookup time SHALL be refused.
 
-A missing parent directory SHALL NOT be created during validation. It SHALL be created on first use of the descriptor by a write, so a call refused for an unrelated reason leaves no directories behind, and reads SHALL NOT create it at all.
+A missing parent directory SHALL NOT be created during validation. It SHALL be created on first use of the descriptor by a write, so a call refused for an unrelated reason leaves no directories behind, and reads SHALL NOT create it at all. Each missing directory SHALL be created through a directory descriptor obtained by a fresh beneath-root lookup of the prefix that already exists, and the directory descriptor the write then anchors to SHALL come from a fresh beneath-root lookup of the whole parent path performed after the creation, not from the creation itself.
+
+Directory creation keeps a bounded residual that SHALL be stated rather than claimed closed: there is no beneath-root form of directory creation, so a prefix renamed out of the vault between its lookup and the single creation issued through it yields an empty directory outside the root. The bound is at most one such directory per component **per creation descent**, and it is an empty directory in a place the renaming process already controls — never a note, never note content, and never something the tool reports success about. No directory descriptor a creation produced SHALL be returned to a caller or used as a pathname anchor for a later operation.
+
+What the lookup proves, and what it does not, SHALL be stated exactly, in the words every artifact of this change uses: **Every below-root directory descriptor a call uses as a pathname anchor comes from a lookup the kernel proved beneath the vault root at the moment it resolved, and no directory descriptor retained from a creation descent is ever returned to a caller or used as a pathname anchor — so no operation is ever redirected into a directory that was never beneath the root.** This is a claim about **directory** descriptors used as pathname anchors: a call's own staged payload descriptor is created by that call, is written, flushed and published through by descriptor, and never anchors a pathname lookup. A lookup does not, and cannot, promise where that directory will be a moment later: a directory descriptor keeps naming the same directory however its pathname is subsequently renamed, which is exactly the property that keeps a mutation on the directory the caller named rather than on a substitute left at its name. A process that renames that directory out of the vault after the lookup and before the publish therefore carries the whole call with it, and the note lands there while the tool reports success for the path the caller named. That is a retained residual of descriptor anchoring — unchanged by this change and inherent to it — and it SHALL be recorded as such rather than specified as prevented.
+
+When the kernel or the container cannot perform a beneath-root lookup, the mutation SHALL be refused with an error naming the unsupported capability, and SHALL NOT fall back to a per-component walk.
+
+#### Scenario: An ancestor is renamed out of the vault while the parent is being resolved
+
+- **WHEN** a mutating note tool is resolving the parent of `A/B/note.md` and another process renames `<vault>/A` to a directory outside the vault root during that resolution
+- **THEN** the tool SHALL either anchor to a directory the kernel resolved beneath the vault root or refuse
+- **AND** SHALL NOT anchor to a descriptor produced by opening the path one component at a time, or to any directory whose containment the lookup did not establish
+- **AND** SHALL NOT be redirected into a directory that was never beneath the root
+
+#### Scenario: The anchored parent is renamed out of the vault after the lookup
+
+- **WHEN** the lookup has returned a descriptor the kernel proved beneath the vault root, and another process then renames that directory — or an ancestor of it — to a location outside the root before the tool publishes
+- **THEN** the mutation SHALL take effect in the directory that was resolved, wherever that directory has since been moved, and the tool MAY report success
+- **AND** this SHALL be recorded as a retained residual of anchoring a call to a directory descriptor, not specified as prevented — the same property that makes the mutation land in the directory the caller named rather than in a substitute left at its name
+- **AND** no other directory SHALL be written to: the call SHALL NOT be redirected into a directory the lookup did not resolve
+
+#### Scenario: A parent created on first use is re-looked-up before it is written through
+
+- **WHEN** `create_note("New/Folder/x.md", …)` creates the missing parent directories and then writes
+- **THEN** the directory descriptor the write anchors to SHALL be the result of a beneath-root lookup performed after those directories were created
+- **AND** each of those directories SHALL have been created through a directory descriptor obtained by a fresh beneath-root lookup of the prefix that already existed
+- **AND** the note SHALL be created inside the vault root
+
+#### Scenario: An ancestor is renamed out of the vault while missing parents are created
+
+- **WHEN** `create_note("A/B/C/x.md", …)` is creating the missing directories and another process renames `<vault>/A` outside the root during that creation
+- **THEN** no note and no note content SHALL be written through any directory descriptor that creation produced: the write SHALL anchor to a directory descriptor obtained by a fresh beneath-root lookup performed after the creation, or the call SHALL be refused
+- **AND** what the race can leave outside the root SHALL be at most an empty directory per component, per creation descent — never a note and never note content
+- **AND** the residual SHALL be documented rather than reported as prevented
+
+#### Scenario: The beneath-root lookup is unavailable
+
+- **WHEN** a mutating note tool runs where the kernel or the container cannot perform a beneath-root lookup
+- **THEN** the tool SHALL return an error naming the unsupported capability
+- **AND** SHALL NOT walk the path one component at a time instead
+- **AND** nothing SHALL be written
 
 #### Scenario: The validated parent is renamed and a symlink left at its name
 
