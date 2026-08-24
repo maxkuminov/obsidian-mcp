@@ -37,6 +37,7 @@ from src.services.filters import apply_note_filters
 from src.services.search import full_text_search
 from src.services import transfer, vault_fs
 from src.services.vault import (
+    VaultRootMismatch,
     _vault_root,
     classify_bytes,
     extract_section,
@@ -1653,6 +1654,7 @@ async def _move_note_locked(
     # endpoints are acquired inside the same guard: a non-`ValueError` failure
     # opening the destination would otherwise strand the source's descriptors.
     targets: list = []
+    shared_root_fd: int | None = None
     try:
         try:
             src_target = open_mutable(from_path, user_id=uid)
@@ -1713,6 +1715,17 @@ async def _move_note_locked(
         planned_rewrites: list[tuple[str, object, bytes, str, int]] = []
         rewrite_bytes_held = 0
         failed_rewrite_sources: list[str] = []
+        # One vault-root descriptor for the whole rewrite phase, shared by every
+        # planned rewrite (`MutableTarget.share_root`). It is a `dup` of a root
+        # the kernel has already proved, never a fresh open of the root
+        # *pathname* — re-resolving the name is the substitution surface #59
+        # exists to close, and a `dup` resolves nothing.
+        #
+        # Each target still needs *a* root after its publish: since the chain
+        # rule (#97) a successful write flushes every directory above its
+        # parent, up to the root, and a target with no root descriptor cannot
+        # look those up. Releasing the root — the previous shape — silently
+        # reduced every backlink rewrite to a leaf-parent flush.
 
         def drop(candidate) -> None:
             """Close a per-source target we are not going to keep.
@@ -1732,6 +1745,14 @@ async def _move_note_locked(
             candidate.close()
 
         if rewrite_links and pre_move_index is not None:
+            try:
+                shared_root_fd = os.dup(src_target.root_fd)
+            except OSError as e:
+                return (
+                    "Move aborted: ran out of file descriptors before the link "
+                    f"rewrites could be planned ({e}). Nothing was moved, "
+                    "rewritten or reindexed."
+                )
             for original_src_path in rewrite_sources:
                 # A moved note may link to itself: it is still at its old path now,
                 # so read it there, but emit link targets relative to where it is
@@ -1756,12 +1777,16 @@ async def _move_note_locked(
                         drop(read_target)
                         continue
                     if not moved_note:
-                        # Pinned from here until phase 3 writes it. The number
-                        # of backlink sources is unbounded, so drop the root
-                        # descriptor — a rewrite never creates a directory and
-                        # never touches `.trash` — and hold one fd per source
-                        # instead of two.
-                        read_target.release_root()
+                        # Pinned from here until phase 3 writes it. The number of
+                        # backlink sources is unbounded, so this target hands
+                        # back its *own* root and borrows the phase's shared one:
+                        # one fd per source plus one for the phase, rather than
+                        # two per source. `share_root` verifies the shared
+                        # descriptor names the same inode this target's parent
+                        # was proved beneath before it swaps — a mismatch means
+                        # the vault root was repointed mid-call and is refused
+                        # below, while nothing has been mutated yet.
+                        read_target.share_root(shared_root_fd)
                     original_bytes = read_bytes_at(
                         read_target, max_bytes=MAX_NOTE_BYTES, label=original_src_path
                     )
@@ -1796,6 +1821,17 @@ async def _move_note_locked(
                     failed_rewrite_sources.append(original_src_path)
                     drop(read_target)
                     continue
+                except VaultRootMismatch as e:
+                    # Not a per-source failure: the vault root itself moved, so
+                    # every remaining target is suspect and the endpoints we
+                    # already validated may no longer describe the vault the
+                    # caller meant. Abort while that is still free — phase 2 has
+                    # not run, so nothing has been mutated.
+                    drop(read_target)
+                    return (
+                        f"Move aborted: {e} Nothing was moved, rewritten or "
+                        "reindexed."
+                    )
                 except Exception as e:
                     logger.warning(
                         "Failed to rewrite links in %s: %s", original_src_path, e
@@ -1834,6 +1870,9 @@ async def _move_note_locked(
                 # *process* table and breaks every concurrent request — so the
                 # move aborts here, before any mutation, rather than hitting
                 # EMFILE half way through the rewrites.
+                # `max_move_rewrite_sources()` already charges the phase's one
+                # shared root, so this compares planned rewrites against what is
+                # left for their parent descriptors.
                 fd_budget = max_move_rewrite_sources()
                 if len(planned_rewrites) + 1 > fd_budget:
                     return (
@@ -1940,6 +1979,10 @@ async def _move_note_locked(
     finally:
         for opened in targets:
             opened.close()
+        # After the targets: they borrowed this descriptor, and `close()` on a
+        # borrower deliberately leaves it alone.
+        if shared_root_fd is not None:
+            vault_fs.close_quietly(shared_root_fd, "shared vault root for rewrites")
 
 
 # ────────────────────────────────────────────────────────────────────────────

@@ -329,6 +329,18 @@ def validate_visible_path(relative_path: str, user_id: int | None = None) -> Pat
     return resolved
 
 
+class VaultRootMismatch(RuntimeError):
+    """A shared vault-root descriptor is not the root a target was proved under.
+
+    Raised only by `MutableTarget.share_root`, and only for the identity check —
+    the other refusals there are programming errors and stay plain
+    `RuntimeError`. A distinct type because the one caller has to tell "this
+    vault root moved under us, abort the whole call" apart from "this one source
+    could not be rewritten", and matching on a message to do that is how the two
+    get confused later.
+    """
+
+
 class MutableTarget:
     """A validated mutation target, **anchored to an open parent descriptor**.
 
@@ -378,6 +390,7 @@ class MutableTarget:
         "created",
         "_dir_fd",
         "_root_fd",
+        "_root_owned",
     )
 
     def __init__(
@@ -402,6 +415,10 @@ class MutableTarget:
         self.created: list[str] = []
         self._dir_fd = dir_fd
         self._root_fd: int | None = root_fd
+        # Whether closing this target closes the root descriptor. False once
+        # `share_root` has swapped in a descriptor somebody else's lifetime
+        # governs — see there.
+        self._root_owned = True
 
     # ── descriptors ─────────────────────────────────────────────────────────
 
@@ -418,12 +435,14 @@ class MutableTarget:
     def release_root(self) -> None:
         """Drop the root descriptor, keeping the parent one.
 
-        Only two things need the root after validation: creating a missing
-        parent, and resolving `.trash` for the soft delete. A caller that holds
-        *many* targets at once — `move_note` pins one per link-rewrite source
-        from the preflight read until the post-move write — halves the
-        descriptors it ties up by releasing the roots it will not use. Refuses
-        when the parent is not open yet, which would leave the target unusable.
+        Refuses when the parent is not open yet, which would leave the target
+        unusable.
+
+        **A target with no root cannot flush its ancestor chain**, and since the
+        chain rule (#97) every successful publication owes that chain. So this
+        is now only for a target that will not publish. A caller that holds many
+        targets *and* publishes through them wants `share_root` instead: one
+        descriptor for all of them, rather than none.
         """
         if self._dir_fd is None:
             raise RuntimeError(
@@ -431,8 +450,60 @@ class MutableTarget:
                 "is not open, so the target would become unusable"
             )
         if self._root_fd is not None:
-            vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
+            if self._root_owned:
+                vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
             self._root_fd = None
+
+    def share_root(self, root_fd: int) -> None:
+        """Swap this target's own root descriptor for a shared, borrowed one.
+
+        The descriptor stays usable — `ensure_parent` and the post-publication
+        ancestor flush both still work — but this target no longer owns it and
+        `close()` will not close it. The caller's lifetime governs it.
+
+        **Why this exists.** `move_note(rewrite_links=True)` pins one target per
+        backlink source from its preflight read until its post-move write, and
+        the number of sources is unbounded, so holding two descriptors each
+        (parent + root) would halve how large a move the process can afford.
+        Releasing the root instead was the previous answer and it is wrong now:
+        a target with no root cannot look its ancestors up, so its publication
+        flushed only the leaf's parent and silently skipped the chain the rule
+        promises. Every rewrite target resolves the *same* vault root, so one
+        borrowed descriptor serves all of them — one fd for the whole phase
+        rather than one per source.
+
+        **The identity check is what makes the sharing sound**, and it is why
+        this must be called *instead of* `release_root` rather than after it: a
+        target whose root has already been dropped cannot prove which root it
+        was validated against, and adopting one on faith would anchor its
+        ancestor lookups — and any directory creation — to a root the kernel
+        never proved this target's parent lies beneath. A mismatch means the
+        vault root pathname was repointed mid-call, which is precisely the
+        substitution surface #59 exists for, so it raises rather than guessing.
+        """
+        if self._dir_fd is None:
+            raise RuntimeError(
+                f"Cannot share a root with {self.rel}: its parent directory is "
+                "not open, so the target would become unusable"
+            )
+        if self._root_fd is None:
+            raise RuntimeError(
+                f"Cannot share a root with {self.rel}: its own root descriptor "
+                "is already gone, so there is nothing to verify the shared one "
+                "against"
+            )
+        mine = os.fstat(self._root_fd)
+        theirs = os.fstat(root_fd)
+        if (mine.st_dev, mine.st_ino) != (theirs.st_dev, theirs.st_ino):
+            raise VaultRootMismatch(
+                f"the vault root was repointed while this call was running, so "
+                f"{self.rel} was validated against a different root than the "
+                "one the call is now anchored to."
+            )
+        if self._root_owned:
+            vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
+        self._root_fd = root_fd
+        self._root_owned = False
 
     @property
     def dir_fd(self) -> int:
@@ -487,7 +558,11 @@ class MutableTarget:
             vault_fs.close_quietly(self._dir_fd, f"parent directory for {self.rel}")
             self._dir_fd = None
         if self._root_fd is not None:
-            vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
+            # A borrowed root belongs to whoever lent it (`share_root`); closing
+            # it here would pull it out from under every other target sharing
+            # it, and from under the caller's own cleanup.
+            if self._root_owned:
+                vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
             self._root_fd = None
 
     def __enter__(self) -> "MutableTarget":

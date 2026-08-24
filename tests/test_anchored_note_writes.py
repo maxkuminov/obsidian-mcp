@@ -544,7 +544,10 @@ async def test_a_move_releases_sources_that_need_no_rewrite(vault, monkeypatch):
     assert _open_fds() == before
     # Bounded by the notes actually being rewritten, not by the 125 sources
     # considered. The slack covers the two move endpoints and their roots.
-    assert peak[0] - before <= len(linking) + 6, peak[0] - before
+    # One per *planned* rewrite (5), never one per source (125), plus the two
+    # move endpoints and the phase's single shared root.
+    assert peak[0] - before <= len(linking) + 7, peak[0] - before
+    assert peak[0] - before < len(inert), "a descriptor was pinned per source"
 
 
 async def test_a_move_aborts_when_the_plan_exceeds_the_descriptor_budget(
@@ -595,7 +598,16 @@ def test_the_descriptor_budget_tracks_the_process_limit(monkeypatch):
     monkeypatch.setattr(
         config.resource, "getrlimit", lambda _: (1024, 1024)
     )
-    assert config.max_move_rewrite_sources() == 1024 - config.MOVE_REWRITE_FD_RESERVE
+    # The reserve, plus the one vault-root descriptor the rewrite phase shares
+    # across every planned rewrite. Charged in the budget rather than absorbed
+    # into the reserve, so the arithmetic stays visible.
+    assert config.max_move_rewrite_sources() == (
+        1024 - config.MOVE_REWRITE_FD_RESERVE - config.MOVE_REWRITE_SHARED_ROOT_FDS
+    )
+    assert config.MOVE_REWRITE_SHARED_ROOT_FDS == 1, (
+        "one shared root for the phase, not one per rewrite — a per-target root "
+        "would halve this cap to hold N duplicates of one directory"
+    )
 
     # A limit so small the reserve swallows it refuses outright. There is no
     # floor: a floor would guarantee the exhaustion the cap exists to prevent
@@ -641,8 +653,11 @@ async def test_a_move_with_many_rewrite_sources_does_not_leak(vault, monkeypatch
     assert "Moved" in result, result
     assert "rewrote 20 link(s)" in result, result
     assert _open_fds() == before
-    # One per planned rewrite, not two (`release_root`), plus the endpoints.
-    assert peak[0] - before <= len(sources) + 6, peak[0] - before
+    # One per planned rewrite, not two — each borrows the phase's single shared
+    # root (`share_root`) instead of keeping its own — plus the endpoints and
+    # that one shared descriptor.
+    assert peak[0] - before <= len(sources) + 7, peak[0] - before
+    assert peak[0] - before < 2 * len(sources), "two descriptors per source"
 
 
 class _Row:

@@ -1153,3 +1153,176 @@ def test_a_soft_delete_flushes_a_trash_an_earlier_attempt_left_behind(
     assert "." in seen, (
         f"the entry naming a .trash an earlier attempt created was skipped: {seen}"
     )
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2.10 — a backlink rewrite is a publication, so it owes the same chain
+#
+# `move_note(rewrite_links=True)` pins one target per backlink source from the
+# preflight read until the post-move write, and the number of sources is
+# unbounded — so each source used to hand back its root descriptor to hold one
+# fd instead of two. But a target with no root cannot look its ancestors up:
+# `_flush_target_dirs` caught the missing-root `RuntimeError`, logged it, and
+# returned having flushed only the leaf's parent. Every backlink rewrite was
+# therefore exempt from the chain rule the rest of the write path follows.
+#
+# The fix keeps the descriptor budget: one *shared* root for the whole rewrite
+# phase, borrowed by every planned rewrite after an inode-identity check, so
+# the cost is one descriptor rather than one per source.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _backlink_session(monkeypatch, rows, backlinks) -> None:
+    """`async_session` stand-in: the vault index, then the backlink sources."""
+
+    class FakeSession:
+        calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def execute(self, statement):
+            FakeSession.calls += 1
+            payload = rows if FakeSession.calls == 1 else backlinks
+
+            class Result:
+                def all(self_inner):
+                    return payload if FakeSession.calls <= 2 else []
+
+            return Result()
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(tools, "async_session", FakeSession)
+
+
+class _MoveRow:
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+async def test_a_backlink_rewrite_flushes_its_whole_ancestor_chain(
+    note_vault, monkeypatch
+):
+    """The reviewer's input, asserted where it failed.
+
+    `Refs/New/source.md` links to `old.md`. An external writer — Obsidian, a
+    sync client — can have created `Refs/New` and flushed the file and `New`
+    while leaving the entry naming `Refs` volatile. Moving `old.md` rewrites
+    that backlink and reports success; if the rewrite flushes only `Refs/New`,
+    a power loss can take `New/source.md` with it.
+    """
+    (note_vault / "old.md").write_text("body\n", encoding="utf-8")
+    (note_vault / "Refs" / "New").mkdir(parents=True)
+    (note_vault / "Refs" / "New" / "source.md").write_text(
+        "See [[old]]\n", encoding="utf-8"
+    )
+
+    _backlink_session(
+        monkeypatch,
+        [
+            _MoveRow(file_path="old.md", id=1),
+            _MoveRow(file_path="Refs/New/source.md", id=2),
+        ],
+        [_MoveRow(file_path="Refs/New/source.md")],
+    )
+    seen = _dir_flush_recorder(monkeypatch, note_vault)
+
+    result = await tools.move_note_impl("old.md", "new.md", rewrite_links=True)
+
+    assert "Moved" in result, result
+    assert "rewrote 1 link(s)" in result, result
+    assert (note_vault / "Refs" / "New" / "source.md").read_text(
+        encoding="utf-8"
+    ) == "See [[new]]\n"
+
+    # The rewrite publishes last, so its chain is the tail: innermost first,
+    # ending at the vault root. (The leading entries are the move's own — both
+    # of its parents are the root here, plus the root's chain, which is empty.)
+    assert seen[-3:] == ["Refs/New", "Refs", "."], seen
+    assert "Refs" in seen, (
+        "the entry naming Refs was never flushed, so a crash can lose "
+        "New/source.md after the tool reported success"
+    )
+
+
+async def test_a_backlink_rewrite_holds_one_shared_root_not_one_each(
+    note_vault, monkeypatch
+):
+    """The budget the fix has to respect: one descriptor for the phase.
+
+    Giving every planned rewrite its own root is the other way to make the
+    chain flush work, and it pins two descriptors per source — halving how
+    large a move the process can afford, to hold N duplicate descriptors of one
+    directory.
+    """
+    (note_vault / "old.md").write_text("body\n", encoding="utf-8")
+    sources = [f"Refs/src{i}.md" for i in range(8)]
+    (note_vault / "Refs").mkdir()
+    for name in sources:
+        (note_vault / name).write_text("See [[old]]\n", encoding="utf-8")
+
+    _backlink_session(
+        monkeypatch,
+        [
+            _MoveRow(file_path="old.md", id=1),
+            *[_MoveRow(file_path=n, id=i + 2) for i, n in enumerate(sources)],
+        ],
+        [_MoveRow(file_path=n) for n in sources],
+    )
+
+    roots: list[int] = []
+    real_share = vault_service.MutableTarget.share_root
+
+    def recording_share(self, root_fd):
+        roots.append(root_fd)
+        return real_share(self, root_fd)
+
+    monkeypatch.setattr(vault_service.MutableTarget, "share_root", recording_share)
+
+    result = await tools.move_note_impl("old.md", "new.md", rewrite_links=True)
+
+    assert "rewrote 8 link(s)" in result, result
+    assert len(roots) == len(sources), roots
+    assert len(set(roots)) == 1, (
+        f"each rewrite got its own root descriptor ({len(set(roots))} distinct), "
+        "which doubles the per-source descriptor cost"
+    )
+
+
+async def test_a_repointed_vault_root_aborts_the_move_before_any_mutation(
+    note_vault, monkeypatch
+):
+    """The identity check is what makes sharing sound, so its failure must not
+    be a per-source warning: the root itself moved, and phase 2 has not run."""
+    (note_vault / "old.md").write_text("body\n", encoding="utf-8")
+    (note_vault / "src.md").write_text("See [[old]]\n", encoding="utf-8")
+
+    _backlink_session(
+        monkeypatch,
+        [
+            _MoveRow(file_path="old.md", id=1),
+            _MoveRow(file_path="src.md", id=2),
+        ],
+        [_MoveRow(file_path="src.md")],
+    )
+
+    def mismatching(self, root_fd):
+        raise vault_service.VaultRootMismatch(
+            "the vault root was repointed while this call was running."
+        )
+
+    monkeypatch.setattr(vault_service.MutableTarget, "share_root", mismatching)
+
+    result = await tools.move_note_impl("old.md", "new.md", rewrite_links=True)
+
+    assert "aborted" in result.lower(), result
+    assert "repointed" in result, result
+    # Nothing was mutated: the abort happens in the preflight.
+    assert (note_vault / "old.md").exists(), "the move committed anyway"
+    assert not (note_vault / "new.md").exists()
+    assert (note_vault / "src.md").read_text(encoding="utf-8") == "See [[old]]\n"

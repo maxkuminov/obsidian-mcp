@@ -45,9 +45,24 @@ MAX_MOVE_REWRITE_BYTES = 256 * 1024 * 1024  # 256 MiB
 # raise `RLIMIT_NOFILE`.
 MOVE_REWRITE_FD_RESERVE = 256  # descriptors left for the rest of the process
 
+# The rewrite phase also holds **one** vault-root descriptor for the whole
+# phase, shared by every planned rewrite (`MutableTarget.share_root`). Charged
+# here so the arithmetic is visible rather than absorbed into the reserve.
+#
+# It is one and not one-per-rewrite deliberately. Every rewrite target resolves
+# the same vault root, so the alternative — giving each target its own root, the
+# other way to make the post-publication ancestor flush work — would pin two
+# descriptors per source and **halve** this cap, to hold N duplicate descriptors
+# of one directory. At a 1024 soft limit that is 384 planned rewrites instead of
+# 767. One shared descriptor costs exactly one.
+MOVE_REWRITE_SHARED_ROOT_FDS = 1
+
 
 def max_move_rewrite_sources() -> int:
     """How many planned link rewrites one `move_note` may hold open at once.
+
+    Each planned rewrite pins one parent descriptor from its preflight read
+    until its post-move write; the phase pins one shared root on top of that.
 
     Read at call time, not import time: the limit is a property of the running
     process, and a test (or an operator) may raise it.
@@ -55,7 +70,7 @@ def max_move_rewrite_sources() -> int:
     soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft in (resource.RLIM_INFINITY, -1):
         return sys.maxsize
-    return max(0, soft - MOVE_REWRITE_FD_RESERVE)
+    return max(0, soft - MOVE_REWRITE_FD_RESERVE - MOVE_REWRITE_SHARED_ROOT_FDS)
 
 
 # Headroom for the JSON-RPC envelope around a tool call's content argument:
