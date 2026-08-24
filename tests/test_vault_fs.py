@@ -731,7 +731,11 @@ def test_a_failing_close_does_not_undo_a_completed_soft_delete(
 
     assert (vault / dest).read_bytes() == b"bytes"
     assert not (vault / "Attachments" / "a.png").exists()
-    assert len(set(attempted)) == 2, "a failing close skipped the other descriptor"
+    # Three, since #97: the source parent, the trash directory, and the
+    # descriptor `flush_created_ancestors` opens on the root to make the entry
+    # naming a freshly created `.trash` durable. Every one of them must be
+    # attempted even though the first close raised.
+    assert len(set(attempted)) == 3, "a failing close skipped another descriptor"
 
 
 def test_rename_noreplace_refuses_an_existing_destination(root_fd, vault):

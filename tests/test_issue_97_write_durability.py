@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import errno
+import logging
 import os
 import stat
 import threading
@@ -66,6 +67,19 @@ def deadline_in(seconds: float) -> float:
 
 def temps_under(directory: Path) -> list[str]:
     return [str(p.relative_to(directory)) for p in directory.rglob(".tmp-*")]
+
+
+def prime_publication_probe(directory: Path) -> None:
+    """Run and cache the publication probe before a recorder is installed.
+
+    In production the probe has always run by the time a body is streamed — the
+    mint tools and the upload route all call it before a token is handed out,
+    and since #92 item 1 it is also what decides the root's staging mode. These
+    tests call `stream_to_vault` directly with a `FakeRow`, so without this the
+    probe's own `fsync`s and `link` would land in the recording and the
+    assertion would be about the probe rather than about the upload.
+    """
+    vault_fs.check_publication_support(directory)
 
 
 @pytest.fixture
@@ -283,6 +297,7 @@ async def test_a_failing_payload_flush_publishes_nothing_and_is_pre_publication(
 async def test_the_destination_directory_is_flushed_after_publication(
     vault, monkeypatch
 ):
+    prime_publication_probe(vault)
     order: list[str] = []
     real_fsync = os.fsync
     real_link = os.link
@@ -303,7 +318,11 @@ async def test_the_destination_directory_is_flushed_after_publication(
         row, chunks_of(b"payload"), max_bytes=100, deadline=deadline_in(30)
     )
 
-    assert order == ["payload-flush", "publish", "dir-flush"], order
+    # Two directory flushes after the publish: the destination parent, then the
+    # chain above it up to the root. The *ordering* is what this test is for —
+    # every directory flush follows the publish and the payload's precedes it.
+    assert order[:2] == ["payload-flush", "publish"], order
+    assert set(order[2:]) == {"dir-flush"} and len(order) > 2, order
 
 
 async def test_a_failing_directory_flush_is_a_post_publication_failure(
@@ -315,6 +334,7 @@ async def test_a_failing_directory_flush_is_a_post_publication_failure(
     pre-publication" to the upload route, which answers by releasing the claim —
     handing back a replayable token over a path that already holds the file.
     """
+    prime_publication_probe(vault)
     _fail_dir_fsync(monkeypatch)
     row = FakeRow(str(vault), "Attachments/a.bin")
 
@@ -339,6 +359,7 @@ async def test_directories_the_upload_created_are_flushed_outward(vault, monkeyp
     A crash then loses the whole new folder, and with it a file `check_upload`
     has already reported `completed`.
     """
+    prime_publication_probe(vault)
     seen = _dir_flush_recorder(monkeypatch, vault)
     row = FakeRow(str(vault), "New/Folder/a.bin")
 
@@ -350,10 +371,18 @@ async def test_directories_the_upload_created_are_flushed_outward(vault, monkeyp
     assert (vault / "New" / "Folder" / "a.bin").read_bytes() == b"payload"
 
 
-async def test_a_directory_that_was_already_there_is_not_re_flushed(vault, monkeypatch):
-    """Only the destination — the entry naming `Attachments` is not this call's
-    to make durable, and flushing outward to the root regardless would be a
-    walk with no upper bound in a deep vault."""
+async def test_the_whole_chain_above_the_destination_is_flushed(vault, monkeypatch):
+    """Not only the directories this call created — the chain to the root.
+
+    The earlier rule flushed the destination parent plus whatever *this call*
+    made, which looks precise and is not durable across an abort: an upload that
+    creates a folder and then dies before publication flushes nothing (rightly,
+    it published nothing), and the retry finds the folder there, records no
+    creation, and would leave the entry naming it durable nowhere. The walk is
+    bounded by path depth, not by vault size, and a directory `fsync` is
+    metadata-only. See `vault_fs.publication_flush_dirs`.
+    """
+    prime_publication_probe(vault)
     seen = _dir_flush_recorder(monkeypatch, vault)
     row = FakeRow(str(vault), "Attachments/a.bin")
 
@@ -361,7 +390,7 @@ async def test_a_directory_that_was_already_there_is_not_re_flushed(vault, monke
         row, chunks_of(b"payload"), max_bytes=100, deadline=deadline_in(30)
     )
 
-    assert seen == ["Attachments"], seen
+    assert seen == ["Attachments", "."], seen
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -571,32 +600,37 @@ async def test_a_failed_ancestor_flush_is_logged_and_not_reported(
     assert any("could not flush" in r.getMessage() for r in caplog.records)
 
 
-async def test_a_note_write_into_an_existing_folder_flushes_only_that_folder(
+async def test_a_note_write_into_an_existing_folder_flushes_the_chain(
     note_vault, monkeypatch
 ):
+    """`ensure_parent` has the same abort shape as an upload — a write that
+    creates a folder and then fails leaves it behind unflushed, and the retry
+    records no creations — so the note path takes the same chain rule."""
     (note_vault / "Folder").mkdir()
     seen = _dir_flush_recorder(monkeypatch, note_vault)
 
     await tools.create_note_impl("Folder/x.md", "body\n")
 
-    assert seen == ["Folder"], seen
+    assert seen == ["Folder", "."], seen
 
 
-async def test_a_folder_another_writer_created_is_not_claimed_by_this_call(
+async def test_a_folder_another_writer_created_is_flushed_anyway(
     note_vault, monkeypatch
 ):
-    """`ensure_parent` records what it made, not what it found.
+    """Provenance is still recorded, and it is **no longer** what decides.
 
-    A component another creator won the race to is not this call's entry to make
-    durable, and treating `EEXIST` as "created" would have every write flush a
-    chain it had nothing to do with.
+    `ensure_parent` lists only what it made — a component another creator won
+    the race to is not listed. But the flush no longer follows that list: an
+    entry somebody else created and never flushed is exactly the case the chain
+    rule exists for, and from here it is indistinguishable from the abort-retry
+    shape. So `New` is flushed even though this call did not make it.
     """
     (note_vault / "New").mkdir()
     seen = _dir_flush_recorder(monkeypatch, note_vault)
 
     await tools.create_note_impl("New/Folder/x.md", "body\n")
 
-    assert set(seen) == {"New/Folder", "New"}, seen
+    assert seen == ["New/Folder", "New", "."], seen
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -680,7 +714,10 @@ async def test_a_move_flushes_both_parent_directories(note_vault, monkeypatch):
 
     assert "Moved" in result or "moved" in result, result
     assert order[0] == "rename", order
-    assert set(order[1:]) == {"To", "From"}, order
+    # Both ends, plus the root above each of them (deduplicated per end by the
+    # helper, not across the two calls).
+    assert set(order[1:]) == {"To", "From", "."}, order
+    assert "To" in order[1:] and "From" in order[1:], order
     assert (note_vault / "To" / "note.md").read_text() == "body\n"
 
 
@@ -738,7 +775,7 @@ def test_a_rollback_rename_is_flushed_by_the_same_helper(note_vault, monkeypatch
     ) as back:
         vault_service.move_file_no_clobber(landed, back)
 
-    assert set(seen) == {"From", "To"}, seen
+    assert set(seen) == {"From", "To", "."}, seen
     assert (note_vault / "From" / "note.md").read_text() == "body\n"
 
 
@@ -771,7 +808,7 @@ async def test_a_soft_delete_flushes_the_source_parent_and_the_trash(
     # The probe runs first and renames its own temp file; the flushes under
     # test are the ones after the *delete's* rename, which is the last one.
     tail = order[len(order) - order[::-1].index("rename") :]
-    assert set(tail) == {"Folder", ".trash"}, order
+    assert set(tail) == {"Folder", ".trash", "."}, order
     assert not (note_vault / "Folder" / "note.md").exists()
 
 
@@ -888,3 +925,231 @@ def test_the_raw_file_permanent_delete_flushes_too(note_vault, monkeypatch):
         assert not (note_vault / "Attachments" / "a.bin").exists()
     finally:
         os.close(root_fd)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2.8 — the entry that names a freshly created `.trash`
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Flushing `.trash` persists its *contents*. The entry in the vault root that
+# names `.trash` is a separate write, and on the first soft delete of a vault
+# that entry is brand new. A crash can therefore durably remove
+# `Folder/note.md` and lose the whole `.trash` directory with the only copy of
+# the note inside it — the same created-ancestor class the note and transfer
+# publishes already flush, on the one path that had been missed.
+
+
+def test_a_soft_delete_that_creates_trash_flushes_the_root_that_names_it(
+    vault, monkeypatch
+):
+    (vault / "Attachments" / "a.png").write_bytes(b"bytes")
+    assert not (vault / ".trash").exists()
+    seen = _dir_flush_recorder(monkeypatch, vault)
+
+    root_fd = vault_fs.open_root(vault)
+    try:
+        vault_fs.soft_delete(root_fd, "Attachments/a.png")
+    finally:
+        os.close(root_fd)
+
+    assert "." in seen, (
+        f"the root entry naming the new .trash was never flushed: {seen}"
+    )
+    assert "Attachments" in seen
+    assert ".trash" in seen
+
+
+def test_a_soft_delete_into_an_existing_trash_flushes_the_root_anyway(
+    vault, monkeypatch
+):
+    """The chain rule reaches `.trash` too, with its own version of the abort
+    shape: a probe or a delete that created `.trash` and then failed leaves it
+    there unflushed, and the next delete finds it existing. Nobody can tell the
+    two apart afterwards. `.trash` is a direct child of the root, so this is one
+    extra metadata `fsync`."""
+    (vault / ".trash").mkdir()
+    (vault / "Attachments" / "a.png").write_bytes(b"bytes")
+    seen = _dir_flush_recorder(monkeypatch, vault)
+
+    root_fd = vault_fs.open_root(vault)
+    try:
+        vault_fs.soft_delete(root_fd, "Attachments/a.png")
+    finally:
+        os.close(root_fd)
+
+    assert sorted(seen) == [".", ".trash", "Attachments"], seen
+
+
+def test_a_failing_flush_of_the_new_trash_entry_does_not_fail_the_delete(
+    vault, monkeypatch, caplog
+):
+    """D18's note-path direction. The delete has already happened; reporting a
+    failure invites a retry, and a retried delete finds the source gone and
+    either contradicts the vault or acts on whatever has taken the name."""
+    (vault / "Attachments" / "a.png").write_bytes(b"bytes")
+    real = os.fsync
+
+    def refuse_root(fd):
+        where = os.readlink(f"/proc/self/fd/{fd}")
+        if _is_dir_fd(fd) and Path(where) == vault.resolve():
+            raise OSError(errno.EIO, "input/output error")
+        return real(fd)
+
+    monkeypatch.setattr(os, "fsync", refuse_root)
+
+    root_fd = vault_fs.open_root(vault)
+    try:
+        with caplog.at_level(logging.WARNING, logger="src.services.vault_fs"):
+            dest = vault_fs.soft_delete(root_fd, "Attachments/a.png")
+    finally:
+        os.close(root_fd)
+
+    assert dest.startswith(".trash/")
+    assert not (vault / "Attachments" / "a.png").exists()
+    assert (vault / dest).read_bytes() == b"bytes"
+    assert [r for r in caplog.records if "could not flush" in r.getMessage()], (
+        "the failure was swallowed without a word"
+    )
+
+
+def test_the_trash_probe_flushes_the_root_when_it_creates_trash(vault, monkeypatch):
+    """The probe leaves `.trash` behind — a soft delete is about to need it — so
+    the probe is what owes the root's entry for it a flush."""
+    assert not (vault / ".trash").exists()
+    seen = _dir_flush_recorder(monkeypatch, vault)
+
+    vault_fs.check_trash_support(vault)
+
+    assert (vault / ".trash").is_dir()
+    assert "." in seen, seen
+
+
+def test_the_trash_probe_flushes_the_root_even_for_an_existing_trash(
+    vault, monkeypatch
+):
+    """Same rule, same reason: the probe cannot know whether the `.trash` it
+    found was ever made durable by whoever created it."""
+    (vault / ".trash").mkdir()
+    seen = _dir_flush_recorder(monkeypatch, vault)
+
+    vault_fs.check_trash_support(vault)
+
+    assert "." in seen, seen
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 2.9 — the obligation outlives the call that incurred it
+#
+# The whole reason the flush follows the *chain* and not this call's creation
+# list. An attempt that creates a directory and then aborts flushes nothing —
+# correctly, it published nothing — and the retry finds the directory already
+# there and records no creation. Under a provenance rule the entry naming it
+# would be made durable by nobody, and a crash could take a completed upload,
+# a written note or a soft-deleted file with it.
+#
+# Each case runs the abort and the retry against the same vault and asserts on
+# the *retry's* flushes: the ones a provenance rule would have skipped.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+async def test_a_transfer_retry_flushes_dirs_an_aborted_attempt_created(
+    vault, monkeypatch
+):
+    prime_publication_probe(vault)
+
+    # The abort: the body runs past the cap once the directories exist.
+    with pytest.raises(transfer.TooLarge):
+        await stream_to_vault(
+            FakeRow(str(vault), "New/Folder/a.bin"),
+            chunks_of(b"x" * 200),
+            max_bytes=10,
+            deadline=deadline_in(30),
+        )
+    assert (vault / "New" / "Folder").is_dir(), "the abort did not create them"
+    assert not (vault / "New" / "Folder" / "a.bin").exists()
+
+    # The retry: same path, directories already there, nothing recorded created.
+    created_by_the_retry: list[str] = []
+    real_open_parent = vault_fs.open_parent
+
+    def watching_open_parent(root_fd, rel, *, create=False, created=None):
+        result = real_open_parent(root_fd, rel, create=create, created=created)
+        if created is not None:
+            created_by_the_retry.extend(created)
+        return result
+
+    monkeypatch.setattr(vault_fs, "open_parent", watching_open_parent)
+    seen = _dir_flush_recorder(monkeypatch, vault)
+
+    await stream_to_vault(
+        FakeRow(str(vault), "New/Folder/a.bin"),
+        chunks_of(b"payload"),
+        max_bytes=100,
+        deadline=deadline_in(30),
+    )
+
+    assert created_by_the_retry == [], (
+        "the retry recorded a creation, so this is not the case under test"
+    )
+    assert seen == ["New/Folder", "New", "."], (
+        f"the retry skipped entries only the aborted attempt created: {seen}"
+    )
+    assert (vault / "New" / "Folder" / "a.bin").read_bytes() == b"payload"
+
+
+async def test_a_note_retry_flushes_dirs_an_aborted_write_created(
+    note_vault, monkeypatch
+):
+    """`edit_note(expected=…)` losing its race is the note path's abort: the
+    parent chain is created by `ensure_parent`, then the write refuses."""
+    (note_vault / "New").mkdir()
+
+    with pytest.raises(RuntimeError):
+        vault_service.write_file(
+            "New/Folder/note.md", "body\n", overwrite=True, expected=b"not there"
+        )
+    assert (note_vault / "New" / "Folder").is_dir(), "the abort did not create it"
+    assert not (note_vault / "New" / "Folder" / "note.md").exists()
+
+    seen = _dir_flush_recorder(monkeypatch, note_vault)
+    await tools.create_note_impl("New/Folder/note.md", "body\n")
+
+    assert seen == ["New/Folder", "New", "."], (
+        f"the retry skipped entries only the aborted write created: {seen}"
+    )
+    assert (note_vault / "New" / "Folder" / "note.md").read_text() == "body\n"
+
+
+def test_a_soft_delete_flushes_a_trash_an_earlier_attempt_left_behind(
+    vault, monkeypatch
+):
+    """`.trash`'s version of the same shape: a delete that created the directory
+    and then refused leaves it there unflushed, and the next delete finds it."""
+    (vault / "Attachments" / "a.png").write_bytes(b"bytes")
+    (vault / "Attachments" / "b.png").write_bytes(b"bytes")
+
+    real_rename = vault_fs.rename_noreplace
+
+    def failing_rename(*args, **kwargs):
+        raise OSError(errno.EIO, "input/output error")
+
+    root_fd = vault_fs.open_root(vault)
+    try:
+        # `.trash` is opened (and created) before the rename, so a rename that
+        # fails leaves the directory behind with nothing having flushed the
+        # entry that names it — and nothing published, so nothing should have.
+        monkeypatch.setattr(vault_fs, "rename_noreplace", failing_rename)
+        with pytest.raises(OSError):
+            vault_fs.soft_delete(root_fd, "Attachments/b.png")
+        monkeypatch.setattr(vault_fs, "rename_noreplace", real_rename)
+        assert (vault / ".trash").is_dir(), "the abort did not create it"
+        assert (vault / "Attachments" / "b.png").exists(), "it published something"
+
+        seen = _dir_flush_recorder(monkeypatch, vault)
+        vault_fs.soft_delete(root_fd, "Attachments/a.png")
+    finally:
+        os.close(root_fd)
+
+    assert "." in seen, (
+        f"the entry naming a .trash an earlier attempt created was skipped: {seen}"
+    )

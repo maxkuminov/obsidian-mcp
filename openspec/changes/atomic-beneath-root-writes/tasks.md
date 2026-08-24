@@ -225,7 +225,7 @@ through whatever 3.0 established — no task here depends on the contributor PR
 having landed, and none of them introduces a second knob. Coordinate on #103,
 not in a merge.
 
-- [ ] 3.0 Settle the fallback flag before anything reads it. If the
+- [x] 3.0 Settle the fallback flag before anything reads it. If the
   contributor PR (#103) has landed, consume the existing
   `Settings.vault_allow_named_staging_fallback` and add **nothing** to
   `src/config.py`. If it has not, introduce that field here under exactly that
@@ -234,19 +234,19 @@ not in a merge.
   it. Either way there is one setting and one knob for both write paths — no
   `TRANSFER_*` variant, no per-path override, no "transfers only" escape
   (D27). Nothing else in this group defines or renames it
-- [ ] 3.1 Move `_link_staged_inode` and `_proc_fd_available` from `vault.py`
+- [x] 3.1 Move `_link_staged_inode` and `_proc_fd_available` from `vault.py`
   into `vault_fs.py` and have `vault.py` call them, so the two publish paths
   share one implementation. Keep every kernel note in the docstring:
   `AT_EMPTY_PATH` needs `CAP_DAC_READ_SEARCH` and the `/proc` magic link does
   not; the zero-link-inode rule is about *deleted* inodes; **`O_EXCL` must not
   be set** with `O_TMPFILE` — it forbids linking and makes the publish `ENOENT`
-- [ ] 3.2 Add unnamed staging to `vault_fs` (`O_TMPFILE|O_RDWR` relative to the
+- [x] 3.2 Add unnamed staging to `vault_fs` (`O_TMPFILE|O_RDWR` relative to the
   staging descriptor) and use it from `_stream_locked` in place of
   `create_temp` on every root whose probe selected the unnamed mode.
   `UnsupportedFilesystem` when the filesystem refuses it **and the flag from
   3.0 is off**, with the error naming that flag the way the note path's
   refusal does — never an unflagged fallback to a named staging file
-- [ ] 3.2a The fallback branch (D27): where the probe selected named staging,
+- [x] 3.2a The fallback branch (D27): where the probe selected named staging,
   `_stream_locked` keeps the **pre-change** `create_temp` path in
   `.transfer-tmp` exactly as it is — exclusive, `O_NOFOLLOW`, through the
   staging descriptor the beneath-root lookup returned. Nothing outside the
@@ -254,14 +254,14 @@ not in a merge.
   gate and its lock order, the size caps and the token state machine are the
   same code on both branches. Do not grow a second streaming path; branch at
   staging and at publication only
-- [ ] 3.3 `publish` takes the staged descriptor rather than a staging name in
+- [x] 3.3 `publish` takes the staged descriptor rather than a staging name in
   the unnamed mode. No-clobber → `linkat` through `/proc/self/fd/<fd>` into
   the destination descriptor. Overwrite → materialise a transient name **in
   the staging directory** from that same descriptor, no-clobber with a bounded
   `EEXIST` retry, immediately before the fingerprint check and the `renameat`;
   verify the name still refers to the staged inode before the rename; on
   cleanup unlink it only while it still does, otherwise leave it and log
-- [ ] 3.3a In the fallback mode `publish` keeps the pre-change by-name form —
+- [x] 3.3a In the fallback mode `publish` keeps the pre-change by-name form —
   `create_temp`'s `.tmp-*` in `.transfer-tmp`, `_link_no_clobber` for
   no-clobber (still `EEXIST` on an existing destination, **never** degraded to
   a replacing rename) and `os.replace` for overwrite — but with two guards the
@@ -274,14 +274,14 @@ not in a merge.
   the fallback. The staged name then exists for the whole streaming window
   rather than two syscalls — that is the declared residual (D27), not a bug to
   patch here
-- [ ] 3.4 Rework `Published.temp_removed`, `discard_temp` and
+- [x] 3.4 Rework `Published.temp_removed`, `discard_temp` and
   `_stream_locked`'s `except` branch for a staging file that usually has no
   name: in the unnamed mode closing the descriptor is the discard, and the
   only unlink left is the overwrite path's transient name. In the fallback
   mode the pre-change discard rules apply unchanged — unlink the staged name
   only while it still refers to the inode this call staged, otherwise leave it
   in place and log
-- [ ] 3.5 `probe_publication` additionally exercises unnamed staging and the
+- [x] 3.5 `probe_publication` additionally exercises unnamed staging and the
   by-descriptor publication, **records which staging mode the root will use**
   in its cached per-root result — unnamed, or the fallback where unnamed is
   unavailable and 3.0's flag is on — so the mode is decided once and never per
@@ -293,14 +293,14 @@ not in a merge.
   Also state in the docstring what the probe *cannot* answer for: it links
   root→root and is cached per root, so it cannot see a destination on a
   different filesystem or mount (D23)
-- [ ] 3.5a The probe's two unnamed-staging outcomes. Flag off → raise
+- [x] 3.5a The probe's two unnamed-staging outcomes. Flag off → raise
   `UnsupportedFilesystem` naming the missing capability **and** the flag, so
   no token is minted and no body is streamed. Flag on → select the fallback
   mode after establishing the primitives *it* needs (exclusive
   non-symlink-following creation in `.transfer-tmp`, the hard link within the
   root, the staged-file flush, the directory flush); a root that fails any of
   those is still refused rather than accepting a body it cannot publish
-- [ ] 3.5b Make the fallback observable the way the note path's is: one
+- [x] 3.5b Make the fallback observable the way the note path's is: one
   `WARNING` per process, logged the first time a call **actually stages under
   a name** — not when the flag is set, not when the probe selects the mode —
   and the same `/health` field the note path's fallback exposes, under the
@@ -309,14 +309,14 @@ not in a merge.
   (a probe writes). If 3.0 found the contributor PR already landed, wire the
   transfer path into its existing warning-once helper and its existing field
   rather than adding a parallel pair
-- [ ] 3.6 Leave `prune_stale_staging` in place and update its docstring: it
+- [x] 3.6 Leave `prune_stale_staging` in place and update its docstring: it
   has pre-change litter to collect and a rolling deploy to survive, it no
   longer has anything new to collect **in the unnamed mode** (D19), and in the
   fallback mode an abandoned or killed upload leaves a staged file exactly as
   the pre-change path did, so the sweep keeps a live purpose there (D27). Leave `open_staging_dir`'s `0700`
   and owner check in place and record that they are now defence in depth plus
   the guard on the transient overwrite name
-- [ ] 3.7 Tests, unnamed mode: `.transfer-tmp` holds no entry for the staged
+- [x] 3.7 Tests, unnamed mode: `.transfer-tmp` holds no entry for the staged
   bytes at any point while a body streams; a killed upload leaves nothing to
   sweep; the overwrite path's transient name exists only inside the gate and
   only in `.transfer-tmp`; a transient name substituted **before** the
@@ -324,7 +324,7 @@ not in a merge.
   interval after that check is the declared residual — D20 — and is not
   asserted); directory-`fsync` unavailability refuses at the probe with a
   named error and never falls back
-- [ ] 3.7a Tests, mode selection and the fallback (D27), with `O_TMPFILE` and
+- [x] 3.7a Tests, mode selection and the fallback (D27), with `O_TMPFILE` and
   `/proc` unavailability simulated at the probe:
   - the probe drives the mode: a root that supports unnamed staging stages
     without a name, a root that does not (flag on) stages under one, and the
@@ -349,7 +349,7 @@ not in a merge.
     `/health` creates no file in the vault
   - an abandoned fallback upload leaves a `.tmp-*` file that the existing
     24-hour sweep collects
-- [ ] 3.8 CLAUDE.md: extend "The no-clobber publish never exposes a staging
+- [x] 3.8 CLAUDE.md: extend "The no-clobber publish never exposes a staging
   name at all" to cover the transfer path, **scoped to the mode the probe
   selects where `O_TMPFILE` works**, and record the overwrite path's in-gate
   window. Add the fallback beside it (D27): one flag for both write paths,
@@ -367,7 +367,21 @@ not in a merge.
   without a name" scenario still reads as an unconditional refusal — is
   updated to match it before archiving, so promoting these deltas does not
   silently revert the contributor's requirement. Spec-only reconciliation; no
-  code change belongs to this task
+  code change belongs to this task.
+
+  **State as of group 3 landing:** the contributor PR had **not** landed, so
+  3.0 introduced `Settings.vault_allow_named_staging_fallback`
+  (`VAULT_ALLOW_NAMED_STAGING_FALLBACK`, default `false`) here and the PR
+  rebases onto it. The `vault-write` delta's "The filesystem cannot stage
+  without a name" scenario is therefore **still an unconditional refusal**, and
+  that is correct for the note path *today* — nothing in group 3 changed how
+  `vault._atomic_write_at` stages. It stops being correct the moment #103's
+  note-path fallback lands. Nothing is invented here on the contributor's
+  behalf: the reconciliation is exactly the check this task describes, and it
+  must be done before archiving. The `file-transfer` delta already carries the
+  flag's full requirement, so a reader of the promoted specs would otherwise
+  find one path refusing unconditionally and the other honouring a flag both
+  are meant to share
 
 ## 4. D23 — transfer publication refuses a destination on another mount
 
@@ -380,7 +394,15 @@ published. It is placed last because it is the one item here that is not #87,
 #97 or #92-item-1, and because the descriptors it compares should already be
 the ones group 1 produces.
 
-- [ ] 4.1 Bind `statx(2)` in `vault_fs` through the **glibc wrapper**. Unlike
+**Landed in group 3's commit**, not after it: the adversarial pass called the
+absent preflight a MAJOR against the wave rather than a pending task, and the
+same commit had to carry the `MountBoundary` errno mapping (5.0 item 3) that
+group 3's own `publish` branch introduced the second half of. The ordering the
+group header describes was still honoured — nothing here changed how anything
+is resolved, staged or published, and every group-3 assertion was green before
+these tasks were started.
+
+- [x] 4.1 Bind `statx(2)` in `vault_fs` through the **glibc wrapper**. Unlike
   `openat2` this one exists: checked in the running container, `statx` resolves
   through `ctypes.CDLL(None)` and `openat2` raises `AttributeError`, so D24's
   raw-syscall reasoning does **not** carry over. Expose `mount_id_of(fd)`
@@ -389,24 +411,24 @@ the ones group 1 produces.
   **5.8**, above `openat2`'s 5.6, so this raises the change's kernel floor —
   say so in the docstring and in the `openat2` startup probe's message. Do
   **not** require `STATX_MNT_ID_UNIQUE` (D23)
-- [ ] 4.2 `same_mount(fd_a, fd_b)` reads both ids and compares them **inside
+- [x] 4.2 `same_mount(fd_a, fd_b)` reads both ids and compares them **inside
   the one call**. Never persist an id and compare it against a later reading: a
   mount id can be reused once its mount is gone, and the only thing that makes
   plain `STATX_MNT_ID` sufficient here is that no comparison ever spans time
   (D23)
-- [ ] 4.3 Compare **mount identity, never `st_dev`.** Measured on the
+- [x] 4.3 Compare **mount identity, never `st_dev`.** Measured on the
   deployment kernel: a bind mount of an ext4 directory beneath the vault root
   gives `.transfer-tmp` and the destination the same `st_dev` (66306) and
   different mount ids (653 vs 6036), while `link` and `rename` across it both
   return `EXDEV`. An `st_dev` preflight passes and the publish fails after the
   body has streamed — that was the first draft and review caught it
-- [ ] 4.4 Run the check at mint: in `request_upload` before the row is inserted
+- [x] 4.4 Run the check at mint: in `request_upload` before the row is inserted
   and a URL is handed out, and in `import_from_url` before the fetch begins.
   Where the destination's parent does not exist yet, check the **deepest
   existing ancestor** — a directory created beneath it is created on that
   ancestor's mount. Refuse with an error naming the mount boundary and the
   destination path, never one blaming hard-link support
-- [ ] 4.5 Run it again inside the publish gate, in
+- [x] 4.5 Run it again inside the publish gate, in
   `_publish_into_current_parent` after the authoritative destination lookup and
   **before** `publish`, so a mount established after the mint is refused rather
   than published into. Raising before `publish` is what keeps the refusal
@@ -416,10 +438,10 @@ the ones group 1 produces.
   streamed in full, so this half is pre-*publication*, not pre-*body*. Only
   4.4's check spares the bytes, and only where the boundary already existed at
   mint — do not describe the pair as "refused before any body is streamed"
-- [ ] 4.6 Update the docstring 3.5 added: the destination-mount case the probe
+- [x] 4.6 Update the docstring 3.5 added: the destination-mount case the probe
   cannot see is now covered by this preflight, and what remains uncovered is a
   capability difference between two directories on the *same* mount
-- [ ] 4.7 Tests, in a mount namespace with a same-filesystem bind mount beneath
+- [x] 4.7 Tests, in a mount namespace with a same-filesystem bind mount beneath
   the root: the mint refuses with the named error and inserts no token;
   `import_from_url` refuses before it opens a connection; a mount established
   between mint and redemption is refused in the gate **after the body has been
@@ -428,7 +450,7 @@ the ones group 1 produces.
   `pending`; a vault with no nested mount behaves exactly as before; a `statx`
   stubbed to return no mount-id bit refuses rather than falling back to
   `st_dev` or to the errno
-- [ ] 4.8 CLAUDE.md: record the envelope in the transfer section — publication
+- [x] 4.8 CLAUDE.md: record the envelope in the transfer section — publication
   into a mount beneath the vault root is refused before any body where the
   boundary already exists at mint or fetch start, and pre-publication inside
   the gate (after the body, before the link or rename) where it appears

@@ -324,7 +324,12 @@ def test_the_payload_is_fsynced_before_it_is_published(vault, monkeypatch):
 
     vault_service.write_file("Folder/note.md", "body")
 
-    assert order == ["fsync", "publish", "fsync-dir"]
+    # The payload, then the publish, then one directory flush per level of the
+    # chain above the destination (#97): the parent, then the root. The order is
+    # the assertion — every directory flush follows the publish, the payload's
+    # precedes it.
+    assert order[:2] == ["fsync", "publish"], order
+    assert set(order[2:]) == {"fsync-dir"} and len(order) > 2, order
     # Staged next to the destination, not in `.transfer-tmp` or /tmp — a
     # cross-directory publish could not be an atomic rename.
     assert any(name.startswith(".tmp-") for name in staged[0]), staged[0]
@@ -968,7 +973,9 @@ def test_the_overwrite_cleanup_never_unlinks_a_file_it_did_not_stage(
 def test_publishing_by_descriptor_refuses_without_proc(vault, monkeypatch):
     """No `/proc` means no way to publish an inode — refuse, never fall back to
     publishing whatever a staging *name* points at."""
-    monkeypatch.setattr(vault_service, "_proc_fd_available_cache", False)
+    # The cache lives in `vault_fs` since #92 item 1 — one implementation of
+    # by-descriptor publication for both write paths.
+    monkeypatch.setattr(vault_fs, "_proc_fd_available_cache", False)
 
     with pytest.raises(vault_fs.UnsupportedFilesystem, match="/proc"):
         vault_service.write_bytes("blob.bin", b"ours", overwrite=False)

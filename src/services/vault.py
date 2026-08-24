@@ -78,8 +78,8 @@ what the kernel offers for the last two — not open holes. Every below-root
 directory descriptor a call uses as a pathname anchor comes from a lookup the
 kernel proved beneath the vault root at the moment it resolved, and no
 directory descriptor retained from a creation descent is ever returned to a
-caller or used as a pathname anchor, so no mutation is ever *redirected* into
-a directory that was never beneath the root: the write lands on the path the
+caller or used as a pathname anchor — so no operation is ever redirected into
+a directory that was never beneath the root. The write lands on the path the
 caller named, in the directory that was validated.
 """
 
@@ -566,13 +566,16 @@ def open_mutable(relative_path: str, user_id: int | None = None) -> MutableTarge
       symlinked directories inside the vault (shared attachment folders, a
       common Obsidian setup) keep working while an escaping one is still
       rejected by the containment check;
-    - the resolved parent is then **re-opened by descriptor**, one
-      `O_NOFOLLOW` component at a time from the vault root. `resolve()` output
-      holds no symlinks by construction, so this walk succeeds for exactly the
-      paths the containment check accepted — and refuses if a component became
-      a link in between. That is how the anchored walk stays strict while
-      symlinked ancestors keep working: they are resolved away *before* the
-      walk, never traversed by it;
+    - the resolved parent is then **re-opened by descriptor**, with one
+      `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`
+      from the vault root (#87) rather than one `O_NOFOLLOW` component at a
+      time. `resolve()` output holds no symlinks by construction, so the lookup
+      succeeds for exactly the paths the containment check accepted — and
+      refuses if a component became a link in between. That is how the lookup
+      stays strict while symlinked ancestors keep working: they are resolved
+      away *before* it, never traversed by it. The kernel proves containment
+      for the whole path inside the single call, so no rename *during* the
+      lookup can hand back a descriptor outside the root;
     - the final component is taken **as named** and `lstat`ed through that
       descriptor: if it is a symbolic link — including a dangling one — the
       operation is refused with an error naming the link's canonical
@@ -848,7 +851,11 @@ def _create_nameless_temp(dir_fd: int) -> int:
             raise vault_fs.UnsupportedFilesystem(
                 "The vault filesystem does not support O_TMPFILE, which the "
                 "no-clobber write stages into so that no temporary name is "
-                "ever exposed. Refusing rather than staging under a name."
+                "ever exposed. Refusing rather than staging under a name. "
+                "VAULT_ALLOW_NAMED_STAGING_FALLBACK is the operator switch for "
+                "this; it governs the transfer path today, and the note path's "
+                "half of it is tracked on #103 — until that lands, this write "
+                "refuses whether the flag is set or not."
             ) from exc
         raise
 
@@ -861,21 +868,36 @@ def _flush_target_dirs(target: MutableTarget, what: str) -> None:
     the same thing unconfirmed and both take D18's direction with it.
     """
     vault_fs.flush_dir_quietly(target.dir_fd, f"{what} for {target.rel}")
-    if not target.created:
-        return
+    # Every directory above the destination parent, up to the vault root — not
+    # only the ones this call created. `ensure_parent` has the same abort shape
+    # as an upload: a write that creates `New/Folder` and then fails (an
+    # `expected=` mismatch, an over-cap result) leaves them behind unflushed,
+    # and the retry that succeeds records no creations and would flush only the
+    # leaf's own parent. `RuntimeError` from a released root descriptor is
+    # swallowed with everything else here — see `flush_publication_ancestors_quietly`.
     try:
-        vault_fs.flush_created_ancestors(target.root_fd, target.created)
-    except (OSError, vault_fs.VaultFSError, RuntimeError) as exc:
-        # `RuntimeError` is `release_root` having dropped the root descriptor:
-        # there is then nothing to look the ancestors up from. Same direction —
-        # this cannot be allowed to fail an operation that already landed.
+        root_fd = target.root_fd
+    except RuntimeError as exc:
+        # `release_root` has dropped the root descriptor — `move_note`'s link
+        # rewrites do that to conserve descriptors — so there is nothing to look
+        # the ancestors up from. Same direction as everything else here: this
+        # must not fail an operation that already landed. Accessed inside the
+        # guard rather than passed as an argument, because the property itself
+        # is what raises.
         logger.warning(
-            "Published %s but could not flush the directories it created "
-            "(%s): %s. The operation stands.",
+            "Published %s but could not flush the directories above it: %s. "
+            "The operation stands.",
             target.rel,
-            ", ".join(target.created),
             exc,
         )
+        return
+    parent = str(PurePosixPath(str(target.rel)).parent)
+    vault_fs.flush_publication_ancestors_quietly(
+        root_fd,
+        "" if parent == "." else parent,
+        target.created,
+        str(target.rel),
+    )
 
 
 def _flush_publication(target: MutableTarget) -> None:
@@ -1044,72 +1066,13 @@ def _require_staged_name(dir_fd: int, tmp: str, staged: os.stat_result) -> None:
         )
 
 
-# Whether `/proc/self/fd` is usable for publishing a staged inode. Cached: it
-# is a property of the container, not of the call.
-_proc_fd_available_cache: bool | None = None
-
-
-def _proc_fd_available() -> bool:
-    global _proc_fd_available_cache
-    if _proc_fd_available_cache is None:
-        _proc_fd_available_cache = os.path.isdir("/proc/self/fd")
-    return _proc_fd_available_cache
-
-
-def _link_staged_inode(fd: int, dir_fd: int, name: str) -> None:
-    """Publish the inode behind `fd` as `name`, no-clobber.
-
-    `linkat(AT_FDCWD, "/proc/self/fd/<fd>", dir_fd, name, AT_SYMLINK_FOLLOW)`.
-    The magic link resolves to the open file description, so what gets
-    published is the inode we wrote. `fd` is an `O_TMPFILE` staging descriptor
-    with no directory entry at all, so there is nothing a peer could have
-    substituted and nothing to check.
-
-    Two kernel details worth recording, because both look like blockers and
-    neither is: the `AT_EMPTY_PATH` form of this call needs
-    `CAP_DAC_READ_SEARCH`, which an ordinary container does not have, while the
-    `/proc` magic link does not; and the "cannot link a zero-link inode" rule
-    applies to an inode whose names have all been *removed*, not to one created
-    `O_TMPFILE`. Verified on the deployment's kernel with `CapEff=0`.
-
-    Linux-only, which the declared filesystem semantics already require;
-    without `/proc` there is no way to publish an inode by descriptor and we
-    refuse rather than fall back to publishing whatever a staging *name* points
-    at. `EEXIST` is the ordinary no-clobber refusal — a plain file, a directory
-    and a symlink at the destination all produce it — and propagates as
-    `FileExistsError`.
-    """
-    if not _proc_fd_available():
-        raise vault_fs.UnsupportedFilesystem(
-            "/proc is not available, so a staged file cannot be published by "
-            "descriptor; refusing rather than publishing by name."
-        )
-    try:
-        os.link(
-            f"/proc/self/fd/{fd}",
-            name,
-            dst_dir_fd=dir_fd,
-            follow_symlinks=True,
-        )
-    except FileExistsError:
-        raise
-    except FileNotFoundError as exc:
-        raise vault_fs.Conflict(
-            "The staged copy could not be published; nothing was written. "
-            "Retry the operation."
-        ) from exc
-    except OSError as exc:
-        if getattr(exc, "errno", None) in (
-            errno.EPERM,
-            errno.EOPNOTSUPP,
-            errno.EXDEV,
-        ):
-            raise vault_fs.UnsupportedFilesystem(
-                "The vault filesystem does not support hard links, which the "
-                "no-clobber write depends on; refusing rather than replacing "
-                "an existing file."
-            ) from exc
-        raise
+# `_proc_fd_available` and `_link_staged_inode` live in `vault_fs` (#92 item 1):
+# the transfer publish stages and publishes the same way, and a second copy is
+# how the two paths drifted apart before. These names are kept as module-level
+# aliases so this file reads as it did — and so a test can still hook the
+# publish here without reaching into the shared module.
+_proc_fd_available = vault_fs.proc_fd_available
+_link_staged_inode = vault_fs.link_staged_inode
 
 
 def _discard_temp(

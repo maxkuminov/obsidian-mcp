@@ -118,7 +118,7 @@ The transfer publish path SHALL flush the staged payload to durable storage befo
 
 The payload flush SHALL happen after the body has been fully received and before the pre-publication gate is opened, so that a flush of up to `MAX_FILE_WRITE_BYTES` never runs while the gate's `SELECT … FOR UPDATE` locks are held, and SHALL NOT block the event loop for its duration. A failure of the payload flush SHALL be treated as pre-publication: nothing SHALL be published, the staged bytes SHALL be discarded, and an upload claim SHALL be released to `pending`.
 
-The directory flush SHALL happen after the publication has been recorded and before the completion is committed. A failure of the directory flush SHALL therefore be classified as post-publication and SHALL surface as the post-publication failure type — never as a generic `OSError`, which the upload route reads as "nothing was published" and answers by releasing a replayable claim over a path that already holds the file. An upload whose directory flush failed SHALL remain `claimed`, SHALL NOT be reported `completed` by `check_upload`, and SHALL NOT be replayable. When the call created directories on the way to the destination, each created directory's parent SHALL be flushed as well, outward to the first directory that already existed.
+The directory flush SHALL happen after the publication has been recorded and before the completion is committed. A failure of the directory flush SHALL therefore be classified as post-publication and SHALL surface as the post-publication failure type — never as a generic `OSError`, which the upload route reads as "nothing was published" and answers by releasing a replayable claim over a path that already holds the file. An upload whose directory flush failed SHALL remain `claimed`, SHALL NOT be reported `completed` by `check_upload`, and SHALL NOT be replayable. The directories to flush SHALL be the **complete ancestor chain** from the destination parent up to the vault root, innermost first — not only the directories the publishing call itself created. Per-call creation provenance is insufficient and SHALL NOT be relied on: a call that creates a directory and then aborts before publication flushes nothing, correctly, because it published nothing; the call that later succeeds finds that directory already present, records no creation of it, and would leave the entry naming it made durable by nobody. The obligation outlives the call that incurred it, and outlives the process, so no in-memory record of "who created what" can discharge it. The chain is bounded by path depth and a directory flush is metadata-only, so the conservative rule is also the cheap one.
 
 #### Scenario: The payload is durable before the gate
 
@@ -148,6 +148,12 @@ The directory flush SHALL happen after the publication has been recorded and bef
 
 - **WHEN** an upload publishes into a folder that the same call created
 - **THEN** the directories that call created SHALL be made durable along with the destination entry
+
+#### Scenario: A retry makes durable what an aborted attempt created
+
+- **WHEN** an upload creates the missing directories of its destination and is then refused before publication — an over-cap body, a disconnect, a deadline overrun — releasing its claim without flushing anything, and the capability is redeemed again with a body that publishes successfully
+- **THEN** the successful call SHALL flush the entry naming every directory above its destination parent, up to the vault root, even though it created none of them and recorded no creation
+- **AND** the completed upload SHALL NOT depend for its survival on a flush that only the aborted attempt could have performed
 
 #### Scenario: `import_from_url` gets the same durability
 
@@ -279,6 +285,8 @@ Transfer publication SHALL establish that the destination parent directory is on
 
 The first check has to happen before the bytes move because the failure is otherwise terminal and late. Uploads stage in a root-level staging directory and publish from there into the destination with a hard link (no-clobber) or a replacing rename (overwrite), and `link(2)` and `rename(2)` both refuse to cross a mount boundary with `EXDEV`. The publication probe links root→root and is cached per root, so it cannot see a destination on another mount; without the mint-time check the refusal arrives only after the whole body has been streamed, which is exactly what the in-gate check still costs in the one case the mint could not have seen.
 
+**The final component SHALL be checked as well as the parent, for a publication that replaces an existing file.** A mount can be established on the destination *file* rather than on its directory; the parent then compares equal to the staging directory and the replacing rename still refuses, with `EBUSY` rather than `EXDEV`. That check SHALL read the final component's mount identity without following a symbolic link, SHALL run at the same two points as the parent check, and SHALL apply only where the publication replaces an existing file — a no-clobber publication onto an existing name is refused as an already-existing target whatever the mount layout, and that is the accurate refusal. A final component whose mount identity cannot be read SHALL NOT be treated as a boundary.
+
 **The comparison SHALL be of mount identity, not of `st_dev`.** A bind mount of a directory of the *same* filesystem, mounted beneath the vault root, presents the same `st_dev` as the staging directory and still refuses a link or a rename across itself, so an `st_dev` comparison passes and the publish fails `EXDEV` after the body has streamed. Mount identity SHALL be read with `statx(2)`'s mount-id field.
 
 Both sides of a comparison SHALL be read within the same call and compared immediately. A mount id SHALL NOT be recorded at mint time and compared against a reading taken later, because a mount id may be reused once its mount is gone; the check is performed twice — each time against a freshly read pair — rather than once and remembered.
@@ -317,6 +325,13 @@ This applies to transfer publication only. Note writes stage in the destination'
 - **WHEN** the destination's parent directory does not exist at the time of the check
 - **THEN** the check SHALL be made against the deepest existing ancestor of the destination
 
+#### Scenario: The destination file is itself a mount point
+
+- **WHEN** a capability that replaces an existing file is minted for, or published to, a path whose final component is itself a mount point, so that its parent directory is on the staging directory's mount
+- **THEN** the transfer SHALL be refused with the mount-boundary error, at mint where the mount is already present and inside the publish gate where it appears afterwards
+- **AND** where such a mount is reached by the replacing rename regardless, the resulting `EBUSY` SHALL be reported as a mount boundary **only** after a fresh check establishes that cause, since `EBUSY` has other sources and naming a mount that is not there sends an operator after the wrong thing
+- **AND** the existing file SHALL be left unchanged and the claim released
+
 #### Scenario: Mount identity cannot be read
 
 - **WHEN** the kernel or the container cannot report a mount id for a directory descriptor
@@ -330,6 +345,19 @@ This applies to transfer publication only. Note writes stage in the destination'
 - **THEN** the check SHALL pass and the transfer SHALL proceed exactly as it does today
 
 ## MODIFIED Requirements
+
+### Requirement: A mount refusal on the upload route is distinguishable from a filesystem refusal
+
+The upload route SHALL answer a mount-boundary refusal with a body that names a mount boundary, distinct from the body it uses when the filesystem cannot perform atomic no-clobber publication. Collapsing the two states that the vault's filesystem lacks a capability it has, and is flatly false for a capability minted with `overwrite`, which does not use the no-clobber publication at all. Because the mount-boundary error is a *subtype* of the unsupported-filesystem error, the handler that answers it SHALL be ordered before the general one, or it can never be reached.
+
+That body SHALL NOT contain the destination path or any other vault path: the route is unauthenticated beyond the bearer capability. Precision about *which* path and *which* side of the boundary comes from the authenticated surfaces — the mint tools' error text and `check_upload`. Every unknown, expired, consumed or otherwise unusable token SHALL continue to answer the uniform 404; this refusal is reached only for a token that was valid and whose destination stopped being publishable after it was minted.
+
+#### Scenario: A mount appears between the mint and the redemption
+
+- **WHEN** a valid upload capability is redeemed and the destination has come to sit on a different mount, or its final component has become a mount point
+- **THEN** the route SHALL answer with the mount-boundary body rather than the unsupported-filesystem body
+- **AND** that body SHALL contain no vault path
+- **AND** the claim SHALL be released, so the same link may be redeemed again once the mount is gone
 
 ### Requirement: Upload endpoint claims first, streams within the cap, publishes atomically to the pre-committed path
 

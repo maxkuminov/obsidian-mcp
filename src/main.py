@@ -161,6 +161,47 @@ def _check_openat2_support() -> None:
         sys.exit(1)
 
 
+def _check_mount_identity_support() -> None:
+    """Warn — and keep serving — when `statx` cannot report a mount id.
+
+    `STATX_MNT_ID` is Linux 5.8 and is what lets transfer publication refuse a
+    destination on a mount beneath the vault root *before* a body streams. It is
+    a **transfer-write minimum, not a whole-server floor**, and the difference
+    decides what this does.
+
+    Without it `mount_id_of` raises and `request_upload`, `import_from_url` and
+    `PUT /transfer/upload` refuse — the safe direction, since the alternative is
+    consuming a whole body and failing `EXDEV` at the publish. Everything else —
+    reads, search, every note tool, the panel, OAuth, downloads — is correct and
+    unaffected. Exiting here would trade a transfer-only capability for a
+    whole-server outage, which is the false-positive direction this codebase
+    treats as the expensive failure.
+
+    So: one warning naming exactly what is degraded, the verdict recorded for
+    `/health`, and the server starts. Read-only, and skipped under
+    `MCP_SANDBOX_MODE` alongside the other startup guards.
+    """
+    try:
+        vault_fs.probe_mount_identity()
+    except vault_fs.UnsupportedFilesystem as exc:
+        vault_fs.record_mount_identity_support(False)
+        logging.getLogger(__name__).warning(
+            "Transfer writes are unavailable on this kernel: %s "
+            "statx(2)'s STATX_MNT_ID (Linux 5.8) is how publication refuses a "
+            "destination on a mount beneath the vault root before a body is "
+            "streamed, and there is no safe substitute — st_dev compares equal "
+            "across a same-filesystem bind mount. request_upload, "
+            "import_from_url and PUT /transfer/upload will refuse; every other "
+            "path — reads, search, the note tools, downloads, the panel — is "
+            "unaffected. This is a transfer-write minimum, not a server floor, "
+            "so the server is starting. /health reports it as "
+            "transfer_mount_check_available.",
+            exc,
+        )
+        return
+    vault_fs.record_mount_identity_support(True)
+
+
 async def _validate_fts_configs() -> None:
     """Fail fast at startup if `FTS_CONFIGS` names a text-search config that
     isn't installed in this Postgres instance (e.g. a typo), so a bad config
@@ -219,6 +260,7 @@ async def lifespan(app: FastAPI):
             yield
         return
     _check_openat2_support()
+    _check_mount_identity_support()
     await _check_embedding_dim()
     await _check_pgvector_version()
     await _validate_fts_configs()
@@ -329,7 +371,40 @@ if settings.multi_user_mode:
 
 @app.get("/health")
 async def health():
-    return JSONResponse({"status": "ok"})
+    """Liveness, plus whether the named-staging fallback is in use.
+
+    `vault_named_staging_fallback_active` is process state — true once a call
+    has *actually* staged under a name because this vault's filesystem cannot
+    allocate an unnamed inode and `VAULT_ALLOW_NAMED_STAGING_FALLBACK` is set.
+    One field for both write paths, because there is one flag for both (D27).
+
+    It reports false while nothing has staged under a name, including where the
+    flag is set and every root supports unnamed staging: the distinction between
+    "an operator enabled this defensively" and "this mount is taking the
+    fallback" is the whole point of reporting it.
+
+    `transfer_mount_check_available` is the startup verdict on `statx`'s
+    `STATX_MNT_ID` (Linux 5.8) — `false` means transfer *writes* refuse on this
+    kernel while every other path is unaffected, and `null` means the probe
+    never ran (`MCP_SANDBOX_MODE`, or a process that has no lifespan). It is
+    reported as found rather than guessed.
+
+    It **never probes.** A probe writes, and a health check must not create a
+    file in the vault — nor may it be the thing that decides a root's staging
+    mode. The mount-identity probe is read-only, but it belongs to startup: a
+    health check must not be where a capability verdict is made either.
+    """
+    return JSONResponse(
+        {
+            "status": "ok",
+            "vault_named_staging_fallback_active": (
+                vault_fs.named_staging_fallback_active()
+            ),
+            "transfer_mount_check_available": (
+                vault_fs.mount_identity_available()
+            ),
+        }
+    )
 
 
 # MCP handler used by both /mcp mount and root proxy

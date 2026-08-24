@@ -2396,7 +2396,9 @@ def _fingerprint_of(root: str, rel_path: str) -> dict | None:
         os.close(dir_fd)
 
 
-def _mint_preflight(path: str, *, need_write: bool) -> tuple | str:
+def _mint_preflight(
+    path: str, *, need_write: bool, overwrite: bool = False
+) -> tuple | str:
     """Shared front half of the three mint tools: permission, origin, path, FS.
 
     Returns `(uid, root, rel, base)` or an error string. Every refusal happens
@@ -2407,6 +2409,12 @@ def _mint_preflight(path: str, *, need_write: bool) -> tuple | str:
     read-only identity's read tool writing to the vault — on a fresh vault, the
     first thing it ever did would be to create files. A download publishes
     nothing, so it needs no proof that publication works.
+
+    **So does the mount check**, for the same reason and one more: it is the
+    only check here that can spare a body. A destination on a mount beneath the
+    vault root refuses the link or rename that publishes it, and without this
+    the refusal arrives after the whole 25 MB has been streamed. A download is
+    a read and crosses nothing.
     """
     if need_write and (err := _require_write()):
         return err
@@ -2423,6 +2431,18 @@ def _mint_preflight(path: str, *, need_write: bool) -> tuple | str:
     if need_write:
         try:
             vault_fs.check_publication_support(root)
+            # And that the destination is on the staging directory's mount
+            # (D23). Publication is a `link`/`rename` out of a root-level
+            # staging directory, and both refuse to cross a mount boundary —
+            # which the publication probe cannot see, because it links
+            # root→root and is cached per root while this is a property of the
+            # *pair*. Here, before the row is inserted for `request_upload` and
+            # before the fetch begins for `import_from_url`, is the only place
+            # a boundary that is *already there* costs a syscall instead of a
+            # whole body. A boundary established afterwards is caught inside
+            # the publish gate — still pre-publication, but by then the body
+            # has streamed.
+            vault_fs.check_destination_mount(root, rel, overwrite=overwrite)
         except vault_fs.UnsupportedFilesystem as e:
             return str(e)
         except (OSError, vault_fs.VaultFSError) as e:
@@ -2463,7 +2483,7 @@ async def request_upload_impl(
     expires_in: int | None = None,
 ) -> str:
     """Mint a one-shot link a human can drop a file onto."""
-    pre = _mint_preflight(path, need_write=True)
+    pre = _mint_preflight(path, need_write=True, overwrite=overwrite)
     if isinstance(pre, str):
         return pre
     uid, root, rel, base = pre
@@ -2755,7 +2775,7 @@ def _url_host(url) -> str:
 )
 async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> str:
     """Fetch a public URL straight into the vault, under the outbound policy."""
-    pre = _mint_preflight(path, need_write=True)
+    pre = _mint_preflight(path, need_write=True, overwrite=overwrite)
     if isinstance(pre, str):
         return pre
     _uid, root, rel, _base = pre

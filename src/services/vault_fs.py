@@ -85,6 +85,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
 
+from src.config import settings
+
 logger = logging.getLogger(__name__)
 
 # Bytes per read when hashing a file through a descriptor.
@@ -125,6 +127,64 @@ _O_COMMON = os.O_CLOEXEC | os.O_NOFOLLOW
 STAGING_DIR = ".transfer-tmp"
 TRASH_DIR = ".trash"
 
+# How a root stages an in-flight transfer. Decided **once per root**, by
+# `probe_publication`, and recorded in the probe's cached result — never
+# re-decided per call, per token or per body. A root that staged one upload
+# without a name and the next one under a name would make the window each
+# upload ran in unknowable after the fact.
+STAGING_MODE_UNNAMED = "unnamed"
+STAGING_MODE_NAMED = "named"
+
+# How many transient overwrite names to try before giving up. Each carries 128
+# bits of randomness and is claimed by a no-clobber `linkat`, so one attempt
+# effectively always wins; the retry exists so a hostile pre-creation loop
+# cannot wedge a publish.
+_TRANSIENT_ATTEMPTS = 8
+
+# Whether this process has actually staged under a name (`VAULT_ALLOW_NAMED_
+# STAGING_FALLBACK`). Process state, set on **first exercise** — not when the
+# flag is set and not when a probe merely selects the mode. That distinction is
+# the whole value of the signal: it separates an operator who enabled the flag
+# defensively from a mount that is taking the fallback.
+_named_staging_exercised = False
+
+
+def note_named_staging_exercised() -> None:
+    """Record that a call has staged under a name, warning once per process.
+
+    Shared by both write paths, so one warning and one `/health` field answer
+    for the note path and the transfer path together (D27). Call it at the
+    moment the staging name is created, never earlier.
+    """
+    global _named_staging_exercised
+    if _named_staging_exercised:
+        return
+    _named_staging_exercised = True
+    logger.warning(
+        "VAULT_ALLOW_NAMED_STAGING_FALLBACK is set and this vault's "
+        "filesystem cannot stage without a directory entry, so writes are "
+        "staging under a name in %s. The staged name exists for the whole "
+        "write, which reopens the substitution window unnamed staging closes; "
+        "it is narrowed, not closed, by the identity check that precedes every "
+        "publish. Unset the flag to refuse instead.",
+        STAGING_DIR,
+    )
+
+
+def named_staging_fallback_active() -> bool:
+    """Whether the named-staging fallback has been exercised in this process.
+
+    What `/health` reports. It reads process state and **never probes** — a
+    probe writes, and a health check must not create a file in the vault.
+    """
+    return _named_staging_exercised
+
+
+def reset_named_staging_state() -> None:
+    """Forget that the fallback was exercised (tests only)."""
+    global _named_staging_exercised
+    _named_staging_exercised = False
+
 
 class VaultFSError(Exception):
     """Base class for anchored-filesystem failures."""
@@ -164,12 +224,38 @@ Fingerprint = dict
 # ── directory anchoring ─────────────────────────────────────────────────────
 
 
+class MountBoundary(UnsupportedFilesystem):
+    """The two directories an operation must span are on different mounts.
+
+    A subclass, so every surface that already answers `UnsupportedFilesystem`
+    — the tools' error string, `PUT /transfer/upload`'s 503 — keeps answering
+    it without a new branch. What it buys is a *message that names the real
+    cause*: `link(2)` and `rename(2)` return `EXDEV` across a mount boundary,
+    and reporting that as "the vault filesystem does not support hard links"
+    tells an operator to change filesystems in response to a mount layout.
+    A bind mount of a directory of the same filesystem, mounted beneath the
+    vault root, has the same `st_dev` on both sides and still refuses the link
+    and the rename — which is why the check that produces this is on mount
+    identity and never on `st_dev` (D23).
+    """
+
+
 def open_root(root: Path | str) -> int:
     """Open the vault root as an anchor descriptor.
 
     The root itself is the one path resolved by name — it is operator
-    configuration (a bind mount), not attacker input. Every component *below*
-    it is opened one at a time with `O_NOFOLLOW`.
+    configuration (a bind mount), not attacker input. Everything *below* it is
+    reached with a single `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+    RESOLVE_NO_MAGICLINKS)` from this descriptor (#87), never by opening one
+    component at a time: the kernel proves containment for the whole path
+    inside that one call, so there is no interval between components for a
+    rename to exploit. See `open_dir_beneath`.
+
+    Because the root *is* resolved by name, a repointed root pathname is a real
+    substitution surface — which is why callers that already hold one pass it
+    down rather than re-opening, and why a cached probe result is bound to this
+    descriptor's identity as well as to the configured string
+    (`root_identity`).
     """
     try:
         return os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
@@ -543,6 +629,13 @@ def probe_beneath_root_lookup() -> None:
     Only the availability errnos are a verdict here. Anything else the cwd
     happens to answer is not an answer about the syscall, and this probe does
     not invent one: the call sites raise on their own paths.
+
+    **This is the whole-server floor: Linux 5.6.** `mount_id_of`'s
+    `STATX_MNT_ID` needs 5.8, but that is a **transfer-write minimum**, not a
+    server floor — `probe_mount_identity` checks it separately and warns rather
+    than exiting, because its absence refuses a publish instead of admitting an
+    unchecked one. The message here mentions it so an operator fixing this one
+    knows the other exists.
     """
     fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
@@ -556,7 +649,10 @@ def probe_beneath_root_lookup() -> None:
         raise UnsupportedFilesystem(
             f"openat2(2) is unavailable ({errno.errorcode.get(code, code)}): "
             "the kernel must be 5.6 or newer and the container seccomp "
-            "profile must permit the syscall."
+            "profile must permit the syscall. Transfer *writes* additionally "
+            "need Linux 5.8 for statx(2)'s STATX_MNT_ID; that is a "
+            "transfer-write minimum, checked separately, and it does not stop "
+            "the server."
         )
     if code in (errno.EINVAL, errno.E2BIG):
         raise UnsupportedFilesystem(
@@ -566,6 +662,383 @@ def probe_beneath_root_lookup() -> None:
         )
 
 
+# ── mount identity ──────────────────────────────────────────────────────────
+
+# `statx(2)`'s `STATX_MNT_ID` (Linux **5.8**) — the mount a descriptor was
+# resolved through, which is the only thing that distinguishes a bind mount of
+# a directory of the *same* filesystem from the filesystem it was bound from.
+# `AT_EMPTY_PATH` makes the call operate on the descriptor itself.
+STATX_MNT_ID = 0x00001000
+AT_EMPTY_PATH = 0x1000
+
+
+class _StatxTimestamp(ctypes.Structure):
+    _fields_ = [
+        ("tv_sec", ctypes.c_int64),
+        ("tv_nsec", ctypes.c_uint32),
+        ("__reserved", ctypes.c_int32),
+    ]
+
+
+class _Statx(ctypes.Structure):
+    """`struct statx` (`<linux/stat.h>`), through the field the kernel added last.
+
+    Laid out field by field so `ctypes` computes the offsets rather than a
+    hand-written constant: `stx_mnt_id` lands at 144 and the struct at 256
+    bytes, which is what the running kernel reports. The trailing `__spare3`
+    is what makes the buffer the full size the kernel may write into — a short
+    buffer is how this kind of binding corrupts memory rather than failing.
+    """
+
+    _fields_ = [
+        ("stx_mask", ctypes.c_uint32),
+        ("stx_blksize", ctypes.c_uint32),
+        ("stx_attributes", ctypes.c_uint64),
+        ("stx_nlink", ctypes.c_uint32),
+        ("stx_uid", ctypes.c_uint32),
+        ("stx_gid", ctypes.c_uint32),
+        ("stx_mode", ctypes.c_uint16),
+        ("__spare0", ctypes.c_uint16),
+        ("stx_ino", ctypes.c_uint64),
+        ("stx_size", ctypes.c_uint64),
+        ("stx_blocks", ctypes.c_uint64),
+        ("stx_attributes_mask", ctypes.c_uint64),
+        ("stx_atime", _StatxTimestamp),
+        ("stx_btime", _StatxTimestamp),
+        ("stx_ctime", _StatxTimestamp),
+        ("stx_mtime", _StatxTimestamp),
+        ("stx_rdev_major", ctypes.c_uint32),
+        ("stx_rdev_minor", ctypes.c_uint32),
+        ("stx_dev_major", ctypes.c_uint32),
+        ("stx_dev_minor", ctypes.c_uint32),
+        ("stx_mnt_id", ctypes.c_uint64),
+        ("stx_dio_mem_align", ctypes.c_uint32),
+        ("stx_dio_offset_align", ctypes.c_uint32),
+        ("__spare3", ctypes.c_uint64 * 12),
+    ]
+
+
+_statx_cache: object | None = None
+
+
+def _statx_fn():
+    """The glibc `statx` wrapper, or `None` where it does not exist.
+
+    **Reached through the wrapper, unlike `openat2`** — and the difference is
+    measured rather than assumed. In the running container `statx` resolves
+    through `ctypes.CDLL(None)` and `openat2` raises `AttributeError`: glibc
+    has exported `statx` since 2.28 and exports no `openat2` at any version,
+    which is why D24's raw-syscall-with-a-number-table reasoning applies there
+    and not here. A wrapper also spares us a per-architecture syscall table
+    that a wrong entry would turn into a call to a *different* syscall.
+    """
+    global _statx_cache
+    if _statx_cache is None:
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            fn = libc.statx
+        except (OSError, AttributeError):  # pragma: no cover - no glibc statx
+            _statx_cache = False
+        else:
+            fn.restype = ctypes.c_int
+            fn.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_uint,
+                ctypes.POINTER(_Statx),
+            ]
+            _statx_cache = fn
+    return _statx_cache or None
+
+
+def mount_id_of(fd: int) -> int:
+    """The id of the mount `fd` was resolved through.
+
+    Raises `UnsupportedFilesystem` when `statx` is unavailable or when the
+    kernel answers without setting `STATX_MNT_ID` in `stx_mask` — **never a
+    fall back to `st_dev`, and never to the errno**. `st_dev` is precisely the
+    comparison this exists to replace: a bind mount of an ext4 directory
+    beneath the vault root reports the same `st_dev` on both sides (measured:
+    66306) and different mount ids (653 vs 6036), while `link` and `rename`
+    across it both return `EXDEV`. A preflight that fell back to `st_dev` would
+    pass and let the publish fail after the whole body had streamed — that was
+    the first draft and review caught it. A guard that degrades quietly is the
+    failure mode, so this refuses instead.
+
+    `STATX_MNT_ID` is Linux **5.8**, above `openat2`'s 5.6, so this is what
+    sets the change's kernel floor; the startup probe's message says so.
+    `STATX_MNT_ID_UNIQUE` (6.8) is deliberately **not** required — it would
+    raise the floor again for a property `same_mount` does not need, because
+    `same_mount` never compares across time (D23).
+    """
+    fn = _statx_fn()
+    if fn is None:
+        raise UnsupportedFilesystem(
+            "statx(2) is unavailable, so the mount a directory lives on "
+            "cannot be established. Transfer publication needs it to refuse a "
+            "destination on a different mount before a body is streamed."
+        )
+    buf = _Statx()
+    ctypes.set_errno(0)
+    # `pointer`, not `byref`: `byref` produces a light-weight argument object
+    # with no `.contents`, which a test cannot reach into. 4.7 requires a
+    # `statx` stubbed to answer *without* the mount-id bit — the one case where
+    # falling back to `st_dev` would look like it worked — so the binding has
+    # to be drivable from a stub.
+    rc = fn(fd, b"", AT_EMPTY_PATH, STATX_MNT_ID, ctypes.pointer(buf))
+    if rc != 0:
+        code = ctypes.get_errno()
+        raise UnsupportedFilesystem(
+            f"statx(2) could not read the mount id "
+            f"({errno.errorcode.get(code, code)}); refusing rather than "
+            "comparing st_dev, which a same-filesystem bind mount defeats."
+        )
+    if not buf.stx_mask & STATX_MNT_ID:
+        raise UnsupportedFilesystem(
+            "This kernel's statx(2) does not report STATX_MNT_ID (Linux 5.8 "
+            "and later do), so a destination on a different mount cannot be "
+            "detected before a body is streamed. Refusing rather than "
+            "comparing st_dev, which a same-filesystem bind mount defeats."
+        )
+    return int(buf.stx_mnt_id)
+
+
+# Whether this kernel can answer `STATX_MNT_ID`, as established by the startup
+# probe. `None` until it has run (or in a process that never runs it).
+_mount_identity_available: bool | None = None
+
+
+def probe_mount_identity() -> None:
+    """Refuse if this kernel cannot report a descriptor's mount.
+
+    **Read-only: it creates nothing** — one `statx` of the process's own working
+    directory — so it belongs at startup beside `probe_beneath_root_lookup`.
+
+    Unlike that one it is **not a reason to refuse to start**, and the
+    asymmetry is the point. `openat2` is a *containment* guard: without it every
+    vault write would anchor to a descriptor whose containment nobody checked,
+    so serving is worse than not serving. `STATX_MNT_ID` guards one refusal on
+    one feature — it makes transfer publication decline a destination on another
+    mount before a body streams. Without it `mount_id_of` raises and every
+    transfer *write* refuses, which is the safe direction; every other path in
+    the server — reads, search, the note tools, the panel, OAuth — is correct
+    and unaffected. Killing all of that to defend a transfer-only check would be
+    the false-positive direction: a whole-server outage in response to a partial
+    capability.
+
+    So `src/main.py::_check_mount_identity_support` logs a warning, records the
+    partial service through `record_mount_identity_support`, and starts.
+    """
+    fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        mount_id_of(fd)
+    finally:
+        close_quietly(fd, "mount identity probe working directory")
+
+
+def record_mount_identity_support(available: bool) -> None:
+    """Record what the startup probe found, for `/health` to report."""
+    global _mount_identity_available
+    _mount_identity_available = available
+
+
+def mount_identity_available() -> bool | None:
+    """What the startup probe found: `True`, `False`, or `None` if it never ran.
+
+    `None` is not "unknown and probably fine" — it is a process that skipped the
+    probe (`MCP_SANDBOX_MODE`) or never had one. `/health` reports it as-is
+    rather than guessing, and **never probes**: this is process state.
+    """
+    return _mount_identity_available
+
+
+def reset_mount_identity_state() -> None:
+    """Forget the startup probe's verdict (tests only)."""
+    global _mount_identity_available
+    _mount_identity_available = None
+
+
+def same_mount(fd_a: int, fd_b: int) -> bool:
+    """Whether two open descriptors live on the same mount.
+
+    **Both ids are read inside this one call and compared here.** Never persist
+    a mount id and compare it against a later reading: plain `STATX_MNT_ID` is
+    reused once its mount is gone, and the only thing that makes it sufficient
+    without `STATX_MNT_ID_UNIQUE` is that no comparison here ever spans time
+    (D23). If you find yourself storing one, you need the unique form and a
+    higher kernel floor.
+    """
+    return mount_id_of(fd_a) == mount_id_of(fd_b)
+
+
+def require_same_mount(staging_fd: int, dst_fd: int, dest_label) -> None:
+    """Refuse when the destination is not on the staging directory's mount.
+
+    Uploads and imports stage in a root-level staging directory and publish
+    from there into the destination with a hard link (no-clobber) or a
+    replacing rename (overwrite), and both refuse to cross a mount boundary
+    with `EXDEV`. The publication probe links root→root and is cached per root,
+    so it cannot see this — it is a property of the *pair*, not of the root.
+    """
+    if not same_mount(staging_fd, dst_fd):
+        raise MountBoundary(
+            f"{dest_label} is on a different mount from the vault's staging "
+            "directory, so an upload cannot be published there: the link or "
+            "rename that publishes it cannot cross a mount boundary. The "
+            "filesystem is fine; the mount layout is what refuses. Choose a "
+            "destination on the same mount as the vault root."
+        )
+
+
+def leaf_mount_id(dst_dir_fd: int, name: str) -> int | None:
+    """The mount id of the file at `name`, or `None` when it cannot be read.
+
+    `O_PATH|O_NOFOLLOW`, so it neither opens the file for I/O nor follows a
+    symlink at the final component — and `statx(AT_EMPTY_PATH)` works on an
+    `O_PATH` descriptor, which is one of the things that descriptor kind is for.
+    `None` covers "no such name" and "this kernel cannot answer", both of which
+    mean the caller has nothing to refuse on.
+    """
+    try:
+        fd = os.open(name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dst_dir_fd)
+    except OSError:
+        return None
+    try:
+        return mount_id_of(fd)
+    except UnsupportedFilesystem:
+        return None
+    finally:
+        close_quietly(fd, f"leaf mount check for {name}")
+
+
+def leaf_is_separate_mount(staging_fd: int, dst_dir_fd: int, name: str) -> bool:
+    """Whether `name` is itself a mount point distinct from the staging mount.
+
+    **The parent check does not cover this.** A bind mount can be established on
+    the destination *file*, not its directory: the parent then compares equal to
+    the staging directory and the publish still fails, because a replacing
+    rename onto a mount point is `EBUSY` (measured on the deployment kernel,
+    with the same `st_dev` on both sides). It only matters for an overwrite —
+    a no-clobber publish onto an existing name is `EEXIST` either way, and
+    "target already exists" is the accurate thing to say there.
+
+    True only when **both** ids are read cleanly and differ. Anything unreadable
+    is not evidence of a boundary, and inventing one would refuse a publish that
+    would have worked.
+    """
+    leaf = leaf_mount_id(dst_dir_fd, name)
+    if leaf is None:
+        return False
+    try:
+        return mount_id_of(staging_fd) != leaf
+    except UnsupportedFilesystem:
+        return False
+
+
+def require_leaf_on_same_mount(
+    staging_fd: int, dst_dir_fd: int, name: str, dest_label
+) -> None:
+    """Refuse when the destination *file* is itself a separate mount point."""
+    if leaf_is_separate_mount(staging_fd, dst_dir_fd, name):
+        raise MountBoundary(
+            f"{dest_label} is itself a mount point, so the rename that "
+            "publishes an overwrite cannot replace it. The filesystem is fine; "
+            "the mount layout is what refuses. Unmount it, or choose a "
+            "destination that is an ordinary file."
+        )
+
+
+def deepest_existing_dir(root_fd: int, rel_dir: str | Path) -> tuple[int, str]:
+    """Open the deepest ancestor of `rel_dir` that exists; return `(fd, rel)`.
+
+    For the mint-time mount check, where the destination's parent may not exist
+    yet: a directory created beneath an ancestor is created on **that
+    ancestor's** mount, so the ancestor answers the question the parent would.
+    Each attempt is one beneath-root lookup, and the caller owns the descriptor.
+    """
+    parts = _split(rel_dir)
+    while True:
+        rel = "/".join(parts)
+        try:
+            return open_dir_beneath(root_fd, rel), rel
+        except FileNotFoundError:
+            if not parts:  # pragma: no cover - the root always exists
+                raise
+            parts = parts[:-1]
+
+
+def require_destination_mount(
+    root_fd: int, rel_path: str | Path, *, overwrite: bool = False
+) -> None:
+    """Mint-time half of the mount check: staging directory vs. destination.
+
+    Runs **before a capability is minted or a fetch begins**, so a boundary that
+    is already there costs a syscall rather than a whole body. Where the
+    destination's own parent does not exist yet the deepest existing ancestor
+    is compared instead, because that is the mount any directory created
+    beneath it will land on.
+
+    The staging directory is used when it exists and the **root** when it does
+    not — `.transfer-tmp` is created as a direct child of the root, so it lands
+    on the root's mount, and a mint must not be the thing that creates it. The
+    in-gate half (`transfer._publish_into_current_parent`) always has the real
+    staging descriptor.
+
+    It reaches the staging directory with a plain beneath-root lookup, **not**
+    `open_staging_dir`: that one enforces the 0700 owner-only policy and
+    refuses a directory it cannot tighten, which is the right thing to do when
+    a call is about to put bytes there and the wrong thing to do here. A mint
+    must not fail — or succeed — on the strength of a policy check that belongs
+    to the write. `_stream_locked` and the prune still run the enforcing form.
+
+    This is check-then-act, deliberately: it spares the body where the boundary
+    already exists, and the in-gate re-check is what covers a mount established
+    afterwards. Neither makes the residual `EXDEV` mapping unnecessary.
+    """
+    rel_dir = str(PurePosixPath(str(rel_path)).parent)
+    rel_dir = "" if rel_dir == "." else rel_dir
+    try:
+        staging_fd = open_dir_beneath(root_fd, STAGING_DIR)
+    except (FileNotFoundError, UnsafePath):
+        staging_fd = open_dir_beneath(root_fd, "")
+    try:
+        dst_fd, rel = deepest_existing_dir(root_fd, rel_dir)
+        try:
+            require_same_mount(staging_fd, dst_fd, rel_path)
+            # And the destination *file*, when this mint is for an overwrite: a
+            # bind mount on the target itself leaves the parent comparing equal
+            # and still fails the rename with `EBUSY`. Only when the parent
+            # actually resolved — under a missing parent there is no leaf.
+            if overwrite and rel == rel_dir:
+                require_leaf_on_same_mount(
+                    staging_fd,
+                    dst_fd,
+                    PurePosixPath(str(rel_path)).name,
+                    rel_path,
+                )
+        finally:
+            close_quietly(dst_fd, f"mount check for {rel_path}")
+    finally:
+        close_quietly(staging_fd, "mount check staging directory")
+
+
+def check_destination_mount(
+    root: Path | str, rel_path: str | Path, *, overwrite: bool = False
+) -> None:
+    """`require_destination_mount` for a caller holding the root as a pathname.
+
+    The mint tools' form, mirroring `check_publication_support(root)`. It is
+    deliberately **not** cached: unlike a probe this answers about a *pair*, the
+    destination differs per call, and a mount can appear at any time.
+    """
+    root_fd = open_root(root)
+    try:
+        require_destination_mount(root_fd, rel_path, overwrite=overwrite)
+    finally:
+        close_quietly(root_fd, "vault root")
+
+
 # Owner-only: nothing but this process has any business in the staging
 # directory. See `open_staging_dir`.
 STAGING_DIR_MODE = 0o700
@@ -573,6 +1046,11 @@ STAGING_DIR_MODE = 0o700
 
 def open_staging_dir(root_fd: int, *, create: bool = True) -> int:
     """Open `.transfer-tmp` beneath `root_fd`, enforcing owner-only access.
+
+    The directory stays even though the unnamed staging mode puts nothing in
+    it: `O_TMPFILE` takes a *directory* to choose the filesystem the inode is
+    allocated on, so `.transfer-tmp` is still what selects where staged bytes
+    live (D19). What went away is its contents.
 
     Staged bytes are relaxed to `default_file_mode()` before publication, so
     the directory — not the file — is what keeps an in-flight upload private.
@@ -584,6 +1062,15 @@ def open_staging_dir(root_fd: int, *, create: bool = True) -> int:
     sha256 it reports. 0700 removes both, whatever the staged file's own mode
     and whatever the operator's umask.
 
+    **What the 0700 is now for.** In the unnamed mode it is no longer the only
+    thing protecting staged bytes — an inode with no directory entry cannot be
+    opened by name at all, so that window closes structurally rather than by
+    permissions. The mode enforcement stays as defence in depth, and it is a
+    live guard on the two names that do appear here: the overwrite publish's
+    transient name, which exists for two syscalls inside the gate, and — where
+    `VAULT_ALLOW_NAMED_STAGING_FALLBACK` selects the named mode — a staging
+    name that lives for the whole streaming window.
+
     The mode is enforced on every open, not just at creation: `mkdir` is
     masked by the umask, and a `.transfer-tmp` left at 0755 by an older
     release (or by a `mkdir -p` from anywhere else) must be corrected rather
@@ -591,8 +1078,9 @@ def open_staging_dir(root_fd: int, *, create: bool = True) -> int:
     `O_NOFOLLOW`, so it cannot be redirected to another directory by a
     rename in between.
 
-    Destination directories are deliberately *not* treated this way — they
-    hold published vault content and get the ordinary 0755 from `_open_child`.
+    Destination directories are deliberately *not* treated this way — they hold
+    published vault content and get the ordinary 0755 that
+    `open_dir_beneath(create=True)`'s `mkdirat` produces under the umask.
     """
     fd = open_dir_beneath(root_fd, STAGING_DIR, create=create)
     try:
@@ -697,6 +1185,197 @@ def create_temp(dir_fd: int) -> tuple[int, str]:
     raise VaultFSError("Could not create a temporary file in the target directory") from last
 
 
+def create_nameless_temp(dir_fd: int) -> int:
+    """Stage into an **unnamed** inode inside `dir_fd`; return the descriptor.
+
+    `O_TMPFILE` gives a file with no directory entry at all — nothing for
+    another process to observe, replace or race for the whole streaming window,
+    and nothing to clean up afterwards. That last part is not a convenience: a
+    named staging file has to be unlinked, and an unlink is by *name*, so it can
+    only ever be guarded by an identity check followed by the removal —
+    check-then-act, which could delete a substitute planted in between. With no
+    name there is no such step, and an abandoned upload's bytes are reclaimed by
+    the kernel when the last descriptor closes rather than sitting in
+    `.transfer-tmp` for a day waiting for the sweep.
+
+    `dir_fd` is the **staging directory**, and it is what selects the filesystem
+    the inode is allocated on — which is why `O_TMPFILE` does not retire
+    `.transfer-tmp` or any of `open_staging_dir`'s guarantees about it (D19).
+    What goes away is the directory's *contents*.
+
+    **`O_EXCL` must not be set.** With `O_TMPFILE` it means "this file may never
+    be linked into the filesystem", which makes `link_staged_inode` fail
+    `ENOENT` — the opposite of its usual meaning, and an easy thing to add by
+    reflex.
+
+    A filesystem that refuses it (`EOPNOTSUPP`, or `EISDIR`/`EINVAL`/`ENOSYS`
+    on kernels that report it that way) raises `UnsupportedFilesystem`. ext4 and
+    xfs both do it; TrueNAS SCALE's NFS server does not (#103), which is what
+    `VAULT_ALLOW_NAMED_STAGING_FALLBACK` exists for — and the refusal names it,
+    so an operator meeting this does not have to read the source to find the
+    escape valve. Selecting that fallback is `probe_publication`'s job, once per
+    root; this function only ever refuses.
+    """
+    flags = os.O_TMPFILE | os.O_RDWR | getattr(os, "O_CLOEXEC", 0)
+    try:
+        return os.open(".", flags, 0o600, dir_fd=dir_fd)
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (
+            errno.EOPNOTSUPP,
+            errno.EISDIR,
+            errno.ENOSYS,
+            errno.EINVAL,
+        ):
+            raise UnsupportedFilesystem(
+                "The vault filesystem does not support O_TMPFILE, which "
+                "staging uses so that no temporary name is ever exposed. "
+                "Refusing rather than staging under a name; set "
+                "VAULT_ALLOW_NAMED_STAGING_FALLBACK to take named staging "
+                "back on this mount."
+            ) from exc
+        raise
+
+
+# Whether `/proc/self/fd` is usable for publishing a staged inode. Cached: it
+# is a property of the container, not of the call.
+_proc_fd_available_cache: bool | None = None
+
+
+def proc_fd_available() -> bool:
+    global _proc_fd_available_cache
+    if _proc_fd_available_cache is None:
+        _proc_fd_available_cache = os.path.isdir("/proc/self/fd")
+    return _proc_fd_available_cache
+
+
+def link_staged_inode(fd: int, dir_fd: int, name: str) -> None:
+    """Publish the inode behind `fd` as `name` in `dir_fd`, no-clobber.
+
+    `linkat(AT_FDCWD, "/proc/self/fd/<fd>", dir_fd, name, AT_SYMLINK_FOLLOW)`.
+    The magic link resolves to the open file description, so what gets published
+    is provably the inode this call wrote — no name is consulted, so there is
+    nothing a peer could have substituted and nothing to check. `fd` is an
+    `O_TMPFILE` staging descriptor with no directory entry at all.
+
+    Two kernel details worth recording, because both look like blockers and
+    neither is: the `AT_EMPTY_PATH` form of this call needs
+    `CAP_DAC_READ_SEARCH`, which an ordinary container does not have, while the
+    `/proc` magic link does not; and the "cannot link a zero-link inode" rule
+    applies to an inode whose names have all been *removed*, not to one created
+    `O_TMPFILE`. Verified on the deployment's kernel with `CapEff=0`.
+
+    Linux-only, which the declared filesystem semantics already require; without
+    `/proc` there is no way to publish an inode by descriptor and we refuse
+    rather than fall back to publishing whatever a staging *name* points at.
+    `EEXIST` is the ordinary no-clobber refusal — a plain file, a directory and
+    a symlink at the destination all produce it — and propagates as
+    `FileExistsError` for the caller to phrase.
+
+    This lives here rather than in `vault.py` because both write paths publish
+    this way and a second copy is how the two drifted apart before (#59, #92).
+    """
+    if not proc_fd_available():
+        raise UnsupportedFilesystem(
+            "/proc is not available, so a staged file cannot be published by "
+            "descriptor; refusing rather than publishing by name. Set "
+            "VAULT_ALLOW_NAMED_STAGING_FALLBACK to take named staging back."
+        )
+    try:
+        os.link(
+            f"/proc/self/fd/{fd}",
+            name,
+            dst_dir_fd=dir_fd,
+            follow_symlinks=True,
+        )
+    except FileExistsError:
+        raise
+    except FileNotFoundError as exc:
+        raise Conflict(
+            "The staged copy could not be published; nothing was written. "
+            "Retry the operation."
+        ) from exc
+    except OSError as exc:
+        code = getattr(exc, "errno", None)
+        if code == errno.EXDEV:
+            raise MountBoundary(
+                f"{name} is on a different mount from the directory the bytes "
+                "were staged in, so the staged inode cannot be linked there "
+                "(EXDEV). The filesystem is fine; the mount layout is what "
+                "refuses."
+            ) from exc
+        if code in (errno.EPERM, errno.EOPNOTSUPP):
+            raise UnsupportedFilesystem(
+                "The vault filesystem does not support hard links, which the "
+                "no-clobber publish depends on; refusing rather than replacing "
+                "an existing file."
+            ) from exc
+        raise
+
+
+def _materialise_staged_name(staged_fd: int, dir_fd: int) -> str:
+    """Give the staged inode a transient name in `dir_fd`; return that name.
+
+    The overwrite publish cannot consume an unnamed inode — `renameat` has no
+    by-descriptor form, and `RENAME_EXCHANGE` does not help because it still
+    names the source. So the choice is not "name or no name" but *when* the name
+    exists, and this is called **inside the publish gate**, immediately before
+    the fingerprint check and the rename (D20). The name then exists for two
+    syscalls, in a 0700 directory owned by this process, instead of for the
+    whole multi-minute body plus an unbounded wait on the gate's row locks.
+
+    `dir_fd` is the **staging** directory, never the destination directory —
+    one respect in which the transfer path ends up stronger than the note path,
+    which stages beside its destination in a directory the vault's own tools can
+    write to.
+
+    No-clobber, with a bounded `EEXIST` retry: a hostile pre-creation loop can
+    cost this publish, and must not be able to make it overwrite anything.
+    """
+    last: FileExistsError | None = None
+    for _ in range(_TRANSIENT_ATTEMPTS):
+        name = f".tmp-{secrets.token_hex(16)}"
+        try:
+            link_staged_inode(staged_fd, dir_fd, name)
+            return name
+        except FileExistsError as exc:  # pragma: no cover - 128-bit collision
+            last = exc
+    raise VaultFSError(
+        "Could not give the staged file a transient name in the staging "
+        "directory"
+    ) from last
+
+
+def staged_identity_matches(dir_fd: int, name: str, staged: os.stat_result) -> bool:
+    """Whether `name` in `dir_fd` still refers to the inode we staged."""
+    try:
+        current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    return (current.st_dev, current.st_ino) == (staged.st_dev, staged.st_ino)
+
+
+def require_staged_name(dir_fd: int, name: str, staged: os.stat_result) -> None:
+    """Refuse unless `name` still refers to the bytes this call staged.
+
+    Both by-name publications need it — the `link` of a fallback-mode
+    no-clobber publish and the `renameat` of either mode's overwrite — because
+    both act on whatever is at the source name when they run, and neither can be
+    made to carry an inode the way `linkat` through `/proc/self/fd` can.
+
+    It **narrows** the substitution window to the single publishing syscall; it
+    does not close it, and the spec says "refused" only for the interval where
+    refusal is achievable. A substitution observable here is refused; one landing
+    between here and the publish is still published, and that is a declared
+    residual (D20) rather than a gap — an actor who can create a name in a 0700
+    directory owned by this process can also rewrite the destination directly.
+    """
+    if not staged_identity_matches(dir_fd, name, staged):
+        raise Conflict(
+            "The staged copy was replaced before it could be published; "
+            "nothing was written. Retry the operation."
+        )
+
+
 def _lstat(dir_fd: int, name: str) -> os.stat_result | None:
     try:
         return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
@@ -777,10 +1456,15 @@ class Published:
     """Outcome of `publish`.
 
     `published` is what decides whether the caller may mark the transfer
-    complete. `temp_removed` is bookkeeping: once `link`/`replace` has
-    succeeded the upload *is* published, and a failing trailing unlink of the
-    temp file is a janitorial problem to log — never a reason to fail the
+    complete. `temp_removed` is bookkeeping: once the `link`/`replace` has
+    succeeded the upload *is* published, and a failing trailing unlink of a
+    staging name is a janitorial problem to log — never a reason to fail the
     request or release the claim.
+
+    In the unnamed staging mode there is usually no name at all, so
+    `temp_removed` is true by construction: the discard is closing the
+    descriptor, which the caller owns. The one exception is the overwrite
+    publish's transient name, which `publish` creates and therefore reports on.
     """
 
     name: str
@@ -790,84 +1474,187 @@ class Published:
 
 def publish(
     dir_fd: int,
-    tmp_name: str,
+    tmp_name: str | None,
     final_name: str,
     *,
     overwrite: bool,
     expected_fingerprint: Fingerprint | None,
     dst_dir_fd: int | None = None,
+    staged_fd: int | None = None,
+    staged_st: os.stat_result | None = None,
 ) -> Published:
-    """Move `tmp_name` into place as `final_name`, atomically.
+    """Move the staged file into place as `final_name`, atomically.
 
-    `dir_fd` anchors the *source* (the staging directory holding the temp
-    file); `dst_dir_fd` anchors the destination and defaults to `dir_fd` for
-    the same-directory case. Splitting them is what lets a caller stage bytes
-    somewhere stable for minutes and only then resolve — and re-resolve — the
-    destination directory. Both must be on the same device, which holding both
-    inside the vault root guarantees.
+    `dir_fd` anchors the *staging* directory; `dst_dir_fd` anchors the
+    destination and defaults to `dir_fd` for the same-directory case. Splitting
+    them is what lets a caller stage bytes somewhere stable for minutes and only
+    then resolve — and re-resolve — the destination directory. Both must be on
+    the same mount, which the mint-time and in-gate mount-identity checks
+    establish; holding both inside the vault root is not on its own enough,
+    because a bind mount beneath the root reports the same `st_dev`.
+
+    **Two staging modes, selected once per root by `probe_publication` and
+    passed in here by the shape of the arguments** (D27):
+
+    * **unnamed** — `tmp_name is None` and `staged_fd` is the `O_TMPFILE`
+      descriptor. A no-clobber publish is `linkat` through `/proc/self/fd/<fd>`,
+      so what lands is provably the inode this call wrote and no name is
+      consulted at any point. An overwrite publish materialises a transient
+      name in the **staging** directory immediately before the fingerprint
+      check and the rename, and discards it under the identity guard below.
+    * **named** (the `VAULT_ALLOW_NAMED_STAGING_FALLBACK` fallback, for mounts
+      that refuse `O_TMPFILE`) — `tmp_name` is a `.tmp-*` created through
+      `create_temp`. Both publications are by name, and both run the identity
+      check first. The name exists for the whole streaming window: that is the
+      declared residual of the fallback, narrowed — not closed — by the check.
 
     `overwrite=False` → hard-link no-clobber (kernel-linearizable).
-    `overwrite=True` with `expected_fingerprint=None` → the target was absent
-    at mint and must still be absent, so this also takes the no-clobber path
-    (the sentinel means "expect absence", never "skip the check").
+    `overwrite=True` with `expected_fingerprint=None` → the target was absent at
+    mint and must still be absent, so this also takes the no-clobber path (the
+    sentinel means "expect absence", never "skip the check").
     `overwrite=True` with a fingerprint → compare, re-hash when the mint
     recorded one, then `replace`.
 
-    Raises `Conflict` when the target is not in the committed state and
-    `UnsafePath` when it is a symlink. The temp file is unlinked in `finally`
-    either way.
+    `staged_st` is the `fstat` of the staging descriptor, taken by the caller
+    that created it — the strongest form of the identity the check compares
+    against. Omitting it in named mode falls back to the identity `publish`
+    reads at entry, which still refuses a substitution landing during the
+    publish but cannot see one that landed before `publish` was called; the
+    transfer path always passes the real one. In unnamed mode it is derived from
+    `staged_fd` and the parameter is ignored.
+
+    Raises `Conflict` when the target is not in the committed state or the
+    staged file was substituted, and `UnsafePath` when the target is a symlink.
+    Any name this function is responsible for is discarded in `finally` — under
+    the identity guard, so a substitute is left in place and logged rather than
+    unlinked.
     """
     if dst_dir_fd is None:
         dst_dir_fd = dir_fd
+    unnamed = tmp_name is None
+    if unnamed and staged_fd is None:
+        raise ValueError("Unnamed staging requires the staged descriptor")
+    if unnamed:
+        staged_st = os.fstat(staged_fd)
+    elif staged_st is None:
+        staged_st = _lstat(dir_fd, tmp_name)
+
     published = False
+    transient: str | None = None
     try:
-        # Inside the try, not before it: `publish` owns the temp file from the
+        # Inside the try, not before it: `publish` owns the staged file from the
         # moment it is called, so every exit path — including a rejected
-        # argument — must leave the directory clean.
+        # argument — must leave the staging directory clean.
         if "/" in final_name or final_name in ("", ".", ".."):
             raise UnsafePath(f"Illegal final component: {final_name!r}")
-        if not overwrite or expected_fingerprint is None:
-            _link_no_clobber(dir_fd, tmp_name, final_name, dst_dir_fd=dst_dir_fd)
+        no_clobber = not overwrite or expected_fingerprint is None
+        if unnamed and no_clobber:
+            # The whole point: nothing was ever named, so there is nothing to
+            # verify and nothing to race. `link()` is kernel-atomic.
+            try:
+                link_staged_inode(staged_fd, dst_dir_fd, final_name)
+            except FileExistsError:
+                # A plain file, a directory *and* a symlink at the target all
+                # produce this, which is exactly the promise.
+                raise Conflict(f"Target already exists: {final_name}") from None
             published = True
         else:
-            current = _lstat(dst_dir_fd, final_name)
-            if current is None:
-                raise Conflict(
-                    f"Target disappeared since the token was minted: {final_name}"
+            source = tmp_name
+            if unnamed:
+                # Inside the gate, and only now: two syscalls of exposure in a
+                # 0700 directory instead of a name that lives for minutes (D20).
+                transient = _materialise_staged_name(staged_fd, dir_fd)
+                source = transient
+            if not no_clobber:
+                _require_committed_target(
+                    dst_dir_fd, final_name, expected_fingerprint
                 )
-            _require_regular(current, final_name)
-            got = {
-                "dev": current.st_dev,
-                "inode": current.st_ino,
-                "size": current.st_size,
-                "mtime_ns": current.st_mtime_ns,
-                "ctime_ns": current.st_ctime_ns,
-            }
-            if not _metadata_matches(expected_fingerprint, got):
-                raise Conflict(
-                    f"Target changed since the token was minted: {final_name}"
-                )
-            if expected_fingerprint.get("sha256") is not None:
-                digest = _hash_regular(
-                    dst_dir_fd,
-                    final_name,
-                    expect_ino=current.st_ino,
-                    expect_dev=current.st_dev,
-                )
-                if digest != expected_fingerprint["sha256"]:
-                    raise Conflict(
-                        f"Target contents changed since the token was minted: "
-                        f"{final_name}"
+            if staged_st is not None:
+                require_staged_name(dir_fd, source, staged_st)
+            if no_clobber:
+                _link_no_clobber(dir_fd, source, final_name, dst_dir_fd=dst_dir_fd)
+            else:
+                # Check-then-act: a writer landing here still gets overwritten.
+                # Declared optimistic conflict detection, not linearizable
+                # replacement — see the module docstring and D5.
+                try:
+                    os.replace(
+                        source, final_name, src_dir_fd=dir_fd, dst_dir_fd=dst_dir_fd
                     )
-            # Check-then-act: a writer landing here still gets overwritten.
-            # Declared optimistic conflict detection, not linearizable
-            # replacement — see the module docstring and D5.
-            os.replace(tmp_name, final_name, src_dir_fd=dir_fd, dst_dir_fd=dst_dir_fd)
+                except OSError as exc:
+                    # The overwrite branch used to let `EXDEV` escape as a bare
+                    # `OSError`: correctly classified pre-publication, but it
+                    # reached the upload route's generic handler and gave the
+                    # person a server error where the no-clobber branch gave a
+                    # 503. Both branches name the boundary now.
+                    code = getattr(exc, "errno", None)
+                    if code == errno.EXDEV:
+                        raise MountBoundary(
+                            f"{final_name} is on a different mount from the "
+                            "staging directory, so the rename that publishes "
+                            "an overwrite cannot reach it (EXDEV). The "
+                            "filesystem is fine; the mount layout is what "
+                            "refuses."
+                        ) from exc
+                    # `EBUSY` is what a rename **onto a mount point** returns,
+                    # and it is the one the parent-directory check cannot see.
+                    # It is reclassified only when a fresh look establishes that
+                    # cause: `EBUSY` has other sources, and labelling all of
+                    # them a mount boundary would send an operator after a mount
+                    # that is not there.
+                    if code == errno.EBUSY and leaf_is_separate_mount(
+                        dir_fd, dst_dir_fd, final_name
+                    ):
+                        raise MountBoundary(
+                            f"{final_name} is itself a mount point, so the "
+                            "rename that publishes an overwrite cannot replace "
+                            "it (EBUSY). The filesystem is fine; the mount "
+                            "layout is what refuses."
+                        ) from exc
+                    raise
             published = True
     finally:
-        temp_removed = _unlink_quietly(dir_fd, tmp_name, published=published)
+        owned = transient if unnamed else tmp_name
+        if owned is None:
+            # Unnamed, no-clobber: the inode never had a name. Discarding it is
+            # the caller closing the descriptor it owns.
+            temp_removed = True
+        else:
+            temp_removed = discard_staged_name(
+                dir_fd, owned, staged_st, published=published
+            )
 
     return Published(name=final_name, published=published, temp_removed=temp_removed)
+
+
+def _require_committed_target(
+    dst_dir_fd: int, final_name: str, expected_fingerprint: Fingerprint
+) -> None:
+    """Refuse unless the destination is still the file the mint bound to."""
+    current = _lstat(dst_dir_fd, final_name)
+    if current is None:
+        raise Conflict(f"Target disappeared since the token was minted: {final_name}")
+    _require_regular(current, final_name)
+    got = {
+        "dev": current.st_dev,
+        "inode": current.st_ino,
+        "size": current.st_size,
+        "mtime_ns": current.st_mtime_ns,
+        "ctime_ns": current.st_ctime_ns,
+    }
+    if not _metadata_matches(expected_fingerprint, got):
+        raise Conflict(f"Target changed since the token was minted: {final_name}")
+    if expected_fingerprint.get("sha256") is not None:
+        digest = _hash_regular(
+            dst_dir_fd,
+            final_name,
+            expect_ino=current.st_ino,
+            expect_dev=current.st_dev,
+        )
+        if digest != expected_fingerprint["sha256"]:
+            raise Conflict(
+                f"Target contents changed since the token was minted: {final_name}"
+            )
 
 
 def _link_no_clobber(dir_fd: int, src: str, dst: str, *, dst_dir_fd: int | None = None) -> None:
@@ -880,7 +1667,17 @@ def _link_no_clobber(dir_fd: int, src: str, dst: str, *, dst_dir_fd: int | None 
         # kernel refuses all three identically, which is exactly the promise.
         raise Conflict(f"Target already exists: {dst}") from None
     except OSError as exc:
-        if exc.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV):
+        if exc.errno == errno.EXDEV:
+            # Not a filesystem that cannot link — a boundary that cannot be
+            # crossed. The preflight makes this rare rather than gone (it is
+            # check-then-act), so the mapping still has to be right.
+            raise MountBoundary(
+                f"{dst} is on a different mount from the staging directory, "
+                "so the link that publishes an upload cannot reach it "
+                "(EXDEV). The filesystem is fine; the mount layout is what "
+                "refuses."
+            ) from exc
+        if exc.errno in (errno.EPERM, errno.EOPNOTSUPP):
             raise UnsupportedFilesystem(
                 "The vault filesystem does not support hard links, which the "
                 "no-clobber publish depends on (see probe_publication)"
@@ -905,14 +1702,81 @@ def _unlink_quietly(dir_fd: int, name: str, *, published: bool) -> bool:
         return False
 
 
-def discard_temp(dir_fd: int, name: str) -> bool:
-    """Remove a temp file that never got published; never raises.
+def discard_staged_name(
+    dir_fd: int,
+    name: str,
+    staged: os.stat_result | None,
+    *,
+    published: bool,
+) -> bool:
+    """Remove a staging name — and never anybody else's. Never raises.
 
-    The abandon path of a failed upload. It must not be able to turn one
-    failure (a 413, a disconnect) into a second, noisier one, so an unlink that
-    itself fails is logged and swallowed.
+    Reached on every by-name publication path: a successful `replace` (which
+    consumed the name, so this is a no-op), a `link` publish that leaves its
+    source behind, and every failure after staging.
+
+    **The unlink runs only while the name still refers to the inode this call
+    staged.** If it does not, the file is left in place and logged. Answering an
+    attempted substitution by deleting the substitute is the same
+    destructive-write class this module exists to prevent, just aimed at a
+    different file, so the failure direction is to leave litter rather than
+    remove something we cannot prove is ours — the same posture `soft_delete`
+    and `_discard_temp` in `vault.py` already take.
+
+    The pre-change transfer path unlinked its staging name unconditionally. The
+    named-staging fallback deliberately does **not** inherit that: a name that
+    lives for the whole streaming window has more need of the guard than the
+    transient overwrite name it was introduced for, not less (D27).
+
+    **An absent name is not a substitution.** A successful overwrite publish is
+    a `renameat` that *consumes* the staging name, so by the time this runs
+    there is nothing there — the ordinary case, and it must not be reported as
+    somebody having taken the name over. Only a name that exists and refers to
+    a different inode is a substitution.
+
+    `staged is None` means the caller could not establish an identity to compare
+    against — the name is then removed unguarded, which is the pre-change
+    behaviour and is why every production caller passes one.
     """
-    return _unlink_quietly(dir_fd, name, published=False)
+    if staged is not None:
+        try:
+            current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            # The publish consumed it, or it is already gone. Nothing to do.
+            return True
+        except OSError as exc:
+            logger.warning(
+                "Could not confirm that staging name %s is still ours (%s); "
+                "leaving it in place.",
+                name,
+                exc,
+            )
+            return False
+        if (current.st_dev, current.st_ino) != (staged.st_dev, staged.st_ino):
+            logger.warning(
+                "Staging name %s no longer refers to the file we staged; "
+                "leaving it in place rather than unlinking a file we did not "
+                "create.",
+                name,
+            )
+            return False
+    return _unlink_quietly(dir_fd, name, published=published)
+
+
+def discard_temp(
+    dir_fd: int, name: str, staged: os.stat_result | None = None
+) -> bool:
+    """Discard a staged file that never got published; never raises.
+
+    The abandon path of a failed upload in the named-staging mode. It must not
+    be able to turn one failure (a 413, a disconnect) into a second, noisier
+    one, so an unlink that itself fails is logged and swallowed — and it goes
+    through `discard_staged_name`, so a substitute is left alone.
+
+    The unnamed mode never calls this: there is no name to remove, and closing
+    the descriptor frees the inode.
+    """
+    return discard_staged_name(dir_fd, name, staged, published=False)
 
 
 # ── non-replacing rename ────────────────────────────────────────────────────
@@ -1260,13 +2124,19 @@ def soft_delete_at(
     """
     rel_path = name if label is None else label
     trash_fd: int | None = None
+    # `.trash` on the very first soft delete of a vault. Flushing the directory
+    # persists its *contents*; the entry in the root that names it is a
+    # separate write, and losing that loses the note we just moved into it.
+    created_dirs: list[str] = []
     try:
         st = _lstat(src_dir_fd, name)
         if st is None:
             raise FileNotFoundError(f"File not found: {rel_path}")
         _require_regular(st, str(rel_path))
 
-        trash_fd = open_dir_beneath(root_fd, trash_dir, create=True)
+        trash_fd = open_dir_beneath(
+            root_fd, trash_dir, create=True, created=created_dirs
+        )
         if stamp is None:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         try:
@@ -1298,6 +2168,16 @@ def soft_delete_at(
         # reported failure would invite a retry of it.
         flush_dir_quietly(src_dir_fd, f"parent directory of {rel_path}")
         flush_dir_quietly(trash_fd, f"{trash_dir} directory")
+        # And the entry that *names* `trash_dir`, if this call is what brought
+        # it into existence. Without it a crash can durably remove
+        # `Folder/note.md` and lose the whole `.trash` directory with the only
+        # copy of the note inside it — the same created-ancestor class the note
+        # and transfer publishes already flush. Same D18 direction as the two
+        # above: the delete has happened, so a reported failure would invite a
+        # retry of an operation that already landed.
+        flush_publication_ancestors_quietly(
+            root_fd, trash_dir, created_dirs, f"the soft delete of {rel_path}"
+        )
         return f"{trash_dir}/{created}"
     finally:
         # The verdict is settled by here; a failing close must not change it.
@@ -1390,34 +2270,108 @@ def flush_dir_quietly(dir_fd: int, what: str) -> None:
         )
 
 
-def flush_created_ancestors(root_fd: int, created: Iterable[str]) -> None:
-    """`fsync` the parent of every directory a call created, innermost first.
+def _ancestors_up_to_root(rel_dir: str) -> list[str]:
+    """Strict ancestors of `rel_dir`, innermost first, ending with the root.
 
-    `created` is what `open_dir_beneath(create=True)` / `open_parent` recorded:
-    the vault-relative paths of the directories *this* call brought into
-    existence, outermost first. Making `New/Folder/x.md` durable means flushing
-    `New/Folder` (the destination's own parent — the caller's job, it already
-    holds that descriptor), then `New` for the entry naming `Folder`, then the
-    root for the entry naming `New`. Stop there: the first pre-existing
-    directory's entry was already somebody else's to make durable.
+    `"New/Folder"` → `["New", ""]`; `"Attachments"` → `[""]`; `""` → `[]`.
+    """
+    parts = [p for p in str(rel_dir).split("/") if p not in ("", ".")]
+    return ["/".join(parts[:i]) for i in range(len(parts) - 1, -1, -1)]
 
-    Each parent is re-opened by a fresh beneath-root lookup rather than kept
-    from the descent — `_create_descent` carries no descriptor across, and this
-    must not become the exception that does.
+
+def publication_flush_dirs(rel_dir: str, created: Iterable[str] = ()) -> list[str]:
+    """Directories whose *entries* a publication into `rel_dir` must make durable.
+
+    `rel_dir` is the vault-relative destination **parent**; the caller flushes
+    that one itself, through the descriptor it already holds. This returns
+    everything above it — innermost first, ending with the root — plus the
+    parent of every directory the call recorded creating, deduplicated.
+
+    **Why the whole chain and not just this call's creations.** Attributing the
+    flush to the call that ran the `mkdir` looks precise and is not durable
+    across an *abort*. An upload that creates `New/Folder` and then dies before
+    publication (a 413, a disconnect, a refused deadline) releases its claim and
+    flushes nothing — correctly, since nothing was published. The retry finds
+    both directories already there, records no creations, publishes, and flushes
+    only `New/Folder`. The entry naming `New` was never made durable by anybody,
+    so a crash can take the whole folder and with it a file `check_upload` has
+    already reported `completed`. The same shape reaches a note write through
+    `MutableTarget.ensure_parent`, and `.trash` through a probe or a delete that
+    failed after creating it.
+
+    Per-call provenance cannot close that: the obligation outlives the call that
+    incurred it, and it outlives the *process*. Recording it durably would mean
+    a journal, which is a database for a problem that costs one `fsync` per path
+    component. Vault paths are two or three deep and a directory `fsync` is
+    metadata-only, so the conservative rule is the cheap one — flush the chain
+    on every successful publication, whoever created what.
+
+    The `created` term is kept even though it is currently always a subset: it is
+    what a caller that creates a directory *outside* the destination's own chain
+    would need, and dropping it would make that a silent hole rather than a
+    covered case.
+    """
+    seen: dict[str, None] = {}
+    for rel in _ancestors_up_to_root(str(rel_dir)):
+        seen.setdefault(rel, None)
+    for rel in created:
+        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        seen.setdefault(parent, None)
+    # Innermost first, so a crash midway through leaves the *outer* entries
+    # unflushed rather than the inner ones — the same order
+    # the entries depend on each
+    # other in.
+    return sorted(seen, key=lambda r: len([p for p in r.split("/") if p]), reverse=True)
+
+
+def flush_publication_ancestors(
+    root_fd: int, rel_dir: str, created: Iterable[str] = ()
+) -> None:
+    """`fsync` every directory `publication_flush_dirs` names, innermost first.
+
+    Making `New/Folder/x.md` durable means flushing `New/Folder` (the caller's
+    job — it holds that descriptor) and then `New`, for the entry naming
+    `Folder`, and the root, for the entry naming `New`.
+
+    Each is re-opened by a fresh beneath-root lookup rather than kept from a
+    descent — `_create_descent` carries no descriptor across, and this must not
+    become the exception that does.
 
     Raises like `flush_dir_fd`; the caller decides what a failure means.
     """
-    seen: set[str] = set()
-    for rel in reversed(list(created)):
-        parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
-        if parent in seen:
-            continue
-        seen.add(parent)
-        fd = open_dir_beneath(root_fd, parent)
+    for rel in publication_flush_dirs(rel_dir, created):
+        fd = open_dir_beneath(root_fd, rel)
         try:
             flush_dir_fd(fd)
         finally:
-            close_quietly(fd, f"created ancestor {parent or '.'!r}")
+            close_quietly(fd, f"ancestor {rel or '.'!r}")
+
+
+def flush_publication_ancestors_quietly(
+    root_fd: int, rel_dir: str, created: Iterable[str], what: str
+) -> None:
+    """`flush_publication_ancestors`, every failure logged and swallowed (D18).
+
+    The form the *note* side uses — the soft delete and, through
+    `vault._flush_target_dirs`, every note publish. All of them run after the
+    operation has already landed, so an error here says only that the new state
+    may not survive a crash, and a tool that reported it as a failure would be
+    retried: a retried delete finds the source gone, a retried
+    `edit_note(append=True)` appends the same block twice. The transfer path
+    keeps the raising form, because there the source bytes are gone and the
+    ambiguity has to reach the human.
+    """
+    try:
+        flush_publication_ancestors(root_fd, rel_dir, created)
+    except (OSError, VaultFSError, RuntimeError) as exc:
+        logger.warning(
+            "Completed %s but could not flush the directories above %s: %s. "
+            "The operation stands; only its durability across a crash is "
+            "unconfirmed.",
+            what,
+            rel_dir or ".",
+            exc,
+        )
 
 
 # ── startup probe ───────────────────────────────────────────────────────────
@@ -1476,27 +2430,89 @@ def _probe_flush(fd: int, what: str) -> None:
         raise
 
 
-def probe_publication(root_fd: int) -> None:
-    """Verify a publish can work: hard links, and both flushes, in the root.
+def _probe_unnamed_staging(root_fd: int) -> None:
+    """Exercise `O_TMPFILE` staging and by-descriptor publication at the root.
 
-    **This probe writes** (a temp file and a link, both removed again), so it
-    belongs only on paths that are about to write. A read — a download, a
-    `check_upload` — must never call it: a read-only capability that creates
-    files, however briefly, is a write the caller did not ask for.
+    Raises `UnsupportedFilesystem` when either is unavailable. Creates nothing
+    that survives: the inode has no name until the probe links it, and that link
+    is removed again.
+    """
+    fd = create_nameless_temp(root_fd)
+    linked = f".tmp-{secrets.token_hex(16)}-probe"
+    try:
+        _probe_flush(fd, "a staged file with no directory entry")
+        try:
+            link_staged_inode(fd, root_fd, linked)
+        except FileExistsError:  # pragma: no cover - 128-bit collision
+            raise VaultFSError(
+                "Could not publish the probe's staged inode by descriptor"
+            ) from None
+        _unlink_quietly(root_fd, linked, published=False)
+    finally:
+        close_quietly(fd, "unnamed staging probe")
+
+
+def probe_publication(root_fd: int) -> str:
+    """Verify a publish can work here, and decide **how** this root stages.
+
+    **This probe writes** (a temp file, an unnamed inode and a link, all removed
+    again), so it belongs only on paths that are about to write. A read — a
+    download, a `check_upload` — must never call it: a read-only capability that
+    creates files, however briefly, is a write the caller did not ask for. It
+    creates no `.transfer-tmp` either; everything is exercised at the root,
+    which is the same filesystem the staging directory lives on.
 
     It exercises every primitive the publish depends on and can test from the
-    root: the hard link, a **payload flush** and a **directory flush** (#97).
-    The two flushes are not decoration. A filesystem or container that links
-    happily and rejects `fsync` on a directory would otherwise pass this probe,
-    accept a token, take a whole 25 MB body, publish it — and only then strand
-    the claim on the post-publication flush, which is the one failure the
-    transfer path deliberately cannot undo. The point of a probe is that the
-    environment is refused *before* a body is streamed.
+    root: the hard link, allocation of a file with **no directory entry**,
+    publication of such a file **by descriptor**, a **payload flush** and a
+    **directory flush** (#97). None of them is decoration. A filesystem or
+    container that links happily and rejects `fsync` on a directory would
+    otherwise pass, accept a token, take a whole 25 MB body, publish it — and
+    only then strand the claim on the post-publication flush, which is the one
+    failure the transfer path deliberately cannot undo. The point of a probe is
+    that the environment is refused *before* a body is streamed.
 
-    Raises `UnsupportedFilesystem` when links are refused (`EPERM`/
-    `EOPNOTSUPP`/`ENOSYS`), would cross a device (`EXDEV`), or when either
-    flush is refused.
+    **It returns the staging mode, and that is the whole of how the mode is
+    decided** (D27). `_cached_probe` keeps the answer per root, so a root stages
+    one way for the life of the cached result and never re-decides per call, per
+    token or per body — a root that staged one upload without a name and the
+    next one under a name would make the window each upload ran in unknowable
+    after the fact.
+
+    * unnamed staging works → `STAGING_MODE_UNNAMED`.
+    * it does not and `VAULT_ALLOW_NAMED_STAGING_FALLBACK` is **off** → raise
+      `UnsupportedFilesystem`, naming the missing capability *and* the flag, so
+      no token is minted and no body is streamed.
+    * it does not and the flag is **on** → `STAGING_MODE_NAMED`, but only after
+      the primitives *that* mode needs have been established here too: the
+      exclusive, non-symlink-following creation, the hard link within the root,
+      the payload flush and the directory flush. A root that fails any of them
+      is still refused rather than accepting a body it cannot publish.
+
+    **What it cannot answer for.** It links root→root and is cached per root, so
+    it answers only for properties the root and the destination share. A
+    destination directory whose filesystem or mount differs from the root's can
+    refuse a primitive the root accepted, and this probe cannot see it (D23).
+
+    The one such difference known to occur — a destination on a mount beneath
+    the vault root, which refuses the link and the rename the publish depends
+    on — is now covered by the **mount-identity preflight**
+    (`require_destination_mount` at mint or fetch start,
+    `require_same_mount` inside the publish gate), not by this probe: it is a
+    property of the *pair*, and this probe answers about one root. What remains
+    uncovered is narrower and has no known instance: a capability difference
+    between two directories on the **same** mount. That is detected at the
+    operation itself, which is why the residual `EXDEV` mapping in `publish`
+    stays even with the preflight in front of it.
+
+    The guarantee is therefore "an environment that fails at the root is
+    refused before any body is streamed", not "an environment that passes will
+    publish".
     """
+    # The named primitives first, and unconditionally: they are what the
+    # fallback needs, and the hard link and the two flushes are needed by both
+    # modes. Doing them before the O_TMPFILE attempt means the fallback is only
+    # ever selected for a root that has already proved it can take one.
     fd, tmp_name = create_temp(root_fd)
     try:
         try:
@@ -1509,6 +2525,18 @@ def probe_publication(root_fd: int) -> None:
         # One `finally` around everything after the temp exists: a refused
         # payload flush must not leave the probe's own file in the vault.
         _unlink_quietly(root_fd, tmp_name, published=False)
+
+    try:
+        _probe_unnamed_staging(root_fd)
+    except UnsupportedFilesystem:
+        if not settings.vault_allow_named_staging_fallback:
+            raise
+        # Every primitive the fallback needs has been exercised above. Note the
+        # warning is *not* logged here: selecting the mode is not exercising it,
+        # and the distinction between "an operator enabled this defensively" and
+        # "this mount is taking the fallback" is the whole value of the signal.
+        return STAGING_MODE_NAMED
+    return STAGING_MODE_UNNAMED
 
 
 def probe_trash(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
@@ -1535,8 +2563,14 @@ def probe_trash(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
     os.close(fd)
     trash_fd: int | None = None
     created: str | None = None
+    # The probe does not remove `trash_dir` afterwards — a soft delete is about
+    # to need it — so if this is what created it, this is what owes the root's
+    # entry for it a flush.
+    created_dirs: list[str] = []
     try:
-        trash_fd = open_dir_beneath(root_fd, trash_dir, create=True)
+        trash_fd = open_dir_beneath(
+            root_fd, trash_dir, create=True, created=created_dirs
+        )
         try:
             created = _rename_into_trash(
                 root_fd, tmp_name, trash_fd, f"{tmp_name}-probe"
@@ -1558,6 +2592,9 @@ def probe_trash(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
                 ) from exc
             raise
         _unlink_quietly(trash_fd, created, published=False)
+        flush_publication_ancestors_quietly(
+            root_fd, trash_dir, created_dirs, f"the {trash_dir} probe"
+        )
     finally:
         if trash_fd is not None:
             os.close(trash_fd)
@@ -1573,6 +2610,18 @@ def prune_stale_staging(
     A crash or a hard kill mid-upload leaves a staged temp file nothing will
     ever publish. It is invisible to the indexer and to every dot-dir-guarded
     tool, so it would otherwise sit there consuming disk forever.
+
+    **The sweep stays, and what it collects depends on the mode** (D19, D27).
+    In the unnamed mode it has nothing *new* to collect: an inode with no
+    directory entry is freed by the kernel when the last descriptor closes,
+    which happens in `_stream_locked`'s unwinding for an abandoned upload and at
+    process death for a crash. It is retained regardless — the live vault has
+    pre-change staging files, and a rolling deploy runs both versions at once,
+    so this is the only thing that collects them. Where
+    `VAULT_ALLOW_NAMED_STAGING_FALLBACK` selects the named mode an abandoned or
+    killed upload leaves a staged file exactly as the pre-change path did, so
+    the sweep keeps a live purpose there. Removing it is a separate decision for
+    a later release, once no staging file can exist on any path.
 
     Age is `mtime`, and the comparison is strictly older-than: a file being
     written *right now* has a fresh mtime, so an in-flight upload can never be
@@ -1615,50 +2664,122 @@ def prune_stale_staging(
     return removed
 
 
+def root_identity(fd: int) -> tuple:
+    """What a cached probe result is bound to, besides the configured pathname.
+
+    `(st_dev, st_ino, mount_id)` of the anchored root. The first two already
+    separate two *filesystems* reached through one pathname; the mount id
+    additionally separates two mounts of the same directory, which is the case
+    `st_dev` alone cannot see and the reason `same_mount` exists.
+
+    The mount id is **optional here and required nowhere else**. `same_mount`
+    refuses when `STATX_MNT_ID` is unavailable, because there a fallback to
+    `st_dev` would silently answer the wrong question. This is a different
+    job: it is a *supplementary* binding on top of the pathname, and on a
+    kernel without the bit, `(dev, ino)` is strictly better than the pathname
+    alone rather than a wrong answer. So it degrades to `None` and says so.
+    """
+    st = os.fstat(fd)
+    try:
+        mnt = mount_id_of(fd)
+    except UnsupportedFilesystem:  # pragma: no cover - kernel < 5.8
+        mnt = None
+    return (st.st_dev, st.st_ino, mnt)
+
+
 # Cached per (vault root, probe kind): a probe touches the disk, and every
-# transfer tool needs the answer. `None` means "supported"; an exception
-# instance means the caller must refuse with that message.
-_probe_cache: dict[tuple[str, str], UnsupportedFilesystem | None] = {}
+# transfer tool needs the answer. An exception instance means the caller must
+# refuse with that message; anything else is the probe's own result — the
+# staging mode for `probe_publication`, `None` for `probe_trash`.
+#
+# The publication entry is what makes the staging mode a property of the root
+# rather than of a call: it is computed once and every publication on that root
+# reads it back.
+#
+# **The key is the configured pathname; the entry additionally carries the
+# identity of the root that was actually probed.** A configured root is a
+# *name*, and a name can be repointed: a symlinked vault root moved from
+# filesystem A (where `O_TMPFILE` fails but the fallback's primitives work) to
+# filesystem B (where a directory `fsync` is refused) would otherwise reuse A's
+# verdict and A's staging mode for B, mint a token, stage a whole body under a
+# name on a root nothing ever probed, publish it, and strand the claim on the
+# first directory flush. So every hit re-reads the identity and re-probes on a
+# mismatch. That is one `fstat` plus one `statx` per cached call — the walk the
+# cache exists to avoid is the probe, not this.
+_probe_cache: dict[tuple[str, str], tuple[tuple, UnsupportedFilesystem | str | None]] = {}
 
 
-def _cached_probe(root: Path | str, kind: str, probe, root_fd: int | None = None) -> None:
+def _cached_probe(root: Path | str, kind: str, probe, root_fd: int | None = None):
     key = (str(root), kind)
-    if key not in _probe_cache:
-        # A caller that already holds an anchored root descriptor passes it:
-        # re-opening the root *by name* would walk the pathname again, and the
-        # probe writes, so a root symlink repointed since the caller anchored
-        # would have the probe create `.trash` in somebody else's directory.
-        owned = root_fd is None
-        fd = open_root(root) if owned else root_fd
-        try:
-            probe(fd)
-            _probe_cache[key] = None
-        except UnsupportedFilesystem as exc:
-            _probe_cache[key] = exc
-        finally:
-            if owned:
-                os.close(fd)
-    cached = _probe_cache[key]
-    if cached is not None:
+    # A caller that already holds an anchored root descriptor passes it:
+    # re-opening the root *by name* would walk the pathname again, and the
+    # probe writes, so a root symlink repointed since the caller anchored
+    # would have the probe create `.trash` in somebody else's directory.
+    owned = root_fd is None
+    fd = open_root(root) if owned else root_fd
+    try:
+        identity = root_identity(fd)
+        entry = _probe_cache.get(key)
+        if entry is None or entry[0] != identity:
+            if entry is not None:
+                logger.info(
+                    "Vault root %s now resolves to a different root "
+                    "(%s -> %s); re-running the %s probe rather than reusing "
+                    "a verdict for a filesystem this is not.",
+                    root,
+                    entry[0],
+                    identity,
+                    kind,
+                )
+            try:
+                _probe_cache[key] = (identity, probe(fd))
+            except UnsupportedFilesystem as exc:
+                _probe_cache[key] = (identity, exc)
+    finally:
+        if owned:
+            close_quietly(fd, "vault root")
+    cached = _probe_cache[key][1]
+    if isinstance(cached, UnsupportedFilesystem):
         raise cached
+    return cached
 
 
-def check_publication_support(root: Path | str) -> None:
+def check_publication_support(
+    root: Path | str, *, root_fd: int | None = None
+) -> str:
     """Cached `probe_publication` for one root; raises when unsupported.
+
+    Returns the **staging mode** that root uses — `STAGING_MODE_UNNAMED`, or
+    `STAGING_MODE_NAMED` where unnamed staging is unavailable and
+    `VAULT_ALLOW_NAMED_STAGING_FALLBACK` permits the fallback. Decided once, by
+    the probe, and read back here for every later publication on that root: the
+    mode is never re-decided per call (D27).
+
+    `root_fd`, when given, is the descriptor the probe runs against instead of
+    re-opening `root` by name — the same reason `check_trash_support` takes one.
+    The caller keeps ownership of it.
 
     First use per root is also where abandoned staged uploads are swept, since
     it is the one moment we already know the root is writable and have not yet
     charged anybody for the walk.
     """
     key = (str(root), "publication")
-    first = key not in _probe_cache
-    _cached_probe(root, "publication", probe_publication)
+    # "First" means the first probe of *this root*, not of this pathname: a
+    # re-probe triggered by the identity check is looking at a filesystem
+    # nothing has swept, and its own pre-change litter is exactly what the
+    # sweep exists for.
+    before = _probe_cache.get(key)
+    mode = _cached_probe(root, "publication", probe_publication, root_fd)
+    first = before is None or before[0] != _probe_cache[key][0]
     if first:
-        root_fd = open_root(root)
+        owned = root_fd is None
+        fd = open_root(root) if owned else root_fd
         try:
-            prune_stale_staging(root_fd)
+            prune_stale_staging(fd)
         finally:
-            os.close(root_fd)
+            if owned:
+                os.close(fd)
+    return mode
 
 
 def check_trash_support(root: Path | str, *, root_fd: int | None = None) -> None:
@@ -1673,5 +2794,10 @@ def check_trash_support(root: Path | str, *, root_fd: int | None = None) -> None
 
 
 def reset_filesystem_probe_cache() -> None:
-    """Forget cached probe results (tests, and vault-root reassignment)."""
+    """Forget cached probe results (tests, and vault-root reassignment).
+
+    This drops the recorded staging mode with them, so the next publication on
+    that root re-probes and re-decides. That is the only way the mode ever
+    changes; nothing on a call path may clear it.
+    """
     _probe_cache.clear()

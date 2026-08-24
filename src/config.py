@@ -193,6 +193,28 @@ class Settings(BaseSettings):
     # admits ports 80/8080 for the http scheme (443/8443 stay https-only).
     import_allow_http: bool = False
 
+    # ── Named-staging fallback (one flag, both write paths) ──────────────────
+    # Both write paths stage into an unnamed `O_TMPFILE` inode and publish it
+    # by descriptor, so no staging name ever exists for a peer to observe,
+    # replace or race. Some servers refuse `O_TMPFILE` outright — TrueNAS
+    # SCALE's NFS export answers `EOPNOTSUPP` as root, under NFSv4.1 and
+    # NFSv4.2 alike (#103) — and on such a mount the no-clobber note writes and
+    # every transfer publication would be refused.
+    #
+    # Setting this takes named staging back on **both** paths. It is one knob
+    # on purpose: the failure is one filesystem property met on two paths for
+    # one reason, and two knobs would permit a deployment with a working
+    # `create_note` and a refusing upload — a state nobody chose and nobody can
+    # diagnose from either symptom alone. There is deliberately no `TRANSFER_*`
+    # variant and no per-path override.
+    #
+    # Default off, because it reopens the substitution window unnamed staging
+    # exists to close. When it is taken, the server says so: one WARNING per
+    # process the first time a call actually stages under a name, and
+    # `vault_named_staging_fallback_active` on `/health`.
+    # Env: VAULT_ALLOW_NAMED_STAGING_FALLBACK.
+    vault_allow_named_staging_fallback: bool = False
+
     @property
     def mcp_max_request_body_bytes(self) -> int:
         """Maximum MCP streamable-HTTP request body, derived from the write caps.

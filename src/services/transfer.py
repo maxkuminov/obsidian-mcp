@@ -42,7 +42,7 @@ import unicodedata
 import weakref
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import AsyncContextManager, AsyncIterator, Awaitable, Callable, Iterable
 from urllib.parse import urljoin, urlsplit, urlunsplit
 
@@ -1151,7 +1151,22 @@ async def stream_to_vault(
 
     Returns `{"size", "sha256", "mime"}`. Raises `TooLarge`, `Timeout`,
     `PrePublishAborted`, or `vault_fs.Conflict` / `vault_fs.UnsafePath` — and
-    in every case leaves no temp file and nothing at the target path.
+    in every case leaves no staged file and nothing at the target path.
+
+    **Staging holds no directory entry** (#92 item 1). The body streams into an
+    `O_TMPFILE` inode in `.transfer-tmp`, and a no-clobber publish links that
+    inode into place by descriptor through `/proc/self/fd/<fd>` — so for the
+    whole streaming window there is nothing in the staging directory to observe,
+    replace or race, and an abandoned upload leaves nothing for the sweep. An
+    *overwrite* publish cannot consume an unnamed inode (`renameat` has no
+    by-descriptor form), so it materialises a transient name in the staging
+    directory inside the publish gate, immediately before the fingerprint check
+    and the rename (D20). Where the publication probe finds the filesystem
+    cannot allocate an unnamed inode, the transfer is refused unless
+    `VAULT_ALLOW_NAMED_STAGING_FALLBACK` is set, in which case the pre-change
+    named staging is used instead — with the identity check and the guarded
+    discard the transient name introduced. The probe decides which, once per
+    root; nothing here re-decides it.
 
     **The contract callers depend on: `PostPublishFailure` is the only error
     raised after the bytes are in place.** Every other exception — including an
@@ -1238,13 +1253,22 @@ def _close_quietly(fd: int, what: str) -> None:
         logger.warning("Could not close the %s descriptor: %s", what, exc)
 
 
+def _parent_rel(rel_path: str) -> str:
+    """The vault-relative parent directory of `rel_path` (`""` for the root)."""
+    parent = str(PurePosixPath(str(rel_path)).parent)
+    return "" if parent == "." else parent
+
+
 def _publish_into_current_parent(
     root_fd: int,
     staging_fd: int,
-    tmp_name: str,
+    tmp_name: str | None,
     row,
     on_published: Callable[[object], None] | None = None,
     created: list[str] | None = None,
+    *,
+    staged_fd: int | None = None,
+    staged_st: os.stat_result | None = None,
 ):
     """Resolve the destination parent *now* and link the staged file into it.
 
@@ -1266,6 +1290,10 @@ def _publish_into_current_parent(
     up-front one in `_stream_locked` is the first — which is why D22's bound is
     stated per descent rather than per call.
 
+    **The mount-identity re-check runs here**, after that lookup and before
+    `publish`, so a destination that has come to sit on a different mount is
+    refused rather than published into. See the comment at the call.
+
     `on_published` is called with the outcome the *instant* `publish` returns
     having placed the bytes, before this function does anything else — closing
     the destination descriptor included. Nothing after a successful publish may
@@ -1285,11 +1313,38 @@ def _publish_into_current_parent(
     `created` carries the directories this call made on the way here — from the
     up-front walk in `_stream_locked` as well as from this one — because
     flushing the destination alone leaves the entry that names *it* unflushed.
+
+    `tmp_name` is `None` in the unnamed staging mode, where `staged_fd` is the
+    `O_TMPFILE` descriptor and the no-clobber publish is a `linkat` through
+    `/proc/self/fd/<fd>` — the staged bytes never carry a directory entry, so
+    there is nothing here for a peer to observe or substitute. In the
+    named-staging fallback `tmp_name` is the `.tmp-*` in `.transfer-tmp` and
+    `staged_st` is the `fstat` this call took of it when it was created, which
+    is what `publish`'s identity check compares against. Everything else on this
+    path — the fresh lookup, the gate, the flushes, the callback ordering — is
+    the same code on both branches.
     """
     dst_fd, name = vault_fs.open_parent(
         root_fd, row.path, create=True, created=created
     )
     try:
+        # **Before `publish`, against the authoritative destination descriptor.**
+        # The mint-time check (`vault_fs.require_destination_mount`) refuses a
+        # boundary that was already there before a byte moves; this one catches
+        # a mount established between the mint and now. Raising here keeps the
+        # refusal unambiguously pre-publication — `_stream_locked` sees
+        # `state["published"]` still false, so the claim is released and the
+        # human may retry the same link.
+        #
+        # What it does **not** save: by the time the gate runs the body has
+        # streamed in full. This half is pre-*publication*, not pre-*body*, and
+        # the pair must not be described as "refused before any body is
+        # streamed" (D23).
+        vault_fs.require_same_mount(staging_fd, dst_fd, row.path)
+        if row.overwrite:
+            # A bind mount on the destination *file* leaves the parent check
+            # above satisfied and still fails the rename with `EBUSY`.
+            vault_fs.require_leaf_on_same_mount(staging_fd, dst_fd, name, row.path)
         outcome = vault_fs.publish(
             staging_fd,
             tmp_name,
@@ -1297,13 +1352,25 @@ def _publish_into_current_parent(
             overwrite=bool(row.overwrite),
             expected_fingerprint=row.expected_fingerprint,
             dst_dir_fd=dst_fd,
+            staged_fd=staged_fd,
+            staged_st=staged_st,
         )
         if on_published is not None and outcome.published:
             on_published(outcome)
         if outcome.published:
             vault_fs.flush_dir_fd(dst_fd)
-            if created:
-                vault_fs.flush_created_ancestors(root_fd, created)
+            # And every directory *above* the destination parent, up to the
+            # vault root — not just the ones this call created. A previous
+            # attempt that created `New/Folder` and then aborted (a 413, a
+            # disconnect, a refused deadline) flushed nothing, correctly, since
+            # it published nothing; this call finds both directories there,
+            # records no creations, and would otherwise leave the entry naming
+            # `New` durable nowhere while reporting the upload `completed`.
+            # Per-call provenance cannot cover an obligation that outlives the
+            # call, or the process. See `publication_flush_dirs`.
+            vault_fs.flush_publication_ancestors(
+                root_fd, _parent_rel(row.path), created or ()
+            )
         return outcome
     finally:
         # Never `os.close` bare here: a close that fails *after* publication
@@ -1325,6 +1392,8 @@ async def _stream_locked(
     root_fd = vault_fs.open_root(row.vault_root)
     staging_fd: int | None = None
     tmp_name: str | None = None
+    staged_fd: int | None = None
+    staged_st: os.stat_result | None = None
     # Every directory *this call* creates, from either descent. The up-front
     # walk below usually makes them, so the publish-time walk finds them there
     # and records nothing — collecting from both is what keeps the flush from
@@ -1340,37 +1409,72 @@ async def _stream_locked(
         )
         os.close(probe_fd)
 
+        # How this root stages was decided once, by the publication probe, and
+        # is read back here — never re-decided per call (D27). The probe has
+        # already run on every path that reaches this function (the mint tools
+        # and the upload route all call it before a token is handed out), so
+        # this is a cache read; passing our own anchored root descriptor keeps
+        # it from re-walking the root's pathname if it is not.
+        mode = vault_fs.check_publication_support(row.vault_root, root_fd=root_fd)
+
         staging_fd = vault_fs.open_staging_dir(root_fd)
-        fd, tmp_name = vault_fs.create_temp(staging_fd)
+        if mode == vault_fs.STAGING_MODE_UNNAMED:
+            # No directory entry at any point: nothing in `.transfer-tmp` for a
+            # peer to observe, replace or race for the whole streaming window,
+            # and nothing for a sweep to collect if this upload is abandoned.
+            staged_fd = vault_fs.create_nameless_temp(staging_fd)
+        else:
+            # The `VAULT_ALLOW_NAMED_STAGING_FALLBACK` branch: exactly the
+            # pre-change staging, through the staging descriptor the
+            # beneath-root lookup returned. Only the staging differs — the
+            # payload flush, the gate and its lock order, the size caps, the
+            # deadline and the token state machine below are the same code.
+            staged_fd, tmp_name = vault_fs.create_temp(staging_fd)
+            # First *exercise*, which is the moment the warning means something.
+            vault_fs.note_named_staging_exercised()
         try:
+            # The identity the publish's check compares against. Taken from the
+            # descriptor, so it names the inode this call staged whatever
+            # happens to the name afterwards.
+            staged_st = os.fstat(staged_fd)
             size, digest, head = await _drain(
                 chunks,
-                fd,
+                staged_fd,
                 max_bytes=max_bytes,
                 deadline=deadline,
                 idle_timeout=idle_timeout,
             )
-            # Publication links this very inode into place, so the 0600 the
-            # staging file was created with would become the published mode.
-            # Relax it to what a plain write would have produced, exactly as
+            # Publication links this very inode into place, so the 0600 it was
+            # created with would become the published mode. Relax it to what a
+            # plain write would have produced, exactly as
             # `vault._atomic_write_at` does — an upload must not land less
             # readable than the note beside it (#95).
             #
             # Relaxing it here rather than at publish time means the bytes are
             # group/world-readable for as long as the gate takes, which can be
             # minutes; `open_staging_dir` holds `.transfer-tmp` at 0700 so that
-            # window is not reachable. Keeping the descriptor open until publish
-            # would be the alternative and is worse: it pins an fd across an
-            # unbounded wait on `SELECT … FOR UPDATE`, per upload.
-            os.fchmod(fd, vault_fs.default_file_mode())
+            # window is not reachable — and in the unnamed mode there is no name
+            # through which to reach them at all.
+            os.fchmod(staged_fd, vault_fs.default_file_mode())
             # Durability, before the gate and off the loop — see
             # `_flush_staged_payload`. The body is complete at this point and
             # nothing has been published, so a failure here is a plain
             # pre-publication error: the `except` below discards the staged
             # bytes and the route releases the claim.
-            await _flush_staged_payload(fd)
+            await _flush_staged_payload(staged_fd)
         finally:
-            os.close(fd)
+            if tmp_name is not None and staged_fd is not None:
+                # Named mode releases the descriptor before the gate, as it
+                # always has: holding one across an unbounded wait on
+                # `SELECT … FOR UPDATE`, per upload, is what this avoids. A
+                # close that fails here is genuinely pre-publication and must
+                # not be swallowed.
+                os.close(staged_fd)
+                staged_fd = None
+        # In the unnamed mode the descriptor stays open until after publication
+        # — it is the only handle on the bytes, and publishing *is* linking it
+        # into place. It is closed quietly in the outer `finally`, once the
+        # publication verdict has been decided.
 
         _kind, mime = classify_bytes(head, name)
         result = {"size": size, "sha256": digest, "mime": mime}
@@ -1390,7 +1494,14 @@ async def _stream_locked(
             if before_publish is None:
                 _refuse_if_past_deadline(deadline)
                 _publish_into_current_parent(
-                    root_fd, staging_fd, tmp_name, row, _record, created_dirs
+                    root_fd,
+                    staging_fd,
+                    tmp_name,
+                    row,
+                    _record,
+                    created_dirs,
+                    staged_fd=staged_fd,
+                    staged_st=staged_st,
                 )
                 tmp_name = None  # publish owns cleanup from here
             else:
@@ -1412,7 +1523,14 @@ async def _stream_locked(
                     # write" are the same instant.
                     _refuse_if_past_deadline(deadline)
                     _publish_into_current_parent(
-                        root_fd, staging_fd, tmp_name, row, _record, created_dirs
+                        root_fd,
+                        staging_fd,
+                        tmp_name,
+                        row,
+                        _record,
+                        created_dirs,
+                        staged_fd=staged_fd,
+                        staged_st=staged_st,
                     )
                     tmp_name = None
                     # Inside the context, so completion commits with the locks.
@@ -1431,14 +1549,24 @@ async def _stream_locked(
             raise
         return result
     except BaseException:
+        # Named mode only. The unnamed mode has no name to unlink: closing the
+        # descriptor in the `finally` below frees the inode, which is what makes
+        # an abandoned upload leave nothing for the 24-hour sweep to collect.
+        # The unlink is inode-guarded, so a substitute is left in place and
+        # logged rather than deleted.
         if tmp_name is not None and staging_fd is not None:
-            vault_fs.discard_temp(staging_fd, tmp_name)
+            vault_fs.discard_temp(staging_fd, tmp_name, staged_st)
         raise
     finally:
         # Quietly, and in a `finally` that runs after the publication verdict
         # has already been decided: a descriptor we are done with cannot be
         # allowed to turn a published upload into a generic `OSError` on the
-        # way out, which the route would answer by releasing the claim.
+        # way out, which the route would answer by releasing the claim. The
+        # staged payload's descriptor is here too in the unnamed mode — it is
+        # held across the publish by construction, and by the time we reach this
+        # line the publication has either happened or provably has not.
+        if staged_fd is not None:
+            _close_quietly(staged_fd, "staged upload payload")
         if staging_fd is not None:
             _close_quietly(staging_fd, "upload staging directory")
         _close_quietly(root_fd, "vault root")
