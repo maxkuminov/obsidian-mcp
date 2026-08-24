@@ -56,18 +56,20 @@ than introducing them.
   ABI mismatch; `EAGAIN` **and `EINTR`** → bounded retry, then refuse — the
   `os.open` walk retried `EINTR` transparently and a raw syscall does not, so
   omitting it turns a signal into a false failure of a write (D17)
-- [ ] 1.5 Rewrite the `create=True` descent so **no descriptor is carried
-  across a creation**: for each missing component, re-acquire the
-  already-existing prefix with a fresh `openat2` from the root, issue the one
-  `mkdirat` through it, drop it. The descriptor the caller receives then comes
-  from a *fresh* single beneath-root lookup of the whole parent performed after
-  creation finishes; no descriptor the creation produced may be returned or
-  written through. Record the residual this leaves in the docstring — one
+- [ ] 1.5 Rewrite the `create=True` descent so **no directory descriptor is
+  carried across a creation**: for each missing component, re-acquire the
+  already-existing prefix with a fresh `openat2` from the root, issue the
+  one `mkdirat` through it, drop it. The directory descriptor the caller
+  receives then comes from a *fresh* single beneath-root lookup of the whole
+  parent performed after creation finishes; no directory descriptor the
+  creation produced may be returned to a caller or used as a pathname
+  anchor. Record the residual this leaves in the docstring — at most one
   empty directory per component **per creation descent**, if a prefix is
   renamed out inside a one-syscall window; never a file, never something the
-  tool reports success about; and an upload performs two such descents while a
-  note write performs one — and do **not** try to clean it up: an `rmdir` by name is the
-  delete-the-substitute hazard `_discard_temp` already refuses (D22)
+  tool reports success about; and an upload performs two such descents while
+  a note write performs one — and do **not** try to clean it up: an `rmdir`
+  by name is the delete-the-substitute hazard `_discard_temp` already
+  refuses (D22)
 - [ ] 1.6 Confirm every caller inherits it without its own change:
   `_open_parent` / `open_parent` (transfer publish, `delete_file`),
   `open_staging_dir`, `probe_trash`'s trash open,
@@ -103,14 +105,22 @@ than introducing them.
   precisely"** so the non-atomic-walk bullet is *replaced* — the lookup window
   is gone, and the creation-side residual (D22) takes its place, stated as
   precisely as the bullets around it. The proposal's claim and that section
-  must end up telling the same story, and it must be the **narrowed** one: the
-  lookup is atomic, so nothing is ever redirected into a directory that was
-  never beneath the root and no descriptor a creation produced is ever written
-  through; creation keeps a bounded empty-directory residual per descent (D22);
-  and a lookup proves containment only at the instant it resolves, so a rename
-  landing before the publish carries the call with it (D26). Do **not** write
-  "nothing outside the root is ever written" unqualified — it is false, and it
-  was the claim review rejected
+  must end up telling the same story in the same words: **Every below-root
+  directory descriptor a call uses as a pathname anchor comes from a lookup
+  the kernel proved beneath the vault root at the moment it resolved, and no
+  directory descriptor retained from a creation descent is ever returned to
+  a caller or used as a pathname anchor — so no operation is ever redirected
+  into a directory that was never beneath the root.**
+  Scope it to *directory* descriptors used as pathname anchors and keep it
+  there: a transfer's own staged payload descriptor is created by the call
+  and is written, flushed and published through by descriptor, so the
+  broader "no descriptor whose containment the kernel did not check is ever
+  acted through" is false and must not be written anywhere. Then: creation
+  keeps a bounded empty-directory residual, at most one per component per
+  creation descent (D22); and a lookup proves containment only at the
+  instant it resolves, so a rename landing before the publish carries the
+  call with it (D26). Do **not** write "nothing outside the root is ever
+  written" unqualified — it is false, and it was the claim review rejected
 
 ## 2. #97 — staged bytes and the publication are made durable
 
@@ -280,21 +290,29 @@ the ones group 1 produces.
   **before** `publish`, so a mount established after the mint is refused rather
   than published into. Raising before `publish` is what keeps the refusal
   unambiguously pre-publication: `_stream_locked` then classifies it correctly,
-  the claim is released, and the human may retry the same link
+  the claim is released, and the human may retry the same link. Note what this
+  one does **not** save: by the time the gate runs the body has already
+  streamed in full, so this half is pre-*publication*, not pre-*body*. Only
+  4.4's check spares the bytes, and only where the boundary already existed at
+  mint — do not describe the pair as "refused before any body is streamed"
 - [ ] 4.6 Update the docstring 3.5 added: the destination-mount case the probe
   cannot see is now covered by this preflight, and what remains uncovered is a
   capability difference between two directories on the *same* mount
 - [ ] 4.7 Tests, in a mount namespace with a same-filesystem bind mount beneath
   the root: the mint refuses with the named error and inserts no token;
   `import_from_url` refuses before it opens a connection; a mount established
-  between mint and redemption is refused in the gate, the destination keeps its
-  prior content and the claim is released to `pending`; a vault with no nested
-  mount behaves exactly as before; a `statx` stubbed to return no mount-id bit
-  refuses rather than falling back to `st_dev` or to the errno
+  between mint and redemption is refused in the gate **after the body has been
+  streamed in full** — assert that ordering rather than a pre-body refusal —
+  with the destination keeping its prior content and the claim released to
+  `pending`; a vault with no nested mount behaves exactly as before; a `statx`
+  stubbed to return no mount-id bit refuses rather than falling back to
+  `st_dev` or to the errno
 - [ ] 4.8 CLAUDE.md: record the envelope in the transfer section — publication
-  into a mount beneath the vault root is refused up front and never after the
-  body; reads, note writes, permanent deletes and same-side moves across one
-  are unaffected; the soft delete and the cross-boundary move are known
+  into a mount beneath the vault root is refused before any body where the
+  boundary already exists at mint or fetch start, and pre-publication inside
+  the gate (after the body, before the link or rename) where it appears
+  afterwards; reads, note writes, permanent deletes and same-side moves across
+  one are unaffected; the soft delete and the cross-boundary move are known
   failures with issues open (5.0)
 
 ## 5. Verification
@@ -319,13 +337,33 @@ the ones group 1 produces.
      is **not** an option — it is exactly the `link`+`unlink` shape
      `soft_delete`'s docstring exists to refuse, because it can unlink a
      different inode than it copied. Workaround today: `permanent=True`
-  2. **`move_note` fails across a nested-mount boundary.** Same `renameat2`
-     through `vault_fs.rename_noreplace`, two mounts, the same
-     `UnsupportedFilesystem`. Moves that stay on one side work; reproduced the
-     same way. Options: refuse early with a message naming the boundary, or
-     stage a copy — which carries the same objection as (1) and additionally
-     breaks `move_note`'s "whichever inode is at the source when the call runs
-     is what moves" guarantee
+  2. **`move_note` fails across a nested-mount boundary.** `move_note`
+     publishes with one `renameat2(RENAME_NOREPLACE)` through
+     `vault_fs.rename_noreplace`, issued against the *source* parent
+     descriptor and the *destination* parent descriptor. When those two
+     parents sit on different mounts the kernel returns `EXDEV`, which
+     `rename_noreplace` maps to `UnsupportedFilesystem` — a message blaming
+     a filesystem that renames perfectly well. Reproduction, on kernel 6.8
+     with ext4: `mount --bind <vault>/M <vault>/M` so that `M` is a mount of
+     the same filesystem as the vault root (same `st_dev`, different
+     `STATX_MNT_ID`), create `M/a.md`, then call `move_note("M/a.md",
+     "a.md")` — `EXDEV`. Moves that stay on one side of the boundary work.
+     **No existing probe can catch it, because there is no move probe at
+     all**: `probe_publication` links root→root and `probe_trash` renames
+     root→root/`.trash`, so both exercise the root against itself and
+     neither touches the source-parent/destination-parent pair a move
+     actually names — run against the vault above, both pass while every
+     cross-boundary move fails. Group 4's mount-identity check does not
+     cover it either: that one is transfer publication only, and it compares
+     the *staging* directory with the destination parent, not the two
+     parents of a move. Options: refuse early with a message naming the
+     mount boundary and both paths — group 4's `same_mount(fd_a, fd_b)`
+     already performs exactly this comparison and would need only the move's
+     two parent descriptors — or stage a copy, which carries the same
+     objection as (1) and additionally breaks `move_note`'s "whichever inode
+     is at the source when the call runs is what moves" guarantee.
+     Workaround today: read the note, write it at the destination, delete
+     the source
   3. **Destination-mount errno mapping is inconsistent between the two publish
      modes.** `vault_fs._link_no_clobber` maps `EXDEV` to
      `UnsupportedFilesystem` reading "the vault filesystem does not support
@@ -351,7 +389,13 @@ the ones group 1 produces.
   whether the residual exists. D26 in particular is the one review already
   overturned once — the change must not claim anywhere that nothing is ever
   written outside the root, only that nothing is ever *redirected* into a
-  directory that was never beneath it
+  directory that was never beneath it. Two scoping limits of that claim are
+  load-bearing and should be handed to the reviewer as things to attack: it
+  is about **directory** descriptors used as pathname anchors, not about a
+  call's staged payload descriptor (which the call creates and then writes,
+  flushes and publishes through by descriptor); and the mount check is
+  pre-body only where the boundary already existed at mint or fetch start,
+  pre-publication-but-post-body inside the gate
 - [ ] 5.5 End-to-end exercise against the live server, naming the tools
   actually called: `request_upload` + a real `PUT /transfer/upload` (both
   no-clobber and overwrite), `check_upload`, `import_from_url`, `create_note`,

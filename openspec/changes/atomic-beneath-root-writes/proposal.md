@@ -25,19 +25,30 @@ recorded today as design note D15 of `anchored-note-writes` and as the last
 bullet of CLAUDE.md's "The accepted residual, precisely".
 
 **This change closes the lookup and narrows — but does not remove — the
-creation side.** A descriptor a caller receives always comes from one atomic
-beneath-root lookup, so no operation is ever *redirected* into a directory
-that was never beneath the root, and nothing a creation produced is ever
-written through. Two things it does not close, and both are stated rather than
-implied. Creating a missing directory has no beneath-root form, so it keeps a
-bounded residual: one empty directory per component **per creation descent**,
-in a place the renaming process already controls — and an upload has two such
-descents (D22). And a lookup proves containment *at the instant it resolves*,
-not afterwards: a rename landing between the final lookup and the publish
-carries the whole call into wherever it moved the directory, because a
-descriptor keeps naming its directory across a rename. That second one is
-inherent to descriptor anchoring — it is the property #59 relies on — so it is
-*retained*, not introduced here, and it is recorded as such (D26). That
+creation side.** The claim it is entitled to, in the words every artifact of
+this change uses: **Every below-root directory descriptor a call uses as a
+pathname anchor comes from a lookup the kernel proved beneath the vault root
+at the moment it resolved, and no directory descriptor retained from a
+creation descent is ever returned to a caller or used as a pathname anchor —
+so no operation is ever redirected into a directory that was never beneath
+the root.**
+
+This is a claim about **directory** descriptors used as pathname anchors: a
+call's own staged payload descriptor is created by that call, is written,
+flushed and published through by descriptor, and never anchors a pathname
+lookup.
+
+Two things this change does not close, and both are stated rather than
+implied. Creating a missing directory has no beneath-root form, so it keeps
+a bounded residual: at most one empty directory per component **per creation
+descent**, in a place the renaming process already controls — and an upload
+has two such descents (D22). And a lookup proves containment *at the instant
+it resolves*, not afterwards: a rename landing between the final lookup and
+the publish carries the whole call into wherever it moved the directory,
+because a descriptor keeps naming its directory across a rename. That second
+one is inherent to descriptor anchoring — it is the property #59 relies on —
+so it is *retained*, not introduced here, and it is recorded as such (D26).
+That
 CLAUDE.md bullet is therefore *rewritten*, not deleted.
 
 **The decision is `openat2(2)` with `RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
@@ -156,14 +167,16 @@ whole multi-minute stream.
   RESOLVE_NO_MAGICLINKS` lookup. `open_dir_beneath` keeps its name, signature
   and error vocabulary; the per-component descent stops being how the
   authoritative descriptor is produced.
-- Directory *creation* still happens one component at a time (`openat2` cannot
-  create intermediate directories), but no descriptor is carried across a
-  creation: each `mkdir` is issued through a fresh beneath-root lookup of the
-  prefix that already exists, and the caller's descriptor always comes from a
-  fresh single beneath-root lookup of the whole parent performed **after** the
-  creation completes. That is what covers `MutableTarget.ensure_parent`, the
-  one deferred-creation site. The residual it leaves — one empty directory
-  outside the root, never a file — is stated rather than claimed closed (D22).
+  - Directory *creation* still happens one component at a time (`openat2`
+  cannot create intermediate directories), but no directory descriptor is
+  carried across a creation: each `mkdir` is issued through a fresh
+  beneath-root lookup of the prefix that already exists, and the caller's
+  descriptor always comes from a fresh single beneath-root lookup of the
+  whole parent performed **after** the creation completes. That is what
+  covers `MutableTarget.ensure_parent`, the one deferred-creation site. The
+  residual it leaves — at most one empty directory per component **per
+  creation descent**, outside the root, never a file — is stated rather than
+  claimed closed (D22).
 - A read-only startup probe in `lifespan`, beside `_check_pgvector_version`,
   refuses to start when `openat2` is unavailable; the call site raises
   `UnsupportedFilesystem` on the same errnos.
@@ -185,13 +198,17 @@ whole multi-minute stream.
   body has been streamed. What the probe cannot answer for — a destination
   whose filesystem or mount differs from the root's — is stated rather than
   implied (D23).
-- Transfer publication gains a **mount-identity preflight**: the destination
+  - Transfer publication gains a **mount-identity check**: the destination
   parent must be on the same mount as the staging directory, checked with
-  `statx`'s `STATX_MNT_ID` (never `st_dev`, which a same-filesystem bind mount
-  defeats) at mint and again inside the publish gate, refusing before any body
-  is streamed. That is the whole of what this change does about nested mounts;
-  the soft delete and the cross-boundary `move_note` are enumerated honestly
-  and filed as their own issues (D23).
+  `statx`'s `STATX_MNT_ID` (never `st_dev`, which a same-filesystem bind
+  mount defeats) at mint or fetch start and again inside the publish gate. A
+  boundary that is already there at mint or fetch start is refused **before
+  any body is read, staged or published**; one established afterwards is
+  caught only by the in-gate check, which is still pre-publication — nothing
+  is written and the claim is released — but runs after the body may already
+  have streamed in full. That is the whole of what this change does about
+  nested mounts; the soft delete and the cross-boundary `move_note` are
+  enumerated honestly and filed as their own issues (D23).
 - CLAUDE.md's "The accepted residual, precisely" has its non-atomic-walk
   bullet **rewritten**: the lookup window is gone, the creation-side residual
   (D22) takes its place, and the surrounding sections stop deferring to a
@@ -208,8 +225,9 @@ None.
 - `file-transfer`: the beneath-root lookup primitive shared by the transfer
   publish and `delete_file`; durability of staged bytes and of the
   publication; unnamed staging and by-descriptor publication; what the
-  publication probe covers; refusal of a destination on another mount before
-  any body is streamed.
+  publication probe covers; refusal of a destination on another mount —
+  before any body where the boundary is already present at mint or fetch
+  start, and pre-publication inside the gate where it appears afterwards.
 - `vault-write`: how a note mutation's parent descriptor is obtained;
   durability of the publishing rename or link.
 
@@ -221,7 +239,7 @@ None.
   `_link_staged_inode` and `_proc_fd_available` adopted from `vault.py`.
 - `src/services/transfer.py` — `_stream_locked` (payload flush, unnamed
   staging, discard path), `_publish_into_current_parent` (directory flush
-  after `on_published`, mount-identity preflight before the publish),
+  after `on_published`, mount-identity re-check before the publish),
   `plan_mint_window`'s callers / the mint path for the same preflight.
 - `src/services/vault.py` — `_atomic_write_at` (destination-directory flush,
   plus a flush of every directory `MutableTarget.ensure_parent` created,
@@ -447,15 +465,16 @@ created it under stayed beneath a root. So a missing `A/B/C` cannot be
 conjured atomically, and the honest question is not whether a residual remains
 but how small it can be made and what it can cost.
 
-Made small: no descriptor is carried across a creation. For each missing
-component the prefix that already exists is re-acquired with a fresh
+Made small: no directory descriptor is carried across a creation. For each
+missing component the prefix that already exists is re-acquired with a fresh
 `openat2` from the root, the single `mkdirat` is issued through *that*
 descriptor, and it is dropped. The window is then one syscall per component
 rather than the whole descent, and — the part that matters — the descriptor
 the caller finally receives comes from a fresh beneath-root lookup of the
-complete parent, so nothing the creation produced is ever written through.
-Re-acquiring is cheap: paths are two or three components deep and the lookups
-are `O_RDONLY|O_DIRECTORY` opens.
+complete parent, so no directory descriptor the creation produced is ever
+returned to a caller or used as a pathname anchor. Re-acquiring is cheap:
+paths are two or three components deep and the lookups are
+`O_RDONLY|O_DIRECTORY` opens.
 
 What it can cost: if a prefix is renamed out of the vault in that one-syscall
 window, an **empty directory** is created outside the root. No file, no file
@@ -477,20 +496,28 @@ the publish gate. A coordinated race can therefore leave one escaped empty
 directory for each. A note write performs one descent.
 
 Collapsing the up-front walk to a non-creating one would halve that, and was
-rejected. The `create=True` up front is also what makes a `mkdir` that cannot
-succeed — a read-only mount, a permission, a full disk — fail before 25 MB has
-been streamed rather than after, which is the same "refuse before any body
-moves" principle D23's preflight is built on. Trading it for one fewer empty
-directory, in a location the winner of the race already controls, is a bad
-trade. The honest answer is to state the bound per descent, which is what the
-requirement now does.
+rejected. The `create=True` up front is also what makes a `mkdir` that
+cannot succeed — a read-only mount, a permission, a full disk — fail before
+25 MB has been streamed rather than after, which is the same "refuse before
+any body moves" principle D23's mint-time check is built on. Trading it for
+one fewer empty directory, in a location the winner of the race already
+controls, is a bad trade. The honest answer is to state the bound per
+descent, which is what the requirement now does.
 
 Which is why D15 is recorded as narrowed rather than closed. The claim this
-change is entitled to make is: **every descriptor a call acts through comes
-from a lookup the kernel proved beneath the vault root at the moment it
-resolved, and nothing a creation produced is ever written through — so no
-operation is ever redirected into a directory that was never beneath the
-root.** It is *not* entitled to "nothing outside the root is ever created"
+change is entitled to make is: **Every below-root directory descriptor a
+call uses as a pathname anchor comes from a lookup the kernel proved beneath
+the vault root at the moment it resolved, and no directory descriptor
+retained from a creation descent is ever returned to a caller or used as a
+pathname anchor — so no operation is ever redirected into a directory that
+was never beneath the root.**
+
+This is a claim about **directory** descriptors used as pathname anchors: a
+call's own staged payload descriptor is created by that call, is written,
+flushed and published through by descriptor, and never anchors a pathname
+lookup.
+
+It is *not* entitled to "nothing outside the root is ever created"
 (D22's empty directory), and it is *not* entitled to an unqualified "nothing
 outside the root is ever written" (D26's post-lookup rename interval).
 
@@ -543,15 +570,21 @@ lookup supports nested mounts" out loud, and that sentence sitting next to an
 unqualified publication requirement would read as a promise the code does not
 keep.
 
-**In scope: transfer publication refuses a destination on another mount before
-any body is streamed** — at mint (`request_upload`, or the start of
-`import_from_url`) and again inside the publish gate. That covers the one
-operation whose failure is both late and expensive: by the time it fails, the
+**In scope: transfer publication refuses a destination on another mount — at
+mint (`request_upload`, or the start of `import_from_url`) and again inside the
+publish gate.** The two halves refuse at different moments and the difference
+is worth stating rather than rounding off. A boundary that already exists at
+mint or fetch start costs nothing: no body is read, staged or published, and no
+link is handed to a person that could only ever fail at redemption. A mount
+established *after* the mint can only be caught by the in-gate check, which
+runs once the body has streamed — before the link or rename, so nothing is
+published and the claim is released to `pending`, but the person has already
+sent the bytes. That is the residual price of a check that cannot precede a
+boundary that does not yet exist, and it still covers the one operation whose
+failure is both late and expensive: by the time a publish fails on `EXDEV`, the
 human's copy of the bytes is the only one left and it has already been sent.
-The mint-time half also stops a link being handed to a person that could only
-ever fail at redemption.
 
-**The preflight compares mount identity, not `st_dev`, and that distinction is
+**The check compares mount identity, not `st_dev`, and that distinction is
 the whole point.** A bind mount of an ext4 directory beneath the vault root has
 the *same* `st_dev` as `.transfer-tmp`, so an `st_dev` comparison passes and
 `linkat` still returns `EXDEV` after the body has streamed — which is what the
@@ -678,10 +711,13 @@ adversary it would defend against must already hold rename rights on a vault
 ancestor, at which point the vault's contents are theirs to move regardless —
 the same boundary that puts D20's overwrite window outside the threat model.
 
-What the requirements therefore say is what a lookup actually proves — beneath
-the root **at the moment it resolved**, so nothing is ever redirected into a
-directory that was never beneath it, and no descriptor a creation produced is
-ever written through — and they record the post-lookup rename as a retained
-residual beside D20's and D22's. It is retained, not introduced: the
-per-component walk this change replaces had this interval too, underneath the
-larger window it did close.
+What the requirements therefore say is what a lookup actually proves, in the
+same words everywhere: **Every below-root directory descriptor a call uses
+as a pathname anchor comes from a lookup the kernel proved beneath the vault
+root at the moment it resolved, and no directory descriptor retained from a
+creation descent is ever returned to a caller or used as a pathname anchor —
+so no operation is ever redirected into a directory that was never beneath
+the root.** And they record the post-lookup rename as a retained residual
+beside D20's and D22's. It is retained, not introduced: the per-component
+walk this change replaces had this interval too, underneath the larger
+window it did close.
