@@ -297,7 +297,13 @@ def test_the_payload_is_fsynced_before_it_is_published(vault, monkeypatch):
     """Without the `fsync`, a crash just after the rename can publish a note
     whose data blocks never reached the disk — the truncation the atomic write
     exists to make impossible. The temp must also live in the destination
-    directory, so the publish is a same-directory rename."""
+    directory, so the publish is a same-directory rename.
+
+    The directory flush that follows publication is the other half (#97): the
+    payload's own flush makes the *contents* durable and says nothing about the
+    entry that names them, so both sides of the rename are asserted here in
+    order.
+    """
     (vault / "Folder").mkdir()
     order: list[str] = []
     staged: list[list[str]] = []
@@ -305,7 +311,7 @@ def test_the_payload_is_fsynced_before_it_is_published(vault, monkeypatch):
     real_replace = os.replace
 
     def recording_fsync(fd):
-        order.append("fsync")
+        order.append("fsync-dir" if stat.S_ISDIR(os.fstat(fd).st_mode) else "fsync")
         staged.append(sorted(os.listdir(vault / "Folder")))
         return real_fsync(fd)
 
@@ -318,7 +324,12 @@ def test_the_payload_is_fsynced_before_it_is_published(vault, monkeypatch):
 
     vault_service.write_file("Folder/note.md", "body")
 
-    assert order == ["fsync", "publish"]
+    # The payload, then the publish, then one directory flush per level of the
+    # chain above the destination (#97): the parent, then the root. The order is
+    # the assertion — every directory flush follows the publish, the payload's
+    # precedes it.
+    assert order[:2] == ["fsync", "publish"], order
+    assert set(order[2:]) == {"fsync-dir"} and len(order) > 2, order
     # Staged next to the destination, not in `.transfer-tmp` or /tmp — a
     # cross-directory publish could not be an atomic rename.
     assert any(name.startswith(".tmp-") for name in staged[0]), staged[0]
@@ -533,7 +544,10 @@ async def test_a_move_releases_sources_that_need_no_rewrite(vault, monkeypatch):
     assert _open_fds() == before
     # Bounded by the notes actually being rewritten, not by the 125 sources
     # considered. The slack covers the two move endpoints and their roots.
-    assert peak[0] - before <= len(linking) + 6, peak[0] - before
+    # One per *planned* rewrite (5), never one per source (125), plus the two
+    # move endpoints and the phase's single shared root.
+    assert peak[0] - before <= len(linking) + 7, peak[0] - before
+    assert peak[0] - before < len(inert), "a descriptor was pinned per source"
 
 
 async def test_a_move_aborts_when_the_plan_exceeds_the_descriptor_budget(
@@ -584,7 +598,16 @@ def test_the_descriptor_budget_tracks_the_process_limit(monkeypatch):
     monkeypatch.setattr(
         config.resource, "getrlimit", lambda _: (1024, 1024)
     )
-    assert config.max_move_rewrite_sources() == 1024 - config.MOVE_REWRITE_FD_RESERVE
+    # The reserve, plus the one vault-root descriptor the rewrite phase shares
+    # across every planned rewrite. Charged in the budget rather than absorbed
+    # into the reserve, so the arithmetic stays visible.
+    assert config.max_move_rewrite_sources() == (
+        1024 - config.MOVE_REWRITE_FD_RESERVE - config.MOVE_REWRITE_SHARED_ROOT_FDS
+    )
+    assert config.MOVE_REWRITE_SHARED_ROOT_FDS == 1, (
+        "one shared root for the phase, not one per rewrite — a per-target root "
+        "would halve this cap to hold N duplicates of one directory"
+    )
 
     # A limit so small the reserve swallows it refuses outright. There is no
     # floor: a floor would guarantee the exhaustion the cap exists to prevent
@@ -630,8 +653,11 @@ async def test_a_move_with_many_rewrite_sources_does_not_leak(vault, monkeypatch
     assert "Moved" in result, result
     assert "rewrote 20 link(s)" in result, result
     assert _open_fds() == before
-    # One per planned rewrite, not two (`release_root`), plus the endpoints.
-    assert peak[0] - before <= len(sources) + 6, peak[0] - before
+    # One per planned rewrite, not two — each borrows the phase's single shared
+    # root (`share_root`) instead of keeping its own — plus the endpoints and
+    # that one shared descriptor.
+    assert peak[0] - before <= len(sources) + 7, peak[0] - before
+    assert peak[0] - before < 2 * len(sources), "two descriptors per source"
 
 
 class _Row:
@@ -962,7 +988,9 @@ def test_the_overwrite_cleanup_never_unlinks_a_file_it_did_not_stage(
 def test_publishing_by_descriptor_refuses_without_proc(vault, monkeypatch):
     """No `/proc` means no way to publish an inode — refuse, never fall back to
     publishing whatever a staging *name* points at."""
-    monkeypatch.setattr(vault_service, "_proc_fd_available_cache", False)
+    # The cache lives in `vault_fs` since #92 item 1 — one implementation of
+    # by-descriptor publication for both write paths.
+    monkeypatch.setattr(vault_fs, "_proc_fd_available_cache", False)
 
     with pytest.raises(vault_fs.UnsupportedFilesystem, match="/proc"):
         vault_service.write_bytes("blob.bin", b"ours", overwrite=False)

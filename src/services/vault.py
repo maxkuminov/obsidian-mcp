@@ -32,14 +32,33 @@ inside the directory the caller named:
   such window at all: it stages into an unnamed `O_TMPFILE` inode and publishes
   it through `/proc/self/fd`, so there is no staging name to substitute and
   none to clean up.
-- **the anchored walk itself is not atomic.** `vault_fs.open_dir_beneath` opens
-  one component at a time, and an ancestor renamed *out of the vault* between
-  two of those opens yields a parent descriptor outside the pinned root. This
-  is inherited, not introduced: the transfer routes and `delete_file` have
-  always walked this way. The fix is `openat2(RESOLVE_BENEATH |
-  RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)` through `ctypes`, which makes
-  the kernel enforce containment for the whole path in one call; it belongs to
-  `vault_fs` and is its own change, tracked separately.
+- **creating a missing parent has no beneath-root form** (#87, D22). The lookup
+  itself is now one `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+  RESOLVE_NO_MAGICLINKS)`, so there is no interval between components for a
+  rename to exploit — but `mkdirat` has no such form, and no syscall creates a
+  directory *and* proves the path it created it under stayed beneath a root.
+  `MutableTarget.ensure_parent` therefore descends one component at a time,
+  carrying **no** descriptor across a creation: each `mkdirat` goes through a
+  fresh beneath-root lookup of the prefix that already exists and that
+  descriptor is dropped at once, and the descriptor the write anchors to comes
+  from a fresh lookup of the whole parent performed afterwards. What a race can
+  still cost is at most one **empty** directory per component, per creation
+  descent (a note write performs one), in a place the renaming process already
+  controls — never a note, never note content, and never something the tool
+  reports success about. It is not cleaned up: an `rmdir` by name is the same
+  delete-the-substitute hazard `_discard_temp` refuses.
+- **a lookup proves containment when it resolves, not afterwards** (#87, D26).
+  A directory descriptor keeps naming the same directory however its pathname
+  is later renamed — which is exactly the property this design depends on, so
+  that a mutation lands in the directory that was validated rather than in a
+  substitute left at its name. The other side of it: a process that can rename
+  a vault ancestor can move the resolved parent out of the vault between
+  `open_mutable` and the publish, and the note then lands there while the tool
+  reports success for the path the caller named. Nothing was *redirected* — the
+  bytes went to the directory the caller named, which somebody else moved — and
+  excluding it would need an operation the kernel does not offer. Retained, not
+  introduced: the per-component walk had this interval too, underneath the
+  larger window it did not close.
 - a read-modify-write overwrite (`edit_note`, `set_frontmatter`, `move_note`'s
   link rewrites) is optimistic, not linearizable: `expected=` compares the
   current bytes immediately before the rename, and a writer that lands inside
@@ -54,9 +73,14 @@ inside the directory the caller named:
   delete or `move_note`'s own publication, which are one
   `renameat2(RENAME_NOREPLACE)`.
 
-These are declared limits of optimistic concurrency, not open holes: the
-write always lands on the path the caller named, in the directory that was
-validated.
+These are declared limits — of optimistic concurrency for the leaf ones, of
+what the kernel offers for the last two — not open holes. Every below-root
+directory descriptor a call uses as a pathname anchor comes from a lookup the
+kernel proved beneath the vault root at the moment it resolved, and no
+directory descriptor retained from a creation descent is ever returned to a
+caller or used as a pathname anchor — so no operation is ever redirected into
+a directory that was never beneath the root. The write lands on the path the
+caller named, in the directory that was validated.
 """
 
 import errno
@@ -305,6 +329,18 @@ def validate_visible_path(relative_path: str, user_id: int | None = None) -> Pat
     return resolved
 
 
+class VaultRootMismatch(RuntimeError):
+    """A shared vault-root descriptor is not the root a target was proved under.
+
+    Raised only by `MutableTarget.share_root`, and only for the identity check —
+    the other refusals there are programming errors and stay plain
+    `RuntimeError`. A distinct type because the one caller has to tell "this
+    vault root moved under us, abort the whole call" apart from "this one source
+    could not be rewritten", and matching on a message to do that is how the two
+    get confused later.
+    """
+
+
 class MutableTarget:
     """A validated mutation target, **anchored to an open parent descriptor**.
 
@@ -318,11 +354,17 @@ class MutableTarget:
     directory nobody validated. `expected=` cannot catch it: the decoy may hold
     byte-identical bytes.
 
-    So the parent is walked **once**, from an open root descriptor, one
-    `O_NOFOLLOW` component at a time, and the descriptor is what the rest of
-    the call uses. A directory descriptor keeps pointing at the same directory
-    across a rename of that directory, and no pathname is ever re-resolved, so
-    there is nothing left for a mid-call rename or relink to redirect.
+    So the parent is resolved **once**, by a single kernel-enforced
+    beneath-root lookup from an open root descriptor
+    (`vault_fs.open_dir_beneath`, an `openat2` carrying `RESOLVE_BENEATH |
+    RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`), and that descriptor is what
+    the rest of the call uses. A directory descriptor keeps pointing at the
+    same directory across a rename of that directory, and no pathname is ever
+    re-resolved, so there is nothing left for a mid-call rename or relink to
+    redirect. The lookup being one call rather than a per-component walk is
+    #87: an ancestor renamed out of the vault *between* two such opens used to
+    yield a parent descriptor outside the root, with every mutation anchored to
+    it and the tool reporting success for the path the caller named.
 
     Fields:
 
@@ -339,7 +381,17 @@ class MutableTarget:
     reason (an over-cap body) leaves no directories behind.
     """
 
-    __slots__ = ("path", "rel", "name", "root", "parent_rel", "_dir_fd", "_root_fd")
+    __slots__ = (
+        "path",
+        "rel",
+        "name",
+        "root",
+        "parent_rel",
+        "created",
+        "_dir_fd",
+        "_root_fd",
+        "_root_owned",
+    )
 
     def __init__(
         self,
@@ -357,8 +409,16 @@ class MutableTarget:
         self.name = name
         self.root = root
         self.parent_rel = parent_rel
+        # Directories `ensure_parent` created on the way to this target, if
+        # any. What #97's ancestor flush walks; empty for the ordinary write
+        # into a folder that was already there.
+        self.created: list[str] = []
         self._dir_fd = dir_fd
         self._root_fd: int | None = root_fd
+        # Whether closing this target closes the root descriptor. False once
+        # `share_root` has swapped in a descriptor somebody else's lifetime
+        # governs — see there.
+        self._root_owned = True
 
     # ── descriptors ─────────────────────────────────────────────────────────
 
@@ -375,12 +435,14 @@ class MutableTarget:
     def release_root(self) -> None:
         """Drop the root descriptor, keeping the parent one.
 
-        Only two things need the root after validation: creating a missing
-        parent, and resolving `.trash` for the soft delete. A caller that holds
-        *many* targets at once — `move_note` pins one per link-rewrite source
-        from the preflight read until the post-move write — halves the
-        descriptors it ties up by releasing the roots it will not use. Refuses
-        when the parent is not open yet, which would leave the target unusable.
+        Refuses when the parent is not open yet, which would leave the target
+        unusable.
+
+        **A target with no root cannot flush its ancestor chain**, and since the
+        chain rule (#97) every successful publication owes that chain. So this
+        is now only for a target that will not publish. A caller that holds many
+        targets *and* publishes through them wants `share_root` instead: one
+        descriptor for all of them, rather than none.
         """
         if self._dir_fd is None:
             raise RuntimeError(
@@ -388,8 +450,60 @@ class MutableTarget:
                 "is not open, so the target would become unusable"
             )
         if self._root_fd is not None:
-            vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
+            if self._root_owned:
+                vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
             self._root_fd = None
+
+    def share_root(self, root_fd: int) -> None:
+        """Swap this target's own root descriptor for a shared, borrowed one.
+
+        The descriptor stays usable — `ensure_parent` and the post-publication
+        ancestor flush both still work — but this target no longer owns it and
+        `close()` will not close it. The caller's lifetime governs it.
+
+        **Why this exists.** `move_note(rewrite_links=True)` pins one target per
+        backlink source from its preflight read until its post-move write, and
+        the number of sources is unbounded, so holding two descriptors each
+        (parent + root) would halve how large a move the process can afford.
+        Releasing the root instead was the previous answer and it is wrong now:
+        a target with no root cannot look its ancestors up, so its publication
+        flushed only the leaf's parent and silently skipped the chain the rule
+        promises. Every rewrite target resolves the *same* vault root, so one
+        borrowed descriptor serves all of them — one fd for the whole phase
+        rather than one per source.
+
+        **The identity check is what makes the sharing sound**, and it is why
+        this must be called *instead of* `release_root` rather than after it: a
+        target whose root has already been dropped cannot prove which root it
+        was validated against, and adopting one on faith would anchor its
+        ancestor lookups — and any directory creation — to a root the kernel
+        never proved this target's parent lies beneath. A mismatch means the
+        vault root pathname was repointed mid-call, which is precisely the
+        substitution surface #59 exists for, so it raises rather than guessing.
+        """
+        if self._dir_fd is None:
+            raise RuntimeError(
+                f"Cannot share a root with {self.rel}: its parent directory is "
+                "not open, so the target would become unusable"
+            )
+        if self._root_fd is None:
+            raise RuntimeError(
+                f"Cannot share a root with {self.rel}: its own root descriptor "
+                "is already gone, so there is nothing to verify the shared one "
+                "against"
+            )
+        mine = os.fstat(self._root_fd)
+        theirs = os.fstat(root_fd)
+        if (mine.st_dev, mine.st_ino) != (theirs.st_dev, theirs.st_ino):
+            raise VaultRootMismatch(
+                f"the vault root was repointed while this call was running, so "
+                f"{self.rel} was validated against a different root than the "
+                "one the call is now anchored to."
+            )
+        if self._root_owned:
+            vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
+        self._root_fd = root_fd
+        self._root_owned = False
 
     @property
     def dir_fd(self) -> int:
@@ -412,12 +526,29 @@ class MutableTarget:
         return self._dir_fd
 
     def ensure_parent(self) -> None:
-        """Open — creating if needed — the parent directory descriptor."""
+        """Open — creating if needed — the parent directory descriptor.
+
+        The deferred-creation site, and it inherits #87 whole: `mkdirat` has no
+        beneath-root form, so `open_dir_beneath(create=True)` creates one
+        component at a time — but carries no descriptor across a creation, and
+        the descriptor stored here always comes from a fresh beneath-root
+        lookup of the whole parent performed *after* the creation. So the
+        descriptor a write anchors to is never one a creation produced. The
+        residual that leaves — at most one empty directory per component, per
+        creation descent — is stated in `open_dir_beneath`'s docstring and in
+        this module's own.
+
+        Whatever it creates is recorded in `self.created`, so
+        `_flush_publication` can make those directory *entries* durable too
+        (#97): flushing the note's own parent while the entry that names that
+        parent is still only in the page cache means a crash loses the folder
+        and the note the tool reported writing.
+        """
         if self._dir_fd is not None:
             return
         try:
             self._dir_fd = vault_fs.open_dir_beneath(
-                self.root_fd, self.parent_rel, create=True
+                self.root_fd, self.parent_rel, create=True, created=self.created
             )
         except vault_fs.UnsafePath as exc:
             raise ValueError(str(exc)) from None
@@ -427,7 +558,11 @@ class MutableTarget:
             vault_fs.close_quietly(self._dir_fd, f"parent directory for {self.rel}")
             self._dir_fd = None
         if self._root_fd is not None:
-            vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
+            # A borrowed root belongs to whoever lent it (`share_root`); closing
+            # it here would pull it out from under every other target sharing
+            # it, and from under the caller's own cleanup.
+            if self._root_owned:
+                vault_fs.close_quietly(self._root_fd, f"vault root for {self.rel}")
             self._root_fd = None
 
     def __enter__(self) -> "MutableTarget":
@@ -506,13 +641,16 @@ def open_mutable(relative_path: str, user_id: int | None = None) -> MutableTarge
       symlinked directories inside the vault (shared attachment folders, a
       common Obsidian setup) keep working while an escaping one is still
       rejected by the containment check;
-    - the resolved parent is then **re-opened by descriptor**, one
-      `O_NOFOLLOW` component at a time from the vault root. `resolve()` output
-      holds no symlinks by construction, so this walk succeeds for exactly the
-      paths the containment check accepted — and refuses if a component became
-      a link in between. That is how the anchored walk stays strict while
-      symlinked ancestors keep working: they are resolved away *before* the
-      walk, never traversed by it;
+    - the resolved parent is then **re-opened by descriptor**, with one
+      `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`
+      from the vault root (#87) rather than one `O_NOFOLLOW` component at a
+      time. `resolve()` output holds no symlinks by construction, so the lookup
+      succeeds for exactly the paths the containment check accepted — and
+      refuses if a component became a link in between. That is how the lookup
+      stays strict while symlinked ancestors keep working: they are resolved
+      away *before* it, never traversed by it. The kernel proves containment
+      for the whole path inside the single call, so no rename *during* the
+      lookup can hand back a descriptor outside the root;
     - the final component is taken **as named** and `lstat`ed through that
       descriptor: if it is a symbolic link — including a dangling one — the
       operation is refused with an error naming the link's canonical
@@ -788,9 +926,78 @@ def _create_nameless_temp(dir_fd: int) -> int:
             raise vault_fs.UnsupportedFilesystem(
                 "The vault filesystem does not support O_TMPFILE, which the "
                 "no-clobber write stages into so that no temporary name is "
-                "ever exposed. Refusing rather than staging under a name."
+                "ever exposed. Refusing rather than staging under a name. "
+                "VAULT_ALLOW_NAMED_STAGING_FALLBACK is the operator switch for "
+                "this; it governs the transfer path today, and the note path's "
+                "half of it is tracked on #103 — until that lands, this write "
+                "refuses whether the flag is set or not."
             ) from exc
         raise
+
+
+def _flush_target_dirs(target: MutableTarget, what: str) -> None:
+    """`fsync` a target's parent and every directory the call created there.
+
+    Never raises. Shared by the two kinds of publication a note tool performs —
+    the staged-payload write and the `renameat2` of a move — because both leave
+    the same thing unconfirmed and both take D18's direction with it.
+    """
+    vault_fs.flush_dir_quietly(target.dir_fd, f"{what} for {target.rel}")
+    # Every directory above the destination parent, up to the vault root — not
+    # only the ones this call created. `ensure_parent` has the same abort shape
+    # as an upload: a write that creates `New/Folder` and then fails (an
+    # `expected=` mismatch, an over-cap result) leaves them behind unflushed,
+    # and the retry that succeeds records no creations and would flush only the
+    # leaf's own parent. `RuntimeError` from a released root descriptor is
+    # swallowed with everything else here — see `flush_publication_ancestors_quietly`.
+    try:
+        root_fd = target.root_fd
+    except RuntimeError as exc:
+        # `release_root` has dropped the root descriptor — `move_note`'s link
+        # rewrites do that to conserve descriptors — so there is nothing to look
+        # the ancestors up from. Same direction as everything else here: this
+        # must not fail an operation that already landed. Accessed inside the
+        # guard rather than passed as an argument, because the property itself
+        # is what raises.
+        logger.warning(
+            "Published %s but could not flush the directories above it: %s. "
+            "The operation stands.",
+            target.rel,
+            exc,
+        )
+        return
+    parent = str(PurePosixPath(str(target.rel)).parent)
+    vault_fs.flush_publication_ancestors_quietly(
+        root_fd,
+        "" if parent == "." else parent,
+        target.created,
+        str(target.rel),
+    )
+
+
+def _flush_publication(target: MutableTarget) -> None:
+    """Make a published note write durable — and never fail the write for it.
+
+    Two flushes, both after publication: the destination directory, so the
+    entry the `link`/`replace` created is durable and not only its contents;
+    and the parent of every directory `ensure_parent` created on the way,
+    outward to the first one that already existed, so `create_note` on a new
+    `New/Folder/x.md` cannot lose `New` in a crash and take the note with it.
+
+    **Every failure here is logged and swallowed, and the write is reported as
+    the success it is (D18).** This is deliberately the opposite direction from
+    the transfer path, where the same failure strands the token and surfaces as
+    `PostPublishFailure`. The asymmetry is retry safety: an upload's source
+    bytes are gone, so the ambiguity has to reach the human or it is lost,
+    while a note tool that reports a false failure gets *retried* — and
+    `edit_note(append=True)` retried after a write that actually landed appends
+    the same block twice. A false failure on this path manufactures a
+    destructive outcome; on the transfer path it merely wastes a link. The
+    payload was flushed before publication either way, so what is unconfirmed
+    is only the durability of a directory entry, and the previous content
+    survives regardless.
+    """
+    _flush_target_dirs(target, "destination directory")
 
 
 def _atomic_write_at(
@@ -838,7 +1045,14 @@ def _atomic_write_at(
        make impossible;
     3. `expected` (when given) is compared against the current bytes read
        through the same descriptor — optimistic conflict detection, immediately
-       before publication.
+       before publication;
+    4. the destination directory — and the parent of every directory this call
+       created — is **`fsync`ed after publication** (#97). The payload's flush
+       makes the contents durable and says nothing about the entry that names
+       them, so without this a crash can lose the write entirely. A failure of
+       *this* flush is logged and the write reported as the success it is; see
+       `_flush_publication` for why that is the opposite of what the transfer
+       path does with the same failure.
 
     **What the overwrite window means, precisely.** An adversary who can write
     to the *destination directory itself* can still win the rename race. That
@@ -883,6 +1097,10 @@ def _atomic_write_at(
         else:
             _link_staged_inode(fd, dir_fd, name)
         published = True
+        # After publication, before returning: the directory entry the publish
+        # created is not durable just because the payload is. Never able to
+        # fail the write — see `_flush_publication` and D18.
+        _flush_publication(target)
     finally:
         if tmp is not None:
             _discard_temp(dir_fd, tmp, staged=staged)
@@ -923,72 +1141,13 @@ def _require_staged_name(dir_fd: int, tmp: str, staged: os.stat_result) -> None:
         )
 
 
-# Whether `/proc/self/fd` is usable for publishing a staged inode. Cached: it
-# is a property of the container, not of the call.
-_proc_fd_available_cache: bool | None = None
-
-
-def _proc_fd_available() -> bool:
-    global _proc_fd_available_cache
-    if _proc_fd_available_cache is None:
-        _proc_fd_available_cache = os.path.isdir("/proc/self/fd")
-    return _proc_fd_available_cache
-
-
-def _link_staged_inode(fd: int, dir_fd: int, name: str) -> None:
-    """Publish the inode behind `fd` as `name`, no-clobber.
-
-    `linkat(AT_FDCWD, "/proc/self/fd/<fd>", dir_fd, name, AT_SYMLINK_FOLLOW)`.
-    The magic link resolves to the open file description, so what gets
-    published is the inode we wrote. `fd` is an `O_TMPFILE` staging descriptor
-    with no directory entry at all, so there is nothing a peer could have
-    substituted and nothing to check.
-
-    Two kernel details worth recording, because both look like blockers and
-    neither is: the `AT_EMPTY_PATH` form of this call needs
-    `CAP_DAC_READ_SEARCH`, which an ordinary container does not have, while the
-    `/proc` magic link does not; and the "cannot link a zero-link inode" rule
-    applies to an inode whose names have all been *removed*, not to one created
-    `O_TMPFILE`. Verified on the deployment's kernel with `CapEff=0`.
-
-    Linux-only, which the declared filesystem semantics already require;
-    without `/proc` there is no way to publish an inode by descriptor and we
-    refuse rather than fall back to publishing whatever a staging *name* points
-    at. `EEXIST` is the ordinary no-clobber refusal — a plain file, a directory
-    and a symlink at the destination all produce it — and propagates as
-    `FileExistsError`.
-    """
-    if not _proc_fd_available():
-        raise vault_fs.UnsupportedFilesystem(
-            "/proc is not available, so a staged file cannot be published by "
-            "descriptor; refusing rather than publishing by name."
-        )
-    try:
-        os.link(
-            f"/proc/self/fd/{fd}",
-            name,
-            dst_dir_fd=dir_fd,
-            follow_symlinks=True,
-        )
-    except FileExistsError:
-        raise
-    except FileNotFoundError as exc:
-        raise vault_fs.Conflict(
-            "The staged copy could not be published; nothing was written. "
-            "Retry the operation."
-        ) from exc
-    except OSError as exc:
-        if getattr(exc, "errno", None) in (
-            errno.EPERM,
-            errno.EOPNOTSUPP,
-            errno.EXDEV,
-        ):
-            raise vault_fs.UnsupportedFilesystem(
-                "The vault filesystem does not support hard links, which the "
-                "no-clobber write depends on; refusing rather than replacing "
-                "an existing file."
-            ) from exc
-        raise
+# `_proc_fd_available` and `_link_staged_inode` live in `vault_fs` (#92 item 1):
+# the transfer publish stages and publishes the same way, and a second copy is
+# how the two paths drifted apart before. These names are kept as module-level
+# aliases so this file reads as it did — and so a test can still hook the
+# publish here without reaching into the shared module.
+_proc_fd_available = vault_fs.proc_fd_available
+_link_staged_inode = vault_fs.link_staged_inode
 
 
 def _discard_temp(
@@ -1170,6 +1329,18 @@ def move_file_no_clobber(source: MutableTarget, destination: MutableTarget) -> N
     """
     vault_fs.rename_noreplace(
         source.dir_fd, source.name, destination.dir_fd, destination.name
+    )
+    # Both ends of the rename, after it has landed (#97). One `renameat2`
+    # writes two directory entries — the destination's new one and the
+    # source's removal — and a crash that keeps only one of them leaves the
+    # note duplicated or gone. Every failure is logged and swallowed, D18's
+    # direction: the move *has* happened, and a tool that reported otherwise
+    # would be retried against a source that is no longer there. The rollback
+    # in `_verify_the_moved_inode` calls this with the targets swapped, so a
+    # restore is made durable by the same code.
+    _flush_target_dirs(destination, "destination directory")
+    vault_fs.flush_dir_quietly(
+        source.dir_fd, f"source directory for {source.rel}"
     )
 
 

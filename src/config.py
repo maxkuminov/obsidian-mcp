@@ -45,9 +45,24 @@ MAX_MOVE_REWRITE_BYTES = 256 * 1024 * 1024  # 256 MiB
 # raise `RLIMIT_NOFILE`.
 MOVE_REWRITE_FD_RESERVE = 256  # descriptors left for the rest of the process
 
+# The rewrite phase also holds **one** vault-root descriptor for the whole
+# phase, shared by every planned rewrite (`MutableTarget.share_root`). Charged
+# here so the arithmetic is visible rather than absorbed into the reserve.
+#
+# It is one and not one-per-rewrite deliberately. Every rewrite target resolves
+# the same vault root, so the alternative — giving each target its own root, the
+# other way to make the post-publication ancestor flush work — would pin two
+# descriptors per source and **halve** this cap, to hold N duplicate descriptors
+# of one directory. At a 1024 soft limit that is 384 planned rewrites instead of
+# 767. One shared descriptor costs exactly one.
+MOVE_REWRITE_SHARED_ROOT_FDS = 1
+
 
 def max_move_rewrite_sources() -> int:
     """How many planned link rewrites one `move_note` may hold open at once.
+
+    Each planned rewrite pins one parent descriptor from its preflight read
+    until its post-move write; the phase pins one shared root on top of that.
 
     Read at call time, not import time: the limit is a property of the running
     process, and a test (or an operator) may raise it.
@@ -55,7 +70,7 @@ def max_move_rewrite_sources() -> int:
     soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
     if soft in (resource.RLIM_INFINITY, -1):
         return sys.maxsize
-    return max(0, soft - MOVE_REWRITE_FD_RESERVE)
+    return max(0, soft - MOVE_REWRITE_FD_RESERVE - MOVE_REWRITE_SHARED_ROOT_FDS)
 
 
 # Headroom for the JSON-RPC envelope around a tool call's content argument:
@@ -192,6 +207,28 @@ class Settings(BaseSettings):
     # `import_from_url` refuses plain http by default. Turning this on also
     # admits ports 80/8080 for the http scheme (443/8443 stay https-only).
     import_allow_http: bool = False
+
+    # ── Named-staging fallback (one flag, both write paths) ──────────────────
+    # Both write paths stage into an unnamed `O_TMPFILE` inode and publish it
+    # by descriptor, so no staging name ever exists for a peer to observe,
+    # replace or race. Some servers refuse `O_TMPFILE` outright — TrueNAS
+    # SCALE's NFS export answers `EOPNOTSUPP` as root, under NFSv4.1 and
+    # NFSv4.2 alike (#103) — and on such a mount the no-clobber note writes and
+    # every transfer publication would be refused.
+    #
+    # Setting this takes named staging back on **both** paths. It is one knob
+    # on purpose: the failure is one filesystem property met on two paths for
+    # one reason, and two knobs would permit a deployment with a working
+    # `create_note` and a refusing upload — a state nobody chose and nobody can
+    # diagnose from either symptom alone. There is deliberately no `TRANSFER_*`
+    # variant and no per-path override.
+    #
+    # Default off, because it reopens the substitution window unnamed staging
+    # exists to close. When it is taken, the server says so: one WARNING per
+    # process the first time a call actually stages under a name, and
+    # `vault_named_staging_fallback_active` on `/health`.
+    # Env: VAULT_ALLOW_NAMED_STAGING_FALLBACK.
+    vault_allow_named_staging_fallback: bool = False
 
     @property
     def mcp_max_request_body_bytes(self) -> int:
