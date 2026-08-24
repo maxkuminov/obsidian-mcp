@@ -111,6 +111,10 @@ The system SHALL perform all file writes from MCP write tools by staging the pay
 
 The destination directory SHALL be flushed **after** the publishing rename or link, so that the directory entry the write created or replaced is durable and not only its contents. When the call created parent directories on its way to the destination, each created directory's parent SHALL be flushed as well, outward to the first directory that already existed — flushing only the immediate parent leaves the entry that names *it* unflushed, so a crash can lose the whole new folder and with it a note the tool reported written. A failure of the destination-directory flush, or of any of those ancestor flushes, SHALL be logged and SHALL NOT turn a write that already landed into a reported failure: the payload was already durable, the previous content survives either way, and a note tool that reports a false failure is retried — `edit_note(append=True)` retried after a write that landed appends the same block twice. This is deliberately the opposite failure direction from the transfer path, where the source bytes are gone and the ambiguity must be surfaced instead.
 
+**Durability is a property of every publication, not only of the staged-payload helper.** A note tool publishes in three ways and all three write a directory entry that a crash can lose, so the requirement names them rather than scoping itself to the shared atomic-write helper: the staged-payload `rename`/`link` above; `move_note`'s `renameat2`, which writes **two** entries — the destination's new one and the source's removal — so **both** parent directories SHALL be flushed after it lands, and so SHALL both parents of a rollback rename that puts a source back; and the soft delete's `renameat2` into the trash, which SHALL flush the source's parent **and** the trash directory. A permanent delete's `unlink` SHALL flush the parent directory it removed the entry from. The soft delete's flushes belong to the shared primitive the note and file tools both reach it through, so `delete_file`'s soft delete SHALL get them too. In each case a crash that makes only one of the two entries durable leaves the vault holding the note twice or not at all, or holding an entry for a note the tool reported deleted.
+
+Every one of these flushes SHALL take the same failure direction as the write path's: **logged, and never turned into a reported failure**, for the same reason expressed for the operation at hand. The rename or the unlink has already happened; a tool that reports it as failed is retried, and a retried move or delete finds the source gone and either contradicts the vault or acts on whatever has since taken the name. Nothing is lost by absorbing the failure except a warning.
+
 #### Scenario: Crash mid-write of an overwrite does not truncate the destination
 
 - **WHEN** the server process is killed between the staging write and the
@@ -183,6 +187,32 @@ The destination directory SHALL be flushed **after** the publishing rename or li
 - **AND** where that staging carries a name — the overwrite path only — the
   name SHALL be removed whether the write succeeds or fails, and only while it
   still refers to the inode this call staged
+
+#### Scenario: A move's rename is made durable at both ends
+
+- **WHEN** `move_note` publishes its `renameat2` from one directory to another
+- **THEN** the destination's parent directory SHALL be flushed after the rename, and so SHALL the source's
+- **AND** where the call created directories on the way to the destination, each created directory's parent SHALL be flushed as well, outward to the first that already existed
+- **AND** a failure of any of those flushes SHALL be logged and SHALL NOT turn a move that already landed into a reported failure
+
+#### Scenario: A move that is rolled back is made durable too
+
+- **WHEN** a move is refused after its rename landed — the destination held the caller's inode but is a directory or a symbolic link — and the tool renames it back
+- **THEN** both parent directories SHALL be flushed after the rollback rename lands
+- **AND** the refusal SHALL still be reported to the caller, unchanged by whether those flushes succeeded
+
+#### Scenario: A soft delete's rename is made durable
+
+- **WHEN** a note or a file is soft-deleted by renaming it into the trash directory
+- **THEN** the source's parent directory SHALL be flushed after the rename, and so SHALL the trash directory
+- **AND** a failure of either flush SHALL be logged and the delete SHALL still be reported as the success it is
+- **AND** the same SHALL hold for the rollback rename that puts back a directory the soft delete refuses to take
+
+#### Scenario: A permanent delete's unlink is made durable
+
+- **WHEN** a note or a file is deleted permanently
+- **THEN** the parent directory the entry was removed from SHALL be flushed after the unlink
+- **AND** a failure of that flush SHALL be logged and SHALL NOT be reported as a failed delete, because the file is already unlinked and a retry would act on whatever now holds the name
 
 #### Scenario: A newly created folder is durable too
 

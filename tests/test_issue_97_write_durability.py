@@ -597,3 +597,294 @@ async def test_a_folder_another_writer_created_is_not_claimed_by_this_call(
     await tools.create_note_impl("New/Folder/x.md", "body\n")
 
     assert set(seen) == {"New/Folder", "New"}, seen
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# The rename publications: move, soft delete, permanent unlink
+#
+# A note tool publishes in three ways, and the staged-payload helper is only
+# one of them. `renameat2` writes **two** directory entries at once — the new
+# name and the removal of the old — so a crash that makes only one of them
+# durable leaves the note duplicated or gone; an `unlink` writes one, and an
+# entry that survives resurrects a note the agent was told is deleted. All of
+# these take D18's direction: the rename already happened, and a tool that
+# reported it as failed would be retried against a source that is no longer
+# there.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _no_db(monkeypatch) -> list:
+    """`async_session` stand-in: the index write is not what is under test."""
+    executed: list = []
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def execute(self, statement):
+            executed.append(statement)
+
+            class Empty:
+                def all(self):
+                    return []
+
+            return Empty()
+
+        async def commit(self):
+            return None
+
+    monkeypatch.setattr(tools, "async_session", FakeSession)
+    return executed
+
+
+def _swap_in_a_directory(path: Path) -> None:
+    """Replace `path` with a directory holding a file nobody asked to delete."""
+    path.unlink()
+    path.mkdir()
+    (path / "keep.txt").write_bytes(b"not yours to delete")
+
+
+async def test_a_move_flushes_both_parent_directories(note_vault, monkeypatch):
+    """One `renameat2`, two directory entries, two flushes — after the rename.
+
+    Flushing only the destination leaves the source's removal in the page
+    cache: a crash then restores a name whose note is also at the new path, and
+    the index — which the tool has already updated — names only one of them.
+    """
+    (note_vault / "From").mkdir()
+    (note_vault / "To").mkdir()
+    (note_vault / "From" / "note.md").write_text("body\n", encoding="utf-8")
+    _no_db(monkeypatch)
+
+    order: list[str] = []
+    real_fsync = os.fsync
+    real_rename = vault_fs.rename_noreplace
+
+    def record_fsync(fd):
+        if _is_dir_fd(fd):
+            where = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            order.append(str(where.relative_to(note_vault.resolve())))
+        return real_fsync(fd)
+
+    def record_rename(*args, **kwargs):
+        order.append("rename")
+        return real_rename(*args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(vault_fs, "rename_noreplace", record_rename)
+
+    result = await tools.move_note_impl("From/note.md", "To/note.md")
+
+    assert "Moved" in result or "moved" in result, result
+    assert order[0] == "rename", order
+    assert set(order[1:]) == {"To", "From"}, order
+    assert (note_vault / "To" / "note.md").read_text() == "body\n"
+
+
+async def test_a_move_into_a_folder_it_created_flushes_that_chain_too(
+    note_vault, monkeypatch
+):
+    (note_vault / "note.md").write_text("body\n", encoding="utf-8")
+    _no_db(monkeypatch)
+    seen = _dir_flush_recorder(monkeypatch, note_vault)
+
+    result = await tools.move_note_impl("note.md", "New/Folder/note.md")
+
+    assert "Moved" in result or "moved" in result, result
+    # The destination's own parent, the two entries that name it outward, and
+    # the source's parent — which here is the root, already in the set.
+    assert set(seen) == {"New/Folder", "New", "."}, seen
+    assert (note_vault / "New" / "Folder" / "note.md").read_text() == "body\n"
+
+
+async def test_a_failed_flush_never_turns_a_landed_move_into_a_failure(
+    note_vault, monkeypatch, caplog
+):
+    """D18 again. A move reported as failed is retried, and the retry finds the
+    source gone — so it either contradicts the vault or acts on whatever has
+    since taken the name."""
+    (note_vault / "note.md").write_text("body\n", encoding="utf-8")
+    _no_db(monkeypatch)
+    failed = _fail_dir_fsync(monkeypatch)
+
+    with caplog.at_level("WARNING"):
+        result = await tools.move_note_impl("note.md", "moved.md")
+
+    assert failed, "no directory flush was attempted"
+    assert "Moved" in result or "moved" in result, result
+    assert (note_vault / "moved.md").read_text() == "body\n"
+    assert not (note_vault / "note.md").exists()
+    assert any("flush" in r.getMessage() for r in caplog.records)
+
+
+def test_a_rollback_rename_is_flushed_by_the_same_helper(note_vault, monkeypatch):
+    """The refusal paths put a file back with a second `renameat2`, and a
+    restore that evaporates in a crash is the same reverted-rename class.
+
+    `_verify_the_moved_inode` rolls back by calling `move_file_no_clobber` with
+    the targets swapped, so this asserts the property where it lives: the
+    publication primitive flushes both ends whichever direction it is used in.
+    """
+    (note_vault / "From").mkdir()
+    (note_vault / "To").mkdir()
+    (note_vault / "To" / "note.md").write_text("body\n", encoding="utf-8")
+    seen = _dir_flush_recorder(monkeypatch, note_vault)
+
+    with vault_service.open_mutable("To/note.md") as landed, vault_service.open_mutable(
+        "From/note.md"
+    ) as back:
+        vault_service.move_file_no_clobber(landed, back)
+
+    assert set(seen) == {"From", "To"}, seen
+    assert (note_vault / "From" / "note.md").read_text() == "body\n"
+
+
+async def test_a_soft_delete_flushes_the_source_parent_and_the_trash(
+    note_vault, monkeypatch
+):
+    (note_vault / "Folder").mkdir()
+    (note_vault / "Folder" / "note.md").write_text("body\n", encoding="utf-8")
+
+    order: list[str] = []
+    real_fsync = os.fsync
+    real_rename = vault_fs.rename_noreplace
+
+    def record_fsync(fd):
+        if _is_dir_fd(fd):
+            where = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            order.append(str(where.relative_to(note_vault.resolve())))
+        return real_fsync(fd)
+
+    def record_rename(*args, **kwargs):
+        order.append("rename")
+        return real_rename(*args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(vault_fs, "rename_noreplace", record_rename)
+
+    result = await tools.delete_note_impl("Folder/note.md")
+
+    assert "Soft-deleted" in result, result
+    # The probe runs first and renames its own temp file; the flushes under
+    # test are the ones after the *delete's* rename, which is the last one.
+    tail = order[len(order) - order[::-1].index("rename") :]
+    assert set(tail) == {"Folder", ".trash"}, order
+    assert not (note_vault / "Folder" / "note.md").exists()
+
+
+async def test_a_failed_flush_never_turns_a_landed_soft_delete_into_a_failure(
+    note_vault, monkeypatch, caplog
+):
+    (note_vault / "note.md").write_text("body\n", encoding="utf-8")
+    # The trash probe renames a temp file and would trip the fault first, so
+    # let it run before arming — the probe is not what is under test here.
+    vault_fs.check_trash_support(note_vault)
+    failed = _fail_dir_fsync(monkeypatch)
+
+    with caplog.at_level("WARNING"):
+        result = await tools.delete_note_impl("note.md")
+
+    assert failed, "no directory flush was attempted"
+    assert "Soft-deleted" in result, result
+    assert not (note_vault / "note.md").exists()
+    assert len(list((note_vault / ".trash").iterdir())) == 1
+    assert any("flush" in r.getMessage() for r in caplog.records)
+
+
+def test_a_soft_delete_rollback_flushes_both_ends(note_vault, monkeypatch):
+    """A directory swapped in after the check rides the rename into `.trash`
+    and is put back. That restore is a publication too — and the refusal is
+    reported whether or not its flushes worked."""
+    root_fd = vault_fs.open_root(note_vault)
+    try:
+        source = note_vault / "note.md"
+        source.write_bytes(b"body")
+
+        seen = _dir_flush_recorder(monkeypatch, note_vault)
+        real_rename = vault_fs.rename_noreplace
+        swapped: list[bool] = []
+
+        def swapping_rename(src_dir_fd, src_name, dst_dir_fd, dst_name):
+            if not swapped:
+                swapped.append(True)
+                _swap_in_a_directory(source)
+            return real_rename(src_dir_fd, src_name, dst_dir_fd, dst_name)
+
+        monkeypatch.setattr(vault_fs, "rename_noreplace", swapping_rename)
+
+        with pytest.raises(vault_fs.UnsafePath):
+            vault_fs.soft_delete(root_fd, "note.md")
+        monkeypatch.undo()
+
+        assert swapped, "the race never ran"
+        assert set(seen) == {".", ".trash"}, seen
+        assert (source / "keep.txt").read_bytes() == b"not yours to delete"
+        assert list((note_vault / ".trash").iterdir()) == []
+    finally:
+        os.close(root_fd)
+
+
+async def test_a_permanent_delete_flushes_the_parent_after_the_unlink(
+    note_vault, monkeypatch
+):
+    """An entry that survives a crash resurrects a note the agent was told is
+    gone — and the agent has no reason to look again."""
+    (note_vault / "Folder").mkdir()
+    (note_vault / "Folder" / "note.md").write_text("body\n", encoding="utf-8")
+
+    order: list[str] = []
+    real_fsync = os.fsync
+    real_unlink = os.unlink
+
+    def record_fsync(fd):
+        if _is_dir_fd(fd):
+            where = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            order.append(str(where.relative_to(note_vault.resolve())))
+        return real_fsync(fd)
+
+    def record_unlink(*args, **kwargs):
+        order.append("unlink")
+        return real_unlink(*args, **kwargs)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "unlink", record_unlink)
+
+    result = await tools.delete_note_impl("Folder/note.md", permanent=True)
+
+    assert "Permanently deleted" in result, result
+    assert order == ["unlink", "Folder"], order
+    assert not (note_vault / "Folder" / "note.md").exists()
+
+
+async def test_a_failed_flush_never_turns_a_landed_permanent_delete_into_a_failure(
+    note_vault, monkeypatch, caplog
+):
+    (note_vault / "note.md").write_text("body\n", encoding="utf-8")
+    failed = _fail_dir_fsync(monkeypatch)
+
+    with caplog.at_level("WARNING"):
+        result = await tools.delete_note_impl("note.md", permanent=True)
+
+    assert failed, "no directory flush was attempted"
+    assert "Permanently deleted" in result, result
+    assert not (note_vault / "note.md").exists()
+    assert any("flush" in r.getMessage() for r in caplog.records)
+
+
+def test_the_raw_file_permanent_delete_flushes_too(note_vault, monkeypatch):
+    """`delete_file(permanent=True)` reaches the unlink through `vault_fs.remove`,
+    which is where the flush lives — the note tool and the byte tool must not
+    differ in whether a delete survives a crash."""
+    (note_vault / "Attachments").mkdir()
+    (note_vault / "Attachments" / "a.bin").write_bytes(b"x")
+    root_fd = vault_fs.open_root(note_vault)
+    try:
+        seen = _dir_flush_recorder(monkeypatch, note_vault)
+        vault_fs.remove(root_fd, "Attachments/a.bin")
+        assert seen == ["Attachments"], seen
+        assert not (note_vault / "Attachments" / "a.bin").exists()
+    finally:
+        os.close(root_fd)

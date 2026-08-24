@@ -176,6 +176,17 @@ group 1 now produces.
   `write_file` in both its no-clobber and `overwrite=True` modes. The
   requirement now names `write_file` explicitly because an implementation
   could otherwise satisfy the tool list literally and skip it
+- [x] 2.6c The rename publications get the same treatment, for the same
+  reason #97 exists: deciding durability once for both paths rather than
+  fixing half of one twice. `move_note`'s `renameat2` writes two directory
+  entries, so `move_file_no_clobber` flushes both parents (and the rollback in
+  `_verify_the_moved_inode` inherits it by calling the same helper with the
+  targets swapped); `soft_delete_at` flushes the source's parent and `.trash`,
+  and `_refuse_a_moved_directory` flushes both after a rollback that lands;
+  the permanent unlink flushes the parent it removed the entry from, in
+  `vault_fs.remove` and in `delete_note(permanent=True)`. All D18 direction
+  via `vault_fs.flush_dir_quietly` — a move or delete reported as failed after
+  its rename landed gets retried against a source that is no longer there
 - [x] 2.7 Confirm `import_from_url` is covered by 2.1–2.5 through the shared
   `stream_to_vault`, and that its gate's `complete()` no-op is unaffected
 - [x] 2.8 Tests: the payload flush happens before the gate is entered and

@@ -853,6 +853,31 @@ def _create_nameless_temp(dir_fd: int) -> int:
         raise
 
 
+def _flush_target_dirs(target: MutableTarget, what: str) -> None:
+    """`fsync` a target's parent and every directory the call created there.
+
+    Never raises. Shared by the two kinds of publication a note tool performs —
+    the staged-payload write and the `renameat2` of a move — because both leave
+    the same thing unconfirmed and both take D18's direction with it.
+    """
+    vault_fs.flush_dir_quietly(target.dir_fd, f"{what} for {target.rel}")
+    if not target.created:
+        return
+    try:
+        vault_fs.flush_created_ancestors(target.root_fd, target.created)
+    except (OSError, vault_fs.VaultFSError, RuntimeError) as exc:
+        # `RuntimeError` is `release_root` having dropped the root descriptor:
+        # there is then nothing to look the ancestors up from. Same direction —
+        # this cannot be allowed to fail an operation that already landed.
+        logger.warning(
+            "Published %s but could not flush the directories it created "
+            "(%s): %s. The operation stands.",
+            target.rel,
+            ", ".join(target.created),
+            exc,
+        )
+
+
 def _flush_publication(target: MutableTarget) -> None:
     """Make a published note write durable — and never fail the write for it.
 
@@ -875,30 +900,7 @@ def _flush_publication(target: MutableTarget) -> None:
     is only the durability of a directory entry, and the previous content
     survives regardless.
     """
-    try:
-        vault_fs.flush_dir_fd(target.dir_fd)
-    except OSError as exc:
-        logger.warning(
-            "Published %s but could not flush its directory: %s. The write "
-            "stands; only its durability across a crash is unconfirmed.",
-            target.rel,
-            exc,
-        )
-    if not target.created:
-        return
-    try:
-        vault_fs.flush_created_ancestors(target.root_fd, target.created)
-    except (OSError, vault_fs.VaultFSError, RuntimeError) as exc:
-        # `RuntimeError` is `release_root` having dropped the root descriptor:
-        # there is then nothing to look the ancestors up from. Same direction —
-        # this cannot be allowed to fail a write that already landed.
-        logger.warning(
-            "Published %s but could not flush the directories it created "
-            "(%s): %s. The write stands.",
-            target.rel,
-            ", ".join(target.created),
-            exc,
-        )
+    _flush_target_dirs(target, "destination directory")
 
 
 def _atomic_write_at(
@@ -1289,6 +1291,18 @@ def move_file_no_clobber(source: MutableTarget, destination: MutableTarget) -> N
     """
     vault_fs.rename_noreplace(
         source.dir_fd, source.name, destination.dir_fd, destination.name
+    )
+    # Both ends of the rename, after it has landed (#97). One `renameat2`
+    # writes two directory entries — the destination's new one and the
+    # source's removal — and a crash that keeps only one of them leaves the
+    # note duplicated or gone. Every failure is logged and swallowed, D18's
+    # direction: the move *has* happened, and a tool that reported otherwise
+    # would be retried against a source that is no longer there. The rollback
+    # in `_verify_the_moved_inode` calls this with the targets swapped, so a
+    # restore is made durable by the same code.
+    _flush_target_dirs(destination, "destination directory")
+    vault_fs.flush_dir_quietly(
+        source.dir_fd, f"source directory for {source.rel}"
     )
 
 

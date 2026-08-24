@@ -1086,6 +1086,11 @@ def remove(root_fd: int, rel_path: str | Path) -> None:
             raise FileNotFoundError(f"File not found: {rel_path}")
         _require_regular(st, str(rel_path))
         os.unlink(name, dir_fd=dir_fd)
+        # An unlink is a directory operation like any other publication: an
+        # entry that survives a crash resurrects a file the caller was told is
+        # gone. Swallowed on failure — the file *is* unlinked, and reporting a
+        # failure would invite a retry of a delete that already happened (#97).
+        flush_dir_quietly(dir_fd, f"parent directory of {rel_path}")
     finally:
         os.close(dir_fd)
 
@@ -1154,6 +1159,11 @@ def _refuse_a_moved_directory(
             f"{trash_dir}/{created} — restore it from there; nothing was "
             "removed."
         ) from exc
+    # The rollback is a publication too, and the one whose loss is worst: a
+    # restore that evaporates in a crash leaves the subtree in `.trash` under a
+    # name the refusal message never mentioned (#97).
+    flush_dir_quietly(src_dir_fd, f"parent directory of {rel_path}")
+    flush_dir_quietly(trash_fd, f"{trash_dir} directory")
     raise UnsafePath(
         f"Refused: {rel_path} became a directory after the check. It was moved "
         "back and nothing was deleted."
@@ -1280,6 +1290,14 @@ def soft_delete_at(
         _refuse_a_moved_directory(
             src_dir_fd, name, trash_fd, created, rel_path, trash_dir
         )
+        # Both ends of the rename, after the directory refusal has had its say
+        # — flushing before it would make an intermediate state durable and
+        # then undo it. The source's entry is gone and the trash's is new, and
+        # a crash that keeps only one of those leaves the note either
+        # duplicated or lost (#97). Swallowed: the delete has happened, and a
+        # reported failure would invite a retry of it.
+        flush_dir_quietly(src_dir_fd, f"parent directory of {rel_path}")
+        flush_dir_quietly(trash_fd, f"{trash_dir} directory")
         return f"{trash_dir}/{created}"
     finally:
         # The verdict is settled by here; a failing close must not change it.
@@ -1341,6 +1359,35 @@ def flush_dir_fd(dir_fd: int) -> None:
     retried `edit_note(append=True)` appends the same block twice.
     """
     os.fsync(dir_fd)
+
+
+def flush_dir_quietly(dir_fd: int, what: str) -> None:
+    """`fsync` a directory descriptor; a failure is logged and swallowed (D18).
+
+    The form every *rename* publication uses — `move_note`'s `renameat2`, the
+    soft delete's rename into `.trash`, and the permanent unlink. All of them
+    take the note path's failure direction, and for the note path's reason: the
+    rename has already happened, so an error here says only that the new state
+    may not survive a crash. A tool that reported that as a failure would be
+    *retried*, and a retried move or delete after a rename that landed is its
+    own hazard — the second attempt finds the source gone and either refuses
+    with a message that contradicts the vault or, worse, acts on whatever has
+    since taken the name. What is lost by swallowing is a warning; what is lost
+    by raising is the caller's picture of where the file is.
+
+    `flush_dir_fd` is the raising form, for the one place that must classify
+    the failure rather than absorb it: the transfer path's post-publication
+    flush, which has to reach the human because the source bytes are gone.
+    """
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        logger.warning(
+            "Could not flush the %s to durable storage: %s. The operation "
+            "stands; only its durability across a crash is unconfirmed.",
+            what,
+            exc,
+        )
 
 
 def flush_created_ancestors(root_fd: int, created: Iterable[str]) -> None:

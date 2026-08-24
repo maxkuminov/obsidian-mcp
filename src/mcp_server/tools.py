@@ -1969,6 +1969,13 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
                 os.unlink(target.name, dir_fd=target.dir_fd)
             except OSError as e:
                 return f"Permanent delete failed: {e}"
+            # The unlink is a directory operation, and an entry that survives a
+            # crash resurrects a note the agent was told is gone (#97). Logged
+            # and swallowed: the note *is* unlinked, and a reported failure
+            # would invite a retry of a delete that already happened.
+            vault_fs.flush_dir_quietly(
+                target.dir_fd, f"parent directory of {target.rel}"
+            )
             return f"Permanently deleted: {path}"
 
         # Only the soft delete needs the trash to be usable, and it must be
