@@ -197,26 +197,30 @@ Every pass in the indexer that reads vault files for a user — the scan, the em
 - **WHEN** the embedding pass, the one-shot link backfill or the keyword-vector rebuild reads a user's vault files
 - **THEN** it SHALL read them beneath a root it pinned as the scan pins it
 
-### Requirement: The ancillary passes do nothing for a user whose provenance is not settled
-The embedding pass, the one-shot link backfill and the keyword-vector rebuild SHALL each run, for a given user, only when that user's provenance is recorded and the classification for the assigned root at that moment is **same assignment**. For any other classification they SHALL skip that user, SHALL write no row for that user, and SHALL log the skip once, leaving the work to a later pass once the scan has settled the provenance.
+### Requirement: The unverified ancillary passes do nothing for a user whose provenance is not settled
+The one-shot link backfill and the keyword-vector rebuild SHALL each run, for a given user, only when that user's provenance is recorded and the classification for the assigned root at that moment is **same assignment**. For any other classification they SHALL skip that user, SHALL write no row for that user, and SHALL log the skip once, leaving the work to a later pass once the scan has settled the provenance.
 
 The skip SHALL be **per user**, not global: a user whose provenance is unsettled SHALL NOT prevent these passes from running for every other user.
 
 The classification SHALL be computed by the same function the scan uses, so that "settled" cannot come to mean two different things in two places.
 
-These passes read vault files and write rows the provenance is a claim about — embeddings, link rows and keyword vectors. They cannot assume the scan settled the provenance a moment ago: a user whose notes contain no links leaves the link backfill eligible on every startup, and a reassignment can commit between the scan and any of them. Allowing them to write under an unresolved provenance is what lets a link row extracted from one root be committed against a metadata row from another.
+**The embedding pass is deliberately not among them**, and the reason is stated in "The embedding pass is not gated on provenance, because it verifies every hash it certifies" below: it is the only one of the three that binds what it writes to the content the metadata row records, so it is safe by construction against the root mixing this gate exists to prevent, and gating it is the one gate whose cost is unbounded.
 
-Maintenance that does nothing is safe, which is why skipping is the specified outcome rather than a per-file content check. A delayed embedding, a delayed link backfill of a table that is empty either way, and a delayed keyword index each cost latency and write nothing wrong; the next scan either records the provenance, after which the user becomes eligible, or re-derives, which rebuilds that user's links itself.
+These two passes read vault files and write rows the provenance is a claim about — link rows and keyword vectors — with **no verification of any kind** that the bytes they read are the bytes the row they write against describes. They cannot assume the scan settled the provenance a moment ago: a user whose notes contain no links leaves the link backfill eligible on every startup, and a reassignment can commit between the scan and either of them. Allowing them to write under an unresolved provenance is what lets a link row extracted from one root be committed against a metadata row from another.
 
-#### Scenario: An unsettled user is skipped by every ancillary pass
+Verification is not merely unimplemented for the link backfill: a link row's *resolution* is a function of the whole set of notes under a root rather than of one file's bytes, so no per-file check could license it. The keyword-vector rebuild could in principle be verified the way the embedding pass is, and is still gated, because it records nothing that would let a later pass notice a vector built from foreign bytes — there is no keyword analogue of `embedded_content_hash`.
 
-- **WHEN** a user has no recorded provenance, or the classification for their assigned root is anything other than same assignment, and the embedding pass, the link backfill or the keyword-vector rebuild runs
-- **THEN** that pass SHALL write no `note_embeddings`, `note_links` or keyword-vector row for that user
+Skipping costs those two passes nothing even for a user whose provenance never settles, which is why it is the specified outcome rather than a per-file content check. The re-derive branch does both passes' work itself on every pass: it deletes and re-extracts every one of that user's link rows, and it rewrites every note's keyword vector, because it treats every note as changed. A delayed link backfill of a table the re-derive is filling anyway, and a delayed rebuild of vectors the re-derive is rewriting anyway, cost latency and write nothing wrong.
+
+#### Scenario: An unsettled user is skipped by both gated passes
+
+- **WHEN** a user has no recorded provenance, or the classification for their assigned root is anything other than same assignment, and the link backfill or the keyword-vector rebuild runs
+- **THEN** that pass SHALL write no `note_links` or keyword-vector row for that user
 - **AND** SHALL log the skip once
 
 #### Scenario: The skip does not stop the pass for other users
 
-- **WHEN** one user's provenance is unsettled and another user's is settled, and an ancillary pass runs
+- **WHEN** one user's provenance is unsettled and another user's is settled, and a gated pass runs
 - **THEN** the settled user's work SHALL be performed in that same pass
 
 #### Scenario: A reassignment between the scan and a later pass writes nothing
@@ -227,8 +231,42 @@ Maintenance that does nothing is safe, which is why skipping is the specified ou
 
 #### Scenario: A settled user proceeds unchanged
 
-- **WHEN** a user's recorded provenance matches the assigned root and an ancillary pass runs
+- **WHEN** a user's recorded provenance matches the assigned root and a gated pass runs
 - **THEN** it SHALL do exactly the work it does today
+
+### Requirement: The embedding pass is not gated on provenance, because it verifies every hash it certifies
+The embedding pass SHALL verify that the content it read hashes to the content hash of the `notes_metadata` row it selected, SHALL skip the note and leave the row unmarked when it does not, and SHALL otherwise run for a user **whatever that user's provenance classification is**. These two halves are one requirement: the verification is the entire licence for the un-gating, and neither may be removed or weakened without the other.
+
+Gating the embedding pass on a settled provenance was specified first and was wrong, because the two rules it sits between compose into indefinite staleness. A permanently unreadable file withholds the provenance record forever — deliberately, so that nothing certifies a root the pass could not fully visit — and the embedding gate then turns that withheld record into a permanent refusal to embed **anything** for that user. Meanwhile the scan keeps working: a readable note that the user edits gets a fresh `content_hash` on every pass, while its `note_embeddings` rows still hold the chunk text of the content it used to have. Semantic search reads those chunks without requiring `embedded_content_hash` to equal `content_hash`, so it returns excerpts of superseded content, indefinitely, to a consumer that is an agent and will act on them without a human ever seeing the query. One unreadable file would have converted the whole user's semantic search into a silently wrong one — the failure this system ranks above every expensive one.
+
+The un-gating is sound only because of the verification, and the argument is exact. The gate existed to stop a pass from writing a row derived from one root against a metadata row derived from another. An embedding is a pure function of the note's content, and the verification refuses to embed any bytes that do not hash to the content hash the selected row records. So a chunk vector is written against a row **only** when the bytes it was built from are the bytes that row describes — which directory supplied them is not a fact the vector depends on. The pass therefore cannot mix roots: under a wrong root the hashes disagree and it skips, and under bytes that match the row the embedding is correct by construction.
+
+The verification also SHALL NOT be understood as an optimisation. `embed_note` marks a row embedded by copying the *row's* `content_hash`, not a hash of the bytes it embedded, so without the check a file that differs from its row at embedding time is embedded and then permanently marked as embedded for a hash it does not have — nothing re-embeds it again. That is what makes the re-derive branch's retention of `note_embeddings` sound, and it is now also what makes this requirement's un-gating sound. Anyone proposing to remove it must re-gate the embedding pass in the same change, and this sentence is here so that consequence is visible at the site of the removal.
+
+Nothing else about the pass changes: it still selects only rows whose `embedded_content_hash` differs from their `content_hash`, still reads beneath the root it pinned, and still writes nothing for a note it skipped. The verification governs the path that *embeds* content; the exclude-pattern branch, which reads no file, writes no vector and marks the row from its own recorded hash, is unaffected by it and by the un-gating alike.
+
+#### Scenario: The embedding pass refuses to certify content it did not read
+
+- **WHEN** the embedding pass reads a file whose content does not hash to the content hash of the row it selected
+- **THEN** it SHALL NOT embed that content and SHALL NOT mark the row as embedded
+- **AND** a later pass, after the scan has refreshed the row, SHALL embed it
+
+#### Scenario: A permanently unreadable note does not freeze another note's embeddings
+
+- **WHEN** a user's vault holds one note that can never be read — so every re-derive is incomplete and no provenance is ever recorded — and a second, readable note is changed so that its `content_hash` no longer matches its `embedded_content_hash`
+- **THEN** the next pass SHALL embed the changed note's new content and update its `note_embeddings` rows
+- **AND** it SHALL do so even though no provenance has been recorded for that user and no provenance is recorded by that pass either
+
+#### Scenario: The embedding pass runs under every classification
+
+- **WHEN** a user's classification is provenance unknown, provenance unresolved, or reassigned, and the embedding pass runs
+- **THEN** it SHALL process that user's eligible rows rather than skip the user
+- **AND** each note it embeds SHALL have hashed to the row it was written against
+
+#### Scenario: A foreign root cannot be embedded against a surviving row
+
+- **WHEN** the embedding pass runs for a user whose metadata rows were derived from one directory while the assigned root is another, and the file at a row's relative path under the assigned root holds different bytes
+- **THEN** the pass SHALL skip that note, SHALL write no `note_embeddings` row for it, and SHALL leave its `embedded_content_hash` unchanged
 
 ### Requirement: An assignment that demonstrably changed discards the previous vault's index
 When provenance is recorded for a user and both the recorded assignment string and the recorded real path disagree with the observed ones, the index pass SHALL delete that user's `notes_metadata` rows — and, by cascade, their `note_embeddings` and `note_links` rows — before any file under the new root is read, and SHALL then record the new provenance. The discard and the record SHALL commit as one transaction, so no pass can leave rows from one vault beside a record naming another.
@@ -244,6 +282,12 @@ Because this branch is destructive and costs a full re-embed of the newly assign
 - **WHEN** a user whose index was built under one assignment is assigned a different vault at a different real path and the next index pass runs
 - **THEN** the rows from the previous directory SHALL be deleted before the new root is scanned
 - **AND** the user's `note_embeddings` and `note_links` rows SHALL be removed with them
+
+#### Scenario: A real path too long for a bounded column still discards
+
+- **WHEN** a user whose index was built under one assignment is reassigned to a short assignment that is a symbolic link to a directory whose canonical real path is longer than the width of `users.vault_path`, and the next index pass runs
+- **THEN** the pass SHALL delete that user's rows and record the observed provenance in one committed transaction, storing the real path in full
+- **AND** the transaction SHALL NOT fail on the length of any recorded fact, because a failure there would roll the delete back and leave the former vault's index queryable on every subsequent pass
 
 #### Scenario: Reassignment to the recorded assignment keeps the index
 
@@ -274,7 +318,7 @@ This branch SHALL be reached by a legacy row that carries no record at all, so i
 
 The re-derived pass SHALL extract each changed note's links from the body it already buffered during the scan, and SHALL NOT re-read that note from the filesystem for the link rebuild. Re-reading is a second window in which the file can change or disappear between the scan and the rebuild, which silently drops that note's links while the row the scan wrote stands.
 
-The embedding pass SHALL verify that the content it read hashes to the content hash of the row it selected, and SHALL skip the note when it does not, leaving the note to a later pass. Retaining `note_embeddings` across a re-derive rests on a matching content hash proving that the stored vector is the right vector for that file, and that inference holds only if every vector was in fact produced from content hashing to what was recorded alongside it.
+Retaining `note_embeddings` across a re-derive rests on a matching content hash proving that the stored vector is the right vector for that file, and that inference holds only if every vector was in fact produced from content hashing to what was recorded alongside it. That verification is required by "The embedding pass is not gated on provenance, because it verifies every hash it certifies" above, which is also why the embedding pass keeps running while this branch is repeating — a re-derive that never completes must not freeze a readable note's embeddings at content it no longer has.
 
 #### Scenario: A legacy index with no record is re-derived, not trusted and not discarded
 
@@ -305,11 +349,6 @@ The embedding pass SHALL verify that the content it read hashes to the content h
 - **WHEN** a note is scanned successfully and is then deleted from the vault before the pass rebuilds its links
 - **THEN** the pass SHALL extract that note's links from the body it buffered during the scan
 - **AND** the deletion SHALL NOT cause the note's links to be silently omitted
-
-#### Scenario: The embedding pass refuses to certify content it did not read
-
-- **WHEN** the embedding pass reads a file whose content does not hash to the content hash of the row it selected
-- **THEN** it SHALL NOT embed that content and SHALL NOT mark the row as embedded
 
 #### Scenario: A completed re-derive is recorded and not repeated
 

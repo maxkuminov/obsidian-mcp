@@ -16,8 +16,11 @@ wrong, not a licence to widen it.
 rather than assumed.** Round 4 only *removed* machinery from A (the handle is
 demoted to hardening, the degraded no-handle branch and its warn-once logging
 are gone) and *added* two things, both inside `src/services/indexer.py`: the
-settled-provenance gate on the three ancillary passes (A.6c) and a third
-provenance column (A.1–A.4). Neither reaches a file C owns.
+settled-provenance gate on the unverified ancillary passes (A.6c) and a third
+provenance column (A.1–A.4). Neither reaches a file C owns. **Round 5 changed
+only the shape of those two additions, not the sequencing:** the pathname
+columns become `TEXT` (A.1, A.3, A.8) and `embed_vault` comes back out of the
+gate (A.6c, A.7c). Both stay inside A's own files.
 
 **The one new cross-group edge, and why it is safe.** After the rescope A's
 assignment fact is the *same* normalisation C compares with, so A **imports and
@@ -37,7 +40,8 @@ lived entirely in A's files; findings 3 and 4 in C's; finding 5 in B's.
 
 Round 3's surviving fixes are the pinned root descriptor with anchored
 discovery and reads (A.6a, A.6b) and the completeness accounting (A.7a); round
-4 adds the ancillary-pass gate (A.6c). **All of them land in
+4 adds the ancillary-pass gate (A.6c), which round 5 narrows to two passes.
+**All of them land in
 `src/services/indexer.py`, which only A owns.** The one that had to be checked
 carefully is the anchoring: it needs a descriptor-relative directory walk, and
 this repository already has an anchored-filesystem module in
@@ -145,8 +149,8 @@ that is a design decision rather than an ownership one. **Do not edit
 is how you know the anchored discovery finds what the old one found.
 
 - [ ] A.1 Add three columns to `src/models/db.py` — `User.indexed_vault_assignment`
-      (nullable `String(1024)`), `User.indexed_vault_realpath` (nullable
-      `String(1024)`) and `User.indexed_vault_handle` (nullable `String(320)`) —
+      (nullable `Text`), `User.indexed_vault_realpath` (nullable `Text`) and
+      `User.indexed_vault_handle` (nullable `String(320)`) —
       no server default, each `comment=_INDEXED_PROVENANCE_MARKER` where that
       constant is `"provenance of this user's index, recorded by the index pass
       (016_indexed_vault_provenance)"`. Document on the columns what each one is
@@ -158,6 +162,20 @@ is how you know the anchored discovery finds what the old one found.
       `os.path.realpath` of the directory that assignment named when the pass
       ran, and its only job is to keep a cosmetic rename or an alias from
       costing a full re-embed — **it is not a proof of directory identity**.
+      **The two pathname columns are `Text`, not a width, and that is
+      correctness rather than taste.** The rule is that a provenance column must
+      be able to record any value the fact it mirrors can take: a value the pass
+      observed and cannot store is a bug, never a truncation and never a NULL.
+      A short assignment may be a symlink to a canonical path of any length, and
+      the discard branch writes the record *and* the delete in one transaction —
+      so an oversized value raises `string_data_right_truncation`, rolls the
+      delete back with it, and leaves the former vault's index served on every
+      later pass, which is #91's own symptom caused by a column width. Give
+      `indexed_vault_assignment` `Text` too even though `String(1024)` matches
+      `users.vault_path` today: that sufficiency is a property of another
+      column's DDL and of the current normaliser, not of this record, and the two
+      pathname facts are written and read as one unit. Do **not** add a
+      length check, a truncation, or a NULL-on-oversize rule to either of them.
       `indexed_vault_handle` is an **opaque** `"<handle_type>:<hex of
       f_handle>"` token from `name_to_handle_at`, text, compared by byte
       equality, never parsed, never fed to `open_by_handle_at` — and it is
@@ -169,8 +187,11 @@ is how you know the anchored discovery finds what the old one found.
       handle is at most `MAX_HANDLE_SZ` (128) bytes → 256 hex characters, plus
       type and separator — sufficient for the declared ext4/xfs filesystems and
       for NFSv4's 128-byte maximum, and *not* claimed as an eternal bound; a
-      handle that would not fit is recorded as NULL, never truncated. Keep the
-      marker string byte-identical to `MARKER` in the migration or
+      handle that would not fit is recorded as NULL, never truncated — the one
+      column the totality rule above does not govern, because a handle is a
+      *comparison token* whose absence is a defined state (no hardening signal)
+      while a missing pathname is not a state at all but a half-set record. Keep
+      the marker string byte-identical to `MARKER` in the migration or
       `alembic check` goes dirty.
 - [ ] A.2 Write `alembic/versions/016_indexed_vault_provenance.py`
       (`down_revision = "015"`). `SET LOCAL lock_timeout` /
@@ -189,8 +210,8 @@ is how you know the anchored discovery finds what the old one found.
       lock — is why the deploy is safe.
 - [ ] A.3 Treat pre-existing columns of any of the three names as an ownership
       question, not a convenience, and treat the three as **one unit**: all
-      absent → create and mark; all present, nullable, exactly `varchar(1024)` /
-      `varchar(1024)` / `varchar(320)`, default-free **and** marked → accept as
+      absent → create and mark; all present, nullable, exactly `text` / `text` /
+      `varchar(320)`, default-free **and** marked → accept as
       a re-run; anything else (any one wrong-typed, `NOT NULL`, defaulted or
       unmarked, or a partial set of one or two) → raise naming what was found,
       changing nothing. The marker is what makes this stronger than 015's case:
@@ -287,23 +308,35 @@ is how you know the anchored discovery finds what the old one found.
       `link_backfill_pass` and `rebuild_tsvectors`: each pins its own root, for
       the same within-pass-consistency reason. When you are done, no
       `Path.read_text()` on a vault-derived path remains in the module.
-- [ ] A.6c **Gate the three ancillary passes on settled provenance, per user.**
-      `embed_vault`, `link_backfill_pass` and `rebuild_tsvectors` each write
-      rows the provenance is a claim about — `note_embeddings`, `note_links`,
-      `content_tsvector` — and none of them may assume the scan settled that
-      claim a moment ago: a user whose notes contain no links leaves
+- [ ] A.6c **Gate `link_backfill_pass` and `rebuild_tsvectors` on settled
+      provenance, per user — and leave `embed_vault` out of the gate.** Both
+      gated passes write rows the provenance is a claim about — `note_links`,
+      `content_tsvector` — with no verification that the bytes they read belong
+      to the row they write against, and neither may assume the scan settled
+      that claim a moment ago: a user whose notes contain no links leaves
       `link_backfill_pass` eligible on *every* startup, and a reassignment can
-      commit between the scan and any of them. So each of them, **for each
+      commit between the scan and either of them. So each of them, **for each
       user**, runs the same classification helper A.5 uses and proceeds only on
       the **same assignment** verdict; on anything else it skips **that user**,
       logs once, and writes nothing for them. The skip must be per user — one
       unsettled user must not stop the pass for everybody else — and the
       classification must come from the one function, not a re-implementation.
       Do **not** substitute a per-file content check to let them write anyway:
-      maintenance that does nothing is safe, the next `index_vault` pass either
-      stamps the provenance or re-derives (which rebuilds links itself), and a
-      second verification path is more machinery in three places for work that
-      can simply wait.
+      `link_backfill_pass` cannot be fixed that way at all (resolution is a
+      function of the whole note set, not one file's bytes), `rebuild_tsvectors`
+      records nothing a later pass could use to notice a foreign vector, and the
+      re-derive redoes both their jobs on every pass, so the delay costs nothing.
+      **`embed_vault` must NOT be gated**, and this is a deliberate reversal of
+      the round-4 draft: the gate composes with A.7a's completeness rule into
+      indefinite staleness, because one permanently unreadable file withholds
+      the stamp forever while a *readable* changed note keeps serving the chunk
+      text of content it no longer has (`semantic_search` reads `chunk_text`
+      with no `embedded_content_hash = content_hash` guard —
+      `embeddings.py:353`). It is safe ungated for a reason that is specific to
+      it: A.7c makes it hash-verify every note it certifies, so it can only ever
+      write a vector against a row whose recorded content the bytes actually
+      hash to. If you find yourself removing A.7c, you must re-gate this pass in
+      the same change.
 - [ ] A.7 Add the re-derive mode to `index_vault`: content-hash change
       detection disabled, so every discovered file is parsed and upserted
       regardless of its hash; the ordinary prune unchanged; and every note
@@ -349,13 +382,23 @@ is how you know the anchored discovery finds what the old one found.
       marked as embedded for a hash it does not have. Re-hash the raw text with
       `_content_hash` and skip the note when it does not equal the row's
       `content_hash`; the next pass, having refreshed the row, picks it up.
-      This is what makes the re-derive's retention of `note_embeddings`
-      load-bearing rather than merely plausible: that branch keeps a vector
-      *because* a matching content hash proves it is the right vector.
+      This check does two jobs, and both are load-bearing. It is what makes the
+      re-derive's retention of `note_embeddings` sound: that branch keeps a
+      vector *because* a matching content hash proves it is the right vector.
+      And it is the entire licence for A.6c leaving `embed_vault` ungated — an
+      embedding is a pure function of content, so refusing bytes that do not
+      hash to the selected row's `content_hash` means the vector and the row
+      describe the same content whatever directory supplied the bytes; under a
+      wrong root the hashes disagree and the pass skips. Say that in the
+      docstring, next to the check, so the coupling is visible at the site of any
+      future removal.
 - [ ] A.8 `tests/integration/test_schema_check.py`: set `HEAD_REVISION = "016"`
       (B moves it to `"017"`); a fresh database has all three columns nullable,
-      exactly typed (`varchar(1024)` / `varchar(1024)` / `varchar(320)`),
-      default-free and marked; **016 backfills nothing** — after it, all three
+      exactly typed (`text` / `text` / `varchar(320)`), default-free and marked;
+      a value longer than `users.vault_path`'s own width round-trips through
+      `indexed_vault_realpath` unchanged (assert the stored value equals what was
+      written — that column must not be re-bounded by a later edit);
+      **016 backfills nothing** — after it, all three
       columns are NULL for every user including every assigned one, and no
       `notes_metadata` / `note_embeddings` / `note_links` row changed;
       `alembic stamp 015` then `upgrade head` after the indexer has recorded a
@@ -377,6 +420,14 @@ is how you know the anchored discovery finds what the old one found.
       nothing; a root whose realpath stops naming the pinned inode is
       indeterminate; a retargeted symlink under an unchanged assignment
       re-derives (assignment equal, realpath differs) and does **not** discard;
+      **an over-long realpath still discards** — reassign a user to a *short*
+      assignment that is a symlink to a directory whose canonical realpath
+      exceeds `users.vault_path`'s width (build the depth in the tmpdir; do not
+      mock `os.path.realpath`), and assert the discard commits, the rows are
+      gone, and the recorded realpath equals the observed one in full. This is
+      the round-4 blocker: with a bounded column the transaction raises
+      `string_data_right_truncation`, rolls the delete back, and the former
+      vault stays queryable forever;
       **the shared normaliser** — assert the assignment fact is produced by
       `transfer.canonical_vault_root` itself (patch it and observe both the
       index record and the pre-publish confirmation change together), so a
@@ -441,8 +492,8 @@ is how you know the anchored discovery finds what the old one found.
       deleted between the scan and the link rebuild has its links extracted
       from the scan's buffer and is **not** a skip; a pass with an empty skip
       list stamps;
-      **the ancillary passes** — for a user with no recorded provenance, and for
-      a user reassigned after the scan stamped, each of `embed_vault`,
+      **the gated ancillary passes** — for a user with no recorded provenance,
+      and for a user reassigned after the scan stamped, each of
       `link_backfill_pass` and `rebuild_tsvectors` writes **no** row for that
       user and logs once; in the same call a second user whose provenance is
       settled has their work done normally (assert the skip is per user, not
@@ -451,9 +502,18 @@ is how you know the anchored discovery finds what the old one found.
       hold `Same.md` with different link targets — leaves `note_links`
       unwritten for that user rather than committing a B-derived target against
       an A-derived row;
-      **embedding** — `embed_vault` on a file whose bytes no longer hash to the
-      row's `content_hash` embeds nothing and leaves `embedded_content_hash`
-      alone, and the following pass, after the row is refreshed, embeds it;
+      **embedding, which is deliberately *not* gated** — `embed_vault` on a file
+      whose bytes no longer hash to the row's `content_hash` embeds nothing and
+      leaves `embedded_content_hash` alone, and the following pass, after the row
+      is refreshed, embeds it; and round 4's failing input: a vault holding one
+      permanently unreadable note (real invalid bytes) **and** one readable note
+      whose content is then changed — assert that no provenance is ever recorded
+      for that user *and* that the changed note's `note_embeddings` are updated
+      on the next pass, so a single bad file cannot freeze a readable note's
+      vectors at content it no longer has. Assert the same for a user under a
+      **reassigned** and under a **provenance unknown** classification: the pass
+      processes them rather than skipping, and every note it embeds hashed to
+      the row it was written against;
       **single-user** — `user_id is None` neither reads nor writes the record;
       **inheritance** — all three callers of `index_vault` (startup, tick,
       panel reindex) get the classification.
@@ -738,9 +798,19 @@ path is unchanged.
       a previous root's record standing. Round 4 keeps round 2's pinned root and
       round 3's skip accounting, replaces the identity claim with the
       assignment claim, demotes the handle, adds the per-user ancillary gate,
-      and makes every stamp write all three columns. Ask whether *those*
-      replacements are complete, and whether any of them introduced a new way to
-      **destroy** an index that should have been kept.
+      and makes every stamp write all three columns. Round 4's own review
+      accepted that rescope and attacked its mechanics instead, producing two
+      fixes: the two pathname columns became `TEXT`, because a bounded one could
+      make the discard-and-stamp transaction roll back forever; and `embed_vault`
+      came back *out* of the ancillary gate, because gating it composed with the
+      completeness rule into indefinite semantic staleness — it is safe ungated
+      only because it hash-verifies what it certifies, and the spec binds those
+      two halves into one requirement. Ask whether *those* replacements are
+      complete; whether any of them introduced a new way to **destroy** an index
+      that should have been kept; whether any other write on the provenance path
+      can still fail on a value the pass legitimately observed; and whether the
+      un-gated `embed_vault` can, on any path, write a vector against a row whose
+      content it did not verify.
 - [ ] D.6 `openspec-verifier` subagent against this proposal and the spec deltas
 - [ ] D.7 Deploy: `make deploy`, then `make db-check` must report "No new
       upgrade operations detected"

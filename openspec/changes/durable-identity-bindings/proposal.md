@@ -193,6 +193,25 @@ Three further measurements, because they decide how the hardening is reached:
   assignment and the realpath exactly as it does everywhere else, records NULL
   in the handle column, and says nothing to the operator.
 
+**The two pathname columns are `TEXT`, and that is a correctness decision.**
+The rule is that **a provenance column must be able to record any value the
+fact it mirrors can take**; a value the pass observed and cannot store is a
+bug, never a NULL and never a truncation. The realpath is what forces it: a
+short assignment may be a symlink to a canonical path of any length, and this
+system owns no bound on that. The cost of getting it wrong is not a clipped
+string — the discard branch writes the record *and* the delete in one
+transaction, so an oversized value raises `string_data_right_truncation`, the
+delete rolls back with it, every later pass repeats the failure, and the
+database-backed tools keep serving the former vault forever. A column width
+would have reproduced #91's own symptom. `indexed_vault_assignment` is `TEXT`
+too even though `varchar(1024)` is sufficient *today*: that sufficiency is a
+property of `users.vault_path`'s DDL and of the current normaliser, not of this
+record, and the two pathname facts are written and read as one unit.
+`indexed_vault_handle` stays `varchar(320)` with its NULL-on-oversize rule
+because it is a different kind of value — a comparison token with a documented
+external maximum, whose absence is a *defined* state (no hardening signal),
+where a missing pathname is not a state at all but a half-set record.
+
 **Every stamp writes all three columns, and a fact the pass could not observe
 is written NULL.** There is no partial stamp: no branch updates one column and
 leaves another describing a root it does not describe. That single rule is what
@@ -326,11 +345,14 @@ substitution scenario recognises where it actually lives.
 
 #### Where every prior round's attack lands under this design
 
-Three rounds of review produced eleven findings. Each one has a home here, and
-the point of this table is that a round-4 reviewer can check the *dispositions*
+Four rounds of review produced thirteen findings. Each one has a home here, and
+the point of this table is that the next reviewer can check the *dispositions*
 rather than re-derive the attacks. "Out of scope" appears three times and each
 time it names the non-goal above, which is a declared boundary with an argument,
-not a shrug.
+not a shrug. Rounds 1–3 attacked the identity claim; round 4 accepted the
+rescope and attacked the new design's own mechanics, which is why its two
+findings are about a column width and a gate rather than about what the record
+means.
 
 | # | Round | The attack | Where it lands now |
 | --- | --- | --- | --- |
@@ -343,8 +365,10 @@ not a shrug.
 | 7 | R2 BLOCKER | Identity read from a pathname, then the pathname scanned: an ABA retarget leaves B's rows recorded as A | **Fixed and kept.** The root is pinned once and the facts, the discovery and the reads all come from that descriptor. The rationale is reframed: it makes one pass internally consistent, which is achievable, rather than proving identity across time, which is not |
 | 8 | R2 BLOCKER | The scan `continue`s past unreadable files, so a re-derive can complete over a foreign row and still stamp | **Fixed and kept verbatim.** Any per-file skip makes the re-derive incomplete and withholds the stamp; the link rebuild reads the scan's buffer |
 | 9 | R3 BLOCKER | A cloned ext4/xfs image at the same pathname presents the same handle, so the keep branch keeps the wrong clone's index | **Out of scope, declared.** Also checked by hand: the stated failing input converges on the same end state a fresh index of the clone reaches, and the variant that does not is the pre-existing incremental-indexer defect named in the non-goal |
-| 10 | R3 BLOCKER | `embed_vault` / `link_backfill_pass` / `rebuild_tsvectors` have no defined behaviour under unresolved provenance, so a link row from one root can land against a row from another | **Fixed.** Each runs for a user only on the *same assignment* verdict; otherwise it skips **that user**, logs once, and waits for the next scan |
+| 10 | R3 BLOCKER | `embed_vault` / `link_backfill_pass` / `rebuild_tsvectors` have no defined behaviour under unresolved provenance, so a link row from one root can land against a row from another | **Fixed, and narrowed in round 5.** `link_backfill_pass` and `rebuild_tsvectors` run for a user only on the *same assignment* verdict; otherwise each skips **that user**, logs once, and waits for the next scan. `embed_vault` is not gated — see finding 13 — because it hash-verifies every note it certifies and so cannot write a vector against a row it does not describe |
 | 11 | R3 MAJOR | The no-handle branch stamps nothing, so a previous root's record stands and a later handle-capable pass charges a destructive discard against freshly correct rows | **Dissolved twice over.** There is no no-handle branch any more — an absent handle removes a refusal, not a proof — and every stamp writes all three columns, NULL for anything unobserved, so no record can outlive the root it describes |
+| 12 | R4 BLOCKER | `varchar(1024)` cannot hold every realpath a valid assignment can name, so the discard-and-stamp transaction rolls back on `string_data_right_truncation` and the former vault's index is served forever | **Fixed.** Both pathname columns are `TEXT`, under the stated rule that a provenance column must be able to record any value the fact it mirrors can take; never truncated, never NULL'd. The handle keeps its width because an absent handle is a defined state and an absent pathname is not |
+| 13 | R4 MAJOR | Gating `embed_vault` on settled provenance makes one permanently unreadable file freeze a *readable* note's embeddings indefinitely, and `semantic_search` has no `embedded_content_hash = content_hash` guard | **Fixed.** `embed_vault` is un-gated and runs under every classification, protected by the verify-then-embed rule it already carried; the gate keeps `link_backfill_pass` and `rebuild_tsvectors`, whose work the re-derive redoes on every pass anyway. The verification and the un-gating are specified as one requirement so neither can be removed alone |
 
 Two of the eleven are answered by declaring a boundary rather than by code.
 That is the whole substance of round 4, and it is worth being explicit about the
@@ -400,44 +424,76 @@ handful of descriptors, not thousands. It is a *read* walk and it stays inside
 `src/services/indexer.py`; see the sequencing note in `tasks.md` for why it is
 deliberately not a `vault_fs` helper.
 
-**The three ancillary passes do nothing for a user whose provenance is not
-settled.** `index_vault` is the pass that classifies and stamps, but
-`embed_vault`, `link_backfill_pass` and `rebuild_tsvectors` also read
-`vault / file_path` and also write rows the provenance is a claim about —
-`note_embeddings`, `note_links` and `content_tsvector` respectively. A user
-whose notes contain no links leaves `link_backfill_pass` eligible on *every*
-startup, so "the scan settled this a moment ago" is not something those passes
-may assume. **Each of them therefore runs for a user only when that user's
-provenance is recorded and the classification for the assigned root right now
-is *same assignment* — the keep verdict, computed by the one function that
-computes it. Otherwise it skips that user, logs once, and leaves the work to a
-later pass**, after `index_vault` has settled the provenance. The skip is **per
-user**: an unsettled user does not stop the pass for everybody else.
+**`link_backfill_pass` and `rebuild_tsvectors` do nothing for a user whose
+provenance is not settled.** `index_vault` is the pass that classifies and
+stamps, but both of these also read `vault / file_path` and write rows the
+provenance is a claim about — `note_links` and `content_tsvector` — with **no
+verification of any kind** that the bytes they read belong to the row they
+write against. A user whose notes contain no links leaves `link_backfill_pass`
+eligible on *every* startup, so "the scan settled this a moment ago" is not
+something either may assume. **Each therefore runs for a user only when that
+user's provenance is recorded and the classification for the assigned root
+right now is *same assignment* — the keep verdict, computed by the one function
+that computes it. Otherwise it skips that user, logs once, and leaves the work
+to a later pass**, after `index_vault` has settled the provenance. The skip is
+**per user**: an unsettled user does not stop the pass for everybody else. That
+is round 3's second blocker — a link row extracted from one root landing
+against a metadata row from another — and this is its fix.
 
-Maintenance that does nothing is safe, and that is what makes this the right
-fix rather than a more elaborate one. `embed_vault` skipping a user costs a
-delayed embedding; `link_backfill_pass` skipping one delays a backfill of a
-table that is empty either way; `rebuild_tsvectors` skipping one delays a
-keyword index. None of them writes anything wrong, and the next `index_vault`
-pass either stamps the provenance — after which the user is eligible — or
-re-derives, which rebuilds that user's links itself. The alternative, letting
-them write under an unresolved provenance, is what lets a link row extracted
-from one root land against a metadata row from another; that was round 3's
-second blocker and this is its fix.
+Verification is not merely unimplemented in those two. A link row's
+*resolution* is a function of the whole set of notes under a root (`vault_index`
+is built from the metadata rows, not from one file), so no per-file check could
+license `link_backfill_pass`. `rebuild_tsvectors` could in principle be verified
+the way `embed_vault` is, and is still gated, because nothing records what a
+tsvector was built from — there is no keyword analogue of
+`embedded_content_hash`, so a vector built from foreign bytes leaves no evidence
+a later pass could act on.
 
-**And the embedding pass verifies the hash it is about to certify.**
-`embed_note` sets `note.embedded_content_hash = note.content_hash` — the
-*metadata* row's hash, not a hash of the bytes it just embedded. So a file that
-differs from its row at embedding time is embedded and then marked as embedded
-*for the row's hash*, and nothing will ever re-embed it. That matters here
-because the re-derive branch keeps `note_embeddings` on precisely the argument
-that a matching `content_hash` proves the vector is the right one for that file
-— an inference that is only sound if every vector actually came from content
-hashing to what was stamped. So `embed_vault` re-hashes what it read and skips
-the note when it does not match the row it selected; the next pass, which will
-have refreshed the row, picks it up. One sha256 over bytes already in memory,
-and it is what makes the "keep the embeddings" argument load-bearing rather
-than merely plausible.
+**And skipping costs those two nothing, even for a user whose provenance never
+settles.** The re-derive branch does both of their jobs itself, on every pass:
+it deletes and re-extracts *every* one of that user's link rows, and — because
+it treats every note as changed — it rewrites *every* note's `content_tsvector`
+from the scan's own buffer. So the gated work is a backfill of a table the
+re-derive is filling anyway and a rebuild of vectors the re-derive is rewriting
+anyway. Maintenance that does nothing is safe, which is what makes skipping the
+right fix here rather than a second verification path in two more places.
+
+**`embed_vault` is deliberately not gated, and that is a correction of the
+round-4 draft, which gated all three.** The gate composed with the completeness
+rule into indefinite staleness. A permanently unreadable file withholds the
+stamp forever — by design — and the gate turned that withheld stamp into a
+permanent refusal to embed anything for that user, while the scan kept working:
+a *readable* note the user edits gets a fresh `content_hash` every pass, its
+`note_embeddings` still hold the chunk text of the content it used to have, and
+`semantic_search` reads `chunk_text` with **no** `embedded_content_hash =
+content_hash` guard (`embeddings.py:353`). One bad file would have made that
+user's semantic search silently wrong, indefinitely, for an agent consumer that
+acts on the result without a human seeing the query — the failure CLAUDE.md
+ranks above every expensive one. The re-derive branch does *not* do
+`embed_vault`'s job the way it does the other two, precisely because it keeps
+`note_embeddings` and makes no embedding call; so this was the one gate whose
+cost was unbounded.
+
+**And the un-gating is sound only because the embedding pass verifies the hash
+it is about to certify — the two are one decision.** `embed_note` sets
+`note.embedded_content_hash = note.content_hash` — the *metadata* row's hash,
+not a hash of the bytes it just embedded. So a file that differs from its row at
+embedding time is embedded and then marked as embedded *for the row's hash*, and
+nothing will ever re-embed it. `embed_vault` therefore re-hashes what it read
+and skips the note when it does not match the row it selected; the next pass,
+which will have refreshed the row, picks it up. One sha256 over bytes already in
+memory. That check does two jobs. It is what makes the re-derive's retention of
+`note_embeddings` load-bearing rather than merely plausible — the branch keeps a
+vector *because* a matching `content_hash` proves it is that file's vector. And
+it is what makes running ungated safe: the gate existed to stop a row derived
+from one root being written against a row derived from another, and an embedding
+is a pure function of content, so refusing to embed any bytes that do not hash to
+the selected row's `content_hash` means the vector and the row describe the same
+content *whatever directory supplied the bytes*. Under a wrong root the hashes
+disagree and the pass skips; under bytes that match the row the vector is correct
+by construction. Removing the verification would therefore require re-gating
+`embed_vault` in the same change, and the spec says so at both sites so the
+consequence is visible wherever someone touches one of them.
 
 **The re-derive, precisely — and why it is not a compromise.** For an unresolved
 provenance the pass runs over the assigned root with **content-hash change
@@ -692,15 +748,18 @@ user: no new note is indexed, no deletion is pruned, and nothing is embedded
 until a human intervenes. The chosen rule does every repair it can and declines
 only to *certify*.
 
-**Rejected: let the ancillary passes write under an unresolved provenance,
-guarded by a per-file content check.** Round 3's reviewer offered this as the
-alternative to skipping: have `link_backfill_pass` and `rebuild_tsvectors`
-verify each file's hash against the metadata row before writing, the way
-`embed_vault` now does. It is more machinery in three places, it duplicates a
-verification whose only purpose is to license work that can simply wait, and it
-still cannot decide what to do with a *mismatch* other than skip. Maintenance
-that does nothing is safe; the simple rule is to do nothing until the scan has
-settled the provenance.
+**Rejected: let `link_backfill_pass` and `rebuild_tsvectors` write under an
+unresolved provenance, guarded by a per-file content check.** Round 3's reviewer
+offered this as the alternative to skipping: have both verify each file's hash
+against the metadata row before writing, the way `embed_vault` does. For
+`link_backfill_pass` it does not even work — link *resolution* is a function of
+the whole note set, not of one file's bytes. For `rebuild_tsvectors` it would
+work and is still refused: it is a second verification path, and unlike the
+embedding case it licenses work that can simply wait, because the re-derive
+rewrites every tsvector on every pass anyway. Maintenance that does nothing is
+safe; the simple rule is to do nothing until the scan has settled the
+provenance. `embed_vault` is the exception for the opposite reason — its work
+*cannot* wait, and it already carries the verification.
 
 **Rejected: infer provenance by overlapping the recorded relative paths with the
 files found under the assigned root.** A threshold on a heuristic — high overlap
@@ -957,8 +1016,8 @@ describes a publication that has already happened.
 ## What Changes
 
 - **`users.indexed_vault_assignment`, `users.indexed_vault_realpath` and
-  `users.indexed_vault_handle`** (migration 016, nullable `varchar(1024)`,
-  `varchar(1024)` and `varchar(320)`, no server defaults, one marked unit): the
+  `users.indexed_vault_handle`** (migration 016, nullable `text`, `text` and
+  `varchar(320)`, no server defaults, one marked unit): the
   **provenance** of a user's index — the canonical assignment string the pass
   ran under, the realpath that assignment named at that moment, and, where the
   filesystem offers one, the opaque kernel file handle
@@ -989,19 +1048,24 @@ describes a publication that has already happened.
   the content hash still matches) and stamp after the pass completes; assigned
   root unopenable, or its realpath no longer naming the pinned inode → nothing
   at all. Never for `user_id is None`.
-- **`embed_vault`, `link_backfill_pass` and `rebuild_tsvectors` skip a user
-  whose provenance is not settled**, logging once, and leave the work to a later
-  pass. They proceed only for a user whose recorded provenance matches the
-  assigned root right now — the keep verdict, from the one function that
-  computes it. The skip is per user, not global.
+- **`link_backfill_pass` and `rebuild_tsvectors` skip a user whose provenance
+  is not settled**, logging once, and leave the work to a later pass. They
+  proceed only for a user whose recorded provenance matches the assigned root
+  right now — the keep verdict, from the one function that computes it. The skip
+  is per user, not global. Neither verifies what it reads, and the re-derive
+  redoes both their jobs on every pass, so the delay costs nothing.
 - **A re-derive that skipped any file is incomplete and is not stamped.** Any
   per-file discovery, read, stat, parse or link-extraction skip withholds the
   tail stamp; the pass logs the paths that kept it unstamped and the next pass
   re-derives again.
-- **`embed_vault` verifies the hash it certifies**, re-hashing what it read
-  against the row it selected and skipping on mismatch, so
-  `embedded_content_hash` cannot certify a vector built from other bytes — which
-  is what the re-derive's retention of `note_embeddings` rests on.
+- **`embed_vault` verifies the hash it certifies and is therefore *not* gated**
+  — one decision, specified as one requirement. It re-hashes what it read
+  against the row it selected and skips on mismatch, so `embedded_content_hash`
+  cannot certify a vector built from other bytes; that is what the re-derive's
+  retention of `note_embeddings` rests on, and it is what makes running under
+  any classification safe. Gating it instead would let one permanently
+  unreadable file freeze a readable note's embeddings indefinitely, which
+  `semantic_search` would serve without a staleness guard.
 - **`transfer_tokens.actor_kind` / `actor_label` / `actor_ref`** (migration 017,
   nullable, marked): the denormalised actor, read from `current_actor` inside
   `mint_token` through the same single reader `_log_usage` uses, and copied onto
@@ -1037,9 +1101,10 @@ describes a publication that has already happened.
   before it scans, keeping an index only when the assignment is unchanged,
   discarding one whose assignment demonstrably moved, and re-deriving every
   ambiguous case — recording the result only when the re-derive visited every
-  file, and skipping the ancillary passes for a user whose provenance is not
-  settled. Filesystem substitution behind an unchanged assignment is a declared
-  non-goal.
+  file, and skipping the two unverified ancillary passes for a user whose
+  provenance is not settled while the hash-verifying embedding pass runs
+  regardless. Filesystem substitution behind an unchanged assignment is a
+  declared non-goal.
 - `schema-integrity`: migrations 016 and 017, each owning its columns as a
   marked unit, with `alembic check` clean at head.
 - `file-transfer`: a transfer capability records the actor that minted it, and
@@ -1079,8 +1144,9 @@ stays about the admission gate.
   optional handle — its own function, calling but **not** changing
   `canonical_vault_root`), the descriptor-anchored discovery and read helpers
   used by all four passes, the classification at the head of `index_vault`, the
-  settled-provenance gate on the three ancillary passes, the re-derive mode with
-  its completeness accounting, the link rebuild reading from the scan buffer,
+  settled-provenance gate on `link_backfill_pass` and `rebuild_tsvectors` (and
+  deliberately **not** on `embed_vault`), the re-derive mode with its
+  completeness accounting, the link rebuild reading from the scan buffer,
   `embed_vault`'s hash verification, and the three-column stamp
 - `src/auth/session.py` — the one shared reader of `current_actor`, extracted
   from `tools.py::_actor_columns` so mint and log cannot drift
