@@ -21,7 +21,12 @@ from urllib.parse import urlsplit
 from mcp.server.fastmcp import Image
 from sqlalchemy import text
 
-from src.auth.session import current_actor, current_user_id
+from src.auth.session import (
+    ACTOR_LABEL_MAX as _ACTOR_LABEL_MAX,
+    ACTOR_REF_MAX as _ACTOR_REF_MAX,
+    actor_columns,
+    current_user_id,
+)
 from src.config import (
     MAX_MOVE_REWRITE_BYTES,
     MAX_NOTE_BYTES,
@@ -84,39 +89,18 @@ _NO_CLAUDE_MD_MESSAGE = (
 )
 
 
-# Widths of the denormalised actor columns on `usage_logs` (see `UsageLog`).
-# The values are truncated to them rather than left to overflow: an over-long
-# label raises inside `_log_usage`, whose `except` swallows it, so the failure
-# mode would be the silent loss of the whole usage row — the opposite of what
-# these columns exist for.
-_ACTOR_LABEL_MAX = 255
-_ACTOR_REF_MAX = 64
-
-
 def _actor_columns() -> dict:
-    """The denormalised actor for this request, or `{}` when there is none.
+    """The denormalised actor for this request's `usage_logs` row, or `{}`.
 
-    `APIKeyMiddleware` binds `current_actor` from the credential row it already
-    loaded, so this is a ContextVar read, not a join. Writing the label with
-    the row is the whole point of issue #77: `usage_logs.oauth_token_id` is
-    ON DELETE SET NULL and `usage_logs.key_id` is NULLed by the panel before an
-    API key is deleted, so an actor resolved by join at read time disappears
-    exactly when an operator most wants it — after they revoked the credential
-    they are investigating.
-
-    `{}` (rather than three explicit NULLs) so a caller with no request context
-    — the transfer routes, the tests, sandbox mode — leaves the columns at
-    their database default and the row keeps the shape it had before 015.
+    A thin delegation to `src.auth.session.actor_columns`, which lives beside
+    the ContextVar it reads because the transfer mint records the same triple
+    on `transfer_tokens` (issue #92). One reader is the point: the columns are
+    identically typed on both tables, and a second copy of the mapping is how
+    the mint and the tool-call log start truncating differently. The widths are
+    re-exported above under their old names so nothing that reads
+    `tools._ACTOR_LABEL_MAX` has to learn where they moved.
     """
-    actor = current_actor.get()
-    if actor is None:
-        return {}
-    kind, label, ref = actor
-    return {
-        "actor_kind": kind,
-        "actor_label": label[:_ACTOR_LABEL_MAX] if label else None,
-        "actor_ref": ref[:_ACTOR_REF_MAX] if ref else None,
-    }
+    return actor_columns()
 
 
 # PostgreSQL SQLSTATE for foreign_key_violation — the only insert failure

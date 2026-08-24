@@ -180,6 +180,17 @@ def _log_row(row, tool: str, params: dict, response_size: int | None = None) -> 
     token. `params` never contains the token: the transfer's public id and its
     bound path are enough to correlate, and a log line is exactly the place a
     capability must not appear.
+
+    The FKs alone were not attribution (issue #92). Both are allowed to lose
+    their target while the log row stays — deleting an OAuth client cascades
+    its tokens and `usage_logs.oauth_token_id` is ON DELETE SET NULL, and the
+    panel NULLs a key's `usage_logs.key_id` by hand before deleting the key —
+    so every `upload_file` / `download_file` line rendered "unknown" after the
+    one action an operator takes when they suspect a credential. The three
+    `actor_*` values were recorded on the token at mint, from the credential
+    that request authenticated with, and are copied across here. A row minted
+    before migration 017 carries NULLs and keeps its old shape: nothing is
+    invented for it, and the panel still attributes it by join.
     """
     return UsageLog(
         key_id=row.key_id,
@@ -188,6 +199,9 @@ def _log_row(row, tool: str, params: dict, response_size: int | None = None) -> 
         tool=tool,
         params=params,
         response_size=response_size,
+        actor_kind=row.actor_kind,
+        actor_label=row.actor_label,
+        actor_ref=row.actor_ref,
     )
 
 

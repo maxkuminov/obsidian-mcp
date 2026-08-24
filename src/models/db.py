@@ -1,4 +1,5 @@
 import datetime
+from typing import ClassVar
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
@@ -194,6 +195,15 @@ class APIKey(Base):
 # identical to `MARKER` in `alembic/versions/015_usage_log_actor.py`; a
 # mismatch shows up as a pending `alter_column(comment=...)`.
 _ACTOR_COLUMN_MARKER = "denormalised actor, written at call time (015_usage_log_actor)"
+
+# Migration 017's ownership marker for the same three columns on
+# `transfer_tokens` (issue #92). A separate string because a separate migration
+# owns them: 017's `downgrade()` drops only columns carrying *this* comment,
+# and its upgrade completes only a set carrying it. Must stay byte identical to
+# `MARKER` in `alembic/versions/017_transfer_token_actor.py`.
+_TRANSFER_ACTOR_COLUMN_MARKER = (
+    "denormalised actor, recorded at mint (017_transfer_token_actor)"
+)
 
 
 class UsageLog(Base):
@@ -430,6 +440,11 @@ class TransferToken(Base):
 
     __tablename__ = "transfer_tokens"
 
+    # 017's ownership marker, reachable from the class so a caller checking
+    # model/migration agreement names the table it is checking. `ClassVar` is
+    # what keeps the declarative mapper from reading it as a column.
+    _ACTOR_COLUMN_MARKER: ClassVar[str] = _TRANSFER_ACTOR_COLUMN_MARKER
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # The handle the tools hand back to the agent. Deliberately *not* `id`: the
     # row id is a small sequential integer, so an `upload_id` built on it is
@@ -465,6 +480,37 @@ class TransferToken(Base):
     size: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     mime: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Denormalised attribution for the redemption's `usage_logs` row (issue
+    # #92, migration 017). Recorded at *mint*, from the request-scoped actor
+    # `APIKeyMiddleware` already bound, because redemption has no credential to
+    # read: the request carries a capability and is session-less, so
+    # `src/transfer/routes.py::_log_row` could only attribute by join — through
+    # `key_id`, or through `oauth_token_id` -> `oauth_clients`. Both joins go
+    # NULL on the operator's most urgent path (deleting an OAuth client
+    # cascades its tokens; the panel NULLs a key's `usage_logs.key_id` before
+    # deleting the key), and the rows they take with them are the ones where
+    # bytes entered or left the vault.
+    #
+    # A snapshot of what the credential was called at mint time, never
+    # re-derived: re-reading at redemption would rewrite history on every
+    # rename and would fail outright in the case the scheme exists for. Display
+    # and audit only — `_credential_ok`, the root check and the publish gate
+    # never read it.
+    #
+    # Same kinds and widths as `UsageLog`'s, written through the same single
+    # reader (`src.auth.session.actor_columns`), so the mint and the tool-call
+    # log cannot disagree about the caller or truncate differently. The comment
+    # is 017's ownership marker, declared here so `alembic check` compares it.
+    actor_kind: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, comment=_TRANSFER_ACTOR_COLUMN_MARKER
+    )
+    actor_label: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment=_TRANSFER_ACTOR_COLUMN_MARKER
+    )
+    actor_ref: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_TRANSFER_ACTOR_COLUMN_MARKER
+    )
 
     __table_args__ = (
         Index("ix_transfer_tokens_expires_at", "expires_at"),

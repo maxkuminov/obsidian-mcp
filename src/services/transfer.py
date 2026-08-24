@@ -51,6 +51,7 @@ import idna
 from sqlalchemy import and_, delete, literal, select, update
 from sqlalchemy.orm import aliased
 
+from src.auth.session import actor_columns
 from src.config import settings
 from src.models.db import APIKey, OAuthToken, TransferToken, User
 from src.oauth.scope import token_has_write
@@ -407,6 +408,14 @@ async def mint_token(
     *returned* instead, so the mint tools can say when the credential shortened
     the link.
 
+    The minting request's denormalised actor is recorded on the row for the
+    same reason and by the same discipline (issue #92): the redemption request
+    is session-less and carries a capability, so it has no credential of its
+    own to name in the usage log, and the joins it would otherwise rely on go
+    NULL the moment the operator deletes the credential they are investigating.
+    It is read from `current_actor` here rather than passed in, and it changes
+    no decision — display and audit only.
+
     Raises `CredentialNotUsable` before writing anything when the credential
     cannot back a capability at all.
     """
@@ -434,6 +443,23 @@ async def mint_token(
         oauth_token_id=identity.oauth_token_id,
         user_id=identity.user_id,
         expires_at=window.expires_at,
+        # Who minted this, denormalised (issue #92). Read here, from the
+        # ContextVar `APIKeyMiddleware` bound out of the credential row it had
+        # already loaded, for the same reason the window is computed here: a
+        # caller-supplied value is one the caller can get stale or wrong, and
+        # this one has to be the credential *this* transaction is minting
+        # against. It costs no query — the middleware did the reading — and it
+        # goes through the same reader `_log_usage` uses, so a mint and a tool
+        # call in one request cannot disagree about the caller or truncate
+        # differently.
+        #
+        # Redemption is where it is needed and cannot be taken: that request
+        # carries a capability, not a credential, so `_log_row` could only
+        # attribute by join — and both joins go NULL exactly when an operator
+        # deletes the credential they are investigating. Unset ContextVar (a
+        # mint outside a request) leaves all three NULL and the row keeps its
+        # pre-017 shape; nothing is inferred from `user_id`.
+        **actor_columns(),
     )
     session.add(row)
 

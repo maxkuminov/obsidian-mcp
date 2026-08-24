@@ -58,6 +58,49 @@ current_actor: ContextVar[tuple[str, str | None, str | None] | None] = ContextVa
 )
 
 
+# Widths of the denormalised actor columns, on `usage_logs` (migration 015) and
+# on `transfer_tokens` (migration 017). The values are truncated to them rather
+# than left to overflow: an over-long label raises inside the writer, and on the
+# `usage_logs` path that writer swallows the error, so the failure mode would be
+# the silent loss of the whole row — the opposite of what these columns exist
+# for.
+ACTOR_LABEL_MAX = 255
+ACTOR_REF_MAX = 64
+
+
+def actor_columns() -> dict:
+    """The denormalised actor for this request, or `{}` when there is none.
+
+    `APIKeyMiddleware` binds `current_actor` from the credential row it already
+    loaded, so this is a ContextVar read, not a join. Writing the label *with*
+    the row is the whole point of issue #77: `usage_logs.oauth_token_id` is
+    ON DELETE SET NULL and `usage_logs.key_id` is NULLed by the panel before an
+    API key is deleted, so an actor resolved by join at read time disappears
+    exactly when an operator most wants it — after they revoked the credential
+    they are investigating.
+
+    `{}` (rather than three explicit NULLs) so a caller with no request context
+    — the transfer redemption routes, the tests, sandbox mode — leaves the
+    columns unset and the row keeps the shape it had before the scheme existed.
+
+    **One reader, deliberately.** Two writers record this triple now: the tool
+    call log (`_log_usage`) and the transfer mint (`mint_token`, issue #92).
+    The columns are identically typed on both tables, so a second copy of this
+    mapping is how the two start truncating differently — and a mint and the
+    tool call in the same request would then disagree about who the caller was.
+    It lives here, beside the ContextVar it reads, so neither writer owns it.
+    """
+    actor = current_actor.get()
+    if actor is None:
+        return {}
+    kind, label, ref = actor
+    return {
+        "actor_kind": kind,
+        "actor_label": label[:ACTOR_LABEL_MAX] if label else None,
+        "actor_ref": ref[:ACTOR_REF_MAX] if ref else None,
+    }
+
+
 @dataclass
 class _SingleUserSentinel:
     id: int | None = None

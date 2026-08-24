@@ -59,7 +59,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "016"
+HEAD_REVISION = "017"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -2055,3 +2055,430 @@ def test_downgrade_016_refuses_to_drop_a_set_it_did_not_create():
         assert alembic_version(url) == HEAD_REVISION
         for column, _ in PROVENANCE_COLUMNS:
             assert column_shape(url, "users", column) is not None
+
+
+# ==========================================================================
+# 017 — the actor columns on `transfer_tokens` (issue #92, item 2)
+# ==========================================================================
+#
+# Same three columns as 015's, on the table that mints capabilities, and for
+# the reason 015 does not reach: a redemption request is session-less and
+# carries a **capability, not a credential**, so `_log_row` has no
+# request-scoped actor to read and attributed its `usage_logs` rows by join
+# alone. Both joins go NULL on the operator's most urgent path — deleting an
+# OAuth client cascades its tokens and `usage_logs.oauth_token_id` is ON DELETE
+# SET NULL, and the panel NULLs a key's `usage_logs.key_id` before deleting the
+# key — and the rows they take with them are the ones where bytes entered or
+# left the vault.
+#
+# `alembic check` sees the three columns, their types and their nullability. It
+# cannot see any of what the cases below assert: that the backfill labels a row
+# from *its own* FK and never from another row's, that a row carrying no
+# credential FK stays unattributed rather than being guessed at from `user_id`,
+# that 017 writes nothing at all to `usage_logs`, and — the invariant the first
+# draft omitted — that a label sitting beside a NULL `actor_kind` aborts the
+# migration instead of being overwritten from whatever credential the row
+# points at now.
+
+
+# Deliberately identical to `ACTOR_COLUMNS`: both tables are written through
+# one reader (`src.auth.session.actor_columns`), so a width that differed
+# between them would make that reader truncate correctly for one writer and
+# wrongly for the other. Spelled out rather than aliased, so a change to either
+# table's widths shows up here as a diff.
+TRANSFER_ACTOR_COLUMNS = (
+    ("actor_kind", "character varying(20)"),
+    ("actor_label", "character varying(255)"),
+    ("actor_ref", "character varying(64)"),
+)
+
+# 017's ownership marker, mirrored from the migration *and* from
+# `src/models/db.py::TransferToken._ACTOR_COLUMN_MARKER`. All three must agree:
+# the migration keys its completion and its downgrade on the comment, and the
+# model declares it so `alembic check` compares it. A different string from
+# 015's on purpose — a shared marker would let either `downgrade()` claim the
+# other's columns.
+TRANSFER_ACTOR_MARKER = "denormalised actor, recorded at mint (017_transfer_token_actor)"
+
+
+def transfer_actor_column_is_marked(url, column: str) -> bool:
+    return fetchval(
+        url,
+        "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a "
+        "WHERE a.attrelid = 'transfer_tokens'::regclass AND a.attname = $1",
+        column,
+    ) == TRANSFER_ACTOR_MARKER
+
+
+def insert_transfer_token(
+    url,
+    token_id: int,
+    *,
+    key_id=None,
+    oauth_token_id=None,
+    user_id=None,
+    direction="upload",
+    path="Inbox/report.pdf",
+):
+    sql(
+        url,
+        "INSERT INTO transfer_tokens (id, public_id, token_hash, direction, "
+        "state, path, vault_root, overwrite, key_id, oauth_token_id, user_id, "
+        "expires_at) VALUES ($1, $2, $3, $4, 'pending', $5, '/vaults/alice', "
+        "false, $6, $7, $8, $9)",
+        token_id,
+        f"public-{token_id}",
+        f"{token_id:064d}",
+        direction,
+        path,
+        key_id,
+        oauth_token_id,
+        user_id,
+        FUTURE,
+    )
+
+
+def transfer_actor_of(url, token_id: int):
+    """`(actor_kind, actor_label, actor_ref)` for one transfer token."""
+    row = fetch(
+        url,
+        "SELECT actor_kind, actor_label, actor_ref FROM transfer_tokens WHERE id = $1",
+        token_id,
+    )[0]
+    return row["actor_kind"], row["actor_label"], row["actor_ref"]
+
+
+def transfer_rows(url):
+    """Every `transfer_tokens` row, whole, ordered — for byte-for-byte compare.
+
+    The orphan-label case has to prove the refusal changed *nothing*, not just
+    that the one label it named survived: a migration that raised after writing
+    two of three columns would pass the narrower assertion.
+    """
+    return [
+        dict(row)
+        for row in fetch(url, "SELECT * FROM transfer_tokens ORDER BY id")
+    ]
+
+
+def add_owned_transfer_actor_columns(url, *, marked=True):
+    """The three columns exactly as 017 creates them, marker optional."""
+    for column, coltype in TRANSFER_ACTOR_COLUMNS:
+        sql(url, f"ALTER TABLE transfer_tokens ADD COLUMN {column} {coltype}")
+        if marked:
+            sql(
+                url,
+                f"COMMENT ON COLUMN transfer_tokens.{column} IS "
+                f"'{TRANSFER_ACTOR_MARKER}'",
+            )
+
+
+def refuse_017(url, *, must_mention):
+    """Run `upgrade head`, require 017 to refuse, and return the message."""
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    combined = result.stdout + result.stderr
+    assert result.returncode != 0, combined
+    for fragment in must_mention:
+        assert fragment in combined, combined
+    assert "Nothing has been changed" in combined, combined
+    assert alembic_version(url) == "016"
+    return combined
+
+
+def seed_pre_017_transfers(url):
+    """One key-minted capability, one OAuth-minted one, one with neither FK.
+
+    The third is the single-user / sandbox mint: nothing on the row names a
+    credential, so there is nothing to label and nothing may be guessed. It is
+    *not* the "credential already deleted" case 015 had — both FKs here are
+    ON DELETE CASCADE, so such a row does not survive to be labelled at all.
+
+    A transfer-route `usage_logs` row is seeded beside them, with a live
+    `key_id` and NULL actor columns: exactly the 015 -> 017 gap row, which 017
+    must leave alone.
+    """
+    insert_user(url, 1, "alice")
+    insert_key(url, 1, "nightly sync", "omcp_a1b2c3", user_id=1)
+    insert_key(url, 2, "other key", "omcp_zzzzzz", user_id=1)
+    insert_client(url, "client-abc", "none", None)
+    sql(
+        url,
+        "INSERT INTO oauth_tokens (token_hash, token_type, client_id, scope, "
+        "user_id, grant_id, expires_at, revoked) "
+        "VALUES ($1, 'access', 'client-abc', 'read', 1, 'grant-1', $2, false)",
+        "a" * 64,
+        FUTURE,
+    )
+    token_id = fetchval(url, "SELECT id FROM oauth_tokens WHERE token_hash = $1", "a" * 64)
+
+    insert_transfer_token(url, 1, key_id=1, user_id=1)
+    insert_transfer_token(url, 2, oauth_token_id=token_id, user_id=1)
+    insert_transfer_token(url, 3, direction="download", path="Notes/plan.md")
+
+    # The gap row: written by the transfer route after 015 and before 017, so
+    # its actor columns are NULL even though its credential still resolves.
+    insert_usage(url, 1, key_id=1, tool="upload_file")
+    return token_id
+
+
+def test_the_transfer_actor_columns_are_nullable_and_marked_on_a_fresh_database():
+    """Nullable is load-bearing: a mint that cannot name its actor — single
+    user, sandbox, any path outside a request — must still produce a token.
+    These columns are display and audit, never authorization."""
+    with throwaway_db("schema_tt_actor_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        for column, expected_type in TRANSFER_ACTOR_COLUMNS:
+            shape = column_shape(url, "transfer_tokens", column)
+            assert shape is not None, f"transfer_tokens.{column} is missing"
+            attnotnull, coltype, coldefault = shape
+            assert attnotnull is False, f"{column} must stay nullable"
+            assert coltype == expected_type, f"{column} is {coltype}"
+            assert coldefault is None, f"{column} carries a server default"
+            assert transfer_actor_column_is_marked(url, column), (
+                f"transfer_tokens.{column} lost 017's comment marker"
+            )
+        # `alembic check` clean at head — which is only true while the model's
+        # declared column comments are byte-identical to 017's marker, and
+        # while 016 (run in this same upgrade) agrees with its own model.
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+        assert "No new upgrade operations detected" in check.stdout
+
+
+def test_both_migrations_of_this_wave_run_in_one_upgrade():
+    """The gate covers 016 *and* 017, in the same run, on the same database.
+
+    Per-migration confidence proves nothing about the pair: they land in one
+    deploy, alembic runs them in one transaction, and 017's `down_revision` is
+    what puts them in a line rather than on a branch.
+    """
+    with throwaway_db("schema_wave_both") as url:
+        assert alembic_version(url) == HEAD_REVISION == "017"
+        for column, _ in PROVENANCE_COLUMNS:
+            assert column_shape(url, "users", column) is not None
+            assert provenance_column_is_marked(url, column)
+        for column, _ in TRANSFER_ACTOR_COLUMNS:
+            assert column_shape(url, "transfer_tokens", column) is not None
+            assert transfer_actor_column_is_marked(url, column)
+        # The two markers are distinct, so neither `downgrade()` can claim the
+        # other's columns.
+        assert PROVENANCE_MARKER != TRANSFER_ACTOR_MARKER
+
+
+def test_017_labels_each_token_from_its_own_credential():
+    with throwaway_db("schema_tt_actor_backfill", revision="016") as url:
+        seed_pre_017_transfers(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert transfer_actor_of(url, 1) == ("api_key", "nightly sync", "omcp_a1b2c3")
+        assert transfer_actor_of(url, 2) == ("oauth", "test client", "client-abc")
+        # Never from another row's credential: the second key exists and is the
+        # same user's, and nothing may reach for it.
+        assert "other key" not in {transfer_actor_of(url, i)[1] for i in (1, 2)}
+
+
+def test_a_token_with_no_credential_fk_stays_unattributed():
+    """Nothing is invented.
+
+    Both credential FKs are ON DELETE CASCADE, so a row whose minting
+    credential was deleted is gone. A row with neither FK is a single-user or
+    sandbox mint, and a guess from `user_id` would be worse than an admitted
+    gap: two of a user's keys are different actors.
+    """
+    with throwaway_db("schema_tt_actor_orphan_row", revision="016") as url:
+        seed_pre_017_transfers(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert transfer_actor_of(url, 3) == (None, None, None)
+
+
+def test_017_writes_nothing_to_the_usage_log():
+    """The 015 -> 017 gap row keeps join-only attribution.
+
+    `usage_logs` carries no reference back to the token that produced it, so
+    the only available backfill would be a re-run of 015's own credential join
+    — a second writer on three columns 015 owns and guards. 017 declines, and
+    the gap rows render through the panel's existing pre-015 fallback.
+    """
+    with throwaway_db("schema_tt_actor_usage_untouched", revision="016") as url:
+        seed_pre_017_transfers(url)
+        before = fetch(url, "SELECT * FROM usage_logs ORDER BY id")
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert actor_of(url, 1) == (None, None, None)
+        assert [dict(row) for row in fetch(url, "SELECT * FROM usage_logs ORDER BY id")] == [
+            dict(row) for row in before
+        ]
+
+
+def test_rerunning_017_does_not_rewrite_an_actor_recorded_by_a_mint():
+    """Idempotence that re-executes the body, and history that stays history.
+
+    Stamping back to 016 forces 017 to run again over a row whose recorded
+    label deliberately differs from the credential's current name — what a
+    rename produces. The guard is `actor_kind IS NULL`, so a renamed key must
+    not retroactively rename every capability it ever minted.
+    """
+    with throwaway_db("schema_tt_actor_idempotent", revision="016") as url:
+        seed_pre_017_transfers(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert transfer_actor_of(url, 1) == ("api_key", "nightly sync", "omcp_a1b2c3")
+
+        sql(url, "UPDATE api_keys SET name = 'renamed later' WHERE id = 1")
+        _harness.run_alembic(url, "stamp", "016", dimensions=DIM)
+        assert alembic_version(url) == "016"
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert transfer_actor_of(url, 1) == ("api_key", "nightly sync", "omcp_a1b2c3")
+
+
+def test_a_transfer_label_beside_a_null_kind_is_refused_not_overwritten():
+    """B.5a's invariant, and the reason it exists.
+
+    `actor_kind IS NULL` is the backfill's *only* guard, so a row carrying a
+    label under a NULL kind would be relabelled from whatever credential its FK
+    points at now — overwriting a recorded attribution, which is the one thing
+    these columns must never do. Reachable by a stamp-back re-run over a
+    database that drift or a faulty writer has put in that state.
+    """
+    with throwaway_db("schema_tt_actor_orphan_label", revision="016") as url:
+        seed_pre_017_transfers(url)
+        add_owned_transfer_actor_columns(url)
+        sql(url, "UPDATE transfer_tokens SET actor_label = 'hand written' WHERE id = 1")
+        before = transfer_rows(url)
+
+        refuse_017(url, must_mention=["actor_kind", "will not rewrite", "ids: 1"])
+
+        # Byte for byte: not just the named label, every row and every column.
+        assert transfer_rows(url) == before
+        assert transfer_actor_of(url, 1) == (None, "hand written", None)
+        assert transfer_actor_of(url, 2) == (None, None, None)
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "wrong type",
+            "ALTER TABLE transfer_tokens ALTER COLUMN actor_label TYPE text",
+            "actor_label is text",
+        ),
+        (
+            "NOT NULL",
+            "ALTER TABLE transfer_tokens ALTER COLUMN actor_label SET NOT NULL",
+            "is NOT NULL",
+        ),
+        (
+            "server default",
+            "ALTER TABLE transfer_tokens ALTER COLUMN actor_kind SET DEFAULT 'api_key'",
+            "carries a server default",
+        ),
+    ],
+)
+def test_a_foreign_transfer_actor_column_is_refused(label, ddl, fragment):
+    """013's philosophy: reconcile a column we can verify, refuse to guess.
+
+    A column of unknown provenance under one of these names holds labels this
+    migration did not write — and `_log_row` copies them onto `usage_logs` at
+    redemption, where an operator reads them as an audit trail.
+    """
+    with throwaway_db(f"schema_tt_foreign_{label.replace(' ', '_')}", revision="016") as url:
+        add_owned_transfer_actor_columns(url)
+        sql(url, ddl)
+
+        refuse_017(url, must_mention=[fragment])
+
+
+def test_a_partial_transfer_actor_column_set_is_refused():
+    """The three are one owned unit.
+
+    A database with only `actor_kind` is not a re-run, it is one somebody
+    edited — and `actor_kind IS NULL` is what decides which rows the backfill
+    writes, so a foreign guard column silently decides what gets labelled.
+    """
+    with throwaway_db("schema_tt_partial", revision="016") as url:
+        sql(url, "ALTER TABLE transfer_tokens ADD COLUMN actor_kind character varying(20)")
+        sql(
+            url,
+            f"COMMENT ON COLUMN transfer_tokens.actor_kind IS '{TRANSFER_ACTOR_MARKER}'",
+        )
+
+        refuse_017(url, must_mention=["actor_kind", "actor_label", "absent"])
+
+        assert column_shape(url, "transfer_tokens", "actor_label") is None
+        assert column_shape(url, "transfer_tokens", "actor_ref") is None
+
+
+def test_an_unmarked_transfer_actor_column_set_is_refused():
+    """Type and width are a coincidence anyone could reproduce; the comment is
+    the only evidence that *this* scheme wrote the values."""
+    with throwaway_db("schema_tt_unmarked", revision="016") as url:
+        add_owned_transfer_actor_columns(url, marked=False)
+
+        refuse_017(url, must_mention=["017's comment marker"])
+
+
+def test_a_complete_marked_transfer_actor_set_is_accepted_as_a_rerun():
+    """The benign case: 017's own shape, applied by hand or left by a re-stamp.
+
+    Nothing has to be guessed, so the migration completes and backfills.
+    """
+    with throwaway_db("schema_tt_rerun", revision="016") as url:
+        seed_pre_017_transfers(url)
+        add_owned_transfer_actor_columns(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert transfer_actor_of(url, 1) == ("api_key", "nightly sync", "omcp_a1b2c3")
+        assert transfer_actor_of(url, 2) == ("oauth", "test client", "client-abc")
+
+
+def test_downgrade_017_drops_the_marked_set_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_tt_downgrade", revision="016") as url:
+        seed_pre_017_transfers(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert transfer_actor_of(url, 1)[0] == "api_key"
+
+        _harness.run_alembic(url, "downgrade", "016", dimensions=DIM)
+        assert alembic_version(url) == "016"
+        for column, _ in TRANSFER_ACTOR_COLUMNS:
+            assert column_shape(url, "transfer_tokens", column) is None
+        # 016 is a separate unit and is untouched by 017's downgrade.
+        for column, _ in PROVENANCE_COLUMNS:
+            assert column_shape(url, "users", column) is not None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        # Re-derived from the credentials that still exist.
+        assert transfer_actor_of(url, 1) == ("api_key", "nightly sync", "omcp_a1b2c3")
+
+
+def test_downgrade_017_refuses_to_drop_a_set_it_did_not_create():
+    """All or nothing, decided before anything is touched.
+
+    An unmarked column under one of these names is left in place and reported
+    rather than destroyed on the way past — and its two marked siblings survive
+    with it.
+    """
+    with throwaway_db("schema_tt_downgrade_foreign") as url:
+        sql(url, "COMMENT ON COLUMN transfer_tokens.actor_ref IS 'somebody else'")
+
+        result = _harness.run_alembic(
+            url, "downgrade", "016", dimensions=DIM, check=False
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode != 0, combined
+        assert "actor_ref" in combined, combined
+        assert "Nothing has been changed" in combined, combined
+
+        assert alembic_version(url) == HEAD_REVISION
+        for column, _ in TRANSFER_ACTOR_COLUMNS:
+            assert column_shape(url, "transfer_tokens", column) is not None

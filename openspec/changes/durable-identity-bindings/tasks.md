@@ -584,7 +584,7 @@ clamp, or anything in the publish gate. The label is display and audit only and
 is never read for authorization. Do not add a `transfer_token_id` to
 `usage_logs`. Do not re-run 015's `usage_logs` backfill from 017.
 
-- [ ] B.1 Extract the single reader of `current_actor` — the mapping from the
+- [x] B.1 Extract the single reader of `current_actor` — the mapping from the
       ContextVar triple to `{actor_kind, actor_label, actor_ref}` **including
       the truncation to the stored widths** — out of
       `src/mcp_server/tools.py::_actor_columns` into `src/auth/session.py`,
@@ -592,23 +592,23 @@ is never read for authorization. Do not add a `transfer_token_id` to
       delegation so the tool-call log path is unchanged. One reader is the
       point: the widths are identical on both tables and a second copy is how
       the mint and the log start truncating differently.
-- [ ] B.2 Add `TransferToken.actor_kind` / `actor_label` / `actor_ref` to
+- [x] B.2 Add `TransferToken.actor_kind` / `actor_label` / `actor_ref` to
       `src/models/db.py` — nullable `String(20)` / `String(255)` / `String(64)`,
       no server default, each `comment=TransferToken._ACTOR_COLUMN_MARKER`
       where that constant is `"denormalised actor, recorded at mint
       (017_transfer_token_actor)"`. Document that the redemption request
       carries a capability rather than a credential, which is why the label has
       to be recorded at mint.
-- [ ] B.3 In `mint_token` (`src/services/transfer.py`), populate the three
+- [x] B.3 In `mint_token` (`src/services/transfer.py`), populate the three
       fields from the shared reader **inside the mint transaction**, before the
       INSERT. Read the ContextVar there rather than taking a parameter — the
       `plan_mint_window` discipline: a caller-supplied value is one the caller
       can get stale or wrong. An unset ContextVar leaves all three NULL and the
       row keeps its pre-017 shape.
-- [ ] B.4 In `src/transfer/routes.py::_log_row`, copy `row.actor_kind`,
+- [x] B.4 In `src/transfer/routes.py::_log_row`, copy `row.actor_kind`,
       `row.actor_label` and `row.actor_ref` onto the `UsageLog`. Nothing else
       about that function changes; `params` still never contains the token.
-- [ ] B.5 Write `alembic/versions/017_transfer_token_actor.py`
+- [x] B.5 Write `alembic/versions/017_transfer_token_actor.py`
       (`down_revision = "016"`), same `SET LOCAL` / `RESET` discipline as 016.
       Add the three columns, stamp each with the marker, and backfill guarded
       on `actor_kind IS NULL`: from `api_keys` for rows with `key_id`, and from
@@ -616,7 +616,7 @@ is never read for authorization. Do not add a `transfer_token_id` to
       both FKs are `ON DELETE CASCADE`, a row whose credential is gone does not
       exist to label — the rows left NULL are the ones carrying neither FK, and
       they stay NULL rather than being inferred from `user_id`.
-- [ ] B.5a **Port 015's `_assert_no_orphan_labels` to `transfer_tokens` and run
+- [x] B.5a **Port 015's `_assert_no_orphan_labels` to `transfer_tokens` and run
       it before the backfill.** The first draft of this proposal claimed to
       follow 015 exactly and omitted this; it is the invariant that makes the
       `actor_kind IS NULL` guard safe on a stamp-back re-run. Same shape as
@@ -625,18 +625,18 @@ is never read for authorization. Do not add a `transfer_token_id` to
       raise naming them, and change nothing. Without it a re-run relabels such
       a row from whatever credential its FK points at *now*, rewriting a
       recorded attribution — the one thing these columns must never do.
-- [ ] B.6 Treat the three as one owned unit, exactly as 015 does: all absent →
+- [x] B.6 Treat the three as one owned unit, exactly as 015 does: all absent →
       create and mark; all present, exactly typed, nullable, default-free and
       marked → accept as a re-run; anything else (partial set, `NOT NULL`,
       server default, unmarked, foreign) → raise naming what was found.
       `downgrade()` drops only marked columns, all-or-nothing.
-- [ ] B.7 017 writes **nothing** to `usage_logs`. Record why in the migration's
+- [x] B.7 017 writes **nothing** to `usage_logs`. Record why in the migration's
       docstring: there is no reference from a usage row back to the token that
       produced it, and the only alternative is re-running 015's credential join
       — a second writer on columns 015 owns and guards, which is the second
       resolution path #64 argued against. Rows in the 015→017 gap keep
       join-only attribution and render honestly.
-- [ ] B.8 `tests/integration/test_schema_check.py`: move `HEAD_REVISION` to
+- [x] B.8 `tests/integration/test_schema_check.py`: move `HEAD_REVISION` to
       `"017"`; fresh-database shape and marker for all three columns; the
       backfill labels a key-minted row from its own key and an OAuth-minted row
       from its own client, never from another row; a row with both FKs NULL
@@ -648,7 +648,7 @@ is never read for authorization. Do not add a `transfer_token_id` to
       set, a `NOT NULL` column, a server default, a wrong type and an unmarked
       set; a complete marked set accepted; downgrade drops the marked set and
       leaves a partly unmarked one; `alembic check` clean at head.
-- [ ] B.9 New `tests/test_issue_92_transfer_actor.py`: a mint records the actor
+- [x] B.9 New `tests/test_issue_92_transfer_actor.py`: a mint records the actor
       the middleware bound, on both the API-key and the OAuth branch, and the
       OAuth label is the `client_name`; the mint issues **no additional
       statement** for it (statement count against the pre-change baseline); a
