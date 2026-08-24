@@ -23,6 +23,7 @@ from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
 from src.oauth.routes import router as oauth_router
 from src.services.indexer import run_indexer_loop
+from src.services import vault_fs
 from src.transfer.routes import router as transfer_router
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -119,6 +120,47 @@ async def _check_pgvector_version() -> None:
         sys.exit(1)
 
 
+def _check_openat2_support() -> None:
+    """Refuse to start where a beneath-root lookup is impossible (#87).
+
+    Every directory descriptor below a vault root is obtained with one
+    `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)`,
+    and there is deliberately **no fallback** to the per-component walk it
+    replaced. A server that cannot enforce containment should not accept its
+    first write, so this runs before one can arrive — and the guarantee would
+    otherwise degrade invisibly, since every test runs on a kernel that has
+    the syscall.
+
+    Two causes, both named in the message because they need different fixes:
+    a kernel older than 5.6, or a container seccomp profile that blocks the
+    syscall (an older Docker default does, returning `EPERM` or `ENOSYS`
+    depending on the profile's default action).
+
+    The probe is **read-only and creates nothing** — one `openat2` of `"."`
+    relative to a descriptor of the process's own working directory — which is
+    why it can be a startup guard rather than a per-root probe like
+    `probe_publication` (D21). It is not redundant with the refusal at the call
+    site: this answers for the process at startup, the call site is what a
+    future caller cannot get around, and `MCP_SANDBOX_MODE` — which skips this
+    guard as it skips the others — is the one configuration in which a call
+    site can be reached with the syscall unavailable.
+    """
+    try:
+        vault_fs.probe_beneath_root_lookup()
+    except vault_fs.UnsupportedFilesystem as exc:
+        logging.getLogger(__name__).critical(
+            "Cannot perform a beneath-root path lookup: %s Every vault write "
+            "anchors to a directory descriptor obtained this way, and there is "
+            "no safe fallback to opening one path component at a time — an "
+            "ancestor renamed out of the vault between two such opens yields a "
+            "descriptor outside the root while the tool reports success. "
+            "Upgrade the kernel to 5.6 or newer, or allow openat2 in the "
+            "container's seccomp profile.",
+            exc,
+        )
+        sys.exit(1)
+
+
 async def _validate_fts_configs() -> None:
     """Fail fast at startup if `FTS_CONFIGS` names a text-search config that
     isn't installed in this Postgres instance (e.g. a typo), so a bad config
@@ -176,6 +218,7 @@ async def lifespan(app: FastAPI):
         async with mcp.session_manager.run():
             yield
         return
+    _check_openat2_support()
     await _check_embedding_dim()
     await _check_pgvector_version()
     await _validate_fts_configs()

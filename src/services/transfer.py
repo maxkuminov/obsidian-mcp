@@ -1207,13 +1207,23 @@ def _publish_into_current_parent(
 ):
     """Resolve the destination parent *now* and link the staged file into it.
 
-    The fresh `open_dir_beneath` walk is the point. A descriptor opened before
+    The fresh `open_dir_beneath` lookup is the point. A descriptor opened before
     a minutes-long stream keeps pointing at the same directory even after that
     directory is renamed or moved — including into `.trash` or out of the vault
     entirely — so publishing through it would follow the move and write
-    somewhere the token never named. Re-walking from the root descriptor under
+    somewhere the token never named. Re-resolving from the root descriptor under
     the caller's lock means the bytes land at the path the token committed to,
     as that path resolves at publication time, or not at all.
+
+    That lookup is one `openat2(RESOLVE_BENEATH | …)` since #87, so no rename
+    *during* it can hand back a descriptor outside the root. It proves
+    containment at the instant it resolves and not afterwards (D26): the
+    interval between this lookup and the `link`/`rename` below is the retained
+    residual of anchoring to a descriptor at all, and it is the same interval
+    the per-component walk had underneath the larger window it did not close.
+    This is also the second of an upload's two creating descents — the cheap
+    up-front one in `_stream_locked` is the first — which is why D22's bound is
+    stated per descent rather than per call.
 
     `on_published` is called with the outcome the *instant* `publish` returns
     having placed the bytes, before this function does anything else — closing

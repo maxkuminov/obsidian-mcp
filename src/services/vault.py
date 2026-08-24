@@ -32,14 +32,33 @@ inside the directory the caller named:
   such window at all: it stages into an unnamed `O_TMPFILE` inode and publishes
   it through `/proc/self/fd`, so there is no staging name to substitute and
   none to clean up.
-- **the anchored walk itself is not atomic.** `vault_fs.open_dir_beneath` opens
-  one component at a time, and an ancestor renamed *out of the vault* between
-  two of those opens yields a parent descriptor outside the pinned root. This
-  is inherited, not introduced: the transfer routes and `delete_file` have
-  always walked this way. The fix is `openat2(RESOLVE_BENEATH |
-  RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS)` through `ctypes`, which makes
-  the kernel enforce containment for the whole path in one call; it belongs to
-  `vault_fs` and is its own change, tracked separately.
+- **creating a missing parent has no beneath-root form** (#87, D22). The lookup
+  itself is now one `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+  RESOLVE_NO_MAGICLINKS)`, so there is no interval between components for a
+  rename to exploit — but `mkdirat` has no such form, and no syscall creates a
+  directory *and* proves the path it created it under stayed beneath a root.
+  `MutableTarget.ensure_parent` therefore descends one component at a time,
+  carrying **no** descriptor across a creation: each `mkdirat` goes through a
+  fresh beneath-root lookup of the prefix that already exists and that
+  descriptor is dropped at once, and the descriptor the write anchors to comes
+  from a fresh lookup of the whole parent performed afterwards. What a race can
+  still cost is at most one **empty** directory per component, per creation
+  descent (a note write performs one), in a place the renaming process already
+  controls — never a note, never note content, and never something the tool
+  reports success about. It is not cleaned up: an `rmdir` by name is the same
+  delete-the-substitute hazard `_discard_temp` refuses.
+- **a lookup proves containment when it resolves, not afterwards** (#87, D26).
+  A directory descriptor keeps naming the same directory however its pathname
+  is later renamed — which is exactly the property this design depends on, so
+  that a mutation lands in the directory that was validated rather than in a
+  substitute left at its name. The other side of it: a process that can rename
+  a vault ancestor can move the resolved parent out of the vault between
+  `open_mutable` and the publish, and the note then lands there while the tool
+  reports success for the path the caller named. Nothing was *redirected* — the
+  bytes went to the directory the caller named, which somebody else moved — and
+  excluding it would need an operation the kernel does not offer. Retained, not
+  introduced: the per-component walk had this interval too, underneath the
+  larger window it did not close.
 - a read-modify-write overwrite (`edit_note`, `set_frontmatter`, `move_note`'s
   link rewrites) is optimistic, not linearizable: `expected=` compares the
   current bytes immediately before the rename, and a writer that lands inside
@@ -54,9 +73,14 @@ inside the directory the caller named:
   delete or `move_note`'s own publication, which are one
   `renameat2(RENAME_NOREPLACE)`.
 
-These are declared limits of optimistic concurrency, not open holes: the
-write always lands on the path the caller named, in the directory that was
-validated.
+These are declared limits — of optimistic concurrency for the leaf ones, of
+what the kernel offers for the last two — not open holes. Every below-root
+directory descriptor a call uses as a pathname anchor comes from a lookup the
+kernel proved beneath the vault root at the moment it resolved, and no
+directory descriptor retained from a creation descent is ever returned to a
+caller or used as a pathname anchor, so no mutation is ever *redirected* into
+a directory that was never beneath the root: the write lands on the path the
+caller named, in the directory that was validated.
 """
 
 import errno
@@ -318,11 +342,17 @@ class MutableTarget:
     directory nobody validated. `expected=` cannot catch it: the decoy may hold
     byte-identical bytes.
 
-    So the parent is walked **once**, from an open root descriptor, one
-    `O_NOFOLLOW` component at a time, and the descriptor is what the rest of
-    the call uses. A directory descriptor keeps pointing at the same directory
-    across a rename of that directory, and no pathname is ever re-resolved, so
-    there is nothing left for a mid-call rename or relink to redirect.
+    So the parent is resolved **once**, by a single kernel-enforced
+    beneath-root lookup from an open root descriptor
+    (`vault_fs.open_dir_beneath`, an `openat2` carrying `RESOLVE_BENEATH |
+    RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS`), and that descriptor is what
+    the rest of the call uses. A directory descriptor keeps pointing at the
+    same directory across a rename of that directory, and no pathname is ever
+    re-resolved, so there is nothing left for a mid-call rename or relink to
+    redirect. The lookup being one call rather than a per-component walk is
+    #87: an ancestor renamed out of the vault *between* two such opens used to
+    yield a parent descriptor outside the root, with every mutation anchored to
+    it and the tool reporting success for the path the caller named.
 
     Fields:
 
@@ -412,7 +442,18 @@ class MutableTarget:
         return self._dir_fd
 
     def ensure_parent(self) -> None:
-        """Open — creating if needed — the parent directory descriptor."""
+        """Open — creating if needed — the parent directory descriptor.
+
+        The deferred-creation site, and it inherits #87 whole: `mkdirat` has no
+        beneath-root form, so `open_dir_beneath(create=True)` creates one
+        component at a time — but carries no descriptor across a creation, and
+        the descriptor stored here always comes from a fresh beneath-root
+        lookup of the whole parent performed *after* the creation. So the
+        descriptor a write anchors to is never one a creation produced. The
+        residual that leaves — at most one empty directory per component, per
+        creation descent — is stated in `open_dir_beneath`'s docstring and in
+        this module's own.
+        """
         if self._dir_fd is not None:
             return
         try:

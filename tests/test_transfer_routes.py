@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import errno
 import hashlib
 import logging
 import os
@@ -1119,3 +1120,40 @@ async def test_the_byte_endpoints_have_a_tighter_limit(harness, vault):
             ]
         )
     assert any(r.status_code == 429 for r in results)
+
+
+# ── #87: an unavailable beneath-root lookup must not become an oracle ────────
+
+
+async def test_download_still_404s_when_openat2_is_unavailable(
+    client, harness, download, monkeypatch
+):
+    """D21. `MCP_SANDBOX_MODE` is the one configuration that skips the startup
+    probe, so it is the one in which a call site can be reached with the
+    syscall unavailable. What each surface answers there is its existing
+    contract, not a new one — and on this bearer-protected **read** that is the
+    uniform 404.
+
+    Making it distinguishable would report a server property to an
+    unauthenticated bearer and turn the endpoint into an oracle: answering one
+    status for unknown, expired, consumed, deleted and replaced is what keeps
+    it from being one. Precision comes from `check_upload` and the mint tools,
+    which are authenticated.
+    """
+    real = vault_fs._openat2_raw
+    monkeypatch.setattr(
+        vault_fs, "_openat2_raw", lambda *a, **k: (-1, errno.ENOSYS)
+    )
+    response = await client.get("/transfer/download/file", headers=auth(harness))
+    assert response.status_code == 404
+    head = await client.head("/transfer/download/file", headers=auth(harness))
+    assert head.status_code == 404
+
+    # Byte-identical to the answer for a file that is simply gone. Restore only
+    # this one patch — `monkeypatch.undo()` would take the harness's database
+    # stubs with it.
+    monkeypatch.setattr(vault_fs, "_openat2_raw", real)
+    download.unlink()
+    gone = await client.get("/transfer/download/file", headers=auth(harness))
+    assert gone.status_code == 404
+    assert gone.content == response.content

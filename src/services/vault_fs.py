@@ -8,15 +8,38 @@ capability, and #59 established it is not acceptable for the note write tools
 either: `src/services/vault.py` now anchors every mutation here too, through
 `MutableTarget` / `open_mutable`.
 
-So every operation here is anchored to an open directory descriptor and walks
-one component at a time with ``O_NOFOLLOW``. A symlink anywhere in the chain —
-ancestor or final component — raises instead of being followed, and nothing can
-name a path outside the root because no pathname is ever resolved by the kernel
-across more than one component at a time.
+So every operation here is anchored to an open directory descriptor, and that
+descriptor comes from **one** kernel-enforced beneath-root lookup:
+``openat2(2)`` carrying ``RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS`` (see ``open_dir_beneath``). A symlink anywhere in the
+chain — ancestor or final component — raises instead of being followed, and
+the kernel proves the whole path stayed beneath the root inside the single
+call.
 
-``openat2(RESOLVE_BENEATH)`` would state the intent directly but Python's stdlib
-does not expose it. Per-component ``O_NOFOLLOW`` from an anchored root fd gives
-the same guarantee for our purposes.
+This replaces a per-component ``O_NOFOLLOW`` walk (#87). Each open in that walk
+was individually safe; the *sequence* was not. Between opening ancestor ``A``
+and opening its child ``B``, another process could rename ``<vault>/A`` out of
+the vault, and the descriptor the walk went on to return — with every mutation
+anchored to it — was then outside the root, with nothing later in the call able
+to notice. There is no interval between components to race any more, and there
+is deliberately **no fallback** to the old walk: a containment guard that
+degrades quietly is the failure mode being removed.
+
+What that entitles this module to claim, in the words every artifact of #87
+uses: *every below-root directory descriptor a call uses as a pathname anchor
+comes from a lookup the kernel proved beneath the vault root at the moment it
+resolved, and no directory descriptor retained from a creation descent is ever
+returned to a caller or used as a pathname anchor — so no operation is ever
+redirected into a directory that was never beneath the root.* This is a claim
+about **directory** descriptors used as pathname anchors: a call's own staged
+payload descriptor is created by that call and published through by descriptor,
+and never anchors a pathname lookup. Two residuals sit beside it and are stated
+rather than implied — the bounded empty-directory cost of a creation descent
+(``open_dir_beneath``, D22) and the fact that a lookup proves containment when
+it *resolves* and not afterwards (D26): a descriptor keeps naming its directory
+however that directory's pathname is later renamed, which is the property #59
+relies on, so a rename landing after the lookup and before the publish carries
+the call with it.
 
 One syscall the stdlib does not expose *is* reached for directly, through
 ``ctypes``: ``renameat2(RENAME_NOREPLACE)`` (see ``rename_noreplace``). It is
@@ -83,8 +106,10 @@ _TRASH_ATTEMPTS = 8
 # be inside the window.
 STALE_STAGING_SECONDS = 24 * 60 * 60
 
+# Leaf opens through an already-anchored parent descriptor. Directory
+# *descents* do not use this — they go through `open_dir_beneath`, whose
+# `RESOLVE_NO_SYMLINKS` is the stronger form of the same intent.
 _O_COMMON = os.O_CLOEXEC | os.O_NOFOLLOW
-_O_DIR = os.O_RDONLY | os.O_DIRECTORY | _O_COMMON
 
 # Where in-flight uploads are staged. A dot-directory directly under the vault
 # root, so it is invisible to the indexer and to every dot-dir-guarded tool,
@@ -175,45 +200,346 @@ def _split(rel: str | Path) -> list[str]:
     return parts
 
 
+# ── the beneath-root lookup ─────────────────────────────────────────────────
+
+# `openat2(2)` resolve flags (`<linux/openat2.h>`).
+#
+# `RESOLVE_NO_XDEV` is deliberately **not** among them (D16). It buys nothing
+# for containment — that is `RESOLVE_BENEATH`'s job, and a mount point beneath
+# the root is still beneath the root — while setting it would refuse *lookups*
+# through a mount point, which is what every read, `delete_file`, the note
+# tools and the transfer path share. It would break every path that works
+# across a nested mount and fix none of the three that do not.
+#
+# `RESOLVE_IN_ROOT` was rejected for the same reason `_split` exists: it scopes
+# `..` and absolute paths chroot-style rather than refusing them, so `a/../../b`
+# would be silently accepted as something the caller did not write.
+RESOLVE_NO_MAGICLINKS = 0x02
+RESOLVE_NO_SYMLINKS = 0x04
+RESOLVE_BENEATH = 0x08
+
+_RESOLVE_STRICT = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS
+
+# `O_NOFOLLOW` is not set: `RESOLVE_NO_SYMLINKS` already refuses a symlink at
+# *every* component including the trailing one (measured), and saying it once,
+# in the kernel's own vocabulary, is the point of this change.
+_O_LOOKUP = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+
+# `syscall(2)` numbers for `openat2`. Unlike `_SYS_RENAMEAT2` this table is not
+# a fallback for an old glibc — it is the implementation. **glibc exports no
+# `openat2` wrapper at any version** (D24): measured on glibc 2.36 and 2.39,
+# where `renameat2`, `statx`, `close_range` and `getrandom` all resolve through
+# `ctypes.CDLL(None)` and `openat2` raises `AttributeError`.
+#
+# The number is 437 everywhere, because the syscall postdates the unified
+# numbering convention. That uniformity is a convenience, not a licence to
+# guess: an architecture absent from this table is treated as "no `openat2`",
+# which now means the server refuses to start rather than that a rarely-taken
+# branch is skipped. A wrong number would call a *different* syscall.
+_SYS_OPENAT2 = {
+    "x86_64": 437,
+    "aarch64": 437,
+    "armv7l": 437,
+    "armv8l": 437,
+    "i686": 437,
+    "i386": 437,
+    "ppc64le": 437,
+    "s390x": 437,
+}
+
+# How many times a lookup is re-issued before it is refused. `EAGAIN` (the
+# kernel could not decide containment because the path was being renamed
+# underneath it) and `EINTR` (a signal, and nothing else) are the only two
+# retried; see `_lookup_dir` for why both must be.
+_LOOKUP_ATTEMPTS = 8
+
+
+class _OpenHow(ctypes.Structure):
+    """`struct open_how` (`<linux/openat2.h>`): three `__u64`s, in this order.
+
+    `sizeof` is passed as the syscall's `size` argument, which is how the
+    kernel versions the structure. Getting that wrong is not a soft failure —
+    see `_lookup_dir`'s `EINVAL`/`E2BIG` branch.
+    """
+
+    _fields_ = [
+        ("flags", ctypes.c_uint64),
+        ("mode", ctypes.c_uint64),
+        ("resolve", ctypes.c_uint64),
+    ]
+
+
+_openat2_cache: tuple | None = None
+
+
+def _resolve_openat2():
+    """Find a callable raw `openat2`, or `None` if this platform has none.
+
+    There is no wrapper branch to prefer here (D24), so every part of this is
+    load-bearing and none of it is `pragma: no cover`: the per-architecture
+    number must be right, and an architecture missing from the table means the
+    server will not start.
+    """
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:  # pragma: no cover - no libc to bind against
+        return None
+    number = _SYS_OPENAT2.get(platform.machine())
+    if number is None:
+        return None
+    raw = libc.syscall
+    raw.restype = ctypes.c_long
+
+    def _via_syscall(dir_fd, path, how, size):
+        return raw(
+            ctypes.c_long(number),
+            ctypes.c_int(dir_fd),
+            ctypes.c_char_p(path),
+            ctypes.byref(how),
+            ctypes.c_size_t(size),
+        )
+
+    return _via_syscall
+
+
+def _openat2_fn():
+    """Cached `_resolve_openat2`; the lookup is per-process, not per-call."""
+    global _openat2_cache
+    if _openat2_cache is None:
+        _openat2_cache = (_resolve_openat2(),)
+    return _openat2_cache[0]
+
+
+def _openat2_raw(dir_fd: int, path: str, flags: int, resolve: int) -> tuple[int, int]:
+    """Call `openat2`; return `(fd, 0)` on success or `(-1, errno)` on failure.
+
+    Deliberately the *only* place the syscall is touched, and deliberately
+    returns an errno rather than raising: everything above it is errno mapping,
+    which is the part worth testing, and a test can drive every branch by
+    monkeypatching this one function instead of arranging an exotic kernel.
+    """
+    fn = _openat2_fn()
+    if fn is None:
+        return -1, errno.ENOSYS
+    how = _OpenHow(flags=flags, mode=0, resolve=resolve)
+    ctypes.set_errno(0)
+    rc = fn(dir_fd, os.fsencode(path), how, ctypes.sizeof(how))
+    if rc >= 0:
+        return int(rc), 0
+    return -1, ctypes.get_errno() or errno.EIO
+
+
+def _lookup_dir(root_fd: int, parts: list[str], rel_dir) -> int:
+    """One beneath-root lookup of `parts` under `root_fd`. Never creates.
+
+    The errno contract distinguishes four kinds of failure, because they tell
+    an operator to do four different things:
+
+    * **A refused path.** `ELOOP` (a symlink at some component) and `ENOTDIR`
+      raise `UnsafePath`, and so does `EXDEV` — which here means *containment
+      was violated*, not "cross-device" as it does in `rename_noreplace`
+      (D17). Mapping it to `UnsupportedFilesystem` would tell an operator to
+      change filesystems in response to a blocked escape. Measured: both `..`
+      and an absolute path give `EXDEV`, so it is the ordinary answer for
+      "this path leaves the root" rather than an exotic one. `ENOENT` stays a
+      `FileNotFoundError` so callers keep telling absence from refusal.
+    * **A transient condition**, retried a bounded number of times and then
+      refused. `EAGAIN` means the kernel could not prove containment because
+      the path was being renamed concurrently; treating it as a refusal would
+      fail a legitimate write whenever anything else renamed a directory, and
+      retrying forever would let an adversary renaming in a loop hold the
+      request open. **`EINTR` joins it for a different reason**: the walk this
+      replaced went through `os.open`, which retries `EINTR` transparently
+      under PEP 475, and a raw `ctypes` syscall does not — so without this a
+      signal delivered without `SA_RESTART` would become a false failure of
+      `create_note`, `delete_file`, a transfer or a download.
+    * **An unavailable syscall** (`ENOSYS`, `EPERM` — an older Docker seccomp
+      profile blocks it either way round). `UnsupportedFilesystem`, naming the
+      syscall, the kernel version and the profile. Never a per-component walk.
+    * **An ABI disagreement** (`EINVAL` — a `size` smaller than any version
+      the kernel knows, or a flag or `resolve` bit it does not recognise;
+      `E2BIG` — nonzero extension data past the size this kernel knows).
+      Neither is reachable from a correct binding, which is exactly why
+      neither may escape as a generic `OSError`: they are what a binding bug
+      or a future ABI revision looks like, and a containment lookup that never
+      ran must never be mistaken for one that passed. Measured, and the first
+      draft had these two the wrong way round.
+
+    The traversal error names the **requested vault-relative path** and not the
+    offending component (D25). One `openat2` reports `ELOOP` for the resolution
+    as a whole and says nothing about which component caused it, and a
+    diagnostic walk issued afterwards is not a substitute: by then the link may
+    be gone, or a different component may have become one, so it would report
+    no link at all or the wrong one — authoritatively, about a state the kernel
+    never saw. Nothing load-bearing is lost: naming a symlinked **leaf** with
+    its canonical target is `vault.open_mutable`'s `lstat` through the parent
+    descriptor, which is a different check and is untouched.
+    """
+    path = "/".join(parts) if parts else "."
+    attempts = 0
+    while True:
+        fd, code = _openat2_raw(root_fd, path, _O_LOOKUP, _RESOLVE_STRICT)
+        if code == 0:
+            return fd
+        if code in (errno.EAGAIN, errno.EINTR):
+            attempts += 1
+            if attempts < _LOOKUP_ATTEMPTS:
+                continue
+            raise VaultFSError(
+                f"Could not resolve {str(rel_dir)!r} beneath the vault root "
+                f"after {_LOOKUP_ATTEMPTS} attempts "
+                f"({errno.errorcode.get(code, code)}); the path is being "
+                "renamed concurrently or the process is being signalled"
+            )
+        break
+    if code == errno.ENOENT:
+        raise FileNotFoundError(code, os.strerror(code), str(rel_dir))
+    if code == errno.EXDEV:
+        raise UnsafePath(
+            f"Refusing a path that resolves outside the vault root: "
+            f"{str(rel_dir)!r}"
+        )
+    if code in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
+        raise UnsafePath(
+            f"Refusing to traverse a symlink or non-directory in "
+            f"{str(rel_dir)!r} ({errno.errorcode.get(code, code)})"
+        )
+    if code in (errno.ENOSYS, errno.EPERM):
+        raise UnsupportedFilesystem(
+            f"openat2(2) is unavailable ({errno.errorcode.get(code, code)}). "
+            "A beneath-root lookup needs it: the kernel must be 5.6 or newer "
+            "and the container seccomp profile must permit the syscall. There "
+            "is no fallback to a per-component walk."
+        )
+    if code in (errno.EINVAL, errno.E2BIG):
+        raise UnsupportedFilesystem(
+            f"openat2(2) rejected this struct open_how "
+            f"({errno.errorcode.get(code, code)}); the binding and the "
+            "kernel's ABI disagree, so no containment check was performed. "
+            "There is no fallback to a per-component walk."
+        )
+    raise OSError(code, os.strerror(code), str(rel_dir))
+
+
 def open_dir_beneath(root_fd: int, rel_dir: str | Path, *, create: bool = False) -> int:
-    """Open a directory below `root_fd`, one `O_NOFOLLOW` component at a time.
+    """Open a directory below `root_fd` with one beneath-root lookup.
 
     Always returns a **new** descriptor (even for the root itself), so callers
     can close the result unconditionally without risking the anchor.
 
-    Raises `UnsafePath` when any component is a symlink or not a directory, and
-    `FileNotFoundError` when a component is missing and `create` is false.
+    Raises `UnsafePath` when a component is a symlink or not a directory or the
+    path would escape the root, `FileNotFoundError` when a component is missing
+    and `create` is false, and `UnsupportedFilesystem` when the syscall is
+    unavailable — never a fallback to opening one component at a time.
+
+    `_split` stays in front of the syscall and keeps refusing `..`, absolute
+    paths and NUL bytes with a message naming the offending path. It is not
+    redundant: `RESOLVE_BENEATH` *scopes* `..` rather than forbidding it, so
+    `A/../A` succeeds at the kernel (measured), and this module's posture is
+    that nothing is normalised on our behalf.
+
+    **The creation side keeps a bounded residual, and it is stated rather than
+    claimed closed (D22).** `openat2` resolves; it does not create, `mkdirat`
+    has no beneath-root form, and no syscall creates a directory *and* proves
+    the path it created it under stayed beneath a root. So creation is still
+    one component at a time — but **no directory descriptor is carried across
+    a creation**: each `mkdirat` is issued through a descriptor from a fresh
+    beneath-root lookup of the prefix that already exists, that descriptor is
+    dropped immediately, and the descriptor the caller finally receives comes
+    from a fresh single lookup of the whole path performed *after* the creation
+    finishes. The window is therefore one syscall per component instead of the
+    whole descent, and what a race can cost is at most one **empty** directory
+    per component **per creation descent** — never a file, never file content,
+    and never something a tool then reports success about, because the write
+    goes through the post-creation lookup, which either resolves beneath the
+    root or refuses. The bound is per descent and one call can have more than
+    one: an upload walks its destination twice with creation enabled (a cheap
+    up-front walk so a bad path costs one syscall rather than a whole body, and
+    the authoritative walk inside the publish gate), a note write once.
+
+    **Do not try to clean that up.** An `rmdir` by a name the caller chose is
+    the same delete-the-substitute hazard `_discard_temp` and `soft_delete`
+    already refuse: the thing at that name may no longer be the thing we made.
+    The process that wins the race already holds rename rights on the prefix's
+    parent and write access wherever it moved it, so the empty directory lands
+    somewhere it already controls.
     """
     parts = _split(rel_dir)
-    current = os.open(".", _O_DIR, dir_fd=root_fd)
     try:
-        for part in parts:
-            child = _open_child(current, part, create=create, rel_dir=rel_dir)
-            os.close(current)
-            current = child
-    except BaseException:
-        os.close(current)
-        raise
-    return current
-
-
-def _open_child(parent_fd: int, part: str, *, create: bool, rel_dir) -> int:
-    """Descend one component. Never closes `parent_fd` — the caller owns it."""
-    try:
-        return _open_dir_nofollow(parent_fd, part, rel_dir)
+        return _lookup_dir(root_fd, parts, rel_dir)
     except FileNotFoundError:
         if not create:
             raise
+    _create_descent(root_fd, parts, rel_dir)
+    return _lookup_dir(root_fd, parts, rel_dir)
+
+
+def _create_descent(root_fd: int, parts: list[str], rel_dir) -> None:
+    """Create the missing components of `parts`, carrying no descriptor across.
+
+    One `mkdirat` per component, each through a descriptor obtained by a fresh
+    beneath-root lookup of the prefix that already exists and dropped as soon
+    as the `mkdirat` returns. Nothing this function opens is returned to a
+    caller or used as a pathname anchor — `open_dir_beneath` re-looks-up the
+    whole path afterwards, which is what keeps the residual at empty
+    directories (see its docstring).
+
+    `EEXIST` is a benign race with another creator, or an already-present
+    component: either way the authoritative answer is the post-creation lookup,
+    not the `mkdir`, so it is passed over here and decided there. A symlink
+    sitting at the name likewise gives `EEXIST` and is refused by that lookup.
+    """
+    for depth in range(len(parts)):
+        prefix_fd = _lookup_dir(root_fd, parts[:depth], rel_dir)
+        try:
+            os.mkdir(parts[depth], 0o755, dir_fd=prefix_fd)
+        except FileExistsError:
+            pass
+        finally:
+            close_quietly(prefix_fd, f"prefix of {str(rel_dir)!r}")
+
+
+def probe_beneath_root_lookup() -> None:
+    """Refuse if this kernel and container cannot do a beneath-root lookup.
+
+    **Read-only: it creates nothing**, which is what lets it run at startup
+    rather than on the first write. One `openat2` of `"."` relative to a
+    directory descriptor of the process's own working directory, with the same
+    resolve flags every real lookup uses.
+
+    Unlike `probe_publication` and `probe_trash` this is not a per-root probe
+    and is not cached per root (D21). Those test *filesystem and mount*
+    properties, which genuinely differ per vault root in multi-user mode, and
+    they **write**. `openat2` availability is a property of the kernel and of
+    this container's seccomp profile: one answer for the whole process,
+    identical for every root, knowable before a single request arrives. So it
+    belongs in `lifespan` beside `_check_pgvector_version`, and
+    `src/main.py::_check_openat2_support` is what calls it.
+
+    Only the availability errnos are a verdict here. Anything else the cwd
+    happens to answer is not an answer about the syscall, and this probe does
+    not invent one: the call sites raise on their own paths.
+    """
+    fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     try:
-        os.mkdir(part, 0o755, dir_fd=parent_fd)
-    except FileExistsError:
-        # Lost a benign race with another creator; the reopen below decides
-        # whether what landed there is acceptable.
-        pass
-    # Re-open rather than trusting the mkdir: between the two, the name could
-    # have been replaced by a symlink, and only the O_NOFOLLOW open is
-    # authoritative about what we ended up anchored to.
-    return _open_dir_nofollow(parent_fd, part, rel_dir)
+        probe_fd, code = _openat2_raw(fd, ".", _O_LOOKUP, _RESOLVE_STRICT)
+    finally:
+        close_quietly(fd, "probe working directory")
+    if code == 0:
+        close_quietly(probe_fd, "beneath-root lookup probe")
+        return
+    if code in (errno.ENOSYS, errno.EPERM):
+        raise UnsupportedFilesystem(
+            f"openat2(2) is unavailable ({errno.errorcode.get(code, code)}): "
+            "the kernel must be 5.6 or newer and the container seccomp "
+            "profile must permit the syscall."
+        )
+    if code in (errno.EINVAL, errno.E2BIG):
+        raise UnsupportedFilesystem(
+            f"openat2(2) rejected this struct open_how "
+            f"({errno.errorcode.get(code, code)}): the binding and the "
+            "kernel's ABI disagree, so no containment check can be performed."
+        )
 
 
 # Owner-only: nothing but this process has any business in the staging
@@ -278,20 +604,6 @@ def open_staging_dir(root_fd: int, *, create: bool = True) -> int:
         close_quietly(fd, STAGING_DIR)
         raise
     return fd
-
-
-def _open_dir_nofollow(parent_fd: int, part: str, rel_dir) -> int:
-    try:
-        return os.open(part, _O_DIR, dir_fd=parent_fd)
-    except FileNotFoundError:
-        raise
-    except OSError as exc:
-        if exc.errno in (errno.ELOOP, errno.ENOTDIR, errno.EMLINK):
-            raise UnsafePath(
-                f"Refusing to traverse a symlink or non-directory at "
-                f"{part!r} in {str(rel_dir)!r}"
-            ) from None
-        raise
 
 
 # ── temp files and fingerprints ─────────────────────────────────────────────

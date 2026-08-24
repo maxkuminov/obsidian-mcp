@@ -22,7 +22,7 @@ than introducing them.
 (docstring only), tests. `src/mcp_server/tools.py` and
 `src/transfer/routes.py` are read for 1.6 and not changed.*
 
-- [ ] 1.1 Bind `openat2(2)` through `ctypes` in `vault_fs`, following
+- [x] 1.1 Bind `openat2(2)` through `ctypes` in `vault_fs`, following
   `_renameat2_raw`'s *shape* but not its resolution order: **glibc exports no
   `openat2` wrapper at any version** (D24), so the raw `syscall()` with a
   per-architecture number table is the implementation, not a fallback. It is
@@ -33,7 +33,7 @@ than introducing them.
   from a test. Do **not** carry `_resolve_renameat2`'s `pragma: no cover`
   markers across — the branches they cover are unreachable there and are the
   normal path here
-- [ ] 1.2 Define `struct open_how` (`flags`, `mode`, `resolve` — three
+- [x] 1.2 Define `struct open_how` (`flags`, `mode`, `resolve` — three
   `__u64`s) as a `ctypes.Structure` and pass `sizeof` as the `size` argument.
   Map **both** `EINVAL` (a `size` smaller than any version the kernel knows,
   or an unrecognised flag/`resolve` bit) and `E2BIG` (nonzero extension data
@@ -41,12 +41,12 @@ than introducing them.
   ABI mismatch. Neither is reachable from a correct binding, which is exactly
   why neither may escape as a generic `OSError` — see D24 for the measured
   behaviour, and note the first draft had these two the wrong way round
-- [ ] 1.3 Rewrite `open_dir_beneath` to obtain the returned descriptor from a
+- [x] 1.3 Rewrite `open_dir_beneath` to obtain the returned descriptor from a
   single `openat2(root_fd, rel_dir, RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
   RESOLVE_NO_MAGICLINKS, O_RDONLY|O_DIRECTORY|O_CLOEXEC)`, keeping its name,
   signature, the `_split` pre-check and every existing error type. Do **not**
   set `RESOLVE_NO_XDEV` (D16)
-- [ ] 1.4 Errno mapping, with a test per branch: `ELOOP` → `UnsafePath`
+- [x] 1.4 Errno mapping, with a test per branch: `ELOOP` → `UnsafePath`
   naming the **requested vault-relative path**, with any component
   identification explicitly best-effort (D25); `EXDEV` → `UnsafePath` naming
   the containment violation, **not** `UnsupportedFilesystem` (D17); `ENOENT` →
@@ -56,7 +56,7 @@ than introducing them.
   ABI mismatch; `EAGAIN` **and `EINTR`** → bounded retry, then refuse — the
   `os.open` walk retried `EINTR` transparently and a raw syscall does not, so
   omitting it turns a signal into a false failure of a write (D17)
-- [ ] 1.5 Rewrite the `create=True` descent so **no directory descriptor is
+- [x] 1.5 Rewrite the `create=True` descent so **no directory descriptor is
   carried across a creation**: for each missing component, re-acquire the
   already-existing prefix with a fresh `openat2` from the root, issue the
   one `mkdirat` through it, drop it. The directory descriptor the caller
@@ -70,7 +70,7 @@ than introducing them.
   a note write performs one — and do **not** try to clean it up: an `rmdir`
   by name is the delete-the-substitute hazard `_discard_temp` already
   refuses (D22)
-- [ ] 1.6 Confirm every caller inherits it without its own change:
+- [x] 1.6 Confirm every caller inherits it without its own change:
   `_open_parent` / `open_parent` (transfer publish, `delete_file`),
   `open_staging_dir`, `probe_trash`'s trash open,
   `MutableTarget.ensure_parent` (the deferred-creation site), **and the
@@ -82,13 +82,13 @@ than introducing them.
   raise to an authenticated caller, the download route keeps its uniform 404
   (`except (FileNotFoundError, VaultFSError, OSError)`) and must **not** grow
   a distinguishable status — see D21
-- [ ] 1.7 `_check_openat2_support()` in `src/main.py`, called from `lifespan`
+- [x] 1.7 `_check_openat2_support()` in `src/main.py`, called from `lifespan`
   beside `_check_pgvector_version`, skipped under `MCP_SANDBOX_MODE`:
   read-only (`openat2` of `"."` relative to a descriptor the process already
   holds — it must create nothing), `logging.critical` + `sys.exit(1)` naming
   the syscall, the kernel requirement and the container seccomp profile as the
   two causes
-- [ ] 1.8 Tests: an ancestor renamed out of the vault mid-lookup is refused
+- [x] 1.8 Tests: an ancestor renamed out of the vault mid-lookup is refused
   rather than yielding an outside descriptor; a symlinked component still gets
   the traversal error, naming the requested path; `..` and absolute paths still
   refused by `_split` with their own messages *before* the syscall (the kernel
@@ -100,7 +100,7 @@ than introducing them.
   refusal and **no** per-component fallback; the startup probe exits with the
   named message and creates nothing; with the syscall unavailable and the
   startup probe skipped, a download redemption still answers the uniform 404
-- [ ] 1.9 Update the `vault_fs` module docstring and `vault.py`'s "remaining
+- [x] 1.9 Update the `vault_fs` module docstring and `vault.py`'s "remaining
   residual" paragraph; **rewrite CLAUDE.md's "The accepted residual,
   precisely"** so the non-atomic-walk bullet is *replaced* — the lookup window
   is gone, and the creation-side residual (D22) takes its place, stated as
