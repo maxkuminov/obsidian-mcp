@@ -8,7 +8,7 @@ The question this record answers is **"did the assignment change?"**, not "is th
 The record SHALL comprise three facts, all observed at the same moment, from the directory descriptor the pass pins:
 
 - the **canonical assignment string** — the user's assigned vault path normalised the way the pre-publish assignment check normalises it, without resolving symbolic links. This is the load-bearing fact. The system SHALL use **one** normaliser for both, called rather than re-implemented, so that the index's notion of "the same assignment" and the write path's notion of it cannot drift apart.
-- the **canonical real path** of the directory the pass actually scanned, with symbolic links resolved and separators, `.` and `..` normalised. Its purpose is not to prove identity but to stop the assignment comparison from destroying a valid index over a cosmetic rename: two pathnames naming one directory differ as strings and agree as real paths, so reassignment to an alias re-derives instead of costing a full re-embed.
+- the **canonical real path** of the directory the pass actually scanned, with symbolic links resolved and separators, `.` and `..` normalised. Its purpose is not to prove identity but to stop the assignment comparison from destroying a valid index over a cosmetic rename: two pathnames naming one directory differ as strings and agree as real paths, so reassignment to an alias re-derives instead of costing a full re-embed. This fact SHALL be recorded and compared as the **hexadecimal encoding of its filesystem bytes**, never as text. A pathname the kernel returns is an arbitrary byte sequence, so a component that is not valid UTF-8 decodes to a surrogate escape that a UTF-8 database cannot store; recording it as text would make the one write that must never roll back — the discard — fail on such a path and leave the former vault's index served indefinitely. Comparison is therefore encode-then-compare on both sides, never decode-then-compare, and the recorded value is decoded only to render it to an operator.
 - an **opaque kernel file handle** for that directory, where the filesystem can produce one, stored as text that is compared by byte equality and never parsed.
 
 The file handle SHALL be **best-effort hardening in the refusing direction only**. Where a handle is recorded for a user and a handle can be read for the assigned root now, and the two differ, a verdict that would otherwise keep the index SHALL be downgraded to a re-derive. A handle that **matches SHALL NOT upgrade any verdict** and SHALL NOT be treated as proof of anything. Where no handle is available on either side, the hardening SHALL simply be absent: the pass SHALL decide on the assignment and the real path exactly as it does elsewhere, SHALL NOT enter any degraded mode, SHALL NOT re-derive on every pass for that reason, and SHALL NOT warn. A null handle SHALL mean "no hardening signal", never "provenance unknown".
@@ -286,8 +286,16 @@ Because this branch is destructive and costs a full re-embed of the newly assign
 #### Scenario: A real path too long for a bounded column still discards
 
 - **WHEN** a user whose index was built under one assignment is reassigned to a short assignment that is a symbolic link to a directory whose canonical real path is longer than the width of `users.vault_path`, and the next index pass runs
-- **THEN** the pass SHALL delete that user's rows and record the observed provenance in one committed transaction, storing the real path in full
+- **THEN** the pass SHALL delete that user's rows and record the observed provenance in one committed transaction, storing the encoded real path in full
 - **AND** the transaction SHALL NOT fail on the length of any recorded fact, because a failure there would roll the delete back and leave the former vault's index queryable on every subsequent pass
+
+#### Scenario: A real path containing a non-UTF-8 component still discards
+
+- **WHEN** a user whose index was built under one assignment is reassigned to a vault whose canonical real path contains a component that is not valid UTF-8, so that the observed real path carries a surrogate escape, and the next index pass runs
+- **THEN** the pass SHALL delete that user's `notes_metadata` rows and record all three provenance facts in one committed transaction
+- **AND** the transaction SHALL NOT fail to encode any recorded fact, because a failure there would roll the delete back and leave the former vault's index queryable on every subsequent pass
+- **AND** the recorded real path SHALL decode back to the observed one exactly
+- **AND** a later pass over that same root SHALL find the recorded and observed real paths equal, rather than re-deriving because the two were spelled differently
 
 #### Scenario: Reassignment to the recorded assignment keeps the index
 

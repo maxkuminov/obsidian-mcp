@@ -162,6 +162,22 @@ is how you know the anchored discovery finds what the old one found.
       `os.path.realpath` of the directory that assignment named when the pass
       ran, and its only job is to keep a cosmetic rename or an alias from
       costing a full re-embed — **it is not a proof of directory identity**.
+      **It stores `os.fsencode(realpath).hex()`, not the pathname as text**, and
+      is compared encode-then-compare: reduce the newly observed real path to
+      the same hex and compare the two strings; never decode the stored value in
+      order to compare it. Decode (`os.fsdecode(bytes.fromhex(...))`) only to
+      render it in a log. Say why on the column, because it reads like
+      gratuitous obfuscation otherwise: a POSIX pathname is arbitrary non-NUL
+      bytes, Python decodes a non-UTF-8 component with `surrogateescape`, so
+      `os.path.realpath` can return a lone surrogate like `'\udcff'` that
+      asyncpg cannot UTF-8-encode — and the discard writes the record *and* the
+      delete in one transaction, so that encode failure rolls the delete back on
+      every later pass and serves the former vault forever. Hex has no
+      unrepresentable input, so the column is total over the fact by
+      construction rather than by a bound. Hex and not base64: the handle column
+      already spells opaque bytes as hex, base64 has variant alphabets and
+      optional padding so one value gets two spellings under a byte-equality
+      comparison, and the 2x length is exactly what `Text` is here to absorb.
       **The two pathname columns are `Text`, not a width, and that is
       correctness rather than taste.** The rule is that a provenance column must
       be able to record any value the fact it mirrors can take: a value the pass
@@ -176,6 +192,15 @@ is how you know the anchored discovery finds what the old one found.
       column's DDL and of the current normaliser, not of this record, and the two
       pathname facts are written and read as one unit. Do **not** add a
       length check, a truncation, or a NULL-on-oversize rule to either of them.
+      **`indexed_vault_assignment` is stored as a plain pathname and must NOT be
+      hex-encoded.** Its value is `str(Path(users.vault_path))` — lexical only,
+      reading no directory, introducing no non-ASCII character its input lacked
+      — over a value the database itself handed back, and a UTF-8 database
+      cannot be holding bytes it would refuse to accept, so the totality rule is
+      already satisfied there without an encoding. The environment-derived
+      `settings.vault_path` never reaches this column, because A.5 skips the
+      classification entirely for `user_id is None`. Encoding it too would only
+      make the fact an operator reads in the discard log unreadable.
       `indexed_vault_handle` is an **opaque** `"<handle_type>:<hex of
       f_handle>"` token from `name_to_handle_at`, text, compared by byte
       equality, never parsed, never fed to `open_by_handle_at` — and it is
@@ -252,8 +277,12 @@ is how you know the anchored discovery finds what the old one found.
       stamp did not describe.
 - [ ] A.6 Write the provenance helper **in this module, as a new function**:
       the canonical assignment string, the `os.path.realpath` of the assigned
-      root, and — where available — the **kernel file handle** of the pinned
-      descriptor as `f"{handle_type}:{f_handle.hex()}"`. **Take the assignment
+      root **encoded as `os.fsencode(...).hex()`** (A.1 — the raw string can
+      carry a surrogate escape the driver cannot encode, and this is the one
+      write that must never roll back), and — where available — the **kernel
+      file handle** of the pinned descriptor as
+      `f"{handle_type}:{f_handle.hex()}"`. Both realpath comparisons in A.5 run
+      on the encoded form, on both sides. **Take the assignment
       string from `transfer.canonical_vault_root`**: import and call it, do not
       re-implement `str(Path(path))` and do not change, move or `resolve()` it.
       One normaliser for "the same assignment" is the point — C compares with
@@ -397,7 +426,14 @@ is how you know the anchored discovery finds what the old one found.
       exactly typed (`text` / `text` / `varchar(320)`), default-free and marked;
       a value longer than `users.vault_path`'s own width round-trips through
       `indexed_vault_realpath` unchanged (assert the stored value equals what was
-      written — that column must not be re-bounded by a later edit);
+      written — that column must not be re-bounded by a later edit); **an
+      encoded real path whose bytes are not valid UTF-8 round-trips losslessly**
+      — build it from a real directory whose name carries a non-UTF-8 byte
+      (`os.mkdir` on a `bytes` name containing `\xff`), take `os.path.realpath`
+      of it, write `os.fsencode(rp).hex()`, and assert the write succeeds and
+      `os.fsdecode(bytes.fromhex(stored)) == rp`; assert too that writing the
+      *raw* `rp` to that column raises, which is what keeps the encoding
+      load-bearing rather than decorative;
       **016 backfills nothing** — after it, all three
       columns are NULL for every user including every assigned one, and no
       `notes_metadata` / `note_embeddings` / `note_links` row changed;
@@ -428,6 +464,19 @@ is how you know the anchored discovery finds what the old one found.
       the round-4 blocker: with a bounded column the transaction raises
       `string_data_right_truncation`, rolls the delete back, and the former
       vault stays queryable forever;
+      **a realpath with a non-UTF-8 component still discards** — the round-5
+      blocker, and it must use a **real** directory rather than a mock: create
+      the new vault beneath a directory whose name is a `bytes` path containing
+      `\xff`, reassign the user to it, and assert that the pass deletes the
+      user's `notes_metadata` rows **and** stamps all three provenance columns
+      in one committed transaction; that no `UnicodeEncodeError` escapes; that
+      the stored realpath decodes back to `os.path.realpath` of that directory
+      exactly, surrogates included; and that the *next* pass over the same root
+      classifies it **same assignment** rather than re-deriving, which is what
+      proves the comparison runs on the encoded form on both sides. Skip only if
+      the test filesystem refuses the byte name, and say so — do not substitute a
+      mocked `os.path.realpath`, because the defect is in what the kernel can
+      hand back;
       **the shared normaliser** — assert the assignment fact is produced by
       `transfer.canonical_vault_root` itself (patch it and observe both the
       index record and the pre-publish confirmation change together), so a
@@ -805,12 +854,23 @@ path is unchanged.
       came back *out* of the ancillary gate, because gating it composed with the
       completeness rule into indefinite semantic staleness — it is safe ungated
       only because it hash-verifies what it certifies, and the spec binds those
-      two halves into one requirement. Ask whether *those* replacements are
-      complete; whether any of them introduced a new way to **destroy** an index
-      that should have been kept; whether any other write on the provenance path
-      can still fail on a value the pass legitimately observed; and whether the
-      un-gated `embed_vault` can, on any path, write a vector against a row whose
-      content it did not verify.
+      two halves into one requirement. Round 5 asked this brief's own third
+      question and found the answer was still yes: `TEXT` bounds a value's
+      *length* and not its *bytes*, and `os.path.realpath` can hand back a
+      surrogate-escaped string for a non-UTF-8 pathname component that the
+      driver cannot encode — the same indefinite rollback through a different
+      channel. `indexed_vault_realpath` therefore stores
+      `os.fsencode(realpath).hex()` and is compared encode-then-compare, which
+      makes the column total over the fact by construction rather than by a
+      bound; the assignment column is untouched, because its value comes from
+      `users.vault_path` through a lexical normaliser and a UTF-8 database
+      cannot hold bytes it would refuse to accept back. Ask whether *those*
+      replacements are complete; whether any of them introduced a new way to
+      **destroy** an index that should have been kept; whether any other write
+      on the provenance path can still fail on a value the pass legitimately
+      observed — by length, by encoding, or by any third property of the value;
+      and whether the un-gated `embed_vault` can, on any path, write a vector
+      against a row whose content it did not verify.
 - [ ] D.6 `openspec-verifier` subagent against this proposal and the spec deltas
 - [ ] D.7 Deploy: `make deploy`, then `make db-check` must report "No new
       upgrade operations detected"

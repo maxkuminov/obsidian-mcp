@@ -146,7 +146,10 @@ three rounds kept doing:
   string naming a different directory — makes the two disagree as well, and
   that too routes to the cheap safe branch; but it is a *signal*, not a
   guarantee, and the non-goal below says so rather than letting a reader infer
-  otherwise.
+  otherwise. **It is recorded and compared as the hexadecimal encoding of its
+  filesystem bytes** — `os.fsencode(realpath).hex()` — because a kernel-returned
+  pathname is an arbitrary byte sequence and only this fact is; see the column
+  rationale below.
 - **`indexed_vault_handle` — best-effort hardening, and only in the refusing
   direction.** Where a handle was recorded *and* one can be read for the
   assigned root now, and the two differ, a verdict that would otherwise have
@@ -207,6 +210,39 @@ would have reproduced #91's own symptom. `indexed_vault_assignment` is `TEXT`
 too even though `varchar(1024)` is sufficient *today*: that sufficiency is a
 property of `users.vault_path`'s DDL and of the current normaliser, not of this
 record, and the two pathname facts are written and read as one unit.
+
+**And `TEXT` alone does not satisfy that rule for the realpath, which is why
+that fact is stored hexadecimal-encoded.** A column is total over a fact only
+when neither the *length* nor the *byte content* of an observable value can be
+rejected, and `TEXT` bounds only the first. A POSIX pathname is an arbitrary
+sequence of non-NUL bytes with no obligation to be valid UTF-8; Python decodes
+such a component with `surrogateescape`, so `os.path.realpath` can hand back a
+string carrying a lone surrogate like `'\udcff'`, which the UTF-8 driver cannot
+encode and the database will not accept. The consequence is identical to the
+width bug and reached through a different channel: the discard writes the
+record and the delete in one transaction, the parameter fails to encode, the
+delete rolls back with it, and the former vault is served forever. So
+`indexed_vault_realpath` holds `os.fsencode(realpath).hex()` and comparison is
+encode-then-compare on both sides — every byte value has exactly one
+two-character spelling, so there is no input the column cannot take, and
+`os.fsdecode(bytes.fromhex(stored))` returns the observed string exactly.
+Hexadecimal rather than base64 because the handle column already spells opaque
+bytes that way, because base64's variant alphabets and optional padding give
+one value two spellings and this record is decided by byte equality, and
+because the doubled length is the exact cost `TEXT` is here to absorb.
+
+**`indexed_vault_assignment` needs no such encoding, and that asymmetry is
+about where each fact comes from.** The assignment is `str(Path(vault_path))`:
+a purely lexical normalisation, reading no directory and introducing no
+non-ASCII character its input lacked, over a value the database itself
+supplied — and a UTF-8 database cannot be holding bytes it would refuse to
+accept back, so that fact round-trips by construction. The realpath is
+kernel-derived and constrained by nothing. The one environment-derived pathname
+in the system, `settings.vault_path`, never reaches this column: classification
+is skipped for `user_id is None`, and an assigned user's root is read from
+`users.vault_path`. Encoding it too would buy no totality it already has, and
+would make the fact an operator actually reads in a discard log unreadable —
+the realpath is decoded for the log, never for the comparison.
 `indexed_vault_handle` stays `varchar(320)` with its NULL-on-oversize rule
 because it is a different kind of value — a comparison token with a documented
 external maximum, whose absence is a *defined* state (no hardening signal),
@@ -349,10 +385,12 @@ Four rounds of review produced thirteen findings. Each one has a home here, and
 the point of this table is that the next reviewer can check the *dispositions*
 rather than re-derive the attacks. "Out of scope" appears three times and each
 time it names the non-goal above, which is a declared boundary with an argument,
-not a shrug. Rounds 1–3 attacked the identity claim; round 4 accepted the
-rescope and attacked the new design's own mechanics, which is why its two
-findings are about a column width and a gate rather than about what the record
-means.
+not a shrug. Rounds 1–3 attacked the identity claim; rounds 4 and 5 accepted the
+rescope and attacked the new design's own mechanics, which is why their findings
+are about a column width, a gate and a value domain rather than about what the
+record means. Round 5's single finding is the sharpest of that kind: it did not
+dispute round 4's rule, it showed that round 4's *implementation* of the rule —
+a wider type — enforced only half of it.
 
 | # | Round | The attack | Where it lands now |
 | --- | --- | --- | --- |
@@ -367,10 +405,11 @@ means.
 | 9 | R3 BLOCKER | A cloned ext4/xfs image at the same pathname presents the same handle, so the keep branch keeps the wrong clone's index | **Out of scope, declared.** Also checked by hand: the stated failing input converges on the same end state a fresh index of the clone reaches, and the variant that does not is the pre-existing incremental-indexer defect named in the non-goal |
 | 10 | R3 BLOCKER | `embed_vault` / `link_backfill_pass` / `rebuild_tsvectors` have no defined behaviour under unresolved provenance, so a link row from one root can land against a row from another | **Fixed, and narrowed in round 5.** `link_backfill_pass` and `rebuild_tsvectors` run for a user only on the *same assignment* verdict; otherwise each skips **that user**, logs once, and waits for the next scan. `embed_vault` is not gated — see finding 13 — because it hash-verifies every note it certifies and so cannot write a vector against a row it does not describe |
 | 11 | R3 MAJOR | The no-handle branch stamps nothing, so a previous root's record stands and a later handle-capable pass charges a destructive discard against freshly correct rows | **Dissolved twice over.** There is no no-handle branch any more — an absent handle removes a refusal, not a proof — and every stamp writes all three columns, NULL for anything unobserved, so no record can outlive the root it describes |
-| 12 | R4 BLOCKER | `varchar(1024)` cannot hold every realpath a valid assignment can name, so the discard-and-stamp transaction rolls back on `string_data_right_truncation` and the former vault's index is served forever | **Fixed.** Both pathname columns are `TEXT`, under the stated rule that a provenance column must be able to record any value the fact it mirrors can take; never truncated, never NULL'd. The handle keeps its width because an absent handle is a defined state and an absent pathname is not |
+| 12 | R4 BLOCKER | `varchar(1024)` cannot hold every realpath a valid assignment can name, so the discard-and-stamp transaction rolls back on `string_data_right_truncation` and the former vault's index is served forever | **Fixed, and completed in round 5.** Both pathname columns are `TEXT`, under the stated rule that a provenance column must be able to record any value the fact it mirrors can take; never truncated, never NULL'd. The handle keeps its width because an absent handle is a defined state and an absent pathname is not. `TEXT` turned out to bound only the *length* — row 14 is the same rule applied to the *byte content* |
 | 13 | R4 MAJOR | Gating `embed_vault` on settled provenance makes one permanently unreadable file freeze a *readable* note's embeddings indefinitely, and `semantic_search` has no `embedded_content_hash = content_hash` guard | **Fixed.** `embed_vault` is un-gated and runs under every classification, protected by the verify-then-embed rule it already carried; the gate keeps `link_backfill_pass` and `rebuild_tsvectors`, whose work the re-derive redoes on every pass anyway. The verification and the un-gating are specified as one requirement so neither can be removed alone |
+| 14 | R5 BLOCKER | `TEXT` removes the width bound but not the *encoding* bound: `os.path.realpath` can return a surrogate-escaped string for a non-UTF-8 pathname component, which the driver cannot encode, so the discard-and-stamp transaction still rolls back forever | **Fixed.** `indexed_vault_realpath` stores `os.fsencode(realpath).hex()` and is compared encode-then-compare, so the column is total over the fact by construction rather than by a bound. The assignment column is untouched: its value comes from `users.vault_path` through a lexical normaliser, and a UTF-8 database cannot hold bytes it would refuse to accept back |
 
-Two of the eleven are answered by declaring a boundary rather than by code.
+Two of the fourteen — rows 2 (in part) and 9 — are answered by declaring a boundary rather than by code.
 That is the whole substance of round 4, and it is worth being explicit about the
 trade: **the system detects every operator reassignment, which is what #91
 asked for, and detects storage substitution only by luck.** The previous three
@@ -1019,8 +1058,10 @@ describes a publication that has already happened.
   `users.indexed_vault_handle`** (migration 016, nullable `text`, `text` and
   `varchar(320)`, no server defaults, one marked unit): the
   **provenance** of a user's index — the canonical assignment string the pass
-  ran under, the realpath that assignment named at that moment, and, where the
-  filesystem offers one, the opaque kernel file handle
+  ran under, the realpath that assignment named at that moment — stored as
+  `os.fsencode(realpath).hex()`, because a kernel-returned pathname need not be
+  valid UTF-8 and the discard's transaction must never fail to encode — and,
+  where the filesystem offers one, the opaque kernel file handle
   (`"<handle_type>:<hex>"`, from `name_to_handle_at`) of the pinned directory.
   Written only by `index_vault`, never by an operator-facing handler.
   **016 backfills none of them**, and every stamp writes all three, NULL for a
