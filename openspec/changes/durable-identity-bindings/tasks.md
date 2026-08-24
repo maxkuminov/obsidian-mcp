@@ -684,14 +684,14 @@ this same normalisation — so `canonical_vault_root` has two read-only callers
 and no editor: neither group may change, move or `resolve()` it, and C's import
 path is unchanged.
 
-- [ ] C.1 Add an async confirmation in `src/services/vault.py`: one
+- [x] C.1 Add an async confirmation in `src/services/vault.py`: one
       `SELECT users.vault_path, users.is_active WHERE id = :uid` on its own
       short-lived session, canonicalised and compared against the root this
       request bound in `current_vault_root`. Refuse on any of: differs, now
       NULL, row absent, `is_active` false. Return the confirmation rather than
       a bare boolean, so the caller has something to stamp with. No-op —
       issuing no query at all — when `user_id is None` outside multi-user mode.
-- [ ] C.2 Stamp the confirmation onto the `MutableTarget` the *next* publishing
+- [x] C.2 Stamp the confirmation onto the `MutableTarget` the *next* publishing
       operation will go through, and make the shared publish helpers
       (`_atomic_write_at`, `move_file_no_clobber`, `vault`'s `soft_delete_at`
       call, **and the new permanent-unlink helper of C.2a**) **refuse a target
@@ -700,7 +700,7 @@ path is unchanged.
       operational refusal in C.1 — a reviewer, and a log reader, must be able to
       tell "somebody added a tool and forgot" from "an admin reassigned
       mid-call".
-- [ ] C.2a **Add a `MutableTarget`-based permanent-unlink helper to
+- [x] C.2a **Add a `MutableTarget`-based permanent-unlink helper to
       `src/services/vault.py` and route `delete_note(permanent=True)` through
       it**, replacing the bare `os.unlink(target.name, dir_fd=target.dir_fd)` at
       `src/mcp_server/tools.py:1969`. It is the only bare mutating syscall left
@@ -708,7 +708,7 @@ path is unchanged.
       unstamped target" claim is false rather than merely incomplete. The helper
       keeps the existing semantics — unlink through the parent descriptor, no
       symlink following — and adds only the stamp check.
-- [ ] C.3 Take the confirmation **immediately before each publishing
+- [x] C.3 Take the confirmation **immediately before each publishing
       operation**, covering exactly that operation, and never carry one across
       an `await`, a database transaction or a later publication. Five of the six
       tools publish once, so for them this is one confirmation per call. For
@@ -720,7 +720,7 @@ path is unchanged.
       it is the same staleness this change exists to narrow. The metadata
       transaction itself needs no confirmation: it writes no vault bytes and
       records a publication that already happened.
-- [ ] C.3a On a rewrite refusal, **stop the loop** — every remaining rewrite
+- [x] C.3a On a rewrite refusal, **stop the loop** — every remaining rewrite
       would write into a vault the caller no longer holds, through descriptors
       pinned before the reassignment — and report the partial outcome: the move
       completed in the previous root, the assignment changed mid-call, and these
@@ -729,7 +729,7 @@ path is unchanged.
       distinct reason rather than inventing a second reporting mechanism. Do not
       roll the move back and do not undo the metadata update: the note really is
       at its new path and the rows must keep saying so.
-- [ ] C.4 Wire the six tools in `src/mcp_server/tools.py` — `create_note`,
+- [x] C.4 Wire the six tools in `src/mcp_server/tools.py` — `create_note`,
       `edit_note` (every mode, `dry_run` included: a dry run publishes nothing
       and therefore needs no confirmation, but it must not be the reason a
       later mode skips one), `move_note`, `delete_note`, `set_frontmatter`,
@@ -737,22 +737,22 @@ path is unchanged.
       existing no-clobber refusal so the ordering of error messages stays
       sensible: a symlinked leaf is still named as one rather than reported as
       a reassignment.
-- [ ] C.5 Give `delete_file_impl` its own confirmation before
+- [x] C.5 Give `delete_file_impl` its own confirmation before
       `vault_fs.soft_delete` / `vault_fs.remove`. It resolves through
       `_vault_context` and walks from its own `vault_fs.open_root(root)`, so
       the target stamp does not reach it. Refuse before `check_trash_support`
       creates anything.
-- [ ] C.6 Record the refusal in `usage_logs.params` as an error marker naming a
+- [x] C.6 Record the refusal in `usage_logs.params` as an error marker naming a
       changed vault assignment, distinct from the admission gate's
       `no_vault_assigned`, and with no other new field. Use the request-scoped
       params holder `_tracked` already merges (`src/services/timing.py`);
       `_tracked` remains the only thing that calls `begin()`/`clear()`.
-- [ ] C.7 Document the residual in the tool's own error text and in the
+- [x] C.7 Document the residual in the tool's own error text and in the
       docstrings: the confirmation narrows the window to staging, flush and one
       publishing call — it does not close it, and a reassignment committing
       inside the publish still lands in the former root. Say it at the same
       level as `edit_note(expected=…)`.
-- [ ] C.8 New `tests/test_issue_88_root_confirmed_before_publish.py`:
+- [x] C.8 New `tests/test_issue_88_root_confirmed_before_publish.py`:
       reassignment, unassignment, deactivation and a deleted user row each
       refuse, for each of the seven tools, with the former root's file
       byte-identical afterwards and nothing created in the new root; the
@@ -778,7 +778,7 @@ path is unchanged.
       **the unstamped path** — publishing through each helper with a target
       carrying no confirmation raises, distinguishably from the operational
       refusal.
-- [ ] C.9 A registry-shaped test in the same module, in the idiom of
+- [x] C.9 A registry-shaped test in the same module, in the idiom of
       `tests/test_issue_66_vault_unassignment_revokes_tools.py`: enumerate the
       tools registered on the MCP server, and assert that every one that gates
       on `_require_write` either publishes through a confirmed target or is on

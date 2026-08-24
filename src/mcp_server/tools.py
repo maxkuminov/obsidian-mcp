@@ -37,9 +37,12 @@ from src.services.filters import apply_note_filters
 from src.services.search import full_text_search
 from src.services import transfer, vault_fs
 from src.services.vault import (
+    UnconfirmedPublication,
+    VaultAssignmentChanged,
     VaultRootMismatch,
     _vault_root,
     classify_bytes,
+    confirm_vault_assignment,
     extract_section,
     is_hidden_path,
     list_dir,
@@ -49,6 +52,8 @@ from src.services.vault import (
     read_bytes,
     read_bytes_at,
     read_file,
+    soft_delete_target,
+    unlink_at,
     validate_visible_path,
     write_bytes_at,
     write_file_at,
@@ -275,6 +280,71 @@ _NO_VAULT_MESSAGE = (
 # Marker written into `usage_logs.params` for a call refused by the gate. It
 # carries no new information — the user id and tool name are already columns.
 _NO_VAULT_MARKER = "no_vault_assigned"
+
+# Marker for a *publication* refused because the assignment changed while the
+# call was in flight (#88). Deliberately distinct from `_NO_VAULT_MARKER`: the
+# admission gate's refusal means "this credential never had a vault this call",
+# and this one means "it had one, and an administrator moved it underneath a
+# call that was already running". An operator reading `/admin/usage` after a
+# reassignment has to be able to tell those apart.
+_VAULT_REASSIGNED_MARKER = "vault_assignment_changed"
+
+
+async def _confirm_publication(uid: int | None, *targets) -> str | None:
+    """Confirm the vault assignment and stamp every target about to publish.
+
+    The one entry point every mutating tool uses immediately before *each*
+    publishing operation it performs (#88). Returns `None` when the assignment
+    is unchanged — with each target stamped for exactly the publication that
+    follows — or the tool-error string to return when it changed.
+
+    The refusal is recorded through the request-scoped params holder `_tracked`
+    already merges, so it reaches `usage_logs.params` as one `error` field and
+    nothing else. `_tracked` remains the only thing that calls `begin()` /
+    `clear()`.
+
+    `delete_file` calls this with no targets: it does not publish through a
+    `MutableTarget` at all (it resolves through `_vault_context` and walks from
+    its own `vault_fs.open_root`), so the structural stamp cannot reach it and
+    the confirmation is its own explicit gate. That asymmetry is named rather
+    than left for a reader to find.
+    """
+    err, _ = await _confirm_publication_detail(uid, *targets)
+    return err
+
+
+async def _confirm_publication_detail(uid: int | None, *targets):
+    """`_confirm_publication`, also handing back the confirmation it took.
+
+    Only `move_note` needs it: when a link rewrite is refused *after* the move
+    has committed, the partial-outcome report has to name the root the move
+    completed in, and that is the confirmed assignment string rather than the
+    resolved pathname a `MutableTarget` carries.
+
+    **A database failure is deliberately left to propagate.** It is fail-closed
+    either way — nothing is stamped, so nothing publishes — and the two
+    alternatives are worse: swallowing it would report a write that did not
+    happen as an ordinary refusal, and recording it under the reassignment
+    marker would put a claim in the audit trail that no administrator made.
+    Single-user mode issues no query at all, so a database blip cannot reach a
+    single-user note write through this path.
+    """
+    try:
+        confirmation = await confirm_vault_assignment(uid)
+    except VaultAssignmentChanged as exc:
+        timing.record("error", _VAULT_REASSIGNED_MARKER)
+        return str(exc), None
+    except RuntimeError as exc:
+        # The bound root itself could not be resolved — a cold cache, or an
+        # ownerless credential in multi-user mode. The admission gate refuses
+        # both before the body runs, so this is unreachable in a normal
+        # request; a mutation whose anchor cannot be named must not publish
+        # either, and it is the *admission* marker that describes it.
+        timing.record("error", _NO_VAULT_MARKER)
+        return str(exc), None
+    for target in targets:
+        target.confirm(confirmation)
+    return None, confirmation
 
 
 def _vault_admission_error() -> str | None:
@@ -929,7 +999,14 @@ def _note_size_error(content: str) -> str | None:
 
 @_tracked("create_note", ["path"])
 async def create_note_impl(path: str, content: str) -> str:
-    """Create a new note in the vault."""
+    """Create a new note in the vault.
+
+    Confirms the caller's vault assignment immediately before it
+    publishes (#88). That narrows the window in which an administrator's
+    reassignment can be missed to staging, the durability flush and one
+    publishing call — it does not close it, the same optimistic guarantee
+    the system declares for `edit_note(expected=…)`.
+    """
     if err := _require_write():
         return err
     if not path.endswith(".md"):
@@ -944,6 +1021,12 @@ async def create_note_impl(path: str, content: str) -> str:
         return str(e)
     with target:
         if err := _note_size_error(content):
+            return err
+        # #88, immediately before the publication and after every refusal that
+        # writes nothing: the assignment this request was admitted for must
+        # still be the caller's. A symlinked leaf is still named as one — the
+        # no-clobber `link` below refuses it and `_leaf_state_error` says so.
+        if err := await _confirm_publication(uid, target):
             return err
         try:
             write_file_at(target, content, overwrite=False)
@@ -1352,7 +1435,15 @@ async def edit_note_impl(
     replace_all: bool = False,
     dry_run: bool = False,
 ) -> str:
-    """Edit an existing note in the vault."""
+    """Edit an existing note in the vault.
+
+    Every mode that writes confirms the caller's vault assignment immediately
+    before it publishes (#88). `dry_run` publishes nothing and takes no
+    confirmation — and must never be the reason a later mode skips one. The
+    confirmation narrows the window to staging, the durability flush and one
+    publishing call; it does not close it, at the same optimistic level as this
+    tool's own `expected=` conflict check.
+    """
     if err := _require_write():
         return err
 
@@ -1470,6 +1561,13 @@ async def edit_note_impl(
             ))
             return diff or f"No changes for {path}"
 
+        # #88. Placed after the `dry_run` return above on purpose: a dry run
+        # publishes nothing and so needs no confirmation, but every mode that
+        # does publish takes its own — the dry run must never become the reason
+        # a later write skipped one.
+        if err := await _confirm_publication(uid, target):
+            return err
+
         try:
             write_file_at(target, new_content, expected=existing_bytes)
         except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
@@ -1568,13 +1666,33 @@ def _rewrite_links_in_text(
     return out, len(rewrites)
 
 
-def _rewrite_failure_warning(failed_sources: list[str]) -> str | None:
-    """Describe backlink rewrites that failed after the move completed."""
+def _rewrite_failure_warning(
+    failed_sources: list[str], *, reassigned_from: str | None = None
+) -> str | None:
+    """Describe backlink rewrites that did not happen after the move committed.
+
+    `reassigned_from` names the root the move completed in, and switches the
+    wording to the #88 partial outcome: the vault assignment changed part way
+    through, the rewrites were stopped, and these sources still point at the
+    old path. It reuses this one idiom rather than inventing a second reporting
+    mechanism — the reassignment is a new *reason*, not a new mechanism — and
+    it is what stops a half-rewritten link graph being reported as a clean
+    move, which is precisely the "graph asserting a link the vault bytes do not
+    contain" the preflight exists to prevent.
+    """
     if not failed_sources:
         return None
     preview = ", ".join(failed_sources[:3])
     if len(failed_sources) > 3:
         preview += f", and {len(failed_sources) - 3} more"
+    if reassigned_from is not None:
+        return (
+            "partial success: the note was moved in the vault this call was "
+            f"admitted for ({reassigned_from}), but the vault assignment "
+            "changed while the call was in flight, so the link rewrites were "
+            f"stopped. {len(failed_sources)} note(s) still link to the old "
+            f"path and were left unrewritten: {preview}"
+        )
     return (
         "partial success: note moved, but link rewrites failed in "
         f"{len(failed_sources)} note(s): {preview}"
@@ -1608,7 +1726,18 @@ async def move_note_impl(
     to_path: str,
     rewrite_links: bool = False,
 ) -> str:
-    """Move (rename or relocate) a note inside the vault."""
+    """Move (rename or relocate) a note inside the vault.
+
+    Confirms the caller's vault assignment immediately before the `renameat2`
+    that commits the move **and again before every link rewrite** (#88): the
+    metadata transaction between them is an `await` of unbounded duration, so
+    one stamp cannot cover both. A rewrite refused after the move has committed
+    stops the loop and is reported as a partial outcome — the move is not rolled
+    back, and the metadata rows keep describing where the note now is. Each
+    publication therefore carries its own narrowed window rather than one for
+    the whole call; the tool has several such windows and can be refused part
+    way through.
+    """
     if err := _require_write():
         return err
 
@@ -1887,6 +2016,21 @@ async def _move_note_locked(
                 )
 
         # ── Phase 2: commit ─────────────────────────────────────────────────────
+        # #88, after the whole preflight so a refusal here still aborts before
+        # any mutation, and immediately before the `renameat2` that commits the
+        # move. Both endpoints are stamped from this one confirmation:
+        # `move_file_no_clobber` consumes the destination's, and the source
+        # keeps the spare only so that `_verify_the_moved_inode`'s rollback —
+        # the failure handling of this same operation, which calls that helper
+        # with the targets swapped — is not refused for want of one. The spare
+        # is dropped the moment the move stands.
+        err, move_confirmation = await _confirm_publication_detail(
+            uid, src_target, dst_target
+        )
+        if err:
+            return err
+        admitted_root = move_confirmation.root
+
         # Identify the source *before* the rename: `renameat2` moves whichever
         # inode is there when it runs, so this is the only chance to know what
         # we actually moved.
@@ -1911,6 +2055,12 @@ async def _move_note_locked(
             src_target, dst_target, moved_inode, from_path, to_rel
         ):
             return err
+        # The move stands, so the rollback that the source's spare confirmation
+        # existed for cannot happen any more. Drop it: a confirmation covers
+        # exactly one publication, and a live stamp left on a target the
+        # rewrite loop may write through (the moved note rewrites its own
+        # self-links) is precisely the stale reuse this change removes.
+        src_target.clear_confirmation()
 
         db_failed = False
         try:
@@ -1950,11 +2100,34 @@ async def _move_note_locked(
 
         rewrites_done = 0
         files_modified = 0
-        for write_path, write_target, original_bytes, new_content, n in planned_rewrites:
+        reassigned_from: str | None = None
+        for position, planned in enumerate(planned_rewrites):
+            write_path, write_target, original_bytes, new_content, n = planned
+            # #88, one confirmation per publication. The stamp taken before the
+            # move covers none of this: the metadata transaction above is an
+            # `await` of unbounded duration, and so is every rewrite already
+            # done. Reusing it here would be the same staleness this change
+            # exists to narrow, merely relocated inside one call.
+            if err := await _confirm_publication(uid, write_target):
+                # Stop. Every remaining rewrite would write into a vault the
+                # caller no longer holds, through descriptors pinned before the
+                # reassignment. The move is **not** rolled back and the
+                # metadata update is **not** undone: the note really is at its
+                # new path and the rows must keep saying so.
+                reassigned_from = admitted_root
+                for remaining in planned_rewrites[position:]:
+                    failed_rewrite_sources.append(remaining[0])
+                    drop(remaining[1])
+                break
             try:
                 write_file_at(write_target, new_content, expected=original_bytes)
                 rewrites_done += n
                 files_modified += 1
+            except UnconfirmedPublication:
+                # A publish helper refusing an unstamped target is a bug in this
+                # repository, not a per-source rewrite failure. Never let it be
+                # logged as one.
+                raise
             except Exception as e:
                 logger.warning("Failed to rewrite links in %s: %s", write_path, e)
                 failed_rewrite_sources.append(write_path)
@@ -1972,7 +2145,9 @@ async def _move_note_locked(
             parts.append(
                 f"rewrote {rewrites_done} link(s) across {files_modified} note(s)"
             )
-            warning = _rewrite_failure_warning(failed_rewrite_sources)
+            warning = _rewrite_failure_warning(
+                failed_rewrite_sources, reassigned_from=reassigned_from
+            )
             if warning is not None:
                 parts.append(f"(warning: {warning})")
         return " — ".join(parts) if len(parts) > 1 else parts[0]
@@ -1992,7 +2167,15 @@ async def _move_note_locked(
 
 @_tracked("delete_note", ["path", "permanent"])
 async def delete_note_impl(path: str, permanent: bool = False) -> str:
-    """Soft-delete a note to `.trash/`, or `os.unlink` it when `permanent=True`."""
+    """Soft-delete a note to `.trash/`, or unlink it when `permanent=True`.
+
+    Both forms confirm the caller's vault assignment immediately before they
+    act, and both are refused by the shared publish helpers if they do not
+    (#88). The confirmation narrows the window to the publishing call itself;
+    it does not close it — a reassignment committing inside that call still
+    takes effect in the former root, at the same optimistic level as
+    `edit_note(expected=…)`.
+    """
     if err := _require_write():
         return err
 
@@ -2008,18 +2191,24 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
             return err
 
         if permanent:
+            # #88. The unlink itself lives in `vault.unlink_at`, which takes
+            # the confirmation — the refusal for an unstamped target comes from
+            # the helper, not from a check written into this tool, which is
+            # what makes the enforcement structural rather than conventional.
+            if err := await _confirm_publication(uid, target):
+                return err
             try:
-                os.unlink(target.name, dir_fd=target.dir_fd)
+                unlink_at(target)
             except OSError as e:
                 return f"Permanent delete failed: {e}"
-            # The unlink is a directory operation, and an entry that survives a
-            # crash resurrects a note the agent was told is gone (#97). Logged
-            # and swallowed: the note *is* unlinked, and a reported failure
-            # would invite a retry of a delete that already happened.
-            vault_fs.flush_dir_quietly(
-                target.dir_fd, f"parent directory of {target.rel}"
-            )
             return f"Permanently deleted: {path}"
+
+        # #88, ahead of the trash probe: `check_trash_support` creates `.trash`
+        # and a file inside it, so a delete refused for a changed assignment
+        # must not reach it. No `await` runs between here and the soft delete,
+        # so the confirmation still covers exactly that publication.
+        if err := await _confirm_publication(uid, target):
+            return err
 
         # Only the soft delete needs the trash to be usable, and it must be
         # probed *after* the not-found check: the probe creates `.trash`, and a
@@ -2037,13 +2226,7 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
         # inode sits at the source when the call runs is what moves.
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
         try:
-            dest = vault_fs.soft_delete_at(
-                target.dir_fd,
-                target.name,
-                target.root_fd,
-                stamp=stamp,
-                label=target.rel,
-            )
+            dest = soft_delete_target(target, stamp=stamp, label=target.rel)
         except FileNotFoundError:
             return f"Note not found: {path}"
         except vault_fs.UnsafePath as e:
@@ -2068,7 +2251,14 @@ async def set_frontmatter_impl(
     updates: dict | None = None,
     remove: list[str] | None = None,
 ) -> str:
-    """Merge `updates` into a note's YAML frontmatter and drop keys in `remove`."""
+    """Merge `updates` into a note's YAML frontmatter and drop keys in `remove`.
+
+    Confirms the caller's vault assignment immediately before it
+    publishes (#88). That narrows the window in which an administrator's
+    reassignment can be missed to staging, the durability flush and one
+    publishing call — it does not close it, the same optimistic guarantee
+    the system declares for `edit_note(expected=…)`.
+    """
     if err := _require_write():
         return err
 
@@ -2120,6 +2310,9 @@ async def set_frontmatter_impl(
         # Bound the result before writing (see `edit_note_impl`). A remove-only
         # call can only shrink the note, but the check is uniform.
         if err := _note_size_error(new_raw):
+            return err
+
+        if err := await _confirm_publication(uid, target):  # #88
             return err
 
         try:
@@ -2250,7 +2443,14 @@ async def write_file_impl(
     encoding: str = "base64",
     overwrite: bool = False,
 ) -> str:
-    """Write a file into the vault from base64 or text content."""
+    """Write a file into the vault from base64 or text content.
+
+    Confirms the caller's vault assignment immediately before it
+    publishes (#88). That narrows the window in which an administrator's
+    reassignment can be missed to staging, the durability flush and one
+    publishing call — it does not close it, the same optimistic guarantee
+    the system declares for `edit_note(expected=…)`.
+    """
     if err := _require_write():
         return err
     if encoding not in ("base64", "text"):
@@ -2295,6 +2495,9 @@ async def write_file_impl(
                 f"Content too large ({len(data):,} bytes, "
                 f"max {settings.max_file_write_bytes:,}). No file was written."
             )
+
+        if err := await _confirm_publication(uid, target):  # #88
+            return err
 
         try:
             write_bytes_at(target, data, overwrite=overwrite)
@@ -2918,7 +3121,17 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
 
 @_tracked("delete_file", ["path", "permanent"])
 async def delete_file_impl(path: str, permanent: bool = False) -> str:
-    """Delete a non-markdown vault file, soft by default."""
+    """Delete a non-markdown vault file, soft by default.
+
+    Confirms the caller's vault assignment immediately before deleting (#88).
+    This tool does **not** publish through a `MutableTarget` — it resolves via
+    `_vault_context` and walks from its own `vault_fs.open_root(root)` — so the
+    structural stamp that covers the note tools cannot reach it and the
+    confirmation is stated here explicitly rather than left as an unremarked
+    gap: a destructive operation in a vault the caller has been reassigned away
+    from is the same defect as a write into one. As everywhere else, the check
+    narrows the window to the deleting call and does not close it.
+    """
     if err := _require_write():
         return err
     uid = current_user_id.get()
@@ -2939,6 +3152,12 @@ async def delete_file_impl(path: str, permanent: bool = False) -> str:
             "tool that knows about the index and about backlinks. `delete_file` "
             "handles everything else."
         )
+
+    # #88, before `check_trash_support` creates anything and before either
+    # delete runs. There is no target to stamp on this path, so the
+    # confirmation is consumed by the refusal check itself.
+    if err := await _confirm_publication(uid):
+        return err
 
     if not permanent:
         # Only the soft delete needs the trash to be usable; `permanent=True` is
