@@ -44,10 +44,19 @@ Recall is a benchmark SLO, not a per-query guarantee: HNSW is approximate and
 ANN results move between index builds, which is exactly why (3) repeats across
 rebuilds instead of pinning an expected result set.
 
+(6) is the only case that goes through `_tracked`, and that makes it the only
+one with an *identity* precondition: the decorator resolves the caller's vault
+root before the tool body runs and refuses the whole call if it cannot (issue
+#66). So it calls the tool inside `_as_authenticated_request`, which does what
+`APIKeyMiddleware` does, and `_parse_find_related` refuses to score a refusal
+as an empty result set — issue #99, where exactly that read as three recall
+failures and cost an afternoon of search tuning.
+
 Skipped unless `PGVECTOR_TEST_ADMIN_URL` is set — see `_harness.py`.
 """
 import math
 import random
+from contextlib import asynccontextmanager
 
 import pytest
 import pytest_asyncio
@@ -55,8 +64,10 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import src.mcp_server.tools as tools
+from src.auth.session import current_vault_root
 from src.models.db import NoteEmbedding, NoteMetadata, User
 from src.services import timing
+from src.services import vault as vault_service
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 import _harness
@@ -315,6 +326,17 @@ async def corpus(sessionmaker, queries):
     tools._log_usage = _noop
     yield users
     tools.async_session, tools._log_usage = original_session, original_log
+    # `_user_vault_cache` is process-global and `_as_authenticated_request`
+    # below writes to it, so the ids this module warms (`alice`/`bob`, from a
+    # throwaway database that is about to be dropped) would otherwise ride
+    # along into the rest of a whole-suite run. Measured, not assumed: nothing
+    # in the suite currently collides with them — `test_issue_66_*` uses id
+    # 4242 and its `cold_cache` fixture saves and restores the whole dict — so
+    # this is hygiene rather than a fix for an observed failure. Keep it
+    # anyway: an assigned root left in a shared dict is precisely the state
+    # `_vault_root` refuses to be given for free, and a future module that
+    # seeds a low user id would inherit a vault assignment it never made.
+    vault_service.clear_user_vault_cache()
 
 
 @pytest_asyncio.fixture(loop_scope="module")
@@ -331,6 +353,76 @@ async def rebuild(request, sessionmaker, corpus):
         await session.execute(text("ANALYZE note_embeddings"))
         await session.commit()
     return request.param if hasattr(request, "param") else 0
+
+
+# ── calling a tool the way an authenticated MCP request does ────────────────
+# Anything reached through `_tracked` passes the vault-admission gate first
+# (issue #66): the decorator resolves `_vault_root(current_user_id.get())`
+# *before* the tool body runs and fails the whole call when it raises. A test
+# that binds only `current_user_id` therefore emulates half a request, and the
+# half it leaves out is the precondition — every tool call comes back as the
+# refusal string instead of results.
+#
+# So do exactly what `APIKeyMiddleware` does, both halves of it: warm the
+# process-global cache from the database *and* bind the answer to this context
+# as the request's own snapshot. Binding the ContextVar alone would be enough
+# to pass the gate — `_vault_root` prefers the snapshot over the dict — but it
+# would also be a fixture that cannot fail the way production fails: the whole
+# point of a tool-level benchmark is that the real precondition is what it
+# runs against, and in production that precondition is a `users.vault_path`
+# row read through `warm_user_vault_cache`. Warming from the corpus's own user
+# rows means an unassigned or inactive user would refuse here too.
+
+
+@asynccontextmanager
+async def _as_authenticated_request(sessionmaker, uid):
+    """Bind the identity `APIKeyMiddleware` binds, for the body of a `with`."""
+    async with sessionmaker() as session:
+        root = await vault_service.warm_user_vault_cache(session, uid)
+    assert root is not None, (
+        f"the corpus fixture's user {uid} has no usable `vault_path`, so every "
+        "`_tracked` tool call in this module would be refused before its body "
+        "ran; fix the fixture, not the search code"
+    )
+    uid_token = tools.current_user_id.set(uid)
+    root_token = current_vault_root.set((uid, root))
+    try:
+        yield root
+    finally:
+        current_vault_root.reset(root_token)
+        tools.current_user_id.reset(uid_token)
+
+
+def _assert_the_tool_body_ran(out: str, *, tool: str) -> None:
+    """Fail on a `_tracked` refusal instead of scoring it as a search result.
+
+    Every parser in this module reads a tool's *rendered* output, so a call
+    the decorator refused arrives as a plain string with no result lines in
+    it — indistinguishable, to a recall count, from a search that genuinely
+    found nothing. That is not hypothetical: issue #99 was three parametrised
+    recall failures reading `empty, baseline had 10`, and the actual cause was
+    this module binding `current_user_id` without a vault root, so
+    `find_related_impl` never executed a single statement. The failure text
+    sent the investigation at HNSW tuning; the fix was in the harness.
+
+    Keyed off the production constant rather than a copy of its wording, so a
+    reworded refusal cannot quietly stop matching here.
+    """
+    if tools._NO_VAULT_MESSAGE in out:
+        raise AssertionError(
+            f"{tool} was REFUSED BEFORE ITS BODY RAN by the `_tracked` "
+            "vault-admission gate (issue #66) — it issued no query, so this "
+            "is a harness/precondition failure, NOT a recall or search "
+            "regression. The calling test must establish the vault root the "
+            "way `APIKeyMiddleware` does; use `_as_authenticated_request`. "
+            f"Tool output was: {out!r}"
+        )
+    if out.startswith("Error:"):
+        raise AssertionError(
+            f"{tool} returned a tool-level error rather than results, so "
+            "nothing here measures search quality: "
+            f"{out!r}"
+        )
 
 
 # ── the query under test, run three ways ────────────────────────────────────
@@ -668,7 +760,13 @@ def _parse_find_related(out: str) -> list[tuple[str, float]]:
     ties are already counted as equivalent within 1e-9... except that rounding
     to three decimals is coarser than that. Distances are therefore compared
     with the printed tolerance in `_recall_printed` below.
+
+    The admission check runs *here*, in the parser, rather than at the one call
+    site: this is where a `_tracked` refusal would otherwise be silently turned
+    into an empty result list, so every present and future caller inherits the
+    guard by parsing through it.
     """
+    _assert_the_tool_body_ran(out, tool="find_related")
     results = []
     for line in out.splitlines():
         if not line.startswith("- **") or "sim: " not in line:
@@ -707,8 +805,7 @@ async def test_find_related_recall_meets_the_baseline(sessionmaker, corpus, rebu
             select(NoteMetadata.file_path).where(NoteMetadata.user_id == uid)
         )).scalars().all())
 
-    token = tools.current_user_id.set(uid)
-    try:
+    async with _as_authenticated_request(sessionmaker, uid):
         failures = []
         for path in FIND_RELATED_SOURCES:
             source_id, avg = await _find_related_query_vector(sessionmaker, path, uid)
@@ -725,6 +822,8 @@ async def test_find_related_recall_meets_the_baseline(sessionmaker, corpus, rebu
 
             out = await tools.find_related_impl(path, limit=FIND_RELATED_LIMIT)
             assert "has not been embedded yet" not in out, out
+            # `_parse_find_related` refuses to read an admission refusal as an
+            # empty result set — see `_assert_the_tool_body_ran`.
             got = _parse_find_related(out)
 
             if not got:
@@ -752,8 +851,6 @@ async def test_find_related_recall_meets_the_baseline(sessionmaker, corpus, rebu
                     f"(got {len(got)}, baseline {len(baseline)})"
                 )
         assert not failures, f"rebuild {rebuild}:\n" + "\n".join(failures)
-    finally:
-        tools.current_user_id.reset(token)
 
 
 async def test_find_related_statement_uses_the_hnsw_index(sessionmaker, corpus):
