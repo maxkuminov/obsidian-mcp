@@ -1,155 +1,190 @@
 ## ADDED Requirements
 
-### Requirement: The index records the identity of the directory it was scanned from
-The system SHALL record, per user, the identity of the directory that user's `notes_metadata` rows were actually scanned from, in a record that is independent of the user's current vault assignment and therefore survives an unassignment. That record SHALL be written only by the index pass that establishes the state it describes, and MUST NOT be written by any operator-facing handler that changes the assignment.
+### Requirement: The index records the vault assignment its rows were scanned under
+The system SHALL record, per user, the **provenance** of that user's `notes_metadata` rows — the vault assignment the index pass ran under, and the directory that assignment named at the moment it ran — in a record that is independent of the user's current assignment and therefore survives an unassignment. That record SHALL be written only by the index pass that establishes the state it describes, and MUST NOT be written by any operator-facing handler that changes the assignment.
 
-The record SHALL comprise two facts observed at the same moment, both derived from the directory descriptor the pass pins: the **canonical real path** of the directory scanned, with symbolic links resolved and separators, `.` and `..` normalised; and an **opaque kernel file handle** for that directory, obtained from the pinned descriptor and stored as text that is compared by byte equality and never parsed. A normalised pathname alone is not directory identity, in either direction: a symbolic link retargeted from one directory to another under an unchanged assignment yields the same pathname for a different directory, and two aliases naming one directory yield different pathnames for the same one.
+The question this record answers is **"did the assignment change?"**, not "is this the same directory?". The event it exists to detect is an operator repointing a user at another vault, which is a change to a value this system itself stores and writes; detecting that is exact, and no input defeats it. Proving directory identity across time is a different and unwinnable question, and the requirement below on filesystem substitution states where the boundary is.
 
-The second fact SHALL be a durable identity that distinguishes a directory from a *replacement* of that directory, and a device-and-inode pair SHALL NOT be used for it. Inode numbers are reusable: a directory deleted and re-created at the same path can be handed the same inode number, at which point a real-path comparison and an inode comparison agree unanimously about two different directories and a foreign index would be kept on what the system calls proof. The kernel file handle carries the inode's generation counter for exactly this purpose, so it distinguishes the replacement from the original.
+The record SHALL comprise three facts, all observed at the same moment, from the directory descriptor the pass pins:
+
+- the **canonical assignment string** — the user's assigned vault path normalised the way the pre-publish assignment check normalises it, without resolving symbolic links. This is the load-bearing fact. The system SHALL use **one** normaliser for both, called rather than re-implemented, so that the index's notion of "the same assignment" and the write path's notion of it cannot drift apart.
+- the **canonical real path** of the directory the pass actually scanned, with symbolic links resolved and separators, `.` and `..` normalised. Its purpose is not to prove identity but to stop the assignment comparison from destroying a valid index over a cosmetic rename: two pathnames naming one directory differ as strings and agree as real paths, so reassignment to an alias re-derives instead of costing a full re-embed.
+- an **opaque kernel file handle** for that directory, where the filesystem can produce one, stored as text that is compared by byte equality and never parsed.
+
+The file handle SHALL be **best-effort hardening in the refusing direction only**. Where a handle is recorded for a user and a handle can be read for the assigned root now, and the two differ, a verdict that would otherwise keep the index SHALL be downgraded to a re-derive. A handle that **matches SHALL NOT upgrade any verdict** and SHALL NOT be treated as proof of anything. Where no handle is available on either side, the hardening SHALL simply be absent: the pass SHALL decide on the assignment and the real path exactly as it does elsewhere, SHALL NOT enter any degraded mode, SHALL NOT re-derive on every pass for that reason, and SHALL NOT warn. A null handle SHALL mean "no hardening signal", never "provenance unknown".
+
+**Every write of the record SHALL write all three facts together, and a fact the pass could not observe SHALL be written as null.** No branch may update one part of the record and leave another part describing a root it does not describe. Without that rule a later observation can be compared against a root the stamp did not cover.
 
 Device and inode numbers SHALL NOT be recorded or compared across passes at all. They SHALL be used only within a single observation, to establish that the canonical real path being recorded still names the descriptor that was pinned; a disagreement there SHALL be treated as indeterminate rather than as any kind of match.
 
-Neither fact is identity on its own. A real-path comparison cannot observe a directory deleted and re-created at the same path, and a file handle is unique only within its filesystem. The system SHALL therefore treat the two as independent signals, SHALL NOT collapse them into one, and SHALL require both to agree before it keeps an index.
-
-Where the filesystem holding the assigned root cannot produce a file handle, the system SHALL treat the identity as unobtainable: it SHALL NOT record a partial identity, SHALL NOT keep an index on the remaining signal alone, and SHALL re-derive on every pass. That condition SHALL be reported to the operator through the log — once per process per root, and named as the reason in every re-derive it causes — rather than degraded silently.
-
-The record's normalisation is a **separate** question from the normalisation used to decide whether a caller's vault *assignment* has changed, and the two SHALL NOT be served by one function. This record answers "is this the directory those rows came from?", which is a fact about a directory and requires reading the filesystem. The assignment check answers "is this still the path the operator saved?", which is a fact about a stored value and deliberately does not read the filesystem.
-
-#### Scenario: A completed pass records the directory it scanned
+#### Scenario: A completed pass records the assignment it ran under
 
 - **WHEN** an index pass reconciles a user's index against the assigned root and completes
-- **THEN** it SHALL record both the canonical real path and the file handle of the directory it scanned
+- **THEN** it SHALL record the canonical assignment string, the canonical real path of the directory it scanned, and the file handle of that directory where one is available
 
-#### Scenario: A directory re-created at the same path with a reused inode is not the same directory
+#### Scenario: The record is written as a whole, with unobservable facts null
 
-- **WHEN** the directory a user's index was scanned from is removed, a different directory is created at the same path, and the filesystem hands the new directory the same device and inode numbers as the old one
-- **THEN** the recorded identity SHALL NOT compare equal to the observed identity
-- **AND** the pass SHALL NOT keep that user's index on the strength of the real path and the inode numbers agreeing
+- **WHEN** a pass records provenance for a user and the filesystem cannot produce a file handle
+- **THEN** the recorded handle SHALL be null and the other two facts SHALL be those the pass observed
+- **AND** no part of a previous record SHALL survive the write
 
-#### Scenario: A filesystem with no file handles cannot license a keep
+#### Scenario: A missing file handle changes no verdict
 
-- **WHEN** the assigned root is on a filesystem that does not support file handles
-- **THEN** the pass SHALL re-derive that user's index
-- **AND** SHALL record no identity, so every subsequent pass SHALL re-derive again
-- **AND** the condition SHALL be reported in the log once per process for that root
+- **WHEN** the assigned root is on a filesystem that cannot produce a file handle
+- **THEN** the pass SHALL classify the provenance from the assignment string and the real path alone
+- **AND** SHALL NOT re-derive on that account, SHALL NOT log a degraded-mode warning, and SHALL reach the same verdict it would reach if handles were unavailable everywhere
+
+#### Scenario: A matching handle grants nothing
+
+- **WHEN** the recorded handle equals the observed handle but the recorded assignment string or real path does not equal the observed one
+- **THEN** the pass SHALL NOT keep the index on the strength of the handle agreeing
 
 #### Scenario: The assignment handler does not write the record
 
 - **WHEN** an administrator changes, clears or restores a user's vault assignment through the control panel
-- **THEN** the recorded identity SHALL be left unchanged by that request
+- **THEN** the recorded provenance SHALL be left unchanged by that request
 
 #### Scenario: Single-user mode does not use the record
 
 - **WHEN** an index pass runs with no user identifier
-- **THEN** it SHALL neither read nor write the recorded identity, because single-user mode has no user row
+- **THEN** it SHALL neither read nor write the recorded provenance, because single-user mode has no user row
 - **AND** the pass SHALL behave exactly as it does today
 
 #### Scenario: A cosmetic difference in spelling is not a reassignment
 
-- **WHEN** the assigned root and the recorded root denote the same directory but differ only in a trailing separator, a redundant separator, or a `.` component
-- **THEN** the pass SHALL treat the directory as unchanged and SHALL delete nothing
+- **WHEN** the assigned root and the recorded assignment denote the same path but differ only in a trailing separator, a redundant separator, or a `.` component
+- **THEN** the shared normaliser SHALL render them equal, and the pass SHALL treat the assignment as unchanged and SHALL delete nothing
 
 #### Scenario: Two aliases of one directory are not a reassignment
 
-- **WHEN** a user's index was built through one pathname and the assignment later names a different pathname that resolves to the same directory
-- **THEN** the pass SHALL NOT discard that user's index, and SHALL NOT re-embed the vault
+- **WHEN** a user's index was built under one assignment and the assignment later names a different pathname that resolves to the same directory
+- **THEN** the recorded real path SHALL equal the observed one while the assignment strings differ
+- **AND** the pass SHALL re-derive rather than discard, so the vault SHALL NOT be re-embedded
 
-#### Scenario: A retargeted symlink is a different directory
+#### Scenario: One normaliser, shared with the write path
 
-- **WHEN** the assignment is unchanged but the pathname it names is a symbolic link that has been retargeted to a different directory since the index was built
-- **THEN** the recorded real path and the recorded file handle SHALL both disagree with the directory now scanned
-- **AND** the pass SHALL treat it as a different directory
+- **WHEN** the index record's assignment fact is produced and when the pre-publish confirmation compares a caller's assignment against the root bound at admission
+- **THEN** both SHALL use the same normalisation function, which compares canonical pathnames without resolving symbolic links
+- **AND** the index's real path SHALL be a separate recorded fact rather than a second normalisation of the assignment, and SHALL NOT enter the pre-publish comparison
 
-#### Scenario: The assignment check keeps its own normalisation
+### Requirement: A pass classifies the recorded provenance before it scans, and never resolves an ambiguity by keeping
+Before any file under the assigned root is read, the index pass SHALL compare the recorded provenance with the same facts observed for the assigned root now, and SHALL reach exactly one verdict, from a classification that is total over every combination of inputs.
 
-- **WHEN** the pre-publish confirmation compares a caller's assignment against the root bound at admission
-- **THEN** it SHALL continue to compare canonical pathnames without resolving symbolic links, and SHALL NOT be changed to use the index's directory-identity record
+A recorded provenance SHALL count as **present** only when both the recorded assignment string and the recorded real path are non-null. Any other combination — both null, or one null and the other set — SHALL be treated as **no record at all**, never as a partial match and never as a keep. Both facts are always observable for a root the pass could pin, so a half-set record is drift rather than a state this system writes, and the safe reading of drift is that nothing is known.
 
-### Requirement: A pass classifies the recorded identity before it scans, keeps an index only on proof, and never resolves an ambiguity by keeping
-Before any file under the assigned root is read, the index pass SHALL compare the recorded identity with the identity observed for the assigned root now, and SHALL reach exactly one verdict, from a classification that is total over every combination of inputs.
-
-**Keeping requires proof, and the proof is the file handle.** The system SHALL classify as **same directory** — and therefore do nothing — only when a file handle was obtained for the assigned root, an identity is recorded for that user, the recorded real path equals the observed real path, and the recorded handle equals the observed handle byte for byte. No other combination of inputs SHALL be classified as the same directory. In particular, agreement of the real path together with agreement of device and inode numbers SHALL NOT be sufficient, because that combination is produced by a directory replaced at the same path with a reused inode.
+The system SHALL classify as **same assignment** — and therefore do nothing — only when provenance is present for that user, the recorded assignment string equals the observed one, the recorded real path equals the observed one, and no handle mismatch is observable. A handle mismatch is observable only when a handle is recorded **and** a handle can be read for the assigned root now; where either is absent there is no mismatch to observe and the verdict stands on the other two facts.
 
 The remaining verdicts are:
 
-- **Indeterminate** — the assigned root cannot be opened as a directory, or its canonical real path no longer names the directory the pass pinned. The pass SHALL do nothing at all: no delete, no identity recorded, with the pass failing as it does today.
-- **Provenance unresolved, no proof obtainable** — the root was pinned but the filesystem produced no file handle. The pass SHALL re-derive and SHALL record no identity, so every subsequent pass re-derives.
-- **Provenance unresolved, no record** — a handle was obtained and no identity is recorded for that user. The pass SHALL re-derive and record the observed identity at the end, subject to the completeness rule below.
-- **Different directory** — a handle was obtained, an identity is recorded, and the recorded real path and the recorded handle **both** disagree with the observed ones. The pass SHALL discard.
-- **Provenance unresolved, partial disagreement** — a handle was obtained, an identity is recorded, and exactly one of the two signals disagrees. The pass SHALL re-derive and record the observed identity at the end, subject to the completeness rule below.
+- **Indeterminate** — the assigned root cannot be opened as a directory, or its canonical real path no longer names the directory the pass pinned. The pass SHALL do nothing at all: no delete, no record written, with the pass failing as it does today.
+- **Provenance unknown** — no provenance is present for that user, including a half-set record. The pass SHALL re-derive and record the observed facts at the end, subject to the completeness rule below.
+- **Provenance unresolved, contradicted by the handle** — the assignment string and the real path both agree, and a handle is recorded, and a handle was read now, and the two differ. The pass SHALL re-derive and record at the end, subject to the completeness rule.
+- **Reassigned** — provenance is recorded and the recorded assignment string and the recorded real path **both** disagree with the observed ones. The pass SHALL discard.
+- **Provenance unresolved, partial disagreement** — provenance is recorded and exactly one of the assignment string and the real path disagrees. The pass SHALL re-derive and record at the end, subject to the completeness rule.
 
-The system prefers, in order: never keeping a foreign index without proof, because silently wrong search results are the expensive failure this product names; and never destroying a valid index on ambiguous evidence, because a discard costs a full re-embed. Ambiguity therefore resolves to a branch that asserts nothing and destroys nothing, and only unanimous disagreement destroys.
+The system prefers, in order: never keeping an index across a reassignment, because silently wrong search results are the expensive failure this product names; and never destroying a valid index on ambiguous evidence, because a discard costs a full re-embed. Ambiguity therefore resolves to a branch that asserts nothing and destroys nothing, and only unanimous disagreement destroys.
 
 The indeterminate verdict does nothing because an index cannot be re-derived from a directory that cannot be read, and destroying one because a mount was briefly unavailable buys nothing and costs the full re-embed.
 
-#### Scenario: Both signals agree and a handle was obtained, so the directory is proven unchanged
+#### Scenario: The assignment and the real path both agree, so nothing is done
 
-- **WHEN** a file handle is obtained for the assigned root and both the recorded real path and the recorded handle match it
+- **WHEN** the recorded assignment string and the recorded real path both equal the observed ones and no handle mismatch is observable
 - **THEN** no reconciliation SHALL be performed and the pass SHALL proceed exactly as before
 
-#### Scenario: A restart or a remount does not disturb the record
+#### Scenario: A restart, a recreate or a remount does not disturb the record
 
-- **WHEN** the host reboots, the container is recreated, or the vault filesystem is remounted, and the assigned root is otherwise untouched
-- **THEN** the pass SHALL classify the directory as unchanged and SHALL neither delete a row nor re-embed a note
+- **WHEN** the host reboots, the container is recreated, or the vault filesystem is remounted, and the assignment and the directory are otherwise untouched
+- **THEN** the pass SHALL classify the assignment as unchanged and SHALL neither delete a row nor re-embed a note
 
-#### Scenario: A vault restored in place is re-derived rather than discarded
+#### Scenario: Reassignment to a different vault discards
 
-- **WHEN** the assigned root's contents are restored from a backup at the same pathname, so the real path is unchanged and the directory's file handle is not
-- **THEN** the pass SHALL treat the provenance as unresolved and SHALL re-derive
-- **AND** SHALL NOT discard, so no note is re-embedded on account of a restore
-
-#### Scenario: Both signals disagree, so the directory changed
-
-- **WHEN** a file handle is obtained for the assigned root and both the recorded real path and the recorded handle disagree with it
+- **WHEN** provenance is recorded and both the recorded assignment string and the recorded real path disagree with the observed ones
 - **THEN** the pass SHALL discard that user's index as specified below
 
-#### Scenario: The path matches but the directory was replaced
+#### Scenario: A handle that contradicts an otherwise-matching pair downgrades a keep
 
-- **WHEN** the recorded real path equals the assigned root's real path but the file handle differs, as when a directory is deleted and a new one created at the same path
-- **THEN** the pass SHALL treat the provenance as unresolved and SHALL re-derive rather than keep
-- **AND** SHALL NOT discard, because a replacement at the same pathname is as likely to be a restore as a reassignment
+- **WHEN** the assignment string and the real path both agree, a handle is recorded, a handle is read for the assigned root now, and the two handles differ — as when a directory is deleted and a new one created at the same path
+- **THEN** the pass SHALL re-derive rather than keep
+- **AND** SHALL NOT discard, because a replacement at the same pathname under an unchanged assignment is as likely to be a restore as anything else
 
-#### Scenario: The handle matches but the path differs
+#### Scenario: The real path differs under an unchanged assignment
 
-- **WHEN** the file handle equals the recorded one but the real path differs, as for a bind-mounted alias of the same directory
-- **THEN** the pass SHALL treat the provenance as unresolved and SHALL re-derive
-- **AND** SHALL NOT discard, so no vault is re-embedded on account of an alias
+- **WHEN** the recorded assignment string equals the observed one and the recorded real path does not, as when a symbolic link the assignment names has been retargeted
+- **THEN** the pass SHALL re-derive
+- **AND** SHALL NOT discard and SHALL NOT keep
+
+#### Scenario: A half-set record is no record
+
+- **WHEN** a user's recorded assignment string is set and the recorded real path is null, or the reverse
+- **THEN** the pass SHALL treat the provenance as unknown and SHALL re-derive
+- **AND** SHALL NOT keep and SHALL NOT discard on the strength of the fact that is set
 
 #### Scenario: An unopenable root changes nothing
 
 - **WHEN** the assigned root does not exist, is not a directory, or cannot be opened
-- **THEN** the pass SHALL delete no row and SHALL write no identity record
+- **THEN** the pass SHALL delete no row and SHALL write no provenance record
 
 #### Scenario: A root whose pathname is moving under the pass changes nothing
 
 - **WHEN** the assigned root is pinned but its canonical real path no longer names the directory that was pinned
-- **THEN** the pass SHALL treat the verdict as indeterminate, SHALL delete no row and SHALL write no identity record
+- **THEN** the pass SHALL treat the verdict as indeterminate, SHALL delete no row and SHALL write no provenance record
+
+### Requirement: Filesystem substitution behind an unchanged assignment is out of scope
+The system SHALL NOT claim to detect a change of storage underneath an unchanged vault assignment, and SHALL NOT be extended with a heuristic that claims to. Retargeting a symbolic link the assignment names, remounting a different filesystem at the same pathname, restoring a cloned image over the vault, or replacing the directory with a copy are operator actions on storage. Where the file-handle hardening happens to catch one, the outcome is a cheap re-derive; where it does not, the index is kept and reconciled by the ordinary scan. Neither outcome is promised.
+
+This is a declared boundary rather than an oversight, for three reasons. It is unwinnable by construction: a bit-identical clone of a filesystem presents the same inode numbers, generation counters and therefore the same file handles, at the same pathname, under the same assignment, and no fact a userspace process can read separates it from the original. It is the same trust class as editing the database directly: an actor who can remount the vault can also write the provenance record itself, and the system holds no in-process defence against that anywhere else either. And the system as it stands today, which records nothing at all, is equally blind to every one of these, so the record neither regresses nor closes this.
+
+Most of a substitution heals without any of this machinery, and the system SHALL rely on that rather than on a stronger claim: a kept index is still reconciled by the ordinary scan, which matches every note by relative path and content hash, prunes rows whose path is absent under the root, and re-parses and re-embeds every note whose bytes differ.
+
+One interleaving inside this boundary is worth naming rather than leaving to be found: a re-derive triggered by a real-path disagreement can be **incomplete**, in which case it writes no record, and if the substitution is reverted before the next pass that pass sees both recorded facts agree and keeps — over rows a previous pass partly re-derived from the substitute. That is the same non-goal, reached by a different route, and it is bounded the same way: the ordinary scan reconciles those rows by relative path and content hash, leaving only the case below.
+
+The one case that does not heal SHALL be documented as a **pre-existing defect of the incremental indexer**, not as a gap in this record: a note whose relative path and content hash are both unchanged is classified "no change" and never re-parsed, so its link rows are never re-extracted, and a link whose target was pruned keeps a null resolution permanently. That is reachable today on a single vault with no reassignment anywhere in the sequence, and its fix belongs to link resolution rather than to provenance.
+
+#### Scenario: A cloned filesystem at the same pathname is kept
+
+- **WHEN** the vault filesystem is replaced by a bit-identical clone mounted at the same pathname, under an unchanged assignment, so that every recorded fact including the file handle matches
+- **THEN** the pass SHALL keep the index
+- **AND** the ordinary scan SHALL reconcile it by relative path and content hash, pruning rows whose paths the clone lacks
+- **AND** this SHALL be recorded as a declared non-goal rather than specified as prevented
+
+#### Scenario: A substitution reverted before the next pass is not detected
+
+- **WHEN** the directory an assignment names is substituted, a pass re-derives incompletely and therefore records nothing, and the substitution is reverted before the following pass
+- **THEN** the following pass SHALL find both recorded facts in agreement and SHALL keep
+- **AND** this SHALL be recorded as the same declared non-goal rather than specified as prevented
+
+#### Scenario: The dangling-link residual is attributed to the indexer, not to the record
+
+- **WHEN** a note's relative path and content hash are unchanged and a note it linked to has been pruned
+- **THEN** its link row SHALL keep a null resolution until that note is edited, in exactly the same way as when no reassignment and no substitution has occurred
+- **AND** the system SHALL document this as a defect of incremental change detection rather than as a property of the provenance record
+
+#### Scenario: No heuristic is added to close the boundary
+
+- **WHEN** a design is considered that infers a substituted root from content overlap, path overlap, a mount identifier, or any other proxy
+- **THEN** it SHALL be rejected, because its failure direction is a silent keep on two vaults that merely resemble each other
 
 ### Requirement: The pass pins the assigned root and scans beneath that descriptor
-The index pass SHALL open the assigned root once, as a directory descriptor, before it observes the root's identity, and SHALL derive both recorded facts from that descriptor rather than from the pathname. Discovery of the files to index, and every read of a vault file the pass performs, SHALL be anchored to that same descriptor, so that the verdict, the scan and the recorded identity all describe one directory.
+The index pass SHALL open the assigned root once, as a directory descriptor, before it observes the root's facts, and SHALL derive the observed real path and file handle from that descriptor rather than from the pathname. Discovery of the files to index, and every read of a vault file the pass performs, SHALL be anchored to that same descriptor.
 
-Observing an identity through a pathname and then scanning that pathname is check-then-act, and the interval between them is exploitable in both directions. An assignment naming a symbolic link can be retargeted after the identity is observed and before the scan, so the pass indexes one directory and records another; retargeting it back before the following pass then leaves that record permanently accepted by the keep branch. A directory descriptor keeps naming the same directory however its pathname is later renamed or relinked, which is why the system already anchors its mutation path this way.
+What the pin establishes is deliberately narrow, and the system SHALL NOT claim more from it: **within one pass, the facts observed, the files discovered and the bytes read all come from one inode**, so a pass cannot record provenance describing a directory it did not scan. It does not prove that the pinned directory is the one earlier rows came from; nothing proves that, and the requirement above says so.
+
+Observing facts through a pathname and then scanning that pathname is check-then-act, and the interval between them is exploitable in both directions. An assignment naming a symbolic link can be retargeted after the observation and before the scan, so the pass indexes one directory and records another; retargeting it back before the following pass then leaves that record standing over rows the pass never derived from it. A directory descriptor keeps naming the same directory however its pathname is later renamed or relinked, which is why the system already anchors its mutation path this way.
 
 Anchoring SHALL NOT change what the index contains. Directory symbolic links SHALL still not be descended, and a symbolic link at a discovered file SHALL still be read as it is today; the requirement is about which directory is scanned, and it makes no containment claim about the leaves that the system did not already make. A file's size and modification time SHALL be taken from the same open file the pass read, rather than from a second resolution of its pathname.
 
-Every pass in the indexer that reads vault files for a user — the scan that records the identity, the embedding pass, the one-shot link backfill and the keyword-vector rebuild — SHALL read beneath a root pinned and identity-checked the same way. A recorded identity is a claim about the rows, and a later pass that writes rows for that user through an unanchored pathname would falsify it: a user whose notes contain no links leaves the link backfill eligible to run on every startup.
+Every pass in the indexer that reads vault files for a user — the scan, the embedding pass, the one-shot link backfill and the keyword-vector rebuild — SHALL read beneath a root it pinned this way.
 
-#### Scenario: The identity, the discovery and the reads describe one directory
+#### Scenario: The observation, the discovery and the reads describe one directory
 
 - **WHEN** an index pass runs
-- **THEN** the identity it observes, the files it discovers and the file contents it reads SHALL all come from the single directory descriptor it pinned at the head of the pass
+- **THEN** the facts it observes, the files it discovers and the file contents it reads SHALL all come from the single directory descriptor it pinned at the head of the pass
 
 #### Scenario: A symlinked assignment retargeted mid-pass cannot mislabel the scan
 
 - **WHEN** the assigned root is a symbolic link pointing at one directory when the pass pins it, and the link is retargeted to a second directory before the pass discovers or reads any file
 - **THEN** the pass SHALL scan the directory it pinned, not the directory the link now names
-- **AND** any identity it records SHALL be the identity of the directory it actually scanned
-
-#### Scenario: The retarget-and-restore interleaving cannot certify a foreign index
-
-- **WHEN** the assigned root is a symbolic link that points at directory A while one pass runs, is retargeted to directory B, and is retargeted back to A before the following pass runs
-- **THEN** no pass SHALL leave rows derived from B recorded as having been scanned from A
-- **AND** a subsequent pass SHALL NOT take the keep branch on the strength of such a record
+- **AND** any provenance it records SHALL describe the directory it actually scanned
 
 #### Scenario: Discovery keeps today's symbolic-link behaviour
 
@@ -160,37 +195,70 @@ Every pass in the indexer that reads vault files for a user — the scan that re
 #### Scenario: Every file-reading pass is anchored
 
 - **WHEN** the embedding pass, the one-shot link backfill or the keyword-vector rebuild reads a user's vault files
-- **THEN** it SHALL read them beneath a root pinned and identity-checked as the scan pins and checks it
+- **THEN** it SHALL read them beneath a root it pinned as the scan pins it
 
-### Requirement: A directory that demonstrably changed discards the previous directory's index
-When a file handle was obtained for the assigned root, an identity is recorded for that user, and both the recorded real path and the recorded handle disagree with the observed ones, the index pass SHALL delete that user's `notes_metadata` rows — and, by cascade, their `note_embeddings` and `note_links` rows — before any file under the new root is read, and SHALL then record the new directory's identity. The discard and the record SHALL commit as one transaction, so no pass can leave rows describing one directory beside a record naming another.
+### Requirement: The ancillary passes do nothing for a user whose provenance is not settled
+The embedding pass, the one-shot link backfill and the keyword-vector rebuild SHALL each run, for a given user, only when that user's provenance is recorded and the classification for the assigned root at that moment is **same assignment**. For any other classification they SHALL skip that user, SHALL write no row for that user, and SHALL log the skip once, leaving the work to a later pass once the scan has settled the provenance.
+
+The skip SHALL be **per user**, not global: a user whose provenance is unsettled SHALL NOT prevent these passes from running for every other user.
+
+The classification SHALL be computed by the same function the scan uses, so that "settled" cannot come to mean two different things in two places.
+
+These passes read vault files and write rows the provenance is a claim about — embeddings, link rows and keyword vectors. They cannot assume the scan settled the provenance a moment ago: a user whose notes contain no links leaves the link backfill eligible on every startup, and a reassignment can commit between the scan and any of them. Allowing them to write under an unresolved provenance is what lets a link row extracted from one root be committed against a metadata row from another.
+
+Maintenance that does nothing is safe, which is why skipping is the specified outcome rather than a per-file content check. A delayed embedding, a delayed link backfill of a table that is empty either way, and a delayed keyword index each cost latency and write nothing wrong; the next scan either records the provenance, after which the user becomes eligible, or re-derives, which rebuilds that user's links itself.
+
+#### Scenario: An unsettled user is skipped by every ancillary pass
+
+- **WHEN** a user has no recorded provenance, or the classification for their assigned root is anything other than same assignment, and the embedding pass, the link backfill or the keyword-vector rebuild runs
+- **THEN** that pass SHALL write no `note_embeddings`, `note_links` or keyword-vector row for that user
+- **AND** SHALL log the skip once
+
+#### Scenario: The skip does not stop the pass for other users
+
+- **WHEN** one user's provenance is unsettled and another user's is settled, and an ancillary pass runs
+- **THEN** the settled user's work SHALL be performed in that same pass
+
+#### Scenario: A reassignment between the scan and a later pass writes nothing
+
+- **WHEN** the scan settles a user's provenance and the user is then reassigned to a different vault before the link backfill runs
+- **THEN** the link backfill SHALL classify that user as reassigned rather than same assignment, and SHALL write no link row for them
+- **AND** the next scan SHALL perform the reconciliation for that user
+
+#### Scenario: A settled user proceeds unchanged
+
+- **WHEN** a user's recorded provenance matches the assigned root and an ancillary pass runs
+- **THEN** it SHALL do exactly the work it does today
+
+### Requirement: An assignment that demonstrably changed discards the previous vault's index
+When provenance is recorded for a user and both the recorded assignment string and the recorded real path disagree with the observed ones, the index pass SHALL delete that user's `notes_metadata` rows — and, by cascade, their `note_embeddings` and `note_links` rows — before any file under the new root is read, and SHALL then record the new provenance. The discard and the record SHALL commit as one transaction, so no pass can leave rows from one vault beside a record naming another.
 
 Serving the previous directory's rows is the failure this prevents. The tools served purely from the database — `semantic_search`, `keyword_search`, `list_notes`, `get_recent` and the graph tools — would otherwise return paths, titles, tags, frontmatter and chunk excerpts from a vault the caller no longer has, and a subsequent read of one of those paths can silently return a different note that occupies the same relative path in the new root.
 
 The pass's existing prune by relative path does not make this redundant. A note whose relative path **and** content hash are identical in both directories is classified as unchanged and skipped, so its links are never re-extracted; the notes it pointed at are pruned, and because `note_links.target_note_id` is `ON DELETE SET NULL` the link row survives with its target resolution lost. That link never heals, because the note is never re-parsed again.
 
-Because this branch is destructive and costs a full re-embed of the newly assigned vault, it SHALL fire only on unanimous evidence, and never on a missing or partial record, and never where no file handle was obtainable.
+Because this branch is destructive and costs a full re-embed of the newly assigned vault, it SHALL fire only when both recorded facts disagree, and never on a missing record, never on a partial disagreement, and never on the strength of a file handle — which can refuse a keep but can never establish a discard.
 
-#### Scenario: Reassignment to a different directory
+#### Scenario: Reassignment to a different vault
 
-- **WHEN** a user whose index was built from one directory is assigned a different one and the next index pass runs
+- **WHEN** a user whose index was built under one assignment is assigned a different vault at a different real path and the next index pass runs
 - **THEN** the rows from the previous directory SHALL be deleted before the new root is scanned
 - **AND** the user's `note_embeddings` and `note_links` rows SHALL be removed with them
 
-#### Scenario: Reassignment to the recorded directory keeps the index
+#### Scenario: Reassignment to the recorded assignment keeps the index
 
-- **WHEN** a user's assignment is cleared and later restored to the same directory the index was built from
+- **WHEN** a user's assignment is cleared and later restored to the same path the index was built under, naming the same directory
 - **THEN** no row SHALL be deleted and no note SHALL be re-embedded, preserving the behaviour that makes an unassignment reversible without a full re-index
 
 #### Scenario: The discard precedes the first read of the new root
 
 - **WHEN** a discarding pass runs
-- **THEN** the delete and the identity record SHALL be committed before any file under the newly assigned root is opened, so a failure while scanning cannot leave the previous directory's rows queryable
+- **THEN** the delete and the provenance record SHALL be committed before any file under the newly assigned root is opened, so a failure while scanning cannot leave the previous vault's rows queryable
 
 #### Scenario: A failed pass after a discard retries cleanly
 
 - **WHEN** the discard commits and the subsequent scan of the new root fails
-- **THEN** the next pass SHALL find both signals in agreement, with a file handle obtained, and SHALL simply index, rather than repeating a delete or re-serving the old rows
+- **THEN** the next pass SHALL find the assignment and the real path in agreement and SHALL simply index, rather than repeating a delete or re-serving the old rows
 
 #### Scenario: Every caller of the index pass inherits the reconciliation
 
@@ -210,7 +278,7 @@ The embedding pass SHALL verify that the content it read hashes to the content h
 
 #### Scenario: A legacy index with no record is re-derived, not trusted and not discarded
 
-- **WHEN** the first pass after the record is introduced runs for a user whose index carries no recorded identity
+- **WHEN** the first pass after the record is introduced runs for a user whose index carries no recorded provenance
 - **THEN** the pass SHALL re-derive that user's index from the assigned root
 - **AND** SHALL NOT delete `note_embeddings` for a note whose content hash still matches the file under that root
 
@@ -229,7 +297,7 @@ The embedding pass SHALL verify that the content it read hashes to the content h
 #### Scenario: The re-derive is recorded only when it completes
 
 - **WHEN** a re-deriving pass fails part way through
-- **THEN** no identity SHALL be recorded for that user
+- **THEN** no provenance SHALL be recorded for that user
 - **AND** the next pass SHALL re-derive again, rather than treating a partially repaired index as established
 
 #### Scenario: The link rebuild reads no file
@@ -246,34 +314,34 @@ The embedding pass SHALL verify that the content it read hashes to the content h
 #### Scenario: A completed re-derive is recorded and not repeated
 
 - **WHEN** a re-deriving pass completes without error and without skipping any discovered file
-- **THEN** the identity of the directory it scanned SHALL be recorded after its last write
-- **AND** the next pass SHALL find both signals in agreement, with a file handle obtained, and SHALL take the no-op branch
+- **THEN** the provenance of the directory it scanned SHALL be recorded after its last write, as all three facts together
+- **AND** the next pass SHALL find the assignment and the real path in agreement, with no observable handle mismatch, and SHALL take the no-op branch
 
 ### Requirement: A re-derive that skipped any file is incomplete, and an incomplete re-derive is not recorded
-Any per-file skip during a re-deriving pass SHALL make that re-derive **incomplete**, and an incomplete re-derive SHALL NOT record an identity for that user. A skip is any discovered file the pass did not fully process — a directory it could not open, a file it could not read, stat, decode or parse, or a changed note whose links it could not extract. An incomplete pass SHALL still perform every repair it can, SHALL log the paths that kept it unrecorded, and the next pass SHALL re-derive again.
+Any per-file skip during a re-deriving pass SHALL make that re-derive **incomplete**, and an incomplete re-derive SHALL NOT record provenance for that user. A skip is any discovered file the pass did not fully process — a directory it could not open, a file it could not read, stat, decode or parse, or a changed note whose links it could not extract. An incomplete pass SHALL still perform every repair it can, SHALL log the paths that kept it unrecorded, and the next pass SHALL re-derive again.
 
 Without this rule the pass's structural claim is false. The scan continues past a file it cannot decode or read, and ordinary pruning keeps a row whose relative path exists under the assigned root — which is exactly the row a re-derive exists to replace. A vault that supplies a note at the same relative path as the previous vault, but whose bytes cannot be decoded, therefore leaves the previous vault's metadata row and its link rows untouched while the pass completes and records the new directory over them. One skipped file is enough to certify a foreign row.
 
 The rule fails toward re-work rather than toward wrongness, and that is the trade the system SHALL take. The alternative — transactionally deleting the stale rows for each skipped path, as a fresh index would — is a second deletion path for index contents, and it destroys a row that may be the correct row for a file that was merely unreadable at that moment.
 
-The system SHALL accept, and document, that a file which is permanently unreadable keeps that user in re-derive mode indefinitely. That is preferable to the alternative, which is recording a claim the pass could not establish: the identity would then license the keep branch over rows the pass never visited. The cost is bounded — a re-derive parses and upserts a vault the pass already reads in full and makes no embedding call for unchanged content — and it SHALL be operator-visible: the pass SHALL name the offending paths in its log on every pass, so the file to fix is identified rather than left as an unexplained recurring cost.
+The system SHALL accept, and document, that a file which is permanently unreadable keeps that user in re-derive mode indefinitely. That is preferable to the alternative, which is recording a claim the pass could not establish: the record would then license the keep branch over rows the pass never visited. The cost is bounded — a re-derive parses and upserts a vault the pass already reads in full and makes no embedding call for unchanged content — and it SHALL be operator-visible: the pass SHALL name the offending paths in its log on every pass, so the file to fix is identified rather than left as an unexplained recurring cost.
 
 #### Scenario: An undecodable file withholds the record
 
 - **WHEN** a re-deriving pass discovers a file it cannot decode and completes the rest of its work
-- **THEN** the pass SHALL record no identity for that user
+- **THEN** the pass SHALL record no provenance for that user
 - **AND** the next pass SHALL re-derive again
 
 #### Scenario: A foreign row behind a skipped path is never certified
 
 - **WHEN** a user was indexed from one vault, is assigned another, and the newly assigned vault holds a file at the same relative path whose bytes cannot be decoded
-- **THEN** the pass SHALL NOT record the newly assigned directory's identity
+- **THEN** the pass SHALL NOT record the newly assigned root's provenance
 - **AND** a later pass SHALL NOT take the keep branch over the row that path still carries
 
 #### Scenario: A file that disappears during the scan withholds the record
 
 - **WHEN** a file is discovered by a re-deriving pass and can no longer be read when the pass reaches it
-- **THEN** the pass SHALL treat that path as a skip and SHALL record no identity for that user
+- **THEN** the pass SHALL treat that path as a skip and SHALL record no provenance for that user
 
 #### Scenario: The skipped paths are named
 
@@ -283,10 +351,10 @@ The system SHALL accept, and document, that a file which is permanently unreadab
 #### Scenario: A complete re-derive is recorded
 
 - **WHEN** a re-deriving pass processes every discovered file without a skip and raises nothing
-- **THEN** it SHALL record the identity of the directory it scanned, after its last write
+- **THEN** it SHALL record the provenance of the directory it scanned, after its last write
 
 ### Requirement: The migration introducing the record asserts no provenance, and the deploy order is stated
-The migration that introduces the identity record SHALL leave it unset for every existing row and SHALL NOT derive it from the current vault assignment. "Assigned now" does not establish "indexed from what is assigned now" — reassignment lag is the defect the record exists to close — so a backfill from the assignment would stamp rows built from one vault as belonging to another, after which both signals agree, the no-op branch is taken, and the link case that never heals is guaranteed rather than merely possible.
+The migration that introduces the provenance record SHALL leave every column of it unset for every existing row and SHALL NOT derive any of them from the current vault assignment. "Assigned now" does not establish "indexed under what is assigned now" — reassignment lag is the defect the record exists to close — so a backfill from the assignment would stamp rows built under one assignment as belonging to another, after which both recorded facts agree, the no-op branch is taken, and the link case that never heals is guaranteed rather than merely possible.
 
 Because the migration writes no provenance, an index pass running under the previous code during or after the migration SHALL have no record to contradict: the previous code cannot write these columns, so every row is unset when the new code starts, and the first pass per user takes the unresolved branch and re-derives. This SHALL be documented as the reason the deploy is safe, and it SHALL NOT be described as serialisation: the index pass lock is process-local, and no advisory lock, row lock or other cross-container coordination exists between a migration container and a running application container.
 
@@ -295,7 +363,7 @@ The system SHALL document that overlap between two indexing containers of this s
 #### Scenario: The migration stamps nothing
 
 - **WHEN** the migration introducing the record runs on a database holding both assigned and unassigned users
-- **THEN** the recorded identity SHALL be unset for every row, including every assigned user's
+- **THEN** every column of the recorded provenance SHALL be unset for every row, including every assigned user's
 
 #### Scenario: A reassignment made before the upgrade is still reconciled
 
@@ -306,7 +374,7 @@ The system SHALL document that overlap between two indexing containers of this s
 #### Scenario: A pass under the previous code cannot forge a record
 
 - **WHEN** an index pass under the previous code commits `notes_metadata` rows after the migration has committed
-- **THEN** the recorded identity SHALL remain unset for that user, because the previous code has no code path that writes it
+- **THEN** the recorded provenance SHALL remain unset for that user, because the previous code has no code path that writes it
 - **AND** the first pass under the new code SHALL re-derive that user's index
 
 ### Requirement: A reassignment is honoured at the next index pass, not at the moment of assignment

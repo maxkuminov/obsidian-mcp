@@ -1,59 +1,63 @@
 ## ADDED Requirements
 
-### Requirement: Migration 016 owns the indexed-root identity columns as one marked unit
-Migration 016 SHALL add `users.indexed_vault_path` as a nullable `character varying(1024)` and `users.indexed_vault_handle` as a nullable `character varying(320)`, both with no server default and each stamped with 016's ownership marker as its column comment. It SHALL leave both columns null for **every** existing row and SHALL perform no backfill of any kind. `downgrade()` SHALL drop the columns only if they carry the marker, all-or-nothing. After migrating to head, `alembic check` SHALL report no pending operations, and the same marker string SHALL be declared on the ORM columns so the check compares it.
+### Requirement: Migration 016 owns the index-provenance columns as one marked unit
+Migration 016 SHALL add `users.indexed_vault_assignment` and `users.indexed_vault_realpath` as nullable `character varying(1024)`, and `users.indexed_vault_handle` as nullable `character varying(320)`, all three with no server default and each stamped with 016's ownership marker as its column comment. It SHALL leave all three columns null for **every** existing row and SHALL perform no backfill of any kind. `downgrade()` SHALL drop the columns only if they carry the marker, all-or-nothing. After migrating to head, `alembic check` SHALL report no pending operations, and the same marker string SHALL be declared on the ORM columns so the check compares it.
 
-The width of `indexed_vault_handle` follows the kernel's own bound. A file handle is at most `MAX_HANDLE_SZ` (128) bytes of opaque payload, which is 256 hexadecimal characters, plus a handle type and a separator; 320 characters holds the largest handle any filesystem may return with room to spare, and the column stores text so that nothing is ever tempted to interpret it. On the ext4 and xfs filesystems this system declares support for, the payload is eight bytes.
+The three columns are one unit because they are written as one: every stamp writes all three, with null for a fact the pass could not observe. `indexed_vault_assignment` holds the canonical assignment string the pass ran under and is the fact the keep/discard decision turns on; `indexed_vault_realpath` holds the real path that assignment named at that moment and exists so that a cosmetic rename does not cost a full re-embed; `indexed_vault_handle` holds an opaque kernel file handle where the filesystem produced one, and is best-effort hardening that can only refuse a keep.
 
-Not backfilling is the load-bearing decision, not an omission. Deriving `indexed_vault_path` from `users.vault_path` would assert that an assigned user's index was built from the root assigned *now*, which is exactly the reassignment lag the record exists to detect: an administrator who reassigns and deploys before the next index pass would have rows built from one vault stamped as belonging to another, after which both identity signals agree, the pass takes its no-op branch, and the identical-path/identical-content link case that never heals becomes guaranteed rather than merely possible. A null record means "provenance unknown", which is the only true statement available at migration time, and the pass repairs such a user by re-deriving the index rather than by discarding it — so introducing the columns costs no vault-wide re-embed.
+The two pathname columns are `varchar(1024)` because they hold pathnames, matching what the assignment itself can carry.
+
+`indexed_vault_handle` keeps its name and its width of 320 deliberately. The name is exactly what it stores — demoting a signal from proof to hardening does not change what the value is, and a vaguer name would make the column harder to reason about, not easier. The width follows the kernel's bound for the filesystems this system declares support for: a file handle is at most `MAX_HANDLE_SZ` (128) bytes of opaque payload, which is 256 hexadecimal characters, plus a handle type and a separator, and NFSv4's own maximum is the same 128 bytes; on ext4 and xfs the payload is eight bytes. This SHALL NOT be stated as an eternal maximum for every filesystem that may ever exist. A handle that does not fit SHALL be treated as unobtainable — recorded as null, so the hardening is simply absent for that root — and SHALL NOT be truncated, because a truncated handle compared by byte equality is a signal that can produce a spurious match. Shrinking the column would convert an absent hardening signal into a migration for no storage saving, since a `varchar` in this database costs only what it holds.
+
+Not backfilling is the load-bearing decision, not an omission. Deriving `indexed_vault_assignment` from `users.vault_path` would assert that an assigned user's index was built under the assignment it carries *now*, which is exactly the reassignment lag the record exists to detect: an administrator who reassigns and deploys before the next index pass would have rows built under one assignment stamped as belonging to another, after which both recorded facts agree, the pass takes its no-op branch, and the identical-path/identical-content link case that never heals becomes guaranteed rather than merely possible. A null record means "provenance unknown", which is the only true statement available at migration time, and the pass repairs such a user by re-deriving the index rather than by discarding it — so introducing the columns costs no vault-wide re-embed.
 
 Not backfilling is also what makes the deploy order safe without any cross-container coordination. An index pass running under the previous code during or after the migration cannot write these columns, so it cannot produce a record for the new code to trust; every row is null when the new container starts, whatever that pass committed.
 
-The marker is load-bearing for a stronger reason here than on a display column. This record is the sole input to a decision that can **delete a user's entire index** — `notes_metadata` and, by cascade, their embeddings and link rows. A same-named column of unknown provenance adopted as "the directory those rows came from" is a mass delete on the strength of a value nobody in this scheme wrote. So 016 SHALL refuse a pre-existing column of either name that is not exactly its own — wrong type, wrong width, `NOT NULL`, carrying a server default, or unmarked — and SHALL refuse a partial set in which one column is present and the other absent, naming what it found, rather than adopting it.
+The marker is load-bearing for a stronger reason here than on a display column. This record is the sole input to a decision that can **delete a user's entire index** — `notes_metadata` and, by cascade, their embeddings and link rows. A same-named column of unknown provenance adopted as "the assignment those rows were scanned under" is a mass delete on the strength of a value nobody in this scheme wrote. So 016 SHALL refuse a pre-existing column of any of the three names that is not exactly its own — wrong type, wrong width, `NOT NULL`, carrying a server default, or unmarked — and SHALL refuse a partial set in which some of the three are present and others absent, naming what it found, rather than adopting it.
 
 #### Scenario: Fresh database
 
 - **WHEN** an empty database is migrated to head
-- **THEN** `users.indexed_vault_path` SHALL exist as nullable `character varying(1024)` and `users.indexed_vault_handle` as nullable `character varying(320)`, both with no server default and both carrying 016's marker as their column comment
+- **THEN** `users.indexed_vault_assignment` and `users.indexed_vault_realpath` SHALL exist as nullable `character varying(1024)` and `users.indexed_vault_handle` as nullable `character varying(320)`, all three with no server default and all three carrying 016's marker as their column comment
 - **AND** `alembic check` SHALL report no new upgrade operations
 
 #### Scenario: The migration backfills nothing
 
 - **WHEN** 016 runs on a database holding both assigned and unassigned users, each with existing `notes_metadata` rows
-- **THEN** both columns SHALL be null for every user, including every assigned one
+- **THEN** all three columns SHALL be null for every user, including every assigned one
 - **AND** no `notes_metadata`, `note_embeddings` or `note_links` row SHALL be modified or deleted
 
 #### Scenario: Re-running the migration does not overwrite a record
 
-- **WHEN** the database is stamped back to 015 and upgraded again, after the indexer has recorded an identity that differs from the current `vault_path`
-- **THEN** the recorded identity SHALL be left unchanged
+- **WHEN** the database is stamped back to 015 and upgraded again, after the indexer has recorded provenance whose assignment differs from the current `vault_path`
+- **THEN** the recorded provenance SHALL be left unchanged in all three columns
 
 #### Scenario: A foreign column of the same name is refused
 
-- **WHEN** `users` already carries a column named `indexed_vault_path` or `indexed_vault_handle` that is not exactly 016's column — a different type or width, `NOT NULL`, carrying a server default, or lacking the marker — and 016 runs
+- **WHEN** `users` already carries a column named `indexed_vault_assignment`, `indexed_vault_realpath` or `indexed_vault_handle` that is not exactly 016's column — a different type or width, `NOT NULL`, carrying a server default, or lacking the marker — and 016 runs
 - **THEN** the migration SHALL fail naming what it found
 - **AND** SHALL NOT adopt the column and SHALL leave the schema unchanged
 
 #### Scenario: A partial set is refused
 
-- **WHEN** exactly one of the two columns is present, however well formed, and 016 runs
+- **WHEN** one or two of the three columns are present, however well formed, and 016 runs
 - **THEN** the migration SHALL fail naming what it found and SHALL leave the schema unchanged
 
 #### Scenario: A complete pre-existing set is accepted
 
-- **WHEN** both columns are already present, nullable, exactly typed, default-free and marked, and 016 runs
+- **WHEN** all three columns are already present, nullable, exactly typed, default-free and marked, and 016 runs
 - **THEN** the migration SHALL accept them as its own and complete without error
 
 #### Scenario: The model and the migration agree on the marker
 
 - **WHEN** `alembic check` runs at head
-- **THEN** it SHALL report no operation for either column, which is only true while the models' declared column comments are byte-identical to the migration's marker
+- **THEN** it SHALL report no operation for any of the three columns, which is only true while the models' declared column comments are byte-identical to the migration's marker
 
 #### Scenario: Downgrade drops the marked set, all or nothing
 
 - **WHEN** a database at 016 is downgraded to 015
-- **THEN** both marked columns SHALL be dropped
-- **AND** a set in which either column lacks the marker SHALL be left in place instead
+- **THEN** all three marked columns SHALL be dropped
+- **AND** a set in which any column lacks the marker SHALL be left in place instead
 - **AND** no other column SHALL be altered
 
 ### Requirement: Migration 017 owns the transfer-token actor columns as one marked unit
