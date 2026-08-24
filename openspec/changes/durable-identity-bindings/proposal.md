@@ -83,30 +83,141 @@ is not a comparison but a **record**: a value describing the root the rows were
 built from, independent of the current assignment and therefore surviving the
 unassignment.
 
-**Decision: `users.indexed_vault_path`, nullable `String(1024)`, written only
-by the index pass.** Compared at the head of `index_vault(user_id)`, before
-`discover_markdown_files` reads a single file under the new root, in one
-committed transaction. Three outcomes: equal → nothing; different and non-NULL
-→ delete that user's `notes_metadata` (embeddings and links cascade) and stamp
-the new root, in that one transaction; NULL → stamp, delete nothing, because
-the root those rows came from was never recorded and MUST NOT be guessed.
-Skipped entirely for `user_id is None` — single-user mode has no `users` row.
+**Decision: 016 adds two columns, `users.indexed_vault_path` and
+`users.indexed_vault_fsid`, nullable, one marked unit, written only by the
+index pass — and 016 backfills neither.** The pair is the *identity of the
+directory the rows were actually scanned from*, read at the head of
+`index_vault(user_id)` before `discover_markdown_files` opens a single file, and
+compared against the same two facts observed for the assigned root now. Skipped
+entirely for `user_id is None` — single-user mode has no `users` row.
 
-Two properties this buys that a panel-side comparison could not. It **survives
-the unassignment**, which is the whole reason it is a column. And **the indexer
-stays the only writer of index contents**: a second place that deletes
-`notes_metadata` is how two paths drift apart, which is the argument #64 made
-for resolving a grant family exactly one way. Every caller of `index_vault` —
-the startup pass (`indexer.py:1014`), the periodic tick (`indexer.py:1080`) and
-the panel's `_reindex_background` (`control_panel/routes.py:1536`) — inherits
-the reconciliation by calling it, in the same way every tool inherits the
-admission gate by being registered. **Do not let this be talked into the POST
-handler for latency**; that is the trade below and it is taken deliberately.
+**Identity is not a normalised pathname, and this is the part the first draft
+got wrong.** `transfer.canonical_vault_root` is `str(Path(path))` and nothing
+more — its docstring says so, deliberately, because the question *it* answers is
+"is this still the string the operator saved?". Reused here it is wrong in both
+directions: a symlink retargeted from `/data/A` to `/data/B` under an unchanged
+`/vaults/current` yields the *same* string for a *different* directory, so a
+foreign index is kept; and `/vaults/current` versus `/vaults/real-a` naming one
+directory yields *different* strings for the *same* one, so a good index is
+destroyed and re-embedded. So the record is two facts, not one:
 
-A useful consequence: a pass that commits the discard and then fails while
-scanning the new root retries cleanly. The next pass finds the recorded root
-already equal to the assigned root and simply indexes — it does not repeat the
-delete, and it cannot re-serve the old rows, because they are gone.
+- `indexed_vault_path` — `os.path.realpath` of the root as it was scanned. This
+  resolves symlinks and normalises separators, `.` and `..`, so a trailing
+  separator or an aliasing symlink is never read as a reassignment.
+- `indexed_vault_fsid` — an **opaque** `"<st_dev>:<st_ino>"` token for that
+  directory's inode, observed at the same moment. Text, not integers: nobody
+  should do arithmetic on it, and it sidesteps the unsigned-64 question that
+  `bigint` columns would raise.
+
+Neither alone is identity. A realpath comparison cannot see a directory deleted
+and re-created at the same path; an inode tuple cannot be trusted on its own
+because `st_dev` is not guaranteed stable across a reboot for every device type
+and `st_ino` is reusable. So the pass reaches one of four verdicts, and **a keep
+requires both signals to agree**:
+
+| recorded vs. observed | verdict | what the pass does |
+| --- | --- | --- |
+| realpath equal **and** fsid equal | same directory | nothing |
+| realpath differs **and** fsid differs | different directory | **discard**: delete the user's `notes_metadata` (embeddings and links cascade) and stamp, in one committed transaction, before any file under the new root is read |
+| anything else — no record at all, or exactly one of the two disagreeing | **provenance unresolved** | **re-derive** (below), then stamp at the end of the pass |
+| assigned root absent, not a directory, or not stattable | indeterminate | nothing at all: no delete, no stamp; the pass fails as it does today |
+
+**Which error the design prefers, said plainly.** CLAUDE.md ranks silently wrong
+search results above expensive ones, so the design never resolves an ambiguity
+in favour of keeping. It also never resolves one in favour of the *destructive*
+branch: a discard costs a full re-embed, and firing it on an `st_dev` that
+shifted across a reboot would charge that on every restart. Ambiguity therefore
+goes to a third branch that asserts nothing and destroys nothing. The
+indeterminate row is the one place the design does nothing at all, and for a
+reason: you cannot re-derive from a directory you cannot read, and destroying an
+index because a bind mount was briefly unavailable buys nothing and costs the
+full re-embed.
+
+**The re-derive, precisely — and why it is not a compromise.** For an unresolved
+root the pass runs over the assigned root with **content-hash change detection
+disabled**: every discovered file is parsed and upserted regardless of its hash,
+the ordinary prune removes every row whose relative path is not present under
+that root, and because every note counts as changed,
+`_update_links_for_changed` deletes and re-extracts **every** one of that user's
+link rows and re-resolves them against an index built from those notes alone. So
+after the pass, every surviving row and every link row was written by that pass
+from a file under the assigned root. That is a structural claim about who wrote
+the rows, not an enumeration of columns that has to be re-audited whenever a
+column is added.
+
+`note_embeddings` are **not** deleted, and that is where the cost goes. An
+embedding is a pure function of chunk text and `notes_metadata.content_hash`
+proves content equality, so a vector attached to a row whose hash still matches
+the file under the assigned root is *provably* the right vector for that file.
+`embed_vault` already selects on `embedded_content_hash != content_hash`, so it
+re-embeds exactly the notes whose content differs and nothing else.
+
+The marginal cost over an ordinary pass is consequently small: an ordinary pass
+already reads and hashes **100%** of the vault's files, so the re-derive adds
+only the parse-and-upsert of the notes an ordinary pass would have `continue`d
+past, plus one link re-extraction — and **zero embedding calls** for unchanged
+content. Against that, a discard on this vault means re-embedding ~16.7k chunks
+serially through Ollama bge-m3; CLAUDE.md's own figures (a 14 s cold provider
+reload, a ≈0.47 s warm `semantic_search` that includes one embed) put a single
+chunk in the hundreds of milliseconds, so 16.7k of them is **tens of minutes per
+assigned user**, during which `semantic_search` answers from a shrinking
+fraction of the vault. Charging that on every upgrade, to every assigned user,
+is a real availability event; charging it on a deliberate reassignment the
+operator just performed is not.
+
+**Why 016 backfills nothing.** `indexed_vault_path = vault_path` looks free and
+is not: "assigned now" is not "indexed from what is assigned now", and the
+reassignment lag it ignores is the exact defect this change exists to close. An
+admin who reassigns and deploys before the next pass gets rows from vault A
+stamped as B; the next pass then sees both signals equal, takes the no-op
+branch, and the identical-path/identical-hash case — the one that never heals —
+is *guaranteed* suppressed rather than merely possible. NULL is the only value
+that asserts nothing, and under the classification above NULL is not "stamp and
+move on": it is the unresolved branch, so every legacy user is repaired once,
+cheaply, on the first pass after the upgrade, and stamped only then.
+
+This **deletes a hole rather than costing one**. The earlier draft carried a
+"one-time backfill hole" for accounts already unassigned at migration time,
+which got exactly one reassignment without reconciliation. Those accounts are
+now NULL like everybody else and get the same repair. There is no special case
+left to document.
+
+**The stamp is written where the state it describes is established, which means
+two different places.** On the discard branch the state is "this user has no
+index rows", which is true the instant that transaction commits, so the stamp
+goes with it at the head of the pass — and a pass that then fails while scanning
+retries cleanly, because the next one finds both signals equal and simply
+indexes. On the re-derive branch the state is "every row was derived from this
+root", which is not true until the pass finishes, so the stamp is committed
+**after** the pass's last write and only if the pass raised nothing. A crash
+mid-repair leaves no stamp and the next pass repairs again — bounded,
+idempotent, and never a stamp over a half-repaired index. Head-stamping a
+re-derive would be exactly the false provenance this section is about, written
+by our own code instead of by the migration.
+
+**Deploy ordering, and what actually holds.** `make deploy` runs
+`docker compose run --rm obsidian-mcp alembic upgrade head` in a one-off
+container **while the old container is still running**, and only then
+`docker compose up -d --force-recreate`. So an old-code index pass can be
+mid-flight when 016 commits and can go on committing `notes_metadata` rows from
+the old root afterwards. **Nothing serialises the two.** `index_pass_lock` is an
+in-process `asyncio.Lock`; there is no advisory lock, no row lock and no
+cross-container coordination, and claiming otherwise is exactly the kind of
+thing this document exists to not do.
+
+What makes it safe is not a lock but the absence of a backfill: **016 writes no
+provenance, so an old pass's writes have nothing to contradict.** Old code
+cannot write either column — they are not on its models and no code path sets
+them — so every row is NULL when the new container starts, whatever the old pass
+wrote, and the new container's first pass per user takes the unresolved branch
+and re-derives from the assigned root. Overlap between the two indexer loops is
+prevented by `docker compose up -d --force-recreate` being stop-then-start for
+one service, not by anything in the code. The residual is therefore a property
+of the deploy command: **a deploy that runs two indexing containers of this
+service concurrently — a second replica, a rolling deploy, a manually started
+container — can let an old pass commit rows from the old root after a new pass
+has tail-stamped the new one.** `make deploy` does not do that; an operator who
+changes it must quiesce the old container before migrating.
 
 **Accepted residual.** The reconciliation runs in the indexer, so a
 reassignment is honoured at the *next* pass, not at the Save. The window is
@@ -118,19 +229,11 @@ improvement — or refusing every tool for the whole interval, which breaks the
 disk-backed tools that are already correct against the new root. Neither is
 worth it. Same optimistic level as `edit_note(expected=…)` and the transfer
 fingerprint check, and the same "takes effect at the next authenticated
-request" shape as an OAuth revocation. Declared, not discovered.
-
-**The one-time backfill hole.** 016 backfills `indexed_vault_path =
-vault_path` for every row whose `vault_path` is non-NULL — a fact the indexer's
-own scoping rule guarantees, since only an assigned user is ever indexed — and
-leaves it NULL for the rest. It therefore asserts nothing about an account that
-is **already unassigned when the migration runs**. That account's previous root
-was never recorded anywhere, so it gets exactly one reassignment without
-reconciliation, after which it is stamped and behaves like every other account.
-That is a one-time consequence of introducing the column, not a rule, and it
-MUST NOT be closed by guessing: the only guesses available are "the root it is
-being assigned to now" (which silently keeps a foreign index) and "some other
-user's root" (which is nonsense).
+request" shape as an OAuth revocation. Declared, not discovered. And note that
+the *re-derive* branch does not narrow that window even to "nothing served": its
+rows are replaced as the pass proceeds rather than deleted up front. That is the
+price of not asserting a provenance nobody recorded, and it is paid only by the
+one-time legacy population and by genuinely ambiguous identity.
 
 **Rejected: age-based pruning.** Dropping index rows untouched for N days
 invents a retention policy nobody asked for, deletes exactly the rows #66
@@ -138,6 +241,36 @@ preserves on purpose, and costs the full re-embed #66 exists to avoid when it
 is wrong. Reassignment to a different root is a real event with a real trigger;
 "this index is old" is not an event, and an unassigned account later restored
 to its own directory is the *normal* case.
+
+**Rejected: backfill `indexed_vault_path = vault_path`.** The failing input is
+decisive and is carried into the spec as a scenario: vault A holds `Same.md`
+linking to `OnlyA.md`; vault B holds a byte-identical `Same.md` and no
+`OnlyA.md`; the user is indexed on A, reassigned to B, and the deploy runs
+before the next pass. The backfill stamps B over rows built from A, both signals
+then agree, and `Same.md`'s link is dangling forever — the never-heals case
+turned from *possible* into *guaranteed* by the migration meant to prevent it.
+
+**Rejected: force a full discard for every assigned legacy row.** Correct, and
+the most expensive correct thing available. It charges tens of minutes of serial
+embedding per assigned user on the upgrade, for a population in which the
+genuinely drifted accounts — reassigned but not yet reindexed at migration time
+— are a small minority, and it destroys vectors whose validity a content hash
+already proves. The re-derive is correct by the same structural argument and
+costs no embedding call for unchanged content.
+
+**Rejected: quiesce and discard inside the migration.** It makes 016 a second
+deleter of index contents, which is the rule this section already invokes
+against a panel-side purge and which #64 argued for grant families; it cannot in
+fact quiesce a container it does not control, since `make deploy` migrates from
+a *separate* one-off container while the old app is still up; and it pays the
+same full re-embed as the option above.
+
+**Rejected: infer provenance by overlapping the recorded relative paths with the
+files found under the assigned root.** A threshold on a heuristic — high overlap
+"means" the same root — and CLAUDE.md is explicit that a heuristic pretending to
+be a rule should ship behind a flag or in shadow mode rather than absorb another
+round of threshold tuning. Its failure direction is also the wrong one: two
+vaults that share a directory layout produce a high overlap and a silent keep.
 
 ### 2. Transfer-route usage rows lose attribution when the credential is deleted (#92, item 2)
 
@@ -201,6 +334,17 @@ In the #77 register, and for the #77 reasons:
   label. The rows the backfill leaves NULL are therefore the ones that carry no
   credential FK at all — a single-user or sandbox mint — and they render as
   unattributed rather than as a guess.
+- **A label beside a NULL `actor_kind` is drift, and 017 refuses it — 015's
+  `_assert_no_orphan_labels` rule, which the first draft of this proposal
+  omitted while claiming to follow 015 exactly.** The backfill's only guard is
+  `actor_kind IS NULL`, so a row that already carries an `actor_label` or an
+  `actor_ref` under a NULL kind would be *relabelled* from whatever credential
+  its FK points at now — rewriting a recorded attribution, which is the one
+  thing these columns must never do. It is reachable by a stamp-back re-run
+  over a database that drift or a faulty writer has put in that state, so 017
+  runs the same offender query 015 runs, before the backfill, and raises naming
+  the offending ids while changing nothing. Cheap, and it is the invariant that
+  makes the marker pattern safe on re-run rather than merely well-typed.
 - **017 writes nothing to `usage_logs`, and that is a decision.** A transfer
   usage row written before 017 carries no link back to the token that produced
   it — there is no `transfer_token_id` on `usage_logs` and adding one to label
@@ -254,10 +398,52 @@ every target the call is about to publish through**, and the publish helpers
 **refuse a target that carries no stamp from this call**. That is what makes
 inheritance structural rather than conventional — a mutating tool added later
 cannot publish without one, the way a tool added later cannot skip the
-admission gate. The stamp is taken once per call, immediately before the call's
-first publishing syscall, so `move_note(rewrite_links=True)` confirms before
-the `renameat2` that commits the move and its rewrites are covered by the same
-confirmation.
+admission gate.
+
+**One confirmation per publishing operation, not one per call — the first draft
+had this wrong and the correction simplifies it.** "Once per call" is fine for
+the five tools that publish exactly once, and false for `move_note`. That tool's
+single confirmation would have been taken before the `renameat2` and then reused
+across an `async with async_session()` metadata transaction — an await of
+unbounded duration — and across an arbitrary number of separate
+`write_file_at` publications, one per planned link rewrite. Reusing one stamp
+there is the same staleness the change exists to narrow, just relocated: an
+admin who reassigns during that await sees every remaining rewrite land in the
+former vault under a confirmation taken before the reassignment committed. So
+the rule is the simpler one — **the confirmation is taken immediately before
+each publishing operation and covers exactly that operation** — which is what
+makes the residual below ("staging, flush and one publishing call") *true for
+every tool* rather than true for six of seven. The extra cost is one indexed
+primary-key read per rewrite, against one file read and one file write per
+rewrite that the tool already performs.
+
+**And the permanent unlink goes behind a helper, because otherwise the
+structural claim is false.** `delete_note(permanent=True)` currently reaches a
+bare `os.unlink(target.name, dir_fd=target.dir_fd)` — a mutation through a
+`MutableTarget` that no publish helper mediates, so nothing could refuse it for
+a missing stamp. It is the only bare mutating syscall left on that path. A
+`MutableTarget`-based permanent-unlink helper joins `_atomic_write_at`,
+`move_file_no_clobber` and `soft_delete_at` on the seam, and the direct call is
+replaced by it. Without that, "the publish helpers refuse an unstamped target"
+would be an accurate description of five sixths of a destructive-write surface
+and a false description of the whole.
+
+**What a mid-sequence refusal leaves, and what the caller is told.** For
+`move_note(rewrite_links=True)` a per-publication confirmation can refuse
+*after* the move has committed. There is nothing to roll back: the `renameat2`
+happened, and `notes_metadata` and `note_links` were updated to match it, which
+is correct — refusing the metadata update would leave the database describing a
+note that is no longer there. So the tool **stops at the first refusal** —
+every remaining rewrite would write into a vault the caller no longer has,
+through descriptors pinned before the reassignment — and reports the partial
+outcome explicitly: the move completed in the previous root, the assignment
+changed mid-call, and these sources were left unrewritten. That reuses the
+existing `failed_rewrite_sources` idiom, which already carries per-source
+rewrite failures into the result string as a named warning; the reassignment is
+a new reason, not a new mechanism. Silence here would be the worst option: a
+half-rewritten link graph reported as a clean move is precisely the "graph
+asserting a link the vault bytes do not contain" the preflight exists to
+prevent.
 
 **What "changed" means.** The database's current `users.vault_path` for the
 acting user, canonicalised the way `transfer.canonical_vault_root` canonicalises
@@ -270,6 +456,18 @@ is itself a filesystem read that a concurrent rename can change, and the fact
 being checked is what the operator saved, not what the disk currently looks
 like.
 
+**Two questions, two normalisers, and they must not be merged.** Item 1 above
+replaces a lexical comparison with a realpath-plus-inode identity precisely
+because *its* question is "is this the directory those rows were scanned from?".
+This one's question is "is this still the assignment the operator saved?", and
+for it the lexical form is not a weakness but the definition: #88's harm is a
+write landing in a vault the operator has moved the caller out of, and that is a
+change to the record, not to the disk. A symlink retarget under an unchanged
+assignment is deliberately outside #88 — #59 pins the parent descriptor exactly
+so a pathname relinked mid-call cannot redirect a write, and re-resolving here
+would reintroduce the check-then-act #59 removed. So `canonical_vault_root`
+stays exactly as it is and gains no `resolve()`; item 1's identity helper is a
+*second, separate* function, and neither may be refactored into the other.
 **A fresh read, not a cache hit — and the honest cost.** Reading
 `_user_vault_cache` or `current_vault_root` would be a tautology: those are the
 values being checked. So this is one `SELECT users.vault_path, users.is_active
@@ -303,45 +501,72 @@ is the option this change rejected on purpose. What changes is the size of the
 window: from the whole tool body (a read, a diff, a section resolve, an
 embedding-sized payload) down to staging, `fsync` and one publishing call.
 
+Because the confirmation is per publishing operation rather than per call, that
+bound holds for `move_note(rewrite_links=True)` too — each rewrite carries its
+own window rather than inheriting one taken before the move — at the cost that
+the tool has *several* such windows and can therefore be refused part way
+through. That partial outcome is specified above and reported, not swallowed.
+The metadata transaction between the move and the first rewrite is not covered
+by any confirmation and does not need to be: it writes no vault bytes, and it
+describes a publication that has already happened.
+
 ## What Changes
 
-- **`users.indexed_vault_path`** (migration 016, nullable `varchar(1024)`, no
-  server default, marked): the root a user's index was built from, written only
-  by `index_vault` and never by an operator-facing handler.
-- **`index_vault` reconciles before it scans.** Equal → no-op; different and
-  non-NULL → delete the user's `notes_metadata` (embeddings and links cascade)
-  and stamp, in one committed transaction, before any file under the new root
-  is read; NULL → stamp only. Never for `user_id is None`.
+- **`users.indexed_vault_path` and `users.indexed_vault_fsid`** (migration 016,
+  nullable `varchar(1024)` and `varchar(64)`, no server defaults, one marked
+  unit): the realpath and the opaque `"<st_dev>:<st_ino>"` identity of the
+  directory a user's index was actually scanned from, written only by
+  `index_vault` and never by an operator-facing handler. **016 backfills
+  neither.**
+- **`index_vault` classifies the root before it scans.** Both signals equal →
+  no-op; both differ → delete the user's `notes_metadata` (embeddings and links
+  cascade) and stamp, in one committed transaction, before any file under the
+  new root is read; anything else, including no record at all → re-derive the
+  index from the assigned root (change detection off, prune as usual, every link
+  row re-extracted and re-resolved, embeddings kept where the content hash still
+  matches) and stamp after the pass completes; assigned root unreadable →
+  nothing at all. Never for `user_id is None`.
 - **`transfer_tokens.actor_kind` / `actor_label` / `actor_ref`** (migration 017,
   nullable, marked): the denormalised actor, read from `current_actor` inside
   `mint_token` through the same single reader `_log_usage` uses, and copied onto
   the `UsageLog` by `_log_row` at redemption.
 - **017 backfills `transfer_tokens` only**, from its own surviving FKs, guarded
-  on `actor_kind IS NULL`. It writes nothing to `usage_logs`.
-- **Every vault mutation confirms the assignment before it publishes.** A fresh
-  read stamps the targets the call is about to publish through; the publish
-  helpers refuse an unstamped target; a changed, cleared or deactivated
-  assignment refuses the call with nothing written and
-  `usage_logs.params.error = "vault_reassigned"`.
+  on `actor_kind IS NULL` and preceded by 015's orphan-label check (a label
+  beside a NULL kind aborts the migration, changing nothing). It writes nothing
+  to `usage_logs`.
+- **Every vault mutation confirms the assignment before each publishing
+  operation.** A fresh read stamps the target that operation publishes through;
+  the publish helpers — including a new `MutableTarget`-based permanent-unlink
+  helper that replaces `delete_note(permanent=True)`'s bare `os.unlink` — refuse
+  an unstamped target; a changed, cleared or deactivated assignment refuses with
+  nothing written and `usage_logs.params.error = "vault_reassigned"`.
+- **`move_note(rewrite_links=True)` confirms before the move and before each
+  link rewrite**, stops at the first refusal, and reports the partial outcome:
+  which root the move landed in and which sources were left unrewritten.
 - **`delete_file` confirms the same way** before its soft delete or unlink,
   since it does not publish through a `MutableTarget`.
 - **The schema gate covers both migrations.** `tests/integration/
   test_schema_check.py` gains the 016 and 017 cases at the 013/014/015 bar —
-  fresh shape and marker, backfill grouping, stamp-back idempotence, foreign
-  and partial-column refusals, downgrade — and `HEAD_REVISION` becomes `017`.
+  fresh shape and marker, the absence of a 016 backfill, 017's backfill
+  grouping and orphan-label refusal, stamp-back idempotence, foreign and
+  partial-column refusals, downgrade — and `HEAD_REVISION` becomes `017`.
 
 ## Capabilities
 
 ### Modified Capabilities
-- `index-integrity`: the index records the root it was built from, and a pass
-  discards an index whose root has moved before it scans the new one.
+- `index-integrity`: the index records the identity of the directory it was
+  scanned from; a pass reconciles against that identity before it scans,
+  discarding an index whose directory demonstrably moved and re-deriving one
+  whose provenance it cannot resolve.
 - `schema-integrity`: migrations 016 and 017, each owning its columns as a
   marked unit, with `alembic check` clean at head.
 - `file-transfer`: a transfer capability records the actor that minted it, and
   the redemption's usage row carries that actor; `delete_file` confirms the
   vault assignment before it deletes.
 - `vault-write`: a mutation confirms the caller's vault assignment immediately
-  before it publishes, and refuses when it has moved.
+  before each publishing operation, and refuses when it has moved; every
+  destructive syscall on a mutation target, the permanent unlink included, goes
+  through a helper that enforces it.
 
 No new capability. The two migration requirements go to `schema-integrity`
 rather than beside their behaviour (015 put its migration requirement in
@@ -361,20 +586,27 @@ stays about the admission gate.
 
 ## Impact
 
-- `alembic/versions/016_indexed_vault_path.py` — new
+- `alembic/versions/016_indexed_vault_identity.py` — new
 - `alembic/versions/017_transfer_token_actor.py` — new (`down_revision = "016"`)
-- `src/models/db.py` — `User.indexed_vault_path` with 016's marker;
-  `TransferToken.actor_kind` / `actor_label` / `actor_ref` with 017's marker
-- `src/services/indexer.py` — the reconciliation at the head of `index_vault`
+- `src/models/db.py` — `User.indexed_vault_path` / `User.indexed_vault_fsid`
+  with 016's marker; `TransferToken.actor_kind` / `actor_label` / `actor_ref`
+  with 017's marker
+- `src/services/indexer.py` — the root-identity helper (realpath + fsid, its own
+  function, **not** a change to `transfer.canonical_vault_root`), the
+  classification at the head of `index_vault`, the re-derive mode, and the
+  tail stamp
 - `src/auth/session.py` — the one shared reader of `current_actor`, extracted
   from `tools.py::_actor_columns` so mint and log cannot drift
 - `src/services/transfer.py` — `mint_token` records the actor; the pre-publish
   root confirmation helper
 - `src/transfer/routes.py` — `_log_row` copies the three columns
-- `src/services/vault.py` — the confirmation stamp on `MutableTarget` and the
-  publish helpers' refusal of an unstamped target
-- `src/mcp_server/tools.py` — the confirmation call on each mutating tool,
-  `delete_file`'s own confirmation, and the `vault_reassigned` marker
+- `src/services/vault.py` — the confirmation stamp on `MutableTarget`, the
+  publish helpers' refusal of an unstamped target, and a new permanent-unlink
+  helper on the same seam
+- `src/mcp_server/tools.py` — the confirmation before each publishing operation,
+  `move_note`'s per-rewrite confirmation and partial-outcome reporting,
+  `delete_note(permanent=True)` routed through the new helper, `delete_file`'s
+  own confirmation, and the `vault_reassigned` marker
 - `tests/integration/test_schema_check.py` — 016 and 017 cases;
   `HEAD_REVISION = "017"`
 - `tests/test_issue_91_indexed_root.py`,

@@ -1,61 +1,65 @@
 ## ADDED Requirements
 
-### Requirement: Migration 016 owns the indexed-root column as a marked unit
-Migration 016 SHALL add `users.indexed_vault_path` as a nullable `character varying(1024)` with no server default, stamped with 016's ownership marker as its column comment; SHALL backfill it from `users.vault_path` for every row whose `vault_path` is not null; SHALL leave it null for every row whose `vault_path` is null; and SHALL guard the backfill so that a re-run cannot overwrite a value the indexer has since written. `downgrade()` SHALL drop the column only if it carries the marker. After migrating to head, `alembic check` SHALL report no pending operations.
+### Requirement: Migration 016 owns the indexed-root identity columns as one marked unit
+Migration 016 SHALL add `users.indexed_vault_path` as a nullable `character varying(1024)` and `users.indexed_vault_fsid` as a nullable `character varying(64)`, both with no server default and each stamped with 016's ownership marker as its column comment. It SHALL leave both columns null for **every** existing row and SHALL perform no backfill of any kind. `downgrade()` SHALL drop the columns only if they carry the marker, all-or-nothing. After migrating to head, `alembic check` SHALL report no pending operations, and the same marker string SHALL be declared on the ORM columns so the check compares it.
 
-The marker is load-bearing for a stronger reason here than on a display column. This value is the sole input to a decision that **deletes a user's entire index** — `notes_metadata` and, by cascade, their embeddings and link rows. A same-named `varchar(1024)` of unknown provenance adopted as "the root those rows came from" is a mass delete on the strength of a string nobody in this scheme wrote. So 016 SHALL refuse a pre-existing `indexed_vault_path` that is not exactly its own column — wrong type, wrong width, `NOT NULL`, carrying a server default, or unmarked — naming what it found, rather than adopting it. The same marker string SHALL be declared on the ORM column so `alembic check` compares it and the two cannot silently drift.
+Not backfilling is the load-bearing decision, not an omission. Deriving `indexed_vault_path` from `users.vault_path` would assert that an assigned user's index was built from the root assigned *now*, which is exactly the reassignment lag the record exists to detect: an administrator who reassigns and deploys before the next index pass would have rows built from one vault stamped as belonging to another, after which both identity signals agree, the pass takes its no-op branch, and the identical-path/identical-content link case that never heals becomes guaranteed rather than merely possible. A null record means "provenance unknown", which is the only true statement available at migration time, and the pass repairs such a user by re-deriving the index rather than by discarding it — so introducing the columns costs no vault-wide re-embed.
 
-The backfill asserts a fact the indexer's own scoping rule guarantees: only a user with a non-null `vault_path` is ever indexed, so an assigned user's rows were built from the root currently assigned. It asserts nothing about an unassigned user, whose previous root was never recorded anywhere; such an account is left null and therefore gets exactly one reassignment without reconciliation. That is a one-time consequence of introducing the column, not a rule, and it MUST NOT be closed by guessing a root.
+Not backfilling is also what makes the deploy order safe without any cross-container coordination. An index pass running under the previous code during or after the migration cannot write these columns, so it cannot produce a record for the new code to trust; every row is null when the new container starts, whatever that pass committed.
+
+The marker is load-bearing for a stronger reason here than on a display column. This record is the sole input to a decision that can **delete a user's entire index** — `notes_metadata` and, by cascade, their embeddings and link rows. A same-named column of unknown provenance adopted as "the directory those rows came from" is a mass delete on the strength of a value nobody in this scheme wrote. So 016 SHALL refuse a pre-existing column of either name that is not exactly its own — wrong type, wrong width, `NOT NULL`, carrying a server default, or unmarked — and SHALL refuse a partial set in which one column is present and the other absent, naming what it found, rather than adopting it.
 
 #### Scenario: Fresh database
 
 - **WHEN** an empty database is migrated to head
-- **THEN** `users.indexed_vault_path` SHALL exist as nullable `character varying(1024)` with no server default and SHALL carry 016's marker as its column comment
+- **THEN** `users.indexed_vault_path` SHALL exist as nullable `character varying(1024)` and `users.indexed_vault_fsid` as nullable `character varying(64)`, both with no server default and both carrying 016's marker as their column comment
 - **AND** `alembic check` SHALL report no new upgrade operations
 
-#### Scenario: Backfill on a populated database
+#### Scenario: The migration backfills nothing
 
-- **WHEN** 016 runs on a database holding both assigned and unassigned users
-- **THEN** every assigned user's `indexed_vault_path` SHALL equal that user's own `vault_path`
-- **AND** every unassigned user's `indexed_vault_path` SHALL be null
-- **AND** no user SHALL be stamped with another user's root
+- **WHEN** 016 runs on a database holding both assigned and unassigned users, each with existing `notes_metadata` rows
+- **THEN** both columns SHALL be null for every user, including every assigned one
+- **AND** no `notes_metadata`, `note_embeddings` or `note_links` row SHALL be modified or deleted
 
-#### Scenario: Re-running the migration does not overwrite a stamp
+#### Scenario: Re-running the migration does not overwrite a record
 
-- **WHEN** the database is stamped back to 015 and upgraded again, after the indexer has recorded a root that differs from the current `vault_path`
-- **THEN** the recorded root SHALL be left unchanged
+- **WHEN** the database is stamped back to 015 and upgraded again, after the indexer has recorded an identity that differs from the current `vault_path`
+- **THEN** the recorded identity SHALL be left unchanged
 
 #### Scenario: A foreign column of the same name is refused
 
-- **WHEN** `users` already carries a column named `indexed_vault_path` that is not exactly 016's column — a different type or width, `NOT NULL`, carrying a server default, or lacking the marker — and 016 runs
+- **WHEN** `users` already carries a column named `indexed_vault_path` or `indexed_vault_fsid` that is not exactly 016's column — a different type or width, `NOT NULL`, carrying a server default, or lacking the marker — and 016 runs
 - **THEN** the migration SHALL fail naming what it found
-- **AND** SHALL NOT adopt the column, SHALL NOT backfill it, and SHALL leave the schema unchanged
+- **AND** SHALL NOT adopt the column and SHALL leave the schema unchanged
 
-#### Scenario: A complete pre-existing column is accepted
+#### Scenario: A partial set is refused
 
-- **WHEN** `users.indexed_vault_path` is already present, nullable, exactly typed, default-free and marked, and 016 runs
-- **THEN** the migration SHALL accept it as its own and complete without error
+- **WHEN** exactly one of the two columns is present, however well formed, and 016 runs
+- **THEN** the migration SHALL fail naming what it found and SHALL leave the schema unchanged
+
+#### Scenario: A complete pre-existing set is accepted
+
+- **WHEN** both columns are already present, nullable, exactly typed, default-free and marked, and 016 runs
+- **THEN** the migration SHALL accept them as its own and complete without error
 
 #### Scenario: The model and the migration agree on the marker
 
 - **WHEN** `alembic check` runs at head
-- **THEN** it SHALL report no operation for `users.indexed_vault_path`, which is only true while the model's declared column comment is byte-identical to the migration's marker
+- **THEN** it SHALL report no operation for either column, which is only true while the models' declared column comments are byte-identical to the migration's marker
 
-#### Scenario: Downgrade
+#### Scenario: Downgrade drops the marked set, all or nothing
 
 - **WHEN** a database at 016 is downgraded to 015
-- **THEN** the marked column SHALL be dropped
+- **THEN** both marked columns SHALL be dropped
+- **AND** a set in which either column lacks the marker SHALL be left in place instead
 - **AND** no other column SHALL be altered
-
-#### Scenario: Downgrade leaves an unmarked column alone
-
-- **WHEN** a database at 016 whose `indexed_vault_path` does not carry the marker is downgraded to 015
-- **THEN** the column SHALL be left in place rather than dropped
 
 ### Requirement: Migration 017 owns the transfer-token actor columns as one marked unit
 Migration 017 SHALL add `transfer_tokens.actor_kind`, `actor_label` and `actor_ref` as nullable `character varying(20)`, `character varying(255)` and `character varying(64)` with no server defaults, each stamped with 017's ownership marker as its column comment. It SHALL backfill them from the row's own surviving credential foreign key — through `api_keys` for a key-minted row and through `oauth_tokens` → `oauth_clients` for an OAuth-minted one — guarded on `actor_kind IS NULL` so a re-run cannot rewrite a value minting has since recorded. `downgrade()` SHALL drop only marked columns, all-or-nothing. After migrating to head, `alembic check` SHALL report no pending operations, and the marker SHALL be declared on the ORM columns so the check compares it.
 
 The three columns are one owned unit: 017 SHALL complete only a set that is all present, exactly typed, nullable, default-free **and** marked, and SHALL refuse anything else — a partial set, a `NOT NULL` column, one carrying a server default, or a foreign column of the same name — naming what it found. Type and width are a coincidence anyone could reproduce; the marker is the only evidence that this scheme wrote the values, which is the whole basis for rendering them to an operator as an audit trail.
+
+Before it writes anything, 017 SHALL enforce migration 015's orphan-label invariant on `transfer_tokens`: no row may carry an `actor_label` or an `actor_ref` while its `actor_kind` is null. The backfill's only guard is `actor_kind IS NULL`, so such a row would be relabelled from whatever credential its foreign key points at now, overwriting a recorded attribution — the one thing these columns must never do. On finding any such row the migration SHALL fail naming the offending rows and SHALL change nothing. This state is reached by drift or a faulty writer rather than by any current application path, which is why the check is cheap insurance rather than a hot path; it is also the invariant that makes the marker pattern safe on a stamp-back re-run rather than merely well typed.
 
 Nothing is invented. 017 labels a row from the credential its own foreign key points at, or leaves it null. Because `transfer_tokens.key_id` and `transfer_tokens.oauth_token_id` are both `ON DELETE CASCADE`, a row whose minting credential has been deleted does not survive to be labelled at all; the rows the backfill leaves null are therefore the ones that carry no credential foreign key. 017 SHALL NOT write to `usage_logs`: a transfer usage row written before 017 carries no reference to the token that produced it, and the only alternative — re-running migration 015's own credential join — would put a second writer on columns 015 owns and guards.
 
@@ -87,6 +91,12 @@ Nothing is invented. 017 labels a row from the credential its own foreign key po
 
 - **WHEN** the database is stamped back to 016 and upgraded again, after a mint has recorded an actor whose label differs from the credential's current name
 - **THEN** the recorded actor SHALL be left unchanged
+
+#### Scenario: A label beside a null kind aborts the migration
+
+- **WHEN** the database is stamped back to 016 and upgraded again, and a `transfer_tokens` row carries an `actor_label` or an `actor_ref` while its `actor_kind` is null
+- **THEN** the migration SHALL fail naming the offending rows
+- **AND** SHALL leave every `transfer_tokens` row exactly as it was, rewriting no label from the credential the row points at now
 
 #### Scenario: A partial or foreign set is refused
 
