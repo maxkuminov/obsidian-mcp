@@ -76,9 +76,17 @@ services:
       - "traefik.http.routers.obsidian-mcp-apirest-rtr.tls.certresolver=dns-namecheap"
       - "traefik.http.routers.obsidian-mcp-apirest-rtr.middlewares=chain-oauth@file"
       - "traefik.http.routers.obsidian-mcp-apirest-rtr.service=obsidian-mcp-svc"
-      # Root MCP router — bypass OAuth when any Bearer header present (priority=100)
+      # Root MCP router — bypass OAuth for a bare `/` carrying a Bearer token
+      # (clients like OpenWebUI strip the /mcp prefix; RootMCPProxyMiddleware
+      # rewrites exactly `/` → `/mcp/` and nothing else). The `Path(`/`)` scope
+      # is load-bearing security, not tidiness: without it this rule's
+      # priority=100 outranks the OAuth-protected panel/api routers (whose
+      # default priority is their rule length, ~52–78) for EVERY path, so any
+      # request to `/admin/*` or `/api/*` carrying any `Authorization: Bearer`
+      # header would reach the app with the `chain-oauth@file` middleware
+      # bypassed. Keep the path scope on any future header-matched root rule.
       - "traefik.http.routers.obsidian-mcp-root-rtr.entrypoints=https"
-      - "traefik.http.routers.obsidian-mcp-root-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && HeaderRegexp(`Authorization`, `^Bearer `)"
+      - "traefik.http.routers.obsidian-mcp-root-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && Path(`/`) && HeaderRegexp(`Authorization`, `^Bearer `)"
       - "traefik.http.routers.obsidian-mcp-root-rtr.tls=true"
       - "traefik.http.routers.obsidian-mcp-root-rtr.tls.certresolver=dns-namecheap"
       - "traefik.http.routers.obsidian-mcp-root-rtr.priority=100"
