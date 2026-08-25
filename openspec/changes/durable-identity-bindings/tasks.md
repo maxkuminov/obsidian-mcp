@@ -883,3 +883,95 @@ path is unchanged.
       graph tool after a reindex (the reconciliation left a coherent index).
       Do **not** exercise a live reassignment against the operator's own
       account; that path is covered by tests.
+
+## Adversarial round 1 — record
+
+The first adversarial Codex pass over the implemented change (branch
+`spec/durable-identity-bindings` at `0e23917`) returned FAIL with seven
+findings. All seven were verified against the code before being acted on; none
+was found wrong. Dispositions:
+
+1. **BLOCKER — the discard was not bound to the assignment that produced it**
+   (`indexer.py`). **Fixed.** The discard transaction now takes the `users` row
+   `SELECT … FOR UPDATE`, re-reads it, and requires present/active/assigned and
+   `vault_path == facts.assignment` before deleting anything; the three-column
+   stamp beside it must affect exactly one row or the whole transaction rolls
+   back. Any disagreement deletes nothing, records nothing and aborts the pass,
+   so the next one reclassifies. The re-derive's tail stamp takes the same lock
+   and the same re-read and is *withheld* on disagreement (it destroys nothing,
+   so failing the pass would buy nothing). Spec: index-integrity, the discard
+   requirement plus four scenarios.
+2. **MAJOR — verify-then-embed database TOCTOU.** **Fixed.** `embed_note` takes
+   `certified_hash` / `certified_path` — what the bytes were verified against —
+   and stamps them with a conditional, row-locking `UPDATE … WHERE id AND
+   file_path AND content_hash = H1`, issued **before** any vector is replaced
+   and **after** the provider call. A row that moved matches nothing;
+   `StaleCertification` rolls the note back and leaves it unmarked. The hash
+   written is H1, never one re-read from the row. The reviewer's suggested
+   defence-in-depth `embedded_content_hash = content_hash` predicate on
+   `semantic_search` was **not** adopted: it would silently drop every edited
+   note from semantic search until the next embedding pass, which is a
+   behavioural change of its own and is not what the finding requires.
+3. **MAJOR — a confirmation DB failure after the move stood.** **Fixed.**
+   `VaultConfirmationUnavailable` (deliberately not a `RuntimeError`)
+   distinguishes "the read failed" from "the assignment changed". Before a
+   call's first publication it propagates, as decided. In `move_note`'s rewrite
+   loop, after the move has committed, it is caught: the remaining rewrites
+   stop and the partial outcome is reported through the existing
+   `failed_rewrite_sources` idiom, naming it a **confirmation outage** rather
+   than a reassignment, with the usage marker
+   `vault_confirmation_unavailable` — distinct from both
+   `vault_assignment_changed` and `no_vault_assigned`. Both timings tested.
+4. **MAJOR — 017's deploy window.** **Declared, not quiesced** — the standing
+   decision, and it stands. An old-code mint between the backfill and the
+   container recreate produces a row with NULL actor columns: the tail of the
+   already-declared 015→017 gap, rendering through the join fallback exactly
+   like every pre-017 row and degrading only if the credential is later
+   deleted. Recorded as a declared residual in 017's docstring, in the
+   schema-integrity delta (a requirement symmetric with 016's treatment) and in
+   CLAUDE.md. No Makefile change and no deployment barrier: the window is
+   seconds long, the fallback works, and quiescing the service for a column
+   addition and a small backfill trades a real ongoing availability cost
+   against it.
+5. **MAJOR — the confirmation was not structurally single-use, target-bound or
+   await-safe.** **Fixed, by removing the retainable stamp entirely.**
+   `MutableTarget.confirm` / `take_confirmation` / `clear_confirmation` /
+   `is_confirmed` are gone, `confirm_vault_assignment` is now private, and the
+   single public entry point is
+   `vault.confirmed_publication(user_id, publish)` — it awaits the read and
+   calls a **synchronous** `publish` before returning control, and refuses a
+   coroutine function or a returned awaitable. `RootConfirmation` carries its
+   own spent flag (so one object cannot be spent through two targets) and
+   `consume` validates the acting user id and canonical assignment against
+   `MutableTarget.user_id` / `.assignment`. The two-ended move uses a
+   `MovePermit`: single-use, that target pair only, not a confirmation and not
+   convertible into one. All six tools, `delete_file` and the rewrite loop were
+   reworked; the test that awaited between stamp and publish is gone and is
+   replaced by one asserting the API makes it unwriteable.
+   `UnconfirmedPublication` vs `VaultAssignmentChanged` is unchanged. Spec:
+   vault-write, the structural-enforcement requirement plus four scenarios,
+   including the rollback permit — which also resolves the verifier's
+   concern 2, the two-ended stamp whose reasoning lived only in a comment.
+6. **MAJOR — 017 arbitrarily attributed a double-FK row.** **Fixed.** 017
+   refuses rows where both credential FKs are non-NULL, naming the ids in
+   013's and 015's offender shape, **before** either backfill statement; it
+   then creates `ck_transfer_tokens_one_credential`
+   (`key_id IS NULL OR oauth_token_id IS NULL` — both NULL stays legal),
+   marker-owned, resolved through `pg_constraint` against the server's own
+   rendering, requiring `convalidated`, and dropped on downgrade only if
+   marked. `transfer.Identity.__post_init__` asserts the same invariant.
+   Schema-gate cases added for the fresh shape, the rejected insert, the
+   offender refusal, the impostor / unmarked / `NOT VALID` constraints,
+   stamp-back idempotence and the downgrade.
+7. **MINOR — vacuous parametrization.** **Fixed.**
+   `test_embed_vault_runs_under_every_classification` is replaced by
+   `test_embed_vault_applies_no_provenance_gate_at_all`, which asserts the
+   property directly (the classifier and the provenance read are monkeypatched
+   to fail the test if reached), plus the finding-2 race test and its positive
+   control.
+
+Two non-blocking items from the independent verifier were folded in with these:
+the silent link-extraction skip in `_update_links_for_changed` (a changed path
+with no index row) now records a skip like its sibling, with a test and a spec
+scenario; and CLAUDE.md gained register sections for the #88 confirmation and
+the #91 provenance record.

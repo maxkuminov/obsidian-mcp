@@ -18,7 +18,7 @@ from sqlalchemy.dialects.postgresql import insert
 from src.config import settings
 from src.database import async_session
 from src.models.db import NoteEmbedding, NoteLink, NoteMetadata, OAuthCode, OAuthToken, User
-from src.services.embeddings import embed_note
+from src.services.embeddings import StaleCertification, embed_note
 from src.services.fts import index_tsvector_sql
 from src.services.links import build_vault_index, extract_links, resolve_target
 from src.services.transfer import canonical_vault_root
@@ -456,7 +456,7 @@ async def _read_recorded_provenance(session, user_id: int):
     return row[0], row[1], row[2]
 
 
-async def _stamp_provenance(session, user_id: int, facts: RootFacts) -> None:
+async def _stamp_provenance(session, user_id: int, facts: RootFacts) -> int:
     """Write **all three** facts, NULL for anything not observed.
 
     There is no partial stamp. No branch may update one column and leave
@@ -466,10 +466,14 @@ async def _stamp_provenance(session, user_id: int, facts: RootFacts) -> None:
     handle available NULLs a previously recorded handle rather than leaving it
     beside a freshly observed pathname pair.
 
-    Does not commit: the caller decides which transaction this belongs to, and
-    on the discard path that is emphatically the same one as the delete.
+    Returns the number of rows the UPDATE touched. **Every caller checks it is
+    exactly one**: a stamp that wrote no row is a provenance record that does
+    not exist, and on the discard path the delete beside it must not stand
+    without it. Does not commit: the caller decides which transaction this
+    belongs to, and on the discard path that is emphatically the same one as
+    the delete.
     """
-    await session.execute(
+    result = await session.execute(
         update(User)
         .where(User.id == user_id)
         .values(
@@ -478,6 +482,67 @@ async def _stamp_provenance(session, user_id: int, facts: RootFacts) -> None:
             indexed_vault_handle=facts.handle,
         )
     )
+    return result.rowcount
+
+
+class ProvenanceRaceAborted(RuntimeError):
+    """The assignment moved between the classification and the act.
+
+    Raised by `_assert_still_assigned` when the locked, freshly read
+    `users.vault_path` no longer equals the assignment the classification was
+    computed against. Nothing has been deleted and nothing stamped; the pass
+    aborts and the next one reclassifies against whatever the row says then.
+    """
+
+
+async def _assert_still_assigned(session, user_id: int, facts: RootFacts) -> None:
+    """Lock the user row and prove it still names the assignment we classified.
+
+    **The classification is not, by itself, a licence to act on it.** `facts`
+    is computed from a `vault` path that came out of the process cache, and the
+    branches that act on it — the discard's delete, and either provenance stamp
+    — run in a *later* transaction. In between, an administrator can reassign,
+    or correct a reassignment back to the root the index was actually built
+    from. The reviewer's failing input is the second one: the pass classifies A
+    against B as a discard, the administrator puts the assignment back to A,
+    and the discard then deletes a complete, valid A index and records
+    provenance B beside an empty one.
+
+    So the act is bound to the assignment that produced it. `SELECT … FOR
+    UPDATE` takes the row, and under READ COMMITTED the lock wait re-reads the
+    latest committed version, so what comes back is the assignment as of the
+    moment we hold it — not a snapshot taken before a concurrent commit. It is
+    held for the rest of the transaction, so the delete and the stamp beside it
+    cannot straddle a change either.
+
+    An inactive user, a deleted row, a cleared `vault_path` or a different one
+    all abort: none of them is the state the classification described.
+    """
+    row = (
+        await session.execute(
+            select(User.vault_path, User.is_active)
+            .where(User.id == user_id)
+            .with_for_update()
+        )
+    ).first()
+    if row is None:
+        raise ProvenanceRaceAborted(
+            f"user_id={user_id} no longer exists"
+        )
+    if not row.is_active:
+        raise ProvenanceRaceAborted(
+            f"user_id={user_id} is no longer active"
+        )
+    if row.vault_path is None:
+        raise ProvenanceRaceAborted(
+            f"the vault assignment for user_id={user_id} has been cleared"
+        )
+    current = canonical_vault_root(row.vault_path)
+    if current != facts.assignment:
+        raise ProvenanceRaceAborted(
+            f"the vault assignment for user_id={user_id} is now "
+            f"{current!r}, not the {facts.assignment!r} this pass classified"
+        )
 
 
 async def classify_for_pass(session, user_id: int, vault: Path, root_fd: int):
@@ -726,10 +791,15 @@ async def _reconcile_provenance(
     - **discard** — delete the user's `notes_metadata` (embeddings cascade,
       links cascade on `source_note_id` and null out on `target_note_id`) and
       stamp the new provenance **in one committed transaction**, so no pass can
-      leave rows from one vault beside a record naming another. The pass then
-      indexes the new root ordinarily: the index is empty, so there is nothing
-      to re-derive, and a pass that fails after this retries cleanly because
-      the next one finds both facts in agreement.
+      leave rows from one vault beside a record naming another. That
+      transaction first locks the `users` row and proves it still names the
+      assignment this verdict was computed against (`_assert_still_assigned`),
+      because the classification ran earlier, against a cached root, and an
+      administrator correcting a reassignment back in between would otherwise
+      have a valid index deleted underneath them. The pass then indexes the new
+      root ordinarily: the index is empty, so there is nothing to re-derive,
+      and a pass that fails after this retries cleanly because the next one
+      finds both facts in agreement.
     - **re-derive** — no delete and no stamp here; the stamp is withheld until
       the pass has finished, and only if it raised nothing *and* skipped
       nothing.
@@ -756,10 +826,45 @@ async def _reconcile_provenance(
 
     if classification.verdict == PROVENANCE_DISCARD:
         async with async_session() as session:
+            # **The delete is bound to the assignment that produced the
+            # verdict, not merely to the user.** The classification was
+            # computed in an earlier transaction against a root that came out
+            # of the process cache; between then and here an administrator can
+            # have corrected the reassignment back, and the delete would then
+            # destroy a complete, valid index for the assignment the row
+            # currently names. Lock the row, re-read it, and abort on any
+            # disagreement — nothing deleted, nothing stamped, and the next
+            # pass reclassifies against whatever the row says then.
+            try:
+                await _assert_still_assigned(session, user_id, facts)
+            except ProvenanceRaceAborted as exc:
+                await session.rollback()
+                logger.warning(
+                    "Discard aborted%s: %s. Nothing was deleted and no "
+                    "provenance was recorded; the next pass will reclassify.",
+                    log_suffix,
+                    exc,
+                )
+                raise RuntimeError(
+                    f"Index provenance discard aborted{log_suffix}: {exc}. "
+                    "Nothing was deleted and no provenance was recorded."
+                ) from None
             result = await session.execute(
                 delete(NoteMetadata).where(NoteMetadata.user_id == user_id)
             )
-            await _stamp_provenance(session, user_id, facts)
+            stamped = await _stamp_provenance(session, user_id, facts)
+            if stamped != 1:
+                # The stamp must land on exactly the row we locked. Zero rows
+                # means the record does not exist, and a delete standing beside
+                # a missing record is the "rows from one vault beside a record
+                # naming another" this branch exists to make impossible.
+                await session.rollback()
+                raise RuntimeError(
+                    f"Index provenance discard aborted{log_suffix}: the "
+                    f"provenance stamp for user_id={user_id} matched "
+                    f"{stamped} row(s), not exactly one. Nothing was deleted "
+                    "and no provenance was recorded."
+                )
             await session.commit()
         logger.warning(
             "Vault reassignment detected%s: %s. Discarded %s notes_metadata "
@@ -1110,15 +1215,38 @@ async def _index_vault_pinned(
                     _format_skips(skips),
                 )
             else:
-                await _stamp_provenance(session, user_id, facts)
-                logger.info(
-                    "Re-derive complete%s: recorded provenance "
-                    "assignment=%r realpath=%r handle=%s",
-                    log_suffix,
-                    facts.assignment,
-                    facts.realpath,
-                    facts.handle if facts.handle is not None else "none",
-                )
+                # The same binding as the discard's, for the same reason: this
+                # stamp is provenance too, and a record written under an
+                # assignment the row no longer names is exactly the false
+                # provenance the record exists to prevent. It is withheld
+                # rather than fatal — the re-derive's repairs are still
+                # correct for the root they were read from, nothing was
+                # destroyed, and an unrecorded provenance simply makes the next
+                # pass re-derive again.
+                try:
+                    await _assert_still_assigned(session, user_id, facts)
+                    stamped = await _stamp_provenance(session, user_id, facts)
+                except ProvenanceRaceAborted as exc:
+                    logger.warning(
+                        "Re-derive complete but not recorded%s: %s. The next "
+                        "pass will reclassify and re-derive again.",
+                        log_suffix,
+                        exc,
+                    )
+                else:
+                    if stamped != 1:
+                        raise RuntimeError(
+                            f"Re-derive stamp{log_suffix} matched {stamped} "
+                            f"row(s) for user_id={user_id}, not exactly one."
+                        )
+                    logger.info(
+                        "Re-derive complete%s: recorded provenance "
+                        "assignment=%r realpath=%r handle=%s",
+                        log_suffix,
+                        facts.assignment,
+                        facts.realpath,
+                        facts.handle if facts.handle is not None else "none",
+                    )
         elif skips:
             logger.warning(
                 "%d discovered path(s) were not fully processed%s: %s",
@@ -1189,6 +1317,18 @@ async def _update_links_for_changed(
             for path in changed_paths:
                 src_id = paths_to_id.get(path)
                 if src_id is None:
+                    # Practically unreachable — the index is selected after the
+                    # upsert, in this same transaction — but it is a link
+                    # extraction that did not happen, and A.7a's rule is that
+                    # *any* such skip withholds the re-derive's certification.
+                    # Its sibling below records one; recording only one of the
+                    # two would leave the one branch that can drop a link row
+                    # while still stamping "every link row was written by this
+                    # pass".
+                    if skips is not None:
+                        skips.append(
+                            f"{path} (no index row for the link rebuild)"
+                        )
                     continue
                 content = bodies.get(path)
                 if content is None:
@@ -1571,12 +1711,39 @@ async def _embed_vault_pinned(user_id: int | None, root_fd: int, log_suffix: str
                 )
                 note = note_result.scalar_one()
 
-                chunks = await embed_note(session, note, content)
+                # ── Certify against what was verified, not what was re-read ──
+                # The `select` above is a *second* database read, in a later
+                # transaction than the one that produced `row`, so it can
+                # return a hash another pass has committed since the bytes were
+                # verified. Copying that value onto vectors built from `row`'s
+                # content marked the row embedded for content it does not have,
+                # and the resulting equality then blocked every later repair —
+                # permanently wrong semantic results for an agent that acts on
+                # them unseen. So the hash and path the bytes were verified
+                # against are handed down explicitly: `embed_note` stamps them
+                # with a conditional, row-locking UPDATE before it replaces a
+                # single vector, and raises `StaleCertification` if the row has
+                # moved.
+                chunks = await embed_note(
+                    session,
+                    note,
+                    content,
+                    certified_hash=row.content_hash,
+                    certified_path=row.file_path,
+                )
                 total_chunks += chunks
                 await session.commit()
 
                 if (i + 1) % 50 == 0:
                     logger.info(f"Embedded {i + 1}/{len(unembedded)} notes ({total_chunks} chunks)")
+            except StaleCertification as e:
+                # Not a failure of this note, and not a hole in the index: the
+                # row moved between the byte verification and the
+                # certification, so the vectors in hand describe content the
+                # row no longer claims. Discard them, leave the row unmarked,
+                # and let a later pass embed it as it then stands.
+                logger.info("Skipping %s: %s", row.file_path, e)
+                await session.rollback()
             except Exception as e:
                 logger.warning(f"Failed to embed {row.file_path}: {e}")
                 await session.rollback()

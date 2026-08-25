@@ -148,11 +148,33 @@ STATE_CONSUMED = "consumed"
 
 @dataclass(frozen=True)
 class Identity:
-    """The minting identity, exactly as `APIKeyMiddleware` resolved it."""
+    """The minting identity, exactly as `APIKeyMiddleware` resolved it.
+
+    **At most one credential.** `APIKeyMiddleware` sets both ContextVars to
+    None at the head of every request and then fills in exactly one branch, so
+    a two-credential identity is unreachable today — and that is precisely why
+    it is asserted here rather than assumed. The identity is written straight
+    onto `transfer_tokens.key_id` / `.oauth_token_id`, whose CHECK constraint
+    (migration 017) forbids the pair, and the attribution copied from that row
+    onto `usage_logs` at redemption is shown to an operator as an audit trail:
+    a row naming two actors records which of them minted it nowhere, so any
+    label chosen for it would be an invention. Both None stays legal — that is
+    the single-user and sandbox shape.
+    """
 
     key_id: int | None = None
     oauth_token_id: int | None = None
     user_id: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.key_id is not None and self.oauth_token_id is not None:
+            raise ValueError(
+                "A minting identity names at most one credential, and this one "
+                f"names two (key_id={self.key_id}, "
+                f"oauth_token_id={self.oauth_token_id}). Nothing records which "
+                "of them minted a capability, so nothing may attribute one to "
+                "either."
+            )
 
 
 @dataclass(frozen=True)

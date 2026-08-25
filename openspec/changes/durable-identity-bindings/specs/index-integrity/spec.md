@@ -243,6 +243,10 @@ The un-gating is sound only because of the verification, and the argument is exa
 
 The verification also SHALL NOT be understood as an optimisation. `embed_note` marks a row embedded by copying the *row's* `content_hash`, not a hash of the bytes it embedded, so without the check a file that differs from its row at embedding time is embedded and then permanently marked as embedded for a hash it does not have — nothing re-embeds it again. That is what makes the re-derive branch's retention of `note_embeddings` sound, and it is now also what makes this requirement's un-gating sound. Anyone proposing to remove it must re-gate the embedding pass in the same change, and this sentence is here so that consequence is visible at the site of the removal.
 
+**Verifying the bytes is not sufficient on its own, because the row can move between the verification and the certification.** The pass verifies against the content hash from its initial query and then re-reads the metadata row, and that second read — in a later transaction — can return a hash another pass has committed since. Copying *that* value onto vectors built from the verified content marks the row embedded for content it does not have, and because the pass selects rows whose embedded hash differs from their content hash, the resulting equality then blocks every later repair: permanently wrong semantic results for a consumer that acts on them without a human seeing the query.
+
+So the certification SHALL be a conditional write, in the same transaction as the vector replacement, requiring the row still to have the same id, the same relative path and the same content hash the bytes were verified against; and the value it writes SHALL be that verified hash, never one re-read from the row. The conditional write SHALL be issued **before** any stored vector is deleted or inserted, so the row lock it takes holds for the remainder of the transaction, and **after** the embedding provider call, so no row lock is held across a network request. When it matches no row the generated vectors SHALL be discarded, no stored vector SHALL be deleted or inserted, the row SHALL be left unmarked, and a later pass SHALL embed it as it then stands.
+
 Nothing else about the pass changes: it still selects only rows whose `embedded_content_hash` differs from their `content_hash`, still reads beneath the root it pinned, and still writes nothing for a note it skipped. The verification governs the path that *embeds* content; the exclude-pattern branch, which reads no file, writes no vector and marks the row from its own recorded hash, is unaffected by it and by the un-gating alike.
 
 #### Scenario: The embedding pass refuses to certify content it did not read
@@ -263,6 +267,17 @@ Nothing else about the pass changes: it still selects only rows whose `embedded_
 - **THEN** it SHALL process that user's eligible rows rather than skip the user
 - **AND** each note it embeds SHALL have hashed to the row it was written against
 
+#### Scenario: The row's hash changes between the verification and the certification
+
+- **WHEN** the embedding pass verifies a file's bytes against the content hash from its initial query, and another transaction commits a different content hash for that row before the pass certifies it
+- **THEN** the certification SHALL match no row, the generated vectors SHALL be discarded, and no `note_embeddings` row for that note SHALL be deleted or inserted
+- **AND** `embedded_content_hash` SHALL be left unchanged, so a later pass embeds the note as it then stands
+
+#### Scenario: The certified hash is the one the bytes were verified against
+
+- **WHEN** the embedding pass certifies a note whose row has not moved
+- **THEN** the value written to `embedded_content_hash` SHALL be the hash the bytes were verified against, and SHALL NOT be a value re-read from the metadata row
+
 #### Scenario: A foreign root cannot be embedded against a surviving row
 
 - **WHEN** the embedding pass runs for a user whose metadata rows were derived from one directory while the assigned root is another, and the file at a row's relative path under the assigned root holds different bytes
@@ -276,6 +291,12 @@ Serving the previous directory's rows is the failure this prevents. The tools se
 The pass's existing prune by relative path does not make this redundant. A note whose relative path **and** content hash are identical in both directories is classified as unchanged and skipped, so its links are never re-extracted; the notes it pointed at are pruned, and because `note_links.target_note_id` is `ON DELETE SET NULL` the link row survives with its target resolution lost. That link never heals, because the note is never re-parsed again.
 
 Because this branch is destructive and costs a full re-embed of the newly assigned vault, it SHALL fire only when both recorded facts disagree, and never on a missing record, never on a partial disagreement, and never on the strength of a file handle — which can refuse a keep but can never establish a discard.
+
+**The delete SHALL be bound to the assignment that produced the verdict, not merely to the user.** The classification is computed against a root taken from the process cache, in an earlier transaction than the one that acts on it, so an administrator can reassign — or correct a reassignment back to the root the index really was built from — in between. Filtering the delete by user id alone then destroys a complete, valid index for the assignment the row currently names, records provenance for a root nobody is assigned to, and forces a full re-embed that the next pass discards again. Inside the discard transaction the pass SHALL therefore take the user's row `SELECT … FOR UPDATE`, re-read it, and require that it is present, active, assigned, and assigned to exactly the assignment the classification was computed against. On any disagreement it SHALL delete nothing, record nothing, and abort, leaving the next pass to reclassify against the row as it then stands. The lock SHALL be held for the rest of that transaction, so the delete and the record beside it cannot straddle a change either.
+
+**The provenance record SHALL be written to exactly the row that was locked.** The stamping update SHALL affect exactly one row; zero rows SHALL roll the transaction back, delete included, because a delete standing beside a provenance record that does not exist is precisely the "rows from one vault beside a record naming another" this branch exists to make impossible.
+
+The same binding SHALL govern the re-derive branch's record, which is provenance too: before it is written the pass SHALL take the same lock and make the same re-read, and SHALL withhold the record on disagreement. Withheld rather than fatal, because that branch destroys nothing and its repairs remain correct for the root they were read from; an unrecorded provenance simply makes the next pass re-derive again.
 
 #### Scenario: Reassignment to a different vault
 
@@ -306,6 +327,28 @@ Because this branch is destructive and costs a full re-embed of the newly assign
 
 - **WHEN** a discarding pass runs
 - **THEN** the delete and the provenance record SHALL be committed before any file under the newly assigned root is opened, so a failure while scanning cannot leave the previous vault's rows queryable
+
+#### Scenario: The assignment is corrected back before the discard transaction runs
+
+- **WHEN** a pass classifies a user's index as a discard against a newly assigned root, and an administrator restores the previous assignment before the discard transaction begins
+- **THEN** no `notes_metadata` row SHALL be deleted, no provenance SHALL be recorded, and no file under either root SHALL be read by that pass
+- **AND** the pass SHALL abort so that the next one reclassifies against the assignment the row now carries
+
+#### Scenario: The locked re-read finds a state the classification did not describe
+
+- **WHEN** the discard transaction's locked re-read finds the user's row absent, inactive, or with a cleared vault assignment
+- **THEN** nothing SHALL be deleted and nothing SHALL be recorded
+
+#### Scenario: A provenance stamp that matches no row rolls the delete back
+
+- **WHEN** the discard transaction's stamping update affects a number of rows other than exactly one
+- **THEN** the transaction SHALL roll back, so no delete is committed without the record that must accompany it
+
+#### Scenario: A re-derive record is withheld when the assignment moved under it
+
+- **WHEN** a re-derive completes with nothing skipped but the locked re-read finds the assignment no longer equal to the one the pass ran under
+- **THEN** no provenance SHALL be recorded
+- **AND** the pass's repairs SHALL still commit, and the next pass SHALL re-derive again
 
 #### Scenario: A failed pass after a discard retries cleanly
 
@@ -389,6 +432,12 @@ The system SHALL accept, and document, that a file which is permanently unreadab
 
 - **WHEN** a file is discovered by a re-deriving pass and can no longer be read when the pass reaches it
 - **THEN** the pass SHALL treat that path as a skip and SHALL record no provenance for that user
+
+#### Scenario: Every link-extraction skip is recorded, including the unreachable one
+
+- **WHEN** a re-deriving pass reaches a changed note it cannot extract links for — because it holds no buffered body for that path, or because that path has no index row to attach the links to
+- **THEN** both cases SHALL be recorded as skips, so the record is withheld
+- **AND** neither SHALL be dropped silently, whatever its likelihood, because the record is a claim that every surviving link row was written by that pass
 
 #### Scenario: The skipped paths are named
 

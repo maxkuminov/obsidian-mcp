@@ -84,6 +84,7 @@ caller named, in the directory that was validated.
 """
 
 import errno
+import inspect
 import logging
 import mimetypes
 import os
@@ -377,15 +378,53 @@ class VaultAssignmentChanged(RuntimeError):
         self.reason = reason
 
 
+class VaultAnchorUnavailable(RuntimeError):
+    """**Admission**: the root this request is anchored to cannot be named.
+
+    A cold process cache, or an ownerless credential under `MULTI_USER_MODE`.
+    `APIKeyMiddleware` and `_vault_root` already refuse both before a tool body
+    runs, so it is unreachable in a normal request — but a mutation whose
+    anchor cannot be named must not publish either, and it is the *admission*
+    failure that describes it, not an administrator's reassignment.
+
+    A `RuntimeError` because that is what `_vault_root` has always raised for
+    this condition, and callers that catch `RuntimeError` keep working. It is a
+    **distinct type** so the tool seam can tell it apart from the operational
+    refusal without catching `RuntimeError` broadly — which would also swallow
+    every `RuntimeError` a publish body raises.
+    """
+
+
+class VaultConfirmationUnavailable(Exception):
+    """**Infrastructure**: the assignment could not be read at all.
+
+    The confirming `SELECT` failed — the database is unreachable, the pool is
+    exhausted, the statement timed out. It says nothing about the assignment,
+    so it must never be reported as one: an operator reading "an administrator
+    reassigned your vault" during a database outage is being told something
+    nobody did.
+
+    Deliberately **not** a `RuntimeError`. The tool bodies catch
+    `ValueError`/`RuntimeError`/`OSError` around their publishes and render
+    them as ordinary failure strings, and a confirmation outage rendered as
+    "Write failed" is an infrastructure incident reported as a bad write.
+    Before the first publication of a call it propagates and the call fails;
+    after a publication has already stood it is caught explicitly, by the one
+    caller that has something partial to report (`move_note`).
+    """
+
+
 class UnconfirmedPublication(Exception):
     """**Programming error**: a publish helper reached an unconfirmed target.
 
     Every destructive operation on a `MutableTarget` — the atomic write, the
-    no-clobber move, the soft delete and the permanent unlink — takes the
-    target's confirmation before it acts. A target that carries none means
-    somebody added a mutating tool (or a new publication inside an existing
-    one) and did not confirm the assignment first, which is exactly the hole
-    this scheme exists to make impossible.
+    no-clobber move, the soft delete and the permanent unlink — takes a
+    `RootConfirmation` for the operation it is about to perform. A publication
+    that reaches one without a confirmation, with a confirmation somebody has
+    already spent, or with one taken for a different user or a different root
+    means somebody added a mutating tool (or a new publication inside an
+    existing one) and did not confirm the assignment first, which is exactly
+    the hole this scheme exists to make impossible.
 
     Deliberately **not** a `RuntimeError`: the tool bodies catch `ValueError` /
     `RuntimeError` / `OSError` around their publishes and turn them into
@@ -394,17 +433,34 @@ class UnconfirmedPublication(Exception):
     """
 
 
+def _canonical_root(path) -> str:
+    """`transfer.canonical_vault_root`, imported at call time (import cycle)."""
+    from src.services.transfer import canonical_vault_root
+
+    return canonical_vault_root(path)
+
+
 class RootConfirmation:
     """One fresh confirmation of the caller's vault assignment.
 
-    Produced by `confirm_vault_assignment` and **consumed by exactly one
-    publishing operation**: `MutableTarget.take_confirmation` pops it, so a
-    second publication through the same target raises rather than reusing it.
-    That is what makes "one confirmation per publishing operation" structural
-    rather than a convention — `move_note(rewrite_links=True)` publishes once
-    for the move and once per rewrite, with a metadata transaction of unbounded
-    duration in between, and reusing one stamp across all of that would be the
-    same staleness this exists to narrow, merely relocated.
+    Produced by `_confirm_vault_assignment` and **consumed by exactly one
+    publishing operation**. Three properties, all structural rather than
+    conventional, and each of them was a hole in the first implementation:
+
+    - **Intrinsically single-consumption.** The consumed flag lives on the
+      confirmation itself, not on the target it was stamped onto, so the same
+      object cannot be spent twice by attaching it to two targets. A second
+      consumption raises `UnconfirmedPublication`.
+    - **Target-bound.** `consume` checks the acting user id and the canonical
+      assignment string against the target's own, so a confirmation taken for
+      one user or one root cannot authorise a publication into another.
+    - **Not retainable across an `await`.** There is no public way to obtain
+      one: `_confirm_vault_assignment` is private and every caller goes through
+      an async wrapper (`confirmed_publication` and the typed helpers below)
+      that awaits the read and then invokes a **synchronous** publish before
+      returning control to the event loop. A caller therefore cannot hold a
+      confirmation across a scheduling point, because it never holds one at
+      all.
 
     **The residual, stated rather than implied.** The confirming read is not a
     lock. A reassignment that commits after it and before the publishing
@@ -417,18 +473,127 @@ class RootConfirmation:
     and the spec says no query is issued at all.
     """
 
-    __slots__ = ("user_id", "root", "queried")
+    __slots__ = ("user_id", "root", "queried", "_spent")
 
     def __init__(self, user_id: int | None, root: str, queried: bool) -> None:
         self.user_id = user_id
         self.root = root
         self.queried = queried
+        self._spent = False
+
+    @property
+    def spent(self) -> bool:
+        return self._spent
+
+    def _refuse(self, operation: str, why: str) -> "UnconfirmedPublication":
+        return UnconfirmedPublication(
+            f"Refusing to {operation}: {why} A confirmation covers exactly one "
+            "publication, for the user and root it was taken for. Await a "
+            "confirmed-publication wrapper (vault.confirmed_publication) instead "
+            "of reusing one (#88)."
+        )
+
+    def consume(self, user_id: int | None, assignment: str, operation: str) -> None:
+        """Spend this confirmation for `operation` under `(user_id, assignment)`.
+
+        Checked-and-set: the flag is read and written here, in the same
+        synchronous step that authorises the publication, so there is no state
+        anywhere else that a second publication could find still set.
+        """
+        if self._spent:
+            raise self._refuse(operation, "its vault-root confirmation has already been spent.")
+        if self.user_id != user_id:
+            raise self._refuse(
+                operation,
+                f"its vault-root confirmation was taken for user_id={self.user_id!r}, "
+                f"not user_id={user_id!r}.",
+            )
+        if self.root != assignment:
+            raise self._refuse(
+                operation,
+                f"its vault-root confirmation was taken for {self.root!r}, "
+                f"not {assignment!r}.",
+            )
+        self._spent = True
+
+    def consume_for(self, target: "MutableTarget", operation: str) -> None:
+        """`consume`, reading the user and the assignment off the target."""
+        self.consume(target.user_id, target.assignment, f"{operation} {target.rel}")
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return (
             f"RootConfirmation(user_id={self.user_id!r}, root={self.root!r}, "
-            f"queried={self.queried!r})"
+            f"queried={self.queried!r}, spent={self._spent!r})"
         )
+
+
+class MovePermit:
+    """Licence to undo **one** no-clobber move, and nothing else.
+
+    `move_note`'s failure handling may have to move the file straight back:
+    `_verify_the_moved_inode` calls `move_file_no_clobber` with the endpoints
+    swapped when what arrived at the destination is our inode but is a
+    directory or a symbolic link. Refusing that for want of a confirmation
+    would strand the note somewhere nobody named.
+
+    The first implementation paid for that by stamping the one confirmation
+    onto **both** endpoints, which made a reusable token out of it — the same
+    object could then authorise an unrelated second publication. This is the
+    narrow form instead: the forward move returns a permit naming the exact two
+    targets it moved between, and the permit authorises exactly one reverse
+    move between those same two objects. It is not a confirmation, it cannot be
+    turned into one, and it cannot authorise a publication anywhere else.
+
+    It is not a re-confirmation either, and does not claim to be: the rollback
+    undoes the very publication the confirmation covered, synchronously, with
+    no `await` in between, so it is inside that publication's window rather
+    than a new one.
+    """
+
+    __slots__ = ("_source", "_destination", "_spent")
+
+    def __init__(self, source: "MutableTarget", destination: "MutableTarget") -> None:
+        self._source = source
+        self._destination = destination
+        self._spent = False
+
+    def authorise(self, source: "MutableTarget", destination: "MutableTarget") -> None:
+        if self._spent:
+            raise UnconfirmedPublication(
+                "This move permit has already been used; a rollback is "
+                "authorised once, for the move it undoes (#88)."
+            )
+        if source is not self._destination or destination is not self._source:
+            raise UnconfirmedPublication(
+                "A move permit authorises only the reverse of the move that "
+                f"produced it ({self._destination.rel} → {self._source.rel}), "
+                f"not {source.rel} → {destination.rel} (#88)."
+            )
+        self._spent = True
+
+
+def _require_confirmation(
+    confirmation: "RootConfirmation | None", target: "MutableTarget", operation: str
+) -> None:
+    """Spend `confirmation` for `operation` on `target`, or refuse to publish.
+
+    The structural half of #88, and the reason it lives in one function: every
+    publish helper calls it before it acts, so a mutating tool added later
+    cannot publish without confirming the assignment first — the same way a
+    tool added later cannot skip the admission gate. The refusal is
+    `UnconfirmedPublication`, deliberately distinguishable from
+    `VaultAssignmentChanged`: the first is a bug here, the second is an
+    administrator's action.
+    """
+    if confirmation is None:
+        raise UnconfirmedPublication(
+            f"Refusing to {operation} {target.rel}: no vault-root confirmation "
+            "was taken for this publication. Publish through one of the "
+            "confirmed-publication wrappers "
+            "(vault.confirmed_publication) — it awaits the assignment read and "
+            "publishes before yielding (#88)."
+        )
+    confirmation.consume_for(target, operation)
 
 
 _RESIDUAL_NOTE = (
@@ -455,8 +620,23 @@ def _assignment_changed_error(user_id: int, bound: str, reason: str) -> str:
     )
 
 
-async def confirm_vault_assignment(user_id: int | None = None) -> RootConfirmation:
+CONFIRMATION_UNAVAILABLE_ERROR = (
+    "The vault assignment could not be re-read before publishing: the "
+    "database is unreachable. This is a confirmation outage, not a "
+    "reassignment — nobody changed the assignment, and this server cannot "
+    "currently tell whether anybody did. Nothing was published under an "
+    "unverified assignment."
+)
+
+
+async def _confirm_vault_assignment(user_id: int | None = None) -> RootConfirmation:
     """Re-read the caller's vault assignment and confirm it is unchanged.
+
+    **Private on purpose.** The public surface is the async wrappers below.
+    Handing a caller a confirmation object is what let one be retained across
+    an `await`, stamped onto a second target, or carried past the work it
+    covered; the wrappers award one and spend it in the same synchronous step,
+    so there is no window in which a caller holds an unspent one.
 
     One `SELECT users.vault_path, users.is_active WHERE id = :uid` on its own
     short-lived session, canonicalised through `transfer.canonical_vault_root`
@@ -484,7 +664,8 @@ async def confirm_vault_assignment(user_id: int | None = None) -> RootConfirmati
     Raises `VaultAssignmentChanged` when the assignment differs, is now NULL,
     the row is gone or the user is inactive — the same four conditions
     `APIKeyMiddleware` and `transfer._credential_ok` already treat as loss of
-    entitlement. Returns a single-use `RootConfirmation` otherwise.
+    entitlement; `VaultAnchorUnavailable` when the bound root itself cannot be
+    named; `VaultConfirmationUnavailable` when the read fails outright.
 
     `user_id is None` outside multi-user mode has no user row to re-read, so it
     **issues no query at all** and confirms `settings.vault_path`. Inside
@@ -492,20 +673,18 @@ async def confirm_vault_assignment(user_id: int | None = None) -> RootConfirmati
     already 401s and `_vault_root` already refuses — fail closed here too
     rather than confirm a root that belongs to nobody in particular.
     """
-    from src.services.transfer import canonical_vault_root
-
     if user_id is None:
         if settings.multi_user_mode:
             # An ownerless credential. `APIKeyMiddleware` 401s it and
             # `_vault_root` refuses it, so this is unreachable in a normal
-            # request — and it is a plain `RuntimeError`, exactly as
-            # `_vault_root` raises, because "this credential belongs to nobody"
-            # is the *admission* failure and must not be logged as an
-            # administrator having changed an assignment that never existed.
-            raise RuntimeError(UNOWNED_IN_MULTI_USER_ERROR)
+            # request — and it carries `_vault_root`'s own message, because
+            # "this credential belongs to nobody" is the *admission* failure
+            # and must not be logged as an administrator having changed an
+            # assignment that never existed.
+            raise VaultAnchorUnavailable(UNOWNED_IN_MULTI_USER_ERROR)
         # Single-user mode: no user row exists to disagree with. No query.
         return RootConfirmation(
-            None, canonical_vault_root(settings.vault_path), queried=False
+            None, _canonical_root(settings.vault_path), queried=False
         )
 
     # The comparand is the root this request is anchored to — `_vault_root`
@@ -513,17 +692,33 @@ async def confirm_vault_assignment(user_id: int | None = None) -> RootConfirmati
     # cache, which is exactly the value `open_mutable` validated the target
     # against. A cold cache raises here and the mutation is refused, for the
     # same reason the admission gate refuses one.
-    bound = canonical_vault_root(_vault_root(user_id))
+    try:
+        bound = _canonical_root(_vault_root(user_id))
+    except RuntimeError as exc:
+        raise VaultAnchorUnavailable(str(exc)) from None
 
     from src.database import async_session
     from src.models.db import User
 
-    async with async_session() as session:
-        row = (
-            await session.execute(
-                select(User.vault_path, User.is_active).where(User.id == user_id)
-            )
-        ).first()
+    try:
+        async with async_session() as session:
+            row = (
+                await session.execute(
+                    select(User.vault_path, User.is_active).where(User.id == user_id)
+                )
+            ).first()
+    except (VaultAssignmentChanged, VaultAnchorUnavailable):  # pragma: no cover
+        raise
+    except Exception as exc:
+        # The read failed; the assignment is unknown, which is not the same
+        # fact as "the assignment changed" and must not be reported as one.
+        logger.warning(
+            "publication_refused_confirmation_unavailable",
+            extra={"user_id": user_id, "error": str(exc)},
+        )
+        raise VaultConfirmationUnavailable(
+            f"{CONFIRMATION_UNAVAILABLE_ERROR} ({exc})"
+        ) from exc
 
     if row is None:
         reason = "missing"
@@ -531,7 +726,7 @@ async def confirm_vault_assignment(user_id: int | None = None) -> RootConfirmati
         reason = "inactive"
     elif row.vault_path is None:
         reason = "unassigned"
-    elif canonical_vault_root(row.vault_path) != bound:
+    elif _canonical_root(row.vault_path) != bound:
         reason = "reassigned"
     else:
         return RootConfirmation(user_id, bound, queried=True)
@@ -547,32 +742,68 @@ async def confirm_vault_assignment(user_id: int | None = None) -> RootConfirmati
     )
 
 
+async def confirmed_publication(user_id: int | None, publish):
+    """Confirm the assignment, then run `publish` before yielding control.
+
+    The one seam every mutation goes through (#88), and the shape is the whole
+    point: the confirming read is the *last* `await` before the publication.
+    `publish` is a **synchronous** callable taking the `RootConfirmation` and
+    performing exactly one publishing operation with it, so between the read
+    and the write there is no scheduling point at which a caller could do
+    anything else — including awaiting a reassignment into existence.
+
+    A coroutine function, or a callable that hands back an awaitable, is
+    refused rather than awaited: awaiting it here would reintroduce the very
+    window this closes, and it is a programming error at the call site.
+
+    Raises `VaultAssignmentChanged`, `VaultAnchorUnavailable` or
+    `VaultConfirmationUnavailable` from the confirming read; anything `publish`
+    raises propagates untouched, so a caller can tell a refused confirmation
+    from a failed write by type alone.
+    """
+    if inspect.iscoroutinefunction(publish):
+        raise UnconfirmedPublication(
+            "A confirmed publication must be synchronous: an `await` between "
+            "the confirming read and the write is exactly the window the "
+            "confirmation narrows (#88)."
+        )
+    confirmation = await _confirm_vault_assignment(user_id)
+    result = publish(confirmation)
+    if inspect.isawaitable(result):
+        closer = getattr(result, "close", None)
+        if closer is not None:
+            closer()
+        raise UnconfirmedPublication(
+            "A confirmed publication returned an awaitable, so it had not "
+            "published when control came back. It was not awaited (#88)."
+        )
+    return result
+
+
 def _single_shot_confirmation(user_id: int | None) -> RootConfirmation:
     """The confirmation for the *synchronous*, single-shot convenience writers.
 
     `write_file(path_str, …)` and `write_bytes(path_str, …)` validate and
     publish in one synchronous call and have no production callers — every
-    tool holds its own `MutableTarget` and publishes through `write_file_at` /
-    `write_bytes_at`. In single-user mode the confirmation issues no query by
-    specification, so it is available without an `await` and these keep
-    working unchanged.
+    tool holds its own `MutableTarget` and publishes through
+    `confirmed_publication`. In single-user mode the confirmation issues no
+    query by specification, so it is available without an `await` and these
+    keep working unchanged.
 
     A multi-user caller is refused rather than exempted: confirming a user's
     assignment needs a database read, which a synchronous function cannot do,
-    and quietly publishing unconfirmed is the hole the stamp exists to close.
+    and quietly publishing unconfirmed is the hole the confirmation exists to
+    close.
     """
     if user_id is None and not settings.multi_user_mode:
-        from src.services.transfer import canonical_vault_root
-
         return RootConfirmation(
-            None, canonical_vault_root(settings.vault_path), queried=False
+            None, _canonical_root(settings.vault_path), queried=False
         )
     raise UnconfirmedPublication(
         "write_file()/write_bytes() are synchronous single-shot conveniences "
         "and cannot confirm a multi-user vault assignment before publishing. "
-        "Open the target with open_mutable(), await "
-        "vault.confirm_vault_assignment(user_id), stamp it, and publish with "
-        "write_file_at()/write_bytes_at()."
+        "Open the target with open_mutable() and publish through "
+        "vault.confirmed_publication()."
     )
 
 
@@ -620,6 +851,11 @@ class MutableTarget:
     - `rel` — the vault-relative POSIX path of `path`; what the indexer stores.
     - `name` — the final component, taken exactly as the caller named it.
     - `root` — the resolved vault root.
+    - `user_id` — the caller this target was validated for.
+    - `assignment` — the *canonical assignment string* that user was anchored
+      to, i.e. `_vault_root(user_id)` normalised, not the resolved root. A
+      `RootConfirmation` is checked against `user_id` and `assignment` before
+      it may authorise a publication here (#88).
     - `dir_fd` — the parent directory descriptor.
 
     The caller owns the descriptors and must `close()` (or use `with`). A
@@ -633,12 +869,13 @@ class MutableTarget:
         "rel",
         "name",
         "root",
+        "user_id",
+        "assignment",
         "parent_rel",
         "created",
         "_dir_fd",
         "_root_fd",
         "_root_owned",
-        "_confirmation",
     )
 
     def __init__(
@@ -648,6 +885,8 @@ class MutableTarget:
         rel: str,
         name: str,
         root: Path,
+        user_id: int | None,
+        assignment: str,
         parent_rel: str,
         dir_fd: int | None,
         root_fd: int,
@@ -656,6 +895,13 @@ class MutableTarget:
         self.rel = rel
         self.name = name
         self.root = root
+        # Who this target was validated for, and the canonical assignment
+        # string that user was anchored to. A `RootConfirmation` is checked
+        # against both before it may authorise a publication here (#88): a
+        # confirmation taken for one user, or for one root, must not be able to
+        # publish into another's target.
+        self.user_id = user_id
+        self.assignment = assignment
         self.parent_rel = parent_rel
         # Directories `ensure_parent` created on the way to this target, if
         # any. What #97's ancestor flush walks; empty for the ordinary write
@@ -667,66 +913,6 @@ class MutableTarget:
         # `share_root` has swapped in a descriptor somebody else's lifetime
         # governs — see there.
         self._root_owned = True
-        # The single-use pre-publish confirmation (#88). None until a caller
-        # stamps one, and None again the instant a publish helper takes it.
-        self._confirmation: RootConfirmation | None = None
-
-    # ── the pre-publish confirmation (#88) ──────────────────────────────────
-
-    def confirm(self, confirmation: "RootConfirmation") -> "MutableTarget":
-        """Stamp the confirmation the **next** publication through this target.
-
-        Takes exactly one operation's worth: a publish helper pops it, so the
-        next publication needs a fresh one. Stamping twice without an
-        intervening publication is a programming error — it means a caller
-        confirmed, did something else, and confirmed again, which is the shape
-        of a stamp being carried across work it does not cover.
-        """
-        if self._confirmation is not None:
-            raise UnconfirmedPublication(
-                f"{self.rel} already carries an unused vault-root "
-                "confirmation. A confirmation covers exactly the publication "
-                "it precedes; stamping a second one means the first covered "
-                "nothing."
-            )
-        self._confirmation = confirmation
-        return self
-
-    def take_confirmation(self, operation: str) -> "RootConfirmation":
-        """Pop the confirmation for `operation`, or refuse to publish.
-
-        The structural half of #88. Every publish helper calls this before it
-        acts, so a mutating tool added later cannot publish without confirming
-        the assignment first — the same way a tool added later cannot skip the
-        admission gate. The refusal is `UnconfirmedPublication`, deliberately
-        distinguishable from `VaultAssignmentChanged`: the first is a bug here,
-        the second is an administrator's action.
-        """
-        confirmation = self._confirmation
-        if confirmation is None:
-            raise UnconfirmedPublication(
-                f"Refusing to {operation} {self.rel}: no vault-root "
-                "confirmation was taken for this publication. Await "
-                "vault.confirm_vault_assignment(user_id) and stamp the target "
-                "with .confirm(...) immediately before publishing (#88)."
-            )
-        self._confirmation = None
-        return confirmation
-
-    @property
-    def is_confirmed(self) -> bool:
-        """Whether a publication through this target would be allowed to run."""
-        return self._confirmation is not None
-
-    def clear_confirmation(self) -> None:
-        """Drop an unused confirmation.
-
-        `move_file_no_clobber` stamps both endpoints and consumes only the
-        destination's, so that a rollback of the same operation is not refused
-        for want of one (see there). Once the move stands, the source's spare
-        is dead weight that a later publication must not be able to inherit.
-        """
-        self._confirmation = None
 
     # ── descriptors ─────────────────────────────────────────────────────────
 
@@ -1034,6 +1220,11 @@ def open_mutable(relative_path: str, user_id: int | None = None) -> MutableTarge
             rel=(parent_rel / name).as_posix(),
             name=name,
             root=vault_resolved,
+            user_id=user_id,
+            # The *assignment* string, not the resolved root: it is what
+            # `_confirm_vault_assignment` compares, and re-resolving would
+            # reintroduce the check-then-act #59 removed.
+            assignment=_canonical_root(vault),
             parent_rel=parent_rel_posix,
             dir_fd=dir_fd,
             root_fd=root_fd,
@@ -1315,6 +1506,7 @@ def _atomic_write_at(
     data: bytes | None = None,
     overwrite: bool = True,
     expected: bytes | None = None,
+    confirmation: RootConfirmation | None = None,
 ) -> Path:
     """Write `text` (UTF-8) or `data` (raw bytes) to `target`, atomically.
 
@@ -1370,8 +1562,10 @@ def _atomic_write_at(
     implied.
     """
     # #88: before anything is staged and before `dir_fd` can create a missing
-    # parent — a refused publication must leave no directories behind.
-    target.take_confirmation("write")
+    # parent — a refused publication must leave no directories behind. The
+    # confirmation is spent here, checked against this target's own user and
+    # assignment; there is no way to reach this helper without one.
+    _require_confirmation(confirmation, target, "write")
 
     payload = data if data is not None else (text or "").encode("utf-8")
     dir_fd = target.dir_fd
@@ -1571,6 +1765,7 @@ def write_file_at(
     *,
     overwrite: bool = True,
     expected: bytes | None = None,
+    confirmation: RootConfirmation | None = None,
 ) -> Path:
     """Atomically write a note to an already-validated `MutableTarget`.
 
@@ -1578,7 +1773,11 @@ def write_file_at(
     symlink check happens here.
     """
     return _atomic_write_at(
-        target, text=content, overwrite=overwrite, expected=expected
+        target,
+        text=content,
+        overwrite=overwrite,
+        expected=expected,
+        confirmation=confirmation,
     )
 
 
@@ -1586,13 +1785,17 @@ def write_bytes_at(
     target: MutableTarget,
     data: bytes,
     overwrite: bool = False,
+    *,
+    confirmation: RootConfirmation | None = None,
 ) -> Path:
     """Atomically write raw bytes to an already-validated `MutableTarget`.
 
     Same contract as `write_file_at`. Raises `FileExistsError` when the target
     exists and `overwrite` is False.
     """
-    return _atomic_write_at(target, data=data, overwrite=overwrite)
+    return _atomic_write_at(
+        target, data=data, overwrite=overwrite, confirmation=confirmation
+    )
 
 
 def read_bytes_at(
@@ -1622,7 +1825,13 @@ def read_bytes_at(
         raise ValueError(str(exc).replace(target.name, label, 1)) from exc
 
 
-def move_file_no_clobber(source: MutableTarget, destination: MutableTarget) -> None:
+def move_file_no_clobber(
+    source: MutableTarget,
+    destination: MutableTarget,
+    *,
+    confirmation: RootConfirmation | None = None,
+    permit: MovePermit | None = None,
+) -> MovePermit:
     """Move one regular file between two validated targets, never replacing.
 
     One `renameat2(RENAME_NOREPLACE)` against the two parent descriptors. The
@@ -1639,15 +1848,28 @@ def move_file_no_clobber(source: MutableTarget, destination: MutableTarget) -> N
     `vault_fs.rename_noreplace`; a filesystem that cannot do the non-replacing
     form raises `UnsupportedFilesystem` and there is no safe fallback.
     """
-    # #88: the destination is the publication endpoint, so it is the one whose
-    # confirmation is consumed. `move_note` stamps **both** endpoints from the
-    # one confirmation that covers the move, because the failure handling of
-    # this same operation may have to move the file straight back
-    # (`_verify_the_moved_inode` calls this with the targets swapped, so the
-    # source becomes the destination) — and refusing a rollback for want of a
-    # stamp would strand the note somewhere nobody named. The spare is dropped
-    # by `clear_confirmation` once the move stands, so nothing can inherit it.
-    destination.take_confirmation("move into")
+    # #88. The destination is the publication endpoint, so it is the one the
+    # confirmation is checked against. Exactly one of `confirmation` and
+    # `permit` authorises the call:
+    #
+    # * `confirmation` — the forward move. Spent here, and a `MovePermit`
+    #   naming these two targets is returned so the caller can undo *this*
+    #   move and nothing else.
+    # * `permit` — the rollback `_verify_the_moved_inode` performs when what
+    #   arrived at the destination is our inode but is a directory or a
+    #   symbolic link. It is not a second confirmation and does not claim to
+    #   be: it undoes the publication the confirmation covered, synchronously,
+    #   inside that same window.
+    if (confirmation is None) == (permit is None):
+        raise UnconfirmedPublication(
+            f"Refusing to move {source.rel} → {destination.rel}: a no-clobber "
+            "move takes exactly one of a vault-root confirmation (the forward "
+            "move) or a move permit (its rollback) (#88)."
+        )
+    if permit is not None:
+        permit.authorise(source, destination)
+    else:
+        _require_confirmation(confirmation, destination, "move into")
 
     vault_fs.rename_noreplace(
         source.dir_fd, source.name, destination.dir_fd, destination.name
@@ -1664,10 +1886,18 @@ def move_file_no_clobber(source: MutableTarget, destination: MutableTarget) -> N
     vault_fs.flush_dir_quietly(
         source.dir_fd, f"source directory for {source.rel}"
     )
+    # The licence to undo exactly this move, and nothing else. A rollback of a
+    # rollback is refused (the permit is single-use), and so is a permit
+    # pointed at any other pair of targets.
+    return permit if permit is not None else MovePermit(source, destination)
 
 
 def soft_delete_target(
-    target: MutableTarget, *, stamp: str | None = None, label: str | Path | None = None
+    target: MutableTarget,
+    *,
+    stamp: str | None = None,
+    label: str | Path | None = None,
+    confirmation: RootConfirmation | None = None,
 ) -> str:
     """Soft-delete a validated target into `.trash/`, confirmation required.
 
@@ -1678,7 +1908,7 @@ def soft_delete_target(
     the note's own parent descriptor into `.trash`, walked from the same
     resolved root, with the caller still owning both descriptors.
     """
-    target.take_confirmation("soft-delete")
+    _require_confirmation(confirmation, target, "soft-delete")
     return vault_fs.soft_delete_at(
         target.dir_fd,
         target.name,
@@ -1688,7 +1918,9 @@ def soft_delete_target(
     )
 
 
-def unlink_at(target: MutableTarget) -> None:
+def unlink_at(
+    target: MutableTarget, *, confirmation: RootConfirmation | None = None
+) -> None:
     """Permanently unlink a validated target through its parent descriptor.
 
     `delete_note(permanent=True)` reached a bare
@@ -1703,7 +1935,7 @@ def unlink_at(target: MutableTarget) -> None:
     That flush is logged and swallowed — the note *is* unlinked, and reporting
     a failure would invite a retry of a delete that already happened.
     """
-    target.take_confirmation("permanently delete")
+    _require_confirmation(confirmation, target, "permanently delete")
     dir_fd = target.dir_fd
     os.unlink(target.name, dir_fd=dir_fd)
     vault_fs.flush_dir_quietly(dir_fd, f"parent directory of {target.rel}")
@@ -1735,9 +1967,12 @@ def write_file(
     `_single_shot_confirmation`.
     """
     with open_mutable(relative_path, user_id=user_id) as target:
-        target.confirm(_single_shot_confirmation(user_id))
         return write_file_at(
-            target, content, overwrite=overwrite, expected=expected
+            target,
+            content,
+            overwrite=overwrite,
+            expected=expected,
+            confirmation=_single_shot_confirmation(user_id),
         )
 
 
@@ -1789,9 +2024,13 @@ def write_bytes(
     **Single-user mode only, since #88** — see `write_file`.
     """
     with open_mutable(relative_path, user_id=user_id) as target:
-        target.confirm(_single_shot_confirmation(user_id))
         try:
-            return write_bytes_at(target, data, overwrite=overwrite)
+            return write_bytes_at(
+                target,
+                data,
+                overwrite=overwrite,
+                confirmation=_single_shot_confirmation(user_id),
+            )
         except FileExistsError:
             raise FileExistsError(
                 f"File already exists: {relative_path}"

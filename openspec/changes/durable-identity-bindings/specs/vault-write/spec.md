@@ -9,7 +9,15 @@ A confirmation SHALL cover exactly the publishing operation it precedes, and SHA
 
 The metadata transaction that follows the move SHALL NOT require a confirmation: it writes no vault bytes and it records a publication that has already occurred, so refusing it would leave the database describing a note that is no longer at that path.
 
-The confirmation SHALL be enforced structurally rather than by convention: the shared publish helpers SHALL refuse a mutation target that carries no confirmation for the operation about to be performed, so a mutating tool added later cannot publish without one, in the same way a tool added later cannot skip the admission gate. A refusal for a missing confirmation SHALL be distinguishable from a refusal for a changed assignment, because the first is a programming error and the second is an operational event.
+The confirmation SHALL be enforced structurally rather than by convention, and the enforcement has three parts.
+
+**One awaiting wrapper, and no retainable stamp.** There SHALL be no public way to obtain a confirmation and hold it: the only entry point SHALL be an asynchronous confirmed-publication wrapper that awaits the assignment read and then invokes a **synchronous** publish callable before returning control to the event loop. A caller therefore cannot place an `await` between the confirmation and the publication, because it never holds an unspent confirmation across a scheduling point. A publish callable that is a coroutine function, or that returns an awaitable, SHALL be refused rather than awaited: awaiting it would reopen the window the wrapper exists to close.
+
+**The confirmation is intrinsically single-consumption and target-bound.** The consumed flag SHALL live on the confirmation itself rather than on the target it authorises, so one confirmation cannot be spent by two publications however it is attached, and the publish helper SHALL check the confirmation's user id and canonical assignment against the target's own before spending it. A confirmation taken for one user, or for one root, SHALL NOT authorise a publication into another's target.
+
+**Every publish helper refuses an unauthorised publication.** The shared helpers SHALL refuse a mutation target for which no confirmation is presented, one already spent, or one taken for a different user or root, so a mutating tool added later cannot publish without confirming the assignment first, in the same way a tool added later cannot skip the admission gate. A refusal for a missing or unusable confirmation SHALL be distinguishable from a refusal for a changed assignment, because the first is a programming error and the second is an operational event.
+
+**The rollback of a publication is covered by that publication's confirmation, through a narrowly scoped permit.** `move_note`'s inode verification may have to move the file straight back when what arrived at the destination is the source inode but is a directory or a symbolic link, and refusing that for want of a confirmation would strand the note somewhere nobody named. The forward move SHALL return a permit naming exactly the two targets it moved between, and that permit SHALL authorise exactly one reverse move between those same two targets — not a second forward move, not any other pair, and not itself twice. The permit SHALL NOT be a confirmation and SHALL NOT be usable as one. This is not a second confirmation and is not claimed to be: the rollback undoes the very publication the confirmation covered, synchronously, with no intervening `await`, so it lies inside that publication's window rather than opening a new one. Stamping the one confirmation onto both endpoints instead — so that either could spend it — SHALL NOT be done, because it makes a reusable token of a single-use fact.
 
 **Every destructive operation on a mutation target SHALL go through such a helper, the permanent unlink included.** A tool that reaches a bare unlink syscall on a target's parent descriptor is outside the enforcement, and while any such call site remains the structural claim is false rather than merely incomplete. `delete_note(permanent=True)` is that call site today and SHALL be routed through a permanent-unlink helper on the same seam as the atomic write, the no-clobber move and the soft delete.
 
@@ -62,6 +70,20 @@ The confirmation SHALL be enforced structurally rather than by convention: the s
 - **AND** SHALL NOT report the move as a clean success
 - **AND** the move itself SHALL NOT be rolled back, and the metadata rows recording it SHALL remain consistent with where the note now is
 
+#### Scenario: The confirming read fails before the first publication
+
+- **WHEN** the assignment re-read fails outright — the database is unreachable — before a call has published anything
+- **THEN** the call SHALL fail rather than publish
+- **AND** the failure SHALL NOT be reported as a changed vault assignment, because no administrator changed anything and the server cannot say whether one did
+
+#### Scenario: The confirming read fails after the move has committed
+
+- **WHEN** the assignment re-read fails outright before one of `move_note`'s link rewrites, after the move has already committed
+- **THEN** the tool SHALL stop the remaining rewrites and report the partial outcome through the same mechanism a refusal uses: the completed move, the root it completed in, and every source left unrewritten
+- **AND** it SHALL name the cause as a confirmation outage and SHALL NOT state that the vault assignment changed
+- **AND** the move SHALL NOT be rolled back and the metadata rows SHALL remain consistent with where the note now is
+- **AND** the call SHALL be recorded in `usage_logs` with an error marker distinct from both the changed-assignment marker and the missing-assignment marker
+
 #### Scenario: A permanent delete is refused by a helper, not by a convention
 
 - **WHEN** `delete_note(permanent=True)` reaches its unlink and the assignment has changed
@@ -75,9 +97,32 @@ The confirmation SHALL be enforced structurally rather than by convention: the s
 
 #### Scenario: Every mutating tool inherits the confirmation
 
-- **WHEN** any mutation target reaches a shared publish helper — including the permanent-unlink helper — without a confirmation recorded for the operation about to be performed
+- **WHEN** any mutation target reaches a shared publish helper — including the permanent-unlink helper — without a confirmation for the operation about to be performed
 - **THEN** the helper SHALL raise rather than publish
 - **AND** the resulting error SHALL be distinguishable from the refusal a changed assignment produces
+
+#### Scenario: A confirmation cannot be spent twice, on one target or on two
+
+- **WHEN** a confirmation that has already authorised a publication is presented to a second one — through the same target or through a different target
+- **THEN** the second publication SHALL be refused and nothing SHALL be written
+
+#### Scenario: A confirmation is bound to the user and the root it was taken for
+
+- **WHEN** a confirmation taken for one user id, or for one canonical assignment, is presented for a target validated for another
+- **THEN** the publication SHALL be refused and nothing SHALL be written
+
+#### Scenario: A confirmation cannot be held across a scheduling point
+
+- **WHEN** the public interface for a confirmed publication is examined
+- **THEN** there SHALL be no exported way to obtain a confirmation without publishing with it in the same synchronous step
+- **AND** a publish callable that is asynchronous, or that returns an awaitable, SHALL be refused rather than awaited
+
+#### Scenario: A rollback is authorised by a permit, not by a spare confirmation
+
+- **WHEN** the inode verification after a move has to put the file back
+- **THEN** the reverse move SHALL be authorised by the permit the forward move returned, for exactly those two targets and exactly once
+- **AND** the permit SHALL NOT authorise a second forward move, a move between any other pair of targets, or a second use of itself
+- **AND** no confirmation SHALL be left unspent on either endpoint once the move stands
 
 #### Scenario: The refusal is auditable
 

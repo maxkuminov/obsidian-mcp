@@ -97,6 +97,10 @@ Before it writes anything, 017 SHALL enforce migration 015's orphan-label invari
 
 Nothing is invented. 017 labels a row from the credential its own foreign key points at, or leaves it null. Because `transfer_tokens.key_id` and `transfer_tokens.oauth_token_id` are both `ON DELETE CASCADE`, a row whose minting credential has been deleted does not survive to be labelled at all; the rows the backfill leaves null are therefore the ones that carry no credential foreign key. 017 SHALL NOT write to `usage_logs`: a transfer usage row written before 017 carries no reference to the token that produced it, and the only alternative — re-running migration 015's own credential join — would put a second writer on columns 015 owns and guards.
 
+**A row naming two credentials has no correct label, and SHALL NOT be given one.** The two foreign keys are independently nullable, so nothing in the schema stopped a row carrying both — and nothing in such a row records which of them minted it. The API-key backfill would label it purely because that statement runs first, after which the OAuth statement's `actor_kind IS NULL` guard skips the row it has just mislabelled: a definitive attribution manufactured out of an ambiguity, copied onto `usage_logs` at redemption and shown to an operator as an audit trail. Before either backfill statement, 017 SHALL therefore refuse such rows, naming them in 013's and 015's offender shape — the first several ids and a count — and SHALL change nothing.
+
+**017 SHALL add a CHECK constraint forbidding the state it just refused**, permitting at most one of the two credential foreign keys to be non-null while leaving **both** null legal, because a single-user or sandbox mint carries no credential foreign key at all. The constraint SHALL be created only after the existing rows are known to satisfy it, so a drifted database fails on the offender report that names the ids rather than on an opaque constraint violation. It SHALL be stamped with 017's ownership marker as its constraint comment and SHALL be resolved through `pg_constraint` rather than by name — a same-named `CHECK (true)` satisfies a lookup by name while enforcing nothing — comparing its definition against the server's own rendering of the canonical predicate, requiring it to be validated, and requiring the marker. Anything else SHALL be refused, naming what was found, with nothing changed. `downgrade()` SHALL drop it only if it carries the marker. The same invariant SHALL be asserted where the minting identity is constructed in the application, so the value can never reach the row.
+
 #### Scenario: Fresh database
 
 - **WHEN** an empty database is migrated to head
@@ -109,6 +113,29 @@ Nothing is invented. 017 labels a row from the credential its own foreign key po
 - **THEN** the key-minted rows SHALL carry `actor_kind = 'api_key'` with that key's name and `omcp_` prefix
 - **AND** the OAuth-minted rows SHALL carry `actor_kind = 'oauth'` with that client's name and `client_id`
 - **AND** no row SHALL be labelled from a credential other than the one its own foreign key names
+
+#### Scenario: A row naming two credentials is refused, not attributed
+
+- **WHEN** 017 runs on a database holding a `transfer_tokens` row whose `key_id` and `oauth_token_id` are both non-null
+- **THEN** the migration SHALL fail naming the offending rows before either backfill statement runs
+- **AND** no actor column SHALL be created or written, and the constraint SHALL NOT be installed
+
+#### Scenario: The constraint rejects the state at the database
+
+- **WHEN** an insert names both a `key_id` and an `oauth_token_id` on a database at head
+- **THEN** the database SHALL reject it
+- **AND** an insert naming neither SHALL still be accepted
+
+#### Scenario: A constraint of that name that is not 017's is refused
+
+- **WHEN** `transfer_tokens` already carries a constraint of that name whose predicate differs from the canonical one, that is `NOT VALID`, or that lacks 017's marker, and 017 runs
+- **THEN** the migration SHALL fail naming what it found and SHALL leave the schema unchanged
+
+#### Scenario: The minting identity refuses to name two credentials
+
+- **WHEN** a minting identity is constructed carrying both an API key id and an OAuth token id
+- **THEN** it SHALL be refused before any capability is minted
+- **AND** an identity carrying neither SHALL still be accepted
 
 #### Scenario: A row with no credential foreign key stays unattributed
 
@@ -145,8 +172,35 @@ Nothing is invented. 017 labels a row from the credential its own foreign key po
 #### Scenario: Downgrade drops the marked set, all or nothing
 
 - **WHEN** a database at 017 is downgraded to 016
-- **THEN** all three marked columns SHALL be dropped
+- **THEN** all three marked columns SHALL be dropped, and the marked constraint with them
 - **AND** a set in which any column lacks the marker SHALL be left in place instead
+- **AND** a constraint of that name lacking the marker SHALL be left in place instead
+
+#### Scenario: Re-running the migration adopts its own constraint
+
+- **WHEN** the database is stamped back to 016 and upgraded again with 017's own marked constraint already installed
+- **THEN** the migration SHALL adopt it, SHALL leave exactly one constraint of that name, and SHALL still rewrite no recorded label
+
+### Requirement: The deploy window of this wave is declared, not closed
+Both migrations of this wave run while the previous container is still serving — the deploy migrates, then recreates — and the two are affected differently. This SHALL be stated rather than mitigated by a deployment barrier: quiescing the service for a column addition and a small backfill trades a real, ongoing availability cost against a residual that is seconds long and self-describing.
+
+For **016** the window is closed by construction: it backfills nothing, and an index pass running under the previous code cannot write columns that code does not know about, so every row is null when the new container starts, whatever that pass committed. A null record means "provenance unknown" and the pass repairs such a user by re-deriving.
+
+For **017** the window is open and bounded. Between the backfill and the container recreate, an authenticated request served by the previous code can mint a transfer token with all three actor columns null, because that code does not record them. Such a row is exactly the tail of the 015 → 017 gap this migration already declares: it renders through the panel's existing join fallback like every pre-017 row, and it degrades to "unknown (credential deleted)" only if its minting credential is later deleted. Nothing is mis-attributed and nothing is invented — the row is unlabelled, which is the pre-017 status quo.
+
+The two therefore have symmetric, declared treatments: a null 016 record means *re-derive*, and a null 017 label means *fall back to the join*. The mitigation for 017 is that the window is seconds long and the fallback works until credential deletion. No deployment barrier SHALL be added for it.
+
+#### Scenario: A pass under the previous code cannot forge a provenance record
+
+- **WHEN** an index pass running under the previous code commits during or after 016
+- **THEN** all three provenance columns SHALL be null for every user when the new container starts
+
+#### Scenario: A mint under the previous code produces an unlabelled token
+
+- **WHEN** a transfer token is minted by the previous code after 017's backfill and before the container is recreated
+- **THEN** its three actor columns SHALL be null
+- **AND** the redemption usage row SHALL be attributed by join, exactly as every pre-017 row is
+- **AND** this SHALL be recorded as a declared residual of the deploy window rather than prevented by a deployment barrier
 
 ### Requirement: The schema gate covers both migrations of this wave before deploy
 The schema gate SHALL exercise 016 and 017 on a throwaway database, in the same run, and SHALL assert `alembic check` clean at the resulting head. The head revision the gate asserts SHALL be updated to `017`, so a later migration added without updating the gate fails loudly rather than silently widening what "head" means.

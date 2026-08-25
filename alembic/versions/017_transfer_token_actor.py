@@ -72,6 +72,28 @@ through the panel's existing pre-015 fallback and show "unknown (credential
 deleted)" when that join resolves to nothing. A bounded set that only shrinks,
 stated here rather than left to be found.
 
+## The deploy window, declared rather than closed
+
+The deploy migrates and *then* recreates the container, so this backfill runs
+while the previous code is still serving. Unlike 016 — which backfills nothing,
+so a pass under the previous code cannot produce a record for the new code to
+trust — a mint served by the old code between this backfill and the recreate
+inserts a `transfer_tokens` row with all three actor columns NULL, because that
+code does not record them.
+
+That row is exactly the tail of the 015 -> 017 gap declared above. It renders
+through the panel's existing join fallback like every pre-017 row, and it
+degrades to "unknown (credential deleted)" only if its minting credential is
+later deleted. Nothing is mis-attributed and nothing is invented: the row is
+simply unlabelled, which is the pre-017 status quo.
+
+So the two migrations of this wave have symmetric, declared treatments -- a
+NULL 016 record means *re-derive*, a NULL 017 label means *fall back to the
+join* -- and no deployment barrier is added. The mitigation is that the window
+is seconds long and the fallback works until credential deletion; quiescing the
+service for a column addition and a small backfill would trade a real, ongoing
+availability cost against that.
+
 ## Locks
 
 One `ALTER TABLE ... ADD COLUMN` per column, which takes ACCESS EXCLUSIVE on
@@ -132,6 +154,26 @@ COLUMNS = (
     ("actor_ref", sa.String(64), "character varying(64)"),
 )
 COLUMN_NAMES = tuple(name for name, _t, _e in COLUMNS)
+
+# ── The one-credential invariant (adversarial round 1, MAJOR) ───────────────
+#
+# `transfer_tokens.key_id` and `.oauth_token_id` are independently nullable, so
+# nothing in the schema stopped a row carrying **both**. Such a row names two
+# different actors and records which of them minted it nowhere; the backfill's
+# API-key UPDATE would then label it from the key purely because it runs first,
+# manufacturing a definitive attribution out of an ambiguity. Since these
+# labels are copied onto `usage_logs` at redemption and shown to an operator as
+# an audit trail, inventing one is the one thing this scheme must never do.
+#
+# So: the backfill refuses such rows outright (013's and 015's offender shape),
+# and this constraint stops new ones appearing. **Both NULL stays legal** — a
+# single-user or sandbox mint carries no credential FK at all — so the
+# predicate forbids only the conjunction.
+CONSTRAINT = "ck_transfer_tokens_one_credential"
+CONSTRAINT_PREDICATE = "key_id IS NULL OR oauth_token_id IS NULL"
+CONSTRAINT_MARKER = (
+    "one minting credential, never two (017_transfer_token_actor)"
+)
 
 
 def _quote(value: str) -> str:
@@ -270,6 +312,132 @@ def _reconcile(bind) -> None:
             _refuse(states, f"{column} does not carry 017's comment marker.")
 
 
+def _canonical_constraint_def(bind) -> str:
+    """How *this* PostgreSQL prints 017's predicate, derived at runtime.
+
+    013's device, for 013's reason: a hand-written string pinned to one
+    PostgreSQL major drifts, and `pg_get_constraintdef` normalises. An empty
+    scratch `TEMP` table shaped like `transfer_tokens` is given the constraint
+    and its rendering read straight back, so the comparison is against the
+    server's own normalisation rather than against our spelling of it.
+
+    Needs the TEMP privilege on the database, exactly as 013 does.
+    """
+    bind.execute(sa.text(f"CREATE TEMP TABLE _tt_scratch (LIKE {TABLE})"))
+    try:
+        bind.execute(
+            sa.text(
+                f"ALTER TABLE _tt_scratch ADD CONSTRAINT {CONSTRAINT} "
+                f"CHECK ({CONSTRAINT_PREDICATE})"
+            )
+        )
+        return bind.execute(
+            sa.text(
+                "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+                "WHERE conrelid = CAST('_tt_scratch' AS regclass) "
+                "  AND contype = 'c' AND conname = :name"
+            ),
+            {"name": CONSTRAINT},
+        ).scalar_one()
+    finally:
+        bind.execute(sa.text("DROP TABLE _tt_scratch"))
+
+
+def _constraint_state(bind):
+    """`(definition, validated, comment)` for 017's constraint, or None."""
+    return bind.execute(
+        sa.text(
+            "SELECT pg_get_constraintdef(c.oid) AS definition, "
+            "       c.convalidated, "
+            "       obj_description(c.oid, 'pg_constraint') AS comment "
+            "FROM pg_constraint c "
+            "WHERE c.conrelid = CAST(:table AS regclass) "
+            "  AND c.contype = 'c' AND c.conname = :name"
+        ),
+        {"table": TABLE, "name": CONSTRAINT},
+    ).first()
+
+
+def _assert_one_credential(bind) -> None:
+    """Refuse rows naming two minting credentials, before anything is written.
+
+    Named rather than resolved: nothing in such a row establishes which
+    credential minted it, so there is no correct label to pick and picking one
+    would be an invention. 013's and 015's offender-report shape — the first
+    twenty ids, then a count — and, like theirs, it changes nothing.
+    """
+    offenders = bind.execute(
+        sa.text(
+            f"SELECT id FROM {TABLE} "
+            "WHERE key_id IS NOT NULL AND oauth_token_id IS NOT NULL "
+            "ORDER BY id LIMIT 20"
+        )
+    ).scalars().all()
+    if not offenders:
+        return
+    total = bind.execute(
+        sa.text(
+            f"SELECT count(*) FROM {TABLE} "
+            "WHERE key_id IS NOT NULL AND oauth_token_id IS NOT NULL"
+        )
+    ).scalar_one()
+    raise RuntimeError(
+        f"{total} {TABLE} row(s) carry both a key_id and an oauth_token_id "
+        f"(ids: {', '.join(str(i) for i in offenders)}"
+        f"{', ...' if total > len(offenders) else ''}). Nothing in such a row "
+        "records which credential minted it, so 017 will not label it: the "
+        "API-key backfill would win purely by running first, and the label it "
+        "wrote would be copied onto `usage_logs` at redemption and shown to an "
+        "operator as an audit trail. Resolve by hand -- clear whichever "
+        "foreign key is wrong -- then re-run. Nothing has been changed."
+    )
+
+
+def _reconcile_constraint(bind) -> None:
+    """Create 017's CHECK, or verify a pre-existing one is exactly its own.
+
+    Resolved through `pg_constraint`, never by name alone: a same-named
+    `CHECK (true)` satisfies a lookup by name while enforcing nothing, which is
+    013's finding. The definition is compared against the server's own
+    rendering, the constraint must be `convalidated` (a `NOT VALID` one admits
+    every existing row), and it must carry 017's marker — the only evidence
+    that this migration, rather than somebody else, put an invariant of this
+    name on this table.
+    """
+    state = _constraint_state(bind)
+    if state is None:
+        op.execute(
+            f"ALTER TABLE {TABLE} ADD CONSTRAINT {CONSTRAINT} "
+            f"CHECK ({CONSTRAINT_PREDICATE})"
+        )
+        op.execute(
+            f"COMMENT ON CONSTRAINT {CONSTRAINT} ON {TABLE} IS "
+            f"{_quote(CONSTRAINT_MARKER)}"
+        )
+        return
+
+    definition, validated, comment = state
+    canonical = _canonical_constraint_def(bind)
+    if definition != canonical:
+        raise RuntimeError(
+            f"{TABLE}.{CONSTRAINT} exists but is {definition!r}, not "
+            f"{canonical!r}. 017 will not adopt a constraint of its name that "
+            "enforces something else. Nothing has been changed."
+        )
+    if not validated:
+        raise RuntimeError(
+            f"{TABLE}.{CONSTRAINT} exists but is NOT VALID, so it admits every "
+            "row that already violates it. Validate it by hand or drop it and "
+            "let 017 create it. Nothing has been changed."
+        )
+    if comment != CONSTRAINT_MARKER:
+        raise RuntimeError(
+            f"{TABLE}.{CONSTRAINT} does not carry 017's comment marker "
+            f"({CONSTRAINT_MARKER!r}), so 017 did not create it. Nothing has "
+            "been changed."
+        )
+
+
 def upgrade() -> None:
     bind = op.get_bind()
 
@@ -286,6 +454,15 @@ def upgrade() -> None:
     # the guard column the backfill selects on must not already be lying about
     # which rows are unlabelled.
     _assert_no_orphan_labels(bind)
+
+    # And before either backfill: a row naming two credentials has no correct
+    # label, so it is refused rather than attributed to whichever UPDATE runs
+    # first. The constraint that follows keeps new ones from appearing; it is
+    # created only once the existing rows are known to satisfy it, so a
+    # violating database fails on the offender report -- which names the ids --
+    # rather than on an opaque check-constraint error.
+    _assert_one_credential(bind)
+    _reconcile_constraint(bind)
 
     # API-key mints. `actor_kind IS NULL` is what makes this a one-time stamp
     # rather than a re-derivation: a label is a snapshot of the credential at
@@ -364,6 +541,13 @@ def downgrade() -> None:
             f"({MARKER!r}), so 017 did not create them and will not drop them. "
             "Nothing has been changed. Remove them by hand if you mean to."
         )
+
+    # The constraint goes the same way the columns do: only if it carries
+    # 017's marker. A same-named constraint somebody else installed is left in
+    # place, because a downgrade must undo *this* migration and nothing else.
+    constraint = _constraint_state(bind)
+    if constraint is not None and constraint[2] == CONSTRAINT_MARKER:
+        op.execute(f"ALTER TABLE {TABLE} DROP CONSTRAINT {CONSTRAINT}")
 
     for name in COLUMN_NAMES:
         if states[name] is not None:

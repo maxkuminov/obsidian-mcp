@@ -131,7 +131,7 @@ async def test_embed_vault_breaks_when_paused_before_loop(monkeypatch, tmp_path)
 
     embedded = []
 
-    async def _fake_embed_note(session, note, content):
+    async def _fake_embed_note(session, note, content, **kwargs):
         embedded.append(note)
         return 1
 
@@ -161,7 +161,7 @@ async def test_embed_vault_stops_early_when_pause_flips_mid_pass(monkeypatch, tm
     embedded = []
     paused = {"value": False}
 
-    async def _fake_embed_note(session, note, content):
+    async def _fake_embed_note(session, note, content, **kwargs):
         embedded.append(note)
         # After the first note is embedded, simulate a panel-driven pause.
         paused["value"] = True

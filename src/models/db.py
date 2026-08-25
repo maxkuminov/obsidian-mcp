@@ -522,6 +522,18 @@ class TransferToken(Base):
             "state IN ('pending', 'claimed', 'completed', 'consumed')",
             name="ck_transfer_tokens_state",
         ),
+        # One minting credential, never two (migration 017). Both columns are
+        # independently nullable, so a row could name an API key *and* an OAuth
+        # token — two different actors, with nothing recording which of them
+        # minted it. 017's backfill would then label such a row from the API
+        # key purely because that UPDATE runs first, manufacturing a definitive
+        # attribution out of an ambiguity and copying it onto `usage_logs` at
+        # redemption. Both NULL stays legal: a single-user or sandbox mint
+        # carries no credential foreign key at all.
+        CheckConstraint(
+            "key_id IS NULL OR oauth_token_id IS NULL",
+            name="ck_transfer_tokens_one_credential",
+        ),
     )
 
 

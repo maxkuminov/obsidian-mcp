@@ -25,15 +25,19 @@ here rather than described:
 * **one confirmation per publication, never per call** — five tools publish
   once, and `move_note(rewrite_links=True)` publishes once for the move and
   once per link rewrite with a metadata transaction of unbounded duration in
-  between. A single stamp reused across all of that would be the same staleness
-  this change exists to narrow, merely relocated inside one call.
+  between. A single confirmation reused across all of that would be the same
+  staleness this change exists to narrow, merely relocated inside one call.
+* **the confirmation is not something a caller can hold** — the only entry
+  point is `vault.confirmed_publication`, which awaits the read and calls a
+  *synchronous* publish before returning control, and the confirmation carries
+  its own spent flag and is checked against the target's user and root.
 
 The refusal is optimistic and says so: it narrows the window to staging, the
 durability flush and one publishing call. A reassignment committing inside that
 window still lands in the former root. Nothing here claims otherwise.
 
 The confirming read is faked at `src.database.async_session` — the *function
-level* import `confirm_vault_assignment` performs — while the note tools' own
+level* import `_confirm_vault_assignment` performs — while the note tools' own
 metadata session (`tools.async_session`, bound at import) is faked separately.
 Keeping the two apart is what lets a test count assignment re-reads exactly,
 and what lets one flip the assignment *between* two of them to drive the
@@ -46,6 +50,7 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from sqlalchemy.exc import OperationalError
 
 import src.database
 import src.mcp_server.server as server
@@ -109,6 +114,12 @@ class _AssignmentSession:
     async def execute(self, statement):
         self.state["reads"] += 1
         self.state["statements"].append(str(statement))
+        # The confirmation *outage* lever: the read fails outright rather than
+        # returning a different assignment. Nobody reassigned anything; the
+        # database is simply unreachable.
+        fail = self.state.get("fail_after")
+        if fail is not None and self.state["reads"] >= fail:
+            raise OperationalError("SELECT users.vault_path", {}, Exception("boom"))
         row = self.state["row"]
         flip = self.state.get("flip_after")
         if flip is not None and self.state["reads"] >= flip:
@@ -182,6 +193,7 @@ def multi_user_vault(monkeypatch, tmp_path):
         "statements": [],
         "flip_after": None,
         "flip_to": None,
+        "fail_after": None,
     }
     metadata = {
         "index_rows": [],
@@ -248,13 +260,14 @@ CONDITIONS = ["reassigned", "unassigned", "deactivated", "deleted"]
 
 
 def a_confirmation(ctx) -> vault_service.RootConfirmation:
-    """A confirmation of the bound root, for the tests that stamp by hand.
+    """A confirmation of the bound root, for the tests that drive a publish
+    helper directly.
 
     `_single_shot_confirmation` deliberately refuses under `multi_user_mode`,
     which is the mode these fixtures run in — a synchronous helper cannot read
     a user's assignment, and quietly publishing unconfirmed is the hole the
-    stamp exists to close. So the direct-helper tests build the object the
-    async confirmation would have produced.
+    confirmation exists to close. So the direct-helper tests build the object
+    the async wrapper would have produced.
     """
     return vault_service.RootConfirmation(UID, str(ctx.vault), queried=True)
 
@@ -412,14 +425,15 @@ async def test_an_ownerless_credential_is_refused_without_a_query(
 ):
     """`user_id is None` in multi-user mode is nobody, not the global vault.
 
-    Refused the way `_vault_root` refuses it — a plain `RuntimeError` carrying
-    the admission wording — so the usage row does not claim an administrator
-    changed an assignment that never existed.
+    Refused the way `_vault_root` refuses it — `VaultAnchorUnavailable`, a
+    `RuntimeError` carrying the admission wording — so the usage row does not
+    claim an administrator changed an assignment that never existed.
     """
     ctx = multi_user_vault
-    with pytest.raises(RuntimeError) as excinfo:
-        await vault_service.confirm_vault_assignment(None)
+    with pytest.raises(vault_service.VaultAnchorUnavailable) as excinfo:
+        await vault_service.confirmed_publication(None, lambda c: None)
 
+    assert isinstance(excinfo.value, RuntimeError)
     assert not isinstance(excinfo.value, VaultAssignmentChanged)
     assert "not bound to a user" in str(excinfo.value)
     assert ctx.assignment["reads"] == 0
@@ -687,55 +701,137 @@ def test_the_unstamped_refusal_is_distinguishable_from_the_operational_one():
 
 
 def test_a_confirmation_is_consumed_by_the_publication_it_covers(multi_user_vault):
-    """The stamp is single-use, which is what stops it being carried across an
-    `await`, a transaction or a second publication: whatever happens in between,
-    the next publication has to take its own."""
+    """The confirmation is intrinsically single-consumption.
+
+    The spent flag lives on the confirmation object itself, not on the target it
+    was handed to, so the same object cannot be spent twice — by a second
+    publication through the same target, or by attaching it to a different one.
+    """
     ctx = multi_user_vault
     seed(ctx)
 
     with vault_service.open_mutable("note.md", user_id=UID) as target:
-        target.confirm(a_confirmation(ctx))
-        assert target.is_confirmed
-        vault_service.write_file_at(target, "first\n")
-        assert not target.is_confirmed
-        with pytest.raises(UnconfirmedPublication):
-            vault_service.write_file_at(target, "second\n")
+        confirmation = a_confirmation(ctx)
+        assert not confirmation.spent
+        vault_service.write_file_at(target, "first\n", confirmation=confirmation)
+        assert confirmation.spent
+        with pytest.raises(UnconfirmedPublication) as excinfo:
+            vault_service.write_file_at(
+                target, "second\n", confirmation=confirmation
+            )
+        assert "already been spent" in str(excinfo.value)
 
     assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "first\n"
 
 
-async def test_a_stamp_cannot_be_carried_across_an_await(multi_user_vault):
-    """The same property through the tool seam: `_confirm_publication` stamps,
-    the publication consumes, and an `await` afterwards leaves nothing to
-    reuse."""
+def test_one_confirmation_cannot_be_spent_on_two_targets(multi_user_vault):
+    """The failing input the reviewer named: stamp C onto T1 and T2, publish
+    T1, let the assignment change, publish T2 — both from one database read.
+
+    Consumption used to clear a slot on the *target*, so the second target's
+    slot was still full. It is on the confirmation now, so the second
+    publication is refused whatever it is attached to.
+    """
+    ctx = multi_user_vault
+    seed(ctx)
+
+    with vault_service.open_mutable("note.md", user_id=UID) as first, (
+        vault_service.open_mutable("second.md", user_id=UID)
+    ) as second:
+        confirmation = a_confirmation(ctx)
+        vault_service.write_file_at(first, "one\n", confirmation=confirmation)
+        with pytest.raises(UnconfirmedPublication):
+            vault_service.write_file_at(second, "two\n", confirmation=confirmation)
+
+    assert not (ctx.vault / "second.md").exists()
+
+
+def test_a_confirmation_is_bound_to_the_user_and_the_root_it_was_taken_for(
+    multi_user_vault,
+):
+    """`confirm` used to validate neither field, so a confirmation for one
+    user or one root could authorise a publication into another's target."""
     ctx = multi_user_vault
     seed(ctx)
 
     with vault_service.open_mutable("note.md", user_id=UID) as target:
-        assert await tools._confirm_publication(UID, target) is None
+        wrong_user = vault_service.RootConfirmation(
+            UID + 1, str(ctx.vault), queried=True
+        )
+        with pytest.raises(UnconfirmedPublication) as excinfo:
+            vault_service.write_file_at(target, "x\n", confirmation=wrong_user)
+        assert "taken for user_id" in str(excinfo.value)
+
+        wrong_root = vault_service.RootConfirmation(UID, str(ctx.other), queried=True)
+        with pytest.raises(UnconfirmedPublication) as excinfo:
+            vault_service.write_file_at(target, "x\n", confirmation=wrong_root)
+        assert str(ctx.other) in str(excinfo.value)
+
+    assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "original body\n"
+
+
+async def test_a_confirmation_cannot_be_held_across_an_await(multi_user_vault):
+    """The property is now structural rather than tested by convention.
+
+    The old test *demonstrated the hole*: it stamped a target, awaited, and
+    then published — which is exactly the interleaving an administrator's
+    commit lands in. There is no public way to write that any more. The only
+    entry point is `confirmed_publication`, which awaits the read and calls a
+    **synchronous** publish before returning control, so a caller never holds
+    an unspent confirmation across a scheduling point.
+    """
+    ctx = multi_user_vault
+    seed(ctx)
+
+    # There is no public producer of a confirmation to retain.
+    assert not hasattr(vault_service, "confirm_vault_assignment")
+    assert not hasattr(vault_service.MutableTarget, "confirm")
+    assert not hasattr(vault_service.MutableTarget, "take_confirmation")
+
+    with vault_service.open_mutable("note.md", user_id=UID) as target:
+        assert (
+            await tools._confirmed_publication(
+                UID, lambda c: vault_service.write_file_at(
+                    target, "first\n", confirmation=c
+                )
+            )
+        )[0] is None
         await asyncio.sleep(0)
-        vault_service.write_file_at(target, "first\n")
-        await asyncio.sleep(0)
-        with pytest.raises(UnconfirmedPublication):
-            vault_service.write_file_at(target, "second\n")
-        # A second confirmation is what a second publication costs.
-        assert await tools._confirm_publication(UID, target) is None
-        vault_service.write_file_at(target, "second\n")
+        # A second publication costs a second confirmation, and therefore a
+        # second read.
+        assert (
+            await tools._confirmed_publication(
+                UID, lambda c: vault_service.write_file_at(
+                    target, "second\n", confirmation=c
+                )
+            )
+        )[0] is None
 
     assert ctx.assignment["reads"] == 2
     assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "second\n"
 
 
-def test_stamping_twice_without_publishing_is_refused(multi_user_vault):
-    """A second stamp means the first covered nothing — which is the shape of a
-    confirmation being taken and then carried past work it does not cover."""
+async def test_an_async_publish_callback_is_refused_rather_than_awaited(
+    multi_user_vault,
+):
+    """Awaiting the publish would reopen the window the wrapper closes, so a
+    coroutine function — and a callable that hands one back — is a programming
+    error at the call site rather than something to await."""
     ctx = multi_user_vault
     seed(ctx)
 
-    with vault_service.open_mutable("note.md", user_id=UID) as target:
-        target.confirm(a_confirmation(ctx))
-        with pytest.raises(UnconfirmedPublication):
-            target.confirm(a_confirmation(ctx))
+    async def publishes_later(confirmation):  # pragma: no cover - never run
+        return None
+
+    with pytest.raises(UnconfirmedPublication) as excinfo:
+        await vault_service.confirmed_publication(UID, publishes_later)
+    assert "must be synchronous" in str(excinfo.value)
+
+    with pytest.raises(UnconfirmedPublication) as excinfo:
+        await vault_service.confirmed_publication(
+            UID, lambda c: publishes_later(c)
+        )
+    assert "returned an awaitable" in str(excinfo.value)
 
 
 # ── (g) move_note: the interleavings ────────────────────────────────────────
@@ -813,6 +909,104 @@ async def test_a_move_refused_before_the_commit_leaves_everything_alone(
     assert ctx.metadata["commits"] == 0
 
 
+async def test_a_confirmation_outage_before_the_move_fails_the_call(
+    multi_user_vault,
+):
+    """Adversarial round 1, MAJOR, first timing.
+
+    Before the first publication a database failure propagates as a tool
+    failure. Nothing has been mutated, so there is no partial outcome to
+    report, and the two alternatives are worse: swallowing it would report a
+    write that did not happen as an ordinary refusal, and recording it under
+    the reassignment marker would put a claim in the audit trail that no
+    administrator made.
+    """
+    ctx = multi_user_vault
+    _with_backlinks(ctx)
+    ctx.assignment["fail_after"] = 1
+
+    with pytest.raises(vault_service.VaultConfirmationUnavailable):
+        await tools.move_note_impl("Old.md", "New.md", rewrite_links=True)
+
+    assert (ctx.vault / "Old.md").read_text(encoding="utf-8") == "the moved note\n"
+    assert not (ctx.vault / "New.md").exists()
+    assert ctx.metadata["commits"] == 0
+    # `_tracked` never built a result, so nothing was logged for it.
+    assert ctx.logged == {}
+
+
+async def test_a_confirmation_outage_after_the_move_reports_the_partial_outcome(
+    multi_user_vault,
+):
+    """Adversarial round 1, MAJOR, second timing — the defect itself.
+
+    The move confirms and commits, the metadata transaction commits, and then
+    the first backlink rewrite's confirming SELECT raises. The exception used
+    to propagate: `_tracked` never built or logged a result, and the agent got
+    a traceback while `Old.md` was gone, `New.md` existed and every planned
+    source was still unrewritten.
+
+    It is now the same partial-outcome idiom a per-source failure uses — and it
+    is named as an **outage**, not as a reassignment: nobody changed the
+    assignment, and saying so would be a statement about something that did not
+    happen.
+    """
+    ctx = multi_user_vault
+    _with_backlinks(ctx)
+    # 1: the move. 2: the first rewrite's confirmation — which fails.
+    ctx.assignment["fail_after"] = 2
+
+    result = await tools.move_note_impl("Old.md", "New.md", rewrite_links=True)
+
+    assert "Moved Old.md → New.md" in result
+    assert "partial success" in result
+    assert "confirmation outage, not a reassignment" in result
+    assert "could not be re-read" in result
+    assert str(ctx.vault) in result
+    assert "A.md" in result and "B.md" in result
+    # The move stands and the metadata transaction is not undone.
+    assert not (ctx.vault / "Old.md").exists()
+    assert (ctx.vault / "New.md").read_text(encoding="utf-8") == "the moved note\n"
+    assert ctx.metadata["commits"] == 1
+    # Neither source was rewritten, and the loop stopped at the first one.
+    assert (ctx.vault / "A.md").read_text(encoding="utf-8") == "see [[Old]] here\n"
+    assert (ctx.vault / "B.md").read_text(encoding="utf-8") == "also [[Old]] here\n"
+    # Logged, with a marker distinct from the reassignment one.
+    assert ctx.logged["params"]["error"] == "vault_confirmation_unavailable"
+    assert ctx.logged["params"]["error"] != tools._VAULT_REASSIGNED_MARKER
+
+
+def test_the_three_error_markers_are_distinct():
+    """An operator reading `/admin/usage` after an incident has to be able to
+    tell "this credential had no vault", "an administrator moved it" and "the
+    server could not tell" apart."""
+    markers = {
+        tools._NO_VAULT_MARKER,
+        tools._VAULT_REASSIGNED_MARKER,
+        tools._CONFIRMATION_UNAVAILABLE_MARKER,
+    }
+    assert len(markers) == 3
+
+
+async def test_a_confirmation_outage_between_two_rewrites_stops_at_that_one(
+    multi_user_vault,
+):
+    """The outage can land part way through the rewrites too: the ones already
+    published stand, the rest are reported unrewritten."""
+    ctx = multi_user_vault
+    _with_backlinks(ctx)
+    # 1: the move. 2: A.md's rewrite. 3: B.md's confirmation — which fails.
+    ctx.assignment["fail_after"] = 3
+
+    result = await tools.move_note_impl("Old.md", "New.md", rewrite_links=True)
+
+    assert "rewrote 1 link(s) across 1 note(s)" in result
+    assert "confirmation outage" in result
+    assert "[[New]]" in (ctx.vault / "A.md").read_text(encoding="utf-8")
+    assert (ctx.vault / "B.md").read_text(encoding="utf-8") == "also [[Old]] here\n"
+    assert "B.md" in result
+
+
 async def test_a_reassignment_during_the_metadata_transaction_stops_the_rewrites(
     multi_user_vault,
 ):
@@ -882,13 +1076,18 @@ async def test_a_plain_move_confirms_once(multi_user_vault):
     assert (ctx.vault / "moved.md").read_text(encoding="utf-8") == "original body\n"
 
 
-def test_the_move_endpoints_are_stamped_so_a_rollback_is_never_refused(
+def test_the_rollback_is_authorised_by_a_permit_not_by_a_reusable_stamp(
     multi_user_vault,
 ):
     """`_verify_the_moved_inode` rolls back by calling the same helper with the
-    targets swapped. Refusing that for want of a stamp would strand the note
-    somewhere nobody named, so both endpoints carry the one confirmation that
-    covers the move — and the spare is dropped the moment the move stands."""
+    endpoints swapped. The first implementation paid for that by stamping the
+    one confirmation onto **both** targets, which made a reusable token of it.
+
+    The narrow form instead: the forward move returns a `MovePermit` naming
+    exactly those two targets, and it authorises exactly one reverse move
+    between them — not a second forward move, not any other pair, and not
+    itself twice.
+    """
     ctx = multi_user_vault
     seed(ctx)
 
@@ -896,15 +1095,44 @@ def test_the_move_endpoints_are_stamped_so_a_rollback_is_never_refused(
         vault_service.open_mutable("moved.md", user_id=UID)
     ) as dest:
         confirmation = a_confirmation(ctx)
-        source.confirm(confirmation)
-        dest.confirm(confirmation)
-        vault_service.move_file_no_clobber(source, dest)
-        assert not dest.is_confirmed
-        # The rollback direction still has its stamp.
-        assert source.is_confirmed
-        vault_service.move_file_no_clobber(dest, source)
+        permit = vault_service.move_file_no_clobber(
+            source, dest, confirmation=confirmation
+        )
+        assert confirmation.spent
+        # The permit is not a confirmation and cannot be used as one.
+        assert not isinstance(permit, vault_service.RootConfirmation)
+        # It authorises only the reverse of the move that produced it.
+        with pytest.raises(UnconfirmedPublication) as excinfo:
+            vault_service.move_file_no_clobber(source, dest, permit=permit)
+        assert "only the reverse" in str(excinfo.value)
+
+        vault_service.move_file_no_clobber(dest, source, permit=permit)
+        # And exactly once.
+        with pytest.raises(UnconfirmedPublication) as excinfo:
+            vault_service.move_file_no_clobber(source, dest, permit=permit)
+        assert "already been used" in str(excinfo.value)
 
     assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "original body\n"
+    assert not (ctx.vault / "moved.md").exists()
+
+
+def test_a_move_takes_exactly_one_of_a_confirmation_and_a_permit(multi_user_vault):
+    ctx = multi_user_vault
+    seed(ctx)
+
+    with vault_service.open_mutable("note.md", user_id=UID) as source, (
+        vault_service.open_mutable("moved.md", user_id=UID)
+    ) as dest:
+        with pytest.raises(UnconfirmedPublication):
+            vault_service.move_file_no_clobber(source, dest)
+        with pytest.raises(UnconfirmedPublication):
+            vault_service.move_file_no_clobber(
+                source,
+                dest,
+                confirmation=a_confirmation(ctx),
+                permit=vault_service.MovePermit(dest, source),
+            )
+
     assert not (ctx.vault / "moved.md").exists()
 
 
@@ -1007,7 +1235,7 @@ def test_every_write_tool_publishes_through_a_confirmed_target():
         if tool.name in LOCKED_GATE_TOOLS:
             continue
         confirms = any(
-            callee.startswith("_confirm_publication")
+            callee.startswith("_confirmed_publication")
             for name in reachable
             for callee in _called_names(TOOLS_FUNCTIONS[name])
         )
@@ -1037,7 +1265,7 @@ def test_no_read_tool_confirms_anything():
         if _needs_write(reachable):
             continue
         if any(
-            callee.startswith("_confirm_publication")
+            callee.startswith("_confirmed_publication")
             for name in reachable
             for callee in _called_names(TOOLS_FUNCTIONS[name])
         ):

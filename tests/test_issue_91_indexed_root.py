@@ -37,7 +37,7 @@ from sqlalchemy.sql.dml import Delete, Update
 from sqlalchemy.sql.elements import TextClause
 from sqlalchemy.sql.selectable import Select
 
-from src.services import indexer, transfer
+from src.services import embeddings, indexer, transfer
 
 
 # ── the recording fake session ─────────────────────────────────────────────
@@ -76,9 +76,18 @@ class FakeSession:
 
     def __init__(
         self, *, provenance=(None, None, None), existing=None, note_ids=None,
-        link_count=0,
+        link_count=0, assignment=None, is_active=True,
     ):
         self.provenance = provenance
+        # What the locked, freshly read `users` row says (#91, adversarial
+        # round 1 BLOCKER). `install()` fills it in from the vault the pass is
+        # given; a test that wants the reviewer's interleaving sets it to
+        # something else, or flips it part way through with `flip_assignment`.
+        self.assignment = assignment
+        self.is_active = is_active
+        self.user_row_missing = False
+        # Every locked re-read of the `users` row, in order.
+        self.assignment_reads = 0
         # What `link_backfill_pass`'s completion probe sees. 0 means "no pass
         # has completed for this scope yet", which is when it runs.
         self.link_count = link_count
@@ -128,7 +137,9 @@ class FakeSession:
                  for k, v in values.items()}
             )
             self.timeline.append("stamp")
-            return _Result()
+            # Exactly the one row the caller locked. A stamp that matched no
+            # row aborts the transaction it is in.
+            return _Result(rowcount=0 if self.user_row_missing else 1)
 
         if isinstance(stmt, Delete):
             table = _table_of(stmt)
@@ -149,6 +160,18 @@ class FakeSession:
             rendered = str(stmt)
             if "indexed_vault_assignment" in rendered:
                 return _Result([self.provenance])
+            # The locked re-read that binds a delete or a stamp to the
+            # assignment that produced it.
+            if "users.vault_path" in rendered and "FOR UPDATE" in rendered:
+                self.assignment_reads += 1
+                self.timeline.append("lock:users")
+                if self.user_row_missing:
+                    return _Result([])
+                return _Result([
+                    SimpleNamespace(
+                        vault_path=self.assignment, is_active=self.is_active
+                    )
+                ])
             # `link_backfill_pass`'s "has this user any links yet" probe. Its
             # join condition mentions `notes_metadata.id`, so it has to be
             # recognised before the vault-index branch below.
@@ -212,6 +235,11 @@ def _literal(value):
 def install(monkeypatch, session, vault):
     monkeypatch.setattr(indexer, "async_session", lambda: session)
     monkeypatch.setattr(indexer, "_vault_root", lambda _uid: vault)
+    # By default the database agrees with the root the pass was handed — the
+    # ordinary case. A test that wants the reviewer's interleaving sets
+    # `session.assignment` itself, before or during the pass.
+    if session.assignment is None:
+        session.assignment = str(vault)
 
 
 def facts_for(vault: Path) -> indexer.RootFacts:
@@ -599,6 +627,145 @@ async def test_reassignment_to_a_different_vault_discards(monkeypatch, tmp_path)
         "indexed_vault_realpath": indexer.encode_realpath(os.path.realpath(new)),
         "indexed_vault_handle": facts_for(new).handle,
     }
+
+
+@pytest.mark.asyncio
+async def test_a_discard_is_bound_to_the_assignment_that_produced_it(
+    monkeypatch, tmp_path
+):
+    """Adversarial round 1's BLOCKER, exactly as it was described.
+
+    User 7 is assigned to A and has a complete A index stamped A. The
+    administrator assigns B; the pass caches and pins B and classifies
+    A-versus-B as a discard. Before the discard transaction starts, the
+    administrator corrects the assignment **back to A**. The old code deleted
+    every A row and stamped provenance B, destroying a valid index and forcing
+    a full re-embed of B — which the next pass would then discard again.
+
+    The delete is bound to the assignment that produced the verdict: the
+    transaction locks the `users` row, re-reads it, and finds A. Nothing is
+    deleted, nothing is stamped, and the pass aborts so the next one
+    reclassifies against the row as it now stands.
+    """
+    old = make_vault(tmp_path, "old", {"Note.md": "old body\n"})
+    new = make_vault(tmp_path, "new", {"Fresh.md": "new body\n"})
+    session = FakeSession(
+        provenance=recorded_from(facts_for(old)),
+        existing={"Note.md": hash_of("old body\n")},
+        note_ids={"Fresh.md": 10},
+        # The database says A again by the time the discard transaction runs.
+        assignment=str(old),
+    )
+    install(monkeypatch, session, new)
+    track_reads(monkeypatch, session)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await indexer.index_vault(user_id=7)
+
+    assert "discard aborted" in str(excinfo.value)
+    assert str(old) in str(excinfo.value)
+    assert session.assignment_reads == 1
+    assert session.metadata_deletes == [], "a valid index was destroyed"
+    assert session.stamps == [], "provenance was recorded for a root nobody named"
+    assert not any(e.startswith("read:") for e in session.timeline), session.timeline
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "condition", ["unassigned", "deactivated", "deleted"]
+)
+async def test_a_discard_aborts_when_the_locked_row_no_longer_describes_the_pass(
+    monkeypatch, tmp_path, condition
+):
+    """The other three states the locked re-read can find. None of them is the
+    state the classification described, so none licenses the delete."""
+    old = make_vault(tmp_path, "old", {"Note.md": "old body\n"})
+    new = make_vault(tmp_path, "new", {"Fresh.md": "new body\n"})
+    session = FakeSession(
+        provenance=recorded_from(facts_for(old)),
+        existing={"Note.md": hash_of("old body\n")},
+        note_ids={"Fresh.md": 10},
+        assignment=str(new),
+    )
+    install(monkeypatch, session, new)
+    if condition == "unassigned":
+        session.assignment = None
+    elif condition == "deactivated":
+        session.is_active = False
+    else:
+        session.user_row_missing = True
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await indexer.index_vault(user_id=7)
+
+    assert "discard aborted" in str(excinfo.value)
+    assert session.metadata_deletes == []
+    assert session.stamps == []
+
+
+@pytest.mark.asyncio
+async def test_a_discard_stamp_that_matches_no_row_rolls_the_delete_back(
+    monkeypatch, tmp_path
+):
+    """The stamp has to land on exactly the row the transaction locked.
+
+    A delete standing beside a provenance record that does not exist is the
+    "rows from one vault beside a record naming another" this branch exists to
+    make impossible, so a zero-row stamp aborts the whole transaction rather
+    than committing the delete alone.
+    """
+    old = make_vault(tmp_path, "old", {"Note.md": "old body\n"})
+    new = make_vault(tmp_path, "new", {"Fresh.md": "new body\n"})
+
+    class _NoStampSession(FakeSession):
+        async def execute(self, stmt, params=None):
+            result = await super().execute(stmt, params)
+            if isinstance(stmt, Update) and _table_of(stmt) == "users":
+                return _Result(rowcount=0)
+            return result
+
+    session = _NoStampSession(
+        provenance=recorded_from(facts_for(old)),
+        existing={"Note.md": hash_of("old body\n")},
+        note_ids={"Fresh.md": 10},
+        assignment=str(new),
+    )
+    install(monkeypatch, session, new)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        await indexer.index_vault(user_id=7)
+
+    assert "not exactly one" in str(excinfo.value)
+    assert session.commits == 0, "the delete was committed without its record"
+
+
+@pytest.mark.asyncio
+async def test_a_re_derive_stamp_is_bound_the_same_way_and_is_withheld(
+    monkeypatch, tmp_path
+):
+    """The tail stamp writes provenance too, so it takes the same binding.
+
+    It is withheld rather than fatal: the re-derive's repairs are correct for
+    the root they were read from and nothing was destroyed, so an unrecorded
+    provenance simply makes the next pass re-derive again.
+    """
+    vault = make_vault(tmp_path, "vault", {"Note.md": "body\n"})
+    other = make_vault(tmp_path, "other", {})
+    session = FakeSession(
+        provenance=(None, None, None),
+        existing={},
+        note_ids={"Note.md": 1},
+        assignment=str(other),
+    )
+    install(monkeypatch, session, vault)
+    session.assignment = str(other)
+
+    await indexer.index_vault(user_id=7)
+
+    assert session.assignment_reads == 1
+    assert session.stamps == [], "provenance was recorded under another assignment"
+    # The repairs still happened and still committed.
+    assert session.commits >= 1
 
 
 @pytest.mark.asyncio
@@ -1190,6 +1357,32 @@ async def test_a_note_deleted_between_the_scan_and_the_link_rebuild_is_not_a_ski
 
 
 @pytest.mark.asyncio
+async def test_a_changed_path_with_no_index_row_is_recorded_as_a_skip(
+    monkeypatch, tmp_path
+):
+    """The one link-extraction skip that used to be silent.
+
+    `_update_links_for_changed` drops a changed path whose `paths_to_id` lookup
+    comes back empty. Its sibling — a changed path with no buffered body —
+    records a skip, and A.7a's rule is that *any* such skip withholds the
+    re-derive's certification. Recording only one of the two left the single
+    branch that can drop a link row while still stamping "every link row was
+    written by this pass". Practically unreachable, since the index is selected
+    after the upsert in the same transaction; recorded anyway, because the
+    stamp is a claim about completeness.
+    """
+    vault = make_vault(tmp_path, "vault", {"a.md": "see [[x]]\n", "b.md": "b\n"})
+    session = FakeSession(
+        provenance=(None, None, None), existing={}, note_ids={"a.md": 1}
+    )
+    install(monkeypatch, session, vault)
+
+    await indexer.index_vault(user_id=7)
+
+    assert session.stamps == [], "an incomplete re-derive recorded provenance"
+
+
+@pytest.mark.asyncio
 async def test_a_pass_with_an_empty_skip_list_stamps(monkeypatch, tmp_path):
     vault = make_vault(tmp_path, "vault", {"a.md": "a\n", "sub/b.md": "b\n"})
     session = FakeSession(provenance=(None, None, None), existing={}, note_ids={})
@@ -1495,8 +1688,8 @@ async def test_embed_vault_refuses_to_certify_content_it_did_not_read(
 
     embedded = []
 
-    async def fake_embed_note(session, note, content):
-        embedded.append(note.file_path)
+    async def fake_embed_note(session, note, content, **kwargs):
+        embedded.append((note.file_path, kwargs.get("certified_hash")))
         return 1
 
     monkeypatch.setattr(indexer, "embed_note", fake_embed_note)
@@ -1506,24 +1699,111 @@ async def test_embed_vault_refuses_to_certify_content_it_did_not_read(
     assert embedded == [], "content that does not hash to the row was embedded"
     assert session.marked == [], "the row was marked embedded anyway"
 
-    # A later pass, after the scan has refreshed the row, embeds it.
+    # A later pass, after the scan has refreshed the row, embeds it — and
+    # certifies against the hash the bytes were verified against, never one
+    # re-read from the row.
     row.content_hash = hash_of("the bytes on disk\n")
     await indexer.embed_vault(user_id=7)
-    assert embedded == ["Note.md"]
+    assert embedded == [("Note.md", hash_of("the bytes on disk\n"))]
+
+
+class CertifyingSession:
+    """`embed_vault` against the **real** `embed_note`, with a row that can move.
+
+    `current` is what `notes_metadata` holds *now*: the ORM re-read answers
+    from it, and the conditional certification matches a row only when its
+    predicate agrees with it. That is the whole interleaving — the pass
+    verified bytes against `selected`, and by the time it certifies the row may
+    say something else.
+    """
+
+    def __init__(self, selected, current_hash=None, current_path=None):
+        self.selected = selected
+        self.current_hash = current_hash or selected.content_hash
+        self.current_path = current_path or selected.file_path
+        self.certified: list[tuple[str, str]] = []
+        self.vector_deletes = 0
+        self.added: list = []
+        self.commits = 0
+        self.rollbacks = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def commit(self):
+        self.commits += 1
+
+    async def rollback(self):
+        self.rollbacks += 1
+
+    async def flush(self):
+        pass
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    def expire(self, _obj, _attrs=None):
+        pass
+
+    async def execute(self, stmt, params=None):
+        if isinstance(stmt, TextClause):
+            if "embedded_content_hash IS NULL" in stmt.text:
+                return _Result([self.selected])
+            return _Result()
+        if isinstance(stmt, Update) and _table_of(stmt) == "notes_metadata":
+            rendered = str(stmt.compile(compile_kwargs={"literal_binds": True}))
+            values = {
+                getattr(k, "name", str(k)): _literal(v)
+                for k, v in dict(stmt._values or {}).items()
+            }
+            stamped = values["embedded_content_hash"]
+            # The conditional predicate is evaluated against the row as it is
+            # *now*, exactly as PostgreSQL re-evaluates an UPDATE's WHERE after
+            # taking the row lock under READ COMMITTED.
+            matches = (
+                repr(self.current_hash)[1:-1] in rendered
+                and repr(self.current_path)[1:-1] in rendered
+            )
+            if not matches:
+                return _Result(rowcount=0)
+            self.certified.append((self.current_path, stamped))
+            return _Result(rowcount=1)
+        if isinstance(stmt, Delete) and _table_of(stmt) == "note_embeddings":
+            self.vector_deletes += 1
+            return _Result()
+        if isinstance(stmt, Select):
+            # The ORM re-read: it sees the row as it is now, which is the whole
+            # point of the failing input.
+            note = SimpleNamespace(
+                id=self.selected.id,
+                file_path=self.current_path,
+                content_hash=self.current_hash,
+                embedded_content_hash=None,
+            )
+            result = _Result([note])
+            result.scalar_one = lambda: note
+            return result
+        return _Result()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("classification", ["unknown", "reassigned"])
-async def test_embed_vault_runs_under_every_classification(
-    monkeypatch, tmp_path, classification
-):
-    """Round 4's correction: gating this pass composed with the completeness
-    rule into indefinite staleness.
+async def test_embed_vault_applies_no_provenance_gate_at_all(monkeypatch, tmp_path):
+    """Round 4's correction, asserted rather than decorated.
 
-    A permanently unreadable file withholds the provenance record forever — by
-    design — and the gate would have turned that into a permanent refusal to
-    embed *anything* for that user, while `semantic_search` went on returning
-    the chunk text of content a readable note no longer has.
+    Gating this pass composed with the completeness rule into indefinite
+    staleness: a permanently unreadable file withholds the provenance record
+    forever — by design — and the gate would have turned that into a permanent
+    refusal to embed *anything* for that user, while `semantic_search` went on
+    returning the chunk text of content a readable note no longer has.
+
+    The previous version of this test parametrised a `classification` string
+    that changed no fixture, mock, row or code path, so both cases were
+    identical and it could not have detected a gate. This asserts the property
+    directly: `embed_vault` reads no provenance and calls no classifier, under
+    any recorded state.
     """
     body = "fresh body\n"
     vault = make_vault(tmp_path, "vault", {"Note.md": body})
@@ -1534,19 +1814,105 @@ async def test_embed_vault_runs_under_every_classification(
     monkeypatch.setattr(indexer.settings, "embedding_exclude_patterns", [], raising=False)
     monkeypatch.setattr(indexer, "_is_paused", lambda: False)
 
+    def refuse(*_a, **_kw):  # pragma: no cover - fails the test if reached
+        raise AssertionError("embed_vault consulted the provenance record")
+
+    monkeypatch.setattr(indexer, "classify_for_pass", refuse)
+    monkeypatch.setattr(indexer, "_read_recorded_provenance", refuse)
+    monkeypatch.setattr(indexer, "_reconcile_provenance", refuse)
+
     embedded = []
 
-    async def fake_embed_note(session, note, content):
-        embedded.append(note.file_path)
+    async def fake_embed_note(session, note, content, **kwargs):
+        embedded.append((note.file_path, kwargs.get("certified_hash")))
         return 1
 
     monkeypatch.setattr(indexer, "embed_note", fake_embed_note)
 
     await indexer.embed_vault(user_id=7)
 
-    # Processed, not skipped — and what it embedded hashed to the row it was
-    # written against.
-    assert embedded == ["Note.md"], classification
+    assert embedded == [("Note.md", hash_of(body))]
+    assert not any(
+        "indexed_vault_assignment" in str(stmt)
+        for stmt in getattr(session, "statements", [])
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_row_that_changes_between_verification_and_certification_is_refused(
+    monkeypatch, tmp_path
+):
+    """The reviewer's failing input, exactly.
+
+    The initial query returns note 1 with hash H1; the pass reads content C1
+    and verifies `hash(C1) == H1`. Before the ORM re-read, another index
+    transaction commits note 1 with hash H2. The re-read therefore returns the
+    H2 row — and the old code handed *that* value to `embed_note`, which
+    stamped it onto vectors built from C1. Semantic search then returned C1's
+    chunks while the metadata and the disk described C2, and the equality
+    H2 == H2 blocked every later re-embed: permanently wrong results for a
+    consumer that acts on them without a human seeing the query.
+
+    Now the certification is a conditional write against **H1** — the hash of
+    what was actually embedded — so a row that moved matches nothing, the
+    vectors are discarded, and the row is left unmarked for a later pass.
+    """
+    body = "the bytes this pass read\n"
+    vault = make_vault(tmp_path, "vault", {"Note.md": body})
+    h1 = hash_of(body)
+    h2 = hash_of("what another pass committed\n")
+
+    selected = SimpleNamespace(id=1, file_path="Note.md", content_hash=h1)
+    session = CertifyingSession(selected, current_hash=h2)
+    monkeypatch.setattr(indexer, "async_session", lambda: session)
+    monkeypatch.setattr(indexer, "_vault_root", lambda _uid: vault)
+    monkeypatch.setattr(indexer.settings, "embedding_exclude_patterns", [], raising=False)
+    monkeypatch.setattr(indexer, "_is_paused", lambda: False)
+
+    async def fake_batch(chunks):
+        return [[0.0] * 4 for _ in chunks]
+
+    monkeypatch.setattr(embeddings, "get_embeddings_batch", fake_batch)
+
+    await indexer.embed_vault(user_id=7)
+
+    assert session.certified == [], "stale vectors were certified"
+    assert session.vector_deletes == 0, "the old vectors were dropped anyway"
+    assert session.added == [], "stale vectors were inserted"
+    assert session.rollbacks == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unchanged_row_is_certified_against_what_was_embedded(
+    monkeypatch, tmp_path
+):
+    """The positive control, and the second half of the rule: the hash written
+    is the one the bytes were verified against, never one re-read from the row.
+
+    Without this the test above would pass against an `embed_note` that
+    certifies nothing at all."""
+    body = "the bytes this pass read\n"
+    vault = make_vault(tmp_path, "vault", {"Note.md": body})
+    h1 = hash_of(body)
+
+    selected = SimpleNamespace(id=1, file_path="Note.md", content_hash=h1)
+    session = CertifyingSession(selected)
+    monkeypatch.setattr(indexer, "async_session", lambda: session)
+    monkeypatch.setattr(indexer, "_vault_root", lambda _uid: vault)
+    monkeypatch.setattr(indexer.settings, "embedding_exclude_patterns", [], raising=False)
+    monkeypatch.setattr(indexer, "_is_paused", lambda: False)
+
+    async def fake_batch(chunks):
+        return [[0.0] * 4 for _ in chunks]
+
+    monkeypatch.setattr(embeddings, "get_embeddings_batch", fake_batch)
+
+    await indexer.embed_vault(user_id=7)
+
+    assert session.certified == [("Note.md", h1)]
+    assert session.vector_deletes == 1
+    assert len(session.added) == 1
+    assert session.rollbacks == 0
 
 
 @pytest.mark.asyncio
@@ -1586,7 +1952,7 @@ async def test_one_unreadable_note_does_not_freeze_a_readable_notes_vectors(
 
     embedded = []
 
-    async def fake_embed_note(session, note, content):
+    async def fake_embed_note(session, note, content, **kwargs):
         embedded.append(note.file_path)
         return 1
 

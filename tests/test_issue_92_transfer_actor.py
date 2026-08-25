@@ -438,3 +438,52 @@ def test_both_directions_record_the_actor(direction):
     )
     assert row.direction == direction
     assert row.actor_label == "nightly sync"
+
+
+# ── the one-credential invariant (adversarial round 1, MAJOR) ───────────────
+
+
+def test_an_identity_naming_two_credentials_is_refused():
+    """Nothing in a two-credential row records which of them minted it, so
+    there is no correct label to pick — and 017's backfill would pick the
+    API key purely because that UPDATE runs first.
+
+    `APIKeyMiddleware` sets both ContextVars to None at the head of every
+    request and fills in exactly one branch, so this is unreachable today.
+    That is why it is asserted rather than assumed: the value is written
+    straight onto `transfer_tokens`, whose CHECK constraint forbids the pair,
+    and the attribution copied from that row is shown to an operator as an
+    audit trail.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        transfer.Identity(key_id=7, oauth_token_id=11, user_id=3)
+    assert "at most one credential" in str(excinfo.value)
+
+
+def test_both_credentials_absent_is_still_legal():
+    """The single-user and sandbox shape: no credential foreign key at all."""
+    identity = transfer.Identity()
+    assert identity.key_id is None and identity.oauth_token_id is None
+
+
+def test_the_middleware_never_binds_both_credential_context_vars():
+    """The reason the invariant is unreachable, asserted where it lives."""
+    import inspect
+
+    import src.mcp_server.auth as auth
+
+    source = inspect.getsource(auth)
+    # Both are reset to None at the head of every request, and the OAuth branch
+    # explicitly clears the API-key one before setting its own.
+    assert "current_api_key_id.set(None)" in source
+    assert "current_oauth_token_id.set(None)" in source
+
+
+def test_the_model_declares_the_one_credential_constraint():
+    """`alembic check` does not compare CHECK predicates, so the model's
+    declaration is what keeps a fresh `create_all` and the migration agreeing.
+    """
+    names = {
+        c.name for c in TransferToken.__table__.constraints if hasattr(c, "sqltext")
+    }
+    assert "ck_transfer_tokens_one_credential" in names

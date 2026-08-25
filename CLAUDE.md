@@ -621,6 +621,149 @@ credential and then opens the Usage page to see what it did was shown
   The honest gap is rows written between 015 and 017: they keep join-only
   attribution and render as unattributable when the joins miss. The label
   authorises nothing — redemption still resolves the credential row.
+- **A transfer token names at most one minting credential**, and since 017 the
+  database says so: `ck_transfer_tokens_one_credential`
+  (`key_id IS NULL OR oauth_token_id IS NULL`), created and marked by 017 and
+  resolved through `pg_constraint` — a same-named `CHECK (true)` would satisfy
+  a lookup by name. Both NULL stays legal; that is the single-user and sandbox
+  shape. It exists because nothing in a two-credential row records *which* of
+  them minted it, so the API-key backfill would have labelled such a row purely
+  by running first and the OAuth statement's `actor_kind IS NULL` guard would
+  then have skipped the row it had just mislabelled — an invented attribution,
+  rendered to an operator as an audit trail. 017 refuses such rows by id before
+  either backfill, and `transfer.Identity.__post_init__` refuses the same state
+  in the app. Unreachable today (`APIKeyMiddleware` clears both ContextVars and
+  fills one branch), which is why it is asserted rather than assumed.
+- **The deploy window is declared, not closed.** The deploy migrates and *then*
+  recreates, so a mint served by the old code between 017's backfill and the
+  recreate inserts a row with all three actor columns NULL. That is the tail of
+  the same 015→017 gap: it renders through the join fallback like every pre-017
+  row and degrades only if the credential is later deleted. Symmetric with
+  016's treatment (NULL record ⇒ re-derive; NULL label ⇒ join fallback). No
+  barrier and no quiesce: the window is seconds long and the fallback works.
+
+## Publication confirms the vault root, and the residual is declared
+
+`APIKeyMiddleware` binds `current_vault_root` once, at admission, and that
+snapshot is immutable by design — it is what makes #66's gate fail closed under
+a concurrent bulk cache warm. The cost is that it is *stale by design* for the
+whole of a request: an administrator can reassign, the panel can report it
+complete, and a write already in flight still publishes into the former root.
+So every mutating tool re-reads `users.vault_path` / `is_active` immediately
+before **each** publication and refuses on change (#88). The answer is
+deliberately not a lock: holding the credential and user rows `FOR UPDATE`
+across `move_note`'s link rewrites would put arbitrary vault I/O inside a lock
+every authenticated request contends for. The transfer routes keep their
+stronger locked gate; `import_from_url` and `request_upload` are the two
+allow-listed exemptions.
+
+- **The residual is stated, not implied.** The window shrinks from a whole
+  request to staging, the durability flush and one publishing call. A
+  reassignment committing inside *that* still lands in the former root and the
+  tool reports success — the same optimistic level as `edit_note(expected=…)`
+  and the transfer fingerprint check. `move_note(rewrite_links=True)` has
+  several such windows, one per publication, and can be refused part way
+  through; "one window per tool call" would be false for it and must not be
+  claimed.
+- **There is no retainable stamp.** `vault._confirm_vault_assignment` is
+  private and the only entry point is `vault.confirmed_publication(user_id,
+  publish)`, which awaits the read and calls a **synchronous** `publish` before
+  returning control — so no caller-visible `await` can sit between the two. A
+  coroutine function, or a callable that hands back an awaitable, is refused
+  rather than awaited. The first implementation exposed a stamp on the target
+  and review caught the three holes that follow from it.
+- **`RootConfirmation` is single-consumption and target-bound.** The spent flag
+  lives on the confirmation, not on a slot in the target, so one object cannot
+  be spent by two publications however it is attached; and `consume` checks the
+  acting user id and the canonical assignment against `MutableTarget.user_id` /
+  `.assignment` before spending it. Every publish helper
+  (`_atomic_write_at`, `move_file_no_clobber`, `soft_delete_target`,
+  `unlink_at`) takes one or refuses with `UnconfirmedPublication` — a
+  programming error, deliberately not a `RuntimeError`, because the tool bodies
+  catch `RuntimeError` around their publishes and would render it as a failed
+  write.
+- **A rollback rides the confirmation it undoes, through a `MovePermit`.** The
+  forward `move_file_no_clobber` returns a permit naming exactly its two
+  targets; `_verify_the_moved_inode`'s reverse move presents it. One use, that
+  pair only, and it is not a confirmation and cannot become one. Stamping the
+  one confirmation onto both endpoints — the first shape — made a reusable
+  token of a single-use fact.
+- **Three distinct error markers, because they say different things.**
+  `no_vault_assigned` (admission: this credential had no vault this call),
+  `vault_assignment_changed` (an administrator moved it — `VaultAssignmentChanged`),
+  and `vault_confirmation_unavailable` (the read *failed*;
+  `VaultConfirmationUnavailable`, not a `RuntimeError`, so no tool body renders
+  it as a bad write). An outage recorded under the reassignment marker puts an
+  administrator's name on an infrastructure incident. Before a call's first
+  publication an outage propagates and the call fails; after `move_note`'s move
+  has stood it is caught, the remaining rewrites stop, and the partial outcome
+  is reported through the existing `failed_rewrite_sources` idiom — naming it
+  an outage, never a reassignment.
+- **`delete_file` holds no `MutableTarget`**, so its confirmation is consumed
+  against the `(uid, root)` its own `_vault_context` resolved, and the whole
+  delete — trash probe included — runs inside the confirmed step.
+
+## The index records the vault it was scanned under
+
+`users.indexed_vault_assignment` / `indexed_vault_realpath` /
+`indexed_vault_handle` (migration 016, all nullable, marker-owned, **no
+backfill**) record the root a pass actually scanned, so a reassignment stops
+`semantic_search`/`keyword_search`/`list_notes`/the graph tools answering from
+a vault the caller no longer has (#91). `classify_provenance` is the one
+function that computes the verdict, over six rows: **indeterminate** (root
+unpinnable, or its realpath no longer names the pinned inode) → nothing, and
+the pass fails; **re-derive** (no record, a half-set record, exactly one fact
+differing, or a handle contradicting an otherwise-matching pair); **keep**
+(both agree); **discard** (both differ). A handle can refuse a keep, never
+establish one, and never establish a discard. Ambiguity never resolves toward
+keeping — silently wrong search results are the failure this product ranks
+highest — and never toward discarding, which costs a full re-embed.
+
+- **Not backfilling is the load-bearing decision.** Deriving the assignment
+  from `users.vault_path` would assert that an assigned user's index was built
+  under what it carries *now*, which is exactly the reassignment lag the record
+  exists to detect. NULL means "provenance unknown", the only true statement at
+  migration time, and such a user is repaired by re-deriving rather than
+  discarding — so introducing the record costs no vault-wide re-embed. It is
+  also what makes the deploy order safe with no cross-container coordination:
+  the previous code cannot write these columns.
+- **The whole pass runs beneath one pinned root descriptor**, so the facts
+  observed, the files discovered and the bytes read come from one inode.
+  `indexed_vault_realpath` stores `os.fsencode(realpath).hex()` — a pathname is
+  arbitrary non-NUL bytes, and a surrogate escape would fail to encode inside
+  the one transaction that must not roll back.
+- **A discard is bound to the assignment that produced it.** The verdict is
+  computed in an earlier transaction against a cached root, so the discard
+  transaction takes the `users` row `SELECT … FOR UPDATE`, re-reads it, and
+  requires present/active/assigned/*equal to `facts.assignment`* before
+  deleting anything; the stamp beside it must affect exactly one row or the
+  whole transaction rolls back. Without that, an administrator correcting a
+  reassignment back destroys a complete, valid index and records provenance for
+  a root nobody is assigned to. The re-derive's tail stamp takes the same lock
+  and the same re-read, and is *withheld* on disagreement rather than fatal —
+  it destroys nothing.
+- **A re-derive that skipped anything records nothing.** Any per-file skip —
+  including both link-extraction skips, the missing buffered body and the
+  missing index row — withholds the stamp, because the record's whole claim is
+  that every surviving row was written by that pass.
+- **`embed_vault` is deliberately ungated on provenance, because it verifies.**
+  Gating it composed with the completeness rule into indefinite staleness: one
+  permanently unreadable file withholds the record forever and would then
+  freeze every other note's vectors at content it no longer has, while
+  `semantic_search` kept returning them. Running ungated is sound only because
+  the pass refuses bytes that do not hash to the selected row's `content_hash`
+  — an embedding is a pure function of content, so which directory supplied the
+  bytes is not a fact the vector depends on. **Removing the verification means
+  re-gating the pass in the same change.**
+- **Verifying the bytes is not enough on its own.** The ORM re-read that
+  follows can see a hash another pass has committed (H2) while the vectors were
+  built from H1; stamping H2 marked the row embedded for content it does not
+  have, and H2 == H2 then blocked every later repair. `embed_note` therefore
+  takes `certified_hash`/`certified_path` and stamps them with a conditional,
+  row-locking `UPDATE … WHERE id AND file_path AND content_hash = H1` **before**
+  it replaces a vector and **after** the provider call — so no row lock is held
+  across a network request, and a row that moved matches nothing.
+  `StaleCertification` rolls the note back and leaves it unmarked.
 
 ## The vault assignment is the admission gate for every tool
 

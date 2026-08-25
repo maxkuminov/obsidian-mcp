@@ -7,7 +7,7 @@ from typing import Protocol
 
 import httpx
 import numpy as np
-from sqlalchemy import delete, select, text
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
@@ -203,18 +203,109 @@ async def get_embeddings_batch(texts: list[str]) -> list[list[float]]:
     return await get_provider().embed_batch(texts)
 
 
-async def embed_note(session: AsyncSession, note: NoteMetadata, content: str):
-    """Chunk a note's content, embed, and store in note_embeddings."""
+class StaleCertification(RuntimeError):
+    """The metadata row moved between verification and certification.
+
+    Raised by `_certify` when the conditional stamp matches no row: the note's
+    `content_hash` or `file_path` changed after the pass verified the bytes it
+    read against them, so the vectors in hand describe content the row no
+    longer claims. Nothing is written; the caller rolls back and a later pass
+    embeds the row as it then stands.
+    """
+
+
+async def _certify(
+    session: AsyncSession,
+    note: NoteMetadata,
+    certified_hash: str,
+    certified_path: str,
+) -> None:
+    """Stamp `embedded_content_hash` conditionally, and lock the row doing it.
+
+    **This is the ordering that closes the database TOCTOU, and both halves
+    matter.** `embed_vault` verifies the bytes it read against the
+    `content_hash` from its *initial* query (call it H1) and then re-reads the
+    row through the ORM — a second read, in a later transaction, which can see
+    a hash another indexer pass has since committed (H2). The old code copied
+    that re-read value onto the vectors it had just built from H1's content, so
+    the row ended up marked embedded for content it does not have; and because
+    `embed_vault` selects on `embedded_content_hash != content_hash`, H2 == H2
+    then blocked every later repair. Permanently wrong semantic results, which
+    is the failure this product ranks above every expensive one.
+
+    So the certification is a conditional `UPDATE … WHERE id = :i AND
+    file_path = :p AND content_hash = :h` against **H1**, the hash of what was
+    actually embedded, and never a value re-read from the row. Under READ
+    COMMITTED an `UPDATE` re-evaluates its predicate against the latest
+    committed version after taking the row lock, so a concurrent commit of H2
+    makes it match zero rows rather than silently winning. Nought rows raises,
+    the caller rolls back, and the vectors are discarded.
+
+    It runs **before** the delete/insert of vectors, so from the moment the
+    stamp lands the row is locked for the rest of this transaction and nothing
+    can change it underneath the write it authorises. It runs **after** the
+    provider call, so a row lock is never held across an embedding request.
+    """
+    result = await session.execute(
+        update(NoteMetadata)
+        .where(
+            NoteMetadata.id == note.id,
+            NoteMetadata.file_path == certified_path,
+            NoteMetadata.content_hash == certified_hash,
+        )
+        .values(embedded_content_hash=certified_hash)
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount != 1:
+        raise StaleCertification(
+            f"notes_metadata row {note.id} ({certified_path!r}) no longer "
+            f"records content_hash {certified_hash!r}, so the vectors built "
+            "from those bytes may not be certified against it"
+        )
+    # The raw UPDATE bypassed the identity map; expire the attribute so nothing
+    # later in this session reads (or flushes) the pre-update value.
+    session.expire(note, ["embedded_content_hash"])
+
+
+async def embed_note(
+    session: AsyncSession,
+    note: NoteMetadata,
+    content: str,
+    *,
+    certified_hash: str | None = None,
+    certified_path: str | None = None,
+):
+    """Chunk a note's content, embed, and store in note_embeddings.
+
+    `certified_hash` / `certified_path` are what the caller **verified the
+    bytes against** — `embed_vault` passes the hash and path from its own
+    initial query. When they are given, the row is stamped through `_certify`:
+    conditionally, with that hash, under a row lock, before any vector is
+    replaced. When they are absent the legacy behaviour stands (copy the
+    in-memory row's `content_hash`), which is what the unit tests that drive
+    this function with a stub session exercise.
+    """
+    if (certified_hash is None) != (certified_path is None):
+        # Half a certification is worse than none: `file_path == None` renders
+        # as `IS NULL` and would match no row, turning every certified embed
+        # into a silent skip.
+        raise ValueError(
+            "certified_hash and certified_path are one unit: pass both or "
+            "neither"
+        )
     cleaned = clean_for_embedding(content)
     chunks = chunk_text(cleaned, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
     if not chunks:
         # Empty/fully-filtered notes are successfully represented by zero
         # vectors. Remove stale vectors and stamp the hash so they do not get
         # selected on every embedding pass forever.
+        if certified_hash is not None:
+            await _certify(session, note, certified_hash, certified_path)
         await session.execute(
             delete(NoteEmbedding).where(NoteEmbedding.note_id == note.id)
         )
-        note.embedded_content_hash = note.content_hash
+        if certified_hash is None:
+            note.embedded_content_hash = note.content_hash
         await session.flush()
         return 0
 
@@ -230,6 +321,15 @@ async def embed_note(session: AsyncSession, note: NoteMetadata, content: str):
             len(embeddings), len(chunks), note.file_path,
         )
         return 0
+
+    # Certify first, then replace. The stamp is the conditional write that
+    # proves the row still records the hash these vectors were built from, and
+    # it takes the row lock that keeps that true for the rest of the
+    # transaction — so nothing is deleted on the strength of a row that has
+    # since moved. It raises rather than returning, and `embed_vault` rolls the
+    # whole note back.
+    if certified_hash is not None:
+        await _certify(session, note, certified_hash, certified_path)
 
     # Only delete the old embeddings once new ones are in hand. If the provider
     # call above had failed, deleting first would let embed_vault commit the
@@ -247,7 +347,8 @@ async def embed_note(session: AsyncSession, note: NoteMetadata, content: str):
         ))
 
     await session.flush()
-    note.embedded_content_hash = note.content_hash
+    if certified_hash is None:
+        note.embedded_content_hash = note.content_hash
     return len(chunks)
 
 

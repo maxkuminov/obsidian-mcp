@@ -2482,3 +2482,178 @@ def test_downgrade_017_refuses_to_drop_a_set_it_did_not_create():
         assert alembic_version(url) == HEAD_REVISION
         for column, _ in TRANSFER_ACTOR_COLUMNS:
             assert column_shape(url, "transfer_tokens", column) is not None
+
+
+# ── 017's one-credential invariant (adversarial round 1, MAJOR) ─────────────
+#
+# `transfer_tokens.key_id` and `.oauth_token_id` are independently nullable, so
+# nothing in the schema stopped a row naming both. Such a row records which
+# credential minted it nowhere, and the backfill's API-key UPDATE would label
+# it from the key purely because it runs first — manufacturing a definitive
+# attribution out of an ambiguity, then copying it onto `usage_logs` at
+# redemption and showing it to an operator as an audit trail.
+
+TRANSFER_ONE_CREDENTIAL = "ck_transfer_tokens_one_credential"
+TRANSFER_ONE_CREDENTIAL_MARKER = (
+    "one minting credential, never two (017_transfer_token_actor)"
+)
+
+
+def one_credential_constraint(url):
+    """`(definition, validated, comment)` for 017's CHECK, or None."""
+    rows = fetch(
+        url,
+        "SELECT pg_get_constraintdef(c.oid) AS definition, c.convalidated, "
+        "       obj_description(c.oid, 'pg_constraint') AS comment "
+        "FROM pg_constraint c "
+        "WHERE c.conrelid = 'transfer_tokens'::regclass AND c.contype = 'c' "
+        "  AND c.conname = $1",
+        TRANSFER_ONE_CREDENTIAL,
+    )
+    if not rows:
+        return None
+    return rows[0]["definition"], rows[0]["convalidated"], rows[0]["comment"]
+
+
+def test_the_one_credential_constraint_exists_and_is_marked_on_a_fresh_database():
+    with throwaway_db("schema_tt_one_cred_fresh") as url:
+        state = one_credential_constraint(url)
+        assert state is not None, "017's one-credential CHECK is missing"
+        definition, validated, comment = state
+        assert "key_id IS NULL" in definition and "oauth_token_id IS NULL" in definition
+        assert validated is True, "a NOT VALID constraint admits every existing row"
+        assert comment == TRANSFER_ONE_CREDENTIAL_MARKER
+
+
+def test_the_constraint_rejects_a_two_credential_insert():
+    """The schema, not a convention, is what stops the state reappearing."""
+    with throwaway_db("schema_tt_one_cred_insert") as url:
+        insert_user(url, 1, "alice")
+        insert_key(url, 1, "nightly sync", "omcp_a1b2c3", user_id=1)
+        insert_client(url, "client-abc", "none", None)
+        sql(
+            url,
+            "INSERT INTO oauth_tokens (token_hash, token_type, client_id, scope, "
+            "user_id, grant_id, expires_at, revoked) "
+            "VALUES ($1, 'access', 'client-abc', 'read', 1, 'grant-1', $2, false)",
+            "a" * 64,
+            FUTURE,
+        )
+        token_id = fetchval(
+            url, "SELECT id FROM oauth_tokens WHERE token_hash = $1", "a" * 64
+        )
+
+        with pytest.raises(Exception) as excinfo:
+            insert_transfer_token(url, 1, key_id=1, oauth_token_id=token_id, user_id=1)
+        assert TRANSFER_ONE_CREDENTIAL in str(excinfo.value)
+
+        # Both NULL stays legal — the single-user and sandbox shape.
+        insert_transfer_token(url, 2)
+        assert fetchval(url, "SELECT count(*) FROM transfer_tokens") == 1
+
+
+def test_a_two_credential_row_is_refused_and_nothing_is_labelled():
+    """013's and 015's offender shape: name the ids, change nothing.
+
+    The refusal has to come *before* either backfill, because the API-key
+    UPDATE would otherwise win by running first and the second UPDATE's
+    `actor_kind IS NULL` guard would then skip the row it had just mislabelled.
+    """
+    with throwaway_db("schema_tt_one_cred_offender", revision="016") as url:
+        token_id = seed_pre_017_transfers(url)
+        # At 016 the constraint does not exist yet, so the drifted row goes in.
+        insert_transfer_token(url, 4, key_id=2, oauth_token_id=token_id, user_id=1)
+
+        combined = refuse_017(
+            url, must_mention=["both a key_id and an oauth_token_id", "ids: 4"]
+        )
+        assert "which credential minted it" in combined
+
+        # Nothing labelled, and the constraint was not installed either.
+        for column, _ in TRANSFER_ACTOR_COLUMNS:
+            assert column_shape(url, "transfer_tokens", column) is None
+        assert one_credential_constraint(url) is None
+
+
+def test_an_impostor_constraint_of_that_name_is_refused():
+    """Resolved through `pg_constraint`, never by name: a same-named
+    `CHECK (true)` satisfies a lookup by name while enforcing nothing."""
+    with throwaway_db("schema_tt_one_cred_impostor", revision="016") as url:
+        seed_pre_017_transfers(url)
+        sql(
+            url,
+            f"ALTER TABLE transfer_tokens ADD CONSTRAINT {TRANSFER_ONE_CREDENTIAL} "
+            "CHECK (true)",
+        )
+        refuse_017(url, must_mention=[TRANSFER_ONE_CREDENTIAL, "enforces something else"])
+
+
+def test_an_unmarked_constraint_of_that_name_is_refused():
+    with throwaway_db("schema_tt_one_cred_unmarked", revision="016") as url:
+        seed_pre_017_transfers(url)
+        sql(
+            url,
+            f"ALTER TABLE transfer_tokens ADD CONSTRAINT {TRANSFER_ONE_CREDENTIAL} "
+            "CHECK (key_id IS NULL OR oauth_token_id IS NULL)",
+        )
+        refuse_017(url, must_mention=["017's comment marker"])
+
+
+def test_a_not_valid_constraint_of_that_name_is_refused():
+    with throwaway_db("schema_tt_one_cred_notvalid", revision="016") as url:
+        seed_pre_017_transfers(url)
+        sql(
+            url,
+            f"ALTER TABLE transfer_tokens ADD CONSTRAINT {TRANSFER_ONE_CREDENTIAL} "
+            "CHECK (key_id IS NULL OR oauth_token_id IS NULL) NOT VALID",
+        )
+        refuse_017(url, must_mention=["NOT VALID"])
+
+
+def test_rerunning_017_accepts_its_own_constraint_and_still_does_not_relabel():
+    """Stamp-back idempotence with the constraint in place: the migration body
+    genuinely re-executes, adopts the constraint it can prove it wrote, and
+    leaves every recorded label alone."""
+    with throwaway_db("schema_tt_one_cred_rerun", revision="016") as url:
+        seed_pre_017_transfers(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        sql(
+            url,
+            "UPDATE transfer_tokens SET actor_label = 'renamed since' WHERE id = 1",
+        )
+
+        _harness.run_alembic(url, "stamp", "016", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert transfer_actor_of(url, 1) == ("api_key", "renamed since", "omcp_a1b2c3")
+        state = one_credential_constraint(url)
+        assert state is not None and state[2] == TRANSFER_ONE_CREDENTIAL_MARKER
+        # Still exactly one constraint of that name.
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM pg_constraint WHERE conrelid = "
+            "'transfer_tokens'::regclass AND conname = $1",
+            TRANSFER_ONE_CREDENTIAL,
+        ) == 1
+
+
+def test_downgrade_017_drops_its_own_constraint_but_not_a_foreign_one():
+    with throwaway_db("schema_tt_one_cred_downgrade", revision="016") as url:
+        seed_pre_017_transfers(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert one_credential_constraint(url) is not None
+
+        _harness.run_alembic(url, "downgrade", "016", dimensions=DIM)
+        assert one_credential_constraint(url) is None
+
+        # A same-named constraint somebody else installed survives a downgrade:
+        # it must undo *this* migration and nothing else.
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        sql(
+            url,
+            f"COMMENT ON CONSTRAINT {TRANSFER_ONE_CREDENTIAL} ON transfer_tokens "
+            "IS 'somebody else'",
+        )
+        _harness.run_alembic(url, "downgrade", "016", dimensions=DIM)
+        assert one_credential_constraint(url) is not None
