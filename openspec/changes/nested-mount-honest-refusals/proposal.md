@@ -22,8 +22,7 @@ None.
 ### Modified Capabilities
 
 - `vault-write`: note-path named-fallback publish failures across a mount boundary must name the mount boundary, not hard-link support (#110); `move_note` refuses a cross-mount move naming the mount boundary, best-effort before the rename and via errno mapping after (#109); `delete_note`'s soft delete does the same for a source on a different mount than `.trash` (#108).
-- `file-access`: `delete_file`'s soft delete inherits the same accurate mount-boundary refusal (#108 — same primitive, `soft_delete_at`).
-- `file-transfer`: the named-fallback staging discard after a post-publication failure must not report a legitimately consumed staging name as disappeared (#115).
+- `file-transfer`: the existing `delete_file` requirement is MODIFIED — `EXDEV` leaves the unsupported-rename set and becomes the mount-boundary refusal, with `probe_trash` preserving that cause (#108); and an ADDED requirement makes the named-fallback staging discard publication-aware so a post-publication failure stops reporting a legitimately consumed staging name as disappeared (#115).
 
 ## Impact
 
