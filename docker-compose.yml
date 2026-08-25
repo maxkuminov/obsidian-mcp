@@ -27,6 +27,11 @@ services:
       - apparmor=docker-default
     cap_drop:
       - ALL
+    # memory cap: applied LIVE on 2026-07-07 (docker update) but never written
+    # here, so any recreate silently dropped it -- persisted 2026-07-27.
+    # Peak 378M/2G = 18%, ample headroom.
+    mem_limit: 2g
+    memswap_limit: 2g
     deploy:
       resources:
         limits:
