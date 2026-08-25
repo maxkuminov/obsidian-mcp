@@ -1772,17 +1772,21 @@ def _link_staged_name(dir_fd: int, tmp: str, name: str) -> None:
     except OSError as exc:
         code = getattr(exc, "errno", None)
         if code == errno.EXDEV:
-            # A boundary, not a filesystem without hard links (#110). The note
-            # path stages *beside* its destination, so this needs an exotic
-            # layout to fire at all — but a message that is wrong whenever it
-            # fires is wrong, and the transfer path's equivalent branch
-            # (`vault_fs._link_no_clobber`) already says this. One vocabulary
-            # across both write paths.
-            raise vault_fs.MountBoundary(
-                f"{name} is on a different mount from the staging file the "
-                "named-staging fallback wrote beside it, so the link that "
-                "publishes the write cannot reach it (EXDEV). The filesystem "
-                "is fine; the mount layout is what refuses."
+            # Not a filesystem without hard links (#110) — and **not
+            # automatically a mount boundary either**. Staging here is
+            # same-directory (one `dir_fd` on both sides), so the two ends are
+            # on one mount in every ordinary configuration and a mount claim
+            # would be false in almost every `EXDEV` that can actually fire.
+            # What does answer `EXDEV` for a same-directory link is a security
+            # policy or a boundary internal to the filesystem, which is exactly
+            # what the classifier says when it measures rather than assumes.
+            raise vault_fs.classify_cross_device(
+                dir_fd,
+                dir_fd,
+                operation=(
+                    f"the link that publishes {name} from its staging file"
+                ),
+                ends=f"the staging file and {name}",
             ) from exc
         if code == errno.EOPNOTSUPP:
             raise vault_fs.UnsupportedFilesystem(
@@ -1933,16 +1937,20 @@ def _atomic_write_at(
                 except OSError as exc:
                     if getattr(exc, "errno", None) != errno.EXDEV:
                         raise
-                    # #110's other half. Without this the boundary escapes as a
-                    # bare `OSError` and the tools render it as "could not
-                    # write" with the kernel's own two-word strerror — strictly
-                    # less than the no-clobber branch beside it says, for the
-                    # same layout.
-                    raise vault_fs.MountBoundary(
-                        f"{name} is on a different mount from the staging file "
-                        "written beside it, so the rename that publishes the "
-                        "overwrite cannot reach it (EXDEV). The filesystem is "
-                        "fine; the mount layout is what refuses."
+                    # #110's other half. Without this the refusal escapes as
+                    # a bare `OSError` and the tools render it as "could not
+                    # write" plus the kernel's own two-word strerror —
+                    # strictly less than the no-clobber branch beside it says,
+                    # for the same event. Classified, not assumed, for the same
+                    # reason as there: the staging file sits in the
+                    # destination's own directory.
+                    raise vault_fs.classify_cross_device(
+                        dir_fd,
+                        dir_fd,
+                        operation=(
+                            f"the rename that publishes the overwrite of {name}"
+                        ),
+                        ends=f"the staging file and {name}",
                     ) from exc
             else:
                 _link_staged_name(dir_fd, tmp, name)
@@ -2237,9 +2245,10 @@ def move_file_no_clobber(
     `vault_fs.rename_noreplace`; a filesystem that cannot do the non-replacing
     form raises `UnsupportedFilesystem` and there is no safe fallback.
 
-    Two parents on different mounts raise `MountBoundary` instead, naming the
-    layout — best-effort before the rename (`_refuse_a_cross_mount_move`) and
-    from the rename's own `EXDEV` otherwise. A copying fallback is **not** the
+    An `EXDEV` raises `MountBoundary` or `CrossDeviceRefusal` instead, whichever
+    the mount comparison supports — best-effort before the rename
+    (`_refuse_a_cross_mount_move`, which refuses only a *definite* mismatch)
+    and from the rename's own classified `EXDEV` otherwise. A copying fallback is **not** the
     answer to it: copy-and-unlink relocates a *new* inode and unlinks whatever
     is at the source afterwards, which is precisely the guarantee above that
     the single `renameat2` exists to give.

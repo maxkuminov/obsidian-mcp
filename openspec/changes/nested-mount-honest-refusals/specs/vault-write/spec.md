@@ -72,18 +72,19 @@ The soft delete SHALL refuse to move a file into `.trash/` across a mount bounda
 - **WHEN** `move_note` runs where `STATX_MNT_ID` is unavailable and both parents share a mount
 - **THEN** the preflight SHALL be skipped and the move SHALL succeed
 
-### Requirement: The note path's named-fallback publish maps `EXDEV` to the mount boundary
+### Requirement: The note path's named-fallback publish classifies its `EXDEV`
 
-The note path's named-staging fallback SHALL map `EXDEV` from its publishing link to a mount-boundary error naming the mount layout; and its overwrite publish (`os.replace`) SHALL map `EXDEV` to the same mount-boundary error rather than letting it escape as a bare `OSError`. Of the remaining link errnos, only `EOPNOTSUPP` SHALL be described as the filesystem not supporting hard links; `EPERM` SHALL be described as hard-link publication being denied — pointing at permissions or security policy (seccomp/LSM) as well as filesystem support — because a security policy returns `EPERM` for `link` on filesystems whose hard links work fine, and a message that diagnoses the filesystem there repeats the defect class this change removes. The note path stages beside its destination, so the `EXDEV` cases require an exotic layout to fire — but a message that is wrong whenever it fires is wrong, and the transfer path's equivalent branches already carry the accurate mapping; the two write paths SHALL use the same vocabulary.
+The note path's named-staging fallback SHALL classify `EXDEV` from its publishing link, and from its overwrite publish (`os.replace`), through the same comparison the rename primitive uses rather than letting either escape as a bare `OSError` or asserting a cause it has not measured. Because that fallback stages **in the destination's own directory**, the two ends of both publications are one directory descriptor, so the comparison answers "same mount" in every ordinary configuration that can produce this errno — and a message naming a mount boundary there would be false in almost every case it can fire, which is the defect class this change removes rather than an instance of the thing it fixes. A definite mismatch SHALL still raise the mount-boundary error, so an exotic layout gets the accurate answer and the branch is not dead. Of the remaining link errnos, only `EOPNOTSUPP` SHALL be described as the filesystem not supporting hard links; `EPERM` SHALL be described as hard-link publication being denied — pointing at permissions or security policy (seccomp/LSM) as well as filesystem support — because a security policy returns `EPERM` for `link` on filesystems whose hard links work fine. The two write paths SHALL use the same vocabulary.
 
 #### Scenario: The fallback's no-clobber link fails `EXDEV`
 
-- **WHEN** the named-fallback publish's hard link fails with `EXDEV`
-- **THEN** the raised error SHALL be the mount-boundary type naming the mount layout
+- **WHEN** the named-fallback publish's hard link fails with `EXDEV` and its staging file sits in the destination's own directory, so the two ends provably share a mount
+- **THEN** the raised error SHALL name a security policy or filesystem-internal boundary and SHALL NOT claim a mount boundary
+- **AND** the same failure where the two ends' mount identities provably differ SHALL raise the mount-boundary error naming the layout, and where they cannot be read SHALL present both causes without asserting either
 - **AND** an `EOPNOTSUPP` failure of the same link SHALL keep the message stating the filesystem does not support hard links
 - **AND** an `EPERM` failure SHALL be reported as hard-link publication denied, naming security policy alongside filesystem support as possible causes
 
 #### Scenario: The fallback's overwrite rename fails `EXDEV`
 
 - **WHEN** the named-fallback overwrite publish's replacing rename fails with `EXDEV`
-- **THEN** the raised error SHALL be the mount-boundary type naming the mount layout, not a bare `OSError`
+- **THEN** the raised error SHALL be the classified refusal — not a bare `OSError`, and not a mount-boundary claim unless the mount comparison supports one

@@ -1703,12 +1703,60 @@ def _publish_raises(monkeypatch, name: str, code: int) -> None:
     monkeypatch.setattr(vault_service.os, name, boom)
 
 
-def test_the_fallback_link_names_the_mount_boundary(vault, monkeypatch):
+def _mount_ids_differ(monkeypatch) -> None:
+    seen: list[int] = []
+
+    def fake(fd: int) -> int:
+        seen.append(fd)
+        return len(seen)
+
+    monkeypatch.setattr(vault_fs, "mount_id_of", fake)
+
+
+def _mount_ids_unreadable(monkeypatch) -> None:
+    def refuse(fd: int) -> int:
+        raise vault_fs.UnsupportedFilesystem("no STATX_MNT_ID on this kernel")
+
+    monkeypatch.setattr(vault_fs, "mount_id_of", refuse)
+
+
+def test_the_fallback_link_does_not_invent_a_mount_boundary(vault, monkeypatch):
     """It used to say "the vault filesystem does not support hard links" for
-    `EXDEV` — false, and it sends an agent to change filesystems in response to
-    a mount layout."""
+    `EXDEV` — false. Saying "different mounts" instead would be false too, and
+    here almost always so (adversarial round 1): the fallback stages *in the
+    destination's own directory*, so both ends of the link are one `dir_fd` and
+    the mount comparison the classifier makes answers "same mount" every time
+    an ordinary configuration can produce this. What actually returns `EXDEV`
+    for a same-directory link is a policy or a filesystem-internal boundary,
+    and that is what the message names."""
     _fallback(monkeypatch)
     _publish_raises(monkeypatch, "link", errno.EXDEV)
+    try:
+        with pytest.raises(vault_fs.CrossDeviceRefusal) as caught:
+            vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+    finally:
+        vault_fs.reset_named_staging_state()
+
+    message = str(caught.value)
+    assert "same mount" in message
+    assert "not a mount boundary" in message
+    assert "Landlock" in message
+    assert "hard link" not in message
+    assert not isinstance(caught.value, vault_fs.MountBoundary)
+    # Still an `UnsupportedFilesystem`, so no typed handler needs a new branch.
+    assert isinstance(caught.value, vault_fs.UnsupportedFilesystem)
+    assert not (vault / "blob.bin").exists()
+    assert list(vault.iterdir()) == [], "staging litter left behind"
+
+
+def test_the_fallback_link_names_the_boundary_when_one_is_measured(
+    vault, monkeypatch
+):
+    """The mount branch is not dead code — it is what an exotic layout gets.
+    The comparison decides; nothing here assumes."""
+    _fallback(monkeypatch)
+    _publish_raises(monkeypatch, "link", errno.EXDEV)
+    _mount_ids_differ(monkeypatch)
     try:
         with pytest.raises(vault_fs.MountBoundary) as caught:
             vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
@@ -1716,13 +1764,29 @@ def test_the_fallback_link_names_the_mount_boundary(vault, monkeypatch):
         vault_fs.reset_named_staging_state()
 
     message = str(caught.value)
-    assert "different mount" in message
+    assert "different mounts" in message
     assert "mount layout is what refuses" in message
     assert "hard link" not in message
-    # Still an `UnsupportedFilesystem`, so no typed handler needs a new branch.
-    assert isinstance(caught.value, vault_fs.UnsupportedFilesystem)
-    assert not (vault / "blob.bin").exists()
-    assert list(vault.iterdir()) == [], "staging litter left behind"
+
+
+def test_the_fallback_link_is_ambiguous_when_the_kernel_cannot_tell(
+    vault, monkeypatch
+):
+    _fallback(monkeypatch)
+    _publish_raises(monkeypatch, "link", errno.EXDEV)
+    _mount_ids_unreadable(monkeypatch)
+    try:
+        with pytest.raises(vault_fs.CrossDeviceRefusal) as caught:
+            vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+    finally:
+        vault_fs.reset_named_staging_state()
+
+    message = str(caught.value)
+    assert "cannot be established" in message
+    assert "STATX_MNT_ID" in message
+    assert "a mount boundary between them" in message
+    assert "Landlock" in message
+    assert not isinstance(caught.value, vault_fs.MountBoundary)
 
 
 def test_a_filesystem_without_hard_links_still_says_so(vault, monkeypatch):
@@ -1762,23 +1826,28 @@ def test_a_denied_link_names_security_policy_not_the_filesystem(vault, monkeypat
     assert not (vault / "blob.bin").exists()
 
 
-def test_the_overwrite_replace_names_the_mount_boundary(vault, monkeypatch):
+@pytest.mark.parametrize("layout", ["same-mount", "different-mounts"])
+def test_the_overwrite_replace_classifies_its_exdev(vault, monkeypatch, layout):
     """The other half of #110: this branch had no `EXDEV` handling at all, so
-    the boundary escaped as a bare `OSError` and the tools rendered it as
-    "could not write" plus the kernel's two-word strerror — strictly less than
-    the no-clobber branch beside it says, for the same layout."""
+    the refusal escaped as a bare `OSError` and the tools rendered it as "could
+    not write" plus the kernel's two-word strerror — strictly less than the
+    no-clobber branch beside it says. It classifies the same way, for the same
+    reason: the staging file sits in the destination's own directory."""
     (vault / "blob.bin").write_bytes(b"old")
     _fallback(monkeypatch)
     _publish_raises(monkeypatch, "replace", errno.EXDEV)
+    if layout == "different-mounts":
+        _mount_ids_differ(monkeypatch)
+        expected, wanted = vault_fs.MountBoundary, "different mounts"
+    else:
+        expected, wanted = vault_fs.CrossDeviceRefusal, "not a mount boundary"
     try:
-        with pytest.raises(vault_fs.MountBoundary) as caught:
+        with pytest.raises(expected) as caught:
             vault_service.write_bytes("blob.bin", b"new", overwrite=True)
     finally:
         vault_fs.reset_named_staging_state()
 
-    message = str(caught.value)
-    assert "different mount" in message
-    assert "mount layout is what refuses" in message
+    assert wanted in str(caught.value)
     assert (vault / "blob.bin").read_bytes() == b"old"
     assert [p.name for p in vault.iterdir()] == ["blob.bin"], "staging litter left"
 
