@@ -361,6 +361,81 @@ vanished from the page, so the operator saw a blank space that read as success.
   sets `hnsw.ef_search=80` per query and dedupes per note in Python
   after a 5x overfetch. See "Filtered vector search" below — the
   `SET LOCAL`s are load-bearing for *correctness*, not just speed.
+- **Each embed pass ends with an exclusion reconciliation sweep** (#127). The
+  backlog selects on `embedded_content_hash IS NULL OR != content_hash`, so it
+  is driven entirely by *content* changes and an `EMBEDDING_EXCLUDE_PATTERNS`
+  edit reached nothing: adding a pattern left an excluded note answering
+  `semantic_search` for ever, removing one left a now-included note stamped
+  with zero vectors, hash-equal, never re-selected, silently absent. The sweep
+  therefore reads the rows the backlog *cannot* see — certification-current
+  (`embedded_content_hash IS NOT DISTINCT FROM content_hash`, owner-scoped) —
+  and writes only where the config and the stored vectors disagree. **Every
+  write goes through `certify_embedded`'s `id + content_hash + file_path`
+  predicate, stamp before delete, per-note commit — never a delete by id**: a
+  move changes `file_path` with an unchanged `content_hash`, so a decision
+  about an excluded path would otherwise delete the vectors of a row that is
+  now included and record it embedded with none. Convergence is defined for a
+  *completed* sweep, with three declared exceptions — zero-chunk notes (already
+  correct, and deliberately never rewritten, which is the one file read the
+  sweep repeats per pass), bytes that no longer hash to the row (the backlog
+  owns it next pass), and a failed provider call (left unstamped). A pause
+  stops it between notes; the next pass runs a fresh, idempotent sweep.
+- **Both move paths recompute the stem-derived `title`** (#127). It falls back
+  to the filename stem, so a rename left `Alpha` on a note called `Beta.md`
+  for ever — a move changes no content, so the scan never revisits the row.
+  The indexer's id-preserving branch binds the title from the entry it already
+  parsed for the new path; `move_note` reads the moved file through the
+  destination target's descriptor after `_verify_the_moved_inode`, parses it
+  with `parse_frontmatter` and derives through the same `_note_title`. **Not a
+  SQL `CASE` over the stored JSONB**: that disagreed with `_note_title` on
+  every falsy title (`false`, `0`, `[]`, `{}`, `""` all fall back to the stem)
+  and trusted a copy that can be older than the file. The JSONB derivation
+  survives only as the read/parse-failure fallback, declared best-effort.
+- **The keyword vector attempts the full note and retreats per note** (#127).
+  Both writers bound `content[:100000]`, so every term past that was invisible
+  to `keyword_search` on a note the tool still reported. `write_tsvector_bounded`
+  attempts the whole body, halving down to a floor of **exactly** 100,000
+  characters — today's statement — with each attempt in its own savepoint and
+  the `try` **outside** `async with session.begin_nested()`, so the error
+  unwinds through the context manager's rollback and leaves the outer
+  transaction usable. A floor failure propagates, exactly as before: the
+  incremental pass aborts with nothing committed and retries next tick, and
+  `rebuild_tsvectors` is now **atomic** — its every-500 intermediate commits
+  are gone, so a floor failure rolls the whole rebuild back instead of leaving
+  a keyword index half-built under two FTS configs that no periodic pass would
+  repair. Verified against a real PostgreSQL
+  (`tests/integration/test_tsvector_bounded_pg.py`); a mocked savepoint cannot
+  show the driver's aborted-transaction state clearing.
+- **The rebuild certifies what it writes, and the reason is that nothing else
+  would ever repair it.** It snapshots the table once and then reads the vault
+  note by note, while a keyword vector is rewritten again only when a note's
+  `content_hash` changes — both move paths preserve `content_tsvector` and the
+  scan skips an unchanged hash. So a row it steps over, or writes stale bytes
+  into, stays on the *previous* `FTS_CONFIGS` for ever: `'running'` stored as
+  the english stem `run`, never matching a `simple` query. Two shapes did
+  exactly that — a note moved after the snapshot failed its old-path read and
+  was a silent `continue`, and an UPDATE by `id` alone overwrote a concurrent
+  pass's `tsvector(C2)` with `tsvector(C1)` while the hash stayed `C2`, so every
+  later scan skipped it. The snapshot now retains owner, path and hash, the
+  bytes are verified against that hash, and the UPDATE names all four and
+  requires exactly one row. A zero-row update, a read failure or a hash mismatch
+  is **never** routed through the halving retreat (that addresses size, not
+  staleness): it re-reads the current owner-scoped row — gone → safely absent,
+  moved or advanced → retried against the fresh values within
+  `MAX_REBUILD_REREADS`, and still recording the same path and hash →
+  `TsvectorRebuildAborted`, rolling the single transaction back rather than
+  committing around it.
+- **`OllamaProvider.embed_batch` has no aggregate deadline** (#127); the 30 s
+  per-call `wait_for` is the only liveness bound. The old fixed 300 s
+  whole-batch budget could fire only when every chunk was individually healthy
+  — i.e. exactly on a note with more chunks than 300 s of normal latency
+  covers, which then never certified and was re-selected every tick: a
+  permanent 300 s burn under `index_pass_lock` that could never finish. A
+  *proportional* replacement re-introduces the same boundary one size class up
+  and was rejected. `OpenAIProvider` is untouched. The cost is a giant note
+  holding the pass for 30 s × chunks once; the pause is honoured at the next
+  note boundary, as always. `embed_note` still refuses to certify partial chunk
+  coverage.
 - Indexer runs on startup then every 5 minutes, hash-based change detection.
   Each periodic tick ends with `prewarm_search_caches()` **inside**
   `index_pass_lock`: one `get_embedding("warmup")` (Ollama only — a remote API
@@ -467,13 +542,20 @@ Consequences that are easy to undo by accident:
   distance order across iterations, so both paths select the cosine distance as
   a column and sort by it before per-note dedupe/truncation. This is
   presentation only — it cannot recover candidates the scan never returned.
-- **Zero-row exact fallback.** An empty result from an approximate *filtered*
-  scan is ambiguous. Both paths re-run the identical statement after
-  `SET LOCAL enable_indexscan = off` (pgvector's documented exact search) and
-  use those rows, recording `exact_fallback: true` in `usage_logs.params`. This
-  is what makes "empty only when nothing matches" a construction rather than a
-  benchmark hope. It is O(n), which is acceptable only because it is the rare
-  path — do not make it unconditional.
+- **Zero-row exact fallback, on *every* zero-row result.** An empty result from
+  an approximate filtered scan is ambiguous. Both paths re-run the identical
+  statement after `SET LOCAL enable_indexscan = off` (pgvector's documented
+  exact search) and use those rows, recording `exact_fallback: true` in
+  `usage_logs.params`. This is what makes "empty only when nothing matches" a
+  construction rather than a benchmark hope. Eligibility is **unconditional**
+  since #127: it used to require a `folder`/`tags`/`frontmatter`/named-user
+  predicate, on the reasoning that an unfiltered scan cannot lose candidates to
+  a post-filter — and the owner mapping went total, so there is no unfiltered
+  query left. The ownerless one (`user_id IS NULL` against a database whose
+  vectors mostly belong to a named user) is exactly the shape where the HNSW
+  window fills with candidates the predicate discards, and under the old
+  condition it returned empty while NULL-owned matches sat in the table. Still
+  O(n), still the rare path — it fires only on a genuinely empty result.
 - **The recall contract is a benchmark SLO**, not a per-query guarantee: set
   recall ≥ 0.9 against an *exact filtered sequential scan taken at the same
   overfetch with the same dedupe*. HNSW is approximate and the overfetch is
@@ -844,6 +926,39 @@ highest — and never toward discarding, which costs a full re-embed.
   before the next pass, so that is the same frozen answer in a new place, and
   it would give the move path a dependency on embedding configuration it has no
   other reason to know.
+
+## The read path's owner predicate is total
+
+`apply_note_filters(user_id=None)` used to append **no** owner predicate while
+every write path maps `None` to `user_id IS NULL`. `MULTI_USER_MODE` can be
+turned off after users exist, so a database holding named users' rows read by
+an ownerless credential handed over every tenant's paths, titles, tags,
+frontmatter and chunk excerpts (#127). `None` is now a scoping value — `IS
+NULL` — and every index-backed tool is swept to it: `keyword_search`,
+`semantic_search`, `list_notes`, `get_recent`, **`get_tags`**, `get_backlinks`,
+`get_links`, `get_neighborhood`, `find_related`, `find_orphans`. A single-user
+deployment sees no change; every row there is NULL-owned.
+
+- **`note_links` carries no `user_id`, so ownership rides the endpoint rows —
+  and *where* it rides decides two different things.** In a JOIN's ON clause a
+  cross-owner target simply fails to resolve; as a WHERE on the joined row it
+  would discard every *dangling* link too, which is what `get_links` exists to
+  report. `_owner_predicate_for(entity, uid)` exists so an alias can carry it.
+- **An edge admitted into the neighborhood BFS or the orphan calculus changes
+  what the answer *is*.** It occupies a slot against `limit`, it can bridge two
+  owned notes through a row the caller cannot see, and on the target side it
+  silently strips an owned note's orphan status — so both endpoints must be
+  inside the owned set at *traversal* time, never at hydration time. An edge
+  counts for `find_orphans` only when its source is owned and its target is
+  either owned or genuinely dangling (dangling still means "not an orphan",
+  unchanged, and unrelated to ownership).
+- **`get_links` classifies by what the scoped join resolved**, not by the raw
+  `note_links.target_note_id`, and omits a row that names a target outside the
+  owned set — that row is not dangling, and printing it would print the other
+  owner's path. Unreachable in normal operation (link resolution is per user),
+  which is why it is refused rather than assumed away.
+- The owner predicate counts as a filter for the exact fallback — see "Filtered
+  vector search".
 
 ## The vault assignment is the admission gate for every tool
 

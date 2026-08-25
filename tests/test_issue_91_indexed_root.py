@@ -93,7 +93,7 @@ class FakeSession:
 
     def __init__(
         self, *, provenance=(None, None, None), existing=None, note_ids=None,
-        link_count=0, assignment=None, is_active=True,
+        link_count=0, assignment=None, is_active=True, note_owner=None,
     ):
         self.provenance = provenance
         # What the locked, freshly read `users` row says (#91, adversarial
@@ -113,6 +113,10 @@ class FakeSession:
         self.link_count = link_count
         self.existing = dict(existing or {})
         self.note_ids = dict(note_ids or {})
+        # The owner `rebuild_tsvectors` retains in its snapshot and names in
+        # its certified UPDATE (#127). Nothing here executes SQL, so the value
+        # only has to be the one the rebuild would have read.
+        self.note_owner = note_owner
         self.statements: list = []
         # A short label per statement, per commit and per vault-file read, in
         # order. Ordering is half of what this record has to get right: the
@@ -172,6 +176,14 @@ class FakeSession:
             self.timeline.append("raise")
             raise RuntimeError("injected failure")
 
+        # `rebuild_tsvectors` addresses its UPDATE by a certified predicate and
+        # requires exactly one row (#127); zero means "the row moved or its
+        # content advanced", which sends it down the re-read path. This stub
+        # executes nothing, so it answers for the row it handed out.
+        rendered_text = str(stmt) if isinstance(stmt, TextClause) else ""
+        if "content_tsvector" in rendered_text and "UPDATE" in rendered_text:
+            return _Result(rowcount=1)
+
         if isinstance(stmt, Update) and _table_of(stmt) == "users":
             values = dict(stmt._values or {})
             self.stamps.append(
@@ -227,15 +239,21 @@ class FakeSession:
             # recognised before the vault-index branch below.
             if rendered.startswith("SELECT count("):
                 return _Result([self.link_count])
+            # `rebuild_tsvectors`'s snapshot names id, owner, path *and* hash
+            # since #127, so it has to be matched before the scan's
+            # path+hash select — both mention `content_hash`.
+            if "notes_metadata.id" in rendered:
+                return _Result([
+                    SimpleNamespace(
+                        id=i, user_id=self.note_owner, file_path=p,
+                        content_hash=self.existing.get(p),
+                    )
+                    for p, i in self.note_ids.items()
+                ])
             if "content_hash" in rendered:
                 return _Result([
                     SimpleNamespace(file_path=p, content_hash=h)
                     for p, h in self.existing.items()
-                ])
-            if "notes_metadata.id" in rendered:
-                return _Result([
-                    SimpleNamespace(file_path=p, id=i)
-                    for p, i in self.note_ids.items()
                 ])
         return _Result()
 
@@ -1724,6 +1742,11 @@ async def test_rebuild_tsvectors_proceeds_for_a_settled_user(monkeypatch, tmp_pa
     session = FakeSession(
         provenance=(facts.assignment, facts.realpath_hex, facts.handle),
         note_ids={"Note.md": 1},
+        # The rebuild verifies the bytes it reads against the hash its snapshot
+        # retained before it writes anything (#127), so the stub has to record
+        # the real hash of the file above.
+        existing={"Note.md": indexer._content_hash("body\n")},
+        note_owner=7,
     )
     monkeypatch.setattr(indexer, "_vault_root", lambda _uid: vault)
 

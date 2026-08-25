@@ -110,9 +110,25 @@ def _fake_embedding(monkeypatch):
 # --------------------------------------------------------------------------- #
 # semantic_search
 # --------------------------------------------------------------------------- #
+def _semantic_row(note_id=1, path="a.md"):
+    """One row of `semantic_search`'s select: (NoteEmbedding, NoteMetadata, d).
+
+    A *non-empty* first batch is what keeps `exact_fallback` False now that the
+    owner predicate makes every vector query filtered (#127, D1a) — an empty
+    approximate result is always re-run exactly.
+    """
+    chunk = type("C", (), {
+        "note_id": note_id, "chunk_index": 0, "embedding": [1.0, 0.0, 0.0],
+        "chunk_text": "x",
+    })()
+    return (chunk, _Note(note_id, path), 0.1)
+
+
 @pytest.mark.asyncio
 async def test_semantic_search_logs_embed_db_and_fallback(monkeypatch, captured):
-    monkeypatch.setattr(tools, "async_session", lambda: _Session([[]], delay=0.01))
+    monkeypatch.setattr(
+        tools, "async_session", lambda: _Session([[_semantic_row()]], delay=0.01)
+    )
 
     await tools.semantic_search_impl("needle", limit=5)
 
@@ -259,7 +275,9 @@ async def test_direct_service_call_outside_a_tracked_tool_does_not_raise():
 async def test_concurrent_calls_do_not_share_a_holder(monkeypatch, captured):
     """Each MCP tool call runs in its own task, and a ContextVar is per-task —
     but only if the holder is set inside the call, not at import."""
-    monkeypatch.setattr(tools, "async_session", lambda: _Session([[]], delay=0.02))
+    monkeypatch.setattr(
+        tools, "async_session", lambda: _Session([[_semantic_row()]], delay=0.02)
+    )
 
     await asyncio.gather(
         tools.semantic_search_impl("one", limit=5),

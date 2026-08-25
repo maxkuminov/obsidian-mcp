@@ -38,9 +38,11 @@ async def test_semantic_search_clamps_before_overfetch(monkeypatch):
     session = AsyncMock()
     result = MagicMock()
     result.fetchall.return_value = []
-    # Three `SET LOCAL`s (ef_search, random_page_cost, iterative_scan) then
-    # the vector select.
-    session.execute.side_effect = [None, None, None, result]
+    # Three `SET LOCAL`s (ef_search, random_page_cost, iterative_scan), the
+    # vector select, then — because the owner predicate makes every query
+    # filtered (#127, D1a) — the zero-row exact re-run: one more `SET LOCAL`
+    # and the identical statement.
+    session.execute.side_effect = [None, None, None, result, None, result]
     monkeypatch.setattr(
         embeddings, "get_embedding", AsyncMock(return_value=[0.0] * 1024)
     )
@@ -49,6 +51,8 @@ async def test_semantic_search_clamps_before_overfetch(monkeypatch):
 
     statement = session.execute.await_args_list[-1].args[0]
     assert statement._limit_clause.value == 250
+    # The re-run is the identical statement, so the clamp holds on both.
+    assert session.execute.await_args_list[3].args[0] is statement
 
 
 class _Request:

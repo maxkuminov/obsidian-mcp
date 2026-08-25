@@ -188,26 +188,38 @@ async def test_rebuild_tsvectors_updates_every_note(monkeypatch, tmp_path):
     """`rebuild_tsvectors` re-reads each indexed note and issues an UPDATE that
     sets `content_tsvector` under the configured config(s), carrying the FTS
     config bind params. Fully offline — no DB, no network, no embeddings."""
+    import hashlib
     from collections import namedtuple
 
     import src.services.indexer as indexer
     from sqlalchemy.sql.elements import TextClause
 
-    Row = namedtuple("Row", ["id", "file_path"])
+    # The rebuild certifies against owner + path + hash (#127), so the stub's
+    # rows have to carry what it retains, and the hashes have to be the real
+    # ones for the files below — the rebuild verifies the bytes it reads.
+    Row = namedtuple("Row", ["id", "user_id", "file_path", "content_hash"])
 
     vault = tmp_path / "vault"
     vault.mkdir()
-    (vault / "a.md").write_text("---\ntitle: A\n---\nalpha body\n", encoding="utf-8")
-    (vault / "b.md").write_text("---\ntitle: B\n---\nbeta body\n", encoding="utf-8")
+    bodies = {
+        "a.md": "---\ntitle: A\n---\nalpha body\n",
+        "b.md": "---\ntitle: B\n---\nbeta body\n",
+    }
+    for name, body in bodies.items():
+        (vault / name).write_text(body, encoding="utf-8")
 
     monkeypatch.setattr(indexer.settings, "vault_path", str(vault), raising=False)
     monkeypatch.setattr(indexer.settings, "fts_configs", ["simple", "norwegian"], raising=False)
 
-    rows = [Row(1, "a.md"), Row(2, "b.md")]
+    rows = [
+        Row(i, None, name, hashlib.sha256(body.encode("utf-8")).hexdigest())
+        for i, (name, body) in enumerate(bodies.items(), start=1)
+    ]
 
     class _Result:
-        def __init__(self, data=None):
+        def __init__(self, data=None, rowcount=1):
             self._data = data or []
+            self.rowcount = rowcount
 
         def all(self):
             return self._data
@@ -215,6 +227,24 @@ async def test_rebuild_tsvectors_updates_every_note(monkeypatch, tmp_path):
     class _FakeSession:
         def __init__(self):
             self.updates = []
+
+        def begin_nested(self):
+            """The savepoint each keyword-vector attempt runs in (#127, D4).
+
+            A no-op here: this stub records statements rather than executing them,
+            so there is nothing to roll back. What a stub can never show is that
+            the driver's aborted-transaction state clears between attempts — that
+            is why the retreat has a real-PostgreSQL test
+            (`tests/integration/test_tsvector_bounded_pg.py`).
+            """
+            class _Savepoint:
+                async def __aenter__(self_inner):
+                    return self_inner
+
+                async def __aexit__(self_inner, *exc):
+                    return False
+
+            return _Savepoint()
 
         async def execute(self, stmt, params=None):
             if isinstance(stmt, TextClause) and "content_tsvector" in stmt.text:

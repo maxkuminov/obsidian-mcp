@@ -101,19 +101,30 @@ class OllamaProvider:
             data = response.json()
             return data["embeddings"][0]
 
-    async def embed_batch(
-        self, texts: list[str], batch_timeout: float = 300.0
-    ) -> list[list[float]]:
+    async def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        """Embed each chunk in turn. **The per-call timeout is the only
+        deadline, deliberately** (#127, D5).
+
+        There used to be a fixed 300 s budget over the whole batch. It could
+        only ever fire when every individual chunk was healthy — a hung
+        provider trips the 30 s `wait_for` long before it — so the one thing it
+        actually caught was a note with more chunks than 300 s of normal
+        latency covers. Such a note timed out, was never certified, and was
+        re-selected on the next pass: a permanent 300 s burn per tick, under
+        `index_pass_lock`, that could never complete. A *proportional* budget
+        was rejected in review for re-introducing the same boundary one size
+        class up — chunks that each answer just under 30 s exhaust any
+        per-chunk allowance once loop overhead is counted.
+
+        Liveness is unaffected: a provider that stops responding still fails in
+        ≤ 30 s. The cost is that a giant note holds the pass for 30 s × chunks
+        in the worst case, once, and the pause flag is honoured at the next
+        note boundary as it always was. `OpenAIProvider` is untouched — it
+        batches natively and never had this defect.
+        """
         results: list[list[float]] = []
-        deadline = time.monotonic() + batch_timeout
         for t in texts:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("Embedding batch exceeded total timeout")
-            emb = await asyncio.wait_for(
-                self.embed_one(t), timeout=min(30.0, remaining)
-            )
-            results.append(emb)
+            results.append(await asyncio.wait_for(self.embed_one(t), timeout=30.0))
         return results
 
 
@@ -434,9 +445,18 @@ async def semantic_search(
     # statement with index scans off is pgvector's documented exact search — it
     # is O(n), but only on this rare path, and it turns "non-empty whenever a
     # match exists" from a benchmark hope into a construction.
-    filtered = bool(folder or tags or frontmatter or user_id is not None)
+    #
+    # **Eligibility is unconditional** (#127, D1a). It used to require one of
+    # `folder`/`tags`/`frontmatter`/a named user, on the reasoning that an
+    # unfiltered scan cannot lose candidates to a post-filter. That reasoning
+    # died with the total owner mapping: `apply_note_filters` now always
+    # appends an owner predicate, so *every* query here is filtered and the
+    # ownerless one — `user_id IS NULL` against a database whose vectors are
+    # mostly a named user's — is exactly the shape where the HNSW window fills
+    # with candidates the predicate then discards. Under the old condition
+    # that query returned empty while NULL-owned matches existed.
     exact_fallback = False
-    if filtered and not rows:
+    if not rows:
         # Transaction-scoped, like the three SET LOCALs above: it applies to
         # the re-run on the next line and dies with this transaction. The sole
         # caller (`search_notes_impl`) closes the session as soon as this

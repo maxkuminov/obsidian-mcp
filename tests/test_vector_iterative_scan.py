@@ -199,16 +199,29 @@ async def test_filtered_zero_row_result_falls_back_to_exact_scan(holder):
 
 
 @pytest.mark.asyncio
-async def test_unfiltered_zero_row_result_does_not_fall_back(holder):
-    """An unfiltered empty result means the vault has no embeddings; paying for
-    an O(n) exact scan there would be pure cost."""
-    session = _RecordingSession([[], [_semantic_row(1, "a.md", [1.0], 0.1)]])
+async def test_an_ownerless_zero_row_result_falls_back_too(holder):
+    """There is no unfiltered vector query left (#127, D1a).
+
+    This used to assert the opposite: a call with no `folder`/`tags`/
+    `frontmatter`/`user_id` was treated as unfiltered, so an empty approximate
+    result was believed and the O(n) exact scan skipped. The owner mapping is
+    now total, so such a call carries `user_id IS NULL` — precisely the shape
+    where an HNSW window fills with a named user's vectors and the predicate
+    discards every one of them. Believing that empty result returned nothing
+    while a NULL-owned match sat in the table.
+    """
+    fallback_rows = [_semantic_row(1, "a.md", [1.0, 0.0, 0.0], 0.1)]
+    session = _RecordingSession([[], fallback_rows])
 
     results = await semantic_search(session, "q", limit=5)
 
-    assert results == []
-    assert "enable_indexscan" not in " | ".join(session.statements)
-    assert holder["exact_fallback"] is False
+    assert [r["path"] for r in results] == ["a.md"]
+    assert "SET LOCAL enable_indexscan = off" in " | ".join(
+        _set_locals(session.statements)
+    )
+    selects = _selects(session.statements)
+    assert len(selects) == 2 and selects[0] == selects[1]
+    assert holder["exact_fallback"] is True
 
 
 @pytest.mark.asyncio
@@ -230,6 +243,9 @@ async def test_non_empty_filtered_result_does_not_fall_back(holder):
         {"tags": ["x"]},
         {"frontmatter": {"k": "v"}},
         {"user_id": 3},
+        # The owner predicate is itself a filter, so the empty kwargs shape
+        # arms the fallback too (#127, D1a).
+        {},
     ],
 )
 async def test_every_filter_shape_arms_the_fallback(kwargs, holder):
