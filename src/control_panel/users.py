@@ -576,6 +576,20 @@ async def reset_password(
     if len(new_password) < 8:
         return _back_with_error(user_id, "New password must be at least 8 characters.")
 
+    # Same critical section as `edit_user_submit` and `delete_user`. A password
+    # reset is a full account takeover of the target — it rewrites the hash and
+    # bumps `session_version`, invalidating every live session — so an actor
+    # whose own admin access was revoked while this request queued must not get
+    # to perform it. `require_admin_panel` authorised the request before the
+    # lock was requested, and the wait for the lock is precisely the window in
+    # which another admin's demotion of *this* actor commits.
+    #
+    # The lock is transaction-scoped: nothing may commit between it and the
+    # write below.
+    await _lock_admin_guard(session)
+    if not await _actor_still_privileged(session, user):
+        await session.rollback()
+        return _back_to_list_with_error(_ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
     if target is None:

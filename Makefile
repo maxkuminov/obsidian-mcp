@@ -11,6 +11,11 @@ REGISTRY ?= localhost:5000
 FULL_IMAGE := $(REGISTRY)/$(IMAGE_NAME):$(IMAGE_TAG)
 DEPLOY_DIR ?= .
 DATA_DIR ?= ./data
+# Container running PostgreSQL, for db-backup / db-restore. The bundled
+# compose stacks (docker-compose.simple.yml / .proxy.yml) name it
+# `obsidian-mcp-postgres`; a shared host instance is usually just `postgres`.
+# Override in Makefile.local to match the deployment.
+DB_CONTAINER ?= postgres
 COMPOSE_FILE := $(DEPLOY_DIR)/docker-compose.yml
 ENV_FILE := $(DEPLOY_DIR)/.env
 COMPOSE := docker compose --project-directory $(DEPLOY_DIR) -f $(COMPOSE_FILE)
@@ -109,7 +114,13 @@ image: build trivy push
 
 deploy: image
 	@echo "$(GREEN)Deploying Obsidian MCP...$(NC)"
-	@$(MAKE) db-backup 2>/dev/null || true
+	# A deploy runs `alembic upgrade head` against the live database, so the
+	# backup is the only way back from a bad migration. If it cannot be taken,
+	# stop here rather than migrate unprotected.
+	@$(MAKE) db-backup || { \
+		echo "$(RED)Deploy ABORTED: database backup failed — refusing to migrate without one.$(NC)"; \
+		exit 1; \
+	}
 	# Migrate with the newly built image before replacing the live container.
 	# Migrations are backward-compatible, avoiding a window where new code runs
 	# against the old schema (and matching README's documented deploy behavior).
@@ -188,12 +199,35 @@ test-schema:
 	else echo "$(RED)Schema gate FAILED — do not deploy$(NC)"; fi; \
 	exit $$status
 
+# The pre-migration safety net, so it must fail loudly. The previous recipe
+# `|| true`d both pg_dump and gzip and printed the green line unconditionally,
+# so a wrong container name, a dead database or a full disk produced a
+# zero-byte file, a success message, and a `deploy` that went straight on to
+# `alembic upgrade head` with nothing to roll back to. Three failure modes are
+# now distinguished and all of them abort: a non-zero pg_dump, an empty dump
+# with exit 0 (pg_dump can write nothing and still succeed when it is pointed
+# at the wrong thing), and a failed gzip. The partial file is removed so a
+# later `db-restore` cannot pick a truncated dump out of the backups directory.
 db-backup:
-	@mkdir -p $(DATA_DIR)/backups 2>/dev/null || true
+	@mkdir -p $(DATA_DIR)/backups
 	@TIMESTAMP=$$(date +%Y%m%d_%H%M%S); \
 	BACKUP_FILE="$(DATA_DIR)/backups/backup_$$TIMESTAMP.sql"; \
-	docker exec postgres pg_dump -U postgres obsidian_mcp > $$BACKUP_FILE 2>/dev/null || true; \
-	gzip $$BACKUP_FILE 2>/dev/null || true; \
+	if ! docker exec $(DB_CONTAINER) pg_dump -U postgres obsidian_mcp > $$BACKUP_FILE; then \
+		rm -f $$BACKUP_FILE; \
+		echo "$(RED)Backup FAILED: pg_dump against container '$(DB_CONTAINER)' returned non-zero$(NC)"; \
+		echo "$(YELLOW)Set DB_CONTAINER in Makefile.local if the database container is named differently.$(NC)"; \
+		exit 1; \
+	fi; \
+	if [ ! -s $$BACKUP_FILE ]; then \
+		rm -f $$BACKUP_FILE; \
+		echo "$(RED)Backup FAILED: pg_dump produced an empty dump$(NC)"; \
+		exit 1; \
+	fi; \
+	if ! gzip $$BACKUP_FILE; then \
+		rm -f $$BACKUP_FILE $$BACKUP_FILE.gz; \
+		echo "$(RED)Backup FAILED: could not gzip $$BACKUP_FILE$(NC)"; \
+		exit 1; \
+	fi; \
 	echo "$(GREEN)Backup: $$BACKUP_FILE.gz$(NC)"
 
 db-restore:
@@ -202,9 +236,9 @@ db-restore:
 	@echo "Press Ctrl+C to cancel, waiting 5s..."
 	@sleep 5
 	@if echo "$(FILE)" | grep -q ".gz$$"; then \
-		gunzip -c $(FILE) | docker exec -i postgres psql -U postgres obsidian_mcp; \
+		gunzip -c $(FILE) | docker exec -i $(DB_CONTAINER) psql -U postgres obsidian_mcp; \
 	else \
-		docker exec -i postgres psql -U postgres obsidian_mcp < $(FILE); \
+		docker exec -i $(DB_CONTAINER) psql -U postgres obsidian_mcp < $(FILE); \
 	fi
 	@echo "$(GREEN)Restored from $(FILE)$(NC)"
 

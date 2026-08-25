@@ -444,7 +444,13 @@ def test_nested_mount_cases_pass_in_a_mount_namespace(tmp_path):
         "HOME": str(tmp_path),
         "MCP_SANDBOX_MODE": "true",
         "VAULT_PATH": str(vault),
-        "BASE_URL": "https://vault.example.test",
+        # Loopback, and explicitly set: the mint tools only need
+        # `public_base_url` to be non-None (they assert nothing about the
+        # host), while MCP_SANDBOX_MODE — which this harness needs to skip
+        # auth and Postgres — refuses to boot beside a *public* BASE_URL
+        # (#129). A non-loopback value here would abort the subprocess at
+        # import of `src.config`.
+        "BASE_URL": "http://localhost:8000",
         "DATABASE_URL": "postgresql+asyncpg://test:test@localhost/test",
         "SECRET_KEY": "test",
         "MCP_HOSTNAME": "",
