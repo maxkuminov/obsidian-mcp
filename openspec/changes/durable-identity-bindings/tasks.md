@@ -801,7 +801,7 @@ path is unchanged.
       change carries two migrations
 - [x] D.3 `openspec validate durable-identity-bindings --strict`
 - [x] D.4 `make audit`
-- [ ] D.5 Adversarial Codex pass, framed as a defensive control review. Both
+- [x] D.5 Adversarial Codex pass, framed as a defensive control review. Both
       triggers fire: two migrations, and a refusal on the write path. Give it
       the product framing — the consumer is an agent, the expensive failures
       are destructive writes and silently wrong search results.
@@ -871,7 +871,7 @@ path is unchanged.
       observed — by length, by encoding, or by any third property of the value;
       and whether the un-gated `embed_vault` can, on any path, write a vector
       against a row whose content it did not verify.
-- [ ] D.6 `openspec-verifier` subagent against this proposal and the spec deltas
+- [x] D.6 `openspec-verifier` subagent against this proposal and the spec deltas
 - [ ] D.7 Deploy: `make deploy`, then `make db-check` must report "No new
       upgrade operations detected"
 - [ ] D.8 In place of the `user-representative` browser pass (there is no
@@ -1094,3 +1094,25 @@ out of the source and required to clear the column.
 
 The index-integrity delta and CLAUDE.md's #91 section both state the
 invalidation rule; neither did before.
+
+
+## Verification record (2026-08-24/25)
+
+**D.6** — independent `openspec-verifier` audit at `0e23917`: 0 blocking gaps,
+109/109 scenarios verified, zero falsely-ticked tasks, all four flagged
+judgement calls ruled sound. The three fix commits since (`dd59ea7`,
+`a77bcca`, `1f579e2`) were each spec-synchronised in the same commit and
+verified by the adversarial gate below, with `validate --strict`, the unit
+and full suites, and `make test-schema` green after every one — recorded here
+rather than re-running the full audit against a tree the other gate had just
+verified line-by-line.
+
+**D.5** — adversarial Codex, four rounds against the implementation:
+1 BLOCKER + 5 MAJOR + 1 MINOR → 5 MAJOR → 1 MAJOR → **0, PASS**. Every fix
+carries a regression test built from the reviewer's own failing input and a
+negative control (fix reverted in place → test fails): 13/13 controls fire.
+Two reviewer sub-recommendations declined with recorded reasons (the
+semantic_search hash predicate — ruled "reasonable" by the reviewer itself in
+round 2 — and the 017 deploy-window quiesce, declared instead, symmetric with
+016). Final gates on `1f579e2`: unit 1722 / full 1940 / schema gate 86 /
+validate clean.
