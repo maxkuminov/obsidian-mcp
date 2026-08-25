@@ -50,6 +50,25 @@ escape valve rather than weakening the default guarantee.
   unchanged, fallback still refuses to clobber, no staging litter under
   either outcome, warns exactly once across repeated writes.
 
+Hardening applied at this repo's pre-merge adversarial gate (#104 review),
+all of it in the shared cleanup primitive both write paths already use, so the
+transfer path gets the same treatment:
+
+- the cleanup **never unlinks a staging name it cannot prove is its own**. An
+  `fstat` that failed after the exclusive creation leaves no identity to
+  compare against, and unlinking on that basis let a no-clobber write that
+  published nothing destroy a file that had taken the name over. It now warns
+  and leaves the litter, the same direction an identified substitute already
+  got.
+- an **absent** staging name is quiet only when the write published (a
+  `renameat` consumed it); a name that vanished mid-flight is warned about and
+  reported as a failed discard.
+- the once-per-process signal is spent **after** the staging name exists, so a
+  creation that failed every attempt neither warns nor flips `/health`.
+- the one warning no longer attributes `.transfer-tmp` to the note path: it
+  takes the exercising path kind and names where each path stages, the note
+  path's window being the wider of the two.
+
 Filed as maxkuminov/obsidian-mcp#103 first (design conversation before a PR);
 accepted as shaped, with three follow-ups this change also covers: (1) this
 OpenSpec delta, (2) confirming the fallback stages through the pinned parent

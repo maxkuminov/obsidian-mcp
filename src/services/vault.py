@@ -1867,11 +1867,19 @@ def _atomic_write_at(
         except vault_fs.UnsupportedFilesystem:
             if not settings.vault_allow_named_staging_fallback:
                 raise
-            vault_fs.note_named_staging_exercised()
             fd, tmp = _create_temp_exclusively(dir_fd, name)
+            # **After** the name exists, exactly as the transfer path does it:
+            # the signal is "a call actually staged under a name", so a
+            # creation that failed every attempt must not spend the warn-once
+            # budget or flip `/health` to a fallback this process never took.
+            vault_fs.note_named_staging_exercised(vault_fs.NAMED_STAGING_NOTE_PATH)
     # The `try` opens on the very next line after the descriptor exists: an
-    # `EIO` from the `fstat` below would otherwise leak both the descriptor
-    # and, on the overwrite path, the staging name.
+    # `EIO` from the `fstat` below would otherwise leak the descriptor.
+    # `staged` stays `None` until that `fstat` succeeds, and a `None` there is
+    # what makes the cleanup **leave** any staging name instead of unlinking
+    # it: with no identity, nothing can prove the name still refers to the
+    # inode we created, and a write that published nothing must not remove a
+    # file that took the name over. Litter, deliberately — see `_discard_temp`.
     staged: os.stat_result | None = None
     published = False
     try:
@@ -1956,7 +1964,13 @@ def _discard_temp(
     substitution by deleting the substitute is the same destructive-write
     class this module exists to prevent, just aimed at a different file, so
     the failure direction is to leave litter rather than remove something we
-    cannot prove is ours.
+    cannot prove is ours. A `staged` of `None` — the `fstat` after the
+    exclusive creation failed — is the same refusal with even less evidence:
+    nothing is unlinked, and the name is left and logged.
+
+    An absent name is quiet only when the write **published**; a staging name
+    that disappeared while the write was still in flight is warned about,
+    because that is a substitution's first half and not an ordinary outcome.
 
     The **default** no-clobber path never calls this: it stages into an
     unnamed `O_TMPFILE` inode, so there is no name to remove and no check to

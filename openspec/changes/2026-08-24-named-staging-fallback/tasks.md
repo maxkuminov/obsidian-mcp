@@ -20,10 +20,31 @@
 ## 4. Spec
 
 - [x] 4.1 Spec delta under `specs/vault-write/` (MODIFIED: Atomic write invariant)
-- [ ] 4.2 `openspec validate named-staging-fallback --strict` passes (no local `openspec` CLI available in this environment — validated by hand against the format of prior archived changes)
+- [x] 4.2 `openspec validate 2026-08-24-named-staging-fallback --strict` passes (run at the merge gate, where the CLI is available)
+- [x] 4.3 The MODIFIED requirement is rebased onto the **current** `openspec/specs/vault-write/spec.md` text, not the base the PR was written against: every paragraph and scenario promoted since (complete ancestor-chain durability, move/delete/rollback flushes, backlink-rewrite root sharing, `write_file` coverage, the split crash scenarios) is preserved verbatim, and only the unconditional no-name/refusal clauses change
 
 ## 5. Upstream PR (maxkuminov/obsidian-mcp#103)
 
 - [ ] 5.1 Carry this OpenSpec delta in the PR
 - [ ] 5.2 Note in the PR description that the staged name is created through the pinned `open_mutable` parent descriptor (ask 2)
 - [ ] 5.3 Acknowledge the write-path adversarial review gate in the PR description (ask 3)
+
+## 6. Pre-merge adversarial gate (this repo's write-path review)
+
+- [x] 6.1 BLOCKER: `vault_fs.discard_staged_name` refuses to unlink when
+  `staged is None` — an `fstat` that failed after the exclusive creation left
+  the cleanup with no identity, and unlinking on that basis let a no-clobber
+  write destroy a concurrent replacement. Fail closed: warn, leave the litter.
+  Fixed in the shared primitive, so the transfer path's own `staged=None`
+  shapes (`discard_temp` after a failed `fstat`, `publish`'s fallback `lstat`)
+  are covered by the same change
+- [x] 6.2 MINOR: an absent staging name is quiet only when `published` — an
+  unpublished disappearance is warned about and reported as a failed discard
+- [x] 6.3 MINOR: `note_named_staging_exercised()` is called **after**
+  `_create_temp_exclusively` succeeds, so a creation that failed every attempt
+  neither spends the warn-once budget nor flips `/health`
+- [x] 6.4 MINOR: the shared warning no longer claims `.transfer-tmp` for the
+  note path — it takes the exercising path kind and names both locations,
+  keeping warn-once semantics
+- [x] 6.5 Regression tests for each, including the concurrent replacement over
+  the staging name on the fallback path
