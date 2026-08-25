@@ -24,7 +24,8 @@
 
 - [ ] 4.1 Shared helper in `src/services/indexer.py`: attempts full content; `try` OUTSIDE `async with session.begin_nested()` so the error unwinds the savepoint via the context manager; halve per attempt down to the exact 100,000-char floor; floor failure re-raises.
 - [ ] 4.2 Use it at both call sites (incremental pass ~line 1244, `rebuild_tsvectors` ~line 1938); log every retreat with the prefix length.
-- [ ] 4.3 Real-Postgres integration test (in `tests/integration/`, using the `PGVECTOR_TEST_ADMIN_URL` harness): induce a genuine statement failure (e.g. an over-limit tsvector or a forced error), bounded retry succeeds in the same outer transaction, a later update commits, both rows verified. Offline unit tests may cover the halving arithmetic only.
+- [ ] 4.2b Make `rebuild_tsvectors` atomic: remove its every-500-notes intermediate commits so a floor failure rolls the whole rebuild back and surfaces to the operator; incremental-pass semantics unchanged (nothing commits on abort).
+- [ ] 4.3 Real-Postgres integration test (in `tests/integration/`, using the `PGVECTOR_TEST_ADMIN_URL` harness): induce a genuine statement failure (e.g. an over-limit tsvector or a forced error), bounded retry succeeds in the same outer transaction, a later update commits, both rows verified — covering BOTH call sites, including a rebuild failure past the former 500-note commit boundary rolling everything back. Offline unit tests may cover the halving arithmetic only.
 
 ## 5. No aggregate embed deadline (D5)
 

@@ -153,7 +153,7 @@ Both move paths SHALL leave `notes_metadata.title` exactly what a fresh index of
 
 ### Requirement: Keyword indexing attempts full content and degrades per-note without aborting the pass
 
-The tsvector build (incremental pass and full rebuild alike) SHALL attempt the note's full content. Each attempt SHALL run inside its own savepoint, entered such that a database error unwinds the savepoint through the context manager's rollback before any retry (the failure handling sits outside the savepoint context, so the outer transaction is never left in the aborted state). On failure the build SHALL retreat by halving the content, one fresh savepoint per attempt, down to a floor of exactly 100,000 characters — the pre-change statement. A failure at the floor SHALL propagate and abort the pass exactly as the pre-change implementation did: no metadata for the failing note commits, so no state is stranded and the note is retried next tick.
+The tsvector build (incremental pass and full rebuild alike) SHALL attempt the note's full content. Each attempt SHALL run inside its own savepoint, entered such that a database error unwinds the savepoint through the context manager's rollback before any retry (the failure handling sits outside the savepoint context, so the outer transaction is never left in the aborted state). On failure the build SHALL retreat by halving the content, one fresh savepoint per attempt, down to a floor of exactly 100,000 characters — the pre-change statement. A failure at the floor SHALL propagate, and the two call sites SHALL provide different — but individually stated — guarantees: the **incremental pass** aborts with nothing committed, so no state is stranded and the note is retried next tick (the pre-change behavior); the **full rebuild** SHALL be atomic — no intermediate commits — so a floor failure rolls the entire rebuild back and the error surfaces to the operator who invoked it, never leaving a keyword index half-built under two FTS configurations that no periodic pass would repair.
 
 Verification of the savepoint behavior SHALL include a real-PostgreSQL integration test (mocks cannot prove the driver's aborted-transaction state clears): induce a genuine statement failure, observe the bounded retry succeed within the same outer transaction, perform a further update, commit, and verify both rows.
 
@@ -168,14 +168,20 @@ Verification of the savepoint behavior SHALL include a real-PostgreSQL integrati
 - **THEN** the pass SHALL retreat to a bounded prefix for that note only, log the retreat with the prefix length, index the remaining notes normally, and commit
 - **AND** terms present only beyond the successful prefix are accepted as unsearchable for that note — the declared degradation
 
-#### Scenario: A floor failure behaves exactly as before the change
+#### Scenario: A floor failure in the incremental pass behaves exactly as before the change
 
-- **WHEN** even the 100,000-character floor attempt fails for a note
+- **WHEN** even the 100,000-character floor attempt fails for a note during an incremental index pass
 - **THEN** the error SHALL propagate and the pass SHALL abort with nothing committed, exactly as the pre-change implementation aborted, so the note's metadata hash does not advance and the pass retries next tick
+
+#### Scenario: A floor failure during a full rebuild rolls the whole rebuild back
+
+- **WHEN** `rebuild_tsvectors` is processing a vault of more than 500 notes and a note's floor attempt fails after what would previously have been an intermediate commit boundary
+- **THEN** the entire rebuild SHALL roll back — no note's tsvector changes — and the error SHALL surface to the invoking operator
+- **AND** the keyword index SHALL never be left half-built under two FTS configurations
 
 ### Requirement: A many-chunk note completes, and certifies only on full coverage
 
-The embedding batch SHALL have no aggregate deadline: the per-chunk timeout (30 s per provider call) is the liveness bound, so a note cannot be structurally unable to finish while every chunk is individually healthy. A note SHALL be certified only when every one of its chunks produced a vector; no partial chunk coverage may ever be stamped complete.
+The Ollama (local, sequential) embedding batch SHALL have no aggregate deadline: its per-chunk timeout (30 s per provider call) is the liveness bound, so a note cannot be structurally unable to finish while every chunk is individually healthy. A note SHALL be certified only when every one of its chunks produced a vector; no partial chunk coverage may ever be stamped complete.
 
 #### Scenario: A giant note eventually embeds and stops being retried
 
@@ -184,7 +190,7 @@ The embedding batch SHALL have no aggregate deadline: the per-chunk timeout (30 
 
 #### Scenario: A hung provider still fails fast
 
-- **WHEN** the embedding provider stops responding mid-batch
+- **WHEN** the Ollama embedding provider stops responding mid-batch (the OpenAI provider keeps its own pre-existing contract: per-request HTTP timeout with bounded retries)
 - **THEN** the in-flight chunk call SHALL time out at the per-chunk timeout and the note SHALL remain uncertified
 
 #### Scenario: Partial coverage is never certified
