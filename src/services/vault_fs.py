@@ -301,19 +301,29 @@ class CrossDeviceRefusal(UnsupportedFilesystem):
     """
 
 
-def _mounts_differ(fd_a: int, fd_b: int) -> bool | None:
-    """`True`/`False`/`None` — differ, agree, or the kernel cannot say.
+def _compare_mounts(
+    fd_a: int, fd_b: int
+) -> tuple[bool | None, UnsupportedFilesystem | None]:
+    """`(differ?, why not)` — differ, agree, or could not be read, and why.
 
-    The tri-state `same_mount` deliberately does not have: it raises where
-    `STATX_MNT_ID` is unavailable, which is right for a *guard* and useless for
-    a *diagnosis*, where "cannot tell" is itself the honest answer. Both ids are
+    The tri-state `same_mount` deliberately does not have: it raises where the
+    mount cannot be read, which is right for a *guard* and useless for a
+    *diagnosis*, where "cannot tell" is itself the honest answer. Both ids are
     read inside this one call and never persisted, exactly as `same_mount`
     requires (D23).
+
+    The second element carries `mount_id_of`'s own error, because the reasons
+    it can fail are not one reason: `STATX_MNT_ID` missing on a pre-5.8 kernel,
+    but equally a seccomp profile refusing `statx`, an `EIO`, a libc without
+    the wrapper, or a descriptor that is not what the caller thought. A
+    diagnosis that names only the first would be another confident wrong cause
+    — the thing this whole module is being fixed for — so the caller quotes
+    this rather than guessing.
     """
     try:
-        return mount_id_of(fd_a) != mount_id_of(fd_b)
-    except UnsupportedFilesystem:
-        return None
+        return mount_id_of(fd_a) != mount_id_of(fd_b), None
+    except UnsupportedFilesystem as exc:
+        return None, exc
 
 
 def classify_cross_device(
@@ -332,17 +342,20 @@ def classify_cross_device(
       denying the reparent) or a boundary internal to the filesystem (an
       overlayfs layering restriction, a btrfs subvolume). Sending an operator
       to look at mounts would be the same defect class this change removes;
-    * the kernel **cannot report** mount identity (`STATX_MNT_ID` is Linux 5.8,
-      above the server's `openat2` floor of 5.6) — then neither claim is
-      available, and the honest message is the errno plus both candidates.
-      Inventing a verdict from a missing measurement is what `mount_id_of`
-      refuses to do with `st_dev`, and it is refused here too.
+    * mount identity **cannot be read** — a pre-5.8 kernel without
+      `STATX_MNT_ID` (the server's own floor is `openat2`'s 5.6), but equally a
+      seccomp profile refusing `statx`, an `EIO`, or a libc without the
+      wrapper. The message therefore quotes what actually failed and names
+      both candidates rather than asserting either, and in particular does not
+      diagnose a kernel version it has not established. Inventing a verdict
+      from a missing measurement is what `mount_id_of` refuses to do with
+      `st_dev`, and it is refused here too.
 
     `operation` reads like "the non-replacing rename that moves a.md to b.md";
     `ends` names the two things being compared, and is what "on different
     mounts" is predicated of.
     """
-    differ = _mounts_differ(src_dir_fd, dst_dir_fd)
+    differ, unreadable = _compare_mounts(src_dir_fd, dst_dir_fd)
     if differ is True:
         return MountBoundary(
             f"{ends} are on different mounts, so {operation} cannot cross the "
@@ -359,12 +372,11 @@ def classify_cross_device(
             "mount layout."
         )
     return CrossDeviceRefusal(
-        f"{operation} was refused with EXDEV, and this kernel cannot report "
-        f"which mounts {ends} are on (STATX_MNT_ID needs Linux 5.8), so the "
-        "cause cannot be established here. It is one of two: a mount boundary "
-        "between them, or a security policy (Landlock) or filesystem-internal "
-        "boundary (overlayfs, a btrfs subvolume) refusing an operation that "
-        "stays on one mount."
+        f"{operation} was refused with EXDEV, and which mounts {ends} are on "
+        f"could not be read ({unreadable}), so the cause cannot be established "
+        "here. It is one of two: a mount boundary between them, or a security "
+        "policy (Landlock) or filesystem-internal boundary (overlayfs, a btrfs "
+        "subvolume) refusing an operation that stays on one mount."
     )
 
 
@@ -1044,7 +1056,7 @@ def cross_mount_definitely(fd_a: int, fd_b: int) -> bool:
     appearing between it and the rename is caught by the residual mapping,
     which is why the mapping and not this is the correctness layer.
     """
-    return _mounts_differ(fd_a, fd_b) is True
+    return _compare_mounts(fd_a, fd_b)[0] is True
 
 
 def leaf_mount_id(dst_dir_fd: int, name: str) -> int | None:

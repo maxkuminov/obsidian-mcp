@@ -1713,9 +1713,15 @@ def _mount_ids_differ(monkeypatch) -> None:
     monkeypatch.setattr(vault_fs, "mount_id_of", fake)
 
 
+_UNREADABLE_REASON = "statx(2) could not read the mount id (EPERM)"
+
+
 def _mount_ids_unreadable(monkeypatch) -> None:
+    """Not a pre-5.8 kernel: `mount_id_of` refuses for several reasons, and the
+    classifier must quote the one it got rather than diagnose a version."""
+
     def refuse(fd: int) -> int:
-        raise vault_fs.UnsupportedFilesystem("no STATX_MNT_ID on this kernel")
+        raise vault_fs.UnsupportedFilesystem(_UNREADABLE_REASON)
 
     monkeypatch.setattr(vault_fs, "mount_id_of", refuse)
 
@@ -1783,7 +1789,9 @@ def test_the_fallback_link_is_ambiguous_when_the_kernel_cannot_tell(
 
     message = str(caught.value)
     assert "cannot be established" in message
-    assert "STATX_MNT_ID" in message
+    assert "could not be read" in message
+    assert _UNREADABLE_REASON in message
+    assert "Linux 5.8" not in message
     assert "a mount boundary between them" in message
     assert "Landlock" in message
     assert not isinstance(caught.value, vault_fs.MountBoundary)

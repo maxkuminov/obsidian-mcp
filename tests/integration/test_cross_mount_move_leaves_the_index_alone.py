@@ -161,34 +161,32 @@ async def seed(sessionmaker, root):
         return moved.id, source.id
 
 
+async def _all_rows(session, model) -> list[tuple]:
+    """Every column of `model`'s table, every row, ordered by id.
+
+    Enumerated from `__table__.c` rather than listed by hand. A hand-written
+    projection asserts identity only for the columns whoever wrote it happened
+    to think of, and the claim here is that the *rows* are unchanged — so a
+    future refusal path that touched `tags`, `frontmatter`, the tsvector,
+    `file_size`, `modified_at`, `indexed_at` or a link's `position` would slip
+    straight through a six-column snapshot while every assertion still passed
+    (adversarial round 2). Reading the columns off the model means a new one
+    joins the comparison the day it is added.
+    """
+    columns = list(model.__table__.c)
+    rows = (
+        await session.execute(select(*columns).order_by(model.__table__.c.id))
+    ).all()
+    return [tuple(r) for r in rows]
+
+
 async def snapshot(sessionmaker) -> tuple[list, list]:
-    """Every column of both tables that a move can change, in a fixed order."""
+    """Both tables, whole, in a fixed order."""
     async with sessionmaker() as session:
-        notes = (
-            await session.execute(
-                select(
-                    NoteMetadata.id,
-                    NoteMetadata.file_path,
-                    NoteMetadata.title,
-                    NoteMetadata.content_hash,
-                    NoteMetadata.embedded_content_hash,
-                    NoteMetadata.user_id,
-                ).order_by(NoteMetadata.id)
-            )
-        ).all()
-        links = (
-            await session.execute(
-                select(
-                    NoteLink.id,
-                    NoteLink.source_note_id,
-                    NoteLink.target_note_id,
-                    NoteLink.target_path,
-                    NoteLink.link_text,
-                    NoteLink.kind,
-                ).order_by(NoteLink.id)
-            )
-        ).all()
-    return [tuple(r) for r in notes], [tuple(r) for r in links]
+        return (
+            await _all_rows(session, NoteMetadata),
+            await _all_rows(session, NoteLink),
+        )
 
 
 @pytest.mark.parametrize("rewrite_links", [False, True])
@@ -235,7 +233,8 @@ async def test_the_snapshot_comparison_can_see_a_move_that_is_allowed(
     assert "different mounts" not in result, result
     after_notes, after_links = await snapshot(sessionmaker)
     assert after_notes != before_notes
-    assert sorted(r[1] for r in after_notes) == sorted([MOVED, "Archive/b.md"])
+    paths = NoteMetadata.__table__.c.keys().index("file_path")
+    assert sorted(r[paths] for r in after_notes) == sorted([MOVED, "Archive/b.md"])
     assert after_links == before_links, (
         "the moved note is the link *source* here, so only notes_metadata moves"
     )

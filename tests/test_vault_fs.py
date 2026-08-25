@@ -805,11 +805,16 @@ def _mount_ids_differ(monkeypatch) -> None:
     monkeypatch.setattr(vault_fs, "mount_id_of", fake)
 
 
+# Deliberately *not* a missing-STATX_MNT_ID message: `mount_id_of` refuses for
+# several reasons and the classifier must quote the one it got.
+_UNREADABLE_REASON = "statx(2) could not read the mount id (EPERM)"
+
+
 def _mount_ids_unreadable(monkeypatch) -> None:
-    """A kernel below `STATX_MNT_ID` (Linux 5.8), above the `openat2` floor."""
+    """`mount_id_of` cannot answer — here, a seccomp profile refusing `statx`."""
 
     def refuse(fd: int) -> int:
-        raise UnsupportedFilesystem("no STATX_MNT_ID on this kernel")
+        raise UnsupportedFilesystem(_UNREADABLE_REASON)
 
     monkeypatch.setattr(vault_fs, "mount_id_of", refuse)
 
@@ -870,7 +875,14 @@ def test_an_exdev_with_unreadable_mount_identity_is_reported_as_ambiguous(
     message = str(caught.value)
     assert "EXDEV" in message
     assert "cannot be established" in message
-    assert "STATX_MNT_ID" in message
+    # The *reported* reason is whatever `mount_id_of` actually said, quoted —
+    # never a kernel version this code did not establish. `_compare_mounts`
+    # answers "cannot tell" for a seccomp profile refusing `statx`, an `EIO` or
+    # a libc without the wrapper just as readily as for a pre-5.8 kernel, and
+    # naming only the last would be another confident wrong cause.
+    assert "could not be read" in message
+    assert _UNREADABLE_REASON in message
+    assert "Linux 5.8" not in message
     # Both candidates named, neither asserted.
     assert "a mount boundary between them" in message
     assert "Landlock" in message
