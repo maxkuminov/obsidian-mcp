@@ -872,9 +872,9 @@ path is unchanged.
       and whether the un-gated `embed_vault` can, on any path, write a vector
       against a row whose content it did not verify.
 - [x] D.6 `openspec-verifier` subagent against this proposal and the spec deltas
-- [ ] D.7 Deploy: `make deploy`, then `make db-check` must report "No new
+- [x] D.7 Deploy: `make deploy`, then `make db-check` must report "No new
       upgrade operations detected"
-- [ ] D.8 In place of the `user-representative` browser pass (there is no
+- [x] D.8 In place of the `user-representative` browser pass (there is no
       browser UI on the MCP side), exercise the affected tools against the live
       server and name in the report which were actually called: `create_note`
       and `edit_note` (the confirmed publish path, unchanged assignment),
@@ -1116,3 +1116,24 @@ semantic_search hash predicate — ruled "reasonable" by the reviewer itself in
 round 2 — and the 017 deploy-window quiesce, declared instead, symmetric with
 016). Final gates on `1f579e2`: unit 1722 / full 1940 / schema gate 86 /
 validate clean.
+
+
+## Deploy and live exercise (2026-08-25)
+
+**D.7** — deployed: backup `backup_20260824_214746.sql.gz`, migrations run in
+the one-off container, container recreated and healthy. `alembic current` →
+`017 (head)`; `alembic check` → "No new upgrade operations detected"; zero
+tracebacks in the startup log.
+
+**D.8** — exercised against the live server, naming the tools actually
+called: `create_note`, `edit_note(append=True)`, `move_note`, `delete_note
+(permanent=True)` — each through `confirmed_publication`'s fresh
+read-and-consume — and `request_upload`, whose freshly minted token was
+verified (read-only SQL) to carry `actor_kind='api_key'` and the key's label
+at mint time, distinguishing the mint path from 017's backfill. The first
+post-deploy index pass re-derived and tail-stamped both assigned users: all
+three provenance facts non-NULL, confirming a skip-free re-derive over the
+real vault. The refusal paths (reassignment mid-flight, confirmation outage)
+cannot be exercised against production without mutating a real user's
+assignment; they are covered by the suite's interleaving tests (1940 passing,
+13 negative controls) and stated here rather than claimed live.
