@@ -31,7 +31,9 @@ inside the directory the caller named:
   by an identity check (`_require_staged_name`). The no-clobber publish has no
   such window at all: it stages into an unnamed `O_TMPFILE` inode and publishes
   it through `/proc/self/fd`, so there is no staging name to substitute and
-  none to clean up.
+  none to clean up. (`VAULT_ALLOW_NAMED_STAGING_FALLBACK` is the declared
+  exception: on a filesystem that rejects `O_TMPFILE`, opting in reopens this
+  window for no-clobber writes too — see `_link_staged_name`.)
 - **creating a missing parent has no beneath-root form** (#87, D22). The lookup
   itself is now one `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
   RESOLVE_NO_MAGICLINKS)`, so there is no interval between components for a
@@ -1667,10 +1669,8 @@ def _create_nameless_temp(dir_fd: int) -> int:
                 "The vault filesystem does not support O_TMPFILE, which the "
                 "no-clobber write stages into so that no temporary name is "
                 "ever exposed. Refusing rather than staging under a name. "
-                "VAULT_ALLOW_NAMED_STAGING_FALLBACK is the operator switch for "
-                "this; it governs the transfer path today, and the note path's "
-                "half of it is tracked on #103 — until that lands, this write "
-                "refuses whether the flag is set or not."
+                "Set VAULT_ALLOW_NAMED_STAGING_FALLBACK=true to accept named "
+                "staging instead — a declared, weaker guarantee, not a fix."
             ) from exc
         raise
 
@@ -1740,6 +1740,45 @@ def _flush_publication(target: MutableTarget) -> None:
     _flush_target_dirs(target, "destination directory")
 
 
+def _link_staged_name(dir_fd: int, tmp: str, name: str) -> None:
+    """Publish a **named** staging file as `name`, no-clobber.
+
+    The `VAULT_ALLOW_NAMED_STAGING_FALLBACK` fallback for filesystems that
+    reject `O_TMPFILE` (`_create_nameless_temp`'s `UnsupportedFilesystem`).
+    `link()` creates the destination name or fails `EEXIST` — the same
+    no-clobber guarantee `_link_staged_inode` gives — but `tmp` still exists
+    afterwards either way, unlike a rename; the caller's `finally` removes it
+    via `_discard_temp` (which delegates to `vault_fs.discard_staged_name`,
+    the shared implementation the transfer path already uses), same as the
+    overwrite path.
+
+    This reopens the exact named-staging race `O_TMPFILE` publication exists
+    to close: `tmp` is a real directory entry between staging and this call,
+    so another writer to the directory can observe or replace it.
+    `_require_staged_name`, called immediately before this by the shared
+    caller, narrows that to the single syscall between the check and the
+    link — it does not close it. That is the accepted, declared trade-off of
+    opting into this fallback; see `Settings.vault_allow_named_staging_fallback`.
+
+    Process-state accounting (the once-per-process warning, `/health`'s
+    `vault_named_staging_fallback_active`) is shared with the transfer path
+    via `vault_fs.note_named_staging_exercised()` / `named_staging_fallback_active()`
+    (D27) — this module does not keep its own copy of that flag.
+    """
+    try:
+        os.link(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+    except FileExistsError:
+        raise
+    except OSError as exc:
+        if getattr(exc, "errno", None) in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV):
+            raise vault_fs.UnsupportedFilesystem(
+                "The vault filesystem does not support hard links, which the "
+                "no-clobber write depends on even in named-staging fallback "
+                "mode; refusing rather than replacing an existing file."
+            ) from exc
+        raise
+
+
 def _atomic_write_at(
     target: MutableTarget,
     *,
@@ -1767,6 +1806,13 @@ def _atomic_write_at(
       observed, replaced or raced, and there is nothing to clean up — the inode
       is freed when the descriptor closes. `link` either creates the name or
       fails `EEXIST`, so nothing can be destroyed by a no-clobber publish.
+      When `_create_nameless_temp` reports `UnsupportedFilesystem` (some NFS
+      servers reject `O_TMPFILE` outright) and
+      `settings.vault_allow_named_staging_fallback` is set, this falls back to
+      **named** staging + `_link_staged_name` — the no-clobber write still
+      cannot destroy an existing file, but it reopens the named-staging race
+      the `O_TMPFILE` form exists to close. Off by default: refuse, as before.
+      See `_link_staged_name` for what the fallback does and does not close.
     * **overwrite** (`edit_note`, `set_frontmatter`,
       `write_file(overwrite=True)`) needs `renameat`, which has no
       by-descriptor form, so its source must have a name. That name is created
@@ -1816,7 +1862,13 @@ def _atomic_write_at(
     if overwrite:
         fd, tmp = _create_temp_exclusively(dir_fd, name)
     else:
-        fd = _create_nameless_temp(dir_fd)
+        try:
+            fd = _create_nameless_temp(dir_fd)
+        except vault_fs.UnsupportedFilesystem:
+            if not settings.vault_allow_named_staging_fallback:
+                raise
+            vault_fs.note_named_staging_exercised()
+            fd, tmp = _create_temp_exclusively(dir_fd, name)
     # The `try` opens on the very next line after the descriptor exists: an
     # `EIO` from the `fstat` below would otherwise leak both the descriptor
     # and, on the overwrite path, the staging name.
@@ -1840,7 +1892,10 @@ def _atomic_write_at(
 
         if tmp is not None:
             _require_staged_name(dir_fd, tmp, staged)
-            os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            if overwrite:
+                os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            else:
+                _link_staged_name(dir_fd, tmp, name)
         else:
             _link_staged_inode(fd, dir_fd, name)
         published = True
@@ -1850,7 +1905,7 @@ def _atomic_write_at(
         _flush_publication(target)
     finally:
         if tmp is not None:
-            _discard_temp(dir_fd, tmp, staged=staged)
+            _discard_temp(dir_fd, tmp, staged=staged, published=published)
         # Quiet only once publication has settled: a bare close raising `EIO`
         # here would discard a write that already happened and surface as a
         # generic OSError, which the tools report as a failure — the trap
@@ -1863,71 +1918,53 @@ def _atomic_write_at(
     return target.path
 
 
-def _staged_identity_matches(dir_fd: int, tmp: str, staged: os.stat_result) -> bool:
-    """Whether `tmp` still names the inode we staged."""
-    try:
-        current = os.stat(tmp, dir_fd=dir_fd, follow_symlinks=False)
-    except OSError:
-        return False
-    return (current.st_dev, current.st_ino) == (staged.st_dev, staged.st_ino)
-
-
-def _require_staged_name(dir_fd: int, tmp: str, staged: os.stat_result) -> None:
-    """Refuse unless the temp name still refers to the bytes we just wrote.
-
-    `renameat` moves whatever is at the source name when it runs, so an
-    overwrite publish cannot be made to carry an inode the way `linkat` can.
-    Checking here does not close the race — it narrows it to the one syscall —
-    and it turns the common case of a peer replacing our staging file from
-    "their content published as the note" into a refusal.
-    """
-    if not _staged_identity_matches(dir_fd, tmp, staged):
-        raise vault_fs.Conflict(
-            "The staged copy was replaced before it could be published; "
-            "nothing was written. Retry the operation."
-        )
-
-
-# `_proc_fd_available` and `_link_staged_inode` live in `vault_fs` (#92 item 1):
-# the transfer publish stages and publishes the same way, and a second copy is
-# how the two paths drifted apart before. These names are kept as module-level
-# aliases so this file reads as it did — and so a test can still hook the
-# publish here without reaching into the shared module.
+# `_proc_fd_available`, `_link_staged_inode`, `_staged_identity_matches` and
+# `_require_staged_name` all live in `vault_fs` (#92 item 1, and — as of this
+# fallback — the rest of the by-name publication primitives too, closing #105
+# in the same move): the transfer publish stages, verifies and discards the
+# same way, and a second copy is how the two paths drifted apart before (a
+# drift that is exactly how #105 happened — `vault_fs.discard_staged_name`
+# already treated an absent staging name as "the publish consumed it, not a
+# substitution"; this module's own copy did not, and warned on every
+# successful overwrite publish as a result). These names are kept as
+# module-level aliases so this file reads as it did — and so a test can still
+# hook the publish here without reaching into the shared module.
 _proc_fd_available = vault_fs.proc_fd_available
 _link_staged_inode = vault_fs.link_staged_inode
+_staged_identity_matches = vault_fs.staged_identity_matches
+_require_staged_name = vault_fs.require_staged_name
 
 
 def _discard_temp(
-    dir_fd: int, tmp: str, staged: os.stat_result | None = None
+    dir_fd: int,
+    tmp: str,
+    staged: os.stat_result | None = None,
+    *,
+    published: bool = False,
 ) -> None:
-    """Remove the **overwrite** path's staging name — and never anybody else's.
+    """Remove a **named** staging file — and never anybody else's.
 
-    Reached on two kinds of path: a successful `renameat` (which consumed the
-    name, so this is a no-op) and a failure after staging. In the failure case
-    the name is unlinked only while it still refers to the inode we staged; if
-    it does not, the file is **left in place and logged**. Answering an
-    attempted substitution by deleting the substitute is the same
-    destructive-write class this module exists to prevent, just aimed at a
-    different file, so the failure direction is to leave litter rather than
-    remove something we cannot prove is ours.
+    Delegates to `vault_fs.discard_staged_name`, the same primitive the
+    transfer path uses (#105): reached on three kinds of path — a successful
+    `renameat` (overwrite, which consumed the name, so this is a no-op), a
+    successful `link()` (no-clobber named-staging fallback, which leaves
+    `tmp` behind pointing at the same inode as the now-published `name`), and
+    a failure after staging on either path. **An absent name is not a
+    substitution** — it is the ordinary outcome of the first case — and only
+    a name that exists and refers to a *different* inode is treated as one,
+    logged and left in place rather than unlinked. Answering an attempted
+    substitution by deleting the substitute is the same destructive-write
+    class this module exists to prevent, just aimed at a different file, so
+    the failure direction is to leave litter rather than remove something we
+    cannot prove is ours.
 
-    The no-clobber path never calls this: it stages into an unnamed
-    `O_TMPFILE` inode, so there is no name to remove and no check to race.
-    That asymmetry is deliberate — see `_atomic_write_at`.
+    The **default** no-clobber path never calls this: it stages into an
+    unnamed `O_TMPFILE` inode, so there is no name to remove and no check to
+    race. That asymmetry is deliberate — see `_atomic_write_at`. It is only
+    reached for no-clobber when `VAULT_ALLOW_NAMED_STAGING_FALLBACK` put a
+    name in the directory in the first place — see `_link_staged_name`.
     """
-    if staged is not None and not _staged_identity_matches(dir_fd, tmp, staged):
-        logger.warning(
-            "Temp name %s no longer refers to the file we staged; leaving it "
-            "in place rather than unlinking a file we did not create.",
-            tmp,
-        )
-        return
-    try:
-        os.unlink(tmp, dir_fd=dir_fd)
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        logger.warning("Could not remove temporary file %s: %s", tmp, exc)
+    vault_fs.discard_staged_name(dir_fd, tmp, staged, published=published)
 
 
 def _bound_read(fd: int, label: str, max_bytes: int | None) -> bytes:

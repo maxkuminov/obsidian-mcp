@@ -79,6 +79,7 @@ import os
 import platform
 import secrets
 import stat
+import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -147,6 +148,7 @@ _TRANSIENT_ATTEMPTS = 8
 # the whole value of the signal: it separates an operator who enabled the flag
 # defensively from a mount that is taking the fallback.
 _named_staging_exercised = False
+_named_staging_exercised_lock = threading.Lock()
 
 
 def note_named_staging_exercised() -> None:
@@ -155,11 +157,19 @@ def note_named_staging_exercised() -> None:
     Shared by both write paths, so one warning and one `/health` field answer
     for the note path and the transfer path together (D27). Call it at the
     moment the staging name is created, never earlier.
+
+    The check-then-set is locked: a sync request handler can run this from a
+    thread-pool worker, and without the lock two concurrent first-time
+    fallback writes (racing to be the first exercise, one from each write
+    path) can both observe `False` and both log — the flag still ends up
+    `True` either way, but the warning is meant to fire once per process, not
+    once per race.
     """
     global _named_staging_exercised
-    if _named_staging_exercised:
-        return
-    _named_staging_exercised = True
+    with _named_staging_exercised_lock:
+        if _named_staging_exercised:
+            return
+        _named_staging_exercised = True
     logger.warning(
         "VAULT_ALLOW_NAMED_STAGING_FALLBACK is set and this vault's "
         "filesystem cannot stage without a directory entry, so writes are "
