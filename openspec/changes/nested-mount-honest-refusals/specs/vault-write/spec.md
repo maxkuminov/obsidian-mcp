@@ -4,11 +4,22 @@
 
 ### Requirement: A cross-mount rename names the mount boundary as its cause
 
-The non-replacing rename primitive SHALL map `EXDEV` to a mount-boundary error (`MountBoundary`, the existing subclass of `UnsupportedFilesystem`) whose text names the mount layout as the cause, distinct from the `EINVAL`/`ENOSYS`/`EOPNOTSUPP` cases that genuinely mean the kernel or filesystem cannot perform a non-replacing rename. `EXDEV` from `renameat2` means the two names are on different mounts and nothing else; folding it into a "renameat2 is not available" message blames a filesystem that renames fine, and an agent acting on that text is sent to change filesystems when the fix is the mount layout. Every caller of the primitive — the soft delete, `move_note`'s publication and its rollbacks — SHALL surface that cause rather than re-wrapping it into filesystem-support prose; a caller that wraps rename failures in its own message SHALL handle the mount-boundary subclass before the generic class, or its wrapper is a lie and the subclass handler unreachable.
+The non-replacing rename primitive SHALL classify `EXDEV` on its failure path before naming a cause, because `EXDEV` is not exclusively a mount-boundary signal: Landlock returns it for a same-mount reparenting a policy denies, and overlayfs for renames its layering cannot perform — so an unconditional mount-layout diagnosis is causally false on real same-mount configurations, the same defect class this change removes. On `EXDEV` the primitive SHALL compare the two directory descriptors' mount identities, inside that one failure path and never persisted: a definite mismatch SHALL raise the mount-boundary error (`MountBoundary`, the existing subclass of `UnsupportedFilesystem`) naming the mount layout; a definite match SHALL raise an error that names a security policy (Landlock) or filesystem-internal boundary (overlayfs, btrfs subvolume) as the plausible causes and SHALL NOT claim a mount boundary; and where mount identity cannot be read the error SHALL present `EXDEV` as ambiguous between those causes rather than assert either. All three remain distinct from the `EINVAL`/`ENOSYS`/`EOPNOTSUPP` cases that genuinely mean the kernel or filesystem cannot perform a non-replacing rename. Every caller of the primitive — the soft delete, `move_note`'s publication and its rollbacks — SHALL surface the classified cause rather than re-wrapping it into filesystem-support prose; a caller that wraps rename failures in its own message SHALL handle the mount-boundary subclass before the generic class, or its wrapper is a lie and the subclass handler unreachable. The note path's named-fallback publish mappings SHALL classify the same way — their staging is same-directory, so an unconditional mount claim there is false in almost every case that can fire.
+
+#### Scenario: A same-mount `EXDEV` does not blame the mount layout
+
+- **WHEN** `renameat2(RENAME_NOREPLACE)` returns `EXDEV` for two names whose directories provably share a mount (e.g. a Landlock policy denying the reparent, or an overlayfs rename restriction)
+- **THEN** the raised error SHALL name a security policy or filesystem-internal boundary as the plausible causes
+- **AND** it SHALL NOT claim the two names are on different mounts or tell the caller to change the mount layout
+
+#### Scenario: An `EXDEV` whose mount identity cannot be read is reported as ambiguous
+
+- **WHEN** the same rename fails `EXDEV` where `STATX_MNT_ID` is unavailable
+- **THEN** the error SHALL present the failure as `EXDEV` with both a mount boundary and a policy or filesystem-internal boundary as possible causes, asserting neither
 
 #### Scenario: A rename across a nested mount is refused with the mount-boundary cause
 
-- **WHEN** a `renameat2(RENAME_NOREPLACE)` issued by a vault primitive returns `EXDEV` because its two names sit on different mounts beneath the vault root
+- **WHEN** a `renameat2(RENAME_NOREPLACE)` issued by a vault primitive returns `EXDEV` and the two directories' mount identities provably differ
 - **THEN** the raised error SHALL be the mount-boundary type and its text SHALL name the mount layout as the cause
 - **AND** the text SHALL NOT state or imply that the filesystem lacks non-replacing-rename support
 
