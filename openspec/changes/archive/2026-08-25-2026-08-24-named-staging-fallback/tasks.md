@@ -25,9 +25,9 @@
 
 ## 5. Upstream PR (maxkuminov/obsidian-mcp#103)
 
-- [ ] 5.1 Carry this OpenSpec delta in the PR
-- [ ] 5.2 Note in the PR description that the staged name is created through the pinned `open_mutable` parent descriptor (ask 2)
-- [ ] 5.3 Acknowledge the write-path adversarial review gate in the PR description (ask 3)
+- [x] 5.1 Carry this OpenSpec delta in the PR
+- [x] 5.2 Note in the PR description that the staged name is created through the pinned `open_mutable` parent descriptor (ask 2)
+- [x] 5.3 Acknowledge the write-path adversarial review gate in the PR description (ask 3)
 
 ## 6. Pre-merge adversarial gate (this repo's write-path review)
 
@@ -48,3 +48,18 @@
   keeping warn-once semantics
 - [x] 6.5 Regression tests for each, including the concurrent replacement over
   the staging name on the fallback path
+
+
+## Archive record (2026-08-24)
+
+All three PR-process tasks were satisfied by PR #104 as submitted (the delta
+was carried, the pinned-descriptor staging stated, the gate acknowledged).
+The gate then ran on the merged result: 1 BLOCKER + 1 MAJOR + 3 MINOR, fixed
+forward in `b2ee20d` (round-2 verdict PASS with one cosmetic residual, filed
+as #115). Merged via #114 with the contributor's commits intact; deployed;
+`/health` reports the fallback inactive on the production ext4 mount, which
+is the expected reading — the live exercise of the fallback itself belongs to
+an O_TMPFILE-less filesystem, and the contributor's TrueNAS deployment is the
+real one; the suite's fallback tests (both no-clobber semantics and the
+fail-closed cleanup) stand in for it here, and #103 asks for their
+confirmation. #105 closed by this change's consolidation.
