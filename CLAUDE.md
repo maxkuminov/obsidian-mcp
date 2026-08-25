@@ -665,29 +665,53 @@ allow-listed exemptions.
   several such windows, one per publication, and can be refused part way
   through; "one window per tool call" would be false for it and must not be
   claimed.
-- **There is no retainable stamp.** `vault._confirm_vault_assignment` is
-  private and the only entry point is `vault.confirmed_publication(user_id,
+- **There is no retainable confirmation.** `vault._confirm_vault_assignment`
+  is private and the only entry point is `vault.confirmed_publication(user_id,
   publish)`, which awaits the read and calls a **synchronous** `publish` before
-  returning control — so no caller-visible `await` can sit between the two. A
-  coroutine function, or a callable that hands back an awaitable, is refused
-  rather than awaited. The first implementation exposed a stamp on the target
-  and review caught the three holes that follow from it.
-- **`RootConfirmation` is single-consumption and target-bound.** The spent flag
-  lives on the confirmation, not on a slot in the target, so one object cannot
-  be spent by two publications however it is attached; and `consume` checks the
-  acting user id and the canonical assignment against `MutableTarget.user_id` /
-  `.assignment` before spending it. Every publish helper
+  returning control — so no caller-visible `await` can sit between the two.
+  Coroutine, generator *and* async-generator callbacks are refused, and so is a
+  returned coroutine/generator/awaitable (a callable object whose `__call__` is
+  a generator is none of the first three). Nothing is `close()`d on the way
+  out: that is arbitrary code of a stranger's choosing, and the lease below has
+  already made the object inert.
+- **The confirmation is leased for the callback's dynamic extent, and that is
+  the part that bounds *when*.** `_leased` activates it, and a `finally`
+  revokes it on every exit — normal return, exception, or a callback that
+  stashed the object. `consume` refuses an unleased confirmation, and
+  `confirmed_publication` refuses a callback that returned without consuming
+  one. Single-consumption alone was **not** enough and must not be relied on
+  again: it bounds how many times a confirmation is used and says nothing about
+  when, so `lambda c: saved.append(c)` followed by a reassignment and a later
+  `write_file_at(..., confirmation=saved[0])` was obeyed.
+- **`RootConfirmation` is also single-consumption and target-bound.** The spent
+  flag lives on the confirmation, not on a slot in the target, so one object
+  cannot be spent by two publications however it is attached; and `consume`
+  checks the acting user id and the canonical assignment against
+  `MutableTarget.user_id` / `.assignment`. Every publish helper
   (`_atomic_write_at`, `move_file_no_clobber`, `soft_delete_target`,
   `unlink_at`) takes one or refuses with `UnconfirmedPublication` — a
   programming error, deliberately not a `RuntimeError`, because the tool bodies
   catch `RuntimeError` around their publishes and would render it as a failed
   write.
-- **A rollback rides the confirmation it undoes, through a `MovePermit`.** The
-  forward `move_file_no_clobber` returns a permit naming exactly its two
-  targets; `_verify_the_moved_inode`'s reverse move presents it. One use, that
-  pair only, and it is not a confirmation and cannot become one. Stamping the
-  one confirmation onto both endpoints — the first shape — made a reusable
-  token of a single-use fact.
+- **A rollback rides the confirmation it undoes, through a `MovePermit` that
+  cannot be forged.** The forward `move_file_no_clobber` issues it — nobody
+  else can, `__init__` requires the module-private `_PERMIT_ISSUE` token — and
+  it is bound to that confirmation's *lease*, so it is inert the moment
+  `confirmed_publication` returns, plus the immutable
+  `(user_id, assignment, rel)` of each end and object identity. One use,
+  reverse direction only. Two earlier shapes were wrong: stamping the one
+  confirmation onto both endpoints made a reusable token of a single-use fact,
+  and a public `MovePermit(destination, source)` constructor authorised a
+  rename with no confirmation at all.
+- **Both ends of a move must be one caller, one assignment, one root inode.**
+  `rename_noreplace` removes the source entry as surely as it creates the
+  destination one, yet only the destination's confirmation is consumed, so
+  `_require_one_vault` compares `user_id`, `assignment` and `fstat` of each
+  pinned `root_fd` (a pathname comparison is not enough — two assignments can
+  spell the same string over different directories) before anything is spent,
+  on the forward move and on the rollback. Unreachable from `move_note`, which
+  opens both ends with one `uid`; checked at the primitive because the next
+  caller may not.
 - **Three distinct error markers, because they say different things.**
   `no_vault_assigned` (admission: this credential had no vault this call),
   `vault_assignment_changed` (an administrator moved it — `VaultAssignmentChanged`),
@@ -742,6 +766,20 @@ highest — and never toward discarding, which costs a full re-embed.
   a root nobody is assigned to. The re-derive's tail stamp takes the same lock
   and the same re-read, and is *withheld* on disagreement rather than fatal —
   it destroys nothing.
+- **The two take that lock differently, and it is lock ordering, not tuning.**
+  The discard has its own transaction and locks the parent *before* any child
+  write — the panel's own user-delete direction — so it may wait. The tail
+  stamp runs at the end of the pass's transaction, already holding
+  `notes_metadata` row locks, while a permanent user delete locks `users` first
+  and then cascades onto exactly those rows: waiting there is a real deadlock
+  cycle, and Postgres would abort one side — possibly the operator's delete. So
+  the tail asks `FOR UPDATE NOWAIT` **inside `session.begin_nested()`** and
+  treats `55P03` as a withheld stamp (a state that branch already knows). The
+  savepoint is required, not tidy: a failed statement poisons its transaction,
+  so without one the pass would lose every repair along with the stamp.
+  `_is_lock_not_available` walks `.orig` *and* `__cause__` — the SQLSTATE lives
+  on asyncpg's own error, two layers down, exactly as `_log_usage`'s FK
+  recovery has to walk.
 - **A re-derive that skipped anything records nothing.** Any per-file skip —
   including both link-extraction skips, the missing buffered body and the
   missing index row — withholds the stamp, because the record's whole claim is
@@ -764,6 +802,17 @@ highest — and never toward discarding, which costs a full re-embed.
   it replaces a vector and **after** the provider call — so no row lock is held
   across a network request, and a row that moved matches nothing.
   `StaleCertification` rolls the note back and leaves it unmarked.
+- **The exclusion branch certifies through the same predicate.** It reads no
+  file, but it deletes a note's vectors and marks the row embedded, which is
+  the same claim — and a move is exactly what it cannot see, because relocating
+  a note changes `file_path` and not `content_hash`. Stamping by `id` alone let
+  a decision about `Private/A.md` delete the vectors of a row that had become
+  `Public/A.md` and record it as embedded with none: included, hash-equal, and
+  therefore never selected again — silently and permanently absent from
+  `semantic_search`. `certify_embedded` is shared by both paths, stamps before
+  the delete (the conditional UPDATE is what takes the row lock), and takes
+  `note_id` plus an explicit `expire_on` because the exclusion branch certifies
+  from a plain result row no session maps.
 
 ## The vault assignment is the admission gate for every tool
 

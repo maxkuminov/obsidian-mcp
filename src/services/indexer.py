@@ -18,7 +18,11 @@ from sqlalchemy.dialects.postgresql import insert
 from src.config import settings
 from src.database import async_session
 from src.models.db import NoteEmbedding, NoteLink, NoteMetadata, OAuthCode, OAuthToken, User
-from src.services.embeddings import StaleCertification, embed_note
+from src.services.embeddings import (
+    StaleCertification,
+    certify_embedded,
+    embed_note,
+)
 from src.services.fts import index_tsvector_sql
 from src.services.links import build_vault_index, extract_links, resolve_target
 from src.services.transfer import canonical_vault_root
@@ -495,7 +499,56 @@ class ProvenanceRaceAborted(RuntimeError):
     """
 
 
-async def _assert_still_assigned(session, user_id: int, facts: RootFacts) -> None:
+class ProvenanceLockUnavailable(RuntimeError):
+    """Somebody else holds the `users` row, and we refused to wait for it.
+
+    Raised by `_assert_still_assigned(nowait=True)`. The tail stamp cannot
+    *wait* for that lock: it already holds this pass's `notes_metadata` row
+    locks, and a permanent user delete takes the parent first and then cascades
+    to exactly those children, so waiting closes a cycle and PostgreSQL aborts
+    one of the two — possibly the operator's delete. Withholding the stamp
+    costs one more re-derive; taking the deadlock costs an aborted pass or an
+    aborted panel action.
+    """
+
+
+# PostgreSQL SQLSTATE for `lock_not_available` — what `FOR UPDATE NOWAIT`
+# raises when the row is already locked. Matched on the code rather than on
+# asyncpg's exception class so the driver stays swappable.
+LOCK_NOT_AVAILABLE = "55P03"
+
+
+def _is_lock_not_available(exc: BaseException) -> bool:
+    """Whether `exc` (however many layers it is wrapped in) is 55P03.
+
+    The error arrives wrapped twice and the layers carry different things, the
+    same way `_log_usage`'s foreign-key recovery has to walk them: SQLAlchemy's
+    `.orig` is the asyncpg *dialect's* error and its `__cause__` is asyncpg's
+    own. Walk both chains and take the first SQLSTATE we find.
+    """
+    seen = set()
+    stack = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        code = getattr(current, "sqlstate", None) or getattr(current, "pgcode", None)
+        if code == LOCK_NOT_AVAILABLE:
+            return True
+        stack.extend(
+            [
+                getattr(current, "orig", None),
+                getattr(current, "__cause__", None),
+                getattr(current, "__context__", None),
+            ]
+        )
+    return False
+
+
+async def _assert_still_assigned(
+    session, user_id: int, facts: RootFacts, *, nowait: bool = False
+) -> None:
     """Lock the user row and prove it still names the assignment we classified.
 
     **The classification is not, by itself, a licence to act on it.** `facts`
@@ -517,14 +570,33 @@ async def _assert_still_assigned(session, user_id: int, facts: RootFacts) -> Non
 
     An inactive user, a deleted row, a cleared `vault_path` or a different one
     all abort: none of them is the state the classification described.
+
+    **`nowait` is a lock-ordering requirement, not a tuning knob.** The discard
+    takes this lock in its own transaction *before* it touches a single child
+    row, which is the panel's own parent-then-child direction and therefore
+    safe to wait on. The re-derive's tail stamp cannot: it runs at the end of
+    the pass's transaction, holding `notes_metadata` row locks, and a permanent
+    user delete locks `users` first and then waits on exactly those children —
+    a cycle PostgreSQL resolves by aborting one side, possibly the operator's
+    delete. The tail therefore asks with `NOWAIT` inside a savepoint and treats
+    contention as "withhold the stamp", a state that branch already knows how
+    to be in.
     """
-    row = (
-        await session.execute(
-            select(User.vault_path, User.is_active)
-            .where(User.id == user_id)
-            .with_for_update()
-        )
-    ).first()
+    statement = (
+        select(User.vault_path, User.is_active)
+        .where(User.id == user_id)
+        .with_for_update(nowait=nowait)
+    )
+    try:
+        row = (await session.execute(statement)).first()
+    except Exception as exc:
+        if nowait and _is_lock_not_available(exc):
+            raise ProvenanceLockUnavailable(
+                f"the users row for user_id={user_id} is locked by another "
+                "transaction, and this one already holds notes_metadata row "
+                "locks, so waiting for it could deadlock with a user deletion"
+            ) from None
+        raise
     if row is None:
         raise ProvenanceRaceAborted(
             f"user_id={user_id} no longer exists"
@@ -1223,9 +1295,30 @@ async def _index_vault_pinned(
                 # correct for the root they were read from, nothing was
                 # destroyed, and an unrecorded provenance simply makes the next
                 # pass re-derive again.
+                # **Inside a savepoint, and with `NOWAIT`.** This transaction
+                # already holds `notes_metadata` row locks, and a permanent
+                # user delete locks `users` first and then cascades onto
+                # exactly those rows — so *waiting* here closes a deadlock
+                # cycle that PostgreSQL breaks by aborting one side, possibly
+                # the operator's delete. The savepoint is what makes the
+                # refusal survivable: a failed statement poisons its
+                # transaction, so without one the pass would lose every repair
+                # it had just made rather than merely its stamp.
+                stamped = None
                 try:
-                    await _assert_still_assigned(session, user_id, facts)
-                    stamped = await _stamp_provenance(session, user_id, facts)
+                    async with session.begin_nested():
+                        await _assert_still_assigned(
+                            session, user_id, facts, nowait=True
+                        )
+                        stamped = await _stamp_provenance(session, user_id, facts)
+                except ProvenanceLockUnavailable as exc:
+                    logger.warning(
+                        "Re-derive complete but not recorded%s: %s. The "
+                        "repairs are committed; the next pass will re-derive "
+                        "again and stamp then.",
+                        log_suffix,
+                        exc,
+                    )
                 except ProvenanceRaceAborted as exc:
                     logger.warning(
                         "Re-derive complete but not recorded%s: %s. The next "
@@ -1654,15 +1747,27 @@ async def _embed_vault_pinned(user_id: int | None, root_fd: int, log_suffix: str
                 # configured) and stamp embedded_content_hash so the indexer
                 # doesn't keep re-checking it.
                 if any(fnmatch.fnmatch(row.file_path, pat) for pat in exclude_patterns):
-                    await session.execute(
-                        delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
+                    # **Certified exactly like the embedding path, and for the
+                    # same reason.** This branch used to stamp by `id` alone,
+                    # which made it the one way to mark a row embedded without
+                    # proving the row still describes what was decided about:
+                    # a `move_note` out of an excluded folder commits a new
+                    # `file_path` with an unchanged `content_hash`, so a stale
+                    # decision taken against `Private/A.md` deleted the vectors
+                    # and stamped `Public/A.md` as embedded with none. Included,
+                    # hash-equal, and therefore never selected again —
+                    # permanently absent from `semantic_search`. The predicate
+                    # includes the path, so the moved row matches nothing and
+                    # `StaleCertification` rolls the whole note back.
+                    #
+                    # Stamp first, delete second: the conditional UPDATE is what
+                    # takes the row lock, so nothing is dropped on the strength
+                    # of a row that has since moved.
+                    await certify_embedded(
+                        session, row.id, row.content_hash, row.file_path
                     )
                     await session.execute(
-                        text(
-                            "UPDATE notes_metadata SET embedded_content_hash = :h "
-                            "WHERE id = :i"
-                        ),
-                        {"h": row.content_hash, "i": row.id},
+                        delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
                     )
                     await session.commit()
                     skipped_excluded += 1

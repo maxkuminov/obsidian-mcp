@@ -11,13 +11,23 @@ The metadata transaction that follows the move SHALL NOT require a confirmation:
 
 The confirmation SHALL be enforced structurally rather than by convention, and the enforcement has three parts.
 
-**One awaiting wrapper, and no retainable stamp.** There SHALL be no public way to obtain a confirmation and hold it: the only entry point SHALL be an asynchronous confirmed-publication wrapper that awaits the assignment read and then invokes a **synchronous** publish callable before returning control to the event loop. A caller therefore cannot place an `await` between the confirmation and the publication, because it never holds an unspent confirmation across a scheduling point. A publish callable that is a coroutine function, or that returns an awaitable, SHALL be refused rather than awaited: awaiting it would reopen the window the wrapper exists to close.
+**One awaiting wrapper, and no retainable confirmation.** There SHALL be no public way to obtain a confirmation and hold it: the only entry point SHALL be an asynchronous confirmed-publication wrapper that awaits the assignment read and then invokes a **synchronous** publish callable before returning control to the event loop.
+
+**The confirmation SHALL be leased to that callable's dynamic extent.** The wrapper SHALL activate it before the call and invalidate it in a `finally` on every exit path — normal return, exception, or a callable that retained the object — and `consume` SHALL refuse a confirmation that is not currently leased. Single consumption alone is insufficient and SHALL NOT be relied on: it bounds how many times a confirmation may be used and says nothing about *when*, so a callable that stores its confirmation and publishes with it after the wrapper has returned, and after a reassignment has committed, is otherwise obeyed.
+
+**A successful publication SHALL have consumed exactly one confirmation.** A callable that returns normally without consuming the confirmation it was given SHALL be refused, because that is the shape of a publish path added outside the shared helpers.
+
+Publish callables that would not have published by the time they return SHALL be refused rather than driven: coroutine functions, generator functions and async-generator functions, and likewise a *returned* coroutine, generator or async generator — a callable object whose `__call__` is a generator is none of the first three. The wrapper SHALL NOT invoke `close` or any other method on such a returned object: that is arbitrary code of a stranger's choosing, and the lease has already been revoked, so driving the object later cannot publish.
 
 **The confirmation is intrinsically single-consumption and target-bound.** The consumed flag SHALL live on the confirmation itself rather than on the target it authorises, so one confirmation cannot be spent by two publications however it is attached, and the publish helper SHALL check the confirmation's user id and canonical assignment against the target's own before spending it. A confirmation taken for one user, or for one root, SHALL NOT authorise a publication into another's target.
 
 **Every publish helper refuses an unauthorised publication.** The shared helpers SHALL refuse a mutation target for which no confirmation is presented, one already spent, or one taken for a different user or root, so a mutating tool added later cannot publish without confirming the assignment first, in the same way a tool added later cannot skip the admission gate. A refusal for a missing or unusable confirmation SHALL be distinguishable from a refusal for a changed assignment, because the first is a programming error and the second is an operational event.
 
 **The rollback of a publication is covered by that publication's confirmation, through a narrowly scoped permit.** `move_note`'s inode verification may have to move the file straight back when what arrived at the destination is the source inode but is a directory or a symbolic link, and refusing that for want of a confirmation would strand the note somewhere nobody named. The forward move SHALL return a permit naming exactly the two targets it moved between, and that permit SHALL authorise exactly one reverse move between those same two targets — not a second forward move, not any other pair, and not itself twice. The permit SHALL NOT be a confirmation and SHALL NOT be usable as one. This is not a second confirmation and is not claimed to be: the rollback undoes the very publication the confirmation covered, synchronously, with no intervening `await`, so it lies inside that publication's window rather than opening a new one. Stamping the one confirmation onto both endpoints instead — so that either could spend it — SHALL NOT be done, because it makes a reusable token of a single-use fact.
+
+**The permit SHALL be unforgeable and SHALL expire with the publication that issued it.** It SHALL be constructible only by a successful, confirmed forward move; a permit built by any other caller SHALL be refused rather than honoured, because it would otherwise authorise a rename for which no confirmation was ever taken. It SHALL be bound to the lease of the confirmation the forward move consumed and SHALL be refused once that lease has been revoked, and it SHALL additionally record the immutable `(user id, assignment, vault-relative path)` of each endpoint and refuse a rollback whose endpoints no longer carry them.
+
+**Both ends of a move SHALL belong to one caller, one assignment and one pinned root directory.** A no-clobber move removes the source directory entry as surely as it creates the destination one, but only one confirmation is consumed for the pair. The publish helper SHALL therefore require, before consuming anything and on the rollback path too, that the two targets carry identical user ids and identical canonical assignments, and that their pinned vault-root descriptors name the same directory inode — a pathname comparison is insufficient, since two assignments may spell the same string while different directories were pinned. Requiring this is what makes confirming the destination sufficient for the source; without it a source validated for one user can be removed under another user's confirmation.
 
 **Every destructive operation on a mutation target SHALL go through such a helper, the permanent unlink included.** A tool that reaches a bare unlink syscall on a target's parent descriptor is outside the enforcement, and while any such call site remains the structural claim is false rather than merely incomplete. `delete_note(permanent=True)` is that call site today and SHALL be routed through a permanent-unlink helper on the same seam as the atomic write, the no-clobber move and the soft delete.
 
@@ -116,6 +126,39 @@ The confirmation SHALL be enforced structurally rather than by convention, and t
 - **WHEN** the public interface for a confirmed publication is examined
 - **THEN** there SHALL be no exported way to obtain a confirmation without publishing with it in the same synchronous step
 - **AND** a publish callable that is asynchronous, or that returns an awaitable, SHALL be refused rather than awaited
+
+#### Scenario: A callable that retains its confirmation publishes nothing later
+
+- **WHEN** a publish callable stores the confirmation it was given, returns without consuming it, and the caller later presents that object to a publish helper — after an administrator's reassignment has committed
+- **THEN** the wrapper SHALL refuse the callable's return, because nothing was consumed
+- **AND** the retained confirmation SHALL authorise no publication, because its lease was revoked when the callable returned
+
+#### Scenario: The lease is revoked when the callable raises
+
+- **WHEN** a publish callable raises
+- **THEN** its exception SHALL propagate unchanged
+- **AND** the confirmation SHALL nonetheless be left unable to authorise a later publication
+
+#### Scenario: A deferred publish callable is refused, not driven
+
+- **WHEN** the publish callable is a coroutine function, a generator function or an async-generator function, or returns a coroutine, a generator or an async generator
+- **THEN** it SHALL be refused
+- **AND** the wrapper SHALL NOT call `close` or any other method on the returned object
+
+#### Scenario: A move permit cannot be constructed by a caller
+
+- **WHEN** any caller other than a successful confirmed forward move attempts to build a move permit
+- **THEN** the attempt SHALL be refused, and no rename SHALL be authorised by it
+
+#### Scenario: A move permit is inert once its publication has returned
+
+- **WHEN** a permit issued inside a confirmed publication is presented after that publication has returned
+- **THEN** the rollback SHALL be refused
+
+#### Scenario: A move refuses endpoints that do not share a caller, an assignment and a root
+
+- **WHEN** a no-clobber move is asked to move between two targets validated for different users, under different canonical assignments, or anchored to different vault-root directories
+- **THEN** it SHALL be refused before any confirmation is consumed, and nothing SHALL be renamed
 
 #### Scenario: A rollback is authorised by a permit, not by a spare confirmation
 

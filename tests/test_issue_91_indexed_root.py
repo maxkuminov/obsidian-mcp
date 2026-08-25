@@ -48,6 +48,23 @@ from src.services import embeddings, indexer, transfer
 # wrong rows.
 
 
+class _LockNotAvailable(Exception):
+    """What `SELECT … FOR UPDATE NOWAIT` raises on a contended row.
+
+    Shaped like the real thing: SQLAlchemy's wrapper carries `.orig`, whose
+    `__cause__` is asyncpg's own error, and only the innermost one knows the
+    SQLSTATE. `indexer._is_lock_not_available` has to walk both layers.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("could not obtain lock on row in relation \"users\"")
+        inner = Exception("lock_not_available")
+        inner.sqlstate = indexer.LOCK_NOT_AVAILABLE
+        dialect_level = Exception("(asyncpg.exceptions.LockNotAvailableError)")
+        dialect_level.__cause__ = inner
+        self.orig = dialect_level
+
+
 class _Result:
     def __init__(self, rows=(), rowcount=0):
         self.rows = list(rows)
@@ -86,6 +103,9 @@ class FakeSession:
         self.assignment = assignment
         self.is_active = is_active
         self.user_row_missing = False
+        # Set by a test to make a `FOR UPDATE NOWAIT` on `users` fail the way
+        # PostgreSQL does when somebody else already holds the row.
+        self.users_row_locked = False
         # Every locked re-read of the `users` row, in order.
         self.assignment_reads = 0
         # What `link_backfill_pass`'s completion probe sees. 0 means "no pass
@@ -119,6 +139,28 @@ class FakeSession:
 
     async def rollback(self):
         pass
+
+    def begin_nested(self):
+        """The savepoint the tail stamp takes its `NOWAIT` lock inside.
+
+        Records entry and exit so a test can prove the stamp really is scoped
+        to one, and re-raises whatever the body raised — which is what makes
+        "roll back only the savepoint, keep the repairs" observable here.
+        """
+        session = self
+
+        class _Savepoint:
+            async def __aenter__(self):
+                session.timeline.append("savepoint")
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                session.timeline.append(
+                    "savepoint:rollback" if exc_type is not None else "savepoint:release"
+                )
+                return False
+
+        return _Savepoint()
 
     async def commit(self):
         self.commits += 1
@@ -164,7 +206,15 @@ class FakeSession:
             # assignment that produced it.
             if "users.vault_path" in rendered and "FOR UPDATE" in rendered:
                 self.assignment_reads += 1
-                self.timeline.append("lock:users")
+                # `NOWAIT` is PostgreSQL-specific and the default dialect does
+                # not render it, so the construct is read rather than the SQL
+                # string — which is the stronger assertion anyway.
+                nowait = bool(
+                    getattr(getattr(stmt, "_for_update_arg", None), "nowait", False)
+                )
+                self.timeline.append("lock:users:nowait" if nowait else "lock:users")
+                if nowait and self.users_row_locked:
+                    raise _LockNotAvailable()
                 if self.user_row_missing:
                     return _Result([])
                 return _Result([
@@ -766,6 +816,106 @@ async def test_a_re_derive_stamp_is_bound_the_same_way_and_is_withheld(
     assert session.stamps == [], "provenance was recorded under another assignment"
     # The repairs still happened and still committed.
     assert session.commits >= 1
+
+
+@pytest.mark.asyncio
+async def test_the_discard_takes_the_users_lock_before_any_child_write(
+    monkeypatch, tmp_path
+):
+    """Lock order, asserted where it is decided (adversarial round 2, MAJOR 5).
+
+    The discard runs in its own transaction and must take the parent row before
+    it touches a child — the direction the panel's own user delete takes, so
+    the two queue behind each other instead of closing a cycle. It waits for
+    that lock (no `NOWAIT`), which is only safe *because* it holds nothing yet.
+    """
+    old = make_vault(tmp_path, "old", {"Note.md": "old body\n"})
+    new_root = make_vault(tmp_path, "new", {"Fresh.md": "new body\n"})
+    session = FakeSession(
+        provenance=recorded_from(facts_for(old)),
+        existing={"Note.md": hash_of("old body\n")},
+        note_ids={"Fresh.md": 10},
+        assignment=str(new_root),
+    )
+    install(monkeypatch, session, new_root)
+
+    await indexer.index_vault(user_id=7)
+
+    lock_at = session.timeline.index("lock:users")
+    discard_at = session.timeline.index("discard")
+    assert lock_at < discard_at, session.timeline
+    # It waits, because at that point it holds no child row locks at all.
+    assert "lock:users:nowait" not in session.timeline[:discard_at]
+
+
+@pytest.mark.asyncio
+async def test_the_tail_stamp_asks_without_waiting_inside_a_savepoint(
+    monkeypatch, tmp_path
+):
+    """The other half of the lock-order rule.
+
+    The tail runs at the end of the pass's transaction, holding
+    `notes_metadata` row locks, and a permanent user delete takes `users` first
+    and then cascades onto exactly those rows. Waiting there closes a real
+    deadlock cycle, so the tail asks with `NOWAIT` — inside a savepoint,
+    because a failed statement poisons its transaction and the repairs must
+    survive the refusal.
+    """
+    vault = make_vault(tmp_path, "vault", {"Note.md": "body\n"})
+    session = FakeSession(
+        provenance=(None, None, None), existing={}, note_ids={"Note.md": 1}
+    )
+    install(monkeypatch, session, vault)
+
+    await indexer.index_vault(user_id=7)
+
+    assert "lock:users:nowait" in session.timeline, session.timeline
+    assert "lock:users" not in session.timeline, session.timeline
+    lock_at = session.timeline.index("lock:users:nowait")
+    savepoint_at = session.timeline.index("savepoint")
+    stamp_at = session.timeline.index("stamp")
+    assert savepoint_at < lock_at < stamp_at, session.timeline
+    assert session.timeline[stamp_at + 1] == "savepoint:release", session.timeline
+    assert len(session.stamps) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_contended_users_row_withholds_the_stamp_and_keeps_the_repairs(
+    monkeypatch, tmp_path
+):
+    """Adversarial round 2, MAJOR 5 — the failing input, at the tail.
+
+    T2 holds `users` (a permanent delete on its way to the cascade). The old
+    code waited, which is the cycle. Now the `NOWAIT` fails, only the savepoint
+    rolls back, the stamp is withheld — a state this branch already knows how
+    to be in — and the pass still commits every repair it made.
+    """
+    vault = make_vault(tmp_path, "vault", {"Note.md": "See [[Other]]\n"})
+    session = FakeSession(
+        provenance=(None, None, None), existing={}, note_ids={"Note.md": 1}
+    )
+    install(monkeypatch, session, vault)
+    session.users_row_locked = True
+
+    await indexer.index_vault(user_id=7)
+
+    assert session.stamps == [], "a contended lock still recorded provenance"
+    assert session.timeline[-2:] == ["savepoint:rollback", "commit"], session.timeline
+    # The repairs are still there and still committed.
+    assert [r["target_path"] for r in session.link_inserts()] == ["Other"]
+    assert session.commits >= 1
+
+
+def test_the_lock_not_available_sqlstate_is_found_through_both_wrappers():
+    """Guard the detector: the SQLSTATE lives on asyncpg's own error, two
+    layers below what SQLAlchemy raises, exactly as `_log_usage`'s foreign-key
+    recovery has to walk. Matching on the class instead would silently degrade
+    every contention into a real failure."""
+    assert indexer._is_lock_not_available(_LockNotAvailable())
+    assert not indexer._is_lock_not_available(RuntimeError("something else"))
+    other = Exception("wrong code")
+    other.sqlstate = "40P01"
+    assert not indexer._is_lock_not_available(other)
 
 
 @pytest.mark.asyncio
@@ -1880,6 +2030,71 @@ async def test_a_row_that_changes_between_verification_and_certification_is_refu
     assert session.vector_deletes == 0, "the old vectors were dropped anyway"
     assert session.added == [], "stale vectors were inserted"
     assert session.rollbacks == 1
+
+
+@pytest.mark.asyncio
+async def test_the_exclusion_branch_is_certified_like_the_embedding_path(
+    monkeypatch, tmp_path
+):
+    """Adversarial round 2, MAJOR 4 — the reviewer's exact interleaving.
+
+    id=42 is selected as `Private/A.md` with hash H while `Private/**` is
+    excluded. Before the branch runs, `move_note` commits the same row as
+    `Public/A.md` with **the same H** (a move changes no content). The old
+    branch stamped by `id` alone: it deleted the note's vectors and marked the
+    now-*included* `Public/A.md` embedded with none. `content_hash ==
+    embedded_content_hash`, so no later pass ever selects it again and
+    `semantic_search` omits it silently and permanently.
+
+    The certification predicate includes the path, so the moved row matches
+    nothing, `StaleCertification` rolls the note back, and the vectors it would
+    have deleted stay.
+    """
+    vault = make_vault(tmp_path, "vault", {"Private/A.md": "body\n"})
+    h = hash_of("body\n")
+    selected = SimpleNamespace(id=42, file_path="Private/A.md", content_hash=h)
+    # Committed by a concurrent move before the branch runs.
+    session = CertifyingSession(selected, current_path="Public/A.md", current_hash=h)
+    monkeypatch.setattr(indexer, "async_session", lambda: session)
+    monkeypatch.setattr(indexer, "_vault_root", lambda _uid: vault)
+    monkeypatch.setattr(
+        indexer.settings, "embedding_exclude_patterns", ["Private/*"], raising=False
+    )
+    monkeypatch.setattr(indexer, "_is_paused", lambda: False)
+
+    await indexer.embed_vault(user_id=7)
+
+    assert session.certified == [], "a moved row was stamped by id alone"
+    assert session.vector_deletes == 0, "the vectors were dropped anyway"
+    assert session.rollbacks == 1
+
+
+@pytest.mark.asyncio
+async def test_an_unmoved_excluded_row_is_still_stamped_and_its_vectors_dropped(
+    monkeypatch, tmp_path
+):
+    """The positive control: the exclusion branch still does its job.
+
+    Without this the test above would pass against a branch that certifies
+    nothing and therefore never drops a stale vector either."""
+    vault = make_vault(tmp_path, "vault", {"Private/A.md": "body\n"})
+    h = hash_of("body\n")
+    selected = SimpleNamespace(id=42, file_path="Private/A.md", content_hash=h)
+    session = CertifyingSession(selected)
+    monkeypatch.setattr(indexer, "async_session", lambda: session)
+    monkeypatch.setattr(indexer, "_vault_root", lambda _uid: vault)
+    monkeypatch.setattr(
+        indexer.settings, "embedding_exclude_patterns", ["Private/*"], raising=False
+    )
+    monkeypatch.setattr(indexer, "_is_paused", lambda: False)
+
+    await indexer.embed_vault(user_id=7)
+
+    assert session.certified == [("Private/A.md", h)]
+    assert session.vector_deletes == 1
+    assert session.rollbacks == 0
+    # And it never read the file: the exclusion branch embeds nothing.
+    assert session.added == []
 
 
 @pytest.mark.asyncio

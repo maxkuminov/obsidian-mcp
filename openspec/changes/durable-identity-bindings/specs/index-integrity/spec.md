@@ -247,6 +247,8 @@ The verification also SHALL NOT be understood as an optimisation. `embed_note` m
 
 So the certification SHALL be a conditional write, in the same transaction as the vector replacement, requiring the row still to have the same id, the same relative path and the same content hash the bytes were verified against; and the value it writes SHALL be that verified hash, never one re-read from the row. The conditional write SHALL be issued **before** any stored vector is deleted or inserted, so the row lock it takes holds for the remainder of the transaction, and **after** the embedding provider call, so no row lock is held across a network request. When it matches no row the generated vectors SHALL be discarded, no stored vector SHALL be deleted or inserted, the row SHALL be left unmarked, and a later pass SHALL embed it as it then stands.
 
+**Every path that marks a row embedded SHALL use that same conditional write, the exclusion branch included.** That branch reads no file and computes no vector, but it deletes the note's stored vectors and marks the row embedded from the hash it selected, which is the same claim about the same row — and a move is precisely the change it cannot see, because relocating a note changes its relative path while leaving its content hash untouched. Marking by row id alone therefore lets a decision taken about an excluded path delete the vectors of a row that has since become an *included* one and record it as embedded with none; the row's content hash then equals its embedded hash, so no later pass ever selects it and the note is silently and permanently absent from semantic search. Including the relative path in the predicate makes the moved row match nothing, and the branch SHALL then discard the decision and roll back rather than delete anything.
+
 Nothing else about the pass changes: it still selects only rows whose `embedded_content_hash` differs from their `content_hash`, still reads beneath the root it pinned, and still writes nothing for a note it skipped. The verification governs the path that *embeds* content; the exclude-pattern branch, which reads no file, writes no vector and marks the row from its own recorded hash, is unaffected by it and by the un-gating alike.
 
 #### Scenario: The embedding pass refuses to certify content it did not read
@@ -273,6 +275,17 @@ Nothing else about the pass changes: it still selects only rows whose `embedded_
 - **THEN** the certification SHALL match no row, the generated vectors SHALL be discarded, and no `note_embeddings` row for that note SHALL be deleted or inserted
 - **AND** `embedded_content_hash` SHALL be left unchanged, so a later pass embeds the note as it then stands
 
+#### Scenario: An excluded note that moves out of the exclusion is not marked embedded
+
+- **WHEN** the embedding pass selects a row whose path matches an exclusion pattern, and another transaction commits that row at a non-excluded path with an unchanged content hash before the exclusion branch acts
+- **THEN** the branch SHALL delete no `note_embeddings` row and SHALL leave `embedded_content_hash` unchanged
+- **AND** a later pass SHALL still select that row, so the note is not silently absent from semantic search
+
+#### Scenario: An unmoved excluded note is still marked and its vectors dropped
+
+- **WHEN** the same branch runs for a row that has not moved
+- **THEN** it SHALL delete that note's stored vectors and mark the row embedded from the hash it selected
+
 #### Scenario: The certified hash is the one the bytes were verified against
 
 - **WHEN** the embedding pass certifies a note whose row has not moved
@@ -297,6 +310,8 @@ Because this branch is destructive and costs a full re-embed of the newly assign
 **The provenance record SHALL be written to exactly the row that was locked.** The stamping update SHALL affect exactly one row; zero rows SHALL roll the transaction back, delete included, because a delete standing beside a provenance record that does not exist is precisely the "rows from one vault beside a record naming another" this branch exists to make impossible.
 
 The same binding SHALL govern the re-derive branch's record, which is provenance too: before it is written the pass SHALL take the same lock and make the same re-read, and SHALL withhold the record on disagreement. Withheld rather than fatal, because that branch destroys nothing and its repairs remain correct for the root they were read from; an unrecorded provenance simply makes the next pass re-derive again.
+
+**The two branches SHALL take that lock differently, and the difference is lock ordering rather than tuning.** The discard runs in its own transaction and takes the user's row *before* it touches any child row, which is the parent-then-child direction a permanent user deletion also takes, so the two queue behind one another; it MAY therefore wait for the lock. The re-derive's record is written at the end of the pass's own transaction, which by then holds `notes_metadata` row locks, while a permanent user deletion locks the user row first and then waits on exactly those children — so waiting there closes a cycle that the database resolves by aborting one side, possibly the operator's deletion. The re-derive's record SHALL therefore request the lock **without waiting**, inside a savepoint, and SHALL treat contention as a withheld record: only the savepoint rolls back, the pass's repairs are still committed, and the reason is logged. A savepoint is required rather than optional, because a failed statement aborts its transaction and the pass would otherwise lose every repair it had just made along with its record.
 
 #### Scenario: Reassignment to a different vault
 
@@ -343,6 +358,19 @@ The same binding SHALL govern the re-derive branch's record, which is provenance
 
 - **WHEN** the discard transaction's stamping update affects a number of rows other than exactly one
 - **THEN** the transaction SHALL roll back, so no delete is committed without the record that must accompany it
+
+#### Scenario: The discard locks the user row before any child write
+
+- **WHEN** the discard transaction runs
+- **THEN** it SHALL take the user row's lock before it deletes or updates any `notes_metadata` row
+- **AND** it MAY wait for that lock, because at that point it holds no child row locks
+
+#### Scenario: A contended user row withholds the record without losing the repairs
+
+- **WHEN** the re-derive's record is due and another transaction already holds the user row
+- **THEN** the pass SHALL NOT wait for that lock
+- **AND** no provenance SHALL be recorded, the reason SHALL be logged, and every repair the pass made SHALL still be committed
+- **AND** the next pass SHALL re-derive again and record then
 
 #### Scenario: A re-derive record is withheld when the assignment moved under it
 

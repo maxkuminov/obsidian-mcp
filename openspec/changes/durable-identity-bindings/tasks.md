@@ -975,3 +975,72 @@ the silent link-extraction skip in `_update_links_for_changed` (a changed path
 with no index row) now records a skip like its sibling, with a test and a spec
 scenario; and CLAUDE.md gained register sections for the #88 confirmation and
 the #91 provenance record.
+
+### Adversarial round 2
+
+The second pass, over `dd59ea7`, confirmed round 1's fixes present as described
+and ruled the `semantic_search` hash-predicate declination reasonable ("hiding
+every edited note until embedding completes is a worse default than serving its
+last certified vector"). It returned FAIL with five MAJORs, all against the new
+API. All five were verified against the code before being acted on; none was
+wrong.
+
+1. **`confirmed_publication` leaked an unspent confirmation.** Single
+   consumption bounded *how many times* a confirmation could be used and said
+   nothing about *when*, so `lambda c: saved.append(c)` returned with it
+   unspent and a later `write_file_at(..., confirmation=saved[0])` published
+   into a root the administrator had already reassigned away from. Generator
+   and async-generator callbacks evaded both checks — calling a generator
+   function runs none of its body. **Fixed** with a wrapper-scoped lease:
+   `_leased` activates the confirmation and a `finally` revokes it on every
+   exit; `consume` refuses an unleased one; a callable that returns without
+   consuming is refused; coroutine/generator/async-generator functions *and*
+   returned coroutines/generators/awaitables are refused. Nothing is `close()`d
+   — arbitrary code on an unknown awaitable, and the lease has already made the
+   object inert.
+2. **`MovePermit` was forgeable.** `MovePermit(destination, source)` built by
+   hand authorised a rename with no confirmation at all. **Fixed:** issuance is
+   internal to a successful confirmed forward move (module-private
+   `_PERMIT_ISSUE` token), the permit is bound to that confirmation's lease so
+   it is inert once the enclosing `confirmed_publication` returns, and it
+   carries the immutable `(user_id, assignment, rel)` of each endpoint beside
+   object identity.
+3. **The forward move confirmed only the destination** while `rename_noreplace`
+   removes the source entry too. **Fixed:** `_require_one_vault` demands
+   identical `user_id`, identical canonical `assignment`, and the same root
+   *inode* (`fstat` of each pinned `root_fd`, not a pathname compare) before
+   anything is consumed, on the forward move and on the rollback. Unreachable
+   from `move_note`, which opens both ends with one `uid`; checked at the
+   primitive because the next caller may not.
+4. **The embedding-exclusion branch bypassed certification**, stamping by `id`
+   alone. A concurrent `move_note` out of an excluded folder (same content, so
+   the same hash) left an *included* note marked embedded with zero vectors —
+   hash-equal, never selected again, permanently absent from
+   `semantic_search`. **Fixed:** the branch goes through the same
+   `certify_embedded` predicate (id + path + hash, rowcount exactly one),
+   stamping before the delete so the conditional UPDATE's row lock covers it,
+   and `StaleCertification` rolls the note back.
+5. **The re-derive tail deadlocked with user deletion.** It took the `users`
+   lock *after* holding `notes_metadata` row locks, reversing the panel's
+   parent→child cascade order. **Fixed** per the reviewer's first option:
+   `FOR UPDATE NOWAIT` inside `session.begin_nested()`, `55P03` treated as a
+   withheld stamp, only the savepoint rolled back, the repairs committed, the
+   reason logged. The savepoint is load-bearing — a failed statement poisons
+   its transaction, so without one the pass loses every repair along with the
+   stamp. The **discard head was verified** to take the users lock in its own
+   transaction before any child write (the safe parent→child direction) and is
+   therefore left waiting; a test asserts that ordering so it cannot drift.
+
+Both spec deltas and CLAUDE.md were updated to describe the lease, the permit's
+unforgeability and expiry, the two-ended move rule, the exclusion-branch
+certification, and the asymmetric lock discipline between the discard head and
+the re-derive tail.
+
+**Observed, not caused, and not fixed here:**
+`tests/test_transfer_routes.py::test_pages_are_static_and_nonce_guarded[/transfer/upload]`
+failed once in a full-suite run and passed in isolation and on every re-run.
+`/transfer/*` pages are rate-limited 30/minute by a process-global,
+IP-keyed limiter that no fixture resets, and several modules exercise those
+pages, so a run whose timing packs 30+ requests into one window gets a 429.
+Pre-existing and unrelated to this change, which touches neither the transfer
+routes nor the limiter.

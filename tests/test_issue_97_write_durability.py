@@ -776,10 +776,14 @@ def test_a_rollback_rename_is_flushed_by_the_same_helper(note_vault, monkeypatch
         # #88: the publication endpoint is what the confirmation is checked
         # against, and here that is `back` — the rollback direction, exercised
         # directly as a forward move. Single-user mode, so confirming issues no
-        # query.
-        vault_service.move_file_no_clobber(
-            landed, back, confirmation=vault_service._single_shot_confirmation(None)
-        )
+        # query; the confirmation is leased the way `confirmed_publication`
+        # leases it, because an unleased one authorises nothing.
+        with vault_service._leased(
+            vault_service._single_shot_confirmation(None)
+        ) as confirmation:
+            vault_service.move_file_no_clobber(
+                landed, back, confirmation=confirmation
+            )
 
     assert set(seen) == {"From", "To", "."}, seen
     assert (note_vault / "From" / "note.md").read_text() == "body\n"

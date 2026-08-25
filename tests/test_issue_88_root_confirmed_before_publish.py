@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 from pathlib import Path
 
 import pytest
@@ -259,17 +260,24 @@ def reassign(ctx, condition: str) -> None:
 CONDITIONS = ["reassigned", "unassigned", "deactivated", "deleted"]
 
 
-def a_confirmation(ctx) -> vault_service.RootConfirmation:
-    """A confirmation of the bound root, for the tests that drive a publish
-    helper directly.
+@contextlib.contextmanager
+def a_confirmation(ctx, *, user_id=UID, root=None):
+    """A **leased** confirmation of the bound root, for the tests that drive a
+    publish helper directly.
 
     `_single_shot_confirmation` deliberately refuses under `multi_user_mode`,
     which is the mode these fixtures run in — a synchronous helper cannot read
     a user's assignment, and quietly publishing unconfirmed is the hole the
     confirmation exists to close. So the direct-helper tests build the object
-    the async wrapper would have produced.
+    the async wrapper would have produced, and lease it the way
+    `confirmed_publication` does: a confirmation nobody leased authorises
+    nothing, which is the round-2 fix.
     """
-    return vault_service.RootConfirmation(UID, str(ctx.vault), queried=True)
+    confirmation = vault_service.RootConfirmation(
+        user_id, str(ctx.vault) if root is None else root, queried=True
+    )
+    with vault_service._leased(confirmation):
+        yield confirmation
 
 
 def seed(ctx) -> None:
@@ -711,22 +719,22 @@ def test_a_confirmation_is_consumed_by_the_publication_it_covers(multi_user_vaul
     seed(ctx)
 
     with vault_service.open_mutable("note.md", user_id=UID) as target:
-        confirmation = a_confirmation(ctx)
-        assert not confirmation.spent
-        vault_service.write_file_at(target, "first\n", confirmation=confirmation)
-        assert confirmation.spent
-        with pytest.raises(UnconfirmedPublication) as excinfo:
-            vault_service.write_file_at(
-                target, "second\n", confirmation=confirmation
-            )
-        assert "already been spent" in str(excinfo.value)
+        with a_confirmation(ctx) as confirmation:
+            assert not confirmation.spent
+            vault_service.write_file_at(target, "first\n", confirmation=confirmation)
+            assert confirmation.spent
+            with pytest.raises(UnconfirmedPublication) as excinfo:
+                vault_service.write_file_at(
+                    target, "second\n", confirmation=confirmation
+                )
+            assert "already been spent" in str(excinfo.value)
 
     assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "first\n"
 
 
 def test_one_confirmation_cannot_be_spent_on_two_targets(multi_user_vault):
-    """The failing input the reviewer named: stamp C onto T1 and T2, publish
-    T1, let the assignment change, publish T2 — both from one database read.
+    """Stamp C onto T1 and T2, publish T1, let the assignment change, publish
+    T2 — both from one database read.
 
     Consumption used to clear a slot on the *target*, so the second target's
     slot was still full. It is on the confirmation now, so the second
@@ -738,12 +746,42 @@ def test_one_confirmation_cannot_be_spent_on_two_targets(multi_user_vault):
     with vault_service.open_mutable("note.md", user_id=UID) as first, (
         vault_service.open_mutable("second.md", user_id=UID)
     ) as second:
-        confirmation = a_confirmation(ctx)
-        vault_service.write_file_at(first, "one\n", confirmation=confirmation)
-        with pytest.raises(UnconfirmedPublication):
-            vault_service.write_file_at(second, "two\n", confirmation=confirmation)
+        with a_confirmation(ctx) as confirmation:
+            vault_service.write_file_at(first, "one\n", confirmation=confirmation)
+            with pytest.raises(UnconfirmedPublication):
+                vault_service.write_file_at(
+                    second, "two\n", confirmation=confirmation
+                )
 
     assert not (ctx.vault / "second.md").exists()
+
+
+def test_an_unleased_confirmation_authorises_nothing(multi_user_vault):
+    """Adversarial round 2, MAJOR 1 — the property single-consumption lacked.
+
+    A confirmation bounds *how many times* it may be used; the lease bounds
+    *when*. An object that no confirmed publication is currently holding —
+    never leased, or leased by a call that has already returned — is inert, so
+    a callback that saved one and published with it after the `await` is
+    refused rather than obeyed.
+    """
+    ctx = multi_user_vault
+    seed(ctx)
+
+    never_leased = vault_service.RootConfirmation(UID, str(ctx.vault), queried=True)
+    assert not never_leased.active
+    with vault_service.open_mutable("note.md", user_id=UID) as target:
+        with pytest.raises(UnconfirmedPublication) as excinfo:
+            vault_service.write_file_at(target, "x\n", confirmation=never_leased)
+        assert "not leased" in str(excinfo.value)
+
+        with a_confirmation(ctx) as expired:
+            pass
+        assert not expired.active
+        with pytest.raises(UnconfirmedPublication):
+            vault_service.write_file_at(target, "x\n", confirmation=expired)
+
+    assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "original body\n"
 
 
 def test_a_confirmation_is_bound_to_the_user_and_the_root_it_was_taken_for(
@@ -755,17 +793,15 @@ def test_a_confirmation_is_bound_to_the_user_and_the_root_it_was_taken_for(
     seed(ctx)
 
     with vault_service.open_mutable("note.md", user_id=UID) as target:
-        wrong_user = vault_service.RootConfirmation(
-            UID + 1, str(ctx.vault), queried=True
-        )
-        with pytest.raises(UnconfirmedPublication) as excinfo:
-            vault_service.write_file_at(target, "x\n", confirmation=wrong_user)
-        assert "taken for user_id" in str(excinfo.value)
+        with a_confirmation(ctx, user_id=UID + 1) as wrong_user:
+            with pytest.raises(UnconfirmedPublication) as excinfo:
+                vault_service.write_file_at(target, "x\n", confirmation=wrong_user)
+            assert "taken for user_id" in str(excinfo.value)
 
-        wrong_root = vault_service.RootConfirmation(UID, str(ctx.other), queried=True)
-        with pytest.raises(UnconfirmedPublication) as excinfo:
-            vault_service.write_file_at(target, "x\n", confirmation=wrong_root)
-        assert str(ctx.other) in str(excinfo.value)
+        with a_confirmation(ctx, root=str(ctx.other)) as wrong_root:
+            with pytest.raises(UnconfirmedPublication) as excinfo:
+                vault_service.write_file_at(target, "x\n", confirmation=wrong_root)
+            assert str(ctx.other) in str(excinfo.value)
 
     assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "original body\n"
 
@@ -811,27 +847,115 @@ async def test_a_confirmation_cannot_be_held_across_an_await(multi_user_vault):
     assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "second\n"
 
 
-async def test_an_async_publish_callback_is_refused_rather_than_awaited(
+async def test_a_deferred_publish_callback_is_refused_rather_than_driven(
     multi_user_vault,
 ):
-    """Awaiting the publish would reopen the window the wrapper closes, so a
-    coroutine function — and a callable that hands one back — is a programming
-    error at the call site rather than something to await."""
+    """Adversarial round 2: `iscoroutinefunction` saw neither generator shape.
+
+    A coroutine function, a generator function and an async-generator function
+    all publish on somebody else's schedule — a generator's body does not run
+    at all when it is called — which is exactly the window the wrapper closes.
+    All three are refused as callables, and the *result* is checked too,
+    because a callable object whose `__call__` is a generator is none of them.
+    """
     ctx = multi_user_vault
     seed(ctx)
 
-    async def publishes_later(confirmation):  # pragma: no cover - never run
+    async def a_coroutine(confirmation):  # pragma: no cover - never run
         return None
 
-    with pytest.raises(UnconfirmedPublication) as excinfo:
-        await vault_service.confirmed_publication(UID, publishes_later)
-    assert "must be synchronous" in str(excinfo.value)
+    async def an_async_generator(confirmation):  # pragma: no cover - never run
+        yield None
 
+    def a_generator(confirmation):  # pragma: no cover - never run
+        yield None
+
+    class _CallableGenerator:
+        def __call__(self, confirmation):  # pragma: no cover - never run
+            yield None
+
+    for callback, fragment in (
+        (a_coroutine, "synchronous function"),
+        (an_async_generator, "async generator function"),
+        (a_generator, "generator function"),
+    ):
+        with pytest.raises(UnconfirmedPublication) as excinfo:
+            await vault_service.confirmed_publication(UID, callback)
+        assert fragment in str(excinfo.value)
+
+    # Not a coroutine/generator *function*, so only the result check sees it.
+    with pytest.raises(UnconfirmedPublication) as excinfo:
+        await vault_service.confirmed_publication(UID, _CallableGenerator())
+    assert "returned a generator" in str(excinfo.value)
+
+    pending = []
     with pytest.raises(UnconfirmedPublication) as excinfo:
         await vault_service.confirmed_publication(
-            UID, lambda c: publishes_later(c)
+            UID, lambda c: pending.append(a_coroutine(c)) or pending[-1]
         )
     assert "returned an awaitable" in str(excinfo.value)
+    # The wrapper deliberately does not close an unknown awaitable — that is
+    # arbitrary code of a stranger's choosing — so the *test* closes the one it
+    # created, rather than leaving a "never awaited" warning behind.
+    pending[-1].close()
+
+    untouched(ctx)
+
+
+async def test_a_callback_cannot_retain_its_confirmation(multi_user_vault):
+    """Adversarial round 2, MAJOR 1 — the exact failing input.
+
+    `saved=[]; await confirmed_publication(7, lambda c: saved.append(c))` then
+    a reassignment, then `write_file_at(target, …, confirmation=saved[0])`.
+    The callback returns None, so under single-consumption alone the
+    confirmation was still unspent and the later write succeeded against the
+    old assignment.
+
+    Two things stop it now, and the test asserts both: the wrapper refuses a
+    callback that returned without consuming its confirmation, and the object
+    it retained is inert anyway because the lease was revoked in a `finally`.
+    """
+    ctx = multi_user_vault
+    seed(ctx)
+
+    saved: list = []
+    with pytest.raises(UnconfirmedPublication) as excinfo:
+        await vault_service.confirmed_publication(UID, lambda c: saved.append(c))
+    assert "without consuming" in str(excinfo.value)
+
+    assert len(saved) == 1
+    retained = saved[0]
+    assert not retained.active and not retained.spent
+
+    reassign(ctx, "reassigned")
+    with vault_service.open_mutable("note.md", user_id=UID) as target:
+        with pytest.raises(UnconfirmedPublication) as excinfo:
+            vault_service.write_file_at(
+                target, "stale write\n", confirmation=retained
+            )
+        assert "not leased" in str(excinfo.value)
+
+    assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "original body\n"
+
+
+async def test_the_lease_is_revoked_even_when_the_callback_raises(
+    multi_user_vault,
+):
+    """The `finally` is the mechanism, so an exception must revoke too — and
+    must not be turned into the "did not consume" error on the way out."""
+    ctx = multi_user_vault
+    seed(ctx)
+
+    saved: list = []
+
+    def explode(confirmation):
+        saved.append(confirmation)
+        raise KeyError("boom")
+
+    with pytest.raises(KeyError):
+        await vault_service.confirmed_publication(UID, explode)
+
+    assert not saved[0].active
 
 
 # ── (g) move_note: the interleavings ────────────────────────────────────────
@@ -1076,32 +1200,42 @@ async def test_a_plain_move_confirms_once(multi_user_vault):
     assert (ctx.vault / "moved.md").read_text(encoding="utf-8") == "original body\n"
 
 
-def test_the_rollback_is_authorised_by_a_permit_not_by_a_reusable_stamp(
+async def test_the_rollback_is_authorised_by_a_permit_issued_only_by_the_move(
     multi_user_vault,
 ):
     """`_verify_the_moved_inode` rolls back by calling the same helper with the
-    endpoints swapped. The first implementation paid for that by stamping the
-    one confirmation onto **both** targets, which made a reusable token of it.
+    endpoints swapped. The permit is what authorises that — and round 2 found
+    it was **forgeable**, so a hand-built one renamed with no confirmation at
+    all.
 
-    The narrow form instead: the forward move returns a `MovePermit` naming
-    exactly those two targets, and it authorises exactly one reverse move
-    between them — not a second forward move, not any other pair, and not
-    itself twice.
+    Issuance is internal to a successful confirmed forward move now; the permit
+    authorises exactly one reverse move between those same two targets, and
+    only while the confirmed publication that issued it is still on the stack.
     """
     ctx = multi_user_vault
     seed(ctx)
 
-    with vault_service.open_mutable("note.md", user_id=UID) as source, (
+    # Forging one is refused outright.
+    with vault_service.open_mutable("note.md", user_id=UID) as a, (
         vault_service.open_mutable("moved.md", user_id=UID)
-    ) as dest:
-        confirmation = a_confirmation(ctx)
+    ) as b:
+        with pytest.raises(UnconfirmedPublication) as excinfo:
+            vault_service.MovePermit(source=b, destination=a)
+        assert "issued only by a confirmed forward move" in str(excinfo.value)
+        with pytest.raises(UnconfirmedPublication):
+            vault_service.MovePermit(object(), source=b, destination=a)
+
+    captured: dict = {}
+
+    def _move_and_roll_back(confirmation):
+        source = captured["source"]
+        dest = captured["dest"]
         permit = vault_service.move_file_no_clobber(
             source, dest, confirmation=confirmation
         )
         assert confirmation.spent
-        # The permit is not a confirmation and cannot be used as one.
         assert not isinstance(permit, vault_service.RootConfirmation)
-        # It authorises only the reverse of the move that produced it.
+        # Only the reverse of the move that produced it.
         with pytest.raises(UnconfirmedPublication) as excinfo:
             vault_service.move_file_no_clobber(source, dest, permit=permit)
         assert "only the reverse" in str(excinfo.value)
@@ -1109,11 +1243,57 @@ def test_the_rollback_is_authorised_by_a_permit_not_by_a_reusable_stamp(
         vault_service.move_file_no_clobber(dest, source, permit=permit)
         # And exactly once.
         with pytest.raises(UnconfirmedPublication) as excinfo:
-            vault_service.move_file_no_clobber(source, dest, permit=permit)
+            vault_service.move_file_no_clobber(dest, source, permit=permit)
+        assert "already been used" in str(excinfo.value)
+        return permit
+
+    with vault_service.open_mutable("note.md", user_id=UID) as source, (
+        vault_service.open_mutable("moved.md", user_id=UID)
+    ) as dest:
+        captured["source"] = source
+        captured["dest"] = dest
+        permit = await vault_service.confirmed_publication(
+            UID, _move_and_roll_back
+        )
+
+        # Inert once the confirmed publication has returned.
+        with pytest.raises(UnconfirmedPublication) as excinfo:
+            vault_service.move_file_no_clobber(dest, source, permit=permit)
         assert "already been used" in str(excinfo.value)
 
     assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "original body\n"
     assert not (ctx.vault / "moved.md").exists()
+
+
+async def test_a_permit_is_inert_once_its_publication_has_returned(
+    multi_user_vault,
+):
+    """A rollback is part of the publication it reverses or it is nothing."""
+    ctx = multi_user_vault
+    seed(ctx)
+
+    captured: dict = {}
+
+    def _move(confirmation):
+        return vault_service.move_file_no_clobber(
+            captured["source"], captured["dest"], confirmation=confirmation
+        )
+
+    with vault_service.open_mutable("note.md", user_id=UID) as source, (
+        vault_service.open_mutable("moved.md", user_id=UID)
+    ) as dest:
+        captured["source"] = source
+        captured["dest"] = dest
+        permit = await vault_service.confirmed_publication(UID, _move)
+        assert not permit._confirmation.active
+
+        with pytest.raises(UnconfirmedPublication) as excinfo:
+            vault_service.move_file_no_clobber(dest, source, permit=permit)
+        assert "already returned" in str(excinfo.value)
+
+    # The move stands; the rollback was refused rather than performed.
+    assert (ctx.vault / "moved.md").read_text(encoding="utf-8") == "original body\n"
+    assert not (ctx.vault / "note.md").exists()
 
 
 def test_a_move_takes_exactly_one_of_a_confirmation_and_a_permit(multi_user_vault):
@@ -1125,13 +1305,71 @@ def test_a_move_takes_exactly_one_of_a_confirmation_and_a_permit(multi_user_vaul
     ) as dest:
         with pytest.raises(UnconfirmedPublication):
             vault_service.move_file_no_clobber(source, dest)
-        with pytest.raises(UnconfirmedPublication):
-            vault_service.move_file_no_clobber(
-                source,
-                dest,
-                confirmation=a_confirmation(ctx),
-                permit=vault_service.MovePermit(dest, source),
-            )
+
+    assert not (ctx.vault / "moved.md").exists()
+
+
+async def test_a_move_refuses_endpoints_belonging_to_different_callers(
+    multi_user_vault, monkeypatch, tmp_path
+):
+    """Adversarial round 2, MAJOR 3.
+
+    `rename_noreplace` removes the source entry as surely as it creates the
+    destination one, but only the destination's confirmation was consumed. A
+    source opened for one user under one assignment could therefore be removed
+    under another user's confirmation. Unreachable from `move_note`, which
+    opens both ends with one `uid` — checked at the primitive because the next
+    caller may not.
+    """
+    ctx = multi_user_vault
+    seed(ctx)
+
+    other_uid = UID + 1
+    other_root = tmp_path / "bob"
+    other_root.mkdir()
+    (other_root / "theirs.md").write_text("bob's note\n", encoding="utf-8")
+    vault_service._user_vault_cache[other_uid] = other_root
+    try:
+        with vault_service.open_mutable("note.md", user_id=UID) as mine, (
+            vault_service.open_mutable("theirs.md", user_id=other_uid)
+        ) as theirs:
+            # Different user ids.
+            with a_confirmation(ctx) as confirmation:
+                with pytest.raises(UnconfirmedPublication) as excinfo:
+                    vault_service.move_file_no_clobber(
+                        theirs, mine, confirmation=confirmation
+                    )
+                assert "different callers" in str(excinfo.value)
+                assert not confirmation.spent
+            # And in the other direction, so the refusal is not about which end
+            # the confirmation happens to match.
+            with a_confirmation(ctx) as confirmation:
+                with pytest.raises(UnconfirmedPublication):
+                    vault_service.move_file_no_clobber(
+                        mine, theirs, confirmation=confirmation
+                    )
+    finally:
+        vault_service._user_vault_cache.pop(other_uid, None)
+
+    assert (ctx.vault / "note.md").read_text(encoding="utf-8") == "original body\n"
+    assert (other_root / "theirs.md").read_text(encoding="utf-8") == "bob's note\n"
+
+
+def test_a_move_refuses_endpoints_under_different_assignments(multi_user_vault):
+    """The same rule on the assignment string alone, with one user id."""
+    ctx = multi_user_vault
+    seed(ctx)
+
+    with vault_service.open_mutable("note.md", user_id=UID) as source, (
+        vault_service.open_mutable("moved.md", user_id=UID)
+    ) as dest:
+        object.__setattr__(dest, "assignment", str(ctx.other))
+        with a_confirmation(ctx, root=str(ctx.other)) as confirmation:
+            with pytest.raises(UnconfirmedPublication) as excinfo:
+                vault_service.move_file_no_clobber(
+                    source, dest, confirmation=confirmation
+                )
+            assert "different vault assignments" in str(excinfo.value)
 
     assert not (ctx.vault / "moved.md").exists()
 
