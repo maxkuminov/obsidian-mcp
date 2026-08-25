@@ -1112,10 +1112,28 @@ async def _index_vault_pinned(
         moved_new_paths: set[str] = set()
         if moves:
             user_clause = "user_id IS NULL" if user_id is None else "user_id = :uid"
+            # `embedded_content_hash = NULL` for the same reason `move_note`
+            # clears it: the certification records that this row's *current
+            # content* has been dealt with, and the exclusion branch decides
+            # how by matching `embedding_exclude_patterns` against
+            # `file_path`. A move changes that answer without changing any
+            # content, so carrying the stamp across it freezes the old decision
+            # forever — the embedding pass selects on
+            # `embedded_content_hash != content_hash`, which a preserved stamp
+            # makes false. A note moved out of an excluded folder would stay
+            # included with no vectors and never be selected again; one moved
+            # into an excluded folder would stay searchable. NULL means
+            # "re-evaluate at the next pass", which is the whole repair and
+            # costs an embedding call only for a note that is then included.
+            #
+            # This is the *id-preserving* move path, and that is exactly why it
+            # needs the clause: the ordinary prune-and-upsert path replaces the
+            # row, so a moved note reached through it starts from NULL anyway.
             move_upd_sql = (
                 "UPDATE notes_metadata "
                 "SET file_path = :new, file_size = :size, "
-                "modified_at = :mtime, indexed_at = now() "
+                "modified_at = :mtime, indexed_at = now(), "
+                "embedded_content_hash = NULL "
                 f"WHERE file_path = :old AND {user_clause}"
             )
             # Rewrite stored `target_path` strings that referenced the old

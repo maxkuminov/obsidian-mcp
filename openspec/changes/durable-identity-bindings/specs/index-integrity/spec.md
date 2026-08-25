@@ -249,6 +249,12 @@ So the certification SHALL be a conditional write, in the same transaction as th
 
 **Every path that marks a row embedded SHALL use that same conditional write, the exclusion branch included.** That branch reads no file and computes no vector, but it deletes the note's stored vectors and marks the row embedded from the hash it selected, which is the same claim about the same row — and a move is precisely the change it cannot see, because relocating a note changes its relative path while leaving its content hash untouched. Marking by row id alone therefore lets a decision taken about an excluded path delete the vectors of a row that has since become an *included* one and record it as embedded with none; the row's content hash then equals its embedded hash, so no later pass ever selects it and the note is silently and permanently absent from semantic search. Including the relative path in the predicate makes the moved row match nothing, and the branch SHALL then discard the decision and roll back rather than delete anything.
 
+**A change of `file_path` SHALL invalidate the embedding certification.** The conditional predicate above closes only one ordering — a move that commits *before* the certification. The mirror ordering is not something a predicate can see: when the move happens *after* a correct certification has committed, the stamp is already there and already true of the content. It is no longer true of the *decision*, because `embedded_content_hash` records that a row's current content has been dealt with and says nothing about **how**, while the exclusion branch decides how by matching the exclusion patterns against the path. A move therefore changes the answer without changing any content, and a stamp carried across it freezes the old answer permanently: the pass selects on `embedded_content_hash IS NULL OR embedded_content_hash != content_hash`, which a preserved stamp makes false for ever.
+
+Both boundary directions are wrong and both are permanent. A note moved *out* of an excluded folder keeps a stamp the exclusion branch wrote after deleting its vectors: it is now included, has no vectors, is never selected again, and is silently absent from semantic search with nothing to indicate it. A note moved *into* an excluded folder keeps the vectors it was embedded with and stays searchable although it is now excluded.
+
+**Every statement that changes `file_path` SHALL therefore set `embedded_content_hash` to null in the same statement.** That is `move_note`'s metadata update and the index pass's id-preserving move detection; the ordinary prune-and-insert path is unaffected, because a row it replaces starts from null anyway. Null SHALL be understood as "re-evaluate at the next pass" rather than as "not embedded": a note whose content did not really change is re-embedded only because the selection predicate picks it up, and the exclusion decision is re-taken against the path the row now has. Clearing unconditionally is deliberate and SHALL NOT be replaced by consulting the exclusion configuration at move time: the configuration can change between the move and the next pass, so a decision taken at move time is the same frozen answer in a new place, and the move path would gain a dependency on embedding configuration it otherwise has no reason to know about.
+
 Nothing else about the pass changes: it still selects only rows whose `embedded_content_hash` differs from their `content_hash`, still reads beneath the root it pinned, and still writes nothing for a note it skipped. The verification governs the path that *embeds* content; the exclude-pattern branch, which reads no file, writes no vector and marks the row from its own recorded hash, is unaffected by it and by the un-gating alike.
 
 #### Scenario: The embedding pass refuses to certify content it did not read
@@ -280,6 +286,24 @@ Nothing else about the pass changes: it still selects only rows whose `embedded_
 - **WHEN** the embedding pass selects a row whose path matches an exclusion pattern, and another transaction commits that row at a non-excluded path with an unchanged content hash before the exclusion branch acts
 - **THEN** the branch SHALL delete no `note_embeddings` row and SHALL leave `embedded_content_hash` unchanged
 - **AND** a later pass SHALL still select that row, so the note is not silently absent from semantic search
+
+#### Scenario: A note certified as excluded and then moved out is re-embedded
+
+- **WHEN** the exclusion branch marks a row embedded and deletes its vectors, and the note is afterwards moved to a path the exclusion patterns do not match
+- **THEN** the move SHALL leave `embedded_content_hash` null
+- **AND** the next embedding pass SHALL select that row and give it vectors, so the note is searchable at its new path
+
+#### Scenario: A note certified as included and then moved in is dropped from search
+
+- **WHEN** a note is embedded at an included path and afterwards moved to a path the exclusion patterns match
+- **THEN** the move SHALL leave `embedded_content_hash` null
+- **AND** the next embedding pass SHALL delete its vectors, so an excluded note does not stay searchable
+
+#### Scenario: Both move paths invalidate the certification
+
+- **WHEN** the move is performed by the write tool, and when it is performed by the index pass's id-preserving move detection
+- **THEN** both SHALL clear `embedded_content_hash` in the statement that changes `file_path`
+- **AND** the row identity SHALL be preserved by both, so the clearing is what re-opens the decision rather than a replacement row
 
 #### Scenario: An unmoved excluded note is still marked and its vectors dropped
 

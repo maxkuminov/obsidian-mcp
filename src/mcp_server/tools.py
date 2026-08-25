@@ -2107,13 +2107,35 @@ async def _move_note_locked(
         db_failed = False
         try:
             async with async_session() as session:
+                # **A path change invalidates the embedding certification.**
+                # `embedded_content_hash` records that the row's *current
+                # content* has been dealt with, and one of the things that
+                # decides how it was dealt with is the path: `embed_vault`'s
+                # exclusion branch matches `embedding_exclude_patterns` against
+                # `file_path`. A move changes that answer while changing no
+                # content, so carrying the stamp across it freezes the old
+                # decision forever — the pass selects on
+                # `embedded_content_hash != content_hash`, which is now false.
+                #
+                # Both directions are wrong and both are permanent. A note
+                # moved *out* of an excluded folder keeps a stamp written by
+                # the branch that deleted its vectors, so it is included, has
+                # none, is never selected again, and is silently absent from
+                # `semantic_search`. A note moved *into* one keeps its vectors
+                # and stays searchable although it is now excluded.
+                #
+                # NULL is the conservative repair and needs no knowledge of the
+                # exclusion configuration here: it means "re-evaluate at the
+                # next pass". A note whose content did not really change is
+                # re-embedded only because the hash check selects it, and the
+                # exclusion decision is re-taken against the path it now has.
                 nm_update = (
                     update(NoteMetadata)
                     .where(
                         NoteMetadata.file_path == from_rel,
                         _note_owner_predicate(uid),
                     )
-                    .values(file_path=to_rel)
+                    .values(file_path=to_rel, embedded_content_hash=None)
                 )
                 await session.execute(nm_update)
 

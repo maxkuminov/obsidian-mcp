@@ -2267,3 +2267,85 @@ def test_the_discard_log_renders_both_provenances_decoded(tmp_path):
     # And a column somebody hand-edited to a non-hex value is reported rather
     # than taking the log line down with it.
     assert "undecodable" in indexer.describe_recorded(("/a", "not-hex", None))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# A move re-opens the exclusion decision (adversarial round 3)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The behaviour is a database property and is asserted end to end in
+# `tests/integration/test_move_reevaluates_embedding.py`, which runs the real
+# `embed_vault` around the real move paths. These two are the fast structural
+# guard for the machine that has no PostgreSQL: both statements that change
+# `file_path` must also clear `embedded_content_hash`, because the
+# certification records that a row's current content has been dealt with and
+# the exclusion branch decides *how* by matching the path.
+
+
+def _assigned_string(tree, name: str) -> str:
+    """The concatenated literal parts of `name = ( "..." "..." )`."""
+    import ast as _ast
+
+    for node in _ast.walk(tree):
+        if not isinstance(node, _ast.Assign):
+            continue
+        if not any(
+            isinstance(t, _ast.Name) and t.id == name for t in node.targets
+        ):
+            continue
+        return "".join(
+            part.value
+            for part in _ast.walk(node.value)
+            if isinstance(part, _ast.Constant) and isinstance(part.value, str)
+        )
+    raise AssertionError(f"no assignment to {name} found")
+
+
+def test_the_indexer_move_update_clears_the_embedding_certification():
+    """The id-preserving move path updates the row in place, so a stamp
+    written under the old path would survive the move."""
+    import ast as _ast
+    from pathlib import Path as _Path
+
+    tree = _ast.parse(_Path(indexer.__file__).read_text(encoding="utf-8"))
+    sql = _assigned_string(tree, "move_upd_sql")
+    assert "UPDATE notes_metadata" in sql
+    assert "file_path = :new" in sql
+    assert "embedded_content_hash = NULL" in sql, (
+        "an id-preserving move that keeps embedded_content_hash freezes the "
+        "old exclusion decision forever — the embedding pass selects on "
+        "`embedded_content_hash != content_hash`, which a preserved stamp "
+        "makes false"
+    )
+
+
+def test_move_note_clears_the_embedding_certification():
+    """`move_note`'s own metadata UPDATE, the other statement that can carry a
+    stamp across a path change."""
+    import ast as _ast
+    from pathlib import Path as _Path
+
+    import src.mcp_server.tools as tools_module
+
+    tree = _ast.parse(_Path(tools_module.__file__).read_text(encoding="utf-8"))
+    values_calls = [
+        node
+        for node in _ast.walk(tree)
+        if isinstance(node, _ast.Call)
+        and isinstance(node.func, _ast.Attribute)
+        and node.func.attr == "values"
+        and any(kw.arg == "file_path" for kw in node.keywords)
+    ]
+    assert values_calls, "no `.values(file_path=...)` found in tools.py"
+    for call in values_calls:
+        named = {kw.arg for kw in call.keywords}
+        assert "embedded_content_hash" in named, (
+            "a statement that changes file_path must also clear "
+            f"embedded_content_hash (line {call.lineno})"
+        )
+        cleared = next(
+            kw for kw in call.keywords if kw.arg == "embedded_content_hash"
+        )
+        assert (
+            isinstance(cleared.value, _ast.Constant) and cleared.value.value is None
+        ), "it must be set to None — re-evaluate at the next pass"

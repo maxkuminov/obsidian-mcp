@@ -813,6 +813,25 @@ highest — and never toward discarding, which costs a full re-embed.
   the delete (the conditional UPDATE is what takes the row lock), and takes
   `note_id` plus an explicit `expire_on` because the exclusion branch certifies
   from a plain result row no session maps.
+- **A path change clears `embedded_content_hash`, at every statement that
+  changes `file_path`.** The predicate above closes only *move-before-certify*;
+  the mirror ordering is invisible to it, because when the move lands after a
+  correct certification the stamp is already there and already true of the
+  content. It is no longer true of the *decision*: the stamp says the row's
+  current content has been dealt with and nothing about **how**, and the
+  exclusion branch decides how by matching `EMBEDDING_EXCLUDE_PATTERNS` against
+  the path. Carried across a move it freezes the old answer for ever — the pass
+  selects on `embedded_content_hash != content_hash`, which a preserved stamp
+  makes false. Out of an excluded folder: included, zero vectors, never
+  selected again, silently missing from `semantic_search`. Into one: still
+  searchable while excluded. So `move_note`'s metadata UPDATE and the indexer's
+  **id-preserving** move detection both `SET embedded_content_hash = NULL`
+  (the prune-and-insert path is unaffected — its replacement row starts null).
+  NULL means *re-evaluate next pass*, not *not embedded*. **Do not "improve"
+  this by consulting the exclusion config at move time**: the config can change
+  before the next pass, so that is the same frozen answer in a new place, and
+  it would give the move path a dependency on embedding configuration it has no
+  other reason to know.
 
 ## The vault assignment is the admission gate for every tool
 

@@ -1044,3 +1044,53 @@ IP-keyed limiter that no fixture resets, and several modules exercise those
 pages, so a run whose timing packs 30+ requests into one window gets a 429.
 Pre-existing and unrelated to this change, which touches neither the transfer
 routes nor the limiter.
+
+### Adversarial round 3
+
+The third pass, over `a77bcca`, re-attacked round 2's five fixes at second
+order and found four of them holding: lease revocation survives an exception
+raised from inside `consume`; permits do not retain `_PERMIT_ISSUE`; a released
+root descriptor fails before anything is consumed or mutated; and the tail
+savepoint preserves the repairs only for 55P03, while an anomalous zero-row
+stamp still aborts the outer transaction. One MAJOR remained.
+
+1. **A move did not re-open the path-dependent exclusion decision.** Verified
+   real at both sites before fixing. Round 2's conditional certification closes
+   *move-before-certify*; the mirror ordering is invisible to a predicate,
+   because when the move lands after a correct certification the stamp is
+   already committed and already true of the content. It is no longer true of
+   the *decision*: `embedded_content_hash` records that the row's current
+   content has been dealt with and says nothing about how, and the exclusion
+   branch decides how by matching `EMBEDDING_EXCLUDE_PATTERNS` against
+   `file_path`. Carried across a move the old answer is frozen for ever,
+   because the pass selects on `embedded_content_hash != content_hash`.
+   Excluded → included leaves an included note with zero vectors that is never
+   selected again — silently absent from `semantic_search`; included →
+   excluded leaves an excluded note searchable.
+   **Fixed** conservatively, as directed: every statement that changes
+   `file_path` now clears `embedded_content_hash` in the same statement —
+   `move_note`'s metadata UPDATE (`.values(file_path=…,
+   embedded_content_hash=None)`) and the indexer's **id-preserving** move
+   detection (`SET … embedded_content_hash = NULL`). The prune-and-insert path
+   needs nothing: its replacement row starts null. NULL means "re-evaluate at
+   the next pass", so an unmoved-in-spirit note re-embeds only if the hash
+   check selects it, and the exclusion decision is re-taken against the new
+   path either way. Consulting the exclusion configuration at move time was
+   rejected in the spec text: the configuration can change before the next
+   pass, which is the same frozen answer in a new place, and it would give the
+   move path a dependency on embedding configuration it has no other reason to
+   know about.
+
+`tests/integration/test_move_reevaluates_embedding.py` drives the **real**
+`embed_vault` around the **real** move paths on a throwaway PostgreSQL, because
+the property under test is what the next pass's selection predicate does with
+the row a move left behind. It covers all four cells — certify-then-move and
+move-then-certify, each in both boundary directions — for **both** movers (the
+write tool and the indexer's move detection), and pins that both preserve the
+row id, so the null stamp is the repair rather than a replacement row.
+`tests/test_issue_91_indexed_root.py` adds the fast structural guard for a
+machine with no PostgreSQL: both statements that change `file_path` are parsed
+out of the source and required to clear the column.
+
+The index-integrity delta and CLAUDE.md's #91 section both state the
+invalidation rule; neither did before.
