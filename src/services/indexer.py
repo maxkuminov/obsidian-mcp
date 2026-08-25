@@ -21,6 +21,8 @@ from src.models.db import NoteEmbedding, NoteLink, NoteMetadata, OAuthCode, OAut
 from src.services.embeddings import (
     StaleCertification,
     certify_embedded,
+    chunk_text,
+    clean_for_embedding,
     embed_note,
 )
 from src.services.fts import index_tsvector_sql
@@ -110,6 +112,78 @@ logger = logging.getLogger(__name__)
 
 def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The keyword vector: attempt the whole note, retreat per note (#127, D4)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Both tsvector writers used to bind `content[:100000]` unconditionally, so
+# every term past 100,000 characters was invisible to `keyword_search` — for a
+# note the tool cheerfully reported on, with no indication that it had only
+# been half read. Simply removing the slice is not the fix: PostgreSQL rejects
+# a tsvector larger than 1 MiB, and an uncaught statement error aborts the pass
+# transaction, so nothing commits, no content hash advances, and the same fatal
+# batch is retried on every tick for ever — the #126 freeze class.
+#
+# So the write attempts the full body and retreats by halving, each attempt in
+# its own savepoint, down to a floor of **exactly** the old 100,000 characters.
+TSVECTOR_CONTENT_FLOOR_CHARS = 100_000
+
+
+async def write_tsvector_bounded(
+    session, statement, content: str, params: dict, *, label: str
+) -> int:
+    """Run one `content_tsvector` UPDATE, retreating on failure. Returns the
+    prefix length that succeeded.
+
+    `statement` binds the body under `:content`; `params` carries everything
+    else (the FTS config names, the row key). Two properties are load-bearing:
+
+    **The `try` sits outside `async with session.begin_nested()`**, so a
+    database error unwinds the savepoint through the context manager's own
+    `__aexit__` rollback *before* the `except` body runs. Catching inside the
+    block would leave the outer transaction in the driver's aborted state and
+    every later statement — the retry included — would fail with it.
+
+    **A failure at the floor propagates**, and that is deliberately the
+    pre-change behaviour rather than a new escape hatch. A floor statement that
+    fails here also failed before this change, and size-class failures cannot
+    reach it (a 100,000-character input cannot exceed the 1 MiB tsvector
+    limit). The first draft had a skip list instead; review showed it stranded
+    a committed `content_hash` beside a stale keyword vector, permanently — the
+    note would never be selected again and `keyword_search` would answer from
+    content it no longer has.
+
+    The two call sites carry different, individually stated guarantees: the
+    incremental pass commits nothing on a floor failure, so the note is retried
+    next tick; `rebuild_tsvectors` is atomic, so a floor failure rolls the whole
+    rebuild back and surfaces to the operator who invoked it.
+    """
+    length = len(content)
+    while True:
+        try:
+            async with session.begin_nested():
+                await session.execute(statement, {**params, "content": content[:length]})
+        except Exception as exc:
+            if length <= TSVECTOR_CONTENT_FLOOR_CHARS:
+                # The floor. Propagate exactly as the pre-change code did.
+                logger.exception(
+                    "Failed to update the keyword vector for %s at the "
+                    "%d-character floor", label, length,
+                )
+                raise
+            attempted, length = length, max(
+                length // 2, TSVECTOR_CONTENT_FLOOR_CHARS
+            )
+            logger.warning(
+                "Keyword vector for %s did not build at %d characters (%s); "
+                "retreating to a %d-character prefix. Terms past that prefix "
+                "are not searchable for this note.",
+                label, attempted, exc, length,
+            )
+            continue
+        return length
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1143,9 +1217,18 @@ async def _index_vault_pinned(
             # This is the *id-preserving* move path, and that is exactly why it
             # needs the clause: the ordinary prune-and-upsert path replaces the
             # row, so a moved note reached through it starts from NULL anyway.
+            # `title` moves with the path for the same reason `file_path`
+            # does: it is *derived from the path* when the frontmatter does not
+            # set one, so a row that keeps the old title after a rename reports
+            # `Alpha` for a note called `Beta.md` in every index-backed tool,
+            # for ever — the scan never revisits it because the content hash is
+            # unchanged by definition on this branch (that is what identified
+            # the move). The value is bound from the entry this pass already
+            # parsed for the *new* path, so it is exactly what a fresh index
+            # would write, frontmatter title included (#127, D3).
             move_upd_sql = (
                 "UPDATE notes_metadata "
-                "SET file_path = :new, file_size = :size, "
+                "SET file_path = :new, title = :title, file_size = :size, "
                 "modified_at = :mtime, indexed_at = now(), "
                 "embedded_content_hash = NULL "
                 f"WHERE file_path = :old AND {user_clause}"
@@ -1166,7 +1249,7 @@ async def _index_vault_pinned(
             for old, new in moves:
                 e = entry_by_path[new]
                 params: dict = {
-                    "new": new, "old": old,
+                    "new": new, "old": old, "title": e["title"],
                     "size": e["file_size"], "mtime": e["modified_at"],
                 }
                 if user_id is not None:
@@ -1254,14 +1337,16 @@ async def _index_vault_pinned(
                     skips.append(f"{path} (no buffered body for the keyword vector)")
                     continue
                 content = path_to_content[path]
-                try:
-                    params: dict = {"content": content[:100000], "path": path, **tsv_params}
-                    if user_id is not None:
-                        params["uid"] = user_id
-                    await session.execute(text(tsv_sql), params)
-                except Exception:
-                    logger.exception(f"Failed to update tsvector for {path}")
-                    raise
+                params: dict = {"path": path, **tsv_params}
+                if user_id is not None:
+                    params["uid"] = user_id
+                # Full body first, halving retreat per note, floor failure
+                # re-raised — which aborts the pass with nothing committed,
+                # exactly as the unconditional `content[:100000]` did when it
+                # failed. See `write_tsvector_bounded`.
+                await write_tsvector_bounded(
+                    session, text(tsv_sql), content, params, label=path
+                )
             logger.info(f"Updated tsvectors for {len(paths)} notes{log_suffix}")
 
         # Remove deleted files (scoped to this user when set). `deleted_paths`
@@ -1758,12 +1843,11 @@ async def _embed_vault_pinned(user_id: int | None, root_fd: int, log_suffix: str
         result = await session.execute(text(sql), params)
         unembedded = result.fetchall()
 
+        exclude_patterns = settings.embedding_exclude_patterns or []
         if not unembedded:
             logger.info(f"All notes already embedded{log_suffix}")
-            return
-
-        logger.info(f"Embedding {len(unembedded)} notes...{log_suffix}")
-        exclude_patterns = settings.embedding_exclude_patterns or []
+        else:
+            logger.info(f"Embedding {len(unembedded)} notes...{log_suffix}")
         total_chunks = 0
         skipped_excluded = 0
         for i, row in enumerate(unembedded):
@@ -1890,6 +1974,167 @@ async def _embed_vault_pinned(user_id: int | None, root_fd: int, log_suffix: str
             + (f", {skipped_excluded} skipped by exclude patterns" if skipped_excluded else "")
         )
 
+        # The backlog only ever sees rows whose content changed. Editing
+        # `EMBEDDING_EXCLUDE_PATTERNS` changes no content, so without this the
+        # new configuration reached only notes that happened to be edited
+        # afterwards — see `_reconcile_exclusions`.
+        await _reconcile_exclusions(
+            session, user_id, root_fd, exclude_patterns, log_suffix
+        )
+
+
+async def _reconcile_exclusions(
+    session,
+    user_id: int | None,
+    root_fd: int,
+    exclude_patterns: list[str],
+    log_suffix: str,
+) -> None:
+    """Make the stored vectors agree with the *current* exclusion patterns
+    (#127, D2).
+
+    The backlog selects on `embedded_content_hash IS NULL OR != content_hash`,
+    so it is driven entirely by content changes. `EMBEDDING_EXCLUDE_PATTERNS`
+    is configuration: editing it changes no note's content and therefore
+    selected nothing. Both directions were permanent:
+
+    * **adding** a pattern left the matching notes' vectors in place, so an
+      excluded note kept answering `semantic_search` for ever;
+    * **removing** one left the stamp the exclusion branch wrote beside zero
+      vectors, so a now-included note stayed silently absent from
+      `semantic_search` — hash-equal, never re-selected, with nothing to
+      indicate the hole.
+
+    This sweep therefore looks at the rows the backlog *cannot* see: those
+    whose certification is current. It writes only where the configuration and
+    the stored vectors disagree, and every write goes through the same
+    certified `id + content_hash + file_path` predicate as the backlog — never
+    a delete by id. A row that moved between the decision and the write fails
+    certification, is rolled back, and is left for a later pass.
+
+    **Convergence is defined for a completed sweep.** After one that visited
+    every selected row without pause or error, every certification-current row
+    has vectors iff the configuration includes it, with three defined
+    exceptions: a note whose cleaned content produces zero chunks (correct with
+    zero vectors, and deliberately not rewritten — that is the one probe this
+    sweep repeats per pass), a row whose bytes no longer hash to it (the
+    backlog owns it next pass), and a row whose provider call failed (left
+    unstamped, retried). A pause stops it between notes; the next pass runs a
+    fresh sweep from the start, and the per-note commits make re-visiting an
+    already-repaired row a no-op.
+    """
+    owner_clause = "nm.user_id IS NULL" if user_id is None else "nm.user_id = :uid"
+    params: dict = {} if user_id is None else {"uid": user_id}
+    rows = (await session.execute(text(f"""
+        SELECT nm.id, nm.file_path, nm.content_hash,
+               EXISTS (
+                   SELECT 1 FROM note_embeddings ne WHERE ne.note_id = nm.id
+               ) AS has_vectors
+        FROM notes_metadata nm
+        WHERE {owner_clause}
+          AND nm.embedded_content_hash IS NOT DISTINCT FROM nm.content_hash
+        ORDER BY nm.modified_at DESC
+    """), params)).fetchall()
+
+    if not rows:
+        return
+
+    removed = 0
+    restored = 0
+    for row in rows:
+        # Between notes only, exactly as the backlog checks it: a partially
+        # applied *note* is what the certified predicate exists to prevent.
+        if _is_paused():
+            logger.info(
+                f"Exclusion reconciliation paused, stopping early{log_suffix}"
+            )
+            break
+
+        excluded = any(
+            fnmatch.fnmatch(row.file_path, pat) for pat in exclude_patterns
+        )
+        # Agreement, in both directions: excluded with no vectors, or included
+        # with vectors. Nothing to decide and nothing written — which is the
+        # overwhelmingly common case, so it is the cheap one.
+        if excluded != bool(row.has_vectors):
+            continue
+
+        try:
+            if excluded:
+                # Byte-for-byte the backlog's exclusion branch: stamp through
+                # the conditional, row-locking UPDATE *first* — that is what
+                # takes the lock — then delete. A concurrent move changes
+                # `file_path` without touching `content_hash`, so the predicate
+                # misses and `StaleCertification` rolls the note back rather
+                # than deleting the vectors of a row that is now included.
+                await certify_embedded(
+                    session, row.id, row.content_hash, row.file_path
+                )
+                await session.execute(
+                    delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
+                )
+                await session.commit()
+                removed += 1
+                continue
+
+            # Included, and no vectors. The stamp is either a stale exclusion
+            # stamp (repair it) or a genuinely empty note (leave it alone).
+            try:
+                raw, _stat = read_note_beneath(root_fd, row.file_path)
+            except UnicodeDecodeError:
+                logger.warning(
+                    "Skipping non-UTF8 file during reconciliation: %s",
+                    row.file_path,
+                )
+                continue
+
+            # The same verification the backlog runs, and for the same reason:
+            # nothing may be certified against a row whose content the bytes do
+            # not describe. A mismatch means the scan has not caught up, so the
+            # ordinary backlog owns this row on a later pass.
+            if _content_hash(raw) != row.content_hash:
+                continue
+
+            _, content = parse_frontmatter(raw)
+            if not chunk_text(
+                clean_for_embedding(content),
+                chunk_size=settings.chunk_size,
+                overlap=settings.chunk_overlap,
+            ):
+                # Zero chunks: the row is already exactly right — current
+                # certification, zero vectors. Writing anything here would
+                # re-stamp an unchanged row on every single pass.
+                continue
+
+            note = (await session.execute(
+                select(NoteMetadata).where(NoteMetadata.id == row.id)
+            )).scalar_one()
+            chunks = await embed_note(
+                session,
+                note,
+                content,
+                certified_hash=row.content_hash,
+                certified_path=row.file_path,
+            )
+            await session.commit()
+            if chunks:
+                restored += 1
+        except StaleCertification as e:
+            logger.info("Reconciliation skipped %s: %s", row.file_path, e)
+            await session.rollback()
+        except Exception as e:
+            logger.warning(
+                "Reconciliation failed for %s: %s", row.file_path, e
+            )
+            await session.rollback()
+
+    if removed or restored:
+        logger.info(
+            "Exclusion reconciliation%s: %d note(s) had vectors removed, "
+            "%d re-embedded",
+            log_suffix, removed, restored,
+        )
+
 
 async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
     """Recompute `content_tsvector` for every indexed note under the currently
@@ -1948,13 +2193,22 @@ async def _rebuild_tsvectors_pinned(
         except (UnicodeDecodeError, OSError):
             continue
         _, content = parse_frontmatter(raw)
-        await session.execute(
-            upd_sql, {"content": content[:100000], "id": row.id, **tsv_params}
+        await write_tsvector_bounded(
+            session, upd_sql, content, {"id": row.id, **tsv_params},
+            label=row.file_path,
         )
         updated += 1
         if updated % 500 == 0:
-            await session.commit()
+            # Progress only — **no intermediate commit** (#127, D4). It used to
+            # commit here, so a floor failure a thousand notes in left the
+            # keyword index half-rebuilt: the first N notes under the new
+            # `FTS_CONFIGS`, the rest under the old one, with no periodic pass
+            # that would ever repair them (an unchanged tsvector is never
+            # re-selected). Atomic is the only shape an operator can act on —
+            # either the rebuild happened or it did not.
             logger.info(f"rebuild_tsvectors: {updated}/{len(rows)} notes{log_suffix}")
+    # One commit, at the end. In multi-user mode the script calls this once per
+    # user, so the unit of atomicity is one user's index — never half of one.
     await session.commit()
     logger.info(f"rebuild_tsvectors complete: {updated} notes{log_suffix}")
     return updated

@@ -82,6 +82,24 @@ class _FakeSession:
     async def __aexit__(self, *exc):
         return False
 
+    def begin_nested(self):
+        """The savepoint each keyword-vector attempt runs in (#127, D4).
+
+        A no-op here: this stub records statements rather than executing them,
+        so there is nothing to roll back. What a stub can never show is that
+        the driver's aborted-transaction state clears between attempts — that
+        is why the retreat has a real-PostgreSQL test
+        (`tests/integration/test_tsvector_bounded_pg.py`).
+        """
+        class _Savepoint:
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, *exc):
+                return False
+
+        return _Savepoint()
+
     async def execute(self, stmt, params=None):
         # Capture the tsvector UPDATE (the thing the bug skipped on delete).
         if isinstance(stmt, TextClause) and "content_tsvector" in stmt.text:

@@ -723,8 +723,10 @@ async def get_tags_impl(limit: int = 50) -> str:
             func.unnest(NoteMetadata.tags).label("tag"),
             func.count().label("count"),
         )
-        if uid is not None:
-            tag_query = tag_query.where(NoteMetadata.user_id == uid)
+        # Total mapping: an ownerless call counts the NULL-owned rows' tags
+        # and nobody else's. A named user's private tag vocabulary is exactly
+        # the kind of thing this used to hand over wholesale (#127).
+        tag_query = tag_query.where(_note_owner_predicate(uid))
         result = await session.execute(
             tag_query.group_by("tag")
             .order_by(func.count().desc())
@@ -1060,20 +1062,25 @@ async def create_note_impl(path: str, content: str) -> str:
 @_tracked("get_backlinks", ["path", "limit"])
 async def get_backlinks_impl(path: str, limit: int = 50) -> str:
     """Notes that link TO `path` (resolved links only)."""
-    from sqlalchemy import select
+    from sqlalchemy import and_, select
     from src.models.db import NoteLink, NoteMetadata
 
     uid = current_user_id.get()
     limit = max(1, min(limit, 500))
     async with async_session() as session:
-        target_stmt = select(NoteMetadata).where(NoteMetadata.file_path == path)
-        if uid is not None:
-            target_stmt = target_stmt.where(NoteMetadata.user_id == uid)
+        target_stmt = select(NoteMetadata).where(
+            NoteMetadata.file_path == path, _note_owner_predicate(uid)
+        )
         target = (await session.execute(target_stmt)).scalar_one_or_none()
         if target is None:
             return f"Note not found: {path}"
 
         SourceMeta = NoteMetadata
+        # The owner predicate rides the JOIN: a link row whose *source* is
+        # another owner's note resolves to nothing here, so neither its title
+        # nor its path can be printed. `note_links` carries no `user_id` of its
+        # own, which is why the scope has to be expressed through the endpoint
+        # rows (#127, D1).
         stmt = (
             select(
                 SourceMeta.file_path,
@@ -1082,13 +1089,17 @@ async def get_backlinks_impl(path: str, limit: int = 50) -> str:
                 NoteLink.position,
                 NoteLink.kind,
             )
-            .join(SourceMeta, NoteLink.source_note_id == SourceMeta.id)
+            .join(
+                SourceMeta,
+                and_(
+                    NoteLink.source_note_id == SourceMeta.id,
+                    _owner_predicate_for(SourceMeta, uid),
+                ),
+            )
             .where(NoteLink.target_note_id == target.id)
             .order_by(SourceMeta.file_path, NoteLink.position)
             .limit(limit)
         )
-        if uid is not None:
-            stmt = stmt.where(SourceMeta.user_id == uid)
         rows = (await session.execute(stmt)).all()
 
     if not rows:
@@ -1105,31 +1116,45 @@ async def get_backlinks_impl(path: str, limit: int = 50) -> str:
 @_tracked("get_links", ["path"])
 async def get_links_impl(path: str) -> str:
     """Outgoing links from `path` — both resolved and dangling."""
-    from sqlalchemy import select
+    from sqlalchemy import and_, select
     from sqlalchemy.orm import aliased
     from src.models.db import NoteLink, NoteMetadata
 
     uid = current_user_id.get()
     async with async_session() as session:
-        src_stmt = select(NoteMetadata).where(NoteMetadata.file_path == path)
-        if uid is not None:
-            src_stmt = src_stmt.where(NoteMetadata.user_id == uid)
+        src_stmt = select(NoteMetadata).where(
+            NoteMetadata.file_path == path, _note_owner_predicate(uid)
+        )
         source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
             return f"Note not found: {path}"
 
         TargetMeta = aliased(NoteMetadata)
+        # The owner predicate is part of the outer join's ON clause, not a
+        # WHERE on the joined row: as a WHERE it would discard every dangling
+        # link (`target_note_id IS NULL` joins to a NULL row), which this tool
+        # exists to report. In the ON clause a cross-owner target simply fails
+        # to resolve, and the link is reported by the `target_path` string
+        # stored on the caller's *own* note — nothing of the other owner's row
+        # is read (#127, D1).
+        resolved_id = TargetMeta.id.label("resolved_id")
         stmt = (
             select(
                 NoteLink.kind,
                 NoteLink.link_text,
                 NoteLink.position,
                 NoteLink.target_path,
-                NoteLink.target_note_id,
+                resolved_id,
                 TargetMeta.file_path,
                 TargetMeta.title,
             )
-            .outerjoin(TargetMeta, NoteLink.target_note_id == TargetMeta.id)
+            .outerjoin(
+                TargetMeta,
+                and_(
+                    NoteLink.target_note_id == TargetMeta.id,
+                    _owner_predicate_for(TargetMeta, uid),
+                ),
+            )
             .where(NoteLink.source_note_id == source.id)
             .order_by(NoteLink.position)
         )
@@ -1137,8 +1162,12 @@ async def get_links_impl(path: str) -> str:
 
     if not rows:
         return f"`{path}` has no outgoing links"
-    resolved = [r for r in rows if r.target_note_id is not None]
-    dangling = [r for r in rows if r.target_note_id is None]
+    # Classified by what the *scoped* join resolved, never by the raw
+    # `note_links.target_note_id`: that column can name a row outside the
+    # owned set, and calling such a link "resolved" would print a `None` title
+    # and path for it.
+    resolved = [r for r in rows if r.resolved_id is not None]
+    dangling = [r for r in rows if r.resolved_id is None]
     lines = [f"`{path}` — {len(resolved)} resolved, {len(dangling)} dangling:\n"]
     if resolved:
         lines.append("**Resolved:**")
@@ -1156,7 +1185,8 @@ async def get_links_impl(path: str) -> str:
 @_tracked("get_neighborhood", ["path", "depth", "limit"])
 async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> str:
     """BFS over the resolved-link graph treating links as undirected."""
-    from sqlalchemy import or_, select
+    from sqlalchemy import and_, or_, select
+    from sqlalchemy.orm import aliased
     from src.models.db import NoteLink, NoteMetadata
 
     uid = current_user_id.get()
@@ -1164,9 +1194,9 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
     limit = max(1, min(limit, 200))
 
     async with async_session() as session:
-        src_stmt = select(NoteMetadata).where(NoteMetadata.file_path == path)
-        if uid is not None:
-            src_stmt = src_stmt.where(NoteMetadata.user_id == uid)
+        src_stmt = select(NoteMetadata).where(
+            NoteMetadata.file_path == path, _note_owner_predicate(uid)
+        )
         source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
             return f"Note not found: {path}"
@@ -1179,15 +1209,43 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
         for d in range(1, depth + 1):
             if not frontier:
                 break
-            stmt = select(
-                NoteLink.source_note_id,
-                NoteLink.target_note_id,
-            ).where(
-                or_(
-                    NoteLink.source_note_id.in_(frontier),
-                    NoteLink.target_note_id.in_(frontier),
-                ),
-                NoteLink.target_note_id.isnot(None),
+            # **Both endpoints must be inside the owned set**, and that has
+            # to happen here rather than when the metadata is hydrated below.
+            # A cross-owner edge admitted into the traversal changes what the
+            # answer *is*, not merely what is printed: it occupies a slot in
+            # `seen` (so it counts against `limit` and can truncate the walk
+            # early), and it can act as a bridge — a foreign note linking two
+            # owned notes would make them distance-2 neighbours through a row
+            # the caller cannot see. Dropping it at hydration time is too late
+            # for both (#127, D1).
+            SrcMeta = aliased(NoteMetadata)
+            TgtMeta = aliased(NoteMetadata)
+            stmt = (
+                select(
+                    NoteLink.source_note_id,
+                    NoteLink.target_note_id,
+                )
+                .join(
+                    SrcMeta,
+                    and_(
+                        NoteLink.source_note_id == SrcMeta.id,
+                        _owner_predicate_for(SrcMeta, uid),
+                    ),
+                )
+                .join(
+                    TgtMeta,
+                    and_(
+                        NoteLink.target_note_id == TgtMeta.id,
+                        _owner_predicate_for(TgtMeta, uid),
+                    ),
+                )
+                .where(
+                    or_(
+                        NoteLink.source_note_id.in_(frontier),
+                        NoteLink.target_note_id.in_(frontier),
+                    ),
+                    NoteLink.target_note_id.isnot(None),
+                )
             )
             edges = (await session.execute(stmt)).all()
             next_frontier: list[int] = []
@@ -1206,16 +1264,15 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
             if truncated:
                 break
 
-        # Hydrate metadata for everything except the source. The BFS edges
-        # were already scoped to this user's graph (indexer guarantees the
-        # vault_index is per-user), but we filter again here as a defense
-        # in depth so a corrupted state can't leak rows across users.
+        # Hydrate metadata for everything except the source. The BFS edges are
+        # already closed over the owned set by the joins above; this repeats
+        # the predicate as defence in depth, on the same total mapping.
         ids = [nid for nid in seen if nid != source.id]
         if not ids:
             return f"`{path}` has no resolved-link neighbors"
-        meta_stmt = select(NoteMetadata).where(NoteMetadata.id.in_(ids))
-        if uid is not None:
-            meta_stmt = meta_stmt.where(NoteMetadata.user_id == uid)
+        meta_stmt = select(NoteMetadata).where(
+            NoteMetadata.id.in_(ids), _note_owner_predicate(uid)
+        )
         meta_rows = (await session.execute(meta_stmt)).scalars().all()
         meta_by_id = {m.id: m for m in meta_rows}
         # Drop any ids that the user_id filter excluded (shouldn't happen
@@ -1228,10 +1285,8 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
         via_paths = {source.id: source.file_path}
         if via_ids - {source.id}:
             via_stmt = select(NoteMetadata.id, NoteMetadata.file_path).where(
-                NoteMetadata.id.in_(via_ids)
+                NoteMetadata.id.in_(via_ids), _note_owner_predicate(uid)
             )
-            if uid is not None:
-                via_stmt = via_stmt.where(NoteMetadata.user_id == uid)
             via_rows = (await session.execute(via_stmt)).all()
             for vid, vpath in via_rows:
                 via_paths[vid] = vpath
@@ -1280,8 +1335,11 @@ def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int |
         .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
         .where(NoteEmbedding.note_id != source_id)
     )
-    if user_id is not None:
-        stmt = stmt.where(NoteMetadata.user_id == user_id)
+    # Total mapping, as everywhere else on the read path (#127, D1): `None`
+    # scopes to the NULL-owned slice rather than to everything. This is also
+    # why the caller's zero-row exact fallback is unconditional — there is no
+    # unfiltered form of this statement left (D1a).
+    stmt = stmt.where(_note_owner_predicate(user_id))
     return stmt.order_by(distance).limit(overfetch)
 
 
@@ -1300,9 +1358,9 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         # fetch included — it is accumulated, so the early returns below still
         # report the work they actually did.
         db_start = time.monotonic()
-        src_stmt = select(NoteMetadata).where(NoteMetadata.file_path == path)
-        if uid is not None:
-            src_stmt = src_stmt.where(NoteMetadata.user_id == uid)
+        src_stmt = select(NoteMetadata).where(
+            NoteMetadata.file_path == path, _note_owner_predicate(uid)
+        )
         source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
             timing.add_ms("db_ms", time.monotonic() - db_start)
@@ -1340,7 +1398,9 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
 
         # Zero-row exact fallback, as in semantic_search: an empty result from
         # an approximate filtered scan is ambiguous, so re-run the identical
-        # statement as an exact sequential scan before believing it.
+        # statement as an exact sequential scan before believing it. It is
+        # unconditional here and there (#127, D1a) — the owner predicate is
+        # itself a filter, so there is no unfiltered form of this query.
         exact_fallback = False
         if not rows:
             # Transaction-scoped, like every other SET LOCAL here: it applies
@@ -1396,26 +1456,38 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
 @_tracked("find_orphans", ["folder", "limit"])
 async def find_orphans_impl(folder: str | None = None, limit: int = 50) -> str:
     """Notes with zero incoming AND zero outgoing resolved links."""
-    from sqlalchemy import select, union
+    from sqlalchemy import and_, or_, select, union
     from src.models.db import NoteLink, NoteMetadata
 
     uid = current_user_id.get()
     limit = max(1, min(limit, 500))
 
     async with async_session() as session:
-        # The "connected" subquery collects every NoteLink endpoint id.
-        # Since `note_links` has no `user_id`, scoping happens implicitly:
-        # the outer `NoteMetadata` query filters to this user's notes, so
-        # only those rows are candidates for orphan-ness. Any cross-user
-        # NoteLink rows (which would only exist on a corrupted state)
-        # would still appear in `connected` and exclude the corresponding
-        # note id — that's the safe direction (false negatives, not
-        # false orphans).
+        # The "connected" subquery collects every NoteLink endpoint id, and it
+        # is closed over the owned set before it does so. `note_links` carries
+        # no `user_id`, and the outer filter on `notes_metadata` is not enough:
+        # a *foreign* note linking to an owned one puts the owned id into
+        # `targets` and silently strips its orphan status — an edge the caller
+        # cannot see deciding an answer about a note they own. So an edge
+        # counts only when its source is owned **and** its target is either
+        # owned or genuinely dangling (#127, D1).
+        #
+        # Keeping dangling edges in is today's behaviour, deliberately: a note
+        # whose only link points at nothing is not an orphan here, and that is
+        # unrelated to ownership.
+        owned_ids = select(NoteMetadata.id).where(_note_owner_predicate(uid))
+        edge_within_owned_set = and_(
+            NoteLink.source_note_id.in_(owned_ids),
+            or_(
+                NoteLink.target_note_id.is_(None),
+                NoteLink.target_note_id.in_(owned_ids),
+            ),
+        )
         sources = select(NoteLink.source_note_id.label("nid")).where(
-            NoteLink.source_note_id.isnot(None)
+            NoteLink.source_note_id.isnot(None), edge_within_owned_set
         )
         targets = select(NoteLink.target_note_id.label("nid")).where(
-            NoteLink.target_note_id.isnot(None)
+            NoteLink.target_note_id.isnot(None), edge_within_owned_set
         )
         connected = union(sources, targets).subquery()
         stmt = select(NoteMetadata).where(NoteMetadata.id.notin_(select(connected.c.nid)))
@@ -1738,15 +1810,26 @@ def _rewrite_failure_warning(
     )
 
 
+def _owner_predicate_for(entity, uid: int | None):
+    """The ownership predicate for one `notes_metadata` entity or alias.
+
+    Takes the entity so a graph query can carry the predicate in a JOIN's ON
+    clause — for an outer join that is the difference between "this edge
+    resolves to nothing I own" and "drop the row entirely", and dangling links
+    must still be reported (#127, D1).
+    """
+    return entity.user_id.is_(None) if uid is None else entity.user_id == uid
+
+
 def _note_owner_predicate(uid: int | None):
-    """Return the exact NoteMetadata ownership predicate for a vault context."""
+    """Return the exact NoteMetadata ownership predicate for a vault context.
+
+    Total over `uid`: `None` is `IS NULL`, never "no predicate". Read paths use
+    the same mapping as the write paths — see `apply_note_filters`.
+    """
     from src.models.db import NoteMetadata
 
-    return (
-        NoteMetadata.user_id.is_(None)
-        if uid is None
-        else NoteMetadata.user_id == uid
-    )
+    return _owner_predicate_for(NoteMetadata, uid)
 
 
 def _ensure_move_source_in_index(index: dict, from_rel: str) -> None:
@@ -2104,6 +2187,48 @@ async def _move_note_locked(
         # truth, and nothing retained from the confirmation object.
         admitted_root = src_target.assignment
 
+        # ── The title is derived from the path, so a move changes it ──────
+        # `notes_metadata.title` falls back to the filename stem when the
+        # frontmatter sets none, so a row that keeps its old title after
+        # `Alpha.md → Beta.md` reports `Alpha` in `list_notes`, `get_recent`,
+        # every graph tool and both searches — for ever, because the content
+        # hash is unchanged and the scan therefore never revisits the row
+        # (#127, D3).
+        #
+        # It is derived from the **file**, through the same helper and the same
+        # parser the indexer uses, so the result is byte-identical to what a
+        # fresh index would write — every falsy-title case (`false`, `0`, `[]`,
+        # `{}`, `""`) falls back to the new stem, which a SQL `CASE` over the
+        # stored JSONB got wrong. Reading the file also means frontmatter added
+        # or removed since the last pass decides, rather than a stale copy.
+        #
+        # The read happens *after* `_verify_the_moved_inode`, through the
+        # destination target's own descriptor: the inode there has been proved
+        # to be the one we moved, and the descriptor resolves no pathname.
+        from src.services.indexer import _note_title  # local: avoids a cycle
+        from src.services.vault import parse_frontmatter
+
+        dest_name = PurePosixPath(to_rel).name
+        moved_title: str | None = None
+        try:
+            moved_frontmatter, _ = parse_frontmatter(
+                read_bytes_at(
+                    dst_target, max_bytes=MAX_NOTE_BYTES, label=to_rel
+                ).decode("utf-8")
+            )
+            moved_title = _note_title(moved_frontmatter, dest_name)
+        except Exception as exc:
+            # Best-effort fallback, declared: the file vanished, is no longer
+            # decodable, or its frontmatter no longer parses. Derive from the
+            # row's stored sanitized frontmatter instead — possibly stale, and
+            # self-healing at the note's next content change. Never a reason to
+            # fail a move that has already stood.
+            logger.warning(
+                "Could not read the moved note to derive its title (%s → %s): "
+                "%s; falling back to the indexed frontmatter",
+                from_rel, to_rel, exc,
+            )
+
         db_failed = False
         try:
             async with async_session() as session:
@@ -2129,13 +2254,29 @@ async def _move_note_locked(
                 # next pass". A note whose content did not really change is
                 # re-embedded only because the hash check selects it, and the
                 # exclusion decision is re-taken against the path it now has.
+                title = moved_title
+                if title is None:
+                    # The fallback needs the row, so it is resolved inside the
+                    # same transaction as the UPDATE.
+                    row = (await session.execute(
+                        select(NoteMetadata.frontmatter).where(
+                            NoteMetadata.file_path == from_rel,
+                            _note_owner_predicate(uid),
+                        )
+                    )).scalar_one_or_none()
+                    title = _note_title(row or {}, dest_name)
+
                 nm_update = (
                     update(NoteMetadata)
                     .where(
                         NoteMetadata.file_path == from_rel,
                         _note_owner_predicate(uid),
                     )
-                    .values(file_path=to_rel, embedded_content_hash=None)
+                    .values(
+                        file_path=to_rel,
+                        title=title,
+                        embedded_content_hash=None,
+                    )
                 )
                 await session.execute(nm_update)
 
