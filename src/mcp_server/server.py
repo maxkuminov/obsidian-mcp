@@ -326,9 +326,9 @@ async def edit_note(
     `[TRUNCATED]` notice. A truncated read must be paged to the end before it
     is written back, or full replacement will replace the whole body with the
     fragment. A `read_note(section=...)` response belongs to
-    `edit_note(section=...)`, and note that the read response **includes the
-    heading line** while `section=` here takes the **body only** — pass it back
-    unstripped and the heading is duplicated.
+    `edit_note(section=...)`, and note that a read response
+    **includes the heading line** while `section=` here takes the **body
+    only** — pass it back unstripped and the heading is duplicated.
 
     Section mode resolves headings over the frontmatter-stripped body, exactly
     as `read_note` does, so `#N` ordinals agree between the two and a YAML `#`
@@ -569,8 +569,8 @@ async def set_frontmatter(
     prepended above the broken one — and `remove=` refuses identically rather
     than silently doing nothing. This is reported even for a call with no
     `updates` and no `remove`. An empty fenced block (`---` immediately
-    followed by `---`) is *valid*: it is an empty mapping and is updated in
-    place.
+    followed by `---`) is *valid*: it is a valid empty mapping and is updated
+    in place.
 
     **Only an effective change writes.** `updates` that set every named key to
     the value it already holds (compared type-sensitively, so `true` is not

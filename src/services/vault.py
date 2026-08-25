@@ -2666,6 +2666,20 @@ def _partition_frontmatter(raw: str) -> tuple[dict, str, FrontmatterDiagnosis]:
         body_start += 1
     body = rest[body_start:]
     block = raw[:first_line_end + 1 + body_start]
+    if yaml_text.strip() == "":
+        # Whitespace-only fenced YAML is a valid EMPTY mapping — the one
+        # deliberate behaviour change to `parse_frontmatter` (D3). It has to
+        # land here rather than only in the diagnosing sibling: leaving the
+        # read parser treating `---\n---\n` as absent while the write side
+        # preserved it as a valid block makes the read-body -> default-edit
+        # round trip *duplicate* the block.
+        #
+        # The predicate is whitespace, tested BEFORE the YAML call, not
+        # "safe_load returned None": PyYAML refuses a region that is a bare
+        # tab (a tab cannot start a token), so asking it would make
+        # `---\n \n---\n` valid and `---\n\t\n---\n` a parse error — a
+        # distinction no author could predict and one the spec does not draw.
+        return {}, body, FrontmatterDiagnosis(valid=True, block=block)
     try:
         fm = yaml.safe_load(yaml_text)
     except yaml.YAMLError as e:
@@ -2675,17 +2689,11 @@ def _partition_frontmatter(raw: str) -> tuple[dict, str, FrontmatterDiagnosis]:
             message=f"the frontmatter block does not parse as YAML: {e}",
         )
     if fm is None:
-        # Whitespace-only fenced YAML is a valid EMPTY mapping — the one
-        # deliberate behaviour change to `parse_frontmatter` (D3). It has to
-        # land here rather than only in the diagnosing sibling: leaving the
-        # read parser treating `---\n---\n` as absent while the write side
-        # preserves it as a block makes the read-body -> default-edit round
-        # trip *duplicate* the block.
-        if yaml_text.strip() == "":
-            return {}, body, FrontmatterDiagnosis(valid=True, block=block)
-        # `null`, `~`, or comment-only YAML. Not a mapping — and comment-only
-        # must not be valid, or its `#` line would break read/write section
-        # parity.
+        # `null`, `~`, or comment-only YAML — non-whitespace text that loads to
+        # None. Not a mapping, and comment-only in particular must NOT be
+        # valid: its `#` line would otherwise sit in a region section mode
+        # treats as frontmatter while `read_note`'s scan sees a heading, which
+        # is the read/write parity this change restores.
         return {}, raw, FrontmatterDiagnosis(
             valid=False,
             defect="not_a_mapping",
