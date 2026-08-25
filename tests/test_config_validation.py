@@ -212,3 +212,61 @@ def test_sandbox_mode_with_loopback_allowed_hosts_still_boots():
 def test_public_hostname_without_sandbox_mode_is_unaffected():
     settings = Settings(mcp_hostname="mcp.example.com", secret_key=_SECRET, _env_file=None)
     assert settings.allowed_hosts == ["mcp.example.com", "localhost"]
+
+
+# ── MCP_HOSTNAME is folded to a bare lowercase host (#130) ──────────────────
+# `allowed_hosts` is derived from it and Starlette's TrustedHostMiddleware
+# compares the Host header exactly, while browsers and proxies send it
+# lowercased. So a capitalised hostname booted clean, kept its casing into the
+# derivation, and then 400'd every public request while the localhost health
+# check stayed green.
+
+
+def test_mcp_hostname_is_lowercased_before_anything_is_derived():
+    settings = Settings(mcp_hostname="Vault.Example.COM", secret_key=_SECRET, _env_file=None)
+
+    assert settings.mcp_hostname == "vault.example.com"
+    assert settings.allowed_hosts == ["vault.example.com", "localhost"]
+    assert settings.allowed_origins == ["https://vault.example.com"]
+    assert settings.base_url == "https://vault.example.com"
+
+
+def test_mcp_hostname_is_stripped():
+    settings = Settings(mcp_hostname="  vault.example.com \n", secret_key=_SECRET, _env_file=None)
+
+    assert settings.mcp_hostname == "vault.example.com"
+    assert settings.base_url == "https://vault.example.com"
+
+
+def test_a_whitespace_only_hostname_is_no_hostname():
+    # Not `None`-ing it derived `https://` as the base URL and reported a
+    # public origin the operator never configured.
+    settings = Settings(mcp_hostname="   ", secret_key=_SECRET, _env_file=None)
+
+    assert settings.mcp_hostname is None
+    assert settings.base_url == "http://localhost:8000"
+    assert settings.public_base_url is None
+
+
+def test_a_capitalised_hostname_still_matches_its_base_url():
+    # `_validate_public_transport` compares BASE_URL's host with MCP_HOSTNAME;
+    # an operator who capitalises both must still boot.
+    settings = Settings(
+        mcp_hostname="Vault.Example.com",
+        base_url="https://vault.example.com",
+        secret_key=_SECRET,
+        _env_file=None,
+    )
+
+    assert settings.mcp_hostname == "vault.example.com"
+
+
+def test_sandbox_mode_still_refuses_a_capitalised_public_hostname():
+    with pytest.raises(ValidationError) as exc:
+        Settings(
+            mcp_sandbox_mode=True,
+            mcp_hostname="Vault.Example.com",
+            secret_key=_SECRET,
+            _env_file=None,
+        )
+    assert "MCP_HOSTNAME" in str(exc.value)

@@ -25,6 +25,10 @@
 
 <div class="page-body">
 
+    {% if key_error %}
+    <div class="alert alert-warning anim-1">{{ key_error }}</div>
+    {% endif %}
+
     {% if new_key %}
     <div class="alert alert-success anim-1">
         <div style="font-size:11px;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px;opacity:0.75;">New key created — copy now, won't be shown again</div>

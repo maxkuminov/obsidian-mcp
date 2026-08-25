@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 
@@ -7,6 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from sqlalchemy import text
@@ -351,6 +353,18 @@ app.include_router(api_router)
 # untouched. `tests/test_transfer_routes.py` asserts that rather than trusting
 # it. Each handler authenticates its own request from the token row.
 app.include_router(transfer_router)
+
+# Panel assets (htmx, Chart.js) served from this app rather than a CDN — see
+# the comment in `src/control_panel/templates/base.html`. Mounted under
+# `/admin/` because that is the prefix Traefik already routes to this app for
+# the panel; a top-level `/static` would match no router on the production
+# deploy. `StaticFiles` serves GET/HEAD only and resolves nothing outside its
+# own directory.
+app.mount(
+    "/admin/static",
+    StaticFiles(directory=os.path.join(os.path.dirname(__file__), "control_panel", "static")),
+    name="panel-static",
+)
 
 # Control panel routes at /admin (protected by Traefik OAuth)
 app.include_router(panel_router)

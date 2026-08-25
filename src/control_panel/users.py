@@ -30,7 +30,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, select, text
+from sqlalchemy import func, select, text, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -40,7 +40,7 @@ from src.config import settings
 from src.control_panel.routes import _panel_context, require_admin_panel
 from src.csrf import verify_csrf
 from src.database import get_session
-from src.models.db import APIKey, NoteMetadata, User
+from src.models.db import APIKey, NoteMetadata, UsageLog, User
 from src.services.vault import clear_user_vault_cache, validate_vault_root_path
 
 router = APIRouter(prefix="/admin/users", tags=["users"])
@@ -549,6 +549,23 @@ async def delete_user(
             )
 
     if permanent:
+        # `usage_logs.key_id` has no `ON DELETE` — deliberately, so a log row
+        # outlives the credential that wrote it (see CLAUDE.md, #77). The
+        # database therefore refuses to cascade-delete an `api_keys` row that a
+        # usage log still names, and since `User.api_keys` is
+        # `passive_deletes=True` the ORM no longer NULLs those references on
+        # its own. Do it here, in the same transaction and before the delete,
+        # exactly as `delete_key_form` does for a single key: the rows keep
+        # their denormalised `actor_kind`/`actor_label`/`actor_ref`, so the
+        # Usage page still attributes them.
+        #
+        # `usage_logs.user_id` and `.oauth_token_id` need nothing — both are
+        # `ON DELETE SET NULL`, and the OAuth token rows cascade from the user.
+        await session.execute(
+            sa_update(UsageLog)
+            .where(UsageLog.key_id.in_(select(APIKey.id).where(APIKey.user_id == target.id)))
+            .values(key_id=None)
+        )
         await session.delete(target)
         await session.commit()
         clear_user_vault_cache(target.id)

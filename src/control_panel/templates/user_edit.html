@@ -133,11 +133,23 @@
                         the user can no longer log in. Reversible by re-saving the form above.
                     </div>
                 </div>
+                {#
+                  Both confirm() strings below are static. Interpolating
+                  `target.username` into an inline handler is the same defect
+                  class as the OAuth `client_name` one (see CLAUDE.md): Jinja
+                  escapes an apostrophe to `&#39;`, the HTML parser turns it
+                  back before the JS string is parsed, the handler throws — and
+                  a throwing `onclick` submits the form *unconfirmed*. It is
+                  safe here only because `_USERNAME_RE` allows nothing but
+                  `[a-z0-9_]`, which makes the safety a property of a
+                  validator two files away rather than of this markup. The
+                  page names the user in its heading, so nothing is lost.
+                #}
                 <form method="POST" action="/admin/users/{{ target.id }}/delete">
                     {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                     <button type="submit" class="btn btn-danger"
                             {% if is_self %}disabled{% endif %}
-                            onclick="return confirm('Deactivate {{ target.username }}? They will no longer be able to log in.')">
+                            onclick="return confirm('Deactivate this user? They will no longer be able to log in.')">
                         Deactivate
                     </button>
                 </form>
@@ -155,7 +167,7 @@
                     {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                     <button type="submit" class="btn btn-danger"
                             {% if is_self %}disabled{% endif %}
-                            onclick="return confirm('PERMANENTLY DELETE {{ target.username }} and all their data? This cannot be undone.')">
+                            onclick="return confirm('PERMANENTLY DELETE this user and all their data? This cannot be undone.')">
                         Permanently delete
                     </button>
                 </form>

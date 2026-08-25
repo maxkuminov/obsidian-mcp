@@ -59,11 +59,30 @@ def _safe_next(next_url: str | None) -> str:
     """Return `next_url` if it's a safe in-app redirect, else `/admin/`.
 
     Prevents an open-redirect via `?next=https://evil.example/...`. Only
-    same-origin paths (must start with `/` and not `//`) are allowed.
+    same-origin paths are allowed: one leading `/`, no scheme, no authority.
+
+    Two refusals beyond "starts with a single slash", both about what a
+    *browser* does with the value rather than what a parser says about it:
+
+    * a leading `/` followed by a backslash, where the second slash of `//`
+      would be. Browsers normalise that to `//`, so it navigates off-site
+      exactly as `//evil.example` would.
+    * control characters, including the tab, CR and LF that some clients strip
+      *before* resolving the URL, which lets a value reassemble into an
+      authority after this check has looked at it.
+
+    The producing side (`require_user_panel` in the panel router) now
+    percent-encodes what it puts in `?next=`, so a legitimate path with its own
+    query string arrives here intact instead of half of it landing in the login
+    URL's own query.
     """
     if not next_url:
         return "/admin/"
-    if not next_url.startswith("/") or next_url.startswith("//"):
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in next_url):
+        return "/admin/"
+    if not next_url.startswith("/"):
+        return "/admin/"
+    if next_url[1:2] in ("/", "\\"):
         return "/admin/"
     return next_url
 
@@ -81,6 +100,17 @@ def _render_login(
     username: str = "",
     status_code: int = 200,
 ) -> HTMLResponse:
+    # A raw API key left in the session by an unfollowed `/admin/keys` redirect
+    # must not outlive the hop it was minted for. The panel's own dependency
+    # (`_forget_new_key_flash`) covers every `/admin` and `/api` route; this
+    # router is mounted at the app level and shares none of them, so the login
+    # form — reachable while a stale session cookie is still being replayed —
+    # clears it here. Logout and a successful login already do, through
+    # `request.session.clear()`.
+    try:
+        request.session.pop("flash_new_key", None)
+    except (AssertionError, AttributeError):
+        pass
     return templates.TemplateResponse(
         request,
         "login.html",
