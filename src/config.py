@@ -1,3 +1,4 @@
+import ipaddress
 import resource
 import sys
 from typing import Annotated, Any, Literal
@@ -6,6 +7,29 @@ from urllib.parse import urlparse
 from pydantic import Field, PrivateAttr, field_validator, model_validator
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
+
+
+# Hostnames that can only ever name this machine. Used by the sandbox guard
+# below, which must fail *closed*: anything this cannot prove is loopback —
+# a name it does not recognise, a `*` wildcard that matches every name — is
+# treated as public, because the cost of a false positive is a refused boot
+# and the cost of a false negative is an unauthenticated vault.
+_LOOPBACK_HOSTNAMES = frozenset({"localhost", "::1", "0:0:0:0:0:0:0:1"})
+
+
+def _is_loopback_host(host: str) -> bool:
+    """True when `host` names only this machine (localhost, 127/8, ::1)."""
+    name = (host or "").strip().lower().rstrip(".")
+    if not name or "*" in name:
+        return False
+    if name.startswith("[") and name.endswith("]"):
+        name = name[1:-1]
+    if name in _LOOPBACK_HOSTNAMES:
+        return True
+    try:
+        return ipaddress.ip_address(name).is_loopback
+    except ValueError:
+        return False
 
 
 # Maximum size of a single note, in bytes. Lives here (rather than in
@@ -419,6 +443,35 @@ class Settings(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _reject_wildcard_cors_origin(self) -> "Settings":
+        """Refuse a `*` entry in ALLOWED_ORIGINS.
+
+        `src/main.py` installs `CORSMiddleware(..., allow_credentials=True)`,
+        and Starlette reads `allow_origins=["*"]` alongside credentials as
+        "reflect whatever Origin the request carried" — it echoes the caller's
+        origin back in `Access-Control-Allow-Origin` and sets
+        `Access-Control-Allow-Credentials: true`. Every site the operator has
+        open in the same browser could then make credentialed cross-site
+        requests to the panel, the API and the OAuth endpoints and read the
+        responses. A wildcard is therefore not a permissive setting here, it
+        is the removal of the same-origin boundary the session cookie relies on.
+
+        This runs after `_derive_public_urls`, so `allowed_origins` is always
+        populated; the derived values (`https://$MCP_HOSTNAME`, or the
+        localhost fallback) are never `*`, so the refusal can only ever fire
+        on an explicit ALLOWED_ORIGINS override.
+        """
+        for origin in self.allowed_origins or ():
+            if str(origin).strip() == "*":
+                raise ValueError(
+                    'ALLOWED_ORIGINS must not contain "*". CORS is configured '
+                    "with allow_credentials=True, so a wildcard origin makes "
+                    "the server reflect any Origin and accept credentialed "
+                    "cross-site requests. List the exact origins instead."
+                )
+        return self
+
+    @model_validator(mode="after")
     def _validate_public_transport(self) -> "Settings":
         """Permit plaintext OAuth only for loopback development."""
         base = self.base_url.rstrip("/")
@@ -470,15 +523,55 @@ class Settings(BaseSettings):
         """Refuse to boot a publicly-routed deployment with auth disabled.
 
         MCP_SANDBOX_MODE bypasses all authentication on /mcp (registry-eval
-        only). Combined with a public MCP_HOSTNAME that would expose the
-        vault unauthenticated to the internet, so reject the combination at
+        only). Combined with a public route that would expose the vault
+        unauthenticated to the internet, so reject the combination at
         startup — analogous to the SECRET_KEY placeholder guard above.
+
+        MCP_HOSTNAME is not the only way to declare a public route, so all
+        three of the settings that admit outside traffic are checked:
+
+        * MCP_HOSTNAME — the Traefik/Caddy hostname;
+        * BASE_URL — the origin OAuth redirects and transfer links are built
+          on, which an operator can set without MCP_HOSTNAME;
+        * ALLOWED_HOSTS — what TrustedHostMiddleware will answer for, i.e.
+          the `Host` headers this process accepts at all.
+
+        This validator runs after `_derive_public_urls`, so it sees the
+        *effective* values. That is deliberate: the derived ones are
+        loopback (`http://localhost:8000`, `["localhost"]`) and never trip
+        the check, while an explicit env override does. `_is_loopback_host`
+        fails closed, so an unrecognised name or a `*` wildcard entry — which
+        makes TrustedHostMiddleware answer for every hostname — counts as
+        public.
         """
-        if self.mcp_sandbox_mode and (self.mcp_hostname or "").strip():
+        if not self.mcp_sandbox_mode:
+            return self
+
+        def _refuse(setting: str, detail: str) -> None:
             raise ValueError(
                 "MCP_SANDBOX_MODE disables all authentication on /mcp and must "
-                "never run on a publicly-routed deployment. Either unset "
-                "MCP_SANDBOX_MODE or remove MCP_HOSTNAME."
+                f"never run on a publicly-routed deployment. {setting} {detail}. "
+                f"Either unset MCP_SANDBOX_MODE or remove {setting}."
+            )
+
+        if (self.mcp_hostname or "").strip():
+            _refuse("MCP_HOSTNAME", "declares a public hostname")
+
+        base_host = urlparse(self.base_url or "").hostname or ""
+        if not _is_loopback_host(base_host):
+            _refuse("BASE_URL", f"names the non-loopback host '{base_host}'")
+
+        public_hosts = [
+            str(h).strip()
+            for h in (self.allowed_hosts or ())
+            if not _is_loopback_host(str(h))
+        ]
+        if public_hosts:
+            _refuse(
+                "ALLOWED_HOSTS",
+                "accepts the non-loopback host(s) " + ", ".join(
+                    repr(h) for h in public_hosts
+                ),
             )
         return self
 

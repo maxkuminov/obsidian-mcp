@@ -6,6 +6,7 @@ import pytest
 from src.auth.session import get_current_user
 from src.control_panel import users as panel_users
 from src.mcp_server import tools
+from src.models.db import User
 from src.oauth import routes as oauth_routes
 from src.services import embeddings, search
 
@@ -109,6 +110,73 @@ async def test_password_reset_bumps_session_version(monkeypatch):
     assert target.password_hash == "new-hash"
     assert target.session_version == 4
     db.commit.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_password_reset_takes_the_admin_guard_lock(monkeypatch):
+    """#129: the reset enters the same critical section as edit/delete.
+
+    A password reset rewrites the target's hash and bumps `session_version`,
+    which is a full account takeover — it must not run for an actor whose own
+    admin access was revoked while the request waited for the lock.
+    """
+    actor = User(id=1, username="admin", is_admin=True, is_active=True)
+    lock = MagicMock()
+    actor_row = MagicMock()
+    actor_row.one_or_none.return_value = SimpleNamespace(
+        is_admin=True, is_active=True
+    )
+    target = SimpleNamespace(
+        id=7, password_hash="old", session_version=3, username="alice"
+    )
+    target_row = MagicMock()
+    target_row.scalar_one_or_none.return_value = target
+    db = AsyncMock()
+    db.execute.side_effect = [lock, actor_row, target_row]
+    monkeypatch.setattr(panel_users, "hash_password", lambda _password: "new-hash")
+
+    response = await panel_users.reset_password(
+        user_id=7,
+        new_password="new-password",
+        session=db,
+        user=actor,
+    )
+
+    assert response.status_code == 303
+    # The advisory lock is the *first* statement, before the actor is re-read
+    # and before the target row is loaded.
+    assert "pg_advisory_xact_lock" in str(db.execute.await_args_list[0].args[0])
+    assert target.password_hash == "new-hash"
+    db.commit.assert_awaited_once()
+    db.rollback.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_password_reset_refuses_an_actor_demoted_while_queued(monkeypatch):
+    """#129: `_actor_still_privileged` runs inside the lock, and refuses."""
+    actor = User(id=1, username="admin", is_admin=True, is_active=True)
+    lock = MagicMock()
+    actor_row = MagicMock()
+    actor_row.one_or_none.return_value = SimpleNamespace(
+        is_admin=False, is_active=True
+    )
+    db = AsyncMock()
+    db.execute.side_effect = [lock, actor_row]
+    monkeypatch.setattr(panel_users, "hash_password", lambda _password: "new-hash")
+
+    response = await panel_users.reset_password(
+        user_id=7,
+        new_password="new-password",
+        session=db,
+        user=actor,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/admin/users/?error=")
+    # Nothing was written and the target was never even loaded.
+    assert db.execute.await_count == 2
+    db.rollback.assert_awaited_once()
+    db.commit.assert_not_awaited()
 
 
 @pytest.mark.parametrize(

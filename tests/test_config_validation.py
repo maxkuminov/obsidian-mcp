@@ -106,3 +106,109 @@ def test_unknown_dotenv_key_does_not_leak_into_settings(tmp_path):
     )
     settings = Settings(_env_file=str(env_file))
     assert "some_compose_only_key" not in settings.model_dump()
+
+
+# A non-placeholder SECRET_KEY, so `_validate_multi_user_secret` (which runs
+# before the sandbox guard) never pre-empts the refusal under test. Passing it
+# explicitly also keeps these cases independent of the host environment.
+_SECRET = "0123456789abcdef0123456789abcdef"
+
+
+# ── CORS wildcard (#129) ────────────────────────────────────────────────────
+# `src/main.py` installs CORSMiddleware with `allow_credentials=True`, which
+# makes Starlette treat `allow_origins=["*"]` as "reflect any Origin". The
+# derived values are never `*`, so the refusal only fires on an override.
+
+
+def test_wildcard_allowed_origin_is_refused():
+    with pytest.raises(ValidationError) as exc:
+        Settings(allowed_origins=["*"], secret_key=_SECRET, _env_file=None)
+    assert "ALLOWED_ORIGINS" in str(exc.value)
+    assert "allow_credentials" in str(exc.value)
+
+
+def test_wildcard_among_other_allowed_origins_is_refused():
+    with pytest.raises(ValidationError):
+        Settings(
+            allowed_origins=["https://mcp.example.com", " * "],
+            secret_key=_SECRET, _env_file=None,
+        )
+
+
+def test_explicit_allowed_origins_without_wildcard_still_boot():
+    settings = Settings(
+        allowed_origins=["https://mcp.example.com"],
+        secret_key=_SECRET, _env_file=None,
+    )
+    assert settings.allowed_origins == ["https://mcp.example.com"]
+
+
+def test_derived_allowed_origins_never_trip_the_wildcard_guard():
+    settings = Settings(mcp_hostname="mcp.example.com", secret_key=_SECRET, _env_file=None)
+    assert settings.allowed_origins == ["https://mcp.example.com"]
+    assert Settings(secret_key=_SECRET, _env_file=None).allowed_origins == ["http://localhost:8000"]
+
+
+# ── Sandbox mode may only ever be loopback (#129) ───────────────────────────
+# MCP_SANDBOX_MODE bypasses authentication on /mcp, so every setting that can
+# admit outside traffic has to be loopback — not just MCP_HOSTNAME.
+
+
+def test_sandbox_mode_refuses_public_hostname():
+    with pytest.raises(ValidationError) as exc:
+        Settings(mcp_sandbox_mode=True, mcp_hostname="mcp.example.com", secret_key=_SECRET, _env_file=None)
+    assert "MCP_HOSTNAME" in str(exc.value)
+
+
+def test_sandbox_mode_refuses_public_base_url():
+    with pytest.raises(ValidationError) as exc:
+        Settings(
+            mcp_sandbox_mode=True,
+            base_url="https://mcp.example.com",
+            secret_key=_SECRET, _env_file=None,
+        )
+    assert "BASE_URL" in str(exc.value)
+
+
+def test_sandbox_mode_refuses_public_allowed_host():
+    with pytest.raises(ValidationError) as exc:
+        Settings(
+            mcp_sandbox_mode=True,
+            allowed_hosts=["mcp.example.com"],
+            secret_key=_SECRET, _env_file=None,
+        )
+    assert "ALLOWED_HOSTS" in str(exc.value)
+
+
+def test_sandbox_mode_refuses_wildcard_allowed_host():
+    # `*` makes TrustedHostMiddleware answer for every hostname, which is the
+    # most public setting there is.
+    with pytest.raises(ValidationError) as exc:
+        Settings(mcp_sandbox_mode=True, allowed_hosts=["*"], secret_key=_SECRET, _env_file=None)
+    assert "ALLOWED_HOSTS" in str(exc.value)
+
+
+def test_sandbox_mode_with_defaults_still_boots():
+    settings = Settings(mcp_sandbox_mode=True, secret_key=_SECRET, _env_file=None)
+    assert settings.base_url == "http://localhost:8000"
+    assert settings.allowed_hosts == ["localhost"]
+
+
+@pytest.mark.parametrize("base_url", ["http://localhost:8000", "http://127.0.0.1:9000"])
+def test_sandbox_mode_with_loopback_base_url_still_boots(base_url):
+    settings = Settings(mcp_sandbox_mode=True, base_url=base_url, secret_key=_SECRET, _env_file=None)
+    assert settings.mcp_sandbox_mode is True
+
+
+def test_sandbox_mode_with_loopback_allowed_hosts_still_boots():
+    settings = Settings(
+        mcp_sandbox_mode=True,
+        allowed_hosts=["127.0.0.1", "::1"],
+        secret_key=_SECRET, _env_file=None,
+    )
+    assert settings.allowed_hosts == ["127.0.0.1", "::1", "localhost"]
+
+
+def test_public_hostname_without_sandbox_mode_is_unaffected():
+    settings = Settings(mcp_hostname="mcp.example.com", secret_key=_SECRET, _env_file=None)
+    assert settings.allowed_hosts == ["mcp.example.com", "localhost"]

@@ -414,8 +414,12 @@ is pennies a month.
   (kernel older than 5.6, or a blocking seccomp profile), pgvector older
   than 0.8.0 (`ALTER EXTENSION vector UPDATE`), or `EMBEDDING_DIMENSIONS`
   disagreeing with the live embedding column (`make reset-embeddings`).
-  A placeholder `SECRET_KEY`, and `MCP_SANDBOX_MODE` set together with a
-  public `MCP_HOSTNAME`, are refused the same way.
+  A placeholder `SECRET_KEY`, and `MCP_SANDBOX_MODE` set together with
+  any public route — `MCP_HOSTNAME`, a non-loopback `BASE_URL`, or a
+  non-loopback entry in `ALLOWED_HOSTS` — are refused the same way. A
+  `*` in `ALLOWED_ORIGINS` is refused outright, sandbox or not: CORS
+  runs with credentials enabled, so a wildcard origin would make the
+  server reflect any Origin.
 - Transfer links 404 in the browser. The reverse proxy is not forwarding
   `/transfer/*` — see Step 2 for the bundled Caddy config and the
   external-proxy notes above. If the tools themselves refuse to mint,
