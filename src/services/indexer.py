@@ -1,21 +1,31 @@
 import asyncio
+import contextlib
+import ctypes
+import errno
 import fnmatch
 import hashlib
 import logging
 import os
 import time
+from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import delete, func, literal, or_, select, text
+from sqlalchemy import delete, func, literal, or_, select, text, update
 from sqlalchemy.dialects.postgresql import insert
 
 from src.config import settings
 from src.database import async_session
 from src.models.db import NoteEmbedding, NoteLink, NoteMetadata, OAuthCode, OAuthToken, User
-from src.services.embeddings import embed_note
+from src.services.embeddings import (
+    StaleCertification,
+    certify_embedded,
+    embed_note,
+)
 from src.services.fts import index_tsvector_sql
 from src.services.links import build_vault_index, extract_links, resolve_target
+from src.services.transfer import canonical_vault_root
 from src.services.vault import (
     _vault_root,
     extract_tags,
@@ -88,44 +98,912 @@ def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# Index provenance (issue #91, migration 016)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The question this record answers is **"did the assignment change?"**, not
+# "is this the same directory?". The event it exists to detect is an operator
+# repointing a user at another vault, which is a change to a value this system
+# itself stores and writes; detecting that is exact and no input defeats it.
+# Proving directory identity across time is a different and unwinnable
+# question — a bit-identical clone of a filesystem presents the same inode
+# numbers, generation counters and therefore the same file handles, at the same
+# pathname, under the same assignment — and **filesystem substitution behind an
+# unchanged assignment is a declared non-goal**. Do not add a heuristic for it
+# (content overlap, path overlap, a mount identifier, a filesystem UUID): its
+# failure direction is a silent keep on two vaults that merely resemble each
+# other, and three review rounds rejected exactly that escalation.
+
+# Verdicts. Total over every combination of inputs; see `classify_provenance`.
+PROVENANCE_KEEP = "same_assignment"
+PROVENANCE_REDERIVE = "provenance_unresolved"
+PROVENANCE_DISCARD = "reassigned"
+PROVENANCE_INDETERMINATE = "indeterminate"
+
+# `struct file_handle`'s payload bound (linux/fs.h). A handle is at most this
+# many opaque bytes; on ext4 and xfs it is eight — the inode number plus the
+# inode's generation counter, which the kernel bumps precisely so a reused
+# inode is not mistaken for the old one.
+MAX_HANDLE_SZ = 128
+AT_EMPTY_PATH = 0x1000
+
+# The width of `users.indexed_vault_handle`. A token that will not fit is
+# treated as unobtainable — recorded NULL — never truncated: a truncated token
+# compared by byte equality is a signal that can produce a spurious match.
+HANDLE_COLUMN_CHARS = 320
+
+# How many offending paths an incomplete re-derive names before it summarises
+# the remainder. 013's and 015's offender-report shape.
+SKIP_REPORT_LIMIT = 20
+
+
+class _FileHandle(ctypes.Structure):
+    _fields_ = [
+        ("handle_bytes", ctypes.c_uint),
+        ("handle_type", ctypes.c_int),
+        ("f_handle", ctypes.c_ubyte * MAX_HANDLE_SZ),
+    ]
+
+
+def _resolve_name_to_handle_at():
+    """The glibc `name_to_handle_at` wrapper, or None if there is none.
+
+    **Wrapper-first and wrapper-only**, unlike `vault_fs`'s `renameat2` shim:
+    glibc has exported `name_to_handle_at` since 2.14 and it resolves on every
+    version this project runs on, so there is no raw-syscall fallback and no
+    architecture number table. A missing symbol is simply "no handle
+    available" — not an error, not a guess, and not a degraded mode.
+    """
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+    except OSError:  # pragma: no cover - no libc to bind against
+        return None
+    try:
+        fn = libc.name_to_handle_at
+    except AttributeError:  # pragma: no cover - glibc < 2.14
+        return None
+    fn.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.POINTER(_FileHandle),
+        ctypes.POINTER(ctypes.c_int),
+        ctypes.c_int,
+    ]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+_name_to_handle_at_cache: tuple | None = None
+
+
+def _name_to_handle_at_fn():
+    """Cached `_resolve_name_to_handle_at`; the lookup is per-process."""
+    global _name_to_handle_at_cache
+    if _name_to_handle_at_cache is None:
+        _name_to_handle_at_cache = (_resolve_name_to_handle_at(),)
+    return _name_to_handle_at_cache[0]
+
+
+def read_dir_handle(fd: int) -> str | None:
+    """An opaque `"<handle_type>:<hex>"` token for the pinned directory, or None.
+
+    **Best-effort hardening in the refusing direction only.** Where a handle is
+    recorded for a user *and* one can be read now, and the two differ, a
+    verdict that would otherwise be *keep* is demoted to *re-derive*. A
+    matching handle grants nothing. Every "no": `EOPNOTSUPP` (procfs, sysfs,
+    overlayfs and some FUSE mounts), `ENOSYS`, a missing symbol, an oversized
+    payload — all return None, record NULL, log nothing and change no verdict.
+
+    The token is **opaque**: compared by byte equality, never parsed, and
+    **never fed to `open_by_handle_at`**, which needs `CAP_DAC_READ_SEARCH`
+    that the container does not have. A handle is a value to compare, never a
+    door to open.
+
+    `mount_id` is deliberately ignored. It is not stable across a remount, and
+    the handle bytes for one directory are identical on the host and inside a
+    bind-mounting container whose `mount_id` differs.
+    """
+    fn = _name_to_handle_at_fn()
+    if fn is None:  # pragma: no cover - glibc always has it in practice
+        return None
+    fh = _FileHandle()
+    fh.handle_bytes = MAX_HANDLE_SZ
+    mount_id = ctypes.c_int()
+    ctypes.set_errno(0)
+    rc = fn(fd, b"", ctypes.byref(fh), ctypes.byref(mount_id), AT_EMPTY_PATH)
+    if rc != 0:
+        # The errno is read the way `vault_fs._renameat2_raw` reads it, and
+        # then deliberately **not** branched on. `EOPNOTSUPP`, `ENOSYS`,
+        # `EOVERFLOW` and anything else all mean the same thing here — no
+        # hardening signal for this root — and distinguishing them would only
+        # invite a degraded mode that the design does not have. Bound so a
+        # future reader sees the value was considered rather than dropped.
+        _errno = ctypes.get_errno()
+        del _errno
+        return None
+    size = int(fh.handle_bytes)
+    if size < 0 or size > MAX_HANDLE_SZ:  # pragma: no cover - kernel contract
+        return None
+    token = f"{int(fh.handle_type)}:{bytes(fh.f_handle[:size]).hex()}"
+    if len(token) > HANDLE_COLUMN_CHARS:  # pragma: no cover - 320 > any real handle
+        return None
+    return token
+
+
+def encode_realpath(realpath: str) -> str:
+    """`os.fsencode(realpath).hex()` — the form the record stores and compares.
+
+    A POSIX pathname is an arbitrary sequence of non-NUL bytes under no
+    obligation to be valid UTF-8, and Python decodes such a component with
+    `surrogateescape`, so `os.path.realpath` can return a string carrying a
+    lone surrogate like `'\\udcff'` that asyncpg cannot UTF-8-encode. The
+    discard branch writes this value *and* the delete in **one** transaction,
+    so an encode failure here would roll the delete back on every later pass
+    and serve the former vault's index forever — #91's own symptom, produced by
+    a value domain. Hex has no unrepresentable input, so the column is total
+    over the fact by construction rather than by a bound.
+
+    Comparison is **encode-then-compare on both sides**: never decode the
+    stored value in order to compare it. `decode_realpath` exists only to
+    render it in a log.
+    """
+    return os.fsencode(realpath).hex()
+
+
+def decode_realpath(stored: str) -> str:
+    """The inverse of `encode_realpath`, for **log rendering only**.
+
+    `os.fsdecode(bytes.fromhex(stored))` returns the observed string exactly,
+    surrogates included. Never call this to compare two provenances.
+    """
+    return os.fsdecode(bytes.fromhex(stored))
+
+
+@dataclass(frozen=True)
+class RootFacts:
+    """The three provenance facts, all observed at one moment from one pinned
+    descriptor.
+
+    `realpath` is kept beside `realpath_hex` for logging; only `realpath_hex`
+    is ever compared or stored.
+    """
+
+    assignment: str
+    realpath: str
+    realpath_hex: str
+    handle: str | None
+
+
+@dataclass(frozen=True)
+class Classification:
+    """One of the four verdicts, plus the human-readable reason for the log."""
+
+    verdict: str
+    reason: str
+
+
+@contextlib.contextmanager
+def pinned_root(vault: Path) -> Iterator[int]:
+    """Open the assigned root once and hold it for the pass.
+
+    **What the pin buys is deliberately narrow.** Within one pass, the facts
+    observed, the files discovered and the bytes read all come from **one
+    inode**, so a pass cannot record provenance describing a directory it did
+    not scan. It does **not** prove the pinned directory is the one earlier
+    rows came from; nothing proves that.
+
+    Observing facts through a pathname and then scanning that pathname is
+    check-then-act, and the interval is exploitable in both directions: an
+    assignment naming a symbolic link can be retargeted after the observation
+    and before the scan, so the pass indexes one directory and records another,
+    and retargeting it back before the following pass leaves that record
+    standing over rows the pass never derived from it. A directory descriptor
+    keeps naming the same directory however its pathname is later renamed or
+    relinked — which is why the mutation path is already anchored this way
+    (#59).
+
+    An unopenable root raises, which is the **indeterminate** verdict's
+    "nothing at all, and the pass fails": no delete, no record. That is a
+    change from the pathname-based scan, where `Path.rglob` on a missing
+    directory silently yielded nothing and the ordinary prune then deleted
+    every row the user had.
+    """
+    fd = os.open(vault, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def observe_root_facts(vault: Path, root_fd: int) -> RootFacts | None:
+    """The three facts for the pinned root, or None when they are indeterminate.
+
+    The realpath is bound to the descriptor the way #59's
+    `_require_same_directory` binds its root: `os.stat(os.path.realpath(vault))`
+    must report the same `(st_dev, st_ino)` as `os.fstat(root_fd)`. **That is
+    the only use of device and inode numbers in this design** — a
+    within-one-moment check that the realpath being recorded describes the
+    inode being pinned. They are never stored and never compared across passes,
+    because a reused inode makes two different directories agree.
+
+    A disagreement is *indeterminate*, not a mismatch: the root's pathname is
+    moving under the pass, and nothing observed can be trusted to describe what
+    was scanned.
+    """
+    try:
+        pinned = os.fstat(root_fd)
+        realpath = os.path.realpath(vault)
+        named = os.stat(realpath)
+    except OSError:
+        return None
+    if (named.st_dev, named.st_ino) != (pinned.st_dev, pinned.st_ino):
+        return None
+    return RootFacts(
+        assignment=canonical_vault_root(vault),
+        realpath=realpath,
+        realpath_hex=encode_realpath(realpath),
+        handle=read_dir_handle(root_fd),
+    )
+
+
+def classify_provenance(
+    recorded_assignment: str | None,
+    recorded_realpath_hex: str | None,
+    recorded_handle: str | None,
+    facts: RootFacts | None,
+) -> Classification:
+    """The six-row classification, total over every combination of inputs.
+
+    | observed vs. recorded | verdict |
+    | --- | --- |
+    | the root cannot be opened, or its realpath no longer names the pinned inode | **indeterminate** — nothing at all |
+    | no record present (both null, or a half-set record) | **re-derive** |
+    | assignment equal and realpath equal, no observable handle mismatch | **keep** |
+    | assignment equal and realpath equal, but the recorded and observed handles differ | **re-derive** |
+    | assignment differs **and** realpath differs | **discard** |
+    | exactly one of assignment and realpath differs | **re-derive** |
+
+    A record counts as **present** only when both the assignment string and the
+    realpath are non-null. Both are always observable for a root the pass could
+    pin, so a half-set record is drift rather than a state this code writes —
+    and the safe reading of drift is that nothing is known, not that the half
+    that is set may be trusted.
+
+    A handle mismatch is **observable** only when a handle is recorded *and*
+    one was read now. Either being absent means there is nothing to observe,
+    **not** a degraded mode: the pass decides on the other two facts, does not
+    re-derive on that account, and says nothing to the operator.
+
+    Which error this prefers, said plainly. Ambiguity never resolves toward
+    *keeping*, because silently wrong search results are the failure this
+    product ranks highest — an agent acts on them without a human seeing the
+    query. Ambiguity never resolves toward *discarding* either, because a
+    discard costs a full re-embed of the vault. Everything between goes to a
+    branch that asserts nothing and destroys nothing, and only **unanimous**
+    disagreement destroys.
+
+    This is the one function that computes "settled", so the scan and the gated
+    ancillary passes cannot come to mean two different things by it.
+    """
+    if facts is None:
+        return Classification(
+            PROVENANCE_INDETERMINATE,
+            "the assigned root could not be pinned, or its real path no longer "
+            "names the directory that was pinned",
+        )
+
+    present = recorded_assignment is not None and recorded_realpath_hex is not None
+    if not present:
+        half = recorded_assignment is not None or recorded_realpath_hex is not None
+        return Classification(
+            PROVENANCE_REDERIVE,
+            "a half-set provenance record is no record at all"
+            if half
+            else "no provenance is recorded for this user",
+        )
+
+    assignment_equal = recorded_assignment == facts.assignment
+    realpath_equal = recorded_realpath_hex == facts.realpath_hex
+
+    if assignment_equal and realpath_equal:
+        # The handle can refuse a keep. It can never establish one, and it can
+        # never establish a discard.
+        if (
+            recorded_handle is not None
+            and facts.handle is not None
+            and recorded_handle != facts.handle
+        ):
+            return Classification(
+                PROVENANCE_REDERIVE,
+                "the assignment and the real path agree but the recorded file "
+                "handle does not match the one read now — the directory was "
+                "probably replaced at the same path",
+            )
+        return Classification(
+            PROVENANCE_KEEP, "the assignment and the real path are unchanged"
+        )
+
+    if not assignment_equal and not realpath_equal:
+        return Classification(
+            PROVENANCE_DISCARD,
+            f"the assignment changed from {recorded_assignment!r} to "
+            f"{facts.assignment!r} and the real path changed with it",
+        )
+
+    if assignment_equal:
+        return Classification(
+            PROVENANCE_REDERIVE,
+            "the assignment is unchanged but the real path it names differs "
+            "from the one recorded",
+        )
+    return Classification(
+        PROVENANCE_REDERIVE,
+        f"the assignment changed from {recorded_assignment!r} to "
+        f"{facts.assignment!r} while the real path it names is unchanged",
+    )
+
+
+async def _read_recorded_provenance(session, user_id: int):
+    """`(assignment, realpath_hex, handle)` for a user, all None if no row."""
+    row = (
+        await session.execute(
+            select(
+                User.indexed_vault_assignment,
+                User.indexed_vault_realpath,
+                User.indexed_vault_handle,
+            ).where(User.id == user_id)
+        )
+    ).first()
+    if row is None:
+        return None, None, None
+    return row[0], row[1], row[2]
+
+
+async def _stamp_provenance(session, user_id: int, facts: RootFacts) -> int:
+    """Write **all three** facts, NULL for anything not observed.
+
+    There is no partial stamp. No branch may update one column and leave
+    another describing a root it does not describe — that single rule is what
+    makes a later observation safe to compare, because it can never be measured
+    against a root the stamp did not cover. In particular a stamp taken with no
+    handle available NULLs a previously recorded handle rather than leaving it
+    beside a freshly observed pathname pair.
+
+    Returns the number of rows the UPDATE touched. **Every caller checks it is
+    exactly one**: a stamp that wrote no row is a provenance record that does
+    not exist, and on the discard path the delete beside it must not stand
+    without it. Does not commit: the caller decides which transaction this
+    belongs to, and on the discard path that is emphatically the same one as
+    the delete.
+    """
+    result = await session.execute(
+        update(User)
+        .where(User.id == user_id)
+        .values(
+            indexed_vault_assignment=facts.assignment,
+            indexed_vault_realpath=facts.realpath_hex,
+            indexed_vault_handle=facts.handle,
+        )
+    )
+    return result.rowcount
+
+
+class ProvenanceRaceAborted(RuntimeError):
+    """The assignment moved between the classification and the act.
+
+    Raised by `_assert_still_assigned` when the locked, freshly read
+    `users.vault_path` no longer equals the assignment the classification was
+    computed against. Nothing has been deleted and nothing stamped; the pass
+    aborts and the next one reclassifies against whatever the row says then.
+    """
+
+
+class ProvenanceLockUnavailable(RuntimeError):
+    """Somebody else holds the `users` row, and we refused to wait for it.
+
+    Raised by `_assert_still_assigned(nowait=True)`. The tail stamp cannot
+    *wait* for that lock: it already holds this pass's `notes_metadata` row
+    locks, and a permanent user delete takes the parent first and then cascades
+    to exactly those children, so waiting closes a cycle and PostgreSQL aborts
+    one of the two — possibly the operator's delete. Withholding the stamp
+    costs one more re-derive; taking the deadlock costs an aborted pass or an
+    aborted panel action.
+    """
+
+
+# PostgreSQL SQLSTATE for `lock_not_available` — what `FOR UPDATE NOWAIT`
+# raises when the row is already locked. Matched on the code rather than on
+# asyncpg's exception class so the driver stays swappable.
+LOCK_NOT_AVAILABLE = "55P03"
+
+
+def _is_lock_not_available(exc: BaseException) -> bool:
+    """Whether `exc` (however many layers it is wrapped in) is 55P03.
+
+    The error arrives wrapped twice and the layers carry different things, the
+    same way `_log_usage`'s foreign-key recovery has to walk them: SQLAlchemy's
+    `.orig` is the asyncpg *dialect's* error and its `__cause__` is asyncpg's
+    own. Walk both chains and take the first SQLSTATE we find.
+    """
+    seen = set()
+    stack = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        code = getattr(current, "sqlstate", None) or getattr(current, "pgcode", None)
+        if code == LOCK_NOT_AVAILABLE:
+            return True
+        stack.extend(
+            [
+                getattr(current, "orig", None),
+                getattr(current, "__cause__", None),
+                getattr(current, "__context__", None),
+            ]
+        )
+    return False
+
+
+async def _assert_still_assigned(
+    session, user_id: int, facts: RootFacts, *, nowait: bool = False
+) -> None:
+    """Lock the user row and prove it still names the assignment we classified.
+
+    **The classification is not, by itself, a licence to act on it.** `facts`
+    is computed from a `vault` path that came out of the process cache, and the
+    branches that act on it — the discard's delete, and either provenance stamp
+    — run in a *later* transaction. In between, an administrator can reassign,
+    or correct a reassignment back to the root the index was actually built
+    from. The reviewer's failing input is the second one: the pass classifies A
+    against B as a discard, the administrator puts the assignment back to A,
+    and the discard then deletes a complete, valid A index and records
+    provenance B beside an empty one.
+
+    So the act is bound to the assignment that produced it. `SELECT … FOR
+    UPDATE` takes the row, and under READ COMMITTED the lock wait re-reads the
+    latest committed version, so what comes back is the assignment as of the
+    moment we hold it — not a snapshot taken before a concurrent commit. It is
+    held for the rest of the transaction, so the delete and the stamp beside it
+    cannot straddle a change either.
+
+    An inactive user, a deleted row, a cleared `vault_path` or a different one
+    all abort: none of them is the state the classification described.
+
+    **`nowait` is a lock-ordering requirement, not a tuning knob.** The discard
+    takes this lock in its own transaction *before* it touches a single child
+    row, which is the panel's own parent-then-child direction and therefore
+    safe to wait on. The re-derive's tail stamp cannot: it runs at the end of
+    the pass's transaction, holding `notes_metadata` row locks, and a permanent
+    user delete locks `users` first and then waits on exactly those children —
+    a cycle PostgreSQL resolves by aborting one side, possibly the operator's
+    delete. The tail therefore asks with `NOWAIT` inside a savepoint and treats
+    contention as "withhold the stamp", a state that branch already knows how
+    to be in.
+    """
+    statement = (
+        select(User.vault_path, User.is_active)
+        .where(User.id == user_id)
+        .with_for_update(nowait=nowait)
+    )
+    try:
+        row = (await session.execute(statement)).first()
+    except Exception as exc:
+        if nowait and _is_lock_not_available(exc):
+            raise ProvenanceLockUnavailable(
+                f"the users row for user_id={user_id} is locked by another "
+                "transaction, and this one already holds notes_metadata row "
+                "locks, so waiting for it could deadlock with a user deletion"
+            ) from None
+        raise
+    if row is None:
+        raise ProvenanceRaceAborted(
+            f"user_id={user_id} no longer exists"
+        )
+    if not row.is_active:
+        raise ProvenanceRaceAborted(
+            f"user_id={user_id} is no longer active"
+        )
+    if row.vault_path is None:
+        raise ProvenanceRaceAborted(
+            f"the vault assignment for user_id={user_id} has been cleared"
+        )
+    current = canonical_vault_root(row.vault_path)
+    if current != facts.assignment:
+        raise ProvenanceRaceAborted(
+            f"the vault assignment for user_id={user_id} is now "
+            f"{current!r}, not the {facts.assignment!r} this pass classified"
+        )
+
+
+async def classify_for_pass(session, user_id: int, vault: Path, root_fd: int):
+    """`(Classification, RootFacts | None, recorded_triple)` for a pinned root.
+
+    The one entry point the scan and both gated ancillary passes use, so
+    "settled" cannot come to mean two different things in two places. The
+    recorded triple comes back with it so a discard can log what it is
+    replacing without issuing a second SELECT.
+    """
+    facts = observe_root_facts(vault, root_fd)
+    recorded = await _read_recorded_provenance(session, user_id)
+    return classify_provenance(*recorded, facts), facts, recorded
+
+
+def describe_recorded(recorded) -> str:
+    """The recorded provenance as an operator reads it, in a log line.
+
+    The realpath is stored hex-encoded and is **decoded only here** — never in
+    order to compare it. `decode_realpath` is lossless, surrogates included, so
+    a pathname that cannot be spelled in UTF-8 still renders.
+    """
+    assignment, realpath_hex, handle = recorded
+    if assignment is None and realpath_hex is None:
+        return "no record"
+    try:
+        realpath = repr(decode_realpath(realpath_hex)) if realpath_hex else "none"
+    except ValueError:  # pragma: no cover - a hand-edited column
+        realpath = f"<undecodable: {realpath_hex!r}>"
+    return (
+        f"assignment={assignment!r} realpath={realpath} "
+        f"handle={handle if handle is not None else 'none'}"
+    )
+
+
+def _format_skips(skips: list[str]) -> str:
+    """013's and 015's offender-report shape: the first N, then a count."""
+    shown = skips[:SKIP_REPORT_LIMIT]
+    suffix = (
+        f", and {len(skips) - len(shown)} more"
+        if len(skips) > len(shown)
+        else ""
+    )
+    return ", ".join(shown) + suffix
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The anchored, read-only walk
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Deliberately **not** a `vault_fs` helper, and that is a design decision
+# rather than an ownership one. `vault_fs` is the *mutation* primitive module:
+# every helper in it writes or refuses, and its containment contract forbids a
+# symbolic link anywhere in the path, ever. The indexer needs the opposite leaf
+# policy and must keep it — a markdown file reached through a symbolic link is
+# indexed today. A shared helper would have to fork its symlink policy per
+# caller, and a future editor unifying the two forks would silently change
+# either what the index contains or what a transfer may write. Two walks with
+# two policies, in the two modules that own those policies.
+
+
+@dataclass(frozen=True)
+class DiscoveredFile:
+    """One discovered note, addressed by its **parent descriptor** and name.
+
+    The parent descriptor is open only while the consumer is being handed this
+    entry: the walk closes each directory once its children are done, so it
+    costs one descriptor per level of depth rather than one per file. Read the
+    file *now*, through `read_note_at`, or not at all.
+    """
+
+    rel: str
+    parent_fd: int
+    name: str
+
+
+def discover_markdown_files_at(
+    root_fd: int, *, skips: list[str] | None = None
+) -> Iterator[DiscoveredFile]:
+    """Walk the pinned root depth-first, yielding every indexable note.
+
+    The same rule `Path.rglob` applied, now enforced by the kernel per descent
+    rather than by a library's traversal habit:
+
+    - dot-directories are skipped (`.obsidian`, `.git`, `.trash`, `.smart-env`);
+    - directory symbolic links are **not** descended — `O_DIRECTORY |
+      O_NOFOLLOW` per descent, and the resulting `ELOOP`/`ENOTDIR` is a
+      deliberate non-descent, **not** a skip;
+    - a symbolic link at a discovered `.md` file is left alone here and read as
+      it is today (see `read_note_at`), because anchoring is about *which
+      directory is scanned* and must not change what the index contains.
+
+    A directory that could not be opened for any *other* reason is a genuine
+    skip and is appended to `skips` when one is supplied — a re-derive that
+    could not visit a subtree has not visited the root it is about to certify.
+    """
+
+    def walk(parent_fd: int, prefix: str) -> Iterator[DiscoveredFile]:
+        try:
+            with os.scandir(parent_fd) as entries:
+                children = list(entries)
+        except OSError as e:
+            if skips is not None:
+                skips.append(f"{prefix or '.'} (directory: {e})")
+            return
+        # Sorted so a pass's discovery order is stable, which keeps the
+        # offender report and the move-detection pairing reproducible.
+        for entry in sorted(children, key=lambda e: e.name):
+            name = entry.name
+            if name.startswith("."):
+                continue
+            rel = f"{prefix}/{name}" if prefix else name
+            try:
+                is_dir = entry.is_dir(follow_symlinks=False)
+            except OSError as e:  # pragma: no cover - dirent type is cached
+                if skips is not None:
+                    skips.append(f"{rel} ({e})")
+                continue
+            if is_dir:
+                try:
+                    child_fd = os.open(
+                        name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=parent_fd,
+                    )
+                except OSError as e:
+                    # ELOOP/ENOTDIR: a directory symbolic link, or a directory
+                    # that vanished. `rglob` declines to descend the former and
+                    # silently drops the latter; neither is a skip.
+                    if (
+                        e.errno not in (errno.ELOOP, errno.ENOTDIR, errno.ENOENT)
+                        and skips is not None
+                    ):
+                        skips.append(f"{rel} (directory: {e})")
+                    continue
+                try:
+                    yield from walk(child_fd, rel)
+                finally:
+                    os.close(child_fd)
+                continue
+            if not name.endswith(".md"):
+                continue
+            yield DiscoveredFile(rel=rel, parent_fd=parent_fd, name=name)
+
+    yield from walk(root_fd, "")
+
+
 def discover_markdown_files(vault: Path) -> dict[str, Path]:
     """Every indexable note under `vault`, as `vault-relative str -> abs Path`.
+
+    A thin pathname-taking wrapper over `discover_markdown_files_at`: it opens
+    the root, drains the walk and closes. Kept callable this way so
+    `tests/test_symlink_mutation_guard.py` — which asserts what discovery finds
+    under a symlinked folder — passes **unchanged**, which is how we know the
+    anchoring did not change what the index contains.
 
     This is the single definition of "what the index contains", so it also
     decides what `notes_metadata.file_path` holds — which the write tools must
     agree with. Two properties matter:
 
     - dot-directories are skipped (`.obsidian`, `.git`, `.trash`, …);
-    - `Path.rglob` does **not** descend directory symlinks, so a note under a
-      symlinked folder is discovered once, at its real path (`Real/A.md`), never
-      at the alias (`Shared/A.md`). `open_mutable` reports that same real path as
-      the target's `rel`, which is why `move_note` keys its DB updates on it.
+    - directory symbolic links are **not** descended, so a note under a
+      symlinked folder is discovered once, at its real path (`Real/A.md`),
+      never at the alias (`Shared/A.md`). `open_mutable` reports that same real
+      path as the target's `rel`, which is why `move_note` keys its DB updates
+      on it.
     """
-    files: dict[str, Path] = {}
-    for p in vault.rglob("*.md"):
-        rel = p.relative_to(vault)
-        if any(part.startswith(".") for part in rel.parts):
-            continue
-        files[str(rel)] = p
-    return files
+    with pinned_root(vault) as root_fd:
+        return {
+            found.rel: vault / found.rel
+            for found in discover_markdown_files_at(root_fd)
+        }
+
+
+def read_note_at(parent_fd: int, name: str) -> tuple[str, os.stat_result]:
+    """`(text, stat)` for one note, both from **one** open descriptor.
+
+    Deliberately **no** `O_NOFOLLOW` on the leaf: a symlinked `.md` is read
+    today and this change must not alter what the index contains. Containment
+    at the leaf was never claimed here and `open_mutable` remains the guard
+    that matters for writes.
+
+    The size and modification time come from `os.fstat` on the descriptor whose
+    bytes were just read, replacing a second, independent pathname resolution
+    that could describe a different file from the one that was hashed. Not the
+    reason for the anchoring; a free consequence of it.
+
+    Text mode with the default universal-newline translation, exactly as the
+    `Path.read_text` it replaces — a binary read would leave `\\r\\n` intact and
+    silently change every CRLF note's `content_hash`, forcing a re-embed.
+    """
+    fd = os.open(name, os.O_RDONLY | os.O_CLOEXEC, dir_fd=parent_fd)
+    try:
+        stat = os.fstat(fd)
+        with open(fd, "r", encoding="utf-8", errors="strict", closefd=False) as handle:
+            return handle.read(), stat
+    finally:
+        os.close(fd)
+
+
+def open_beneath(root_fd: int, rel_path: str) -> tuple[int, str]:
+    """`(parent_fd, name)` for a vault-relative path beneath the pinned root.
+
+    For the passes that read a note the database already named rather than one
+    a walk just discovered. Descends with the walk's rule — `O_DIRECTORY |
+    O_NOFOLLOW` per component — and leaves the leaf alone, so a symlinked `.md`
+    still reads. The caller owns `parent_fd` and must close it.
+    """
+    parts = [p for p in rel_path.split("/") if p and p != "."]
+    if not parts or any(p == ".." for p in parts):
+        raise OSError(f"not a vault-relative path: {rel_path!r}")
+    fd = os.open(".", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC, dir_fd=root_fd)
+    try:
+        for part in parts[:-1]:
+            child = os.open(
+                part,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=fd,
+            )
+            os.close(fd)
+            fd = child
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd, parts[-1]
+
+
+def read_note_beneath(root_fd: int, rel_path: str) -> tuple[str, os.stat_result]:
+    """`read_note_at` for a path the caller names rather than one it walked."""
+    parent_fd, name = open_beneath(root_fd, rel_path)
+    try:
+        return read_note_at(parent_fd, name)
+    finally:
+        os.close(parent_fd)
+
+
+async def _reconcile_provenance(
+    user_id: int, vault: Path, root_fd: int, log_suffix: str
+) -> tuple[bool, RootFacts | None]:
+    """Classify the pinned root and act, **before any file under it is read**.
+
+    Returns `(re_derive, facts)`. `facts` is what a later stamp must write; it
+    is None only when there is nothing to stamp.
+
+    - **keep** — nothing at all, and nothing to stamp.
+    - **discard** — delete the user's `notes_metadata` (embeddings cascade,
+      links cascade on `source_note_id` and null out on `target_note_id`) and
+      stamp the new provenance **in one committed transaction**, so no pass can
+      leave rows from one vault beside a record naming another. That
+      transaction first locks the `users` row and proves it still names the
+      assignment this verdict was computed against (`_assert_still_assigned`),
+      because the classification ran earlier, against a cached root, and an
+      administrator correcting a reassignment back in between would otherwise
+      have a valid index deleted underneath them. The pass then indexes the new
+      root ordinarily: the index is empty, so there is nothing to re-derive,
+      and a pass that fails after this retries cleanly because the next one
+      finds both facts in agreement.
+    - **re-derive** — no delete and no stamp here; the stamp is withheld until
+      the pass has finished, and only if it raised nothing *and* skipped
+      nothing.
+    - **indeterminate** — nothing at all, and the pass fails, because an index
+      cannot be re-derived from a directory that cannot be read and destroying
+      one because a bind mount was briefly unavailable buys nothing and costs
+      the full re-embed.
+    """
+    async with async_session() as session:
+        classification, facts, recorded = await classify_for_pass(
+            session, user_id, vault, root_fd
+        )
+
+    if classification.verdict == PROVENANCE_INDETERMINATE:
+        raise RuntimeError(
+            f"Index provenance indeterminate{log_suffix}: {classification.reason}. "
+            "Nothing was deleted and no provenance was recorded."
+        )
+
+    if classification.verdict == PROVENANCE_KEEP:
+        return False, None
+
+    assert facts is not None  # every non-indeterminate verdict observed them
+
+    if classification.verdict == PROVENANCE_DISCARD:
+        async with async_session() as session:
+            # **The delete is bound to the assignment that produced the
+            # verdict, not merely to the user.** The classification was
+            # computed in an earlier transaction against a root that came out
+            # of the process cache; between then and here an administrator can
+            # have corrected the reassignment back, and the delete would then
+            # destroy a complete, valid index for the assignment the row
+            # currently names. Lock the row, re-read it, and abort on any
+            # disagreement — nothing deleted, nothing stamped, and the next
+            # pass reclassifies against whatever the row says then.
+            try:
+                await _assert_still_assigned(session, user_id, facts)
+            except ProvenanceRaceAborted as exc:
+                await session.rollback()
+                logger.warning(
+                    "Discard aborted%s: %s. Nothing was deleted and no "
+                    "provenance was recorded; the next pass will reclassify.",
+                    log_suffix,
+                    exc,
+                )
+                raise RuntimeError(
+                    f"Index provenance discard aborted{log_suffix}: {exc}. "
+                    "Nothing was deleted and no provenance was recorded."
+                ) from None
+            result = await session.execute(
+                delete(NoteMetadata).where(NoteMetadata.user_id == user_id)
+            )
+            stamped = await _stamp_provenance(session, user_id, facts)
+            if stamped != 1:
+                # The stamp must land on exactly the row we locked. Zero rows
+                # means the record does not exist, and a delete standing beside
+                # a missing record is the "rows from one vault beside a record
+                # naming another" this branch exists to make impossible.
+                await session.rollback()
+                raise RuntimeError(
+                    f"Index provenance discard aborted{log_suffix}: the "
+                    f"provenance stamp for user_id={user_id} matched "
+                    f"{stamped} row(s), not exactly one. Nothing was deleted "
+                    "and no provenance was recorded."
+                )
+            await session.commit()
+        logger.warning(
+            "Vault reassignment detected%s: %s. Discarded %s notes_metadata "
+            "row(s) (embeddings and links cascade). Was [%s]; now recorded "
+            "[assignment=%r realpath=%r handle=%s].",
+            log_suffix,
+            classification.reason,
+            result.rowcount,
+            describe_recorded(recorded),
+            facts.assignment,
+            facts.realpath,
+            facts.handle if facts.handle is not None else "none",
+        )
+        return False, facts
+
+    logger.info(
+        "Re-deriving index%s: %s. Every discovered file will be re-parsed and "
+        "every link row re-extracted; note_embeddings are kept.",
+        log_suffix,
+        classification.reason,
+    )
+    return True, facts
 
 
 async def index_vault(user_id: int | None = None):
     """Scan vault, upsert notes_metadata with tsvector, remove deleted files.
 
     Single-user mode (`user_id is None`) keeps the legacy behavior: queries
-    and inserts do not filter by `user_id` (NULL passes through every guard).
-    Multi-user mode (`user_id` int) scopes existing-row lookups and stamps
-    `user_id` on every upserted row.
+    and inserts do not filter by `user_id` (NULL passes through every guard),
+    and the index-provenance record is neither read nor written — single-user
+    mode has no `users` row. Multi-user mode (`user_id` int) scopes
+    existing-row lookups, stamps `user_id` on every upserted row, and
+    reconciles the provenance record at the head of the pass.
+
+    **The whole pass runs beneath one pinned root descriptor** (`pinned_root`):
+    the facts observed, the files discovered and the bytes read all come from
+    one inode, so a pass cannot record provenance describing a directory it did
+    not scan. The reconciliation lives here rather than in any one caller, so
+    the startup pass, the periodic tick and an operator-triggered reindex all
+    inherit it.
     """
     vault = _vault_root(user_id)
     log_suffix = f" (user_id={user_id})" if user_id is not None else ""
     logger.info(f"Starting vault index scan...{log_suffix}")
 
-    # Collect all .md files (skip dot-dirs)
-    files = discover_markdown_files(vault)
+    with pinned_root(vault) as root_fd:
+        await _index_vault_pinned(user_id, vault, root_fd, log_suffix)
 
-    logger.info(f"Found {len(files)} markdown files{log_suffix}")
+
+async def _index_vault_pinned(
+    user_id: int | None, vault: Path, root_fd: int, log_suffix: str
+):
+    re_derive = False
+    facts: RootFacts | None = None
+    if user_id is not None:
+        re_derive, facts = await _reconcile_provenance(
+            user_id, vault, root_fd, log_suffix
+        )
+
+    # Anything the pass discovered but could not fully process. **A non-empty
+    # list makes a re-derive incomplete and withholds the stamp** (A.7a): the
+    # re-derive's whole claim is that every surviving row was written by this
+    # pass from a file under the assigned root, and one skipped path falsifies
+    # it — the ordinary prune keeps a row whose relative path exists under the
+    # new root, which is exactly the row a re-derive exists to replace. The
+    # repairs are still performed; only the certification is withheld.
+    skips: list[str] = []
 
     async with async_session() as session:
         # Get existing hashes (scoped to this user when set)
@@ -140,44 +1018,74 @@ async def index_vault(user_id: int | None = None):
         # Determine changes
         to_upsert = []
         # Body text parsed during this scan, keyed by rel_path. The tsvector
-        # loop below reuses these instead of re-reading from disk — a concurrent
-        # delete between the two passes would otherwise raise FileNotFoundError
-        # and leave the just-committed row's content_tsvector null/stale.
+        # loop and the link rebuild below both reuse these instead of
+        # re-reading from disk — a concurrent delete between the passes would
+        # otherwise raise FileNotFoundError and leave the just-committed row's
+        # content_tsvector null/stale, or silently drop that note's links while
+        # the row the scan wrote stands.
+        #
+        # Memory shape, because re-derive mode changes it: an ordinary pass
+        # buffers only the *changed* notes' parsed bodies, while a re-deriving
+        # pass treats every note as changed and therefore holds the whole
+        # vault's parsed bodies for the duration of the pass.
         path_to_content: dict[str, str] = {}
-        for rel_path, full_path in files.items():
-            try:
-                raw = full_path.read_text(encoding="utf-8", errors="strict")
-            except UnicodeDecodeError:
-                logger.warning(f"Skipping non-UTF8 file: {rel_path}")
-                continue
-            except Exception as e:
-                logger.warning(f"Failed to read {rel_path}: {e}")
-                continue
+        # The set of discovered relative paths, accumulated as the walk yields
+        # them. Discovery is a generator rather than a dict so the walk can
+        # close each directory once its children are done — one descriptor per
+        # level of depth, not one per file — which means each file must be read
+        # *now*, while its parent descriptor is open.
+        seen: set[str] = set()
+        walk = discover_markdown_files_at(root_fd, skips=skips)
+        with contextlib.closing(walk):
+            for found in walk:
+                rel_path = found.rel
+                seen.add(rel_path)
+                try:
+                    raw, stat = read_note_at(found.parent_fd, found.name)
+                except UnicodeDecodeError:
+                    logger.warning(f"Skipping non-UTF8 file: {rel_path}")
+                    skips.append(f"{rel_path} (not valid UTF-8)")
+                    continue
+                except Exception as e:
+                    logger.warning(f"Failed to read {rel_path}: {e}")
+                    skips.append(f"{rel_path} ({e})")
+                    continue
 
-            h = _content_hash(raw)
-            if rel_path in existing and existing[rel_path] == h:
-                continue  # No change
+                h = _content_hash(raw)
+                # **Content-hash change detection is disabled under a
+                # re-derive**, so every discovered file is parsed and upserted
+                # regardless of its hash — which is also what makes every note
+                # "changed" for the link rebuild below, and therefore what
+                # deletes and re-extracts every one of this user's link rows.
+                if not re_derive and rel_path in existing and existing[rel_path] == h:
+                    continue  # No change
 
-            frontmatter, content = parse_frontmatter(raw)
-            path_to_content[rel_path] = content
-            title = frontmatter.get("title") or full_path.stem
-            tags = extract_tags(raw, frontmatter)
-            stat = full_path.stat()
+                try:
+                    frontmatter, content = parse_frontmatter(raw)
+                    tags = extract_tags(raw, frontmatter)
+                except Exception as e:
+                    logger.warning(f"Failed to parse {rel_path}: {e}")
+                    skips.append(f"{rel_path} (parse: {e})")
+                    continue
+                path_to_content[rel_path] = content
+                title = frontmatter.get("title") or os.path.splitext(found.name)[0]
 
-            to_upsert.append({
-                "user_id": user_id,
-                "file_path": rel_path,
-                "title": title,
-                "tags": tags,
-                "frontmatter": _sanitize_frontmatter(frontmatter),
-                "content_hash": h,
-                "file_size": stat.st_size,
-                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
-            })
+                to_upsert.append({
+                    "user_id": user_id,
+                    "file_path": rel_path,
+                    "title": title,
+                    "tags": tags,
+                    "frontmatter": _sanitize_frontmatter(frontmatter),
+                    "content_hash": h,
+                    "file_size": stat.st_size,
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+                })
+
+        logger.info(f"Found {len(seen)} markdown files{log_suffix}")
 
         # Compute deleted paths up front so the move-detection block can
         # repair them before the delete/insert pipeline tears them apart.
-        deleted_paths = set(existing.keys()) - set(files.keys())
+        deleted_paths = set(existing.keys()) - seen
 
         # ── Move detection ────────────────────────────────────────────────
         # An external move (file dragged in Obsidian) looks like
@@ -204,10 +1112,28 @@ async def index_vault(user_id: int | None = None):
         moved_new_paths: set[str] = set()
         if moves:
             user_clause = "user_id IS NULL" if user_id is None else "user_id = :uid"
+            # `embedded_content_hash = NULL` for the same reason `move_note`
+            # clears it: the certification records that this row's *current
+            # content* has been dealt with, and the exclusion branch decides
+            # how by matching `embedding_exclude_patterns` against
+            # `file_path`. A move changes that answer without changing any
+            # content, so carrying the stamp across it freezes the old decision
+            # forever — the embedding pass selects on
+            # `embedded_content_hash != content_hash`, which a preserved stamp
+            # makes false. A note moved out of an excluded folder would stay
+            # included with no vectors and never be selected again; one moved
+            # into an excluded folder would stay searchable. NULL means
+            # "re-evaluate at the next pass", which is the whole repair and
+            # costs an embedding call only for a note that is then included.
+            #
+            # This is the *id-preserving* move path, and that is exactly why it
+            # needs the clause: the ordinary prune-and-upsert path replaces the
+            # row, so a moved note reached through it starts from NULL anyway.
             move_upd_sql = (
                 "UPDATE notes_metadata "
                 "SET file_path = :new, file_size = :size, "
-                "modified_at = :mtime, indexed_at = now() "
+                "modified_at = :mtime, indexed_at = now(), "
+                "embedded_content_hash = NULL "
                 f"WHERE file_path = :old AND {user_clause}"
             )
             # Rewrite stored `target_path` strings that referenced the old
@@ -307,7 +1233,11 @@ async def index_vault(user_id: int | None = None):
                 # Reuse the body parsed during the scan loop above instead of
                 # re-reading from disk; a concurrent delete between the passes
                 # would otherwise leave content_tsvector null/stale (issue #18).
+                # A changed path with no buffered body is a skip, not a silent
+                # `continue`: it leaves a row whose keyword vector this pass did
+                # not write, which a re-derive must not certify.
                 if path not in path_to_content:
+                    skips.append(f"{path} (no buffered body for the keyword vector)")
                     continue
                 content = path_to_content[path]
                 try:
@@ -347,6 +1277,93 @@ async def index_vault(user_id: int | None = None):
                 vault,
                 [n["file_path"] for n in to_upsert] + list(moved_new_paths),
                 user_id=user_id,
+                path_to_content=path_to_content,
+                skips=skips,
+            )
+
+        # ── The tail stamp ────────────────────────────────────────────────
+        # Written where the state it describes is established. On the re-derive
+        # branch that state is "every surviving row was derived from this
+        # root", which is not true until the pass has finished — so the stamp
+        # is issued after the pass's last write and **only if it skipped
+        # nothing**. Head-stamping a re-derive would be exactly the false
+        # provenance this record exists to prevent, written by our own code
+        # instead of by a migration.
+        #
+        # Committing it with the pass's own writes rather than afterwards makes
+        # a crash mid-repair leave the previous record untouched, so the next
+        # pass repairs again: bounded, idempotent, and never a stamp over a
+        # half-repaired index.
+        if re_derive and facts is not None:
+            if skips:
+                logger.warning(
+                    "Re-derive incomplete%s: %d discovered path(s) were not "
+                    "fully processed, so no provenance was recorded and the "
+                    "next pass will re-derive again. Offenders: %s",
+                    log_suffix,
+                    len(skips),
+                    _format_skips(skips),
+                )
+            else:
+                # The same binding as the discard's, for the same reason: this
+                # stamp is provenance too, and a record written under an
+                # assignment the row no longer names is exactly the false
+                # provenance the record exists to prevent. It is withheld
+                # rather than fatal — the re-derive's repairs are still
+                # correct for the root they were read from, nothing was
+                # destroyed, and an unrecorded provenance simply makes the next
+                # pass re-derive again.
+                # **Inside a savepoint, and with `NOWAIT`.** This transaction
+                # already holds `notes_metadata` row locks, and a permanent
+                # user delete locks `users` first and then cascades onto
+                # exactly those rows — so *waiting* here closes a deadlock
+                # cycle that PostgreSQL breaks by aborting one side, possibly
+                # the operator's delete. The savepoint is what makes the
+                # refusal survivable: a failed statement poisons its
+                # transaction, so without one the pass would lose every repair
+                # it had just made rather than merely its stamp.
+                stamped = None
+                try:
+                    async with session.begin_nested():
+                        await _assert_still_assigned(
+                            session, user_id, facts, nowait=True
+                        )
+                        stamped = await _stamp_provenance(session, user_id, facts)
+                except ProvenanceLockUnavailable as exc:
+                    logger.warning(
+                        "Re-derive complete but not recorded%s: %s. The "
+                        "repairs are committed; the next pass will re-derive "
+                        "again and stamp then.",
+                        log_suffix,
+                        exc,
+                    )
+                except ProvenanceRaceAborted as exc:
+                    logger.warning(
+                        "Re-derive complete but not recorded%s: %s. The next "
+                        "pass will reclassify and re-derive again.",
+                        log_suffix,
+                        exc,
+                    )
+                else:
+                    if stamped != 1:
+                        raise RuntimeError(
+                            f"Re-derive stamp{log_suffix} matched {stamped} "
+                            f"row(s) for user_id={user_id}, not exactly one."
+                        )
+                    logger.info(
+                        "Re-derive complete%s: recorded provenance "
+                        "assignment=%r realpath=%r handle=%s",
+                        log_suffix,
+                        facts.assignment,
+                        facts.realpath,
+                        facts.handle if facts.handle is not None else "none",
+                    )
+        elif skips:
+            logger.warning(
+                "%d discovered path(s) were not fully processed%s: %s",
+                len(skips),
+                log_suffix,
+                _format_skips(skips),
             )
 
         # Metadata hashes, keyword vectors, deletions, and link rows describe
@@ -363,6 +1380,8 @@ async def _update_links_for_changed(
     vault: Path,
     changed_paths: list[str],
     user_id: int | None = None,
+    path_to_content: dict[str, str] | None = None,
+    skips: list[str] | None = None,
 ):
     """Re-extract and upsert links for the given changed paths.
 
@@ -374,7 +1393,20 @@ async def _update_links_for_changed(
     In multi-user mode the vault_index is scoped to `user_id` so a user's
     wikilinks cannot resolve to another user's note (they share the same
     `file_path` string but live in distinct `notes_metadata.id`s).
+
+    **This reads no file.** It used to re-read each changed note from disk,
+    which was both a second read of bytes the scan had already parsed and a
+    second window in which the file could change or vanish — a disappearance
+    between the scan and the rebuild silently dropped that note's links while
+    the row the scan wrote stood. It now extracts from `path_to_content`, the
+    buffer the scan already fills for the tsvector loop, which holds exactly
+    the post-frontmatter body `extract_links` consumes. A changed path missing
+    from the buffer is recorded in `skips` rather than silently passed over: it
+    means a link row this pass was supposed to write is absent.
+
+    `vault` is retained in the signature and is deliberately unused for reads.
     """
+    bodies = path_to_content if path_to_content is not None else {}
     # Build vault_index once for the entire pass — scoped to this user when set.
     vi_stmt = select(NoteMetadata.file_path, NoteMetadata.id)
     if user_id is None:
@@ -396,13 +1428,24 @@ async def _update_links_for_changed(
             for path in changed_paths:
                 src_id = paths_to_id.get(path)
                 if src_id is None:
+                    # Practically unreachable — the index is selected after the
+                    # upsert, in this same transaction — but it is a link
+                    # extraction that did not happen, and A.7a's rule is that
+                    # *any* such skip withholds the re-derive's certification.
+                    # Its sibling below records one; recording only one of the
+                    # two would leave the one branch that can drop a link row
+                    # while still stamping "every link row was written by this
+                    # pass".
+                    if skips is not None:
+                        skips.append(
+                            f"{path} (no index row for the link rebuild)"
+                        )
                     continue
-                full_path = vault / path
-                try:
-                    raw = full_path.read_text(encoding="utf-8", errors="strict")
-                except (UnicodeDecodeError, FileNotFoundError, OSError):
+                content = bodies.get(path)
+                if content is None:
+                    if skips is not None:
+                        skips.append(f"{path} (no buffered body for the link rebuild)")
                     continue
-                _, content = parse_frontmatter(raw)
                 for link in extract_links(content):
                     target_id = resolve_target(link.target, path, vault_index)
                     new_rows.append({
@@ -480,6 +1523,60 @@ async def _update_links_for_changed(
         await session.execute(text(reresolve_sql), params)
 
 
+async def _ancillary_pass_is_permitted(
+    session, user_id: int | None, vault: Path, root_fd: int, label: str
+) -> bool:
+    """May this unverified ancillary pass write rows for this user?
+
+    **Only on the `same assignment` verdict.** The one-shot link backfill and
+    the keyword-vector rebuild both read `vault / file_path` and write rows the
+    provenance is a claim about — `note_links`, `content_tsvector` — with **no
+    verification of any kind** that the bytes they read belong to the row they
+    write against. And neither may assume the scan settled that claim a moment
+    ago: a user whose notes contain no links leaves the link backfill eligible
+    on *every* startup, and a reassignment can commit between the scan and
+    either of them. Allowing them to write under an unresolved provenance is
+    exactly what lets a link row extracted from one root be committed against a
+    metadata row from another.
+
+    Verification is not merely unimplemented in those two. A link row's
+    *resolution* is a function of the whole set of notes under a root rather
+    than of one file's bytes, so no per-file check could license the backfill.
+    The keyword rebuild could in principle be verified the way the embedding
+    pass is, and is still gated, because nothing records what a tsvector was
+    built from — there is no keyword analogue of `embedded_content_hash`, so a
+    vector built from foreign bytes leaves no evidence a later pass could act
+    on.
+
+    Skipping costs them nothing even for a user whose provenance never settles:
+    the re-derive branch does both of their jobs itself on every pass. So this
+    is a delay, never a loss.
+
+    **`embed_vault` is deliberately not gated** — see its own docstring. Its
+    hash verification makes it safe by construction, and gating it composes
+    with the completeness rule into indefinite staleness.
+
+    The skip is **per user**: one unsettled user must not stop the pass for
+    everybody else. Single-user mode has no `users` row and is ungated, exactly
+    as it behaves today.
+    """
+    if user_id is None:
+        return True
+    classification, _facts, _recorded = await classify_for_pass(
+        session, user_id, vault, root_fd
+    )
+    if classification.verdict == PROVENANCE_KEEP:
+        return True
+    logger.info(
+        "%s skipped for user_id=%s: provenance is not settled (%s). No row was "
+        "written for this user; the next index pass will settle it.",
+        label,
+        user_id,
+        classification.reason,
+    )
+    return False
+
+
 async def link_backfill_pass(user_id: int | None = None):
     """One-shot backfill that populates `note_links` for every note.
 
@@ -492,7 +1589,18 @@ async def link_backfill_pass(user_id: int | None = None):
     """
     global link_backfill_in_progress
     vault = _vault_root(user_id)
+    with pinned_root(vault) as root_fd:
+        await _link_backfill_pinned(user_id, vault, root_fd)
+
+
+async def _link_backfill_pinned(user_id: int | None, vault: Path, root_fd: int):
+    global link_backfill_in_progress
     async with async_session() as session:
+        if not await _ancillary_pass_is_permitted(
+            session, user_id, vault, root_fd, "Link backfill"
+        ):
+            return
+
         # Completion is inferred per user, never from the global table. The
         # rebuild itself commits atomically below, so any visible row proves a
         # prior pass for this scope completed (a zero-link vault is harmlessly
@@ -531,10 +1639,9 @@ async def link_backfill_pass(user_id: int | None = None):
             )
             buffer: list[dict] = []
             for i, row in enumerate(rows, start=1):
-                full_path = vault / row.file_path
                 try:
-                    raw = full_path.read_text(encoding="utf-8", errors="strict")
-                except (UnicodeDecodeError, FileNotFoundError, OSError):
+                    raw, _stat = read_note_beneath(root_fd, row.file_path)
+                except (UnicodeDecodeError, OSError):
                     continue
                 _, content = parse_frontmatter(raw)
                 for link in extract_links(content):
@@ -570,11 +1677,45 @@ async def embed_vault(user_id: int | None = None):
     embeddings go into `note_embeddings`, which inherits user scope via its
     `note_id` FK back to `notes_metadata`. No `user_id` column on
     `note_embeddings` itself.
+
+    **This pass is deliberately NOT gated on settled provenance, and it
+    verifies every hash it certifies. The two halves are one decision.**
+
+    Gating it was specified first and was wrong, because the two rules it would
+    sit between compose into indefinite staleness. A permanently unreadable
+    file withholds the provenance record forever — by design, so that nothing
+    certifies a root the pass could not fully visit — and the gate would turn
+    that withheld record into a permanent refusal to embed *anything* for that
+    user. Meanwhile the scan keeps working: a readable note the user edits gets
+    a fresh `content_hash` on every pass while its `note_embeddings` still hold
+    the chunk text of the content it used to have, and `semantic_search` reads
+    `chunk_text` with **no** `embedded_content_hash = content_hash` guard. One
+    unreadable file would have converted that user's semantic search into a
+    silently wrong one, indefinitely, for an agent consumer that acts on the
+    result without a human ever seeing the query.
+
+    Running ungated is sound only because of the verification below, and the
+    argument is exact. The gate existed to stop a pass writing a row derived
+    from one root against a metadata row derived from another. An embedding is
+    a **pure function of content**, and the verification refuses to embed any
+    bytes that do not hash to the `content_hash` the selected row records — so
+    a chunk vector is written against a row only when the bytes it was built
+    from are the bytes that row describes, and which directory supplied them is
+    not a fact the vector depends on. Under a wrong root the hashes disagree
+    and the pass skips.
+
+    Reads are anchored beneath a root this pass pins itself, for the same
+    within-pass-consistency reason the scan pins one.
     """
     vault = _vault_root(user_id)
     log_suffix = f" (user_id={user_id})" if user_id is not None else ""
     logger.info(f"Starting embedding pass...{log_suffix}")
 
+    with pinned_root(vault) as root_fd:
+        await _embed_vault_pinned(user_id, root_fd, log_suffix)
+
+
+async def _embed_vault_pinned(user_id: int | None, root_fd: int, log_suffix: str):
     async with async_session() as session:
         # Find notes without embeddings or with stale embeddings, scoped
         # to this user when set. We bind the user_id parameter even in
@@ -624,26 +1765,67 @@ async def embed_vault(user_id: int | None = None):
                 # configured) and stamp embedded_content_hash so the indexer
                 # doesn't keep re-checking it.
                 if any(fnmatch.fnmatch(row.file_path, pat) for pat in exclude_patterns):
-                    await session.execute(
-                        delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
+                    # **Certified exactly like the embedding path, and for the
+                    # same reason.** This branch used to stamp by `id` alone,
+                    # which made it the one way to mark a row embedded without
+                    # proving the row still describes what was decided about:
+                    # a `move_note` out of an excluded folder commits a new
+                    # `file_path` with an unchanged `content_hash`, so a stale
+                    # decision taken against `Private/A.md` deleted the vectors
+                    # and stamped `Public/A.md` as embedded with none. Included,
+                    # hash-equal, and therefore never selected again —
+                    # permanently absent from `semantic_search`. The predicate
+                    # includes the path, so the moved row matches nothing and
+                    # `StaleCertification` rolls the whole note back.
+                    #
+                    # Stamp first, delete second: the conditional UPDATE is what
+                    # takes the row lock, so nothing is dropped on the strength
+                    # of a row that has since moved.
+                    await certify_embedded(
+                        session, row.id, row.content_hash, row.file_path
                     )
                     await session.execute(
-                        text(
-                            "UPDATE notes_metadata SET embedded_content_hash = :h "
-                            "WHERE id = :i"
-                        ),
-                        {"h": row.content_hash, "i": row.id},
+                        delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
                     )
                     await session.commit()
                     skipped_excluded += 1
                     continue
 
-                full_path = vault / row.file_path
                 try:
-                    raw = full_path.read_text(encoding="utf-8", errors="strict")
+                    raw, _stat = read_note_beneath(root_fd, row.file_path)
                 except UnicodeDecodeError:
                     logger.warning(f"Skipping non-UTF8 file: {row.file_path}")
                     continue
+
+                # ── Verify the hash before certifying it ──────────────────
+                # `embed_note` marks a row embedded by copying the **row's**
+                # `content_hash`, not a hash of the bytes it just embedded. So
+                # a file that differs from its row at embedding time would be
+                # embedded and then permanently marked as embedded for a hash
+                # it does not have, and nothing would ever re-embed it.
+                #
+                # This check does two load-bearing jobs. It is what makes the
+                # re-derive branch's retention of `note_embeddings` sound —
+                # that branch keeps a vector *because* a matching content hash
+                # proves it is the right vector for that file. And it is the
+                # **entire licence** for this pass running ungated on
+                # provenance (see the docstring): refusing bytes that do not
+                # hash to the selected row's `content_hash` means the vector
+                # and the row describe the same content whatever directory
+                # supplied the bytes.
+                #
+                # Anyone removing this must re-gate `embed_vault` on settled
+                # provenance in the same change.
+                if _content_hash(raw) != row.content_hash:
+                    logger.info(
+                        "Skipping %s: its bytes no longer hash to the indexed "
+                        "content_hash, so nothing may be certified against that "
+                        "row. A later pass will embed it once the scan has "
+                        "refreshed the row.",
+                        row.file_path,
+                    )
+                    continue
+
                 _, content = parse_frontmatter(raw)
 
                 # Get the NoteMetadata object
@@ -652,12 +1834,39 @@ async def embed_vault(user_id: int | None = None):
                 )
                 note = note_result.scalar_one()
 
-                chunks = await embed_note(session, note, content)
+                # ── Certify against what was verified, not what was re-read ──
+                # The `select` above is a *second* database read, in a later
+                # transaction than the one that produced `row`, so it can
+                # return a hash another pass has committed since the bytes were
+                # verified. Copying that value onto vectors built from `row`'s
+                # content marked the row embedded for content it does not have,
+                # and the resulting equality then blocked every later repair —
+                # permanently wrong semantic results for an agent that acts on
+                # them unseen. So the hash and path the bytes were verified
+                # against are handed down explicitly: `embed_note` stamps them
+                # with a conditional, row-locking UPDATE before it replaces a
+                # single vector, and raises `StaleCertification` if the row has
+                # moved.
+                chunks = await embed_note(
+                    session,
+                    note,
+                    content,
+                    certified_hash=row.content_hash,
+                    certified_path=row.file_path,
+                )
                 total_chunks += chunks
                 await session.commit()
 
                 if (i + 1) % 50 == 0:
                     logger.info(f"Embedded {i + 1}/{len(unembedded)} notes ({total_chunks} chunks)")
+            except StaleCertification as e:
+                # Not a failure of this note, and not a hole in the index: the
+                # row moved between the byte verification and the
+                # certification, so the vectors in hand describe content the
+                # row no longer claims. Discard them, leave the row unmarked,
+                # and let a later pass embed it as it then stands.
+                logger.info("Skipping %s: %s", row.file_path, e)
+                await session.rollback()
             except Exception as e:
                 logger.warning(f"Failed to embed {row.file_path}: {e}")
                 await session.rollback()
@@ -683,9 +1892,28 @@ async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
     `None` and rebuilds every note. Reuses `index_tsvector_sql` so the rebuilt
     tsvector is byte-identical to what the indexer would write for the same
     config(s).
+
+    **Gated on settled provenance, per user**, and anchored beneath a root it
+    pins itself — see `_ancillary_pass_is_permitted` for why an unverified
+    writer of rows the provenance is a claim about may not run under an
+    unresolved one. A skipped user is logged once and returns zero.
     """
     vault = _vault_root(user_id)
     log_suffix = f" (user_id={user_id})" if user_id is not None else ""
+    with pinned_root(vault) as root_fd:
+        return await _rebuild_tsvectors_pinned(
+            session, user_id, vault, root_fd, log_suffix
+        )
+
+
+async def _rebuild_tsvectors_pinned(
+    session, user_id: int | None, vault: Path, root_fd: int, log_suffix: str
+) -> int:
+    if not await _ancillary_pass_is_permitted(
+        session, user_id, vault, root_fd, "Keyword-vector rebuild"
+    ):
+        return 0
+
     tsv_frag, tsv_params = index_tsvector_sql("content")
     upd_sql = text(
         f"UPDATE notes_metadata SET content_tsvector = {tsv_frag} WHERE id = :id"
@@ -701,10 +1929,9 @@ async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
 
     updated = 0
     for row in rows:
-        full_path = vault / row.file_path
         try:
-            raw = full_path.read_text(encoding="utf-8", errors="strict")
-        except (UnicodeDecodeError, FileNotFoundError, OSError):
+            raw, _stat = read_note_beneath(root_fd, row.file_path)
+        except (UnicodeDecodeError, OSError):
             continue
         _, content = parse_frontmatter(raw)
         await session.execute(

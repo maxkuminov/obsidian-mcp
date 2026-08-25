@@ -1,4 +1,5 @@
 import datetime
+from typing import ClassVar
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
@@ -27,6 +28,17 @@ class Base(DeclarativeBase):
     pass
 
 
+# Migration 016's ownership marker for the three index-provenance columns on
+# `users`, mirrored here so `alembic check` compares it like any other column
+# attribute. Must stay byte identical to `MARKER` in
+# `alembic/versions/016_indexed_vault_provenance.py`; a mismatch shows up as a
+# pending `alter_column(comment=...)`.
+_INDEXED_PROVENANCE_MARKER = (
+    "provenance of this user's index, recorded by the index pass "
+    "(016_indexed_vault_provenance)"
+)
+
+
 class User(Base):
     __tablename__ = "users"
 
@@ -41,6 +53,114 @@ class User(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     last_login_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # ── Index provenance (issue #91, migration 016) ────────────────────────
+    #
+    # What this user's `notes_metadata` rows were scanned under. **The index
+    # pass is the only writer**: a panel handler that changes `vault_path`
+    # leaves these alone, and that asymmetry is the whole point — the record
+    # means "what the rows were scanned under", never "what the assignment is".
+    # It exists because the transition an operator actually performs,
+    # `/old -> unassigned -> /new`, erases the evidence a panel-side
+    # old-vs-new comparison would need: on the second Save the handler sees
+    # `None -> /new`, which is byte for byte the shape of a *restore*.
+    #
+    # **Every stamp writes all three columns together**, NULL for any fact the
+    # pass could not observe. No branch updates one and leaves another
+    # describing a root it does not describe — otherwise a later observation
+    # can be compared against a root the stamp never covered.
+    #
+    # A record counts as *present* only when `indexed_vault_assignment` and
+    # `indexed_vault_realpath` are both non-NULL. A half-set record is drift,
+    # not a state this code writes, and is read as "nothing is known".
+
+    # The canonical assignment string — `transfer.canonical_vault_root`'s form,
+    # i.e. `str(Path(users.vault_path))`. **This is the fact the keep/discard
+    # decision turns on**: it changes when an operator reassigns and for no
+    # other reason, because it *is* the operator's saved value.
+    #
+    # Stored as a plain pathname and deliberately **not** hex-encoded, unlike
+    # the realpath below. Its value is a purely lexical normalisation — it
+    # reads no directory and introduces no non-ASCII character its input
+    # lacked — over a value the database itself handed back, and a UTF-8
+    # database cannot be holding bytes it would refuse to accept again. So the
+    # round trip holds by construction without an encoding, and leaving it
+    # readable keeps the one fact an operator actually reads in a discard log
+    # legible. The environment-derived `settings.vault_path` never reaches this
+    # column: the classification is skipped entirely for `user_id is None`.
+    #
+    # `Text` rather than `String(1024)` (which would match `vault_path` today)
+    # because the two pathname facts are written and read as one unit, and
+    # because that sufficiency is a property of *another* column's DDL and of
+    # the current normaliser rather than of this record.
+    indexed_vault_assignment: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment=_INDEXED_PROVENANCE_MARKER
+    )
+
+    # `os.path.realpath` of the directory that assignment named when the pass
+    # ran, proven at that moment to name the descriptor the pass pinned.
+    #
+    # **Its only job is to keep a cosmetic rename or an alias from costing a
+    # full re-embed** — `/vaults/current` (a symlink to `/data/A`) and
+    # `/data/A` differ as strings and agree as realpaths, so reassigning
+    # between them re-derives instead of discarding. **It is not a proof of
+    # directory identity**; nothing is, and filesystem substitution behind an
+    # unchanged assignment is a declared non-goal.
+    #
+    # **It stores `os.fsencode(realpath).hex()`, not the pathname as text**,
+    # and is compared encode-then-compare: the newly observed real path is
+    # reduced to the same hex and the two strings compared. Never decode the
+    # stored value in order to compare it; decode
+    # (`os.fsdecode(bytes.fromhex(...))`) only to render it in a log.
+    #
+    # Why, because it reads like gratuitous obfuscation otherwise: a POSIX
+    # pathname is an arbitrary sequence of non-NUL bytes under no obligation to
+    # be valid UTF-8, and Python decodes such a component with
+    # `surrogateescape` — so `os.path.realpath` can hand back a string carrying
+    # a lone surrogate like `'\udcff'` that asyncpg cannot UTF-8-encode. The
+    # discard branch writes this record *and* the delete in **one**
+    # transaction, so that encode failure would roll the delete back on every
+    # later pass and serve the former vault's index forever, which is #91's own
+    # symptom produced by a value domain. Hex has no unrepresentable input —
+    # each of the 256 byte values has exactly one two-character spelling — so
+    # the column is total over the fact by construction rather than by a bound.
+    #
+    # Hex and not base64: the handle column below already spells opaque bytes
+    # as hex, base64 has variant alphabets and optional padding so one value
+    # gets two spellings under a byte-equality comparison, and the doubled
+    # length is exactly what `Text` is here to absorb.
+    #
+    # Do **not** add a length check, a truncation, or a NULL-on-oversize rule
+    # to either pathname column: a value the pass observed and cannot store is
+    # a bug, never a truncation and never a NULL.
+    indexed_vault_realpath: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment=_INDEXED_PROVENANCE_MARKER
+    )
+
+    # An **opaque** `"<handle_type>:<hex of f_handle>"` token from
+    # `name_to_handle_at`, compared by byte equality, never parsed, never fed
+    # to `open_by_handle_at`.
+    #
+    # **Best-effort hardening in the refusing direction only**: where a handle
+    # is recorded *and* one can be read for the assigned root now, and the two
+    # differ, a verdict that would otherwise be *keep* is demoted to
+    # *re-derive*. A matching handle grants nothing and never upgrades a
+    # verdict. NULL means "no hardening signal here", never "provenance
+    # unknown" — a filesystem that cannot produce a handle simply removes a
+    # refusal, with no degraded mode and no warning.
+    #
+    # 320 characters because a handle is at most `MAX_HANDLE_SZ` (128) bytes of
+    # opaque payload — 256 hex characters — plus a handle type and a separator;
+    # sufficient for the declared ext4/xfs filesystems and for NFSv4's own
+    # 128-byte maximum, and *not* claimed as an eternal bound. A handle that
+    # would not fit is recorded NULL, never truncated: a truncated token
+    # compared by byte equality is a signal that can produce a spurious match.
+    # This is the one column the "record any value the fact can take" rule does
+    # not govern, because a handle is a *comparison token* whose absence is a
+    # defined state, while a missing pathname is not a state at all.
+    indexed_vault_handle: Mapped[str | None] = mapped_column(
+        String(320), nullable=True, comment=_INDEXED_PROVENANCE_MARKER
+    )
 
     api_keys: Mapped[list["APIKey"]] = relationship(back_populates="user", cascade="all, delete-orphan")
     oauth_clients: Mapped[list["OAuthClient"]] = relationship(back_populates="user", cascade="all, delete-orphan")
@@ -75,6 +195,15 @@ class APIKey(Base):
 # identical to `MARKER` in `alembic/versions/015_usage_log_actor.py`; a
 # mismatch shows up as a pending `alter_column(comment=...)`.
 _ACTOR_COLUMN_MARKER = "denormalised actor, written at call time (015_usage_log_actor)"
+
+# Migration 017's ownership marker for the same three columns on
+# `transfer_tokens` (issue #92). A separate string because a separate migration
+# owns them: 017's `downgrade()` drops only columns carrying *this* comment,
+# and its upgrade completes only a set carrying it. Must stay byte identical to
+# `MARKER` in `alembic/versions/017_transfer_token_actor.py`.
+_TRANSFER_ACTOR_COLUMN_MARKER = (
+    "denormalised actor, recorded at mint (017_transfer_token_actor)"
+)
 
 
 class UsageLog(Base):
@@ -311,6 +440,11 @@ class TransferToken(Base):
 
     __tablename__ = "transfer_tokens"
 
+    # 017's ownership marker, reachable from the class so a caller checking
+    # model/migration agreement names the table it is checking. `ClassVar` is
+    # what keeps the declarative mapper from reading it as a column.
+    _ACTOR_COLUMN_MARKER: ClassVar[str] = _TRANSFER_ACTOR_COLUMN_MARKER
+
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     # The handle the tools hand back to the agent. Deliberately *not* `id`: the
     # row id is a small sequential integer, so an `upload_id` built on it is
@@ -347,6 +481,37 @@ class TransferToken(Base):
     sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     mime: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
+    # Denormalised attribution for the redemption's `usage_logs` row (issue
+    # #92, migration 017). Recorded at *mint*, from the request-scoped actor
+    # `APIKeyMiddleware` already bound, because redemption has no credential to
+    # read: the request carries a capability and is session-less, so
+    # `src/transfer/routes.py::_log_row` could only attribute by join — through
+    # `key_id`, or through `oauth_token_id` -> `oauth_clients`. Both joins go
+    # NULL on the operator's most urgent path (deleting an OAuth client
+    # cascades its tokens; the panel NULLs a key's `usage_logs.key_id` before
+    # deleting the key), and the rows they take with them are the ones where
+    # bytes entered or left the vault.
+    #
+    # A snapshot of what the credential was called at mint time, never
+    # re-derived: re-reading at redemption would rewrite history on every
+    # rename and would fail outright in the case the scheme exists for. Display
+    # and audit only — `_credential_ok`, the root check and the publish gate
+    # never read it.
+    #
+    # Same kinds and widths as `UsageLog`'s, written through the same single
+    # reader (`src.auth.session.actor_columns`), so the mint and the tool-call
+    # log cannot disagree about the caller or truncate differently. The comment
+    # is 017's ownership marker, declared here so `alembic check` compares it.
+    actor_kind: Mapped[str | None] = mapped_column(
+        String(20), nullable=True, comment=_TRANSFER_ACTOR_COLUMN_MARKER
+    )
+    actor_label: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, comment=_TRANSFER_ACTOR_COLUMN_MARKER
+    )
+    actor_ref: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_TRANSFER_ACTOR_COLUMN_MARKER
+    )
+
     __table_args__ = (
         Index("ix_transfer_tokens_expires_at", "expires_at"),
         CheckConstraint(
@@ -356,6 +521,18 @@ class TransferToken(Base):
         CheckConstraint(
             "state IN ('pending', 'claimed', 'completed', 'consumed')",
             name="ck_transfer_tokens_state",
+        ),
+        # One minting credential, never two (migration 017). Both columns are
+        # independently nullable, so a row could name an API key *and* an OAuth
+        # token — two different actors, with nothing recording which of them
+        # minted it. 017's backfill would then label such a row from the API
+        # key purely because that UPDATE runs first, manufacturing a definitive
+        # attribution out of an ambiguity and copying it onto `usage_logs` at
+        # redemption. Both NULL stays legal: a single-user or sandbox mint
+        # carries no credential foreign key at all.
+        CheckConstraint(
+            "key_id IS NULL OR oauth_token_id IS NULL",
+            name="ck_transfer_tokens_one_credential",
         ),
     )
 

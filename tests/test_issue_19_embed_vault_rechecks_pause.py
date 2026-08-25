@@ -98,11 +98,23 @@ class _FakeSession:
 
 
 def _make_rows(vault, n):
+    """Rows whose `content_hash` genuinely describes the file on disk.
+
+    `embed_vault` re-hashes what it read and refuses to embed bytes that do not
+    hash to the selected row's `content_hash` (#91, group A) — an embedding is
+    marked against the *row's* hash, so certifying content the row does not
+    describe would permanently mark a note as embedded for a hash it does not
+    have. A fabricated hash here would make every note skip for that reason and
+    assert nothing about the pause flag, which is what this module is for.
+    """
     rows = []
     for i in range(n):
         rel = f"note{i}.md"
-        (vault / rel).write_text(f"# Note {i}\n\nbody {i}\n", encoding="utf-8")
-        rows.append(_Row(id=i + 1, file_path=rel, content_hash=f"hash{i}"))
+        body = f"# Note {i}\n\nbody {i}\n"
+        (vault / rel).write_text(body, encoding="utf-8")
+        rows.append(
+            _Row(id=i + 1, file_path=rel, content_hash=indexer._content_hash(body))
+        )
     return rows
 
 
@@ -119,7 +131,7 @@ async def test_embed_vault_breaks_when_paused_before_loop(monkeypatch, tmp_path)
 
     embedded = []
 
-    async def _fake_embed_note(session, note, content):
+    async def _fake_embed_note(session, note, content, **kwargs):
         embedded.append(note)
         return 1
 
@@ -149,7 +161,7 @@ async def test_embed_vault_stops_early_when_pause_flips_mid_pass(monkeypatch, tm
     embedded = []
     paused = {"value": False}
 
-    async def _fake_embed_note(session, note, content):
+    async def _fake_embed_note(session, note, content, **kwargs):
         embedded.append(note)
         # After the first note is embedded, simulate a panel-driven pause.
         paused["value"] = True

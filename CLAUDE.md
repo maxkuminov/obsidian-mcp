@@ -610,10 +610,228 @@ credential and then opens the Usage page to see what it did was shown
   the label survives it, which
   `tests/integration/test_schema_check.py::test_the_label_survives_the_panel_deleting_an_api_key`
   runs as the real two-statement sequence.
-- **Transfer-route rows are not labelled.** `src/transfer/routes.py::_log_row`
-  builds its own `UsageLog` from the minting identity and has no request-scoped
-  actor to read, so those rows keep join-only attribution. Carrying the label
-  on `transfer_tokens` at mint is the fix; it is not done.
+- **Transfer rows carry the actor from mint** (migration 017, the 015 register:
+  marker-owned nullable columns on `transfer_tokens`, snapshot never re-derived,
+  orphan-label refusal before any backfill). `mint_token` splices in the actor
+  `APIKeyMiddleware` already bound — one shared reader,
+  `src.auth.session.actor_columns`, so mint and `_log_usage` cannot drift in
+  truncation — and `_log_row` copies it at redemption. The backfill labels
+  `transfer_tokens` only, from the row's own FK; it writes nothing to
+  `usage_logs`, because no usage row references the token that produced it.
+  The honest gap is rows written between 015 and 017: they keep join-only
+  attribution and render as unattributable when the joins miss. The label
+  authorises nothing — redemption still resolves the credential row.
+- **A transfer token names at most one minting credential**, and since 017 the
+  database says so: `ck_transfer_tokens_one_credential`
+  (`key_id IS NULL OR oauth_token_id IS NULL`), created and marked by 017 and
+  resolved through `pg_constraint` — a same-named `CHECK (true)` would satisfy
+  a lookup by name. Both NULL stays legal; that is the single-user and sandbox
+  shape. It exists because nothing in a two-credential row records *which* of
+  them minted it, so the API-key backfill would have labelled such a row purely
+  by running first and the OAuth statement's `actor_kind IS NULL` guard would
+  then have skipped the row it had just mislabelled — an invented attribution,
+  rendered to an operator as an audit trail. 017 refuses such rows by id before
+  either backfill, and `transfer.Identity.__post_init__` refuses the same state
+  in the app. Unreachable today (`APIKeyMiddleware` clears both ContextVars and
+  fills one branch), which is why it is asserted rather than assumed.
+- **The deploy window is declared, not closed.** The deploy migrates and *then*
+  recreates, so a mint served by the old code between 017's backfill and the
+  recreate inserts a row with all three actor columns NULL. That is the tail of
+  the same 015→017 gap: it renders through the join fallback like every pre-017
+  row and degrades only if the credential is later deleted. Symmetric with
+  016's treatment (NULL record ⇒ re-derive; NULL label ⇒ join fallback). No
+  barrier and no quiesce: the window is seconds long and the fallback works.
+
+## Publication confirms the vault root, and the residual is declared
+
+`APIKeyMiddleware` binds `current_vault_root` once, at admission, and that
+snapshot is immutable by design — it is what makes #66's gate fail closed under
+a concurrent bulk cache warm. The cost is that it is *stale by design* for the
+whole of a request: an administrator can reassign, the panel can report it
+complete, and a write already in flight still publishes into the former root.
+So every mutating tool re-reads `users.vault_path` / `is_active` immediately
+before **each** publication and refuses on change (#88). The answer is
+deliberately not a lock: holding the credential and user rows `FOR UPDATE`
+across `move_note`'s link rewrites would put arbitrary vault I/O inside a lock
+every authenticated request contends for. The transfer routes keep their
+stronger locked gate; `import_from_url` and `request_upload` are the two
+allow-listed exemptions.
+
+- **The residual is stated, not implied.** The window shrinks from a whole
+  request to staging, the durability flush and one publishing call. A
+  reassignment committing inside *that* still lands in the former root and the
+  tool reports success — the same optimistic level as `edit_note(expected=…)`
+  and the transfer fingerprint check. `move_note(rewrite_links=True)` has
+  several such windows, one per publication, and can be refused part way
+  through; "one window per tool call" would be false for it and must not be
+  claimed.
+- **There is no retainable confirmation.** `vault._confirm_vault_assignment`
+  is private and the only entry point is `vault.confirmed_publication(user_id,
+  publish)`, which awaits the read and calls a **synchronous** `publish` before
+  returning control — so no caller-visible `await` can sit between the two.
+  Coroutine, generator *and* async-generator callbacks are refused, and so is a
+  returned coroutine/generator/awaitable (a callable object whose `__call__` is
+  a generator is none of the first three). Nothing is `close()`d on the way
+  out: that is arbitrary code of a stranger's choosing, and the lease below has
+  already made the object inert.
+- **The confirmation is leased for the callback's dynamic extent, and that is
+  the part that bounds *when*.** `_leased` activates it, and a `finally`
+  revokes it on every exit — normal return, exception, or a callback that
+  stashed the object. `consume` refuses an unleased confirmation, and
+  `confirmed_publication` refuses a callback that returned without consuming
+  one. Single-consumption alone was **not** enough and must not be relied on
+  again: it bounds how many times a confirmation is used and says nothing about
+  when, so `lambda c: saved.append(c)` followed by a reassignment and a later
+  `write_file_at(..., confirmation=saved[0])` was obeyed.
+- **`RootConfirmation` is also single-consumption and target-bound.** The spent
+  flag lives on the confirmation, not on a slot in the target, so one object
+  cannot be spent by two publications however it is attached; and `consume`
+  checks the acting user id and the canonical assignment against
+  `MutableTarget.user_id` / `.assignment`. Every publish helper
+  (`_atomic_write_at`, `move_file_no_clobber`, `soft_delete_target`,
+  `unlink_at`) takes one or refuses with `UnconfirmedPublication` — a
+  programming error, deliberately not a `RuntimeError`, because the tool bodies
+  catch `RuntimeError` around their publishes and would render it as a failed
+  write.
+- **A rollback rides the confirmation it undoes, through a `MovePermit` that
+  cannot be forged.** The forward `move_file_no_clobber` issues it — nobody
+  else can, `__init__` requires the module-private `_PERMIT_ISSUE` token — and
+  it is bound to that confirmation's *lease*, so it is inert the moment
+  `confirmed_publication` returns, plus the immutable
+  `(user_id, assignment, rel)` of each end and object identity. One use,
+  reverse direction only. Two earlier shapes were wrong: stamping the one
+  confirmation onto both endpoints made a reusable token of a single-use fact,
+  and a public `MovePermit(destination, source)` constructor authorised a
+  rename with no confirmation at all.
+- **Both ends of a move must be one caller, one assignment, one root inode.**
+  `rename_noreplace` removes the source entry as surely as it creates the
+  destination one, yet only the destination's confirmation is consumed, so
+  `_require_one_vault` compares `user_id`, `assignment` and `fstat` of each
+  pinned `root_fd` (a pathname comparison is not enough — two assignments can
+  spell the same string over different directories) before anything is spent,
+  on the forward move and on the rollback. Unreachable from `move_note`, which
+  opens both ends with one `uid`; checked at the primitive because the next
+  caller may not.
+- **Three distinct error markers, because they say different things.**
+  `no_vault_assigned` (admission: this credential had no vault this call),
+  `vault_assignment_changed` (an administrator moved it — `VaultAssignmentChanged`),
+  and `vault_confirmation_unavailable` (the read *failed*;
+  `VaultConfirmationUnavailable`, not a `RuntimeError`, so no tool body renders
+  it as a bad write). An outage recorded under the reassignment marker puts an
+  administrator's name on an infrastructure incident. Before a call's first
+  publication an outage propagates and the call fails; after `move_note`'s move
+  has stood it is caught, the remaining rewrites stop, and the partial outcome
+  is reported through the existing `failed_rewrite_sources` idiom — naming it
+  an outage, never a reassignment.
+- **`delete_file` holds no `MutableTarget`**, so its confirmation is consumed
+  against the `(uid, root)` its own `_vault_context` resolved, and the whole
+  delete — trash probe included — runs inside the confirmed step.
+
+## The index records the vault it was scanned under
+
+`users.indexed_vault_assignment` / `indexed_vault_realpath` /
+`indexed_vault_handle` (migration 016, all nullable, marker-owned, **no
+backfill**) record the root a pass actually scanned, so a reassignment stops
+`semantic_search`/`keyword_search`/`list_notes`/the graph tools answering from
+a vault the caller no longer has (#91). `classify_provenance` is the one
+function that computes the verdict, over six rows: **indeterminate** (root
+unpinnable, or its realpath no longer names the pinned inode) → nothing, and
+the pass fails; **re-derive** (no record, a half-set record, exactly one fact
+differing, or a handle contradicting an otherwise-matching pair); **keep**
+(both agree); **discard** (both differ). A handle can refuse a keep, never
+establish one, and never establish a discard. Ambiguity never resolves toward
+keeping — silently wrong search results are the failure this product ranks
+highest — and never toward discarding, which costs a full re-embed.
+
+- **Not backfilling is the load-bearing decision.** Deriving the assignment
+  from `users.vault_path` would assert that an assigned user's index was built
+  under what it carries *now*, which is exactly the reassignment lag the record
+  exists to detect. NULL means "provenance unknown", the only true statement at
+  migration time, and such a user is repaired by re-deriving rather than
+  discarding — so introducing the record costs no vault-wide re-embed. It is
+  also what makes the deploy order safe with no cross-container coordination:
+  the previous code cannot write these columns.
+- **The whole pass runs beneath one pinned root descriptor**, so the facts
+  observed, the files discovered and the bytes read come from one inode.
+  `indexed_vault_realpath` stores `os.fsencode(realpath).hex()` — a pathname is
+  arbitrary non-NUL bytes, and a surrogate escape would fail to encode inside
+  the one transaction that must not roll back.
+- **A discard is bound to the assignment that produced it.** The verdict is
+  computed in an earlier transaction against a cached root, so the discard
+  transaction takes the `users` row `SELECT … FOR UPDATE`, re-reads it, and
+  requires present/active/assigned/*equal to `facts.assignment`* before
+  deleting anything; the stamp beside it must affect exactly one row or the
+  whole transaction rolls back. Without that, an administrator correcting a
+  reassignment back destroys a complete, valid index and records provenance for
+  a root nobody is assigned to. The re-derive's tail stamp takes the same lock
+  and the same re-read, and is *withheld* on disagreement rather than fatal —
+  it destroys nothing.
+- **The two take that lock differently, and it is lock ordering, not tuning.**
+  The discard has its own transaction and locks the parent *before* any child
+  write — the panel's own user-delete direction — so it may wait. The tail
+  stamp runs at the end of the pass's transaction, already holding
+  `notes_metadata` row locks, while a permanent user delete locks `users` first
+  and then cascades onto exactly those rows: waiting there is a real deadlock
+  cycle, and Postgres would abort one side — possibly the operator's delete. So
+  the tail asks `FOR UPDATE NOWAIT` **inside `session.begin_nested()`** and
+  treats `55P03` as a withheld stamp (a state that branch already knows). The
+  savepoint is required, not tidy: a failed statement poisons its transaction,
+  so without one the pass would lose every repair along with the stamp.
+  `_is_lock_not_available` walks `.orig` *and* `__cause__` — the SQLSTATE lives
+  on asyncpg's own error, two layers down, exactly as `_log_usage`'s FK
+  recovery has to walk.
+- **A re-derive that skipped anything records nothing.** Any per-file skip —
+  including both link-extraction skips, the missing buffered body and the
+  missing index row — withholds the stamp, because the record's whole claim is
+  that every surviving row was written by that pass.
+- **`embed_vault` is deliberately ungated on provenance, because it verifies.**
+  Gating it composed with the completeness rule into indefinite staleness: one
+  permanently unreadable file withholds the record forever and would then
+  freeze every other note's vectors at content it no longer has, while
+  `semantic_search` kept returning them. Running ungated is sound only because
+  the pass refuses bytes that do not hash to the selected row's `content_hash`
+  — an embedding is a pure function of content, so which directory supplied the
+  bytes is not a fact the vector depends on. **Removing the verification means
+  re-gating the pass in the same change.**
+- **Verifying the bytes is not enough on its own.** The ORM re-read that
+  follows can see a hash another pass has committed (H2) while the vectors were
+  built from H1; stamping H2 marked the row embedded for content it does not
+  have, and H2 == H2 then blocked every later repair. `embed_note` therefore
+  takes `certified_hash`/`certified_path` and stamps them with a conditional,
+  row-locking `UPDATE … WHERE id AND file_path AND content_hash = H1` **before**
+  it replaces a vector and **after** the provider call — so no row lock is held
+  across a network request, and a row that moved matches nothing.
+  `StaleCertification` rolls the note back and leaves it unmarked.
+- **The exclusion branch certifies through the same predicate.** It reads no
+  file, but it deletes a note's vectors and marks the row embedded, which is
+  the same claim — and a move is exactly what it cannot see, because relocating
+  a note changes `file_path` and not `content_hash`. Stamping by `id` alone let
+  a decision about `Private/A.md` delete the vectors of a row that had become
+  `Public/A.md` and record it as embedded with none: included, hash-equal, and
+  therefore never selected again — silently and permanently absent from
+  `semantic_search`. `certify_embedded` is shared by both paths, stamps before
+  the delete (the conditional UPDATE is what takes the row lock), and takes
+  `note_id` plus an explicit `expire_on` because the exclusion branch certifies
+  from a plain result row no session maps.
+- **A path change clears `embedded_content_hash`, at every statement that
+  changes `file_path`.** The predicate above closes only *move-before-certify*;
+  the mirror ordering is invisible to it, because when the move lands after a
+  correct certification the stamp is already there and already true of the
+  content. It is no longer true of the *decision*: the stamp says the row's
+  current content has been dealt with and nothing about **how**, and the
+  exclusion branch decides how by matching `EMBEDDING_EXCLUDE_PATTERNS` against
+  the path. Carried across a move it freezes the old answer for ever — the pass
+  selects on `embedded_content_hash != content_hash`, which a preserved stamp
+  makes false. Out of an excluded folder: included, zero vectors, never
+  selected again, silently missing from `semantic_search`. Into one: still
+  searchable while excluded. So `move_note`'s metadata UPDATE and the indexer's
+  **id-preserving** move detection both `SET embedded_content_hash = NULL`
+  (the prune-and-insert path is unaffected — its replacement row starts null).
+  NULL means *re-evaluate next pass*, not *not embedded*. **Do not "improve"
+  this by consulting the exclusion config at move time**: the config can change
+  before the next pass, so that is the same frozen answer in a new place, and
+  it would give the move path a dependency on embedding configuration it has no
+  other reason to know.
 
 ## The vault assignment is the admission gate for every tool
 

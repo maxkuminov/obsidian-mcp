@@ -66,6 +66,15 @@ class FakeRow:
     size: int | None = None
     sha256: str | None = None
     mime: str | None = None
+    # Recorded at mint from the minting request's credential (issue #92,
+    # migration 017) and copied onto the redemption's `usage_logs` row, because
+    # this request carries a capability and has no credential of its own to
+    # name. Defaulted None here — the pre-017 row shape — so the route is
+    # exercised on the path where there is nothing to copy as well as the one
+    # where there is.
+    actor_kind: str | None = None
+    actor_label: str | None = None
+    actor_ref: str | None = None
 
 
 class FakeSession:
@@ -486,6 +495,31 @@ async def test_upload_round_trip(client, harness, vault):
     assert [log.tool for log in harness.logs] == ["upload_file"]
     log = harness.logs[0]
     assert log.key_id == harness.row.key_id
+    assert harness.token not in str(log.params)
+
+
+async def test_the_usage_row_carries_the_actor_recorded_at_mint(client, harness, vault):
+    """This request has no credential to name (issue #92).
+
+    It authenticates with a capability, so the actor was recorded on the token
+    at mint and is copied onto the usage row here — which is what keeps the
+    line attributed after the operator deletes the credential and the joins go
+    NULL. A route that dropped it would still pass every other case in this
+    file, because they read the FKs.
+    """
+    harness.row.actor_kind = "oauth"
+    harness.row.actor_label = "Claude Desktop"
+    harness.row.actor_ref = "client-abc"
+
+    response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+    assert response.status_code == 200, response.text
+
+    log = harness.logs[0]
+    assert (log.actor_kind, log.actor_label, log.actor_ref) == (
+        "oauth",
+        "Claude Desktop",
+        "client-abc",
+    )
     assert harness.token not in str(log.params)
 
 
