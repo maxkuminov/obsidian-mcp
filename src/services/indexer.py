@@ -91,6 +91,20 @@ def _sanitize_frontmatter(fm: dict) -> dict:
     """Convert non-JSON-serializable values (dates, etc) to strings."""
     return _sanitize_value(fm)
 
+
+def _note_title(frontmatter: dict, filename: str) -> str:
+    """Frontmatter `title` coerced to a bounded string, or the filename stem.
+
+    YAML parses `title: 2026-08-25` into a date and `title: [a, b]` into a
+    list, and nothing bounds the length; `notes_metadata.title` is
+    VARCHAR(512). An unsanitized value makes the whole batch INSERT raise,
+    aborting the pass transaction — and since nothing commits, the content
+    hash never advances and every subsequent tick retries the same fatal
+    batch forever (#126).
+    """
+    value = _sanitize_value(frontmatter.get("title"))
+    return str(value or os.path.splitext(filename)[0])[:512]
+
 logger = logging.getLogger(__name__)
 
 
@@ -1068,7 +1082,7 @@ async def _index_vault_pinned(
                     skips.append(f"{rel_path} (parse: {e})")
                     continue
                 path_to_content[rel_path] = content
-                title = frontmatter.get("title") or os.path.splitext(found.name)[0]
+                title = _note_title(frontmatter, found.name)
 
                 to_upsert.append({
                     "user_id": user_id,
