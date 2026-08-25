@@ -80,19 +80,12 @@ jobs:
           # Real Postgres for tests/integration/*. The harness creates and drops
           # its own databases on this server.
           PGVECTOR_TEST_ADMIN_URL: postgresql+asyncpg://postgres:test@localhost:5432/postgres
-          # TEST_DATABASE_URL is deliberately NOT set, so
-          # tests/test_fts_integration.py stays skipped as it is everywhere
-          # else today. Pointing it at the service container was tried and
-          # surfaced two pre-existing failures that are a property of the
-          # Norwegian snowball stemmer, not of the runner: PostgreSQL 16 stems
-          # the document word "datasenteret" to `datasenter` and the *query*
-          # word "datasenter" to `datasent`, so
-          # test_norwegian_stemmer_matches_inflected_form and
-          # test_multi_config_matches_either_language assert a match the
-          # stemmer does not produce. Reproduced identically against this
-          # project's own production Postgres 16.15, so it is a latent bug in
-          # the module's expectations rather than anything CI can fix here.
-          # Enable this variable once that module is corrected.
+          # tests/test_fts_integration.py runs read-only SELECTs and rolls
+          # back, so pointing it at the service's maintenance database is
+          # safe. Enabled after #124 corrected the module's Norwegian
+          # inflection pair to one the snowball stemmer collapses in both
+          # directions (huset/hus; datasenteret/datasenter was not).
+          TEST_DATABASE_URL: postgresql+asyncpg://postgres:test@localhost:5432/postgres
         run: pytest -q -rs --junitxml=pytest-report.xml
 
       # House rule: a gate that silently skips is not a gate. The namespace

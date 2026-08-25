@@ -1,9 +1,16 @@
 """Integration tests for configurable FTS — exercises real PostgreSQL stemming.
 
 These verify the end-to-end semantics the unit tests can't: that the Norwegian
-stemmer matches `datasenter` against `datasenteret`, that `english` does not,
-that `simple` matches only exact forms, and that a multi-config list matches
-across languages.
+stemmer matches `hus` against `huset`, that `english` does not, that `simple`
+matches only exact forms, and that a multi-config list matches across
+languages.
+
+The inflection pair must stem identically on the document side and the query
+side — snowball is not idempotent, so not every pair does. The original
+`datasenteret`/`datasenter` pair fails exactly that way on PostgreSQL 16:
+the document form stems `datasenteret` -> `datasenter` but the query form
+stems `datasenter` -> `datasent`, so the asserted match never existed (#124).
+`huset` -> `hus` and `hus` -> `hus` are stable in both directions.
 
 The index side is built through the real `index_tsvector_sql` helper; the query
 side mirrors `combined_tsquery`'s OR-of-`websearch_to_tsquery` shape in raw SQL
@@ -87,31 +94,32 @@ async def _matches(conn, configs, body, query):
     return bool(row.scalar())
 
 
-# "datasenteret" = "the data center" (definite form); stem is "datasenter".
-NORWEGIAN = "Vi bygde datasenteret i fjor."
+# "huset" = "the house" (definite form); stems to "hus", and the query form
+# "hus" also stems to "hus" — stable both ways, which "datasenteret" was not.
+NORWEGIAN = "Vi bygde huset i fjor."
 
 
 @pytest.mark.asyncio
 async def test_norwegian_stemmer_matches_inflected_form(conn):
-    assert await _matches(conn, ["norwegian"], NORWEGIAN, "datasenter")
+    assert await _matches(conn, ["norwegian"], NORWEGIAN, "hus")
 
 
 @pytest.mark.asyncio
 async def test_english_config_misses_norwegian_inflection(conn):
-    assert not await _matches(conn, ["english"], NORWEGIAN, "datasenter")
+    assert not await _matches(conn, ["english"], NORWEGIAN, "hus")
 
 
 @pytest.mark.asyncio
 async def test_simple_matches_exact_form_only(conn):
-    assert await _matches(conn, ["simple"], NORWEGIAN, "datasenteret")
-    assert not await _matches(conn, ["simple"], NORWEGIAN, "datasenter")
+    assert await _matches(conn, ["simple"], NORWEGIAN, "huset")
+    assert not await _matches(conn, ["simple"], NORWEGIAN, "hus")
 
 
 @pytest.mark.asyncio
 async def test_multi_config_matches_either_language(conn):
-    body = "The servers run fast. Vi bygde datasenteret."
+    body = "The servers run fast. Vi bygde huset."
     assert await _matches(conn, ["english", "norwegian"], body, "server")
-    assert await _matches(conn, ["english", "norwegian"], body, "datasenter")
+    assert await _matches(conn, ["english", "norwegian"], body, "hus")
 
 
 @pytest.mark.asyncio
