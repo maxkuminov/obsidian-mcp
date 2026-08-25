@@ -162,10 +162,35 @@ class User(Base):
         String(320), nullable=True, comment=_INDEXED_PROVENANCE_MARKER
     )
 
-    api_keys: Mapped[list["APIKey"]] = relationship(back_populates="user", cascade="all, delete-orphan")
-    oauth_clients: Mapped[list["OAuthClient"]] = relationship(back_populates="user", cascade="all, delete-orphan")
-    oauth_tokens: Mapped[list["OAuthToken"]] = relationship(back_populates="user", cascade="all, delete-orphan")
-    notes: Mapped[list["NoteMetadata"]] = relationship(back_populates="user", cascade="all, delete-orphan")
+    # `passive_deletes=True` on all four: every one of these FKs is
+    # `ON DELETE CASCADE` in the database (migration 009 for the first four
+    # tables, 001 for `note_embeddings` below), so the database can do the
+    # cascade in one statement. Without it SQLAlchemy insists on doing the work
+    # itself — a permanent user delete SELECTed ~2,500 `notes_metadata` rows,
+    # then their ~16,700 `note_embeddings`, built an ORM object for each and
+    # emitted a DELETE per row, all inside the transaction that holds
+    # `_lock_admin_guard`'s advisory lock (`src/control_panel/users.py`), so
+    # every other admin-flag handler waited on it.
+    #
+    # This is an ORM-side hint only: no column, no constraint and no server
+    # default changes, so `alembic check` sees nothing. What it *does* change
+    # is that the children are no longer loaded — and one of them was relying
+    # on that. `usage_logs.key_id` has **no** `ON DELETE` (deliberately; see
+    # CLAUDE.md), and the unloaded-children behaviour of `APIKey.usage_logs`
+    # was what NULLed it. `delete_user` therefore NULLs it explicitly before
+    # deleting the row, exactly as the panel's own key delete already does.
+    api_keys: Mapped[list["APIKey"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", passive_deletes=True
+    )
+    oauth_clients: Mapped[list["OAuthClient"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", passive_deletes=True
+    )
+    oauth_tokens: Mapped[list["OAuthToken"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", passive_deletes=True
+    )
+    notes: Mapped[list["NoteMetadata"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan", passive_deletes=True
+    )
 
 
 class APIKey(Base):
@@ -292,8 +317,14 @@ class NoteMetadata(Base):
         DateTime(timezone=True), server_default=func.now()
     )
 
+    # `note_embeddings.note_id` is `ON DELETE CASCADE` (migration 001), so the
+    # chunks of a deleted note go with it without the ORM loading one row per
+    # chunk. This is the half that dominates a user delete: ~16,700 embedding
+    # rows against ~2,500 notes. Removing a single chunk from the loaded
+    # collection still deletes it — `passive_deletes=True` governs the
+    # parent-delete path, not orphan removal.
     embeddings: Mapped[list["NoteEmbedding"]] = relationship(
-        back_populates="note", cascade="all, delete-orphan"
+        back_populates="note", cascade="all, delete-orphan", passive_deletes=True
     )
     user: Mapped["User | None"] = relationship(back_populates="notes")
 

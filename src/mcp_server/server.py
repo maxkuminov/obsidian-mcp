@@ -1,3 +1,5 @@
+from urllib.parse import urlparse
+
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
@@ -30,6 +32,61 @@ from src.mcp_server.tools import (
     write_file_impl,
 )
 
+
+def _host_patterns(hosts) -> list[str]:
+    """Expand configured hosts into the forms the MCP SDK actually matches.
+
+    `TransportSecurityMiddleware._validate_host` compares the Host header
+    exactly and additionally understands one wildcard form, a trailing `:*`
+    meaning "this host on any port". It does **not** strip the port the way
+    Starlette's `TrustedHostMiddleware` does, so `ALLOWED_HOSTS=["localhost"]`
+    accepted `Host: localhost:8000` at the app boundary and then answered 421
+    from the `/mcp` mount — the health check passes, the tool call does not.
+
+    So every port-less entry is emitted twice, bare and with `:*`. An entry
+    that already carries a colon (an explicit `host:port`, or an IPv6 literal)
+    is passed through untouched: appending `:*` to it would produce a pattern
+    that matches nothing.
+    """
+    out: list[str] = []
+    for raw in hosts or ():
+        host = str(raw).strip()
+        if not host:
+            continue
+        candidates = [host] if ":" in host else [host, f"{host}:*"]
+        for candidate in candidates:
+            if candidate not in out:
+                out.append(candidate)
+    return out
+
+
+def _origin_patterns(origins) -> list[str]:
+    """Same expansion for Origin values, which carry a scheme.
+
+    `urlparse` is what decides whether an origin already names a port —
+    `"https://host"` contains a colon but has none, so the textual test used
+    for hosts would get this wrong.
+    """
+    out: list[str] = []
+    for raw in origins or ():
+        origin = str(raw).strip().rstrip("/")
+        if not origin:
+            continue
+        candidates = [origin]
+        try:
+            has_port = urlparse(origin).port is not None
+        except ValueError:
+            # A malformed port ("https://host:notaport"). Treat it as literal
+            # rather than guessing; config validation owns the complaint.
+            has_port = True
+        if not has_port:
+            candidates.append(f"{origin}:*")
+        for candidate in candidates:
+            if candidate not in out:
+                out.append(candidate)
+    return out
+
+
 mcp = FastMCP(
     "obsidian-vault",
     stateless_http=True,
@@ -41,7 +98,12 @@ mcp = FastMCP(
     max_request_body_size=settings.mcp_max_request_body_bytes,
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=not settings.mcp_sandbox_mode,
-        allowed_hosts=settings.allowed_hosts,
+        allowed_hosts=_host_patterns(settings.allowed_hosts),
+        # Not passing this leaves the SDK default `[]`, and an empty list is
+        # not "no opinion" there: `_validate_origin` accepts an absent Origin
+        # and rejects every present one, so any browser-based MCP client got a
+        # blanket 403 while the same request from a CLI client succeeded.
+        allowed_origins=_origin_patterns(settings.allowed_origins),
     ),
 )
 

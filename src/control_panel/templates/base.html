@@ -5,8 +5,32 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="theme-color" content="#070910">
     <title>{% block title %}Obsidian MCP{% endblock %}</title>
-    <script src="https://unpkg.com/htmx.org@2.0.4"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+    {#
+      htmx and Chart.js are served from this app, not from a CDN: a third-party
+      origin with no `integrity` could change what the panel executes, and the
+      panel is the surface that mints API keys and deletes users. The files in
+      `src/control_panel/static/vendor/` are the exact upstream bytes —
+        htmx-2.0.4.min.js       https://unpkg.com/htmx.org@2.0.4
+                                sha256 e209dda5c8235479f3166defc7750e1dbcd5a5c1808b7792fc2e6733768fb447
+        chart-4.4.7.umd.min.js  https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js
+                                sha256 206b6e8bb00fc7bba2c7ee80ca41db3e9e05ba7be0aa35abeba9cfd5357f5d0e
+      — so a version bump is `curl` plus the checksum above. Same-origin makes
+      an `integrity` attribute redundant (it would guard the same bytes this
+      server already serves) and would break the panel on any byte-level
+      transformation, so the checksum is recorded here instead of enforced.
+
+      There is deliberately no CSP on the panel. Every template here drives its
+      controls with inline `onclick`/`onsubmit` and htmx attributes, so the only
+      policy they would survive is one carrying `unsafe-inline` for scripts —
+      which permits exactly the injection a CSP is bought to stop. A real policy
+      means nonces on every inline handler across fifteen templates; that is a
+      change of its own, not a header.
+
+      Google Fonts stays remote: it ships no executable code, and self-hosting
+      the four families is a separate call.
+    #}
+    <script src="/admin/static/vendor/htmx-2.0.4.min.js"></script>
+    <script src="/admin/static/vendor/chart-4.4.7.umd.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600;9..40,700&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">

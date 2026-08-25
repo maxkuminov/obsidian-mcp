@@ -1,10 +1,12 @@
 import logging
 import os
+import re
 import secrets
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
@@ -83,6 +85,43 @@ templates = Jinja2Templates(
 # any unauthenticated request 302s to `/admin/auth/login?next=<original>`.
 
 
+def _forget_new_key_flash(request: Request) -> None:
+    """Drop a raw API key still parked in the session cookie.
+
+    `create_key_form` stashes the one-time key in the session so it survives
+    the POST/redirect/GET, and `keys_page` pops it for the single render it
+    exists for. If that redirect is never followed — the operator closes the
+    tab, the browser blocks it, the response is discarded — the raw secret
+    stays in the signed (and *unencrypted*) session cookie, replayed on every
+    later request until the keys page happens to be visited.
+
+    So any other request clears it: the value is only ever meant to survive
+    one hop. This runs on every panel and `/api` route (the dependency below
+    is attached router-wide) and on login and logout, which is every way a
+    session continues, so "displayed once, then gone" holds regardless of
+    which request comes next.
+    """
+    if request.method in ("GET", "HEAD") and request.url.path.rstrip("/") == "/admin/keys":
+        return  # the one render the flash exists for; `keys_page` pops it
+    try:
+        request.session.pop("flash_new_key", None)
+    except (AssertionError, AttributeError):
+        # No SessionMiddleware in this app (some unit-test harnesses), so
+        # there is no cookie holding anything to forget.
+        pass
+
+
+def _wants_json(request: Request) -> bool:
+    """True for the REST surface, which must never be answered with HTML.
+
+    `/api/*` shares this dependency with the browser panel (see
+    `src/api/routes.py`), so an expired session sent a JSON client a 302 to a
+    login *page*. A programmatic caller follows it, parses the HTML as JSON
+    and reports a decoding failure instead of "your session expired".
+    """
+    return request.url.path == "/api" or request.url.path.startswith("/api/")
+
+
 async def require_user_panel(
     request: Request,
     user: User | _SingleUserSentinel | None = Depends(get_current_user),
@@ -101,7 +140,13 @@ async def require_user_panel(
     instead. Without this, users land on a login form they can't pass
     and have no obvious way to reach the bootstrap form.
     """
+    _forget_new_key_flash(request)
     if user is None or (isinstance(user, User) and not user.is_active):
+        if _wants_json(request):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated",
+            )
         target = request.url.path
         if request.url.query:
             target = f"{target}?{request.url.query}"
@@ -115,9 +160,15 @@ async def require_user_panel(
                     headers={"Location": "/admin/register"},
                 )
         # FastAPI surfaces an HTTPException with a Location header as a 302.
+        # `next` is percent-encoded: interpolating the raw path+query put the
+        # original `?a=1&b=2` into the *login* URL's own query string, so the
+        # login form read `next=/admin/usage` and dropped everything after the
+        # first `&` — and a crafted link could inject parameters of its own
+        # into the login handler. `_safe_next` on the consuming side is what
+        # keeps the decoded value a relative in-app path.
         raise HTTPException(
             status_code=status.HTTP_302_FOUND,
-            headers={"Location": f"/admin/auth/login?next={target}"},
+            headers={"Location": "/admin/auth/login?" + urlencode({"next": target})},
         )
     return user
 
@@ -448,11 +499,43 @@ async def keys_page(
         })
     try:
         new_key = request.session.pop("flash_new_key", None)
+        key_error = request.session.pop("flash_key_error", None)
     except (AssertionError, AttributeError):
         new_key = None
+        key_error = None
     return templates.TemplateResponse(request, "keys.html", _panel_context(request, user, {
-        "active": "keys", "keys": keys, "new_key": new_key,
+        "active": "keys", "keys": keys, "new_key": new_key, "key_error": key_error,
     }))
+
+
+# The JSON twin of this form (`CreateKeyRequest` in `src/api/routes.py`)
+# constrains the name; the form did not, so the two surfaces disagreed about
+# the same column. `name` is `String(255)` — over that, PostgreSQL raises and
+# the operator gets a 500 with no key and no explanation — and a name of pure
+# whitespace produced an unidentifiable row on a page whose only handle on a
+# credential *is* its name.
+_KEY_NAME_MAX = 255
+_KEY_NAME_RE = re.compile(r"^[\w\-. ]+$")
+
+
+def _key_name_error(name: str) -> str | None:
+    """Validate a form-submitted key name exactly as the JSON API does.
+
+    Returns the message to show, or None. The strip is this side's own
+    addition: pydantic's `min_length=1` accepts `"   "` because the pattern
+    admits the space character, which is defensible for a name with spaces
+    *in* it and useless as a whole name.
+    """
+    if not name.strip():
+        return "Key name is required."
+    if len(name) > _KEY_NAME_MAX:
+        return f"Key name must be at most {_KEY_NAME_MAX} characters."
+    if not _KEY_NAME_RE.match(name):
+        return (
+            "Key name may contain only letters, digits, spaces, and the "
+            "characters _ - . "
+        )
+    return None
 
 
 @router.post("/keys/create")
@@ -463,6 +546,17 @@ async def create_key_form(
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
+    name_error = _key_name_error(name)
+    if name_error is not None:
+        # Carried in the session rather than a query string: the value is the
+        # server's own message, and a `?error=` the operator can be linked to
+        # lets a third party choose what an authenticated admin reads.
+        try:
+            request.session["flash_key_error"] = name_error
+        except (AssertionError, AttributeError):
+            pass
+        return RedirectResponse("/admin/keys", status_code=303)
+
     raw_key = f"omcp_{secrets.token_hex(24)}"
     # The keys.html <select> only constrains the UI; a scripted/tampered POST
     # can submit any value. Mirror the JSON API's invariant (src/api/routes.py)
@@ -1333,8 +1427,38 @@ def _spawn(coro):
     task.add_done_callback(_background_tasks.discard)
 
 
-# Indexer pause flag, also surfaced via the reset progress endpoint.
+# Indexer pause flag, also surfaced via the reset progress endpoint and read
+# by `src.services.indexer._is_paused` (which `getattr`s this module
+# attribute). It stays a plain bool because that is the published contract;
+# what changed is that nothing sets it directly any more.
 indexer_paused: bool = False
+
+# How many danger-zone actions are currently holding the pause. A bare
+# `indexer_paused = False` in each handler's `finally` was wrong under
+# overlap: two resets that interleave (the second starts while the first is
+# still waiting on `index_pass_lock`) had the first one to finish clear the
+# flag for both, so the indexer resumed underneath the other's destructive
+# statements and `/settings/reset-embeddings/progress` reported "not paused"
+# about a pause that was still in force. The depth is mutated only between
+# `await`s on the single event loop, so a lock would guard nothing.
+_pause_depth: int = 0
+
+
+@contextmanager
+def _pause_indexer():
+    """Hold the indexer pause for the duration of the block.
+
+    Nesting-safe: the flag goes true on the first holder and false only when
+    the last one leaves.
+    """
+    global _pause_depth, indexer_paused
+    _pause_depth += 1
+    indexer_paused = True
+    try:
+        yield
+    finally:
+        _pause_depth -= 1
+        indexer_paused = _pause_depth > 0
 
 
 @asynccontextmanager
@@ -1394,7 +1518,6 @@ async def trigger_reembed(
     user=Depends(require_admin_panel),
 ):
     """Clear all embeddings and re-embed from scratch. Requires a valid signed token."""
-    global indexer_paused
     try:
         _reembed_serializer().loads(token, max_age=60)
     except (BadSignature, SignatureExpired):
@@ -1403,8 +1526,7 @@ async def trigger_reembed(
     from src.models.db import NoteEmbedding, NoteMetadata
     from sqlalchemy import delete, update
 
-    indexer_paused = True
-    try:
+    with _pause_indexer():
         async with _pass_lock_without_a_connection(session):
             async with async_session() as fresh:
                 await fresh.execute(delete(NoteEmbedding))
@@ -1418,8 +1540,6 @@ async def trigger_reembed(
                     update(NoteMetadata).values(embedded_content_hash=None)
                 )
                 await fresh.commit()
-    finally:
-        indexer_paused = False
 
     _spawn(_reindex_background())
     return RedirectResponse("/admin/settings", status_code=303)
@@ -1437,7 +1557,6 @@ async def reset_embeddings(
 
     Returns a JSON status object the dashboard can poll.
     """
-    global indexer_paused
     from sqlalchemy import delete
     from src.models.db import NoteEmbedding, NoteMetadata
 
@@ -1447,8 +1566,7 @@ async def reset_embeddings(
     # completes; semantic_search falls back to a sequential scan. See issue #6.
     hnsw = dim <= 2000
 
-    indexer_paused = True
-    try:
+    with _pause_indexer():
         async with _pass_lock_without_a_connection(session):
             async with async_session() as fresh:
                 await fresh.execute(text("SET LOCAL statement_timeout = '5min'"))
@@ -1484,8 +1602,6 @@ async def reset_embeddings(
         # The pre-warm caches whether an HNSW index exists; this route is the
         # one place that changes the answer.
         invalidate_hnsw_index_cache()
-    finally:
-        indexer_paused = False
 
     _spawn(_reindex_background())
 

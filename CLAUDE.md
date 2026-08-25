@@ -11,7 +11,14 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
   - `OllamaProvider` — bge-m3 by default, set `OLLAMA_URL` in `.env`
   - `OpenAIProvider` — `text-embedding-3-{small,large}` over httpx, supports
     Azure OpenAI / OpenAI-compatible base URLs
-- Jinja2 + htmx + Tailwind CDN control panel
+- Jinja2 control panel. htmx and Chart.js are **vendored** under
+  `src/control_panel/static/vendor/` and served from `/admin/static` — no CDN,
+  no `integrity` to keep in sync (#130). There is no Tailwind; the styling is
+  hand-written CSS in `base.html`. Google Fonts is the one remaining remote
+  origin and ships no executable code. **No CSP on the panel**, deliberately:
+  every template drives its controls with inline `onclick`/`onsubmit` and htmx
+  attributes, so the only policy they survive is one carrying `unsafe-inline`
+  for scripts — which permits exactly the injection a CSP is bought to stop.
 
 ## Project Layout
 - `src/main.py` — FastAPI app, lifespan, MCP mount
@@ -378,8 +385,13 @@ vanished from the page, so the operator saw a blank space that read as success.
   write: it answers "is *this process's* loop alive", which is a property of
   the process, and it resets to `None` on restart until the startup pass lands.
 - **Because the pre-warm holds `index_pass_lock`, the panel's destructive
-  actions take it too.** `reset_embeddings` and `trigger_reembed` set
-  `indexer_paused`, then `await session.close()` on the request's own session
+  actions take it too.** `reset_embeddings` and `trigger_reembed` take
+  `_pause_indexer()` — a **depth counter** whose first holder sets
+  `indexer_paused` and whose last one clears it, because a bare
+  `indexer_paused = False` in each handler's `finally` had the first of two
+  overlapping actions unpause the indexer underneath the second, and the
+  progress endpoint then reported "not paused" about a pause still in force
+  (#130) — then `await session.close()` on the request's own session
   **before** waiting for the lock — a waiter that keeps its pooled connection
   deadlocks against a lock holder that needs one — and only then open a fresh
   session inside the lock (`_pass_lock_without_a_connection`). `trigger_reembed`

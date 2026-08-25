@@ -392,6 +392,29 @@ class Settings(BaseSettings):
     # is useless to the human who is supposed to open it).
     _public_origin_explicit: bool = PrivateAttr(default=False)
 
+    @field_validator("mcp_hostname", mode="before")
+    @classmethod
+    def _normalize_mcp_hostname(cls, v):
+        """Fold `MCP_HOSTNAME` to a bare lowercase host, or `None`.
+
+        Field validators run before every `mode="after"` model validator, so
+        every derivation below sees the normalized form — which is the point.
+        `allowed_hosts` is derived from this value and Starlette's
+        `TrustedHostMiddleware` compares the Host header *exactly*, while
+        browsers and proxies send the host lowercased. So `Vault.Example.com`
+        booted clean, kept its casing into `allowed_hosts`, and then 400'd
+        every public request while the localhost health check (matched by the
+        always-appended "localhost") stayed green — a deployment that looks
+        healthy and serves nobody.
+
+        A value that is only whitespace becomes `None` rather than a truthy
+        blank: it would otherwise derive `https://` as the base URL and read
+        as an operator-supplied public origin.
+        """
+        if not isinstance(v, str):
+            return v
+        return v.strip().lower() or None
+
     @model_validator(mode="after")
     def _record_public_origin(self) -> "Settings":
         """Record whether a public origin was operator-supplied.
