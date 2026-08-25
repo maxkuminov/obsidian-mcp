@@ -82,11 +82,17 @@ The named-staging fallback's discard SHALL be told whether the publication lande
 - **THEN** the failure SHALL remain classified post-publish and the claim SHALL strand exactly as specified elsewhere
 - **AND** the outer cleanup's discard SHALL be invoked with the published outcome true and SHALL log no warning about the staging name having disappeared, whether the name was consumed by the publish or a matching residual name remains to be removed quietly
 
-#### Scenario: A failure before the drain completes cleans up exactly as before
+#### Scenario: A failure after the staged identity was recorded cleans up exactly as before
 
-- **WHEN** a named-fallback upload fails after its staging name exists but before publication — an over-cap body, a disconnect, a failing `fstat`, `fchmod` or payload flush
+- **WHEN** a named-fallback upload fails after its staging name exists and its identity `fstat` has succeeded, but before publication — an over-cap body, a disconnect, a failing `fchmod` or payload flush
 - **THEN** the original failure SHALL propagate unmasked and the claim handling SHALL be the pre-publication behavior specified elsewhere
 - **AND** the discard SHALL run with the published outcome false, removing a name that still refers to the staged inode and warning if the name has disappeared
+
+#### Scenario: A failing identity `fstat` leaves the name in place
+
+- **WHEN** a named-fallback upload's identity `fstat` itself fails, so no staged identity was ever recorded
+- **THEN** the original failure SHALL propagate unmasked with the published outcome false
+- **AND** the discard SHALL be invoked with no recorded identity and SHALL remove nothing — the name is left in place with the cannot-confirm warning, because with no identity nothing can prove the name still refers to the staged inode, and unlinking it could destroy a concurrent substitute (the destructive-write class the guard exists to refuse)
 
 #### Scenario: A pre-publication disappearance still warns
 

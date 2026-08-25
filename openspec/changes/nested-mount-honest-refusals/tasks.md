@@ -21,18 +21,18 @@
 
 ## 4. Transfer discard published-state (D4, #115)
 
-- [ ] 4.1 Hoist `state = {"published": False}` in `stream_to_vault` to **before** the staging block, so it exists from before `tmp_name` can (Codex finding 1 — otherwise any pre-drain failure hits `UnboundLocalError` in the modified cleanup, masking the real error and skipping the guarded discard).
-- [ ] 4.2 In the outer `except BaseException` cleanup, replace `vault_fs.discard_temp(staging_fd, tmp_name, staged_st)` with `vault_fs.discard_staged_name(staging_fd, tmp_name, staged_st, published=state["published"])`. `discard_temp` itself is unchanged.
+- [ ] 4.1 Hoist `state = {"published": False}` in `_stream_locked` (the inner function of `stream_to_vault` that owns the staging block and cleanup) to **before** the staging block, so it exists from before `tmp_name` can (Codex finding 1 — otherwise any pre-drain failure hits `UnboundLocalError` in the modified cleanup, masking the real error and skipping the guarded discard).
+- [ ] 4.2 In `_stream_locked`'s outer `except BaseException` cleanup, replace `vault_fs.discard_temp(staging_fd, tmp_name, staged_st)` with `vault_fs.discard_staged_name(staging_fd, tmp_name, staged_st, published=state["published"])`. `discard_temp` itself is unchanged.
 
 ## 5. Tests (D5)
 
 - [ ] 5.1 Real nested mount (`tests/_nested_mount_cases.py`): soft delete of a file on `M/` via `delete_note` and `delete_file` → `MountBoundary` text naming the layout and the workaround, file untouched, nothing in `.trash/`; `permanent=True` still works.
 - [ ] 5.2 Real nested mount: `move_note("M/a.md", "a.md")` → mount-boundary refusal, source untouched, no destination entry; `move_note("M/a.md", "New/Sub/a.md")` with `New/Sub` absent → refusal **and neither `New/` nor `New/Sub/` exists afterwards** (finding 4); a same-side move still succeeds; `.trash` bind-mounted as its own mount → `probe_trash` fails `MountBoundary` with accurate prose (finding 3).
-- [ ] 5.3 No-DB-mutation proof (finding 5): session/statement spy (or DB-backed case) asserting a refused cross-mount move executes and commits nothing against `notes_metadata`/`note_links`, including `rewrite_links=True` with ≥1 planned backlink whose source note is byte-identical afterwards.
+- [ ] 5.3 No-DB-mutation proof (finding 5): session/statement spy (or DB-backed case) asserting a refused cross-mount move executes **no mutating statement and no commit** (absence of DML plus row snapshots of `notes_metadata`/`note_links`; the planning SELECTs are expected), including `rewrite_links=True` with ≥1 planned backlink whose source note is byte-identical afterwards.
 - [ ] 5.4 Degraded-kernel policy (stubbed sibling module): `mount_id_of` raising ⇒ soft-delete and move preflights skip and same-mount operations succeed; transfer's `require_same_mount` still refuses — the two directions pinned apart.
 - [ ] 5.5 Fault injection (#110): named-fallback note write with the publishing link / overwrite replace monkeypatched to raise `EXDEV` → `MountBoundary`; `EOPNOTSUPP` → filesystem hard-link message; `EPERM` → publication-denied message naming security policy.
 - [ ] 5.6 #115 post-publish: fallback mode, successful overwrite publish, post-publication flush raising → `PostPublishFailure`, claim stranded, `caplog` holds **no** disappearance warning, and a spy asserts the outer discard ran with `published=True` (finding 6); cover the residual-matching-name shape (link publish) too.
-- [ ] 5.7 #115 pre-publish: early fallback failures (over-cap body; failing `fstat`/`fchmod`/payload flush) → original exception propagates unmasked, guarded discard runs with `published=False`, staged name removed (finding 1); a pre-publication disappearance still warns.
+- [ ] 5.7 #115 pre-publish: early fallback failures split by whether the staged identity was recorded (round-2 finding 1). Identity recorded (over-cap body; failing `fchmod`/payload flush) → original exception unmasked, guarded discard with `published=False` removes a name still referring to the staged inode, warns if it disappeared. Identity `fstat` itself failed → original exception unmasked, discard invoked with no identity and removes **nothing**: the name stays, with the cannot-confirm warning.
 - [ ] 5.8 Grep the test suite for assertions pinning the old lying strings ("cannot receive a non-replacing rename", "does not support hard links") on cross-mount cases and update them.
 
 ## 6. Verification and shipping
