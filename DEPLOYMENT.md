@@ -113,19 +113,12 @@ Before starting Caddy, generate a password hash and replace the
 docker run --rm caddy:2 caddy hash-password --plaintext 'your-password'
 ```
 
-The bundled configuration protects `/admin`, `/api`, and `/authorize` and
-fails closed while the placeholder remains. Everything it does not name
-is answered 404, so if you want the file-transfer tools, add
-`/transfer*` to the public matcher alongside `/mcp*`:
-
-```caddyfile
-@mcp {
-    path /mcp* /transfer* /health /.well-known* /register /token /revoke
-}
-```
-
-`/transfer/*` is public by design — the capability token in the request
-is what authorises it — so it must not go behind the basic-auth block.
+The bundled configuration protects `/admin`, `/api`, and `/authorize`,
+fails closed while the placeholder remains, and answers everything it
+does not name with 404. Its public matcher already forwards
+`/transfer*`: those routes are public by design — the capability token
+in the request is what authorises them — so if you customise the file,
+keep them out of the basic-auth block.
 
 > Leave `MCP_SANDBOX_MODE` unset (it appears commented-out in
 > `.env.example`). It exists only for the Glama registry's automated

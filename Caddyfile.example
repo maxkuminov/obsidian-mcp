@@ -6,8 +6,15 @@
     encode gzip
 
     # ── Public MCP endpoint (API-key auth at the application layer) ──
+    # /transfer* is public by design: the capability token in the
+    # Authorization header is what authorises a redemption, and precise
+    # status is only ever reported to the authenticated side. Do NOT move
+    # it behind the basic_auth block below — the person redeeming a link
+    # has no panel credentials. Caddy does not log request headers by
+    # default and streams request bodies; keep both defaults, or upload
+    # links stop working and live capabilities end up in your logs.
     @mcp {
-        path /mcp* /health /.well-known* /register /token /revoke
+        path /mcp* /transfer* /health /.well-known* /register /token /revoke
     }
     handle @mcp {
         reverse_proxy obsidian-mcp:8000
