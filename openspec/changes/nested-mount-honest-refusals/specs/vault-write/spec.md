@@ -1,0 +1,90 @@
+# vault-write — delta for nested-mount-honest-refusals
+
+## ADDED Requirements
+
+### Requirement: A cross-mount rename names the mount boundary as its cause
+
+The non-replacing rename primitive SHALL classify `EXDEV` on its failure path before naming a cause, because `EXDEV` is not exclusively a mount-boundary signal: Landlock returns it for a same-mount reparenting a policy denies, and overlayfs for renames its layering cannot perform — so an unconditional mount-layout diagnosis is causally false on real same-mount configurations, the same defect class this change removes. On `EXDEV` the primitive SHALL compare the two directory descriptors' mount identities, inside that one failure path and never persisted: a definite mismatch SHALL raise the mount-boundary error (`MountBoundary`, the existing subclass of `UnsupportedFilesystem`) naming the mount layout; a definite match SHALL raise an error that names a security policy (Landlock) or filesystem-internal boundary (overlayfs, btrfs subvolume) as the plausible causes and SHALL NOT claim a mount boundary; and where mount identity cannot be read the error SHALL present `EXDEV` as ambiguous between those causes rather than assert either. All three remain distinct from the `EINVAL`/`ENOSYS`/`EOPNOTSUPP` cases that genuinely mean the kernel or filesystem cannot perform a non-replacing rename. Every caller of the primitive — the soft delete, `move_note`'s publication and its rollbacks — SHALL surface the classified cause rather than re-wrapping it into filesystem-support prose; a caller that wraps rename failures in its own message SHALL handle the mount-boundary subclass before the generic class, or its wrapper is a lie and the subclass handler unreachable. The note path's named-fallback publish mappings SHALL classify the same way — their staging is same-directory, so an unconditional mount claim there is false in almost every case that can fire.
+
+#### Scenario: A same-mount `EXDEV` does not blame the mount layout
+
+- **WHEN** `renameat2(RENAME_NOREPLACE)` returns `EXDEV` for two names whose directories provably share a mount (e.g. a Landlock policy denying the reparent, or an overlayfs rename restriction)
+- **THEN** the raised error SHALL name a security policy or filesystem-internal boundary as the plausible causes
+- **AND** it SHALL NOT claim the two names are on different mounts or tell the caller to change the mount layout
+
+#### Scenario: An `EXDEV` whose mount identity cannot be read is reported as ambiguous
+
+- **WHEN** the same rename fails `EXDEV` where `STATX_MNT_ID` is unavailable
+- **THEN** the error SHALL present the failure as `EXDEV` with both a mount boundary and a policy or filesystem-internal boundary as possible causes, asserting neither
+
+#### Scenario: A rename across a nested mount is refused with the mount-boundary cause
+
+- **WHEN** a `renameat2(RENAME_NOREPLACE)` issued by a vault primitive returns `EXDEV` and the two directories' mount identities provably differ
+- **THEN** the raised error SHALL be the mount-boundary type and its text SHALL name the mount layout as the cause
+- **AND** the text SHALL NOT state or imply that the filesystem lacks non-replacing-rename support
+
+#### Scenario: The genuinely unsupported cases keep their message
+
+- **WHEN** the same primitive fails with `EINVAL`, `ENOSYS` or `EOPNOTSUPP`
+- **THEN** the error SHALL remain the generic unsupported-filesystem refusal stating that a non-replacing rename is unavailable and there is no safe fallback
+
+### Requirement: A soft delete across a mount boundary is refused with an accurate cause and an actionable workaround
+
+The soft delete SHALL refuse to move a file into `.trash/` across a mount boundary with a mount-boundary error naming the layout — the file's directory and the vault root's `.trash` are on different mounts, which the rename cannot cross — and naming `permanent=True` as the workaround; it SHALL NOT blame `.trash/`'s ability to receive a non-replacing rename for a cross-mount failure. Where the kernel can answer the mount question (`STATX_MNT_ID`), a best-effort preflight comparing the source parent with the opened `.trash` descriptor SHALL raise that refusal before the rename is attempted; where it cannot answer, the preflight SHALL be skipped — never failed closed, because a kernel between the 5.6 floor and 5.8 serves same-mount soft deletes correctly today — and the rename's own `EXDEV` classification is the backstop — which, with the identity unreadable, presents the refusal as ambiguous rather than asserting a mount boundary it cannot prove. Both mount ids SHALL be read inside a single comparison immediately before use and never persisted. The behavior SHALL live in the shared soft-delete primitive, so `delete_note` (specified here) and `delete_file` (whose own requirement in `file-transfer` states the same refusal) cannot drift apart; soft-deleting into a per-mount trash is out of scope and the operation still fails on such a layout — only the reported cause changes.
+
+#### Scenario: Soft delete of a file on a nested mount
+
+- **WHEN** `delete_note(path)` or `delete_file(path)` soft-deletes a file whose directory is on a different mount than the vault root's `.trash/` (e.g. a directory of the same filesystem bind-mounted beneath the root)
+- **THEN** the tool SHALL refuse with a mount-boundary error naming the mount layout as the cause and `permanent=True` as the workaround
+- **AND** the file SHALL be untouched and nothing SHALL be created in `.trash/`
+- **AND** the error SHALL NOT claim that `.trash/` cannot receive a non-replacing rename from the vault
+
+#### Scenario: A kernel that cannot answer the mount question keeps its soft delete
+
+- **WHEN** the same soft delete runs where `STATX_MNT_ID` is unavailable and the source and `.trash/` share a mount
+- **THEN** the preflight SHALL be skipped and the soft delete SHALL proceed and succeed
+- **AND** a cross-mount attempt on such a kernel SHALL still be refused by the rename's `EXDEV` classification, presented as ambiguous between a mount boundary and a policy or filesystem-internal boundary — the identity that would prove the mount claim is exactly what such a kernel cannot read
+
+### Requirement: `move_note` refuses a cross-mount move naming the mount boundary
+
+`move_note` SHALL refuse a move whose source and destination parents sit on different mounts with a mount-boundary error naming the layout, and SHALL NOT attribute the failure to missing filesystem support for the non-replacing rename. Where the kernel can answer the mount question, a best-effort preflight SHALL refuse before the rename, before any mutating database statement and before any commit — the read-only planning SELECTs the tool issues before the move (backlink planning, assignment confirmation) are permitted and change nothing — and the preflight itself SHALL create nothing: when the destination parent does not exist yet, the comparison SHALL run against the destination's deepest **existing** ancestor — a directory created beneath it lands on that ancestor's mount, the same reasoning the transfer mint preflight already uses — never by materializing the destination parent to compare against it. Where the kernel cannot answer, the preflight SHALL be skipped and the rename's `EXDEV` mapping is the backstop; on that path missing destination parent directories may have been created before the rename refuses, and what such a refusal can leave behind SHALL be at most empty directories — the same bounded residual already declared for creation descents — never a moved note, a lost note, or a database change. The preflight SHALL run only on the forward move: a rollback SHALL always attempt its rename, because refusing a rollback on a preflight strands the note at the destination, and a forward rename that landed proves both parents share a mount. A refused move SHALL update no database row — `notes_metadata` and `note_links` SHALL be untouched, including under `rewrite_links=True` with planned rewrites, and the refusal SHALL come before any source note is rewritten. Moves that stay on one side of a boundary SHALL be unaffected, and a copying fallback SHALL NOT be introduced — it breaks the guarantee that whichever inode is at the source when the call runs is what moves.
+
+#### Scenario: A move across a nested-mount boundary
+
+- **WHEN** `move_note("M/a.md", "a.md")` runs where `M/` is a mount beneath the vault root
+- **THEN** the tool SHALL refuse with a mount-boundary error naming the mount layout as the cause
+- **AND** the source note SHALL be untouched, nothing SHALL exist at the destination, and no mutating database statement SHALL be executed and nothing SHALL be committed — verified against the session (absence of DML plus row snapshots of `notes_metadata` and `note_links`), not inferred from the refusal text; read-only planning SELECTs are permitted — including under `rewrite_links=True` with at least one planned backlink rewrite, whose source notes SHALL be byte-identical afterwards
+- **AND** the error SHALL NOT claim that `renameat2(RENAME_NOREPLACE)` is unavailable
+
+#### Scenario: A cross-mount move to a missing destination folder creates nothing
+
+- **WHEN** `move_note("M/a.md", "New/Sub/a.md")` runs where `M/` is a mount beneath the vault root and `New/Sub/` does not exist, on a kernel that can answer the mount question
+- **THEN** the preflight SHALL refuse against the deepest existing destination ancestor's mount
+- **AND** neither `New/` nor `New/Sub/` SHALL exist after the refusal
+
+#### Scenario: A move on one side of the boundary still works
+
+- **WHEN** a note is moved between two directories on the same mount, in a vault that also contains a nested mount elsewhere
+- **THEN** the move SHALL proceed exactly as before this change
+
+#### Scenario: A degraded kernel keeps its moves
+
+- **WHEN** `move_note` runs where `STATX_MNT_ID` is unavailable and both parents share a mount
+- **THEN** the preflight SHALL be skipped and the move SHALL succeed
+
+### Requirement: The note path's named-fallback publish classifies its `EXDEV`
+
+The note path's named-staging fallback SHALL classify `EXDEV` from its publishing link, and from its overwrite publish (`os.replace`), through the same comparison the rename primitive uses rather than letting either escape as a bare `OSError` or asserting a cause it has not measured. Because that fallback stages **in the destination's own directory**, the two ends of both publications are one directory descriptor, so the comparison answers "same mount" in every ordinary configuration that can produce this errno — and a message naming a mount boundary there would be false in almost every case it can fire, which is the defect class this change removes rather than an instance of the thing it fixes. A definite mismatch SHALL still raise the mount-boundary error, so an exotic layout gets the accurate answer and the branch is not dead. Of the remaining link errnos, only `EOPNOTSUPP` SHALL be described as the filesystem not supporting hard links; `EPERM` SHALL be described as hard-link publication being denied — pointing at permissions or security policy (seccomp/LSM) as well as filesystem support — because a security policy returns `EPERM` for `link` on filesystems whose hard links work fine. The two write paths SHALL use the same vocabulary.
+
+#### Scenario: The fallback's no-clobber link fails `EXDEV`
+
+- **WHEN** the named-fallback publish's hard link fails with `EXDEV` and its staging file sits in the destination's own directory, so the two ends provably share a mount
+- **THEN** the raised error SHALL name a security policy or filesystem-internal boundary and SHALL NOT claim a mount boundary
+- **AND** the same failure where the two ends' mount identities provably differ SHALL raise the mount-boundary error naming the layout, and where they cannot be read SHALL present both causes without asserting either
+- **AND** an `EOPNOTSUPP` failure of the same link SHALL keep the message stating the filesystem does not support hard links
+- **AND** an `EPERM` failure SHALL be reported as hard-link publication denied, naming security policy alongside filesystem support as possible causes
+
+#### Scenario: The fallback's overwrite rename fails `EXDEV`
+
+- **WHEN** the named-fallback overwrite publish's replacing rename fails with `EXDEV`
+- **THEN** the raised error SHALL be the classified refusal — not a bare `OSError`, and not a mount-boundary claim unless the mount comparison supports one

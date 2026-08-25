@@ -431,3 +431,133 @@ def test_a_leaf_bind_of_a_different_file_is_caught_by_the_fingerprint_first(
         os.close(root)
         unbind(VAULT / "target.bin")
     assert (VAULT / "target.bin").read_bytes() == b"old"
+
+
+# ── nested-mount-honest-refusals: the vault side (#108, #109) ───────────────
+#
+# The sibling module stubs `mount_id_of`, which pins the *policy*. These pin
+# the premise for the vault path the way the transfer cases above pin it for
+# publication: a real bind mount, a real `renameat2`, and the kernel deciding.
+# The database is not reachable from this sandbox, so the "no row was touched"
+# half of the contract is asserted against a session spy in the sibling module;
+# what is asserted here is the filesystem and the message.
+
+
+def test_a_rename_across_the_boundary_really_does_fail(clean_vault):
+    """`renameat2(RENAME_NOREPLACE)` refuses across a mount, on a filesystem
+    that renames perfectly well — the premise the old message denied."""
+    bind(clean_vault, clean_vault)
+    (clean_vault / "a.md").write_bytes(b"body\n")
+    root, mounted = _fd(VAULT), _fd(clean_vault)
+    try:
+        with pytest.raises(vault_fs.MountBoundary) as exc:
+            vault_fs.rename_noreplace(mounted, "a.md", root, "a.md")
+    finally:
+        os.close(root)
+        os.close(mounted)
+    assert "different mounts" in str(exc.value)
+    assert "not available" not in str(exc.value)
+    assert (clean_vault / "a.md").read_bytes() == b"body\n"
+
+
+async def test_delete_note_refuses_across_the_boundary(clean_vault):
+    bind(clean_vault, clean_vault)
+    note = clean_vault / "a.md"
+    note.write_text("body\n", encoding="utf-8")
+
+    result = await tools.delete_note_impl("M/a.md")
+
+    assert "different mounts" in result, result
+    assert "permanent=True" in result
+    assert "cannot receive a non-replacing rename" not in result
+    assert note.read_text(encoding="utf-8") == "body\n"
+    trash = VAULT / ".trash"
+    assert not trash.exists() or list(trash.iterdir()) == []
+
+
+async def test_delete_file_refuses_across_the_boundary(clean_vault):
+    """Same refusal through the other tool: both reach one primitive."""
+    bind(clean_vault, clean_vault)
+    blob = clean_vault / "a.bin"
+    blob.write_bytes(b"bytes")
+
+    result = await tools.delete_file_impl("M/a.bin")
+
+    assert "different mounts" in result, result
+    assert "permanent=True" in result
+    assert blob.read_bytes() == b"bytes"
+
+
+async def test_a_permanent_delete_still_works_across_the_boundary(clean_vault):
+    """The workaround the message names has to actually work: an unlink
+    crosses no mount boundary."""
+    bind(clean_vault, clean_vault)
+    (clean_vault / "a.bin").write_bytes(b"bytes")
+
+    result = await tools.delete_file_impl("M/a.bin", permanent=True)
+
+    assert "different mounts" not in result, result
+    assert not (clean_vault / "a.bin").exists()
+
+
+async def test_move_note_refuses_across_the_boundary(clean_vault):
+    bind(clean_vault, clean_vault)
+    note = clean_vault / "a.md"
+    note.write_text("body\n", encoding="utf-8")
+
+    result = await tools.move_note_impl("M/a.md", "a.md")
+
+    assert "different mounts" in result, result
+    assert "mount layout is what refuses" in result
+    assert "not available" not in result
+    assert note.read_text(encoding="utf-8") == "body\n"
+    assert not (VAULT / "a.md").exists()
+
+
+async def test_a_cross_mount_move_to_a_missing_folder_creates_nothing(clean_vault):
+    """Codex finding 4, with the kernel supplying the boundary: the preflight
+    compares against the destination's deepest *existing* ancestor, so it never
+    materialises `New/` in order to ask which mount it would be on."""
+    bind(clean_vault, clean_vault)
+    (clean_vault / "a.md").write_text("body\n", encoding="utf-8")
+
+    result = await tools.move_note_impl("M/a.md", "New/Sub/a.md")
+
+    assert "different mounts" in result, result
+    assert not (VAULT / "New").exists(), "the preflight created a directory"
+    assert (clean_vault / "a.md").read_text(encoding="utf-8") == "body\n"
+
+
+async def test_a_move_on_one_side_of_the_boundary_still_works(clean_vault):
+    """The refusal is per pair, so a vault that merely contains a nested mount
+    keeps every move that does not cross it."""
+    bind(clean_vault, clean_vault)
+    (VAULT / "a.md").write_text("body\n", encoding="utf-8")
+
+    result = await tools.move_note_impl("a.md", "Attachments/a.md")
+
+    assert "different mounts" not in result, result
+    assert (VAULT / "Attachments" / "a.md").read_text(encoding="utf-8") == "body\n"
+
+
+def test_a_trash_on_its_own_mount_is_named_by_the_probe(clean_vault):
+    """Codex finding 3. `probe_trash` renames root→`.trash`, so its `EXDEV`
+    means `.trash` is itself a mount — and the generic re-wrap would have
+    erased both the subtype and the cause into "the vault filesystem cannot
+    move files … with a non-replacing rename", which is false: it can.
+    """
+    trash = VAULT / vault_fs.TRASH_DIR
+    trash.mkdir(exist_ok=True)
+    bind(trash, trash)
+    root = _fd(VAULT)
+    try:
+        with pytest.raises(vault_fs.MountBoundary) as exc:
+            vault_fs.probe_trash(root)
+    finally:
+        os.close(root)
+        unbind(trash)
+    message = str(exc.value)
+    assert "different mounts" in message
+    assert vault_fs.TRASH_DIR in message
+    assert "cannot move files" not in message
+    assert "permanent=True" in message

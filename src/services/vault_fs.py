@@ -246,10 +246,15 @@ class UnsupportedFilesystem(VaultFSError):
     """The vault filesystem cannot support an operation this module needs.
 
     Two independent capabilities, probed separately because different callers
-    need different ones: hard links within the root (`EPERM`/`EOPNOTSUPP`/
-    `EXDEV`) for the no-clobber publish, and a same-device `rename` into
-    `.trash` (`EXDEV`) for the soft delete. The transfer tools refuse rather
-    than silently degrading to an overwriting move.
+    need different ones: hard links within the root (`EPERM`/`EOPNOTSUPP`) for
+    the no-clobber publish, and a `rename` into `.trash` (`EINVAL`/`ENOSYS`/
+    `EOPNOTSUPP`) for the soft delete. The transfer tools refuse rather than
+    silently degrading to an overwriting move.
+
+    `EXDEV` is deliberately **not** in either list. It is a mount boundary, not
+    a missing capability, and it raises `MountBoundary` — a subclass, so every
+    surface that answers this one keeps answering it while the message names
+    the layout instead of the filesystem.
     """
 
 
@@ -273,6 +278,106 @@ class MountBoundary(UnsupportedFilesystem):
     and the rename — which is why the check that produces this is on mount
     identity and never on `st_dev` (D23).
     """
+
+
+class CrossDeviceRefusal(UnsupportedFilesystem):
+    """`EXDEV`, from an operation whose two ends are **not** proven to differ.
+
+    `EXDEV` is usually a mount boundary and is not only that (adversarial round
+    1). Landlock answers `EXDEV` for a reparenting its ruleset denies, and
+    overlayfs for a rename its layering cannot perform — both on names that sit
+    on one mount. So a diagnosis is owed a *comparison*, not an assumption:
+    `classify_cross_device` reads both mount ids on the failure path and picks
+    between `MountBoundary` (they provably differ) and this (they provably
+    agree, or the kernel cannot say).
+
+    A sibling of `MountBoundary` rather than a parent or a child: they are two
+    different findings about one errno, and the callers that re-wrap rename
+    failures need to tell them apart — a message blaming the mount layout for a
+    Landlock denial is the same defect class as one blaming the filesystem for
+    a mount boundary, just aimed at a third subsystem. Both stay
+    `UnsupportedFilesystem`, so every surface that already answers one answers
+    this without a new branch.
+    """
+
+
+def _compare_mounts(
+    fd_a: int, fd_b: int
+) -> tuple[bool | None, UnsupportedFilesystem | None]:
+    """`(differ?, why not)` — differ, agree, or could not be read, and why.
+
+    The tri-state `same_mount` deliberately does not have: it raises where the
+    mount cannot be read, which is right for a *guard* and useless for a
+    *diagnosis*, where "cannot tell" is itself the honest answer. Both ids are
+    read inside this one call and never persisted, exactly as `same_mount`
+    requires (D23).
+
+    The second element carries `mount_id_of`'s own error, because the reasons
+    it can fail are not one reason: `STATX_MNT_ID` missing on a pre-5.8 kernel,
+    but equally a seccomp profile refusing `statx`, an `EIO`, a libc without
+    the wrapper, or a descriptor that is not what the caller thought. A
+    diagnosis that names only the first would be another confident wrong cause
+    — the thing this whole module is being fixed for — so the caller quotes
+    this rather than guessing.
+    """
+    try:
+        return mount_id_of(fd_a) != mount_id_of(fd_b), None
+    except UnsupportedFilesystem as exc:
+        return None, exc
+
+
+def classify_cross_device(
+    src_dir_fd: int, dst_dir_fd: int, *, operation: str, ends: str
+) -> UnsupportedFilesystem:
+    """Build the error an `EXDEV` actually supports. Returns; never raises.
+
+    Called only from a failure path, so the pair of `statx` calls costs nothing
+    on the happy path — and buys the difference between three genuinely
+    different pieces of advice:
+
+    * the two directories are on **different mounts** — the mount layout is the
+      cause and `MountBoundary` says so;
+    * they are on the **same mount** — a mount boundary is then flatly untrue,
+      and what answers `EXDEV` there is a security policy (a Landlock ruleset
+      denying the reparent) or a boundary internal to the filesystem (an
+      overlayfs layering restriction, a btrfs subvolume). Sending an operator
+      to look at mounts would be the same defect class this change removes;
+    * mount identity **cannot be read** — a pre-5.8 kernel without
+      `STATX_MNT_ID` (the server's own floor is `openat2`'s 5.6), but equally a
+      seccomp profile refusing `statx`, an `EIO`, or a libc without the
+      wrapper. The message therefore quotes what actually failed and names
+      both candidates rather than asserting either, and in particular does not
+      diagnose a kernel version it has not established. Inventing a verdict
+      from a missing measurement is what `mount_id_of` refuses to do with
+      `st_dev`, and it is refused here too.
+
+    `operation` reads like "the non-replacing rename that moves a.md to b.md";
+    `ends` names the two things being compared, and is what "on different
+    mounts" is predicated of.
+    """
+    differ, unreadable = _compare_mounts(src_dir_fd, dst_dir_fd)
+    if differ is True:
+        return MountBoundary(
+            f"{ends} are on different mounts, so {operation} cannot cross the "
+            "boundary (EXDEV). The filesystem is fine; the mount layout is "
+            "what refuses."
+        )
+    if differ is False:
+        return CrossDeviceRefusal(
+            f"{operation} was refused with EXDEV although {ends} are on the "
+            "same mount, so this is not a mount boundary. A security policy "
+            "(a Landlock ruleset denying the reparent) or a boundary internal "
+            "to the filesystem (an overlayfs layering restriction, a btrfs "
+            "subvolume) answers EXDEV the same way. Look there, not at the "
+            "mount layout."
+        )
+    return CrossDeviceRefusal(
+        f"{operation} was refused with EXDEV, and which mounts {ends} are on "
+        f"could not be read ({unreadable}), so the cause cannot be established "
+        "here. It is one of two: a mount boundary between them, or a security "
+        "policy (Landlock) or filesystem-internal boundary (overlayfs, a btrfs "
+        "subvolume) refusing an operation that stays on one mount."
+    )
 
 
 def open_root(root: Path | str) -> int:
@@ -924,6 +1029,34 @@ def require_same_mount(staging_fd: int, dst_fd: int, dest_label) -> None:
             "filesystem is fine; the mount layout is what refuses. Choose a "
             "destination on the same mount as the vault root."
         )
+
+
+def cross_mount_definitely(fd_a: int, fd_b: int) -> bool:
+    """Whether two descriptors are **definitely** on different mounts.
+
+    The fail-*open* form of `same_mount`, and the policy is written here once
+    rather than at each call: "cannot establish" answers `False`, so the caller
+    proceeds and the syscall's own `EXDEV` — mapped by `rename_noreplace` — is
+    what names the cause. Only a clean reading of both mount ids that differ
+    is a refusal.
+
+    **Not for the transfer path.** `require_same_mount` fails *closed* on the
+    same question and that is deliberate: a late `EXDEV` there costs a body
+    that has already streamed in full, so "cannot check" must not mint a
+    capability. Here the failure a preflight would prevent costs nothing — the
+    rename fails immediately and accurately either way — while failing closed
+    on a kernel between the `openat2` floor (5.6) and `STATX_MNT_ID` (5.8)
+    would take soft delete and `move_note` away from a deployment that serves
+    them correctly today. The two directions are opposite on purpose; do not
+    reuse this one to "simplify" the other.
+
+    `same_mount`'s no-time-spanning rule is respected by construction: both ids
+    are read inside its single call, immediately before the act, and neither is
+    stored. Like every preflight in this module it is check-then-act — a mount
+    appearing between it and the rename is caught by the residual mapping,
+    which is why the mapping and not this is the correctness layer.
+    """
+    return _compare_mounts(fd_a, fd_b)[0] is True
 
 
 def leaf_mount_id(dst_dir_fd: int, name: str) -> int | None:
@@ -1976,9 +2109,31 @@ def rename_noreplace(
 
     Raises `FileExistsError` (EEXIST — the caller retries with another name),
     `FileNotFoundError` (ENOENT), `UnsupportedFilesystem` (EINVAL/ENOSYS/
-    EOPNOTSUPP/EXDEV — the kernel or filesystem cannot do a non-replacing
-    rename here), `UnsafePath` (EISDIR/ENOTDIR — the two names are not the same
-    kind of object), and plain `OSError` for anything else.
+    EOPNOTSUPP — the kernel or filesystem cannot do a non-replacing rename
+    here), `MountBoundary` or `CrossDeviceRefusal` (EXDEV, see below),
+    `UnsafePath` (EISDIR/ENOTDIR — the two names are not the same kind of
+    object), and plain `OSError` for anything else.
+
+    **`EXDEV` is not one of the unsupported cases and must not be folded back
+    in with them.** Those three mean this kernel or this filesystem cannot
+    perform a non-replacing rename at all, which `EXDEV` never means: the
+    filesystem renames perfectly well. Reporting it as "renameat2 is not
+    available" sends an operator, or an agent acting on the text, to change
+    filesystems in response to something else entirely.
+
+    **Nor is it unconditionally a mount boundary** — that was this change's own
+    first draft and review caught it. Landlock answers `EXDEV` for a same-mount
+    reparenting its ruleset denies, and overlayfs for a rename its layering
+    cannot perform. So the errno is handed to `classify_cross_device`, which
+    reads both directories' mount ids *here, on the failure path* and picks
+    between `MountBoundary` (they provably differ), a same-mount
+    `CrossDeviceRefusal` naming policy and filesystem-internal boundaries, and
+    an explicitly ambiguous one where the kernel cannot say.
+
+    Every caller inherits the classified cause from here, so a caller that
+    re-wraps rename failures in its own prose has to handle both subclasses
+    **before** `UnsupportedFilesystem`, or its wrapper is a lie and the
+    subclass branches unreachable — see `soft_delete_at` and `probe_trash`.
     """
     code = _renameat2_raw(
         src_dir_fd, src_name, dst_dir_fd, dst_name, RENAME_NOREPLACE
@@ -1989,7 +2144,21 @@ def rename_noreplace(
         raise FileExistsError(code, os.strerror(code), dst_name)
     if code == errno.ENOENT:
         raise FileNotFoundError(code, os.strerror(code), src_name)
-    if code in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.EXDEV):
+    if code == errno.EXDEV:
+        # **Classified, not assumed.** `EXDEV` is usually a mount boundary and
+        # is not only that: Landlock returns it for a same-mount reparent its
+        # ruleset denies, and overlayfs for a rename its layering cannot
+        # perform. Asserting the mount layout unconditionally would be exactly
+        # the causally-false diagnosis this change exists to remove, aimed at a
+        # different subsystem. The two `statx` calls run only here, on the
+        # failure path.
+        raise classify_cross_device(
+            src_dir_fd,
+            dst_dir_fd,
+            operation=f"the non-replacing rename of {src_name} to {dst_name}",
+            ends=f"{src_name} and {dst_name}",
+        )
+    if code in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
         raise UnsupportedFilesystem(
             f"renameat2(RENAME_NOREPLACE) is not available for this rename "
             f"({errno.errorcode.get(code, code)}); a non-replacing move is "
@@ -2026,6 +2195,33 @@ def remove(root_fd: int, rel_path: str | Path) -> None:
         flush_dir_quietly(dir_fd, f"parent directory of {rel_path}")
     finally:
         os.close(dir_fd)
+
+
+def _trash_mount_boundary(
+    rel_path: str | Path, trash_dir: str, detail: str | None = None
+) -> MountBoundary:
+    """The soft delete's mount-boundary refusal, in one place.
+
+    Raised from two points that must not drift: the best-effort preflight, and
+    the residual mapping of an `EXDEV` that reached the rename. Both say the
+    same thing because it is the same fact — `.trash` is opened beneath the
+    vault *root*, so a file on a mount nested beneath that root has a source
+    parent the trash rename cannot reach.
+
+    It names `permanent=True` because that is the workaround an agent can
+    actually act on: an unlink crosses no mount boundary. A per-mount trash
+    would make the soft delete work and is explicitly out of scope here; what
+    this closes is a message that blamed `.trash/`'s ability to receive a
+    non-replacing rename for a layout the filesystem has no say in.
+    """
+    because = f" ({detail})" if detail else ""
+    return MountBoundary(
+        f"{rel_path} and the vault root's {trash_dir}/ are on different "
+        f"mounts, so the rename that soft-deletes it cannot cross the "
+        f"boundary{because}. The filesystem is fine; the mount layout is what "
+        f"refuses — {trash_dir}/ lives beside the vault root and the file does "
+        "not. Pass permanent=True to unlink the file instead."
+    )
 
 
 def _rename_into_trash(
@@ -2157,9 +2353,13 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) 
     kind of success an agent never questions.
 
     `.trash` lives inside the vault root, so the rename is same-device by
-    construction; `EXDEV` (separate mount) and `EINVAL`/`ENOSYS` (a filesystem
-    or kernel without `RENAME_NOREPLACE`) raise `UnsupportedFilesystem`, which
-    `probe_trash` catches up front rather than at the first delete.
+    construction — but not same-*mount* by construction: a directory bind
+    mounted beneath the root shares the root's `st_dev` and still refuses the
+    rename. That case raises `MountBoundary` naming the layout (best-effort
+    before the rename, and from the rename's own `EXDEV` otherwise), while
+    `EINVAL`/`ENOSYS`/`EOPNOTSUPP` — a filesystem or kernel without
+    `RENAME_NOREPLACE` — raise `UnsupportedFilesystem`, which `probe_trash`
+    catches up front rather than at the first delete.
     """
     src_fd, name = _open_parent(root_fd, rel_path, create=False)
     try:
@@ -2206,6 +2406,15 @@ def soft_delete_at(
         trash_fd = open_dir_beneath(
             root_fd, trash_dir, create=True, created=created_dirs
         )
+        # Best-effort, and before anything is renamed: where the kernel can
+        # answer the mount question a boundary that is already there is
+        # refused with an accurate cause instead of an `EXDEV` the caller has
+        # to interpret. `cross_mount_definitely` fails open, so a kernel
+        # without `STATX_MNT_ID` keeps its soft delete and the mapping below
+        # is the backstop. Nothing has been created in the trash yet beyond
+        # `trash_dir` itself, which the next delete needs anyway.
+        if cross_mount_definitely(src_dir_fd, trash_fd):
+            raise _trash_mount_boundary(rel_path, trash_dir)
         if stamp is None:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         try:
@@ -2216,6 +2425,27 @@ def soft_delete_at(
             # Somebody else removed the source between the `lstat` and here.
             # Nothing was created in the trash, so there is nothing to undo.
             raise FileNotFoundError(f"File not found: {rel_path}") from None
+        except MountBoundary as exc:
+            # **Above the `UnsupportedFilesystem` branch, or it is
+            # unreachable** — `MountBoundary` is a subclass. It is also the one
+            # cause the generic wrapper below would actively misreport: a mount
+            # boundary says nothing about whether `.trash/` can receive a
+            # non-replacing rename, and it can.
+            raise _trash_mount_boundary(rel_path, trash_dir, str(exc)) from exc
+        except CrossDeviceRefusal as exc:
+            # The other half of the classified `EXDEV`, and it needs its own
+            # branch for the mirror-image reason: the generic wrapper below
+            # would say the filesystem cannot do a non-replacing rename, and
+            # the mount branch above would blame the layout. For a Landlock
+            # denial or an overlayfs restriction both are false, and the
+            # classifier's own message already names the real candidates — so
+            # this adds the missing half (which two directories, and what to do
+            # instead) and asserts nothing about the cause.
+            raise CrossDeviceRefusal(
+                f"{rel_path} could not be moved into the vault root's "
+                f"{trash_dir}/ ({exc}). Pass permanent=True to unlink the file "
+                "instead."
+            ) from exc
         except UnsupportedFilesystem as exc:
             raise UnsupportedFilesystem(
                 f"{trash_dir}/ cannot receive a non-replacing rename from the "
@@ -2615,7 +2845,9 @@ def probe_trash(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
     different pair of directories, and because only `delete_file` needs it. A
     vault whose `.trash` is a separate mount passes the publication probe and
     fails this one with `EXDEV` — and would then be unable to soft-delete at
-    all, so it has to be caught here rather than at the first delete.
+    all, so it has to be caught here rather than at the first delete. That case
+    is re-raised as `MountBoundary` with the layout named, not as generic
+    filesystem inability: see the handler below.
 
     Note it probes `rename`, not `link`: `soft_delete` moves the file with one
     rename, so a filesystem that refuses hard links but renames fine is
@@ -2644,6 +2876,31 @@ def probe_trash(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
             created = _rename_into_trash(
                 root_fd, tmp_name, trash_fd, f"{tmp_name}-probe"
             )
+        except MountBoundary as exc:
+            # **Before the `UnsupportedFilesystem` branch**, which would
+            # otherwise erase the subtype and, worse, the cause: this probe
+            # renames root→`trash_dir`, so its `EXDEV` means `trash_dir` is
+            # itself a mount distinct from the root's. That is the layout this
+            # probe meets first and the one the generic wording is furthest
+            # from — the filesystem moves files with a non-replacing rename
+            # perfectly well.
+            raise MountBoundary(
+                f"The vault root and {trash_dir}/ are on different mounts "
+                f"({exc}), so the rename that performs a soft delete cannot "
+                f"reach {trash_dir}/. The filesystem is fine; the mount "
+                "layout is what refuses. `delete_file`'s soft delete is "
+                f"disabled on this layout — unmount {trash_dir}/ or pass "
+                "permanent=True to unlink instead."
+            ) from exc
+        except CrossDeviceRefusal as exc:
+            # Same ordering rule and same reason as in `soft_delete_at`: an
+            # `EXDEV` the classifier could not pin on the mount layout must not
+            # be re-reported as the filesystem being unable to rename.
+            raise CrossDeviceRefusal(
+                f"The rename that performs a soft delete into {trash_dir}/ was "
+                f"refused ({exc}). `delete_file`'s soft delete relies on it and "
+                "is disabled; pass permanent=True to unlink instead."
+            ) from exc
         except UnsupportedFilesystem as exc:
             raise UnsupportedFilesystem(
                 f"The vault filesystem cannot move files into {trash_dir}/ "

@@ -317,11 +317,12 @@ def test_the_traversal_error_names_the_requested_path_not_a_component(
 def test_exdev_is_a_containment_refusal_not_an_unsupported_filesystem(
     monkeypatch, root_fd
 ):
-    """D17. `rename_noreplace` maps `EXDEV` to `UnsupportedFilesystem` — there
-    it means "different devices". From `openat2` it means the resolution would
-    have escaped the root, which is the opposite kind of event: an attack was
-    blocked, or a path was wrong. Telling an operator to change filesystems in
-    response to a blocked escape is the failure this pins."""
+    """D17. `rename_noreplace` maps `EXDEV` to `MountBoundary` — there it means
+    the two names are on different mounts. From `openat2` it means the
+    resolution would have escaped the root, which is the opposite kind of
+    event: an attack was blocked, or a path was wrong. Telling an operator to
+    change mounts or filesystems in response to a blocked escape is the failure
+    this pins."""
     _inject(monkeypatch, [errno.EXDEV])
     with pytest.raises(UnsafePath) as caught:
         open_dir_beneath(root_fd, "A/B")

@@ -1676,3 +1676,201 @@ async def test_a_failure_opening_the_destination_closes_the_source(
         assert "Could not open" in result, result
     assert _open_fds() == before
     assert (vault / "source.md").read_text(encoding="utf-8") == "body\n"
+
+
+# ── #110: the fallback's publish errnos say what actually refused ───────────
+#
+# The note path stages *beside* its destination, so a genuine `EXDEV` here
+# needs an exotic layout and cannot be produced by a bind mount at all — a
+# same-directory link or rename does not cross anything. These inject the errno
+# instead. That is not a claim the case is common: a message that is wrong
+# whenever it fires is wrong, and the transfer path's equivalent branches
+# already carry the accurate mapping. One vocabulary across both write paths.
+
+
+def _fallback(monkeypatch) -> None:
+    _refuse_o_tmpfile(monkeypatch)
+    monkeypatch.setattr(
+        vault_service.settings, "vault_allow_named_staging_fallback", True
+    )
+    vault_fs.reset_named_staging_state()
+
+
+def _publish_raises(monkeypatch, name: str, code: int) -> None:
+    def boom(*args, **kwargs):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(vault_service.os, name, boom)
+
+
+def _mount_ids_differ(monkeypatch) -> None:
+    seen: list[int] = []
+
+    def fake(fd: int) -> int:
+        seen.append(fd)
+        return len(seen)
+
+    monkeypatch.setattr(vault_fs, "mount_id_of", fake)
+
+
+_UNREADABLE_REASON = "statx(2) could not read the mount id (EPERM)"
+
+
+def _mount_ids_unreadable(monkeypatch) -> None:
+    """Not a pre-5.8 kernel: `mount_id_of` refuses for several reasons, and the
+    classifier must quote the one it got rather than diagnose a version."""
+
+    def refuse(fd: int) -> int:
+        raise vault_fs.UnsupportedFilesystem(_UNREADABLE_REASON)
+
+    monkeypatch.setattr(vault_fs, "mount_id_of", refuse)
+
+
+def test_the_fallback_link_does_not_invent_a_mount_boundary(vault, monkeypatch):
+    """It used to say "the vault filesystem does not support hard links" for
+    `EXDEV` — false. Saying "different mounts" instead would be false too, and
+    here almost always so (adversarial round 1): the fallback stages *in the
+    destination's own directory*, so both ends of the link are one `dir_fd` and
+    the mount comparison the classifier makes answers "same mount" every time
+    an ordinary configuration can produce this. What actually returns `EXDEV`
+    for a same-directory link is a policy or a filesystem-internal boundary,
+    and that is what the message names."""
+    _fallback(monkeypatch)
+    _publish_raises(monkeypatch, "link", errno.EXDEV)
+    try:
+        with pytest.raises(vault_fs.CrossDeviceRefusal) as caught:
+            vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+    finally:
+        vault_fs.reset_named_staging_state()
+
+    message = str(caught.value)
+    assert "same mount" in message
+    assert "not a mount boundary" in message
+    assert "Landlock" in message
+    assert "hard link" not in message
+    assert not isinstance(caught.value, vault_fs.MountBoundary)
+    # Still an `UnsupportedFilesystem`, so no typed handler needs a new branch.
+    assert isinstance(caught.value, vault_fs.UnsupportedFilesystem)
+    assert not (vault / "blob.bin").exists()
+    assert list(vault.iterdir()) == [], "staging litter left behind"
+
+
+def test_the_fallback_link_names_the_boundary_when_one_is_measured(
+    vault, monkeypatch
+):
+    """The mount branch is not dead code — it is what an exotic layout gets.
+    The comparison decides; nothing here assumes."""
+    _fallback(monkeypatch)
+    _publish_raises(monkeypatch, "link", errno.EXDEV)
+    _mount_ids_differ(monkeypatch)
+    try:
+        with pytest.raises(vault_fs.MountBoundary) as caught:
+            vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+    finally:
+        vault_fs.reset_named_staging_state()
+
+    message = str(caught.value)
+    assert "different mounts" in message
+    assert "mount layout is what refuses" in message
+    assert "hard link" not in message
+
+
+def test_the_fallback_link_is_ambiguous_when_the_kernel_cannot_tell(
+    vault, monkeypatch
+):
+    _fallback(monkeypatch)
+    _publish_raises(monkeypatch, "link", errno.EXDEV)
+    _mount_ids_unreadable(monkeypatch)
+    try:
+        with pytest.raises(vault_fs.CrossDeviceRefusal) as caught:
+            vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+    finally:
+        vault_fs.reset_named_staging_state()
+
+    message = str(caught.value)
+    assert "cannot be established" in message
+    assert "could not be read" in message
+    assert _UNREADABLE_REASON in message
+    assert "Linux 5.8" not in message
+    assert "a mount boundary between them" in message
+    assert "Landlock" in message
+    assert not isinstance(caught.value, vault_fs.MountBoundary)
+
+
+def test_a_filesystem_without_hard_links_still_says_so(vault, monkeypatch):
+    """Splitting `EXDEV` out must not make `EOPNOTSUPP` vague: for that one the
+    old message is exactly right."""
+    _fallback(monkeypatch)
+    _publish_raises(monkeypatch, "link", errno.EOPNOTSUPP)
+    try:
+        with pytest.raises(vault_fs.UnsupportedFilesystem) as caught:
+            vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+    finally:
+        vault_fs.reset_named_staging_state()
+
+    assert not isinstance(caught.value, vault_fs.MountBoundary)
+    assert "does not support hard links" in str(caught.value)
+    assert not (vault / "blob.bin").exists()
+
+
+def test_a_denied_link_names_security_policy_not_the_filesystem(vault, monkeypatch):
+    """Codex finding 7. A seccomp profile, an LSM or a mount option refuses
+    `link` with `EPERM` on filesystems whose hard links work perfectly, so
+    diagnosing the filesystem there is the same defect class as blaming it for
+    a mount layout."""
+    _fallback(monkeypatch)
+    _publish_raises(monkeypatch, "link", errno.EPERM)
+    try:
+        with pytest.raises(vault_fs.UnsupportedFilesystem) as caught:
+            vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+    finally:
+        vault_fs.reset_named_staging_state()
+
+    message = str(caught.value)
+    assert "denied" in message
+    assert "security policy" in message
+    assert "does not support hard links" not in message
+    assert not isinstance(caught.value, vault_fs.MountBoundary)
+    assert not (vault / "blob.bin").exists()
+
+
+@pytest.mark.parametrize("layout", ["same-mount", "different-mounts"])
+def test_the_overwrite_replace_classifies_its_exdev(vault, monkeypatch, layout):
+    """The other half of #110: this branch had no `EXDEV` handling at all, so
+    the refusal escaped as a bare `OSError` and the tools rendered it as "could
+    not write" plus the kernel's two-word strerror — strictly less than the
+    no-clobber branch beside it says. It classifies the same way, for the same
+    reason: the staging file sits in the destination's own directory."""
+    (vault / "blob.bin").write_bytes(b"old")
+    _fallback(monkeypatch)
+    _publish_raises(monkeypatch, "replace", errno.EXDEV)
+    if layout == "different-mounts":
+        _mount_ids_differ(monkeypatch)
+        expected, wanted = vault_fs.MountBoundary, "different mounts"
+    else:
+        expected, wanted = vault_fs.CrossDeviceRefusal, "not a mount boundary"
+    try:
+        with pytest.raises(expected) as caught:
+            vault_service.write_bytes("blob.bin", b"new", overwrite=True)
+    finally:
+        vault_fs.reset_named_staging_state()
+
+    assert wanted in str(caught.value)
+    assert (vault / "blob.bin").read_bytes() == b"old"
+    assert [p.name for p in vault.iterdir()] == ["blob.bin"], "staging litter left"
+
+
+def test_an_unrelated_replace_errno_still_propagates(vault, monkeypatch):
+    """Only `EXDEV` is reclassified; everything else keeps its own diagnosis."""
+    (vault / "blob.bin").write_bytes(b"old")
+    _fallback(monkeypatch)
+    _publish_raises(monkeypatch, "replace", errno.EIO)
+    try:
+        with pytest.raises(OSError) as caught:
+            vault_service.write_bytes("blob.bin", b"new", overwrite=True)
+    finally:
+        vault_fs.reset_named_staging_state()
+
+    assert not isinstance(caught.value, vault_fs.VaultFSError)
+    assert caught.value.errno == errno.EIO
+    assert (vault / "blob.bin").read_bytes() == b"old"
