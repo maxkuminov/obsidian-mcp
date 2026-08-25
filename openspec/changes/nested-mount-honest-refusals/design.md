@@ -14,7 +14,7 @@ Constraint inherited from D23: `mount_id_of` **raises** `UnsupportedFilesystem` 
 
 **Goals:**
 
-- Every `EXDEV` a vault-side publish, soft delete, or move surfaces names the mount boundary as the cause, in `MountBoundary` vocabulary, on every kernel (this is the backstop and it needs no `statx`).
+- Every `EXDEV` a vault-side publish, soft delete, or move surfaces names an honestly classified cause on every kernel: `MountBoundary` on a measured mount mismatch, policy/filesystem-internal-boundary prose on a measured match, and explicitly ambiguous prose where the identity cannot be read (adversarial round 1 — the errno alone proves no mount claim, so the backstop classifies rather than asserts).
 - Soft delete and `move_note` refuse a *pre-existing* cross-mount layout early with the same accurate message, where the kernel can answer the mount question (best-effort preflight).
 - A named-fallback upload that published successfully never logs a staging-name "disappeared" warning about the name its own publish consumed.
 

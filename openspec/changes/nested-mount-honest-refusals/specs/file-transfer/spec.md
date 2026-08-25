@@ -43,7 +43,7 @@
 
 - **WHEN** a soft delete runs where `STATX_MNT_ID` is unavailable and the source and `.trash/` share a mount
 - **THEN** the preflight SHALL be skipped and the soft delete SHALL proceed and succeed
-- **AND** a cross-mount attempt on such a kernel SHALL still be refused by the rename's `EXDEV` mapping with the mount-boundary cause
+- **AND** a cross-mount attempt on such a kernel SHALL still be refused by the rename's `EXDEV` classification, presented as ambiguous between a mount boundary and a policy or filesystem-internal boundary — the identity that would prove the mount claim is exactly what such a kernel cannot read
 
 #### Scenario: Soft delete
 
