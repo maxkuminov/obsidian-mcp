@@ -159,12 +159,22 @@ async def write_tsvector_bounded(
     incremental pass commits nothing on a floor failure, so the note is retried
     next tick; `rebuild_tsvectors` is atomic, so a floor failure rolls the whole
     rebuild back and surfaces to the operator who invoked it.
+
+    Returns `(prefix_length, rowcount)`. **The rowcount is not something this
+    helper acts on, deliberately.** `rebuild_tsvectors` addresses its UPDATE by
+    a certified predicate (id + owner + path + hash), so a zero-row result
+    means the row moved or its content advanced under the rebuild — staleness,
+    which halving the prefix cannot fix and must never be retried here. It is
+    handed back so the caller routes it to its own re-read-or-abort path.
     """
     length = len(content)
     while True:
         try:
             async with session.begin_nested():
-                await session.execute(statement, {**params, "content": content[:length]})
+                result = await session.execute(
+                    statement, {**params, "content": content[:length]}
+                )
+                rowcount = result.rowcount
         except Exception as exc:
             if length <= TSVECTOR_CONTENT_FLOOR_CHARS:
                 # The floor. Propagate exactly as the pre-change code did.
@@ -185,7 +195,7 @@ async def write_tsvector_bounded(
                 label, attempted, exc, length,
             )
             continue
-        return length
+        return length, rowcount
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -2172,6 +2182,40 @@ async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
         )
 
 
+class TsvectorRebuildAborted(RuntimeError):
+    """`rebuild_tsvectors` met a row it could not certify, and rolled back.
+
+    Deliberately fatal rather than a skip. A rebuild exists to move every row
+    onto the *current* `FTS_CONFIGS`, and a row it silently steps over keeps its
+    old-config vector with nothing that would ever repair it — the ordinary scan
+    only rewrites a note's vector when its `content_hash` changes, and the two
+    states that produce this error (a file the rebuild cannot read, and bytes
+    that do not hash to the row) are exactly the states where that will not
+    happen or cannot be relied on. The rebuild is one transaction, so raising
+    rolls the whole thing back: the operator sees an error and re-runs, rather
+    than a keyword index silently half-migrated between two configurations.
+    """
+
+
+# How many times one row may be re-read after the snapshot turns out stale. A
+# move or a concurrent pass is repaired on the first retry; a row being rewritten
+# in a tight loop is not something a rebuild should chase for ever.
+MAX_REBUILD_REREADS = 3
+
+
+async def _reread_rebuild_target(session, note_id: int, owner: int | None):
+    """The row as it stands now, scoped to the owner the snapshot recorded.
+
+    Owner-scoped on purpose: a row that is no longer this rebuild's to write is
+    indistinguishable from a deleted one *for this rebuild*, and both mean
+    "safely absent" — there is nothing left in scope to leave stale.
+    """
+    return (await session.execute(text(
+        "SELECT id, user_id, file_path, content_hash FROM notes_metadata "
+        "WHERE id = :id AND user_id IS NOT DISTINCT FROM :uid"
+    ), {"id": note_id, "uid": owner})).first()
+
+
 async def _rebuild_tsvectors_pinned(
     session, user_id: int | None, vault: Path, root_fd: int, log_suffix: str
 ) -> int:
@@ -2181,11 +2225,44 @@ async def _rebuild_tsvectors_pinned(
         return 0
 
     tsv_frag, tsv_params = index_tsvector_sql("content")
+    # ── The rebuild certifies what it writes ──────────────────────────────
+    # It used to address the UPDATE by `id` alone, over a snapshot holding only
+    # `(id, file_path)`, and to treat a read failure as a silent `continue`.
+    # Both were unsound for the same underlying reason: the snapshot is taken
+    # once and the vault and the table both keep moving underneath it, while a
+    # keyword vector is only ever rewritten again when a note's `content_hash`
+    # changes.
+    #
+    # * A note **moved** after the snapshot (either move path, or externally)
+    #   fails its old-path read. Silently continuing committed every other note
+    #   and left that row on the old configuration for ever: both move paths
+    #   preserve `content_tsvector`, and the scan skips a row whose hash has not
+    #   changed, so nothing would ever revisit it. `'running'` stays stored as
+    #   the english stem `run` and never matches a `simple` query again.
+    # * A concurrent index pass that commits `content_hash(C2)` and
+    #   `tsvector(C2)` between the rebuild's read of `C1` and its UPDATE had
+    #   `tsvector(C1)` written over the top of it while the hash stayed `C2`.
+    #   Every later scan skips the row, so the vector describes content the note
+    #   does not have: false negatives for C2's terms and false positives for
+    #   C1's, permanently.
+    #
+    # So the snapshot retains owner, path and hash; the bytes are verified
+    # against that hash before anything is written; and the UPDATE names all
+    # four, requiring exactly one row. Anything else is staleness, and staleness
+    # is re-read and retried against the fresh row — or aborts the whole
+    # transaction. It is never committed around.
     upd_sql = text(
-        f"UPDATE notes_metadata SET content_tsvector = {tsv_frag} WHERE id = :id"
+        f"UPDATE notes_metadata SET content_tsvector = {tsv_frag} "
+        "WHERE id = :id AND user_id IS NOT DISTINCT FROM :uid "
+        "  AND file_path = :path AND content_hash = :hash"
     )
 
-    rows_stmt = select(NoteMetadata.id, NoteMetadata.file_path)
+    rows_stmt = select(
+        NoteMetadata.id,
+        NoteMetadata.user_id,
+        NoteMetadata.file_path,
+        NoteMetadata.content_hash,
+    )
     if user_id is None:
         rows_stmt = rows_stmt.where(NoteMetadata.user_id.is_(None))
     else:
@@ -2194,16 +2271,82 @@ async def _rebuild_tsvectors_pinned(
     logger.info(f"Rebuilding tsvectors for {len(rows)} notes{log_suffix}")
 
     updated = 0
-    for row in rows:
-        try:
-            raw, _stat = read_note_beneath(root_fd, row.file_path)
-        except (UnicodeDecodeError, OSError):
+    vanished = 0
+    for snapshot in rows:
+        owner = snapshot.user_id
+        path, chash = snapshot.file_path, snapshot.content_hash
+        wrote = False
+
+        for _attempt in range(MAX_REBUILD_REREADS + 1):
+            stale_reason: str | None = None
+            try:
+                raw, _stat = read_note_beneath(root_fd, path)
+            except (UnicodeDecodeError, OSError) as exc:
+                stale_reason = f"could not be read at {path!r} ({exc})"
+            else:
+                _, content = parse_frontmatter(raw)
+                if _content_hash(raw) != chash:
+                    stale_reason = (
+                        f"the bytes at {path!r} no longer hash to the "
+                        "content_hash the rebuild selected"
+                    )
+                else:
+                    _used, rowcount = await write_tsvector_bounded(
+                        session, upd_sql, content,
+                        {"id": snapshot.id, "uid": owner, "path": path,
+                         "hash": chash, **tsv_params},
+                        label=path,
+                    )
+                    if rowcount == 1:
+                        wrote = True
+                        break
+                    # Zero rows: the row moved, its hash advanced, or it was
+                    # deleted, between the read and the write. Nothing was
+                    # written — and this must not reach the helper's halving
+                    # retreat, which addresses a *size* failure and cannot fix
+                    # a stale target.
+                    stale_reason = (
+                        "the certified UPDATE matched no row, so it moved or "
+                        "its content advanced during the rebuild"
+                    )
+
+            fresh = await _reread_rebuild_target(session, snapshot.id, owner)
+            if fresh is None:
+                # Deleted, or no longer owned by the identity this rebuild is
+                # running for: nothing in scope is left to leave stale.
+                vanished += 1
+                break
+            if (fresh.file_path, fresh.content_hash) == (path, chash):
+                # The row still claims exactly what we tried to write against,
+                # so this is not a race we can win by looking again: the file
+                # itself is unreadable, or the vault has bytes the scan has not
+                # caught up with. Either way nothing will revisit this row —
+                # the scan rewrites a keyword vector only when the hash changes,
+                # and a note edited and then reverted before the next pass never
+                # changes it. Abort, and roll the whole rebuild back.
+                raise TsvectorRebuildAborted(
+                    f"keyword-vector rebuild aborted: {path!r} {stale_reason}, "
+                    "and the row still records that path and content hash. "
+                    "Nothing has been committed — the whole rebuild is rolled "
+                    "back. Re-run it once the index pass has caught up with "
+                    "the vault."
+                )
+            logger.info(
+                "rebuild_tsvectors: %r moved or changed during the rebuild "
+                "(%s); retrying against the current row %r",
+                path, stale_reason, fresh.file_path,
+            )
+            path, chash = fresh.file_path, fresh.content_hash
+        else:
+            raise TsvectorRebuildAborted(
+                f"keyword-vector rebuild aborted: {snapshot.file_path!r} kept "
+                f"changing across {MAX_REBUILD_REREADS} re-reads, so nothing "
+                "could be certified for it. Nothing has been committed — the "
+                "whole rebuild is rolled back."
+            )
+
+        if not wrote:
             continue
-        _, content = parse_frontmatter(raw)
-        await write_tsvector_bounded(
-            session, upd_sql, content, {"id": row.id, **tsv_params},
-            label=row.file_path,
-        )
         updated += 1
         if updated % 500 == 0:
             # Progress only — **no intermediate commit** (#127, D4). It used to
@@ -2217,7 +2360,10 @@ async def _rebuild_tsvectors_pinned(
     # One commit, at the end. In multi-user mode the script calls this once per
     # user, so the unit of atomicity is one user's index — never half of one.
     await session.commit()
-    logger.info(f"rebuild_tsvectors complete: {updated} notes{log_suffix}")
+    logger.info(
+        f"rebuild_tsvectors complete: {updated} notes{log_suffix}"
+        + (f", {vanished} gone before they could be written" if vanished else "")
+    )
     return updated
 
 

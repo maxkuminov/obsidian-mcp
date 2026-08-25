@@ -44,8 +44,11 @@ import src.services.indexer as indexer  # noqa: E402
 class _FakeResult:
     """Mimics the slice of the SQLAlchemy Result API that index_vault uses."""
 
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, rowcount=1):
         self._rows = rows or []
+        # `write_tsvector_bounded` reads it so the *rebuild* can tell a stale
+        # target from a written one (#127). The incremental pass ignores it.
+        self.rowcount = rowcount
 
     def fetchall(self):
         return self._rows

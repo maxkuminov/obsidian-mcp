@@ -399,6 +399,25 @@ vanished from the page, so the operator saw a blank space that read as success.
   repair. Verified against a real PostgreSQL
   (`tests/integration/test_tsvector_bounded_pg.py`); a mocked savepoint cannot
   show the driver's aborted-transaction state clearing.
+- **The rebuild certifies what it writes, and the reason is that nothing else
+  would ever repair it.** It snapshots the table once and then reads the vault
+  note by note, while a keyword vector is rewritten again only when a note's
+  `content_hash` changes — both move paths preserve `content_tsvector` and the
+  scan skips an unchanged hash. So a row it steps over, or writes stale bytes
+  into, stays on the *previous* `FTS_CONFIGS` for ever: `'running'` stored as
+  the english stem `run`, never matching a `simple` query. Two shapes did
+  exactly that — a note moved after the snapshot failed its old-path read and
+  was a silent `continue`, and an UPDATE by `id` alone overwrote a concurrent
+  pass's `tsvector(C2)` with `tsvector(C1)` while the hash stayed `C2`, so every
+  later scan skipped it. The snapshot now retains owner, path and hash, the
+  bytes are verified against that hash, and the UPDATE names all four and
+  requires exactly one row. A zero-row update, a read failure or a hash mismatch
+  is **never** routed through the halving retreat (that addresses size, not
+  staleness): it re-reads the current owner-scoped row — gone → safely absent,
+  moved or advanced → retried against the fresh values within
+  `MAX_REBUILD_REREADS`, and still recording the same path and hash →
+  `TsvectorRebuildAborted`, rolling the single transaction back rather than
+  committing around it.
 - **`OllamaProvider.embed_batch` has no aggregate deadline** (#127); the 30 s
   per-call `wait_for` is the only liveness bound. The old fixed 300 s
   whole-batch budget could fire only when every chunk was individually healthy

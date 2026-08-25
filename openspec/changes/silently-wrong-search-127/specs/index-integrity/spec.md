@@ -157,6 +157,33 @@ The tsvector build (incremental pass and full rebuild alike) SHALL attempt the n
 
 Verification of the savepoint behavior SHALL include a real-PostgreSQL integration test (mocks cannot prove the driver's aborted-transaction state clears): induce a genuine statement failure, observe the bounded retry succeed within the same outer transaction, perform a further update, commit, and verify both rows.
 
+**The full rebuild SHALL update only rows it certifies.** It snapshots the table once and then reads the vault note by note, so both the rows and the files move underneath it — and a keyword vector is only ever rewritten again when a note's `content_hash` changes, because both move paths preserve `content_tsvector` and the ordinary scan skips a row whose hash is unchanged. A row the rebuild steps over, or writes the wrong bytes into, therefore stays on the previous configuration with nothing that would ever revisit it.
+
+The rebuild's snapshot SHALL therefore retain each row's owner, relative path and content hash; the bytes it reads SHALL be verified to hash to that retained content hash before anything is written; and its UPDATE SHALL be conditional on all four of id, owner, relative path and content hash, and SHALL require that exactly one row matched. A zero-row update, a read failure, or a hash mismatch SHALL NOT be committed around and SHALL NOT be routed through the size-halving retreat, which addresses a size failure and cannot fix a stale target. Each SHALL instead trigger a bounded re-read of the current owner-scoped row: a row that is gone is safely absent and SHALL be skipped; a row whose path or hash has changed SHALL be retried against those fresh values within a bounded number of attempts; and a row that still records the path and hash the rebuild acted on — an unreadable file, or bytes the scan has not caught up with — SHALL abort the whole rebuild, which being one transaction rolls every other note back with it.
+
+#### Scenario: A note moved mid-rebuild is repaired, never stepped over
+
+- **WHEN** a note's `file_path` changes (by either move path) after the rebuild's snapshot and before it reads that row, so the read at the snapshotted path fails
+- **THEN** the rebuild SHALL re-read the row, retry against its current path, and write that row's tsvector under the current configuration
+- **AND** it SHALL NOT commit the remaining notes while leaving that row on the previous configuration
+
+#### Scenario: A stale write does not land when the content hash advances
+
+- **WHEN** a concurrent index pass commits a new `content_hash` and a matching `content_tsvector` for a row between the rebuild's read of the earlier content and its UPDATE
+- **THEN** the certified UPDATE SHALL match no row and the earlier content's tsvector SHALL NOT be written
+- **AND** the rebuild SHALL re-read the row and rebuild it against the committed content, so the stored hash and the stored tsvector describe the same content
+
+#### Scenario: A row it cannot certify aborts the whole rebuild
+
+- **WHEN** the rebuild cannot read a note, or the bytes it reads do not hash to the row's `content_hash`, and a re-read shows the row still records that path and that hash
+- **THEN** the rebuild SHALL abort and its transaction SHALL roll back, leaving every note's `content_tsvector` unchanged
+- **AND** the error SHALL surface to the operator who invoked it, rather than the rebuild committing around that row
+
+#### Scenario: A row deleted mid-rebuild is safely absent
+
+- **WHEN** the row is deleted (or leaves the rebuild's owner scope) between the snapshot and the write
+- **THEN** the rebuild SHALL skip it without aborting, because no row remains in scope to leave on the previous configuration
+
 #### Scenario: Terms beyond the former 100K slice are searchable when the full build succeeds
 
 - **WHEN** a valid note carries a distinctive term past 100,000 characters and its full-content tsvector build succeeds
