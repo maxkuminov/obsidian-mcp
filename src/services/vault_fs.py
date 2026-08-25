@@ -79,6 +79,7 @@ import os
 import platform
 import secrets
 import stat
+import threading
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -147,26 +148,60 @@ _TRANSIENT_ATTEMPTS = 8
 # the whole value of the signal: it separates an operator who enabled the flag
 # defensively from a mount that is taking the fallback.
 _named_staging_exercised = False
+_named_staging_exercised_lock = threading.Lock()
 
 
-def note_named_staging_exercised() -> None:
+# Which write path took the fallback, for the one warning below. The two
+# staging *locations* are not equivalent (D27): a transfer stages in
+# `.transfer-tmp` — `0700`, owner-checked, dot-prefixed, hidden from every
+# vault tool — while a note write stages beside its destination, in an
+# ordinary vault directory the vault's own write tools can reach, which is
+# the wider of the two windows. One warning that named only `.transfer-tmp`
+# was therefore false for every note-path exercise, so the warning names both
+# locations and says which path fired it.
+NAMED_STAGING_NOTE_PATH = "note write"
+NAMED_STAGING_TRANSFER_PATH = "transfer upload"
+
+
+def note_named_staging_exercised(path_kind: str) -> None:
     """Record that a call has staged under a name, warning once per process.
 
     Shared by both write paths, so one warning and one `/health` field answer
     for the note path and the transfer path together (D27). Call it at the
-    moment the staging name is created, never earlier.
+    moment the staging name **has been created**, never earlier: a creation
+    that failed every attempt staged nothing, and must neither spend the
+    warn-once budget nor flip `/health` to a fallback this process never took.
+
+    `path_kind` is `NAMED_STAGING_NOTE_PATH` or `NAMED_STAGING_TRANSFER_PATH`
+    — the path that reached here *first*. The warning states both locations
+    regardless, because it fires once and the other path may well exercise the
+    fallback afterwards with no second warning; that is the declared
+    warn-once semantic, not an accident to correct with a second message.
+
+    The check-then-set is locked: a sync request handler can run this from a
+    thread-pool worker, and without the lock two concurrent first-time
+    fallback writes (racing to be the first exercise, one from each write
+    path) can both observe `False` and both log — the flag still ends up
+    `True` either way, but the warning is meant to fire once per process, not
+    once per race.
     """
     global _named_staging_exercised
-    if _named_staging_exercised:
-        return
-    _named_staging_exercised = True
+    with _named_staging_exercised_lock:
+        if _named_staging_exercised:
+            return
+        _named_staging_exercised = True
     logger.warning(
         "VAULT_ALLOW_NAMED_STAGING_FALLBACK is set and this vault's "
         "filesystem cannot stage without a directory entry, so writes are "
-        "staging under a name in %s. The staged name exists for the whole "
-        "write, which reopens the substitution window unnamed staging closes; "
-        "it is narrowed, not closed, by the identity check that precedes every "
-        "publish. Unset the flag to refuse instead.",
+        "staging under a name. The first exercise in this process was a %s; "
+        "note writes stage beside the destination, in an ordinary vault "
+        "directory, and transfer uploads stage in %s/. The staged name exists "
+        "for the whole write, which reopens the substitution window unnamed "
+        "staging closes; it is narrowed, not closed, by the identity check "
+        "that precedes every publish, and the note path's window is the wider "
+        "of the two. This fires once per process, so a later exercise by the "
+        "other path is not announced again. Unset the flag to refuse instead.",
+        path_kind,
         STAGING_DIR,
     )
 
@@ -1521,7 +1556,10 @@ def publish(
     reads at entry, which still refuses a substitution landing during the
     publish but cannot see one that landed before `publish` was called; the
     transfer path always passes the real one. In unnamed mode it is derived from
-    `staged_fd` and the parameter is ignored.
+    `staged_fd` and the parameter is ignored. If the name is already gone when
+    that fallback `lstat` runs, the identity stays `None` and the `finally`
+    below **leaves** whatever now holds the name rather than unlinking it —
+    `discard_staged_name` will not remove a name it cannot prove is ours.
 
     Raises `Conflict` when the target is not in the committed state or the
     staged file was substituted, and `UnsafePath` when the target is a symlink.
@@ -1734,32 +1772,61 @@ def discard_staged_name(
     somebody having taken the name over. Only a name that exists and refers to
     a different inode is a substitution.
 
-    `staged is None` means the caller could not establish an identity to compare
-    against — the name is then removed unguarded, which is the pre-change
-    behaviour and is why every production caller passes one.
+    **`staged is None` refuses to unlink at all.** It means the caller could
+    not establish what it staged — an `fstat` that failed after the exclusive
+    creation, or a name already gone when `publish` looked for it — so nothing
+    here can prove the name still refers to our inode, and a concurrent
+    replacement would be destroyed by a write that published nothing. That is
+    the same destructive-write class the identity check above refuses, reached
+    by a path that has *less* evidence rather than more, so it takes the same
+    direction: warn, leave the litter, return False. The pre-change transfer
+    path removed it unguarded; the fallback deliberately does not inherit
+    that (#104 review).
+
+    **An absent name is ordinary only after a publish that consumes it.** With
+    `published=True` a `renameat` took the name and there is nothing to do.
+    With `published=False` the staging name disappeared while the write was
+    still in flight — a substitution's first half, or somebody else's cleanup
+    — which is exactly the kind of event this function exists to surface, so
+    it is warned about and reported as a failed discard.
     """
-    if staged is not None:
-        try:
-            current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            # The publish consumed it, or it is already gone. Nothing to do.
+    if staged is None:
+        logger.warning(
+            "Cannot confirm what was staged under %s, so it is left in place "
+            "rather than unlinked: removing a name whose inode we cannot "
+            "prove is ours is the destructive write this guard exists to "
+            "refuse.",
+            name,
+        )
+        return False
+    try:
+        current = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        if published:
+            # The publish consumed it. The ordinary case.
             return True
-        except OSError as exc:
-            logger.warning(
-                "Could not confirm that staging name %s is still ours (%s); "
-                "leaving it in place.",
-                name,
-                exc,
-            )
-            return False
-        if (current.st_dev, current.st_ino) != (staged.st_dev, staged.st_ino):
-            logger.warning(
-                "Staging name %s no longer refers to the file we staged; "
-                "leaving it in place rather than unlinking a file we did not "
-                "create.",
-                name,
-            )
-            return False
+        logger.warning(
+            "Staging name %s disappeared before its write was published; "
+            "nothing was removed by this cleanup.",
+            name,
+        )
+        return False
+    except OSError as exc:
+        logger.warning(
+            "Could not confirm that staging name %s is still ours (%s); "
+            "leaving it in place.",
+            name,
+            exc,
+        )
+        return False
+    if (current.st_dev, current.st_ino) != (staged.st_dev, staged.st_ino):
+        logger.warning(
+            "Staging name %s no longer refers to the file we staged; "
+            "leaving it in place rather than unlinking a file we did not "
+            "create.",
+            name,
+        )
+        return False
     return _unlink_quietly(dir_fd, name, published=published)
 
 
@@ -1771,7 +1838,9 @@ def discard_temp(
     The abandon path of a failed upload in the named-staging mode. It must not
     be able to turn one failure (a 413, a disconnect) into a second, noisier
     one, so an unlink that itself fails is logged and swallowed — and it goes
-    through `discard_staged_name`, so a substitute is left alone.
+    through `discard_staged_name`, so a substitute is left alone, and so is
+    the name when `staged` is `None` (the caller never got an identity to
+    compare against, which is strictly less evidence, not more).
 
     The unnamed mode never calls this: there is no name to remove, and closing
     the descriptor frees the inode.

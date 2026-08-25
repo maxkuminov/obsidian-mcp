@@ -1478,8 +1478,11 @@ async def _stream_locked(
             # payload flush, the gate and its lock order, the size caps, the
             # deadline and the token state machine below are the same code.
             staged_fd, tmp_name = vault_fs.create_temp(staging_fd)
-            # First *exercise*, which is the moment the warning means something.
-            vault_fs.note_named_staging_exercised()
+            # First *exercise*, which is the moment the warning means something
+            # — after the name exists, never before.
+            vault_fs.note_named_staging_exercised(
+                vault_fs.NAMED_STAGING_TRANSFER_PATH
+            )
         try:
             # The identity the publish's check compares against. Taken from the
             # descriptor, so it names the inode this call staged whatever

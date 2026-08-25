@@ -945,6 +945,288 @@ def test_a_no_clobber_write_refuses_without_o_tmpfile(vault, monkeypatch):
     assert list(vault.iterdir()) == []
 
 
+def _refuse_o_tmpfile(monkeypatch):
+    real_open = os.open
+
+    def refuse(path, flags, *args, **kwargs):
+        if flags & getattr(os, "O_TMPFILE", 0) == getattr(os, "O_TMPFILE", 0):
+            raise OSError(errno.EOPNOTSUPP, "operation not supported")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(vault_service.os, "open", refuse)
+
+
+def test_the_named_staging_fallback_is_off_by_default(vault, monkeypatch):
+    """`VAULT_ALLOW_NAMED_STAGING_FALLBACK` defaults false: an O_TMPFILE
+    refusal still refuses, even with the fallback machinery present."""
+    _refuse_o_tmpfile(monkeypatch)
+    assert vault_service.settings.vault_allow_named_staging_fallback is False
+
+    with pytest.raises(vault_fs.UnsupportedFilesystem, match="O_TMPFILE"):
+        vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+
+    assert list(vault.iterdir()) == []
+    assert vault_fs.named_staging_fallback_active() is False
+
+
+def test_the_named_staging_fallback_still_refuses_to_clobber(
+    vault, monkeypatch, caplog
+):
+    """Opting into the fallback survives an O_TMPFILE refusal, still refuses
+    to clobber an existing file, leaves no staging name behind either way,
+    and warns loudly exactly once per process — not once per write.
+
+    The once-per-process state (`named_staging_fallback_active`) is shared
+    with the transfer path via `vault_fs` (D27), not kept per-module — see
+    `vault._link_staged_name` / `vault._discard_temp`, which delegate to
+    `vault_fs` for the same reason (#105).
+    """
+    _refuse_o_tmpfile(monkeypatch)
+    monkeypatch.setattr(
+        vault_service.settings, "vault_allow_named_staging_fallback", True
+    )
+    vault_fs.reset_named_staging_state()
+    assert vault_fs.named_staging_fallback_active() is False
+
+    with caplog.at_level("WARNING"):
+        vault_service.write_bytes("blob.bin", b"first", overwrite=False)
+
+    assert (vault / "blob.bin").read_bytes() == b"first"
+    assert [p.name for p in vault.iterdir()] == ["blob.bin"], "staging litter left"
+    assert vault_fs.named_staging_fallback_active() is True
+    assert (
+        sum("VAULT_ALLOW_NAMED_STAGING_FALLBACK" in r.message for r in caplog.records)
+        == 1
+    )
+
+    caplog.clear()
+    try:
+        with pytest.raises(FileExistsError):
+            vault_service.write_bytes("blob.bin", b"second", overwrite=False)
+
+        assert (vault / "blob.bin").read_bytes() == b"first"
+        assert [p.name for p in vault.iterdir()] == ["blob.bin"], "staging litter left"
+        # Already active — no second warning for the second write.
+        assert not any(
+            "VAULT_ALLOW_NAMED_STAGING_FALLBACK" in r.message for r in caplog.records
+        )
+    finally:
+        vault_fs.reset_named_staging_state()
+
+
+def test_the_fallback_warning_names_where_each_path_stages(vault, monkeypatch, caplog):
+    """The one warning is accurate for whichever path fired it.
+
+    It used to say writes were staging "under a name in `.transfer-tmp`",
+    which is false for a note write: the note path stages **beside the
+    destination**, in an ordinary vault directory, which is the *wider* of the
+    two windows (D27). One warning per process is the declared semantic, so
+    the fix is a warning that names both locations and says which path
+    exercised it — not a second warning when the other path follows.
+    """
+    _refuse_o_tmpfile(monkeypatch)
+    monkeypatch.setattr(
+        vault_service.settings, "vault_allow_named_staging_fallback", True
+    )
+    vault_fs.reset_named_staging_state()
+    try:
+        with caplog.at_level("WARNING"):
+            vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+
+        warnings = [
+            r.message
+            for r in caplog.records
+            if "VAULT_ALLOW_NAMED_STAGING_FALLBACK" in r.message
+        ]
+        assert len(warnings) == 1
+        message = warnings[0]
+        assert vault_fs.NAMED_STAGING_NOTE_PATH in message, message
+        assert "beside the destination" in message, message
+        # And it still names the transfer path's own location, because the
+        # other path may take the fallback later with no second warning.
+        assert vault_fs.STAGING_DIR in message, message
+    finally:
+        vault_fs.reset_named_staging_state()
+
+
+def test_a_failed_staging_creation_neither_warns_nor_flips_health(
+    vault, monkeypatch, caplog
+):
+    """The signal is "a call actually staged under a name".
+
+    The exercised flag was set *before* `_create_temp_exclusively`, so a
+    creation that failed every attempt still spent the once-per-process
+    warning and made `/health` report a fallback this process never took
+    (#104 review). Every attempt fails here — the candidate name is fixed and
+    a symlink already sits at it, which `O_EXCL|O_NOFOLLOW` refuses.
+    """
+    _refuse_o_tmpfile(monkeypatch)
+    monkeypatch.setattr(
+        vault_service.settings, "vault_allow_named_staging_fallback", True
+    )
+    monkeypatch.setattr(vault_service, "_temp_candidate", lambda name: ".tmp-fixed")
+    (vault / ".tmp-fixed").symlink_to(vault / "decoy.bin")
+    vault_fs.reset_named_staging_state()
+    try:
+        with caplog.at_level("WARNING"):
+            with pytest.raises(RuntimeError, match="temporary file"):
+                vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+
+        assert vault_fs.named_staging_fallback_active() is False
+        assert not any(
+            "VAULT_ALLOW_NAMED_STAGING_FALLBACK" in r.message for r in caplog.records
+        )
+        assert not (vault / "blob.bin").exists()
+        assert not (vault / "decoy.bin").exists(), "wrote through the planted link"
+    finally:
+        vault_fs.reset_named_staging_state()
+
+
+def test_a_cleanup_without_an_identity_unlinks_nothing(vault, monkeypatch, caplog):
+    """The BLOCKER: a no-clobber write must not destroy somebody else's file.
+
+    On the fallback path the staging name exists for the whole write. If the
+    `fstat` that establishes *what we staged* fails afterwards, the cleanup
+    has no identity to compare against — and unlinking the name on that basis
+    destroys whatever has since taken it. Here another writer renames its
+    sole-link file over the staging name inside exactly that window: the file
+    must survive a write that published nothing, and the litter must be
+    reported rather than removed.
+    """
+    _refuse_o_tmpfile(monkeypatch)
+    monkeypatch.setattr(
+        vault_service.settings, "vault_allow_named_staging_fallback", True
+    )
+    monkeypatch.setattr(vault_service, "_temp_candidate", lambda name: ".tmp-fixed")
+    (vault / "victim.bin").write_bytes(b"somebody else's bytes")
+    vault_fs.reset_named_staging_state()
+
+    real_fstat = os.fstat
+
+    def boom(fd):
+        info = real_fstat(fd)
+        if stat.S_ISDIR(info.st_mode):
+            return info
+        # The concurrent replacement lands in the window the failed `fstat`
+        # opens: the name now refers to the victim's inode, not ours.
+        os.rename(vault / "victim.bin", vault / ".tmp-fixed")
+        raise OSError(errno.EIO, "I/O error")
+
+    monkeypatch.setattr(vault_service.os, "fstat", boom)
+    try:
+        with caplog.at_level("WARNING"):
+            with pytest.raises(OSError):
+                vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+    finally:
+        monkeypatch.setattr(vault_service.os, "fstat", real_fstat)
+        vault_fs.reset_named_staging_state()
+
+    assert (vault / ".tmp-fixed").read_bytes() == b"somebody else's bytes"
+    assert not (vault / "blob.bin").exists(), "published despite the failure"
+    assert any(
+        ".tmp-fixed" in r.message and "left in place" in r.message
+        for r in caplog.records
+    ), [r.message for r in caplog.records]
+
+
+def test_a_staging_name_that_vanishes_before_publication_is_reported(
+    vault, monkeypatch, caplog
+):
+    """An absent staging name is ordinary only *after* a consuming publish.
+
+    Returning quietly regardless of `published` hid the other case entirely:
+    a staging name that disappeared while the write was still in flight is a
+    substitution's first half, and the cleanup is the only thing that sees it.
+    """
+    _refuse_o_tmpfile(monkeypatch)
+    monkeypatch.setattr(
+        vault_service.settings, "vault_allow_named_staging_fallback", True
+    )
+    monkeypatch.setattr(vault_service, "_temp_candidate", lambda name: ".tmp-fixed")
+    vault_fs.reset_named_staging_state()
+    real_require = vault_service._require_staged_name
+
+    def vanish(dir_fd, tmp, staged):
+        os.unlink(tmp, dir_fd=dir_fd)
+        return real_require(dir_fd, tmp, staged)
+
+    monkeypatch.setattr(vault_service, "_require_staged_name", vanish)
+    try:
+        with caplog.at_level("WARNING"):
+            with pytest.raises(vault_fs.Conflict):
+                vault_service.write_bytes("blob.bin", b"ours", overwrite=False)
+    finally:
+        vault_fs.reset_named_staging_state()
+
+    assert not (vault / "blob.bin").exists()
+    assert any(
+        ".tmp-fixed" in r.message and "disappeared before" in r.message
+        for r in caplog.records
+    ), [r.message for r in caplog.records]
+
+
+def test_the_shared_discard_is_quiet_only_for_a_consuming_publish(tmp_path, caplog):
+    """The primitive itself, in both directions and for both write paths.
+
+    `discard_staged_name` is what the note path and the transfer path both
+    clean up through (D27), and the transfer path reaches it with `staged=None`
+    on the same shape — an `fstat` that failed after `create_temp` — so the
+    refusal belongs in the primitive rather than in one caller.
+    """
+    dir_fd = os.open(str(tmp_path), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        # 1. Consumed by a publish: absent, published, quiet.
+        with caplog.at_level("WARNING"):
+            assert (
+                vault_fs.discard_staged_name(
+                    dir_fd, ".tmp-gone", os.stat(tmp_path), published=True
+                )
+                is True
+            )
+        assert not caplog.records, [r.message for r in caplog.records]
+
+        # 2. Absent and *not* published: warned, and reported as a failure.
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            assert (
+                vault_fs.discard_staged_name(
+                    dir_fd, ".tmp-gone", os.stat(tmp_path), published=False
+                )
+                is False
+            )
+        assert any("disappeared before" in r.message for r in caplog.records)
+
+        # 3. No identity at all: nothing is unlinked, on either path.
+        (tmp_path / ".tmp-theirs").write_bytes(b"not ours")
+        caplog.clear()
+        with caplog.at_level("WARNING"):
+            assert (
+                vault_fs.discard_staged_name(
+                    dir_fd, ".tmp-theirs", None, published=False
+                )
+                is False
+            )
+            # The transfer path's abandon path is the same call.
+            assert vault_fs.discard_temp(dir_fd, ".tmp-theirs", None) is False
+        assert (tmp_path / ".tmp-theirs").read_bytes() == b"not ours"
+        assert len(
+            [r for r in caplog.records if "left in place" in r.message]
+        ) == 2
+
+        # 4. Ours, present, unpublished: removed, as it always was.
+        staged_path = tmp_path / ".tmp-ours"
+        staged_path.write_bytes(b"ours")
+        assert (
+            vault_fs.discard_staged_name(
+                dir_fd, ".tmp-ours", os.stat(staged_path), published=False
+            )
+            is True
+        )
+        assert not staged_path.exists()
+    finally:
+        os.close(dir_fd)
+
+
 async def test_a_swapped_staging_file_is_refused_by_an_overwrite(
     vault, monkeypatch
 ):
@@ -998,10 +1280,19 @@ def test_publishing_by_descriptor_refuses_without_proc(vault, monkeypatch):
     assert not (vault / "blob.bin").exists()
 
 
-def test_an_fstat_failure_leaks_neither_descriptor_nor_staging_name(
-    vault, monkeypatch
+def test_an_fstat_failure_leaks_no_descriptor_and_unlinks_nothing(
+    vault, monkeypatch, caplog
 ):
-    """The `try` opens immediately after the descriptor exists (round-2 #4)."""
+    """The `try` opens immediately after the descriptor exists (round-2 #4).
+
+    The descriptor is closed on the way out. The staging **name** is
+    deliberately *not*: an `fstat` that failed left this call with no identity
+    to compare the name against, so the cleanup cannot prove the name still
+    refers to the inode it created, and unlinking it on that basis is the
+    destructive write the whole guard exists to refuse (#104 review). The
+    declared failure direction is to leave litter and say so — the next
+    lines assert exactly that, and the warning names what was left.
+    """
     (vault / "note.md").write_text("before\n", encoding="utf-8")
     before = _open_fds()
     real_fstat = os.fstat
@@ -1018,13 +1309,18 @@ def test_an_fstat_failure_leaks_neither_descriptor_nor_staging_name(
 
     monkeypatch.setattr(vault_service.os, "fstat", boom)
 
-    for _ in range(3):
-        with pytest.raises(OSError):
-            vault_service.write_file("note.md", "after\n", overwrite=True)
+    with caplog.at_level("WARNING"):
+        for _ in range(3):
+            with pytest.raises(OSError):
+                vault_service.write_file("note.md", "after\n", overwrite=True)
 
     monkeypatch.setattr(vault_service.os, "fstat", real_fstat)
     assert _open_fds() == before
-    assert [p.name for p in vault.iterdir()] == ["note.md"]
+    left = sorted(p.name for p in vault.iterdir() if p.name != "note.md")
+    assert len(left) == 3, left
+    assert all(name.startswith(".tmp-note.md-") for name in left), left
+    for name in left:
+        assert any(name in r.message for r in caplog.records), name
     assert (vault / "note.md").read_text(encoding="utf-8") == "before\n"
 
 

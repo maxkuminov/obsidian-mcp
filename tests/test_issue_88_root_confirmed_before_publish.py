@@ -1566,13 +1566,18 @@ DIR_FD_KEYWORDS = {"dir_fd", "src_dir_fd", "dst_dir_fd"}
 
 # The only functions permitted to reach one, and why each is a publish helper
 # rather than a call site that slipped the net:
-#   `_atomic_write_at`  — the overwrite publication (`os.replace`).
-#   `_discard_temp`     — removes the *staging* name it created, never the
-#                         target's, and only while that name still refers to the
-#                         inode it staged.
-#   `unlink_at`         — the permanent-unlink helper this change added; the
-#                         call site C.2a moved out of `delete_note`.
-PUBLISH_HELPERS = {"_atomic_write_at", "_discard_temp", "unlink_at"}
+#   `_atomic_write_at`   — the overwrite publication (`os.replace`).
+#   `_link_staged_name`  — the named-staging fallback's no-clobber publication
+#                          (#103/#104, `os.link` — creates the name or fails
+#                          `EEXIST`); called only from `_atomic_write_at`,
+#                          after `_require_confirmation` has run, with the same
+#                          standing as its `os.replace`.
+#   `unlink_at`          — the permanent-unlink helper #88 added; the call
+#                          site C.2a moved out of `delete_note`.
+# `_discard_temp` left this list when #104 delegated it to
+# `vault_fs.discard_staged_name` (the D27 consolidation): the unlink now lives
+# in the primitive module the scan deliberately does not police.
+PUBLISH_HELPERS = {"_atomic_write_at", "_link_staged_name", "unlink_at"}
 
 
 def _enclosing_function(tree: ast.AST, target: ast.AST) -> str | None:
@@ -1634,7 +1639,7 @@ def test_the_structural_scan_actually_sees_the_permitted_call_sites():
         for syscall, function, _ in _dir_fd_mutations(source)
     }
     assert ("vault.py", "replace", "_atomic_write_at") in seen
-    assert ("vault.py", "unlink", "_discard_temp") in seen
+    assert ("vault.py", "link", "_link_staged_name") in seen
     assert ("vault.py", "unlink", "unlink_at") in seen
     # And nothing under `src/mcp_server/` reaches one at all any more.
     assert not [entry for entry in seen if entry[0] != "vault.py"], seen

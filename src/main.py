@@ -22,6 +22,7 @@ from src.limiter import limiter
 from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
 from src.oauth.routes import router as oauth_router
+from src.services import vault
 from src.services.indexer import run_indexer_loop
 from src.services import vault_fs
 from src.transfer.routes import router as transfer_router
