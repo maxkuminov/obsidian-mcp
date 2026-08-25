@@ -1116,7 +1116,7 @@ async def get_backlinks_impl(path: str, limit: int = 50) -> str:
 @_tracked("get_links", ["path"])
 async def get_links_impl(path: str) -> str:
     """Outgoing links from `path` — both resolved and dangling."""
-    from sqlalchemy import and_, select
+    from sqlalchemy import and_, or_, select
     from sqlalchemy.orm import aliased
     from src.models.db import NoteLink, NoteMetadata
 
@@ -1155,7 +1155,21 @@ async def get_links_impl(path: str) -> str:
                     _owner_predicate_for(TargetMeta, uid),
                 ),
             )
-            .where(NoteLink.source_note_id == source.id)
+            .where(
+                NoteLink.source_note_id == source.id,
+                # Three cases, not two. A row with no `target_note_id` is
+                # genuinely dangling and is reported — that is why the owner
+                # predicate is in the ON clause above and not here. A row that
+                # resolved inside the owned set is reported. A row that names a
+                # `target_note_id` outside it is **omitted**: it is not
+                # dangling, and reporting it would print the other owner's path
+                # (a state the per-user link resolution does not produce, so
+                # this is the corrupted/adversarial path).
+                or_(
+                    NoteLink.target_note_id.is_(None),
+                    TargetMeta.id.isnot(None),
+                ),
+            )
             .order_by(NoteLink.position)
         )
         rows = (await session.execute(stmt)).all()

@@ -517,6 +517,28 @@ FILTER_CASES = {
 }
 
 
+def _cases(corpus):
+    """The filter shapes, each carrying the owner predicate production carries.
+
+    Since #127 the owner mapping is *total*: `apply_note_filters` appends
+    `user_id IS NULL` when no user is given, so a shape without one no longer
+    describes any statement this server issues — and against this corpus, whose
+    every benchmark row belongs to `alice` or `bob`, it would select nothing and
+    every recall assertion would pass on an empty baseline. `B/` is exactly
+    bob's slice, so pairing each shape with his id keeps the selectivity (and
+    therefore the plan) the sizing comments above were measured against.
+    """
+    owned = {"user_id": corpus["bob"]}
+    cases = {name: {**f, **owned} for name, f in FILTER_CASES.items()}
+    cases["user_scope"] = dict(owned)
+    return cases
+
+
+def _owned(corpus, **filters):
+    """One filter shape plus the owner predicate — for the ad-hoc `B/` calls."""
+    return {**filters, "user_id": corpus["bob"]}
+
+
 # ── 1. the fixture is exercising the index at all ───────────────────────────
 async def test_filtered_query_uses_the_hnsw_index(sessionmaker, corpus, queries):
     """Without this, every assertion below passes vacuously on a seq scan.
@@ -528,8 +550,7 @@ async def test_filtered_query_uses_the_hnsw_index(sessionmaker, corpus, queries)
     plan production runs. One shape did exactly that before this test was
     widened.
     """
-    cases = dict(FILTER_CASES)
-    cases["user_scope"] = {"user_id": corpus["bob"]}
+    cases = _cases(corpus)
     missing = []
     for case, filters in sorted(cases.items()):
         plan = await _explain(sessionmaker, queries[0], mode="iterative", **filters)
@@ -539,7 +560,9 @@ async def test_filtered_query_uses_the_hnsw_index(sessionmaker, corpus, queries)
 
 
 async def test_exact_baseline_does_not_use_the_hnsw_index(sessionmaker, corpus, queries):
-    plan = await _explain(sessionmaker, queries[0], mode="exact", folder="B/")
+    plan = await _explain(
+        sessionmaker, queries[0], mode="exact", **_owned(corpus, folder="B/")
+    )
     assert HNSW_INDEX not in plan, plan
 
 
@@ -552,8 +575,9 @@ async def test_iterative_scan_off_loses_the_filtered_result(
     or the fixture is not reproducing what was fixed."""
     broken = []
     for vec in queries:
-        baseline = await _run(sessionmaker, vec, mode="exact", folder="B/")
-        off = await _run(sessionmaker, vec, mode="off", folder="B/")
+        shape = _owned(corpus, folder="B/")
+        baseline = await _run(sessionmaker, vec, mode="exact", **shape)
+        off = await _run(sessionmaker, vec, mode="off", **shape)
         broken.append((len(off), len(baseline), _recall(off, baseline)))
 
     assert any(
@@ -577,8 +601,7 @@ async def test_filtered_recall_meets_the_baseline(
     it is the filter with a security consequence, since a wrong-but-empty
     result is indistinguishable from "this user has no such note".
     """
-    cases = dict(FILTER_CASES)
-    cases["user_scope"] = {"user_id": corpus["bob"]}
+    cases = _cases(corpus)
 
     failures = []
     for case, filters in sorted(cases.items()):
@@ -606,7 +629,9 @@ async def test_returned_distances_are_monotone(sessionmaker, corpus, queries):
     """`relaxed_order` may emit rows out of order across scan iterations; the
     service re-sorts before dedupe."""
     for vec in queries:
-        got = await _run(sessionmaker, vec, mode="iterative", folder="B/")
+        got = await _run(
+            sessionmaker, vec, mode="iterative", **_owned(corpus, folder="B/")
+        )
         dists = [d for _, d in got]
         assert dists == sorted(dists), dists
 
@@ -617,7 +642,9 @@ async def test_semantic_search_output_is_monotone(sessionmaker, corpus, queries,
 
     monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
     async with sessionmaker() as session:
-        results = await semantic_search(session, "anything", limit=10, folder="B/")
+        results = await semantic_search(
+            session, "anything", limit=10, folder="B/", user_id=corpus["bob"]
+        )
     assert results
     sims = [r["similarity"] for r in results]
     assert sims == sorted(sims, reverse=True), sims
@@ -672,9 +699,43 @@ async def test_zero_row_filtered_result_falls_back_to_exact(
     assert results == []
 
 
-async def test_unfiltered_search_does_not_pay_for_a_fallback(
+async def test_a_non_empty_result_does_not_pay_for_a_fallback(
     sessionmaker, corpus, queries, monkeypatch
 ):
+    """The fallback is armed on every query since #127 (the owner predicate is
+    itself a filter), but it still only *fires* on zero rows.
+
+    This case used to be "an unfiltered search does not pay for a fallback",
+    passing no `user_id` at all. That shape no longer exists: the mapping is
+    total, so such a call now means `user_id IS NULL` — which selects nothing
+    here, since every benchmark row belongs to `alice` or `bob`. The property
+    worth keeping is the cost one, so it is asserted on a scope that matches.
+    """
+    async def _fake(_text):
+        return queries[0]
+
+    monkeypatch.setattr("src.services.embeddings.get_embedding", _fake)
+    token = timing.begin()
+    try:
+        async with sessionmaker() as session:
+            results = await semantic_search(
+                session, "anything", limit=10, user_id=corpus["bob"]
+            )
+        holder = timing.current()
+    finally:
+        timing.clear(token)
+
+    assert results
+    assert holder["exact_fallback"] is False
+
+
+async def test_an_ownerless_scope_on_an_owned_corpus_falls_back(
+    sessionmaker, corpus, queries, monkeypatch
+):
+    """And the shape that replaced it: `user_id IS NULL` against a database
+    whose vectors all belong to named users. Under the old eligibility rule
+    this counted as *unfiltered*, so the empty result was believed — while the
+    predicate it carried was precisely the one discarding the HNSW window."""
     async def _fake(_text):
         return queries[0]
 
@@ -687,8 +748,8 @@ async def test_unfiltered_search_does_not_pay_for_a_fallback(
     finally:
         timing.clear(token)
 
-    assert results
-    assert holder["exact_fallback"] is False
+    assert results == []
+    assert holder["exact_fallback"] is True
 
 
 # ── 6. find_related ─────────────────────────────────────────────────────────

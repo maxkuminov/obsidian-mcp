@@ -169,8 +169,10 @@ async def write_tsvector_bounded(
             if length <= TSVECTOR_CONTENT_FLOOR_CHARS:
                 # The floor. Propagate exactly as the pre-change code did.
                 logger.exception(
-                    "Failed to update the keyword vector for %s at the "
-                    "%d-character floor", label, length,
+                    "Failed to update the keyword vector for %s at %d "
+                    "characters, at or below the %d-character floor; "
+                    "propagating, as the pre-change implementation did",
+                    label, length, TSVECTOR_CONTENT_FLOOR_CHARS,
                 )
                 raise
             attempted, length = length, max(
@@ -1969,10 +1971,15 @@ async def _embed_vault_pinned(user_id: int | None, root_fd: int, log_suffix: str
                 logger.warning(f"Failed to embed {row.file_path}: {e}")
                 await session.rollback()
 
-        logger.info(
-            f"Embedding complete{log_suffix}: {len(unembedded)} notes, {total_chunks} chunks"
-            + (f", {skipped_excluded} skipped by exclude patterns" if skipped_excluded else "")
-        )
+        if unembedded:
+            logger.info(
+                f"Embedding complete{log_suffix}: {len(unembedded)} notes, "
+                f"{total_chunks} chunks"
+                + (
+                    f", {skipped_excluded} skipped by exclude patterns"
+                    if skipped_excluded else ""
+                )
+            )
 
         # The backlog only ever sees rows whose content changed. Editing
         # `EMBEDDING_EXCLUDE_PATTERNS` changes no content, so without this the
