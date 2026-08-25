@@ -1770,11 +1770,38 @@ def _link_staged_name(dir_fd: int, tmp: str, name: str) -> None:
     except FileExistsError:
         raise
     except OSError as exc:
-        if getattr(exc, "errno", None) in (errno.EPERM, errno.EOPNOTSUPP, errno.EXDEV):
+        code = getattr(exc, "errno", None)
+        if code == errno.EXDEV:
+            # A boundary, not a filesystem without hard links (#110). The note
+            # path stages *beside* its destination, so this needs an exotic
+            # layout to fire at all — but a message that is wrong whenever it
+            # fires is wrong, and the transfer path's equivalent branch
+            # (`vault_fs._link_no_clobber`) already says this. One vocabulary
+            # across both write paths.
+            raise vault_fs.MountBoundary(
+                f"{name} is on a different mount from the staging file the "
+                "named-staging fallback wrote beside it, so the link that "
+                "publishes the write cannot reach it (EXDEV). The filesystem "
+                "is fine; the mount layout is what refuses."
+            ) from exc
+        if code == errno.EOPNOTSUPP:
             raise vault_fs.UnsupportedFilesystem(
                 "The vault filesystem does not support hard links, which the "
                 "no-clobber write depends on even in named-staging fallback "
                 "mode; refusing rather than replacing an existing file."
+            ) from exc
+        if code == errno.EPERM:
+            # Kept apart from `EOPNOTSUPP` deliberately: a seccomp profile, an
+            # LSM or a mount option refuses `link` with `EPERM` on filesystems
+            # whose hard links work perfectly, and diagnosing the filesystem
+            # there is the same defect class as blaming it for a mount layout.
+            raise vault_fs.UnsupportedFilesystem(
+                "Hard-link publication was denied (EPERM), and the no-clobber "
+                "write depends on it even in named-staging fallback mode. "
+                "That is not necessarily missing filesystem support: a "
+                "security policy (seccomp, an LSM) or a mount option can "
+                "refuse `link` where hard links otherwise work. Refusing "
+                "rather than replacing an existing file."
             ) from exc
         raise
 
@@ -1901,7 +1928,22 @@ def _atomic_write_at(
         if tmp is not None:
             _require_staged_name(dir_fd, tmp, staged)
             if overwrite:
-                os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                try:
+                    os.replace(tmp, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                except OSError as exc:
+                    if getattr(exc, "errno", None) != errno.EXDEV:
+                        raise
+                    # #110's other half. Without this the boundary escapes as a
+                    # bare `OSError` and the tools render it as "could not
+                    # write" with the kernel's own two-word strerror — strictly
+                    # less than the no-clobber branch beside it says, for the
+                    # same layout.
+                    raise vault_fs.MountBoundary(
+                        f"{name} is on a different mount from the staging file "
+                        "written beside it, so the rename that publishes the "
+                        "overwrite cannot reach it (EXDEV). The filesystem is "
+                        "fine; the mount layout is what refuses."
+                    ) from exc
             else:
                 _link_staged_name(dir_fd, tmp, name)
         else:
@@ -2117,6 +2159,61 @@ def read_bytes_at(
         raise ValueError(str(exc).replace(target.name, label, 1)) from exc
 
 
+def _refuse_a_cross_mount_move(
+    source: MutableTarget, destination: MutableTarget
+) -> None:
+    """Refuse a forward move whose two ends are definitely on different mounts.
+
+    Best-effort and forward-only, for the same reason the soft delete's twin is
+    (#109). `rename(2)` cannot cross a mount boundary at all, so the move fails
+    either way; what this buys is that the refusal names the mount layout
+    *before* the rename rather than leaving the caller to interpret an `EXDEV`.
+    Where `STATX_MNT_ID` is unavailable `vault_fs.cross_mount_definitely`
+    answers `False` and the rename's own mapping is the backstop — failing
+    closed there would take `move_note` away from a kernel that serves it.
+
+    **It creates nothing, and that is a constraint on how it asks the
+    question.** `MutableTarget.dir_fd` creates a missing parent on first use,
+    so comparing against *that* would `mkdir` the destination folder and then
+    refuse the move — a mutation performed by the check that exists to refuse
+    before any mutation. So it uses the never-creating `parent_fd`, and where
+    the parent does not exist yet it compares against the destination's deepest
+    **existing** ancestor: a directory created beneath an ancestor is created
+    on that ancestor's mount, which is the same reasoning
+    `vault_fs.require_destination_mount` uses at transfer mint time.
+
+    A source with no open parent is skipped rather than materialised for the
+    same reason; such a move has no source to rename and fails `ENOENT` on its
+    own.
+    """
+    src_fd = source.parent_fd
+    if src_fd is None:
+        return
+    dst_fd = destination.parent_fd
+    if dst_fd is not None:
+        crossed = vault_fs.cross_mount_definitely(src_fd, dst_fd)
+    else:
+        probe_fd, _rel = vault_fs.deepest_existing_dir(
+            destination.root_fd, destination.parent_rel
+        )
+        try:
+            crossed = vault_fs.cross_mount_definitely(src_fd, probe_fd)
+        finally:
+            vault_fs.close_quietly(
+                probe_fd, f"mount check for {destination.rel}"
+            )
+    if not crossed:
+        return
+    raise vault_fs.MountBoundary(
+        f"Refusing to move {source.rel} → {destination.rel}: the two "
+        "directories are on different mounts, so the non-replacing rename "
+        "that performs the move cannot cross the boundary. The filesystem is "
+        "fine; the mount layout is what refuses — a move relocates the very "
+        "inode that sits at the source, and no rename can do that across "
+        "mounts. Choose a destination on the source's mount."
+    )
+
+
 def move_file_no_clobber(
     source: MutableTarget,
     destination: MutableTarget,
@@ -2139,6 +2236,13 @@ def move_file_no_clobber(
     the second: it can unlink a *different* inode than the one it linked. See
     `vault_fs.rename_noreplace`; a filesystem that cannot do the non-replacing
     form raises `UnsupportedFilesystem` and there is no safe fallback.
+
+    Two parents on different mounts raise `MountBoundary` instead, naming the
+    layout — best-effort before the rename (`_refuse_a_cross_mount_move`) and
+    from the rename's own `EXDEV` otherwise. A copying fallback is **not** the
+    answer to it: copy-and-unlink relocates a *new* inode and unlinks whatever
+    is at the source afterwards, which is precisely the guarantee above that
+    the single `renameat2` exists to give.
     """
     # #88. The destination is the publication endpoint, so it is the one the
     # confirmation is checked against. Exactly one of `confirmation` and
@@ -2167,6 +2271,16 @@ def move_file_no_clobber(
         permit.authorise(source, destination)
     else:
         _require_confirmation(confirmation, destination, "move into")
+        # Forward moves only (#109), and after the confirmation bookkeeping, so
+        # a refusal here leaves exactly the state any other refused rename does
+        # — the confirmation spent, nothing renamed and nothing created.
+        #
+        # **A rollback never preflights.** It must attempt its rename whatever
+        # a mount check says: refusing one strands the note at the destination
+        # on the strength of a preflight, and a forward rename that landed is
+        # itself proof that both parents share a mount, so the check could only
+        # ever misfire there.
+        _refuse_a_cross_mount_move(source, destination)
 
     vault_fs.rename_noreplace(
         source.dir_fd, source.name, destination.dir_fd, destination.name

@@ -28,10 +28,12 @@ cannot be:
 """
 from __future__ import annotations
 
+import inspect
 import errno
 import json
 import logging
 import os
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -596,13 +598,18 @@ async def test_an_abandoned_fallback_upload_is_collected_by_the_sweep(
         raise Boom("killed")
 
     row = FakeRow(str(vault), "Attachments/a.bin")
-    real_discard = vault_fs.discard_temp
-    monkeypatch.setattr(vault_fs, "discard_temp", lambda *a, **k: False)
+    # The stub goes on `discard_staged_name`, which is what the outer cleanup
+    # calls directly since #115 (it has to pass the real publication outcome,
+    # and `discard_temp`'s `published=False` is baked in). Stubbing
+    # `discard_temp` would neuter nothing and the litter would be swept up
+    # before the sweep could be asked to do it.
+    real_discard = vault_fs.discard_staged_name
+    monkeypatch.setattr(vault_fs, "discard_staged_name", lambda *a, **k: False)
     with pytest.raises(Boom):
         await stream_to_vault(
             row, dying_chunks(), max_bytes=1000, deadline=deadline_in(30)
         )
-    monkeypatch.setattr(vault_fs, "discard_temp", real_discard)
+    monkeypatch.setattr(vault_fs, "discard_staged_name", real_discard)
 
     left = staging_entries(vault)
     assert len(left) == 1, left
@@ -655,3 +662,264 @@ async def test_a_consumed_staging_name_is_not_reported_as_a_substitution(
     assert not [
         r for r in caplog.records if "no longer refers" in r.getMessage()
     ], [r.getMessage() for r in caplog.records]
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# #115 — the outer cleanup's discard is told whether the publish landed
+#
+# `tmp_name` is cleared on the happy path, so the outer `except BaseException`
+# is reached with a name *and* a publication in exactly one shape: a failure
+# after `publish` returned — the post-publication directory flush — which is
+# correctly a `PostPublishFailure` with the claim stranded. Reaching
+# `discard_staged_name` through `discard_temp`, whose `published=False` is
+# baked in, made that doubly-degraded corner warn that the staging name had
+# "disappeared before its write was published" about a name the publish had
+# legitimately consumed. A false disappearance warning trains an operator to
+# ignore the true one, which is the substitution signal.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _spy_on_the_outer_discard(monkeypatch) -> list[bool]:
+    """Record `published=` for the discard `_stream_locked`'s cleanup makes.
+
+    Only that one: `publish` has an inner discard of its own that already
+    passes the real flag, so a spy that recorded every call would be satisfied
+    by a plain successful upload and would never see the changed cleanup at all
+    (Codex round-2 finding 6). The caller's frame name is what separates them.
+    """
+    seen: list[bool] = []
+    real = vault_fs.discard_staged_name
+
+    def recording(dir_fd, name, staged, *, published):
+        caller = inspect.currentframe().f_back.f_code.co_name
+        if caller == "_stream_locked":
+            seen.append(published)
+        return real(dir_fd, name, staged, published=published)
+
+    monkeypatch.setattr(vault_fs, "discard_staged_name", recording)
+    return seen
+
+
+def _fail_the_post_publication_flush(monkeypatch) -> None:
+    """`fsync` of the destination directory fails once the bytes are in place.
+
+    The one failure that is genuinely post-publication and genuinely reaches
+    the outer cleanup with a staging name still recorded.
+    """
+
+    def boom(fd):
+        raise OSError(errno.EIO, "input/output error")
+
+    monkeypatch.setattr(vault_fs, "flush_dir_fd", boom)
+
+
+def _disappearance_warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if "disappeared" in r.getMessage()]
+
+
+async def _fingerprint_of(vault: Path, folder: str, name: str):
+    root_fd = vault_fs.open_root(vault)
+    try:
+        dir_fd = vault_fs.open_dir_beneath(root_fd, folder)
+        try:
+            return vault_fs.fingerprint(dir_fd, name, hash_up_to=10_000)
+        finally:
+            os.close(dir_fd)
+    finally:
+        os.close(root_fd)
+
+
+async def test_a_published_fallback_upload_does_not_warn_that_its_name_vanished(
+    vault, monkeypatch, caplog
+):
+    """#115, the consumed-name shape: an overwrite publish is a rename, so the
+    staging name is gone by the time any cleanup looks for it. That is the
+    ordinary case, not a substitution."""
+    refuse_o_tmpfile(monkeypatch)
+    allow_fallback(monkeypatch)
+    target = vault / "Attachments" / "a.bin"
+    target.write_bytes(b"old")
+    want = await _fingerprint_of(vault, "Attachments", "a.bin")
+    seen = _spy_on_the_outer_discard(monkeypatch)
+    _fail_the_post_publication_flush(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="src.services.vault_fs"):
+        with pytest.raises(transfer.PostPublishFailure):
+            await upload(
+                vault, "Attachments/a.bin", b"new",
+                overwrite=True, expected_fingerprint=want,
+            )
+
+    # The bytes really did land — this is why the claim strands rather than
+    # being handed back for a replay over a path that already holds the file.
+    assert target.read_bytes() == b"new"
+    assert seen == [True], "the outer cleanup was not reached, or lied"
+    assert _disappearance_warnings(caplog) == []
+    assert staging_entries(vault) == []
+
+
+async def test_a_residual_staging_name_after_a_publish_is_removed_quietly(
+    vault, monkeypatch, caplog
+):
+    """The other shape: a no-clobber publish is a `link`, so its staging name
+    legitimately survives publication. `publish`'s own discard normally removes
+    it; here that unlink fails once, so the name reaches the outer cleanup
+    still referring to our inode. With the real outcome threaded through it is
+    removed quietly — the `published=True` branch — rather than reported as a
+    disappearance or, worse, left as litter."""
+    refuse_o_tmpfile(monkeypatch)
+    allow_fallback(monkeypatch)
+    seen = _spy_on_the_outer_discard(monkeypatch)
+
+    real_unlink = vault_fs._unlink_quietly
+    skipped: list[str] = []
+
+    def skip_once(dir_fd, name, *, published):
+        if not skipped:
+            skipped.append(name)
+            return False
+        return real_unlink(dir_fd, name, published=published)
+
+    monkeypatch.setattr(vault_fs, "_unlink_quietly", skip_once)
+    _fail_the_post_publication_flush(monkeypatch)
+
+    with caplog.at_level(logging.WARNING, logger="src.services.vault_fs"):
+        with pytest.raises(transfer.PostPublishFailure):
+            await upload(vault, "Attachments/a.bin", b"payload")
+
+    assert (vault / "Attachments" / "a.bin").read_bytes() == b"payload"
+    assert skipped, "the residual-name shape was never set up"
+    assert seen == [True]
+    assert _disappearance_warnings(caplog) == []
+    assert not [
+        r for r in caplog.records if "no longer refers" in r.getMessage()
+    ], [r.getMessage() for r in caplog.records]
+    # Quietly removed by the outer cleanup, not left behind for the sweep.
+    assert staging_entries(vault) == []
+
+
+async def test_an_over_cap_body_still_cleans_up_and_propagates_unmasked(
+    vault, monkeypatch, caplog
+):
+    """Codex finding 1. `state` used to be created down beside the gate, after
+    the staging, the drain, the `fstat`, the `fchmod` and the payload flush — so
+    every failure in that stretch would have reached the modified cleanup with
+    `state` unbound and raised `UnboundLocalError`, masking the real failure and
+    skipping the guarded discard entirely. Hoisting it above the staging block
+    is what makes this pass."""
+    refuse_o_tmpfile(monkeypatch)
+    allow_fallback(monkeypatch)
+    seen = _spy_on_the_outer_discard(monkeypatch)
+    row = FakeRow(str(vault), "Attachments/a.bin")
+
+    with caplog.at_level(logging.WARNING, logger="src.services.vault_fs"):
+        with pytest.raises(transfer.TooLarge):
+            await stream_to_vault(
+                row, chunks_of(b"far too many bytes"),
+                max_bytes=4, deadline=deadline_in(30),
+            )
+
+    assert seen == [False], "the pre-publication discard was told the wrong thing"
+    assert _disappearance_warnings(caplog) == []
+    # The staged name still referred to our inode, so it was removed.
+    assert staging_entries(vault) == []
+    assert not (vault / "Attachments" / "a.bin").exists()
+
+
+async def test_a_failing_payload_flush_propagates_unmasked(
+    vault, monkeypatch, caplog
+):
+    """The same stretch, one step later: the identity was recorded, the body is
+    complete, and the durability flush fails. Pre-publication, so the claim is
+    released and the human may retry the same link."""
+    refuse_o_tmpfile(monkeypatch)
+    allow_fallback(monkeypatch)
+    seen = _spy_on_the_outer_discard(monkeypatch)
+    # Let the publication probe run and cache its verdict first: it flushes
+    # too, and a probe that fails refuses before anything is staged, which is
+    # a different path from the one under test.
+    vault_fs.check_publication_support(vault)
+
+    def failing_fsync(fd):
+        raise OSError(errno.EIO, "input/output error")
+
+    monkeypatch.setattr(transfer.os, "fsync", failing_fsync)
+
+    with caplog.at_level(logging.WARNING, logger="src.services.vault_fs"):
+        with pytest.raises(OSError):
+            await upload(vault, "Attachments/a.bin", b"payload")
+
+    assert seen == [False]
+    assert _disappearance_warnings(caplog) == []
+    assert staging_entries(vault) == []
+    assert not (vault / "Attachments" / "a.bin").exists()
+
+
+async def test_a_failing_identity_fstat_leaves_the_name_in_place(
+    vault, monkeypatch, caplog
+):
+    """Round-2 finding 1's second half. With no recorded identity nothing can
+    prove the name still refers to the inode this call staged, so unlinking it
+    could destroy a concurrent substitute — the destructive-write class the
+    guard exists to refuse. The name stays, with the cannot-confirm warning,
+    and the original failure propagates unmasked."""
+    refuse_o_tmpfile(monkeypatch)
+    allow_fallback(monkeypatch)
+    seen = _spy_on_the_outer_discard(monkeypatch)
+    vault_fs.check_publication_support(vault)
+
+    real_fstat = transfer.os.fstat
+
+    def failing_fstat(fd):
+        # Only the staged payload's own descriptor: directories are `fstat`ed
+        # all over the anchored walk, and failing those would refuse the upload
+        # somewhere else entirely.
+        if stat.S_ISREG(real_fstat(fd).st_mode):
+            raise OSError(errno.EIO, "input/output error")
+        return real_fstat(fd)
+
+    monkeypatch.setattr(transfer.os, "fstat", failing_fstat)
+
+    with caplog.at_level(logging.WARNING, logger="src.services.vault_fs"):
+        with pytest.raises(OSError):
+            await upload(vault, "Attachments/a.bin", b"payload")
+
+    monkeypatch.setattr(transfer.os, "fstat", real_fstat)
+    assert seen == [False]
+    assert _disappearance_warnings(caplog) == []
+    assert any(
+        "Cannot confirm what was staged" in r.getMessage() for r in caplog.records
+    ), [r.getMessage() for r in caplog.records]
+    # Litter, deliberately: the failure direction is to leave a file rather
+    # than remove one we cannot prove is ours. The 24-hour sweep collects it.
+    assert len(staging_entries(vault)) == 1
+
+
+async def test_a_pre_publication_disappearance_still_warns(
+    vault, monkeypatch, caplog
+):
+    """The warning is not being weakened, only aimed. A staging name that
+    vanishes while the write has genuinely not published is a substitution's
+    first half, and that is exactly what it exists to surface."""
+    refuse_o_tmpfile(monkeypatch)
+    allow_fallback(monkeypatch)
+    seen = _spy_on_the_outer_discard(monkeypatch)
+
+    async def vanishing_chunks():
+        yield b"half"
+        # Somebody removes the staged name while the body is still streaming.
+        for entry in (vault / vault_fs.STAGING_DIR).iterdir():
+            entry.unlink()
+        raise RuntimeError("connection dropped")
+
+    row = FakeRow(str(vault), "Attachments/a.bin")
+    with caplog.at_level(logging.WARNING, logger="src.services.vault_fs"):
+        with pytest.raises(RuntimeError):
+            await stream_to_vault(
+                row, vanishing_chunks(), max_bytes=1000, deadline=deadline_in(30)
+            )
+
+    assert seen == [False]
+    assert _disappearance_warnings(caplog), [
+        r.getMessage() for r in caplog.records
+    ]

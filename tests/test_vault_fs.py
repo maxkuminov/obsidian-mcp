@@ -24,6 +24,7 @@ import pytest
 from src.services import vault_fs
 from src.services.vault_fs import (
     Conflict,
+    MountBoundary,
     UnsafePath,
     UnsupportedFilesystem,
     create_temp,
@@ -777,16 +778,38 @@ def test_renameat2_is_available_on_this_platform():
     assert vault_fs._renameat2_fn() is not None
 
 
-@pytest.mark.parametrize(
-    "code", [errno.EINVAL, errno.ENOSYS, errno.EXDEV, errno.EOPNOTSUPP]
-)
+@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP])
 def test_rename_noreplace_maps_unsupported_errnos(root_fd, vault, monkeypatch, code):
     """A kernel or filesystem without RENAME_NOREPLACE is a refusal, not a fallback."""
     monkeypatch.setattr(
         vault_fs, "_renameat2_raw", lambda *a, **k: code
     )
-    with pytest.raises(UnsupportedFilesystem):
+    with pytest.raises(UnsupportedFilesystem) as caught:
         vault_fs.rename_noreplace(root_fd, "a", root_fd, "b")
+    # These three really are "this filesystem cannot do it", so they keep the
+    # message that says so — and must not be blurred into the mount-boundary
+    # wording by the split (#110).
+    assert not isinstance(caught.value, MountBoundary)
+    assert "not available for this rename" in str(caught.value)
+
+
+def test_rename_noreplace_maps_exdev_to_the_mount_boundary(
+    root_fd, vault, monkeypatch
+):
+    """`EXDEV` from `renameat2` means the two names are on different mounts and
+    nothing else. Folding it in with the three above sent an operator — or an
+    agent acting on the text — to change a filesystem that renames fine (#108,
+    #109). Every caller of the primitive inherits the accurate cause from here.
+    """
+    monkeypatch.setattr(vault_fs, "_renameat2_raw", lambda *a, **k: errno.EXDEV)
+    with pytest.raises(MountBoundary) as caught:
+        vault_fs.rename_noreplace(root_fd, "a", root_fd, "b")
+    message = str(caught.value)
+    assert "different mounts" in message
+    assert "mount layout is what refuses" in message
+    assert "not available" not in message
+    # The subclass keeps every existing typed handler working.
+    assert isinstance(caught.value, UnsupportedFilesystem)
 
 
 @pytest.mark.parametrize("code", [errno.EISDIR, errno.ENOTDIR])
@@ -850,21 +873,46 @@ def test_soft_delete_missing_file(root_fd):
         soft_delete(root_fd, "Attachments/nope.png")
 
 
-@pytest.mark.parametrize("code", [errno.EXDEV, errno.EINVAL, errno.ENOSYS])
+@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOSYS])
 def test_soft_delete_maps_an_unusable_trash(root_fd, vault, monkeypatch, code):
-    """`.trash` on another mount, or a filesystem without RENAME_NOREPLACE.
+    """A filesystem without RENAME_NOREPLACE refuses the delete outright.
 
-    Both refuse the delete outright. Neither may degrade to a replacing
-    `os.rename`, which is exactly what would make the trash name clobberable
-    again.
+    It may not degrade to a replacing `os.rename`, which is exactly what would
+    make the trash name clobberable again.
     """
     (vault / "Attachments" / "a.png").write_bytes(b"bytes")
 
     monkeypatch.setattr(vault_fs, "_renameat2_raw", lambda *a, **k: code)
-    with pytest.raises(UnsupportedFilesystem):
+    with pytest.raises(UnsupportedFilesystem) as caught:
         soft_delete(root_fd, "Attachments/a.png")
     monkeypatch.undo()
 
+    assert not isinstance(caught.value, MountBoundary)
+    assert "cannot receive a non-replacing rename" in str(caught.value)
+    assert (vault / "Attachments" / "a.png").read_bytes() == b"bytes"
+    assert list((vault / ".trash").iterdir()) == []
+
+
+def test_soft_delete_names_the_mount_boundary_and_the_workaround(
+    root_fd, vault, monkeypatch
+):
+    """#108, at the residual mapping — the path a degraded kernel takes.
+
+    The old wording blamed `.trash/`'s ability to receive a non-replacing
+    rename, which is a property of the filesystem and has nothing to say about
+    the mount layout. `permanent=True` is named because it is the one thing the
+    caller can actually do: an unlink crosses no boundary.
+    """
+    (vault / "Attachments" / "a.png").write_bytes(b"bytes")
+    monkeypatch.setattr(vault_fs, "_renameat2_raw", lambda *a, **k: errno.EXDEV)
+    with pytest.raises(MountBoundary) as caught:
+        soft_delete(root_fd, "Attachments/a.png")
+    monkeypatch.undo()
+
+    message = str(caught.value)
+    assert "different mounts" in message
+    assert "permanent=True" in message
+    assert "cannot receive a non-replacing rename" not in message
     assert (vault / "Attachments" / "a.png").read_bytes() == b"bytes"
     assert list((vault / ".trash").iterdir()) == []
 
@@ -933,21 +981,40 @@ def test_probe_trash_passes_and_leaves_nothing(root_fd, vault):
     assert list((vault / ".trash").iterdir()) == []
 
 
-@pytest.mark.parametrize("code", [errno.EXDEV, errno.EINVAL, errno.ENOSYS])
+@pytest.mark.parametrize("code", [errno.EINVAL, errno.ENOSYS])
 def test_probe_trash_catches_an_unusable_trash(root_fd, vault, monkeypatch, code):
-    """A `.trash` on a separate mount, or one that cannot do RENAME_NOREPLACE.
+    """A `.trash` on a filesystem that cannot do RENAME_NOREPLACE.
 
-    That combination is the dangerous one: `publish` keeps working, so nothing
-    looks wrong until the first `delete_file` cannot move anything into the
-    trash — and a naive implementation would have unlinked the original by then.
-    `EINVAL`/`ENOSYS` are here because the probe must exercise the *flag*: a
-    filesystem that renames fine but rejects `RENAME_NOREPLACE` would otherwise
-    pass and then fail every single delete.
+    That is the dangerous case: `publish` keeps working, so nothing looks wrong
+    until the first `delete_file` cannot move anything into the trash — and a
+    naive implementation would have unlinked the original by then. The probe
+    must exercise the *flag*: a filesystem that renames fine but rejects
+    `RENAME_NOREPLACE` would otherwise pass and then fail every single delete.
     """
     monkeypatch.setattr(vault_fs, "_renameat2_raw", lambda *a, **k: code)
-    with pytest.raises(UnsupportedFilesystem, match=r"\.trash"):
+    with pytest.raises(UnsupportedFilesystem, match=r"\.trash") as caught:
         probe_trash(root_fd)
     monkeypatch.undo()
+    assert not isinstance(caught.value, MountBoundary)
+
+
+def test_probe_trash_preserves_the_mount_boundary(root_fd, vault, monkeypatch):
+    """A `.trash` that is itself a mount is the layout this probe meets first.
+
+    Its rename is root→`.trash`, so `EXDEV` here says exactly that — and the
+    generic re-wrap would have erased both the subtype and the cause into "the
+    vault filesystem cannot move files with a non-replacing rename", which is
+    false: it can (#108, Codex finding 3).
+    """
+    monkeypatch.setattr(vault_fs, "_renameat2_raw", lambda *a, **k: errno.EXDEV)
+    with pytest.raises(MountBoundary) as caught:
+        probe_trash(root_fd)
+    monkeypatch.undo()
+    message = str(caught.value)
+    assert "different mounts" in message
+    assert ".trash" in message
+    assert "cannot move files" not in message
+    assert "permanent=True" in message
     assert _temps(vault) == []
 
 

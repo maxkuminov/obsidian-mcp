@@ -712,3 +712,335 @@ async def test_health_reports_the_transfer_mount_capability(vault, monkeypatch):
         assert body["transfer_mount_check_available"] is True
     finally:
         vault_fs.reset_mount_identity_state()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# nested-mount-honest-refusals — the vault side (#108, #109)
+#
+# The mount ids are stubbed here, which pins the *policy*. The premise — a
+# same-filesystem bind mount really does refuse the rename — is pinned by the
+# namespace harness above, where the kernel answers for itself.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def note_vault(monkeypatch, tmp_path):
+    """A vault the note tools can act on: settings, permission, no usage log."""
+    import src.mcp_server.tools as tools_mod
+    from src.mcp_server.auth import current_permission
+    from src.services import vault as vault_service
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(vault_service.settings, "vault_path", str(tmp_path))
+    monkeypatch.setattr(tools_mod, "_log_usage", noop)
+    vault_fs.reset_filesystem_probe_cache()
+    token = current_permission.set("readwrite")
+    yield tmp_path
+    current_permission.reset(token)
+    vault_fs.reset_filesystem_probe_cache()
+
+
+class _SessionSpy:
+    """An `async_session` stand-in that records what a tool asks the database.
+
+    `move_note` reads before it moves — the backlink plan and the vault index
+    are SELECTs — so a zero-SQL contract is unimplementable and would be the
+    wrong thing to assert. What a refusal owes is that no *mutating* statement
+    ran and nothing was committed, which is what this separates: `dml` holds
+    every `Update`/`Insert`/`Delete`, `commits` counts the commits, and the
+    planning SELECTs are answered from `rows`/`backlinks` and otherwise
+    ignored.
+    """
+
+    def __init__(self, rows=(), backlinks=()):
+        self._rows = list(rows)
+        self._backlinks = list(backlinks)
+        self.dml: list = []
+        self.commits = 0
+        self._selects = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def execute(self, statement):
+        from sqlalchemy.sql import Delete, Insert, Update
+
+        if isinstance(statement, (Update, Insert, Delete)):
+            self.dml.append(statement)
+            return _Rows([])
+        self._selects += 1
+        # First SELECT is the vault index, the second the backlink sources.
+        return _Rows(self._rows if self._selects == 1 else self._backlinks)
+
+    async def commit(self):
+        self.commits += 1
+
+
+class _Rows:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def all(self):
+        return self._rows
+
+
+class _Row:
+    def __init__(self, file_path, note_id=None):
+        self.file_path = file_path
+        self.id = note_id
+
+
+def _install_session(monkeypatch, spy: "_SessionSpy") -> None:
+    import src.mcp_server.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "async_session", lambda: spy)
+
+
+async def test_a_cross_mount_move_is_refused_and_touches_no_database_row(
+    note_vault, monkeypatch
+):
+    """#109. The refusal comes from the preflight, before the rename — and the
+    proof that nothing was mutated is taken from the session, not read out of
+    the refusal text. A tool that returned this message *after* updating
+    `notes_metadata` would leave the index pointing at a path the vault does
+    not have, which is exactly the class of silent wrongness this product ranks
+    highest.
+    """
+    import src.mcp_server.tools as tools_mod
+
+    (note_vault / "M").mkdir()
+    (note_vault / "M" / "a.md").write_text("body\n", encoding="utf-8")
+    _mount_ids(monkeypatch, {"/M": 99})
+    spy = _SessionSpy()
+    _install_session(monkeypatch, spy)
+
+    result = await tools_mod.move_note_impl("M/a.md", "a.md")
+
+    assert "different mounts" in result, result
+    assert "mount layout is what refuses" in result
+    # Never the message the primitive used to give for this layout.
+    assert "not available" not in result
+    assert (note_vault / "M" / "a.md").read_text() == "body\n"
+    assert not (note_vault / "a.md").exists()
+    assert spy.dml == [], "a refused move executed a mutating statement"
+    assert spy.commits == 0, "a refused move committed"
+
+
+async def test_a_cross_mount_move_with_planned_rewrites_mutates_nothing(
+    note_vault, monkeypatch
+):
+    """The same claim with the expensive path taken: at least one backlink
+    rewrite is *planned* — read, rewritten in memory, its descriptor pinned —
+    and then the move is refused. Nothing is written: not the note, not the
+    backlink source, not a row.
+    """
+    import src.mcp_server.tools as tools_mod
+
+    (note_vault / "M").mkdir()
+    (note_vault / "M" / "a.md").write_text("body\n", encoding="utf-8")
+    backlink = note_vault / "b.md"
+    backlink.write_text("see [[M/a]] for more\n", encoding="utf-8")
+    before = backlink.read_bytes()
+
+    planned: list[tuple[str, int]] = []
+    real_rewrite = tools_mod._rewrite_links_in_text
+
+    def spying_rewrite(content, from_rel, to_rel, source_path, *args, **kwargs):
+        new, n = real_rewrite(content, from_rel, to_rel, source_path, *args, **kwargs)
+        planned.append((source_path, n))
+        return new, n
+
+    monkeypatch.setattr(tools_mod, "_rewrite_links_in_text", spying_rewrite)
+    _mount_ids(monkeypatch, {"/M": 99})
+    spy = _SessionSpy(
+        rows=[_Row("M/a.md", 1), _Row("b.md", 2)], backlinks=[_Row("b.md")]
+    )
+    _install_session(monkeypatch, spy)
+
+    result = await tools_mod.move_note_impl("M/a.md", "a.md", rewrite_links=True)
+
+    assert "different mounts" in result, result
+    assert [p for p in planned if p[0] == "b.md" and p[1] > 0], planned
+    assert backlink.read_bytes() == before, "a refused move rewrote a backlink"
+    assert (note_vault / "M" / "a.md").read_text() == "body\n"
+    assert not (note_vault / "a.md").exists()
+    assert spy.dml == []
+    assert spy.commits == 0
+
+
+async def test_a_cross_mount_move_to_a_missing_folder_creates_nothing(
+    note_vault, monkeypatch
+):
+    """Codex finding 4. `MutableTarget.dir_fd` creates a missing parent on
+    first use, so a preflight that asked it the mount question would `mkdir`
+    the destination folder and *then* refuse — a mutation performed by the
+    check whose whole point is to refuse before any mutation. The comparison
+    runs against the deepest existing ancestor instead.
+    """
+    import src.mcp_server.tools as tools_mod
+
+    (note_vault / "M").mkdir()
+    (note_vault / "M" / "a.md").write_text("body\n", encoding="utf-8")
+    _mount_ids(monkeypatch, {"/M": 99})
+    spy = _SessionSpy()
+    _install_session(monkeypatch, spy)
+
+    result = await tools_mod.move_note_impl("M/a.md", "New/Sub/a.md")
+
+    assert "different mounts" in result, result
+    assert not (note_vault / "New").exists(), "the preflight created a directory"
+    assert not (note_vault / "New" / "Sub").exists()
+    assert (note_vault / "M" / "a.md").read_text() == "body\n"
+    assert spy.dml == []
+    assert spy.commits == 0
+
+
+async def test_a_move_on_one_side_of_the_boundary_still_works(
+    note_vault, monkeypatch
+):
+    """The refusal is per pair. A vault that contains a nested mount somewhere
+    keeps every move that does not cross it."""
+    import src.mcp_server.tools as tools_mod
+
+    (note_vault / "M").mkdir()
+    (note_vault / "Folder").mkdir()
+    (note_vault / "a.md").write_text("body\n", encoding="utf-8")
+    _mount_ids(monkeypatch, {"/M": 99})
+    _install_session(monkeypatch, _SessionSpy())
+
+    result = await tools_mod.move_note_impl("a.md", "Folder/a.md")
+
+    assert "different mounts" not in result, result
+    assert (note_vault / "Folder" / "a.md").read_text() == "body\n"
+
+
+async def test_a_cross_mount_soft_delete_names_the_layout_and_the_workaround(
+    note_vault, monkeypatch
+):
+    """#108, at the preflight. `.trash` is opened beneath the *root*, so a note
+    on a mount nested below it can never be soft-deleted — but the message used
+    to blame `.trash/`'s ability to receive a non-replacing rename, which is a
+    property of the filesystem and has nothing to say about the layout.
+    """
+    import src.mcp_server.tools as tools_mod
+
+    (note_vault / "M").mkdir()
+    (note_vault / "M" / "a.md").write_text("body\n", encoding="utf-8")
+    _mount_ids(monkeypatch, {"/M": 99})
+    _install_session(monkeypatch, _SessionSpy())
+
+    result = await tools_mod.delete_note_impl("M/a.md")
+
+    assert "different mounts" in result, result
+    assert "permanent=True" in result
+    assert "cannot receive a non-replacing rename" not in result
+    assert (note_vault / "M" / "a.md").read_text() == "body\n"
+    trash = note_vault / ".trash"
+    assert not trash.exists() or list(trash.iterdir()) == []
+
+
+async def test_a_cross_mount_delete_file_names_the_layout_too(
+    note_vault, monkeypatch
+):
+    """`delete_note` and `delete_file` share the primitive, which is the point
+    of putting the refusal in `soft_delete_at` rather than in either tool."""
+    import src.mcp_server.tools as tools_mod
+
+    (note_vault / "M").mkdir()
+    (note_vault / "M" / "a.bin").write_bytes(b"bytes")
+    _mount_ids(monkeypatch, {"/M": 99})
+
+    result = await tools_mod.delete_file_impl("M/a.bin")
+
+    assert "different mounts" in result, result
+    assert "permanent=True" in result
+    assert (note_vault / "M" / "a.bin").read_bytes() == b"bytes"
+
+
+async def test_a_permanent_delete_still_crosses_the_boundary(
+    note_vault, monkeypatch
+):
+    """An unlink crosses no mount boundary, so the workaround the message names
+    has to actually work."""
+    import src.mcp_server.tools as tools_mod
+
+    (note_vault / "M").mkdir()
+    (note_vault / "M" / "a.bin").write_bytes(b"bytes")
+    _mount_ids(monkeypatch, {"/M": 99})
+
+    result = await tools_mod.delete_file_impl("M/a.bin", permanent=True)
+
+    assert "different mounts" not in result, result
+    assert not (note_vault / "M" / "a.bin").exists()
+
+
+# ── the degraded kernel: fail *open* here, fail *closed* on the transfer path ─
+
+
+def _no_mount_ids(monkeypatch) -> None:
+    """A kernel between the `openat2` floor (5.6) and `STATX_MNT_ID` (5.8)."""
+
+    def refuse(fd: int) -> int:
+        raise vault_fs.UnsupportedFilesystem("no STATX_MNT_ID on this kernel")
+
+    monkeypatch.setattr(vault_fs, "mount_id_of", refuse)
+
+
+def test_the_helper_answers_false_when_the_kernel_cannot_tell(vault, monkeypatch):
+    _no_mount_ids(monkeypatch)
+    fd = _fd(str(vault))
+    try:
+        assert vault_fs.cross_mount_definitely(fd, fd) is False
+    finally:
+        os.close(fd)
+
+
+async def test_a_degraded_kernel_keeps_its_soft_delete(note_vault, monkeypatch):
+    """Failing closed here would remove soft delete from a deployment that
+    serves it correctly — the failure a preflight prevents costs nothing,
+    because the rename refuses immediately and accurately either way."""
+    import src.mcp_server.tools as tools_mod
+
+    (note_vault / "a.bin").write_bytes(b"bytes")
+    _no_mount_ids(monkeypatch)
+
+    result = await tools_mod.delete_file_impl("a.bin")
+
+    assert "different mounts" not in result, result
+    assert not (note_vault / "a.bin").exists()
+    assert len(list((note_vault / ".trash").iterdir())) == 1
+
+
+async def test_a_degraded_kernel_keeps_its_moves(note_vault, monkeypatch):
+    import src.mcp_server.tools as tools_mod
+
+    (note_vault / "Folder").mkdir()
+    (note_vault / "a.md").write_text("body\n", encoding="utf-8")
+    _no_mount_ids(monkeypatch)
+    _install_session(monkeypatch, _SessionSpy())
+
+    result = await tools_mod.move_note_impl("a.md", "Folder/a.md")
+
+    assert "different mounts" not in result, result
+    assert (note_vault / "Folder" / "a.md").read_text() == "body\n"
+
+
+def test_the_transfer_path_still_fails_closed_on_the_same_kernel(
+    vault, monkeypatch
+):
+    """The two directions are opposite on purpose and this is where that is
+    pinned. A late `EXDEV` on the transfer path costs a body that has already
+    streamed in full, so "cannot check" must not mint; on the vault path the
+    same answer costs nothing, so it proceeds."""
+    _no_mount_ids(monkeypatch)
+    fd = _fd(str(vault))
+    try:
+        with pytest.raises(vault_fs.UnsupportedFilesystem):
+            vault_fs.require_same_mount(fd, fd, "Attachments/a.bin")
+    finally:
+        os.close(fd)

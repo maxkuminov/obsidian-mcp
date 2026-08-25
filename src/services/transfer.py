@@ -1447,6 +1447,19 @@ async def _stream_locked(
     # and records nothing — collecting from both is what keeps the flush from
     # silently covering nothing (#97).
     created_dirs: list[str] = []
+    # **Before the staging block, so it exists from before `tmp_name` can.**
+    # The outer cleanup reads it to tell a name its publish consumed from one
+    # that disappeared while the write was still in flight (#115), and that
+    # cleanup is reached by every failure after staging — the drain, the
+    # identity `fstat`, the `fchmod`, the payload flush. Created down beside
+    # the gate, as it was, those failures would find it unbound and the
+    # cleanup would raise `UnboundLocalError`: the real failure masked, and the
+    # guarded discard skipped entirely.
+    state = {"published": False}
+
+    def _record(_outcome) -> None:
+        state["published"] = True
+
     try:
         # Walk the destination once up front so a `..`, a symlinked ancestor or
         # a non-directory costs a syscall rather than a whole upload. The
@@ -1531,16 +1544,11 @@ async def _stream_locked(
         result = {"size": size, "sha256": digest, "mime": mime}
 
         # `publish` succeeding is the point of no return, and it is recorded
-        # through this callback rather than from the return value: the return
-        # value only becomes visible once `_publish_into_current_parent` has
-        # finished unwinding, and anything that raises on the way out — a
-        # failing descriptor close, most plausibly — would otherwise leave
-        # `published` false for a file that is already on disk.
-        state = {"published": False}
-
-        def _record(_outcome) -> None:
-            state["published"] = True
-
+        # through `_record` above rather than taken from the return value: the
+        # return value only becomes visible once `_publish_into_current_parent`
+        # has finished unwinding, and anything that raises on the way out — a
+        # failing directory flush, a failing descriptor close — would otherwise
+        # leave `published` false for a file that is already on disk.
         try:
             if before_publish is None:
                 _refuse_if_past_deadline(deadline)
@@ -1605,8 +1613,23 @@ async def _stream_locked(
         # an abandoned upload leave nothing for the 24-hour sweep to collect.
         # The unlink is inode-guarded, so a substitute is left in place and
         # logged rather than deleted.
+        #
+        # **`published=` is the real outcome, not a hardcoded `False`** (#115).
+        # `tmp_name` is cleared on the happy path, so this is reached with a
+        # name *and* a publication only in one place: a failure after `publish`
+        # returned — the post-publication directory flush — which is correctly
+        # a `PostPublishFailure` with the claim stranded. Reaching
+        # `discard_staged_name` through `discard_temp`, whose contract is the
+        # abandon path and whose `published=False` is baked in, made that
+        # doubly-degraded corner log "staging name disappeared before its write
+        # was published" about a name the overwrite rename had legitimately
+        # consumed. A false disappearance warning trains an operator to ignore
+        # the true one, which is the substitution signal. `discard_temp` keeps
+        # its contract; this caller simply stops borrowing it.
         if tmp_name is not None and staging_fd is not None:
-            vault_fs.discard_temp(staging_fd, tmp_name, staged_st)
+            vault_fs.discard_staged_name(
+                staging_fd, tmp_name, staged_st, published=state["published"]
+            )
         raise
     finally:
         # Quietly, and in a `finally` that runs after the publication verdict

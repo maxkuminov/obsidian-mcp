@@ -246,10 +246,15 @@ class UnsupportedFilesystem(VaultFSError):
     """The vault filesystem cannot support an operation this module needs.
 
     Two independent capabilities, probed separately because different callers
-    need different ones: hard links within the root (`EPERM`/`EOPNOTSUPP`/
-    `EXDEV`) for the no-clobber publish, and a same-device `rename` into
-    `.trash` (`EXDEV`) for the soft delete. The transfer tools refuse rather
-    than silently degrading to an overwriting move.
+    need different ones: hard links within the root (`EPERM`/`EOPNOTSUPP`) for
+    the no-clobber publish, and a `rename` into `.trash` (`EINVAL`/`ENOSYS`/
+    `EOPNOTSUPP`) for the soft delete. The transfer tools refuse rather than
+    silently degrading to an overwriting move.
+
+    `EXDEV` is deliberately **not** in either list. It is a mount boundary, not
+    a missing capability, and it raises `MountBoundary` — a subclass, so every
+    surface that answers this one keeps answering it while the message names
+    the layout instead of the filesystem.
     """
 
 
@@ -924,6 +929,37 @@ def require_same_mount(staging_fd: int, dst_fd: int, dest_label) -> None:
             "filesystem is fine; the mount layout is what refuses. Choose a "
             "destination on the same mount as the vault root."
         )
+
+
+def cross_mount_definitely(fd_a: int, fd_b: int) -> bool:
+    """Whether two descriptors are **definitely** on different mounts.
+
+    The fail-*open* form of `same_mount`, and the policy is written here once
+    rather than at each call: "cannot establish" answers `False`, so the caller
+    proceeds and the syscall's own `EXDEV` — mapped by `rename_noreplace` — is
+    what names the cause. Only a clean reading of both mount ids that differ
+    is a refusal.
+
+    **Not for the transfer path.** `require_same_mount` fails *closed* on the
+    same question and that is deliberate: a late `EXDEV` there costs a body
+    that has already streamed in full, so "cannot check" must not mint a
+    capability. Here the failure a preflight would prevent costs nothing — the
+    rename fails immediately and accurately either way — while failing closed
+    on a kernel between the `openat2` floor (5.6) and `STATX_MNT_ID` (5.8)
+    would take soft delete and `move_note` away from a deployment that serves
+    them correctly today. The two directions are opposite on purpose; do not
+    reuse this one to "simplify" the other.
+
+    `same_mount`'s no-time-spanning rule is respected by construction: both ids
+    are read inside its single call, immediately before the act, and neither is
+    stored. Like every preflight in this module it is check-then-act — a mount
+    appearing between it and the rename is caught by the residual mapping,
+    which is why the mapping and not this is the correctness layer.
+    """
+    try:
+        return not same_mount(fd_a, fd_b)
+    except UnsupportedFilesystem:
+        return False
 
 
 def leaf_mount_id(dst_dir_fd: int, name: str) -> int | None:
@@ -1976,9 +2012,22 @@ def rename_noreplace(
 
     Raises `FileExistsError` (EEXIST — the caller retries with another name),
     `FileNotFoundError` (ENOENT), `UnsupportedFilesystem` (EINVAL/ENOSYS/
-    EOPNOTSUPP/EXDEV — the kernel or filesystem cannot do a non-replacing
-    rename here), `UnsafePath` (EISDIR/ENOTDIR — the two names are not the same
-    kind of object), and plain `OSError` for anything else.
+    EOPNOTSUPP — the kernel or filesystem cannot do a non-replacing rename
+    here), `MountBoundary` (EXDEV), `UnsafePath` (EISDIR/ENOTDIR — the two
+    names are not the same kind of object), and plain `OSError` for anything
+    else.
+
+    **`EXDEV` is not one of the unsupported cases and must not be folded back
+    in with them.** The other three mean this kernel or this filesystem cannot
+    perform a non-replacing rename at all; `EXDEV` from `renameat2` means,
+    definitionally, that the two names sit on different mounts — the filesystem
+    renames perfectly well. Reporting it as "renameat2 is not available" sends
+    an operator, or an agent acting on the text, to change filesystems in
+    response to a mount layout, which is the defect class `MountBoundary`
+    exists to remove. Every caller inherits the accurate cause from here, so a
+    caller that re-wraps rename failures in its own prose has to catch the
+    subclass **before** `UnsupportedFilesystem` or its wrapper is a lie and the
+    subclass branch unreachable — see `soft_delete_at` and `probe_trash`.
     """
     code = _renameat2_raw(
         src_dir_fd, src_name, dst_dir_fd, dst_name, RENAME_NOREPLACE
@@ -1989,7 +2038,14 @@ def rename_noreplace(
         raise FileExistsError(code, os.strerror(code), dst_name)
     if code == errno.ENOENT:
         raise FileNotFoundError(code, os.strerror(code), src_name)
-    if code in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP, errno.EXDEV):
+    if code == errno.EXDEV:
+        raise MountBoundary(
+            f"{src_name} and {dst_name} are on different mounts, so the "
+            "non-replacing rename that moves one to the other cannot cross "
+            "the boundary (EXDEV). The filesystem is fine; the mount layout "
+            "is what refuses."
+        )
+    if code in (errno.EINVAL, errno.ENOSYS, errno.EOPNOTSUPP):
         raise UnsupportedFilesystem(
             f"renameat2(RENAME_NOREPLACE) is not available for this rename "
             f"({errno.errorcode.get(code, code)}); a non-replacing move is "
@@ -2026,6 +2082,33 @@ def remove(root_fd: int, rel_path: str | Path) -> None:
         flush_dir_quietly(dir_fd, f"parent directory of {rel_path}")
     finally:
         os.close(dir_fd)
+
+
+def _trash_mount_boundary(
+    rel_path: str | Path, trash_dir: str, detail: str | None = None
+) -> MountBoundary:
+    """The soft delete's mount-boundary refusal, in one place.
+
+    Raised from two points that must not drift: the best-effort preflight, and
+    the residual mapping of an `EXDEV` that reached the rename. Both say the
+    same thing because it is the same fact — `.trash` is opened beneath the
+    vault *root*, so a file on a mount nested beneath that root has a source
+    parent the trash rename cannot reach.
+
+    It names `permanent=True` because that is the workaround an agent can
+    actually act on: an unlink crosses no mount boundary. A per-mount trash
+    would make the soft delete work and is explicitly out of scope here; what
+    this closes is a message that blamed `.trash/`'s ability to receive a
+    non-replacing rename for a layout the filesystem has no say in.
+    """
+    because = f" ({detail})" if detail else ""
+    return MountBoundary(
+        f"{rel_path} and the vault root's {trash_dir}/ are on different "
+        f"mounts, so the rename that soft-deletes it cannot cross the "
+        f"boundary{because}. The filesystem is fine; the mount layout is what "
+        f"refuses — {trash_dir}/ lives beside the vault root and the file does "
+        "not. Pass permanent=True to unlink the file instead."
+    )
 
 
 def _rename_into_trash(
@@ -2157,9 +2240,13 @@ def soft_delete(root_fd: int, rel_path: str | Path, trash_dir: str = TRASH_DIR) 
     kind of success an agent never questions.
 
     `.trash` lives inside the vault root, so the rename is same-device by
-    construction; `EXDEV` (separate mount) and `EINVAL`/`ENOSYS` (a filesystem
-    or kernel without `RENAME_NOREPLACE`) raise `UnsupportedFilesystem`, which
-    `probe_trash` catches up front rather than at the first delete.
+    construction — but not same-*mount* by construction: a directory bind
+    mounted beneath the root shares the root's `st_dev` and still refuses the
+    rename. That case raises `MountBoundary` naming the layout (best-effort
+    before the rename, and from the rename's own `EXDEV` otherwise), while
+    `EINVAL`/`ENOSYS`/`EOPNOTSUPP` — a filesystem or kernel without
+    `RENAME_NOREPLACE` — raise `UnsupportedFilesystem`, which `probe_trash`
+    catches up front rather than at the first delete.
     """
     src_fd, name = _open_parent(root_fd, rel_path, create=False)
     try:
@@ -2206,6 +2293,15 @@ def soft_delete_at(
         trash_fd = open_dir_beneath(
             root_fd, trash_dir, create=True, created=created_dirs
         )
+        # Best-effort, and before anything is renamed: where the kernel can
+        # answer the mount question a boundary that is already there is
+        # refused with an accurate cause instead of an `EXDEV` the caller has
+        # to interpret. `cross_mount_definitely` fails open, so a kernel
+        # without `STATX_MNT_ID` keeps its soft delete and the mapping below
+        # is the backstop. Nothing has been created in the trash yet beyond
+        # `trash_dir` itself, which the next delete needs anyway.
+        if cross_mount_definitely(src_dir_fd, trash_fd):
+            raise _trash_mount_boundary(rel_path, trash_dir)
         if stamp is None:
             stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         try:
@@ -2216,6 +2312,13 @@ def soft_delete_at(
             # Somebody else removed the source between the `lstat` and here.
             # Nothing was created in the trash, so there is nothing to undo.
             raise FileNotFoundError(f"File not found: {rel_path}") from None
+        except MountBoundary as exc:
+            # **Above the `UnsupportedFilesystem` branch, or it is
+            # unreachable** — `MountBoundary` is a subclass. It is also the one
+            # cause the generic wrapper below would actively misreport: a mount
+            # boundary says nothing about whether `.trash/` can receive a
+            # non-replacing rename, and it can.
+            raise _trash_mount_boundary(rel_path, trash_dir, str(exc)) from exc
         except UnsupportedFilesystem as exc:
             raise UnsupportedFilesystem(
                 f"{trash_dir}/ cannot receive a non-replacing rename from the "
@@ -2615,7 +2718,9 @@ def probe_trash(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
     different pair of directories, and because only `delete_file` needs it. A
     vault whose `.trash` is a separate mount passes the publication probe and
     fails this one with `EXDEV` — and would then be unable to soft-delete at
-    all, so it has to be caught here rather than at the first delete.
+    all, so it has to be caught here rather than at the first delete. That case
+    is re-raised as `MountBoundary` with the layout named, not as generic
+    filesystem inability: see the handler below.
 
     Note it probes `rename`, not `link`: `soft_delete` moves the file with one
     rename, so a filesystem that refuses hard links but renames fine is
@@ -2644,6 +2749,22 @@ def probe_trash(root_fd: int, trash_dir: str = TRASH_DIR) -> None:
             created = _rename_into_trash(
                 root_fd, tmp_name, trash_fd, f"{tmp_name}-probe"
             )
+        except MountBoundary as exc:
+            # **Before the `UnsupportedFilesystem` branch**, which would
+            # otherwise erase the subtype and, worse, the cause: this probe
+            # renames root→`trash_dir`, so its `EXDEV` means `trash_dir` is
+            # itself a mount distinct from the root's. That is the layout this
+            # probe meets first and the one the generic wording is furthest
+            # from — the filesystem moves files with a non-replacing rename
+            # perfectly well.
+            raise MountBoundary(
+                f"The vault root and {trash_dir}/ are on different mounts "
+                f"({exc}), so the rename that performs a soft delete cannot "
+                f"reach {trash_dir}/. The filesystem is fine; the mount "
+                "layout is what refuses. `delete_file`'s soft delete is "
+                f"disabled on this layout — unmount {trash_dir}/ or pass "
+                "permanent=True to unlink instead."
+            ) from exc
         except UnsupportedFilesystem as exc:
             raise UnsupportedFilesystem(
                 f"The vault filesystem cannot move files into {trash_dir}/ "
