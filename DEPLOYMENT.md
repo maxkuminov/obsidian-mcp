@@ -28,6 +28,26 @@ reverse proxy, use `docker-compose.proxy.yml` instead — see
 - A VPS with at least 2 GB RAM and 20 GB disk. 4 GB / 40 GB is more
   comfortable if your vault is large or you self-host Postgres on the
   same box. Any Ubuntu/Debian/Rocky/Alma image works.
+- **Linux kernel 5.6 or newer.** Path containment is enforced with
+  `openat2()`, and the server exits at startup if the syscall is
+  unavailable — an old kernel, or a container runtime whose seccomp
+  profile blocks it. `uname -r` on the VPS. Kernel **5.8** additionally
+  enables the mount check the file-transfer tools need; below it the
+  server starts, logs one warning, and refuses uploads and imports while
+  everything else works.
+- **A filesystem that supports hard links and
+  `renameat2(RENAME_NOREPLACE)`** for the vault mount — ext4 and xfs do.
+  Note creation, `move_note` and the soft delete refuse with a named
+  error otherwise, rather than degrading to a write that could clobber.
+  `O_TMPFILE` is used where available; on a mount that refuses it (some
+  NFS exports, including TrueNAS SCALE's) set
+  `VAULT_ALLOW_NAMED_STAGING_FALLBACK=true`. The vault must also not
+  have another mount nested underneath it — the transfer tools refuse to
+  publish across a mount boundary.
+- **PostgreSQL 16 with pgvector 0.8.0 or newer.** Older pgvector
+  silently loses recall on filtered semantic search, so the server exits
+  rather than run on it. `pgvector/pgvector:pg16` (what the bundled
+  compose files use) is fine.
 - A domain or subdomain (e.g. `obsidian.example.com`) with an A record
   pointed at the VPS's public IP. DNS propagation takes a few minutes.
 - Ports 80 and 443 open on the VPS firewall, plus 22 for SSH.
@@ -94,7 +114,18 @@ docker run --rm caddy:2 caddy hash-password --plaintext 'your-password'
 ```
 
 The bundled configuration protects `/admin`, `/api`, and `/authorize` and
-fails closed while the placeholder remains.
+fails closed while the placeholder remains. Everything it does not name
+is answered 404, so if you want the file-transfer tools, add
+`/transfer*` to the public matcher alongside `/mcp*`:
+
+```caddyfile
+@mcp {
+    path /mcp* /transfer* /health /.well-known* /register /token /revoke
+}
+```
+
+`/transfer/*` is public by design — the capability token in the request
+is what authorises it — so it must not go behind the basic-auth block.
 
 > Leave `MCP_SANDBOX_MODE` unset (it appears commented-out in
 > `.env.example`). It exists only for the Glama registry's automated
@@ -164,6 +195,14 @@ WebSocket / streaming passthrough on `/mcp`. The file's header comment
 walks through both patterns and the exact headers your proxy must
 forward.
 
+If you plan to use the file-transfer tools (`request_upload`,
+`request_download`), the proxy must also forward **`/transfer/*`** —
+unauthenticated at the proxy, since the capability token is checked by
+the app — with request buffering off so an upload streams. Two more
+constraints come with it: the token travels in the URL *fragment*, so
+keep header logging **off** (Traefik's default is `drop`) and don't let
+an APM capture request headers, or you will log live capabilities.
+
 > [!WARNING]
 > `docker-compose.proxy.yml` trusts proxy headers and, in single-user
 > mode, relies on your reverse proxy to protect `/admin`. Keep the app's
@@ -216,9 +255,10 @@ and an agent edit the same note within seconds of each other, expect
 to occasionally clean these up. Practical mitigation:
 
 - Don't run agent writes on a note while you have it open in Obsidian.
-  The MCP server's atomic-write path (`os.replace` onto the
-  destination) means writes either land or don't, but Nextcloud still
-  sees them as "remote change while local was dirty."
+  The MCP server stages every write, flushes it, and publishes it with a
+  single atomic operation, so writes either land whole or not at all —
+  but Nextcloud still sees them as "remote change while local was
+  dirty."
 - Nextcloud's default sync interval is fast enough that this is rare
   in practice. Most agent sessions are either read-only or write in
   batches the user reviews after.
@@ -279,7 +319,9 @@ docker compose -f docker-compose.simple.yml exec postgres \
 ```
 
 You should see the tables: `api_keys`, `notes_metadata`,
-`note_embeddings`, `note_links`, etc.
+`note_embeddings`, `note_links`, `oauth_clients`,
+`oauth_codes`, `oauth_tokens`, `transfer_tokens`, `usage_logs`,
+`users`, plus `alembic_version`.
 
 After Step 4 the indexer will pick up your vault on the next pass
 (every 5 min). To trigger immediately, run `make reindex` or click
@@ -374,6 +416,28 @@ is pennies a month.
   20k-note vault will run around $6 for the first index. The default
   model (`text-embedding-3-small`) is about 5× cheaper. The Reset
   embeddings button in the panel makes it cheap to switch.
+- Container exits immediately with a `critical` log line. Three startup
+  checks can do that, and each names itself: `openat2` unavailable
+  (kernel older than 5.6, or a blocking seccomp profile), pgvector older
+  than 0.8.0 (`ALTER EXTENSION vector UPDATE`), or `EMBEDDING_DIMENSIONS`
+  disagreeing with the live embedding column (`make reset-embeddings`).
+  A placeholder `SECRET_KEY`, and `MCP_SANDBOX_MODE` set together with a
+  public `MCP_HOSTNAME`, are refused the same way.
+- Transfer links 404 in the browser. The reverse proxy is not forwarding
+  `/transfer/*` — see Step 2 for the bundled Caddy config and the
+  external-proxy notes above. If the tools themselves refuse to mint,
+  check that `MCP_HOSTNAME` (or `BASE_URL`) is set: without a public
+  origin the server will not hand out a localhost link.
+- Uploads refuse with "the filesystem does not support…". Two different
+  causes. On a mount without `O_TMPFILE` (some NFS exports) the message
+  names `VAULT_ALLOW_NAMED_STAGING_FALLBACK`; setting it to `true`
+  accepts named staging, which is a weaker but declared guarantee, and
+  `/health` then reports `vault_named_staging_fallback_active: true`
+  once a write actually uses it. On a kernel below 5.8 the mount check
+  is unavailable and transfer writes refuse regardless —
+  `/health` reports `transfer_mount_check_available: false`. A nested
+  mount underneath the vault root is refused too: publication cannot
+  cross a mount boundary.
 - `/admin` exposed without auth. Don't skip Step 6. The MCP endpoint
   itself is API-key gated, but the panel can mint new keys and reset
   embeddings.
@@ -388,6 +452,28 @@ is pennies a month.
   failure mode it prevents is your inference provider rejecting the
   request outright with "input exceeds the context window", which is far
   harder to diagnose than a truncation notice.
+
+## Day-2 operations
+
+The `Makefile` targets in the README assume the registry-and-Traefik
+deployment; on a compose-file deployment the equivalents are plain
+`docker compose -f <file> …` commands. Either way:
+
+- **Health.** `curl -s https://your-hostname/health` returns `status`
+  plus `transfer_mount_check_available` and
+  `vault_named_staging_fallback_active` — the two capability facts that
+  are otherwise only visible in the startup log.
+- **Upgrades.** Pull, rebuild, and bring the stack up again; migrations
+  run on start. After a release that carries one, confirm the schema
+  agrees with the models:
+  `docker compose -f docker-compose.simple.yml exec obsidian-mcp alembic check`
+  should print "No new upgrade operations detected."
+- **Backups.** `pg_dump` the database on a schedule; the vault itself is
+  covered by whatever sync you chose in Step 4. Note that a soft delete
+  moves files into `.trash/` inside the vault, so your sync sees them.
+- **Dependency audit.** `make audit` (pip-audit) and `make trivy` (image
+  CVE scan) work from a checkout regardless of which compose file runs
+  the container.
 
 ## What's not covered
 

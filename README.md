@@ -174,7 +174,8 @@ makes this feel natural.
 
 ## What's in the box
 
-The server exposes 20 MCP tools across six concerns.
+The server exposes 25 MCP tools across five families, plus the auth
+and ops layer around them.
 
 ### Search and discovery
 - `keyword_search(query, folder?, tags?, frontmatter?, limit=20)`,
@@ -252,8 +253,10 @@ redeemed over the public `/transfer/*` routes.
   opens it, picks a file, and it lands at `path` — nothing else can be
   written with it.
 - `check_upload(upload_id)`, reports `pending` / `uploading` /
-  `completed` (with size, sha256 and MIME) / `expired`, scoped to the
-  identity that minted it.
+  `completed` (with path, size, sha256 and MIME) / `unknown` (a stream
+  started and the server never recorded how it ended — read the path
+  before re-minting) / `revoked` (the credential or vault root changed
+  under the link) / `expired`, scoped to the identity that minted it.
 - `request_download(path, expires_in?)`, mints a link the human can
   save one vault file from. Usable more than once until it expires, and
   bound to the file's exact bytes at mint time.
@@ -291,11 +294,30 @@ origin the mint tools refuse rather than emit a localhost link.
 - Control panel (Jinja2, htmx, Tailwind) for keys, usage logs,
   indexer status, embedding-provider info, and a danger-zone reset.
 - Every tool call is logged to `usage_logs` with name, params
-  (truncated to 200 chars), duration, and response size.
+  (truncated to 200 chars), duration, response size, and the calling
+  credential's name — recorded at call time, so the audit trail
+  survives deleting the key or OAuth client it describes.
+- `/health` is unauthenticated and returns `status` plus two capability
+  fields: `transfer_mount_check_available` (the kernel supports the
+  mount check transfer writes need) and
+  `vault_named_staging_fallback_active` (a write has actually staged
+  under a name on this process).
 
-All write tools route through `src/services/vault.py::write_file`,
-which writes to a tmp file in the same directory and `os.replace()`s
-it onto the destination. A crash mid-write cannot truncate a note.
+Every write — note tools, `write_file`, uploads and imports — stages
+the new bytes in a temporary inode, `fsync`s them, and only then
+publishes. Creation publishes with a kernel-atomic hard link that
+refuses to clobber; `move_note` and the soft delete publish with a
+single non-replacing rename; an overwrite is a same-directory rename
+onto the destination. The destination directory (and any directory the
+call created) is `fsync`ed afterwards, so a crash mid-write can neither
+truncate a note nor lose one the server reported as written.
+
+Staging happens in an unnamed inode wherever the filesystem supports
+one, so no temporary name is ever visible in the vault. On a mount that
+refuses that (some NFS exports do), those writes refuse with an error
+naming `VAULT_ALLOW_NAMED_STAGING_FALLBACK`; setting that flag takes
+named staging back on both write paths as a declared, weaker guarantee.
+See [System requirements](#system-requirements).
 
 ## vs. other Obsidian MCP servers
 
@@ -381,6 +403,12 @@ and claude.ai that expect a proper authorization-code dance. The OAuth
 server supports public (`none`) and confidential (`client_secret_post`)
 token-endpoint authentication plus refresh tokens.
 
+Each client's page lists its grants — one row per `/authorize` approval,
+not per token — with a Revoke control and a permission select per grant,
+so revoking really ends the session instead of leaving a refresh token
+to mint a replacement. Revoked and expired rows stay listed, dimmed, for
+a week.
+
 ![API keys](screenshots/api-keys.png)
 ![OAuth clients](screenshots/oauth-clients.png)
 
@@ -394,8 +422,17 @@ that the container sees what you think it sees.
 ### Settings
 
 Indexer status, current embedding provider and model, vault path, and
-the danger-zone reset that drops and recreates the embeddings column
-at the configured dimension. Use this when switching providers.
+the danger zone: **Reset embeddings** (drops and recreates the
+embeddings column at the configured dimension — use it when switching
+providers) and **Force re-embed** (keeps the column, clears every
+note's embedded-content hash so the next pass re-embeds the vault).
+Both pause the indexer while they run.
+
+The dashboard separates two things that used to be conflated: **Last
+run** is the indexer's own heartbeat — the last pass that completed,
+whether or not anything had changed — and **Last change detected** is
+the newest `indexed_at` on any note. A quiet vault makes the second one
+old while the indexer is perfectly healthy.
 
 ![Settings](screenshots/settings.png)
 
@@ -411,11 +448,49 @@ The bundled Caddy configuration fails closed on `/admin`, `/api`, and
 ### Prerequisites
 
 - Docker and Docker Compose
-- A PostgreSQL 16 instance reachable from the container, with the
-  `pgvector` extension installed
+- A PostgreSQL 16 instance reachable from the container, with
+  `pgvector` **0.8.0 or newer** installed
 - Either an Ollama instance running `bge-m3`, or an OpenAI API key.
   Anything that speaks the OpenAI embeddings protocol works (Azure
   OpenAI, OpenRouter, Together, etc.).
+- Linux, kernel 5.6 or newer (see below)
+
+### System requirements
+
+The server checks these at startup and tells you which one failed
+rather than misbehaving later.
+
+**Linux kernel ≥ 5.6.** Every directory below the vault root is opened
+with a single `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+RESOLVE_NO_MAGICLINKS)`, which is what makes the kernel — not the
+application — prove that a write stayed inside the vault. There is no
+fallback: on an older kernel, or under a container seccomp profile that
+blocks `openat2`, the server logs the reason and exits non-zero.
+
+**Kernel ≥ 5.8 for file transfer.** `statx()`'s `STATX_MNT_ID` is how a
+publication refuses a destination that sits on a different mount than
+the staging directory (a nested bind mount under the vault root would
+otherwise fail only after a whole upload body had streamed). Below 5.8
+the server logs one warning and starts: `request_upload`,
+`import_from_url` and `PUT /transfer/upload` refuse, and everything else
+— reads, note writes, search, downloads, the panel, OAuth — is
+unaffected. `/health` reports it as `transfer_mount_check_available`.
+
+**pgvector ≥ 0.8.0.** Filtered semantic search needs
+`hnsw.iterative_scan`, which landed in 0.8.0. An older extension accepts
+the setting as an unknown placeholder and silently runs a plan that
+drops post-filter candidates — silently worse search results — so the
+server exits instead. Fix with `ALTER EXTENSION vector UPDATE` or a
+newer database image.
+
+**Filesystem.** Case-sensitive and non-normalising (ext4, xfs, and the
+usual bind mounts). It must support hard links within the vault root and
+`renameat2(RENAME_NOREPLACE)`; without those, note creation, `move_note`
+and the soft delete refuse with a named error rather than degrading to a
+publish that can clobber. `O_TMPFILE` is wanted but optional: where it
+is unavailable, set `VAULT_ALLOW_NAMED_STAGING_FALLBACK=true` to accept
+named staging instead (see [Configuration](#configuration)). macOS and
+Windows hosts are out of scope; run the container on a Linux VM.
 
 ### 1. Clone, configure, point at your vault
 
@@ -644,6 +719,13 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `VAULT_PATH` | `/obsidian` | In-container vault mount |
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
+| `MULTI_USER_MODE` | `false` | In-app login, per-user vaults. See [Multi-user mode](#multi-user-mode). |
+| `MCP_HOSTNAME` | — | Public hostname. Derives `BASE_URL`, `ALLOWED_ORIGINS` and `ALLOWED_HOSTS` as `https://<host>`. Required (or `BASE_URL`) for the transfer tools. |
+| `BASE_URL` | derived | Explicit public origin. HTTPS except on loopback. |
+| `ALLOWED_ORIGINS` | derived | CORS origins, JSON list |
+| `ALLOWED_HOSTS` | derived | Accepted `Host` headers, JSON list. `localhost` is always added. |
+| `SESSION_MAX_AGE` | `604800` | Panel session cookie lifetime, seconds (multi-user mode) |
+| `SESSION_COOKIE_NAME` | `omcp_session` | Panel session cookie name |
 | `MAX_FILE_READ_BYTES` | `10485760` | `read_file` cap (10 MB); bounds what the server reads from disk |
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
 | `MAX_READ_RESPONSE_CHARS` | `40000` | `read_note` / `read_file` cap on what is returned to the caller (≈10K tokens). See [Response size limits](#response-size-limits). |
@@ -652,19 +734,29 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `TRANSFER_MAX_UPLOAD_SECONDS` | `600` | How long one claimed upload may stream before the token is spent |
 | `TRANSFER_MAX_CONCURRENT_UPLOADS` | `4` | Simultaneous upload streams |
 | `IMPORT_ALLOW_HTTP` | `false` | Let `import_from_url` fetch plain http. Off by default. |
+| `VAULT_ALLOW_NAMED_STAGING_FALLBACK` | `false` | Accept named staging on filesystems without `O_TMPFILE`. One flag, both write paths. See [System requirements](#system-requirements). |
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | — | Used when provider is Ollama |
 | `EMBEDDING_MODEL` | `bge-m3` | Ollama model name |
+| `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident. `-1` pins it; a Go duration (`30m`) frees VRAM when idle. Ollama only. |
 | `OPENAI_API_KEY` | — | Required when provider is OpenAI |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model |
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
 | `CHUNK_OVERLAP` | `0` | Token overlap between chunks |
+| `EMBEDDING_EXCLUDE_PATTERNS` | `["*.excalidraw.md","Excalidraw/*"]` | Globs skipped by the embedder. Excluded files stay keyword-searchable. |
 | `MCP_SANDBOX_MODE` | `false` | Registry-eval only. Skips DB, indexer, embedding provider, and `/mcp` auth so introspection works without external deps. Do not enable in production. |
 
 See `.env.example` for the full set with comments. For first-index
 spend on OpenAI, see [Cost expectations](#cost-expectations) above.
+
+The MCP transport's request-body limit is **derived, not configured**:
+`max(2 × MAX_FILE_WRITE_BYTES, 6 × 10 MB) + 1 MiB`, which is 61 MiB with
+the defaults. It has to track the write caps so that every supported
+write is refused by the tool — with an actionable message — rather than
+by the transport with a bare HTTP 413. Raise `MAX_FILE_WRITE_BYTES` and
+the transport limit follows.
 
 ### Switching providers
 
@@ -803,7 +895,7 @@ deployment.
 │ MCP clients  │   HTTP + Bearer key   │   FastAPI app        │
 │  Claude Desk │ ────────────────────▶ │  ┌────────────────┐  │
 │  Claude Code │                       │  │  MCP server    │  │
-│  n8n agents  │                       │  │  (20 tools)    │  │
+│  n8n agents  │                       │  │  (25 tools)    │  │
 │  OpenWebUI   │                       │  └─────┬──────────┘  │
 └──────────────┘                       │        ▼             │
                                        │  ┌────────────────┐  │
@@ -863,7 +955,9 @@ ignores mtime jitter. Stale embeddings are caught by the
 | `note_links` | Wikilink graph: source/target IDs, target_path, kind (`link`, `embed`, `markdown`) |
 | `api_keys` | Hashed bearer tokens, prefix for display, permission, expiry |
 | `usage_logs` | Per-tool-call audit |
-| `oauth_clients`, `oauth_codes`, `oauth_tokens` | OAuth 2.0 PKCE state |
+| `oauth_clients`, `oauth_codes`, `oauth_tokens` | OAuth 2.0 PKCE state, including the grant id that ties a consent's tokens together |
+| `transfer_tokens` | Capability rows behind the `/transfer/*` links: direction, destination path, state, fingerprint, expiry |
+| `users` | Multi-user mode: login, role, per-user `vault_path`, and the vault the index was last built under |
 
 GIN indexes on `content_tsvector` and `tags[]`. B-tree indexes on the
 hot foreign keys. pgvector HNSW index on the embedding column
@@ -879,7 +973,10 @@ src/
   database.py         async SQLAlchemy engine/session
   models/db.py        ORM models
   mcp_server/         MCP server, tools, auth middleware
-  services/           vault ops, search, embeddings, links, indexer
+  services/           vault ops, anchored filesystem, search, FTS,
+                      embeddings, links, indexer, transfer
+  transfer/           public /transfer/* capability-redemption routes
+  auth/               login, sessions, per-request identity context
   api/                control-panel REST endpoints
   control_panel/      Jinja2 templates and static assets
   oauth/              OAuth 2.0 authorization-code flow
@@ -912,16 +1009,31 @@ DATABASE_URL=... SECRET_KEY=... VAULT_PATH=... uvicorn src.main:app --reload
 ```
 make init             First-time setup (data dirs, .env)
 make build            Build Docker image (no cache)
+make build-cached     Build Docker image (with cache)
+make push             Push the image to the configured registry
+make image            Build and push
 make deploy           Build, scan, push, backup, migrate, recreate container
+make up / down / restart / shell   Container lifecycle
+make logs             Tail container logs
 make db-init          Create database, user, and pgvector extension
 make db-migrate       Run alembic migrations
+make db-check         alembic check — schema vs. ORM models (must be clean)
+make test-schema      Schema gate: migrations vs. models on a throwaway pgvector container
 make db-backup        Dump database to backups dir
-make logs             Tail container logs
+make db-restore FILE=<path>   Restore from a backup
 make reindex          Trigger a reindex via the API
 make reset-embeddings Drop and recreate embedding column at configured dim
 make rebuild-tsvectors Recompute keyword index for FTS_CONFIGS (no embeddings, no API calls)
 make status           Show container and health status
+make audit            Audit Python dependencies (pip-audit)
+make trivy            Scan the local image for HIGH/CRITICAL CVEs
+make clean            Remove containers and images (data preserved)
 ```
+
+`make deploy` runs the whole pipeline: build, image scan, push, database
+backup, `alembic upgrade head`, then recreate the container. Run
+`make test-schema` before any deploy that carries a migration, and
+`make db-check` after one.
 
 ## Security notes
 
@@ -933,8 +1045,25 @@ make status           Show container and health status
 - The OpenAI key is rendered on the settings page as
   `key[:8] + "..." + key[-4:]` and never appears in full in HTML or
   JS sources.
-- Path traversal is blocked at the service layer. All write paths
-  resolve through `Path.resolve().relative_to(vault_root)`.
+- Path traversal is blocked at the service layer, and containment is
+  proved by the kernel: every directory below the vault root is opened
+  with one `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+  RESOLVE_NO_MAGICLINKS)` from an open root descriptor, and the rest of
+  the operation acts on that descriptor rather than re-walking a name.
+- Mutating tools act on the path as named. A final component that is a
+  symlink is refused (naming the link's target) instead of being
+  followed, so an in-vault alias cannot redirect a write. Reads still
+  follow links, which is what an alias is for.
+- Every path guard also refuses hidden components, so `.obsidian`,
+  `.git`, `.trash` and friends are out of reach of every tool.
+- Transfer links carry their token in the URL fragment, which browsers
+  never send, and are redeemed only from an `Authorization: Bearer`
+  header. Keep header logging off at your reverse proxy and APM.
+  Unknown, expired, consumed and revoked tokens all get one identical
+  404 from the public routes; precise status comes from the
+  authenticated `check_upload` tool.
+- `import_from_url` fetches only genuinely public addresses, under an
+  explicit deny list re-applied at every redirect.
 - Parameterized queries everywhere. No string interpolation into SQL.
 - Response headers include HSTS, `X-Content-Type-Options: nosniff`,
   and `X-Frame-Options: DENY`.
