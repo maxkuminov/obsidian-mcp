@@ -86,7 +86,20 @@ SEED = 1234
 N_QUERIES = 5
 # Per query: enough near neighbours to own the `ef_search = 80` window on their
 # own, which is what makes a non-iterative filtered scan come back empty.
-A_NOTES_PER_QUERY = 300
+#
+# Reduced from 300 by #127, and the reason is the planner, not the scan. Every
+# query now carries an owner predicate (`apply_note_filters`'s mapping is
+# total), so each shape below is `<filter> AND user_id = bob` — two predicates
+# selecting the *same* rows, whose estimated selectivities the planner
+# multiplies. At the old sizing `B/` was ~51% of the notes, so the combined
+# estimate fell to ~26%, the planner picked a seq scan + sort, and both fixture
+# guards below failed: the HNSW plan the recall bug lives in never appeared.
+# Shrinking the crowd lifts `B/` to ~76%, putting the *product* back around
+# where the single predicate used to be. `A/` still holds well over `ef_search`
+# chunks per query at 0.05 cosine while `B/` is at random directions, so the
+# starvation the second guard asserts is unaffected — and that guard is what
+# proves it.
+A_NOTES_PER_QUERY = 100
 # The filtered half has to be *large*, not just present. A filter matching a
 # few percent of the corpus makes the planner estimate a tiny join and pick a
 # seq scan + sort — the index plan the bug lives in never appears, and every
