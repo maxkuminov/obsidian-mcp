@@ -41,4 +41,4 @@
 
 - [x] 6.1 Full suite: `pytest tests/` plus the nested-mount runner (`pytest tests/test_nested_mount_publication.py`).
 - [x] 6.2 `openspec validate --strict` clean for this change.
-- [ ] 6.3 PR (main is protected), verifier + adversarial Codex gates, deploy, exercise the affected tools live (delete/move on the production vault are same-mount — exercise success paths; the refusal paths are covered by the unshare harness), archive with `Closes #108 #109 #110 #115`.
+- [x] 6.3 PR (main is protected), verifier + adversarial Codex gates, deploy, exercise the affected tools live (delete/move on the production vault are same-mount — exercise success paths; the refusal paths are covered by the unshare harness), archive with `Closes #108 #109 #110 #115`.
