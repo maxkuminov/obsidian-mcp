@@ -590,6 +590,10 @@ async def test_the_refusal_writes_the_distinct_error_marker(multi_user_vault):
         "section",
         "replace_all",
         "dry_run",
+        # The destructive-intent flag joined the allow-list with #128; an
+        # operator reading this row after a frontmatter block went missing
+        # needs to see whether wholesale replacement was asked for.
+        "replace_frontmatter",
         "error",
     }
     assert params["path"] == "note.md"

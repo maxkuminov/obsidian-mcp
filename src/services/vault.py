@@ -95,6 +95,7 @@ import posixpath
 import re
 import stat
 import uuid
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -2590,6 +2591,121 @@ def list_dir(
     return entries, truncated
 
 
+_FRONTMATTER_CLOSING_RE = re.compile(r"(?m)^---[ \t]*\r?$")
+
+
+@dataclass(frozen=True)
+class FrontmatterDiagnosis:
+    """What a note's line-1 frontmatter region actually is.
+
+    `valid` is the unambiguous has-valid-block signal every write path keys
+    off. `defect` is `None` when there is nothing wrong to name — which covers
+    BOTH a valid block and a note with no line-1 fence at all, so the two are
+    told apart by `valid`, never by `defect is None`.
+
+    `block` is the parser's own computed span: the opening fence, the YAML
+    region, the closing fence and the single newline after it, so
+    `block + body == raw` exactly whenever `valid` is true. It is never
+    derived as `raw[:-len(body)]`, which is wrong for an empty body.
+    """
+
+    valid: bool
+    defect: str | None = None       # "unclosed_fence" | "yaml_error" | "not_a_mapping"
+    message: str | None = None      # human phrase; carries PyYAML's own text
+    block: str = ""
+
+
+_ABSENT = FrontmatterDiagnosis(valid=False)
+
+
+def _partition_frontmatter(raw: str) -> tuple[dict, str, FrontmatterDiagnosis]:
+    """The one partition of a note into frontmatter and body.
+
+    `parse_frontmatter` and `parse_frontmatter_diagnose` are both thin wrappers
+    over this, so the read side and the write side can never disagree about
+    what a block is — a block `read_note` strips must never be diagnosed
+    differently by a tool that is about to write (D3).
+
+    Returns `(fm, body, diagnosis)`. For anything that is not a valid block the
+    body is `raw` unchanged, exactly as the read parser has always returned it.
+    """
+    if not raw.startswith("---"):
+        return {}, raw, _ABSENT
+    # Require the opening fence to occupy line 1 alone (allow trailing CR).
+    first_line_end = raw.find("\n")
+    if first_line_end == -1:
+        # A file that is nothing but an unterminated `---` line: a line-1 fence
+        # with no closing fence, i.e. defective rather than absent.
+        if raw.rstrip("\r") != "---":
+            return {}, raw, _ABSENT
+        return {}, raw, FrontmatterDiagnosis(
+            valid=False,
+            defect="unclosed_fence",
+            message=(
+                "the `---` frontmatter fence on line 1 is never closed "
+                "(the file is a single unterminated fence line)"
+            ),
+        )
+    first_line = raw[:first_line_end].rstrip("\r")
+    if first_line != "---":
+        return {}, raw, _ABSENT
+
+    # Find the closing fence on its own line.
+    rest = raw[first_line_end + 1:]
+    m = _FRONTMATTER_CLOSING_RE.search(rest)
+    if m is None:
+        return {}, raw, FrontmatterDiagnosis(
+            valid=False,
+            defect="unclosed_fence",
+            message="the `---` frontmatter fence on line 1 is never closed",
+        )
+    yaml_text = rest[:m.start()]
+    body_start = m.end()
+    # Skip the single newline after the closing fence, if present.
+    if body_start < len(rest) and rest[body_start] == "\n":
+        body_start += 1
+    body = rest[body_start:]
+    block = raw[:first_line_end + 1 + body_start]
+    try:
+        fm = yaml.safe_load(yaml_text)
+    except yaml.YAMLError as e:
+        return {}, raw, FrontmatterDiagnosis(
+            valid=False,
+            defect="yaml_error",
+            message=f"the frontmatter block does not parse as YAML: {e}",
+        )
+    if fm is None:
+        # Whitespace-only fenced YAML is a valid EMPTY mapping — the one
+        # deliberate behaviour change to `parse_frontmatter` (D3). It has to
+        # land here rather than only in the diagnosing sibling: leaving the
+        # read parser treating `---\n---\n` as absent while the write side
+        # preserves it as a block makes the read-body -> default-edit round
+        # trip *duplicate* the block.
+        if yaml_text.strip() == "":
+            return {}, body, FrontmatterDiagnosis(valid=True, block=block)
+        # `null`, `~`, or comment-only YAML. Not a mapping — and comment-only
+        # must not be valid, or its `#` line would break read/write section
+        # parity.
+        return {}, raw, FrontmatterDiagnosis(
+            valid=False,
+            defect="not_a_mapping",
+            message=(
+                "the frontmatter block's YAML is not a mapping "
+                "(it is null, `~`, or comments only)"
+            ),
+        )
+    if not isinstance(fm, dict):
+        return {}, raw, FrontmatterDiagnosis(
+            valid=False,
+            defect="not_a_mapping",
+            message=(
+                "the frontmatter block's YAML is not a mapping "
+                f"(it parses as a {type(fm).__name__})"
+            ),
+        )
+    return fm, body, FrontmatterDiagnosis(valid=True, block=block)
+
+
 def parse_frontmatter(raw: str) -> tuple[dict, str]:
     """Split YAML frontmatter from content.
 
@@ -2599,36 +2715,30 @@ def parse_frontmatter(raw: str) -> tuple[dict, str]:
     Returns `(metadata, body)`. `body` preserves leading whitespace exactly
     as it appears after the closing `---\n`; only a single newline separator
     is consumed.
-    """
-    if not raw.startswith("---"):
-        return {}, raw
-    # Require the opening fence to occupy line 1 alone (allow trailing CR).
-    first_line_end = raw.find("\n")
-    if first_line_end == -1:
-        return {}, raw
-    first_line = raw[:first_line_end].rstrip("\r")
-    if first_line != "---":
-        return {}, raw
 
-    # Find the closing fence on its own line.
-    rest = raw[first_line_end + 1:]
-    closing_re = re.compile(r"(?m)^---[ \t]*\r?$")
-    m = closing_re.search(rest)
-    if m is None:
-        return {}, raw
-    yaml_text = rest[:m.start()]
-    body_start = m.end()
-    # Skip the single newline after the closing fence, if present.
-    if body_start < len(rest) and rest[body_start] == "\n":
-        body_start += 1
-    body = rest[body_start:]
-    try:
-        fm = yaml.safe_load(yaml_text)
-    except yaml.YAMLError:
-        return {}, raw
-    if not isinstance(fm, dict):
-        return {}, raw
+    A whitespace-only fenced region (`---\n---\n`) is a valid EMPTY mapping:
+    `({}, body)` with the block stripped. Every other malformed shape —
+    unclosed fence, YAML error, non-mapping YAML — returns `({}, raw)` with
+    the block left in the body, as it always has. Use
+    `parse_frontmatter_diagnose` when the caller needs to tell those apart.
+    """
+    fm, body, _ = _partition_frontmatter(raw)
     return fm, body
+
+
+def parse_frontmatter_diagnose(
+    raw: str,
+) -> tuple[dict, str, FrontmatterDiagnosis]:
+    """`parse_frontmatter` plus a verdict on the frontmatter region (D3).
+
+    Same predicates as the read parser, by construction — both call
+    `_partition_frontmatter`. The write paths need the distinction the read
+    parser deliberately collapses: "this note has no frontmatter" and "this
+    note's frontmatter is broken" both parse to `({}, raw)`, and prepending a
+    second block above a broken one, or scanning a broken one for headings, is
+    a silently-wrong write.
+    """
+    return _partition_frontmatter(raw)
 
 
 def serialize_frontmatter(meta: dict, body: str) -> str:

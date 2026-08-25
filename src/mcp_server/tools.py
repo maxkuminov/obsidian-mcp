@@ -590,7 +590,17 @@ async def read_note_impl(
     offset: int = 0,
     limit: int | None = None,
 ) -> str:
-    """Read a note by its vault-relative path, capped to a context-safe size."""
+    """Read a note by its vault-relative path, capped to a context-safe size.
+
+    The frontmatter block is rendered as a summary and stripped from the
+    content. Only a **complete, unwindowed whole-note** response (`section=None`,
+    `offset=0`, no `[TRUNCATED]` notice) round-trips through
+    `edit_note(path, content)` — default full replacement preserves the block
+    and takes what it is given as the entire new body, so a truncated read must
+    be paged to the end before it is written back. A `section=` response
+    belongs to `edit_note(section=...)`, and it **includes the heading line**
+    while `edit_note(section=...)` takes the body only.
+    """
     uid = current_user_id.get()
     try:
         note = read_file(path, user_id=uid)
@@ -1003,6 +1013,29 @@ def _note_size_error(content: str) -> str | None:
     rather than by the MCP transport's body limit, which sits well above it.
     """
     return _note_size_error_for(len(content.encode("utf-8")))
+
+
+def _frontmatter_defect_error(tool: str, path: str, diagnosis) -> str:
+    """Refuse a write over a defective frontmatter block, naming the defect.
+
+    The two callers refuse for different immediate reasons and share this text
+    because the caller's next move is the same in both: `set_frontmatter`
+    would otherwise prepend a *second* block above the broken one and report
+    success, and a section write would otherwise resolve headings over raw
+    bytes where a YAML `#` comment is selectable and a replacement can delete
+    the closing fence.
+
+    The repair named is `edit_note(replace_frontmatter=True)` — the one mode
+    that replaces the block wholesale — because nothing else in the tool
+    surface can rewrite a block that does not parse.
+    """
+    return (
+        f"{tool}: {path} has a malformed frontmatter block — "
+        f"{diagnosis.message}. Nothing was written. Read the note, then repair "
+        "the whole file with `edit_note(path, content=<complete note text>, "
+        "replace_frontmatter=True)`, which replaces the frontmatter block "
+        "along with the body."
+    )
 
 
 @_tracked("create_note", ["path"])
@@ -1522,7 +1555,15 @@ async def find_orphans_impl(folder: str | None = None, limit: int = 50) -> str:
 
 @_tracked(
     "edit_note",
-    ["path", "append", "operation", "find", "section", "replace_all", "dry_run"],
+    # `replace_frontmatter` is logged because it is the destructive-intent flag
+    # on this tool: it is the difference between a write that preserved the
+    # note's frontmatter and one that replaced it wholesale, and an operator
+    # reading `usage_logs` after a block went missing needs to see which was
+    # asked for. `content` stays out, as it always has.
+    [
+        "path", "append", "operation", "find", "section", "replace_all",
+        "dry_run", "replace_frontmatter",
+    ],
 )
 async def edit_note_impl(
     path: str,
@@ -1533,8 +1574,36 @@ async def edit_note_impl(
     section: str | None = None,
     replace_all: bool = False,
     dry_run: bool = False,
+    replace_frontmatter: bool = False,
 ) -> str:
     """Edit an existing note in the vault.
+
+    **Full replacement preserves an existing valid frontmatter block by
+    default.** `content` is the note's new *body*; a valid line-1 `---` block
+    is kept byte-identical ahead of it (with one `\n` inserted when the block
+    ends at EOF without a newline and `content` is non-empty). No property of
+    `content`'s shape changes that — a leading `---`, or a complete
+    mapping-shaped fenced block, is body. Pass `replace_frontmatter=True` to
+    overwrite the whole file, frontmatter included; that is the escape hatch
+    for replacing, dropping or repairing a block, and the only way to fix a
+    malformed one. A note with no valid block (absent or malformed) is
+    replaced wholesale by default, since there is nothing valid to preserve.
+
+    **The round-trip guarantee covers a complete, unwindowed whole-note read
+    only** — `read_note(path)` with no `section`, `offset=0` and no
+    `[TRUNCATED]` notice. Feed that response's content back through default
+    full replacement and the note is unchanged. A truncated read must be
+    completed (page with `offset`) before it is written back; a
+    `read_note(section=...)` response belongs to `edit_note(section=...)`, and
+    it **includes the heading line** while `edit_note(section=...)` takes the
+    body only — pass it back unstripped and the heading is duplicated.
+
+    Section mode resolves and replaces over the frontmatter-stripped body, so
+    a YAML `#` comment is never selectable and never counted by an ordinal,
+    and the block is reattached byte-identically. Over a *defective* block
+    (unclosed fence, YAML error, non-mapping) a section write is refused by
+    name; reads are deliberately asymmetric there — `read_note` still extracts
+    from such a note, because a read destroys nothing.
 
     Every mode that writes confirms the caller's vault assignment immediately
     before it publishes (#88). `dry_run` publishes nothing and takes no
@@ -1565,14 +1634,27 @@ async def edit_note_impl(
         selected.append("section=...")
     if operation == "replace" and selected:
         selected.append('operation="replace"')
+    if replace_frontmatter and selected:
+        # `replace_frontmatter` selects wholesale full replacement, so it is
+        # meaningless in the other three modes. Ignoring it there would be the
+        # worse failure: a caller who passed it with `section=` believes the
+        # block was replaced, and it was not.
+        selected.append("replace_frontmatter=True")
     if len(selected) > 1:
-        return (
+        message = (
             "edit_note: choose at most one of append, find, section "
             f"(got {', '.join(selected)})."
         )
+        if replace_frontmatter:
+            message += (
+                " replace_frontmatter applies to full replacement only — it "
+                "is what makes a full replacement overwrite the frontmatter "
+                "block instead of preserving it."
+            )
+        return message
 
     uid = current_user_id.get()
-    from src.services.vault import replace_section
+    from src.services.vault import parse_frontmatter_diagnose, replace_section
 
     try:
         # Resolved and *opened* before the read, so every mode — `dry_run`
@@ -1606,9 +1688,22 @@ async def edit_note_impl(
         success_message: str = f"Updated note: {path}"
 
         if section is not None:
-            new_content, err = replace_section(existing, section, content)
+            # D5. A valid block is held out of the scan entirely, so heading
+            # resolution, the replacement and the not-found/ambiguity listings
+            # all run over exactly the text `read_note` scans — restoring the
+            # selector parity the spec already promises — and the block is
+            # reattached byte-identically. A *defective* block is refused
+            # rather than scanned: over raw bytes a YAML `#` comment inside a
+            # broken block is selectable as a heading, and the replacement span
+            # can swallow the closing fence.
+            _, stripped_body, diagnosis = parse_frontmatter_diagnose(existing)
+            if diagnosis.defect is not None:
+                return _frontmatter_defect_error("edit_note", path, diagnosis)
+            scan_text = stripped_body if diagnosis.valid else existing
+            new_body, err = replace_section(scan_text, section, content)
             if err is not None:
                 return err
+            new_content = diagnosis.block + new_body
         elif find is not None:
             if find == "":
                 return (
@@ -1637,8 +1732,35 @@ async def edit_note_impl(
                 new_content = existing.replace(find, content, 1)
         elif append:
             new_content = existing + "\n" + content
-        else:
+        elif replace_frontmatter:
+            # Today's behaviour, now opt-in: the whole file, frontmatter
+            # included, becomes exactly `content`. Also the escape hatch for
+            # dropping a block or repairing a defective one.
             new_content = content
+        else:
+            # D1/D2. `content` is always the new *body*; an existing valid
+            # block is preserved byte-identically ahead of it. `content` is
+            # NEVER classified — a body whose first line is a thematic break
+            # `---`, or which itself opens with a complete mapping-shaped
+            # fenced block (exactly what `read_note` returns for such a note),
+            # is body. Three audit rounds established that destructive intent
+            # cannot be inferred from content shape, so it is asked for
+            # explicitly instead.
+            _, _, diagnosis = parse_frontmatter_diagnose(existing)
+            if not diagnosis.valid:
+                # Nothing valid to preserve (absent or defective) — wholesale,
+                # which is what keeps the repair path open without the flag.
+                new_content = content
+            else:
+                block = diagnosis.block
+                # A metadata-only note whose closing fence sits at EOF without
+                # a newline. Exactly one `\n` goes in, and only when there is a
+                # body to separate — otherwise `---Body` would corrupt the
+                # fence, or an empty `content` would gain a stray line.
+                separator = (
+                    "\n" if content and not block.endswith("\n") else ""
+                )
+                new_content = block + separator + content
 
         # Bound the *result*, before the diff and before the atomic write, so an
         # over-cap edit is refused by the tool in every mode (including dry_run)
@@ -2506,6 +2628,38 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
 # ────────────────────────────────────────────────────────────────────────────
 
 
+def _same_frontmatter_value(current, proposed) -> bool:
+    """Type-sensitive structural equality for one frontmatter value.
+
+    `set_frontmatter` writes only when something actually changed, and the
+    comparison that decides it cannot be plain `==`: in Python `True == 1` and
+    `False == 0`, so setting `draft: true` over a stored `draft: 1` would look
+    like a no-op and leave the note carrying the integer. YAML round-trips
+    these as visibly different documents (`true` vs `1`), so an agent reading
+    the note back would see the value it did not ask for and a success report
+    that said nothing happened.
+
+    Concrete types must match exactly at every level; containers are compared
+    element-wise so a nested `1` never satisfies a nested `True`.
+    """
+    if type(current) is not type(proposed):
+        return False
+    if isinstance(current, dict):
+        if len(current) != len(proposed):
+            return False
+        return all(
+            k in proposed and _same_frontmatter_value(v, proposed[k])
+            for k, v in current.items()
+        )
+    if isinstance(current, (list, tuple)):
+        if len(current) != len(proposed):
+            return False
+        return all(
+            _same_frontmatter_value(a, b) for a, b in zip(current, proposed)
+        )
+    return current == proposed
+
+
 @_tracked("set_frontmatter", ["path"])
 async def set_frontmatter_impl(
     path: str,
@@ -2513,6 +2667,28 @@ async def set_frontmatter_impl(
     remove: list[str] | None = None,
 ) -> str:
     """Merge `updates` into a note's YAML frontmatter and drop keys in `remove`.
+
+    **A malformed block is refused, not worked around.** An unclosed line-1
+    fence, a fenced block that fails YAML parsing, and one whose YAML is not a
+    mapping (`null`, `~`, comments only, a list, a scalar) each produce an
+    error naming the defect and pointing at
+    `edit_note(replace_frontmatter=True)` as the repair; nothing is written,
+    and in particular no second block is prepended above the broken one.
+    `remove=` refuses identically rather than silently doing nothing. The
+    diagnosis runs *before* the empty-`updates`/`remove` no-op check, so a
+    caller that passes neither still learns the note is broken.
+
+    A whitespace-only fenced block (`---\n---\n`) is a **valid empty
+    mapping** and is updated in place. A note with no line-1 fence at all
+    still gets a fresh block prepended ahead of its unchanged body.
+
+    Only an *effective* mutation writes: `updates` that set every named key to
+    the value it already holds (compared type-sensitively — `True` is not `1`)
+    and `remove` naming only absent keys is a byte-identical no-op. That is
+    what keeps a remove-of-nothing from dropping a valid empty block, which
+    would promote a mapping-shaped body prefix into active frontmatter.
+    Removing the last key removes the block entirely — no fences, no YAML
+    region, no separator, exactly the prior body.
 
     Confirms the caller's vault assignment immediately before it
     publishes (#88). That narrows the window in which an administrator's
@@ -2526,7 +2702,10 @@ async def set_frontmatter_impl(
     updates = dict(updates or {})
     remove = list(remove or [])
 
-    from src.services.vault import parse_frontmatter, serialize_frontmatter
+    from src.services.vault import (
+        parse_frontmatter_diagnose,
+        serialize_frontmatter,
+    )
 
     uid = current_user_id.get()
     try:
@@ -2541,9 +2720,6 @@ async def set_frontmatter_impl(
         ):
             return err
 
-        if not updates and not remove:
-            return f"No changes for {path} (empty updates and remove)"
-
         try:
             raw_bytes = read_bytes_at(target, max_bytes=MAX_NOTE_BYTES, label=path)
             raw = raw_bytes.decode("utf-8")
@@ -2552,10 +2728,24 @@ async def set_frontmatter_impl(
             # link after validation; report it rather than raising.
             return f"Failed to read {path}: {e}"
 
-        fm, body = parse_frontmatter(raw)
+        fm, body, diagnosis = parse_frontmatter_diagnose(raw)
+        # D6: diagnosis precedes the no-op check. A caller passing neither
+        # `updates` nor `remove` on a broken note must be told the note is
+        # broken, not handed a success report about a file this tool cannot
+        # safely touch.
+        if diagnosis.defect is not None:
+            return _frontmatter_defect_error("set_frontmatter", path, diagnosis)
+
+        if not updates and not remove:
+            return f"No changes for {path} (empty updates and remove)"
 
         set_keys: list[str] = []
         for k, v in updates.items():
+            # Only an *effective* set counts. `==` alone conflates `True` with
+            # `1` and `False` with `0`, which would report a real type change
+            # as a no-op and leave the note carrying the old type.
+            if k in fm and _same_frontmatter_value(fm[k], v):
+                continue
             fm[k] = v
             set_keys.append(k)
         removed_keys: list[str] = []
@@ -2563,6 +2753,14 @@ async def set_frontmatter_impl(
             if k in fm:
                 del fm[k]
                 removed_keys.append(k)
+
+        if not set_keys and not removed_keys:
+            # Nothing changed, so nothing is serialized. This is the guard
+            # that stops a remove-of-nothing from dropping a valid EMPTY
+            # block: `serialize_frontmatter({}, body)` emits no fences at all,
+            # which on a note whose body opens with a mapping-shaped fenced
+            # block would promote that body prefix into active frontmatter.
+            return f"No changes for {path}"
 
         new_raw = serialize_frontmatter(fm, body)
         if new_raw == raw:
@@ -2592,8 +2790,8 @@ async def set_frontmatter_impl(
             summary.append(f"set: {', '.join(set_keys)}")
         if removed_keys:
             summary.append(f"removed: {', '.join(removed_keys)}")
-        if not summary:
-            summary.append("no key changes (whitespace-only)")
+        if not fm and removed_keys:
+            summary.append("frontmatter block removed (last key)")
         return f"Updated frontmatter in {path} ({'; '.join(summary)})"
 
 
