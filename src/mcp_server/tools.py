@@ -1580,7 +1580,7 @@ async def edit_note_impl(
 
     **Full replacement preserves an existing valid frontmatter block by
     default.** `content` is the note's new *body*; a valid line-1 `---` block
-    is kept byte-identical ahead of it (with one `\n` inserted when the block
+    is kept byte-identical ahead of it (with one `\\n` inserted when the block
     ends at EOF without a newline and `content` is non-empty). No property of
     `content`'s shape changes that — a leading `---`, or a complete
     mapping-shaped fenced block, is body. Pass `replace_frontmatter=True` to

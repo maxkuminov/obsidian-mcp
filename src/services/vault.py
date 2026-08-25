@@ -2724,7 +2724,7 @@ def parse_frontmatter(raw: str) -> tuple[dict, str]:
     as it appears after the closing `---\n`; only a single newline separator
     is consumed.
 
-    A whitespace-only fenced region (`---\n---\n`) is a valid EMPTY mapping:
+    A whitespace-only fenced region (`---\\n---\\n`) is a valid EMPTY mapping:
     `({}, body)` with the block stripped. Every other malformed shape —
     unclosed fence, YAML error, non-mapping YAML — returns `({}, raw)` with
     the block left in the body, as it always has. Use

@@ -1040,12 +1040,85 @@ Link extraction lives in `src/services/links.py`. The extractor strips fenced/in
 
 ## Write tools
 - `create_note(path, content)` — create a new note (atomic write).
-- `edit_note(path, content, append=False, find=None, section=None, replace_all=False, dry_run=False)` — four mutually exclusive modes (full-replace, append, find/replace, section). `dry_run` returns a unified diff without writing; `replace_all` lifts the single-match guard for `find`. Section mode matches ATX headings only and supports `Parent/Child` path-style and `#N` ordinal disambiguation (see "Section addressing" below).
+- `edit_note(path, content, append=False, find=None, section=None, replace_all=False, dry_run=False, replace_frontmatter=False)` — four mutually exclusive modes (full-replace, append, find/replace, section). `dry_run` returns a unified diff without writing; `replace_all` lifts the single-match guard for `find`. Section mode matches ATX headings only and supports `Parent/Child` path-style and `#N` ordinal disambiguation (see "Section addressing" below). Full-replace **preserves an existing valid frontmatter block** and section mode never touches one — see "Frontmatter is preserved unless the caller says otherwise" below.
 - `move_note(from_path, to_path, rewrite_links=False)` — rename or relocate a note. Updates `notes_metadata.file_path` and `note_links.target_path` rows for the moved note. With `rewrite_links=True`, also rewrites `[[Old]]` / `[[Old|alias]]` / `[[Old#anchor]]` / `![[Old]]` / `[[folder/Old]]` forms in source notes.
 - `delete_note(path, permanent=False)` — soft-delete to `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` by default (the same non-replacing `renameat2` `delete_file` uses; the hex suffix is what makes two same-second deletes distinct); `permanent=True` unlinks through the parent descriptor. The indexer skips dot-dirs, so search/embedding cleanup happens on the next reindex pass.
-- `set_frontmatter(path, updates, remove=[])` — structured YAML frontmatter mutation. Round-trips via `yaml.safe_dump` (does not preserve YAML comments). Leaves the body byte-identical.
+- `set_frontmatter(path, updates, remove=[])` — structured YAML frontmatter mutation. Round-trips via `yaml.safe_dump` (does not preserve YAML comments). Leaves the body byte-identical. **Refuses a malformed block by name** rather than prepending a second one; only an effective mutation writes.
 
 All write tools route through `src/services/vault.py::_atomic_write_at`, which stages a tmp file in the destination's own directory, `fsync`s it, publishes it with a same-directory `renameat`/`linkat` **relative to the parent descriptor opened at validation**, and `fsync`s that directory afterwards — a crash mid-write cannot truncate the destination, and nothing that happens to the pathname meanwhile can redirect the write.
+
+### Frontmatter is preserved unless the caller says otherwise
+
+Issue #128. `read_note` strips the YAML block and full-replace wrote exactly
+what it was given, so the natural agent read-modify-write — read a note, edit
+the content portion, pass it back — **silently deleted the frontmatter**. In
+the same family, `set_frontmatter` over a malformed block prepended a *second*
+`---` block above the broken one and reported success, and `remove=` no-oped.
+Destructive and silently-wrong writes, the class this product ranks highest.
+
+- **`content` is the new body; a valid line-1 block is kept byte-identically
+  ahead of it.** The separator is one `\n`, inserted **only** when the block
+  slice does not end in a newline (a metadata-only note whose closing fence
+  sits at EOF) and `content` is non-empty. The slice is the parser's own
+  computed span — never `raw[:-len(body)]`, which is wrong for an empty body.
+- **`content` is never classified, and that is the whole design.** Three audit
+  rounds broke every attempt to infer intent from content shape: a line-1 `---`
+  test breaks on bodies opening with a thematic break, a complete-valid-block
+  test breaks on a stripped body that itself opens with a mapping-shaped fenced
+  block — which is exactly what `read_note` returns for such a note. Intent is
+  asked for instead: **`replace_frontmatter=True`** replaces the whole file
+  (today's behaviour, now opt-in) and is the only way to drop or repair a
+  block. It is in `edit_note`'s `_tracked` allow-list, because it is the
+  difference an operator needs to see after a block goes missing. Combined with
+  `append`/`find`/`section` it is the multi-mode error; with
+  `operation="replace"` it is not, since both name full replacement.
+- **A note with no valid block — absent *or* defective — is replaced wholesale
+  by default.** There is nothing valid to preserve, and this keeps the repair
+  path open without the flag.
+- **Section mode resolves over the frontmatter-stripped body and reattaches the
+  block**, restoring the read/write selector parity the spec already promised:
+  a YAML `#` comment is never selectable and never counted by an ordinal, which
+  it was on the write side. Over a **defective** block a section write is
+  **refused by name** — resolving over raw bytes there lets a `#` line inside
+  the broken block be selected and lets the replacement span swallow the
+  closing fence. Reads are deliberately asymmetric: `read_note` still extracts
+  from such a note, because a read destroys nothing.
+- **`set_frontmatter` diagnoses before the empty-`updates`/`remove` no-op**, so
+  a broken note is reported broken even for a call that would have changed
+  nothing. Unclosed fence, YAML error and non-mapping (list, scalar, `null`,
+  `~`, comment-only) each refuse naming the defect and the
+  `edit_note(replace_frontmatter=True)` repair; `remove=` refuses identically.
+- **Only an *effective* mutation reaches the serializer, compared
+  type-sensitively.** Plain `==` conflates `True` with `1`, which would report
+  a real type change as a no-op. The guard is also what stops a
+  remove-of-nothing from dropping a valid **empty** block —
+  `serialize_frontmatter({}, body)` emits no fences, so on a note whose body
+  opens with a mapping-shaped fenced block that drop would promote the body
+  prefix into active frontmatter. Removing the last *actual* key does remove
+  the block: no fences, no separator, exactly the prior body.
+- **One partition, shared by read and write.** `parse_frontmatter` and
+  `parse_frontmatter_diagnose` both call `_partition_frontmatter`, so a block
+  `read_note` strips can never be diagnosed differently by a tool about to
+  write. `parse_frontmatter` gained **exactly one** behaviour change:
+  whitespace-only fenced YAML is a valid empty mapping for *every* consumer.
+  That has to be shared — leaving the read side treating `---\n---\n` as
+  absent while the write side preserved it makes the read-body round trip
+  *duplicate* the block. The predicate is whitespace, tested **before** the
+  YAML call: PyYAML refuses a bare tab, so asking it would make `---\n \n---\n`
+  valid and `---\n\t\n---\n` a parse error.
+- **Declared staleness.** Notes already indexed under the old empty-block
+  partition (the block surfacing as literal body text, and `note_links.position`
+  measured against it) do not self-heal on an ordinary pass — change detection
+  hashes the raw bytes before parsing, so unchanged bytes skip the reparse. The
+  artifact is cosmetic and vanishingly rare; it heals on the note's next
+  hash-changing edit or under the explicit per-index rebuilds
+  (`make rebuild-tsvectors`, reset/re-embed). A parser-revision invalidation
+  mechanism is not worth building for it.
+- **The round-trip guarantee is scoped, and both layers' docstrings say so:**
+  it covers a complete, unwindowed whole-note read only (`section=None`,
+  `offset=0`, no `[TRUNCATED]`). A truncated read must be paged to the end
+  first, and a `read_note(section=…)` response **includes the heading line**
+  while `edit_note(section=…)` takes the body only.
 
 ### Mutations act on the path as named — never through a symlink
 
