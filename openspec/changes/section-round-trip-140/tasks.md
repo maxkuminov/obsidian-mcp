@@ -84,7 +84,12 @@
       silently edit an assertion.
 - [ ] 4.2 Verify section mode over a valid frontmatter block still resolves
       against the stripped body and reattaches the block byte-identically,
-      and that a defective block still refuses by name.
+      and that a defective block still refuses by name. Assert the asymmetry
+      deliberately: on a defective block a section *read* succeeds over the raw
+      bytes while the section *write* refuses. The round-trip property in 3.1
+      must therefore skip such notes rather than be made to pass on them —
+      widening parity there would mean scanning a broken block on the write
+      side, which is the destructive behaviour #128 removed.
 - [ ] 4.3 Confirm `outline_sections` is **entirely** unchanged across the
       corpus — ordinals and `size` alike. `size` is `body_end - line_start` and
       this change moves neither endpoint, so any observed shift means the fix

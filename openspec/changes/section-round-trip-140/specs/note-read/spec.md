@@ -13,7 +13,18 @@ section's body as `edit_note(section=…)` defines it: nothing more and nothing
 less. Apart from the heading line and its terminator — which a section read
 returns and a section write deliberately preserves — there SHALL be no region
 of a note that a section read returns but a section write to the same selector
-cannot replace. Whitespace, blank lines, and
+cannot replace.
+
+The parity claim is scoped to notes for which section-mode writing is
+**admitted**. A note whose line-1 frontmatter is defective (unclosed fence,
+YAML error, or non-mapping) stays readable by section — the read scans its raw
+bytes — while every section write to it is refused by name, per the vault-write
+requirement this change does not relax. On such a note the guarantee is the
+refusal, not the round trip: it is the safe asymmetry, and widening parity to
+cover it would mean scanning a broken block for headings on the write side,
+which is the destructive behaviour #128 removed.
+
+Whitespace, blank lines, and
 fenced code blocks (as recognised by the shared code masker) between the
 heading line and the next heading of equal-or-shallower depth are part of the
 body on both sides.

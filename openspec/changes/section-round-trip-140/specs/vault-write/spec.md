@@ -79,7 +79,8 @@ scans there.
   `<sel>` (`offset=0`, no `[TRUNCATED]` notice) is stripped of its heading line
   and its terminator, and the remainder is passed back as
   `edit_note(path, content=<remainder>, section=<sel>)`, on a note whose body
-  newlines are LF
+  newlines are LF and whose line-1 frontmatter is absent or valid — the notes
+  for which a section write is admitted at all
 - **THEN** the resulting file SHALL be byte-identical to the original
 - **AND** this SHALL hold for every `#N` ordinal in the note, including
   sections whose body begins with a blank line, sections whose body begins
@@ -91,6 +92,9 @@ scans there.
 - **AND** it SHALL NOT extend to a windowed or truncated section response —
   writing such a window back replaces the whole body with the fragment and
   deletes the remainder, exactly as the note-read requirement already warns
+- **AND** it SHALL NOT be read as weakening the refusal on a defective
+  frontmatter block: such a note remains readable by section and refused for
+  section writes, and the refusal takes precedence over the round trip
 
 #### Scenario: An empty section survives a round trip
 
