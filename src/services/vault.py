@@ -95,6 +95,7 @@ import posixpath
 import re
 import stat
 import uuid
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -2590,6 +2591,151 @@ def list_dir(
     return entries, truncated
 
 
+# Line terminators, universal-newline order: CRLF must be tried before the bare
+# CR alternative or a `\r\n` would be split down the middle.
+_LINE_BREAK_RE = re.compile(r"\r\n|\n|\r")
+
+# A closing fence: `---` plus optional trailing spaces/tabs, occupying a whole
+# line. `(?m)^...$` cannot express this — Python's `re` treats only `\n` as a
+# line boundary, so a lone-CR note (classic Mac line endings) had no line
+# starts at all and the fence was never found. The read path resolves such a
+# file through universal-newline translation and recognises the block; the
+# write path reads raw bytes and did not, which is the divergence this
+# spells out explicitly instead.
+_FRONTMATTER_CLOSING_RE = re.compile(
+    r"(?:\A|(?<=\n)|(?<=\r))---[ \t]*(?=\r\n|\n|\r|\Z)"
+)
+
+
+@dataclass(frozen=True)
+class FrontmatterDiagnosis:
+    """What a note's line-1 frontmatter region actually is.
+
+    `valid` is the unambiguous has-valid-block signal every write path keys
+    off. `defect` is `None` when there is nothing wrong to name — which covers
+    BOTH a valid block and a note with no line-1 fence at all, so the two are
+    told apart by `valid`, never by `defect is None`.
+
+    `block` is the parser's own computed span: the opening fence, the YAML
+    region, the closing fence and the single newline after it, so
+    `block + body == raw` exactly whenever `valid` is true. It is never
+    derived as `raw[:-len(body)]`, which is wrong for an empty body.
+    """
+
+    valid: bool
+    defect: str | None = None       # "unclosed_fence" | "yaml_error" | "not_a_mapping"
+    message: str | None = None      # human phrase; carries PyYAML's own text
+    block: str = ""
+
+
+_ABSENT = FrontmatterDiagnosis(valid=False)
+
+
+def _partition_frontmatter(raw: str) -> tuple[dict, str, FrontmatterDiagnosis]:
+    """The one partition of a note into frontmatter and body.
+
+    `parse_frontmatter` and `parse_frontmatter_diagnose` are both thin wrappers
+    over this, so the read side and the write side can never disagree about
+    what a block is — a block `read_note` strips must never be diagnosed
+    differently by a tool that is about to write (D3).
+
+    Returns `(fm, body, diagnosis)`. For anything that is not a valid block the
+    body is `raw` unchanged, exactly as the read parser has always returned it.
+
+    A line ends at LF, CRLF **or a lone CR**, matching the universal-newline
+    translation `read_file` applies before the read side ever calls this. The
+    write paths read raw bytes, so without the lone-CR case a classic-Mac note
+    was recognised on read and diagnosed *absent* on write: default
+    full-replace took its wholesale branch and deleted a block the round trip
+    advertises it preserves, and `set_frontmatter` prepended a second one.
+    """
+    if not raw.startswith("---"):
+        return {}, raw, _ABSENT
+    # Require the opening fence to occupy line 1 alone.
+    first_break = _LINE_BREAK_RE.search(raw)
+    if first_break is None:
+        # A file that is nothing but an unterminated `---` line: a line-1 fence
+        # with no closing fence, i.e. defective rather than absent.
+        if raw != "---":
+            return {}, raw, _ABSENT
+        return {}, raw, FrontmatterDiagnosis(
+            valid=False,
+            defect="unclosed_fence",
+            message=(
+                "the `---` frontmatter fence on line 1 is never closed "
+                "(the file is a single unterminated fence line)"
+            ),
+        )
+    if raw[:first_break.start()] != "---":
+        return {}, raw, _ABSENT
+
+    # Find the closing fence on its own line.
+    rest = raw[first_break.end():]
+    m = _FRONTMATTER_CLOSING_RE.search(rest)
+    if m is None:
+        return {}, raw, FrontmatterDiagnosis(
+            valid=False,
+            defect="unclosed_fence",
+            message="the `---` frontmatter fence on line 1 is never closed",
+        )
+    yaml_text = rest[:m.start()]
+    body_start = m.end()
+    # Consume the single line terminator after the closing fence, if present —
+    # CRLF as one unit, so a `\r` is never left stranded at the head of the
+    # body where it would read as an extra blank line.
+    closing_break = _LINE_BREAK_RE.match(rest, body_start)
+    if closing_break is not None:
+        body_start = closing_break.end()
+    body = rest[body_start:]
+    block = raw[:first_break.end() + body_start]
+    if yaml_text.strip() == "":
+        # Whitespace-only fenced YAML is a valid EMPTY mapping — the one
+        # deliberate behaviour change to `parse_frontmatter` (D3). It has to
+        # land here rather than only in the diagnosing sibling: leaving the
+        # read parser treating `---\n---\n` as absent while the write side
+        # preserved it as a valid block makes the read-body -> default-edit
+        # round trip *duplicate* the block.
+        #
+        # The predicate is whitespace, tested BEFORE the YAML call, not
+        # "safe_load returned None": PyYAML refuses a region that is a bare
+        # tab (a tab cannot start a token), so asking it would make
+        # `---\n \n---\n` valid and `---\n\t\n---\n` a parse error — a
+        # distinction no author could predict and one the spec does not draw.
+        return {}, body, FrontmatterDiagnosis(valid=True, block=block)
+    try:
+        fm = yaml.safe_load(yaml_text)
+    except yaml.YAMLError as e:
+        return {}, raw, FrontmatterDiagnosis(
+            valid=False,
+            defect="yaml_error",
+            message=f"the frontmatter block does not parse as YAML: {e}",
+        )
+    if fm is None:
+        # `null`, `~`, or comment-only YAML — non-whitespace text that loads to
+        # None. Not a mapping, and comment-only in particular must NOT be
+        # valid: its `#` line would otherwise sit in a region section mode
+        # treats as frontmatter while `read_note`'s scan sees a heading, which
+        # is the read/write parity this change restores.
+        return {}, raw, FrontmatterDiagnosis(
+            valid=False,
+            defect="not_a_mapping",
+            message=(
+                "the frontmatter block's YAML is not a mapping "
+                "(it is null, `~`, or comments only)"
+            ),
+        )
+    if not isinstance(fm, dict):
+        return {}, raw, FrontmatterDiagnosis(
+            valid=False,
+            defect="not_a_mapping",
+            message=(
+                "the frontmatter block's YAML is not a mapping "
+                f"(it parses as a {type(fm).__name__})"
+            ),
+        )
+    return fm, body, FrontmatterDiagnosis(valid=True, block=block)
+
+
 def parse_frontmatter(raw: str) -> tuple[dict, str]:
     """Split YAML frontmatter from content.
 
@@ -2597,38 +2743,34 @@ def parse_frontmatter(raw: str) -> tuple[dict, str]:
     treated as no frontmatter, even if a `---` fence appears further down.
 
     Returns `(metadata, body)`. `body` preserves leading whitespace exactly
-    as it appears after the closing `---\n`; only a single newline separator
-    is consumed.
-    """
-    if not raw.startswith("---"):
-        return {}, raw
-    # Require the opening fence to occupy line 1 alone (allow trailing CR).
-    first_line_end = raw.find("\n")
-    if first_line_end == -1:
-        return {}, raw
-    first_line = raw[:first_line_end].rstrip("\r")
-    if first_line != "---":
-        return {}, raw
+    as it appears after the closing fence; only a single line terminator is
+    consumed. A line ends at LF, CRLF or a lone CR — the same universal-newline
+    rule `read_file` applies before calling this, so the raw-bytes write paths
+    partition a note exactly as the read path does.
 
-    # Find the closing fence on its own line.
-    rest = raw[first_line_end + 1:]
-    closing_re = re.compile(r"(?m)^---[ \t]*\r?$")
-    m = closing_re.search(rest)
-    if m is None:
-        return {}, raw
-    yaml_text = rest[:m.start()]
-    body_start = m.end()
-    # Skip the single newline after the closing fence, if present.
-    if body_start < len(rest) and rest[body_start] == "\n":
-        body_start += 1
-    body = rest[body_start:]
-    try:
-        fm = yaml.safe_load(yaml_text)
-    except yaml.YAMLError:
-        return {}, raw
-    if not isinstance(fm, dict):
-        return {}, raw
+    A whitespace-only fenced region (`---\\n---\\n`) is a valid EMPTY mapping:
+    `({}, body)` with the block stripped. Every other malformed shape —
+    unclosed fence, YAML error, non-mapping YAML — returns `({}, raw)` with
+    the block left in the body, as it always has. Use
+    `parse_frontmatter_diagnose` when the caller needs to tell those apart.
+    """
+    fm, body, _ = _partition_frontmatter(raw)
     return fm, body
+
+
+def parse_frontmatter_diagnose(
+    raw: str,
+) -> tuple[dict, str, FrontmatterDiagnosis]:
+    """`parse_frontmatter` plus a verdict on the frontmatter region (D3).
+
+    Same predicates as the read parser, by construction — both call
+    `_partition_frontmatter`. The write paths need the distinction the read
+    parser deliberately collapses: "this note has no frontmatter" and "this
+    note's frontmatter is broken" both parse to `({}, raw)`, and prepending a
+    second block above a broken one, or scanning a broken one for headings, is
+    a silently-wrong write.
+    """
+    return _partition_frontmatter(raw)
 
 
 def serialize_frontmatter(meta: dict, body: str) -> str:
@@ -2649,7 +2791,32 @@ def serialize_frontmatter(meta: dict, body: str) -> str:
     return f"---\n{yaml_text}---\n{body}"
 
 
-_ATX_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.MULTILINE)
+# `(?m)^...$` again cannot express "a whole line", because Python's `re` knows
+# only `\n` as a boundary. On a lone-CR note that made the WHOLE file one line:
+# `.` matches `\r`, so `## Tasks\rold\r## Notes` scanned as a single heading
+# whose text ran to the end of the file. Harmless while the frontmatter fix was
+# missing (the scan found no heading at all and section mode refused), and a
+# wrong write the moment the block was stripped correctly — so the boundary
+# rule has to match the partition's, and both have to match the universal
+# newlines `read_note` resolves the same file through.
+_ATX_HEADING_RE = re.compile(
+    # Two whitespace classes, and the difference between them is deliberate.
+    #
+    # The SEPARATOR is `[^\S\r\n]+` — all whitespace except the three line
+    # terminators. The first CR-aware draft used `[ \t]`, which quietly
+    # narrowed the original `\s+` and dropped every heading separated by a
+    # non-ASCII space: an LF-only note whose marker is followed by an NBSP
+    # lost its heading, so names and `#N` ordinals shifted on existing vaults.
+    #
+    # The TRAILING run stays the original `\s*`, unnarrowed and still allowed
+    # to cross line boundaries. `_section_body_span` compensates for that, and
+    # it is what decides where a replaced section's body BEGINS — narrowing it
+    # would change the bytes `edit_note(section=…)` writes for ordinary LF
+    # notes. Generalising the old `$` to "before any terminator, or end" is
+    # what makes the whole pattern work on a lone-CR note while leaving LF and
+    # CRLF byte-for-byte alone.
+    r"(?:\A|(?<=\n)|(?<=\r))(#{1,6})[^\S\r\n]+([^\r\n]+?)\s*(?=\r|\n|\Z)"
+)
 
 
 def _scan_headings(text: str) -> list[dict]:
@@ -2795,8 +2962,13 @@ def _section_body_span(text: str, headings: list[dict], idx: int) -> tuple[int, 
             break
 
     body_start = matched["line_end"]
-    if body_start < len(text) and text[body_start] == "\n":
-        body_start += 1
+    # One line terminator, CRLF as a unit. `line_end` now sits *before* the
+    # terminator in every dialect (the heading match no longer swallows a `\r`
+    # into its trailing-whitespace run), so this is the single place that
+    # steps over it.
+    terminator = _LINE_BREAK_RE.match(text, body_start)
+    if terminator is not None:
+        body_start = terminator.end()
     return body_start, body_end
 
 
@@ -2863,9 +3035,9 @@ def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None,
     # the new body would glue directly onto the heading text. Prepend one
     # newline to separate them. No-op when the prefix already ends in "\n".
     prefix = text[:body_start]
-    if prefix and not prefix.endswith("\n"):
+    if prefix and not prefix.endswith(("\n", "\r")):
         inserted = "\n" + inserted
-    if next_heading_line_start is not None and not inserted.endswith("\n"):
+    if next_heading_line_start is not None and not inserted.endswith(("\n", "\r")):
         inserted = inserted + "\n"
 
     new_text = text[:body_start] + inserted + text[body_end:]

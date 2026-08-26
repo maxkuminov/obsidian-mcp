@@ -150,6 +150,15 @@ async def read_note(
     the one section you need with `section=` rather than paging through the
     whole note.
 
+    The YAML frontmatter block is rendered as a summary above the content and
+    stripped from the content itself. **Only a complete, unwindowed whole-note
+    response** — no `section`, `offset=0`, no `[TRUNCATED]` notice — round-trips
+    through `edit_note(path, content)`, which preserves the block and treats
+    what you pass as the whole new body. A truncated response must be paged to
+    the end first; a `section=` response belongs to `edit_note(section=...)`,
+    and it **includes the heading line** while `edit_note(section=...)` takes
+    the body only, so strip the heading or it is duplicated.
+
     Args:
         path: Vault-relative path to the note (e.g. "Cards/My Note.md")
         section: Optional ATX heading to read instead of the whole note. Plain
@@ -283,6 +292,7 @@ async def edit_note(
     section: str | None = None,
     replace_all: bool = False,
     dry_run: bool = False,
+    replace_frontmatter: bool = False,
 ) -> str:
     """Edit an existing note in the Obsidian vault. Requires a readwrite API key.
 
@@ -290,13 +300,41 @@ async def edit_note(
     (naming, folder placement, frontmatter, tags).
 
     Four mutually exclusive modes (set at most one of append/find/section):
-    1. **Full replace** (default): provide only `content`; the entire file is overwritten.
+    1. **Full replace** (default): provide only `content`. `content` becomes the
+       note's **body**; an existing valid line-1 YAML frontmatter block is
+       **preserved byte-identically** ahead of it. Pass
+       `replace_frontmatter=True` to overwrite the entire file, frontmatter
+       included.
     2. **Append**: `append=True`; `content` is added at the end (preceded by a single newline).
     3. **Find & replace**: `find=<exact text>`; replaced with `content`. Must match
-       exactly once unless `replace_all=True`.
+       exactly once unless `replace_all=True`. This mode operates on the raw
+       file, so it is the one mode that can edit frontmatter text in place.
     4. **Section**: `section=<heading>`; replaces the body under the named ATX heading.
        Use the path-style form `Parent/Child` to disambiguate when the same heading
        appears more than once. Setext (`====`/`----`) headings are not matched.
+
+    **Frontmatter and the round trip.** Read a note, edit the content portion,
+    pass it straight back to full replacement: the frontmatter survives. No
+    property of `content`'s shape changes that — a body whose first line is a
+    thematic break `---`, or which itself begins with a complete
+    mapping-shaped fenced block, is body. A note with no valid block (no
+    line-1 fence, or a malformed one) is replaced wholesale by default, which
+    is the repair path and needs no flag.
+
+    **The round-trip guarantee covers a complete, unwindowed whole-note read
+    only** — `read_note(path)` with no `section`, `offset=0` and no
+    `[TRUNCATED]` notice. A truncated read must be paged to the end before it
+    is written back, or full replacement will replace the whole body with the
+    fragment. A `read_note(section=...)` response belongs to
+    `edit_note(section=...)`, and note that a read response
+    **includes the heading line** while `section=` here takes the **body
+    only** — pass it back unstripped and the heading is duplicated.
+
+    Section mode resolves headings over the frontmatter-stripped body, exactly
+    as `read_note` does, so `#N` ordinals agree between the two and a YAML `#`
+    comment inside the block is never selectable. A note whose block is
+    malformed (unclosed fence, YAML error, non-mapping) refuses section writes,
+    naming the defect and the `replace_frontmatter=True` repair.
 
     Flags:
     - `operation="append"`: legacy alias for `append=True`. This is accepted to
@@ -304,18 +342,23 @@ async def edit_note(
       `operation="replace"` explicitly selects full replacement.
     - `replace_all=True`: with `find`, replace every occurrence rather than failing on
       multiple matches. Ignored when `find` is unset.
+    - `replace_frontmatter=True`: full replacement overwrites the entire file
+      including the frontmatter block. Combined with append/find/section it is
+      an error and nothing is written.
     - `dry_run=True`: compute the would-be result and return a unified diff without
-      writing. Works for all four modes.
+      writing. Works for all four modes, and diffs the composed result.
 
     Writes are atomic (tmp file + os.replace) so a crash mid-write cannot truncate
-    the destination. Frontmatter mutation is better done via `set_frontmatter` —
-    PyYAML serialization there discards YAML comments. A path whose final
-    component is a symlink is refused in every mode (`dry_run` included), naming
-    the link's target; symlinked folders inside the vault work normally.
+    the destination. Structured frontmatter mutation is better done via
+    `set_frontmatter` — PyYAML serialization there discards YAML comments. A
+    path whose final component is a symlink is refused in every mode
+    (`dry_run` included), naming the link's target; symlinked folders inside
+    the vault work normally.
 
     Args:
         path: Vault-relative path to the note.
-        content: New full content, replacement text, text to append, or section body.
+        content: New body (full replace), replacement text, text to append, or
+            section body.
         append: If True, append content to the end of the note.
         operation: Legacy mode selector; accepts "append" or "replace".
         find: Exact text to find and replace.
@@ -323,6 +366,9 @@ async def edit_note(
             Use `Parent/Child` to disambiguate repeated headings.
         replace_all: With `find`, replace every match instead of requiring uniqueness.
         dry_run: Return a unified diff and do not write.
+        replace_frontmatter: Full-replace only. If True, `content` replaces the
+            entire file including any frontmatter block. Default False
+            preserves an existing valid block.
     """
     return await edit_note_impl(
         path,
@@ -333,6 +379,7 @@ async def edit_note(
         section=section,
         replace_all=replace_all,
         dry_run=dry_run,
+        replace_frontmatter=replace_frontmatter,
     )
 
 
@@ -514,6 +561,23 @@ async def set_frontmatter(
     body is preserved byte-for-byte. If the note has no frontmatter (no `---`
     fence on line 1), a fresh block is prepended ahead of the unchanged body.
 
+    **A malformed block is refused, never worked around.** An unclosed line-1
+    fence, YAML that fails to parse, and YAML that is not a mapping (`null`,
+    `~`, comments only, a list, a scalar) each return an error naming the
+    defect and pointing at `edit_note(path, content, replace_frontmatter=True)`
+    as the repair. Nothing is written — in particular no second block is
+    prepended above the broken one — and `remove=` refuses identically rather
+    than silently doing nothing. This is reported even for a call with no
+    `updates` and no `remove`. An empty fenced block (`---` immediately
+    followed by `---`) is *valid*: it is a valid empty mapping and is updated
+    in place.
+
+    **Only an effective change writes.** `updates` that set every named key to
+    the value it already holds (compared type-sensitively, so `true` is not
+    `1`) together with `remove` naming only absent keys report no changes and
+    leave the file byte-identical. Removing the last key removes the block
+    entirely — no fences, no separator, exactly the prior body.
+
     Re-serialization uses `yaml.safe_dump(default_flow_style=False,
     sort_keys=False, allow_unicode=True)`. **Caveat:** PyYAML does NOT preserve
     YAML comments — any `# comment` in the original frontmatter will be lost on
@@ -529,7 +593,8 @@ async def set_frontmatter(
         path: Vault-relative path to the note.
         updates: Mapping of keys to set. Use the empty dict (or omit) to skip.
         remove: List of keys to delete from the frontmatter. Missing keys are
-            silently ignored.
+            ignored (and, on their own, make the call a no-op rather than a
+            write).
     """
     return await set_frontmatter_impl(path, updates=updates, remove=remove)
 
