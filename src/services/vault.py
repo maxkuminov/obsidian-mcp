@@ -2379,7 +2379,13 @@ def write_file(
     overwrite: bool = True,
     expected: bytes | None = None,
 ) -> Path:
-    """Write content to a note atomically (tmp file in same dir + `renameat`).
+    """Write content to a note atomically, staged then published.
+
+    An overwrite stages a temp file in the destination's own directory and
+    publishes it with a same-directory `os.replace`; a no-clobber write stages
+    an unnamed `O_TMPFILE` inode and publishes it with `linkat`, refusing on a
+    filesystem without `O_TMPFILE` unless `VAULT_ALLOW_NAMED_STAGING_FALLBACK`
+    is set. See `_atomic_write_at`.
 
     Validation goes through `open_mutable`, so a symlinked final component is
     refused rather than silently retargeted and the write runs against the
@@ -2446,7 +2452,9 @@ def write_bytes(
 
     Validates path + visibility, enforces no-clobber unless `overwrite`,
     creates any missing parent directories, and routes through the shared
-    atomic temp-file + `os.replace` write. Raises `FileExistsError` when the
+    staged-then-published write (`_atomic_write_at`): a same-directory
+    `os.replace` for an overwrite, a `linkat` of an unnamed staged inode for a
+    no-clobber write. Raises `FileExistsError` when the
     target exists and `overwrite` is False, leaving the existing file
     untouched, and `ValueError` when the final component is a symlink
     (`validate_mutable_path`) — writing through an alias would clobber the

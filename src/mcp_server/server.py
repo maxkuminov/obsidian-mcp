@@ -145,10 +145,12 @@ async def read_note(
 ) -> str:
     """Read a note from the Obsidian vault by its relative path.
 
-    Responses are capped to a context-safe size. If the note is larger than the
-    cap, you get the first window plus an outline of the note's headings — read
-    the one section you need with `section=` rather than paging through the
-    whole note.
+    Responses are capped to a context-safe size, and the cap applies **per
+    component**, not to the whole response: if the note is larger than the cap
+    you get a first content window bounded by the cap *plus* an outline of the
+    note's headings bounded by the cap independently, so a truncated whole-note
+    response can run to roughly twice the cap. Read the one section you need
+    with `section=` rather than paging through the whole note.
 
     The YAML frontmatter block is rendered as a summary above the content and
     stripped from the content itself. **Only a complete, unwindowed whole-note
@@ -242,12 +244,12 @@ async def semantic_search(
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
 ) -> str:
-    """Vector similarity search using bge-m3 embeddings. Use this for conceptual or paraphrased
-    queries — anywhere exact word matching would miss the point.
+    """Vector similarity search over the vault's chunk embeddings. Use this for conceptual
+    or paraphrased queries — anywhere exact word matching would miss the point.
 
     For exact identifiers, code symbols, proper nouns, or known phrases, use keyword_search instead.
 
-    Each result is one note (deduped) with its best-matching chunk as a ~500-char preview.
+    Each result is one note (deduped) with its best-matching chunk as a ~200-character preview.
     Call `read_note` on a result's path to get the full note content.
 
     Args:
@@ -266,7 +268,8 @@ async def semantic_search(
 
 @mcp.tool()
 async def create_note(path: str, content: str) -> str:
-    """Create a new markdown note in the Obsidian vault. Requires a readwrite API key.
+    """Create a new markdown note in the Obsidian vault. Requires write permission — a `readwrite` API key, or an OAuth token
+    carrying the `readwrite` scope.
 
     See `get_vault_guide` for Obsidian syntax and any vault-specific conventions
     (naming, folder placement, frontmatter, tags).
@@ -274,6 +277,13 @@ async def create_note(path: str, content: str) -> str:
     Refuses a path whose final component is a symlink, naming its target, so a
     write never lands on a note other than the one named; symlinked folders
     inside the vault work normally.
+
+    The note is published no-clobber: the content is staged out of sight and
+    linked into place in one kernel-atomic step, so an existing file at `path`
+    can never be replaced by this tool. A vault filesystem that cannot stage an
+    unnamed file refuses the write with an error naming
+    `VAULT_ALLOW_NAMED_STAGING_FALLBACK` rather than staging under a visible
+    name.
 
     Args:
         path: Vault-relative path for the new note (e.g. "Cards/New Topic.md"). The .md extension is added if missing.
@@ -294,7 +304,8 @@ async def edit_note(
     dry_run: bool = False,
     replace_frontmatter: bool = False,
 ) -> str:
-    """Edit an existing note in the Obsidian vault. Requires a readwrite API key.
+    """Edit an existing note in the Obsidian vault. Requires write permission — a `readwrite` API key, or an OAuth token
+    carrying the `readwrite` scope.
 
     See `get_vault_guide` for Obsidian syntax and any vault-specific conventions
     (naming, folder placement, frontmatter, tags).
@@ -311,7 +322,13 @@ async def edit_note(
        file, so it is the one mode that can edit frontmatter text in place.
     4. **Section**: `section=<heading>`; replaces the body under the named ATX heading.
        Use the path-style form `Parent/Child` to disambiguate when the same heading
-       appears more than once. Setext (`====`/`----`) headings are not matched.
+       appears more than once, or the `#N` ordinal form ("#7", 1-based document
+       order) — the ordinal is the only form that can address duplicate headings
+       sharing one parent, and it is the selector the outline of a truncated
+       `read_note` advertises. A bare "#N" always selects by position and is
+       never shadowed by a heading whose text happens to be "#N"; reach such a
+       heading by title with "Parent/#N". The same selectors resolve to the same
+       section in `read_note`. Setext (`====`/`----`) headings are not matched.
 
     **Frontmatter and the round trip.** Read a note, edit the content portion,
     pass it straight back to full replacement: the frontmatter survives. No
@@ -348,8 +365,13 @@ async def edit_note(
     - `dry_run=True`: compute the would-be result and return a unified diff without
       writing. Works for all four modes, and diffs the composed result.
 
-    Writes are atomic (tmp file + os.replace) so a crash mid-write cannot truncate
-    the destination. Structured frontmatter mutation is better done via
+    Writes are atomic: the composed result is staged in the note's own directory,
+    flushed to disk, and published with a single same-directory rename, so a
+    crash mid-write cannot truncate the destination. The publish is optimistic,
+    not locked — the bytes this call read are compared against the file
+    immediately before that rename, so a note somebody else changed in the
+    meantime fails with `File changed while editing: <name>` and nothing is
+    written; re-read and retry. Structured frontmatter mutation is better done via
     `set_frontmatter` — PyYAML serialization there discards YAML comments. A
     path whose final component is a symlink is refused in every mode
     (`dry_run` included), naming the link's target; symlinked folders inside
@@ -363,7 +385,8 @@ async def edit_note(
         operation: Legacy mode selector; accepts "append" or "replace".
         find: Exact text to find and replace.
         section: ATX heading text identifying the section whose body to replace.
-            Use `Parent/Child` to disambiguate repeated headings.
+            Use `Parent/Child` to disambiguate repeated headings, or a "#N"
+            ordinal ("#7", 1-based document order) for duplicate siblings.
         replace_all: With `find`, replace every match instead of requiring uniqueness.
         dry_run: Return a unified diff and do not write.
         replace_frontmatter: Full-replace only. If True, `content` replaces the
@@ -476,23 +499,38 @@ async def find_orphans(folder: str | None = None, limit: int = 50) -> str:
 async def move_note(
     from_path: str, to_path: str, rewrite_links: bool = False
 ) -> str:
-    """Move or rename a note inside the vault. Requires a readwrite API key.
+    """Move or rename a note inside the vault. Requires write permission — a `readwrite` API key, or an OAuth token
+    carrying the `readwrite` scope.
 
     Updates `notes_metadata.file_path` for the moved note and `note_links.target_path`
     rows whose stored target matched the old path. Backlinks via `target_note_id`
     keep working without rewriting source notes (the moved note's id is unchanged).
 
     With `rewrite_links=True`, also opens every source note that linked to this
-    note and rewrites the link title in-place: `[[Old]]` → `[[New]]`,
+    note and rewrites the link in place: `[[Old]]` → `[[New]]`,
     `[[Old|alias]]` → `[[New|alias]]`, `[[Old#anchor]]` → `[[New#anchor]]`,
-    `![[Old]]` → `![[New]]`, and path-style `[[folder/Old]]` → `[[new/folder/New]]`.
-    Aliases and anchors are preserved; only the title portion is rewritten.
-    All rewrites are computed before anything changes: if one would push a
+    `![[Old]]` → `![[New]]`, path-style `[[folder/Old]]` → `[[new/folder/New]]`,
+    and markdown links `[text](Old.md)` → `[text](<new path>)`, whose href is
+    written relative to the linking note's own folder (anchors preserved).
+    Aliases and anchors survive; only the target portion is rewritten.
+    **The moved note's own body is rewritten as well**, so a self-reference
+    does not end up pointing at the old path.
+
+    The rewrites are planned before anything changes: if one would push a
     source note past the 10 MiB note limit the whole move is refused, naming
-    that source, so the link graph never disagrees with the vault bytes.
-    That preflight is also bounded in aggregate: if the originals plus rewrites
-    for all backlink sources would exceed 256 MiB in memory the move is refused
-    before anything changes, naming the note count and the limit.
+    that source, before any file is touched. That preflight is also bounded in
+    aggregate: if the originals plus rewrites for all backlink sources would
+    exceed 256 MiB in memory the move is refused before anything changes,
+    naming the note count and the limit.
+
+    **A rewrite can still fail after the move has committed.** The move is one
+    rename and the rewrites follow it, so an I/O failure, a vault reassignment,
+    or a database that cannot be reached to confirm the assignment stops the
+    remaining rewrites — and the result then reads `partial success: …`, naming
+    the sources that still link to the old path. The move is **not** rolled back
+    and the index rows describe where the note now is. Treat the link graph as
+    agreeing with the vault bytes only when the result reports plain success;
+    on a partial outcome, fix the named sources with `edit_note`.
 
     Writes are atomic. Either path is refused, naming the link's target, when
     its final component is a symlink; symlinked folders inside the vault work
@@ -514,7 +552,8 @@ async def move_note(
 
 @mcp.tool()
 async def delete_note(path: str, permanent: bool = False) -> str:
-    """Delete a note from the vault. Requires a readwrite API key.
+    """Delete a note from the vault. Requires write permission — a `readwrite` API key, or an OAuth token
+    carrying the `readwrite` scope.
 
     By default this is a soft-delete: the file is moved to
     `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` inside the vault root, by a
@@ -553,8 +592,8 @@ async def set_frontmatter(
     updates: dict | None = None,
     remove: list[str] | None = None,
 ) -> str:
-    """Mutate a note's YAML frontmatter without touching its body. Requires a
-    readwrite API key.
+    """Mutate a note's YAML frontmatter without touching its body. Requires write permission — a `readwrite` API key, or an OAuth token
+    carrying the `readwrite` scope.
 
     Parses the existing frontmatter, merges in `updates` (overwriting matching
     keys, adding any new ones), then drops keys listed in `remove`. The note
@@ -625,11 +664,13 @@ async def read_file(
     Files larger than `MAX_FILE_READ_BYTES` (default 10 MB) are refused with a
     size report. Base64 reads pass through the model context and inflate ~33%,
     so they are token-heavy — check a file's size with `list_files` before
-    reading large binaries. Dot-directories (`.obsidian`, `.git`, `.trash`, …)
-    and path traversal are rejected.
+    reading large binaries. Any path with a component starting with `.` is
+    rejected — dot-directories (`.obsidian`, `.git`, `.trash`, …) and dot-files
+    alike — as is path traversal.
 
-    Text results are additionally capped to a context-safe size and continue
-    via `offset`; base64 and image results are not windowed.
+    Text results are additionally capped to a context-safe size: the cap bounds
+    the returned window, and a truncated read appends a short notice carrying
+    the `offset` to continue from. Base64 and image results are not windowed.
 
     Args:
         path: Vault-relative path to the file (e.g. "Reference Docs/spec.pdf").
@@ -650,17 +691,25 @@ async def write_file(
     overwrite: bool = False,
 ) -> str:
     """Write a file into the vault — including non-markdown (e.g. save a
-    generated PDF or image). Requires a readwrite API key. Peer to
-    `create_note`/`edit_note`, which stay markdown-only.
+    generated PDF or image). Requires write permission — a `readwrite` API key, or an OAuth token
+    carrying the `readwrite` scope.
+    Peer to `create_note`/`edit_note`, which stay markdown-only.
 
     `content` carries the bytes: with `encoding="base64"` (default) it is
     base64-decoded to raw bytes; with `encoding="text"` it is written verbatim
-    as UTF-8. The write is atomic (tmp file + `os.replace`), missing parent
-    folders are created, and content over `MAX_FILE_WRITE_BYTES` (default
-    25 MB, decoded length) is refused.
+    as UTF-8. The write is atomic — the bytes are staged and flushed before
+    anything is published — missing parent folders are created, and content over
+    `MAX_FILE_WRITE_BYTES` (default 25 MB, decoded length) is refused.
 
     No-clobber by default: writing over an existing file requires
-    `overwrite=True`. Dot-directories and path traversal are rejected; invalid
+    `overwrite=True`. The default publishes by linking a staged, never-named
+    inode into place in one kernel-atomic step, so an existing file cannot be
+    replaced; `overwrite=True` publishes with a single same-directory rename
+    instead. A vault filesystem that cannot stage an unnamed file refuses the
+    no-clobber write with an error naming
+    `VAULT_ALLOW_NAMED_STAGING_FALLBACK`, rather than staging under a visible
+    name. Any path with a component starting with `.` (dot-directories and
+    dot-files alike) and path traversal are rejected; invalid
     base64 errors without writing anything. A path whose final component is a
     symlink is refused, naming its target, so `overwrite=True` cannot clobber a
     file through an alias; symlinked folders inside the vault work normally.
@@ -697,8 +746,10 @@ async def list_files(
     By default lists the immediate children of `folder` — subdirectories and
     files, each file with size and modification time. `pattern` is a glob that
     filters file entries (e.g. "*.pdf"); `recursive=True` descends into
-    subfolders and returns matching files. Dot-directories (`.obsidian`,
-    `.git`, `.trash`, …) are hidden, and a dot-directory `folder` is rejected.
+    subfolders and returns matching files. Anything with a path component
+    starting with `.` is hidden — dot-directories (`.obsidian`, `.git`,
+    `.trash`, …) **and dot-files** — and a `folder` with such a component is
+    rejected.
 
     At most `limit` entries are returned (default 200, hard cap 1000); the
     response indicates when the listing was truncated.
@@ -721,8 +772,10 @@ async def request_upload(
     expires_in: int | None = None,
 ) -> str:
     """Get a short-lived link a person can use to put a file into the vault.
-    Requires a readwrite API key. Peer to `write_file`, which takes the bytes
-    directly — use this one when you do not have them.
+    Requires write permission — a `readwrite` API key, or an OAuth token
+    carrying the `readwrite` scope.
+    Peer to `write_file`, which takes the bytes directly — use this one when you
+    do not have them.
 
     No MCP client can hand a tool the bytes of a file the user is looking at,
     and your shell cannot reach their machine. This mints a link bound to
@@ -769,8 +822,12 @@ async def check_upload(upload_id: str) -> str:
     finished before you tell the user it did, and to get the sha256 if they
     want to verify it.
 
-    Only links minted by this same API key or OAuth token are visible; anyone
-    else's `upload_id` reads as `not found`.
+    Visibility is scoped to the *principal* that minted the link, not to one
+    credential row. For an API key that is the key itself. For OAuth it is the
+    whole grant family behind the access token you are calling with, so a handle
+    stays readable across the hourly token refresh that mints a new row. A
+    different API key, a different client, or a separate approval of the same
+    client reads as `not found`.
 
     `uploading` names the deadline the stream has. Check again after it: past
     that point the answer becomes either `completed` or `unknown`. **`unknown`
@@ -821,9 +878,10 @@ async def request_download(path: str, expires_in: int | None = None) -> str:
 
 @mcp.tool()
 async def import_from_url(url: str, path: str, overwrite: bool = False) -> str:
-    """Fetch a file from a public https URL straight into the vault. Requires a
-    readwrite API key. Peer to `write_file` and `request_upload` — use this one
-    when the bytes are already somewhere public.
+    """Fetch a file from a public https URL straight into the vault. Requires write permission — a `readwrite` API key, or an OAuth token
+    carrying the `readwrite` scope.
+    Peer to `write_file` and `request_upload` — use this one when the bytes are
+    already somewhere public.
 
     The server does the fetching, so nothing passes through your context: a
     20 MB PDF costs one tool call. Returns the path, size, sha256, MIME type
@@ -831,8 +889,10 @@ async def import_from_url(url: str, path: str, overwrite: bool = False) -> str:
 
     **Only genuinely public addresses.** This server sits on a private network
     next to a database and other services, so the fetch is restricted: https
-    only, no credentials in the URL, no private/loopback/link-local/metadata
-    addresses in any spelling, and the same rules re-checked at every redirect.
+    only — plain http is refused unless the operator has set
+    `IMPORT_ALLOW_HTTP=true` — no credentials in the URL, no
+    private/loopback/link-local/metadata addresses in any spelling, and the same
+    rules re-checked at every redirect.
     A refusal names the rule that was violated — that is information about the
     URL, not a hint to work around it. Rewriting the URL to evade the check is
     never the right next step; ask the user for a public link instead.
@@ -840,6 +900,11 @@ async def import_from_url(url: str, path: str, overwrite: bool = False) -> str:
     Size-capped at `MAX_FILE_WRITE_BYTES`, with one 30-second deadline for the
     whole fetch. No-clobber unless `overwrite=True`. Nothing is written unless
     the whole body arrives intact.
+
+    This tool shares the transfer tools' preflight, so it also refuses when the
+    server has no public origin configured (`MCP_HOSTNAME` or `BASE_URL`), even
+    though it mints no link — that is an operator setting, not something to work
+    around.
 
     Args:
         url: Public https URL of the file.
@@ -851,7 +916,8 @@ async def import_from_url(url: str, path: str, overwrite: bool = False) -> str:
 
 @mcp.tool()
 async def delete_file(path: str, permanent: bool = False) -> str:
-    """Delete a non-markdown file from the vault. Requires a readwrite API key.
+    """Delete a non-markdown file from the vault. Requires write permission — a `readwrite` API key, or an OAuth token
+    carrying the `readwrite` scope.
     Peer to `delete_note`, which stays markdown-only.
 
     By default this is a soft delete: the file moves to
