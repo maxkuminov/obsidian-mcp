@@ -288,3 +288,160 @@ def test_the_body_is_byte_identical_across_an_ordinary_update(vault):
     asyncio.run(tools.set_frontmatter_impl("n.md", updates={"b": 2}))
     _, after_body = vault_service.parse_frontmatter(read(vault, "n.md"))
     assert after_body == body
+
+
+# ── a cancelling update+remove pair is a NET no-op ──────────────────────────
+
+
+def test_an_update_cancelled_by_a_remove_writes_nothing(vault):
+    """Per-key bookkeeping records the *steps*; the question is whether the
+    destination differs. `updates={"temp": 1}, remove=["temp"]` takes two
+    recorded steps back to where it started, so both lists are non-empty and
+    the old guard waved it through — serializing an unchanged mapping, which
+    on this note drops the valid empty block and promotes the body's own
+    fenced prefix into active frontmatter."""
+    original = "---\n---\n---\npromoted: yes\n---\nbody\n"
+    write(vault, "n.md", original)
+    result = asyncio.run(
+        tools.set_frontmatter_impl("n.md", updates={"temp": 1}, remove=["temp"])
+    )
+    assert "No changes" in result
+    assert read(vault, "n.md") == original
+    fm, _ = vault_service.parse_frontmatter(read(vault, "n.md"))
+    assert fm == {}
+
+
+def test_a_cancelling_pair_on_an_ordinary_note_writes_nothing(vault):
+    original = "---\nstatus: draft\n# comment kept\n---\nbody\n"
+    write(vault, "n.md", original)
+    result = asyncio.run(
+        tools.set_frontmatter_impl("n.md", updates={"temp": 1}, remove=["temp"])
+    )
+    assert "No changes" in result
+    assert read(vault, "n.md") == original
+
+
+def test_removing_a_key_the_same_call_also_sets_still_removes_it(vault):
+    """The documented precedence: updates first, then removals. A key named in
+    both ends up removed — and that IS a net change."""
+    write(vault, "n.md", "---\nstatus: draft\nkeep: me\n---\nbody\n")
+    result = asyncio.run(
+        tools.set_frontmatter_impl(
+            "n.md", updates={"status": "done"}, remove=["status"]
+        )
+    )
+    assert "Updated frontmatter" in result
+    fm, _ = vault_service.parse_frontmatter(read(vault, "n.md"))
+    assert fm == {"keep": "me"}
+
+
+def test_a_reordering_update_is_a_change(vault):
+    """`safe_dump` runs with `sort_keys=False`, so key order is part of the
+    note's bytes. A reorder that compared equal would report no change while
+    the order the caller asked for was dropped."""
+    write(vault, "n.md", "---\nmeta:\n  a: 1\n  b: 2\n---\nbody\n")
+    result = asyncio.run(
+        tools.set_frontmatter_impl("n.md", updates={"meta": {"b": 2, "a": 1}})
+    )
+    assert "Updated frontmatter" in result
+    assert read(vault, "n.md").index("b: 2") < read(vault, "n.md").index("a: 1")
+
+
+# ── signed zero ─────────────────────────────────────────────────────────────
+
+
+def test_signed_zero_is_a_change(vault):
+    """`-0.0 == 0.0` is True, while `safe_dump` writes them differently — so a
+    caller correcting the sign was told nothing changed and the note kept the
+    sign it had."""
+    write(vault, "n.md", "---\nzero: -0.0\n---\nbody\n")
+    result = asyncio.run(tools.set_frontmatter_impl("n.md", updates={"zero": 0.0}))
+    assert "Updated frontmatter" in result
+    fm, _ = vault_service.parse_frontmatter(read(vault, "n.md"))
+    import math
+    assert not math.copysign(1.0, fm["zero"]) < 0
+
+
+def test_nested_signed_zero_is_a_change(vault):
+    write(vault, "n.md", "---\nvals:\n  - -0.0\n---\nbody\n")
+    result = asyncio.run(
+        tools.set_frontmatter_impl("n.md", updates={"vals": [0.0]})
+    )
+    assert "Updated frontmatter" in result
+    import math
+    fm, _ = vault_service.parse_frontmatter(read(vault, "n.md"))
+    assert not math.copysign(1.0, fm["vals"][0]) < 0
+
+
+def test_an_identical_signed_zero_is_not_a_change(vault):
+    original = "---\nzero: -0.0\n# comment kept\n---\nbody\n"
+    write(vault, "n.md", original)
+    result = asyncio.run(tools.set_frontmatter_impl("n.md", updates={"zero": -0.0}))
+    assert "No changes" in result
+    assert read(vault, "n.md") == original
+
+
+def test_an_identical_float_is_not_a_change(vault):
+    original = "---\nratio: 1.5\n# comment kept\n---\nbody\n"
+    write(vault, "n.md", original)
+    result = asyncio.run(tools.set_frontmatter_impl("n.md", updates={"ratio": 1.5}))
+    assert "No changes" in result
+    assert read(vault, "n.md") == original
+
+
+def test_two_nans_are_the_same_value(vault):
+    """Documented non-finite policy: `.hex()` renders every NaN as `'nan'`, so
+    two of them compare equal here. YAML round-trips both to `.nan`, so
+    "changing" one to the other would rewrite the note to bytes it already
+    holds."""
+    original = "---\nn: .nan\n# comment kept\n---\nbody\n"
+    write(vault, "n.md", original)
+    result = asyncio.run(
+        tools.set_frontmatter_impl("n.md", updates={"n": float("nan")})
+    )
+    assert "No changes" in result
+    assert read(vault, "n.md") == original
+
+
+def test_opposite_infinities_are_a_change(vault):
+    write(vault, "n.md", "---\nbound: .inf\n---\nbody\n")
+    result = asyncio.run(
+        tools.set_frontmatter_impl("n.md", updates={"bound": float("-inf")})
+    )
+    assert "Updated frontmatter" in result
+    fm, _ = vault_service.parse_frontmatter(read(vault, "n.md"))
+    assert fm["bound"] == float("-inf")
+
+
+# ── lone-CR notes ───────────────────────────────────────────────────────────
+
+
+def test_a_lone_cr_block_is_updated_rather_than_prepended(vault):
+    """The read path recognises this note's block through universal-newline
+    translation. While the write path did not, `set_frontmatter` merged into an
+    empty mapping and prepended a SECOND block above the real one."""
+    write(vault, "n.md", "---\rtitle: Keep\r---\rbody\r")
+    result = asyncio.run(tools.set_frontmatter_impl("n.md", updates={"status": "done"}))
+    assert "Updated frontmatter" in result
+    after = read(vault, "n.md")
+    fm, body = vault_service.parse_frontmatter(after)
+    assert fm == {"title": "Keep", "status": "done"}
+    assert body == "body\r"
+    # Exactly one block: no second one prepended above the first.
+    assert after.count("---") == 2
+
+
+@pytest.mark.parametrize(
+    "original,defect",
+    [
+        ("---\ra: [\r---\rbody\r", "does not parse as YAML"),
+        ("---\r- a\r---\rbody\r", "not a mapping"),
+        ("---\rnope\r", "never closed"),
+    ],
+)
+def test_a_defective_lone_cr_block_is_refused(vault, original, defect):
+    write(vault, "n.md", original)
+    result = asyncio.run(tools.set_frontmatter_impl("n.md", updates={"a": 1}))
+    assert "malformed frontmatter block" in result
+    assert defect in result
+    assert read(vault, "n.md") == original

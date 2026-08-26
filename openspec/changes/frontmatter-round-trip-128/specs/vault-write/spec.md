@@ -89,6 +89,23 @@ actionable error and SHALL NOT mutate the file.
 - **THEN** default full-replace SHALL treat the note as carrying a valid
   block and preserve it byte-identically, trailing whitespace included
 
+#### Scenario: Fence lines end at LF, CRLF or a lone CR
+
+- **WHEN** a note's fence lines are terminated by LF, by CRLF, or by a
+  lone CR (classic-Mac line endings)
+- **THEN** the shared parser SHALL recognize the block in every case,
+  consistent with the universal-newline translation the read path applies
+  before it parses the same file — so a note whose block `read_note`
+  strips is never diagnosed as having no frontmatter by a tool that is
+  about to write
+- **AND** default full-replace SHALL preserve that block
+  byte-identically, its own terminators included, and SHALL insert the
+  separator newline only when the block's bytes end in no line terminator
+  at all
+- **AND** `set_frontmatter` SHALL update such a block rather than
+  prepending a second one above it, and SHALL refuse it by name when it
+  is defective
+
 #### Scenario: The composed result meets the cap and conflict checks
 
 - **WHEN** preservation composes a result whose byte size exceeds the
@@ -252,6 +269,42 @@ scans there.
   ordinal always selects by position
 - **AND** the heading titled `#2` SHALL remain reachable via the path-style
   form and via its own ordinal
+
+
+### Requirement: Usage logs capture the new tools and parameters
+
+Calls to `move_note`, `delete_note`, and `set_frontmatter` SHALL be
+recorded via the existing `_tracked` decorator with `tool` set to the
+respective tool name. Calls to `edit_note` that include `dry_run`,
+`replace_all`, `section`, or `replace_frontmatter` SHALL include those
+parameters in `usage_logs.params` (subject to the existing
+string-truncation behavior of `_tracked`).
+
+#### Scenario: `move_note` invocation is logged
+
+- **WHEN** an agent calls `move_note(from_path="A.md", to_path="B.md")`
+- **THEN** a row SHALL be appended to `usage_logs` with
+  `tool='move_note'` and `params` containing `from_path` and `to_path`
+
+#### Scenario: `dry_run` flag is logged on `edit_note`
+
+- **WHEN** an agent calls `edit_note(path, content, dry_run=True)`
+- **THEN** the `usage_logs` row for that call SHALL have `tool='edit_note'`
+- **AND** `params` SHALL include `dry_run`
+
+#### Scenario: `replace_frontmatter` is logged on `edit_note`
+
+- **WHEN** an agent calls
+  `edit_note(path, content, replace_frontmatter=True)`
+- **THEN** the `usage_logs` row for that call SHALL have
+  `tool='edit_note'`
+- **AND** `params` SHALL include `replace_frontmatter`, because it is the
+  destructive-intent flag on this tool: it is the difference between a
+  write that preserved the note's frontmatter and one that replaced it
+  wholesale, which is what an operator reading the audit trail after a
+  block went missing needs to see
+- **AND** the note's `content` SHALL remain absent from `params`, as it
+  is today
 
 
 ### Requirement: `set_frontmatter` performs structured frontmatter mutations

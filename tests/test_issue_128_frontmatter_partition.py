@@ -197,3 +197,84 @@ def test_absent_frontmatter_is_neither_valid_nor_defective(raw):
     assert diagnosis.block == ""
     assert (fm, body) == ({}, raw)
     assert parse_frontmatter(raw) == ({}, raw)
+
+
+# ── lone-CR notes: the read path recognises them, so the write path must ────
+#
+# `read_file` reads with universal-newline translation, so a classic-Mac
+# CR-only note reaches the read parser as LF and its block is recognised and
+# stripped. The write paths read raw bytes. While the partition split on `\n`
+# alone it therefore diagnosed the very same file ABSENT — default full-replace
+# took its wholesale branch and deleted a block the round trip advertises it
+# preserves, and `set_frontmatter` prepended a second one above it.
+
+
+@pytest.mark.parametrize(
+    "raw,fm,body,block",
+    [
+        (
+            "---\rtitle: Keep\r---\r# Body\rold\r",
+            {"title": "Keep"},
+            "# Body\rold\r",
+            "---\rtitle: Keep\r---\r",
+        ),
+        # Empty block, CR terminated.
+        ("---\r---\rbody\r", {}, "body\r", "---\r---\r"),
+        # Metadata-only, closing fence at EOF with no terminator at all.
+        ("---\ra: 1\r---", {"a": 1}, "", "---\ra: 1\r---"),
+        # Trailing whitespace on a CR-terminated closer.
+        ("---\ra: 1\r---  \rbody\r", {"a": 1}, "body\r", "---\ra: 1\r---  \r"),
+    ],
+)
+def test_a_lone_cr_note_is_partitioned_like_any_other(raw, fm, body, block):
+    got_fm, got_body, diagnosis = parse_frontmatter_diagnose(raw)
+    assert diagnosis.valid is True
+    assert diagnosis.defect is None
+    assert got_fm == fm
+    assert got_body == body
+    assert diagnosis.block == block
+    assert diagnosis.block + got_body == raw
+    assert parse_frontmatter(raw) == (got_fm, got_body)
+
+
+@pytest.mark.parametrize(
+    "raw,defect",
+    [
+        ("---\rnope\r", "unclosed_fence"),
+        ("---\r", "unclosed_fence"),
+        ("---\ra: [\r---\rbody\r", "yaml_error"),
+        ("---\r- a\r---\rbody\r", "not_a_mapping"),
+        ("---\r# only a comment\r---\rbody\r", "not_a_mapping"),
+    ],
+)
+def test_a_defective_lone_cr_block_is_diagnosed_not_missed(raw, defect):
+    """A broken CR-only block must be REFUSED by the write tools, not read as
+    a note with no frontmatter at all — which is what silently prepending a
+    second block came from."""
+    fm, body, diagnosis = parse_frontmatter_diagnose(raw)
+    assert diagnosis.valid is False
+    assert diagnosis.defect == defect
+    assert (fm, body) == ({}, raw)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["----\rx\r", "--- x\r---\r", "x\r---\ra: 1\r---\r"],
+)
+def test_lone_cr_does_not_invent_a_block(raw):
+    """Widening the terminator must not widen what counts as a fence."""
+    fm, body, diagnosis = parse_frontmatter_diagnose(raw)
+    assert diagnosis.valid is False
+    assert diagnosis.defect is None
+    assert (fm, body) == ({}, raw)
+
+
+def test_a_crlf_terminator_is_never_split_down_the_middle(raw=None):
+    """The alternation order is load-bearing: try CRLF before the bare CR, or
+    the `\\r` is consumed as the terminator and the `\\n` is left stranded at the
+    head of the body, where it reads as an extra blank line."""
+    fm, body, diagnosis = parse_frontmatter_diagnose("---\r\na: 1\r\n---\r\nbody\r\n")
+    assert diagnosis.valid is True
+    assert body == "body\r\n"
+    assert not body.startswith("\n")
+    assert diagnosis.block == "---\r\na: 1\r\n---\r\n"

@@ -444,3 +444,52 @@ def test_the_registered_read_note_states_the_same_scoping(phrase):
 )
 def test_the_registered_set_frontmatter_states_the_refusal(phrase):
     assert phrase in _registered("set_frontmatter").description
+
+
+# ── lone-CR notes (classic Mac line endings) ────────────────────────────────
+#
+# `read_note` reads through universal-newline translation, so such a note's
+# block is recognised and stripped on the read side. The write side reads raw
+# bytes; while the partition split on `\n` alone it diagnosed the same file as
+# having NO frontmatter and full-replace took the wholesale branch — deleting
+# the block the round trip advertises it preserves.
+
+
+def test_a_lone_cr_block_is_preserved_by_default_full_replace(vault):
+    write(vault, "n.md", "---\rtitle: Keep\r---\r# Body\rold\r")
+    result = asyncio.run(tools.edit_note_impl("n.md", "new body\n"))
+    assert "Updated note" in result
+    # The block keeps its CR bytes exactly; only the body is the caller's.
+    assert read(vault, "n.md") == "---\rtitle: Keep\r---\rnew body\n"
+
+
+def test_a_lone_cr_note_round_trips_through_read_note(vault):
+    """The block survives byte-identically, CR fences included. The BODY comes
+    back LF-normalised through the read path's pre-existing universal-newline
+    translation — the same declared property as the CRLF case above, and for
+    the same reason."""
+    write(vault, "n.md", "---\rtitle: CR\r---\rline one\rline two\r")
+    rendered = asyncio.run(tools.read_note_impl("n.md"))
+    body = rendered.split("\n---\n", 1)[1]
+
+    asyncio.run(tools.edit_note_impl("n.md", body))
+    after = read(vault, "n.md")
+    assert after.startswith("---\rtitle: CR\r---\r")
+    assert after == "---\rtitle: CR\r---\r" + "line one\nline two\n"
+    # And in particular: exactly one block, not two, and not zero.
+    assert after.count("---") == 2
+
+
+def test_a_lone_cr_metadata_only_note_gains_one_separator(vault):
+    """The separator is one `\\n` whatever the note's own line endings are —
+    the rule is about the block slice not ending in a terminator, and a fresh
+    body is the caller's bytes."""
+    write(vault, "n.md", "---\rtitle: Meta\r---")
+    asyncio.run(tools.edit_note_impl("n.md", "Body\n"))
+    assert read(vault, "n.md") == "---\rtitle: Meta\r---\nBody\n"
+
+
+def test_a_defective_lone_cr_block_still_replaces_wholesale(vault):
+    write(vault, "n.md", "---\ra: [\r---\rbody\r")
+    asyncio.run(tools.edit_note_impl("n.md", "replacement\n"))
+    assert read(vault, "n.md") == "replacement\n"

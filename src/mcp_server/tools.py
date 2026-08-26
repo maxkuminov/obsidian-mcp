@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import binascii
+import copy
 import errno
 import inspect
 import logging
@@ -1754,11 +1755,17 @@ async def edit_note_impl(
             else:
                 block = diagnosis.block
                 # A metadata-only note whose closing fence sits at EOF without
-                # a newline. Exactly one `\n` goes in, and only when there is a
-                # body to separate — otherwise `---Body` would corrupt the
+                # a terminator. Exactly one `\n` goes in, and only when there is
+                # a body to separate — otherwise `---Body` would corrupt the
                 # fence, or an empty `content` would gain a stray line.
+                #
+                # The test is "ends in a line terminator", not "ends in `\n`":
+                # a lone-CR note's block ends `\r`, which already terminates
+                # the fence line, and adding `\n` there would rewrite that
+                # terminator to CRLF — the block would no longer be the
+                # byte-identical slice this branch promises.
                 separator = (
-                    "\n" if content and not block.endswith("\n") else ""
+                    "\n" if content and not block.endswith(("\n", "\r")) else ""
                 )
                 new_content = block + separator + content
 
@@ -2641,15 +2648,31 @@ def _same_frontmatter_value(current, proposed) -> bool:
 
     Concrete types must match exactly at every level; containers are compared
     element-wise so a nested `1` never satisfies a nested `True`.
+
+    Floats go through `float.hex()`, which is where `==` fails a second time:
+    `-0.0 == 0.0` is True while `yaml.safe_dump` writes them as `-0.0` and
+    `0.0`, so a caller correcting the sign of a zero would be told nothing
+    changed and the note would keep the sign it had. `.hex()` is exact for
+    every finite float and returns `'inf'` / `'-inf'` / `'nan'` for the
+    non-finite ones — which makes two NaNs compare *equal* here, deliberately:
+    YAML round-trips both to `.nan`, so "changing" one to the other would
+    rewrite the note to the bytes it already holds.
+
+    Mappings are compared in **order** as well as by content. `safe_dump` runs
+    with `sort_keys=False`, so key order is part of the note's bytes: a
+    reordered mapping that compared equal would be reported as no change while
+    the order the caller asked for was silently dropped.
     """
     if type(current) is not type(proposed):
         return False
+    if isinstance(current, float):
+        return current.hex() == proposed.hex()
     if isinstance(current, dict):
         if len(current) != len(proposed):
             return False
         return all(
-            k in proposed and _same_frontmatter_value(v, proposed[k])
-            for k, v in current.items()
+            _same_frontmatter_value(ck, pk) and _same_frontmatter_value(cv, pv)
+            for (ck, cv), (pk, pv) in zip(current.items(), proposed.items())
         )
     if isinstance(current, (list, tuple)):
         if len(current) != len(proposed):
@@ -2739,27 +2762,41 @@ async def set_frontmatter_impl(
         if not updates and not remove:
             return f"No changes for {path} (empty updates and remove)"
 
+        # The comparison baseline: the mapping as the file holds it, deep-copied
+        # so nothing below can mutate it. Per-key bookkeeping alone was not
+        # enough — it records the steps, and the question is whether the
+        # *destination* differs. `updates={"temp": 1}, remove=["temp"]` takes
+        # two recorded steps back to where it started, and on a note whose
+        # valid EMPTY block sits above a mapping-shaped fenced body prefix,
+        # serializing that unchanged mapping drops the block and promotes the
+        # prefix into active frontmatter.
+        original_fm = copy.deepcopy(fm)
+
         set_keys: list[str] = []
         for k, v in updates.items():
-            # Only an *effective* set counts. `==` alone conflates `True` with
-            # `1` and `False` with `0`, which would report a real type change
-            # as a no-op and leave the note carrying the old type.
+            # Only an *effective* set is named in the summary. `==` alone
+            # conflates `True` with `1` and `False` with `0`, which would
+            # report a real type change as a no-op and leave the note carrying
+            # the old type.
             if k in fm and _same_frontmatter_value(fm[k], v):
                 continue
             fm[k] = v
             set_keys.append(k)
         removed_keys: list[str] = []
+        # Documented precedence: every update is applied first, then every
+        # removal — so a key named in both ends up removed.
         for k in remove:
             if k in fm:
                 del fm[k]
                 removed_keys.append(k)
 
-        if not set_keys and not removed_keys:
-            # Nothing changed, so nothing is serialized. This is the guard
-            # that stops a remove-of-nothing from dropping a valid EMPTY
-            # block: `serialize_frontmatter({}, body)` emits no fences at all,
-            # which on a note whose body opens with a mapping-shaped fenced
-            # block would promote that body prefix into active frontmatter.
+        if _same_frontmatter_value(original_fm, fm):
+            # No NET change, so nothing is serialized. This is the guard that
+            # stops a remove-of-nothing — and a cancelling update+remove pair —
+            # from dropping a valid EMPTY block: `serialize_frontmatter({},
+            # body)` emits no fences at all, which on a note whose body opens
+            # with a mapping-shaped fenced block would promote that body prefix
+            # into active frontmatter.
             return f"No changes for {path}"
 
         new_raw = serialize_frontmatter(fm, body)

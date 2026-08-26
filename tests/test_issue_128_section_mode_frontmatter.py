@@ -231,3 +231,30 @@ def test_reads_are_deliberately_not_refused(vault):
     extracted = asyncio.run(tools.read_note_impl("n.md", section="Tasks"))
     assert "## Tasks" in extracted
     assert "old" in extracted
+
+
+# ── lone-CR notes ───────────────────────────────────────────────────────────
+
+
+def test_a_lone_cr_block_is_held_out_of_the_section_scan(vault):
+    """With the block unrecognised, the `#`-comment line inside it was a
+    heading on the write side and the replacement could run from inside the
+    block."""
+    original = "---\r# Not A Heading\rtitle: T\r---\r## Tasks\rold\r## Notes\rkeep\r"
+    write(vault, "n.md", original)
+    asyncio.run(tools.edit_note_impl("n.md", "new\n", section="#1"))
+    after = read(vault, "n.md")
+    # `#1` is the body's first heading, not the `#` comment inside the block —
+    # which is what proves the block was held out of the scan.
+    assert after == "---\r# Not A Heading\rtitle: T\r---\r## Tasks\rnew\n## Notes\rkeep\r"
+    # The block is reattached byte-identically, CR terminators included.
+    assert after.startswith("---\r# Not A Heading\rtitle: T\r---\r")
+
+
+def test_a_defective_lone_cr_block_refuses_a_section_write(vault):
+    original = "---\r# Tasks\r---\r# Body\rkeep\r"
+    write(vault, "n.md", original)
+    result = asyncio.run(tools.edit_note_impl("n.md", "x", section="Tasks"))
+    assert "malformed frontmatter block" in result
+    assert "not a mapping" in result
+    assert read(vault, "n.md") == original

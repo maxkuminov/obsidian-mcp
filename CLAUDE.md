@@ -1094,8 +1094,23 @@ Destructive and silently-wrong writes, the class this product ranks highest.
   remove-of-nothing from dropping a valid **empty** block —
   `serialize_frontmatter({}, body)` emits no fences, so on a note whose body
   opens with a mapping-shaped fenced block that drop would promote the body
-  prefix into active frontmatter. Removing the last *actual* key does remove
-  the block: no fences, no separator, exactly the prior body.
+  prefix into active frontmatter. The guard compares the **final** mapping
+  against an untouched deep copy, not the per-key bookkeeping: an update and a
+  removal that cancel (`updates={"temp": 1}, remove=["temp"]`) record two steps
+  and arrive back where they started, and the step-counting version waved that
+  through into the serializer. Removing the last *actual* key does remove the
+  block: no fences, no separator, exactly the prior body — and **if the body's
+  own first lines are a mapping-shaped fenced block, that prefix becomes the
+  note's active frontmatter.** Spec-mandated and caller-requested, unlike the
+  accidental version above, but declared here because the outcome is the same
+  shape.
+- **Equality is type-sensitive, order-sensitive and signed-zero-sensitive.**
+  `True == 1` and `-0.0 == 0.0` are both True in Python and both write
+  different YAML, so either would report a real change as a no-op; floats go
+  through `float.hex()`, which is exact for finite values and renders every NaN
+  as `'nan'` (two NaNs are therefore the same value — YAML round-trips both to
+  `.nan`). Mappings compare in order, because `safe_dump` runs with
+  `sort_keys=False` and key order is part of the note's bytes.
 - **One partition, shared by read and write.** `parse_frontmatter` and
   `parse_frontmatter_diagnose` both call `_partition_frontmatter`, so a block
   `read_note` strips can never be diagnosed differently by a tool about to
@@ -1106,6 +1121,19 @@ Destructive and silently-wrong writes, the class this product ranks highest.
   *duplicate* the block. The predicate is whitespace, tested **before** the
   YAML call: PyYAML refuses a bare tab, so asking it would make `---\n \n---\n`
   valid and `---\n\t\n---\n` a parse error.
+- **A line ends at LF, CRLF or a lone CR, in the partition and in the heading
+  scan alike.** `read_file` applies universal-newline translation, so a
+  classic-Mac note reaches the read parser as LF and its block is recognized;
+  the write paths read raw bytes. While either predicate knew only `\n`, the
+  same file was stripped on read and diagnosed *absent* on write — full-replace
+  deleted the block and `set_frontmatter` prepended a second one — and `.`
+  matching `\r` made the whole file one line, so `## A\rold\r## B` scanned as a
+  single heading running to EOF. `(?m)^…$` cannot express either rule in
+  Python; both use explicit `(?:\A|(?<=\n)|(?<=\r))` / `(?=\r|\n|\Z)`
+  boundaries, and CRLF is always matched before the bare CR alternative so a
+  terminator is never split down the middle. The two must move together: fixing
+  the partition alone turns section mode's safe "no ATX headings" refusal on
+  such a note into a write against a bogus heading.
 - **Declared staleness.** Notes already indexed under the old empty-block
   partition (the block surfacing as literal body text, and `note_links.position`
   measured against it) do not self-heal on an ordinary pass — change detection
