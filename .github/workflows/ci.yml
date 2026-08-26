@@ -159,6 +159,31 @@ jobs:
       - name: openspec validate --specs --strict
         run: npx -y @fission-ai/openspec@1.3.1 validate --specs --strict
 
+  # The same gate `make trivy` runs before every deploy, mirrored into CI the
+  # way the Honeydew projects run it: build the image, scan, fail the check on
+  # HIGH/CRITICAL findings. Flags match the Makefile gate exactly —
+  # `ignore-unfixed` so a CVE with no upstream fix cannot block an unrelated
+  # PR (the same reasoning that makes `audit` advisory), and `vuln` scanners
+  # only, so CI red always means `make deploy` would refuse too.
+  trivy-scan:
+    name: trivy-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t obsidian-mcp:ci .
+
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "obsidian-mcp:ci"
+          severity: "HIGH,CRITICAL"
+          exit-code: "1"
+          ignore-unfixed: true
+          scanners: "vuln"
+
   # Advisory: a new upstream CVE disclosed against a pinned dependency must not
   # block an unrelated PR. It still shows red in the checks list.
   audit:
