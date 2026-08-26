@@ -221,11 +221,122 @@ find/replace, and section. The four modes SHALL be mutually exclusive —
 supplying parameters that select more than one mode SHALL return an
 actionable error and SHALL NOT mutate the file.
 
-#### Scenario: Full-replace mode (default)
+#### Scenario: Full-replace mode (default) preserves a valid frontmatter block
 
 - **WHEN** the client calls `edit_note(path, content)` with neither
-  `append`, `find`, nor `section` set
-- **THEN** the entire note SHALL be overwritten with `content`
+  `append`, `find`, nor `section` set and without
+  `replace_frontmatter=True`, on a note that carries a valid line-1
+  frontmatter block
+- **THEN** the written file SHALL be the existing raw block
+  byte-identical, a separator (one `\n` inserted only when the block's
+  bytes do not already end in a newline and `content` is non-empty),
+  then `content` as the entire body
+- **AND** no property of `content`'s shape — a leading `---`, an
+  unclosed fence, or a complete mapping-shaped fenced block (exactly
+  what `read_note` returns for a note whose body begins with one) —
+  SHALL change this: `content` is always the body
+
+#### Scenario: Any stripped body round-trips unchanged
+
+- **WHEN** the note-content portion of a **complete, unwindowed
+  whole-note** `read_note` response (`section=None`, `offset=0`, no
+  truncation notice) is passed back via `edit_note(path, body)` —
+  including a body whose first line is a thematic break `---`, a body
+  that itself begins with a complete mapping-shaped fenced block, and
+  the body of a note whose frontmatter is the whitespace-only empty
+  block (which the shared parser SHALL strip on read exactly as it
+  preserves it on write)
+- **THEN** the resulting file SHALL be identical to the original for a
+  note whose body newlines are LF
+- **AND** for a CRLF-bodied note the frontmatter block SHALL still be
+  preserved byte-identically (CRLF fences included); the *body* comes
+  back through `read_note`'s pre-existing universal-newline translation
+  as LF, and the round trip preserves content, not the body's original
+  newline bytes — a pre-existing property of the read path, declared,
+  not a regression introduced here
+
+#### Scenario: The round-trip guarantee does not extend to windows or sections
+
+- **WHEN** a `read_note` response was a selected section
+  (`section=<sel>`), a paged window (`offset>0` or a `[TRUNCATED]`
+  notice), or otherwise less than the whole body, and its content is
+  passed to default full-replace
+- **THEN** full-replace still preserves the frontmatter block but
+  replaces the ENTIRE body with the partial text — so both layers'
+  docstrings SHALL state that section responses belong to section mode
+  and truncated reads must be completed before a full-replace write
+
+#### Scenario: replace_frontmatter selects wholesale replacement
+
+- **WHEN** the client calls
+  `edit_note(path, content, replace_frontmatter=True)` in full-replace
+  mode
+- **THEN** the entire note, frontmatter included, SHALL be overwritten
+  with exactly `content`
+- **AND** `replace_frontmatter=True` combined with `append`, `find`, or
+  `section` SHALL return the multi-mode error and SHALL NOT modify the
+  file
+
+#### Scenario: A note without a valid block is replaced wholesale
+
+- **WHEN** the existing note has no line-1 fence, or its block is
+  defective (unclosed fence — a bare unterminated `---` at EOF included
+  — YAML error, or non-mapping), and the client calls
+  `edit_note(path, content)` in full-replace mode
+- **THEN** the entire note SHALL be overwritten with `content` (there is
+  no valid block to preserve; this is the repair path and needs no flag)
+
+#### Scenario: A metadata-only note gains a correct separator
+
+- **WHEN** the existing note is exactly a valid frontmatter block whose
+  closing fence ends at EOF without a trailing newline, and the client
+  calls `edit_note(path, "Body\n")` in default full-replace mode
+- **THEN** the written file SHALL contain the block, a single inserted
+  newline, then `Body\n` — the closing fence SHALL remain a recognized
+  fence
+
+#### Scenario: A trailing-whitespace closing fence is one block everywhere
+
+- **WHEN** a note's closing fence carries trailing spaces or tabs
+  (which `parse_frontmatter` accepts today)
+- **THEN** default full-replace SHALL treat the note as carrying a valid
+  block and preserve it byte-identically, trailing whitespace included
+
+#### Scenario: Fence lines end at LF, CRLF or a lone CR
+
+- **WHEN** a note's fence lines are terminated by LF, by CRLF, or by a
+  lone CR (classic-Mac line endings)
+- **THEN** the shared parser SHALL recognize the block in every case,
+  consistent with the universal-newline translation the read path applies
+  before it parses the same file — so a note whose block `read_note`
+  strips is never diagnosed as having no frontmatter by a tool that is
+  about to write
+- **AND** default full-replace SHALL preserve that block
+  byte-identically, its own terminators included, and SHALL insert the
+  separator newline only when the block's bytes end in no line terminator
+  at all
+- **AND** `set_frontmatter` SHALL update such a block rather than
+  prepending a second one above it, and SHALL refuse it by name when it
+  is defective
+- **AND** the fenced/inline code masking that heading resolution runs on
+  SHALL use the same terminator rule, so a heading inside a code block is
+  hidden from `edit_note(section=…)` exactly as it is from
+  `read_note(section=…)` — otherwise a selector resolves inside code on
+  the write side only, and the replacement deletes the closing fence
+- **AND** widening the terminator rule SHALL NOT narrow which characters
+  separate a heading's `#` marker from its text: every whitespace
+  character except the three terminators still separates them, so no
+  heading present on an existing note loses its name or its `#N` ordinal
+
+#### Scenario: The composed result meets the cap and conflict checks
+
+- **WHEN** preservation composes a result whose byte size exceeds the
+  note-size cap, or `expected=` was supplied and any part of the raw
+  file — the frontmatter block included — changed since it was read
+- **THEN** the call SHALL be refused without writing (the cap applies to
+  the composed result; `expected=` compares the complete raw bytes, so a
+  concurrent frontmatter-only change conflicts)
+- **AND** `dry_run=True` SHALL diff the composed result
 
 #### Scenario: Append mode
 
@@ -321,6 +432,46 @@ every ancestor, so no chain distinguishes them.
 The same selector grammar SHALL be used by every tool that accepts a `section`
 argument, so a selector that names a section for reading names the same section
 for writing.
+
+When the note carries a valid line-1 frontmatter block, heading resolution
+(all three selector forms), body replacement, and the not-found/ambiguity
+listings SHALL operate on the frontmatter-stripped body — the same text
+`read_note` scans — and the write SHALL reattach the raw block
+byte-identically. A line inside the block (a YAML `#` comment included)
+SHALL never be selectable as a heading and SHALL never be counted by an
+ordinal. When the note's block is **defective** (unclosed fence, YAML
+error, or non-mapping — comment-only YAML included), section-mode writes
+SHALL be refused with an error naming the defect and pointing at
+`edit_note(replace_frontmatter=True)` as the repair — never resolved over
+the raw bytes, where a `#` line inside the broken block could be selected
+and a replacement could delete the closing fence. A note with no fence at
+all resolves over its raw content, which is identical to what `read_note`
+scans there.
+
+#### Scenario: A YAML comment in frontmatter is not a heading
+
+- **WHEN** a note is `---\n# Tasks\nstatus: draft\n---\n# Body\nkeep\n`
+  and the client calls `edit_note(path, "x", section="Tasks")`
+- **THEN** the selector SHALL NOT match the `# Tasks` line inside the
+  frontmatter block; it resolves against the body's headings only (here
+  reporting `Tasks` not found and listing `Body`)
+- **AND** the frontmatter block SHALL be untouched by any section edit
+
+#### Scenario: Ordinals agree between read_note and edit_note
+
+- **WHEN** a note's frontmatter block contains `#`-prefixed comment lines
+  and its body contains ATX headings
+- **THEN** `edit_note(section="#N")` SHALL select the same heading that
+  `read_note(section="#N")` extracts
+
+#### Scenario: A defective block refuses section writes by name
+
+- **WHEN** a note is `---\n# Tasks\n---\n# Body\nkeep\n` (comment-only
+  YAML — a non-mapping) or carries an unclosed or YAML-erroring block,
+  and the client calls `edit_note(path, "x", section=<anything>)`
+- **THEN** the call SHALL be refused with an error naming the defect and
+  the `replace_frontmatter=True` repair path
+- **AND** SHALL NOT modify the file
 
 #### Scenario: Replace section under a level-2 heading
 
@@ -588,8 +739,71 @@ modified.
 #### Scenario: Empty updates and empty removes is a no-op
 
 - **WHEN** the client calls `set_frontmatter(path, updates={}, remove=[])`
+  on a note whose frontmatter is absent or valid
 - **THEN** the response SHALL indicate no changes
 - **AND** the file SHALL be byte-identical before and after the call
+- **AND** on a note whose frontmatter is malformed, the same call SHALL
+  return the defect refusal (diagnosis precedes the no-op check), not a
+  success report
+
+#### Scenario: Unclosed frontmatter fence is refused
+
+- **WHEN** the note's first line is exactly `---` with no closing fence
+  on any later line — a file consisting solely of an unterminated `---`
+  line included — and the client calls `set_frontmatter` with any
+  `updates` or `remove`
+- **THEN** the tool SHALL return an error naming the unclosed fence and
+  the `edit_note(replace_frontmatter=True)` repair path
+- **AND** SHALL NOT modify the file, and in particular SHALL NOT prepend
+  a second frontmatter block
+
+#### Scenario: Frontmatter that fails YAML parsing is refused
+
+- **WHEN** the note has a line-1 fenced block whose contents fail YAML
+  parsing
+- **THEN** the tool SHALL return an error that includes the parser's
+  message
+- **AND** SHALL NOT modify the file
+
+#### Scenario: Non-mapping frontmatter is refused
+
+- **WHEN** the note has a line-1 fenced block whose YAML parses to a
+  list, a scalar, or non-whitespace YAML loading to `None` (`null`, `~`,
+  or only comments)
+- **THEN** the tool SHALL return an error naming the non-mapping shape
+- **AND** SHALL NOT modify the file
+
+#### Scenario: remove on a malformed block refuses rather than no-ops
+
+- **WHEN** the note's frontmatter is malformed in any of the above ways
+  and the client calls `set_frontmatter(path, updates={}, remove=["x"])`
+- **THEN** the tool SHALL return the same refusal, not a success report
+
+#### Scenario: An empty fenced block is a valid empty mapping
+
+- **WHEN** the note begins with `---\n---\n` (or the CRLF equivalent)
+  and the client calls `set_frontmatter(path, updates={"a": 1})`
+- **THEN** the block SHALL be treated as a valid empty mapping and
+  updated to contain `a: 1`, with the body preserved exactly — including
+  when the body is empty
+
+#### Scenario: Removing the last key removes the block entirely
+
+- **WHEN** the note's frontmatter contains exactly one key and the
+  client calls `set_frontmatter(path, updates={}, remove=[<that key>])`
+- **THEN** the written file SHALL contain no opening fence, no YAML
+  region, no closing fence and no separator — exactly the prior body
+
+#### Scenario: A call that changes no key writes nothing
+
+- **WHEN** `set_frontmatter` is called with `updates` that set every
+  named key to the value it already has, and/or `remove` naming only
+  keys that are not present — including on a note whose frontmatter is
+  the valid whitespace-only empty block
+- **THEN** the response SHALL indicate no changes and the file SHALL be
+  byte-identical — in particular, an existing empty block SHALL NOT be
+  dropped by a remove that removed nothing (dropping it would promote a
+  mapping-shaped body prefix into active frontmatter)
 
 ### Requirement: Write-tool docstrings use neutral framing
 
@@ -610,9 +824,9 @@ Write-tool docstrings SHALL NOT instruct the agent to call `get_vault_guide` fir
 Calls to `move_note`, `delete_note`, and `set_frontmatter` SHALL be
 recorded via the existing `_tracked` decorator with `tool` set to the
 respective tool name. Calls to `edit_note` that include `dry_run`,
-`replace_all`, or `section` SHALL include those parameters in
-`usage_logs.params` (subject to the existing string-truncation behavior
-of `_tracked`).
+`replace_all`, `section`, or `replace_frontmatter` SHALL include those
+parameters in `usage_logs.params` (subject to the existing
+string-truncation behavior of `_tracked`).
 
 #### Scenario: `move_note` invocation is logged
 
@@ -625,6 +839,20 @@ of `_tracked`).
 - **WHEN** an agent calls `edit_note(path, content, dry_run=True)`
 - **THEN** the `usage_logs` row for that call SHALL have `tool='edit_note'`
 - **AND** `params` SHALL include `dry_run`
+
+#### Scenario: `replace_frontmatter` is logged on `edit_note`
+
+- **WHEN** an agent calls
+  `edit_note(path, content, replace_frontmatter=True)`
+- **THEN** the `usage_logs` row for that call SHALL have
+  `tool='edit_note'`
+- **AND** `params` SHALL include `replace_frontmatter`, because it is the
+  destructive-intent flag on this tool: it is the difference between a
+  write that preserved the note's frontmatter and one that replaced it
+  wholesale, which is what an operator reading the audit trail after a
+  block went missing needs to see
+- **AND** the note's `content` SHALL remain absent from `params`, as it
+  is today
 
 ### Requirement: No-clobber mutations are race-safe
 
@@ -1194,3 +1422,4 @@ The note path's named-staging fallback SHALL classify `EXDEV` from its publishin
 
 - **WHEN** the named-fallback overwrite publish's replacing rename fails with `EXDEV`
 - **THEN** the raised error SHALL be the classified refusal — not a bare `OSError`, and not a mount-boundary claim unless the mount comparison supports one
+
