@@ -141,7 +141,8 @@
       write replaces the entire body, so content the caller omits is deleted.
       Include the concrete fenced-block example: on
       `# A\n```\nimportant\n```\nold\n`,
-      `edit_note(section="A", content="new")` now yields `# A\nnew\n`. A
+      `edit_note(section="A", content="new")` now yields `# A\nnew` (no trailing
+      newline — `A` is the last heading, so no separator is needed). A
       reader who learns only about the blank line will not predict that.
 - [x] 6.3 Record why this change documents **no** extraction procedure, with
       both reproductions (the multiline title and the quoted

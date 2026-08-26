@@ -74,7 +74,9 @@ zero-divergence envelope forbade — so the contract decision belongs here.
     write whose `content` does not resend it. On
     `# A\n```\nimportant\n```\nold\n`,
     `edit_note(section="A", content="new")` previously kept the block and
-    replaced only `old`; it now yields `# A\nnew\n`. That is the intended
+    replaced only `old`; it now yields `# A\nnew` — no trailing newline,
+    because `A` is the last heading and the trailing separator exists only to
+    keep a following heading from gluing onto the body. That is the intended
     contract — leaving the block behind *was* the duplication bug — but the
     blast radius is content loss for a caller that does not round-trip, and
     both the docstrings and `vault-tools.md` must say so in those words.

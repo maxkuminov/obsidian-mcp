@@ -195,7 +195,10 @@ cosmetic and was wrong:
 - A blank separator that used to survive is lost unless `content` includes it.
 - **A fenced code block directly under the heading is deleted.** On
   `# A\n```\nimportant\n```\nold\n`, `edit_note(section="A", content="new")`
-  previously kept the block and replaced only `old`; it now yields `# A\nnew\n`.
+  previously kept the block and replaced only `old`; it now yields `# A\nnew`
+  (no trailing newline — `A` is the last heading, and the trailing separator is
+  only ever inserted to keep a *following* heading off the body, the rule #5
+  pinned).
   Leaving the block behind *was* the duplication bug, so replacing it is correct
   — but a caller that does not round-trip loses content, and the docstrings must
   say so rather than implying only whitespace is at stake.

@@ -300,8 +300,9 @@ does not resend is **deleted**:
   there is no following heading to separate the new body from, and the
   trailing separator exists only to prevent that gluing (the rule
   `tests/test_issue_5_replace_section_eof_heading.py` has pinned since #5).
-  #140's proposal and design render this example as `# A\nnew\n`; that extra
-  terminator is an illustration slip, not the contract —
+  #140's proposal, design and tasks originally rendered this example as
+  `# A\nnew\n`; the extra terminator was an illustration slip, caught during
+  implementation and corrected in the same change.
   `tests/test_issue_140_section_round_trip.py` pins the real bytes.
 
 What bounds it: no note is rewritten until someone writes to that section, and
