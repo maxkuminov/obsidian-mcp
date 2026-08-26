@@ -31,11 +31,17 @@ zero-divergence envelope forbade — so the contract decision belongs here.
 
 - **A section's body SHALL begin on the line immediately after the heading
   line.** This is the whole change, stated once and applied to both sides:
-  `read_note(section=S)` returns the heading line, its terminator, and that
-  body; `edit_note(section=S, content=B)` replaces exactly that body. The
-  portion of a section response after its first line is therefore precisely the
-  region a section write replaces, and the round trip is byte-identical on LF
-  notes.
+  the *selected-content portion* of a `read_note(section=S)` response is the
+  heading line, its terminator, and that body; `edit_note(section=S, content=B)`
+  replaces exactly that body.
+
+  **The extraction rule is stated explicitly, because the response is not raw
+  section text.** `read_note` prefixes every response with a title/path/tags
+  envelope terminated by a `\n---\n` separator line. "Strip the first line of
+  the response" — the obvious formulation, and the one the first draft of this
+  spec used — would write `**Path:** \u0060…\u0060` into the note. The rule is:
+  take the text after the response's first `\n---\n` separator, then drop its
+  first line. Both docstrings SHALL say this in those terms.
 - **Mechanically:** `_ATX_HEADING_RE`'s trailing whitespace run narrows from
   `\s*` (which crosses line boundaries) to `[^\S\r\n]*` (horizontal only), so a
   heading's `line_end` is genuinely the end of its heading line in every
@@ -43,16 +49,28 @@ zero-divergence envelope forbade — so the contract decision belongs here.
   Nothing else in the resolver changes: heading *text*, depth, ordinals,
   `line_start`, and every selector form are unaffected, so no existing selector
   starts naming a different section.
-- **BREAKING (declared, and the point of the change):** whitespace and fenced
-  blocks that sit between a heading line and its first line of prose are now
-  part of the body. Two consequences on notes that exist today:
+- **`replace_section` SHALL insert a separator newline only for a non-empty
+  replacement body.** Today it appends one before the following heading, and
+  prepends one after an unterminated EOF heading, unconditionally — so an
+  *empty* section is not round-trip stable even with the regex fixed
+  (`# A\n# B\nb\n` gains a blank line; `# A` gains a newline). Verified against
+  the current helpers. Without this the headline property is false for the
+  commonest degenerate note.
+- **BREAKING (declared, and the point of the change) — and it is destructive,
+  not cosmetic.** Everything between a heading line and the next heading of
+  equal-or-shallower depth is now the body, so a section write replaces all of
+  it. Consequences on notes that exist today:
   - `edit_note(section="Tasks", content="- x")` on `## Tasks\n\n- old\n`
     now writes `## Tasks\n- x\n`, not `## Tasks\n\n- x\n`. The blank separator
-    is the caller's to send (`content="\n- x"`), and a caller that round-trips
-    a read gets it back for free.
-  - A fenced block directly under a heading is now *replaced* by a section
-    write rather than being left behind with new content inserted after it.
-    That is the fix, not a regression: leaving it was the duplication bug.
+    is the caller's to send (`content="\n- x"`).
+  - **A fenced block directly under a heading is now deleted** by a section
+    write whose `content` does not resend it. On
+    `# A\n\u0060\u0060\u0060\nimportant\n\u0060\u0060\u0060\nold\n`,
+    `edit_note(section="A", content="new")` previously kept the block and
+    replaced only `old`; it now yields `# A\nnew\n`. That is the intended
+    contract — leaving the block behind *was* the duplication bug — but the
+    blast radius is content loss for a caller that does not round-trip, and
+    both the docstrings and `vault-tools.md` must say so in those words.
 - Docstrings at both layers — the registered wrappers in `server.py` (what MCP
   clients see) and the `tools.py` impls — state the round-trip contract in the
   terms callers need: *the section response minus its first line is exactly
@@ -78,15 +96,37 @@ zero-divergence envelope forbade — so the contract decision belongs here.
 ## Impact
 
 - `src/services/vault.py` — `_ATX_HEADING_RE` (the trailing class only) and the
-  comment block above it, which currently documents the opposite decision.
-  `_scan_headings`, `_section_body_span`, `extract_section`, `replace_section`
-  and `outline_sections` keep their signatures and their roles.
+  comment block above it, which currently documents the opposite decision; plus
+  `replace_section`'s two separator insertions, which become conditional on a
+  non-empty body. `_scan_headings`, `_section_body_span`, `extract_section`,
+  `replace_section` and `outline_sections` keep their signatures and their
+  roles.
 - `src/mcp_server/server.py` and `src/mcp_server/tools.py` — docstrings only.
 - `docs/architecture/vault-tools.md` — the section-addressing section.
 - **No schema change, no migration, no index effect.** `outline_sections`'
-  reported `size` shifts by the bytes that moved from heading to body for
-  sections that had a blank line or a leading fence; it is a display number in
-  a truncation outline, and the `#N` ordinals it advertises are unchanged.
+  reported `size` is `body_end - line_start`; this change moves neither
+  endpoint, so both the sizes and the `#N` ordinals in a truncation outline are
+  **unchanged**. Verified across the corpus.
+- **Declared residual (pre-existing, unchanged here): the code masker's fence
+  grammar is narrower than CommonMark.** `_FENCE_RE` recognises only a
+  column-zero opener closed by a fence of exactly the same length, so an
+  indented fence, or one closed by a longer run, is not masked — a heading
+  inside such a block is selectable, and a section write there already deletes
+  the opening fence and orphans the contents. Measured before and after this
+  change: the bytes written are **identical**, so this change neither creates
+  nor worsens it. Fixing the masker shifts which lines count as headings and
+  therefore re-addresses every `#N` ordinal on affected notes, which is a
+  larger compat break than this one and belongs in its own change; filed
+  separately. The spec here says "fenced code block **as recognised by the
+  shared masker**" rather than claiming CommonMark coverage it does not have.
+- **Declared residual: newline dialect.** `read_note` applies universal-newline
+  translation; `edit_note` reads and rewrites raw bytes. A section round trip
+  on a CRLF note therefore rewrites *that section's* terminators as LF while
+  the retained heading line and the rest of the note keep CRLF — measured:
+  `# A\r\nold\r\n# B\r\nkeep\r\n` becomes `# A\r\nold\n# B\r\nkeep\r\n`.
+  This is the section-mode instance of the whole-note residual #128 already
+  declared; the byte-identity guarantee is stated for LF-bodied notes only, and
+  the docstrings say so.
 - Notes already in the vault are not rewritten. The change is to what a *future*
   section write does, and the direction is strictly toward preserving what the
   caller read.

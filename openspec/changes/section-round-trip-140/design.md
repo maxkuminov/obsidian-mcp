@@ -106,18 +106,103 @@ this tool must not do.
 leave the two spans still defined differently, so the next shape that lands in
 the gap becomes the third bug in this family.
 
+## The regex is necessary but not sufficient
+
+Three things the first draft of this design got wrong, found by the pre-implementation
+audit and verified against the current helpers.
+
+### 1. `read_note` does not return raw section text
+
+`read_note` builds every response as an envelope — `# <title>`, `**Path:**`,
+optional `**Tags:**` and `**Frontmatter:**` — then `"\n---\n"` and the selected
+content (`src/mcp_server/tools.py`, the `parts` list). So the response's first
+line is the *title*, not the heading. "Strip the first line and write it back",
+the obvious phrasing and the one the first draft used, makes an agent write
+
+```
+**Path:** `n.md`
+
+---
+# A
+```
+
+into the note. That is precisely the destructive-write class this repo exists to
+avoid, and the spec would have instructed it.
+
+The contract is therefore stated over the **selected-content portion**: the text
+after the response's first `\n---\n`, minus its first line. Both docstrings must
+carry that rule verbatim, and the end-to-end check must perform that extraction
+against a real MCP response rather than against the pure helper.
+
+### 2. `replace_section` inserts separators unconditionally
+
+Independent of the regex, `replace_section` prepends a newline when the retained
+prefix does not end in one, and appends one when a following heading exists and
+the body does not end in a terminator. Both fire even when `new_body` is `""`.
+Measured with the narrowed regex in place:
+
+| note | round trip result | stable |
+| --- | --- | --- |
+| `# A\n# B\nb\n` | `# A\n\n# B\nb\n` | no |
+| `# A` | `# A\n` | no |
+
+So a section with no body — two consecutive headings, the commonest degenerate
+shape in an outline-heavy note — still accumulates a blank line per round trip.
+Both insertions become conditional on a non-empty body. The non-empty cases that
+issue #5 pinned (`# Notes` at EOF, replaced with `- item`) are untouched.
+
+### 3. The masker's fence grammar is narrower than CommonMark
+
+`_FENCE_RE` requires a column-zero opener and a closer of *exactly* the same
+length. CommonMark allows up to three spaces of indentation and a closer at
+least as long as the opener. So `# A\n   ```\n# Hidden\n…` leaves `# Hidden`
+visible to the scanner, and a section write there replaces only the opening
+fence — orphaning the code and leaving the closer.
+
+That is a genuine destructive-write hazard, and it is **not this change's**.
+Measured before and after the narrowing, on both the indented-fence and
+longer-closer shapes, the bytes written are identical. Widening the masker would
+change which lines count as headings, which shifts every `#N` ordinal on an
+affected note — a re-addressing break strictly larger than this one, and one
+that must not ride along on it. It gets its own issue; this spec says "fenced
+code block *as recognised by the shared masker*" rather than claiming coverage
+the code does not have.
+
 ## The accepted cost
 
-`edit_note(section=S, content=B)` where `B` does not itself begin with a newline
-now loses a blank separator that used to survive. This is the declared break.
-Three things bound it:
+`edit_note(section=S, content=B)` now replaces the section's entire body, so
+anything the caller does not resend is gone. This is the declared break, and it
+is **destructive, not cosmetic** — the first draft of this design called it
+cosmetic and was wrong:
 
-- It is cosmetic — no content is lost, and no note is rewritten until someone
-  writes to that section.
-- The read→modify→write path, which is the one an agent actually takes, comes
-  out *better*: it now preserves the separator, which it previously duplicated.
-- It is discoverable from the docstrings, which state that `content` is the
-  body exactly as `read_note(section=…)` returns it below the heading line.
+- A blank separator that used to survive is lost unless `content` includes it.
+- **A fenced code block directly under the heading is deleted.** On
+  `# A\n```\nimportant\n```\nold\n`, `edit_note(section="A", content="new")`
+  previously kept the block and replaced only `old`; it now yields `# A\nnew\n`.
+  Leaving the block behind *was* the duplication bug, so replacing it is correct
+  — but a caller that does not round-trip loses content, and the docstrings must
+  say so rather than implying only whitespace is at stake.
+
+What bounds it:
+
+- No note is rewritten until someone writes to that section.
+- The read→modify→write path, the one an agent actually takes, comes out
+  strictly better: it now preserves what it previously duplicated.
+- It is discoverable from the docstrings, which state the extraction rule, the
+  whole-body replacement, and the LF qualification.
+
+## Declared residual: newline dialect
+
+`read_note` applies universal-newline translation before the caller ever sees a
+section; `edit_note` reads and rewrites raw bytes. A CRLF note's section round
+trip therefore rewrites *that section's* terminators as LF and leaves everything
+else CRLF. Measured: `# A\r\nold\r\n# B\r\nkeep\r\n` →
+`# A\r\nold\n# B\r\nkeep\r\n`. Content is preserved; bytes are not.
+
+This is the section-mode instance of the whole-note residual #128 already
+declared and accepted. It is not fixed here — normalising on write would rewrite
+terminators the caller never touched — but the byte-identity guarantee is scoped
+to LF-bodied notes and both docstrings say so.
 
 ## Verification shape
 

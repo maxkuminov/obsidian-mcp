@@ -9,11 +9,26 @@ rewritten.
 
 A section's body SHALL begin at the first byte of the line immediately
 following the heading line, and SHALL end immediately before the next heading of
-equal-or-shallower depth, or at end of file. Exactly one line terminator (LF,
-CRLF as a unit, or a lone CR) separates the heading line from the body. No
-whitespace, blank line, or fenced code block between the heading line and the
-next heading of equal-or-shallower depth SHALL be excluded from the body: a
-section has no third region between its heading line and its body.
+equal-or-shallower depth, or at end of file. At most one line terminator (LF,
+CRLF as a unit, or a lone CR) separates the heading line from the body; a
+heading at end of file with no trailing terminator has an empty body. No
+whitespace, blank line, or fenced code block — as recognised by the shared code
+masker — between the heading line and the next heading of equal-or-shallower
+depth SHALL be excluded from the body: a section has no third region between
+its heading line and its body.
+
+A separator newline SHALL be inserted around the replacement only when the
+replacement body is **non-empty**: one before it when the retained prefix does
+not already end in a terminator (an end-of-file heading), and one after it when
+a following heading would otherwise be glued to it. Replacing an empty body
+with an empty body SHALL leave the note byte-identical — an unconditional
+separator makes a section with no body grow a blank line on every round trip,
+and makes an unterminated end-of-file heading grow a newline.
+
+Because a section write replaces the whole body, content the caller does not
+resend is **deleted**, fenced code blocks included. This is the contract, not
+an accident; it SHALL be stated in the caller-visible documentation in those
+terms.
 
 The selector SHALL accept three forms:
 
@@ -60,24 +75,60 @@ scans there.
 
 #### Scenario: A section round trip is byte-identical
 
-- **WHEN** a `read_note(path, section=<sel>)` response that was not
-  truncated is stripped of its first line (the heading line and its
-  terminator) and the remainder is passed back as
-  `edit_note(path, content=<remainder>, section=<sel>)`, on a note whose
-  body newlines are LF
+- **WHEN** the **selected-content portion** of an untruncated
+  `read_note(path, section=<sel>)` response — the text after the response's
+  `\n---\n` envelope separator — is stripped of its first line (the heading
+  line and its terminator) and the remainder is passed back as
+  `edit_note(path, content=<remainder>, section=<sel>)`, on a note whose body
+  newlines are LF
 - **THEN** the resulting file SHALL be byte-identical to the original
 - **AND** this SHALL hold for every `#N` ordinal in the note, including
   sections whose body begins with a blank line, sections whose body begins
-  with a fenced code block, and the final section of the note
+  with a fenced code block, sections with an empty body, and the final
+  section of the note
+
+#### Scenario: An empty section survives a round trip
+
+- **WHEN** a note is `# A\n# B\nb\n` (the first section has no body) and
+  the client calls `edit_note(path, "", section="#1")`
+- **THEN** the resulting note SHALL be `# A\n# B\nb\n`, unchanged — no
+  separator newline SHALL be inserted for an empty body
+- **AND** on the note `# A` (a heading at end of file with no trailing
+  terminator), the same call SHALL leave the note as `# A`
+
+#### Scenario: A non-empty body is still separated from what surrounds it
+
+- **WHEN** the client calls `edit_note(path, "- item", section="Notes")` on
+  a note whose `# Notes` heading is the last line and carries no trailing
+  newline
+- **THEN** the heading SHALL NOT be glued to the content: the result SHALL
+  be `# Notes\n- item`
+- **AND** when a following heading exists, a terminator SHALL be ensured
+  between the new body and that heading
 
 #### Scenario: A fenced block under a heading is replaced, not duplicated
 
-- **WHEN** a note is `# A\n` followed by a fenced code block (whose
-  content may itself contain `#`-prefixed lines) followed by `# B\nb\n`,
-  and the client calls `edit_note(path, "new", section="#1")`
+- **WHEN** a note is `# A\n` followed by a fenced code block recognised by
+  the shared masker (whose content may itself contain `#`-prefixed lines)
+  followed by `# B\nb\n`, and the client calls
+  `edit_note(path, "new", section="#1")`
 - **THEN** the fenced block SHALL be replaced by `new`
 - **AND** the resulting note SHALL contain the fence exactly zero further
   times — it SHALL NOT be retained with `new` inserted after it
+- **AND** the caller-visible documentation SHALL state that this is a
+  deletion: a `content` that does not resend the block loses it
+
+#### Scenario: A fence the masker does not recognise is out of scope, not covered
+
+- **WHEN** a fence is indented, or is closed by a run longer than its
+  opener — shapes `_FENCE_RE` does not currently mask — so that a heading
+  inside it is visible to the scanner
+- **THEN** this requirement's fenced-code guarantees SHALL NOT be read as
+  covering it, and the behaviour SHALL be identical to the behaviour before
+  this change (verified, not assumed)
+- **AND** the gap SHALL be recorded as a declared residual with its own
+  tracking issue, because widening the masker re-addresses `#N` ordinals on
+  existing notes and is a larger compat break than this change
 
 #### Scenario: A blank line after a heading belongs to the body
 
@@ -188,7 +239,17 @@ by reading it, and getting it wrong is how a section round trip corrupts a note.
 
 The docstrings SHALL state that any blank line the caller wants between the
 heading and its content belongs in `content`, and SHALL point at
-`read_note(section=…)` as the source of a round-trippable body.
+`read_note(section=…)` as the source of a round-trippable body — together with
+the exact extraction: **the text after the response's `\n---\n` envelope
+separator, minus its first line.** They SHALL NOT tell a caller to strip the
+response's own first line, which is the envelope's `# <title>` and would write
+`**Path:**` into the note.
+
+They SHALL further state (a) that a section write **replaces the whole body**,
+so content omitted from `content` — a fenced code block included — is deleted,
+and (b) that byte-identity holds for notes whose body newlines are LF; on a
+CRLF or lone-CR note the round trip preserves content but rewrites the selected
+body's terminators as LF.
 
 #### Scenario: An MCP client can learn the contract from introspection
 

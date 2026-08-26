@@ -18,6 +18,13 @@
       whitespace run from `\s*` to `[^\S\r\n]*`. Change nothing else in the
       pattern — the separator class `[^\S\r\n]+` and the text capture
       `([^\r\n]+?)` stay exactly as they are.
+- [ ] 2.1b In `replace_section`, make **both** separator insertions conditional
+      on a non-empty `new_body`. Unconditional insertion means an empty section
+      (`# A\n# B\nb\n`) gains a blank line and an unterminated EOF heading
+      (`# A`) gains a newline on every round trip — the regex fix alone does
+      not make the headline property true. Do not touch the non-empty
+      behaviour: `tests/test_issue_5_replace_section_eof_heading.py` pins it
+      and must stay green unmodified.
 - [ ] 2.2 Rewrite the comment block above the regex. It currently documents
       the opposite decision ("The TRAILING run stays the original `\s*`,
       unnarrowed and still allowed to cross line boundaries … narrowing it
@@ -32,17 +39,30 @@
 
 - [ ] 3.1 Add the differential property test: for every ordinal `#N` in a
       note, `replace_section(text, "#N", extract_section(text, "#N") minus its
-      first line)` SHALL return `text` unchanged.
+      first line)` SHALL return `text` unchanged. Note the level: these are the
+      *pure helpers*, where `extract_section` really does return raw section
+      text. The tool-level property is different and is task 5.3 — do not
+      conflate them.
 - [ ] 3.2 Run that property over a corpus covering, at minimum: blank line(s)
       after a heading; a fenced block directly under a heading, including one
       containing `#`-prefixed lines and one using `~~~`; inline code on a
       heading line; a heading at EOF with and without a trailing newline; a
       heading line with trailing spaces, tabs, and a non-ASCII space; a note
-      whose only content is headings; nested depths where the next heading is
-      deeper (body must run past it) and shallower (body must stop).
-- [ ] 3.3 Run the same property over CRLF and lone-CR notes, asserting the
-      dialect's own terminators are preserved — the #128 terminator rule must
-      survive this change intact.
+      whose only content is headings; **empty sections** (two consecutive
+      headings, and a heading at EOF with no body) in every dialect; nested
+      depths where the next heading is deeper (body must run past it) and
+      shallower (body must stop).
+- [ ] 3.3 Run the same property over CRLF and lone-CR notes at the **helper**
+      level, asserting the dialect's own terminators are preserved — the #128
+      terminator rule must survive this change intact.
+- [ ] 3.3b Pin the declared newline residual at the **tool** level as a test,
+      not as prose: reading a CRLF note's section (which arrives LF-normalised)
+      and writing it back yields `# A\r\nold\n# B\r\nkeep\r\n`. Assert that
+      exact string, so the residual is visible and cannot drift silently.
+- [ ] 3.3c Pin that the unmasked-fence shapes (an indented fence, and one
+      closed by a longer run) produce **byte-identical** output before and
+      after this change. This is the evidence for the "not this change's bug"
+      claim; assert the explicit expected bytes.
 - [ ] 3.4 Assert the **non**-regression that makes this safe: over the whole
       corpus, `_scan_headings` reports identical `depth`, trimmed `text`,
       `line_start`, and document order before and after the fix. Pin it by
@@ -62,23 +82,35 @@
 - [ ] 4.2 Verify section mode over a valid frontmatter block still resolves
       against the stripped body and reattaches the block byte-identically,
       and that a defective block still refuses by name.
-- [ ] 4.3 Confirm `outline_sections`' `#N` ordinals are unchanged across the
-      corpus; the `size` field may shift and the test SHALL assert the new
-      values explicitly rather than being loosened.
+- [ ] 4.3 Confirm `outline_sections` is **entirely** unchanged across the
+      corpus — ordinals and `size` alike. `size` is `body_end - line_start` and
+      this change moves neither endpoint, so any observed shift means the fix
+      went further than intended. Assert explicit values.
 
 ## 5. The caller-visible contract
 
 - [ ] 5.1 Update the `edit_note` docstring in `src/mcp_server/server.py` (the
-      MCP-visible one) to state that in section mode `content` is the body
-      beginning on the line after the heading line — the text a
-      `read_note(section=…)` response carries below its heading line — and
-      that a wanted blank separator belongs in `content`.
-- [ ] 5.2 Make the same statement in `src/mcp_server/tools.py`'s `edit_note`
-      docstring so the two layers do not diverge.
-- [ ] 5.3 Add an end-to-end exercise against the running server: `read_note`
-      a section, write the body back with `edit_note`, read the whole note and
-      assert it is unchanged. Name in the report which tools were actually
-      called.
+      MCP-visible one) to state, in this order: (a) `content` is the body
+      beginning on the line after the heading line; (b) the extraction rule —
+      the text after a `read_note(section=…)` response's `\n---\n` envelope
+      separator, **minus its first line** (never the response's own first line,
+      which is `# <title>`); (c) a section write replaces the whole body, so
+      omitted content — a fenced block included — is deleted; (d) a wanted
+      blank separator belongs in `content`; (e) byte-identity holds for
+      LF-bodied notes, and a CRLF note's selected body comes back as LF.
+- [ ] 5.2 Make the same five statements in `src/mcp_server/tools.py`'s
+      `edit_note` docstring so the two layers do not diverge. Check
+      `read_note`'s docstring in both layers too — it currently says a section
+      response "includes the heading line", which is true but insufficient
+      once a caller is being told to extract from it.
+- [ ] 5.3 Add an end-to-end exercise against the running server that performs
+      the **documented extraction on a real MCP response**, not on the helper's
+      return value: call `read_note(path, section=…)`, split on the first
+      `\n---\n`, drop the first line of the remainder, pass that to
+      `edit_note(section=…)`, then `read_note(path)` the whole note and assert
+      it is unchanged. A test that skips the envelope split does not test the
+      contract the docstring states. Name in the report which tools were
+      actually called.
 
 ## 6. Documentation
 
@@ -90,3 +122,15 @@
 - [ ] 6.2 State the declared compat break there in the terms a future reader
       needs: a section write no longer preserves a blank line the caller did
       not send.
+
+## 7. Residuals and follow-ups
+
+- [ ] 7.1 Do NOT widen `_FENCE_RE` in this change. Confirm by test (3.3c) that
+      the unmasked-fence shapes are byte-identical before and after, then open
+      a follow-up issue describing the gap (indented openers, longer closers),
+      its destructive symptom (a section write deletes the opening fence and
+      orphans the contents), and why fixing it re-addresses `#N` ordinals and
+      therefore needs its own proposal. Link it from `vault-tools.md`.
+- [ ] 7.2 Record the newline residual in `docs/architecture/vault-tools.md`
+      beside the whole-note one #128 already declared, with the measured
+      before/after string.
