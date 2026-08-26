@@ -795,7 +795,7 @@ async def semantic_search_impl(
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
 ) -> str:
-    """Vector similarity search using bge-m3 embeddings."""
+    """Vector similarity search over the configured embedding provider's vectors."""
     limit = _clamp_limit(limit, _MAX_SEMANTIC_RESULTS)
     uid = current_user_id.get()
     async with async_session() as session:
@@ -837,9 +837,19 @@ async def get_vault_guide_impl() -> str:
 
 
 def _require_write() -> str | None:
-    """Return an error message if current key lacks write permission."""
+    """Return an error message if the current credential lacks write permission.
+
+    Credential-neutral on purpose: `current_permission` is set from an API
+    key's `permission` *or* from an OAuth token's scope (`src/mcp_server/auth.py`),
+    so naming "a readwrite API key" told an OAuth caller to go get a kind of
+    credential it does not use and cannot mint.
+    """
     if current_permission.get() != "readwrite":
-        return "Permission denied: this API key has read-only access. A 'readwrite' key is required."
+        return (
+            "Permission denied: this credential has read-only access. Write "
+            "permission is required — a 'readwrite' API key, or an OAuth token "
+            "carrying the 'readwrite' scope."
+        )
     return None
 
 

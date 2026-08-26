@@ -61,7 +61,7 @@ help:
 	@echo "  make db-restore FILE=<path> - Restore from backup"
 	@echo ""
 	@echo "$(YELLOW)Operations:$(NC)"
-	@echo "  make reindex      - Trigger full vault reindex"
+	@echo "  make reindex      - Explain how to trigger a reindex (panel only)"
 	@echo "  make reset-embeddings - Drop & recreate embedding column at configured dim"
 	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS (no embeddings, no API calls)"
 	@echo "  make status       - Show container and health status"
@@ -69,7 +69,7 @@ help:
 	@echo ""
 	@echo "$(YELLOW)Security:$(NC)"
 	@echo "  make audit        - Audit Python deps (pip-audit)"
-	@echo "  make trivy        - Scan local image for HIGH/CRITICAL CVEs"
+	@echo "  make trivy        - Scan local image for HIGH/CRITICAL CVEs (SCAN_IMAGE=... to override)"
 
 init:
 	@echo "$(GREEN)Setting up Obsidian MCP...$(NC)"
@@ -105,9 +105,15 @@ push:
 	docker push $(FULL_IMAGE)
 	@echo "$(GREEN)Pushed: $(FULL_IMAGE)$(NC)"
 
+# Defaults to what `make build` produces (obsidian-mcp:latest). The bundled
+# docker-compose.simple.yml / docker-compose.proxy.yml stacks build their own
+# tag instead, so scan those with:
+#     make trivy SCAN_IMAGE=obsidian-mcp:local
+SCAN_IMAGE ?= $(IMAGE_NAME):$(IMAGE_TAG)
+
 trivy:
-	@echo "$(GREEN)Scanning $(IMAGE_NAME):$(IMAGE_TAG) for HIGH/CRITICAL CVEs...$(NC)"
-	@trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --no-progress --scanners vuln $(IMAGE_NAME):$(IMAGE_TAG)
+	@echo "$(GREEN)Scanning $(SCAN_IMAGE) for HIGH/CRITICAL CVEs...$(NC)"
+	@trivy image --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed --no-progress --scanners vuln $(SCAN_IMAGE)
 	@echo "$(GREEN)No fixable HIGH/CRITICAL CVEs$(NC)"
 
 image: build trivy push
@@ -242,9 +248,26 @@ db-restore:
 	fi
 	@echo "$(GREEN)Restored from $(FILE)$(NC)"
 
+# There is no headless trigger. The only on-demand reindex is
+# `POST /admin/settings/reindex` (src/control_panel/routes.py), which sits on
+# the panel router behind `require_admin_panel` *and* `verify_csrf`: it needs a
+# signed panel session cookie plus a CSRF token that is only minted while
+# rendering a panel page. curl cannot produce either, and the container
+# publishes no host port anyway — the old `/api/reindex` recipe was a 404
+# against a socket that was not listening.
 reindex:
-	@echo "$(GREEN)Triggering reindex...$(NC)"
-	@curl -s -X POST http://localhost:8000/api/reindex | python3 -m json.tool 2>/dev/null || echo "$(RED)Service not responding$(NC)"
+	@echo "$(YELLOW)No headless reindex trigger exists.$(NC)"
+	@echo ""
+	@echo "  The indexer already runs on startup and every"
+	@echo "  INDEX_INTERVAL_SECONDS (default 300s), so a reindex normally"
+	@echo "  needs no action at all."
+	@echo ""
+	@echo "  To force one now, use the control panel: \"Reindex Now\" on the"
+	@echo "  dashboard, or Settings -> Indexer -> Reindex. Both POST"
+	@echo "  /admin/settings/reindex, which requires an admin panel session"
+	@echo "  and a CSRF token - neither of which curl can obtain."
+	@echo ""
+	@echo "  To restart the indexer instead: make restart"
 
 reset-embeddings:
 	@echo "$(YELLOW)Resetting embeddings — column will be recreated at EMBEDDING_DIMENSIONS$(NC)"

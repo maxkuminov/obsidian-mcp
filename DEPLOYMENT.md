@@ -317,8 +317,11 @@ You should see the tables: `api_keys`, `notes_metadata`,
 `users`, plus `alembic_version`.
 
 After Step 4 the indexer will pick up your vault on the next pass
-(every 5 min). To trigger immediately, run `make reindex` or click
-"Reindex Now" in the panel.
+(every 5 min). To trigger immediately, click "Reindex Now" in the
+panel — that is the only on-demand trigger; `POST
+/admin/settings/reindex` needs an admin panel session and a CSRF
+token, so there is no headless (curl) equivalent. `make reindex`
+prints these instructions.
 
 ## Step 6. Lock down the control panel
 

@@ -239,7 +239,8 @@ no embedding or indexing of non-markdown files.
   atomic rename. Refuses markdown (that is `delete_note`), directories,
   and symlinks.
 
-All four reuse the path-traversal guard and exclude dot-directories
+All four reuse the path-traversal guard and exclude any path with a
+component starting with `.` (dot-directories and dot-files)
 (`.obsidian`, `.git`, `.trash`, …), matching the indexer's visibility
 rule.
 
@@ -642,8 +643,9 @@ vault and keys carry over to the bootstrap admin.
 ### Enabling
 
 1. Set `MULTI_USER_MODE=true` and a strong `SECRET_KEY` in `.env`
-   (`openssl rand -hex 32` is fine). The app refuses to start with the
-   placeholder value when the flag is on.
+   (`openssl rand -hex 32` is fine). The app refuses to start with a
+   placeholder `SECRET_KEY` **unconditionally** — single-user mode
+   included — so this is not something the flag turns on.
 2. `make deploy` (or `docker compose up -d --force-recreate`).
 3. Visit the panel. Because the `users` table is empty, you're routed
    to `/admin/register` — the one-time bootstrap form. It's still
@@ -763,11 +765,28 @@ the transport limit follows.
 Different models produce non-comparable vectors, so a provider switch
 requires reindexing.
 
-1. `make down`
-2. Update `.env`. Change `EMBEDDING_PROVIDER`, set credentials,
-   optionally change `EMBEDDING_DIMENSIONS`.
-3. `make reset-embeddings`
-4. `make up`. The next indexer pass re-embeds the vault.
+**Same `EMBEDDING_DIMENSIONS`** (just a different provider or model):
+
+1. Update `.env` — `EMBEDDING_PROVIDER`, credentials, model name.
+2. `make reset-embeddings`, **while the old container is still up**. The
+   target is `docker compose exec`, so it needs a running container;
+   `make down` first and it fails.
+3. `make deploy` (or `docker compose up -d --force-recreate`). The next
+   indexer pass re-embeds the vault.
+
+**Also changing `EMBEDDING_DIMENSIONS`** — one extra wrinkle, because
+`docker compose exec` runs inside the *existing* container and sees the
+environment baked in when that container was created, not your edited
+`.env`. Use a one-off container, which does read the new `.env`:
+
+1. Update `.env`, including `EMBEDDING_DIMENSIONS`.
+2. `docker compose run --rm obsidian-mcp python -m scripts.reset_embeddings`
+3. `make deploy` (or `docker compose up -d --force-recreate`).
+
+Do **not** recreate the container before the reset. The startup
+dimension guard compares the live column width against
+`EMBEDDING_DIMENSIONS` and `sys.exit(1)`s on a mismatch, and a container
+that has exited cannot be `exec`ed into.
 
 You can also use Settings → Danger zone → Reset embeddings in the
 control panel, which performs the same SQL while the server is running
@@ -1021,12 +1040,12 @@ make db-check         alembic check — schema vs. ORM models (must be clean)
 make test-schema      Schema gate: migrations vs. models on a throwaway pgvector container
 make db-backup        Dump database to backups dir
 make db-restore FILE=<path>   Restore from a backup
-make reindex          Trigger a reindex via the API
+make reindex          Explain how to trigger a reindex (panel only; there is no headless trigger)
 make reset-embeddings Drop and recreate embedding column at configured dim
 make rebuild-tsvectors Recompute keyword index for FTS_CONFIGS (no embeddings, no API calls)
 make status           Show container and health status
 make audit            Audit Python dependencies (pip-audit)
-make trivy            Scan the local image for HIGH/CRITICAL CVEs
+make trivy            Scan the local image for HIGH/CRITICAL CVEs (SCAN_IMAGE=obsidian-mcp:local for the bundled stacks)
 make clean            Remove containers and images (data preserved)
 ```
 
