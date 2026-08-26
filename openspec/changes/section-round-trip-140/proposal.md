@@ -43,17 +43,29 @@ zero-divergence envelope forbade — so the contract decision belongs here.
   take the text after the response's first `\n---\n` separator, then drop its
   first line. Both docstrings SHALL say this in those terms.
 - **The envelope SHALL be framed unambiguously, so that rule is safe to
-  follow.** `read_note` interpolates the title, path, tags and frontmatter
-  values into the envelope unsanitized, and a note may legitimately carry a
-  multiline YAML title. Reproduced: frontmatter
-  `title: |-` with a `---` line inside it emits a bare `---` line *above* the
-  real separator, so the documented split lands inside the envelope and the
-  round trip writes `**Path:** \u0060n.md\u0060` into the note — the
-  documentation itself becoming the destructive instruction. Every dynamic
-  envelope value is therefore rendered on a single line (interior line
-  terminators collapsed to spaces), which also repairs the display bug where
-  such a title already breaks the response layout on an ordinary whole-note
-  read. The note body is never sanitized — only the envelope's own fields.
+  follow — stated as an invariant, not a list of fields.** No dynamic component
+  of a successful response's envelope may contain a line terminator, enforced at
+  a single rendering choke point that title, path, tags, frontmatter **keys**
+  and frontmatter values all pass through. The enumeration is what failed twice:
+  audit round 2 found a multiline *title* could forge the separator, round 3
+  found a multiline frontmatter *key* could do it through the
+  `**Frontmatter:**` block. Both are valid YAML. Patching the named field would
+  have invited a third.
+
+  Concretely, before this change: the valid key `"safe\n---\nforged": value` renders as two
+  lines inside the `**Frontmatter:**` block, and the documented extraction then
+  yields `\n---\n# A\nold\n` — which written back clobbers the section. Both
+  reproductions are in the tasks as end-to-end cases, alongside a guard test
+  that names no field at all: no line before the envelope separator may be
+  exactly `---`.
+
+  A component is rendered by stringifying it and collapsing terminators in the
+  *resulting* string, which is deterministic and needs no rule about recursing
+  into composites — `str()` escapes newlines inside a list or dict, so only a
+  bare string component can carry one through. This also repairs the existing
+  display bug where such a title breaks the response layout on an ordinary
+  whole-note read. The note body is never sanitized, and error responses — which
+  carry no envelope and no selected content — are out of scope.
 - **Mechanically:** `_ATX_HEADING_RE`'s trailing whitespace run narrows from
   `\s*` (which crosses line boundaries) to `[^\S\r\n]*` (horizontal only), so a
   heading's `line_end` is genuinely the end of its heading line in every

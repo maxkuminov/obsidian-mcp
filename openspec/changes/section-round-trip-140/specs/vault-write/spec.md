@@ -247,9 +247,12 @@ response's own first line, which is the envelope's `# <title>` and would write
 
 They SHALL further state (a) that a section write **replaces the whole body**,
 so content omitted from `content` — a fenced code block included — is deleted,
-and (b) that byte-identity holds for notes whose body newlines are LF; on a
-CRLF or lone-CR note the round trip preserves content but rewrites the selected
-body's terminators as LF.
+and (b) that byte-identity holds only for notes whose body newlines are LF.
+Every non-LF terminator inside the **selected body** comes back as LF, whether
+the note uses one dialect throughout or mixes them, because the read path
+normalises and the write path rewrites raw bytes; terminators outside the
+selected body are untouched, so a round trip can leave a note with more mixed
+endings than it started with.
 
 #### Scenario: An MCP client can learn the contract from introspection
 

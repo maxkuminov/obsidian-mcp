@@ -58,7 +58,10 @@
 - [ ] 3.3b Pin the declared newline residual at the **tool** level as a test,
       not as prose: reading a CRLF note's section (which arrives LF-normalised)
       and writing it back yields `# A\r\nold\n# B\r\nkeep\r\n`. Assert that
-      exact string, so the residual is visible and cannot drift silently.
+      exact string, so the residual is visible and cannot drift silently. Add a
+      **mixed**-ending case too — the normalisation is per-terminator, not
+      per-note: `# A\r\none\r\ntwo\nthree\r# B\rkeep\r` yields
+      `# A\r\none\ntwo\nthree\n# B\rkeep\r`.
 - [ ] 3.3c Pin that the unmasked-fence shapes (an indented fence, and one
       closed by a longer run) produce **byte-identical** output before and
       after this change. This is the evidence for the "not this change's bug"
@@ -105,11 +108,19 @@
       once a caller is being told to extract from it.
 - [ ] 5.0 Make the response envelope unambiguous in
       `src/mcp_server/tools.py`'s `read_note_impl` **before** documenting the
-      extraction rule: render every interpolated value (title, path, tags, and
-      each frontmatter value) on a single line, collapsing interior line
-      terminators. A multiline YAML title containing a `---` line otherwise
-      emits a bare separator above the real one, and the documented split lands
-      inside the envelope. Do not touch the body.
+      extraction rule. Implement it as **one choke point** — a single helper
+      that stringifies a component and collapses every LF/CRLF/CR in the result
+      to a space — and route *every* interpolated component through it: title,
+      path, each tag, **each frontmatter key**, and each frontmatter value. Do
+      not write this as a list of per-field fixes: two successive audit rounds
+      each found a different field that could forge the separator (round 2 the
+      title, round 3 the key), which is what an enumeration buys you. Do not
+      touch the body.
+- [ ] 5.0b Leave error and end-of-content responses alone — a missing note, an
+      out-of-range `offset`, an unknown section. They carry no envelope and no
+      selected content, so no extraction contract applies; the requirement is
+      scoped to successful enveloped responses and the tests should not assert
+      otherwise.
 - [ ] 5.3 Add an end-to-end exercise against the running server that performs
       the **documented extraction on a real MCP response**, not on the helper's
       return value: call `read_note(path, section=…)`, split on the first
@@ -118,13 +129,22 @@
       it is unchanged. A test that skips the envelope split does not test the
       contract the docstring states. Name in the report which tools were
       actually called.
-- [ ] 5.4 Run that same end-to-end round trip over the two adversarial
-      envelopes, asserting the note is unchanged: (a) a note whose frontmatter
+- [ ] 5.4 Run that same end-to-end round trip over the adversarial envelopes,
+      asserting the note is unchanged in each: (a) a note whose frontmatter
       `title` is a multiline YAML scalar containing a `---` line and markup
       (`title: |-` / `[Project](https://example.invalid)` / `---` /
-      `injected`), and (b) a note whose selected section *body* itself contains
-      a `\n---\n` line. Case (a) fails today and is what task 5.0 fixes; case
-      (b) must already pass, because the real separator comes first.
+      `injected`); (b) a note carrying the valid quoted frontmatter key
+      `"safe\n---\nforged": value`, which forges a separator through the
+      `**Frontmatter:**` block rather than the title; (c) a frontmatter value
+      that is a list or dict with newline-bearing string leaves; and (d) a note
+      whose selected section *body* itself contains a `\n---\n` line. Cases
+      (a)–(c) fail today and are what task 5.0 fixes; case (d) must already
+      pass, because the real separator comes first.
+- [ ] 5.5 Add a guard test that does not name fields: build a response for a
+      note that exercises every envelope component, and assert no line before
+      the envelope separator is exactly `---`. This is the invariant; a future
+      field added to the envelope should fail this test rather than ship a
+      third forgery.
 
 ## 6. Documentation
 

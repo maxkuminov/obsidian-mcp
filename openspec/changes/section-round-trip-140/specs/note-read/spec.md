@@ -89,14 +89,15 @@ line into the note.
 
 ### Requirement: The response envelope SHALL be unambiguously terminated
 
-Every value `read_note` interpolates into a response's envelope SHALL be rendered on a single line, with any interior line terminator replaced by a space. This covers the title, the path, the tags, and each frontmatter value. No dynamic
-envelope value SHALL be able to emit a bare `---` line, so the first `\n---\n`
-in any `read_note` response is always the envelope's own separator.
+No dynamic component interpolated into a successful `read_note` response's envelope SHALL contain a line terminator. This is stated as an invariant over *every* component rather than as a list of fields, and SHALL be enforced at a single rendering choke point that every component passes through — the title, the path, each tag, **each frontmatter key**, and each frontmatter value alike, together with any component added later. Enumerating today's fields is what let two successive audit rounds each find a different field that could forge the separator; the invariant is what closes the class.
 
-This is load-bearing rather than cosmetic: the section round-trip contract
-instructs callers to split on that separator, so a value that can forge one
-turns the documentation into a destructive instruction. The note **body** SHALL
-NOT be sanitized — only the envelope's own fields.
+A component SHALL be rendered by stringifying it and replacing every LF, CRLF, or lone CR in the **resulting string** with a single space. Applying the rule to the rendered string rather than recursively to a composite's leaves is deterministic and needs no normalization order: Python's `str()` of a list or dict escapes interior newlines, so only a bare string component can carry a literal terminator into the envelope.
+
+Consequently the first `\n---\n` in a successful, enveloped response is always the envelope's own separator, which is what makes the section round-trip extraction safe to document.
+
+The guarantee is scoped to **successful responses that carry an envelope**. Error and end-of-content responses — a missing note, an out-of-range `offset`, an unknown section — carry no envelope and no selected content, so no extraction contract applies to them; they are outside this requirement and SHALL NOT be read as promising anything about their `---` lines.
+
+The note **body** SHALL NOT be sanitized — only the envelope's own components.
 
 #### Scenario: A multiline title cannot forge the separator
 
@@ -109,6 +110,24 @@ NOT be sanitized — only the envelope's own fields.
   back leaves the note unchanged — rather than yielding a remainder beginning
   `**Path:**` and clobbering the section
 
+#### Scenario: A multiline frontmatter KEY cannot forge the separator
+
+- **WHEN** a note's frontmatter contains the valid quoted key
+  `"safe\n---\nforged": value` and the client calls
+  `read_note(path, section="#1")`
+- **THEN** the rendered key SHALL occupy one line, so the response contains no
+  `---` line before the envelope separator
+- **AND** the documented extraction SHALL yield the section rather than
+  `\n---\n# A\nold\n`, which written back would clobber the section
+
+#### Scenario: Composite frontmatter values are rendered deterministically
+
+- **WHEN** a frontmatter value is a list or a dict whose string leaves contain
+  newlines, for example `items: ["a\nb"]`
+- **THEN** the component SHALL be stringified first and the terminators
+  collapsed in the resulting string, yielding one line
+- **AND** the rule SHALL NOT depend on recursing into the composite's leaves
+
 #### Scenario: A body containing a separator line is unaffected
 
 - **WHEN** the selected section's body itself contains a `\n---\n` line (a
@@ -120,7 +139,7 @@ NOT be sanitized — only the envelope's own fields.
 
 #### Scenario: The note body is never sanitized
 
-- **WHEN** any `read_note` response is produced
-- **THEN** only envelope fields SHALL have line terminators collapsed
+- **WHEN** a successful enveloped `read_note` response is produced
+- **THEN** only envelope components SHALL have line terminators collapsed
 - **AND** the note content portion SHALL be byte-exact apart from the read
   path's pre-existing universal-newline translation
