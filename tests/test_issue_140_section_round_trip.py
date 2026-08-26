@@ -358,23 +358,42 @@ UNMASKED_FENCE_SHAPES = {
         "# A\n   ```\n# Hidden\nx\n   ```\n# B\nb\n",
         [(1, "A", 0), (1, "Hidden", 11), (1, "B", 29)],
         "# A\nnew\n# Hidden\nx\n   ```\n# B\nb\n",
+        "# A\n# Hidden\nx\n   ```\n# B\nb\n",
     ),
     "longer_closer": (
         "# A\n```\n# Hidden\nx\n`````\n# B\nb\n",
         [(1, "A", 0), (1, "Hidden", 8), (1, "B", 25)],
         "# A\nnew\n# Hidden\nx\n`````\n# B\nb\n",
+        "# A\n# Hidden\nx\n`````\n# B\nb\n",
     ),
 }
 
 
 @pytest.mark.parametrize("name", sorted(UNMASKED_FENCE_SHAPES))
 def test_an_unmasked_fence_behaves_exactly_as_before(name):
-    text, expected_headings, expected_write = UNMASKED_FENCE_SHAPES[name]
+    text, expected_headings, expected_write, _ = UNMASKED_FENCE_SHAPES[name]
     observed = [(h["depth"], h["text"], h["line_start"]) for h in _scan_headings(text)]
     assert observed == expected_headings
     new_text, err = replace_section(text, "#1", "new")
     assert err is None
     assert new_text == expected_write
+
+
+@pytest.mark.parametrize("name", sorted(UNMASKED_FENCE_SHAPES))
+def test_an_unmasked_fence_diverges_only_by_the_dropped_separator(name):
+    """The one intended divergence on these shapes.
+
+    The "identical to before" claim holds for a NON-empty replacement body; an
+    empty one picks up the separator-conditionality rule like everywhere else,
+    so the result differs from the pre-change tree by exactly the blank line
+    that rule no longer inserts. Pre-change this wrote `# A\n\n# Hidden…`.
+    A removal, not a loss — pinned so the distinction cannot drift into an
+    unqualified claim again.
+    """
+    text, _, _, expected_empty = UNMASKED_FENCE_SHAPES[name]
+    new_text, err = replace_section(text, "#1", "")
+    assert err is None
+    assert new_text == expected_empty
 
 
 # ── 2.1b/spec scenarios: the empty body ─────────────────────────────────────

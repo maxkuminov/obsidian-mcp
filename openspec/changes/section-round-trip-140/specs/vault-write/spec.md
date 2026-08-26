@@ -133,8 +133,12 @@ scans there.
   opener — shapes `_FENCE_RE` does not currently mask — so that a heading
   inside it is visible to the scanner
 - **THEN** this requirement's fenced-code guarantees SHALL NOT be read as
-  covering it, and the behaviour SHALL be identical to the behaviour before
-  this change (verified, not assumed)
+  covering it, and for a **non-empty** replacement body the bytes written SHALL
+  be identical to the bytes written before this change (verified, not assumed)
+- **AND** for an **empty** replacement body the separator-conditionality rule
+  above applies here as everywhere else, so the result differs from before this
+  change by the one blank line that rule stops inserting — a removal, not a
+  loss, and the only intended divergence on these shapes
 - **AND** the gap SHALL be recorded as a declared residual with its own
   tracking issue, because widening the masker re-addresses `#N` ordinals on
   existing notes and is a larger compat break than this change
