@@ -42,6 +42,18 @@ zero-divergence envelope forbade — so the contract decision belongs here.
   spec used — would write `**Path:** \u0060…\u0060` into the note. The rule is:
   take the text after the response's first `\n---\n` separator, then drop its
   first line. Both docstrings SHALL say this in those terms.
+- **The envelope SHALL be framed unambiguously, so that rule is safe to
+  follow.** `read_note` interpolates the title, path, tags and frontmatter
+  values into the envelope unsanitized, and a note may legitimately carry a
+  multiline YAML title. Reproduced: frontmatter
+  `title: |-` with a `---` line inside it emits a bare `---` line *above* the
+  real separator, so the documented split lands inside the envelope and the
+  round trip writes `**Path:** \u0060n.md\u0060` into the note — the
+  documentation itself becoming the destructive instruction. Every dynamic
+  envelope value is therefore rendered on a single line (interior line
+  terminators collapsed to spaces), which also repairs the display bug where
+  such a title already breaks the response layout on an ordinary whole-note
+  read. The note body is never sanitized — only the envelope's own fields.
 - **Mechanically:** `_ATX_HEADING_RE`'s trailing whitespace run narrows from
   `\s*` (which crosses line boundaries) to `[^\S\r\n]*` (horizontal only), so a
   heading's `line_end` is genuinely the end of its heading line in every
@@ -73,8 +85,10 @@ zero-divergence envelope forbade — so the contract decision belongs here.
     both the docstrings and `vault-tools.md` must say so in those words.
 - Docstrings at both layers — the registered wrappers in `server.py` (what MCP
   clients see) and the `tools.py` impls — state the round-trip contract in the
-  terms callers need: *the section response minus its first line is exactly
-  what `edit_note(section=…)` takes*.
+  terms callers need: *take the text after the section response's `\n---\n`
+  envelope separator, drop its first line, and that is exactly what
+  `edit_note(section=…)` takes*. They SHALL NOT say "the response minus its
+  first line" — the response's first line is the envelope's `# <title>`.
 - `docs/architecture/vault-tools.md` is updated in the same change: its
   "the trailing run stays the original `\s*` … narrowing it would change the
   bytes `edit_note(section=…)` writes on ordinary LF notes" note is now the
@@ -101,7 +115,10 @@ zero-divergence envelope forbade — so the contract decision belongs here.
   non-empty body. `_scan_headings`, `_section_body_span`, `extract_section`,
   `replace_section` and `outline_sections` keep their signatures and their
   roles.
-- `src/mcp_server/server.py` and `src/mcp_server/tools.py` — docstrings only.
+- `src/mcp_server/tools.py` — `read_note_impl`'s envelope construction, so no
+  interpolated field can emit a bare `\n---\n` line; plus `edit_note`'s and
+  `read_note`'s docstrings. `src/mcp_server/server.py` — the registered
+  wrappers' docstrings, which must carry the same statements.
 - `docs/architecture/vault-tools.md` — the section-addressing section.
 - **No schema change, no migration, no index effect.** `outline_sections`'
   reported `size` is `body_end - line_start`; this change moves neither

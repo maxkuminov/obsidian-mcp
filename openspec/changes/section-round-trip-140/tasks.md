@@ -103,6 +103,13 @@
       `read_note`'s docstring in both layers too — it currently says a section
       response "includes the heading line", which is true but insufficient
       once a caller is being told to extract from it.
+- [ ] 5.0 Make the response envelope unambiguous in
+      `src/mcp_server/tools.py`'s `read_note_impl` **before** documenting the
+      extraction rule: render every interpolated value (title, path, tags, and
+      each frontmatter value) on a single line, collapsing interior line
+      terminators. A multiline YAML title containing a `---` line otherwise
+      emits a bare separator above the real one, and the documented split lands
+      inside the envelope. Do not touch the body.
 - [ ] 5.3 Add an end-to-end exercise against the running server that performs
       the **documented extraction on a real MCP response**, not on the helper's
       return value: call `read_note(path, section=…)`, split on the first
@@ -111,6 +118,13 @@
       it is unchanged. A test that skips the envelope split does not test the
       contract the docstring states. Name in the report which tools were
       actually called.
+- [ ] 5.4 Run that same end-to-end round trip over the two adversarial
+      envelopes, asserting the note is unchanged: (a) a note whose frontmatter
+      `title` is a multiline YAML scalar containing a `---` line and markup
+      (`title: |-` / `[Project](https://example.invalid)` / `---` /
+      `injected`), and (b) a note whose selected section *body* itself contains
+      a `\n---\n` line. Case (a) fails today and is what task 5.0 fixes; case
+      (b) must already pass, because the real separator comes first.
 
 ## 6. Documentation
 
@@ -120,8 +134,17 @@
       must record what changed, when, and why, and it must state the new
       body-start rule as the load-bearing invariant.
 - [ ] 6.2 State the declared compat break there in the terms a future reader
-      needs: a section write no longer preserves a blank line the caller did
-      not send.
+      needs, and state the *whole* of it — not just the blank line. A section
+      write replaces the entire body, so content the caller omits is deleted.
+      Include the concrete fenced-block example: on
+      `# A\n\u0060\u0060\u0060\nimportant\n\u0060\u0060\u0060\nold\n`,
+      `edit_note(section="A", content="new")` now yields `# A\nnew\n`. A
+      reader who learns only about the blank line will not predict that.
+- [ ] 6.3 Record the envelope-framing rule beside the section-addressing
+      material: why the `\n---\n` separator is load-bearing for the round-trip
+      contract, and why every interpolated envelope value must stay
+      single-line. This is the "do not undo it" note for a future refactor that
+      restores a raw multiline title.
 
 ## 7. Residuals and follow-ups
 
