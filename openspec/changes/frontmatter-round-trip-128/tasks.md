@@ -24,6 +24,46 @@
 - [x] 4.3 Docstrings updated at both layers.
 - [x] 4.4 Tests: three defect classes refused with nothing written (incl. `null`/`~`/comment-only); empty-block update works (empty and non-empty bodies); last-key removal leaves exactly the prior body; absent-fence prepend unchanged.
 
+## 6. Terminator rule and its compatibility envelope (adversarial rounds 2–3)
+
+- [x] 6.1 One terminator rule — LF, CRLF or a lone CR — across the frontmatter
+  partition, the ATX heading scan AND the fenced/inline code masker the scan
+  runs on (`src/services/links.py`). The read path normalizes before parsing,
+  so every one of these diverged from `read_note` on a lone-CR note: the block
+  was deleted by full-replace, `set_frontmatter` prepended a second one, a
+  heading inside a `~~~` block became selectable on the write side only (its
+  replacement then deleting the closing fence), and inline code joined two
+  lines and hid a real heading. CRLF is matched ahead of the bare CR
+  everywhere, so a terminator is never split down the middle.
+- [x] 6.2 **The rewrite must not narrow a `\s`.** The heading separator is
+  `[^\S\r\n]+` — all whitespace except the three terminators — not `[ \t]+`:
+  an LF-only note whose marker is followed by an NBSP would otherwise lose that
+  heading, shifting names and `#N` ordinals on existing vaults. The heading's
+  TRAILING run keeps the original `\s*` unnarrowed, line-crossing included,
+  because `_section_body_span` compensates for it and it decides where a
+  replaced section's body begins; likewise the closing code fence keeps `\s*`.
+  Only `$` is generalized, to "before any terminator, or end".
+- [x] 6.3 Differential: 45,630 LF/CRLF inputs (Unicode-whitespace headings —
+  NBSP, thin, ideographic, VT, FF — code fences, blank-line runs, frontmatter
+  present and absent, with and without a trailing terminator) over
+  `mask_code`, `parse_frontmatter`, `outline_sections` (names, ordinals,
+  sizes), `extract_links` (targets and byte offsets), `extract_section` and
+  `replace_section`. **0 divergences in every category**, plus an assertion
+  that masking never changes the string's length — the masker must stay
+  offset-stable, since heading positions and link offsets index the unmasked
+  text.
+- [x] 6.4 `_same_frontmatter_value` memoizes visited `(id(a), id(b))` container
+  pairs, treating a revisited pair as equal. A recursive YAML alias
+  (`a: &A [*A]`) is valid input that `safe_load` returns as a self-referencing
+  list, and the net-change comparison walks it — so even a remove-of-nothing
+  raised `RecursionError`. Sound because `all()` short-circuits: an unequal
+  pair propagates out before anything can revisit it.
+- [x] 6.5 Tests: read-vs-write heading parity over CR-delimited `~~~` and
+  backtick fences and over inline-code over-reach; a heading inside a CR fence
+  unselectable with the fence intact; mask length stability; a
+  Unicode-whitespace heading still addressable on an LF note; the
+  recursive-alias no-op returning "No changes" with the file untouched.
+
 ## 5. Gates
 
 - [x] 5.1 `.venv/bin/python -m pytest -q tests/` green.

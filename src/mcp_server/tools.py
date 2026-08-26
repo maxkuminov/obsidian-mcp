@@ -2635,7 +2635,7 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
 # ────────────────────────────────────────────────────────────────────────────
 
 
-def _same_frontmatter_value(current, proposed) -> bool:
+def _same_frontmatter_value(current, proposed, _seen: set | None = None) -> bool:
     """Type-sensitive structural equality for one frontmatter value.
 
     `set_frontmatter` writes only when something actually changed, and the
@@ -2662,23 +2662,39 @@ def _same_frontmatter_value(current, proposed) -> bool:
     with `sort_keys=False`, so key order is part of the note's bytes: a
     reordered mapping that compared equal would be reported as no change while
     the order the caller asked for was silently dropped.
+
+    `_seen` carries the container pairs already being compared, so a note whose
+    YAML uses a recursive alias (`a: &A [*A]` — valid YAML that `safe_load`
+    accepts and returns as a self-referencing list) is answered instead of
+    raising `RecursionError`. A revisited pair is treated as equal, which is
+    sound because `all()` short-circuits: a pair that already finished
+    comparing UNequal has propagated that out before anything can revisit it.
     """
+    if _seen is None:
+        _seen = set()
     if type(current) is not type(proposed):
         return False
     if isinstance(current, float):
         return current.hex() == proposed.hex()
+    if isinstance(current, (dict, list, tuple)):
+        pair = (id(current), id(proposed))
+        if pair in _seen:
+            return True
+        _seen.add(pair)
     if isinstance(current, dict):
         if len(current) != len(proposed):
             return False
         return all(
-            _same_frontmatter_value(ck, pk) and _same_frontmatter_value(cv, pv)
+            _same_frontmatter_value(ck, pk, _seen)
+            and _same_frontmatter_value(cv, pv, _seen)
             for (ck, cv), (pk, pv) in zip(current.items(), proposed.items())
         )
     if isinstance(current, (list, tuple)):
         if len(current) != len(proposed):
             return False
         return all(
-            _same_frontmatter_value(a, b) for a, b in zip(current, proposed)
+            _same_frontmatter_value(a, b, _seen)
+            for a, b in zip(current, proposed)
         )
     return current == proposed
 

@@ -258,3 +258,111 @@ def test_a_defective_lone_cr_block_refuses_a_section_write(vault):
     assert "malformed frontmatter block" in result
     assert "not a mapping" in result
     assert read(vault, "n.md") == original
+
+
+# ── code masking obeys the same terminator rule as everything else ──────────
+#
+# The masker feeds the heading scanner, and it was LF-only. On a lone-CR note
+# that diverged in BOTH directions against `read_note`, which sees the same
+# file through universal-newline translation:
+#
+#   * a `~~~`-fenced block was never masked, so a heading INSIDE code was
+#     selectable by `edit_note(section=…)` while `read_note` hid it — and the
+#     replacement span then ran through the closing fence and deleted it;
+#   * inline code, whose class ran happily across `\r`, joined two lines and
+#     masked a REAL heading that `read_note` could see.
+
+
+def _write_side(text):
+    from src.services.vault import _scan_headings
+    return [(h["depth"], h["text"]) for h in _scan_headings(text)]
+
+
+def _read_side(text):
+    """What `read_note` scans: the same bytes after universal-newline
+    translation, which is what `Path.read_text` hands the read path."""
+    from src.services.vault import _scan_headings
+    return [(h["depth"], h["text"]) for h in _scan_headings(text.replace("\r", "\n"))]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # Tilde fence: never masked on the raw side, so `## Hidden` was a
+        # selectable heading on write and invisible on read.
+        "~~~\r## Hidden\r~~~\r## Real\rold\r## Next\rkeep\r",
+        "~~~~\r## Hidden\r~~~~\r## Real\rold\r",
+        # Backtick fences, including one carrying an info string.
+        "```\r## Hidden\r```\r## Real\rold\r## Next\rkeep\r",
+        "```py\r## Hidden\r```\r## Real\rold\r",
+        # Inline code over-reach: an odd backtick on one CR line paired with
+        # one on a later line, masking `## Real` on the write side only.
+        "a ` b\r## Real\rc ` d\r## Next\rx\r",
+    ],
+)
+def test_read_and_write_agree_about_headings_inside_cr_code(body):
+    assert _write_side(body) == _read_side(body)
+
+
+def test_a_heading_inside_a_cr_fenced_block_is_not_selectable(vault):
+    """The BLOCKER in tool terms: `#1` must mean the same section to both
+    tools, and a section write must never reach inside a code fence."""
+    original = (
+        "---\rtitle: T\r---\r```\r## Hidden\r```\r## Real\rold\r## Next\rkeep\r"
+    )
+    write(vault, "n.md", original)
+
+    extracted = asyncio.run(tools.read_note_impl("n.md", section="#1"))
+    assert "## Real" in extracted
+    assert "## Hidden" not in extracted
+
+    asyncio.run(tools.edit_note_impl("n.md", "new\n", section="#1"))
+    after = read(vault, "n.md")
+    # `#1` resolved to `Real` on the write side too, and the code fence — both
+    # of its delimiters and the heading inside it — is untouched.
+    assert after == (
+        "---\rtitle: T\r---\r```\r## Hidden\r```\r## Real\rnew\n## Next\rkeep\r"
+    )
+    assert after.count("```") == 2
+    assert "## Hidden" in after
+
+
+def test_a_cr_fenced_block_is_masked_without_moving_offsets(vault):
+    """The masker must stay offset-stable — `_scan_headings` reports positions
+    into the UNMASKED text and `extract_links` records byte offsets against
+    the original."""
+    from src.services.links import mask_code
+
+    for text in [
+        "~~~\r## Hidden\r~~~\r## Real\rold\r",
+        "```\r## Hidden\r```\r## Real\rold\r",
+        "a ` b\r## Real\rc ` d\r",
+        "~~~\n## Hidden\n~~~\n## Real\nold\n",
+    ]:
+        assert len(mask_code(text)) == len(text)
+
+
+def test_a_unicode_space_heading_survives_on_an_lf_note(vault):
+    """The separator class is "all whitespace except the three terminators".
+    An earlier CR-aware draft used `[ \\t]`, which dropped every heading
+    separated by a non-ASCII space — shifting names and `#N` ordinals on
+    existing LF-only vaults."""
+    nbsp, thin, ideo = " ", " ", "　"
+    # Siblings at one depth, so replacing the middle one bounds cleanly.
+    original = (
+        f"##{nbsp}Legacy\nalpha\n"
+        f"##{thin}Thin\nbeta\n"
+        f"##{ideo}Ideo\ngamma\n"
+    )
+    write(vault, "n.md", original)
+    assert _write_side(original) == [(2, "Legacy"), (2, "Thin"), (2, "Ideo")]
+    # ...and the ordinals an agent is told to rely on still address them.
+    assert _write_side(original) == _read_side(original)
+
+    result = asyncio.run(tools.edit_note_impl("n.md", "BETA\n", section="Thin"))
+    assert "Updated note" in result
+    assert read(vault, "n.md") == (
+        f"##{nbsp}Legacy\nalpha\n"
+        f"##{thin}Thin\nBETA\n"
+        f"##{ideo}Ideo\ngamma\n"
+    )

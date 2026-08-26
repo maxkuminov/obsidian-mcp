@@ -105,6 +105,15 @@ actionable error and SHALL NOT mutate the file.
 - **AND** `set_frontmatter` SHALL update such a block rather than
   prepending a second one above it, and SHALL refuse it by name when it
   is defective
+- **AND** the fenced/inline code masking that heading resolution runs on
+  SHALL use the same terminator rule, so a heading inside a code block is
+  hidden from `edit_note(section=…)` exactly as it is from
+  `read_note(section=…)` — otherwise a selector resolves inside code on
+  the write side only, and the replacement deletes the closing fence
+- **AND** widening the terminator rule SHALL NOT narrow which characters
+  separate a heading's `#` marker from its text: every whitespace
+  character except the three terminators still separates them, so no
+  heading present on an existing note loses its name or its `#N` ordinal
 
 #### Scenario: The composed result meets the cap and conflict checks
 

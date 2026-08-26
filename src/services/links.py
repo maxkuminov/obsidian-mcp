@@ -44,17 +44,44 @@ _MDLINK_RE = re.compile(
     r"|(?P<href>[^)\n]+?\.md)(?:#[^)\n]*)?)\)"
 )
 
-# Fenced code blocks (``` or ~~~) — match the whole fence including newlines.
-_FENCE_RE = re.compile(r"(?ms)^([`~]{3,})[^\n]*\n.*?^\1\s*$")
-# Inline code: backtick-delimited runs that don't span newlines.
-_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
+# A line ends at LF, CRLF or a lone CR, the same universal-newline rule
+# `read_file` applies before the read path ever parses a note and the same one
+# the frontmatter partition and the ATX heading scan use. `(?m)^...$` knows
+# only `\n`, and this masker feeds the heading scanner, so on a lone-CR note it
+# diverged in BOTH directions: a `~~~`-fenced block was never masked, leaving a
+# heading inside code selectable by `edit_note(section=…)` while `read_note`
+# (which sees the same file normalised) hid it — a section write there replaces
+# through the closing fence and deletes it — and inline code, whose `[^`\n]*`
+# ran happily across `\r`, joined two lines and masked a REAL heading the read
+# side could see. CRLF is matched ahead of the bare `\r` so a terminator is
+# never split down the middle.
+_LINE_BREAK = r"(?:\r\n|\n|\r)"
+_AT_LINE_START = r"(?:\A|(?<=\n)|(?<=\r))"
+# Fenced code blocks (``` or ~~~) — the whole block, terminators included.
+#
+# The closing fence keeps the original `\s*` (NOT a horizontal-only class):
+# `\s` matches Unicode whitespace, and greedily running it up to the last
+# position a line can end at is what the original `\s*$` did. Narrowing it
+# would change which trailing blank lines fall inside the mask on LF and CRLF
+# notes, and a heading's `#N` ordinal is exactly what shifts when masking
+# changes — the compat break this rewrite must not introduce. Generalising `$`
+# to "before any terminator, or end" reproduces it byte for byte on LF and
+# CRLF while making it work at all on a lone-CR note.
+_FENCE_RE = re.compile(
+    rf"(?s){_AT_LINE_START}([`~]{{3,}})[^\r\n]*{_LINE_BREAK}"
+    rf".*?{_AT_LINE_START}\1\s*(?={_LINE_BREAK}|\Z)"
+)
+# Inline code: backtick-delimited runs that don't span a line, in any dialect.
+_INLINE_CODE_RE = re.compile(r"`[^`\r\n]*`")
 
 
 def _mask_code(text: str) -> str:
     """Replace fenced/inline code with same-length whitespace.
 
     Preserves byte offsets so `position` values in `ExtractedLink` are valid
-    against the original content (useful for snippet extraction later).
+    against the original content (useful for snippet extraction later), and so
+    `_scan_headings` can report positions into the unmasked text. Every
+    substitution is exactly as long as what it replaces.
     """
     def _spaces(match: re.Match) -> str:
         return " " * (match.end() - match.start())

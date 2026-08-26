@@ -445,3 +445,57 @@ def test_a_defective_lone_cr_block_is_refused(vault, original, defect):
     assert "malformed frontmatter block" in result
     assert defect in result
     assert read(vault, "n.md") == original
+
+
+# ── recursive YAML aliases ──────────────────────────────────────────────────
+
+
+def test_a_recursive_alias_no_op_does_not_raise(vault):
+    """`a: &A [*A]` is valid YAML, and `safe_load` returns a genuinely
+    self-referencing list. The net-change comparison walks the mapping, so
+    without cycle detection even a remove-of-nothing died with a
+    RecursionError — failing closed, but regressing input the parser accepts."""
+    original = "---\na: &A [*A]\n---\nbody\n"
+    write(vault, "n.md", original)
+    result = asyncio.run(
+        tools.set_frontmatter_impl("n.md", updates={}, remove=["absent"])
+    )
+    assert "No changes" in result
+    assert read(vault, "n.md") == original
+
+
+def test_a_recursive_alias_update_to_the_same_value_is_a_no_op(vault):
+    original = "---\na: &A [*A]\nstatus: draft\n---\nbody\n"
+    write(vault, "n.md", original)
+    result = asyncio.run(
+        tools.set_frontmatter_impl("n.md", updates={"status": "draft"})
+    )
+    assert "No changes" in result
+    assert read(vault, "n.md") == original
+
+
+def test_a_recursive_alias_note_still_accepts_a_real_change(vault):
+    """Cycle detection must answer the comparison, not short-circuit the
+    tool: a genuine change on such a note still writes."""
+    write(vault, "n.md", "---\na: &A [*A]\nstatus: draft\n---\nbody\n")
+    result = asyncio.run(
+        tools.set_frontmatter_impl("n.md", updates={"status": "done"})
+    )
+    assert "set: status" in result
+    assert "status: done" in read(vault, "n.md")
+
+
+def test_the_comparison_itself_terminates_on_self_referencing_input():
+    import copy
+    import yaml
+
+    fm = yaml.safe_load("a: &A [*A]\n")
+    assert fm["a"][0] is fm["a"]          # genuinely cyclic
+    assert tools._same_frontmatter_value(copy.deepcopy(fm), fm) is True
+    assert tools._same_frontmatter_value(fm, fm) is True
+    # A revisited pair is treated as equal, which is sound because `all()`
+    # short-circuits — an unequal pair propagates out before anything can
+    # revisit it. So a real difference beside a cycle is still detected.
+    other = yaml.safe_load("a: &A [*A]\n")
+    other["b"] = 1
+    assert tools._same_frontmatter_value(fm, other) is False

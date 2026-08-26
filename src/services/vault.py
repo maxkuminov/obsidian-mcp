@@ -2800,7 +2800,22 @@ def serialize_frontmatter(meta: dict, body: str) -> str:
 # rule has to match the partition's, and both have to match the universal
 # newlines `read_note` resolves the same file through.
 _ATX_HEADING_RE = re.compile(
-    r"(?:\A|(?<=\n)|(?<=\r))(#{1,6})[ \t]+([^\r\n]+?)[ \t]*(?=\r|\n|\Z)"
+    # Two whitespace classes, and the difference between them is deliberate.
+    #
+    # The SEPARATOR is `[^\S\r\n]+` — all whitespace except the three line
+    # terminators. The first CR-aware draft used `[ \t]`, which quietly
+    # narrowed the original `\s+` and dropped every heading separated by a
+    # non-ASCII space: an LF-only note whose marker is followed by an NBSP
+    # lost its heading, so names and `#N` ordinals shifted on existing vaults.
+    #
+    # The TRAILING run stays the original `\s*`, unnarrowed and still allowed
+    # to cross line boundaries. `_section_body_span` compensates for that, and
+    # it is what decides where a replaced section's body BEGINS — narrowing it
+    # would change the bytes `edit_note(section=…)` writes for ordinary LF
+    # notes. Generalising the old `$` to "before any terminator, or end" is
+    # what makes the whole pattern work on a lone-CR note while leaving LF and
+    # CRLF byte-for-byte alone.
+    r"(?:\A|(?<=\n)|(?<=\r))(#{1,6})[^\S\r\n]+([^\r\n]+?)\s*(?=\r|\n|\Z)"
 )
 
 

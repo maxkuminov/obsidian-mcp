@@ -1110,7 +1110,12 @@ Destructive and silently-wrong writes, the class this product ranks highest.
   through `float.hex()`, which is exact for finite values and renders every NaN
   as `'nan'` (two NaNs are therefore the same value — YAML round-trips both to
   `.nan`). Mappings compare in order, because `safe_dump` runs with
-  `sort_keys=False` and key order is part of the note's bytes.
+  `sort_keys=False` and key order is part of the note's bytes. The walk
+  memoizes visited `(id(a), id(b))` container pairs and treats a revisit as
+  equal — a recursive YAML alias (`a: &A [*A]`) is valid input that
+  `safe_load` returns as a self-referencing list, and without that even a
+  remove-of-nothing raised `RecursionError`. Sound because `all()`
+  short-circuits: an unequal pair propagates out before anything revisits it.
 - **One partition, shared by read and write.** `parse_frontmatter` and
   `parse_frontmatter_diagnose` both call `_partition_frontmatter`, so a block
   `read_note` strips can never be diagnosed differently by a tool about to
@@ -1131,9 +1136,28 @@ Destructive and silently-wrong writes, the class this product ranks highest.
   single heading running to EOF. `(?m)^…$` cannot express either rule in
   Python; both use explicit `(?:\A|(?<=\n)|(?<=\r))` / `(?=\r|\n|\Z)`
   boundaries, and CRLF is always matched before the bare CR alternative so a
-  terminator is never split down the middle. The two must move together: fixing
-  the partition alone turns section mode's safe "no ATX headings" refusal on
-  such a note into a write against a bogus heading.
+  terminator is never split down the middle. **All three must move together** —
+  the partition, the heading scan, and the fenced/inline code masker the scan
+  runs on (`src/services/links.py`): fixing the partition alone turns section
+  mode's safe "no ATX headings" refusal into a write against a bogus heading,
+  and leaving the masker behind lets a heading inside a `~~~` block be selected
+  on the write side while `read_note` hides it — the replacement then deleting
+  the closing fence — while inline code, whose class ran across `\r`, joined
+  two lines and masked a *real* heading. The masker is offset-stable by
+  contract: every substitution is exactly as long as what it replaces, because
+  heading positions and `ExtractedLink.position` index the unmasked text.
+- **Widening the terminator rule must never narrow a `\s`.** The heading
+  separator is `[^\S\r\n]+` — all whitespace except the three terminators —
+  because `[ \t]+` drops a heading whose marker is followed by an NBSP, and a
+  dropped heading shifts every later `#N` ordinal on an existing vault. The
+  heading's *trailing* run and the closing code fence keep the original `\s*`,
+  line-crossing included: `_section_body_span` compensates for it and it is
+  what decides where a replaced section's body begins, so narrowing it would
+  change the bytes `edit_note(section=…)` writes on ordinary LF notes. Only
+  `$` is generalized, to "before any terminator, or end". A 45,630-input
+  LF/CRLF differential over masking, parsing, outlines, links, extraction and
+  replacement holds at **0 divergences**; that is the compatibility envelope,
+  and it is what any future change to these patterns has to re-establish.
 - **Declared staleness.** Notes already indexed under the old empty-block
   partition (the block surfacing as literal body text, and `note_links.position`
   measured against it) do not self-heal on an ordinary pass — change detection
