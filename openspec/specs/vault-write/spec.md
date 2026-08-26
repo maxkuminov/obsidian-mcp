@@ -405,10 +405,32 @@ without `find` SHALL be ignored (no error).
 ### Requirement: Section mode replaces the body under a named heading
 
 When `section=<heading>` is supplied, `edit_note` SHALL locate the matching
-ATX heading (1–6 `#` characters) and SHALL replace the lines between that
-heading and the next heading of equal-or-shallower depth (or end of file)
-with the supplied `content`. The matched heading line itself SHALL NOT be
-removed or rewritten.
+ATX heading (1–6 `#` characters) and SHALL replace that heading's **body** with
+the supplied `content`. The matched heading line itself SHALL NOT be removed or
+rewritten.
+
+A section's body SHALL begin at the first byte of the line immediately
+following the heading line, and SHALL end immediately before the next heading of
+equal-or-shallower depth, or at end of file. At most one line terminator (LF,
+CRLF as a unit, or a lone CR) separates the heading line from the body; a
+heading at end of file with no trailing terminator has an empty body. No
+whitespace, blank line, or fenced code block — as recognised by the shared code
+masker — between the heading line and the next heading of equal-or-shallower
+depth SHALL be excluded from the body: a section has no third region between
+its heading line and its body.
+
+A separator newline SHALL be inserted around the replacement only when the
+replacement body is **non-empty**: one before it when the retained prefix does
+not already end in a terminator (an end-of-file heading), and one after it when
+a following heading would otherwise be glued to it. Replacing an empty body
+with an empty body SHALL leave the note byte-identical — an unconditional
+separator makes a section with no body grow a blank line on every round trip,
+and makes an unterminated end-of-file heading grow a newline.
+
+Because a section write replaces the whole body, content the caller does not
+resend is **deleted**, fenced code blocks included. This is the contract, not
+an accident; it SHALL be stated in the caller-visible documentation in those
+terms.
 
 The selector SHALL accept three forms:
 
@@ -433,6 +455,11 @@ The same selector grammar SHALL be used by every tool that accepts a `section`
 argument, so a selector that names a section for reading names the same section
 for writing.
 
+Narrowing the body's start to the line after the heading line SHALL NOT change
+which heading any selector resolves to. Heading depth, trimmed heading text,
+document order, and therefore every `#N` ordinal SHALL be unchanged by this
+requirement.
+
 When the note carries a valid line-1 frontmatter block, heading resolution
 (all three selector forms), body replacement, and the not-found/ambiguity
 listings SHALL operate on the frontmatter-stripped body — the same text
@@ -447,6 +474,95 @@ the raw bytes, where a `#` line inside the broken block could be selected
 and a replacement could delete the closing fence. A note with no fence at
 all resolves over its raw content, which is identical to what `read_note`
 scans there.
+
+#### Scenario: A section round trip is byte-identical
+
+- **WHEN** the selected content of a **complete, unwindowed** section read for
+  `<sel>` (`offset=0`, no `[TRUNCATED]` notice) is stripped of its heading line
+  and its terminator, and the remainder is passed back as
+  `edit_note(path, content=<remainder>, section=<sel>)`, on a note whose body
+  newlines are LF and whose line-1 frontmatter is absent or valid — the notes
+  for which a section write is admitted at all
+- **THEN** the resulting file SHALL be byte-identical to the original
+- **AND** this SHALL hold for every `#N` ordinal in the note, including
+  sections whose body begins with a blank line, sections whose body begins
+  with a fenced code block, sections with an empty body, and the final
+  section of the note
+- **AND** the guarantee SHALL be verified against the shared section helpers,
+  which operate on note text; recovering the selected content from a rendered
+  response is not part of this contract and is tracked separately
+- **AND** it SHALL NOT extend to a windowed or truncated section response —
+  writing such a window back replaces the whole body with the fragment and
+  deletes the remainder, exactly as the note-read requirement already warns
+- **AND** it SHALL NOT be read as weakening the refusal on a defective
+  frontmatter block: such a note remains readable by section and refused for
+  section writes, and the refusal takes precedence over the round trip
+
+#### Scenario: An empty section survives a round trip
+
+- **WHEN** a note is `# A\n# B\nb\n` (the first section has no body) and
+  the client calls `edit_note(path, "", section="#1")`
+- **THEN** the resulting note SHALL be `# A\n# B\nb\n`, unchanged — no
+  separator newline SHALL be inserted for an empty body
+- **AND** on the note `# A` (a heading at end of file with no trailing
+  terminator), the same call SHALL leave the note as `# A`
+
+#### Scenario: A non-empty body is still separated from what surrounds it
+
+- **WHEN** the client calls `edit_note(path, "- item", section="Notes")` on
+  a note whose `# Notes` heading is the last line and carries no trailing
+  newline
+- **THEN** the heading SHALL NOT be glued to the content: the result SHALL
+  be `# Notes\n- item`
+- **AND** when a following heading exists, a terminator SHALL be ensured
+  between the new body and that heading
+
+#### Scenario: A fenced block under a heading is replaced, not duplicated
+
+- **WHEN** a note is `# A\n` followed by a fenced code block recognised by
+  the shared masker (whose content may itself contain `#`-prefixed lines)
+  followed by `# B\nb\n`, and the client calls
+  `edit_note(path, "new", section="#1")`
+- **THEN** the fenced block SHALL be replaced by `new`
+- **AND** the resulting note SHALL contain the fence exactly zero further
+  times — it SHALL NOT be retained with `new` inserted after it
+- **AND** the caller-visible documentation SHALL state that this is a
+  deletion: a `content` that does not resend the block loses it
+
+#### Scenario: A fence the masker does not recognise is out of scope, not covered
+
+- **WHEN** a fence is indented, or is closed by a run longer than its
+  opener — shapes `_FENCE_RE` does not currently mask — so that a heading
+  inside it is visible to the scanner
+- **THEN** this requirement's fenced-code guarantees SHALL NOT be read as
+  covering it, and for a **non-empty** replacement body the bytes written SHALL
+  be identical to the bytes written before this change (verified, not assumed)
+- **AND** for an **empty** replacement body the separator-conditionality rule
+  above applies here as everywhere else, so the result differs from before this
+  change by the one blank line that rule stops inserting — a removal, not a
+  loss, and the only intended divergence on these shapes
+- **AND** the gap SHALL be recorded as a declared residual with its own
+  tracking issue, because widening the masker re-addresses `#N` ordinals on
+  existing notes and is a larger compat break than this change
+
+#### Scenario: A blank line after a heading belongs to the body
+
+- **WHEN** a note is `# A\n\nold\n# B\nb\n` and the client calls
+  `edit_note(path, "new", section="#1")`
+- **THEN** the resulting note SHALL be `# A\nnew\n# B\nb\n` — the blank
+  line is part of the replaced body, and a caller that wants it back
+  SHALL include it in `content`
+- **AND** repeating the read-strip-write round trip on the original note
+  any number of times SHALL NOT change the file
+
+#### Scenario: Trailing spaces on a heading line stay on the heading line
+
+- **WHEN** a heading line carries trailing horizontal whitespace (spaces,
+  tabs, or a non-ASCII space) before its terminator
+- **THEN** that whitespace SHALL remain part of the heading line and SHALL
+  NOT become part of the body
+- **AND** the heading's trimmed text, and therefore its addressability by
+  the exact-text and path-style selectors, SHALL be unchanged
 
 #### Scenario: A YAML comment in frontmatter is not a heading
 
@@ -1422,4 +1538,43 @@ The note path's named-staging fallback SHALL classify `EXDEV` from its publishin
 
 - **WHEN** the named-fallback overwrite publish's replacing rename fails with `EXDEV`
 - **THEN** the raised error SHALL be the classified refusal — not a bare `OSError`, and not a mount-boundary claim unless the mount comparison supports one
+
+### Requirement: Section-mode docstrings state the round-trip contract
+
+Both layers' `edit_note` docstrings SHALL state that in section mode `content` is the section's **body only** — the registered wrapper in `server.py` (what an MCP client sees) and the implementation in `tools.py` alike. The body is the text a
+`read_note(section=…)` response carries *below* its heading line, beginning on
+the line immediately after it. This is the contract a caller can only discover
+by reading it, and getting it wrong is how a section round trip corrupts a note.
+
+The docstrings SHALL state that any blank line the caller wants between the
+heading and its content belongs in `content`, and SHALL name
+`read_note(section=…)` as the matching read: a section response carries the
+heading line and the body, and `edit_note(section=…)` takes the body.
+
+They SHALL NOT prescribe a textual procedure for recovering that body from a
+response — no "split on the separator", no "drop the first line". The response
+envelope interpolates note-controlled values, so any such procedure can be
+forged by note content into an instruction that writes `**Path:** …` into the
+note. Making the body unambiguously recoverable is tracked as its own change.
+
+They SHALL further state (a) that a section write **replaces the whole body**,
+so content omitted from `content` — a fenced code block included — is deleted,
+and (b) that byte-identity holds only for notes whose body newlines are LF.
+Every non-LF terminator inside the **selected body** comes back as LF, whether
+the note uses one dialect throughout or mixes them, because the read path
+normalises and the write path rewrites raw bytes; terminators outside the
+selected body are untouched, so a round trip can leave a note with more mixed
+endings than it started with.
+
+#### Scenario: An MCP client can learn the contract from introspection
+
+- **WHEN** an MCP client introspects `edit_note`
+- **THEN** the documentation for `section` SHALL say that `content` replaces
+  the body beginning on the line after the heading line
+- **AND** SHALL say that the whole body is replaced, so omitted content — a
+  fenced code block included — is deleted
+- **AND** SHALL name `read_note(section=…)` as the matching read, without
+  prescribing how to extract from its response
+- **AND** the same statements SHALL appear in the `tools.py` implementation's
+  docstring, so the two layers do not diverge
 
