@@ -94,57 +94,28 @@
 
 - [ ] 5.1 Update the `edit_note` docstring in `src/mcp_server/server.py` (the
       MCP-visible one) to state, in this order: (a) `content` is the body
-      beginning on the line after the heading line; (b) the extraction rule —
-      the text after a `read_note(section=…)` response's `\n---\n` envelope
-      separator, **minus its first line** (never the response's own first line,
-      which is `# <title>`); (c) a section write replaces the whole body, so
-      omitted content — a fenced block included — is deleted; (d) a wanted
-      blank separator belongs in `content`; (e) byte-identity holds for
-      LF-bodied notes, and a CRLF note's selected body comes back as LF.
-- [ ] 5.2 Make the same five statements in `src/mcp_server/tools.py`'s
-      `edit_note` docstring so the two layers do not diverge. Check
-      `read_note`'s docstring in both layers too — it currently says a section
-      response "includes the heading line", which is true but insufficient
-      once a caller is being told to extract from it.
-- [ ] 5.0 Make the response envelope unambiguous in
-      `src/mcp_server/tools.py`'s `read_note_impl` **before** documenting the
-      extraction rule. Implement it as **one choke point** — a single helper
-      that stringifies a component and collapses every LF/CRLF/CR in the result
-      to a space — and route *every* interpolated component through it: title,
-      path, each tag, **each frontmatter key**, and each frontmatter value. Do
-      not write this as a list of per-field fixes: two successive audit rounds
-      each found a different field that could forge the separator (round 2 the
-      title, round 3 the key), which is what an enumeration buys you. Do not
-      touch the body.
-- [ ] 5.0b Leave error and end-of-content responses alone — a missing note, an
-      out-of-range `offset`, an unknown section. They carry no envelope and no
-      selected content, so no extraction contract applies; the requirement is
-      scoped to successful enveloped responses and the tests should not assert
-      otherwise.
-- [ ] 5.3 Add an end-to-end exercise against the running server that performs
-      the **documented extraction on a real MCP response**, not on the helper's
-      return value: call `read_note(path, section=…)`, split on the first
-      `\n---\n`, drop the first line of the remainder, pass that to
-      `edit_note(section=…)`, then `read_note(path)` the whole note and assert
-      it is unchanged. A test that skips the envelope split does not test the
-      contract the docstring states. Name in the report which tools were
-      actually called.
-- [ ] 5.4 Run that same end-to-end round trip over the adversarial envelopes,
-      asserting the note is unchanged in each: (a) a note whose frontmatter
-      `title` is a multiline YAML scalar containing a `---` line and markup
-      (`title: |-` / `[Project](https://example.invalid)` / `---` /
-      `injected`); (b) a note carrying the valid quoted frontmatter key
-      `"safe\n---\nforged": value`, which forges a separator through the
-      `**Frontmatter:**` block rather than the title; (c) a frontmatter value
-      that is a list or dict with newline-bearing string leaves; and (d) a note
-      whose selected section *body* itself contains a `\n---\n` line. Cases
-      (a)–(c) fail today and are what task 5.0 fixes; case (d) must already
-      pass, because the real separator comes first.
-- [ ] 5.5 Add a guard test that does not name fields: build a response for a
-      note that exercises every envelope component, and assert no line before
-      the envelope separator is exactly `---`. This is the invariant; a future
-      field added to the envelope should fail this test rather than ship a
-      third forgery.
+      beginning on the line after the heading line; (b) a section write
+      replaces the **whole body**, so omitted content — a fenced block included
+      — is deleted; (c) a wanted blank separator belongs in `content`; (d)
+      `read_note(section=…)` is the matching read, which carries the heading
+      line and the body; (e) byte-identity holds for LF-bodied notes, and every
+      non-LF terminator in the selected body comes back as LF.
+      **Do not write a parsing recipe** — no "split on the separator", no "drop
+      the first line". Such a procedure is forgeable by note content; the
+      reason belongs in `vault-tools.md`, not in a docstring a future author
+      will "helpfully" complete.
+- [ ] 5.2 Make the same statements in `src/mcp_server/tools.py`'s `edit_note`
+      docstring so the two layers do not diverge. Leave `read_note`'s
+      docstrings alone beyond consistency — its response shape is not changing
+      here, and the framing work is a separate filed change.
+- [ ] 5.3 Add an end-to-end exercise against the running server, written so it
+      does not depend on parsing a response: create a note with known bytes,
+      call `read_note(path, section=…)` and assert the response contains the
+      expected section, then call `edit_note(path, content=<the known body>,
+      section=…)` and assert via `read_note(path)` that the whole note is
+      byte-unchanged. Cover a section whose body starts with a blank line, one
+      starting with a fenced block, and an empty section. Name in the report
+      which tools were actually called.
 
 ## 6. Documentation
 
@@ -157,23 +128,23 @@
       needs, and state the *whole* of it — not just the blank line. A section
       write replaces the entire body, so content the caller omits is deleted.
       Include the concrete fenced-block example: on
-      `# A\n\u0060\u0060\u0060\nimportant\n\u0060\u0060\u0060\nold\n`,
+      `# A\n```\nimportant\n```\nold\n`,
       `edit_note(section="A", content="new")` now yields `# A\nnew\n`. A
       reader who learns only about the blank line will not predict that.
-- [ ] 6.3 Record the envelope-framing rule beside the section-addressing
-      material: why the `\n---\n` separator is load-bearing for the round-trip
-      contract, and why every interpolated envelope value must stay
-      single-line. This is the "do not undo it" note for a future refactor that
-      restores a raw multiline title.
+- [ ] 6.3 Record why this change documents **no** extraction procedure, with
+      both reproductions (the multiline title and the quoted
+      `"safe\n---\nforged"` key) and the reason sanitising fields does not fix
+      it. This is the "do not undo it" note for the next author who notices the
+      docstring stops short of telling the agent how to get the body, and
+      helpfully adds a split rule. Link **#149**.
 
 ## 7. Residuals and follow-ups
 
 - [ ] 7.1 Do NOT widen `_FENCE_RE` in this change. Confirm by test (3.3c) that
-      the unmasked-fence shapes are byte-identical before and after, then open
-      a follow-up issue describing the gap (indented openers, longer closers),
-      its destructive symptom (a section write deletes the opening fence and
-      orphans the contents), and why fixing it re-addresses `#N` ordinals and
-      therefore needs its own proposal. Link it from `vault-tools.md`.
+      the unmasked-fence shapes are byte-identical before and after, then link **#150**
+      from `vault-tools.md`, which describes the gap (indented openers, longer
+      closers), its destructive symptom, and why fixing it re-addresses `#N`
+      ordinals and needs its own proposal.
 - [ ] 7.2 Record the newline residual in `docs/architecture/vault-tools.md`
       beside the whole-note one #128 already declared, with the measured
       before/after string.

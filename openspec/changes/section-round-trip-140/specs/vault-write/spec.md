@@ -75,10 +75,8 @@ scans there.
 
 #### Scenario: A section round trip is byte-identical
 
-- **WHEN** the **selected-content portion** of an untruncated
-  `read_note(path, section=<sel>)` response — the text after the response's
-  `\n---\n` envelope separator — is stripped of its first line (the heading
-  line and its terminator) and the remainder is passed back as
+- **WHEN** the selected content a section read returns for `<sel>` is stripped
+  of its heading line and its terminator, and the remainder is passed back as
   `edit_note(path, content=<remainder>, section=<sel>)`, on a note whose body
   newlines are LF
 - **THEN** the resulting file SHALL be byte-identical to the original
@@ -86,6 +84,9 @@ scans there.
   sections whose body begins with a blank line, sections whose body begins
   with a fenced code block, sections with an empty body, and the final
   section of the note
+- **AND** the guarantee SHALL be verified against the shared section helpers,
+  which operate on note text; recovering the selected content from a rendered
+  response is not part of this contract and is tracked separately
 
 #### Scenario: An empty section survives a round trip
 
@@ -238,12 +239,15 @@ the line immediately after it. This is the contract a caller can only discover
 by reading it, and getting it wrong is how a section round trip corrupts a note.
 
 The docstrings SHALL state that any blank line the caller wants between the
-heading and its content belongs in `content`, and SHALL point at
-`read_note(section=…)` as the source of a round-trippable body — together with
-the exact extraction: **the text after the response's `\n---\n` envelope
-separator, minus its first line.** They SHALL NOT tell a caller to strip the
-response's own first line, which is the envelope's `# <title>` and would write
-`**Path:**` into the note.
+heading and its content belongs in `content`, and SHALL name
+`read_note(section=…)` as the matching read: a section response carries the
+heading line and the body, and `edit_note(section=…)` takes the body.
+
+They SHALL NOT prescribe a textual procedure for recovering that body from a
+response — no "split on the separator", no "drop the first line". The response
+envelope interpolates note-controlled values, so any such procedure can be
+forged by note content into an instruction that writes `**Path:** …` into the
+note. Making the body unambiguously recoverable is tracked as its own change.
 
 They SHALL further state (a) that a section write **replaces the whole body**,
 so content omitted from `content` — a fenced code block included — is deleted,
@@ -259,6 +263,9 @@ endings than it started with.
 - **WHEN** an MCP client introspects `edit_note`
 - **THEN** the documentation for `section` SHALL say that `content` replaces
   the body beginning on the line after the heading line
-- **AND** SHALL name `read_note(section=…)` as the matching read
-- **AND** the same statement SHALL appear in the `tools.py` implementation's
+- **AND** SHALL say that the whole body is replaced, so omitted content — a
+  fenced code block included — is deleted
+- **AND** SHALL name `read_note(section=…)` as the matching read, without
+  prescribing how to extract from its response
+- **AND** the same statements SHALL appear in the `tools.py` implementation's
   docstring, so the two layers do not diverge

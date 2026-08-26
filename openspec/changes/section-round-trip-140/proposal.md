@@ -35,44 +35,27 @@ zero-divergence envelope forbade — so the contract decision belongs here.
   heading line, its terminator, and that body; `edit_note(section=S, content=B)`
   replaces exactly that body.
 
-  **The extraction rule is stated explicitly, because the response is not raw
-  section text.** `read_note` prefixes every response with a title/path/tags
-  envelope terminated by a `\n---\n` separator line. "Strip the first line of
-  the response" — the obvious formulation, and the one the first draft of this
-  spec used — would write `**Path:** \u0060…\u0060` into the note. The rule is:
-  take the text after the response's first `\n---\n` separator, then drop its
-  first line. Both docstrings SHALL say this in those terms.
-- **The envelope SHALL be framed unambiguously, so that rule is safe to
-  follow — stated as an invariant, not a list of fields.** No dynamic component
-  of a successful response's envelope may contain a line terminator, enforced at
-  a single rendering choke point that title, path, tags, frontmatter **keys**
-  and frontmatter values all pass through. The enumeration is what failed twice:
-  audit round 2 found a multiline *title* could forge the separator, round 3
-  found a multiline frontmatter *key* could do it through the
-  `**Frontmatter:**` block. Both are valid YAML. Patching the named field would
-  have invited a third.
+  **The guarantee is stated over note text, not over rendered response text,
+  and that boundary is deliberate.** Every textual procedure for recovering a
+  section from a `read_note` response proved forgeable: the envelope
+  interpolates the title, the path, the tags and each frontmatter key and
+  value, and a valid note can make any of them emit a line that mimics the
+  envelope's own `---` separator. Reproduced twice, on different fields — a
+  multiline YAML title, and the valid quoted key `"safe\n---\nforged"` — each
+  time yielding a remainder beginning `**Path:** `n.md`` that
+  clobbers the section when written back. Sanitising the named fields does not
+  close it (two audit rounds, two different fields), and collapsing terminators
+  to make them safe is lossy: the distinct paths `a\nb.md` and `a b.md` would
+  render identically, trading a destructive write for a silently wrong read.
 
-  Concretely, before this change: the valid key `"safe\n---\nforged": value` renders as two
-  lines inside the `**Frontmatter:**` block, and the documented extraction then
-  yields `\n---\n# A\nold\n` — which written back clobbers the section. Both
-  reproductions are in the tasks as end-to-end cases, alongside a guard test
-  that names no field at all: no line before the envelope separator may be
-  exactly `---`.
+  So this change does **not** document an extraction procedure, and forbids the
+  docstrings from prescribing one. Making the selected content unambiguously
+  recoverable needs structural framing of the response — separate metadata and
+  section-body fields — which changes `read_note`'s response shape and belongs
+  in its own proposal — filed as **#149**. Until it lands, the docstrings state the
+  relationship (a section response carries the heading line and the body;
+  `edit_note(section=…)` takes the body) without a parsing recipe.
 
-  A component is rendered by stringifying it and collapsing terminators in the
-  *resulting* string, which is deterministic and needs no rule about recursing
-  into composites — `str()` escapes newlines inside a list or dict, so only a
-  bare string component can carry one through. This also repairs the existing
-  display bug where such a title breaks the response layout on an ordinary
-  whole-note read. The note body is never sanitized, and error responses — which
-  carry no envelope and no selected content — are out of scope.
-- **Mechanically:** `_ATX_HEADING_RE`'s trailing whitespace run narrows from
-  `\s*` (which crosses line boundaries) to `[^\S\r\n]*` (horizontal only), so a
-  heading's `line_end` is genuinely the end of its heading line in every
-  dialect. `_section_body_span` keeps stepping over exactly one terminator.
-  Nothing else in the resolver changes: heading *text*, depth, ordinals,
-  `line_start`, and every selector form are unaffected, so no existing selector
-  starts naming a different section.
 - **`replace_section` SHALL insert a separator newline only for a non-empty
   replacement body.** Today it appends one before the following heading, and
   prepends one after an unterminated EOF heading, unconditionally — so an
@@ -89,7 +72,7 @@ zero-divergence envelope forbade — so the contract decision belongs here.
     is the caller's to send (`content="\n- x"`).
   - **A fenced block directly under a heading is now deleted** by a section
     write whose `content` does not resend it. On
-    `# A\n\u0060\u0060\u0060\nimportant\n\u0060\u0060\u0060\nold\n`,
+    `# A\n```\nimportant\n```\nold\n`,
     `edit_note(section="A", content="new")` previously kept the block and
     replaced only `old`; it now yields `# A\nnew\n`. That is the intended
     contract — leaving the block behind *was* the duplication bug — but the
@@ -127,10 +110,9 @@ zero-divergence envelope forbade — so the contract decision belongs here.
   non-empty body. `_scan_headings`, `_section_body_span`, `extract_section`,
   `replace_section` and `outline_sections` keep their signatures and their
   roles.
-- `src/mcp_server/tools.py` — `read_note_impl`'s envelope construction, so no
-  interpolated field can emit a bare `\n---\n` line; plus `edit_note`'s and
-  `read_note`'s docstrings. `src/mcp_server/server.py` — the registered
-  wrappers' docstrings, which must carry the same statements.
+- `src/mcp_server/server.py` and `src/mcp_server/tools.py` — docstrings only.
+  `read_note`'s response shape is unchanged here; the envelope framing is a
+  separate, filed change.
 - `docs/architecture/vault-tools.md` — the section-addressing section.
 - **No schema change, no migration, no index effect.** `outline_sections`'
   reported `size` is `body_end - line_start`; this change moves neither
@@ -145,8 +127,8 @@ zero-divergence envelope forbade — so the contract decision belongs here.
   change: the bytes written are **identical**, so this change neither creates
   nor worsens it. Fixing the masker shifts which lines count as headings and
   therefore re-addresses every `#N` ordinal on affected notes, which is a
-  larger compat break than this one and belongs in its own change; filed
-  separately. The spec here says "fenced code block **as recognised by the
+  larger compat break than this one and belongs in its own change; filed as
+  **#150**. The spec here says "fenced code block **as recognised by the
   shared masker**" rather than claiming CommonMark coverage it does not have.
 - **Declared residual: newline dialect.** `read_note` applies universal-newline
   translation; `edit_note` reads and rewrites raw bytes. A section round trip

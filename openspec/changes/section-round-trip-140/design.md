@@ -111,28 +111,45 @@ the gap becomes the third bug in this family.
 Three things the first draft of this design got wrong, found by the pre-implementation
 audit and verified against the current helpers.
 
-### 1. `read_note` does not return raw section text
+### 1. `read_note` does not return raw section text — and no textual rule recovers it
 
 `read_note` builds every response as an envelope — `# <title>`, `**Path:**`,
 optional `**Tags:**` and `**Frontmatter:**` — then `"\n---\n"` and the selected
 content (`src/mcp_server/tools.py`, the `parts` list). So the response's first
-line is the *title*, not the heading. "Strip the first line and write it back",
-the obvious phrasing and the one the first draft used, makes an agent write
+line is the *title*, not the heading, and "strip the first line and write it
+back" makes an agent write `**Path:** \`n.md\`` into the note.
 
-```
-**Path:** `n.md`
+The obvious repair — "split on the first `\n---\n` instead" — is also wrong, and
+this took two further audit rounds to establish. Every component of that
+envelope is note-controlled, and a valid note can make one emit a line that
+mimics the separator:
 
----
-# A
-```
+| forged via | frontmatter | what the rule then extracts |
+| --- | --- | --- |
+| the title | `title: \|-` with a `---` line in the scalar | `**Path:** \`n.md\`…` |
+| a key | `"safe\n---\nforged": value` | `\n---\n# A\nold\n` |
 
-into the note. That is precisely the destructive-write class this repo exists to
-avoid, and the spec would have instructed it.
+Both reproduced. Both write garbage into the section. Sanitising the named
+fields does not close the class — round 2 patched the title, round 3 found the
+key — and collapsing terminators to make components safe is itself lossy: the
+distinct paths `a\nb.md` and `a b.md` would render identically, which trades a
+destructive write for a silently wrong read. Nor does a per-component invariant
+compose: a component whose value is exactly `---`, containing no terminator at
+all, would forge a separator the moment any future field is rendered alone on a
+line.
 
-The contract is therefore stated over the **selected-content portion**: the text
-after the response's first `\n---\n`, minus its first line. Both docstrings must
-carry that rule verbatim, and the end-to-end check must perform that extraction
-against a real MCP response rather than against the pure helper.
+**So this change specifies no extraction procedure and forbids the docstrings
+from prescribing one.** The round-trip guarantee is stated over *note text* and
+verified against the shared section helpers, which is where the two reported
+bugs actually live. Making the selected content unambiguously recoverable from
+a response needs structural framing — separate metadata and section-body fields
+in the MCP result — which changes `read_note`'s response shape and every
+consumer of it. That is filed as **#149** rather than bundled into a
+section-span fix.
+
+The cost of the split is honest and small: an agent that wants a guaranteed
+round trip must know the note's bytes rather than recover them from a rendered
+response. The two bugs #140 reports are fixed either way.
 
 ### 2. `replace_section` inserts separators unconditionally
 
@@ -164,7 +181,7 @@ Measured before and after the narrowing, on both the indented-fence and
 longer-closer shapes, the bytes written are identical. Widening the masker would
 change which lines count as headings, which shifts every `#N` ordinal on an
 affected note — a re-addressing break strictly larger than this one, and one
-that must not ride along on it. It gets its own issue; this spec says "fenced
+that must not ride along on it. It gets its own issue (**#150**); this spec says "fenced
 code block *as recognised by the shared masker*" rather than claiming coverage
 the code does not have.
 
