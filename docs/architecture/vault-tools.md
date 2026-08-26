@@ -114,14 +114,30 @@ Destructive and silently-wrong writes, the class this product ranks highest.
   separator is `[^\S\r\n]+` — all whitespace except the three terminators —
   because `[ \t]+` drops a heading whose marker is followed by an NBSP, and a
   dropped heading shifts every later `#N` ordinal on an existing vault. The
-  heading's *trailing* run and the closing code fence keep the original `\s*`,
-  line-crossing included: `_section_body_span` compensates for it and it is
-  what decides where a replaced section's body begins, so narrowing it would
-  change the bytes `edit_note(section=…)` writes on ordinary LF notes. Only
-  `$` is generalized, to "before any terminator, or end". A 45,630-input
+  closing code fence still keeps the original `\s*`, line-crossing included.
+  Only `$` is generalized, to "before any terminator, or end". A 45,630-input
   LF/CRLF differential over masking, parsing, outlines, links, extraction and
   replacement holds at **0 divergences**; that is the compatibility envelope,
   and it is what any future change to these patterns has to re-establish.
+- **The heading's *trailing* run no longer keeps `\s*` — that constraint was
+  deliberately lifted in #140 (2026-08), and this bullet is its history, not a
+  live prohibition.** It used to read: the trailing run keeps the original
+  `\s*`, line-crossing included, because `_section_body_span` compensates for
+  it and narrowing it would change the bytes `edit_note(section=…)` writes on
+  ordinary LF notes. That reasoning held the zero-divergence envelope above
+  and was wrong about the compensation: the trailing run is what set
+  `line_end`, so a heading followed by blank lines — or by a fenced block,
+  which the masker turns into a run of *spaces* the run happily crossed —
+  produced a `line_end` far past the heading line. The read
+  (`extract_section`, from `line_start`) returned that region and the write
+  (`replace_section`, from `body_start`) could not replace it, so a
+  read-modify-write round trip duplicated it: a fence came back twice, blank
+  lines grew +1, +2, +4 over three round trips. The run is now
+  `[^\S\r\n]*`, and the load-bearing invariant is stated once: **a section's
+  body begins at the first byte of the line immediately after the heading
+  line.** See "Section addressing" below for the compat break that bought,
+  and re-establish the differential envelope before touching these patterns
+  again.
 - **Declared staleness.** Notes already indexed under the old empty-block
   partition (the block surfacing as literal body text, and `note_links.position`
   measured against it) do not self-heal on an ordinary pass — change detection
@@ -237,3 +253,153 @@ The ordinal exists because **path-style cannot disambiguate duplicate siblings**
 Ambiguity stays an error that names the resolving ordinals; it never silently picks the first match (that is how an agent edits the wrong section and reports success).
 
 Helpers: `_resolve_section_index` (selector → index), `_section_body_span` (index → body span), `extract_section` (heading line **plus** body, for reads), `replace_section` (body only, for writes), `outline_sections` (depth/text/size/ordinal per section).
+
+### Where a section's body begins, and what a section write destroys (#140)
+
+**A section's body begins at the first byte of the line immediately after the
+heading line, and ends immediately before the next heading of equal-or-shallower
+depth, or at end of file.** At most one terminator (LF, CRLF as a unit, or a
+lone CR) separates the two; a heading at EOF with no terminator has an empty
+body. There is no third region: no whitespace, no blank line, and no fenced
+code block sits between the heading line and the body. `extract_section`
+returns the heading line, its terminator, and exactly the span `replace_section`
+writes — by construction, not by coincidence.
+
+Before #140 the two disagreed, and the gap was **readable but unwritable**:
+whatever the heading regex's trailing `\s*` swallowed came back from a section
+read and lay outside the section write's span, so an agent that read a section
+and wrote it back duplicated it. Two symptoms, one cause — see the terminator
+bullet above for the mechanism.
+
+**The break this bought is declared, and it is destructive rather than
+cosmetic.** A section write replaces the **whole body**, so content the caller
+does not resend is **deleted**:
+
+- A blank separator that used to survive is gone unless `content` carries it.
+  `edit_note(section="Tasks", content="- x")` on `## Tasks\n\n- old\n` now
+  writes `## Tasks\n- x\n`. The blank line is the caller's to send
+  (`content="\n- x"`).
+- **A fenced code block directly under the heading is deleted.** Given this
+  note:
+
+  ````markdown
+  # A
+  ```
+  important
+  ```
+  old
+  ````
+
+  `edit_note(section="A", content="new")` previously kept the block and
+  replaced only `old`; it now yields exactly `# A\nnew`. Leaving the block
+  behind *was* the duplication bug, so replacing it is the fix — but a caller
+  who does not round-trip loses content, and both `edit_note` docstrings say
+  so in those words.
+
+  Note the exact bytes: **no trailing newline**. `A` is the last heading, so
+  there is no following heading to separate the new body from, and the
+  trailing separator exists only to prevent that gluing (the rule
+  `tests/test_issue_5_replace_section_eof_heading.py` has pinned since #5).
+  #140's proposal and design render this example as `# A\nnew\n`; that extra
+  terminator is an illustration slip, not the contract —
+  `tests/test_issue_140_section_round_trip.py` pins the real bytes.
+
+What bounds it: no note is rewritten until someone writes to that section, and
+the read→modify→write path an agent actually takes comes out strictly better —
+it now preserves what it used to duplicate.
+
+**A separator newline is inserted only for a non-empty replacement body.**
+Both insertions — one before the body when the retained prefix does not end in
+a terminator (an EOF heading), one after it when a following heading would
+otherwise be glued to it — are conditional on `new_body` being non-empty. They
+used to be unconditional, which meant an *empty* section was not round-trip
+stable even with the regex fixed: `# A\n# B\nb\n` gained a blank line and `# A`
+gained a newline on every pass. Two consecutive headings are the commonest
+degenerate shape in an outline-heavy note, so without this the headline
+property was simply false. The non-empty behaviour is untouched and
+`tests/test_issue_5_replace_section_eof_heading.py` pins it.
+
+**What did NOT change, and why that made the narrowing admissible.** The
+heading capture is `([^\r\n]+?)` with `.strip()` applied either way, so heading
+depth, trimmed text, `line_start` and document order are bit-identical before
+and after — and therefore so is every `#N` ordinal and every
+`outline_sections` `size` (`body_end - line_start`; the change moves neither
+endpoint). **No selector changes meaning; no existing note is re-addressed.**
+`tests/test_issue_140_section_round_trip.py` pins this against explicit values
+captured from the pre-change tree, not by comparing two regexes.
+
+### No documented way to recover a section body from a response — on purpose (#149)
+
+The round-trip guarantee is stated over **note text**, verified against the
+shared section helpers. It is deliberately *not* stated over a rendered
+`read_note` response, and **no docstring may instruct a caller to extract the
+body from one** — no "split on the separator", no "drop the first line". If
+you are the next author who notices the docstrings stop short of telling the
+agent how to get the body, and you are about to helpfully add a split rule:
+don't. This is why.
+
+`read_note` builds every response as an envelope — `# <title>`, `**Path:**`,
+optional `**Tags:**` and `**Frontmatter:**` — then `"\n---\n"` and the selected
+content. So the response's first line is the *title*, not the heading: "strip
+the first line and write it back" makes an agent write ``**Path:** `n.md` ``
+into the note. The obvious repair, "split on the first `\n---\n`", is also
+forgeable, because every component of that envelope is note-controlled and a
+*valid* note can make one emit a line that mimics the separator. Both
+reproduced during #140's audit:
+
+| forged via | frontmatter | what the rule then extracts |
+| --- | --- | --- |
+| the title | `title: \|-` with a `---` line in the block scalar | ``**Path:** `n.md`…`` |
+| a key | `"safe\n---\nforged": value` | `\n---\n# A\nold\n` |
+
+Sanitising the named fields does not close the class — one audit round patched
+the title, the next found the key — and collapsing terminators to make
+components safe is itself lossy: the distinct paths `a\nb.md` and `a b.md`
+would render identically, trading a destructive write for a silently wrong
+read. Nor does a per-component invariant compose: a component whose value is
+exactly `---` forges a separator the moment any future field is rendered alone
+on a line.
+
+Making the selected content unambiguously recoverable needs **structural**
+framing — separate metadata and section-body fields in the MCP result — which
+changes `read_note`'s response shape and every consumer of it. That is filed
+as **#149**. Until it lands, the docstrings state the relationship (a section
+response carries the heading line and the body; `edit_note(section=…)` takes
+the body) and stop there.
+
+### Declared residual: the masker's fence grammar is narrower than CommonMark (#150)
+
+`_FENCE_RE` in `src/services/links.py` recognises only a **column-zero** opener
+closed by a fence of **exactly** the same length. CommonMark allows up to three
+spaces of indentation and a closer at least as long as the opener. So an
+indented fence, or one closed by a longer run, is not masked: a heading inside
+such a block is selectable, and a section write there already deletes the
+opening fence and orphans the contents.
+
+That is a genuine destructive-write hazard, and it is **not #140's**. Measured
+before and after the narrowing on both shapes, the bytes written are
+**identical** — pinned by `tests/test_issue_140_section_round_trip.py` against
+explicit expected bytes, which is the evidence for this claim. Widening the
+masker changes which lines count as headings, which shifts every `#N` ordinal
+on an affected note — a re-addressing break strictly larger than #140's, and
+one that must not ride along on it. It is filed as **#150** and needs its own
+proposal. This is why #140's spec says "fenced code block **as recognised by
+the shared masker**" rather than claiming CommonMark coverage the code does not
+have.
+
+### Declared residual: a section round trip normalises the body's terminators
+
+Beside the whole-note newline residual #128 already declared: `read_note`
+applies universal-newline translation before the caller ever sees a section,
+while `edit_note` reads and rewrites raw bytes. A section round trip therefore
+rewrites *that section's* terminators as LF and leaves everything else alone.
+Measured, and pinned as bytes:
+
+- `# A\r\nold\r\n# B\r\nkeep\r\n` → `# A\r\nold\n# B\r\nkeep\r\n`
+- mixed endings, since the normalisation is per-terminator and not per-note:
+  `# A\r\none\r\ntwo\nthree\r# B\rkeep\r` → `# A\r\none\ntwo\nthree\n# B\rkeep\r`
+
+Content is preserved; bytes are not. Normalising on write would rewrite
+terminators the caller never touched, so this is accepted rather than fixed:
+the byte-identity guarantee is scoped to LF-bodied notes and both `edit_note`
+docstrings say so.

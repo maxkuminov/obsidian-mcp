@@ -2816,14 +2816,55 @@ _ATX_HEADING_RE = re.compile(
     # non-ASCII space: an LF-only note whose marker is followed by an NBSP
     # lost its heading, so names and `#N` ordinals shifted on existing vaults.
     #
-    # The TRAILING run stays the original `\s*`, unnarrowed and still allowed
-    # to cross line boundaries. `_section_body_span` compensates for that, and
-    # it is what decides where a replaced section's body BEGINS — narrowing it
-    # would change the bytes `edit_note(section=…)` writes for ordinary LF
-    # notes. Generalising the old `$` to "before any terminator, or end" is
-    # what makes the whole pattern work on a lone-CR note while leaving LF and
+    # The TRAILING run is `[^\S\r\n]*` — horizontal whitespace only. It was
+    # the original `\s*`, allowed to cross line boundaries, and #140 narrowed
+    # it deliberately. Do not widen it back.
+    #
+    # `\s` matches `\n` and `\r`, and the lookahead only requires that the run
+    # *end* at a line boundary, so the run crossed as many blank lines as it
+    # liked and stopped before the last terminator it could reach. Worse,
+    # `_scan_headings` scans `mask_code(text)`, where a fenced block is an
+    # equal-length run of SPACES — internal terminators included — so the run
+    # sailed straight through a fenced block sitting under a heading too.
+    # `line_end` was therefore not "the end of the heading line" at all
+    # whenever whitespace-only lines or a masked block followed.
+    #
+    # That put a region of the note inside what `extract_section` returns
+    # (it starts from `line_start`) and outside what `replace_section`
+    # replaces (it starts from `body_start`, one terminator past `line_end`):
+    # readable but unwritable. An agent that read a section, changed it and
+    # wrote it back duplicated whatever sat in the gap — a fenced block came
+    # back twice, and blank lines accumulated +1, +2, +4 over three round
+    # trips.
+    #
+    # What the narrowing cost: it is a declared, destructive compat break.
+    # A section's body now begins on the line immediately after the heading
+    # line, so `edit_note(section=…)` replaces ALL of it — a blank separator
+    # that used to survive is gone unless `content` resends it, and a fenced
+    # block directly under the heading is DELETED unless `content` resends it.
+    # Leaving that block behind was the duplication bug, so replacing it is
+    # the fix, but the blast radius is real content loss for a caller that
+    # does not round-trip. Both `edit_note` docstrings and
+    # `docs/architecture/vault-tools.md` say so in those words.
+    #
+    # What it bought: `line_end` means what this module has always documented,
+    # `body_start` is the first byte of the line after the heading line, and
+    # `extract_section` == heading line + terminator + the exact span
+    # `replace_section` writes — by construction rather than by coincidence.
+    #
+    # What it did NOT change: the capture is `([^\r\n]+?)` and `.strip()` is
+    # applied to it either way, so heading depth, trimmed text, `line_start`
+    # and document order — and therefore every `#N` ordinal and every
+    # `outline_sections` size — are bit-identical before and after. No
+    # selector changes meaning; no existing note is re-addressed. That is what
+    # made this narrowing admissible at all, and
+    # `tests/test_issue_140_section_round_trip.py` pins it against explicit
+    # values captured from the pre-change tree.
+    #
+    # Generalising the old `$` to "before any terminator, or end" is what
+    # makes the whole pattern work on a lone-CR note while leaving LF and
     # CRLF byte-for-byte alone.
-    r"(?:\A|(?<=\n)|(?<=\r))(#{1,6})[^\S\r\n]+([^\r\n]+?)\s*(?=\r|\n|\Z)"
+    r"(?:\A|(?<=\n)|(?<=\r))(#{1,6})[^\S\r\n]+([^\r\n]+?)[^\S\r\n]*(?=\r|\n|\Z)"
 )
 
 
@@ -2831,9 +2872,16 @@ def _scan_headings(text: str) -> list[dict]:
     """Find ATX headings (1–6 `#`) outside code, with byte positions.
 
     Returns dicts with `depth`, `text` (trimmed), `line_start` (byte pos at
-    the leading `#`) and `line_end` (byte pos at end of heading text, before
-    any trailing newline). Code blocks are masked first so headings inside
-    fenced or inline code are ignored.
+    the leading `#`) and `line_end` (byte pos at the END OF THE HEADING LINE:
+    past the heading text and any trailing horizontal whitespace, and before
+    that line's terminator — which `line_end` never crosses, in any dialect).
+    A section's body therefore begins at `line_end` plus at most one line
+    terminator; `_section_body_span` is the single place that steps over it.
+
+    Code blocks are masked first so headings inside fenced or inline code are
+    ignored. Because the mask is a run of spaces, `line_end` only means the
+    above while the heading pattern's trailing whitespace class refuses to
+    cross a line boundary — see the comment on `_ATX_HEADING_RE` (#140).
     """
     from src.services.links import mask_code
 
@@ -2956,9 +3004,16 @@ def _resolve_section_index(
 def _section_body_span(text: str, headings: list[dict], idx: int) -> tuple[int, int]:
     """Return `(body_start, body_end)` for the section at `idx`.
 
-    The body runs from the line after the matched heading up to (but not
-    including) the next heading at depth less than or equal to the matched
-    depth, or end of text.
+    The body begins at the first byte of the line IMMEDIATELY FOLLOWING the
+    heading line — `line_end` plus at most one line terminator — and runs up
+    to (but not including) the next heading at depth less than or equal to the
+    matched depth, or end of text. Nothing sits between the heading line and
+    the body: no blank line, no whitespace, no fenced block. A heading at end
+    of file with no trailing terminator has an empty body.
+
+    `extract_section` returns `line_start … body_end`, i.e. the heading line,
+    its terminator, and exactly this span — so what a section read returns
+    below its heading line is exactly what a section write replaces (#140).
     """
     matched = headings[idx]
     matched_depth = matched["depth"]
@@ -3026,7 +3081,13 @@ def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None,
     the target heading and the preceding parts are ancestors in
     outermost-first order. The replacement runs from the line after the
     matched heading up to (but not including) the next heading at depth
-    less than or equal to the matched depth, or end of file.
+    less than or equal to the matched depth, or end of file — the whole body,
+    so anything `new_body` does not resend is deleted, a blank separator and a
+    fenced block directly under the heading included (#140).
+
+    A separator newline is inserted around `new_body` only when it is
+    non-empty; replacing an empty body with an empty body leaves `text`
+    byte-identical.
     """
     headings = _scan_headings(text)
     idx, err = _resolve_section_index(headings, heading)
@@ -3038,15 +3099,26 @@ def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None,
     next_heading_line_start = body_end if body_end < len(text) else None
 
     inserted = new_body
-    # If the retained prefix lacks a trailing newline (an end-of-file heading
-    # with no trailing newline, where the heading match consumed to EOF),
-    # the new body would glue directly onto the heading text. Prepend one
-    # newline to separate them. No-op when the prefix already ends in "\n".
-    prefix = text[:body_start]
-    if prefix and not prefix.endswith(("\n", "\r")):
-        inserted = "\n" + inserted
-    if next_heading_line_start is not None and not inserted.endswith(("\n", "\r")):
-        inserted = inserted + "\n"
+    # Both separators are conditional on a NON-EMPTY body, and that condition
+    # is load-bearing (#140). A separator exists to keep the new body from
+    # gluing onto its neighbours; with no body there is nothing to separate,
+    # and inserting one anyway means an empty section grows a byte on every
+    # round trip — `# A\n# B\nb\n` gained a blank line, `# A` gained a
+    # newline, and the round-trip guarantee was false for the commonest
+    # degenerate shape in an outline-heavy note. Replacing an empty body with
+    # an empty body must leave the note byte-identical.
+    if inserted:
+        # If the retained prefix lacks a trailing newline (an end-of-file
+        # heading with no trailing newline, where the body span begins at
+        # EOF), the new body would glue directly onto the heading text.
+        # Prepend one newline to separate them. No-op when the prefix already
+        # ends in a terminator. Pinned by
+        # `tests/test_issue_5_replace_section_eof_heading.py`.
+        prefix = text[:body_start]
+        if prefix and not prefix.endswith(("\n", "\r")):
+            inserted = "\n" + inserted
+        if next_heading_line_start is not None and not inserted.endswith(("\n", "\r")):
+            inserted = inserted + "\n"
 
     new_text = text[:body_start] + inserted + text[body_end:]
     return new_text, None

@@ -600,7 +600,8 @@ async def read_note_impl(
     and takes what it is given as the entire new body, so a truncated read must
     be paged to the end before it is written back. A `section=` response
     belongs to `edit_note(section=...)`, and it **includes the heading line**
-    while `edit_note(section=...)` takes the body only.
+    while `edit_note(section=...)` takes the body only — the body being
+    everything from the line after the heading line to the end of the section.
     """
     uid = current_user_id.get()
     try:
@@ -1604,10 +1605,24 @@ async def edit_note_impl(
     only** — `read_note(path)` with no `section`, `offset=0` and no
     `[TRUNCATED]` notice. Feed that response's content back through default
     full replacement and the note is unchanged. A truncated read must be
-    completed (page with `offset`) before it is written back; a
-    `read_note(section=...)` response belongs to `edit_note(section=...)`, and
-    it **includes the heading line** while `edit_note(section=...)` takes the
-    body only — pass it back unstripped and the heading is duplicated.
+    completed (page with `offset`) before it is written back.
+
+    **Section mode: what `content` replaces.** In section mode `content` is the
+    section's **body**: the text beginning on the line immediately after the
+    matched heading line, running to the next heading of equal-or-shallower
+    depth or to end of note. The heading line itself is never removed or
+    rewritten. A section write replaces that body **whole**, so anything
+    `content` does not resend is **deleted** — a blank line, and a **fenced
+    code block sitting directly under the heading**, included; there is no
+    third region between the heading line and the body that survives a write.
+    A blank line wanted between the heading and its content therefore belongs
+    in `content`. `read_note(path, section=...)` is the matching read: a
+    section response carries the heading line and that same body, and
+    `edit_note(section=...)` takes the body. Byte-identity holds for notes
+    whose body newlines are LF; every non-LF terminator inside the *selected
+    body* comes back as LF, whether the note uses one dialect throughout or
+    mixes them, because the read path normalises and this tool writes raw
+    bytes. Terminators outside the selected body are untouched.
 
     Section mode resolves and replaces over the frontmatter-stripped body, so
     a YAML `#` comment is never selectable and never counted by an ordinal,
