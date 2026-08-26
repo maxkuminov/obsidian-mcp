@@ -75,8 +75,9 @@ scans there.
 
 #### Scenario: A section round trip is byte-identical
 
-- **WHEN** the selected content a section read returns for `<sel>` is stripped
-  of its heading line and its terminator, and the remainder is passed back as
+- **WHEN** the selected content of a **complete, unwindowed** section read for
+  `<sel>` (`offset=0`, no `[TRUNCATED]` notice) is stripped of its heading line
+  and its terminator, and the remainder is passed back as
   `edit_note(path, content=<remainder>, section=<sel>)`, on a note whose body
   newlines are LF
 - **THEN** the resulting file SHALL be byte-identical to the original
@@ -87,6 +88,9 @@ scans there.
 - **AND** the guarantee SHALL be verified against the shared section helpers,
   which operate on note text; recovering the selected content from a rendered
   response is not part of this contract and is tracked separately
+- **AND** it SHALL NOT extend to a windowed or truncated section response —
+  writing such a window back replaces the whole body with the fragment and
+  deletes the remainder, exactly as the note-read requirement already warns
 
 #### Scenario: An empty section survives a round trip
 

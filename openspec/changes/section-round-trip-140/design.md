@@ -205,8 +205,9 @@ What bounds it:
 - No note is rewritten until someone writes to that section.
 - The read→modify→write path, the one an agent actually takes, comes out
   strictly better: it now preserves what it previously duplicated.
-- It is discoverable from the docstrings, which state the extraction rule, the
-  whole-body replacement, and the LF qualification.
+- It is discoverable from the docstrings, which state the whole-body
+  replacement and the LF qualification. They state no extraction rule — see
+  above for why there is none to state.
 
 ## Declared residual: newline dialect
 

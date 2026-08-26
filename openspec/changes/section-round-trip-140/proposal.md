@@ -79,11 +79,11 @@ zero-divergence envelope forbade — so the contract decision belongs here.
     blast radius is content loss for a caller that does not round-trip, and
     both the docstrings and `vault-tools.md` must say so in those words.
 - Docstrings at both layers — the registered wrappers in `server.py` (what MCP
-  clients see) and the `tools.py` impls — state the round-trip contract in the
-  terms callers need: *take the text after the section response's `\n---\n`
-  envelope separator, drop its first line, and that is exactly what
-  `edit_note(section=…)` takes*. They SHALL NOT say "the response minus its
-  first line" — the response's first line is the envelope's `# <title>`.
+  clients see) and the `tools.py` impls — state the read/write *relationship*:
+  a `read_note(section=…)` response carries the heading line and the body, and
+  `edit_note(section=…)` takes the body, which begins on the line after the
+  heading line and is replaced whole. They state **no procedure** for
+  recovering that body from a rendered response, for the reason above.
 - `docs/architecture/vault-tools.md` is updated in the same change: its
   "the trailing run stays the original `\s*` … narrowing it would change the
   bytes `edit_note(section=…)` writes on ordinary LF notes" note is now the

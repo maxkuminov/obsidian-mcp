@@ -10,8 +10,10 @@ The **selected content** a section response carries — the note text within it,
 as distinct from the title/path/tags envelope every `read_note` response
 begins with — SHALL be exactly the heading line, its line terminator, and the
 section's body as `edit_note(section=…)` defines it: nothing more and nothing
-less. There SHALL be no region of a note that a section read returns but a
-section write to the same selector cannot replace. Whitespace, blank lines, and
+less. Apart from the heading line and its terminator — which a section read
+returns and a section write deliberately preserves — there SHALL be no region
+of a note that a section read returns but a section write to the same selector
+cannot replace. Whitespace, blank lines, and
 fenced code blocks (as recognised by the shared code masker) between the
 heading line and the next heading of equal-or-shallower depth are part of the
 body on both sides.
