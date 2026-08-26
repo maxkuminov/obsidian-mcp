@@ -269,16 +269,23 @@ reindex:
 	@echo ""
 	@echo "  To restart the indexer instead: make restart"
 
+# `run --rm`, not `exec` (#142): `exec` runs inside the LIVE container, whose
+# environment was baked at creation — a changed .env (EMBEDDING_DIMENSIONS,
+# FTS_CONFIGS) is invisible to it, so the reset recreated the column at the
+# OLD dim and the rebuild indexed under the OLD configs. `run --rm` starts a
+# fresh container that re-reads .env, and also works while the service is
+# down — which matters here, because a dim-mismatched container exits at
+# startup and a dead container cannot be exec'd into.
 reset-embeddings:
 	@echo "$(YELLOW)Resetting embeddings — column will be recreated at EMBEDDING_DIMENSIONS$(NC)"
 	@echo "Press Ctrl+C to cancel, waiting 5s..."
 	@sleep 5
-	$(COMPOSE) exec obsidian-mcp python -m scripts.reset_embeddings
+	$(COMPOSE) run --rm obsidian-mcp python -m scripts.reset_embeddings
 	@echo "$(GREEN)Done. The next indexer pass will re-embed all notes.$(NC)"
 
 rebuild-tsvectors:
 	@echo "$(YELLOW)Rebuilding keyword (FTS) index for the configured FTS_CONFIGS...$(NC)"
-	$(COMPOSE) exec obsidian-mcp python -m scripts.rebuild_tsvectors
+	$(COMPOSE) run --rm obsidian-mcp python -m scripts.rebuild_tsvectors
 	@echo "$(GREEN)Done. Keyword search now reflects FTS_CONFIGS (embeddings untouched, no API calls).$(NC)"
 
 status:

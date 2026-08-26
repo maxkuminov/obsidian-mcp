@@ -765,28 +765,22 @@ the transport limit follows.
 Different models produce non-comparable vectors, so a provider switch
 requires reindexing.
 
-**Same `EMBEDDING_DIMENSIONS`** (just a different provider or model):
+Whether or not `EMBEDDING_DIMENSIONS` changes, the steps are the same:
 
-1. Update `.env` — `EMBEDDING_PROVIDER`, credentials, model name.
-2. `make reset-embeddings`, **while the old container is still up**. The
-   target is `docker compose exec`, so it needs a running container;
-   `make down` first and it fails.
+1. Update `.env` — `EMBEDDING_PROVIDER`, credentials, model name, and
+   `EMBEDDING_DIMENSIONS` if it differs.
+2. `make reset-embeddings`. The target is `docker compose run --rm`, so
+   it starts a one-off container that reads your edited `.env` — it
+   works whether the service is up or down, and recreates the column at
+   the *new* dimension.
 3. `make deploy` (or `docker compose up -d --force-recreate`). The next
    indexer pass re-embeds the vault.
 
-**Also changing `EMBEDDING_DIMENSIONS`** — one extra wrinkle, because
-`docker compose exec` runs inside the *existing* container and sees the
-environment baked in when that container was created, not your edited
-`.env`. Use a one-off container, which does read the new `.env`:
-
-1. Update `.env`, including `EMBEDDING_DIMENSIONS`.
-2. `docker compose run --rm obsidian-mcp python -m scripts.reset_embeddings`
-3. `make deploy` (or `docker compose up -d --force-recreate`).
-
-Do **not** recreate the container before the reset. The startup
-dimension guard compares the live column width against
-`EMBEDDING_DIMENSIONS` and `sys.exit(1)`s on a mismatch, and a container
-that has exited cannot be `exec`ed into.
+When changing `EMBEDDING_DIMENSIONS`, run the reset **before**
+recreating the container: the startup dimension guard compares the live
+column width against `EMBEDDING_DIMENSIONS` and `sys.exit(1)`s on a
+mismatch, so a recreated-first container just exits until the reset has
+run.
 
 You can also use Settings → Danger zone → Reset embeddings in the
 control panel, which performs the same SQL while the server is running
