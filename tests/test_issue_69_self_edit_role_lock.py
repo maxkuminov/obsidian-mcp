@@ -36,6 +36,7 @@ try:
     from starlette.templating import Jinja2Templates
 
     from src.control_panel import users as users_mod
+    from src.control_panel.flash import FLASH_SESSION_KEY
     from src.models.db import User
 finally:
     pydantic_settings.BaseSettings.__init__ = _orig_init
@@ -134,6 +135,26 @@ def _user(**overrides) -> User:
     return u
 
 
+class _Req:
+    """The `Request` the handlers now take (#138).
+
+    Only two attributes are ever touched: `session`, where the flash lands,
+    and `query_params`, which `delete_user` reads for `?permanent=true`.
+    """
+
+    def __init__(self, query_params: dict | None = None):
+        self.session: dict = {}
+        self.query_params = query_params if query_params is not None else {}
+
+
+def _flash_of(request: _Req) -> tuple[str | None, str]:
+    """`(message, kind)` the handler parked in the session, or `(None, "ok")`."""
+    entry = request.session.get(FLASH_SESSION_KEY)
+    if not entry:
+        return None, "ok"
+    return entry["message"], entry["kind"]
+
+
 def _submit(actor: User, target: User, *, is_admin: str | None,
             is_active: str | None, remaining_admins: int = 1,
             actor_after_lock=None):
@@ -141,9 +162,11 @@ def _submit(actor: User, target: User, *, is_admin: str | None,
         target, remaining_admins=remaining_admins,
         actor_after_lock=actor_after_lock,
     )
+    request = _Req()
     response = asyncio.run(
         users_mod.edit_user_submit(
             user_id=target.id,
+            request=request,
             vault_path="",
             vault_path_custom="",
             is_admin=is_admin,
@@ -152,11 +175,17 @@ def _submit(actor: User, target: User, *, is_admin: str | None,
             user=actor,
         )
     )
+    # The refusal is no longer visible in the redirect target (#138) — the
+    # message rides the session — so the request that carried it has to reach
+    # the assertions. Every call site already unpacks two values.
+    response.flash_request = request
     return response, session
 
 
 def _is_error_redirect(response) -> bool:
-    return "error=" in response.headers["location"]
+    """A refusal: an `err`-kind flash was set for the next panel render."""
+    message, kind = _flash_of(response.flash_request)
+    return message is not None and kind == "err"
 
 
 # --- The bug: self-demotion with a second admin present -------------------
@@ -277,18 +306,16 @@ def _delete(actor: User, target: User, *, permanent=False, remaining_admins=1,
         target, remaining_admins=remaining_admins,
         actor_after_lock=actor_after_lock,
     )
-
-    class _Req:
-        query_params = {"permanent": "true"} if permanent else {}
-
+    request = _Req({"permanent": "true"} if permanent else {})
     response = asyncio.run(
         users_mod.delete_user(
             user_id=target.id,
-            request=_Req(),
+            request=request,
             session=session,
             user=actor,
         )
     )
+    response.flash_request = request
     return response, session
 
 
@@ -314,7 +341,7 @@ def test_delete_still_refuses_the_last_active_admin():
     bob.id = 2
     response, session = _delete(me, bob, remaining_admins=0)
     assert bob.is_active is True
-    assert "error=" in response.headers["location"]
+    assert _is_error_redirect(response)
     assert session.committed is False
 
 
@@ -333,7 +360,7 @@ def test_edit_refuses_when_the_actor_was_demoted_while_waiting():
     assert bob.is_admin is True, "a demoted actor still performed the mutation"
     assert session.committed is False
     assert session.rolled_back is True, "the advisory lock must be released"
-    assert "error=" in response.headers["location"]
+    assert _is_error_redirect(response)
 
 
 def test_edit_refuses_when_the_actor_was_deactivated_while_waiting():
@@ -346,7 +373,7 @@ def test_edit_refuses_when_the_actor_was_deactivated_while_waiting():
     )
     assert bob.is_admin is True
     assert session.committed is False
-    assert "error=" in response.headers["location"]
+    assert _is_error_redirect(response)
 
 
 def test_edit_refuses_when_the_actor_row_is_gone():
@@ -361,7 +388,7 @@ def test_edit_refuses_when_the_actor_row_is_gone():
     )
     assert bob.is_admin is True
     assert session.committed is False
-    assert "error=" in response.headers["location"]
+    assert _is_error_redirect(response)
 
 
 def test_edit_actor_recheck_happens_after_the_lock():
@@ -390,7 +417,7 @@ def test_delete_refuses_when_the_actor_was_demoted_while_waiting():
     assert bob.is_active is True, "a demoted actor still deleted a user"
     assert session.committed is False
     assert session.rolled_back is True
-    assert "error=" in response.headers["location"]
+    assert _is_error_redirect(response)
 
 
 def test_delete_actor_recheck_happens_after_the_lock():
@@ -421,7 +448,7 @@ def test_single_user_sentinel_is_not_re_read():
         _Sentinel(), bob, is_admin=None, is_active="on", remaining_admins=1
     )
     assert session.committed is True
-    assert "error=" not in response.headers["location"]
+    assert not _is_error_redirect(response)
     assert not any(
         sql.startswith("SELECT users.is_admin, users.is_active")
         for sql in session.statements
@@ -455,8 +482,12 @@ def test_absent_checkboxes_on_a_self_edit_mean_unchanged_not_unchecked():
     assert me.is_admin is True
     assert me.is_active is True
     assert session.committed is True
-    assert "error=" not in response.headers["location"]
-    assert "flash=" in response.headers["location"]
+    assert not _is_error_redirect(response)
+    # The success message is a session flash now, not a query parameter (#138).
+    assert _flash_of(response.flash_request) == (
+        f"Updated user '{me.username}'.", "ok"
+    )
+    assert response.headers["location"] == "/admin/users/"
 
 
 # --- Editing somebody else is unchanged -----------------------------------
@@ -471,7 +502,7 @@ def test_demoting_another_admin_still_works_when_admins_remain():
     )
     assert bob.is_admin is False
     assert session.committed is True
-    assert "error=" not in response.headers["location"]
+    assert not _is_error_redirect(response)
 
 
 def test_demoting_the_last_active_admin_is_still_refused():

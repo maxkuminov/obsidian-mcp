@@ -37,6 +37,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.passwords import hash_password
 from src.auth.session import _SingleUserSentinel
 from src.config import settings
+from src.control_panel.flash import ERR, flash
 from src.control_panel.routes import _panel_context, require_admin_panel
 from src.csrf import verify_csrf
 from src.database import get_session
@@ -226,21 +227,19 @@ async def list_users(
             "notes": note_counts.get(u.id, 0),
         })
 
-    flash = request.query_params.get("flash")
-    flash_kind = request.query_params.get("flash_kind", "ok")
-    error = request.query_params.get("error")
-
+    # `flash` / `flash_kind` come from the session, through `_panel_context`
+    # (#138). Reading them from `request.query_params` let a crafted link
+    # choose what an authenticated admin read on the page whose controls
+    # delete accounts.
     return templates.TemplateResponse(request, "users.html", _panel_context(request, user, {
         "active": "users",
         "users": users,
-        "flash": flash,
-        "flash_kind": flash_kind,
-        "error": error,
     }))
 
 
 @router.post("/create")
 async def create_user(
+    request: Request,
     username: str = Form(...),
     initial_password: str = Form(...),
     session: AsyncSession = Depends(get_session),
@@ -248,21 +247,19 @@ async def create_user(
 ):
     normalized = (username or "").strip().lower()
     if not _USERNAME_RE.match(normalized):
-        return RedirectResponse(
-            "/admin/users/?error=" + _q("Username must be 1–64 chars, lowercase letters / digits / underscores only."),
-            status_code=303,
+        return _back_to_list_with_error(
+            request,
+            "Username must be 1–64 chars, lowercase letters / digits / underscores only.",
         )
     if len(initial_password) < 8:
-        return RedirectResponse(
-            "/admin/users/?error=" + _q("Initial password must be at least 8 characters."),
-            status_code=303,
+        return _back_to_list_with_error(
+            request, "Initial password must be at least 8 characters."
         )
 
     existing = (await session.execute(select(User.id).where(User.username == normalized))).scalar_one_or_none()
     if existing is not None:
-        return RedirectResponse(
-            "/admin/users/?error=" + _q(f"Username '{normalized}' already exists."),
-            status_code=303,
+        return _back_to_list_with_error(
+            request, f"Username '{normalized}' already exists."
         )
 
     new_user = User(
@@ -277,14 +274,12 @@ async def create_user(
         await session.commit()
     except IntegrityError:
         await session.rollback()
-        return RedirectResponse(
-            "/admin/users/?error=" + _q("Could not create user (DB integrity error)."),
-            status_code=303,
+        return _back_to_list_with_error(
+            request, "Could not create user (DB integrity error)."
         )
 
-    return RedirectResponse(
-        f"/admin/users/?flash=" + _q(f"User '{normalized}' created. Set their vault path next."),
-        status_code=303,
+    return _back_to_list(
+        request, f"User '{normalized}' created. Set their vault path next."
     )
 
 
@@ -306,8 +301,7 @@ async def edit_user_form(
     if target.vault_path and target.vault_path not in available_vaults:
         available_vaults.insert(0, target.vault_path)
 
-    error = request.query_params.get("error")
-    flash = request.query_params.get("flash")
+    # Same as `list_users`: the flash rides the session, not the URL (#138).
     return templates.TemplateResponse(request, "user_edit.html", _panel_context(request, user, {
         "active": "users",
         "target": {
@@ -319,14 +313,13 @@ async def edit_user_form(
         },
         "available_vaults": available_vaults,
         "is_self": (isinstance(user, User) and user.id == target.id),
-        "error": error,
-        "flash": flash,
     }))
 
 
 @router.post("/{user_id}/edit")
 async def edit_user_submit(
     user_id: int,
+    request: Request,
     vault_path: str = Form(""),
     vault_path_custom: str = Form(""),
     # `None` means the field was **absent** from the submission; "" means it
@@ -348,7 +341,7 @@ async def edit_user_submit(
     await _lock_admin_guard(session)
     if not await _actor_still_privileged(session, user):
         await session.rollback()
-        return _back_to_list_with_error(_ACTOR_REVOKED_MSG)
+        return _back_to_list_with_error(request, _ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
     if target is None:
@@ -382,11 +375,13 @@ async def edit_user_submit(
     if is_self:
         if is_admin is not None and target.is_admin and not new_admin:
             return _back_with_error(
+                request,
                 user_id,
                 "You can't remove your own admin role. Ask another admin to do it.",
             )
         if is_active is not None and target.is_active and not new_active:
             return _back_with_error(
+                request,
                 user_id,
                 "You can't deactivate your own account. Ask another admin to do it.",
             )
@@ -411,22 +406,25 @@ async def edit_user_submit(
             # flags; kept as a backstop if that guard is ever relaxed.
             if is_self:
                 return _back_with_error(
+                    request,
                     user_id,
                     "Refusing to remove the last admin (yourself). Promote another user to admin first.",
                 )
             return _back_with_error(
-                user_id, "Refusing to demote or deactivate the last active admin."
+                request,
+                user_id,
+                "Refusing to demote or deactivate the last active admin.",
             )
 
     normalized, err = _validate_vault_path(vault_path)
     if err:
-        return _back_with_error(user_id, err)
+        return _back_with_error(request, user_id, err)
     if normalized:
         uniq_err = await _check_vault_path_unique(
             session, normalized, exclude_user_id=target.id
         )
         if uniq_err:
-            return _back_with_error(user_id, uniq_err)
+            return _back_with_error(request, user_id, uniq_err)
 
     old_vault = target.vault_path
     target.vault_path = normalized
@@ -437,17 +435,14 @@ async def edit_user_submit(
         await session.commit()
     except IntegrityError:
         await session.rollback()
-        return _back_with_error(user_id, "Database integrity error (vault path may not be unique).")
+        return _back_with_error(request, user_id, "Database integrity error (vault path may not be unique).")
 
     # Invalidate the in-process vault cache so the next indexer pass and
     # any authenticated request resolves the new path.
     if old_vault != normalized:
         clear_user_vault_cache(target.id)
 
-    return RedirectResponse(
-        f"/admin/users/?flash=" + _q(f"Updated user '{target.username}'."),
-        status_code=303,
-    )
+    return _back_to_list(request, f"Updated user '{target.username}'.")
 
 
 @router.post("/{user_id}/delete")
@@ -498,7 +493,7 @@ async def delete_user(
     await _lock_admin_guard(session)
     if not await _actor_still_privileged(session, user):
         await session.rollback()
-        return _back_to_list_with_error(_ACTOR_REVOKED_MSG)
+        return _back_to_list_with_error(request, _ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
     if target is None:
@@ -517,6 +512,7 @@ async def delete_user(
     # is the same `isinstance` test `edit_user_submit` uses.
     if isinstance(user, User) and user.id == target.id:
         return _back_to_list_with_error(
+            request,
             "You can't delete or deactivate your own account — neither the "
             "soft delete nor the permanent one. Ask another admin to remove it."
         )
@@ -545,6 +541,7 @@ async def delete_user(
         )).scalar() or 0
         if remaining_admins == 0:
             return _back_to_list_with_error(
+                request,
                 "Refusing to delete the last active admin — promote someone else first."
             )
 
@@ -569,29 +566,26 @@ async def delete_user(
         await session.delete(target)
         await session.commit()
         clear_user_vault_cache(target.id)
-        return RedirectResponse(
-            f"/admin/users/?flash=" + _q(f"User '{target.username}' permanently deleted."),
-            status_code=303,
+        return _back_to_list(
+            request, f"User '{target.username}' permanently deleted."
         )
 
     target.is_active = False
     await session.commit()
     clear_user_vault_cache(target.id)
-    return RedirectResponse(
-        f"/admin/users/?flash=" + _q(f"User '{target.username}' deactivated."),
-        status_code=303,
-    )
+    return _back_to_list(request, f"User '{target.username}' deactivated.")
 
 
 @router.post("/{user_id}/reset-password")
 async def reset_password(
     user_id: int,
+    request: Request,
     new_password: str = Form(...),
     session: AsyncSession = Depends(get_session),
     user: User | _SingleUserSentinel = Depends(require_admin_panel),
 ):
     if len(new_password) < 8:
-        return _back_with_error(user_id, "New password must be at least 8 characters.")
+        return _back_with_error(request, user_id, "New password must be at least 8 characters.")
 
     # Same critical section as `edit_user_submit` and `delete_user`. A password
     # reset is a full account takeover of the target — it rewrites the hash and
@@ -606,7 +600,7 @@ async def reset_password(
     await _lock_admin_guard(session)
     if not await _actor_still_privileged(session, user):
         await session.rollback()
-        return _back_to_list_with_error(_ACTOR_REVOKED_MSG)
+        return _back_to_list_with_error(request, _ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
     if target is None:
@@ -616,30 +610,23 @@ async def reset_password(
     target.session_version += 1
     await session.commit()
 
-    return RedirectResponse(
-        f"/admin/users/?flash=" + _q(f"Password reset for '{target.username}'."),
-        status_code=303,
-    )
+    return _back_to_list(request, f"Password reset for '{target.username}'.")
 
 
 # --- Internal helpers -----------------------------------------------------
 
 
-def _q(s: str) -> str:
-    """Minimal URL-encode for the flash/error querystrings."""
-    from urllib.parse import quote
-    return quote(s)
+def _back_to_list(request: Request | None, msg: str) -> RedirectResponse:
+    """Success redirect to the list, with the message in the session (#138)."""
+    flash(request, msg)
+    return RedirectResponse("/admin/users/", status_code=303)
 
 
-def _back_with_error(user_id: int, msg: str) -> RedirectResponse:
-    return RedirectResponse(
-        f"/admin/users/{user_id}/edit?error={_q(msg)}",
-        status_code=303,
-    )
+def _back_with_error(request: Request | None, user_id: int, msg: str) -> RedirectResponse:
+    flash(request, msg, ERR)
+    return RedirectResponse(f"/admin/users/{user_id}/edit", status_code=303)
 
 
-def _back_to_list_with_error(msg: str) -> RedirectResponse:
-    return RedirectResponse(
-        f"/admin/users/?error={_q(msg)}&flash_kind=err",
-        status_code=303,
-    )
+def _back_to_list_with_error(request: Request | None, msg: str) -> RedirectResponse:
+    flash(request, msg, ERR)
+    return RedirectResponse("/admin/users/", status_code=303)

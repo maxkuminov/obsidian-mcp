@@ -332,6 +332,22 @@ vanished from the page, so the operator saw a blank space that read as success.
 - API keys use `omcp_` prefix, stored as SHA-256 hashes
 - Panel/OAuth passwords: direct `bcrypt` (`$2b$`, cost 12); both hash and verify truncate the UTF-8 encoding at 72 bytes and reject NUL bytes — passlib's historical semantics — so existing hashes stay valid; don't "fix" the truncation.
 - **OAuth consent preselects "Read only" unconditionally — never bind `checked` to the requested scope.** On an HTML form the checked radio *is* the submitted value, so the preselect is the default grant, not a display detail. `/register` is unauthenticated and a DCR client that omits `scope` is registered `read readwrite offline_access`, so a requested-scope preselect lets one unchanged **Approve** click hand vault-wide write to any self-registered client (#63; #62 introduced exactly that and it was reverted). What #62 was right about is kept as *prose*: `authorize_get` passes `requested_write` (from the validated scope alone, ungated by the registered scope — display only) and `write_unavailable`, and the request box names the level asked for and says when the client cannot hold it. `_clamp_scope` in `authorize_post` is the enforcement boundary and is unrelated to any of this. The markup default is not enough on its own: Firefox restores a control's dynamic checked state across page loads in preference to it, so the form **and** every `name="scope"` radio carry `autocomplete="off"` — without them a user who once picked write gets that radio re-checked on a repeat visit to the same `/authorize` URL (clients reuse `state`/PKCE) and one Approve re-grants write after a revocation. The `.scope-option:has(:checked)` highlight lives in standalone rule blocks: a selector list is dropped wholesale when any part fails to parse, so grouping it would take the native-radio fallback down with it.
+- **Panel flash messages ride the session, never the query string** (#138,
+  A6 of #130). `src/control_panel/flash.py` holds the pair — `flash(request,
+  message, kind)` before the redirect, `pop_flash` called from *one* place,
+  `_panel_context`, so every panel render pops exactly once and a message is
+  shown once and gone on reload. The old `?flash=` / `?error=` /
+  `&flash_kind=err` was escaped by Jinja and so was never an XSS; the defect
+  is that a crafted link chose what an authenticated admin read, on the page
+  whose controls delete accounts, and survived every reload and re-share of
+  the URL. Templates must render the context variable and never
+  `request.query_params` — `tests/test_issue_138_session_flash.py` sweeps
+  `src/control_panel`, `src/api` and `src/auth` for both halves. Untouched by
+  this: the login and bootstrap pages, which pass `error` straight into the
+  same response they render (no redirect, nothing in a URL), and every OAuth
+  `error=` — those are protocol parameters on a redirect to the *client*, not
+  panel flash. The pre-existing `flash_new_key` / `flash_key_error` /
+  `flash_oauth_error` session entries keep their own dedicated render slots.
 - Vault mounted read-write at /obsidian in container
 - Read responses are capped in characters (`MAX_READ_RESPONSE_CHARS`, default
   40,000) independently of the byte caps on disk I/O — see "Three kinds of size

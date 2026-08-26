@@ -46,6 +46,7 @@ try:
 
     from src.auth.session import _SingleUserSentinel
     from src.control_panel import users as users_mod
+    from src.control_panel.flash import FLASH_SESSION_KEY
     from src.models.db import User
 finally:
     pydantic_settings.BaseSettings.__init__ = _orig_init
@@ -142,41 +143,63 @@ def _user(**overrides) -> User:
     return u
 
 
+class _Req:
+    """The `Request` the handler now takes (#138).
+
+    Only `session` (where the flash lands) and `query_params` are read.
+    """
+
+    def __init__(self, query_params: dict | None = None):
+        self.session: dict = {}
+        self.query_params = query_params if query_params is not None else {}
+
+
 def _delete(actor, target: User, *, permanent=False, remaining_admins=1,
             actor_after_lock=None):
     session = _FakeSession(
         target, remaining_admins=remaining_admins,
         actor_after_lock=actor_after_lock,
     )
-
-    class _Req:
-        query_params = {"permanent": "true"} if permanent else {}
-
+    request = _Req({"permanent": "true"} if permanent else {})
     response = asyncio.run(
         users_mod.delete_user(
             user_id=target.id,
-            request=_Req(),
+            request=request,
             session=session,
             user=actor,
         )
     )
+    # The message no longer rides the redirect target (#138); it is parked in
+    # the session for the next panel render, so the assertions need the
+    # request that carried it.
+    response.flash_request = request
     return response, session
 
 
-def _location(response) -> str:
-    return response.headers["location"]
+def _flash(response) -> tuple[str | None, str]:
+    """`(message, kind)` the handler parked in the session."""
+    entry = response.flash_request.session.get(FLASH_SESSION_KEY)
+    if not entry:
+        return None, "ok"
+    return entry["message"], entry["kind"]
+
+
+def _flash_message(response) -> str:
+    message, _kind = _flash(response)
+    assert message is not None, "the handler set no flash"
+    return message
 
 
 def _is_error_redirect(response) -> bool:
-    return "error=" in _location(response)
+    """A refusal: an `err`-kind flash for the next render of the panel."""
+    message, kind = _flash(response)
+    return message is not None and kind == "err"
 
 
 def _mentions_another_admin(response) -> bool:
-    """The refusal has to name the way out. `_q` URL-encodes the message, so
-    match on the encoded form the operator's browser actually receives."""
-    from urllib.parse import unquote
-
-    return "another admin" in unquote(_location(response)).lower()
+    """The refusal has to name the way out. The message is now stored
+    verbatim in the session — no URL-encoding to undo."""
+    return "another admin" in _flash_message(response).lower()
 
 
 # --- The bug: self-delete with other admins present -----------------------
@@ -294,9 +317,7 @@ def test_last_admin_guard_still_fires_on_its_one_reachable_path():
         assert session.deleted is None
         assert session.committed is False
         assert _is_error_redirect(response)
-        from urllib.parse import unquote
-
-        assert "last active admin" in unquote(_location(response)).lower()
+        assert "last active admin" in _flash_message(response).lower()
 
 
 def test_deleting_a_non_admin_succeeds_on_a_table_with_no_active_admin():
@@ -360,9 +381,7 @@ def test_a_demoted_actor_gets_the_actor_revoked_message_not_the_self_one():
         me, me, remaining_admins=3,
         actor_after_lock=_ActorRow(is_admin=False, is_active=True),
     )
-    from urllib.parse import unquote
-
-    msg = unquote(_location(response))
+    msg = _flash_message(response)
     assert users_mod._ACTOR_REVOKED_MSG in msg
     assert "your own account" not in msg.lower()
     assert me.is_active is True
@@ -402,9 +421,6 @@ def test_a_missing_target_is_still_a_404():
 
     me = _user()
     session = _FakeSession(target=None, remaining_admins=3)
-
-    class _Req:
-        query_params: dict = {}
 
     try:
         asyncio.run(
@@ -463,8 +479,10 @@ def _render_user_edit(is_self: bool) -> str:
             },
             "available_vaults": ["/vaults/max"],
             "is_self": is_self,
-            "error": None,
+            # What `_panel_context` supplies since #138 — one flash and its
+            # kind, popped from the session rather than read off the URL.
             "flash": None,
+            "flash_kind": "ok",
         },
     )
     return response.body.decode()
