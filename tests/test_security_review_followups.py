@@ -5,6 +5,7 @@ import pytest
 
 from src.auth.session import get_current_user
 from src.control_panel import users as panel_users
+from src.control_panel.flash import FLASH_SESSION_KEY
 from src.mcp_server import tools
 from src.models.db import User
 from src.oauth import routes as oauth_routes
@@ -92,6 +93,18 @@ async def test_current_user_rejects_and_clears_stale_session(monkeypatch, cookie
     assert request.session == {}
 
 
+class _PanelRequest:
+    """The `Request` the panel user handlers take since #138.
+
+    The flash message is parked in `session` on the way to the redirect, so
+    a handler called directly still needs somewhere to put it.
+    """
+
+    def __init__(self):
+        self.session: dict = {}
+        self.query_params: dict = {}
+
+
 @pytest.mark.asyncio
 async def test_password_reset_bumps_session_version(monkeypatch):
     target = SimpleNamespace(
@@ -103,8 +116,10 @@ async def test_password_reset_bumps_session_version(monkeypatch):
     db.execute.return_value = result
     monkeypatch.setattr(panel_users, "hash_password", lambda _password: "new-hash")
 
+    request = _PanelRequest()
     response = await panel_users.reset_password(
         user_id=7,
+        request=request,
         new_password="new-password",
         session=db,
         user=SimpleNamespace(is_admin=True),
@@ -139,8 +154,10 @@ async def test_password_reset_takes_the_admin_guard_lock(monkeypatch):
     db.execute.side_effect = [lock, actor_row, target_row]
     monkeypatch.setattr(panel_users, "hash_password", lambda _password: "new-hash")
 
+    request = _PanelRequest()
     response = await panel_users.reset_password(
         user_id=7,
+        request=request,
         new_password="new-password",
         session=db,
         user=actor,
@@ -168,15 +185,22 @@ async def test_password_reset_refuses_an_actor_demoted_while_queued(monkeypatch)
     db.execute.side_effect = [lock, actor_row]
     monkeypatch.setattr(panel_users, "hash_password", lambda _password: "new-hash")
 
+    request = _PanelRequest()
     response = await panel_users.reset_password(
         user_id=7,
+        request=request,
         new_password="new-password",
         session=db,
         user=actor,
     )
 
     assert response.status_code == 303
-    assert response.headers["location"].startswith("/admin/users/?error=")
+    # The refusal message rides the session now, not the query string (#138).
+    assert response.headers["location"] == "/admin/users/"
+    assert request.session[FLASH_SESSION_KEY] == {
+        "message": panel_users._ACTOR_REVOKED_MSG,
+        "kind": "err",
+    }
     # Nothing was written and the target was never even loaded.
     assert db.execute.await_count == 2
     db.rollback.assert_awaited_once()

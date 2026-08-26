@@ -16,11 +16,11 @@
 
 <div class="page-body">
 
+    {# One session-backed flash (#138), never a query parameter. `flash_kind`
+       picks the styling — `err` is the refusal case the old `?error=` param
+       carried. Both come from `_panel_context`, which pops them. #}
     {% if flash %}
-    <div class="alert alert-success anim-1">{{ flash }}</div>
-    {% endif %}
-    {% if error %}
-    <div class="alert alert-warning anim-1">{{ error }}</div>
+    <div class="alert {% if flash_kind == 'err' %}alert-warning{% else %}alert-success{% endif %} anim-1">{{ flash }}</div>
     {% endif %}
 
     <div class="card anim-1">

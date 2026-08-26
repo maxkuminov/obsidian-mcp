@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.session import _SingleUserSentinel, get_current_user
 from src.config import settings
+from src.control_panel.flash import pop_flash
 from src.csrf import generate_csrf_token, verify_csrf
 from src.database import async_session, get_session
 from src.mcp_server.auth import hash_key
@@ -205,12 +206,21 @@ def _panel_context(
     user sentinel has `username="admin"` and `is_admin=True`, so
     `base.html`'s `{% if multi_user_mode and username %}` user-badge block
     stays hidden in single-user mode regardless of how it's rendered.
+
+    It is also the **only** place a panel flash is read (#138). Every render
+    pops the session entry, so a message set before a redirect is shown once
+    and is gone on reload — and, because it comes from the session, nothing
+    a link can carry ever reaches the page. An `extra` may still override
+    `flash`/`flash_kind` explicitly; nothing does today.
     """
+    flash_message, flash_kind = pop_flash(request)
     ctx: dict[str, Any] = {
         "is_admin": bool(user.is_admin),
         "username": user.username,
         "multi_user_mode": bool(settings.multi_user_mode),
         "csrf_token": generate_csrf_token(request),
+        "flash": flash_message,
+        "flash_kind": flash_kind,
     }
     if extra:
         ctx.update(extra)
