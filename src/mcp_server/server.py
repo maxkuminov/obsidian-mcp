@@ -159,7 +159,8 @@ async def read_note(
     what you pass as the whole new body. A truncated response must be paged to
     the end first; a `section=` response belongs to `edit_note(section=...)`,
     and it **includes the heading line** while `edit_note(section=...)` takes
-    the body only, so strip the heading or it is duplicated.
+    the body only — the body being everything from the line after the heading
+    line to the end of the section.
 
     Args:
         path: Vault-relative path to the note (e.g. "Cards/My Note.md")
@@ -320,7 +321,8 @@ async def edit_note(
     3. **Find & replace**: `find=<exact text>`; replaced with `content`. Must match
        exactly once unless `replace_all=True`. This mode operates on the raw
        file, so it is the one mode that can edit frontmatter text in place.
-    4. **Section**: `section=<heading>`; replaces the body under the named ATX heading.
+    4. **Section**: `section=<heading>`; replaces the **whole body** under the
+       named ATX heading — see "Section mode: what `content` replaces" below.
        Use the path-style form `Parent/Child` to disambiguate when the same heading
        appears more than once, or the `#N` ordinal form ("#7", 1-based document
        order) — the ordinal is the only form that can address duplicate headings
@@ -342,10 +344,28 @@ async def edit_note(
     only** — `read_note(path)` with no `section`, `offset=0` and no
     `[TRUNCATED]` notice. A truncated read must be paged to the end before it
     is written back, or full replacement will replace the whole body with the
-    fragment. A `read_note(section=...)` response belongs to
-    `edit_note(section=...)`, and note that a read response
-    **includes the heading line** while `section=` here takes the **body
-    only** — pass it back unstripped and the heading is duplicated.
+    fragment.
+
+    **Section mode: what `content` replaces.**
+    - In section mode `content` is the section's **body**: the text beginning
+      on the line immediately after the matched heading line, running to the
+      next heading of equal-or-shallower depth or to end of note. The heading
+      line itself is never removed or rewritten.
+    - A section write replaces that body **whole**. Anything `content` does not
+      resend is **deleted** — a blank line, a list, and a **fenced code block
+      sitting directly under the heading** included. There is no third region
+      between the heading line and the body that survives a write.
+    - So a blank line you want between the heading and its content belongs in
+      `content` (send `"\\ntext"`, not `"text"`).
+    - `read_note(path, section=...)` is the matching read: a section response
+      **includes the heading line** and that same body, and
+      `edit_note(section=...)` takes the body.
+    - Byte-identity holds for notes whose body newlines are LF. Every non-LF
+      terminator inside the **selected body** (CRLF, or a lone CR) comes back
+      as LF — the read path normalises and this tool writes raw bytes — whether
+      the note uses one dialect throughout or mixes them. Terminators outside
+      the selected body are untouched, so a round trip can leave a note with
+      more mixed endings than it started with.
 
     Section mode resolves headings over the frontmatter-stripped body, exactly
     as `read_note` does, so `#N` ordinals agree between the two and a YAML `#`
