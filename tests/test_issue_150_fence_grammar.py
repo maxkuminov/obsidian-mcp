@@ -30,11 +30,6 @@ def masked(text, context=BODY):
     return out
 
 
-def unmasked_regions(text, context=BODY):
-    """The text with every masked span blanked — what a consumer still sees."""
-    return masked(text, context=context)
-
-
 # ── opener and closer shapes ────────────────────────────────────────────────
 
 
