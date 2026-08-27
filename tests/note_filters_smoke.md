@@ -74,12 +74,12 @@ returns "no results" double-check that the index has been re-populated since dep
 - Call: `semantic_search(query="application status", frontmatter={"status": "applied"}, limit=10)`
 - Expect: at most 10 results, all from notes whose YAML frontmatter has `status: applied`.
 - PASS if: response is non-empty (10 such notes exist in the live DB).
-  Spot-check one result with `read_note(path)` and confirm its frontmatter shows `status: applied`.
+  Spot-check one result with `read_note(path)` and confirm its `frontmatter` field shows `status: applied`.
 
 ### 3.2 keyword_search + frontmatter
 - Call: `keyword_search(query="role", frontmatter={"status": "active"}, limit=5)`
 - Expect: results restricted to notes with `status: active` in frontmatter (16 such notes total in live DB).
-- PASS if: 0 ≤ N ≤ 5 results, all of which (when read with `read_note`) show `status: active`.
+- PASS if: 0 ≤ N ≤ 5 results, all of which (when read with `read_note`) have `frontmatter` showing `status: active`.
 
 ### 3.3 Strict type matching (negative test)
 - Call: `keyword_search(query="role", frontmatter={"status": 0}, limit=5)`
@@ -123,7 +123,7 @@ returns "no results" double-check that the index has been re-populated since dep
 
 Quick yes/no calls — each should return a non-error response:
 
-- `read_note(path="<one of the paths from test 2.2>")` → returns note body.
+- `read_note(path="<one of the paths from test 2.2>")` → `content` carries the note body.
 - `get_tags(limit=10)` → returns top 10 tags.
 - `get_vault_guide()` → returns the Obsidian primer plus CLAUDE.md contents (or onboarding text if absent).
 - `create_note` and `edit_note` — only run if you have a readwrite key; otherwise skip.

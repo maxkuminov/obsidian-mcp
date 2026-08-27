@@ -191,11 +191,15 @@ and ops layer around them.
   `CLAUDE.md`, served live
 
 ### Read and write
-- `read_note(path, section?, offset=0, limit?)`, bounded by
+- `read_note(path, section?, offset=0, limit?)` returns a **structured
+  result** — `path`, `title`, `tags`, `frontmatter_yaml` and a JSON
+  `frontmatter` view, `heading` (section reads), `content`, and
+  truncation as data (`truncated`, `offset`, `next_offset`,
+  `total_chars`, `outline`, `notice`). Bounded by
   `MAX_READ_RESPONSE_CHARS` (default 40,000) — see
   [Response size limits](#response-size-limits). `section=<heading>`
-  returns one section instead of the whole note; `offset` continues a
-  truncated read.
+  returns one section's body instead of the whole note; `offset`
+  continues a truncated read.
 - `create_note(path, content)`, atomic write, refuses overwrite
 - `edit_note(path, …)` with four mutually exclusive modes: full
   replace (default), `append=True`, `find=…` (with optional
@@ -855,20 +859,30 @@ cap and will still destroy a context window; both caps are needed and
 they have different correct values.
 
 It applies **per component**, not once to the whole response: the
-content window gets the cap, and the heading outline gets it
-independently. A truncated read can carry both, so budget for a
-worst case of roughly `2 × MAX_READ_RESPONSE_CHARS` plus a few hundred
-characters of fixed notice text — not one cap's worth.
+`content` window gets the cap, the heading `outline` gets it
+independently, and the metadata fields (`title`, `tags`,
+`frontmatter_yaml` and its JSON view, `heading`) share a third. A
+truncated read can carry all three, so budget for a worst case of
+roughly `3 × MAX_READ_RESPONSE_CHARS` plus fixed prose — doubled again
+because the MCP result carries both structured content and a JSON text
+block, and multiplied by JSON escaping for content that is mostly
+control characters.
 
-When a note exceeds the cap you get the first window plus a
-`[TRUNCATED]` notice carrying the exact `offset` to continue from, and
-— for a whole-note read — an outline of the note's sections:
+When a note exceeds the cap you get the first window plus truncation as
+data — `truncated`, the `next_offset` to continue from, `total_chars` —
+and, for a whole-note read, an `outline` of the note's sections:
 
-```
-- `#1` `# Client Records` (2,855,343 chars)  ⚠ over the cap, will page
-- `#2` `## Balance Sheet.xlsx` (391,199 chars)  ⚠ over the cap, will page
-- `#3` `## Lease Agreement.pdf` (464 chars)
-- `#4` `## Invoice 2025-044.pdf` (1,075 chars)  ← duplicate title, use the ordinal
+```json
+{"entries": [
+  {"ordinal": 1, "depth": 1, "text": "Client Records",
+   "size": 2855343, "exceeds_cap": true,  "duplicate": false},
+  {"ordinal": 2, "depth": 2, "text": "Balance Sheet.xlsx",
+   "size": 391199,  "exceeds_cap": true,  "duplicate": false},
+  {"ordinal": 3, "depth": 2, "text": "Lease Agreement.pdf",
+   "size": 464,     "exceeds_cap": false, "duplicate": false},
+  {"ordinal": 4, "depth": 2, "text": "Invoice 2025-044.pdf",
+   "size": 1075,    "exceeds_cap": false, "duplicate": true}
+ ], "truncated": false}
 ```
 
 Paging a multi-megabyte note 40K at a time is technically possible and
@@ -887,19 +901,33 @@ via its own ordinal.
 
 The outline is itself bounded by the cap: a note with thousands of
 headings gets a truncated listing that reports how many sections were
-omitted and the full ordinal range, rather than an outline larger than
-the content window it accompanies.
+omitted (`omitted`) and the full ordinal range (`first_ordinal`,
+`last_ordinal`), rather than an outline larger than the content window
+it accompanies. Metadata that does not fit its budget is dropped whole
+and reported in `metadata_omissions` — never marked inside the field
+itself, so nothing in a note-controlled field is ever server prose.
 
 `limit` can lower the cap for a single call but never raise it. If your
 clients genuinely want larger reads, raise `MAX_READ_RESPONSE_CHARS` —
 that is an operator decision, made once, by someone who knows the
 deployment.
 
-> **Upgrading:** this is a visible contract change. Before this, a
-> `read_note` on a large note returned the whole thing; now it
-> truncates. The notice is self-describing, so an agent needs no prior
+> **Upgrading:** two visible contract changes, in two releases.
+>
+> `read_note` on a large note used to return the whole thing; it now
+> truncates. The response is self-describing, so an agent needs no prior
 > knowledge to continue, but a script that assumed whole-note reads
 > should either pass `section=` or raise the cap.
+>
+> And `read_note` used to return one rendered string — a `# <title>` /
+> `**Path:**` header, a `\n---\n` separator, then the content. It now
+> returns fields, because every component of that header was
+> note-controlled: a note could forge the separator, so an agent
+> recovering the section body by splitting the response could recover a
+> crafted string and write it back over the section. A client that
+> parsed the old envelope must read `content` (and, for section reads,
+> `heading`) instead; clients that ignore `structuredContent` still get
+> an unambiguous JSON text block.
 
 ## Architecture
 

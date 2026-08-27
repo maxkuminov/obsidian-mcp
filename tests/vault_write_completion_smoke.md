@@ -101,8 +101,8 @@ needs at the top and references them by name. Final cleanup at the bottom.
 ### 3.1 Dry-run on full-replace returns a unified diff
 - Call: `edit_note(path="Cards/_smoke/edit_modes.md", content="totally new\n", dry_run=True)`.
 - PASS if: response includes `--- Cards/_smoke/edit_modes.md`, `+++ Cards/_smoke/edit_modes.md`,
-  `@@`, AND a subsequent `read_note(path="Cards/_smoke/edit_modes.md")` returns
-  the prior content (file untouched).
+  `@@`, AND a subsequent `read_note(path="Cards/_smoke/edit_modes.md")` has
+  `content` = the prior content (file untouched).
 
 ### 3.2 Dry-run on append
 - Call: `edit_note(path="Cards/_smoke/edit_modes.md", content="appended", append=True, dry_run=True)`.
@@ -129,7 +129,7 @@ needs at the top and references them by name. Final cleanup at the bottom.
 ### 4.2 `replace_all=True` replaces all occurrences and reports the count
 - Call: `edit_note(path="Cards/_smoke/edit_modes.md", content="bird", find="cat", replace_all=True)`.
 - PASS if: response is "Replaced 3 occurrence(s) in Cards/_smoke/edit_modes.md"
-  AND `read_note` shows `bird dog bird dog bird`.
+  AND `read_note`'s `content` is `bird dog bird dog bird`.
 
 ### 4.3 Single match with `replace_all=True` still works (N=1 edge case)
 - Reset: `edit_note(path="Cards/_smoke/edit_modes.md", content="apple banana\n")`.
@@ -161,9 +161,9 @@ needs at the top and references them by name. Final cleanup at the bottom.
 
 ### 5.3 Path-style disambiguation
 - Call: `edit_note(path="Cards/_smoke/section.md", content="REPLACED A NOTES\n", section="Project A/Notes")`.
-- PASS if: `read_note` shows the body under `## Notes` within Project A is
-  now `REPLACED A NOTES` AND the second `## Notes` (under Project B) still
-  reads `B notes`.
+- PASS if: `read_note(section="Project A/Notes")` has `content` =
+  `REPLACED A NOTES\n` AND `read_note(section="Project B/Notes")` still has
+  `content` = `B notes\n`.
 
 ### 5.4 Section bounded by next equal-or-shallower heading
 - Reset section.md per 5.1 if needed.
@@ -209,8 +209,8 @@ needs at the top and references them by name. Final cleanup at the bottom.
 - Call: `move_note(from_path="Cards/_smoke/move_src.md", to_path="Cards/_smoke/move_dst.md")`.
 - PASS if: response is "Moved Cards/_smoke/move_src.md → Cards/_smoke/move_dst.md"
   AND `read_note(path="Cards/_smoke/move_dst.md")` returns the content
-  AND `read_note(path="Cards/_smoke/move_src.md")` returns "Note not found"
-  AND `read_note(path="Cards/_smoke/move_link_src.md")` shows the body
+  AND `read_note(path="Cards/_smoke/move_src.md")` returns `error` = "Note not found: …"
+  AND `read_note(path="Cards/_smoke/move_link_src.md")` has `content`
   unchanged (still says `[[move_src]]` etc).
 
 ### 6.3 Destination already exists
@@ -280,7 +280,7 @@ needs at the top and references them by name. Final cleanup at the bottom.
 - Setup: `create_note(path="Cards/_smoke/fm_existing.md", content="---\nstatus: draft\nproject: Foo\n---\n\n# Body\nbody text\n")`.
 - Call: `set_frontmatter(path="Cards/_smoke/fm_existing.md", updates={"status": "done"})`.
 - PASS if: response mentions "set: status"
-  AND `read_note` shows `status: done` and `project: Foo` both present
+  AND `read_note`'s `frontmatter` has `status: done` and `project: Foo` both present
   AND the body still reads `# Body\nbody text` (untouched).
 
 ### 8.2 Add a new key
@@ -291,7 +291,7 @@ needs at the top and references them by name. Final cleanup at the bottom.
 ### 8.3 Remove keys
 - Call: `set_frontmatter(path="Cards/_smoke/fm_existing.md", updates={}, remove=["project", "wip"])`.
 - PASS if: response mentions "removed: project" (NOT "wip" since it didn't
-  exist) AND `read_note` shows the frontmatter no longer has `project`.
+  exist) AND `read_note`'s `frontmatter` no longer has `project`.
 
 ### 8.4 No-op short-circuits
 - Call: `set_frontmatter(path="Cards/_smoke/fm_existing.md", updates={}, remove=[])`.
@@ -301,25 +301,25 @@ needs at the top and references them by name. Final cleanup at the bottom.
 ### 8.5 Note with no frontmatter gets a fresh block prepended
 - Setup: `create_note(path="Cards/_smoke/fm_none.md", content="# Heading\n\nbody only, no frontmatter\n")`.
 - Call: `set_frontmatter(path="Cards/_smoke/fm_none.md", updates={"tags": ["new"]})`.
-- PASS if: `read_note` returns a file beginning with `---\ntags:\n- new\n---\n`
-  followed by the original `# Heading\n\nbody only, no frontmatter\n`.
+- PASS if: `read_note`'s `frontmatter_yaml` is `tags:\n- new\n` and its
+  `content` is the original `# Heading\n\nbody only, no frontmatter\n`.
 
 ### 8.6 Frontmatter not on line 1 is treated as no frontmatter
 - Setup: `create_note(path="Cards/_smoke/fm_none.md", content="\n---\nfoo: 1\n---\nactually a body\n")`
   (note the leading blank line — frontmatter must start on line 1 per
   Obsidian's rule).
 - Call: `set_frontmatter(path="Cards/_smoke/fm_none.md", updates={"tags": ["new"]})`.
-- PASS if: `read_note` shows a frontmatter block with ONLY `tags: [new]`
-  prepended at line 1 — the original `---\nfoo: 1\n---\n` content stays as
-  body text and is NOT merged into the new frontmatter.
+- PASS if: `read_note`'s `frontmatter` is ONLY `{"tags": ["new"]}` — the
+  original `---\nfoo: 1\n---\n` stays in `content` as body text and is NOT
+  merged into the new frontmatter.
 
 ### 8.7 Body byte-identical when only frontmatter changes
 - Setup with body containing trailing whitespace:
   `create_note(path="Cards/_smoke/fm_existing.md", content="---\nfoo: 1\n---\n\nline a\nline b   \n\n")`.
 - Run `stat` (or capture file size) on the file.
 - Call: `set_frontmatter(path="Cards/_smoke/fm_existing.md", updates={"foo": 2})`.
-- PASS if: `read_note` shows `foo: 2`, AND the body text after the closing
-  `---\n` is byte-identical to the original (trailing spaces and blank lines
+- PASS if: `read_note`'s `frontmatter` shows `foo: 2`, AND its `content` is
+  byte-identical to the original body (trailing spaces and blank lines
   preserved).
 
 ---
