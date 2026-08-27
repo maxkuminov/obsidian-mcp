@@ -450,39 +450,64 @@ def test_a_defective_lone_cr_block_is_refused(vault, original, defect):
 # ── recursive YAML aliases ──────────────────────────────────────────────────
 
 
-def test_a_recursive_alias_no_op_does_not_raise(vault):
-    """`a: &A [*A]` is valid YAML, and `safe_load` returns a genuinely
-    self-referencing list. The net-change comparison walks the mapping, so
-    without cycle detection even a remove-of-nothing died with a
-    RecursionError — failing closed, but regressing input the parser accepts."""
-    original = "---\na: &A [*A]\n---\nbody\n"
+# `a: &A [*A]` is valid YAML and `safe_load` returns a genuinely
+# self-referencing list. This tool used to accept such a note — cycle detection
+# in the net-change comparison kept it from dying with a RecursionError — and
+# since #149's representability scrub it is **refused by name** instead.
+#
+# Why the change is the right direction, and not a lost capability: the shared
+# parser now drops values nothing downstream can render, a self-referencing
+# container among them (it is not JSON-serializable, and it sent the indexer's
+# `_sanitize_value` into unbounded recursion). This tool rewrites the block
+# *from the parsed mapping*, so serializing the pruned one would delete `a`
+# from the note as a side effect of setting an unrelated key — a destructive
+# write reported as a success. The refusal precedes the no-op check for exactly
+# the reason D6 gives for the defect refusal: a caller who asks for nothing on
+# a note this tool cannot safely rewrite must be told about the note, not handed
+# a success report.
+
+
+def _refuses_a_note_it_cannot_rewrite(vault, original, **kwargs):
     write(vault, "n.md", original)
-    result = asyncio.run(
-        tools.set_frontmatter_impl("n.md", updates={}, remove=["absent"])
-    )
-    assert "No changes" in result
+    result = asyncio.run(tools.set_frontmatter_impl("n.md", **kwargs))
+    assert "cannot represent" in result, result
+    assert "`a`" in result
+    assert "edit_note(replace_frontmatter=True)" in result
     assert read(vault, "n.md") == original
 
 
-def test_a_recursive_alias_update_to_the_same_value_is_a_no_op(vault):
-    original = "---\na: &A [*A]\nstatus: draft\n---\nbody\n"
-    write(vault, "n.md", original)
-    result = asyncio.run(
-        tools.set_frontmatter_impl("n.md", updates={"status": "draft"})
+def test_a_recursive_alias_no_op_is_refused_not_silently_accepted(vault):
+    _refuses_a_note_it_cannot_rewrite(
+        vault, "---\na: &A [*A]\n---\nbody\n", updates={}, remove=["absent"]
     )
-    assert "No changes" in result
-    assert read(vault, "n.md") == original
 
 
-def test_a_recursive_alias_note_still_accepts_a_real_change(vault):
-    """Cycle detection must answer the comparison, not short-circuit the
-    tool: a genuine change on such a note still writes."""
-    write(vault, "n.md", "---\na: &A [*A]\nstatus: draft\n---\nbody\n")
-    result = asyncio.run(
-        tools.set_frontmatter_impl("n.md", updates={"status": "done"})
+def test_a_recursive_alias_update_to_the_same_value_is_refused(vault):
+    _refuses_a_note_it_cannot_rewrite(
+        vault,
+        "---\na: &A [*A]\nstatus: draft\n---\nbody\n",
+        updates={"status": "draft"},
     )
-    assert "set: status" in result
-    assert "status: done" in read(vault, "n.md")
+
+
+def test_a_recursive_alias_note_refuses_a_real_change_rather_than_dropping_it(vault):
+    """The one that would have been destructive: writing `status: done` would
+    have re-serialized a mapping no longer containing `a`."""
+    _refuses_a_note_it_cannot_rewrite(
+        vault,
+        "---\na: &A [*A]\nstatus: draft\n---\nbody\n",
+        updates={"status": "done"},
+    )
+
+
+def test_the_same_refusal_covers_a_value_that_will_not_render(vault):
+    """Not only cycles: a hex integer past CPython's digit limit is dropped by
+    the same scrub and must refuse the same way."""
+    _refuses_a_note_it_cannot_rewrite(
+        vault,
+        "---\na: 0x" + "f" * 5_000 + "\nstatus: draft\n---\nbody\n",
+        updates={"status": "done"},
+    )
 
 
 def test_the_comparison_itself_terminates_on_self_referencing_input():

@@ -727,9 +727,9 @@ def test_read_note_still_serves_a_section_of_an_undecidable_note(offline):
 
     response = asyncio.run(tools.read_note_impl("n.md", section="B"))
 
-    assert "indented fence opener" not in response
-    assert "keep" in response
-    assert "# B" in response
+    assert response.error is None
+    assert response.heading == "# B"
+    assert "keep" in response.content
 
 
 def test_read_note_outlines_an_undecidable_note_under_the_not_a_fence_reading(
@@ -739,8 +739,8 @@ def test_read_note_outlines_an_undecidable_note_under_the_not_a_fence_reading(
 
     response = asyncio.run(tools.read_note_impl("n.md", section="A"))
 
-    assert "indented fence opener" not in response
+    assert response.error is None
     # `A` runs to `# B` under the not-a-fence reading, so the list and the
     # opener are inside it and `keep` is not.
-    assert "- item" in response
-    assert "keep" not in response
+    assert "- item" in response.content
+    assert "keep" not in response.content

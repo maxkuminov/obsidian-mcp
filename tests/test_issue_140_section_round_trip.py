@@ -580,17 +580,23 @@ def test_a_tool_level_section_round_trip_leaves_the_note_byte_identical(vault, n
     assert section.startswith("# ")
     assert body_of(section) == body, "the test's own idea of the body is wrong"
 
+    # Post-#149 the tool answers in fields, so the agreement is checkable
+    # against the RESPONSE and not only against the helpers: `content` **is**
+    # the body, so there is no recovery procedure left to get wrong.
     response = asyncio.run(tools.read_note_impl("n.md", section=selector))
-    assert "not found" not in response
-    assert section in response
+    assert response.error is None
+    assert response.heading + "\n" + response.content == section or (
+        response.content == "" and response.heading == section.rstrip("\n")
+    )
+    assert response.content == body
 
-    result = asyncio.run(tools.edit_note_impl("n.md", body, section=selector))
+    result = asyncio.run(tools.edit_note_impl("n.md", response.content, section=selector))
     assert "Updated note" in result, result
     assert read(vault, "n.md") == note
 
     # And the whole-note read still shows the note it started as.
     whole = asyncio.run(tools.read_note_impl("n.md"))
-    assert scanned in whole
+    assert whole.content == scanned
 
 
 def test_the_declared_content_loss_is_reachable_from_the_tool(vault):
@@ -649,9 +655,8 @@ def test_a_defective_block_is_readable_by_section_and_refused_for_writes(vault):
 
     # The read succeeds, over the raw bytes: `# Tasks` is heading #1 there.
     response = asyncio.run(tools.read_note_impl("n.md", section="#1"))
-    assert "not found" not in response
-    assert "malformed frontmatter block" not in response
-    assert "# Tasks" in response
+    assert response.error is None
+    assert response.heading == "# Tasks"
 
     # The write refuses, by name, and touches nothing.
     for selector in ("#1", "Tasks", "Parent/Tasks"):

@@ -210,7 +210,7 @@ neither should affect existing behavior. Quick sanity:
 - `semantic_search(query="ideas", limit=3)` → returns results.
 - `list_notes(limit=3)` → returns 3 recent notes.
 - `get_recent(limit=3)` → returns 3 recent notes.
-- `read_note(path="HOME.md")` → returns content.
+- `read_note(path="HOME.md")` → `content` carries the note body.
 - `get_tags(limit=5)` → returns 5 tags.
 
 PASS if all six return non-error responses.

@@ -109,10 +109,12 @@ def test_the_whole_note_read_round_trips_byte_identically(vault):
     original = "---\ntitle: Round Trip\nstatus: draft\n---\n# Heading\n\nBody text.\n"
     write(vault, "n.md", original)
 
-    rendered = asyncio.run(tools.read_note_impl("n.md"))
-    assert "[TRUNCATED]" not in rendered
-    # The content portion is everything after the rendered header's separator.
-    body = rendered.split("\n---\n", 1)[1]
+    response = asyncio.run(tools.read_note_impl("n.md"))
+    assert response.truncated is False
+    # The content portion is a FIELD. It used to be recovered by splitting the
+    # rendered response on `\n---\n`, which a note's own frontmatter could
+    # forge (#149) — there is nothing left to split.
+    body = response.content
 
     asyncio.run(tools.edit_note_impl("n.md", body))
     assert read(vault, "n.md") == original
@@ -126,8 +128,7 @@ def test_an_empty_block_note_round_trips_and_is_not_duplicated(vault):
     original = "---\n---\nBody under an empty block.\n"
     write(vault, "n.md", original)
 
-    rendered = asyncio.run(tools.read_note_impl("n.md"))
-    body = rendered.split("\n---\n", 1)[1]
+    body = asyncio.run(tools.read_note_impl("n.md")).content
     assert body == "Body under an empty block.\n"
 
     asyncio.run(tools.edit_note_impl("n.md", body))
@@ -144,8 +145,7 @@ def test_a_crlf_note_keeps_its_crlf_block_while_the_body_arrives_lf(vault):
     original = "---\r\ntitle: CRLF\r\n---\r\nline one\r\nline two\r\n"
     write(vault, "n.md", original)
 
-    rendered = asyncio.run(tools.read_note_impl("n.md"))
-    body = rendered.split("\n---\n", 1)[1]
+    body = asyncio.run(tools.read_note_impl("n.md")).content
     asyncio.run(tools.edit_note_impl("n.md", body))
 
     after = read(vault, "n.md")
@@ -412,8 +412,12 @@ def test_the_registered_edit_note_takes_the_parameter():
         "replace_frontmatter",
         "preserved byte-identically",
         "round-trip guarantee",
-        "[TRUNCATED]",
-        "includes the heading",
+        # Post-#149 the scoping is stated over FIELDS. `[TRUNCATED]` and "a
+        # section response includes the heading line" described the rendered
+        # envelope and are now false — truncation is the `truncated` field and
+        # the heading line is the `heading` field.
+        "`truncated`",
+        "`heading` field",
     ],
 )
 def test_the_registered_edit_note_description_states_the_contract(phrase):
@@ -432,10 +436,18 @@ def test_the_registered_edit_note_no_longer_claims_a_bare_whole_file_overwrite()
 
 @pytest.mark.parametrize(
     "phrase",
-    ["[TRUNCATED]", "includes the heading", "round-trips"],
+    ["`truncated`", "`heading`", "byte-exact input"],
 )
 def test_the_registered_read_note_states_the_same_scoping(phrase):
     assert phrase in _registered("read_note").description
+
+
+@pytest.mark.parametrize("phrase", ["[TRUNCATED]", "includes the heading"])
+def test_the_registered_descriptions_no_longer_teach_the_rendered_envelope(phrase):
+    """#149 retired the envelope; a docstring that still describes it teaches
+    an agent to split a response that no longer exists."""
+    for name in ("read_note", "edit_note"):
+        assert phrase not in _registered(name).description, name
 
 
 @pytest.mark.parametrize(
@@ -469,8 +481,7 @@ def test_a_lone_cr_note_round_trips_through_read_note(vault):
     translation — the same declared property as the CRLF case above, and for
     the same reason."""
     write(vault, "n.md", "---\rtitle: CR\r---\rline one\rline two\r")
-    rendered = asyncio.run(tools.read_note_impl("n.md"))
-    body = rendered.split("\n---\n", 1)[1]
+    body = asyncio.run(tools.read_note_impl("n.md")).content
 
     asyncio.run(tools.edit_note_impl("n.md", body))
     after = read(vault, "n.md")

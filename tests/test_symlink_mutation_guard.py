@@ -723,7 +723,7 @@ async def test_reads_still_follow_an_alias(alias, writable):
     """An alias reading as its target is the whole point of an alias, and a
     read cannot destroy anything — so `read_note`/`read_file` are untouched."""
     note = await tools.read_note_impl("alias.md")
-    assert "important body" in note
+    assert "important body" in note.content
 
     text = await tools.read_file_impl("alias.md", encoding="text")
     assert "important body" in text

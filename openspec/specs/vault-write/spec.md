@@ -258,9 +258,9 @@ actionable error and SHALL NOT mutate the file.
 #### Scenario: The round-trip guarantee does not extend to windows or sections
 
 - **WHEN** a `read_note` response was a selected section
-  (`section=<sel>`), a paged window (`offset>0` or a `[TRUNCATED]`
-  notice), or otherwise less than the whole body, and its content is
-  passed to default full-replace
+  (`section=<sel>`), a paged window (`offset>0`, or `truncated` true in
+  the structured result), or otherwise less than the whole body, and its
+  `content` is passed to default full-replace
 - **THEN** full-replace still preserves the frontmatter block but
   replaces the ENTIRE body with the partial text — so both layers'
   docstrings SHALL state that section responses belong to section mode
@@ -477,10 +477,9 @@ scans there.
 
 #### Scenario: A section round trip is byte-identical
 
-- **WHEN** the selected content of a **complete, unwindowed** section read for
-  `<sel>` (`offset=0`, no `[TRUNCATED]` notice) is stripped of its heading line
-  and its terminator, and the remainder is passed back as
-  `edit_note(path, content=<remainder>, section=<sel>)`, on a note whose body
+- **WHEN** the `content` field of a **complete, unwindowed** section read for
+  `<sel>` (`offset=0`, `truncated` false) is passed back unchanged as
+  `edit_note(path, content=<content>, section=<sel>)`, on a note whose body
   newlines are LF, whose line-1 frontmatter is absent or valid, and which
   contains no unmatched indented fence opener — the notes for which a section
   write is admitted at all
@@ -489,12 +488,13 @@ scans there.
   sections whose body begins with a blank line, sections whose body begins
   with a fenced code block, sections with an empty body, and the final
   section of the note
-- **AND** the guarantee SHALL be verified against the shared section helpers,
-  which operate on note text; recovering the selected content from a rendered
-  response is not part of this contract and is tracked separately
-- **AND** it SHALL NOT extend to a windowed or truncated section response —
-  writing such a window back replaces the whole body with the fragment and
-  deletes the remainder, exactly as the note-read requirement already warns
+- **AND** the guarantee SHALL be verified against the shared section helpers
+  AND against the structured response itself: the section read's `content`
+  field **is** the body, so no recovery procedure exists to get wrong
+- **AND** it SHALL NOT extend to a windowed or truncated section response
+  (`truncated` true) — writing such a window back replaces the whole body with
+  the fragment and deletes the remainder, exactly as the note-read requirement
+  already warns
 - **AND** it SHALL NOT be read as weakening the refusal on a defective
   frontmatter block: such a note remains readable by section and refused for
   section writes, and the refusal takes precedence over the round trip
@@ -1543,21 +1543,20 @@ The note path's named-staging fallback SHALL classify `EXDEV` from its publishin
 
 ### Requirement: Section-mode docstrings state the round-trip contract
 
-Both layers' `edit_note` docstrings SHALL state that in section mode `content` is the section's **body only** — the registered wrapper in `server.py` (what an MCP client sees) and the implementation in `tools.py` alike. The body is the text a
-`read_note(section=…)` response carries *below* its heading line, beginning on
-the line immediately after it. This is the contract a caller can only discover
-by reading it, and getting it wrong is how a section round trip corrupts a note.
+Both layers' `edit_note` docstrings SHALL state that in section mode `content` is the section's **body only** — the registered wrapper in `server.py` (what an MCP client sees) and the implementation in `tools.py` alike. The body is exactly what a `read_note(section=…)` response's `content` field carries, beginning on the line immediately after the heading line.
 
 The docstrings SHALL state that any blank line the caller wants between the
 heading and its content belongs in `content`, and SHALL name
 `read_note(section=…)` as the matching read: a section response carries the
-heading line and the body, and `edit_note(section=…)` takes the body.
+heading line in its `heading` field and the body in its `content` field, and
+`edit_note(section=…)` takes exactly that `content`.
 
-They SHALL NOT prescribe a textual procedure for recovering that body from a
-response — no "split on the separator", no "drop the first line". The response
-envelope interpolates note-controlled values, so any such procedure can be
-forged by note content into an instruction that writes `**Path:** …` into the
-note. Making the body unambiguously recoverable is tracked as its own change.
+They SHALL NOT prescribe a textual procedure for recovering the body from a
+rendered response — no "split on the separator", no "drop the first line".
+The structured `content` field is the recovery; the reason such procedures
+were banned (any rendered envelope interpolates note-controlled values and can
+be forged into an instruction that writes `**Path:** …` into the note) SHALL
+stay recorded where a future author will find it.
 
 They SHALL further state (a) that a section write **replaces the whole body**,
 so content omitted from `content` — a fenced code block included — is deleted,
@@ -1575,8 +1574,8 @@ endings than it started with.
   the body beginning on the line after the heading line
 - **AND** SHALL say that the whole body is replaced, so omitted content — a
   fenced code block included — is deleted
-- **AND** SHALL name `read_note(section=…)` as the matching read, without
-  prescribing how to extract from its response
+- **AND** SHALL name `read_note(section=…)` as the matching read and its
+  `content` field as the exact body to pass back
 - **AND** the same statements SHALL appear in the `tools.py` implementation's
   docstring, so the two layers do not diverge
 

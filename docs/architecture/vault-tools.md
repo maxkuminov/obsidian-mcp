@@ -158,9 +158,14 @@ Destructive and silently-wrong writes, the class this product ranks highest.
   staleness again.
 - **The round-trip guarantee is scoped, and both layers' docstrings say so:**
   it covers a complete, unwindowed whole-note read only (`section=None`,
-  `offset=0`, no `[TRUNCATED]`). A truncated read must be paged to the end
-  first, and a `read_note(section=…)` response **includes the heading line**
-  while `edit_note(section=…)` takes the body only.
+  `offset=0`, and `truncated` false in the structured result). A truncated read
+  must be paged to the end first. A `read_note(section=…)` response carries the
+  matched heading line in its **`heading` field** and the body in **`content`**,
+  and `edit_note(section=…)` takes exactly that `content` — the pre-#149 shape,
+  where the response was one rendered string that *included* the heading line
+  and the caller had to strip it, is gone; see "The read→write round trip is
+  field-based" below for why no docstring may describe recovering the body from
+  a rendered response.
 
 ### Mutations act on the path as named — never through a symlink
 
@@ -238,15 +243,61 @@ There are **byte** caps, a **character** cap, and a **transport** cap, and they 
 - `MAX_READ_RESPONSE_CHARS` (default 40,000 ≈ 10K tokens) bounds what `read_note` / `read_file` **return to the caller**, whose context the result consumes. It truncates rather than refusing.
 - The MCP streamable-HTTP **request body limit** bounds what the transport accepts at all, before any tool runs. It is derived, not configured: `max(2 × MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB` (61 MiB with the defaults), passed to `FastMCP(max_request_body_size=)` from `Settings.mcp_max_request_body_bytes`. The SDK's own default is 4 MiB, which would silently reject writes far below our documented 25 MB cap. The formula guarantees — for a *canonical* envelope, i.e. JSON-RPC framing plus non-content arguments under 1 MiB — that a base64 `write_file` at the cap (base64 is `4·⌈n/3⌉ ≤ 2n + 2`) and any note write up to `MAX_NOTE_BYTES` (JSON escaping expands a byte at most 6×) always reach the tool, which then decides. Unsupported shapes are bounded by the transport with a bare HTTP 413 and no tool error: text-mode `write_file` whose escaping exceeds the limit (send base64 — always safe), an envelope over 1 MiB, and arguments that are large but discarded.
 
+**An argument that is not UTF-8 never reaches a tool body.** `_tracked` screens
+every bound argument — strings, and an **iterative, depth-unlimited** walk into
+list and mapping arguments like `set_frontmatter(updates=…)` — and refuses the
+call with
+`_UNENCODABLE_ARG_MARKER` in `usage_logs`, distinct from the vault markers so an
+operator can tell "this credential has no vault" from "this client is emitting
+bad JSON escapes". The refusal names the parameter and never repeats the value,
+which is the point: the value is precisely the one that cannot be encoded into
+the response carrying the complaint.
+
+The screen sits in the shared decorator rather than in each tool because
+auditing interpolations one at a time is how this class stayed open for two
+audit rounds. `read_note`'s `path` and `section` were closed individually first;
+the very next review found `edit_note(section=…)` — the shared resolver's
+not-found listing quotes the selector straight back — and `edit_note(find=…)`
+beside it. Anything a future tool accepts is covered by construction. `path` is
+*also* refused at the vault layer (`validate_path`, `_mutable_parts`), because a
+path that is not UTF-8 cannot name a file and that is true regardless of which
+decorator ran.
+
+**The walk had a six-level depth cap and that was a bug, not a bound.**
+`{"deep": [[[[[["\ud800"]]]]]]}` walked past it and the value was written to
+the note. It is an explicit stack now, with no depth constant: total argument
+size is already bounded by the transport's request-body limit, so depth was the
+only unbounded axis and a loop removes it. Visited containers are skipped, so a
+self-referential argument (impossible over the wire, reachable from an
+in-process caller) terminates.
+
 **Every note write tool caps its own result.** `create_note`, `edit_note` (all modes, `dry_run` included), and `set_frontmatter` refuse a result over `MAX_NOTE_BYTES` with a tool-level error and no write, via `_note_size_error()` in `tools.py`. That is what keeps the tool, not the transport, in charge of every supported write — the transport limit sits deliberately above every tool cap. `MAX_NOTE_BYTES` lives in `src/config.py` (not `tools.py`) because the transport formula needs it.
 
-**Precisely: it is a per-component budget, not a single ceiling on the whole response.** The content window is bounded by the cap, and the heading outline is *independently* bounded by the cap. A truncated whole-note read can therefore carry both, so the worst-case response is about `2 × cap` plus the fixed notice prose — not `cap`. Every component must have a budget; if you add a third, give it one, and update the worst case here and in the end-to-end test.
+**Precisely: it is a per-component budget, not a single ceiling on the whole response.** Since #149 `read_note` returns fields, and each note-controlled field carries its own budget:
+
+| field | budget |
+| --- | --- |
+| `content` | `MAX_READ_RESPONSE_CHARS`, lowered by `limit`, windowed by `_window()` |
+| `outline` | its own independent `MAX_READ_RESPONSE_CHARS` (also lowered by `limit`), measured over the **serialized** outline object |
+| `title`, `tags`, `frontmatter_yaml` + its JSON view, `heading` | one shared **metadata budget**, `MAX_READ_RESPONSE_CHARS` and *not* lowered by `limit` — `limit` is documented as bounding returned content, and letting `limit=1` silently strip a note's title made a cheap probe useless |
+| `path` | none needed: it is returned **exactly**, bounded instead at admission by `vault.MAX_PATH_CHARS` (1,024, matching `notes_metadata.file_path`) and by `vault.is_encodable` (a path that is not UTF-8 cannot name a file, and cannot be serialized into the response either) |
+| `error`, `notice` | fixed server prose plus bounded interpolations only — the path (1,024) and the section selector (`_NOTICE_SELECTOR_MAX`); the whole `error` string is additionally cut to the metadata budget |
+
+**The worst-case serialized response**, stated for the new shape: `(content cap + outline budget + metadata budget + the fixed path allocation and prose) × 2` for the structured-content-plus-text-block duplication `× up to 6` for JSON string escaping of note-controlled text (`\u0001` is six characters for one). At the 40,000 default that is roughly 1.4 M characters in the pathological case — a note whose body is 40,000 control characters *and* whose frontmatter is over-budget *and* which is heading-dense. The old "≈ `2 × cap`" figure was retired with the envelope. Every component must have a budget; if you add a fourth, give it one, and update this table, the worst case, and the end-to-end test in `tests/test_read_response_cap.py`.
+
+**Why the metadata budget exists at all.** `read_note` goes through `read_file()`, which has no byte cap, so a note can carry a multi-megabyte frontmatter block above a one-character body: without a third budget the response is governed by the content cap and is still megabytes wide.
+
+**Overflow drops a field WHOLE, in a fixed order, and reports it out of band.** The order is the lossy `frontmatter` JSON view (the raw block says everything it does), then `frontmatter_yaml`, then `tags`, then `heading`, then `title`. It is a **priority list, not an optimizer**: each step runs only if the remainder still does not fit, and it stops as soon as it does — so an oversized `title` costs the `heading` first, deterministically, rather than the server searching for the cheapest set to drop.
+
+**No field is ever cut short.** Not truncated in place, not elided, not replaced by an in-band marker — a shortened or marked value inside a note-controlled field is indistinguishable from note content, which is the forgery class #149 exists to end. That covers the two short fields where an in-place cut looks harmless: an earlier revision elided `heading` and `title`, and it also computed the heading's room from the *un-dropped* title, so an oversized title silently zeroed `heading` to `""` — a present-but-empty note-controlled field, colliding with this tool's own convention that `""` is an *answer* (an empty section body) rather than an absence. Both are gone; `tests/test_issue_149_read_note_framing.py` pins all five steps and the `""` case.
+
+Every drop is reported in the server-controlled `metadata_omissions` list, naming the field, a stable reason code, and how to read the value anyway (the note's raw bytes). `frontmatter_yaml` in particular is dropped rather than cut because half a YAML block still parses: a truncated one is a *corrupt* block that looks valid.
 
 Satisfying the byte caps says nothing about the response. A 3 MB note is well inside the 10 MB read cap and will still exhaust a context window — that is exactly how this bit us: `read_note` had no cap at all and returned a 3.4 M-char tool result, which the caller's inference provider rejected as "input exceeds the context window". `read_note` goes through `read_file()` in the vault service, not `read_bytes()`, so it never even had the byte cap.
 
 **If you add a tool that returns file or note content, it needs the character cap too.** `_window()` and `_capped_text()` in `tools.py` are the shared helpers.
 
-Over-cap reads return the first window, a `[TRUNCATED]` notice with the exact continuing `offset`, and — for a whole-note read — a section outline. `limit` may lower the cap for one call but never raise it; raising is an operator decision via the env var.
+Over-cap reads return the first window plus truncation **as data** — `truncated`, `offset`, `next_offset` (absent at the end), `total_chars` — a server-authored `notice` carrying the guidance prose, and, for a whole-note read, the `outline` object. `limit` may lower the cap for one call but never raise it; raising is an operator decision via the env var.
 
 ## Section addressing
 
@@ -262,7 +313,7 @@ The ordinal exists because **path-style cannot disambiguate duplicate siblings**
 
 Ambiguity stays an error that names the resolving ordinals; it never silently picks the first match (that is how an agent edits the wrong section and reports success).
 
-Helpers: `_resolve_section_index` (selector → index), `_section_body_span` (index → body span), `extract_section` (heading line **plus** body, for reads), `replace_section` (body only, for writes), `outline_sections` (depth/text/size/ordinal per section).
+Helpers: `_resolve_section_index` (selector → index), `_section_body_span` (index → body span), `extract_section_parts` (heading line and body **separately** — what `read_note` returns as its `heading` and `content` fields), `extract_section` (the same two concatenated, for callers that want one string), `replace_section` (body only, for writes), `outline_sections` (depth/text/size/ordinal per section).
 
 **Selector parity is about resolution on writes this tool admits, not about
 admission.** Two shapes read fine by section and refuse every section write —
@@ -386,7 +437,9 @@ lone CR) separates the two; a heading at EOF with no terminator has an empty
 body. There is no third region: no whitespace, no blank line, and no fenced
 code block sits between the heading line and the body. `extract_section`
 returns the heading line, its terminator, and exactly the span `replace_section`
-writes — by construction, not by coincidence.
+writes — by construction, not by coincidence — and `extract_section_parts`
+returns those two halves apart, which is what `read_note` puts in `heading` and
+`content` (#149).
 
 Before #140 the two disagreed, and the gap was **readable but unwritable**:
 whatever the heading regex's trailing `\s*` swallowed came back from a section
@@ -452,24 +505,32 @@ endpoint). **No selector changes meaning; no existing note is re-addressed.**
 `tests/test_issue_140_section_round_trip.py` pins this against explicit values
 captured from the pre-change tree, not by comparing two regexes.
 
-### No documented way to recover a section body from a response — on purpose (#149)
+### The read→write round trip is field-based, because every textual one was forgeable (#149)
 
-The round-trip guarantee is stated over **note text**, verified against the
-shared section helpers. It is deliberately *not* stated over a rendered
-`read_note` response, and **no docstring may instruct a caller to extract the
-body from one** — no "split on the separator", no "drop the first line". If
-you are the next author who notices the docstrings stop short of telling the
-agent how to get the body, and you are about to helpfully add a split rule:
-don't. This is why.
+**`read_note` returns a structured result, not a rendered document**
+(`ReadNoteResult` in `src/mcp_server/read_result.py`). The round trip is a
+*field*:
 
-`read_note` builds every response as an envelope — `# <title>`, `**Path:**`,
-optional `**Tags:**` and `**Frontmatter:**` — then `"\n---\n"` and the selected
-content. So the response's first line is the *title*, not the heading: "strip
-the first line and write it back" makes an agent write ``**Path:** `n.md` ``
-into the note. The obvious repair, "split on the first `\n---\n`", is also
-forgeable, because every component of that envelope is note-controlled and a
-*valid* note can make one emit a line that mimics the separator. Both
-reproduced during #140's audit:
+- a section read's `content` **is** the body `edit_note(section=…)` replaces —
+  the same `_section_body_span` computes both, via `extract_section_parts`;
+- a complete, unwindowed whole-note read's `content` is the body
+  `edit_note(path, content)` full replacement accepts;
+- the matched heading line is its own `heading` field and is never part of
+  `content`, which ends the old read-returns-heading / write-takes-body
+  asymmetry an agent had to compensate for.
+
+**No docstring may instruct a caller to extract the body from a rendered
+response** — no "split on the separator", no "drop the first line". That
+prohibition survives the fix, because the reason for it does. Here it is.
+
+Before #149 `read_note` built every response as an envelope — `# <title>`,
+`**Path:**`, optional `**Tags:**` and `**Frontmatter:**` — then `"\n---\n"`
+and the selected content. The response's first line was the *title*, not the
+heading: "strip the first line and write it back" makes an agent write
+``**Path:** `n.md` `` into the note. The obvious repair, "split on the first
+`\n---\n`", is also forgeable, because every component of that envelope is
+note-controlled and a *valid* note can make one emit a line that mimics the
+separator. Both reproduced during #140's audit:
 
 | forged via | frontmatter | what the rule then extracts |
 | --- | --- | --- |
@@ -482,14 +543,196 @@ components safe is itself lossy: the distinct paths `a\nb.md` and `a b.md`
 would render identically, trading a destructive write for a silently wrong
 read. Nor does a per-component invariant compose: a component whose value is
 exactly `---` forges a separator the moment any future field is rendered alone
-on a line.
+on a line. **The rejected alternative** was to keep the string and reversibly
+escape each component, validating the composed envelope and refusing on
+forgery: that is a permanent availability hole for notes that merely *contain*
+`---` shapes, the escaping has to be specified and taught to agents, and the
+validation is a denylist over renderings — the class this history says is
+unclosable. JSON supplies the reversible escaping instead, at the protocol
+layer, where nobody has to invent it.
 
-Making the selected content unambiguously recoverable needs **structural**
-framing — separate metadata and section-body fields in the MCP result — which
-changes `read_note`'s response shape and every consumer of it. That is filed
-as **#149**. Until it lands, the docstrings state the relationship (a section
-response carries the heading line and the body; `edit_note(section=…)` takes
-the body) and stop there.
+Both forgeries are pinned end to end in
+`tests/test_issue_149_read_note_framing.py`, including the write-back through
+`edit_note(section=…)` that used to clobber the section.
+
+**Three SDK realities shape the implementation** (MCP 1.29 FastMCP, verified in
+the pinned wheel — `mcp/server/fastmcp/utilities/func_metadata.py`):
+
+1. The text block is rendered from the **returned object**
+   (`pydantic_core.to_json(result, fallback=str, indent=2)`) and
+   `structuredContent` from the **validated dump**
+   (`model_validate(result).model_dump(mode="json")`). So every value must be
+   made JSON-safe *when the model is built* — never inside a serializer, or the
+   two renderings diverge. A parity test pins them equal.
+2. Optional pydantic fields serialize as `null`. `null` in `content` is not the
+   same statement as no `content`, so the model's `_OmitNone` serializer drops
+   `None` from both renderings. `""`, `[]` and `False` are answers and survive.
+3. A result with `error` set is an MCP **success** (`isError=false`) — in-band
+   errors are this server's application convention, unchanged from before. And
+   `_tracked`'s admission-refusal path must return a typed
+   `ReadNoteResult(error=…)` for this tool (via `_tracked(refusal_result=…)`):
+   a bare string from a tool with an output schema fails FastMCP's output
+   validation and reaches the agent as a *protocol* error instead of the
+   in-band refusal the vault-root gate promises.
+
+**Frontmatter twice, and only one of them is authoritative.** `frontmatter_yaml`
+is the block's YAML source, fence lines excluded — content-lossless whenever
+present, and dropped whole rather than cut under budget pressure. `frontmatter`
+is a best-effort JSON view built by a depth-, node- and size-bounded,
+cycle-safe walk, and it is **omitted entirely** (with the reason stated in
+`metadata_omissions`) whenever it cannot be honest, because a *valid* YAML
+block has shapes JSON does not:
+
+- recursive aliases — `x: &X [*X]` loads into a self-referential list that
+  crashes or hangs a naive walk;
+- non-string keys — `1:` and `"1":` are two YAML keys and one JSON key, so
+  rendering the view silently loses one of them;
+- dates and timestamps — no JSON form, so they become ISO strings, which is
+  lossy in the other direction;
+- **values that will not become text** — two shapes, both *valid YAML*, both
+  reachable from a note a user can save, and `vault.coerce_text` is the one
+  predicate for both (see "The representability boundary" below for where it
+  runs):
+  - `title: "\uD800"` decodes to a lone surrogate: a valid Python `str`, not a
+    Unicode scalar value, so it cannot be UTF-8-encoded. `pydantic_core`, which
+    renders *both* halves of the MCP result, raises
+    `PydanticSerializationError` on it — note-controlled frontmatter
+    manufacturing a **protocol error**, a whole class above the in-band errors
+    this tool promises. Reason code `unpaired_surrogate`.
+  - `title: 0x<5000 hex digits>` is *constructed* by PyYAML without complaint
+    — CPython's integer-string digit limit guards decimal parsing, not hex
+    literals — and then `str()` on the value raises `ValueError`. Reason code
+    `not_json_representable`.
+
+  `frontmatter_yaml` is unaffected in both cases: in the file the value is
+  ordinary text. `heading`, `content` and the outline's titles are slices of
+  `Path.read_text(encoding="utf-8")`, which is strict, so they cannot carry a
+  surrogate at all.
+
+A partial view is never emitted: a caller cannot tell a pruned map from the
+real one. **Mutation goes through `set_frontmatter`, or through the raw block
+with `edit_note(find=…)` — never a round trip of the JSON view**, and all four
+docstrings say so.
+
+### The representability boundary: scrub once, at the parse (#149)
+
+**`_partition_frontmatter` returns a mapping every consumer can carry.** The
+scrub (`_scrub_frontmatter`) runs there, once per parse, and every reader of a
+parsed block inherits it: `read_note`'s fields, `extract_tags`, the indexer's
+`title` column and its JSONB `frontmatter` column, the control panel's note
+viewer, `move_note`'s title refresh. A key whose value nothing can render is
+**dropped**, and the loss is recorded on the diagnosis (`lossy`, keyed by the
+top-level frontmatter key it happened under).
+
+**Why the boundary and not the consumers.** Three review rounds closed this
+class one consumer at a time and it came back each time: `read_note`'s fields,
+then `edit_note`'s selector, then — in the same review — the indexer's
+`_note_title`, JSONB serialization of `notes_metadata.frontmatter`, and
+`extract_tags`' *scalar-string* `tags:` branch, which the previous round's fix
+to its list branch had walked straight past. Screening per consumer is a list
+you have to remember to add to. A predicate at the parse cannot be forgotten by
+the next consumer, because the next consumer never sees the value. Both crashes
+Codex reproduced are pinned in `tests/test_issue_149_read_note_framing.py`
+against the *unmodified* indexer helpers, which is the check that the
+inheritance is real.
+
+**What it removes, and what it deliberately leaves.** It removes only what
+*nothing* can render: a string that is not UTF-8-encodable, an integer whose
+`str()` raises, a container that contains itself, and a subtree nested deeper
+than `_SCRUB_MAX_DEPTH` (64). It does **not** unify how the renderable is
+rendered — dates and non-string keys come through exactly as
+PyYAML built them, because each consumer's own coercion of those is
+load-bearing (an indexed frontmatter value is what
+`keyword_search(frontmatter=…)` matches against, and `read_note`'s JSON view
+ISO-formats a date where the indexer `str()`s it). Widening the scrub into a
+normalizer would silently re-key the index.
+
+**The walk is iterative, with an explicit stack**, so the walk itself cannot
+blow the stack however deep the input goes. Total work is bounded by a node
+budget derived from the block's own length (a YAML document of N characters
+cannot construct more than N nodes), and the frame stack carries the ids on the
+current descent, so `x: &X [*X]` is recognised as recursion rather than looped
+on.
+
+**Depth is bounded too, and it is a bound on the predicate, not on the walk.**
+`_SCRUB_MAX_DEPTH` (64) exists because the consumers this boundary protects are
+recursive and always will be: `indexer._sanitize_value`, `_note_title`,
+`copy.deepcopy` and `yaml.safe_dump` all descend a frontmatter value frame by
+frame. A structure deeper than they can descend is a structure *nothing can
+render*, which is precisely what this scrub removes — reached structurally
+instead of scalar by scalar, and reported as `excessive_depth`.
+
+Getting this wrong once is instructive. **The node budget bounds size and says
+nothing about depth**, and the two are independent axes. A 550 KB alias chain
+(`a0: &a0 {k: 1}` / `a1: &a1 {n: *a0}` / …) parses cleanly — PyYAML composes
+every `a<i>` at depth one, so its own composer never recurses even though the
+constructed graph is thousands deep — passed the budget with a 1,045-deep
+subtree intact, and came back `valid=True, lossy={}`. `_sanitize_value` then
+raised `RecursionError` on every index pass, forever, because nothing commits
+and the content hash never advances: #126's failure mode, reached by a new
+route. The empty loss record also walked straight through `set_frontmatter`'s
+refusal, where `deepcopy` and `safe_dump` raised in turn.
+
+**Do not fix that by converting the consumers to iterative walks.** That is
+four rewrites and a standing obligation on the fifth consumer, against one
+bound here that all of them inherit — the same argument that moved the whole
+predicate to this boundary. 64 is generous for a real vault (Obsidian's own
+frontmatter is flat; the deepest thing anyone writes by hand is a few levels of
+nested mapping) and sits far below CPython's ~1,000-frame limit with room for
+the several frames each consumer spends per level.
+
+**Consequences that are not obvious:**
+
+- A subtree past the depth bound is pruned at that point, so the levels above
+  it survive and the note stays readable; only the tail nobody could render is
+  gone.
+- A container all of whose contents were dropped survives *pruned*
+  (`{"nested": {}}`). That is the right answer for a consumer that only needs
+  not to crash. It is also exactly why `read_note` omits its `frontmatter` JSON
+  view for **any** loss anywhere in the block, however deep and under whatever
+  unrelated key: a pruned mapping is indistinguishable from the real one, and
+  this tool does not emit a partial view. `frontmatter_yaml` still carries the
+  block verbatim.
+- **`set_frontmatter` refuses a note whose block lost something**, by name,
+  pointing at `edit_note(find=…)` or `replace_frontmatter=True`. It rewrites
+  the block *from the parsed mapping*, so serializing the pruned one would
+  delete those keys as a side effect of setting an unrelated one — a
+  destructive write reported as a success. The refusal precedes the no-op check
+  for the same reason D6 gives for the defective-block refusal. This is a
+  deliberate behaviour change: `a: &A [*A]` notes used to accept a
+  `set_frontmatter` and now do not, and
+  `tests/test_issue_128_set_frontmatter_refusals.py` records why.
+- Section writes and default full-replace are unaffected — neither goes through
+  the mapping; both reattach `diagnosis.block` byte-identically.
+
+**`frontmatter_yaml` is LF-normalized, not byte-exact — declared, not fixed.**
+The read path hands the shared parser `Path.read_text()` output, which has
+already applied universal-newline translation, so a CRLF or lone-CR block comes
+back with LF terminators. It is the same residual a section body carries and it
+has the same cause. Re-reading the file as bytes purely to serve one response
+field would give `read_note` a *second* partition of the same note, which is
+exactly what D3 exists to prevent, and the two could disagree. `edit_note` is
+unaffected — it works from raw bytes and still reattaches a CRLF block
+byte-identically — so the residual is a read-side rendering detail, stated in
+both `read_note` docstrings.
+
+**A block the parser refuses to load is a `yaml_error`, on both sides.**
+`yaml.YAMLError` is not PyYAML's whole failure surface. Two shapes a user can
+save escape it: `n: <6000 digits>` raises a bare `ValueError` from CPython's
+integer-string digit limit, inside the *constructor*, and a few thousand nested
+flow collections raise `RecursionError` out of the composer. Uncaught, both took
+out `read_note` **and** every write path that diagnoses a block, on a note
+nobody could then repair. `_partition_frontmatter` catches all three and
+classifies them as `yaml_error` — the class that already means "the parser
+refused this region" — so the consequences compose the way every other defect
+does: the block stays in the body (the read still returns every byte of the
+note, in `content`), section writes and `set_frontmatter` refuse by name with
+the `replace_frontmatter=True` repair, and default full-replace rewrites the
+file wholesale. **The rejected alternative** was to call such a block *valid*
+with an empty mapping, so the read could still expose `frontmatter_yaml`: that
+hands `set_frontmatter` a `{}` to merge into and `safe_dump` over the top of a
+block it never parsed — a destructive write on a note whose only defect is that
+it is large.
 
 ### Resolved residual: the masker's narrower-than-CommonMark fence grammar (#150)
 
