@@ -24,6 +24,7 @@ from src.services.embeddings import (
     chunk_text,
     clean_for_embedding,
     embed_note,
+    embedding_fence_spans,
 )
 from src.services.fts import index_tsvector_sql
 from src.services.links import build_vault_index, extract_links, resolve_target
@@ -112,6 +113,46 @@ logger = logging.getLogger(__name__)
 
 def _content_hash(content: str) -> str:
     return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The extraction-version marker (#150)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Links, tags and vectors are all derived through the shared fence recognizer,
+# and re-derivation is gated on `content_hash` — which a grammar change cannot
+# move, because it hashes the note's bytes and those are unchanged. So a
+# grammar change ships a marker instead: `notes_metadata.extraction_version`
+# (migration 018) records which grammar derived a row, and a row whose marker
+# is behind this constant is treated as changed for the whole pass — parsed,
+# re-tagged, re-linked, re-tsvectored and re-stamped.
+#
+# **Bump this in the same commit as any change to the fence grammar.** A
+# grammar change without a bump leaves every unchanged note deriving from the
+# old grammar forever; a bump without a grammar change costs one no-op pass.
+#
+# Embedding invalidation is scoped, not blanket: the pass compares the fence
+# spans the row's *stamped* grammar recognised against the ones the current
+# grammar recognises (`embedding_fence_spans`, whose per-version registry keeps
+# every version's recognizer frozen while a row still carries it) and clears
+# `embedded_content_hash` only when they differ. It only ever CLEARS, so it can
+# never suppress an invalidation another rule mandates — a content change, a
+# `file_path` change, a provider change, exclusion reconciliation.
+CURRENT_EXTRACTION_VERSION = 1
+
+
+def _grammar_changed_the_embedding_text(stamped_version: int, body: str) -> bool:
+    """Would this note's `clean_for_embedding` output differ across grammars?
+
+    An unknown stamped version — a build downgraded past a bump — answers True:
+    a row whose grammar this build cannot reproduce must be re-embedded rather
+    than certified against a comparison that was never made.
+    """
+    if stamped_version == CURRENT_EXTRACTION_VERSION:
+        return False
+    was = embedding_fence_spans(stamped_version, body)
+    now = embedding_fence_spans(CURRENT_EXTRACTION_VERSION, body)
+    return was is None or now is None or was != now
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1107,16 +1148,30 @@ async def _index_vault_pinned(
 
     async with async_session() as session:
         # Get existing hashes (scoped to this user when set)
-        existing_stmt = select(NoteMetadata.file_path, NoteMetadata.content_hash)
+        existing_stmt = select(
+            NoteMetadata.file_path,
+            NoteMetadata.content_hash,
+            NoteMetadata.extraction_version,
+        )
         if user_id is None:
             existing_stmt = existing_stmt.where(NoteMetadata.user_id.is_(None))
         else:
             existing_stmt = existing_stmt.where(NoteMetadata.user_id == user_id)
-        result = await session.execute(existing_stmt)
-        existing = {row.file_path: row.content_hash for row in result.fetchall()}
+        existing_rows = (await session.execute(existing_stmt)).fetchall()
+        existing = {row.file_path: row.content_hash for row in existing_rows}
+        # Kept beside `existing` rather than folded into it: that dict is the
+        # move-detection input, keyed and reverse-keyed by content hash alone.
+        stamped_version = {
+            row.file_path: row.extraction_version for row in existing_rows
+        }
 
         # Determine changes
         to_upsert = []
+        # Notes whose vectors this grammar change invalidates: their marker was
+        # stale AND their recognised fence spans differ between the stamped
+        # grammar and the current one. `embedded_content_hash` is cleared for
+        # exactly these, in the same transaction as the stamp.
+        grammar_invalidated: list[str] = []
         # Body text parsed during this scan, keyed by rel_path. The tsvector
         # loop and the link rebuild below both reuse these instead of
         # re-reading from disk — a concurrent delete between the passes would
@@ -1152,12 +1207,25 @@ async def _index_vault_pinned(
                     continue
 
                 h = _content_hash(raw)
+                # A stale extraction marker makes a note changed even when its
+                # bytes are not: the derived state (links, tags, vectors) came
+                # out of a fence grammar this build no longer uses, and nothing
+                # else on the row can see that.
+                marker_stale = (
+                    stamped_version.get(rel_path, CURRENT_EXTRACTION_VERSION)
+                    != CURRENT_EXTRACTION_VERSION
+                )
                 # **Content-hash change detection is disabled under a
                 # re-derive**, so every discovered file is parsed and upserted
                 # regardless of its hash — which is also what makes every note
                 # "changed" for the link rebuild below, and therefore what
                 # deletes and re-extracts every one of this user's link rows.
-                if not re_derive and rel_path in existing and existing[rel_path] == h:
+                if (
+                    not re_derive
+                    and not marker_stale
+                    and rel_path in existing
+                    and existing[rel_path] == h
+                ):
                     continue  # No change
 
                 try:
@@ -1170,6 +1238,22 @@ async def _index_vault_pinned(
                 path_to_content[rel_path] = content
                 title = _note_title(frontmatter, found.name)
 
+                # Grammar-attributable embedding invalidation, scoped to notes
+                # whose recognised spans actually moved. Only asked where it
+                # can be the deciding factor: a new path has no vectors, and a
+                # changed hash already invalidates through the ordinary
+                # predicate. Clearing is additive — it never suppresses an
+                # invalidation another rule mandates.
+                if (
+                    marker_stale
+                    and rel_path in existing
+                    and existing[rel_path] == h
+                    and _grammar_changed_the_embedding_text(
+                        stamped_version[rel_path], content
+                    )
+                ):
+                    grammar_invalidated.append(rel_path)
+
                 to_upsert.append({
                     "user_id": user_id,
                     "file_path": rel_path,
@@ -1177,6 +1261,7 @@ async def _index_vault_pinned(
                     "tags": tags,
                     "frontmatter": _sanitize_frontmatter(frontmatter),
                     "content_hash": h,
+                    "extraction_version": CURRENT_EXTRACTION_VERSION,
                     "file_size": stat.st_size,
                     "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
                 })
@@ -1238,6 +1323,16 @@ async def _index_vault_pinned(
             # the move). The value is bound from the entry this pass already
             # parsed for the *new* path, so it is exactly what a fresh index
             # would write, frontmatter title included (#127, D3).
+            #
+            # **`extraction_version` is deliberately NOT stamped here.** This
+            # branch repairs a row's path; it does not re-extract the row's
+            # tags, and the marker means "this row's derived state came out of
+            # the current grammar". Stamping one over tags nobody re-derived is
+            # exactly the false certification the marker exists to prevent.
+            # Leaving it stale costs one extra pass — the row's hash now
+            # matches its new path, so the ordinary branch picks it up on the
+            # next tick, parses it and stamps then — and this branch already
+            # NULLs `embedded_content_hash`, so the vectors rebuild regardless.
             move_upd_sql = (
                 "UPDATE notes_metadata "
                 "SET file_path = :new, title = :title, file_size = :size, "
@@ -1306,6 +1401,12 @@ async def _index_vault_pinned(
                         "tags": stmt.excluded.tags,
                         "frontmatter": stmt.excluded.frontmatter,
                         "content_hash": stmt.excluded.content_hash,
+                        # Stamped in the same statement that writes the state
+                        # it certifies, inside the pass's one transaction: a
+                        # pass that fails anywhere commits neither, so a stale
+                        # marker never survives beside re-derived rows and a
+                        # current marker never survives beside stale ones.
+                        "extraction_version": stmt.excluded.extraction_version,
                         "file_size": stmt.excluded.file_size,
                         "modified_at": stmt.excluded.modified_at,
                         "indexed_at": text("now()"),
@@ -1313,6 +1414,31 @@ async def _index_vault_pinned(
                 )
                 await session.execute(stmt)
             logger.info(f"Upserted {len(to_upsert)} notes")
+
+        # Grammar-attributable embedding invalidation. A separate statement
+        # because the upsert deliberately does NOT carry
+        # `embedded_content_hash` — it must stay untouched for every note the
+        # grammar did not affect, or a marker bump would re-embed the vault.
+        # Owner-scoped like every other write in this pass: `user_id IS NULL`
+        # in single-user mode, `user_id = :uid` in multi-user mode, so one
+        # user's grammar sweep can never clear another's certification.
+        if grammar_invalidated:
+            user_clause = "user_id IS NULL" if user_id is None else "user_id = :uid"
+            inval_params: dict = {"paths": grammar_invalidated}
+            if user_id is not None:
+                inval_params["uid"] = user_id
+            await session.execute(
+                text(
+                    "UPDATE notes_metadata SET embedded_content_hash = NULL "
+                    f"WHERE file_path = ANY(:paths) AND {user_clause}"
+                ),
+                inval_params,
+            )
+            logger.info(
+                "Fence-grammar change invalidated embeddings for %d note(s)%s",
+                len(grammar_invalidated),
+                log_suffix,
+            )
 
         # Update tsvectors for changed notes
         if to_upsert:

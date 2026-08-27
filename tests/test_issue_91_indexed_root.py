@@ -251,8 +251,16 @@ class FakeSession:
                     for p, i in self.note_ids.items()
                 ])
             if "content_hash" in rendered:
+                # `extraction_version` joined the scan's select with #150.
+                # These rows stand for an index already derived under the
+                # current grammar, so the marker is never the reason a note in
+                # this file's fixtures is rescanned.
                 return _Result([
-                    SimpleNamespace(file_path=p, content_hash=h)
+                    SimpleNamespace(
+                        file_path=p,
+                        content_hash=h,
+                        extraction_version=indexer.CURRENT_EXTRACTION_VERSION,
+                    )
                     for p, h in self.existing.items()
                 ])
         return _Result()
