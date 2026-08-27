@@ -15,13 +15,13 @@
 ## 3. Re-derivation remediation
 
 - [x] 3.1 Schema: `notes_metadata.extraction_version SMALLINT NOT NULL SERVER DEFAULT 0` in `src/models/db.py` + alembic migration (additive, server default; downgrade drops it). `make test-schema` green; `alembic check` clean.
-- [x] 3.2 Indexer: `CURRENT_EXTRACTION_VERSION = 1`; re-derive when hash changed OR marker stale — re-extract links/tags; compare recognised fence spans between the frozen recognizer of the row's stamped version (per-version registry: v0 = legacy regexes copied verbatim; entries removable once no row carries the version) and the current recognizer, and clear `embedded_content_hash` when they differ (never suppressing an invalidation another rule mandates — path change, content change, provider change); stamp marker in the same transaction (retry-safety per index-integrity: a failed pass must not leave a stamped marker with unfinished work).
+- [x] 3.2 Indexer: `CURRENT_EXTRACTION_VERSION = 1`; re-derive when hash changed OR marker stale — re-extract links/tags; compare cleaned-for-embedding output between the frozen cleaner of the row's stamped version (per-version registry: v0 = the legacy sequential cleaner copied verbatim; entries removable once no row carries the version) and the current cleaner, and clear `embedded_content_hash` when they differ (never suppressing an invalidation another rule mandates — path change, content change, provider change); stamp marker in the same transaction (retry-safety per index-integrity: a failed pass must not leave a stamped marker with unfinished work).
   - Amended by the adversarial review: the registry stores frozen per-version
     **cleaning functions**, and invalidation compares cleaned **outputs**, not
     span tuples — v0's cleaner substituted sequentially, so span equality is
     neither necessary nor sufficient for embedded-text equality. Both
     counterexamples pinned in `tests/test_clean_for_embedding.py`.
-- [x] 3.3 Integration tests (throwaway pgvector container, per `make test-schema` harness or existing test DB fixtures): stale-marker pass refreshes links+tags for all notes; embedding invalidation only for span-diff notes (assert embed-call count); external rename between migration and pass keeps identity via true `content_hash` (no cascade delete); tsvectors intact.
+- [x] 3.3 Integration tests (throwaway pgvector container, per `make test-schema` harness or existing test DB fixtures): stale-marker pass refreshes links+tags for all notes; embedding invalidation only for cleaned-output-diff notes (assert embed-call count); external rename between migration and pass keeps identity via true `content_hash` (no cascade delete); tsvectors intact.
 
 ### 3a. Transition-window controls (adversarial review)
 
