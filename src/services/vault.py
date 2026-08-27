@@ -96,6 +96,7 @@ import re
 import stat
 import uuid
 from dataclasses import dataclass
+from types import MappingProxyType
 from pathlib import Path, PurePosixPath
 
 import yaml
@@ -1666,28 +1667,23 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
         raise FileNotFoundError(f"Note not found: {relative_path}")
     raw = path.read_text(encoding="utf-8")
     frontmatter, content, diagnosis = parse_frontmatter_diagnose(raw)
-    # `lossy_metadata` maps a derived field to why it could not be rendered as
-    # JSON-safe text. This is the only place that can say so: it is the one
-    # function holding both the parsed mapping and the values derived from it.
-    # A field that lost something is `None`/short here rather than substituted
-    # — `read_note` omits it whole and names the reason, and no caller is ever
-    # handed a plausible-looking replacement (falling back to the filename for
-    # an unrenderable `title:` would be exactly that).
-    lossy_metadata: dict[str, str] = {}
-    title, reason = coerce_text(frontmatter.get("title") or path.stem)
-    if reason is not None:
-        lossy_metadata["title"] = reason
+    # `frontmatter` is already scrubbed — `_partition_frontmatter` removed
+    # anything unrenderable before this function ever saw it — so nothing here
+    # screens, and `title`/`tags` below cannot raise. What this passes on is the
+    # parse's own record of *what* was dropped, keyed by top-level frontmatter
+    # key, so `read_note` can omit the affected response fields whole and name
+    # the reason. Consumers that only need to not crash (the indexer, the
+    # control panel) ignore it and take the scrubbed mapping as-is.
+    title = frontmatter.get("title") or path.stem
+    # `title:` is whatever YAML says it is — a list, a date, a mapping — and
+    # every consumer wants a string. Safe by the invariant above: the scrub has
+    # already removed anything `str()` would refuse.
+    title = title if isinstance(title, str) else str(title)
     tags = extract_tags(content, frontmatter)
-    fm_tags = frontmatter.get("tags")
-    if isinstance(fm_tags, list):
-        for _, tag_reason in map(coerce_text, fm_tags):
-            if tag_reason is not None:
-                lossy_metadata["tags"] = tag_reason
-                break
     return {
         "path": relative_path,
         "title": title,
-        "lossy_metadata": lossy_metadata,
+        "lossy_metadata": dict(diagnosis.lossy),
         "frontmatter": frontmatter,
         # The block's YAML source, or None when the note carries no valid
         # line-1 block. `read_note` returns this as the *authoritative*
@@ -2770,6 +2766,10 @@ class FrontmatterDiagnosis:
     thing D3 exists to prevent. The write paths, which pass raw bytes, get the
     raw bytes back here — that is why `edit_note` can still reattach a CRLF
     block byte-identically.
+
+    `lossy` names the **top-level** frontmatter keys under which something was
+    dropped by the representability scrub, mapped to why. Empty for almost
+    every note. See `_scrub_frontmatter`.
     """
 
     valid: bool
@@ -2777,9 +2777,177 @@ class FrontmatterDiagnosis:
     message: str | None = None      # human phrase; carries PyYAML's own text
     block: str = ""
     yaml_text: str = ""
+    lossy: "MappingProxyType[str, str]" = MappingProxyType({})
 
 
 _ABSENT = FrontmatterDiagnosis(valid=False)
+
+# JSON has no integer width but every consumer of one does, and beyond this an
+# int is carried as text rather than as a number. Matches the response model's
+# own bound; the point of the bound is that `str()` on the value still works.
+_JSON_INT_BOUND = 2 ** 63
+
+# Floor on the scrub's node budget, so a tiny block still gets a sane walk. The
+# budget itself is derived from the block's own length: a YAML document of N
+# characters cannot construct more than N nodes, so the note-size cap that
+# already bounds a read bounds this too. There is deliberately no depth
+# constant — depth is the axis a recursive walk could not bound, and the walk
+# below is iterative, so it does not need one.
+_SCRUB_MIN_NODES = 1_024
+
+
+def _representability(value) -> str | None:
+    """Why nothing downstream can carry `value`, or None when everything can.
+
+    The predicate, once, for every consumer of a parsed block. Two ways a
+    *valid* YAML value refuses to be carried, both reachable from a note a user
+    can save, and both of them were separate production failures:
+
+    * `title: 0x<5000 hex digits>` — PyYAML constructs the int (CPython's
+      digit limit guards decimal parsing, not hex literals) and then `str()`
+      on it raises `ValueError`. That crashed `read_note`, the control panel's
+      note viewer, the indexer's batch (`_note_title`), and JSONB
+      serialization of `notes_metadata.frontmatter`.
+    * `title: "\uD800"` — decodes to a lone surrogate, a valid Python `str`
+      that is not a Unicode scalar value, so it cannot be UTF-8-encoded.
+      `pydantic_core` raises on it, and it reaches the panel's HTML.
+
+    Note what is deliberately *not* here: dates, non-string keys, non-finite
+    floats. Every consumer already renders those its own way — the indexer with
+    `str()`, `read_note`'s JSON view with `isoformat()` — and those renderings
+    are load-bearing (an indexed frontmatter value is what
+    `keyword_search(frontmatter=…)` matches against). The scrub removes what
+    *nothing* can render; it does not unify how the renderable is rendered.
+    """
+    if isinstance(value, str):
+        return None if is_encodable(value) else TEXT_UNENCODABLE
+    if value is None or isinstance(value, (bool, float)):
+        return None
+    if isinstance(value, int):
+        if -_JSON_INT_BOUND < value < _JSON_INT_BOUND:
+            return None
+        try:
+            rendered = str(value)
+        except Exception:
+            return TEXT_UNRENDERABLE
+        return None if is_encodable(rendered) else TEXT_UNENCODABLE
+    # Dates, bytes, and whatever else a YAML tag constructs. Every consumer
+    # reaches these through `str()`; all this asks is that it not raise.
+    return coerce_text(value)[1]
+
+
+def _scrub_frontmatter(fm: dict, budget: int) -> tuple[dict, dict[str, str]]:
+    """Return `(mapping, lossy)` — the block with unrenderable values removed.
+
+    **This is the boundary.** Every consumer of a parsed frontmatter block —
+    `read_note`, `extract_tags`, the indexer's title and JSONB columns, the
+    control panel's note viewer, `move_note`'s title refresh — reads what this
+    returns, so each one inherits safety instead of screening for itself.
+    Screening per consumer is what kept this class alive for three review
+    rounds: `read_note`'s fields were closed, then `edit_note`'s selector, then
+    the indexer and the panel and `extract_tags`' scalar branch turned up with
+    the same shape. A predicate applied once at the parse cannot be forgotten
+    by the next consumer, because the next consumer never sees the value.
+
+    A key whose value cannot be carried is **dropped whole**, and the loss is
+    recorded against the top-level key it sits under, so a caller that must not
+    show a pruned mapping (`read_note`'s JSON view) can omit it entirely and a
+    caller that just needs to not crash (the indexer) can carry the rest.
+    Silent substitution is not on the menu: a placeholder inside a
+    note-controlled value is indistinguishable from note content, which is the
+    forgery class #149 exists to end.
+
+    The walk is **iterative**, with an explicit stack, for the reason the
+    decorator's argument screen is: a recursive one needs a depth constant, and
+    a depth constant is a hole — `{"a": [[[[[[…]]]]]]}` walks past it and the
+    value arrives unscreened. Depth here is bounded only by the heap, and total
+    work by `budget` nodes, derived from the block's own length.
+
+    Cycle-safe by construction: `x: &X [*X]` builds a container that contains
+    itself, and the frame stack carries the ids on the current path, so the
+    second visit is recognised as recursion and dropped rather than looped on.
+    """
+    if not isinstance(fm, dict) or not fm:
+        return fm, {}
+
+    lossy: dict[str, str] = {}
+    remaining = max(_SCRUB_MIN_NODES, budget)
+
+    def note_loss(top_key, reason: str) -> None:
+        label = top_key if isinstance(top_key, str) else _UNRENDERABLE_KEY
+        lossy.setdefault(label, reason)
+
+    out: dict = {}
+    # Each frame: the source container, the output container it fills, an
+    # iterator over the source's items, and the top-level key the whole subtree
+    # hangs from. `path` holds the ids of the containers on the current
+    # descent, which is what makes recursion detectable without a depth limit.
+    stack: list[tuple[object, object, object, object]] = [
+        (fm, out, iter(fm.items()), None)
+    ]
+    path: set[int] = {id(fm)}
+
+    while stack:
+        src, dest, items, top_key = stack[-1]
+        try:
+            step = next(items)
+        except StopIteration:
+            stack.pop()
+            path.discard(id(src))
+            continue
+
+        if isinstance(dest, dict):
+            key, value = step
+            here = key if top_key is None else top_key
+            reason = _representability(key)
+            if reason is not None:
+                note_loss(here if top_key is not None else _UNRENDERABLE_KEY, reason)
+                continue
+        else:
+            key, value = None, step
+            here = top_key
+
+        remaining -= 1
+        if remaining < 0:
+            note_loss(here, TEXT_UNRENDERABLE)
+            continue
+
+        def place(rendered) -> None:
+            if isinstance(dest, dict):
+                dest[key] = rendered
+            else:
+                dest.append(rendered)
+
+        if isinstance(value, dict) or isinstance(value, (list, tuple)):
+            if id(value) in path:
+                # A recursive alias. The block's text still carries it; the
+                # mapping cannot.
+                note_loss(here, TEXT_UNRENDERABLE)
+                continue
+            child: object = {} if isinstance(value, dict) else []
+            place(child)
+            path.add(id(value))
+            stack.append((
+                value,
+                child,
+                iter(value.items()) if isinstance(value, dict) else iter(value),
+                here,
+            ))
+            continue
+
+        reason = _representability(value)
+        if reason is not None:
+            note_loss(here, reason)
+            continue
+        place(value)
+
+    return out, lossy
+
+
+# The label a loss is recorded under when the *key itself* could not be
+# rendered, so there is no name to record it against.
+_UNRENDERABLE_KEY = "<unrenderable key>"
+
 
 
 def _partition_frontmatter(raw: str) -> tuple[dict, str, FrontmatterDiagnosis]:
@@ -2908,7 +3076,17 @@ def _partition_frontmatter(raw: str) -> tuple[dict, str, FrontmatterDiagnosis]:
                 f"(it parses as a {type(fm).__name__})"
             ),
         )
-    return fm, body, FrontmatterDiagnosis(valid=True, block=block, yaml_text=yaml_text)
+    # The representability boundary. Everything downstream of this line —
+    # `read_note`'s fields, `extract_tags`, the indexer's title and JSONB
+    # columns, the control panel — reads the scrubbed mapping, so none of them
+    # has to screen for itself and none of them can forget to.
+    fm, lossy = _scrub_frontmatter(fm, len(yaml_text))
+    return fm, body, FrontmatterDiagnosis(
+        valid=True,
+        block=block,
+        yaml_text=yaml_text,
+        lossy=MappingProxyType(lossy),
+    )
 
 
 def parse_frontmatter(raw: str) -> tuple[dict, str]:
@@ -3339,16 +3517,22 @@ def extract_tags(body: str, frontmatter: dict) -> list[str]:
       because the partition hands back the raw text as the body there. That
       matches the read path, which resolves such a note over its raw content
       too.
+
+    Precondition: `frontmatter` comes from the shared parser, so its values are
+    already representable. Do not call this with a mapping straight out of
+    `yaml.safe_load`.
     """
     tags = set()
-    # Frontmatter tags. Coercion goes through `coerce_text`, which never raises:
-    # a `tags: [0x<5000 hex digits>]` entry used to take out `str()` and with it
-    # `read_file`, the control panel's note viewer and the indexer's scan of
-    # that note. An entry that will not render is skipped here; `read_file`
-    # reports the loss separately, for the one caller that can say so.
+    # `frontmatter` MUST be a mapping from the shared parser, which has already
+    # removed every value nothing can render (`_scrub_frontmatter`). That is
+    # what makes `str()` safe here — a `tags: [0x<5000 hex digits>]` entry used
+    # to raise out of this line and take `read_file`, the control panel's note
+    # viewer and the indexer's scan of that note with it. An earlier fix
+    # screened *this* branch; the scalar branch below still bypassed it, which
+    # is why the screen moved to the parse instead of living here.
     fm_tags = frontmatter.get("tags", [])
     if isinstance(fm_tags, list):
-        tags.update(text for text, _ in map(coerce_text, fm_tags) if text is not None)
+        tags.update(str(t) for t in fm_tags)
     elif isinstance(fm_tags, str):
         tags.update(t.strip() for t in fm_tags.split(","))
     # Inline #tags (not inside code blocks)

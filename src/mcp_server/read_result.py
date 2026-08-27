@@ -496,23 +496,27 @@ def _tag_cost(tags: list[str]) -> int:
 def screen_unrenderable(
     result: "ReadNoteResult", lossy: dict[str, str]
 ) -> list[MetadataOmission]:
-    """Report — and finish — the drops `vault.read_file` already had to make.
+    """Turn the parse's loss record into this response's omissions.
 
-    `read_file` is the one place holding both the parsed mapping and the values
-    derived from it, so it is the one place that can tell a value apart from a
-    value that would not render. It hands back `lossy_metadata`; this turns that
-    into the caller-visible omissions and makes sure the field really is gone.
+    This function no longer *screens* anything: `_scrub_frontmatter` removed
+    every unrenderable value at the parse, so by the time a mapping reaches
+    here it is safe, and so are the `title` and `tags` derived from it. What is
+    left is the assembly job — deciding what a dropped key costs *this
+    response*, which is a question only the response shape can answer:
 
-    Only the fields whose values come from YAML rather than from the note's
-    decoded bytes are involved: `title` and `tags`. `heading`, `content`,
-    `frontmatter_yaml` and the outline's titles are slices of
-    `Path.read_text(encoding="utf-8")`, which is strict, so they cannot carry a
-    lone surrogate and cannot be anything but text. `path` and the section
-    selector are screened earlier still, at admission, where a bad one is an
-    error rather than an omission — see `vault.is_encodable`.
+    * `title` and `tags` are dropped whole, because `read_file`'s fallback
+      would otherwise hand the agent the filename as a title that the note does
+      not carry, and a tag list quietly missing an entry;
+    * the `frontmatter` JSON view is dropped for **any** loss anywhere in the
+      block, including one nested three levels down under an unrelated key,
+      because a pruned mapping is indistinguishable from the real one and this
+      tool does not emit a partial view. `frontmatter_yaml` is untouched and
+      remains the authoritative copy of what was actually in the note.
 
-    Whole-field drops, like every other omission: no value is cut down to the
-    part of itself that would have rendered.
+    `heading`, `content`, `frontmatter_yaml` and the outline's titles are slices
+    of `Path.read_text(encoding="utf-8")`, which is strict, so they cannot be
+    anything but renderable text. `path` and the section selector are refused
+    at admission, where a bad one is an error rather than an omission.
     """
     omissions: list[MetadataOmission] = []
     for field in ("title", "tags"):
@@ -521,9 +525,18 @@ def screen_unrenderable(
             continue
         setattr(result, field, None)
         omissions.append(unrenderable_omission(field, reason))
-    # Belt and braces. Nothing should reach here that `read_file` did not
-    # already catch, but the cost of being wrong is a protocol error, and the
-    # cost of the check is two `encode` calls.
+    if lossy:
+        # Unconditionally, not `if result.frontmatter is not None`: when the
+        # dropped key was the block's *only* key the view is already empty, and
+        # silently showing nothing is exactly the pruned-mapping answer this
+        # tool does not give. The caller is told the view is unavailable.
+        result.frontmatter = None
+        omissions.append(unrenderable_omission("frontmatter", _worst_reason(lossy)))
+    # Belt and braces on the two fields that are not pure slices of the note's
+    # decoded bytes: `title` falls back to the filename, which the OS can hand
+    # back through surrogate-escape. Nothing should reach here that the parse
+    # did not already catch, but the cost of being wrong is a protocol error and
+    # the cost of the check is two `encode` calls.
     if result.title is not None and not is_encodable(result.title):
         result.title = None
         omissions.append(unrenderable_omission("title", OMITTED_UNPAIRED_SURROGATE))
@@ -531,6 +544,18 @@ def screen_unrenderable(
         result.tags = None
         omissions.append(unrenderable_omission("tags", OMITTED_UNPAIRED_SURROGATE))
     return omissions
+
+
+def _worst_reason(lossy: dict[str, str]) -> str:
+    """One reason for the view's omission when several keys were dropped.
+
+    An unpaired surrogate is the more alarming of the two — it is the one that
+    would have produced a protocol error — so it wins when both are present.
+    """
+    reasons = set(lossy.values())
+    if OMITTED_UNPAIRED_SURROGATE in reasons:
+        return OMITTED_UNPAIRED_SURROGATE
+    return OMITTED_NOT_REPRESENTABLE
 
 
 def apply_metadata_budget(

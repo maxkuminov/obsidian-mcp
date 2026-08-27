@@ -421,13 +421,6 @@ def _response_size(result) -> int:
     return len(str(result))
 
 
-# How deep the argument screen walks into a container argument. Every tool
-# argument is a scalar, a flat list, or a one-level mapping (`frontmatter=`,
-# `updates=`); the bound exists so a pathological nested argument cannot turn
-# the screen itself into the denial of service it is defending against.
-_ARG_SCREEN_MAX_DEPTH = 6
-
-
 def _first_unencodable_argument(bound) -> str | None:
     """The name of the first argument carrying an unpaired surrogate, or None.
 
@@ -448,22 +441,44 @@ def _first_unencodable_argument(bound) -> str | None:
     including arguments no error message quotes today but might tomorrow.
     """
 
-    def offends(value, depth: int) -> bool:
-        if depth > _ARG_SCREEN_MAX_DEPTH:
-            return False
-        if isinstance(value, str):
-            return not is_encodable(value)
-        if isinstance(value, dict):
-            return any(
-                offends(key, depth + 1) or offends(item, depth + 1)
-                for key, item in value.items()
-            )
-        if isinstance(value, (list, tuple, set, frozenset)):
-            return any(offends(item, depth + 1) for item in value)
+    def offends(root) -> bool:
+        # Iterative, with an explicit stack and **no depth limit**. The first
+        # version was recursive and stopped at six levels, which is not a bound
+        # — it is a hole with a number on it: `{"a": [[[[[[["\ud800"]]]]]]]}`
+        # walked straight past it and the value was written to the note. Depth
+        # is the only axis that needs a loop; total size is already bounded by
+        # the transport's request-body limit, so a document that reaches this
+        # function is finite and the walk terminates.
+        #
+        # Containers already visited are skipped, which makes a self-referential
+        # argument terminate as well. An argument cannot be recursive over the
+        # wire (JSON has no aliases), but this function is called on whatever a
+        # caller passes an impl directly, in tests and in future in-process
+        # callers.
+        stack = [root]
+        seen: set[int] = set()
+        while stack:
+            value = stack.pop()
+            if isinstance(value, str):
+                if not is_encodable(value):
+                    return True
+                continue
+            if isinstance(value, dict):
+                if id(value) in seen:
+                    continue
+                seen.add(id(value))
+                stack.extend(value.keys())
+                stack.extend(value.values())
+                continue
+            if isinstance(value, (list, tuple, set, frozenset)):
+                if id(value) in seen:
+                    continue
+                seen.add(id(value))
+                stack.extend(value)
         return False
 
     for name, value in bound.arguments.items():
-        if offends(value, 0):
+        if offends(value):
             return name
     return None
 
@@ -3220,6 +3235,24 @@ async def set_frontmatter_impl(
         # safely touch.
         if diagnosis.defect is not None:
             return _frontmatter_defect_error("set_frontmatter", path, diagnosis)
+
+        if diagnosis.lossy:
+            # This tool rewrites the block from the parsed mapping, and the
+            # parser drops what nothing can render (a hex integer past the
+            # digit limit, an unpaired surrogate). Serializing the pruned
+            # mapping would delete those keys from the note as a side effect of
+            # setting an unrelated one — a destructive write reported as a
+            # success, which is the class this server treats as the expensive
+            # failure. Refused by name, like a defective block, and for the
+            # same reason: the repair is the caller's to make deliberately.
+            keys = ", ".join(f"`{k}`" for k in sorted(diagnosis.lossy))
+            return (
+                f"set_frontmatter: {path} has frontmatter this server cannot "
+                f"represent, under {keys}, so rewriting the block from the "
+                "parsed mapping would silently delete it. Edit the raw block "
+                "with `edit_note(find=...)`, or replace it with "
+                "`edit_note(replace_frontmatter=True)`."
+            )
 
         if not updates and not remove:
             return f"No changes for {path} (empty updates and remove)"

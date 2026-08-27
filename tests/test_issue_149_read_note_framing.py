@@ -498,6 +498,51 @@ async def test_the_screen_reaches_into_container_arguments(vault):
 
 
 @pytest.mark.asyncio
+async def test_the_argument_screen_has_no_depth_limit(vault):
+    """The screen was recursive with a six-level cap, which is not a bound —
+    it is a hole with a number on it. Codex walked past it at depth seven and
+    the value was written to the note."""
+    original = "---\na: 1\n---\nbody\n"
+    write(vault, "n.md", original)
+
+    deep_seven = {"deep": [[[[[["\ud800"]]]]]]}
+    blocks, _ = await mcp.call_tool(
+        "set_frontmatter", {"path": "n.md", "updates": deep_seven}
+    )
+    assert "Argument 'updates' is not valid UTF-8" in blocks[0].text
+    assert read(vault, "n.md") == original
+
+    buried = "\udc00"
+    for _ in range(50):
+        buried = [buried]
+    blocks, _ = await mcp.call_tool(
+        "set_frontmatter", {"path": "n.md", "updates": {"k": buried}}
+    )
+    assert "Argument 'updates' is not valid UTF-8" in blocks[0].text
+    assert read(vault, "n.md") == original
+
+
+def test_the_argument_screen_terminates_on_a_self_referencing_argument():
+    """It cannot arrive over the wire — JSON has no aliases — but the impls are
+    called directly, in tests and by future in-process callers."""
+    loop: list = []
+    loop.append(loop)
+
+    class _Bound:
+        arguments = {"updates": {"k": loop}}
+
+    assert tools._first_unencodable_argument(_Bound()) is None
+
+    loop2: list = ["\ud800"]
+    loop2.append(loop2)
+
+    class _Bound2:
+        arguments = {"updates": loop2}
+
+    assert tools._first_unencodable_argument(_Bound2()) == "updates"
+
+
+@pytest.mark.asyncio
 async def test_a_refused_argument_is_logged_under_its_own_marker(vault, monkeypatch):
     """An operator reading `/admin/usage` must be able to tell "this credential
     has no vault" from "this client is emitting bad JSON escapes"."""
@@ -600,10 +645,39 @@ async def test_an_unrenderable_value_never_becomes_a_protocol_error(vault, block
     ReadNoteResult.model_validate(structured)
 
 
-def test_the_shared_coercion_helper_never_raises(vault):
-    """`vault.coerce_text` is the single place a YAML value becomes text, and
-    the indexer and the control panel depend on it not raising either — a
-    `tags: [0x…]` note used to break the indexer's scan of that note."""
+def _parsed(block: str):
+    """`(mapping, lossy)` for a frontmatter block, through the shared parser."""
+    fm, _body, diagnosis = vault_service.parse_frontmatter_diagnose(
+        f"---\n{block}\n---\nbody\n"
+    )
+    return fm, dict(diagnosis.lossy)
+
+
+def test_the_parse_is_where_unrenderable_values_are_removed():
+    """The structural fix. Three review rounds closed this class one consumer
+    at a time — `read_note`'s fields, then `edit_note`'s selector, then the
+    indexer and the panel and `extract_tags`' scalar branch — so the predicate
+    moved to the boundary they all read from. A consumer cannot forget a screen
+    it never had to write, because the value never reaches it."""
+    fm, lossy = _parsed(f"title: {_HEX_BIG_INT}")
+    assert fm == {}
+    assert lossy == {"title": "not_json_representable"}
+
+    fm, lossy = _parsed('title: "\\uD800"')
+    assert fm == {}
+    assert lossy == {"title": "unpaired_surrogate"}
+
+    # Loss is attributed to the TOP-LEVEL key, however deep it happened.
+    fm, lossy = _parsed(f"nested:\n  deep:\n    k: {_HEX_BIG_INT}")
+    assert fm == {"nested": {"deep": {}}}
+    assert lossy == {"nested": "not_json_representable"}
+
+    # A recursive alias is a container that contains itself: unrepresentable
+    # for JSONB, and infinite recursion for the indexer's sanitizer.
+    fm, lossy = _parsed("x: &X [*X]")
+    assert lossy == {"x": "not_json_representable"}
+
+    # And the predicate underneath, directly: one helper, two named reasons.
     import yaml as _yaml
 
     huge = _yaml.safe_load(f"n: {_HEX_BIG_INT}")["n"]
@@ -611,8 +685,85 @@ def test_the_shared_coercion_helper_never_raises(vault):
     assert vault_service.coerce_text("\ud800") == (None, "unpaired_surrogate")
     assert vault_service.coerce_text("plain") == ("plain", None)
     assert vault_service.coerce_text(7) == ("7", None)
-    # The lossy entry is skipped, not fatal, and the good one survives.
-    assert vault_service.extract_tags("", {"tags": ["ok", huge]}) == ["ok"]
+
+
+def test_the_parse_leaves_the_merely_awkward_alone():
+    """The scrub removes what *nothing* can render. It does not unify how the
+    renderable is rendered: dates and non-string keys stay exactly as PyYAML
+    built them, because each consumer's own coercion of those is load-bearing
+    (an indexed frontmatter value is what `keyword_search(frontmatter=…)`
+    matches against, and `read_note`'s view ISO-formats where the indexer
+    `str()`s)."""
+    import datetime
+
+    fm, lossy = _parsed("d: 2020-01-02\n1: a\n\"1\": b\nf: 1.5\nn: null")
+    assert lossy == {}
+    assert fm["d"] == datetime.date(2020, 1, 2)
+    assert fm[1] == "a" and fm["1"] == "b"
+    assert fm["f"] == 1.5 and fm["n"] is None
+
+
+def test_the_scrub_walks_without_a_depth_limit():
+    """Iterative, with an explicit stack. A recursive walk needs a depth
+    constant, and a depth constant is a hole with a number on it."""
+    deep = "a: " + "[" * 200 + f"{_HEX_BIG_INT}" + "]" * 200
+    fm, lossy = _parsed(deep)
+    assert lossy == {"a": "not_json_representable"}
+
+    nested = "".join("  " * i + f"k{i}:\n" for i in range(200))
+    fm, lossy = _parsed(nested + "  " * 200 + f"deep: {_HEX_BIG_INT}")
+    assert lossy == {"k0": "not_json_representable"}
+
+
+def test_extract_tags_inherits_the_invariant_on_both_branches():
+    """`extract_tags` used to screen its *list* branch and not its scalar-split
+    branch, which is how a surrogate reached the panel's HTML and the indexer.
+    Neither branch screens now; both are safe because the mapping is."""
+    fm, lossy = _parsed(f"tags: [ok, {_HEX_BIG_INT}]")
+    assert vault_service.extract_tags("", fm) == ["ok"]
+    assert lossy == {"tags": "not_json_representable"}
+
+    # The scalar-split branch: one unrenderable character costs the whole
+    # scalar, because the value is one string and it is dropped whole.
+    fm, lossy = _parsed('tags: "ok,\\uD800bad"')
+    assert vault_service.extract_tags("", fm) == []
+    assert lossy == {"tags": "unpaired_surrogate"}
+
+
+def test_the_indexer_inherits_the_invariant_with_no_changes_of_its_own():
+    """Codex's two reproduced indexer crashes, against the boundary fix.
+    `_note_title` and `_sanitize_value` are untouched by this change."""
+    import json as _json
+
+    from src.services import indexer
+
+    fm, _ = _parsed(f"title: {_HEX_BIG_INT}")
+    assert indexer._note_title(fm, "note.md") == "note"      # was ValueError
+
+    fm, _ = _parsed(f"tags: [ok, {_HEX_BIG_INT}]\nnested:\n  k: {_HEX_BIG_INT}")
+    assert _json.dumps(indexer._sanitize_frontmatter(fm)) == (
+        '{"tags": ["ok"], "nested": {}}'                     # was ValueError
+    )
+
+    # And the cycle the sanitizer would have recursed into forever. Note the
+    # shape: the container survives, pruned of what could not be carried. That
+    # is the right answer for a consumer that only needs to not crash — and it
+    # is exactly why `read_note` omits its JSON view for ANY loss anywhere in
+    # the block rather than showing a pruned mapping as if it were the note's.
+    fm, _ = _parsed("x: &X [*X]")
+    assert _json.dumps(indexer._sanitize_frontmatter(fm)) == '{"x": []}'
+
+
+@pytest.mark.asyncio
+async def test_the_panel_reads_such_a_note_without_raising(vault):
+    """The control panel's note viewer goes through `read_file` too, and it is
+    the surface where a surrogate would have reached rendered HTML."""
+    write(vault, "n.md", f'---\ntitle: {_HEX_BIG_INT}\ntags: "a,\\uD800"\n---\nbody\n')
+    data = vault_service.read_file("n.md")
+    assert data["title"] == "n"
+    assert data["tags"] == []
+    assert vault_service.is_encodable(data["title"])
+    assert set(data["lossy_metadata"]) == {"title", "tags"}
 
 
 # A well-formed YAML integer past CPython's int-string digit limit. PyYAML's

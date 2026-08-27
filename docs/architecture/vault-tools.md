@@ -244,8 +244,9 @@ There are **byte** caps, a **character** cap, and a **transport** cap, and they 
 - The MCP streamable-HTTP **request body limit** bounds what the transport accepts at all, before any tool runs. It is derived, not configured: `max(2 × MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB` (61 MiB with the defaults), passed to `FastMCP(max_request_body_size=)` from `Settings.mcp_max_request_body_bytes`. The SDK's own default is 4 MiB, which would silently reject writes far below our documented 25 MB cap. The formula guarantees — for a *canonical* envelope, i.e. JSON-RPC framing plus non-content arguments under 1 MiB — that a base64 `write_file` at the cap (base64 is `4·⌈n/3⌉ ≤ 2n + 2`) and any note write up to `MAX_NOTE_BYTES` (JSON escaping expands a byte at most 6×) always reach the tool, which then decides. Unsupported shapes are bounded by the transport with a bare HTTP 413 and no tool error: text-mode `write_file` whose escaping exceeds the limit (send base64 — always safe), an envelope over 1 MiB, and arguments that are large but discarded.
 
 **An argument that is not UTF-8 never reaches a tool body.** `_tracked` screens
-every bound argument — strings, and one bounded walk into list and mapping
-arguments like `set_frontmatter(updates=…)` — and refuses the call with
+every bound argument — strings, and an **iterative, depth-unlimited** walk into
+list and mapping arguments like `set_frontmatter(updates=…)` — and refuses the
+call with
 `_UNENCODABLE_ARG_MARKER` in `usage_logs`, distinct from the vault markers so an
 operator can tell "this credential has no vault" from "this client is emitting
 bad JSON escapes". The refusal names the parameter and never repeats the value,
@@ -261,6 +262,14 @@ beside it. Anything a future tool accepts is covered by construction. `path` is
 *also* refused at the vault layer (`validate_path`, `_mutable_parts`), because a
 path that is not UTF-8 cannot name a file and that is true regardless of which
 decorator ran.
+
+**The walk had a six-level depth cap and that was a bug, not a bound.**
+`{"deep": [[[[[["\ud800"]]]]]]}` walked past it and the value was written to
+the note. It is an explicit stack now, with no depth constant: total argument
+size is already bounded by the transport's request-body limit, so depth was the
+only unbounded axis and a loop removes it. Visited containers are skipped, so a
+self-referential argument (impossible over the wire, reachable from an
+in-process caller) terminates.
 
 **Every note write tool caps its own result.** `create_note`, `edit_note` (all modes, `dry_run` included), and `set_frontmatter` refuse a result over `MAX_NOTE_BYTES` with a tool-level error and no write, via `_note_size_error()` in `tools.py`. That is what keeps the tool, not the transport, in charge of every supported write — the transport limit sits deliberately above every tool cap. `MAX_NOTE_BYTES` lives in `src/config.py` (not `tools.py`) because the transport formula needs it.
 
@@ -582,7 +591,8 @@ block has shapes JSON does not:
   lossy in the other direction;
 - **values that will not become text** — two shapes, both *valid YAML*, both
   reachable from a note a user can save, and `vault.coerce_text` is the one
-  place either is handled:
+  predicate for both (see "The representability boundary" below for where it
+  runs):
   - `title: "\uD800"` decodes to a lone surrogate: a valid Python `str`, not a
     Unicode scalar value, so it cannot be UTF-8-encoded. `pydantic_core`, which
     renders *both* halves of the MCP result, raises
@@ -594,21 +604,76 @@ block has shapes JSON does not:
     literals — and then `str()` on the value raises `ValueError`. Reason code
     `not_json_representable`.
 
-  Both are screened at model-build time, on `title`, `tags` and every string in
-  the view, and the offending field is dropped **whole**. `frontmatter_yaml` is
-  unaffected in both cases: in the file the value is ordinary text.
-  `heading`, `content` and the outline's titles are slices of
+  `frontmatter_yaml` is unaffected in both cases: in the file the value is
+  ordinary text. `heading`, `content` and the outline's titles are slices of
   `Path.read_text(encoding="utf-8")`, which is strict, so they cannot carry a
-  surrogate and are not screened. **`extract_tags` uses the same helper**, so a
-  `tags: [0x…]` note no longer takes out `read_file`, the control panel's note
-  viewer, or the indexer's scan of that note — it silently skips the entry it
-  cannot render, and `read_file` reports the loss in `lossy_metadata` so
-  `read_note` can drop the whole field and name the reason.
+  surrogate at all.
 
 A partial view is never emitted: a caller cannot tell a pruned map from the
 real one. **Mutation goes through `set_frontmatter`, or through the raw block
 with `edit_note(find=…)` — never a round trip of the JSON view**, and all four
 docstrings say so.
+
+### The representability boundary: scrub once, at the parse (#149)
+
+**`_partition_frontmatter` returns a mapping every consumer can carry.** The
+scrub (`_scrub_frontmatter`) runs there, once per parse, and every reader of a
+parsed block inherits it: `read_note`'s fields, `extract_tags`, the indexer's
+`title` column and its JSONB `frontmatter` column, the control panel's note
+viewer, `move_note`'s title refresh. A key whose value nothing can render is
+**dropped**, and the loss is recorded on the diagnosis (`lossy`, keyed by the
+top-level frontmatter key it happened under).
+
+**Why the boundary and not the consumers.** Three review rounds closed this
+class one consumer at a time and it came back each time: `read_note`'s fields,
+then `edit_note`'s selector, then — in the same review — the indexer's
+`_note_title`, JSONB serialization of `notes_metadata.frontmatter`, and
+`extract_tags`' *scalar-string* `tags:` branch, which the previous round's fix
+to its list branch had walked straight past. Screening per consumer is a list
+you have to remember to add to. A predicate at the parse cannot be forgotten by
+the next consumer, because the next consumer never sees the value. Both crashes
+Codex reproduced are pinned in `tests/test_issue_149_read_note_framing.py`
+against the *unmodified* indexer helpers, which is the check that the
+inheritance is real.
+
+**What it removes, and what it deliberately leaves.** It removes only what
+*nothing* can render: a string that is not UTF-8-encodable, an integer whose
+`str()` raises, a container that contains itself. It does **not** unify how the
+renderable is rendered — dates and non-string keys come through exactly as
+PyYAML built them, because each consumer's own coercion of those is
+load-bearing (an indexed frontmatter value is what
+`keyword_search(frontmatter=…)` matches against, and `read_note`'s JSON view
+ISO-formats a date where the indexer `str()`s it). Widening the scrub into a
+normalizer would silently re-key the index.
+
+**The walk is iterative, with an explicit stack.** No depth constant — a depth
+constant is a hole with a number on it, which is exactly how the decorator's
+argument screen let `{"a": [[[[[[["\ud800"]]]]]]]}` through at seven levels.
+Total work is bounded by a node budget derived from the block's own length (a
+YAML document of N characters cannot construct more than N nodes), and the
+frame stack carries the ids on the current descent, so `x: &X [*X]` is
+recognised as recursion rather than looped on.
+
+**Consequences that are not obvious:**
+
+- A container all of whose contents were dropped survives *pruned*
+  (`{"nested": {}}`). That is the right answer for a consumer that only needs
+  not to crash. It is also exactly why `read_note` omits its `frontmatter` JSON
+  view for **any** loss anywhere in the block, however deep and under whatever
+  unrelated key: a pruned mapping is indistinguishable from the real one, and
+  this tool does not emit a partial view. `frontmatter_yaml` still carries the
+  block verbatim.
+- **`set_frontmatter` refuses a note whose block lost something**, by name,
+  pointing at `edit_note(find=…)` or `replace_frontmatter=True`. It rewrites
+  the block *from the parsed mapping*, so serializing the pruned one would
+  delete those keys as a side effect of setting an unrelated one — a
+  destructive write reported as a success. The refusal precedes the no-op check
+  for the same reason D6 gives for the defective-block refusal. This is a
+  deliberate behaviour change: `a: &A [*A]` notes used to accept a
+  `set_frontmatter` and now do not, and
+  `tests/test_issue_128_set_frontmatter_refusals.py` records why.
+- Section writes and default full-replace are unaffected — neither goes through
+  the mapping; both reattach `diagnosis.block` byte-identically.
 
 **`frontmatter_yaml` is LF-normalized, not byte-exact — declared, not fixed.**
 The read path hands the shared parser `Path.read_text()` output, which has
