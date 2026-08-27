@@ -638,24 +638,54 @@ inheritance is real.
 
 **What it removes, and what it deliberately leaves.** It removes only what
 *nothing* can render: a string that is not UTF-8-encodable, an integer whose
-`str()` raises, a container that contains itself. It does **not** unify how the
-renderable is rendered — dates and non-string keys come through exactly as
+`str()` raises, a container that contains itself, and a subtree nested deeper
+than `_SCRUB_MAX_DEPTH` (64). It does **not** unify how the renderable is
+rendered — dates and non-string keys come through exactly as
 PyYAML built them, because each consumer's own coercion of those is
 load-bearing (an indexed frontmatter value is what
 `keyword_search(frontmatter=…)` matches against, and `read_note`'s JSON view
 ISO-formats a date where the indexer `str()`s it). Widening the scrub into a
 normalizer would silently re-key the index.
 
-**The walk is iterative, with an explicit stack.** No depth constant — a depth
-constant is a hole with a number on it, which is exactly how the decorator's
-argument screen let `{"a": [[[[[[["\ud800"]]]]]]]}` through at seven levels.
-Total work is bounded by a node budget derived from the block's own length (a
-YAML document of N characters cannot construct more than N nodes), and the
-frame stack carries the ids on the current descent, so `x: &X [*X]` is
-recognised as recursion rather than looped on.
+**The walk is iterative, with an explicit stack**, so the walk itself cannot
+blow the stack however deep the input goes. Total work is bounded by a node
+budget derived from the block's own length (a YAML document of N characters
+cannot construct more than N nodes), and the frame stack carries the ids on the
+current descent, so `x: &X [*X]` is recognised as recursion rather than looped
+on.
+
+**Depth is bounded too, and it is a bound on the predicate, not on the walk.**
+`_SCRUB_MAX_DEPTH` (64) exists because the consumers this boundary protects are
+recursive and always will be: `indexer._sanitize_value`, `_note_title`,
+`copy.deepcopy` and `yaml.safe_dump` all descend a frontmatter value frame by
+frame. A structure deeper than they can descend is a structure *nothing can
+render*, which is precisely what this scrub removes — reached structurally
+instead of scalar by scalar, and reported as `excessive_depth`.
+
+Getting this wrong once is instructive. **The node budget bounds size and says
+nothing about depth**, and the two are independent axes. A 550 KB alias chain
+(`a0: &a0 {k: 1}` / `a1: &a1 {n: *a0}` / …) parses cleanly — PyYAML composes
+every `a<i>` at depth one, so its own composer never recurses even though the
+constructed graph is thousands deep — passed the budget with a 1,045-deep
+subtree intact, and came back `valid=True, lossy={}`. `_sanitize_value` then
+raised `RecursionError` on every index pass, forever, because nothing commits
+and the content hash never advances: #126's failure mode, reached by a new
+route. The empty loss record also walked straight through `set_frontmatter`'s
+refusal, where `deepcopy` and `safe_dump` raised in turn.
+
+**Do not fix that by converting the consumers to iterative walks.** That is
+four rewrites and a standing obligation on the fifth consumer, against one
+bound here that all of them inherit — the same argument that moved the whole
+predicate to this boundary. 64 is generous for a real vault (Obsidian's own
+frontmatter is flat; the deepest thing anyone writes by hand is a few levels of
+nested mapping) and sits far below CPython's ~1,000-frame limit with room for
+the several frames each consumer spends per level.
 
 **Consequences that are not obvious:**
 
+- A subtree past the depth bound is pruned at that point, so the levels above
+  it survive and the note stays readable; only the tail nobody could render is
+  gone.
 - A container all of whose contents were dropped survives *pruned*
   (`{"nested": {}}`). That is the right answer for a consumer that only needs
   not to crash. It is also exactly why `read_note` omits its `frontmatter` JSON

@@ -70,6 +70,7 @@ OMITTED_BUDGET = "metadata_budget"
 OMITTED_NOT_REPRESENTABLE = "not_json_representable"
 OMITTED_DUPLICATE_KEY = "duplicate_json_key"
 OMITTED_UNPAIRED_SURROGATE = "unpaired_surrogate"
+OMITTED_TOO_DEEP = "excessive_depth"
 
 
 class MetadataOmission(_OmitNone):
@@ -93,6 +94,10 @@ _UNRENDERABLE_DETAIL = {
     OMITTED_NOT_REPRESENTABLE: (
         "holds a value the server cannot render as text at all (an integer far "
         "past the digit limit CPython will convert, for instance)"
+    ),
+    OMITTED_TOO_DEEP: (
+        "nests deeper than this server can render, so the subtree below that "
+        "point is not carried"
     ),
 }
 
@@ -555,7 +560,9 @@ def _worst_reason(lossy: dict[str, str]) -> str:
     reasons = set(lossy.values())
     if OMITTED_UNPAIRED_SURROGATE in reasons:
         return OMITTED_UNPAIRED_SURROGATE
-    return OMITTED_NOT_REPRESENTABLE
+    if OMITTED_NOT_REPRESENTABLE in reasons:
+        return OMITTED_NOT_REPRESENTABLE
+    return OMITTED_TOO_DEEP
 
 
 def apply_metadata_budget(

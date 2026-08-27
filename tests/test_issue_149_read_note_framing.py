@@ -703,16 +703,23 @@ def test_the_parse_leaves_the_merely_awkward_alone():
     assert fm["f"] == 1.5 and fm["n"] is None
 
 
-def test_the_scrub_walks_without_a_depth_limit():
-    """Iterative, with an explicit stack. A recursive walk needs a depth
-    constant, and a depth constant is a hole with a number on it."""
+def test_the_scrub_walk_itself_needs_no_depth_limit_to_be_safe():
+    """Two different bounds, and the distinction is load-bearing.
+
+    The *walk* is iterative, so it cannot blow the stack however deep the input
+    goes — that is why it can afford to reach 200 levels here and report a
+    verdict instead of dying. The *predicate* separately refuses anything past
+    `_SCRUB_MAX_DEPTH`, not because the walk needs it but because the recursive
+    consumers downstream do (see the deep-alias tests below). A deep structure
+    is reported either way; what changes is the reason.
+    """
     deep = "a: " + "[" * 200 + f"{_HEX_BIG_INT}" + "]" * 200
     fm, lossy = _parsed(deep)
-    assert lossy == {"a": "not_json_representable"}
+    assert set(lossy) == {"a"}
 
     nested = "".join("  " * i + f"k{i}:\n" for i in range(200))
     fm, lossy = _parsed(nested + "  " * 200 + f"deep: {_HEX_BIG_INT}")
-    assert lossy == {"k0": "not_json_representable"}
+    assert set(lossy) == {"k0"}
 
 
 def test_extract_tags_inherits_the_invariant_on_both_branches():
@@ -728,6 +735,115 @@ def test_extract_tags_inherits_the_invariant_on_both_branches():
     fm, lossy = _parsed('tags: "ok,\\uD800bad"')
     assert vault_service.extract_tags("", fm) == []
     assert lossy == {"tags": "unpaired_surrogate"}
+
+
+def _alias_chain(levels: int) -> str:
+    """A frontmatter block whose *object graph* is `levels` deep.
+
+    Aliases, not nesting: PyYAML composes each `a<i>` at depth one, so its own
+    composer never recurses and the block parses cleanly — and the constructed
+    graph is nonetheless a chain `a<n> -> a<n-1> -> … -> a0`. That is what makes
+    this shape the interesting one: an inline-flow block 500 deep blows the
+    composer and is already refused as a yaml-error, while this one arrives at
+    the scrub looking perfectly ordinary.
+    """
+    lines = ["a0: &a0 {k: 1}"]
+    lines += [f"a{i}: &a{i} {{n: *a{i - 1}}}" for i in range(1, levels)]
+    return "\n".join(lines)
+
+
+def _graph_depth(value) -> int:
+    deepest = 0
+    stack = [(value, 0)]
+    while stack:
+        node, depth = stack.pop()
+        deepest = max(deepest, depth)
+        if isinstance(node, dict):
+            stack.extend((v, depth + 1) for v in node.values())
+        elif isinstance(node, list):
+            stack.extend((v, depth + 1) for v in node)
+    return deepest
+
+
+def test_a_legal_depth_block_is_untouched():
+    """The bound has to be generous enough that no real vault meets it. Thirty
+    levels of nested mapping is far past anything written by hand and passes
+    through with nothing recorded and nothing removed."""
+    block = "deep: " + "{n: " * 30 + "1" + "}" * 30
+    fm, lossy = _parsed(block)
+    assert lossy == {}
+    assert _graph_depth(fm) == 31
+
+
+@pytest.mark.parametrize("levels", [500, 6_000], ids=["500", "6000"])
+def test_a_deep_alias_chain_is_pruned_at_the_boundary(levels):
+    """Size and depth are independent axes, and the node budget bounds only the
+    first. A 550 KB chain passed it with a 1,045-deep subtree intact, which
+    `indexer._sanitize_value` then met as a `RecursionError` on every index
+    pass — forever, because nothing commits and the content hash never
+    advances. Depth beyond what the recursive consumers can descend IS
+    "nothing can render this", so it is part of the predicate."""
+    fm, lossy = _parsed(_alias_chain(levels))
+
+    assert lossy, "a deep block must never come back with an empty loss record"
+    assert "excessive_depth" in set(lossy.values())
+    assert _graph_depth(fm) <= vault_service._SCRUB_MAX_DEPTH
+
+
+@pytest.mark.parametrize("levels", [500, 6_000], ids=["500", "6000"])
+def test_the_recursive_consumers_survive_a_deep_block(levels):
+    """Every consumer that descends a frontmatter value frame by frame, against
+    the boundary fix. None of them was converted to an iterative walk —
+    inheriting the bound is the point."""
+    import copy as _copy
+    import json as _json
+
+    from src.services import indexer
+
+    fm, _ = _parsed(_alias_chain(levels))
+
+    assert indexer._note_title(fm, "note.md") == "note"
+    _json.dumps(indexer._sanitize_frontmatter(fm))
+    _copy.deepcopy(fm)
+    vault_service.serialize_frontmatter(fm, "body\n")
+
+
+@pytest.mark.parametrize("levels", [500, 6_000], ids=["500", "6000"])
+@pytest.mark.asyncio
+async def test_a_deep_block_reads_in_band_with_the_view_omitted(vault, levels):
+    write(vault, "n.md", f"---\n{_alias_chain(levels)}\n---\nbody\n")
+    blocks, structured = await mcp.call_tool("read_note", {"path": "n.md"})
+
+    assert json.loads(blocks[0].text) == structured
+    assert "error" not in structured
+    assert structured["content"] == "body\n"
+    # The view is unavailable and the response says why. The reason is the
+    # worst of several — a block this shape trips the scrub's node budget too —
+    # so what is pinned is that a reason is stated, not which one won.
+    assert "frontmatter" not in structured
+    omitted = {o["field"]: o["reason"] for o in structured["metadata_omissions"]}
+    assert "frontmatter" in omitted
+    # The raw block stays the authoritative copy whenever it fits the metadata
+    # budget; the 6,000-level chain is half a megabyte and does not, in which
+    # case it too is omitted whole with the budget as its stated reason.
+    if "frontmatter_yaml" in structured:
+        assert structured["frontmatter_yaml"].startswith("a0: &a0 {k: 1}")
+    else:
+        assert omitted["frontmatter_yaml"] == "metadata_budget"
+
+
+@pytest.mark.parametrize("levels", [500, 6_000], ids=["500", "6000"])
+@pytest.mark.asyncio
+async def test_a_deep_block_refuses_set_frontmatter_by_name(vault, levels):
+    """The bypass this closes: an empty loss record let a deep note through
+    `set_frontmatter`'s refusal, and `deepcopy`/`safe_dump` then raised."""
+    original = f"---\n{_alias_chain(levels)}\n---\nbody\n"
+    write(vault, "n.md", original)
+
+    result = await tools.set_frontmatter_impl("n.md", updates={"status": "done"})
+    assert "cannot represent" in result, result
+    assert "edit_note(replace_frontmatter=True)" in result
+    assert read(vault, "n.md") == original
 
 
 def test_the_indexer_inherits_the_invariant_with_no_changes_of_its_own():

@@ -346,6 +346,9 @@ def is_encodable(text: str) -> bool:
 # reason codes. `read_note` reports them; they are part of that tool's contract.
 TEXT_UNENCODABLE = "unpaired_surrogate"
 TEXT_UNRENDERABLE = "not_json_representable"
+# Structural rather than scalar: the value itself is fine, and the *shape*
+# around it is what nothing can render. See `_SCRUB_MAX_DEPTH`.
+TEXT_TOO_DEEP = "excessive_depth"
 
 
 def coerce_text(value) -> tuple[str | None, str | None]:
@@ -2790,10 +2793,34 @@ _JSON_INT_BOUND = 2 ** 63
 # Floor on the scrub's node budget, so a tiny block still gets a sane walk. The
 # budget itself is derived from the block's own length: a YAML document of N
 # characters cannot construct more than N nodes, so the note-size cap that
-# already bounds a read bounds this too. There is deliberately no depth
-# constant — depth is the axis a recursive walk could not bound, and the walk
-# below is iterative, so it does not need one.
+# already bounds a read bounds this too.
 _SCRUB_MIN_NODES = 1_024
+
+# How deep a frontmatter structure may be and still be *representable*.
+#
+# This is not an implementation shortcut for the walk below — that walk is
+# iterative and needs no limit. It is part of the predicate, because the
+# consumers this boundary protects are recursive and always will be:
+# `indexer._sanitize_value`, `_note_title`, `copy.deepcopy` and
+# `yaml.safe_dump` all descend a frontmatter value frame by frame. A structure
+# deeper than they can descend is a structure *nothing can render*, which is
+# exactly what this scrub removes. Converting those consumers to iterative
+# walks was the alternative and is the wrong shape: it is four rewrites and a
+# standing obligation on the fifth consumer, versus one bound here that all of
+# them inherit.
+#
+# The node budget does NOT imply a depth bound, which is what made this a bug
+# rather than a theoretical gap. Size and depth are independent axes: a
+# 550 KB alias chain passes the budget with a 1,045-deep subtree intact, and
+# `_sanitize_value` then raises `RecursionError` on every index pass, forever,
+# because nothing commits and the content hash never advances (#126's failure
+# mode).
+#
+# 64 is generous for a real vault — Obsidian's own frontmatter is flat, and the
+# deepest thing anyone writes by hand is a few levels of nested mapping — and
+# it sits far below CPython's ~1,000-frame limit with room for the several
+# frames each consumer spends per level.
+_SCRUB_MAX_DEPTH = 64
 
 
 def _representability(value) -> str | None:
@@ -2857,11 +2884,14 @@ def _scrub_frontmatter(fm: dict, budget: int) -> tuple[dict, dict[str, str]]:
     note-controlled value is indistinguishable from note content, which is the
     forgery class #149 exists to end.
 
-    The walk is **iterative**, with an explicit stack, for the reason the
-    decorator's argument screen is: a recursive one needs a depth constant, and
-    a depth constant is a hole — `{"a": [[[[[[…]]]]]]}` walks past it and the
-    value arrives unscreened. Depth here is bounded only by the heap, and total
-    work by `budget` nodes, derived from the block's own length.
+    The walk is **iterative**, with an explicit stack, so that the walk itself
+    needs no depth limit to be safe. It nonetheless *applies* one — see
+    `_SCRUB_MAX_DEPTH` — and the distinction is the whole point: the walk could
+    descend forever, and the recursive consumers downstream could not, so
+    "deeper than they can render" is a fact about representability and belongs
+    in the predicate. Size and depth are independent axes and the node budget
+    bounds only the first; a 550 KB alias chain passes it with a 1,045-deep
+    subtree intact.
 
     Cycle-safe by construction: `x: &X [*X]` builds a container that contains
     itself, and the frame stack carries the ids on the current path, so the
@@ -2879,16 +2909,18 @@ def _scrub_frontmatter(fm: dict, budget: int) -> tuple[dict, dict[str, str]]:
 
     out: dict = {}
     # Each frame: the source container, the output container it fills, an
-    # iterator over the source's items, and the top-level key the whole subtree
-    # hangs from. `path` holds the ids of the containers on the current
-    # descent, which is what makes recursion detectable without a depth limit.
-    stack: list[tuple[object, object, object, object]] = [
-        (fm, out, iter(fm.items()), None)
+    # iterator over the source's items, the top-level key the whole subtree
+    # hangs from, and how deep that container sits. `path` holds the ids of the
+    # containers on the current descent, which is what makes a recursive alias
+    # detectable; `depth` is a separate bound, on representability rather than
+    # on the walk — see `_SCRUB_MAX_DEPTH`.
+    stack: list[tuple[object, object, object, object, int]] = [
+        (fm, out, iter(fm.items()), None, 0)
     ]
     path: set[int] = {id(fm)}
 
     while stack:
-        src, dest, items, top_key = stack[-1]
+        src, dest, items, top_key, depth = stack[-1]
         try:
             step = next(items)
         except StopIteration:
@@ -2924,6 +2956,14 @@ def _scrub_frontmatter(fm: dict, budget: int) -> tuple[dict, dict[str, str]]:
                 # mapping cannot.
                 note_loss(here, TEXT_UNRENDERABLE)
                 continue
+            if depth + 1 >= _SCRUB_MAX_DEPTH:
+                # Deeper than the recursive consumers can descend, so nothing
+                # can render it — the same verdict as an unencodable string,
+                # reached structurally instead of scalar by scalar. Pruned here
+                # rather than left for `_sanitize_value` to hit as a
+                # `RecursionError` on every index pass.
+                note_loss(here, TEXT_TOO_DEEP)
+                continue
             child: object = {} if isinstance(value, dict) else []
             place(child)
             path.add(id(value))
@@ -2932,6 +2972,7 @@ def _scrub_frontmatter(fm: dict, budget: int) -> tuple[dict, dict[str, str]]:
                 child,
                 iter(value.items()) if isinstance(value, dict) else iter(value),
                 here,
+                depth + 1,
             ))
             continue
 
