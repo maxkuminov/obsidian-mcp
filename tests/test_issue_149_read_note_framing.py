@@ -775,7 +775,7 @@ def test_a_legal_depth_block_is_untouched():
     assert _graph_depth(fm) == 31
 
 
-@pytest.mark.parametrize("levels", [500, 6_000], ids=["500", "6000"])
+@pytest.mark.parametrize("levels", [500, 6_000, 20_000], ids=["500", "6000", "20000"])
 def test_a_deep_alias_chain_is_pruned_at_the_boundary(levels):
     """Size and depth are independent axes, and the node budget bounds only the
     first. A 550 KB chain passed it with a 1,045-deep subtree intact, which
@@ -790,7 +790,7 @@ def test_a_deep_alias_chain_is_pruned_at_the_boundary(levels):
     assert _graph_depth(fm) <= vault_service._SCRUB_MAX_DEPTH
 
 
-@pytest.mark.parametrize("levels", [500, 6_000], ids=["500", "6000"])
+@pytest.mark.parametrize("levels", [500, 6_000, 20_000], ids=["500", "6000", "20000"])
 def test_the_recursive_consumers_survive_a_deep_block(levels):
     """Every consumer that descends a frontmatter value frame by frame, against
     the boundary fix. None of them was converted to an iterative walk —
@@ -808,7 +808,7 @@ def test_the_recursive_consumers_survive_a_deep_block(levels):
     vault_service.serialize_frontmatter(fm, "body\n")
 
 
-@pytest.mark.parametrize("levels", [500, 6_000], ids=["500", "6000"])
+@pytest.mark.parametrize("levels", [500, 6_000, 20_000], ids=["500", "6000", "20000"])
 @pytest.mark.asyncio
 async def test_a_deep_block_reads_in_band_with_the_view_omitted(vault, levels):
     write(vault, "n.md", f"---\n{_alias_chain(levels)}\n---\nbody\n")
@@ -832,7 +832,7 @@ async def test_a_deep_block_reads_in_band_with_the_view_omitted(vault, levels):
         assert omitted["frontmatter_yaml"] == "metadata_budget"
 
 
-@pytest.mark.parametrize("levels", [500, 6_000], ids=["500", "6000"])
+@pytest.mark.parametrize("levels", [500, 6_000, 20_000], ids=["500", "6000", "20000"])
 @pytest.mark.asyncio
 async def test_a_deep_block_refuses_set_frontmatter_by_name(vault, levels):
     """The bypass this closes: an empty loss record let a deep note through
