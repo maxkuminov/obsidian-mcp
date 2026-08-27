@@ -14,26 +14,99 @@ from src.config import settings
 from src.models.db import NoteEmbedding, NoteMetadata
 from src.services import timing
 from src.services.filters import apply_note_filters
+from src.services.links import BODY, scan_fences
 
 logger = logging.getLogger(__name__)
 
 # Strip fenced code blocks before embedding so serialized data dumps
 # (Excalidraw JSON, base64 blobs, mermaid graphs) don't dominate vector
 # space. Keyword search is unaffected — tsvector still indexes everything.
-_FENCE_BACKTICK_RE = re.compile(r"^```[^\n]*\n.*?\n```\s*$", re.MULTILINE | re.DOTALL)
-_FENCE_TILDE_RE = re.compile(r"^~~~[^\n]*\n.*?\n~~~\s*$", re.MULTILINE | re.DOTALL)
+#
+# The grammar is `src/services/links.py`'s shared recognizer, not a private
+# one. This module carried its own pair of regexes (LF-only, column-zero,
+# exact-length closer) until #150: they disagreed with the masker heading
+# resolution uses, so an indented or longer-closed block was embedded as prose
+# while the same block was invisible to `read_note(section=…)`.
 
 
 def clean_for_embedding(content: str) -> str:
     """Strip fenced code blocks (``` and ~~~) from markdown before embedding.
 
-    Inline backtick code is preserved (typically short identifiers, often
-    semantically meaningful). Indented code blocks are not stripped — they're
-    ambiguous with regular indented prose in personal notes.
+    `content` is a note's post-frontmatter **body**, so the recognizer runs in
+    `BODY` context and never re-partitions. Inline backtick code is preserved
+    (typically short identifiers, often semantically meaningful). Indented
+    code blocks are not stripped — they're ambiguous with regular indented
+    prose in personal notes, and are a documented divergence of the grammar.
     """
-    content = _FENCE_BACKTICK_RE.sub("", content)
-    content = _FENCE_TILDE_RE.sub("", content)
-    return content
+    return _remove_spans(content, scan_fences(content, context=BODY).spans)
+
+
+def _remove_spans(text: str, spans) -> str:
+    if not spans:
+        return text
+    out: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        out.append(text[cursor:start])
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+# ── The frozen per-version fence grammars (`notes_metadata.extraction_version`)
+#
+# A grammar change does not change a note's bytes, so `content_hash` cannot
+# see it and the embed backlog would certify stale vectors forever. The
+# indexer therefore compares the fence spans a note's **stamped** grammar
+# recognised against the ones the **current** grammar recognises, and clears
+# `embedded_content_hash` only when they differ (`CURRENT_EXTRACTION_VERSION`
+# in `src/services/indexer.py`).
+#
+# What is registered here is each version's *embedding* fence grammar,
+# because that is what determined the vectors a row stamped with that version
+# carries — links and tags are re-derived unconditionally whenever the marker
+# is stale, so they need no version-to-version diff. Version 0 is therefore
+# the two regexes this module used before #150, copied verbatim; it becomes
+# removable once no row is stamped 0.
+#
+# The comparison is direction-aware by construction, which is what makes a
+# rollback work: revert the grammar, bump the current version, and a
+# v1-stamped row compares frozen v1 against the restored grammar and
+# invalidates exactly the notes that change — see the rollback recipe in
+# `docs/architecture/indexing-and-embeddings.md`.
+_V0_FENCE_BACKTICK_RE = re.compile(r"^```[^\n]*\n.*?\n```\s*$", re.MULTILINE | re.DOTALL)
+_V0_FENCE_TILDE_RE = re.compile(r"^~~~[^\n]*\n.*?\n~~~\s*$", re.MULTILINE | re.DOTALL)
+
+
+def _v0_spans(body: str) -> tuple[tuple[int, int], ...]:
+    spans = [
+        (m.start(), m.end())
+        for rx in (_V0_FENCE_BACKTICK_RE, _V0_FENCE_TILDE_RE)
+        for m in rx.finditer(body)
+    ]
+    return tuple(sorted(spans))
+
+
+def _v1_spans(body: str) -> tuple[tuple[int, int], ...]:
+    return scan_fences(body, context=BODY).spans
+
+
+_EXTRACTION_GRAMMARS = {
+    0: _v0_spans,
+    1: _v1_spans,
+}
+
+
+def embedding_fence_spans(version: int, body: str) -> tuple[tuple[int, int], ...] | None:
+    """The fence spans version `version` recognised in `body`, or None.
+
+    None means "no frozen recognizer for that version", which the caller must
+    treat as *differs* — a row stamped with a grammar this build cannot
+    reproduce (a downgrade past a bump) must be re-embedded rather than
+    certified against a comparison that was never made.
+    """
+    grammar = _EXTRACTION_GRAMMARS.get(version)
+    return grammar(body) if grammar is not None else None
 
 
 def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[str]:

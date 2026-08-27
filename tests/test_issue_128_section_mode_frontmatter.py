@@ -331,7 +331,7 @@ def test_a_cr_fenced_block_is_masked_without_moving_offsets(vault):
     """The masker must stay offset-stable — `_scan_headings` reports positions
     into the UNMASKED text and `extract_links` records byte offsets against
     the original."""
-    from src.services.links import mask_code
+    from src.services.links import BODY, FULL_NOTE, mask_code
 
     for text in [
         "~~~\r## Hidden\r~~~\r## Real\rold\r",
@@ -339,7 +339,10 @@ def test_a_cr_fenced_block_is_masked_without_moving_offsets(vault):
         "a ` b\r## Real\rc ` d\r",
         "~~~\n## Hidden\n~~~\n## Real\nold\n",
     ]:
-        assert len(mask_code(text)) == len(text)
+        # `context` became explicit with the #150 fence grammar; the
+        # same-length invariant is a property of both contexts.
+        assert len(mask_code(text, context=BODY)) == len(text)
+        assert len(mask_code(text, context=FULL_NOTE)) == len(text)
 
 
 def test_a_unicode_space_heading_survives_on_an_lf_note(vault):

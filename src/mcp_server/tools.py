@@ -1050,6 +1050,68 @@ def _frontmatter_defect_error(tool: str, path: str, diagnosis) -> str:
     )
 
 
+def _note_unmatched_openers(scan_text: str, diagnosis=None):
+    """Unmatched indented fence openers in `scan_text`, positioned on the file.
+
+    `scan_text` is what the write path resolves over — the frontmatter-stripped
+    body when the note carries a valid block — so the recognizer runs in `BODY`
+    context (it must never re-partition a body whose own first line is `---`)
+    and the reported position is then re-based onto the whole file, which is
+    the only coordinate the caller can act on.
+    """
+    from src.services.links import BODY, unmatched_indented_openers
+
+    openers = unmatched_indented_openers(scan_text, context=BODY)
+    if not openers or diagnosis is None or not getattr(diagnosis, "valid", False):
+        return openers
+    block = diagnosis.block
+    return tuple(
+        o.shifted(chars=len(block), lines=len(_LINE_BREAK_SPLIT_RE.findall(block)))
+        for o in openers
+    )
+
+
+_LINE_BREAK_SPLIT_RE = re.compile(r"\r\n|\n|\r")
+
+
+def _rewrite_source_unmatched_openers(content: str):
+    """Unmatched indented fence openers in a `move_note` rewrite source.
+
+    `FULL_NOTE`, unlike the section-write guard: a rewrite is spliced into the
+    source's raw bytes, so the frontmatter block is part of the scanned text
+    and must be held out of fence recognition rather than stripped first.
+    """
+    from src.services.links import FULL_NOTE, unmatched_indented_openers
+
+    return unmatched_indented_openers(content, context=FULL_NOTE)
+
+
+def _unmatched_fence_error(path: str, scan_text: str, diagnosis=None) -> str | None:
+    """Refuse a section write over an undecidable fence, naming the opener.
+
+    `None` when the note has none, so the caller can use it as a guard. The
+    refusal is deliberately asymmetric with reads, exactly as the defective-
+    frontmatter refusal is: reads destroy nothing, so `read_note(section=…)`
+    and the truncation outline keep working under the not-a-fence reading,
+    and the guarantee on such a note is the refusal rather than the round trip.
+    """
+    openers = _note_unmatched_openers(scan_text, diagnosis)
+    if not openers:
+        return None
+    where = "; ".join(o.describe() for o in openers)
+    return (
+        f"edit_note: {path} contains an indented fence opener that nothing "
+        f"below it closes — {where}. Nothing was written. A fence indented by "
+        "one to three spaces may be inside a list item, whose code block ends "
+        "where the item does; this server does not parse container blocks, so "
+        "it cannot tell whether the text below the opener is code or content, "
+        "and a section write there would either split the block or replace "
+        "real content. Close the fence (or unindent it to column zero), then "
+        "reissue the section write. `read_note(path, section=...)` still "
+        "works, and a whole-note `edit_note` without `section=` is unaffected."
+    )
+
+
 @_tracked("create_note", ["path"])
 async def create_note_impl(path: str, content: str) -> str:
     """Create a new note in the vault.
@@ -1631,6 +1693,17 @@ async def edit_note_impl(
     name; reads are deliberately asymmetric there — `read_note` still extracts
     from such a note, because a read destroys nothing.
 
+    **A section write is also refused, by name and without writing, on a note
+    containing a fence opener indented by one to three spaces that nothing
+    below it closes.** Such an opener may sit inside a list item, whose code
+    block ends where the item does; this server does not parse container
+    blocks, so it cannot tell code from content there and will not guess.
+    Reads stay asymmetric for the same reason as above: `read_note(section=…)`
+    and the truncation outline keep resolving on such a note under the
+    not-a-fence reading. Selector parity between the two tools is therefore a
+    claim about **how a selector resolves on a write this tool admits**, not a
+    promise that every readable section is writable.
+
     Every mode that writes confirms the caller's vault assignment immediately
     before it publishes (#88). `dry_run` publishes nothing and takes no
     confirmation — and must never be the reason a later mode skips one. The
@@ -1726,6 +1799,15 @@ async def edit_note_impl(
             if diagnosis.defect is not None:
                 return _frontmatter_defect_error("edit_note", path, diagnosis)
             scan_text = stripped_body if diagnosis.valid else existing
+            # An indented fence opener with no closer below it is the one
+            # shape the flat grammar cannot decide: under CommonMark the block
+            # may end at an enclosing list item's end, so any flat reading
+            # either splits a code block or extends a section over real
+            # content. Reads keep working under the not-a-fence reading;
+            # writes are refused by name, exactly as a defective frontmatter
+            # block is (#150).
+            if err := _unmatched_fence_error(path, scan_text, diagnosis):
+                return err
             new_body, err = replace_section(scan_text, section, content)
             if err is not None:
                 return err
@@ -1864,7 +1946,7 @@ def _rewrite_links_in_text(
     rewritten to the full new path-style form (preserving any trailing `.md`).
     Markdown links always get the new full path. Code blocks are skipped.
     """
-    from src.services.links import mask_code, resolve_target
+    from src.services.links import FULL_NOTE, mask_code, resolve_target
 
     paths = pre_move_index.get("paths", {})
     from_id = paths.get(from_rel)
@@ -1874,7 +1956,9 @@ def _rewrite_links_in_text(
     to_stem = PurePosixPath(to_rel).stem
     to_no_md = to_rel[:-3] if to_rel.endswith(".md") else to_rel
 
-    masked = mask_code(content)
+    # `FULL_NOTE`: `content` is the source note's raw bytes, frontmatter block
+    # included, and the rewrite is spliced back into those same bytes.
+    masked = mask_code(content, context=FULL_NOTE)
     rewrites: list[tuple[int, int, str]] = []
 
     for m in _WIKILINK_REWRITE_RE.finditer(masked):
@@ -2018,6 +2102,16 @@ async def move_note_impl(
 ) -> str:
     """Move (rename or relocate) a note inside the vault.
 
+    **`rewrite_links=True` preflights every source it would rewrite — the
+    moved note's own body included — and refuses the whole move, before the
+    rename, if any of them contains a fence opener indented by one to three
+    spaces that nothing below it closes.** The refusal names each such source
+    and where its opener sits. Rewriting mutates note text, and a link under
+    an unmatched indented opener may be inside a list item's code block, which
+    this server does not parse; it will not silently rewrite text whose
+    code-or-content status it had to guess. `rewrite_links=False` is
+    unaffected and remains the way to move such a note.
+
     Confirms the caller's vault assignment immediately before the `renameat2`
     that commits the move **and again before every link rewrite** (#88): the
     metadata transaction between them is an `await` of unbounded duration, so
@@ -2136,6 +2230,10 @@ async def _move_note_locked(
         planned_rewrites: list[tuple[str, object, bytes, str, int]] = []
         rewrite_bytes_held = 0
         failed_rewrite_sources: list[str] = []
+        # Sources the flat fence grammar cannot decide. Collected across the
+        # whole preflight and refused as a set *before* phase 2, so the move
+        # is never published half-decided; see `_unmatched_fence_error`.
+        undecidable_sources: list[tuple[str, tuple]] = []
         # One vault-root descriptor for the whole rewrite phase, shared by every
         # planned rewrite (`MutableTarget.share_root`). It is a `dup` of a root
         # the kernel has already proved, never a fresh open of the root
@@ -2212,6 +2310,15 @@ async def _move_note_locked(
                         read_target, max_bytes=MAX_NOTE_BYTES, label=original_src_path
                     )
                     content = original_bytes.decode("utf-8")
+                    # Every SELECTED source is inspected, whether or not it
+                    # turns out to carry a link to rewrite: the refusal is
+                    # about text this call would mutate, and the decision has
+                    # to be made before phase 2 publishes the rename. The scan
+                    # is `FULL_NOTE` because a rewrite splices back into these
+                    # raw bytes, frontmatter block included.
+                    openers = _rewrite_source_unmatched_openers(content)
+                    if openers:
+                        undecidable_sources.append((original_src_path, openers))
                     new_content, n = _rewrite_links_in_text(
                         content,
                         from_rel,
@@ -2306,6 +2413,28 @@ async def _move_note_locked(
                 planned_rewrites.append(
                     (out_path, write_target, original_bytes, new_content, n)
                 )
+
+        if undecidable_sources:
+            # Refused as a set, and before the rename: a link inside an actual
+            # list-contained unterminated fence is code, and rewriting it
+            # would silently mutate code the flat grammar only guessed at.
+            # `rewrite_links=False` never reaches here, and is unaffected.
+            where = "; ".join(
+                f"{src} — {', '.join(o.describe() for o in openers)}"
+                for src, openers in undecidable_sources
+            )
+            return (
+                "Move aborted: rewriting links would touch "
+                f"{len(undecidable_sources)} note(s) containing an indented "
+                f"fence opener that nothing below them closes — {where}. "
+                "Nothing was moved, rewritten or reindexed. A fence indented "
+                "by one to three spaces may be inside a list item, whose code "
+                "block ends where the item does; this server does not parse "
+                "container blocks, so it cannot tell whether a link below the "
+                "opener is code or content. Close the fences (or unindent "
+                "them to column zero), or move with rewrite_links=False and "
+                "update the links yourself."
+            )
 
         # ── Phase 2: commit ─────────────────────────────────────────────────────
         # #88, after the whole preflight so a refusal here still aborts before

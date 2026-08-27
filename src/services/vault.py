@@ -2883,9 +2883,13 @@ def _scan_headings(text: str) -> list[dict]:
     above while the heading pattern's trailing whitespace class refuses to
     cross a line boundary — see the comment on `_ATX_HEADING_RE` (#140).
     """
-    from src.services.links import mask_code
+    from src.services.links import BODY, mask_code
 
-    masked = mask_code(text)
+    # `BODY`: every caller hands this the frontmatter-stripped body — the same
+    # text `read_note` scans and `replace_section` writes back into. Scanning
+    # it in `FULL_NOTE` context would re-partition a body whose own first line
+    # is `---` and hide real headings inside a phantom second block.
+    masked = mask_code(text, context=BODY)
     out: list[dict] = []
     for m in _ATX_HEADING_RE.finditer(masked):
         out.append({
@@ -3134,9 +3138,13 @@ def extract_tags(raw: str, frontmatter: dict) -> list[str]:
     elif isinstance(fm_tags, str):
         tags.update(t.strip() for t in fm_tags.split(","))
     # Inline #tags (not inside code blocks)
-    from src.services.links import mask_code
+    from src.services.links import FULL_NOTE, mask_code
 
-    masked = mask_code(raw)
+    # `FULL_NOTE`: `raw` is the whole note, frontmatter block included, so the
+    # recognizer must discover that block and hold it out of fence scanning.
+    # A fence-shaped YAML scalar would otherwise open a block that swallows
+    # every inline tag in the body.
+    masked = mask_code(raw, context=FULL_NOTE)
     for match in re.finditer(r"(?:^|\s)#([a-zA-Z][a-zA-Z0-9_/-]*)", masked):
         tags.add(match.group(1))
     return sorted(tags)
