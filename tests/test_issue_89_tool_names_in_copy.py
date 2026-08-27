@@ -227,13 +227,45 @@ async def test_a_truncated_outline_still_offers_a_registered_tool(vault, cap):
     _assert_whole_output_is_callable(out.notice, "truncated-outline notice")
 
 
-def test_the_outline_object_names_no_tool_at_all():
+@pytest.mark.parametrize("outline_cap", [_OUTLINE_CAP, 5_000, 100])
+def test_the_outline_object_names_no_tool_at_all(outline_cap):
     """The other half of retiring producer 1: it cannot name a wrong tool now,
-    because it carries no prose to name one in."""
-    outline = tools.build_outline(_note_with_many_headings(), _OUTLINE_CAP)
+    because it carries no prose to name one in.
+
+    Swept over all three states the requirement names — complete, truncated,
+    and degraded to the bare marker — because "carries no prose" has to hold in
+    every one of them, and the degraded state is the one a future author is
+    most likely to reach for a marker string in.
+    """
+    outline = tools.build_outline(_note_with_many_headings(), outline_cap)
     assert outline is not None
-    assert outline.truncated is True
     assert _tool_references(outline.model_dump_json()) == set()
+
+
+def test_the_three_outline_states_are_all_actually_exercised():
+    """Guard on the sweep above: if the fixture drifts so that all three caps
+    produce the same state, the sweep silently stops covering anything."""
+    note = _note_with_many_headings()
+    complete = tools.build_outline(note, 5_000)
+    truncated = tools.build_outline(note, _OUTLINE_CAP)
+    degraded = tools.build_outline(note, 100)
+    assert complete.truncated is False and complete.entries
+    assert truncated.truncated is True and truncated.entries
+    assert degraded.truncated is True and degraded.entries == []
+
+
+@pytest.mark.asyncio
+async def test_even_a_degraded_outline_leaves_the_notice_callable(vault, monkeypatch):
+    """The requirement is over ANY truncated response, and the marker-only
+    outline is the state with the least left in it."""
+    monkeypatch.setattr(tools.settings, "max_read_response_chars", 100)
+    (vault / "many.md").write_text(_note_with_many_headings(), encoding="utf-8")
+    out = await tools.read_note_impl("many.md")
+
+    assert out.outline is not None and out.outline.entries == []
+    clause = _the_guidance_clause(out.notice.split("\n\n"), "degraded-outline notice")
+    _assert_guidance_names_the_search_tool(clause, "degraded-outline notice")
+    _assert_whole_output_is_callable(out.notice, "degraded-outline notice")
 
 
 # --- shape 2: the notice on a headingless note ------------------------------

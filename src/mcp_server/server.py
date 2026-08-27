@@ -160,13 +160,17 @@ async def read_note(
       terminator. It is *not* part of `content`, and a section write must not
       be sent it — the heading line is never rewritten.
     - `path`, `title`, `tags` — metadata as data.
-    - `frontmatter_yaml` — the frontmatter block's YAML exactly as stored
-      (fence lines excluded). This is the authoritative copy. `frontmatter` is
-      a best-effort JSON view of the same block for convenience and may be
-      absent (dates, non-string keys and recursive aliases have no faithful
-      JSON form). To change frontmatter use `set_frontmatter`, or edit the raw
-      block with `edit_note(find=...)`; never write back a round trip of the
-      JSON view.
+    - `frontmatter_yaml` — the frontmatter block's YAML source, fence lines
+      excluded, LF-normalized (a CRLF or lone-CR block comes back with LF
+      terminators — the same declared residual `content` carries, because this
+      tool normalises and the write tools work on raw bytes; `edit_note` still
+      reattaches the original block byte-identically). This is the
+      authoritative copy. `frontmatter` is a best-effort JSON view of the same
+      block for convenience and may be absent — dates, non-string keys,
+      recursive aliases and unpaired-surrogate escapes have no faithful JSON
+      form, and `metadata_omissions` then says which and why. To change
+      frontmatter use `set_frontmatter`, or edit the raw block with
+      `edit_note(find=...)`; never write back a round trip of the JSON view.
     - `truncated`, `offset`, `next_offset`, `total_chars` — truncation as data.
       `outline` (whole-note reads that were truncated) lists every section with
       its `#N` ordinal so you can fetch the one you want directly, and `notice`

@@ -90,6 +90,10 @@ def read(vault, name):
     return (vault / name).read_bytes().decode("utf-8")
 
 
+def outline_size(outline) -> int:
+    return len(outline.model_dump_json())
+
+
 def registered(name):
     for tool in mcp._tool_manager.list_tools():
         if tool.name == name:
@@ -357,6 +361,174 @@ async def test_a_deeply_nested_block_omits_the_view_rather_than_recursing(vault)
     assert out.metadata_omissions[0].reason == "not_json_representable"
 
 
+# ── parser-accepted values the server cannot represent ─────────────────────
+#
+# A note can be *valid YAML* and still hold something no JSON serializer will
+# take. These cost at most the affected fields: never a raise, never a protocol
+# error, never a divergence between the text block and structuredContent.
+
+SURROGATES = {
+    # A lone HIGH surrogate and a lone LOW surrogate. PyYAML decodes both
+    # escapes into real (unpaired) code points; `pydantic_core` — which renders
+    # BOTH halves of the MCP result — refuses to encode either.
+    "high": "\\uD800",
+    "low": "\\uDC00",
+}
+
+
+@pytest.mark.parametrize("half", sorted(SURROGATES))
+@pytest.mark.asyncio
+async def test_a_lone_surrogate_in_the_title_costs_the_title_only(vault, half):
+    escape = SURROGATES[half]
+    write(vault, "n.md", f'---\ntitle: "{escape}"\n---\nbody\n')
+    out = await tools.read_note_impl("n.md")
+
+    assert out.error is None
+    assert out.content == "body\n"
+    assert out.title is None
+    assert out.frontmatter is None
+    # The raw block is UNAFFECTED: in the file the escape is six literal ASCII
+    # characters, so the authoritative copy carries it losslessly.
+    assert out.frontmatter_yaml == f'title: "{escape}"\n'
+    reasons = {(o.field, o.reason) for o in out.metadata_omissions}
+    assert ("title", "unpaired_surrogate") in reasons
+    assert ("frontmatter", "unpaired_surrogate") in reasons
+
+
+@pytest.mark.parametrize("half", sorted(SURROGATES))
+@pytest.mark.asyncio
+async def test_a_lone_surrogate_does_not_become_a_protocol_error(vault, half):
+    """The BLOCKER, at the layer it fired on: FastMCP renders the text block
+    with `pydantic_core.to_json`, which raises `PydanticSerializationError` on
+    an unpaired surrogate. Note-controlled frontmatter must not be able to
+    manufacture a transport failure."""
+    escape = SURROGATES[half]
+    write(vault, "n.md", f'---\ntitle: "{escape}"\nk: "{escape}"\n---\nbody\n')
+    blocks, structured = await mcp.call_tool("read_note", {"path": "n.md"})
+
+    assert json.loads(blocks[0].text) == structured
+    assert structured["content"] == "body\n"
+    assert "title" not in structured
+    assert "frontmatter" not in structured
+    assert structured["frontmatter_yaml"].count(escape) == 2
+    ReadNoteResult.model_validate(structured)
+
+
+@pytest.mark.parametrize("half", sorted(SURROGATES))
+@pytest.mark.asyncio
+async def test_a_lone_surrogate_in_a_tag_costs_the_tags(vault, half):
+    escape = SURROGATES[half]
+    write(vault, "n.md", f'---\ntags: ["ok", "{escape}"]\n---\nbody\n')
+    out = await tools.read_note_impl("n.md")
+
+    assert out.error is None
+    assert out.tags is None
+    assert ("tags", "unpaired_surrogate") in {
+        (o.field, o.reason) for o in out.metadata_omissions
+    }
+
+
+@pytest.mark.asyncio
+async def test_a_surrogate_bearing_path_is_a_bounded_typed_error(vault):
+    """Not an omission — a path that is not UTF-8 cannot name a file at all, so
+    it is refused at admission, and the refusal does not quote it back."""
+    blocks, structured = await mcp.call_tool("read_note", {"path": "a\ud800.md"})
+
+    assert json.loads(blocks[0].text) == structured
+    assert "path" not in structured            # never echoed
+    assert "not valid UTF-8" in structured["error"]
+    assert "\ud800" not in structured["error"]
+    ReadNoteResult.model_validate(structured)
+
+
+@pytest.mark.asyncio
+async def test_a_surrogate_bearing_selector_is_a_bounded_typed_error(vault):
+    write(vault, "n.md", "# A\nbody\n")
+    blocks, structured = await mcp.call_tool(
+        "read_note", {"path": "n.md", "section": "A\ud800"}
+    )
+
+    assert json.loads(blocks[0].text) == structured
+    assert "not valid UTF-8" in structured["error"]
+    assert "\ud800" not in structured["error"]
+    assert "content" not in structured
+
+
+@pytest.mark.asyncio
+async def test_the_vault_layer_refuses_an_unencodable_path_for_every_tool(vault):
+    """The guard sits beside the length bound, so a write tool cannot be handed
+    a path the read tool refuses."""
+    assert vault_service.is_encodable("ok.md") is True
+    assert vault_service.is_encodable("a\ud800.md") is False
+    for validator in (vault_service.validate_path, vault_service.validate_mutable_path):
+        with pytest.raises(ValueError) as exc:
+            validator("a\ud800.md")
+        assert "not valid UTF-8" in str(exc.value)
+
+
+# A well-formed YAML integer past CPython's int-string digit limit. PyYAML's
+# *constructor* raises a bare `ValueError` — not a `YAMLError` — which used to
+# escape `parse_frontmatter_diagnose` and take the whole read out.
+_BIG_INT_NOTE = "---\nn: " + "1" * 6_000 + "\n---\n# A\nbody\n"
+
+# Same shape, different exception: PyYAML's composer blows the stack on deeply
+# nested flow collections and raises `RecursionError`.
+_DEEP_NOTE = "---\na: " + "[" * 3_000 + "]" * 3_000 + "\n---\n# A\nbody\n"
+
+
+@pytest.mark.parametrize(
+    "note", [_BIG_INT_NOTE, _DEEP_NOTE], ids=["big_int", "deep_nesting"]
+)
+@pytest.mark.asyncio
+async def test_a_parser_refused_block_never_raises_or_becomes_a_protocol_error(
+    vault, note
+):
+    write(vault, "n.md", note)
+    blocks, structured = await mcp.call_tool("read_note", {"path": "n.md"})
+
+    assert json.loads(blocks[0].text) == structured
+    assert "error" not in structured
+    # The block is classified as defective, so it stays in the body — every
+    # byte of the note is still returned, nothing is silently lost.
+    assert structured["content"] == note
+    assert "frontmatter" not in structured
+    assert "frontmatter_yaml" not in structured
+
+
+@pytest.mark.parametrize(
+    "note", [_BIG_INT_NOTE, _DEEP_NOTE], ids=["big_int", "deep_nesting"]
+)
+def test_a_parser_refused_block_is_diagnosed_as_a_yaml_error(vault, note):
+    """The read and the write sides must agree about what this block is.
+
+    Classifying it `yaml_error` is what keeps `set_frontmatter` and section
+    writes refusing it by name. The rejected alternative — calling it valid
+    with an empty mapping so the read could still expose `frontmatter_yaml` —
+    hands `set_frontmatter` a `{}` to merge into and `safe_dump` over the top
+    of a block it never parsed: a destructive write on a note whose only defect
+    is that it is large.
+    """
+    fm, body, diagnosis = vault_service.parse_frontmatter_diagnose(note)
+    assert (fm, body) == ({}, note)
+    assert diagnosis.valid is False
+    assert diagnosis.defect == "yaml_error"
+
+
+@pytest.mark.parametrize(
+    "note", [_BIG_INT_NOTE, _DEEP_NOTE], ids=["big_int", "deep_nesting"]
+)
+@pytest.mark.asyncio
+async def test_the_write_side_refuses_a_parser_refused_block_by_name(vault, note):
+    write(vault, "n.md", note)
+    for result in (
+        await tools.edit_note_impl("n.md", "x", section="#1"),
+        await tools.set_frontmatter_impl("n.md", {"a": 1}),
+    ):
+        assert "malformed frontmatter block" in result, result
+        assert "replace_frontmatter=True" in result
+    assert read(vault, "n.md") == note
+
+
 @pytest.mark.asyncio
 async def test_a_non_string_title_does_not_break_the_model(vault):
     """`title:` is whatever YAML says it is. The coercion happens at model
@@ -409,38 +581,99 @@ async def test_a_constructible_view_that_does_not_fit_is_dropped_first(vault, mo
     assert (omission.field, omission.reason) == ("frontmatter", "metadata_budget")
 
 
+def _crowded_note(title_len=100, heading_len=300):
+    return (
+        "---\ntitle: " + "T" * title_len
+        + "\ntags: [" + ", ".join("t" * 20 for _ in range(6)) + "]"
+        + "\nfiller: " + "f" * 300
+        + "\n---\n## " + "H" * heading_len + "\nbody\n"
+    )
+
+
 @pytest.mark.asyncio
 async def test_the_drop_order_is_the_declared_one(vault, monkeypatch):
-    """View first (the raw block says everything it does), then the raw block,
-    then tags, then the heading is elided, then the title."""
-    monkeypatch.setattr(tools.settings, "max_read_response_chars", 200)
-    write(
-        vault, "n.md",
-        "---\ntitle: " + "T" * 60 + "\ntags: [" + ", ".join("t" * 20 for _ in range(6))
-        + "]\nfiller: " + "f" * 300 + "\n---\n## " + "H" * 300 + "\nbody\n",
-    )
+    """All five steps, in order: view (the raw block says everything it does),
+    raw block, tags, heading, title. The budget is small enough that even the
+    title alone does not fit, so the last step is exercised too — it used to be
+    unreachable in this fixture and therefore untested."""
+    monkeypatch.setattr(tools.settings, "max_read_response_chars", 60)
+    write(vault, "n.md", _crowded_note())
     out = await tools.read_note_impl("n.md", section="#1")
-    dropped = [(o.field, o.reason) for o in out.metadata_omissions]
-    assert dropped[0] == ("frontmatter", "metadata_budget")
-    assert dropped[1] == ("frontmatter_yaml", "metadata_budget")
-    assert dropped[2] == ("tags", "metadata_budget")
-    assert dropped[3] == ("heading", "metadata_budget_elided")
+
+    assert [(o.field, o.reason) for o in out.metadata_omissions] == [
+        ("frontmatter", "metadata_budget"),
+        ("frontmatter_yaml", "metadata_budget"),
+        ("tags", "metadata_budget"),
+        ("heading", "metadata_budget"),
+        ("title", "metadata_budget"),
+    ]
+    assert out.frontmatter is None
+    assert out.frontmatter_yaml is None
     assert out.tags is None
+    assert out.heading is None
+    assert out.title is None
+    # The content field is NOT metadata and is untouched by any of this.
+    assert out.content == "body\n"
 
 
 @pytest.mark.asyncio
-async def test_a_dropped_field_is_never_marked_in_place(vault, monkeypatch):
-    """The whole point. A marker inside a note-controlled field is
+async def test_the_order_stops_as_soon_as_the_remainder_fits(vault, monkeypatch):
+    """Not "drop everything" — drop until it fits, then stop. A budget the
+    heading and title clear between them keeps both."""
+    monkeypatch.setattr(tools.settings, "max_read_response_chars", 500)
+    write(vault, "n.md", _crowded_note())
+    out = await tools.read_note_impl("n.md", section="#1")
+
+    assert [o.field for o in out.metadata_omissions] == [
+        "frontmatter", "frontmatter_yaml",
+    ]
+    assert out.frontmatter is None
+    assert out.frontmatter_yaml is None
+    assert out.tags is not None
+    assert out.heading == "## " + "H" * 300
+    assert out.title == "T" * 100
+
+
+@pytest.mark.asyncio
+async def test_an_oversized_title_never_leaves_an_empty_heading(vault, monkeypatch):
+    """Regression on the ordering bug the whole-field rework removed.
+
+    The heading's room used to be computed from the *un-dropped* title, so a
+    title larger than the whole budget cut the heading to `""` — a
+    present-but-empty note-controlled field, which collides with this tool's
+    own convention that `""` is an answer (an empty section body) rather than
+    an absence. The heading still goes, because the declared order is a
+    priority list and `heading` precedes `title` in it — but it goes as an
+    absence with a stated reason, not as a zero-length value.
+    """
+    monkeypatch.setattr(tools.settings, "max_read_response_chars", 200)
+    write(vault, "n.md", "---\ntitle: " + "T" * 5_000 + "\n---\n## Short\nbody\n")
+    out = await tools.read_note_impl("n.md", section="#1")
+
+    assert out.heading is None                 # absent, never ""
+    assert out.title is None
+    assert [o.field for o in out.metadata_omissions] == [
+        "frontmatter", "frontmatter_yaml", "heading", "title",
+    ]
+    # Absent, not present-and-empty: the distinction the `""` cut destroyed.
+    assert "heading" not in json.loads(out.model_dump_json())
+
+
+@pytest.mark.asyncio
+async def test_no_field_is_ever_a_prefix_of_itself(vault, monkeypatch):
+    """The whole point. A shortened value inside a note-controlled field is
     indistinguishable from note content — that is the forgery class."""
     monkeypatch.setattr(tools.settings, "max_read_response_chars", 120)
     write(vault, "n.md", "---\nk: " + "v" * 5_000 + "\n---\n## " + "H" * 400 + "\nb\n")
     out = await tools.read_note_impl("n.md", section="#1")
 
     assert out.frontmatter_yaml is None          # omitted whole, not cut
-    assert out.heading is not None
-    assert "…" not in out.heading                # elided with no marker
-    assert "TRUNCATED" not in out.model_dump_json()
-    assert out.heading == ("## " + "H" * 400)[:len(out.heading)]
+    assert out.heading is None                   # omitted whole, not cut to fit
+    rendered = out.model_dump_json()
+    assert "TRUNCATED" not in rendered
+    assert "…" not in rendered
+    # Whatever survived is the real value, not a prefix of one.
+    assert out.content == "b\n"
 
 
 @pytest.mark.asyncio
@@ -468,6 +701,63 @@ async def test_control_characters_in_content_stay_within_the_stated_worst_case(
     assert len(serialized) <= 6 * (3 * cap) + 2_000
     # And the escaping really is happening — otherwise this proves nothing.
     assert "\\u0001" in serialized
+
+
+# The prose allowance in the bound below. `notice` and `path` are the only
+# components with no budget of their own: both are fixed server text plus
+# interpolations bounded at admission (`MAX_PATH_CHARS`, `_NOTICE_SELECTOR_MAX`),
+# so they are a constant, not a term that scales with the cap.
+_FIXED_PROSE = 4_000
+
+
+@pytest.mark.asyncio
+async def test_the_whole_mcp_response_meets_the_documented_combined_bound(vault, cap):
+    """The bound as the architecture doc states it, measured on the wire.
+
+    Everything at once and everything hostile: content at the cap and made
+    entirely of control characters (six JSON characters each), an outline whose
+    titles are at the per-title limit on a note with more sections than fit,
+    and metadata large enough to exercise the metadata budget. Measured over
+    the MCP text block PLUS the serialized structuredContent, because the
+    result carries both and the caller pays for both — that doubling is the
+    `× 2` in the documented figure, and measuring only one half would hide it.
+    """
+    # Outline titles are plain ASCII at the per-title limit: that is the
+    # configuration that actually FILLS the outline budget. Control-character
+    # titles would escape six-fold, so fewer entries fit and the outline gets
+    # smaller — the budget doing its job, but a weaker test of the total.
+    sections = "".join(
+        f"## {'S' * 90} {i}\n" + "\x01" * 200 + "\n" for i in range(400)
+    )
+    # A raw control character is not legal in a YAML plain scalar, so the
+    # escape-heavy title goes in as a double-quoted scalar with `\\u0001`
+    # escapes — valid YAML whose *value* is 600 control characters.
+    write(
+        vault, "n.md",
+        '---\ntitle: "' + "\\u0001" * 600 + '"'
+        + "\ntags: [" + ", ".join("t" * 40 for _ in range(50)) + "]"
+        + "\nfiller: " + "f" * 30_000
+        + "\n---\n" + sections,
+    )
+
+    blocks, structured = await mcp.call_tool("read_note", {"path": "n.md"})
+    text = blocks[0].text
+    assert json.loads(text) == structured
+
+    # Every budgeted component is actually loaded, or the bound proves nothing.
+    assert len(structured["content"]) == cap
+    assert structured["truncated"] is True
+    assert structured["outline"]["truncated"] is True
+    assert structured["outline"]["entries"], "no outline entries — fixture is wrong"
+    assert structured["metadata_omissions"], "no drops — fixture is wrong"
+    assert "\\u0001" in text, "no escaping happened — the bound proves nothing"
+
+    on_the_wire = len(text) + len(json.dumps(structured, ensure_ascii=False))
+    documented = 2 * (6 * (3 * cap) + _FIXED_PROSE)
+    assert on_the_wire <= documented, (
+        f"{on_the_wire} characters on the wire, documented worst case is "
+        f"{documented}"
+    )
 
 
 @pytest.mark.asyncio
@@ -522,6 +812,59 @@ async def test_an_incomplete_outline_reports_its_omission_as_data(vault, cap):
     assert outline.omitted == 400 - len(outline.entries)
     assert (outline.first_ordinal, outline.last_ordinal) == (1, 400)
     assert len(outline.model_dump_json()) <= cap
+
+
+def test_one_oversized_entry_does_not_suppress_the_ones_that_fit():
+    """"At least one entry SHALL be emitted whenever one fits" is a claim about
+    *any* entry, not about the first.
+
+    Stopping at the first entry that does not fit made it false for the
+    commonest real shape there is: a note whose opening section has a very long
+    heading. Codex's fixture — a 300-character first title, a short second, a
+    160-character budget — produced zero entries beside a bare omission count.
+    """
+    note = "# " + "T" * 300 + "\nbody\n## Short\nb\n"
+    # 170 is chosen so the short entry fits and the elided-but-still-long first
+    # one does not — the whole point is that entry 2 survives entry 1.
+    out = tools.build_outline(note, 170)
+
+    assert [e.ordinal for e in out.entries] == [2]
+    assert out.entries[0].text == "Short"
+    assert out.truncated is True
+    assert out.omitted == 1
+    # Skipping must not renumber anything: the ordinals still address the note.
+    assert (out.first_ordinal, out.last_ordinal) == (1, 2)
+    assert outline_size(out) <= 170
+
+    # And the cap still wins: below the size of even the short entry, the
+    # outline degrades to its marker rather than emitting something oversized.
+    degraded = tools.build_outline(note, 160)
+    assert degraded.entries == []
+    assert degraded.truncated is True
+    assert outline_size(degraded) <= 160
+
+
+@pytest.mark.asyncio
+async def test_duplicate_titles_are_flagged_and_the_notice_names_the_remedy(
+    vault, cap
+):
+    """The archived duplicate-headings scenario has two halves, and the second
+    one — *direct the caller to the ordinal* — used to live in the outline's
+    rendered `← duplicate title, use the ordinal` suffix. The flag is now data,
+    so the guidance has to be pinned where it moved to."""
+    write(
+        vault, "n.md",
+        "# Top\n" + "x" * 600 + "\n## Report\na\n## Other\nb\n## Report\nc\n",
+    )
+    out = await tools.read_note_impl("n.md")
+
+    by_ordinal = {e.ordinal: e for e in out.outline.entries}
+    assert by_ordinal[2].duplicate is True and by_ordinal[4].duplicate is True
+    assert by_ordinal[3].duplicate is False
+    # And the caller is told what to do about it, by name.
+    assert "ordinal" in out.notice
+    assert 'section="#7"' in out.notice
+    assert "titles repeat" in out.notice
 
 
 @pytest.mark.asyncio
@@ -634,6 +977,39 @@ def test_both_read_note_layers_point_frontmatter_mutation_elsewhere(layer):
     )
     assert "set_frontmatter" in text
     assert "frontmatter_yaml" in text
+
+
+@pytest.mark.asyncio
+async def test_a_crlf_frontmatter_block_comes_back_lf_normalized(vault):
+    """`frontmatter_yaml` is content-lossless, not byte-exact.
+
+    The read path hands the shared parser `read_text()` output, which has
+    already applied universal-newline translation — the same declared residual
+    a section body carries, and for the same reason. Re-reading the file as
+    bytes to serve one field would give `read_note` a second, disagreeing
+    partition of the same note. `edit_note` still reattaches the CRLF block
+    byte-identically, because it works from raw bytes.
+    """
+    original = "---\r\ntitle: T\r\nk: v\r\n---\r\n# A\r\nbody\r\n"
+    write(vault, "n.md", original)
+    out = await tools.read_note_impl("n.md")
+
+    assert out.frontmatter_yaml == "title: T\nk: v\n"       # LF, not CRLF
+    assert out.frontmatter == {"title": "T", "k": "v"}
+    assert out.content == "# A\nbody\n"
+
+    # And the write side is unaffected: the block goes back byte-identically.
+    await tools.edit_note_impl("n.md", out.content)
+    assert read(vault, "n.md").startswith("---\r\ntitle: T\r\nk: v\r\n---\r\n")
+
+
+@pytest.mark.parametrize("layer", ["registered", "impl"])
+def test_both_read_note_layers_declare_the_frontmatter_lf_residual(layer):
+    text = (
+        registered("read_note").description if layer == "registered"
+        else tools.read_note_impl.__doc__
+    )
+    assert "LF-normalized" in text or "LF-normalised" in text
 
 
 @pytest.mark.asyncio

@@ -39,7 +39,7 @@ from typing import Any
 
 from pydantic import BaseModel, model_serializer
 
-from src.services.vault import outline_sections
+from src.services.vault import is_encodable, outline_sections
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +67,9 @@ class _OmitNone(BaseModel):
 # Reason codes. They are part of the tool's contract, so they are stable
 # strings rather than an enum whose rename would be invisible here.
 OMITTED_BUDGET = "metadata_budget"
-OMITTED_BUDGET_ELIDED = "metadata_budget_elided"
 OMITTED_NOT_REPRESENTABLE = "not_json_representable"
 OMITTED_DUPLICATE_KEY = "duplicate_json_key"
+OMITTED_UNPAIRED_SURROGATE = "unpaired_surrogate"
 
 
 class MetadataOmission(_OmitNone):
@@ -83,6 +83,26 @@ class MetadataOmission(_OmitNone):
     field: str
     reason: str
     detail: str
+
+
+def _surrogate_omission(field: str) -> MetadataOmission:
+    """The one wording for "this value is not UTF-8-encodable".
+
+    A note may legally write `title: "\\uD800"`. PyYAML decodes the escape into
+    a lone surrogate — a valid Python `str`, not a Unicode scalar value — and
+    `pydantic_core`, which renders both halves of the MCP result, raises
+    `PydanticSerializationError` on it. Note-controlled frontmatter would then
+    produce a *protocol* error, so the value is dropped at model-build time and
+    reported here instead. The raw block is unaffected: in the file the escape
+    is literal ASCII (`\\uD800`, six characters), so `frontmatter_yaml` carries
+    it losslessly and remains the authoritative copy.
+    """
+    return _omission(
+        field,
+        OMITTED_UNPAIRED_SURROGATE,
+        f"The note's {field} contains an unpaired surrogate code point, which "
+        "is not valid UTF-8 and cannot be serialized into this response.",
+    )
 
 
 def _omission(field: str, reason: str, detail: str) -> MetadataOmission:
@@ -130,6 +150,10 @@ class _ViewKeyCollision(Exception):
     """Two YAML keys would land on one JSON key."""
 
 
+class _ViewNotEncodable(Exception):
+    """A string in the block is not UTF-8-encodable (an unpaired surrogate)."""
+
+
 def _view_key(key: Any) -> str:
     if isinstance(key, str):
         return key
@@ -158,6 +182,12 @@ def _view_str(text: str, budget: dict) -> str:
     budget["chars"] -= len(text)
     if budget["chars"] < 0:
         raise _ViewUnrepresentable("frontmatter view exceeded its character budget")
+    # Checked HERE, at model-build time, and not in a serializer: the SDK
+    # renders the text block from the returned object and `structuredContent`
+    # from the validated dump, so a value only one of them can encode is a
+    # desynchronized response at best and a protocol error at worst.
+    if not is_encodable(text):
+        raise _ViewNotEncodable(text)
     return text
 
 
@@ -203,6 +233,8 @@ def frontmatter_view(frontmatter: dict) -> tuple[dict | None, MetadataOmission |
     budget = {"nodes": _VIEW_MAX_NODES, "chars": _VIEW_MAX_CHARS}
     try:
         return _view_walk(frontmatter, 0, frozenset(), budget), None
+    except _ViewNotEncodable:
+        return None, _surrogate_omission("frontmatter")
     except _ViewKeyCollision as exc:
         return None, _omission(
             "frontmatter",
@@ -344,15 +376,24 @@ def build_outline(content: str, cap: int) -> NoteOutline | None:
             last_ordinal=total,
         )
 
-    # Greedy fill against an estimate: the empty truncated form plus each
-    # entry's own serialization and its separating comma.
-    overhead = _serialized_len(_truncated([]))
-    used = overhead
+    # Fill against an estimate: the empty truncated form plus each entry's own
+    # serialization and its separating comma.
+    #
+    # It does NOT stop at the first entry that does not fit. "At least one
+    # entry SHALL be emitted whenever one fits" is a claim about *any* entry,
+    # not about the first, and stopping made it false for the commonest real
+    # shape there is: a note whose opening section has a very long heading. One
+    # 300-character title ahead of fifty short ones produced an outline with
+    # zero entries and a bare omission count, which is the least useful answer
+    # available while a perfectly good listing was affordable. Skipping keeps
+    # scanning, so the omission count and the ordinal range still describe the
+    # whole note and every ordinal an entry carries is still its own.
+    used = _serialized_len(_truncated([]))
     kept: list[OutlineEntry] = []
     for entry in entries:
         cost = _serialized_len(entry) + 1
         if used + cost > cap:
-            break
+            continue
         kept.append(entry)
         used += cost
 
@@ -425,9 +466,38 @@ def _tag_cost(tags: list[str]) -> int:
     return sum(len(tag) + 3 for tag in tags)
 
 
+def screen_unencodable(result: "ReadNoteResult") -> list[MetadataOmission]:
+    """Drop any metadata value that is not UTF-8-encodable, before serializing.
+
+    Runs at model-build time, on the fields whose values can come from YAML
+    escapes rather than from the note's decoded bytes:
+
+    * `title` — `title: "\\uD800"` in the block, or (in principle) a filename
+      the OS handed back through surrogate-escape;
+    * `tags` — same source, via `extract_tags`' `str()` coercion.
+
+    `heading`, `content`, `frontmatter_yaml` and the outline's titles are all
+    slices of `Path.read_text(encoding="utf-8")`, which is strict, so they
+    cannot carry a lone surrogate and are not screened. `path` and the selector
+    are screened earlier, at admission, where a bad one is an error rather than
+    an omission — see `vault.is_encodable`.
+
+    Whole-field drops, like every other omission: there is no cutting a value
+    down to its encodable prefix.
+    """
+    omissions: list[MetadataOmission] = []
+    if result.title is not None and not is_encodable(result.title):
+        result.title = None
+        omissions.append(_surrogate_omission("title"))
+    if result.tags is not None and not all(is_encodable(tag) for tag in result.tags):
+        result.tags = None
+        omissions.append(_surrogate_omission("tags"))
+    return omissions
+
+
 def apply_metadata_budget(
     result: ReadNoteResult,
-    view_omission: MetadataOmission | None,
+    carried: list[MetadataOmission],
     budget: int,
 ) -> None:
     """Bring `result`'s metadata fields inside `budget`, recording every drop.
@@ -439,15 +509,23 @@ def apply_metadata_budget(
 
     Drop order is fixed and stated in the spec: the lossy JSON view first (the
     raw block says everything it does), then `frontmatter_yaml`, then `tags`,
-    then the heading is elided, then the title. Fields are dropped **whole** —
-    a truncated `frontmatter_yaml` is a *corrupt* YAML block that looks valid,
-    which is worse than no block at all. Elision, where it happens, is a plain
-    cut with **no** marker character: a marker inside a note-controlled field
-    is indistinguishable from note content.
+    then `heading`, then `title`.
+
+    **Every drop is a whole field.** Nothing is truncated in place, cut short,
+    or replaced by a marker — not even the two short fields where an in-place
+    cut looks harmless. A shortened value inside a note-controlled field is
+    indistinguishable from note content, which is the forgery class this whole
+    change exists to end, and a `heading` cut to `""` would additionally
+    collide with the convention that `""` is an *answer* (an empty section
+    body) rather than an absence. An earlier revision elided `heading` and
+    `title`; it also computed the heading's room from the *un-dropped* title,
+    so an oversized title silently zeroed the heading. Both are gone.
+
+    `carried` holds omissions decided before the budget ran — the JSON view's
+    own construction failures, and the unencodable-value screen — so the list
+    the caller sees is in decision order.
     """
-    omissions: list[MetadataOmission] = []
-    if view_omission is not None:
-        omissions.append(view_omission)
+    omissions = list(carried)
 
     def _cost() -> int:
         total = 0
@@ -463,54 +541,46 @@ def apply_metadata_budget(
             total += len(result.heading)
         return total
 
+    def _drop(field: str, detail: str) -> None:
+        setattr(result, field, None)
+        omissions.append(_omission(field, OMITTED_BUDGET, detail))
+
     if _cost() > budget and result.frontmatter is not None:
-        result.frontmatter = None
-        omissions.append(_omission(
+        _drop(
             "frontmatter",
-            OMITTED_BUDGET,
             "The frontmatter JSON view did not fit this response's metadata budget.",
-        ))
+        )
 
     if _cost() > budget and result.frontmatter_yaml:
-        result.frontmatter_yaml = None
-        omissions.append(_omission(
+        _drop(
             "frontmatter_yaml",
-            OMITTED_BUDGET,
             "The frontmatter block did not fit this response's metadata budget "
             "and is omitted whole rather than truncated, because half a YAML "
             "block still parses.",
-        ))
+        )
 
     if _cost() > budget and result.tags:
         dropped = len(result.tags)
-        result.tags = None
-        omissions.append(_omission(
+        _drop(
             "tags",
-            OMITTED_BUDGET,
             f"{dropped:,} tag(s) did not fit this response's metadata budget.",
-        ))
+        )
 
     if _cost() > budget and result.heading:
-        room = max(0, budget - (len(result.title) if result.title else 0))
-        result.heading = result.heading[:room]
-        omissions.append(_omission(
+        _drop(
             "heading",
-            OMITTED_BUDGET_ELIDED,
-            f"The heading line was cut to {room:,} character(s) to fit this "
-            "response's metadata budget; no marker is added, so what is here is "
-            "a prefix of the real heading.",
-        ))
+            "The heading line did not fit this response's metadata budget. It is "
+            "omitted whole rather than cut, so nothing here is a prefix "
+            "masquerading as a full heading; `content` is still the section's "
+            "body and is unaffected.",
+        )
 
     if _cost() > budget and result.title:
-        room = max(0, budget - (len(result.heading) if result.heading else 0))
-        result.title = result.title[:room]
-        omissions.append(_omission(
+        _drop(
             "title",
-            OMITTED_BUDGET_ELIDED,
-            f"The title was cut to {room:,} character(s) to fit this response's "
-            "metadata budget; no marker is added, so what is here is a prefix of "
-            "the real title.",
-        ))
+            "The title did not fit this response's metadata budget and is "
+            "omitted whole rather than cut.",
+        )
 
     if omissions:
         result.metadata_omissions = omissions

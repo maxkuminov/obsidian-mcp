@@ -42,6 +42,7 @@ from src.mcp_server.read_result import (
     apply_metadata_budget,
     build_outline,
     frontmatter_view,
+    screen_unencodable,
 )
 from src.models.db import UsageLog
 from src.services import timing
@@ -60,6 +61,7 @@ from src.services.vault import (
     classify_bytes,
     confirmed_publication,
     extract_section_parts,
+    is_encodable,
     is_hidden_path,
     list_dir,
     move_file_no_clobber,
@@ -549,12 +551,30 @@ _NOTICE_SELECTOR_MAX = 256
 def _bounded(text: str, limit: int) -> str:
     """Cut `text` to `limit` characters. No marker — see below.
 
-    A marker appended to a note-controlled value is indistinguishable from note
-    content, which is the forgery class #149 exists to end. Server-authored
-    strings (errors, notices) are cut plainly and the fact is either obvious
-    from the shape or reported out of band in `metadata_omissions`.
+    **Only ever applied to server-authored prose** (`error`, `notice`, and the
+    caller-supplied selector they quote). Note-controlled *fields* are never cut
+    at all: they are dropped whole, because a shortened or marked value inside
+    one is indistinguishable from note content, which is the forgery class #149
+    exists to end. A marker is left off here too, for the same reason — the
+    selector a message quotes is caller text sitting inside server text.
     """
     return text if len(text) <= limit else text[:limit]
+
+
+def _scalar_safe(text: str) -> str:
+    """Server-authored prose, guaranteed UTF-8-encodable.
+
+    The one place a replacement character is acceptable. `error` and `notice`
+    are server prose, not note-controlled fields, so substituting U+FFFD for an
+    unpaired surrogate cannot be mistaken for content — and the alternative is
+    `pydantic_core` refusing to serialize the response at all, which turns an
+    in-band error into a protocol error. Every known route to an unencodable
+    interpolation is already closed upstream (the path and the selector are
+    refused at admission); this catches the next one.
+    """
+    if is_encodable(text):
+        return text
+    return text.encode("utf-8", "replace").decode("utf-8")
 
 
 def _as_text(value) -> str | None:
@@ -676,10 +696,15 @@ async def read_note_impl(
       only**, byte-exact input for `edit_note(path, content, section=…)`.
     - `heading` — section reads: the matched heading line, no terminator. It is
       NOT part of `content`, and a section write must not be sent it.
-    - `frontmatter_yaml` — the block as stored, authoritative. `frontmatter` is
-      a best-effort JSON view beside it and can be absent; mutate frontmatter
-      through `set_frontmatter` or the raw block, never by round-tripping the
-      view.
+    - `frontmatter_yaml` — the block's YAML source, authoritative, and
+      LF-normalized rather than byte-exact (a CRLF block's terminators come
+      back as LF, the same declared residual `content` carries; `edit_note`
+      still reattaches the original block byte-identically). `frontmatter` is a
+      best-effort JSON view beside it and can be absent — with the reason in
+      `metadata_omissions` — because dates, non-string keys, recursive aliases
+      and unpaired-surrogate escapes have no faithful JSON form. Mutate
+      frontmatter through `set_frontmatter` or the raw block, never by
+      round-tripping the view.
     - `metadata_omissions` — every metadata field this response dropped, and
       why. Nothing is signalled inside a note-controlled field.
 
@@ -699,10 +724,17 @@ async def read_note_impl(
     cap = settings.max_read_response_chars
 
     def _fail(message: str) -> ReadNoteResult:
-        result = ReadNoteResult(error=_bounded(message, metadata_budget))
-        # An over-long path is refused before it is echoed anywhere; every
-        # other error names the path the caller asked for, exactly.
-        if len(path) <= MAX_PATH_CHARS:
+        # `_scalar_safe` is the last line of defence, not the first: the path
+        # and the selector are both refused at admission when they carry an
+        # unpaired surrogate, precisely so no error message has to quote one.
+        # It stays because an error string that cannot be serialized is a
+        # protocol error, and this function is the only place every one of them
+        # passes through.
+        result = ReadNoteResult(error=_scalar_safe(_bounded(message, metadata_budget)))
+        # An over-long or unencodable path is refused before it is echoed
+        # anywhere; every other error names the path the caller asked for,
+        # exactly.
+        if len(path) <= MAX_PATH_CHARS and is_encodable(path):
             result.path = path
         return result
 
@@ -722,6 +754,17 @@ async def read_note_impl(
         cap = min(limit, cap)
     if offset < 0:
         return _fail(f"read_note: offset must be >= 0 (got {offset}).")
+    if section is not None and not is_encodable(section):
+        # A selector is caller-supplied and every failure to resolve it quotes
+        # it back — into `error`, which `pydantic_core` then has to serialize.
+        # An unpaired surrogate there is a protocol error manufactured from a
+        # tool argument, so it is refused as a parameter, before resolution, and
+        # the refusal does not repeat the value.
+        return _fail(
+            "read_note: section is not valid UTF-8 — it contains an unpaired "
+            "surrogate code point. Re-send the selector as UTF-8 text, or use "
+            'the "#N" ordinal form.'
+        )
 
     content = note["content"]
     heading: str | None = None
@@ -772,7 +815,12 @@ async def read_note_impl(
             note["path"], section, offset, min(offset, total) + len(chunk),
             total, next_offset, result.outline,
         )
-    apply_metadata_budget(result, view_omission, metadata_budget)
+    # Unencodable values are screened BEFORE the budget so `metadata_omissions`
+    # reads in decision order, and so the budget never spends room on a field
+    # that is about to be dropped anyway.
+    carried = [] if view_omission is None else [view_omission]
+    carried += screen_unencodable(result)
+    apply_metadata_budget(result, carried, metadata_budget)
     return result
 
 

@@ -158,9 +158,14 @@ Destructive and silently-wrong writes, the class this product ranks highest.
   staleness again.
 - **The round-trip guarantee is scoped, and both layers' docstrings say so:**
   it covers a complete, unwindowed whole-note read only (`section=None`,
-  `offset=0`, no `[TRUNCATED]`). A truncated read must be paged to the end
-  first, and a `read_note(section=…)` response **includes the heading line**
-  while `edit_note(section=…)` takes the body only.
+  `offset=0`, and `truncated` false in the structured result). A truncated read
+  must be paged to the end first. A `read_note(section=…)` response carries the
+  matched heading line in its **`heading` field** and the body in **`content`**,
+  and `edit_note(section=…)` takes exactly that `content` — the pre-#149 shape,
+  where the response was one rendered string that *included* the heading line
+  and the caller had to strip it, is gone; see "The read→write round trip is
+  field-based" below for why no docstring may describe recovering the body from
+  a rendered response.
 
 ### Mutations act on the path as named — never through a symlink
 
@@ -247,14 +252,18 @@ There are **byte** caps, a **character** cap, and a **transport** cap, and they 
 | `content` | `MAX_READ_RESPONSE_CHARS`, lowered by `limit`, windowed by `_window()` |
 | `outline` | its own independent `MAX_READ_RESPONSE_CHARS` (also lowered by `limit`), measured over the **serialized** outline object |
 | `title`, `tags`, `frontmatter_yaml` + its JSON view, `heading` | one shared **metadata budget**, `MAX_READ_RESPONSE_CHARS` and *not* lowered by `limit` — `limit` is documented as bounding returned content, and letting `limit=1` silently strip a note's title made a cheap probe useless |
-| `path` | none needed: it is returned **exactly**, bounded instead at admission by `vault.MAX_PATH_CHARS` (1,024, matching `notes_metadata.file_path`) |
+| `path` | none needed: it is returned **exactly**, bounded instead at admission by `vault.MAX_PATH_CHARS` (1,024, matching `notes_metadata.file_path`) and by `vault.is_encodable` (a path that is not UTF-8 cannot name a file, and cannot be serialized into the response either) |
 | `error`, `notice` | fixed server prose plus bounded interpolations only — the path (1,024) and the section selector (`_NOTICE_SELECTOR_MAX`); the whole `error` string is additionally cut to the metadata budget |
 
 **The worst-case serialized response**, stated for the new shape: `(content cap + outline budget + metadata budget + the fixed path allocation and prose) × 2` for the structured-content-plus-text-block duplication `× up to 6` for JSON string escaping of note-controlled text (`\u0001` is six characters for one). At the 40,000 default that is roughly 1.4 M characters in the pathological case — a note whose body is 40,000 control characters *and* whose frontmatter is over-budget *and* which is heading-dense. The old "≈ `2 × cap`" figure was retired with the envelope. Every component must have a budget; if you add a fourth, give it one, and update this table, the worst case, and the end-to-end test in `tests/test_read_response_cap.py`.
 
 **Why the metadata budget exists at all.** `read_note` goes through `read_file()`, which has no byte cap, so a note can carry a multi-megabyte frontmatter block above a one-character body: without a third budget the response is governed by the content cap and is still megabytes wide.
 
-**Overflow drops a field WHOLE, in a fixed order, and reports it out of band.** The order is the lossy `frontmatter` JSON view (the raw block says everything it does), then `frontmatter_yaml`, then `tags`, then `heading` elided, then `title` elided. A dropped field is never truncated in place and **never replaced by an in-band marker** — a marker inside a note-controlled field is indistinguishable from note content, which is the forgery class #149 exists to end. Elision, where it happens, is a plain cut with no ellipsis for the same reason. Every drop and every elision is reported in the server-controlled `metadata_omissions` list, naming the field, a stable reason code, and how to read the value anyway (the note's raw bytes). `frontmatter_yaml` in particular is dropped rather than cut because half a YAML block still parses: a truncated one is a *corrupt* block that looks valid.
+**Overflow drops a field WHOLE, in a fixed order, and reports it out of band.** The order is the lossy `frontmatter` JSON view (the raw block says everything it does), then `frontmatter_yaml`, then `tags`, then `heading`, then `title`. It is a **priority list, not an optimizer**: each step runs only if the remainder still does not fit, and it stops as soon as it does — so an oversized `title` costs the `heading` first, deterministically, rather than the server searching for the cheapest set to drop.
+
+**No field is ever cut short.** Not truncated in place, not elided, not replaced by an in-band marker — a shortened or marked value inside a note-controlled field is indistinguishable from note content, which is the forgery class #149 exists to end. That covers the two short fields where an in-place cut looks harmless: an earlier revision elided `heading` and `title`, and it also computed the heading's room from the *un-dropped* title, so an oversized title silently zeroed `heading` to `""` — a present-but-empty note-controlled field, colliding with this tool's own convention that `""` is an *answer* (an empty section body) rather than an absence. Both are gone; `tests/test_issue_149_read_note_framing.py` pins all five steps and the `""` case.
+
+Every drop is reported in the server-controlled `metadata_omissions` list, naming the field, a stable reason code, and how to read the value anyway (the note's raw bytes). `frontmatter_yaml` in particular is dropped rather than cut because half a YAML block still parses: a truncated one is a *corrupt* block that looks valid.
 
 Satisfying the byte caps says nothing about the response. A 3 MB note is well inside the 10 MB read cap and will still exhaust a context window — that is exactly how this bit us: `read_note` had no cap at all and returned a 3.4 M-char tool result, which the caller's inference provider rejected as "input exceeds the context window". `read_note` goes through `read_file()` in the vault service, not `read_bytes()`, so it never even had the byte cap.
 
@@ -539,7 +548,7 @@ the pinned wheel — `mcp/server/fastmcp/utilities/func_metadata.py`):
    in-band refusal the vault-root gate promises.
 
 **Frontmatter twice, and only one of them is authoritative.** `frontmatter_yaml`
-is the block's YAML source as stored, fence lines excluded — lossless whenever
+is the block's YAML source, fence lines excluded — content-lossless whenever
 present, and dropped whole rather than cut under budget pressure. `frontmatter`
 is a best-effort JSON view built by a depth-, node- and size-bounded,
 cycle-safe walk, and it is **omitted entirely** (with the reason stated in
@@ -551,12 +560,55 @@ block has shapes JSON does not:
 - non-string keys — `1:` and `"1":` are two YAML keys and one JSON key, so
   rendering the view silently loses one of them;
 - dates and timestamps — no JSON form, so they become ISO strings, which is
-  lossy in the other direction.
+  lossy in the other direction;
+- **unpaired surrogates** — `title: "\uD800"` is legal YAML, and PyYAML decodes
+  the escape into a code point that is a valid Python `str` and not a Unicode
+  scalar value. `pydantic_core`, which renders *both* halves of the MCP result,
+  raises `PydanticSerializationError` on it, so note-controlled frontmatter
+  could manufacture a **protocol error** — a whole class above the in-band
+  errors this tool promises. The check runs at model-build time, on `title`,
+  `tags` and every string in the view; each unencodable value is dropped whole
+  with the `unpaired_surrogate` reason. `frontmatter_yaml` is unaffected: in
+  the file the escape is six literal ASCII characters. `heading`, `content` and
+  the outline's titles are slices of `Path.read_text(encoding="utf-8")`, which
+  is strict, so they cannot carry one and are not screened. A surrogate-bearing
+  **path or selector** is not an omission but an admission-time error — a path
+  that is not UTF-8 cannot name a file — refused by `vault.is_encodable`
+  beside the length bound, and the refusal never quotes the value back.
 
 A partial view is never emitted: a caller cannot tell a pruned map from the
 real one. **Mutation goes through `set_frontmatter`, or through the raw block
 with `edit_note(find=…)` — never a round trip of the JSON view**, and all four
 docstrings say so.
+
+**`frontmatter_yaml` is LF-normalized, not byte-exact — declared, not fixed.**
+The read path hands the shared parser `Path.read_text()` output, which has
+already applied universal-newline translation, so a CRLF or lone-CR block comes
+back with LF terminators. It is the same residual a section body carries and it
+has the same cause. Re-reading the file as bytes purely to serve one response
+field would give `read_note` a *second* partition of the same note, which is
+exactly what D3 exists to prevent, and the two could disagree. `edit_note` is
+unaffected — it works from raw bytes and still reattaches a CRLF block
+byte-identically — so the residual is a read-side rendering detail, stated in
+both `read_note` docstrings.
+
+**A block the parser refuses to load is a `yaml_error`, on both sides.**
+`yaml.YAMLError` is not PyYAML's whole failure surface. Two shapes a user can
+save escape it: `n: <6000 digits>` raises a bare `ValueError` from CPython's
+integer-string digit limit, inside the *constructor*, and a few thousand nested
+flow collections raise `RecursionError` out of the composer. Uncaught, both took
+out `read_note` **and** every write path that diagnoses a block, on a note
+nobody could then repair. `_partition_frontmatter` catches all three and
+classifies them as `yaml_error` — the class that already means "the parser
+refused this region" — so the consequences compose the way every other defect
+does: the block stays in the body (the read still returns every byte of the
+note, in `content`), section writes and `set_frontmatter` refuse by name with
+the `replace_frontmatter=True` repair, and default full-replace rewrites the
+file wholesale. **The rejected alternative** was to call such a block *valid*
+with an empty mapping, so the read could still expose `frontmatter_yaml`: that
+hands `set_frontmatter` a `{}` to merge into and `safe_dump` over the top of a
+block it never parsed — a destructive write on a note whose only defect is that
+it is large.
 
 ### Resolved residual: the masker's narrower-than-CommonMark fence grammar (#150)
 

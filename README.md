@@ -904,8 +904,13 @@ headings gets a truncated listing that reports how many sections were
 omitted (`omitted`) and the full ordinal range (`first_ordinal`,
 `last_ordinal`), rather than an outline larger than the content window
 it accompanies. Metadata that does not fit its budget is dropped whole
-and reported in `metadata_omissions` — never marked inside the field
-itself, so nothing in a note-controlled field is ever server prose.
+and reported in `metadata_omissions` — never cut short and never marked
+inside the field itself, so nothing in a note-controlled field is ever
+a prefix or server prose. `frontmatter_yaml` is the frontmatter block's
+YAML source with the fence lines removed, LF-normalized (the same
+declared terminator residual `content` carries); it is the authoritative
+copy, and the `frontmatter` JSON view beside it is a convenience that is
+omitted, with a reason, when YAML holds something JSON cannot say.
 
 `limit` can lower the cap for a single call but never raise it. If your
 clients genuinely want larger reads, raise `MAX_READ_RESPONSE_CHARS` —

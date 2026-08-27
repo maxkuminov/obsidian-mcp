@@ -322,10 +322,43 @@ def path_too_long_error(relative_path: str) -> str:
     )
 
 
+def is_encodable(text: str) -> bool:
+    """True when `text` is a sequence of Unicode *scalars* — UTF-8-encodable.
+
+    A JSON-RPC argument can carry a lone surrogate (`"\\ud800"`): it is a valid
+    Python `str` and a valid JSON string, and it is not a Unicode scalar value,
+    so it cannot be encoded as UTF-8. That matters twice over. It cannot name a
+    file — `os.fsencode` refuses it — and, since #149, `read_note`'s result is
+    serialized by `pydantic_core`, which raises `PydanticSerializationError` on
+    exactly this input. A caller-supplied string that reaches either is a
+    protocol error manufactured from a tool argument, so the check belongs at
+    admission with the length bound.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def path_not_encodable_error(relative_path: str) -> str:
+    """The one wording for "this path is not UTF-8". Never quotes the path.
+
+    Quoting it back is the whole problem: the value is precisely the one that
+    cannot be encoded into the response carrying the complaint.
+    """
+    return (
+        "Path is not valid UTF-8: it contains an unpaired surrogate code point, "
+        "which cannot name a file. Re-send the path as UTF-8 text."
+    )
+
+
 def validate_path(relative_path: str, user_id: int | None = None) -> Path:
     """Resolve a relative path within the vault, preventing traversal."""
     if len(relative_path) > MAX_PATH_CHARS:
         raise ValueError(path_too_long_error(relative_path))
+    if not is_encodable(relative_path):
+        raise ValueError(path_not_encodable_error(relative_path))
     vault = _vault_root(user_id)
     resolved = (vault / relative_path).resolve()
     try:
@@ -1363,6 +1396,8 @@ def _mutable_parts(relative_path: str) -> list[str]:
     raw = str(relative_path).replace(os.sep, "/")
     if len(raw) > MAX_PATH_CHARS:
         raise ValueError(path_too_long_error(raw))
+    if not is_encodable(raw):
+        raise ValueError(path_not_encodable_error(raw))
     if "\x00" in raw:
         raise ValueError(f"Path traversal denied: {relative_path}")
     if raw.endswith("/"):
@@ -1603,11 +1638,14 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
         "path": relative_path,
         "title": title,
         "frontmatter": frontmatter,
-        # The block's YAML source as stored, or None when the note carries no
-        # valid line-1 block. `read_note` returns this as the *authoritative*
+        # The block's YAML source, or None when the note carries no valid
+        # line-1 block. `read_note` returns this as the *authoritative*
         # frontmatter representation (#149) and the parsed mapping above only
         # as a lossy view beside it. `""` (a valid empty block) and `None` (no
         # block) are different answers and must stay distinguishable.
+        # `read_text` above has already normalized terminators, so this is
+        # LF-normalized rather than byte-exact — the declared residual, stated
+        # in both `read_note` docstrings.
         "frontmatter_yaml": diagnosis.yaml_text if diagnosis.valid else None,
         "tags": tags,
         "content": content,
@@ -2663,13 +2701,24 @@ class FrontmatterDiagnosis:
     `block + body == raw` exactly whenever `valid` is true. It is never
     derived as `raw[:-len(body)]`, which is wrong for an empty body.
 
-    `yaml_text` is that same span with the two fence lines excluded — the YAML
-    source as stored, byte for byte. It exists because `read_note` returns it
-    (#149): the parsed mapping is a *lossy* view of a block (dates, non-string
-    keys, anchors), so the response carries the raw text as the authoritative
-    representation and the mapping only as a best-effort convenience. It is
-    `""` for a valid empty block (`---\\n---\\n`) and for anything not valid,
-    which `valid` already distinguishes.
+    `yaml_text` is that same span with the two fence lines excluded: the YAML
+    source **as this function received it**. It exists because `read_note`
+    returns it (#149): the parsed mapping is a *lossy* view of a block (dates,
+    non-string keys, anchors), so the response carries the source text as the
+    authoritative representation and the mapping only as a best-effort
+    convenience. It is `""` for a valid empty block (`---\\n---\\n`) and for
+    anything not valid, which `valid` already distinguishes.
+
+    **Not byte-exact for a CRLF or lone-CR note, and that is declared, not
+    fixed.** The read path hands this function `Path.read_text()` output, which
+    has already applied universal-newline translation, so `yaml_text` there is
+    LF-normalized — the same residual a section body carries, for the same
+    reason. Content is preserved; the block's own terminator bytes are not.
+    Re-reading the file as bytes purely to serve one response field would give
+    `read_note` a second, disagreeing partition of the same note, which is the
+    thing D3 exists to prevent. The write paths, which pass raw bytes, get the
+    raw bytes back here — that is why `edit_note` can still reattach a CRLF
+    block byte-identically.
     """
 
     valid: bool
@@ -2757,7 +2806,29 @@ def _partition_frontmatter(raw: str) -> tuple[dict, str, FrontmatterDiagnosis]:
         )
     try:
         fm = yaml.safe_load(yaml_text)
-    except yaml.YAMLError as e:
+    except (yaml.YAMLError, ValueError, RecursionError) as e:
+        # `yaml.YAMLError` is not the whole failure surface, and the two extras
+        # are reachable from a note a user can save (#149 audit):
+        #
+        #   * `n: <6000 digits>` — well-formed YAML whose *constructor* raises a
+        #     bare `ValueError` from CPython's integer-string digit limit;
+        #   * `a: [[[[…]]]]` nested a couple of thousand deep — `RecursionError`
+        #     out of the composer.
+        #
+        # Uncaught, both escaped this function and took out `read_note` AND
+        # every write path that diagnoses a block, on a note nobody could then
+        # repair. Classifying them as `yaml_error` is the safe direction and
+        # needs no new defect vocabulary: a region the parser refuses to load is
+        # exactly what that class already means. The consequences compose the
+        # way the existing defect classes do — the block stays in the body (so
+        # `read_note` still returns every byte of the note, in `content`),
+        # section writes and `set_frontmatter` are refused **by name** with the
+        # `replace_frontmatter=True` repair, and default full-replace rewrites
+        # the file wholesale. The rejected alternative was to call the block
+        # valid with an empty mapping so the read could still expose
+        # `frontmatter_yaml`: that hands `set_frontmatter` a `{}` to merge into
+        # and `safe_dump` over the top of a block it never parsed, which is a
+        # destructive write on a note whose only defect is that it is large.
         return {}, raw, FrontmatterDiagnosis(
             valid=False,
             defect="yaml_error",
