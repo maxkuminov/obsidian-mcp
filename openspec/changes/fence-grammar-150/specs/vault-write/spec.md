@@ -38,6 +38,27 @@ When a note contains an indented (1–3 space) fence opener with no closing fenc
 - **WHEN** every indented opener in a note has a closing fence
 - **THEN** section writes SHALL proceed normally under the masked interpretation
 
+#### Scenario: A rewrite-enabled move preflights every rewrite source
+
+- **WHEN** `move_note(from, to, rewrite_links=True)` selects sources for link
+  rewriting (the moved note's own body included) and any of them reports an
+  unmatched indented fence opener
+- **THEN** the whole move SHALL be refused before the rename is published,
+  naming each such source and the opener's position, because rewriting would
+  mutate text whose code/prose status the flat grammar cannot decide — a link
+  inside an actual list-contained unterminated fence must not be silently
+  rewritten
+- **AND** the same move with `rewrite_links=False` SHALL be unaffected
+
+#### Scenario: The refusal is disclosed where callers read
+
+- **WHEN** the `edit_note` and `move_note` docstrings (the MCP-facing
+  registrations and the implementation docstrings alike) describe when a call
+  is refused
+- **THEN** they SHALL disclose the unmatched-indented-fence-opener refusal
+  alongside the defective-frontmatter refusal, and SHALL NOT advertise
+  unqualified read/write selector parity on such notes
+
 ## MODIFIED Requirements
 
 ### Requirement: Section mode replaces the body under a named heading
@@ -119,8 +140,9 @@ scans there.
   `<sel>` (`offset=0`, no `[TRUNCATED]` notice) is stripped of its heading line
   and its terminator, and the remainder is passed back as
   `edit_note(path, content=<remainder>, section=<sel>)`, on a note whose body
-  newlines are LF and whose line-1 frontmatter is absent or valid — the notes
-  for which a section write is admitted at all
+  newlines are LF, whose line-1 frontmatter is absent or valid, and which
+  contains no unmatched indented fence opener — the notes for which a section
+  write is admitted at all
 - **THEN** the resulting file SHALL be byte-identical to the original
 - **AND** this SHALL hold for every `#N` ordinal in the note, including
   sections whose body begins with a blank line, sections whose body begins
@@ -135,6 +157,12 @@ scans there.
 - **AND** it SHALL NOT be read as weakening the refusal on a defective
   frontmatter block: such a note remains readable by section and refused for
   section writes, and the refusal takes precedence over the round trip
+- **AND** the same precedence SHALL hold for the unmatched-indented-fence-opener
+  refusal this change introduces: such a note remains readable by section, its
+  selectors resolve for reads under the not-a-fence interpretation, and every
+  section write to it is refused by name — selector parity between read and
+  write is a claim about resolution on admitted writes, not a promise that
+  every readable section is writable
 
 #### Scenario: An empty section survives a round trip
 

@@ -11,12 +11,12 @@ Link rows, inline tags, and embedded vectors are derived through the shared fenc
 
 #### Scenario: Embedding invalidation is scoped to affected notes
 
-- **WHEN** the re-derivation pass processes a note whose recognised fence spans are identical under the old and new grammars
-- **THEN** that note SHALL NOT be re-embedded
+- **WHEN** the re-derivation pass processes a note whose recognised fence spans are identical under the old and new grammars, and no independent invalidator applies (no content change, no `file_path` change, no provider or configuration change, no exclusion reconciliation)
+- **THEN** the grammar migration SHALL NOT cause that note to be re-embedded — span comparison governs only invalidation attributable to the grammar change and never suppresses an invalidation another requirement mandates
 - **WHEN** it processes a note whose spans differ (e.g. one containing an indented fence around text)
 - **THEN** that note's embeddings SHALL be rebuilt from the newly cleaned text on a subsequent embed pass
 
 #### Scenario: Move detection survives the remediation window
 
 - **WHEN** a note is externally renamed after the migration runs but before the re-derivation pass reaches it
-- **THEN** the indexer's content-hash move matching SHALL still identify it as the same note (its `content_hash` is real), preserving identity and its embeddings rather than delete-and-reinserting
+- **THEN** the indexer's content-hash move matching SHALL still identify it as the same note (its `content_hash` is real), preserving row identity rather than delete-and-reinserting — the path-change invalidation the existing requirements mandate for a move still applies

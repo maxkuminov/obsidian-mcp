@@ -80,14 +80,21 @@ Unterminated openers split by indentation: a **column-zero** opener with no clos
 - **WHEN** a fence-looking run is indented by four or more spaces
 - **THEN** it SHALL NOT open or close a fenced block (indented code blocks are a documented divergence: they are not masked)
 
-### Requirement: Fence state does not cross the frontmatter boundary
+### Requirement: Fence state does not cross the frontmatter boundary, and the partition happens at most once
 
-When a note begins with a valid line-1 frontmatter block (as recognised by the shared frontmatter partition), the fence recognizer SHALL treat that block as opaque: no line inside it opens or closes a fence, and fence scanning begins at the first line after the block. On a note whose frontmatter is absent or defective, the whole raw text is scanned.
+When a note begins with a valid line-1 frontmatter block (as recognised by the shared frontmatter partition), that block SHALL be opaque to fence recognition: no line inside it opens or closes a fence, and fence scanning begins at the first line after the block. On a note whose frontmatter is absent or defective, the whole raw text is scanned.
+
+The partition SHALL be computed **at most once per note, against the full raw text**. The recognizer SHALL take its input context explicitly: given a full note, it discovers and skips the valid line-1 block itself; given a body from which the frontmatter block has already been stripped, it SHALL NOT re-partition — scanning starts at the first character, and a mapping-shaped block at the top of such a body is content, never a second frontmatter block. Consumers that operate on stripped bodies (heading resolution over the stripped body, index-time link extraction, embedding cleanup) SHALL invoke it in body context; consumers that operate on raw text SHALL invoke it in full-note context.
 
 #### Scenario: A fence-shaped YAML scalar does not swallow the body
 
 - **WHEN** a note is `---\nliteral: |\n   ```\n---\n#real\n[[Old]]\n`
 - **THEN** the indented fence-shaped line inside the valid frontmatter block SHALL NOT open a block, `#real` SHALL be extracted as a tag, and `[[Old]]` SHALL be extracted (and rewritten by `move_note(rewrite_links=True)`) normally
+
+#### Scenario: A stripped body is never re-partitioned
+
+- **WHEN** a note's valid outer frontmatter is stripped and its body begins with a second mapping-shaped fenced block that contains an unmatched indented fence opener, followed by `# Hidden\npayload\n`
+- **THEN** body-context recognition SHALL scan the mapping-shaped prefix as content, SHALL report the unmatched indented opener, and the section-write refusal SHALL fire for `edit_note(section="Hidden", …)` — the opener SHALL NOT be hidden inside a phantom second frontmatter block
 
 ### Requirement: Documented divergences from CommonMark
 
