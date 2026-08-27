@@ -481,8 +481,9 @@ scans there.
   `<sel>` (`offset=0`, no `[TRUNCATED]` notice) is stripped of its heading line
   and its terminator, and the remainder is passed back as
   `edit_note(path, content=<remainder>, section=<sel>)`, on a note whose body
-  newlines are LF and whose line-1 frontmatter is absent or valid — the notes
-  for which a section write is admitted at all
+  newlines are LF, whose line-1 frontmatter is absent or valid, and which
+  contains no unmatched indented fence opener — the notes for which a section
+  write is admitted at all
 - **THEN** the resulting file SHALL be byte-identical to the original
 - **AND** this SHALL hold for every `#N` ordinal in the note, including
   sections whose body begins with a blank line, sections whose body begins
@@ -497,6 +498,12 @@ scans there.
 - **AND** it SHALL NOT be read as weakening the refusal on a defective
   frontmatter block: such a note remains readable by section and refused for
   section writes, and the refusal takes precedence over the round trip
+- **AND** the same precedence SHALL hold for the unmatched-indented-fence-opener
+  refusal this change introduces: such a note remains readable by section, its
+  selectors resolve for reads under the not-a-fence interpretation, and every
+  section write to it is refused by name — selector parity between read and
+  write is a claim about resolution on admitted writes, not a promise that
+  every readable section is writable
 
 #### Scenario: An empty section survives a round trip
 
@@ -529,21 +536,16 @@ scans there.
 - **AND** the caller-visible documentation SHALL state that this is a
   deletion: a `content` that does not resend the block loses it
 
-#### Scenario: A fence the masker does not recognise is out of scope, not covered
+#### Scenario: Indented and longer-closed fences are covered by the masker
 
-- **WHEN** a fence is indented, or is closed by a run longer than its
-  opener — shapes `_FENCE_RE` does not currently mask — so that a heading
-  inside it is visible to the scanner
-- **THEN** this requirement's fenced-code guarantees SHALL NOT be read as
-  covering it, and for a **non-empty** replacement body the bytes written SHALL
-  be identical to the bytes written before this change (verified, not assumed)
-- **AND** for an **empty** replacement body the separator-conditionality rule
-  above applies here as everywhere else, so the result differs from before this
-  change by the one blank line that rule stops inserting — a removal, not a
-  loss, and the only intended divergence on these shapes
-- **AND** the gap SHALL be recorded as a declared residual with its own
-  tracking issue, because widening the masker re-addresses `#N` ordinals on
-  existing notes and is a larger compat break than this change
+- **WHEN** a fence is indented by one to three spaces, or is closed by a
+  run at least as long as its opener — shapes the `code-masking`
+  capability's grammar recognises
+- **THEN** this requirement's fenced-code guarantees SHALL cover it: a
+  heading inside it is not selectable and does not bound a section
+- **AND** the re-addressing this widening causes on notes containing such
+  shapes is the declared break of the fence-grammar change (issue #150),
+  superseding the residual this scenario previously declared out of scope
 
 #### Scenario: A blank line after a heading belongs to the body
 
@@ -1578,3 +1580,61 @@ endings than it started with.
 - **AND** the same statements SHALL appear in the `tools.py` implementation's
   docstring, so the two layers do not diverge
 
+### Requirement: Section addressing hides code per the code-masking grammar
+
+Section resolution for `edit_note(section=…)` and `read_note(section=…)` SHALL scan text masked by the shared masker under the `code-masking` capability's grammar, so no heading inside any recognised fenced block is selectable, occupies a `#N` ordinal, or bounds a neighbouring section. The re-addressing consequence is declared: on a note containing a fence shape the previous masker missed (indented opener or closer, longer closer, unterminated column-zero fence), `#N` ordinals emitted before this change MAY shift, because a line inside code stops counting as a heading.
+
+#### Scenario: An indented fence no longer exposes a heading to section writes
+
+- **WHEN** a note is `# A\n   ```\n# Hidden\ntext\n   ```\n# B\nb\n` and a client calls `edit_note(section="#1", content="new")`
+- **THEN** the section `A` SHALL be the entire span through the masked block (its body ending before `# B`), the write SHALL replace that whole body, and `# Hidden` SHALL NOT be selectable by any selector nor occupy an ordinal — `#2` SHALL resolve to `# B`
+
+#### Scenario: A longer-closed fence is one opaque span
+
+- **WHEN** a note is `# A\n```\n# Hidden\n````\n# B\nb\n`
+- **THEN** section resolution SHALL treat the fenced span as body of `A`, a write to `A` SHALL replace it whole rather than splitting at `# Hidden`, and `# B` SHALL remain the note's second section — the closing line's terminator survives masking
+
+#### Scenario: No heading below an unterminated column-zero fence is selectable
+
+- **WHEN** a note opens a column-zero fence that is never closed, with `#`-prefixed lines below it
+- **THEN** none of those lines SHALL be selectable sections, and the truncation outline SHALL NOT list them
+
+#### Scenario: The outline and the resolver agree after the grammar change
+
+- **WHEN** `read_note` emits a truncation outline for a note containing any newly-recognised fence shape
+- **THEN** every `#N` in that outline SHALL resolve, via `read_note(section=…)` and `edit_note(section=…)`, to exactly the heading the outline listed
+
+### Requirement: Section writes are refused on a note with an unmatched indented fence opener
+
+When a note contains an indented (1–3 space) fence opener with no closing fence below it, `edit_note(section=…)` SHALL refuse the write, naming the unmatched opener and where it sits, because the block's true extent depends on container structure the flat grammar does not parse — under CommonMark the block could end at an enclosing list item's end, so any flat interpretation risks either splitting a code block or extending a section over real content. Reads (`read_note(section=…)` and the outline) SHALL keep working under the not-a-fence interpretation; as with defective frontmatter, the guarantee on such a note is the refusal, not the round trip. All other section-mode refusal semantics (naming, no write performed) follow the existing refusal patterns.
+
+#### Scenario: The list-item fence shape cannot extend a section to end of note
+
+- **WHEN** a note is `# A\n- item\n  ```\n  code\n\n# B\nkeep\n` and a client calls `edit_note(section="A", content="new")`
+- **THEN** the call SHALL be refused without writing, the refusal SHALL name the unmatched indented opener, and `# B` SHALL still resolve as a section for reads
+
+#### Scenario: A matched indented fence does not trigger the refusal
+
+- **WHEN** every indented opener in a note has a closing fence
+- **THEN** section writes SHALL proceed normally under the masked interpretation
+
+#### Scenario: A rewrite-enabled move preflights every rewrite source
+
+- **WHEN** `move_note(from, to, rewrite_links=True)` selects sources for link
+  rewriting (the moved note's own body included) and any of them reports an
+  unmatched indented fence opener
+- **THEN** the whole move SHALL be refused before the rename is published,
+  naming each such source and the opener's position, because rewriting would
+  mutate text whose code/prose status the flat grammar cannot decide — a link
+  inside an actual list-contained unterminated fence must not be silently
+  rewritten
+- **AND** the same move with `rewrite_links=False` SHALL be unaffected
+
+#### Scenario: The refusal is disclosed where callers read
+
+- **WHEN** the `edit_note` and `move_note` docstrings (the MCP-facing
+  registrations and the implementation docstrings alike) describe when a call
+  is refused
+- **THEN** they SHALL disclose the unmatched-indented-fence-opener refusal
+  alongside the defective-frontmatter refusal, and SHALL NOT advertise
+  unqualified read/write selector parity on such notes

@@ -38,4 +38,4 @@
 ## 5. Gates
 
 - [x] 5.1 Pre-deploy: full test suite green (unit + integration), `make test-schema` green — which runs `alembic check` against a fresh 001→018 database and asserts "No new upgrade operations detected" — and `openspec validate fence-grammar-150 --strict` clean.
-- [ ] 5.2 Post-deploy: `make db-check` against the production container once `make deploy` has run 018, and confirm from the logs that the first pass completed the re-derivation (it logs `Fence-grammar change invalidated embeddings for N note(s)`). Until that pass finishes, `move_note(rewrite_links=True)` refuses by design (task 3a.1).
+- [x] 5.2 Post-deploy: `make db-check` against the production container once `make deploy` has run 018, and confirm from the logs that the first pass completed the re-derivation (it logs `Fence-grammar change invalidated embeddings for N note(s)`). Until that pass finishes, `move_note(rewrite_links=True)` refuses by design (task 3a.1).
