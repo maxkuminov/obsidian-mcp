@@ -1,53 +1,49 @@
 ## Context
 
-`mask_code` (`src/services/links.py`) is the single shared masker: `_scan_headings` (section addressing for `read_note`/`edit_note`, outlines), `extract_links` (the `note_links` graph), `extract_tags` (inline tags), and `move_note`'s link rewriting all scan `mask_code(text)`. Its `_FENCE_RE` recognises only a column-zero opener closed by an equally-long fence. CommonMark permits 0–3 spaces of indentation on either fence and a closer at least as long as the opener; an unterminated fence runs to the end of the containing block. The gap is a reproduced silent destructive write (issue #150): a heading "hidden" inside an unrecognised fence is selectable, and a section write there deletes the opening fence and orphans the block.
+`mask_code` (`src/services/links.py`) feeds `_scan_headings` (section addressing, outlines), `extract_links`, `extract_tags`, and `move_note` link rewriting; `clean_for_embedding` (`src/services/embeddings.py`) separately strips fences before embedding with its own LF-only, column-zero, exact-closer regexes. Neither implements CommonMark's fence rules (0–3 space indentation, closer ≥ opener, unterminated-runs-to-container-end). The gap is a reproduced silent destructive write (issue #150).
 
-Constraints inherited from #140/#146 (see `docs/architecture/vault-tools.md` and the comment blocks in `links.py`):
-- universal terminators — LF, CRLF as a unit, lone CR — everywhere the masker and heading scanner look;
-- masking is same-length space substitution so byte offsets survive;
-- headings are column-zero only (deliberately stricter than CommonMark) — do not change this here;
-- read and write sides share one resolver, so masking changes affect both symmetrically by construction.
+Constraints inherited from #140/#146: universal terminators (LF, CRLF as a unit, lone CR); masking is same-length substitution so positions survive; headings are column-zero only; read and write share one resolver.
 
 ## Goals / Non-Goals
 
 **Goals:**
-- Pin the fence grammar explicitly as a CommonMark subset and make `_FENCE_RE` (or a successor scanner) implement it.
-- Close the reproduced destructive write: a heading inside any CommonMark-recognised fence is never selectable.
-- Refresh the stale derived state (`note_links`, `notes_metadata.tags`) that the hash-driven indexer will not refresh on its own.
+- One shared fence recognizer, grammar pinned in the `code-masking` spec, feeding both `mask_code` and `clean_for_embedding`.
+- Close the reproduced destructive write; refuse the one shape flat scanning cannot decide.
+- Re-derive stale links/tags/embeddings without corrupting note identity.
 
 **Non-Goals:**
-- 4-space indented code blocks (not masked; documented divergence — column-zero headings can't hide in them, and link extraction there matches current behavior).
-- Inline-code fidelity (CommonMark's equal-backtick-run pairing); the single-line single-backtick approximation stays.
-- Widening ATX heading recognition to CommonMark's 0–3 space indentation.
-- Any change to section write semantics (#140's body-span contract is untouched).
+- Container-aware parsing (lists, blockquotes); 4-space indented code blocks; CommonMark inline-code pairing; widening heading recognition; any change to #140's body-span contract.
 
 ## Decisions
 
-**1. Regex vs. line scanner.** The current single `(?s)` regex cannot express "closer at least as long as the opener" cleanly with a backreference (`\1` matches the exact opener; a longer closer needs `\1[`~]*` with a same-char guarantee). Prefer rewriting fence masking as a small line-by-line scanner over the universal-terminator line split: find opener lines with `^ {0,3}(([`~])\2{2,})(info)$`, then scan forward for the first line matching `^ {0,3}(\2{N,})[ \t]*$` where N = opener run length and same char; mask opener line through closer line inclusive (or through end of text when unterminated). A scanner is auditable against the CommonMark clauses one-by-one, where a widened regex was exactly what hid this bug. Byte-offset preservation is kept by masking spans of the original text.
-- Alternative (rejected): patch the regex incrementally — each of the four grammar clauses composes badly in one pattern (the #146 comment block already strains to justify the current one).
+**1. Line scanner exposing fence spans; regex retired.** A single `(?s)` regex cannot express "closer at least as long as the opener" or the indented-unterminated exclusion. The recognizer scans lines (universal-terminator split), returns `(start, end, unmatched_indented_openers)` spans; `mask_code` masks the spans (same code-point length, positions preserved), `clean_for_embedding` deletes them, section writes consult the unmatched-opener list. Each CommonMark clause is auditable in isolation — a widened regex is exactly what hid this bug class.
 
-**2. Backtick info strings may not contain backticks (CommonMark).** Without this, a one-line ```` ```code``` ```` inline-ish span opens a "block" that swallows everything to the next fence line. Tilde-fence info strings are unrestricted, per CommonMark.
+**2. Mask span excludes the closing line's terminator** (the current masker's convention, kept deliberately): the surviving terminator is what lets an immediately following heading match `_AT_LINE_START`. Internal terminators are masked to spaces as today. (Codex spec-audit finding 1.)
 
-**3. Unterminated fence masks to end of note.** CommonMark closes the block at the end of the containing block; here that is the document. This also kills the current failure where an unterminated fence masks nothing.
+**3. Unterminated openers split by indentation.** Column-zero: the document is the CommonMark container, so mask to end of note. Indented (1–3 spaces): the opener may be a list-item child whose block ends at the item's end — unknowable flat — so it is **not a fence**, and `edit_note(section=…)` on a note containing one is **refused by name** (position included). Reads and the outline keep working under the not-a-fence interpretation, mirroring the defective-frontmatter doctrine: the guarantee is the refusal, not the round trip. (Codex finding 2.) Rejected alternatives: container-aware parsing (unbounded scope, new divergence surface); masking to EOF (lets one stray line inside a list swallow every later real section — a *new* destructive class); refusing reads too (reads are non-destructive; refusing them walls off content).
 
-**4. Closer line = 0–3 spaces, same-char run ≥ opener length, then horizontal whitespace only.** The old pattern's trailing `\s*` could swallow following blank lines into the mask; the scanner stops at the closer line's terminator. Blank lines are spaces-after-masking either way and heading/link/tag scanning cannot match inside them, so no consumer-visible behavior rides on this; do not contort the scanner to reproduce the old trailing-blank-line absorption.
+**4. Backtick info strings may not contain backticks; closer suffix is U+0020/U+0009 only** (CommonMark; NBSP does not close). Tilde info strings unrestricted.
 
-**5. No refusal mode for "ambiguous" notes.** With the grammar pinned, every note parses deterministically — there is no ambiguity class to refuse. Refusing e.g. "any note whose masking would differ between old and new grammar" would permanently wall off legitimate notes over a one-time transition. Rejected.
+**5. Frontmatter is opaque to fence scanning.** The recognizer skips a valid line-1 frontmatter block (shared partition helper) before scanning; defective/absent frontmatter → raw scan, as today. Without this, a fence-shaped YAML scalar (now indent-matchable) would swallow the body for the raw-text consumers (`extract_tags`, `move_note` rewriting). (Codex finding 5.)
 
-**6. Re-addressing is accepted, not versioned.** Ordinals shift only on notes containing a newly-recognised shape, and only because a fake heading inside code stops occupying an ordinal. Selectors are advertised per-response (the truncation outline); nothing durable stores ordinals. The `#140` re-addressing concern was about *not bundling* this break — shipping it as its own change with its own record is precisely the mitigation.
+**6. `clean_for_embedding` consumes the shared recognizer** and keeps its remove-don't-mask behavior and inline-code preservation. Its private regexes are deleted. (Codex finding 3.)
 
-**7. Stale-index remediation: clear `content_hash` in a data migration.** Link/tag extraction runs only when `content_hash` changes; the masker change alters derived rows without touching bytes. An alembic data migration sets `notes_metadata.content_hash = NULL` (column is nullable; if not, use an impossible sentinel), so the next indexer pass re-extracts links and tags for every note. `embedded_content_hash` still equals the recomputed hash, so **no re-embedding** occurs and no Ollama/OpenAI cost is incurred. Downgrade is a no-op (the hashes regenerate).
-- Alternative (rejected): truncate `note_links` to trigger the empty-table backfill — refreshes links but not `notes_metadata.tags`, and deletes graph data ahead of its recomputation instead of letting upserts replace it.
+**7. Length/position invariant is stated in code points, not bytes.** Python `str` offsets are what every consumer stores and reports; "byte" phrasing was inherited prose. Non-ASCII tests pin it. (Codex finding 7.)
+
+**8. Remediation: `extraction_version` column, not `content_hash` games.** `content_hash` is NOT NULL and is the indexer's move-detection key; nulling it fails and a sentinel breaks rename identity (cascade-deletes embeddings). New column `notes_metadata.extraction_version SMALLINT NOT NULL DEFAULT 0` (server default so the migration is metadata-only); code constant `CURRENT_EXTRACTION_VERSION = 1`. Index pass re-derives a note when its hash changed **or** its marker is stale: re-extract links/tags; recompute recognised fence spans under the new grammar and under a frozen copy of the legacy regexes (kept only for this comparison, removable next release) — if they differ, clear `embedded_content_hash` so the embed pass rebuilds that note; stamp the marker. Ollama (production provider) makes the re-embed compute-only, and the scoping keeps it to affected notes. (Codex finding 4.)
+
+**9. No blanket refusal mode for "grammar-ambiguous" notes.** The grammar is deterministic except the unmatched-indented-opener case, which gets the targeted refusal in decision 3; a broader refusal would permanently wall off legitimate notes over a one-time transition.
 
 ## Risks / Trade-offs
 
-- [Ordinal shift surprises a concurrent agent holding a pre-deploy outline] → outlines are short-lived tool responses; the shifted ordinals only occur on notes where the old ordinal targeted a heading inside code, where a write was already destructive. Accepted.
-- [Scanner diverges from regex on an untested shape] → the spec's scenario list (indent 1–3, longer closer, `~~~`, mixed chars, nested-looking, unterminated, cross-section, CRLF/CR terminators, backtick-in-info) becomes the test matrix; tests pin exact masked/unmasked byte spans. Adversarial Codex pass is mandatory (section-addressing surface).
-- [Indexer pass after `content_hash` reset is heavy] → it is the same work as the existing first-deploy backfill over ~2,600 notes, minus embedding; runs inside the normal index loop.
-- [A note legitimately containing `#` lines inside a now-masked fence loses those "sections"] → that is the fix, not a regression; the sections were never real.
+- [Ordinal shift surprises an agent holding a pre-deploy outline] → outlines are per-response; shifted ordinals occur only where the old ordinal named a heading inside code, where a write was already destructive. Accepted, declared.
+- [Flat extent of a *matched* indented fence diverges from container semantics (e.g. closer outside the list)] → documented divergence; the refusal covers only the unmatched case. Real-vault cost is bounded: a matched pair masks something CommonMark might not, which under-counts headings — never extends a write past a visible heading... it can hide a real heading between opener and closer; that heading was between two fence lines the author wrote as a pair, accepted.
+- [Scanner diverges from spec on an untested shape] → the code-masking scenario list is the test matrix; exact masked spans pinned; adversarial Codex pass mandatory (section-addressing surface).
+- [extraction_version pass is heavy] → same work as the existing first-deploy backfill, minus embedding for unaffected notes.
+- [Legacy-regex comparator drifts] → it is frozen (copied verbatim from the pre-change tree), used only in the remediation branch, and deleted once the fleet is stamped.
 
 ## Migration Plan
 
-1. Deploy ships the code and the data migration together (`make deploy` runs alembic before recreate).
-2. First indexer pass after startup re-extracts links/tags for all notes (content_hash NULL ≠ recomputed hash). Verify via dashboard/logs that the pass completes and `note_links` settles.
-3. Rollback: redeploy the previous image; the next indexer pass re-extracts under the old grammar the same way. No schema change, nothing to downgrade.
+1. `make test-schema` (change carries a migration), then `make deploy` (build → backup → migrate → recreate); `make db-check` clean after.
+2. First index pass re-derives all notes (stale markers); dashboard/logs confirm completion; spot-check `note_links` and a known indented-fence note's outline via live MCP tools.
+3. Rollback: redeploy previous image. Old code ignores the new column (additive); re-derivation under the old grammar re-runs the same way if ever needed by bumping nothing — rows already stamped are simply stale relative to a *future* version bump.
