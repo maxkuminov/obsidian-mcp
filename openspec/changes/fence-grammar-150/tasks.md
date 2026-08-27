@@ -16,7 +16,20 @@
 
 - [x] 3.1 Schema: `notes_metadata.extraction_version SMALLINT NOT NULL SERVER DEFAULT 0` in `src/models/db.py` + alembic migration (additive, server default; downgrade drops it). `make test-schema` green; `alembic check` clean.
 - [x] 3.2 Indexer: `CURRENT_EXTRACTION_VERSION = 1`; re-derive when hash changed OR marker stale — re-extract links/tags; compare recognised fence spans between the frozen recognizer of the row's stamped version (per-version registry: v0 = legacy regexes copied verbatim; entries removable once no row carries the version) and the current recognizer, and clear `embedded_content_hash` when they differ (never suppressing an invalidation another rule mandates — path change, content change, provider change); stamp marker in the same transaction (retry-safety per index-integrity: a failed pass must not leave a stamped marker with unfinished work).
+  - Amended by the adversarial review: the registry stores frozen per-version
+    **cleaning functions**, and invalidation compares cleaned **outputs**, not
+    span tuples — v0's cleaner substituted sequentially, so span equality is
+    neither necessary nor sufficient for embedded-text equality. Both
+    counterexamples pinned in `tests/test_clean_for_embedding.py`.
 - [x] 3.3 Integration tests (throwaway pgvector container, per `make test-schema` harness or existing test DB fixtures): stale-marker pass refreshes links+tags for all notes; embedding invalidation only for span-diff notes (assert embed-call count); external rename between migration and pass keeps identity via true `content_hash` (no cascade delete); tsvectors intact.
+
+### 3a. Transition-window controls (adversarial review)
+
+- [x] 3a.1 `move_note(rewrite_links=True)` refuses, owner-scoped and before the rename, while any `notes_metadata` row in the caller's scope carries a stale `extraction_version`: its rewrite-source inventory is `note_links`, and a link the old grammar masked as code has no row at all, so the move would succeed and silently strand it. One `LIMIT 1` probe in the preflight (`_stale_extraction_error`); `rewrite_links=False` unaffected; the refusal clears itself when the pass completes. Tests: refuses while a stale row exists in scope; the same move with `rewrite_links=False` proceeds; succeeds once every row is stamped; the probe carries the caller's ownership predicate.
+- [x] 3a.2 The ID-preserving external-move branch re-derives the moved note's links and tags under the current grammar and stamps `extraction_version` in the same UPDATE, instead of deferring to a second pass — a rename must not cost a note its next-pass refresh. `tags` is bound through `bindparam(type_=ARRAY(String))`; `move_upd_sql` stays a string literal because `test_issue_91` reads it out of the AST.
+- [x] 3a.3 `extract_tags` takes the already-partitioned **body** in `BODY` context (every caller is already holding the parsed mapping), and the move preflight takes one `FULL_NOTE` scan per source and hands it to the rewriter via `apply_fence_mask` — so the frontmatter partition really does run at most once per note.
+- [x] 3a.4 A pinning test for the vault-write scenario "The refusal is disclosed where callers read": `tests/test_issue_150_docstrings.py` over all four docstrings, with the parity assertion checked non-vacuously (mutation-tested).
+- [x] 3a.5 A tool-layer read test: `read_note_impl(path, section=…)` still serves a note with an unmatched indented opener — the refusal is write-only.
 
 ## 4. Docs
 
@@ -24,9 +37,5 @@
 
 ## 5. Gates
 
-- [x] 5.1 Full test suite green; `openspec validate fence-grammar-150 --strict` clean; `make db-check` clean post-deploy.
-  - Done pre-deploy: unit suite, integration suite, `make test-schema` (which
-    runs `alembic check` against a fresh 001→018 database and asserts "No new
-    upgrade operations detected"), and `openspec validate --strict`.
-  - **Still owed at deploy time:** `make db-check` against the production
-    container after `make deploy` has run 018.
+- [x] 5.1 Pre-deploy: full test suite green (unit + integration), `make test-schema` green — which runs `alembic check` against a fresh 001→018 database and asserts "No new upgrade operations detected" — and `openspec validate fence-grammar-150 --strict` clean.
+- [ ] 5.2 Post-deploy: `make db-check` against the production container once `make deploy` has run 018, and confirm from the logs that the first pass completed the re-derivation (it logs `Fence-grammar change invalidated embeddings for N note(s)`). Until that pass finishes, `move_note(rewrite_links=True)` refuses by design (task 3a.1).

@@ -446,8 +446,12 @@ async def test_move_through_a_symlinked_folder_keeps_the_index_consistent(
     # And the backlink itself was rewritten.
     assert (writable / "src.md").read_text(encoding="utf-8") == "See [[B]]\n"
 
+    # `statements[2]` is the #150 stale-extraction guard — a SELECT, and the
+    # move only got this far because it found nothing.
+    assert "extraction_version" in str(statements[2].compile())
+
     # Both UPDATEs are keyed on the resolved paths.
-    for statement in statements[2:]:
+    for statement in statements[3:]:
         values = set(statement.compile().params.values())
         assert "Real/A.md" in values
         assert "Real/B.md" in values

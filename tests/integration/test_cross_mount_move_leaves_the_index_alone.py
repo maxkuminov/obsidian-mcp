@@ -39,7 +39,7 @@ import src.database
 import src.mcp_server.tools as tools
 from src.mcp_server.auth import current_permission
 from src.models.db import NoteLink, NoteMetadata
-from src.services import vault_fs
+from src.services import indexer, vault_fs
 import _harness
 from src.config import settings
 
@@ -132,11 +132,15 @@ async def seed(sessionmaker, root):
     async with sessionmaker() as session:
         await session.execute(text("DELETE FROM note_links"))
         await session.execute(text("DELETE FROM notes_metadata"))
+        # Stamped current: this module is about the cross-mount refusal, and a
+        # row left at the column default (0) would trip #150's transition-window
+        # guard first and refuse the move for a different reason entirely.
         moved = NoteMetadata(
             file_path=MOVED,
             title="A",
             content_hash=content_hash("body\n"),
             embedded_content_hash=content_hash("body\n"),
+            extraction_version=indexer.CURRENT_EXTRACTION_VERSION,
             user_id=None,
         )
         source = NoteMetadata(
@@ -144,6 +148,7 @@ async def seed(sessionmaker, root):
             title="B",
             content_hash=content_hash(BACKLINK_BODY),
             embedded_content_hash=content_hash(BACKLINK_BODY),
+            extraction_version=indexer.CURRENT_EXTRACTION_VERSION,
             user_id=None,
         )
         session.add_all([moved, source])

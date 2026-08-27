@@ -337,7 +337,18 @@ def _mask_code(text: str, *, context: FenceContext) -> str:
     consumer stores and reports, so non-ASCII content is covered by the same
     invariant.
     """
-    scan = scan_fences(text, context=context)
+    return apply_fence_mask(text, scan_fences(text, context=context))
+
+
+def apply_fence_mask(text: str, scan: FenceScan) -> str:
+    """`mask_code`'s body, for a caller that already has the scan.
+
+    A consumer that needs both the unmatched-opener report and the masked text
+    — `move_note`'s rewrite preflight — would otherwise scan each source twice,
+    and the second scan would re-run the frontmatter partition the recognizer
+    promises to run at most once per note. `scan` MUST have been produced from
+    this exact `text`, in the context that consumer declares.
+    """
     if scan.spans:
         out: list[str] = []
         cursor = 0

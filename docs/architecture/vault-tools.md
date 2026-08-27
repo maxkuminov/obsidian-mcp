@@ -311,9 +311,15 @@ to be checked against:
   its context explicitly: `FULL_NOTE` discovers and skips the block,
   `BODY` scans from character zero and never re-partitions. Both mistakes are
   real: `BODY` on a raw note lets a fence-shaped YAML scalar swallow the body
-  for `extract_tags` and `move_note`; `FULL_NOTE` on a stripped body eats a
+  for `move_note`'s rewriter; `FULL_NOTE` on a stripped body eats a
   mapping-shaped body prefix as a phantom second block, hiding an unmatched
-  opener from the refusal that must fire on it.
+  opener from the refusal that must fire on it. **At most once** is enforced by
+  handing the recognizer already-partitioned text wherever the caller has it:
+  `extract_tags` takes the **body**, not the raw note — it is already holding
+  the parsed mapping, so a `#` inside a *valid* block is structured data rather
+  than an inline tag — and `move_note`'s preflight takes one `FULL_NOTE` scan
+  per source and passes it to the rewriter via `apply_fence_mask` instead of
+  masking the same bytes a second time.
 
 Deliberate divergences, kept: container blocks are not parsed, so a *matched*
 fence's extent is computed flat even when its opener sits in a list item;
@@ -343,6 +349,13 @@ grammar closes.
   rename**, naming each offending source. Rewriting mutates note text, and a
   link under such an opener may be inside a list item's code block.
   `rewrite_links=False` is unaffected and is the way to move such a note.
+
+`move_note(rewrite_links=True)` carries a **third**, unrelated refusal from the
+same change: it aborts while any note in the caller's owner scope still carries
+a stale `extraction_version`, because its rewrite-source inventory is
+`note_links` and a stale-grammar extraction may have omitted rows. That one is
+transitional and clears itself — see
+[the transition window](indexing-and-embeddings.md#the-transition-window-two-controls-150).
 
 Reads stay asymmetric on purpose, the same doctrine as defective frontmatter:
 `read_note(section=…)` and the truncation outline keep resolving under the
@@ -478,25 +491,16 @@ as **#149**. Until it lands, the docstrings state the relationship (a section
 response carries the heading line and the body; `edit_note(section=…)` takes
 the body) and stop there.
 
-### Declared residual: the masker's fence grammar is narrower than CommonMark (#150)
+### Resolved residual: the masker's narrower-than-CommonMark fence grammar (#150)
 
-`_FENCE_RE` in `src/services/links.py` recognises only a **column-zero** opener
-closed by a fence of **exactly** the same length. CommonMark allows up to three
-spaces of indentation and a closer at least as long as the opener. So an
-indented fence, or one closed by a longer run, is not masked: a heading inside
-such a block is selectable, and a section write there already deletes the
-opening fence and orphans the contents.
-
-That is a genuine destructive-write hazard, and it is **not #140's**. Measured
-before and after the narrowing on both shapes, the bytes written are
-**identical** — pinned by `tests/test_issue_140_section_round_trip.py` against
-explicit expected bytes, which is the evidence for this claim. Widening the
-masker changes which lines count as headings, which shifts every `#N` ordinal
-on an affected note — a re-addressing break strictly larger than #140's, and
-one that must not ride along on it. It is filed as **#150** and needs its own
-proposal. This is why #140's spec says "fenced code block **as recognised by
-the shared masker**" rather than claiming CommonMark coverage the code does not
-have.
+This heading used to declare a live residual: `_FENCE_RE` recognised only a
+column-zero opener closed by a run of exactly the same length, so an indented
+or longer-closed fence was not masked and a heading inside it was selectable.
+**#150 closed it** — see "The fence grammar every consumer shares" above for
+the grammar that replaced it, the two write refusals, and the declared
+re-addressing break the widening caused. Nothing here is a live constraint any
+more; the history is kept only so the phrase #140's spec uses — "fenced code
+block **as recognised by the shared masker**" — still has a referent.
 
 ### Declared residual: a section round trip normalises the body's terminators
 

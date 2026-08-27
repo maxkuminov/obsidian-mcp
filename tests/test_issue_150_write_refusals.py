@@ -238,7 +238,13 @@ class _Row:
         self.__dict__.update(kw)
 
 
-def _fake_session(monkeypatch, result_rows):
+def _fake_session(monkeypatch, result_rows, stale=()):
+    """Replay canned rows positionally, except the stale-extraction probe.
+
+    That probe is routed by its SQL rather than by position so a test can say
+    "this owner has an unfinished re-derivation" without having to know where
+    in the sequence the query lands.
+    """
     calls = {"n": 0}
 
     class Result:
@@ -256,6 +262,8 @@ def _fake_session(monkeypatch, result_rows):
             return None
 
         async def execute(self, statement):
+            if "extraction_version" in str(statement.compile()):
+                return Result(list(stale))
             i = calls["n"]
             calls["n"] += 1
             return Result(result_rows[i] if i < len(result_rows) else [])
@@ -269,7 +277,7 @@ def _fake_session(monkeypatch, result_rows):
 REFS_WITH_LIST_FENCE = "# Refs\n- item\n  ```\n  see [[Target]]\n\nmore\n"
 
 
-def _seed_move(offline, monkeypatch, refs_text):
+def _seed_move(offline, monkeypatch, refs_text, stale=()):
     write(offline, "Target.md", "the moved note\n")
     write(offline, "Refs.md", refs_text)
     _fake_session(
@@ -278,6 +286,7 @@ def _seed_move(offline, monkeypatch, refs_text):
             [_Row(file_path="Target.md", id=1), _Row(file_path="Refs.md", id=2)],
             [_Row(file_path="Refs.md")],
         ],
+        stale=stale,
     )
 
 
@@ -448,3 +457,158 @@ def test_a_link_inside_a_newly_recognised_fence_is_not_extracted(shape):
     from src.services.links import extract_links
 
     assert extract_links(NEWLY_MASKED_SOURCES[shape]) == []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The transition window: a rewrite-enabled move cannot trust stale link rows
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `move_note(rewrite_links=True)` discovers its rewrite sources from
+# `note_links`. Under the pre-#150 grammar a note like
+# "```code```\n[[Target]]\n```\n" had its link masked as code, so it produced
+# NO row; v1 reads the same bytes as prose. Between the deploy and the
+# re-derivation pass, that note is a backlink the graph does not know about —
+# and a move that rewrites from the graph would report success while leaving
+# the link pointing at the old path.
+
+
+STALE_ERA_INVISIBLE_LINK = "```code```\n[[Target]]\n```\n"
+
+
+def test_the_stale_era_shape_really_did_hide_its_link_under_v0():
+    """The premise, checked rather than asserted: v0 masked this link and v1
+    does not. If this ever stops holding, the refusal below is arguing about
+    an input that cannot occur."""
+    from src.services.embeddings import _v0_clean
+    from src.services.links import extract_links
+
+    # v1 reads the whole thing as prose (a backtick info string containing a
+    # backtick opens nothing), so the link is extracted.
+    assert [link.target for link in extract_links(STALE_ERA_INVISIBLE_LINK)] == [
+        "Target"
+    ]
+    # v0's cleaner removed it, which is the same grammar the v0 masker used to
+    # decide the link was code.
+    assert "[[Target]]" not in _v0_clean(STALE_ERA_INVISIBLE_LINK)
+
+
+async def test_a_rewrite_enabled_move_refuses_while_a_stale_marker_remains(
+    offline, monkeypatch
+):
+    _seed_move(
+        offline,
+        monkeypatch,
+        STALE_ERA_INVISIBLE_LINK,
+        stale=[_Row(file_path="Refs.md")],
+    )
+
+    result = await tools.move_note_impl(
+        "Target.md", "Moved/Renamed.md", rewrite_links=True
+    )
+
+    assert "Move aborted" in result
+    assert "re-derived" in result
+    assert "Refs.md" in result  # names the first note still pending
+    assert "rewrite_links=False" in result  # and the way through
+    # Refused before the rename.
+    assert (offline / "Target.md").exists()
+    assert not (offline / "Moved" / "Renamed.md").exists()
+    assert read(offline, "Refs.md") == STALE_ERA_INVISIBLE_LINK
+
+
+async def test_the_same_move_without_rewriting_is_unaffected_by_a_stale_marker(
+    offline, monkeypatch
+):
+    _seed_move(
+        offline,
+        monkeypatch,
+        STALE_ERA_INVISIBLE_LINK,
+        stale=[_Row(file_path="Refs.md")],
+    )
+
+    result = await tools.move_note_impl(
+        "Target.md", "Moved/Renamed.md", rewrite_links=False
+    )
+
+    assert "Move aborted" not in result
+    assert (offline / "Moved" / "Renamed.md").exists()
+
+
+async def test_the_refusal_clears_once_every_row_is_stamped(offline, monkeypatch):
+    """`stale=()` stands for a completed pass: nothing about the note or the
+    call changed, only the marker, and the move goes through and rewrites the
+    link the old grammar had hidden."""
+    _seed_move(offline, monkeypatch, STALE_ERA_INVISIBLE_LINK, stale=())
+
+    result = await tools.move_note_impl(
+        "Target.md", "Moved/Renamed.md", rewrite_links=True
+    )
+
+    assert "Move aborted" not in result
+    assert (offline / "Moved" / "Renamed.md").exists()
+    assert "[[Renamed]]" in read(offline, "Refs.md")
+
+
+async def test_another_owners_stale_marker_does_not_refuse(offline, monkeypatch):
+    """Owner-scoped: the probe carries this caller's ownership predicate, so a
+    different account's unfinished pass returns no rows here. Without that, one
+    idle vault would wedge rewrite-enabled moves for every user."""
+    captured: list[str] = []
+    _seed_move(offline, monkeypatch, "see [[Target]]\n", stale=())
+
+    real = tools._stale_extraction_error
+
+    async def spy(session, uid):
+        from sqlalchemy import select
+
+        from src.models.db import NoteMetadata
+
+        captured.append(
+            str(
+                select(NoteMetadata.file_path)
+                .where(tools._note_owner_predicate(uid))
+                .compile()
+            )
+        )
+        return await real(session, uid)
+
+    monkeypatch.setattr(tools, "_stale_extraction_error", spy)
+
+    result = await tools.move_note_impl(
+        "Target.md", "Moved/Renamed.md", rewrite_links=True
+    )
+
+    assert "Move aborted" not in result
+    assert captured and "user_id IS NULL" in captured[0]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The read side, at the tool layer
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_read_note_still_serves_a_section_of_an_undecidable_note(offline):
+    """The helper-layer pin says `extract_section` resolves; this says the
+    TOOL does. The refusal is write-only, and a read that started refusing
+    would wall off content for no safety gain."""
+    write(offline, "n.md", LIST_FENCE)
+
+    response = asyncio.run(tools.read_note_impl("n.md", section="B"))
+
+    assert "indented fence opener" not in response
+    assert "keep" in response
+    assert "# B" in response
+
+
+def test_read_note_outlines_an_undecidable_note_under_the_not_a_fence_reading(
+    offline,
+):
+    write(offline, "n.md", LIST_FENCE)
+
+    response = asyncio.run(tools.read_note_impl("n.md", section="A"))
+
+    assert "indented fence opener" not in response
+    # `A` runs to `# B` under the not-a-fence reading, so the list and the
+    # opener are inside it and `keep` is not.
+    assert "- item" in response
+    assert "keep" not in response

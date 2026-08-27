@@ -1074,16 +1074,22 @@ def _note_unmatched_openers(scan_text: str, diagnosis=None):
 _LINE_BREAK_SPLIT_RE = re.compile(r"\r\n|\n|\r")
 
 
-def _rewrite_source_unmatched_openers(content: str):
-    """Unmatched indented fence openers in a `move_note` rewrite source.
+def _scan_rewrite_source(content: str):
+    """The one fence scan a `move_note` rewrite source gets.
 
     `FULL_NOTE`, unlike the section-write guard: a rewrite is spliced into the
     source's raw bytes, so the frontmatter block is part of the scanned text
     and must be held out of fence recognition rather than stripped first.
-    """
-    from src.services.links import FULL_NOTE, unmatched_indented_openers
 
-    return unmatched_indented_openers(content, context=FULL_NOTE)
+    Returned whole rather than reduced to its unmatched openers, because the
+    caller needs the masked text too and the recognizer's contract is that the
+    frontmatter partition runs **at most once per note**.
+    """
+    from src.services.links import FULL_NOTE, scan_fences
+
+    return scan_fences(content, context=FULL_NOTE)
+
+
 
 
 def _unmatched_fence_error(path: str, scan_text: str, diagnosis=None) -> str | None:
@@ -1937,6 +1943,7 @@ def _rewrite_links_in_text(
     source_path: str,
     pre_move_index: dict,
     output_source_path: str | None = None,
+    fence_scan=None,
 ) -> tuple[str, int]:
     """Rewrite any wikilink/embed/markdown-link in `content` whose pre-move
     resolution would have pointed at `from_rel`, so it now refers to `to_rel`.
@@ -1945,8 +1952,12 @@ def _rewrite_links_in_text(
     target stays bare (uses the new stem), while a path-style target is
     rewritten to the full new path-style form (preserving any trailing `.md`).
     Markdown links always get the new full path. Code blocks are skipped.
+
+    `fence_scan` is the caller's already-computed `FULL_NOTE` scan of this
+    exact `content` — the preflight has one, and passing it keeps the
+    frontmatter partition to one run per note. Omitted, this scans for itself.
     """
-    from src.services.links import FULL_NOTE, mask_code, resolve_target
+    from src.services.links import FULL_NOTE, apply_fence_mask, resolve_target, scan_fences
 
     paths = pre_move_index.get("paths", {})
     from_id = paths.get(from_rel)
@@ -1958,7 +1969,9 @@ def _rewrite_links_in_text(
 
     # `FULL_NOTE`: `content` is the source note's raw bytes, frontmatter block
     # included, and the rewrite is spliced back into those same bytes.
-    masked = mask_code(content, context=FULL_NOTE)
+    if fence_scan is None:
+        fence_scan = scan_fences(content, context=FULL_NOTE)
+    masked = apply_fence_mask(content, fence_scan)
     rewrites: list[tuple[int, int, str]] = []
 
     for m in _WIKILINK_REWRITE_RE.finditer(masked):
@@ -2082,6 +2095,50 @@ def _note_owner_predicate(uid: int | None):
     from src.models.db import NoteMetadata
 
     return _owner_predicate_for(NoteMetadata, uid)
+
+
+async def _stale_extraction_error(session, uid) -> str | None:
+    """Refuse a rewrite-enabled move while this owner's re-derivation is open.
+
+    `None` when every one of the caller's rows is stamped with the current
+    grammar, so the caller can use it as a guard.
+
+    Owner-scoped, and that is load-bearing on a multi-user server: another
+    user's unfinished pass says nothing about whether *this* caller's
+    `note_links` rows can be trusted, and refusing on it would wedge every
+    account behind one idle vault.
+
+    One indexed row, `LIMIT 1` — the predicate is over
+    `(user_id, extraction_version)` on a table already indexed by `user_id`, so
+    it costs one row read on the overwhelmingly common path where nothing is
+    stale.
+    """
+    from sqlalchemy import select
+
+    from src.models.db import NoteMetadata
+    from src.services.indexer import CURRENT_EXTRACTION_VERSION
+
+    stale = (
+        await session.execute(
+            select(NoteMetadata.file_path)
+            .where(_note_owner_predicate(uid))
+            .where(NoteMetadata.extraction_version != CURRENT_EXTRACTION_VERSION)
+            .limit(1)
+        )
+    ).all()
+    if not stale:
+        return None
+    return (
+        "Move aborted: this vault's index is still being re-derived after a "
+        "note-parsing change, so the link graph is not yet a trustworthy list "
+        "of the notes that link here — a link the previous parser read as code "
+        "has no row yet, and rewriting would silently leave it pointing at the "
+        f"old path (first note still pending: {stale[0].file_path}). Nothing was "
+        "moved, rewritten or reindexed. The re-derivation runs automatically "
+        "on the indexer's next pass (within about five minutes); retry after "
+        "that, or move now with rewrite_links=False and update the links "
+        "yourself."
+    )
 
 
 def _ensure_move_source_in_index(index: dict, from_rel: str) -> None:
@@ -2215,6 +2272,20 @@ async def _move_note_locked(
                     rewrite_sources.extend(r.file_path for r in src_rows)
                     rewrite_sources = list(dict.fromkeys(rewrite_sources))
 
+                # **That inventory is `note_links`, so it is only as good as
+                # the grammar that built it (#150).** While any row in this
+                # caller's scope still carries a stale extraction marker, some
+                # of those rows came out of the previous fence grammar — and a
+                # link the old grammar masked as code but the new one reads as
+                # prose has NO row at all, so it is not in `rewrite_sources`
+                # and never will be on this call. The move would then succeed,
+                # report success, and silently strand that link: exactly the
+                # class of failure the rest of this preflight exists to
+                # prevent. Checked here, still before the rename, and it clears
+                # itself once the re-derivation pass finishes.
+                if err := await _stale_extraction_error(session, uid):
+                    return err
+
         # ── Phase 1: preflight ──────────────────────────────────────────────────
         # Compute every rewritten body *before* anything is mutated. If one would
         # exceed the note cap the whole move aborts: the alternative (move, update
@@ -2315,10 +2386,15 @@ async def _move_note_locked(
                     # about text this call would mutate, and the decision has
                     # to be made before phase 2 publishes the rename. The scan
                     # is `FULL_NOTE` because a rewrite splices back into these
-                    # raw bytes, frontmatter block included.
-                    openers = _rewrite_source_unmatched_openers(content)
-                    if openers:
-                        undecidable_sources.append((original_src_path, openers))
+                    # raw bytes, frontmatter block included — and it is taken
+                    # ONCE and handed on to the rewriter, because the
+                    # recognizer's contract is that the frontmatter partition
+                    # runs at most once per note.
+                    fence_scan = _scan_rewrite_source(content)
+                    if fence_scan.unmatched_indented_openers:
+                        undecidable_sources.append(
+                            (original_src_path, fence_scan.unmatched_indented_openers)
+                        )
                     new_content, n = _rewrite_links_in_text(
                         content,
                         from_rel,
@@ -2326,6 +2402,7 @@ async def _move_note_locked(
                         original_src_path,
                         pre_move_index,
                         output_source_path=out_path,
+                        fence_scan=fence_scan,
                     )
                 except OSError as e:
                     if getattr(e, "errno", None) in (errno.EMFILE, errno.ENFILE):

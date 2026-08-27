@@ -265,28 +265,58 @@ async def test_an_external_rename_in_the_window_keeps_note_identity(
     updates the row in place. A sentinel there would have made this a
     delete-and-insert, cascade-deleting the note's vectors."""
     ids = await seed_pre_150(sessionmaker, vault, CORPUS)
-    plain_id = ids["Plain.md"]
+    buried_id = ids["Buried.md"]
 
-    (vault / "Plain.md").rename(vault / "Renamed.md")
+    (vault / "Buried.md").rename(vault / "Renamed.md")
     await indexer.index_vault(user_id=None)
 
     after = await rows(sessionmaker)
-    assert "Plain.md" not in after
-    assert after["Renamed.md"].id == plain_id  # same row, id preserved
-    assert after["Renamed.md"].content_hash == content_hash(PLAIN)
+    assert "Buried.md" not in after
+    assert after["Renamed.md"].id == buried_id  # same row, id preserved
+    assert after["Renamed.md"].content_hash == content_hash(BURIED)
     # The vectors went with the row rather than being cascade-deleted.
     async with sessionmaker() as session:
         vectors = (
             await session.execute(
-                select(NoteEmbedding.id).where(NoteEmbedding.note_id == plain_id)
+                select(NoteEmbedding.id).where(NoteEmbedding.note_id == buried_id)
             )
         ).all()
     assert len(vectors) == 1
-    # The move branch deliberately does not stamp — it repairs a path without
-    # re-extracting tags — so the ordinary branch picks the row up next pass.
-    assert after["Renamed.md"].extraction_version == 0
+
+
+async def test_a_rename_in_the_window_still_re_derives_in_one_pass(
+    sessionmaker, vault
+):
+    """The id-preserving move branch is the only writer that touches a note
+    during the remediation window, so deferring its re-derivation to "the next
+    pass" broke the next-pass refresh promise for exactly the notes a rename
+    touched. It re-derives and stamps in its own transaction instead."""
+    ids = await seed_pre_150(sessionmaker, vault, CORPUS)
+    buried_id = ids["Buried.md"]
+
+    (vault / "Buried.md").rename(vault / "Renamed.md")
     await indexer.index_vault(user_id=None)
-    assert (await rows(sessionmaker))["Renamed.md"].extraction_version == (
+
+    after = await rows(sessionmaker)
+    row = after["Renamed.md"]
+    # ONE pass: the marker is stamped and the tags came out of the current
+    # grammar — `#buried` sits inside a newly recognised fence and is gone,
+    # `#visible` sits outside it and stayed. The seeded row carried both.
+    assert row.extraction_version == indexer.CURRENT_EXTRACTION_VERSION
+    assert row.tags == ["visible"]
+    # Links likewise, through `moved_new_paths`: `[[Plain]]` was inside the
+    # fence, `[[Spans]]` outside it.
+    assert await link_targets(sessionmaker, buried_id) == ["Spans"]
+    # The path change still invalidates the certification (#127) — unchanged
+    # by the marker, and not the grammar rule.
+    assert row.embedded_content_hash is None
+
+    # And a second pass changes nothing, so the stamp really did settle it.
+    before = after
+    await indexer.index_vault(user_id=None)
+    again = await rows(sessionmaker)
+    assert again["Renamed.md"].tags == before["Renamed.md"].tags
+    assert again["Renamed.md"].extraction_version == (
         indexer.CURRENT_EXTRACTION_VERSION
     )
 

@@ -119,3 +119,97 @@ def test_the_shorter_impostor_closer_does_not_end_the_block():
     out = clean_for_embedding(text)
     assert "first" not in out and "second" not in out
     assert "Intro" in out and "End." in out
+
+
+# ── the frozen v0 cleaner, and why the comparison is over OUTPUT ────────────
+#
+# `notes_metadata.extraction_version` decides whether a note's vectors survive
+# a grammar change by comparing what the stamped version would have embedded
+# against what the current one embeds. An earlier draft compared recognised
+# *span tuples* instead, which is wrong in BOTH directions because v0's cleaner
+# applied its two regexes sequentially: the backtick pass ran first and changed
+# the text the tilde pass matched against, and the two patterns' `$`-anchored
+# spans could overlap. These two inputs are the counterexamples, and they are
+# what makes the output comparison load-bearing rather than stylistic.
+
+IDENTICAL_SPANS_DIFFERENT_TEXT = "~~~\ncode\n~~~\n```\n# H\ncode\n```\n[[X]]\n"
+DIFFERENT_SPANS_IDENTICAL_TEXT = "```\n~~~\ncode\n~~~\n```"
+
+
+def _v1_spans(body):
+    from src.services.links import BODY, scan_fences
+
+    return scan_fences(body, context=BODY).spans
+
+
+def _v0_spans(body):
+    """What the retired span-based comparator computed for version 0."""
+    from src.services.embeddings import _V0_FENCE_BACKTICK_RE, _V0_FENCE_TILDE_RE
+
+    return tuple(sorted(
+        (m.start(), m.end())
+        for rx in (_V0_FENCE_BACKTICK_RE, _V0_FENCE_TILDE_RE)
+        for m in rx.finditer(body)
+    ))
+
+
+def test_equal_spans_can_still_mean_different_embedded_text():
+    """Span comparison would have certified a stale vector here."""
+    from src.services.embeddings import clean_at_version
+
+    body = IDENTICAL_SPANS_DIFFERENT_TEXT
+    assert _v0_spans(body) == _v1_spans(body)
+    assert clean_at_version(0, body) != clean_at_version(1, body)
+
+
+def test_different_spans_can_still_mean_identical_embedded_text():
+    """And here it would have re-embedded for nothing."""
+    from src.services.embeddings import clean_at_version
+
+    body = DIFFERENT_SPANS_IDENTICAL_TEXT
+    assert _v0_spans(body) != _v1_spans(body)
+    assert clean_at_version(0, body) == clean_at_version(1, body)
+
+
+def test_the_indexer_predicate_follows_the_output_not_the_spans():
+    from src.services.indexer import _grammar_changed_the_embedding_text
+
+    assert _grammar_changed_the_embedding_text(0, IDENTICAL_SPANS_DIFFERENT_TEXT)
+    assert not _grammar_changed_the_embedding_text(0, DIFFERENT_SPANS_IDENTICAL_TEXT)
+
+
+def test_the_current_version_never_compares_against_itself():
+    from src.services.indexer import (
+        CURRENT_EXTRACTION_VERSION,
+        _grammar_changed_the_embedding_text,
+    )
+
+    assert not _grammar_changed_the_embedding_text(
+        CURRENT_EXTRACTION_VERSION, IDENTICAL_SPANS_DIFFERENT_TEXT
+    )
+
+
+def test_an_unknown_stamped_version_counts_as_differing():
+    """A build downgraded past a bump cannot reproduce the grammar that wrote
+    the row, so it must re-embed rather than certify a comparison it never
+    made."""
+    from src.services.embeddings import clean_at_version
+    from src.services.indexer import _grammar_changed_the_embedding_text
+
+    assert clean_at_version(99, "anything") is None
+    assert _grammar_changed_the_embedding_text(99, "no fences at all\n")
+
+
+def test_the_v0_cleaner_is_the_pre_150_behaviour_verbatim():
+    """The frozen entry is a copy, not a reimplementation: it must still be
+    LF-only, column-zero and exact-closer, which is precisely what makes it
+    disagree with the current grammar on the shapes #150 widened."""
+    from src.services.embeddings import clean_at_version
+
+    for widened in (
+        "   ```\ncode\n   ```\n",       # indented
+        "```\ncode\n`````\n",           # longer closer
+        "~~~\rcode\r~~~\r",             # lone CR
+    ):
+        assert clean_at_version(0, widened) == widened, widened
+        assert clean_at_version(1, widened) != widened, widened

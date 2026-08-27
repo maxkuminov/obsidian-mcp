@@ -53,60 +53,73 @@ def _remove_spans(text: str, spans) -> str:
     return "".join(out)
 
 
-# ── The frozen per-version fence grammars (`notes_metadata.extraction_version`)
+# ── The frozen per-version cleaners (`notes_metadata.extraction_version`)
 #
 # A grammar change does not change a note's bytes, so `content_hash` cannot
 # see it and the embed backlog would certify stale vectors forever. The
-# indexer therefore compares the fence spans a note's **stamped** grammar
-# recognised against the ones the **current** grammar recognises, and clears
-# `embedded_content_hash` only when they differ (`CURRENT_EXTRACTION_VERSION`
-# in `src/services/indexer.py`).
+# indexer therefore compares what a note's **stamped** version would have
+# embedded against what the **current** one embeds, and clears
+# `embedded_content_hash` only when the two differ
+# (`CURRENT_EXTRACTION_VERSION` in `src/services/indexer.py`).
 #
-# What is registered here is each version's *embedding* fence grammar,
-# because that is what determined the vectors a row stamped with that version
-# carries — links and tags are re-derived unconditionally whenever the marker
-# is stale, so they need no version-to-version diff. Version 0 is therefore
-# the two regexes this module used before #150, copied verbatim; it becomes
-# removable once no row is stamped 0.
+# **The comparison is over cleaned OUTPUT, never over recognised spans.** Span
+# equality is neither necessary nor sufficient for embedded-text equality,
+# because v0's cleaner applied its two regexes *sequentially*: the first
+# substitution changed the text the second matched against, and the two
+# patterns' `$`-anchored spans could overlap. Both directions have real
+# inputs, and both are pinned in `tests/test_clean_for_embedding.py`:
+#
+#   "~~~\ncode\n~~~\n```\n# H\ncode\n```\n[[X]]\n"
+#       identical spans under v0 and v1, DIFFERENT cleaned text — span
+#       comparison would wrongly certify the stale vector.
+#   "```\n~~~\ncode\n~~~\n```"
+#       different spans, IDENTICAL cleaned text — span comparison would
+#       re-embed for nothing.
+#
+# So what is registered is each version's whole cleaning function. Only the
+# *embedding* cleaner needs a frozen history: links and tags are re-derived
+# unconditionally whenever the marker is stale, so they need no
+# version-to-version diff. Version 0 is the exact pair of regexes this module
+# used before #150, applied in the exact order it applied them; the entry
+# becomes removable once no row is stamped 0.
 #
 # The comparison is direction-aware by construction, which is what makes a
 # rollback work: revert the grammar, bump the current version, and a
-# v1-stamped row compares frozen v1 against the restored grammar and
+# v1-stamped row compares frozen v1 against the restored cleaner and
 # invalidates exactly the notes that change — see the rollback recipe in
 # `docs/architecture/indexing-and-embeddings.md`.
 _V0_FENCE_BACKTICK_RE = re.compile(r"^```[^\n]*\n.*?\n```\s*$", re.MULTILINE | re.DOTALL)
 _V0_FENCE_TILDE_RE = re.compile(r"^~~~[^\n]*\n.*?\n~~~\s*$", re.MULTILINE | re.DOTALL)
 
 
-def _v0_spans(body: str) -> tuple[tuple[int, int], ...]:
-    spans = [
-        (m.start(), m.end())
-        for rx in (_V0_FENCE_BACKTICK_RE, _V0_FENCE_TILDE_RE)
-        for m in rx.finditer(body)
-    ]
-    return tuple(sorted(spans))
+def _v0_clean(body: str) -> str:
+    """`clean_for_embedding` exactly as it stood before #150. Frozen.
+
+    Copied verbatim, **sequential** substitution included: the order is part of
+    the behaviour being reproduced, not an implementation detail. Do not
+    "simplify" it into one pass or into a span set.
+    """
+    body = _V0_FENCE_BACKTICK_RE.sub("", body)
+    body = _V0_FENCE_TILDE_RE.sub("", body)
+    return body
 
 
-def _v1_spans(body: str) -> tuple[tuple[int, int], ...]:
-    return scan_fences(body, context=BODY).spans
-
-
-_EXTRACTION_GRAMMARS = {
-    0: _v0_spans,
-    1: _v1_spans,
+_EXTRACTION_CLEANERS = {
+    0: _v0_clean,
+    1: clean_for_embedding,
 }
 
 
-def embedding_fence_spans(version: int, body: str) -> tuple[tuple[int, int], ...] | None:
-    """The fence spans version `version` recognised in `body`, or None.
+def clean_at_version(version: int, body: str) -> str | None:
+    """What version `version` would have embedded for `body`, or None.
 
-    None means "no frozen recognizer for that version", which the caller must
+    None means "no frozen cleaner for that version", which the caller must
     treat as *differs* — a row stamped with a grammar this build cannot
     reproduce (a downgrade past a bump) must be re-embedded rather than
     certified against a comparison that was never made.
     """
-    grammar = _EXTRACTION_GRAMMARS.get(version)
-    return grammar(body) if grammar is not None else None
+    cleaner = _EXTRACTION_CLEANERS.get(version)
+    return cleaner(body) if cleaner is not None else None
 
 
 def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[str]:

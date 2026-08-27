@@ -12,8 +12,18 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from sqlalchemy import delete, func, literal, or_, select, text, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import (
+    String,
+    bindparam,
+    delete,
+    func,
+    literal,
+    or_,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.dialects.postgresql import ARRAY, insert
 
 from src.config import settings
 from src.database import async_session
@@ -22,9 +32,9 @@ from src.services.embeddings import (
     StaleCertification,
     certify_embedded,
     chunk_text,
+    clean_at_version,
     clean_for_embedding,
     embed_note,
-    embedding_fence_spans,
 )
 from src.services.fts import index_tsvector_sql
 from src.services.links import build_vault_index, extract_links, resolve_target
@@ -131,18 +141,21 @@ def _content_hash(content: str) -> str:
 # grammar change without a bump leaves every unchanged note deriving from the
 # old grammar forever; a bump without a grammar change costs one no-op pass.
 #
-# Embedding invalidation is scoped, not blanket: the pass compares the fence
-# spans the row's *stamped* grammar recognised against the ones the current
-# grammar recognises (`embedding_fence_spans`, whose per-version registry keeps
-# every version's recognizer frozen while a row still carries it) and clears
-# `embedded_content_hash` only when they differ. It only ever CLEARS, so it can
-# never suppress an invalidation another rule mandates — a content change, a
-# `file_path` change, a provider change, exclusion reconciliation.
+# Embedding invalidation is scoped, not blanket: the pass compares the text the
+# row's *stamped* version would have embedded against the text the current one
+# embeds (`clean_at_version`, whose per-version registry keeps every version's
+# whole cleaning function frozen while a row still carries it) and clears
+# `embedded_content_hash` only when they differ. **Cleaned output, not
+# recognised spans** — v0's cleaner substituted sequentially, so span equality
+# is neither necessary nor sufficient for embedded-text equality. It only ever
+# CLEARS, so it can never suppress an invalidation another rule mandates — a
+# content change, a `file_path` change, a provider change, exclusion
+# reconciliation.
 CURRENT_EXTRACTION_VERSION = 1
 
 
 def _grammar_changed_the_embedding_text(stamped_version: int, body: str) -> bool:
-    """Would this note's `clean_for_embedding` output differ across grammars?
+    """Would this note's `clean_for_embedding` output differ across versions?
 
     An unknown stamped version — a build downgraded past a bump — answers True:
     a row whose grammar this build cannot reproduce must be re-embedded rather
@@ -150,8 +163,8 @@ def _grammar_changed_the_embedding_text(stamped_version: int, body: str) -> bool
     """
     if stamped_version == CURRENT_EXTRACTION_VERSION:
         return False
-    was = embedding_fence_spans(stamped_version, body)
-    now = embedding_fence_spans(CURRENT_EXTRACTION_VERSION, body)
+    was = clean_at_version(stamped_version, body)
+    now = clean_at_version(CURRENT_EXTRACTION_VERSION, body)
     return was is None or now is None or was != now
 
 
@@ -1230,7 +1243,7 @@ async def _index_vault_pinned(
 
                 try:
                     frontmatter, content = parse_frontmatter(raw)
-                    tags = extract_tags(raw, frontmatter)
+                    tags = extract_tags(content, frontmatter)
                 except Exception as e:
                     logger.warning(f"Failed to parse {rel_path}: {e}")
                     skips.append(f"{rel_path} (parse: {e})")
@@ -1324,21 +1337,37 @@ async def _index_vault_pinned(
             # parsed for the *new* path, so it is exactly what a fresh index
             # would write, frontmatter title included (#127, D3).
             #
-            # **`extraction_version` is deliberately NOT stamped here.** This
-            # branch repairs a row's path; it does not re-extract the row's
-            # tags, and the marker means "this row's derived state came out of
-            # the current grammar". Stamping one over tags nobody re-derived is
-            # exactly the false certification the marker exists to prevent.
-            # Leaving it stale costs one extra pass — the row's hash now
-            # matches its new path, so the ordinary branch picks it up on the
-            # next tick, parses it and stamps then — and this branch already
-            # NULLs `embedded_content_hash`, so the vectors rebuild regardless.
+            # **`tags` and `extraction_version` move with it, for the same
+            # reason (#150).** The first draft of this branch left both alone
+            # and let the *next* pass re-derive them, on the argument that
+            # stamping a marker over tags nobody re-extracted is a false
+            # certification. That argument is right about the marker and wrong
+            # about the remedy: this branch is the only writer that touches a
+            # note during the remediation window, and deferring left a moved
+            # note with old-grammar tags for a whole tick — the "the next index
+            # pass refreshes links and tags" promise, broken by a rename. So
+            # the tags are re-derived here instead, bound from the entry this
+            # pass already parsed for the new path under the CURRENT grammar
+            # (`extract_tags` in the scan loop above), the links are re-derived
+            # because `moved_new_paths` feeds `_update_links_for_changed`, and
+            # the marker is stamped in the same statement — one transaction, no
+            # window in which the stamp outruns the derivation.
+            #
+            # `embedded_content_hash = NULL` stays unconditional and is not the
+            # grammar rule: it is the path-change invalidation (#127), which
+            # applies to every move whatever the marker says.
             move_upd_sql = (
                 "UPDATE notes_metadata "
-                "SET file_path = :new, title = :title, file_size = :size, "
-                "modified_at = :mtime, indexed_at = now(), "
+                "SET file_path = :new, title = :title, tags = :tags, "
+                "file_size = :size, modified_at = :mtime, indexed_at = now(), "
+                "extraction_version = :xver, "
                 "embedded_content_hash = NULL "
                 f"WHERE file_path = :old AND {user_clause}"
+            )
+            # `tags` is `varchar[]`; a bare `:tags` leaves the driver to guess
+            # the parameter's type from a Python list and asyncpg will not.
+            move_upd_stmt = text(move_upd_sql).bindparams(
+                bindparam("tags", type_=ARRAY(String))
             )
             # Rewrite stored `target_path` strings that referenced the old
             # path. Two forms: the full path (`Folder/Old.md`) and the
@@ -1357,11 +1386,12 @@ async def _index_vault_pinned(
                 e = entry_by_path[new]
                 params: dict = {
                     "new": new, "old": old, "title": e["title"],
+                    "tags": e["tags"], "xver": CURRENT_EXTRACTION_VERSION,
                     "size": e["file_size"], "mtime": e["modified_at"],
                 }
                 if user_id is not None:
                     params["uid"] = user_id
-                await session.execute(text(move_upd_sql), params)
+                await session.execute(move_upd_stmt, params)
 
                 old_no_ext = old[:-3] if old.endswith(".md") else old
                 new_no_ext = new[:-3] if new.endswith(".md") else new

@@ -1570,7 +1570,7 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
     raw = path.read_text(encoding="utf-8")
     frontmatter, content = parse_frontmatter(raw)
     title = frontmatter.get("title") or path.stem
-    tags = extract_tags(raw, frontmatter)
+    tags = extract_tags(content, frontmatter)
     return {
         "path": relative_path,
         "title": title,
@@ -3128,8 +3128,27 @@ def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None,
     return new_text, None
 
 
-def extract_tags(raw: str, frontmatter: dict) -> list[str]:
-    """Extract tags from frontmatter and inline #tags."""
+def extract_tags(body: str, frontmatter: dict) -> list[str]:
+    """Extract tags from a parsed frontmatter mapping and the body's inline #tags.
+
+    **`body` is the post-frontmatter body, not the raw note.** Every caller has
+    already partitioned — it is holding `frontmatter` — so handing the raw text
+    back would make the recognizer re-run the partition it promises to run at
+    most once per note, purely to skip a block the caller had already removed.
+    On a note with no valid block `parse_frontmatter` returns the raw text as
+    the body, so nothing changes there.
+
+    Two consequences of scanning the body, both deliberate:
+
+    - A `#`-shaped string inside a *valid* frontmatter block is no longer a
+      tag. Frontmatter tags are structured data and come from the parsed
+      mapping; a `#` inside a YAML scalar or comment is not an inline tag, and
+      treating it as one was an artifact of scanning raw text.
+    - A note whose block is **defective** still has that region scanned,
+      because the partition hands back the raw text as the body there. That
+      matches the read path, which resolves such a note over its raw content
+      too.
+    """
     tags = set()
     # Frontmatter tags
     fm_tags = frontmatter.get("tags", [])
@@ -3138,13 +3157,9 @@ def extract_tags(raw: str, frontmatter: dict) -> list[str]:
     elif isinstance(fm_tags, str):
         tags.update(t.strip() for t in fm_tags.split(","))
     # Inline #tags (not inside code blocks)
-    from src.services.links import FULL_NOTE, mask_code
+    from src.services.links import BODY, mask_code
 
-    # `FULL_NOTE`: `raw` is the whole note, frontmatter block included, so the
-    # recognizer must discover that block and hold it out of fence scanning.
-    # A fence-shaped YAML scalar would otherwise open a block that swallows
-    # every inline tag in the body.
-    masked = mask_code(raw, context=FULL_NOTE)
+    masked = mask_code(body, context=BODY)
     for match in re.finditer(r"(?:^|\s)#([a-zA-Z][a-zA-Z0-9_/-]*)", masked):
         tags.add(match.group(1))
     return sorted(tags)
