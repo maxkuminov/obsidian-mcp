@@ -132,3 +132,89 @@
   under its own label "Last change detected". No migration and no per-tick
   write: it answers "is *this process's* loop alive", which is a property of
   the process, and it resets to `None` on restart until the startup pass lands.
+
+## Re-deriving after a grammar change (#150)
+
+`clean_for_embedding` no longer carries its own fence regexes. It consumes the
+shared recognizer in `src/services/links.py` — the `code-masking` capability,
+grammar written out in
+[vault tools](vault-tools.md#the-fence-grammar-every-consumer-shares-150) — in
+`BODY` context, because what it is handed is a note's post-frontmatter body.
+Its private pair (LF-only, column-zero, exact-length closer) disagreed with the
+masker heading resolution uses, so an indented or longer-closed block was
+embedded as prose while the same block was invisible to `read_note(section=…)`.
+
+**A grammar change moves no bytes, so `content_hash` cannot see it.** Links,
+tags and vectors are all derived through that recognizer, and re-derivation is
+gated on the hash of the note's bytes — which is unchanged. Ship a widened
+grammar with nothing else and every unchanged note keeps answering from link
+rows and vectors built under the old one, permanently: the scan skips it, the
+embed backlog's `embedded_content_hash != content_hash` predicate is false, and
+nothing else ever revisits it.
+
+`notes_metadata.extraction_version` (SMALLINT NOT NULL DEFAULT 0, migration
+018) is the marker, and `CURRENT_EXTRACTION_VERSION` in
+`src/services/indexer.py` is what it is compared against. **Bump that constant
+in the same commit as any change to the fence grammar.** A grammar change
+without a bump is the silent-staleness bug above; a bump without a grammar
+change costs one no-op pass.
+
+- **A stale marker makes a note changed for the whole pass** — parsed,
+  re-tagged, re-linked, re-tsvectored, upserted, and stamped. The stamp goes in
+  the same statement as the state it certifies, inside the pass's one
+  transaction, so a pass that dies part way through commits neither: a stale
+  marker never survives beside re-derived rows, and a current marker never
+  survives beside stale ones. Retry is simply the next tick.
+- **Embedding invalidation is scoped, not blanket.** Re-embedding 2,577 notes
+  to fix a grammar that affects a handful is the failure mode the marker exists
+  to avoid. The pass compares the fence spans the row's **stamped** grammar
+  recognised in that note's body against the ones the **current** grammar
+  recognises, and clears `embedded_content_hash` only when they differ. It only
+  ever clears, so it can never suppress an invalidation another rule mandates —
+  a content change, a `file_path` change, a provider change, the exclusion
+  reconciliation sweep above.
+- **Per-version frozen recognizers**, `_EXTRACTION_GRAMMARS` in
+  `src/services/embeddings.py`. Version 0 is the two pre-#150 regexes copied
+  verbatim; each entry stays while any row is stamped with it and is removable
+  once none is. What is registered is each version's *embedding* fence grammar,
+  because that is what determined the vectors a row stamped with that version
+  carries — links and tags are re-derived unconditionally on a stale marker and
+  need no version-to-version diff. An unknown stamped version (a build
+  downgraded past a bump) counts as *differs*: a row whose grammar this build
+  cannot reproduce must be re-embedded rather than certified against a
+  comparison that was never made.
+- **`content_hash` is never nulled and never sentinelled.** It is `NOT NULL`,
+  and it is the move detector's key: a sentinel would make an external rename
+  landing between the migration and the pass look like delete-plus-insert,
+  which destroys the row and cascade-deletes its `note_embeddings`. A re-embed
+  of the whole note, to fix a marker. So the marker lives beside the hash, and
+  move detection keeps working throughout the remediation window.
+- **The id-preserving move branch deliberately does not stamp.** It repairs a
+  row's path without re-extracting its tags, and the marker means "this row's
+  derived state came out of the current grammar" — stamping one over tags
+  nobody re-derived is exactly the false certification the marker prevents.
+  Leaving it stale costs one extra pass (the row's hash now matches its new
+  path, so the ordinary branch picks it up on the next tick), and that branch
+  already NULLs `embedded_content_hash`, so the vectors rebuild regardless.
+
+### Rollback is roll-forward, and the plan says so
+
+**A bare redeploy of the previous image does NOT restore derived state.** Old
+code ignores `extraction_version` and skips unchanged notes by `content_hash`,
+so links, tags and vectors stay derived under the new grammar indefinitely —
+the same silent staleness, pointing the other way.
+
+The rollback procedure is:
+
+1. revert the grammar commits on a branch;
+2. **bump `CURRENT_EXTRACTION_VERSION`** in that build (to 2, then 3, …) and
+   keep the versioned mechanism and the frozen per-version registry — the
+   registry is what lets the pass compare each row's stamped grammar against
+   the restored one;
+3. deploy.
+
+The owner-scoped re-derivation pass then rebuilds every note's links and tags,
+and (span-diff-scoped, direction-aware) its embeddings, under the restored
+grammar, without touching `content_hash`. Comparing legacy-to-legacy instead —
+which is what a registry without the frozen v1 entry would do — would certify
+the stale vectors for ever.

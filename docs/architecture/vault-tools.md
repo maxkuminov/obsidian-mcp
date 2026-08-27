@@ -108,8 +108,12 @@ Destructive and silently-wrong writes, the class this product ranks highest.
   on the write side while `read_note` hides it — the replacement then deleting
   the closing fence — while inline code, whose class ran across `\r`, joined
   two lines and masked a *real* heading. The masker is offset-stable by
-  contract: every substitution is exactly as long as what it replaces, because
+  contract: every substitution is exactly as long as what it replaces — in
+  **code points**, which is what every consumer stores and reports — because
   heading positions and `ExtractedLink.position` index the unmasked text.
+  Since #150 the masker is a line scanner rather than a regex, and
+  `clean_for_embedding` consumes it too: see "The fence grammar every consumer
+  shares" below.
 - **Widening the terminator rule must never narrow a `\s`.** The heading
   separator is `[^\S\r\n]+` — all whitespace except the three terminators —
   because `[ \t]+` drops a heading whose marker is followed by an NBSP, and a
@@ -145,7 +149,13 @@ Destructive and silently-wrong writes, the class this product ranks highest.
   artifact is cosmetic and vanishingly rare; it heals on the note's next
   hash-changing edit or under the explicit per-index rebuilds
   (`make rebuild-tsvectors`, reset/re-embed). A parser-revision invalidation
-  mechanism is not worth building for it.
+  mechanism was judged not worth building **for that artifact**, and that
+  judgement stands for it. #150 built one anyway, for a larger blast radius —
+  a masker grammar change re-derives every note's links and tags — and it is
+  the general mechanism now: `notes_metadata.extraction_version`, described in
+  [indexing and embeddings](indexing-and-embeddings.md#re-deriving-after-a-grammar-change-150).
+  A future parser revision should bump that marker rather than declare
+  staleness again.
 - **The round-trip guarantee is scoped, and both layers' docstrings say so:**
   it covers a complete, unwindowed whole-note read only (`section=None`,
   `offset=0`, no `[TRUNCATED]`). A truncated read must be paged to the end
@@ -253,6 +263,106 @@ The ordinal exists because **path-style cannot disambiguate duplicate siblings**
 Ambiguity stays an error that names the resolving ordinals; it never silently picks the first match (that is how an agent edits the wrong section and reports success).
 
 Helpers: `_resolve_section_index` (selector → index), `_section_body_span` (index → body span), `extract_section` (heading line **plus** body, for reads), `replace_section` (body only, for writes), `outline_sections` (depth/text/size/ordinal per section).
+
+**Selector parity is about resolution on writes this tool admits, not about
+admission.** Two shapes read fine by section and refuse every section write —
+a defective frontmatter block, and the unmatched indented fence opener below.
+Both docstring layers say so; do not restore the unqualified "a selector that
+names a section for reading names the same section for writing".
+
+### The fence grammar every consumer shares (#150)
+
+`_scan_headings` scans `mask_code(text)`, so **what counts as fenced code is
+what decides which lines are headings** — and therefore which sections exist,
+which ordinals they carry, and what a section write replaces. That grammar
+lives in one place, `src/services/links.py`, and is the `code-masking`
+capability (`openspec/specs/code-masking/spec.md`). Its consumers are heading
+resolution, `extract_links`, `extract_tags`, `move_note` link rewriting, and
+`clean_for_embedding`. **No consumer may carry a private grammar.**
+`clean_for_embedding` did, and the two disagreed: semantic search embedded code
+the masker hid.
+
+The pinned CommonMark subset, in one place so a future widening has something
+to be checked against:
+
+- **Opener** — 0–3 leading U+0020 spaces, a run of ≥3 backticks or ≥3 tildes,
+  an info string. A backtick fence's info string may not contain a backtick, so
+  a one-line `` ```code``` `` inline span never opens a block.
+- **Closer** — 0–3 leading spaces, a run of the **same character at least as
+  long as the opener's**, then nothing but U+0020 / U+0009. A shorter run does
+  not close; the other fence character does not close; an NBSP after the run
+  does not close.
+- **Span** — the opening line's first character through the closing line's last
+  character, **excluding the closing line's terminator**. Masking is a
+  same-length substitution and the heading pattern matches only at a line
+  start, so swallowing that terminator would leave an immediately following
+  heading with no line boundary in front of it and hide it from the read and
+  write sides alike. Terminators *inside* the span are masked like anything
+  else. This is the rule that keeps `# B` a heading in
+  ``` `# A\n```\n# Hidden\n```\n# B\n` ```.
+- **Unterminated at column zero** — masks to end of note; a document is
+  CommonMark's outermost container.
+- **Unterminated, indented 1–3 spaces** — **not a fence**, and reported to the
+  caller instead. See the refusal below.
+- **Terminators** — LF, CRLF as a unit, or a lone CR, matching the partition
+  and the heading scan.
+- **Frontmatter** — a valid line-1 block is opaque to fence recognition, and
+  the partition runs **at most once per note**. The recognizer therefore takes
+  its context explicitly: `FULL_NOTE` discovers and skips the block,
+  `BODY` scans from character zero and never re-partitions. Both mistakes are
+  real: `BODY` on a raw note lets a fence-shaped YAML scalar swallow the body
+  for `extract_tags` and `move_note`; `FULL_NOTE` on a stripped body eats a
+  mapping-shaped body prefix as a phantom second block, hiding an unmatched
+  opener from the refusal that must fire on it.
+
+Deliberate divergences, kept: container blocks are not parsed, so a *matched*
+fence's extent is computed flat even when its opener sits in a list item;
+4+-space indented code blocks are not masked; ATX headings stay column-zero
+only; inline-code masking remains a single-line approximation that never
+crosses a terminator.
+
+A single `(?s)` regex cannot express "closer at least as long as the opener"
+or the indented-unterminated exclusion. The widened regex that tried is exactly
+what hid this bug class, so the recognizer is a line scanner whose clauses can
+be audited one at a time. `tests/test_issue_150_fence_grammar.py` is one case
+per spec scenario, with exact span offsets.
+
+**Two refusals, both naming the opener and writing nothing.** An indented
+opener with no closer is the one shape the flat grammar genuinely cannot
+decide: under CommonMark the block may end where an enclosing list item does,
+so any flat reading either splits a code block or extends a section over real
+content, and fabricating an end-of-note extent would let one stray line swallow
+every later section — a *new* destructive class, worse than the one this
+grammar closes.
+
+- `edit_note(section=…)` refuses such a note, naming the opener's line and
+  character position (re-based onto the whole file when the note carries a
+  frontmatter block, since that is the only coordinate the caller can act on).
+- `move_note(rewrite_links=True)` preflights **every** source it would rewrite,
+  the moved note's own body included, and refuses the whole move **before the
+  rename**, naming each offending source. Rewriting mutates note text, and a
+  link under such an opener may be inside a list item's code block.
+  `rewrite_links=False` is unaffected and is the way to move such a note.
+
+Reads stay asymmetric on purpose, the same doctrine as defective frontmatter:
+`read_note(section=…)` and the truncation outline keep resolving under the
+not-a-fence reading, because a read destroys nothing. **The guarantee on such
+a note is the refusal, not the round trip.**
+
+**The declared re-addressing break.** Widening the masker changes which lines
+are headings, so on a note containing a newly recognised shape — an indented
+opener or closer, a longer closer, an unterminated column-zero fence — `#N`
+ordinals emitted before #150 may shift and previously-selectable sections
+disappear. Accepted, and small: the heading that vanishes was inside code, and
+writing to it was already destructive (that is issue #150). Outlines are
+per-response, so the exposure is an agent holding a pre-deploy outline.
+`tests/test_issue_140_section_round_trip.py` keeps the pre-#150 bytes beside
+the current ones for the two shapes #140 froze as out of scope.
+
+Derived state does not heal on its own — the bytes on disk are unchanged, so
+`content_hash` cannot see the grammar move. See the `extraction_version`
+mechanism in
+[indexing and embeddings](indexing-and-embeddings.md#re-deriving-after-a-grammar-change-150).
 
 ### Where a section's body begins, and what a section write destroys (#140)
 
