@@ -42,7 +42,7 @@ from src.mcp_server.read_result import (
     apply_metadata_budget,
     build_outline,
     frontmatter_view,
-    screen_unencodable,
+    screen_unrenderable,
 )
 from src.models.db import UsageLog
 from src.services import timing
@@ -284,6 +284,13 @@ _NO_VAULT_MARKER = "no_vault_assigned"
 # and this one means "it had one, and an administrator moved it underneath a
 # call that was already running". An operator reading `/admin/usage` after a
 # reassignment has to be able to tell those apart.
+# Marker for a call refused because one of its arguments carries an unpaired
+# surrogate (#149). Distinct from every vault marker on purpose: it says the
+# credential was fine and the *request* was not, which is the difference between
+# an operator investigating a permission problem and one investigating a client
+# that is emitting bad JSON escapes.
+_UNENCODABLE_ARG_MARKER = "argument_not_encodable"
+
 _VAULT_REASSIGNED_MARKER = "vault_assignment_changed"
 
 # Marker for a publication stopped because the assignment could not be **read**
@@ -414,6 +421,65 @@ def _response_size(result) -> int:
     return len(str(result))
 
 
+# How deep the argument screen walks into a container argument. Every tool
+# argument is a scalar, a flat list, or a one-level mapping (`frontmatter=`,
+# `updates=`); the bound exists so a pathological nested argument cannot turn
+# the screen itself into the denial of service it is defending against.
+_ARG_SCREEN_MAX_DEPTH = 6
+
+
+def _first_unencodable_argument(bound) -> str | None:
+    """The name of the first argument carrying an unpaired surrogate, or None.
+
+    A JSON-RPC argument can hold `"\ud800"`: a valid JSON string, a valid
+    Python `str`, and not a Unicode scalar value — so it cannot be encoded as
+    UTF-8. Nothing good happens downstream. It cannot name a file. It cannot be
+    written to one. And when a tool quotes it back in an error message — which
+    every not-found and every ambiguity listing does — the MCP layer's own
+    serialization raises, turning a careful in-band error into a *protocol*
+    error that the agent cannot act on and the audit trail does not explain.
+
+    So the screen sits in the decorator every tool shares, above the individual
+    error paths, for the same reason #66's vault gate does: auditing each
+    interpolation one at a time is how the #149 forgery class stayed open for
+    two audit rounds. `read_note`'s `path` and `section` were closed
+    individually first; this closes `edit_note(section=…)`, `edit_note(find=…)`,
+    `operation=`, `set_frontmatter(updates=…)` and everything added later,
+    including arguments no error message quotes today but might tomorrow.
+    """
+
+    def offends(value, depth: int) -> bool:
+        if depth > _ARG_SCREEN_MAX_DEPTH:
+            return False
+        if isinstance(value, str):
+            return not is_encodable(value)
+        if isinstance(value, dict):
+            return any(
+                offends(key, depth + 1) or offends(item, depth + 1)
+                for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return any(offends(item, depth + 1) for item in value)
+        return False
+
+    for name, value in bound.arguments.items():
+        if offends(value, 0):
+            return name
+    return None
+
+
+def _unencodable_argument_error(name: str) -> str:
+    """The refusal wording. Deliberately does not repeat the value.
+
+    Quoting it back is the whole problem: the argument is precisely the one
+    that cannot be encoded into the response carrying the complaint.
+    """
+    return (
+        f"Argument '{name}' is not valid UTF-8: it contains an unpaired "
+        "surrogate code point. Re-send it as UTF-8 text."
+    )
+
+
 def _tracked(
     tool_name: str,
     param_keys: list[str],
@@ -454,12 +520,28 @@ def _tracked(
                 # reaches the tool body, including the DB-only ones. The
                 # refusal is still logged, like any other tool error.
                 refusal = _vault_admission_error()
+                extra = {"error": _NO_VAULT_MARKER} if refusal is not None else {}
+                if refusal is None:
+                    # Second admission gate, same altitude: an argument that
+                    # cannot be encoded as UTF-8 never reaches a tool body,
+                    # where quoting it back into an error message would make
+                    # the MCP layer's serialization raise.
+                    try:
+                        screened = sig.bind(*args, **kwargs)
+                        screened.apply_defaults()
+                    except TypeError:
+                        screened = None
+                    offender = (
+                        None if screened is None
+                        else _first_unencodable_argument(screened)
+                    )
+                    if offender is not None:
+                        refusal = _unencodable_argument_error(offender)
+                        extra = {"error": _UNENCODABLE_ARG_MARKER}
                 if refusal is not None:
                     result = refusal if refusal_result is None else refusal_result(refusal)
-                    extra = {"error": _NO_VAULT_MARKER}
                 else:
                     result = await fn(*args, **kwargs)
-                    extra = {}
                 duration_ms = int((time.monotonic() - start) * 1000)
                 params = {}
                 # Resolve logged params by NAME via the wrapped signature so
@@ -561,6 +643,9 @@ def _bounded(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit]
 
 
+_SURROGATE_RE = re.compile("[\ud800-\udfff]")
+
+
 def _scalar_safe(text: str) -> str:
     """Server-authored prose, guaranteed UTF-8-encodable.
 
@@ -570,26 +655,16 @@ def _scalar_safe(text: str) -> str:
     `pydantic_core` refusing to serialize the response at all, which turns an
     in-band error into a protocol error. Every known route to an unencodable
     interpolation is already closed upstream (the path and the selector are
-    refused at admission); this catches the next one.
+    refused at admission, in both tools); this catches the next one.
+
+    It substitutes explicitly rather than via `encode(errors="replace")`, which
+    despite the name emits ASCII `?` on the encode side — indistinguishable from
+    a question mark the caller actually sent, in a message a human is meant to
+    read.
     """
     if is_encodable(text):
         return text
-    return text.encode("utf-8", "replace").decode("utf-8")
-
-
-def _as_text(value) -> str | None:
-    """A frontmatter-derived value as a string, or None.
-
-    `title:` is whatever YAML says it is — a list, a date, a mapping — while
-    the result model's field is a string. The coercion happens **here**, at
-    model-build time, and never in a serializer: FastMCP renders the text block
-    from the returned object and `structuredContent` from the validated dump,
-    so a coercion only one of them applies is a coercion that makes the two
-    renderings disagree.
-    """
-    if value is None or isinstance(value, str):
-        return value
-    return str(value)
+    return _SURROGATE_RE.sub("\ufffd", text)
 
 
 def _origin_label(section: str | None) -> str:
@@ -754,18 +829,6 @@ async def read_note_impl(
         cap = min(limit, cap)
     if offset < 0:
         return _fail(f"read_note: offset must be >= 0 (got {offset}).")
-    if section is not None and not is_encodable(section):
-        # A selector is caller-supplied and every failure to resolve it quotes
-        # it back — into `error`, which `pydantic_core` then has to serialize.
-        # An unpaired surrogate there is a protocol error manufactured from a
-        # tool argument, so it is refused as a parameter, before resolution, and
-        # the refusal does not repeat the value.
-        return _fail(
-            "read_note: section is not valid UTF-8 — it contains an unpaired "
-            "surrogate code point. Re-send the selector as UTF-8 text, or use "
-            'the "#N" ordinal form.'
-        )
-
     content = note["content"]
     heading: str | None = None
     body = content
@@ -795,7 +858,7 @@ async def read_note_impl(
     view, view_omission = frontmatter_view(note["frontmatter"])
     result = ReadNoteResult(
         path=note["path"],
-        title=_as_text(note["title"]),
+        title=note["title"],
         tags=list(note["tags"]) or None,
         frontmatter_yaml=note["frontmatter_yaml"],
         frontmatter=view,
@@ -811,15 +874,19 @@ async def read_note_impl(
         # has already chosen, and does not need the others listed.
         if section is None:
             result.outline = build_outline(content, cap)
-        result.notice = _read_notice(
+        # `_scalar_safe` on the notice as well as the error. Nothing can reach
+        # it today — the path and the selector it interpolates are both refused
+        # at admission — but "cannot happen today" is the reasoning that kept
+        # this class open for two audit rounds, and the guard is one call.
+        result.notice = _scalar_safe(_read_notice(
             note["path"], section, offset, min(offset, total) + len(chunk),
             total, next_offset, result.outline,
-        )
-    # Unencodable values are screened BEFORE the budget so `metadata_omissions`
-    # reads in decision order, and so the budget never spends room on a field
-    # that is about to be dropped anyway.
+        ))
+    # Values that would not render are reported BEFORE the budget runs, so
+    # `metadata_omissions` reads in decision order and the budget never spends
+    # room on a field that is about to be dropped anyway.
     carried = [] if view_omission is None else [view_omission]
-    carried += screen_unencodable(result)
+    carried += screen_unrenderable(result, note["lossy_metadata"])
     apply_metadata_budget(result, carried, metadata_budget)
     return result
 

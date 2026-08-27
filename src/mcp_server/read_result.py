@@ -85,23 +85,34 @@ class MetadataOmission(_OmitNone):
     detail: str
 
 
-def _surrogate_omission(field: str) -> MetadataOmission:
-    """The one wording for "this value is not UTF-8-encodable".
+_UNRENDERABLE_DETAIL = {
+    OMITTED_UNPAIRED_SURROGATE: (
+        "contains an unpaired surrogate code point, which is not valid UTF-8 "
+        "and cannot be serialized into this response"
+    ),
+    OMITTED_NOT_REPRESENTABLE: (
+        "holds a value the server cannot render as text at all (an integer far "
+        "past the digit limit CPython will convert, for instance)"
+    ),
+}
 
-    A note may legally write `title: "\\uD800"`. PyYAML decodes the escape into
-    a lone surrogate — a valid Python `str`, not a Unicode scalar value — and
-    `pydantic_core`, which renders both halves of the MCP result, raises
-    `PydanticSerializationError` on it. Note-controlled frontmatter would then
-    produce a *protocol* error, so the value is dropped at model-build time and
-    reported here instead. The raw block is unaffected: in the file the escape
-    is literal ASCII (`\\uD800`, six characters), so `frontmatter_yaml` carries
-    it losslessly and remains the authoritative copy.
+
+def unrenderable_omission(field: str, reason: str) -> MetadataOmission:
+    """The one wording for "this value refuses to become JSON-safe text".
+
+    Two failure modes, both reachable from a note a user can save, both of them
+    *valid YAML* — see `vault.coerce_text` for the shapes. Either one would
+    otherwise escape as an exception from a code path that promises in-band
+    errors, so the value is dropped at model-build time and reported here.
+
+    The raw block is unaffected in both cases: whatever the value decodes to,
+    in the file it is ordinary text, so `frontmatter_yaml` carries it losslessly
+    and remains the authoritative copy.
     """
     return _omission(
         field,
-        OMITTED_UNPAIRED_SURROGATE,
-        f"The note's {field} contains an unpaired surrogate code point, which "
-        "is not valid UTF-8 and cannot be serialized into this response.",
+        reason,
+        f"The note's {field} {_UNRENDERABLE_DETAIL[reason]}.",
     )
 
 
@@ -234,7 +245,7 @@ def frontmatter_view(frontmatter: dict) -> tuple[dict | None, MetadataOmission |
     try:
         return _view_walk(frontmatter, 0, frozenset(), budget), None
     except _ViewNotEncodable:
-        return None, _surrogate_omission("frontmatter")
+        return None, unrenderable_omission("frontmatter", OMITTED_UNPAIRED_SURROGATE)
     except _ViewKeyCollision as exc:
         return None, _omission(
             "frontmatter",
@@ -250,8 +261,12 @@ def frontmatter_view(frontmatter: dict) -> tuple[dict | None, MetadataOmission |
             f"The frontmatter has no bounded JSON form ({exc}); frontmatter_yaml "
             "carries it verbatim.",
         )
-    except Exception:  # pragma: no cover — defence in depth, not a known path
-        logger.exception("frontmatter JSON view construction failed")
+    except Exception:
+        # Reached, not hypothetical: `str()` on a hex integer past CPython's
+        # digit limit raises from inside the walk. `debug`, not `exception` —
+        # this is a note the server is handling correctly, not an incident, and
+        # a stack trace per read of such a note is noise in the log.
+        logger.debug("frontmatter JSON view construction failed", exc_info=True)
         return None, _omission(
             "frontmatter",
             OMITTED_NOT_REPRESENTABLE,
@@ -388,19 +403,31 @@ def build_outline(content: str, cap: int) -> NoteOutline | None:
     # available while a perfectly good listing was affordable. Skipping keeps
     # scanning, so the omission count and the ordinal range still describe the
     # whole note and every ordinal an entry carries is still its own.
-    used = _serialized_len(_truncated([]))
+    # The most the `omitted` count can shrink as entries are kept: it starts at
+    # `total` and bottoms out at one digit.
+    slack = len(str(total)) - 1
     kept: list[OutlineEntry] = []
+    used = _serialized_len(_truncated([]))
     for entry in entries:
-        cost = _serialized_len(entry) + 1
-        if used + cost > cap:
+        # Two steps, and the order matters. The cheap step is a *lower* bound —
+        # never rejects an entry that could have fitted — so it only skips work.
+        # The decision itself measures the candidate outline, because no
+        # per-entry arithmetic gets it right: charging a separating comma
+        # over-counts by exactly one for the first entry (there is nothing to
+        # separate it from), which rejected an entry that fitted the cap
+        # precisely, and the omission count's own digit width shrinks as entries
+        # are kept. Without the cheap filter this is quadratic on a note with
+        # ten thousand headings.
+        entry_len = _serialized_len(entry)
+        if used + entry_len + (1 if kept else 0) - slack > cap:
             continue
-        kept.append(entry)
-        used += cost
+        candidate = _truncated(kept + [entry])
+        candidate_len = _serialized_len(candidate)
+        if candidate_len <= cap:
+            kept.append(entry)
+            used = candidate_len
 
     outline = _truncated(kept)
-    while kept and _serialized_len(outline) > cap:
-        kept.pop()
-        outline = _truncated(kept)
     if _serialized_len(outline) > cap:
         # Degenerate budget: not even the marker fits. Emitting nothing is the
         # only answer that respects the cap, and the cap wins.
@@ -466,32 +493,43 @@ def _tag_cost(tags: list[str]) -> int:
     return sum(len(tag) + 3 for tag in tags)
 
 
-def screen_unencodable(result: "ReadNoteResult") -> list[MetadataOmission]:
-    """Drop any metadata value that is not UTF-8-encodable, before serializing.
+def screen_unrenderable(
+    result: "ReadNoteResult", lossy: dict[str, str]
+) -> list[MetadataOmission]:
+    """Report — and finish — the drops `vault.read_file` already had to make.
 
-    Runs at model-build time, on the fields whose values can come from YAML
-    escapes rather than from the note's decoded bytes:
+    `read_file` is the one place holding both the parsed mapping and the values
+    derived from it, so it is the one place that can tell a value apart from a
+    value that would not render. It hands back `lossy_metadata`; this turns that
+    into the caller-visible omissions and makes sure the field really is gone.
 
-    * `title` — `title: "\\uD800"` in the block, or (in principle) a filename
-      the OS handed back through surrogate-escape;
-    * `tags` — same source, via `extract_tags`' `str()` coercion.
+    Only the fields whose values come from YAML rather than from the note's
+    decoded bytes are involved: `title` and `tags`. `heading`, `content`,
+    `frontmatter_yaml` and the outline's titles are slices of
+    `Path.read_text(encoding="utf-8")`, which is strict, so they cannot carry a
+    lone surrogate and cannot be anything but text. `path` and the section
+    selector are screened earlier still, at admission, where a bad one is an
+    error rather than an omission — see `vault.is_encodable`.
 
-    `heading`, `content`, `frontmatter_yaml` and the outline's titles are all
-    slices of `Path.read_text(encoding="utf-8")`, which is strict, so they
-    cannot carry a lone surrogate and are not screened. `path` and the selector
-    are screened earlier, at admission, where a bad one is an error rather than
-    an omission — see `vault.is_encodable`.
-
-    Whole-field drops, like every other omission: there is no cutting a value
-    down to its encodable prefix.
+    Whole-field drops, like every other omission: no value is cut down to the
+    part of itself that would have rendered.
     """
     omissions: list[MetadataOmission] = []
+    for field in ("title", "tags"):
+        reason = lossy.get(field)
+        if reason is None:
+            continue
+        setattr(result, field, None)
+        omissions.append(unrenderable_omission(field, reason))
+    # Belt and braces. Nothing should reach here that `read_file` did not
+    # already catch, but the cost of being wrong is a protocol error, and the
+    # cost of the check is two `encode` calls.
     if result.title is not None and not is_encodable(result.title):
         result.title = None
-        omissions.append(_surrogate_omission("title"))
+        omissions.append(unrenderable_omission("title", OMITTED_UNPAIRED_SURROGATE))
     if result.tags is not None and not all(is_encodable(tag) for tag in result.tags):
         result.tags = None
-        omissions.append(_surrogate_omission("tags"))
+        omissions.append(unrenderable_omission("tags", OMITTED_UNPAIRED_SURROGATE))
     return omissions
 
 

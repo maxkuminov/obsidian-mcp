@@ -454,6 +454,74 @@ async def test_a_surrogate_bearing_selector_is_a_bounded_typed_error(vault):
     assert "content" not in structured
 
 
+@pytest.mark.parametrize("half", sorted(SURROGATES))
+@pytest.mark.parametrize("param", ["section", "find"])
+@pytest.mark.asyncio
+async def test_edit_note_refuses_a_surrogate_bearing_selector(vault, half, param):
+    """`read_note`'s path and selector were closed one at a time in round 1.
+    `edit_note` has the same reflected-argument hazard through the shared
+    resolver's not-found listing and through find/replace, so the screen moved
+    up into the decorator every tool shares."""
+    original = "# A\nbody\n"
+    write(vault, "n.md", original)
+    bad = "A" + ("\ud800" if half == "high" else "\udc00")
+
+    blocks, structured = await mcp.call_tool(
+        "edit_note", {"path": "n.md", "content": "x", param: bad}
+    )
+
+    text = blocks[0].text
+    assert f"Argument '{param}' is not valid UTF-8" in text
+    assert "\ud800" not in text and "\udc00" not in text
+    assert read(vault, "n.md") == original       # nothing written
+
+
+@pytest.mark.asyncio
+async def test_the_screen_reaches_into_container_arguments(vault):
+    """`set_frontmatter(updates=…)` and the search tools' `tags=`/`frontmatter=`
+    are mappings and lists, and a surrogate inside one is written to the note or
+    reflected in an error just the same."""
+    original = "---\na: 1\n---\nbody\n"
+    write(vault, "n.md", original)
+
+    blocks, _ = await mcp.call_tool(
+        "set_frontmatter", {"path": "n.md", "updates": {"k": "v\ud800"}}
+    )
+    assert "Argument 'updates' is not valid UTF-8" in blocks[0].text
+    assert read(vault, "n.md") == original
+
+    blocks, _ = await mcp.call_tool(
+        "set_frontmatter", {"path": "n.md", "updates": {"k\ud800": "v"}}
+    )
+    assert "Argument 'updates' is not valid UTF-8" in blocks[0].text
+    assert read(vault, "n.md") == original
+
+
+@pytest.mark.asyncio
+async def test_a_refused_argument_is_logged_under_its_own_marker(vault, monkeypatch):
+    """An operator reading `/admin/usage` must be able to tell "this credential
+    has no vault" from "this client is emitting bad JSON escapes"."""
+    seen = {}
+
+    async def _capture(tool, params, duration_ms, response_size):
+        seen.update(params)
+
+    monkeypatch.setattr(tools, "_log_usage", _capture)
+    await tools.read_note_impl("n.md", section="\ud800")
+
+    assert seen["error"] == tools._UNENCODABLE_ARG_MARKER
+    assert seen["error"] != tools._NO_VAULT_MARKER
+
+
+def test_scalar_safe_substitutes_the_replacement_character_not_a_question_mark():
+    """`encode(errors="replace")` emits ASCII `?` on the *encode* side, which is
+    indistinguishable from a question mark the caller actually sent."""
+    assert tools._scalar_safe("a\ud800b") == "a\ufffdb"
+    assert tools._scalar_safe("a\udc00b") == "a\ufffdb"
+    assert "?" not in tools._scalar_safe("a\ud800b")
+    assert tools._scalar_safe("plain ? text") == "plain ? text"
+
+
 @pytest.mark.asyncio
 async def test_the_vault_layer_refuses_an_unencodable_path_for_every_tool(vault):
     """The guard sits beside the length bound, so a write tool cannot be handed
@@ -464,6 +532,87 @@ async def test_the_vault_layer_refuses_an_unencodable_path_for_every_tool(vault)
         with pytest.raises(ValueError) as exc:
             validator("a\ud800.md")
         assert "not valid UTF-8" in str(exc.value)
+
+
+# A hex integer past CPython's int-string digit *conversion* limit. PyYAML
+# constructs it without complaint — the limit guards decimal parsing, not hex
+# literals — and then `str()` on the value raises. The block is valid, the
+# mapping is fine, and only *rendering* the value fails, which is a different
+# failure from the block-level ones below and has to cost less.
+_HEX_BIG_INT = "0x" + "f" * 5_000
+
+
+@pytest.mark.asyncio
+async def test_an_unrenderable_title_costs_the_title_only(vault):
+    write(vault, "n.md", f"---\ntitle: {_HEX_BIG_INT}\nk: v\n---\nbody\n")
+    out = await tools.read_note_impl("n.md")
+
+    assert out.error is None
+    assert out.content == "body\n"
+    assert out.title is None
+    # The block is VALID, so its text is still the authoritative copy — this is
+    # not the yaml-error case, where the block ends up in `content`.
+    assert out.frontmatter_yaml == f"title: {_HEX_BIG_INT}\nk: v\n"
+    assert ("title", "not_json_representable") in {
+        (o.field, o.reason) for o in out.metadata_omissions
+    }
+
+
+@pytest.mark.asyncio
+async def test_an_unrenderable_tag_costs_the_tags_only(vault):
+    write(vault, "n.md", f"---\ntags: [ok, {_HEX_BIG_INT}]\n---\nbody\n")
+    out = await tools.read_note_impl("n.md")
+
+    assert out.error is None
+    assert out.content == "body\n"
+    # Whole-field: the one tag that WOULD have rendered goes with it, rather
+    # than the caller receiving a list that silently lost an entry.
+    assert out.tags is None
+    assert ("tags", "not_json_representable") in {
+        (o.field, o.reason) for o in out.metadata_omissions
+    }
+    assert out.frontmatter_yaml == f"tags: [ok, {_HEX_BIG_INT}]\n"
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "title: {big}",
+        "tags: [ok, {big}]",
+        "nested:\n  deep: [1, {big}]",
+        "{big}: keyed-by-a-huge-int",
+    ],
+    ids=["title", "tags", "nested_value", "key"],
+)
+@pytest.mark.asyncio
+async def test_an_unrenderable_value_never_becomes_a_protocol_error(vault, block):
+    """Anywhere in the block, at the layer that actually serializes."""
+    write(vault, "n.md", "---\n" + block.format(big=_HEX_BIG_INT) + "\n---\nbody\n")
+    blocks, structured = await mcp.call_tool("read_note", {"path": "n.md"})
+
+    assert json.loads(blocks[0].text) == structured
+    assert "error" not in structured
+    # Either the value alone was unrenderable (block still valid, its text in
+    # `frontmatter_yaml`) or the parser could not construct the mapping at all
+    # (the yaml-error defect, block text in `content`). Both are in-band, and
+    # both keep every byte of the note reachable.
+    assert structured["content"].endswith("body\n")
+    ReadNoteResult.model_validate(structured)
+
+
+def test_the_shared_coercion_helper_never_raises(vault):
+    """`vault.coerce_text` is the single place a YAML value becomes text, and
+    the indexer and the control panel depend on it not raising either — a
+    `tags: [0x…]` note used to break the indexer's scan of that note."""
+    import yaml as _yaml
+
+    huge = _yaml.safe_load(f"n: {_HEX_BIG_INT}")["n"]
+    assert vault_service.coerce_text(huge) == (None, "not_json_representable")
+    assert vault_service.coerce_text("\ud800") == (None, "unpaired_surrogate")
+    assert vault_service.coerce_text("plain") == ("plain", None)
+    assert vault_service.coerce_text(7) == ("7", None)
+    # The lossy entry is skipped, not fatal, and the good one survives.
+    assert vault_service.extract_tags("", {"tags": ["ok", huge]}) == ["ok"]
 
 
 # A well-formed YAML integer past CPython's int-string digit limit. PyYAML's
@@ -711,32 +860,39 @@ _FIXED_PROSE = 4_000
 
 
 @pytest.mark.asyncio
-async def test_the_whole_mcp_response_meets_the_documented_combined_bound(vault, cap):
-    """The bound as the architecture doc states it, measured on the wire.
+async def test_the_whole_mcp_response_meets_the_documented_combined_bound(vault):
+    """The bound as the architecture doc states it, measured on the wire, at
+    the real cap, with every budget actually full of escape-heavy data.
 
-    Everything at once and everything hostile: content at the cap and made
-    entirely of control characters (six JSON characters each), an outline whose
-    titles are at the per-title limit on a note with more sections than fit,
-    and metadata large enough to exercise the metadata budget. Measured over
-    the MCP text block PLUS the serialized structuredContent, because the
-    result carries both and the caller pays for both — that doubling is the
-    `× 2` in the documented figure, and measuring only one half would hide it.
+    Deliberately NOT using the shrunken `cap` fixture: the documented figure is
+    stated at `MAX_READ_RESPONSE_CHARS`, and a 500-character cap leaves the
+    per-entry outline overhead dominating, so the test would pass on a fixture
+    that never loaded a budget. Here all three are loaded, and all three are
+    loaded with characters that JSON escapes six-fold (`\\u0001`):
+
+    * `content` — a full cap window of control characters;
+    * `title` — a cap-sized control-character title that SURVIVES, because the
+      three fields ahead of it in the drop order are dropped first;
+    * `outline` — control-character headings, filled to the outline budget.
+
+    Measured over the MCP text block PLUS the serialized structuredContent,
+    because the result carries both and the caller pays for both — that
+    doubling is the `× 2` in the documented figure, and measuring one half
+    would hide it.
     """
-    # Outline titles are plain ASCII at the per-title limit: that is the
-    # configuration that actually FILLS the outline budget. Control-character
-    # titles would escape six-fold, so fewer entries fit and the outline gets
-    # smaller — the budget doing its job, but a weaker test of the total.
+    cap = tools.settings.max_read_response_chars
+    assert cap == 40_000, "this test is stated at the documented default cap"
+
+    # 80 control characters per heading is the outline's per-title limit, so
+    # every entry is as expensive as an entry can be.
     sections = "".join(
-        f"## {'S' * 90} {i}\n" + "\x01" * 200 + "\n" for i in range(400)
+        f"## {'\\u0001' * 90}\n" + "\x01" * 400 + "\n" for i in range(400)
     )
-    # A raw control character is not legal in a YAML plain scalar, so the
-    # escape-heavy title goes in as a double-quoted scalar with `\\u0001`
-    # escapes — valid YAML whose *value* is 600 control characters.
     write(
         vault, "n.md",
-        '---\ntitle: "' + "\\u0001" * 600 + '"'
-        + "\ntags: [" + ", ".join("t" * 40 for _ in range(50)) + "]"
-        + "\nfiller: " + "f" * 30_000
+        '---\ntitle: "' + "\\u0001" * cap + '"'
+        + "\ntags: [" + ", ".join("t" * 40 for _ in range(200)) + "]"
+        + "\nfiller: " + "f" * 50_000
         + "\n---\n" + sections,
     )
 
@@ -744,15 +900,27 @@ async def test_the_whole_mcp_response_meets_the_documented_combined_bound(vault,
     text = blocks[0].text
     assert json.loads(text) == structured
 
-    # Every budgeted component is actually loaded, or the bound proves nothing.
+    # Every budgeted component is loaded to its limit, or the bound is vacuous.
     assert len(structured["content"]) == cap
     assert structured["truncated"] is True
+    assert len(structured["title"]) == cap, "the title did not survive the drops"
+    assert set(structured["title"]) == {"\x01"}, "the title is not escape-heavy"
+    # Compact separators, matching how `build_outline` measures its own budget
+    # and how the JSON-RPC layer puts `structuredContent` on the wire.
+    compact = {"ensure_ascii": False, "separators": (",", ":")}
+    outline_chars = len(json.dumps(structured["outline"], **compact))
     assert structured["outline"]["truncated"] is True
-    assert structured["outline"]["entries"], "no outline entries — fixture is wrong"
-    assert structured["metadata_omissions"], "no drops — fixture is wrong"
-    assert "\\u0001" in text, "no escaping happened — the bound proves nothing"
+    assert outline_chars > cap // 2, (
+        f"outline only filled {outline_chars} of a {cap} budget — not a worst case"
+    )
+    assert {o["field"] for o in structured["metadata_omissions"]} >= {
+        "frontmatter", "frontmatter_yaml", "tags",
+    }
+    assert text.count("\\u0001") > cap, "escaping is not dominating the response"
 
-    on_the_wire = len(text) + len(json.dumps(structured, ensure_ascii=False))
+    assert outline_chars <= cap, "the outline exceeded its own budget"
+
+    on_the_wire = len(text) + len(json.dumps(structured, **compact))
     documented = 2 * (6 * (3 * cap) + _FIXED_PROSE)
     assert on_the_wire <= documented, (
         f"{on_the_wire} characters on the wire, documented worst case is "
@@ -842,6 +1010,31 @@ def test_one_oversized_entry_does_not_suppress_the_ones_that_fit():
     assert degraded.entries == []
     assert degraded.truncated is True
     assert outline_size(degraded) <= 160
+
+
+def test_an_entry_that_fits_the_cap_exactly_is_emitted():
+    """Off-by-one regression. The fill charged a separating comma for every
+    entry including the *first*, which has nothing to separate it from, so an
+    outline whose serialization was exactly `cap` characters got rejected in
+    favour of the bare marker. The fill measures the candidate outline now, so
+    the boundary is where arithmetic says it is."""
+    note = "# " + "T" * 300 + "\nbody\n## Short\nb\n"
+    # The smallest budget that admits the short entry, discovered rather than
+    # hardcoded, so a change to the entry's shape moves the boundary with it.
+    exact = min(
+        cap for cap in range(80, 400)
+        if (o := tools.build_outline(note, cap)) is not None and o.entries
+    )
+
+    at_the_cap = tools.build_outline(note, exact)
+    assert [e.ordinal for e in at_the_cap.entries] == [2]
+    # The budget is spent to the last character: this is the exactly-fitting
+    # case the off-by-one used to reject.
+    assert outline_size(at_the_cap) == exact
+
+    below = tools.build_outline(note, exact - 1)
+    assert below.entries == []
+    assert below.truncated is True
 
 
 @pytest.mark.asyncio

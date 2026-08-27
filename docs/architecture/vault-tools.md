@@ -243,6 +243,25 @@ There are **byte** caps, a **character** cap, and a **transport** cap, and they 
 - `MAX_READ_RESPONSE_CHARS` (default 40,000 ≈ 10K tokens) bounds what `read_note` / `read_file` **return to the caller**, whose context the result consumes. It truncates rather than refusing.
 - The MCP streamable-HTTP **request body limit** bounds what the transport accepts at all, before any tool runs. It is derived, not configured: `max(2 × MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB` (61 MiB with the defaults), passed to `FastMCP(max_request_body_size=)` from `Settings.mcp_max_request_body_bytes`. The SDK's own default is 4 MiB, which would silently reject writes far below our documented 25 MB cap. The formula guarantees — for a *canonical* envelope, i.e. JSON-RPC framing plus non-content arguments under 1 MiB — that a base64 `write_file` at the cap (base64 is `4·⌈n/3⌉ ≤ 2n + 2`) and any note write up to `MAX_NOTE_BYTES` (JSON escaping expands a byte at most 6×) always reach the tool, which then decides. Unsupported shapes are bounded by the transport with a bare HTTP 413 and no tool error: text-mode `write_file` whose escaping exceeds the limit (send base64 — always safe), an envelope over 1 MiB, and arguments that are large but discarded.
 
+**An argument that is not UTF-8 never reaches a tool body.** `_tracked` screens
+every bound argument — strings, and one bounded walk into list and mapping
+arguments like `set_frontmatter(updates=…)` — and refuses the call with
+`_UNENCODABLE_ARG_MARKER` in `usage_logs`, distinct from the vault markers so an
+operator can tell "this credential has no vault" from "this client is emitting
+bad JSON escapes". The refusal names the parameter and never repeats the value,
+which is the point: the value is precisely the one that cannot be encoded into
+the response carrying the complaint.
+
+The screen sits in the shared decorator rather than in each tool because
+auditing interpolations one at a time is how this class stayed open for two
+audit rounds. `read_note`'s `path` and `section` were closed individually first;
+the very next review found `edit_note(section=…)` — the shared resolver's
+not-found listing quotes the selector straight back — and `edit_note(find=…)`
+beside it. Anything a future tool accepts is covered by construction. `path` is
+*also* refused at the vault layer (`validate_path`, `_mutable_parts`), because a
+path that is not UTF-8 cannot name a file and that is true regardless of which
+decorator ran.
+
 **Every note write tool caps its own result.** `create_note`, `edit_note` (all modes, `dry_run` included), and `set_frontmatter` refuse a result over `MAX_NOTE_BYTES` with a tool-level error and no write, via `_note_size_error()` in `tools.py`. That is what keeps the tool, not the transport, in charge of every supported write — the transport limit sits deliberately above every tool cap. `MAX_NOTE_BYTES` lives in `src/config.py` (not `tools.py`) because the transport formula needs it.
 
 **Precisely: it is a per-component budget, not a single ceiling on the whole response.** Since #149 `read_note` returns fields, and each note-controlled field carries its own budget:
@@ -561,20 +580,30 @@ block has shapes JSON does not:
   rendering the view silently loses one of them;
 - dates and timestamps — no JSON form, so they become ISO strings, which is
   lossy in the other direction;
-- **unpaired surrogates** — `title: "\uD800"` is legal YAML, and PyYAML decodes
-  the escape into a code point that is a valid Python `str` and not a Unicode
-  scalar value. `pydantic_core`, which renders *both* halves of the MCP result,
-  raises `PydanticSerializationError` on it, so note-controlled frontmatter
-  could manufacture a **protocol error** — a whole class above the in-band
-  errors this tool promises. The check runs at model-build time, on `title`,
-  `tags` and every string in the view; each unencodable value is dropped whole
-  with the `unpaired_surrogate` reason. `frontmatter_yaml` is unaffected: in
-  the file the escape is six literal ASCII characters. `heading`, `content` and
-  the outline's titles are slices of `Path.read_text(encoding="utf-8")`, which
-  is strict, so they cannot carry one and are not screened. A surrogate-bearing
-  **path or selector** is not an omission but an admission-time error — a path
-  that is not UTF-8 cannot name a file — refused by `vault.is_encodable`
-  beside the length bound, and the refusal never quotes the value back.
+- **values that will not become text** — two shapes, both *valid YAML*, both
+  reachable from a note a user can save, and `vault.coerce_text` is the one
+  place either is handled:
+  - `title: "\uD800"` decodes to a lone surrogate: a valid Python `str`, not a
+    Unicode scalar value, so it cannot be UTF-8-encoded. `pydantic_core`, which
+    renders *both* halves of the MCP result, raises
+    `PydanticSerializationError` on it — note-controlled frontmatter
+    manufacturing a **protocol error**, a whole class above the in-band errors
+    this tool promises. Reason code `unpaired_surrogate`.
+  - `title: 0x<5000 hex digits>` is *constructed* by PyYAML without complaint
+    — CPython's integer-string digit limit guards decimal parsing, not hex
+    literals — and then `str()` on the value raises `ValueError`. Reason code
+    `not_json_representable`.
+
+  Both are screened at model-build time, on `title`, `tags` and every string in
+  the view, and the offending field is dropped **whole**. `frontmatter_yaml` is
+  unaffected in both cases: in the file the value is ordinary text.
+  `heading`, `content` and the outline's titles are slices of
+  `Path.read_text(encoding="utf-8")`, which is strict, so they cannot carry a
+  surrogate and are not screened. **`extract_tags` uses the same helper**, so a
+  `tags: [0x…]` note no longer takes out `read_file`, the control panel's note
+  viewer, or the indexer's scan of that note — it silently skips the entry it
+  cannot render, and `read_file` reports the loss in `lossy_metadata` so
+  `read_note` can drop the whole field and name the reason.
 
 A partial view is never emitted: a caller cannot tell a pruned map from the
 real one. **Mutation goes through `set_frontmatter`, or through the raw block

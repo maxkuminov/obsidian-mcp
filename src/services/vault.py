@@ -341,6 +341,40 @@ def is_encodable(text: str) -> bool:
     return True
 
 
+# Why a frontmatter value may refuse to become text, as `metadata_omissions`
+# reason codes. `read_note` reports them; they are part of that tool's contract.
+TEXT_UNENCODABLE = "unpaired_surrogate"
+TEXT_UNRENDERABLE = "not_json_representable"
+
+
+def coerce_text(value) -> tuple[str | None, str | None]:
+    """A parsed-YAML value as JSON-safe text: `(text, failure_reason)`.
+
+    Exactly one half is None. This is the **single** place a frontmatter-derived
+    value becomes a string, because `str(value)` is not the total function it
+    looks like and both ways it fails are reachable from a note a user can save:
+
+    * `title: 0x<5000 hex digits>` — PyYAML *constructs* the int happily
+      (CPython's digit limit guards decimal parsing, not hex literals), and then
+      `str()` on it raises `ValueError`. The value is fine; rendering it is not.
+    * `title: "\uD800"` — decodes to a lone surrogate, which is a valid Python
+      `str` and not a Unicode scalar value, so it cannot be encoded as UTF-8 and
+      `pydantic_core` refuses to serialize it.
+
+    Neither may cost more than the field it appears in: `frontmatter_yaml` still
+    carries the block verbatim, and `content` is untouched. Callers that cannot
+    report a reason (the indexer, `extract_tags`) simply skip a `None`.
+    """
+    if not isinstance(value, str):
+        try:
+            value = str(value)
+        except Exception:
+            return None, TEXT_UNRENDERABLE
+    if not is_encodable(value):
+        return None, TEXT_UNENCODABLE
+    return value, None
+
+
 def path_not_encodable_error(relative_path: str) -> str:
     """The one wording for "this path is not UTF-8". Never quotes the path.
 
@@ -1632,11 +1666,28 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
         raise FileNotFoundError(f"Note not found: {relative_path}")
     raw = path.read_text(encoding="utf-8")
     frontmatter, content, diagnosis = parse_frontmatter_diagnose(raw)
-    title = frontmatter.get("title") or path.stem
+    # `lossy_metadata` maps a derived field to why it could not be rendered as
+    # JSON-safe text. This is the only place that can say so: it is the one
+    # function holding both the parsed mapping and the values derived from it.
+    # A field that lost something is `None`/short here rather than substituted
+    # — `read_note` omits it whole and names the reason, and no caller is ever
+    # handed a plausible-looking replacement (falling back to the filename for
+    # an unrenderable `title:` would be exactly that).
+    lossy_metadata: dict[str, str] = {}
+    title, reason = coerce_text(frontmatter.get("title") or path.stem)
+    if reason is not None:
+        lossy_metadata["title"] = reason
     tags = extract_tags(content, frontmatter)
+    fm_tags = frontmatter.get("tags")
+    if isinstance(fm_tags, list):
+        for _, tag_reason in map(coerce_text, fm_tags):
+            if tag_reason is not None:
+                lossy_metadata["tags"] = tag_reason
+                break
     return {
         "path": relative_path,
         "title": title,
+        "lossy_metadata": lossy_metadata,
         "frontmatter": frontmatter,
         # The block's YAML source, or None when the note carries no valid
         # line-1 block. `read_note` returns this as the *authoritative*
@@ -3290,10 +3341,14 @@ def extract_tags(body: str, frontmatter: dict) -> list[str]:
       too.
     """
     tags = set()
-    # Frontmatter tags
+    # Frontmatter tags. Coercion goes through `coerce_text`, which never raises:
+    # a `tags: [0x<5000 hex digits>]` entry used to take out `str()` and with it
+    # `read_file`, the control panel's note viewer and the indexer's scan of
+    # that note. An entry that will not render is skipped here; `read_file`
+    # reports the loss separately, for the one caller that can say so.
     fm_tags = frontmatter.get("tags", [])
     if isinstance(fm_tags, list):
-        tags.update(str(t) for t in fm_tags)
+        tags.update(text for text, _ in map(coerce_text, fm_tags) if text is not None)
     elif isinstance(fm_tags, str):
         tags.update(t.strip() for t in fm_tags.split(","))
     # Inline #tags (not inside code blocks)
