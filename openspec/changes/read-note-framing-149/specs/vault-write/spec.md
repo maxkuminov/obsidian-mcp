@@ -280,3 +280,157 @@ endings than it started with.
   `content` field as the exact body to pass back
 - **AND** the same statements SHALL appear in the `tools.py` implementation's
   docstring, so the two layers do not diverge
+
+### Requirement: `edit_note` supports four mutually exclusive modes
+
+The `edit_note` tool SHALL expose exactly four edit modes, selected by the
+combination of parameters supplied: full-replace (default), append,
+find/replace, and section. The four modes SHALL be mutually exclusive —
+supplying parameters that select more than one mode SHALL return an
+actionable error and SHALL NOT mutate the file.
+
+#### Scenario: Full-replace mode (default) preserves a valid frontmatter block
+
+- **WHEN** the client calls `edit_note(path, content)` with neither
+  `append`, `find`, nor `section` set and without
+  `replace_frontmatter=True`, on a note that carries a valid line-1
+  frontmatter block
+- **THEN** the written file SHALL be the existing raw block
+  byte-identical, a separator (one `\n` inserted only when the block's
+  bytes do not already end in a newline and `content` is non-empty),
+  then `content` as the entire body
+- **AND** no property of `content`'s shape — a leading `---`, an
+  unclosed fence, or a complete mapping-shaped fenced block (exactly
+  what `read_note` returns for a note whose body begins with one) —
+  SHALL change this: `content` is always the body
+
+#### Scenario: Any stripped body round-trips unchanged
+
+- **WHEN** the note-content portion of a **complete, unwindowed
+  whole-note** `read_note` response (`section=None`, `offset=0`, no
+  truncation notice) is passed back via `edit_note(path, body)` —
+  including a body whose first line is a thematic break `---`, a body
+  that itself begins with a complete mapping-shaped fenced block, and
+  the body of a note whose frontmatter is the whitespace-only empty
+  block (which the shared parser SHALL strip on read exactly as it
+  preserves it on write)
+- **THEN** the resulting file SHALL be identical to the original for a
+  note whose body newlines are LF
+- **AND** for a CRLF-bodied note the frontmatter block SHALL still be
+  preserved byte-identically (CRLF fences included); the *body* comes
+  back through `read_note`'s pre-existing universal-newline translation
+  as LF, and the round trip preserves content, not the body's original
+  newline bytes — a pre-existing property of the read path, declared,
+  not a regression introduced here
+
+#### Scenario: The round-trip guarantee does not extend to windows or sections
+
+- **WHEN** a `read_note` response was a selected section
+  (`section=<sel>`), a paged window (`offset>0`, or `truncated` true in
+  the structured result), or otherwise less than the whole body, and its
+  `content` is passed to default full-replace
+- **THEN** full-replace still preserves the frontmatter block but
+  replaces the ENTIRE body with the partial text — so both layers'
+  docstrings SHALL state that section responses belong to section mode
+  and truncated reads must be completed before a full-replace write
+
+#### Scenario: replace_frontmatter selects wholesale replacement
+
+- **WHEN** the client calls
+  `edit_note(path, content, replace_frontmatter=True)` in full-replace
+  mode
+- **THEN** the entire note, frontmatter included, SHALL be overwritten
+  with exactly `content`
+- **AND** `replace_frontmatter=True` combined with `append`, `find`, or
+  `section` SHALL return the multi-mode error and SHALL NOT modify the
+  file
+
+#### Scenario: A note without a valid block is replaced wholesale
+
+- **WHEN** the existing note has no line-1 fence, or its block is
+  defective (unclosed fence — a bare unterminated `---` at EOF included
+  — YAML error, or non-mapping), and the client calls
+  `edit_note(path, content)` in full-replace mode
+- **THEN** the entire note SHALL be overwritten with `content` (there is
+  no valid block to preserve; this is the repair path and needs no flag)
+
+#### Scenario: A metadata-only note gains a correct separator
+
+- **WHEN** the existing note is exactly a valid frontmatter block whose
+  closing fence ends at EOF without a trailing newline, and the client
+  calls `edit_note(path, "Body\n")` in default full-replace mode
+- **THEN** the written file SHALL contain the block, a single inserted
+  newline, then `Body\n` — the closing fence SHALL remain a recognized
+  fence
+
+#### Scenario: A trailing-whitespace closing fence is one block everywhere
+
+- **WHEN** a note's closing fence carries trailing spaces or tabs
+  (which `parse_frontmatter` accepts today)
+- **THEN** default full-replace SHALL treat the note as carrying a valid
+  block and preserve it byte-identically, trailing whitespace included
+
+#### Scenario: Fence lines end at LF, CRLF or a lone CR
+
+- **WHEN** a note's fence lines are terminated by LF, by CRLF, or by a
+  lone CR (classic-Mac line endings)
+- **THEN** the shared parser SHALL recognize the block in every case,
+  consistent with the universal-newline translation the read path applies
+  before it parses the same file — so a note whose block `read_note`
+  strips is never diagnosed as having no frontmatter by a tool that is
+  about to write
+- **AND** default full-replace SHALL preserve that block
+  byte-identically, its own terminators included, and SHALL insert the
+  separator newline only when the block's bytes end in no line terminator
+  at all
+- **AND** `set_frontmatter` SHALL update such a block rather than
+  prepending a second one above it, and SHALL refuse it by name when it
+  is defective
+- **AND** the fenced/inline code masking that heading resolution runs on
+  SHALL use the same terminator rule, so a heading inside a code block is
+  hidden from `edit_note(section=…)` exactly as it is from
+  `read_note(section=…)` — otherwise a selector resolves inside code on
+  the write side only, and the replacement deletes the closing fence
+- **AND** widening the terminator rule SHALL NOT narrow which characters
+  separate a heading's `#` marker from its text: every whitespace
+  character except the three terminators still separates them, so no
+  heading present on an existing note loses its name or its `#N` ordinal
+
+#### Scenario: The composed result meets the cap and conflict checks
+
+- **WHEN** preservation composes a result whose byte size exceeds the
+  note-size cap, or `expected=` was supplied and any part of the raw
+  file — the frontmatter block included — changed since it was read
+- **THEN** the call SHALL be refused without writing (the cap applies to
+  the composed result; `expected=` compares the complete raw bytes, so a
+  concurrent frontmatter-only change conflicts)
+- **AND** `dry_run=True` SHALL diff the composed result
+
+#### Scenario: Append mode
+
+- **WHEN** the client calls `edit_note(path, content, append=True)`
+  without `find` or `section`
+- **THEN** the new file content SHALL be the prior content followed by a
+  single `\n` separator and `content`
+
+#### Scenario: Find/replace mode
+
+- **WHEN** the client calls `edit_note(path, content, find=<text>)`
+  without `append=True` or `section`
+- **THEN** the system SHALL replace occurrences of `find` in the prior
+  content with `content` per the `replace_all` rules below
+
+#### Scenario: Section mode
+
+- **WHEN** the client calls `edit_note(path, content, section=<heading>)`
+  without `append=True` or `find`
+- **THEN** the system SHALL replace the body under the named ATX heading
+  per the section-mode rules below
+
+#### Scenario: Multiple modes set is rejected
+
+- **WHEN** the client supplies more than one of `append=True`,
+  `find=...`, or `section=...` in the same call
+- **THEN** the system SHALL return an error naming the conflicting
+  parameters
+- **AND** SHALL NOT modify the file
