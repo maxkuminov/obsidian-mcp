@@ -4,6 +4,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
 from src.config import settings
+from src.mcp_server.read_result import ReadNoteResult
 from src.mcp_server.tools import (
     check_upload_impl,
     create_note_impl,
@@ -142,25 +143,54 @@ async def read_note(
     section: str | None = None,
     offset: int = 0,
     limit: int | None = None,
-) -> str:
+) -> ReadNoteResult:
     """Read a note from the Obsidian vault by its relative path.
 
-    Responses are capped to a context-safe size, and the cap applies **per
-    component**, not to the whole response: if the note is larger than the cap
-    you get a first content window bounded by the cap *plus* an outline of the
-    note's headings bounded by the cap independently, so a truncated whole-note
-    response can run to roughly twice the cap. Read the one section you need
-    with `section=` rather than paging through the whole note.
+    Returns a **structured result**, not a rendered document. Metadata and note
+    content sit in separate fields, so there is no envelope to parse and no
+    textual procedure to get wrong — read the fields:
 
-    The YAML frontmatter block is rendered as a summary above the content and
-    stripped from the content itself. **Only a complete, unwindowed whole-note
-    response** — no `section`, `offset=0`, no `[TRUNCATED]` notice — round-trips
-    through `edit_note(path, content)`, which preserves the block and treats
-    what you pass as the whole new body. A truncated response must be paged to
-    the end first; a `section=` response belongs to `edit_note(section=...)`,
-    and it **includes the heading line** while `edit_note(section=...)` takes
-    the body only — the body being everything from the line after the heading
-    line to the end of the section.
+    - `content` — the selected note text. Whole-note reads: the body with a
+      valid YAML frontmatter block stripped, which is exactly what
+      `edit_note(path, content)` full replacement accepts. Section reads: the
+      section's **body only**, which is exactly what
+      `edit_note(path, content, section=...)` accepts. Pass it straight back;
+      do not add, strip or split anything.
+    - `heading` — section reads only: the matched heading line, with no line
+      terminator. It is *not* part of `content`, and a section write must not
+      be sent it — the heading line is never rewritten.
+    - `path`, `title`, `tags` — metadata as data.
+    - `frontmatter_yaml` — the frontmatter block's YAML exactly as stored
+      (fence lines excluded). This is the authoritative copy. `frontmatter` is
+      a best-effort JSON view of the same block for convenience and may be
+      absent (dates, non-string keys and recursive aliases have no faithful
+      JSON form). To change frontmatter use `set_frontmatter`, or edit the raw
+      block with `edit_note(find=...)`; never write back a round trip of the
+      JSON view.
+    - `truncated`, `offset`, `next_offset`, `total_chars` — truncation as data.
+      `outline` (whole-note reads that were truncated) lists every section with
+      its `#N` ordinal so you can fetch the one you want directly, and `notice`
+      carries the guidance in prose.
+    - `metadata_omissions` — any metadata field this response had to drop, and
+      why. Nothing is ever signalled by a marker inside a field.
+    - `error` — set when the read failed (missing note, bad `offset`/`limit`,
+      unknown section). It is a normal result, not a transport error, and the
+      content-bearing fields are absent beside it.
+
+    Budgets are per field, not per response: `content` is bounded by the
+    server's response cap, the outline by its own equal budget, and the
+    metadata fields by a third — so a truncated whole-note read can carry
+    several capped components. Read the one section you need with `section=`
+    rather than paging a large note.
+
+    **Round trips.** A whole-note `content` is byte-exact input for
+    `edit_note(path, content)` only when the read is complete and unwindowed
+    (`offset=0` and `truncated` false); a truncated read must be paged to the
+    end first, or full replacement replaces the whole body with the fragment.
+    A section `content` is byte-exact input for `edit_note(section=...)` under
+    the same completeness condition. Byte-identity holds for notes whose body
+    newlines are LF: terminators inside the selected content come back as LF,
+    because this tool normalises and the write tools rewrite raw bytes.
 
     Args:
         path: Vault-relative path to the note (e.g. "Cards/My Note.md")
@@ -169,14 +199,14 @@ async def read_note(
             heading appears under different parents, or a "#N" ordinal ("#7",
             1-based document order) — the ordinal is the only form that can
             address duplicate headings sharing the same parent. The outline
-            printed with a truncated note lists the ordinal for every section.
-            A bare "#N" always selects by position and is never shadowed by a
-            heading whose text happens to be "#N"; use "Parent/#N" to reach
-            such a heading by title.
+            returned with a truncated note carries the ordinal for every
+            section. A bare "#N" always selects by position and is never
+            shadowed by a heading whose text happens to be "#N"; use
+            "Parent/#N" to reach such a heading by title.
         offset: Character offset to start reading from (default 0). Use the
-            value the truncation notice reports to continue.
-        limit: Maximum characters to return. Only lowers the server cap; it
-            cannot raise it.
+            `next_offset` the response reports to continue.
+        limit: Maximum characters of `content` to return. Only lowers the
+            server cap; it cannot raise it.
     """
     return await read_note_impl(path, section=section, offset=offset, limit=limit)
 
@@ -336,17 +366,20 @@ async def edit_note(
        deliberately not writable. Setext (`====`/`----`) headings are not
        matched.
 
-    **Frontmatter and the round trip.** Read a note, edit the content portion,
-    pass it straight back to full replacement: the frontmatter survives. No
-    property of `content`'s shape changes that — a body whose first line is a
-    thematic break `---`, or which itself begins with a complete
-    mapping-shaped fenced block, is body. A note with no valid block (no
-    line-1 fence, or a malformed one) is replaced wholesale by default, which
-    is the repair path and needs no flag.
+    **Frontmatter and the round trip.** Read a note, edit the `content` field
+    of the response, pass it straight back to full replacement: the frontmatter
+    survives. No property of `content`'s shape changes that — a body whose
+    first line is a thematic break `---`, or which itself begins with a
+    complete mapping-shaped fenced block, is body. A note with no valid block
+    (no line-1 fence, or a malformed one) is replaced wholesale by default,
+    which is the repair path and needs no flag. To change the frontmatter
+    itself use `set_frontmatter`, or edit the raw block through `find=`; a
+    `read_note` response's `frontmatter` JSON view is a lossy convenience and
+    must never be written back.
 
     **The round-trip guarantee covers a complete, unwindowed whole-note read
-    only** — `read_note(path)` with no `section`, `offset=0` and no
-    `[TRUNCATED]` notice. A truncated read must be paged to the end before it
+    only** — `read_note(path)` with no `section`, `offset=0` and `truncated`
+    false in the response. A truncated read must be paged to the end before it
     is written back, or full replacement will replace the whole body with the
     fragment.
 
@@ -361,9 +394,10 @@ async def edit_note(
       between the heading line and the body that survives a write.
     - So a blank line you want between the heading and its content belongs in
       `content` (send `"\\ntext"`, not `"text"`).
-    - `read_note(path, section=...)` is the matching read: a section response
-      **includes the heading line** and that same body, and
-      `edit_note(section=...)` takes the body.
+    - `read_note(path, section=...)` is the matching read: its response carries
+      the heading line in the `heading` field and the body in the `content`
+      field, and this tool takes exactly that `content`. Pass the field
+      through unchanged — there is nothing to split off and nothing to strip.
     - Byte-identity holds for notes whose body newlines are LF. Every non-LF
       terminator inside the **selected body** (CRLF, or a lone CR) comes back
       as LF — the read path normalises and this tool writes raw bytes — whether

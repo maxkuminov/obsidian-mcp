@@ -734,7 +734,9 @@ def test_a_refused_call_still_records_the_actor(monkeypatch):
 
     result = asyncio.run(run())
 
-    assert result == tools._NO_VAULT_MESSAGE
+    # `read_note` declares an output schema, so its refusal is typed (#149).
+    assert result.error == tools._NO_VAULT_MESSAGE
+    assert result.content is None
     row = session.added[0]
     assert row.params["error"] == tools._NO_VAULT_MARKER
     assert (row.actor_kind, row.actor_label, row.actor_ref) == (

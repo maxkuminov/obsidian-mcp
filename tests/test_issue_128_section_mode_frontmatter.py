@@ -93,7 +93,7 @@ def test_ordinals_agree_between_read_note_and_edit_note(vault):
     )
     for ordinal, heading in [("#1", "# Alpha"), ("#2", "# Beta"), ("#3", "# Gamma")]:
         extracted = asyncio.run(tools.read_note_impl("n.md", section=ordinal))
-        assert heading in extracted
+        assert extracted.heading == heading
         result = asyncio.run(
             tools.edit_note_impl("n.md", f"body-{ordinal}\n", section=ordinal)
         )
@@ -229,8 +229,9 @@ def test_reads_are_deliberately_not_refused(vault):
     `read_note` keeps extracting from a malformed-block note."""
     write(vault, "n.md", "---\nbroken: [\n---\n## Tasks\nold\n")
     extracted = asyncio.run(tools.read_note_impl("n.md", section="Tasks"))
-    assert "## Tasks" in extracted
-    assert "old" in extracted
+    assert extracted.error is None
+    assert extracted.heading == "## Tasks"
+    assert extracted.content == "old\n"
 
 
 # ── lone-CR notes ───────────────────────────────────────────────────────────
@@ -313,8 +314,8 @@ def test_a_heading_inside_a_cr_fenced_block_is_not_selectable(vault):
     write(vault, "n.md", original)
 
     extracted = asyncio.run(tools.read_note_impl("n.md", section="#1"))
-    assert "## Real" in extracted
-    assert "## Hidden" not in extracted
+    assert extracted.heading == "## Real"
+    assert "## Hidden" not in extracted.content
 
     asyncio.run(tools.edit_note_impl("n.md", "new\n", section="#1"))
     after = read(vault, "n.md")

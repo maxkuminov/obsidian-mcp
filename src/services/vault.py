@@ -298,8 +298,34 @@ def validate_vault_root_path(p: str) -> tuple[str | None, str | None]:
     return normalized, None
 
 
+# The one bound on how long a vault-relative path may be. It matches
+# `notes_metadata.file_path`'s `String(1024)`, so a path this server admits is
+# a path the index can hold — but the reason it is enforced *here*, at
+# admission, is the response budget (#149): `read_note` returns `path`
+# **exactly**, never elided and never marked, because two paths that differ
+# only by a character a lossy rendering would collapse (`a\nb.md` versus
+# `a b.md`) must stay distinguishable. An exact field can only be a fixed
+# allocation in the response if the value itself is bounded, so the bound sits
+# at the door rather than in the renderer. Every path-bearing error message
+# inherits it for the same reason.
+#
+# The refusal deliberately does NOT quote the path: repeating an over-long
+# value back is the unbounded interpolation the limit exists to prevent.
+MAX_PATH_CHARS = 1024
+
+
+def path_too_long_error(relative_path: str) -> str:
+    """The one wording for "this path is longer than the server accepts"."""
+    return (
+        f"Path too long: {len(relative_path):,} characters, and the limit is "
+        f"{MAX_PATH_CHARS:,}. Shorten the path or the note's filename."
+    )
+
+
 def validate_path(relative_path: str, user_id: int | None = None) -> Path:
     """Resolve a relative path within the vault, preventing traversal."""
+    if len(relative_path) > MAX_PATH_CHARS:
+        raise ValueError(path_too_long_error(relative_path))
     vault = _vault_root(user_id)
     resolved = (vault / relative_path).resolve()
     try:
@@ -1335,6 +1361,8 @@ class MutableTarget:
 def _mutable_parts(relative_path: str) -> list[str]:
     """Lexical half of the mutable-path guard: components, or a `ValueError`."""
     raw = str(relative_path).replace(os.sep, "/")
+    if len(raw) > MAX_PATH_CHARS:
+        raise ValueError(path_too_long_error(raw))
     if "\x00" in raw:
         raise ValueError(f"Path traversal denied: {relative_path}")
     if raw.endswith("/"):
@@ -1568,13 +1596,19 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
     if not path.is_file():
         raise FileNotFoundError(f"Note not found: {relative_path}")
     raw = path.read_text(encoding="utf-8")
-    frontmatter, content = parse_frontmatter(raw)
+    frontmatter, content, diagnosis = parse_frontmatter_diagnose(raw)
     title = frontmatter.get("title") or path.stem
     tags = extract_tags(content, frontmatter)
     return {
         "path": relative_path,
         "title": title,
         "frontmatter": frontmatter,
+        # The block's YAML source as stored, or None when the note carries no
+        # valid line-1 block. `read_note` returns this as the *authoritative*
+        # frontmatter representation (#149) and the parsed mapping above only
+        # as a lossy view beside it. `""` (a valid empty block) and `None` (no
+        # block) are different answers and must stay distinguishable.
+        "frontmatter_yaml": diagnosis.yaml_text if diagnosis.valid else None,
         "tags": tags,
         "content": content,
         "size": path.stat().st_size,
@@ -2628,12 +2662,21 @@ class FrontmatterDiagnosis:
     region, the closing fence and the single newline after it, so
     `block + body == raw` exactly whenever `valid` is true. It is never
     derived as `raw[:-len(body)]`, which is wrong for an empty body.
+
+    `yaml_text` is that same span with the two fence lines excluded — the YAML
+    source as stored, byte for byte. It exists because `read_note` returns it
+    (#149): the parsed mapping is a *lossy* view of a block (dates, non-string
+    keys, anchors), so the response carries the raw text as the authoritative
+    representation and the mapping only as a best-effort convenience. It is
+    `""` for a valid empty block (`---\\n---\\n`) and for anything not valid,
+    which `valid` already distinguishes.
     """
 
     valid: bool
     defect: str | None = None       # "unclosed_fence" | "yaml_error" | "not_a_mapping"
     message: str | None = None      # human phrase; carries PyYAML's own text
     block: str = ""
+    yaml_text: str = ""
 
 
 _ABSENT = FrontmatterDiagnosis(valid=False)
@@ -2709,7 +2752,9 @@ def _partition_frontmatter(raw: str) -> tuple[dict, str, FrontmatterDiagnosis]:
         # tab (a tab cannot start a token), so asking it would make
         # `---\n \n---\n` valid and `---\n\t\n---\n` a parse error — a
         # distinction no author could predict and one the spec does not draw.
-        return {}, body, FrontmatterDiagnosis(valid=True, block=block)
+        return {}, body, FrontmatterDiagnosis(
+            valid=True, block=block, yaml_text=yaml_text
+        )
     try:
         fm = yaml.safe_load(yaml_text)
     except yaml.YAMLError as e:
@@ -2741,7 +2786,7 @@ def _partition_frontmatter(raw: str) -> tuple[dict, str, FrontmatterDiagnosis]:
                 f"(it parses as a {type(fm).__name__})"
             ),
         )
-    return fm, body, FrontmatterDiagnosis(valid=True, block=block)
+    return fm, body, FrontmatterDiagnosis(valid=True, block=block, yaml_text=yaml_text)
 
 
 def parse_frontmatter(raw: str) -> tuple[dict, str]:
@@ -3072,6 +3117,30 @@ def extract_section(text: str, heading: str) -> tuple[str | None, str | None]:
         return None, err
     _, body_end = _section_body_span(text, headings, idx)
     return text[headings[idx]["line_start"]:body_end], None
+
+
+def extract_section_parts(
+    text: str, heading: str
+) -> tuple[tuple[str, str] | None, str | None]:
+    """Return `((heading_line, body), None)` or `(None, error)` for a section.
+
+    The heading line carries **no** line terminator, and `body` is exactly the
+    span `replace_section` overwrites — both come from the same
+    `_section_body_span` the write side uses, so `read_note`'s `content` field
+    cannot drift from what `edit_note(section=…)` replaces (#149).
+    `extract_section` remains the concatenating sibling, for callers that want
+    the heading line and its body as one string.
+    """
+    headings = _scan_headings(text)
+    idx, err = _resolve_section_index(headings, heading)
+    if err is not None:
+        return None, err
+    body_start, body_end = _section_body_span(text, headings, idx)
+    matched = headings[idx]
+    return (
+        text[matched["line_start"]:matched["line_end"]],
+        text[body_start:body_end],
+    ), None
 
 
 def replace_section(text: str, heading: str, new_body: str) -> tuple[str | None, str | None]:

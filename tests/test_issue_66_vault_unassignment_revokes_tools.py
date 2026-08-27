@@ -156,18 +156,36 @@ def test_the_registry_is_not_empty():
     assert len(_registered_tools()) >= 25
 
 
+def _refusal_text(result, tool_name: str) -> str:
+    """The refusal the caller was handed, whatever shape the tool returns.
+
+    Nearly every tool returns `str`. `read_note` declares an MCP output schema
+    (#149), so its refusal has to be a typed `ReadNoteResult` carrying the same
+    message in `error` — a bare string there fails FastMCP's output validation
+    and reaches the agent as a *protocol* error instead of the in-band refusal
+    the admission gate promises.
+    """
+    if isinstance(result, str):
+        return result
+    error = getattr(result, "error", None)
+    assert isinstance(error, str), f"{tool_name} returned {result!r}"
+    # Nothing rides along with the refusal.
+    assert getattr(result, "content", None) is None, tool_name
+    return error
+
+
 @pytest.mark.parametrize("tool", _registered_tools(), ids=lambda t: t.name)
 def test_unassigned_user_is_refused_by_every_registered_tool(as_unassigned_user, tool):
     """No exemptions. `get_vault_guide` returns the vault's own CLAUDE.md and
     `check_upload` reports a published vault path, so every registered tool
     reads or writes vault content or vault metadata."""
     result, params, _ = _run_capturing_log(lambda: tool.fn(**_dummy_args(tool.fn)))
-    assert isinstance(result, str), f"{tool.name} returned {type(result)!r}"
-    assert result == tools._NO_VAULT_MESSAGE, (
-        f"{tool.name} did not refuse: {result[:200]!r}"
+    refusal = _refusal_text(result, tool.name)
+    assert refusal == tools._NO_VAULT_MESSAGE, (
+        f"{tool.name} did not refuse: {refusal[:200]!r}"
     )
     # The refusal must not name a path, a note or an excerpt.
-    assert "Projects/Alpha.md" not in result
+    assert "Projects/Alpha.md" not in str(result)
     assert params is not None, f"{tool.name} refusal was not logged"
 
 

@@ -513,7 +513,7 @@ async def test_a_read_tool_issues_no_assignment_re_read(multi_user_vault):
 
     result = await tools.read_note_impl("note.md")
 
-    assert "original body" in result
+    assert "original body" in result.content
     assert ctx.assignment["reads"] == 0
 
 

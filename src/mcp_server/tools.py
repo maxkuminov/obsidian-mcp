@@ -11,7 +11,6 @@ import posixpath
 import re
 import stat
 import time
-from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import wraps
@@ -19,7 +18,9 @@ from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
+import pydantic_core
 from mcp.server.fastmcp import Image
+from pydantic import BaseModel
 from sqlalchemy import text
 
 from src.auth.session import (
@@ -36,6 +37,12 @@ from src.config import (
 )
 from src.database import async_session
 from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
+from src.mcp_server.read_result import (
+    ReadNoteResult,
+    apply_metadata_budget,
+    build_outline,
+    frontmatter_view,
+)
 from src.models.db import UsageLog
 from src.services import timing
 from src.services.embeddings import semantic_search
@@ -43,6 +50,7 @@ from src.services.filters import apply_note_filters
 from src.services.search import full_text_search
 from src.services import transfer, vault_fs
 from src.services.vault import (
+    MAX_PATH_CHARS,
     UnconfirmedPublication,
     VaultAnchorUnavailable,
     VaultAssignmentChanged,
@@ -51,7 +59,7 @@ from src.services.vault import (
     _vault_root,
     classify_bytes,
     confirmed_publication,
-    extract_section,
+    extract_section_parts,
     is_hidden_path,
     list_dir,
     move_file_no_clobber,
@@ -385,7 +393,31 @@ def _vault_admission_error() -> str | None:
     return None
 
 
-def _tracked(tool_name: str, param_keys: list[str], transforms: dict | None = None):
+def _response_size(result) -> int:
+    """How many characters this result costs the caller's context.
+
+    A tool that declares a structured output type does not put `str(result)` on
+    the wire: FastMCP renders the text block with
+    `pydantic_core.to_json(result, fallback=str, indent=2)` and sends
+    `structuredContent` beside it. `len(str(model))` would record a pydantic
+    `repr` — a number that tracks nothing an operator can act on. So models are
+    measured as the JSON the client actually receives; everything else keeps
+    the accounting it always had.
+    """
+    if isinstance(result, BaseModel):
+        try:
+            return len(pydantic_core.to_json(result, fallback=str, indent=2).decode())
+        except Exception:  # pragma: no cover — accounting must never fail a call
+            logger.exception("could not measure a structured tool result")
+    return len(str(result))
+
+
+def _tracked(
+    tool_name: str,
+    param_keys: list[str],
+    transforms: dict | None = None,
+    refusal_result=None,
+):
     """Decorator that times the call and logs it to usage_logs.
 
     `transforms` maps a parameter name to a function applied before the value
@@ -393,6 +425,13 @@ def _tracked(tool_name: str, param_keys: list[str], transforms: dict | None = No
     its host: the whole point of the allow-list is that a capability or a URL
     carrying one never reaches `usage_logs`, and "just don't log the URL" would
     lose the one field that makes an import auditable.
+
+    `refusal_result` maps the admission gate's refusal *message* onto the shape
+    this particular tool returns. It exists for `read_note`, which declares a
+    structured output type (#149): a bare string from a tool FastMCP validates
+    against an output schema is not an in-band error, it is a protocol error —
+    the agent sees a transport failure instead of "you have no vault". Tools
+    that return strings leave it None and get the message unchanged.
     """
     transforms = transforms or {}
 
@@ -414,7 +453,7 @@ def _tracked(tool_name: str, param_keys: list[str], transforms: dict | None = No
                 # refusal is still logged, like any other tool error.
                 refusal = _vault_admission_error()
                 if refusal is not None:
-                    result = refusal
+                    result = refusal if refusal_result is None else refusal_result(refusal)
                     extra = {"error": _NO_VAULT_MARKER}
                 else:
                     result = await fn(*args, **kwargs)
@@ -441,7 +480,7 @@ def _tracked(tool_name: str, param_keys: list[str], transforms: dict | None = No
                 # Whatever the service measured. Absent for tools that measure
                 # nothing, so `params` keeps its current shape for them.
                 logged.update(timing.current() or {})
-                await _log_usage(tool_name, logged, duration_ms, len(str(result)))
+                await _log_usage(tool_name, logged, duration_ms, _response_size(result))
                 return result
             finally:
                 timing.clear(token)
@@ -500,190 +539,242 @@ def _window(body: str, offset: int, limit: int) -> tuple[str, int | None]:
     return chunk, (end if end < len(body) else None)
 
 
-_MAX_OUTLINE_TITLE = 80
+# How much of a caller-supplied section selector may be quoted back inside a
+# server-authored notice or error. The selector is an argument, not note text,
+# but it is unbounded, and the response requirement is that error and notice
+# strings interpolate only bounded values (#149).
+_NOTICE_SELECTOR_MAX = 256
 
 
-def _outline_text(content: str, cap: int) -> str | None:
-    """Render a navigable heading outline, or None if there are no headings.
+def _bounded(text: str, limit: int) -> str:
+    """Cut `text` to `limit` characters. No marker — see below.
 
-    The returned string NEVER exceeds `cap` characters. The outline is appended
-    to a response that exists *because* the content was too large, so it is the
-    one place where adding context can recreate the problem being solved: a note
-    with thousands of headings otherwise produces an outline many times the size
-    of the content window it accompanies.
-
-    The budget is enforced in layers, because each has a hole that only shows
-    up at an extreme:
-      1. Long titles are elided at `_MAX_OUTLINE_TITLE`.
-      2. If the complete listing fits, it is emitted as-is. No summary is
-         needed when nothing is omitted, so no room is reserved for one —
-         reserving unconditionally drops entries that had room and returns a
-         near-empty outline for a small note.
-      3. Otherwise entries are added only while they fit, with room reserved
-         for the omitted-sections summary, which is itself text and must be
-         paid for before it is spent.
-      4. A final hard truncation, so the guarantee holds unconditionally even
-         for a degenerate `cap` (a caller may pass `limit=1`) where not even
-         one entry or the bare summary can fit. In that case the outline
-         degrades to a marker; there is no `cap`-respecting alternative.
+    A marker appended to a note-controlled value is indistinguishable from note
+    content, which is the forgery class #149 exists to end. Server-authored
+    strings (errors, notices) are cut plainly and the fact is either obvious
+    from the shape or reported out of band in `metadata_omissions`.
     """
-    sections = outline_sections(content)
-    if not sections:
-        return None
-    seen = Counter(s["text"] for s in sections)
+    return text if len(text) <= limit else text[:limit]
 
-    def _summary(omitted: int) -> str:
-        return (
-            f"- … {omitted:,} more section(s) not shown (outline truncated "
-            f"to stay within the response cap). Ordinals run #1–"
-            f"#{len(sections)}; request one directly, or narrow with "
-            f"`keyword_search`."
+
+def _as_text(value) -> str | None:
+    """A frontmatter-derived value as a string, or None.
+
+    `title:` is whatever YAML says it is — a list, a date, a mapping — while
+    the result model's field is a string. The coercion happens **here**, at
+    model-build time, and never in a serializer: FastMCP renders the text block
+    from the returned object and `structuredContent` from the validated dump,
+    so a coercion only one of them applies is a coercion that makes the two
+    renderings disagree.
+    """
+    if value is None or isinstance(value, str):
+        return value
+    return str(value)
+
+
+def _origin_label(section: str | None) -> str:
+    """What a notice or error calls the thing being read."""
+    if section is None:
+        return "note"
+    return f"section '{_bounded(section, _NOTICE_SELECTOR_MAX)}'"
+
+
+def _read_notice(
+    path: str,
+    section: str | None,
+    offset: int,
+    shown_to: int,
+    total: int,
+    next_offset: int | None,
+    outline,
+) -> str:
+    """The server-authored prose beside a truncated read's truncation fields.
+
+    Truncation itself is *data* now (`truncated`, `offset`, `next_offset`,
+    `total_chars`, and the outline object); this string is the guidance an
+    agent acts on, and it is the single producer of the narrowing guidance the
+    note-read spec requires to name only registered tools. Every value it
+    interpolates is bounded: `path` by `MAX_PATH_CHARS` at admission, the
+    selector by `_NOTICE_SELECTOR_MAX`, the rest are integers.
+    """
+    origin = _origin_label(section)
+    parts = [
+        f"Truncated: showing characters {offset:,}–{shown_to:,} of {total:,} "
+        f"for this {origin}."
+    ]
+    if next_offset is not None:
+        call = f'read_note(path="{path}"'
+        if section is not None:
+            call += f', section="{_bounded(section, _NOTICE_SELECTOR_MAX)}"'
+        call += f", offset={next_offset})"
+        parts.append(f"Continue with `{call}`.")
+
+    if section is None:
+        if outline is not None and outline.entries:
+            parts.append(
+                "This note's sections are listed in the outline field, each with "
+                "the ordinal that addresses it. Read one directly with "
+                f'`read_note(path="{path}", section="<heading>")`, or by ordinal '
+                '(`section="#7"`). A bare `#N` always selects by position, so it '
+                "stays reliable when titles repeat."
+            )
+            if outline.truncated:
+                listed = len(outline.entries)
+                parts.append(
+                    f"The outline lists {listed:,} of {listed + (outline.omitted or 0):,} "
+                    "sections; the ones it left out are counted in its own "
+                    "omission fields rather than left silent."
+                )
+        elif outline is not None:
+            parts.append(
+                "This note has sections, but not one outline entry fits the "
+                "response budget, so the outline carries only its truncation "
+                "marker."
+            )
+        parts.append(
+            "You can also narrow the request with `keyword_search` instead of "
+            "reading the whole note."
         )
-
-    def _entry(s: dict) -> str:
-        marker = "#" * s["depth"]
-        title = s["text"]
-        if len(title) > _MAX_OUTLINE_TITLE:
-            title = title[:_MAX_OUTLINE_TITLE - 1] + "…"
-        flag = "" if s["size"] <= cap else "  ⚠ over the cap, will page"
-        # A repeated heading can only be addressed by its ordinal — the
-        # path-style form cannot separate duplicate siblings.
-        dup = "  ← duplicate title, use the ordinal" if seen[s["text"]] > 1 else ""
-        return f"- `#{s['ordinal']}` `{marker} {title}` ({s['size']:,} chars){flag}{dup}"
-
-    entries = [_entry(s) for s in sections]
-
-    # Fast path: if the complete listing fits, emit it. The summary is only
-    # needed when something is actually omitted, so charging its reservation
-    # here would drop entries that had room — a short outline is a worse
-    # answer than a complete one, and the cap is not under threat.
-    full = "\n".join(entries)
-    if len(full) <= cap:
-        return full
-
-    # Truncating: now the summary is real text that must be paid for before
-    # it is spent, or appending it pushes the result back over `cap`.
-    reserve = len(_summary(len(sections))) + 1
-    lines: list[str] = []
-    used = 0
-    for i, line in enumerate(entries):
-        if used + len(line) + 1 + reserve > cap:
-            lines.append(_summary(len(sections) - i))
-            break
-        lines.append(line)
-        used += len(line) + 1
-
-    if not lines:
-        lines.append(_summary(len(sections)))
-
-    out = "\n".join(lines)
-    if len(out) > cap:
-        # Degenerate cap: even the summary does not fit. Truncating to a bare
-        # marker is better than silently blowing the budget we are enforcing.
-        out = out[:cap - 1] + "…" if cap > 1 else out[:cap]
-    return out
+    return "\n\n".join(parts)
 
 
-@_tracked("read_note", ["path", "section", "offset", "limit"])
+def _read_note_refusal(message: str) -> ReadNoteResult:
+    """The admission gate's refusal, in the shape this tool declares.
+
+    `read_note` is the one tool with an MCP output schema, so the gate cannot
+    hand back a bare string: FastMCP would fail output validation and the agent
+    would see a protocol error where the contract promises an in-band one. The
+    path is deliberately NOT echoed — the gate runs before any validation, so
+    the argument is unbounded, and this response's whole discipline is that
+    nothing unbounded is interpolated.
+    """
+    return ReadNoteResult(error=message)
+
+
+@_tracked(
+    "read_note",
+    ["path", "section", "offset", "limit"],
+    refusal_result=_read_note_refusal,
+)
 async def read_note_impl(
     path: str,
     section: str | None = None,
     offset: int = 0,
     limit: int | None = None,
-) -> str:
+) -> ReadNoteResult:
     """Read a note by its vault-relative path, capped to a context-safe size.
 
-    The frontmatter block is rendered as a summary and stripped from the
-    content. Only a **complete, unwindowed whole-note** response (`section=None`,
-    `offset=0`, no `[TRUNCATED]` notice) round-trips through
-    `edit_note(path, content)` — default full replacement preserves the block
-    and takes what it is given as the entire new body, so a truncated read must
-    be paged to the end before it is written back. A `section=` response
-    belongs to `edit_note(section=...)`, and it **includes the heading line**
-    while `edit_note(section=...)` takes the body only — the body being
-    everything from the line after the heading line to the end of the section.
+    Returns a **structured result**, not a rendered string: metadata and note
+    content sit in separate fields, so nothing a note contains can change which
+    field anything else appears in (#149 — the previous envelope was forgeable
+    by a note's own frontmatter, twice reproduced).
+
+    - `content` — whole-note reads: the body with a valid frontmatter block
+      stripped, which is what `edit_note(path, content)` full replacement
+      accepts, but **only** when the read is complete and unwindowed
+      (`offset=0`, `truncated` false). Section reads: the section's **body
+      only**, byte-exact input for `edit_note(path, content, section=…)`.
+    - `heading` — section reads: the matched heading line, no terminator. It is
+      NOT part of `content`, and a section write must not be sent it.
+    - `frontmatter_yaml` — the block as stored, authoritative. `frontmatter` is
+      a best-effort JSON view beside it and can be absent; mutate frontmatter
+      through `set_frontmatter` or the raw block, never by round-tripping the
+      view.
+    - `metadata_omissions` — every metadata field this response dropped, and
+      why. Nothing is signalled inside a note-controlled field.
+
+    Byte-identity on a round trip holds for LF-bodied notes; terminators inside
+    the selected body come back as LF because this path normalises and the
+    write path rewrites raw bytes.
+
+    There is no textual procedure for recovering content from this response,
+    and none is needed: the field is the recovery.
     """
     uid = current_user_id.get()
+    # `limit` lowers the CONTENT window (and, as it always has, the outline's
+    # own budget). The metadata budget is the server cap: `limit` is documented
+    # as bounding what content comes back, and letting `limit=1` silently drop
+    # a note's title and tags would make a cheap probe useless.
+    metadata_budget = settings.max_read_response_chars
+    cap = settings.max_read_response_chars
+
+    def _fail(message: str) -> ReadNoteResult:
+        result = ReadNoteResult(error=_bounded(message, metadata_budget))
+        # An over-long path is refused before it is echoed anywhere; every
+        # other error names the path the caller asked for, exactly.
+        if len(path) <= MAX_PATH_CHARS:
+            result.path = path
+        return result
+
+    # Error precedence, in this order and no other: path resolution first, then
+    # parameter validation, then section resolution. Exactly one error comes
+    # back, and no content-bearing field rides with it.
     try:
         note = read_file(path, user_id=uid)
     except FileNotFoundError:
-        return f"Note not found: {path}"
+        return _fail(f"Note not found: {path}")
     except ValueError as e:
-        return str(e)
+        return _fail(str(e))
 
-    cap = settings.max_read_response_chars
     if limit is not None:
         if limit < 1:
-            return f"read_note: limit must be >= 1 (got {limit})."
+            return _fail(f"read_note: limit must be >= 1 (got {limit}).")
         cap = min(limit, cap)
     if offset < 0:
-        return f"read_note: offset must be >= 0 (got {offset})."
+        return _fail(f"read_note: offset must be >= 0 (got {offset}).")
 
     content = note["content"]
+    heading: str | None = None
     body = content
-    origin = "note"
     if section is not None:
-        extracted, err = extract_section(content, section)
+        parts, err = extract_section_parts(content, section)
         if err is not None:
-            return err
-        body = extracted
-        origin = f"section '{section}'"
+            return _fail(err)
+        heading, body = parts
 
-    parts = [f"# {note['title']}\n**Path:** `{note['path']}`"]
-    if note["tags"]:
-        parts.append(f"**Tags:** {', '.join(note['tags'])}")
-    if note["frontmatter"]:
-        fm_lines = [f"  {k}: {v}" for k, v in note["frontmatter"].items() if k not in ("title", "tags")]
-        if fm_lines:
-            parts.append("**Frontmatter:**\n" + "\n".join(fm_lines))
-
-    if offset == 0 and len(body) <= cap:
-        parts.append(f"\n---\n{body}")
-        return "\n".join(parts)
-
+    total = len(body)
     chunk, next_offset = _window(body, offset, cap)
     if not chunk and offset > 0:
-        if offset == len(body):
-            return (
-                f"read_note: offset {offset:,} is exactly the end of {origin} "
-                f"in {path} ({len(body):,} chars) — the whole {origin} has "
-                f"been read, there is nothing further."
+        # Empty content at offset 0 is a successful read of an empty section;
+        # only a *continuation* offset can run off the end.
+        if offset == total:
+            return _fail(
+                f"read_note: offset {offset:,} is exactly the end of "
+                f"{_origin_label(section)} in {path} ({total:,} chars) — the "
+                "whole selection has been read, there is nothing further."
             )
-        return (
-            f"read_note: offset {offset:,} is past the end of {origin} in {path} "
-            f"({len(body):,} chars)."
+        return _fail(
+            f"read_note: offset {offset:,} is past the end of "
+            f"{_origin_label(section)} in {path} ({total:,} chars)."
         )
 
-    shown_to = min(offset, len(body)) + len(chunk)
-    notice = [
-        f"\n\n---\n**[TRUNCATED]** Showing chars {offset:,}–{shown_to:,} "
-        f"of {len(body):,} for this {origin}."
-    ]
-    if next_offset is not None:
-        notice.append(
-            f'Continue with `read_note(path="{path}"'
-            + (f', section="{section}"' if section is not None else "")
-            + f', offset={next_offset})`.'
+    truncated = offset > 0 or next_offset is not None
+    view, view_omission = frontmatter_view(note["frontmatter"])
+    result = ReadNoteResult(
+        path=note["path"],
+        title=_as_text(note["title"]),
+        tags=list(note["tags"]) or None,
+        frontmatter_yaml=note["frontmatter_yaml"],
+        frontmatter=view,
+        heading=heading,
+        content=chunk,
+        truncated=truncated,
+        offset=offset,
+        next_offset=next_offset,
+        total_chars=total,
+    )
+    if truncated:
+        # The outline is a whole-note affordance: a caller who named a section
+        # has already chosen, and does not need the others listed.
+        if section is None:
+            result.outline = build_outline(content, cap)
+        result.notice = _read_notice(
+            note["path"], section, offset, min(offset, total) + len(chunk),
+            total, next_offset, result.outline,
         )
-    if section is None:
-        outline = _outline_text(content, cap)
-        if outline:
-            notice.append(
-                "Prefer jumping straight to what you need — this note's sections "
-                f'are listed below. Read one with `read_note(path="{path}", '
-                'section="<heading>")`, or by the `#N` ordinal shown '
-                '(`section="#7"`). A bare `#N` always selects by position, so '
-                'it stays reliable when titles repeat:\n'
-                + outline
-            )
-        notice.append(
-            "You can also narrow the search first with `keyword_search` instead of "
-            "reading the whole note."
-        )
+    apply_metadata_budget(result, view_omission, metadata_budget)
+    return result
 
-    parts.append(f"\n---\n{chunk}")
-    parts.append("\n\n".join(notice))
-    return "\n".join(parts)
 
 
 @_tracked("list_notes", ["folder", "limit", "tags", "frontmatter"])
@@ -1670,10 +1761,13 @@ async def edit_note_impl(
     replaced wholesale by default, since there is nothing valid to preserve.
 
     **The round-trip guarantee covers a complete, unwindowed whole-note read
-    only** — `read_note(path)` with no `section`, `offset=0` and no
-    `[TRUNCATED]` notice. Feed that response's content back through default
-    full replacement and the note is unchanged. A truncated read must be
-    completed (page with `offset`) before it is written back.
+    only** — `read_note(path)` with no `section`, `offset=0` and `truncated`
+    false in the response. Feed that response's `content` field back through
+    default full replacement and the note is unchanged. A truncated read must
+    be completed (page with `offset`) before it is written back. To change the
+    frontmatter itself use `set_frontmatter` or edit the raw block with
+    `find=`; the response's `frontmatter` JSON view is a lossy convenience and
+    is never valid input to a write.
 
     **Section mode: what `content` replaces.** In section mode `content` is the
     section's **body**: the text beginning on the line immediately after the
@@ -1684,9 +1778,15 @@ async def edit_note_impl(
     code block sitting directly under the heading**, included; there is no
     third region between the heading line and the body that survives a write.
     A blank line wanted between the heading and its content therefore belongs
-    in `content`. `read_note(path, section=...)` is the matching read: a
-    section response carries the heading line and that same body, and
-    `edit_note(section=...)` takes the body. Byte-identity holds for notes
+    in `content`. `read_note(path, section=...)` is the matching read: its
+    response carries the heading line in the `heading` field and the body in
+    the `content` field, and this tool takes exactly that `content` — pass the
+    field through unchanged; there is nothing to split off it and nothing to
+    strip from it. (There used to be: the response was one rendered string and
+    the docstrings had to describe recovering the body from it. Every such
+    procedure was forgeable by a note's own frontmatter into a write that
+    clobbered the section, which is why the response is fields now — #149,
+    `docs/architecture/vault-tools.md`.) Byte-identity holds for notes
     whose body newlines are LF; every non-LF terminator inside the *selected
     body* comes back as LF, whether the note uses one dialect throughout or
     mixes them, because the read path normalises and this tool writes raw

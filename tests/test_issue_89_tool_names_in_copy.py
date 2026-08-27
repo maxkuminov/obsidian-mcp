@@ -11,11 +11,19 @@ This is the *other half* of #78, which found the same wrong name in
 `usage_logs.tool`. That fix corrected `_tracked`'s first argument and the panel
 and left the agent-facing copy alone.
 
-What is pinned here is the property, not the string, over the **two** producers
-of that guidance and no wider:
+What is pinned here is the property, not the string, over the producer of that
+guidance and no wider.
 
-  * producer 1 — the omitted-sections summary inside `_outline_text`;
-  * producer 2 — the truncation notice `read_note_impl` builds.
+**There used to be two producers; #149 left one.** The outline was a rendered
+string carrying its own "N more sections not shown — narrow with
+`keyword_search`" summary; it is now an object whose omission state is data
+(`omitted`, `first_ordinal`, `last_ordinal`, `truncated`) and carries no prose
+at all. All narrowing guidance therefore lives in the response's `notice`
+field, and the tests below isolate that one producer in each of the two shapes
+the old pair covered: a truncated read whose outline is *itself* truncated
+(what producer 1 covered) and a truncated read of a headingless note (what
+producer 2 covered). The outline object is additionally checked to yield no
+tool reference at all — data cannot name an unregistered tool.
 
 A source-wide scan of `tools.py` cannot work: `list_files`'s own truncation
 line emits a bare `` `pattern` ``, lexically identical to a bare
@@ -198,51 +206,54 @@ def _note_with_many_headings() -> str:
 _HEADINGLESS_BODY = "plain filler text, one long unbroken line. " * 250
 
 
-# --- producer 1: the outline's omitted-sections summary ---------------------
+# --- shape 1: the notice beside a TRUNCATED outline -------------------------
+#
+# What producer 1 used to cover. The outline no longer speaks — it reports its
+# omission as data — so the guidance for a caller whose outline was cut short
+# is the notice's one narrowing clause, and it must still be callable.
 
 
-def test_outline_summary_narrows_with_a_registered_tool():
-    """`_outline_text`'s summary must offer `keyword_search`, and only real tools.
+@pytest.mark.asyncio
+async def test_a_truncated_outline_still_offers_a_registered_tool(vault, cap):
+    (vault / "many.md").write_text(_note_with_many_headings(), encoding="utf-8")
+    out = await tools.read_note_impl("many.md")
+    assert out.truncated is True
+    assert out.outline is not None and out.outline.truncated is True, (
+        "fixture no longer truncates the outline; this test would pass vacuously"
+    )
 
-    The cap is deliberately well above the summary's own length: the degenerate
-    branch (`limit=1`) hard-truncates the outline mid-string and can cut the
-    name out of it, which would test the truncation rather than the copy.
-    """
-    outline = tools._outline_text(_note_with_many_headings(), _OUTLINE_CAP)
+    clause = _the_guidance_clause(out.notice.split("\n\n"), "truncated-outline notice")
+    _assert_guidance_names_the_search_tool(clause, "truncated-outline notice")
+    _assert_whole_output_is_callable(out.notice, "truncated-outline notice")
+
+
+def test_the_outline_object_names_no_tool_at_all():
+    """The other half of retiring producer 1: it cannot name a wrong tool now,
+    because it carries no prose to name one in."""
+    outline = tools.build_outline(_note_with_many_headings(), _OUTLINE_CAP)
     assert outline is not None
-    assert len(outline) <= _OUTLINE_CAP
-
-    # The summary is its own line, so newlines are this producer's clause
-    # separator. If nothing was omitted there is no summary and no clause
-    # matches the anchor — which fails loudly rather than passing vacuously.
-    clauses = outline.split("\n")
-    clause = _the_guidance_clause(clauses, "outline summary")
-
-    _assert_guidance_names_the_search_tool(clause, "outline summary")
-    _assert_whole_output_is_callable(outline, "outline summary")
+    assert outline.truncated is True
+    assert _tool_references(outline.model_dump_json()) == set()
 
 
-# --- producer 2: the read_note truncation notice ----------------------------
+# --- shape 2: the notice on a headingless note ------------------------------
 
 
 @pytest.mark.asyncio
 async def test_truncation_notice_narrows_with_a_registered_tool(vault, cap):
-    """A truncated read of a **headingless** note isolates producer 2's clause.
-
-    Headingless is the point: `_outline_text` returns None, so producer 1's
-    summary is not embedded in the notice and the clause the notice appends is
-    the only narrowing guidance in the output.
-    """
+    """A truncated read of a **headingless** note: no outline exists at all, so
+    the notice's narrowing clause is the only guidance in the response."""
     (vault / "flat.md").write_text(_HEADINGLESS_BODY, encoding="utf-8")
     out = await tools.read_note_impl("flat.md")
-    assert "[TRUNCATED]" in out
+    assert out.truncated is True
+    assert out.outline is None
 
     # The notice's parts are joined with a blank line.
-    clauses = out.split("\n\n")
+    clauses = out.notice.split("\n\n")
     clause = _the_guidance_clause(clauses, "truncation notice")
 
     _assert_guidance_names_the_search_tool(clause, "truncation notice")
-    _assert_whole_output_is_callable(out, "truncation notice")
+    _assert_whole_output_is_callable(out.notice, "truncation notice")
 
 
 # --- (d) over the shape production actually emits ---------------------------
@@ -250,17 +261,19 @@ async def test_truncation_notice_narrows_with_a_registered_tool(vault, cap):
 
 @pytest.mark.asyncio
 async def test_a_with_headings_truncated_read_names_only_registered_tools(vault, cap):
-    """The real shape: producer 1's summary embedded inside producer 2's notice.
+    """The real shape: a note with sections, truncated, outline and all.
 
-    No clause is isolated here — two narrowing clauses coexist — so only the
-    whole-output registry check applies.
+    The whole response is checked, not just the notice — the outline rides in
+    the same result and any tool name anywhere in it is agent-facing.
     """
     body = _note_with_many_headings() + "\n\n" + _HEADINGLESS_BODY
     (vault / "sectioned.md").write_text(body, encoding="utf-8")
     out = await tools.read_note_impl("sectioned.md")
-    assert "[TRUNCATED]" in out
+    assert out.truncated is True
 
-    _assert_whole_output_is_callable(out, "with-headings truncated read")
+    _assert_whole_output_is_callable(
+        out.model_dump_json(), "with-headings truncated read"
+    )
 
 
 # --- the name that was wrong -----------------------------------------------
