@@ -728,3 +728,30 @@ The Ollama (local, sequential) embedding batch SHALL have no aggregate deadline:
 - **WHEN** the provider returns fewer vectors than chunks for a note
 - **THEN** the note SHALL NOT be certified and its previous vectors SHALL remain in place
 
+### Requirement: A masker grammar change forces re-derivation without corrupting note identity
+
+Link rows, inline tags, and embedded vectors are derived through the shared fence recognizer, but re-derivation is normally gated on `content_hash`, which does not change when only the grammar changes. A grammar change SHALL therefore ship with a versioned re-derivation mechanism: a per-note extraction-version marker, distinct from `content_hash`, compared against a code-level current version. When a note's marker is stale, the next index pass SHALL re-extract its links and tags, and SHALL then stamp the marker. Grammar-attributable embedding invalidation SHALL occur exactly when the note's **embedded text — the cleaned-for-embedding output — differs between the grammar version that stamped the note's recorded version and the current grammar**; each version's cleaning function is retained frozen while any row remains stamped with it, so the comparison is direction-aware and works for rollbacks as well as upgrades. The comparison is over cleaned output, not recognised-span tuples, because span equality is neither necessary nor sufficient for embedded-text equality (the v0 cleaner applied its two regexes sequentially, so adjacent mixed fences produce identical spans but different cleaned text, and vice versa). Independent invalidators (content change, `file_path` change, provider or configuration change, exclusion reconciliation) are cumulative: the cleaned-output comparison SHALL NOT suppress an invalidation any other requirement mandates. `content_hash` SHALL always hold the true hash of the note's bytes — it SHALL NOT be nulled or overwritten with a sentinel — so hash-based move/rename matching keeps working throughout the remediation window.
+
+#### Scenario: The fence-grammar deploy refreshes links and tags
+
+- **WHEN** this change's migration has run and the indexer completes its next pass
+- **THEN** every note's `note_links` rows and extracted tags SHALL reflect the new grammar
+
+#### Scenario: Embedding invalidation is scoped to affected notes
+
+- **WHEN** the re-derivation pass processes a note whose cleaned-for-embedding output is identical under the stamped version's frozen cleaner and the current one, and no independent invalidator applies (no content change, no `file_path` change, no provider or configuration change, no exclusion reconciliation)
+- **THEN** the grammar migration SHALL NOT cause that note to be re-embedded — cleaned-output comparison governs only invalidation attributable to the grammar change and never suppresses an invalidation another requirement mandates
+- **WHEN** it processes a note whose cleaned output differs (e.g. one containing an indented fence around text)
+- **THEN** that note's embeddings SHALL be rebuilt from the newly cleaned text on a subsequent embed pass
+
+#### Scenario: Move detection survives the remediation window
+
+- **WHEN** a note is externally renamed after the migration runs but before the re-derivation pass reaches it
+- **THEN** the indexer's content-hash move matching SHALL still identify it as the same note (its `content_hash` is real), preserving row identity rather than delete-and-reinserting — the path-change invalidation the existing requirements mandate for a move still applies
+- **AND** the ID-preserving move branch SHALL re-derive that note's links and tags under the current grammar and stamp its marker in the same transaction, so the note does not need a second pass to satisfy the next-pass refresh promise
+
+#### Scenario: Rewrite-enabled moves refuse while re-derivation is incomplete
+
+- **WHEN** any note in the caller's owner scope still carries a stale extraction marker and a client calls `move_note(from, to, rewrite_links=True)`
+- **THEN** the move SHALL be refused before the rename, naming the in-progress re-derivation, because rewrite-source discovery reads `note_links` rows that a stale-grammar extraction may have wrongly omitted (a link inside a span the old grammar masked but the new grammar reads as prose would be silently left broken)
+- **AND** the same move with `rewrite_links=False` SHALL be unaffected, and the refusal SHALL clear on its own once the re-derivation pass completes

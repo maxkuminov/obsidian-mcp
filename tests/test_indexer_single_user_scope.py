@@ -45,7 +45,12 @@ class _Session:
 
 @pytest.mark.asyncio
 async def test_index_vault_reads_and_deletes_only_null_owned_rows(monkeypatch, tmp_path):
-    old = SimpleNamespace(file_path="gone.md", content_hash="hash")
+    # `extraction_version` joined the scan's select with #150.
+    old = SimpleNamespace(
+        file_path="gone.md",
+        content_hash="hash",
+        extraction_version=indexer.CURRENT_EXTRACTION_VERSION,
+    )
     session = _Session([_Result([old])])
     monkeypatch.setattr(indexer, "async_session", lambda: session)
     monkeypatch.setattr(indexer, "_vault_root", lambda _uid: tmp_path)

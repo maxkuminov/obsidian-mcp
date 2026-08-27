@@ -339,19 +339,18 @@ def test_outline_sections_is_entirely_unchanged(name):
     assert observed == [tuple(e) for e in EXPECTED_OUTLINE[name]]
 
 
-# ── 3.3c the residual this change does NOT fix (#150) ───────────────────────
+# ── 3.3c the residual this change did NOT fix, closed by #150 ───────────────
 
-# `_FENCE_RE` recognises only a column-zero opener closed by a fence of exactly
-# the same length. CommonMark allows up to three spaces of indentation and a
-# closer at least as long as the opener, so these two shapes are NOT masked: a
-# heading inside them is visible to the scanner, and a section write there
-# already deletes the opening fence and orphans the contents.
+# The pre-#150 `_FENCE_RE` recognised only a column-zero opener closed by a
+# fence of exactly the same length, so these two shapes were NOT masked: a
+# heading inside them was visible to the scanner, and a section write there
+# deleted the opening fence and orphaned the contents. #140 froze the bytes the
+# tree then wrote as evidence that the hazard predated it; the fence-grammar
+# change (#150) widened the masker and superseded that residual, so what is
+# frozen here now is the CURRENT behaviour beside the historic one.
 #
-# That is a genuine destructive-write hazard and it is issue #150, not this
-# change. Widening the masker shifts which lines count as headings, which
-# re-addresses every `#N` ordinal on an affected note — a strictly larger
-# compat break. These are the bytes the tree wrote BEFORE the narrowing,
-# captured and frozen; they are the evidence for "not this change's bug".
+# Each entry: (text, pre-#150 headings, pre-#150 `#1`-write, pre-#150 empty
+# `#1`-write, post-#150 headings, post-#150 `#1`-write, post-#150 empty write).
 
 UNMASKED_FENCE_SHAPES = {
     "indented_opener": (
@@ -359,38 +358,49 @@ UNMASKED_FENCE_SHAPES = {
         [(1, "A", 0), (1, "Hidden", 11), (1, "B", 29)],
         "# A\nnew\n# Hidden\nx\n   ```\n# B\nb\n",
         "# A\n# Hidden\nx\n   ```\n# B\nb\n",
+        [(1, "A", 0), (1, "B", 29)],
+        "# A\nnew\n# B\nb\n",
+        "# A\n# B\nb\n",
     ),
     "longer_closer": (
         "# A\n```\n# Hidden\nx\n`````\n# B\nb\n",
         [(1, "A", 0), (1, "Hidden", 8), (1, "B", 25)],
         "# A\nnew\n# Hidden\nx\n`````\n# B\nb\n",
         "# A\n# Hidden\nx\n`````\n# B\nb\n",
+        [(1, "A", 0), (1, "B", 25)],
+        "# A\nnew\n# B\nb\n",
+        "# A\n# B\nb\n",
     ),
 }
 
 
 @pytest.mark.parametrize("name", sorted(UNMASKED_FENCE_SHAPES))
-def test_an_unmasked_fence_behaves_exactly_as_before(name):
-    text, expected_headings, expected_write, _ = UNMASKED_FENCE_SHAPES[name]
+def test_a_newly_masked_fence_no_longer_exposes_its_heading(name):
+    """#150 closed the residual: `# Hidden` is inside code, so it is not a
+    heading, does not occupy an ordinal, and does not bound `A`. `# B` keeps
+    its `line_start`, so the ordinal shift is exactly the removal of the
+    heading that was never one."""
+    text, before_headings, _, _, after_headings, expected_write, _ = (
+        UNMASKED_FENCE_SHAPES[name]
+    )
     observed = [(h["depth"], h["text"], h["line_start"]) for h in _scan_headings(text)]
-    assert observed == expected_headings
+    assert observed != before_headings
+    assert observed == after_headings
     new_text, err = replace_section(text, "#1", "new")
     assert err is None
     assert new_text == expected_write
+    # The destructive half of the #140 contract, now covering these shapes:
+    # the whole block is the body of `A` and a write replaces it entire.
+    assert "Hidden" not in new_text
+    assert "```" not in new_text
 
 
 @pytest.mark.parametrize("name", sorted(UNMASKED_FENCE_SHAPES))
-def test_an_unmasked_fence_diverges_only_by_the_dropped_separator(name):
-    """The one intended divergence on these shapes.
-
-    The "identical to before" claim holds for a NON-empty replacement body; an
-    empty one picks up the separator-conditionality rule like everywhere else,
-    so the result differs from the pre-change tree by exactly the blank line
-    that rule no longer inserts. Pre-change this wrote `# A\n\n# Hidden…`.
-    A removal, not a loss — pinned so the distinction cannot drift into an
-    unqualified claim again.
-    """
-    text, _, _, expected_empty = UNMASKED_FENCE_SHAPES[name]
+def test_a_newly_masked_fence_still_inserts_no_separator_when_emptied(name):
+    """The separator-conditionality rule #140 pinned is unchanged by the wider
+    masker: an empty replacement body inserts no blank line, on these shapes as
+    on every other."""
+    text, _, _, _, _, _, expected_empty = UNMASKED_FENCE_SHAPES[name]
     new_text, err = replace_section(text, "#1", "")
     assert err is None
     assert new_text == expected_empty

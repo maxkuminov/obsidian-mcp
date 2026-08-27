@@ -11,10 +11,12 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    SmallInteger,
     String,
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -230,6 +232,16 @@ _TRANSFER_ACTOR_COLUMN_MARKER = (
     "denormalised actor, recorded at mint (017_transfer_token_actor)"
 )
 
+# Migration 018's ownership marker for `notes_metadata.extraction_version`
+# (#150). Mirrored here for 015's and 017's reason: `alembic check` compares
+# column comments, so a marker that drifted from the migration keying on it
+# shows up as a pending `alter_column(comment=...)` rather than as a
+# `downgrade()` that has quietly stopped recognising its own work. Must stay
+# byte identical to `MARKER` in `alembic/versions/018_extraction_version.py`.
+_EXTRACTION_VERSION_COLUMN_MARKER = (
+    "fence-grammar derivation marker (018_extraction_version)"
+)
+
 
 class UsageLog(Base):
     __tablename__ = "usage_logs"
@@ -310,6 +322,20 @@ class NoteMetadata(Base):
     frontmatter: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     embedded_content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Which fence grammar derived this row's links, tags and vectors.
+    # `content_hash` cannot see a grammar change — the bytes are unchanged — so
+    # without a separate marker the derivation gate would certify stale link
+    # rows and stale vectors forever (#150). Compared against
+    # `src.services.indexer.CURRENT_EXTRACTION_VERSION`; the frozen per-version
+    # recognizers live in `src.services.embeddings`. Server default 0 so
+    # migration 018 is metadata-only and every pre-existing row reads as
+    # "derived by the pre-#150 grammar".
+    extraction_version: Mapped[int] = mapped_column(
+        SmallInteger,
+        nullable=False,
+        server_default=text("0"),
+        comment=_EXTRACTION_VERSION_COLUMN_MARKER,
+    )
     content_tsvector: Mapped[str | None] = mapped_column(TSVECTOR, nullable=True)
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     modified_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

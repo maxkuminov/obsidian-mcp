@@ -781,7 +781,13 @@ class _SessionSpy:
             return _Rows([])
         self._selects += 1
         # First SELECT is the vault index, the second the backlink sources.
-        return _Rows(self._rows if self._selects == 1 else self._backlinks)
+        # Anything after that is the #150 stale-extraction guard, which must
+        # find nothing or the move is refused for the wrong reason.
+        if self._selects == 1:
+            return _Rows(self._rows)
+        if self._selects == 2:
+            return _Rows(self._backlinks)
+        return _Rows([])
 
     async def commit(self):
         self.commits += 1

@@ -132,3 +132,127 @@
   under its own label "Last change detected". No migration and no per-tick
   write: it answers "is *this process's* loop alive", which is a property of
   the process, and it resets to `None` on restart until the startup pass lands.
+
+## Re-deriving after a grammar change (#150)
+
+`clean_for_embedding` no longer carries its own fence regexes. It consumes the
+shared recognizer in `src/services/links.py` — the `code-masking` capability,
+grammar written out in
+[vault tools](vault-tools.md#the-fence-grammar-every-consumer-shares-150) — in
+`BODY` context, because what it is handed is a note's post-frontmatter body.
+Its private pair (LF-only, column-zero, exact-length closer) disagreed with the
+masker heading resolution uses, so an indented or longer-closed block was
+embedded as prose while the same block was invisible to `read_note(section=…)`.
+
+**A grammar change moves no bytes, so `content_hash` cannot see it.** Links,
+tags and vectors are all derived through that recognizer, and re-derivation is
+gated on the hash of the note's bytes — which is unchanged. Ship a widened
+grammar with nothing else and every unchanged note keeps answering from link
+rows and vectors built under the old one, permanently: the scan skips it, the
+embed backlog's `embedded_content_hash != content_hash` predicate is false, and
+nothing else ever revisits it.
+
+`notes_metadata.extraction_version` (SMALLINT NOT NULL DEFAULT 0, migration
+018) is the marker, and `CURRENT_EXTRACTION_VERSION` in
+`src/services/indexer.py` is what it is compared against. **Bump that constant
+in the same commit as any change to the fence grammar.** A grammar change
+without a bump is the silent-staleness bug above; a bump without a grammar
+change costs one no-op pass.
+
+- **A stale marker makes a note changed for the whole pass** — parsed,
+  re-tagged, re-linked, re-tsvectored, upserted, and stamped. The stamp goes in
+  the same statement as the state it certifies, inside the pass's one
+  transaction, so a pass that dies part way through commits neither: a stale
+  marker never survives beside re-derived rows, and a current marker never
+  survives beside stale ones. Retry is simply the next tick.
+- **Embedding invalidation is scoped, not blanket.** Re-embedding 2,577 notes
+  to fix a grammar that affects a handful is the failure mode the marker exists
+  to avoid. The pass compares what the row's **stamped** version would have
+  embedded for that note's body against what the **current** one embeds, and
+  clears `embedded_content_hash` only when the two differ. It only ever clears,
+  so it can never suppress an invalidation another rule mandates — a content
+  change, a `file_path` change, a provider change, the exclusion reconciliation
+  sweep above.
+- **The comparison is over cleaned OUTPUT, never over recognised spans**, and
+  that is not a stylistic preference. v0's cleaner applied its two regexes
+  **sequentially**, so the first substitution changed the text the second
+  matched against and the two patterns' `$`-anchored spans could overlap. Span
+  equality is therefore neither necessary nor sufficient for embedded-text
+  equality, in both directions, with real inputs:
+  `"~~~\ncode\n~~~\n` ``` `\n# H\ncode\n` ``` `\n[[X]]\n"` has identical spans
+  and different cleaned text (span comparison would certify a stale vector),
+  and ``` "```\n~~~\ncode\n~~~\n```" ``` has different spans and identical
+  cleaned text (span comparison would re-embed for nothing). Both are pinned in
+  `tests/test_clean_for_embedding.py`.
+- **Per-version frozen cleaners**, `_EXTRACTION_CLEANERS` in
+  `src/services/embeddings.py`, reached through `clean_at_version`. Version 0
+  is `_v0_clean` — the two pre-#150 regexes, in the order the old cleaner
+  applied them, copied verbatim; do not "simplify" it into one pass. Each entry
+  stays while any row is stamped with it and is removable once none is. Only
+  the *embedding* cleaner needs a frozen history, because links and tags are
+  re-derived unconditionally on a stale marker. An unknown stamped version (a
+  build downgraded past a bump) counts as *differs*: a row whose grammar this
+  build cannot reproduce must be re-embedded rather than certified against a
+  comparison that was never made.
+- **`content_hash` is never nulled and never sentinelled.** It is `NOT NULL`,
+  and it is the move detector's key: a sentinel would make an external rename
+  landing between the migration and the pass look like delete-plus-insert,
+  which destroys the row and cascade-deletes its `note_embeddings`. A re-embed
+  of the whole note, to fix a marker. So the marker lives beside the hash, and
+  move detection keeps working throughout the remediation window.
+- **The id-preserving move branch re-derives and stamps in its own
+  transaction.** It is the one writer that touches a note during the
+  remediation window, so deferring to "the ordinary branch will pick it up next
+  tick" left a moved note carrying old-grammar tags for a whole pass — the
+  next-pass refresh promise, broken by a rename. It therefore binds `tags` from
+  the entry the scan already parsed under the current grammar (links come free:
+  `moved_new_paths` feeds `_update_links_for_changed`) and stamps
+  `extraction_version` in the same UPDATE. The marker never outruns the
+  derivation, because both are one statement. `embedded_content_hash = NULL`
+  there is unconditional and unrelated: it is #127's path-change invalidation.
+
+### The transition window: two controls (#150)
+
+Between "018 has run" and "the re-derivation pass has finished", derived state
+is a mix of the two grammars. Reads degrade gracefully — a stale link row or
+tag is wrong in the way it was wrong yesterday — but one **write** path reads
+derived state and mutates notes from it, and that one is closed:
+
+**`move_note(rewrite_links=True)` refuses while any row in the caller's owner
+scope carries a stale marker.** Its rewrite-source inventory is `note_links`,
+so it is only as good as the grammar that built it. Under v0 a note like
+`` ```code```\n[[Target]]\n``` `` had its `[[Target]]` masked as code and
+produced no row at all; v1 reads the same bytes as prose. Move `Target.md` with
+`rewrite_links=True` before the pass reaches that note and the move succeeds,
+reports success, and silently strands the link — the exact class of failure the
+rest of this tool's preflight exists to prevent. So the preflight adds one
+`LIMIT 1` query (`_stale_extraction_error` in `src/mcp_server/tools.py`) before
+the rename. It is **owner-scoped**: another user's unfinished pass says nothing
+about this caller's rows, and refusing on it would wedge every account behind
+one idle vault. The refusal names the first pending note and clears itself when
+the pass completes; `rewrite_links=False` is untouched and is the way through.
+
+`edit_note(section=…)` needs no such control: it resolves headings from the
+note's own bytes, never from `note_links`.
+
+### Rollback is roll-forward, and the plan says so
+
+**A bare redeploy of the previous image does NOT restore derived state.** Old
+code ignores `extraction_version` and skips unchanged notes by `content_hash`,
+so links, tags and vectors stay derived under the new grammar indefinitely —
+the same silent staleness, pointing the other way.
+
+The rollback procedure is:
+
+1. revert the grammar commits on a branch;
+2. **bump `CURRENT_EXTRACTION_VERSION`** in that build (to 2, then 3, …) and
+   keep the versioned mechanism and the frozen per-version registry — the
+   registry is what lets the pass compare each row's stamped grammar against
+   the restored one;
+3. deploy.
+
+The owner-scoped re-derivation pass then rebuilds every note's links and tags,
+and (span-diff-scoped, direction-aware) its embeddings, under the restored
+grammar, without touching `content_hash`. Comparing legacy-to-legacy instead —
+which is what a registry without the frozen v1 entry would do — would certify
+the stale vectors for ever.

@@ -329,8 +329,12 @@ async def edit_note(
        sharing one parent, and it is the selector the outline of a truncated
        `read_note` advertises. A bare "#N" always selects by position and is
        never shadowed by a heading whose text happens to be "#N"; reach such a
-       heading by title with "Parent/#N". The same selectors resolve to the same
-       section in `read_note`. Setext (`====`/`----`) headings are not matched.
+       heading by title with "Parent/#N". A selector resolves to the same
+       section in `read_note` as in this tool **on any write this tool
+       admits** — that parity is about resolution, not about admission: see
+       the two section-mode refusals below, where a section that reads fine is
+       deliberately not writable. Setext (`====`/`----`) headings are not
+       matched.
 
     **Frontmatter and the round trip.** Read a note, edit the content portion,
     pass it straight back to full replacement: the frontmatter survives. No
@@ -369,9 +373,25 @@ async def edit_note(
 
     Section mode resolves headings over the frontmatter-stripped body, exactly
     as `read_note` does, so `#N` ordinals agree between the two and a YAML `#`
-    comment inside the block is never selectable. A note whose block is
-    malformed (unclosed fence, YAML error, non-mapping) refuses section writes,
-    naming the defect and the `replace_frontmatter=True` repair.
+    comment inside the block is never selectable. A heading inside a fenced
+    code block is not a heading: fences count with up to three spaces of
+    indentation and a closer at least as long as the opener, and an unclosed
+    column-zero fence hides everything below it.
+
+    **Two shapes refuse a section write outright, naming the problem and
+    writing nothing:**
+    - a malformed frontmatter block (unclosed fence, YAML error, non-mapping)
+      — the refusal names the defect and the `replace_frontmatter=True`
+      repair;
+    - a fence opener indented by one to three spaces that nothing below it
+      closes — such an opener may sit inside a list item, whose code block
+      ends where the item does, and this server does not parse container
+      blocks, so it will not guess whether the text below is code or content.
+      Close the fence or unindent it to column zero, then reissue.
+
+    Both refusals are asymmetric with reads on purpose: `read_note(section=…)`
+    and the truncation outline keep working on such notes, because a read
+    destroys nothing.
 
     Flags:
     - `operation="append"`: legacy alias for `append=True`. This is accepted to
@@ -542,6 +562,16 @@ async def move_note(
     aggregate: if the originals plus rewrites for all backlink sources would
     exceed 256 MiB in memory the move is refused before anything changes,
     naming the note count and the limit.
+
+    **The same preflight refuses the whole move, before the rename, when any
+    source it would rewrite — the moved note's own body included — contains a
+    fence opener indented by one to three spaces that nothing below it
+    closes.** The refusal names each such source and where its opener sits. A
+    link under such an opener may be inside a list item's code block, which
+    this server does not parse, and a rewrite would mutate text whose
+    code-or-content status had to be guessed. Move with `rewrite_links=False`
+    (unaffected by this refusal) and fix the links yourself, or close the
+    fences first.
 
     **A rewrite can still fail after the move has committed.** The move is one
     rename and the rewrites follow it, so an I/O failure, a vault reassignment,

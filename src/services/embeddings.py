@@ -14,26 +14,112 @@ from src.config import settings
 from src.models.db import NoteEmbedding, NoteMetadata
 from src.services import timing
 from src.services.filters import apply_note_filters
+from src.services.links import BODY, scan_fences
 
 logger = logging.getLogger(__name__)
 
 # Strip fenced code blocks before embedding so serialized data dumps
 # (Excalidraw JSON, base64 blobs, mermaid graphs) don't dominate vector
 # space. Keyword search is unaffected — tsvector still indexes everything.
-_FENCE_BACKTICK_RE = re.compile(r"^```[^\n]*\n.*?\n```\s*$", re.MULTILINE | re.DOTALL)
-_FENCE_TILDE_RE = re.compile(r"^~~~[^\n]*\n.*?\n~~~\s*$", re.MULTILINE | re.DOTALL)
+#
+# The grammar is `src/services/links.py`'s shared recognizer, not a private
+# one. This module carried its own pair of regexes (LF-only, column-zero,
+# exact-length closer) until #150: they disagreed with the masker heading
+# resolution uses, so an indented or longer-closed block was embedded as prose
+# while the same block was invisible to `read_note(section=…)`.
 
 
 def clean_for_embedding(content: str) -> str:
     """Strip fenced code blocks (``` and ~~~) from markdown before embedding.
 
-    Inline backtick code is preserved (typically short identifiers, often
-    semantically meaningful). Indented code blocks are not stripped — they're
-    ambiguous with regular indented prose in personal notes.
+    `content` is a note's post-frontmatter **body**, so the recognizer runs in
+    `BODY` context and never re-partitions. Inline backtick code is preserved
+    (typically short identifiers, often semantically meaningful). Indented
+    code blocks are not stripped — they're ambiguous with regular indented
+    prose in personal notes, and are a documented divergence of the grammar.
     """
-    content = _FENCE_BACKTICK_RE.sub("", content)
-    content = _FENCE_TILDE_RE.sub("", content)
-    return content
+    return _remove_spans(content, scan_fences(content, context=BODY).spans)
+
+
+def _remove_spans(text: str, spans) -> str:
+    if not spans:
+        return text
+    out: list[str] = []
+    cursor = 0
+    for start, end in spans:
+        out.append(text[cursor:start])
+        cursor = end
+    out.append(text[cursor:])
+    return "".join(out)
+
+
+# ── The frozen per-version cleaners (`notes_metadata.extraction_version`)
+#
+# A grammar change does not change a note's bytes, so `content_hash` cannot
+# see it and the embed backlog would certify stale vectors forever. The
+# indexer therefore compares what a note's **stamped** version would have
+# embedded against what the **current** one embeds, and clears
+# `embedded_content_hash` only when the two differ
+# (`CURRENT_EXTRACTION_VERSION` in `src/services/indexer.py`).
+#
+# **The comparison is over cleaned OUTPUT, never over recognised spans.** Span
+# equality is neither necessary nor sufficient for embedded-text equality,
+# because v0's cleaner applied its two regexes *sequentially*: the first
+# substitution changed the text the second matched against, and the two
+# patterns' `$`-anchored spans could overlap. Both directions have real
+# inputs, and both are pinned in `tests/test_clean_for_embedding.py`:
+#
+#   "~~~\ncode\n~~~\n```\n# H\ncode\n```\n[[X]]\n"
+#       identical spans under v0 and v1, DIFFERENT cleaned text — span
+#       comparison would wrongly certify the stale vector.
+#   "```\n~~~\ncode\n~~~\n```"
+#       different spans, IDENTICAL cleaned text — span comparison would
+#       re-embed for nothing.
+#
+# So what is registered is each version's whole cleaning function. Only the
+# *embedding* cleaner needs a frozen history: links and tags are re-derived
+# unconditionally whenever the marker is stale, so they need no
+# version-to-version diff. Version 0 is the exact pair of regexes this module
+# used before #150, applied in the exact order it applied them; the entry
+# becomes removable once no row is stamped 0.
+#
+# The comparison is direction-aware by construction, which is what makes a
+# rollback work: revert the grammar, bump the current version, and a
+# v1-stamped row compares frozen v1 against the restored cleaner and
+# invalidates exactly the notes that change — see the rollback recipe in
+# `docs/architecture/indexing-and-embeddings.md`.
+_V0_FENCE_BACKTICK_RE = re.compile(r"^```[^\n]*\n.*?\n```\s*$", re.MULTILINE | re.DOTALL)
+_V0_FENCE_TILDE_RE = re.compile(r"^~~~[^\n]*\n.*?\n~~~\s*$", re.MULTILINE | re.DOTALL)
+
+
+def _v0_clean(body: str) -> str:
+    """`clean_for_embedding` exactly as it stood before #150. Frozen.
+
+    Copied verbatim, **sequential** substitution included: the order is part of
+    the behaviour being reproduced, not an implementation detail. Do not
+    "simplify" it into one pass or into a span set.
+    """
+    body = _V0_FENCE_BACKTICK_RE.sub("", body)
+    body = _V0_FENCE_TILDE_RE.sub("", body)
+    return body
+
+
+_EXTRACTION_CLEANERS = {
+    0: _v0_clean,
+    1: clean_for_embedding,
+}
+
+
+def clean_at_version(version: int, body: str) -> str | None:
+    """What version `version` would have embedded for `body`, or None.
+
+    None means "no frozen cleaner for that version", which the caller must
+    treat as *differs* — a row stamped with a grammar this build cannot
+    reproduce (a downgrade past a bump) must be re-embedded rather than
+    certified against a comparison that was never made.
+    """
+    cleaner = _EXTRACTION_CLEANERS.get(version)
+    return cleaner(body) if cleaner is not None else None
 
 
 def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[str]:

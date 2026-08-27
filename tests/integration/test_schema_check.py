@@ -59,7 +59,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "017"
+HEAD_REVISION = "018"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -2255,7 +2255,7 @@ def test_both_migrations_of_this_wave_run_in_one_upgrade():
     what puts them in a line rather than on a branch.
     """
     with throwaway_db("schema_wave_both") as url:
-        assert alembic_version(url) == HEAD_REVISION == "017"
+        assert alembic_version(url) == HEAD_REVISION
         for column, _ in PROVENANCE_COLUMNS:
             assert column_shape(url, "users", column) is not None
             assert provenance_column_is_marked(url, column)
@@ -2657,3 +2657,168 @@ def test_downgrade_017_drops_its_own_constraint_but_not_a_foreign_one():
         )
         _harness.run_alembic(url, "downgrade", "016", dimensions=DIM)
         assert one_credential_constraint(url) is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 018 — the fence-grammar derivation marker on `notes_metadata` (issue #150)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The column is one SMALLINT with a server default, so there is far less to get
+# wrong than in 015/016/017 — and exactly three things that still are. The
+# **server default** is what keeps the ADD COLUMN metadata-only on a table
+# carrying a tsvector and two GIN indexes, and what gives every pre-existing
+# row the one correct value (0 = "derived by the pre-#150 grammar"). **NOT
+# NULL** is what lets the indexer read the value as a version instead of
+# branching on NULL. And the **marker** is what `downgrade()` keys on, mirrored
+# on the ORM column so `alembic check` compares it.
+
+EXTRACTION_VERSION_MARKER = "fence-grammar derivation marker (018_extraction_version)"
+
+
+def extraction_version_comment(url):
+    return fetchval(
+        url,
+        "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a "
+        "WHERE a.attrelid = 'notes_metadata'::regclass "
+        "  AND a.attname = 'extraction_version'",
+    )
+
+
+def seed_pre_018_notes(url):
+    """Two notes written by the pre-#150 indexer: no marker column at all."""
+    insert_user(url, 1, "alice")
+    sql(
+        url,
+        "INSERT INTO notes_metadata "
+        "(id, user_id, file_path, title, content_hash, embedded_content_hash) "
+        "VALUES (1, 1, 'A.md', 'A', 'hash-a', 'hash-a'), "
+        "       (2, 1, 'B.md', 'B', 'hash-b', NULL)",
+    )
+
+
+def refuse_018(url, *, must_mention):
+    """Run `upgrade head`, require 018 to refuse, and return the message."""
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "018 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    return combined
+
+
+def test_the_extraction_marker_is_not_null_defaulted_and_marked_on_a_fresh_db():
+    with throwaway_db("schema_xv_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        shape = column_shape(url, "notes_metadata", "extraction_version")
+        assert shape is not None, "notes_metadata.extraction_version is missing"
+        attnotnull, coltype, coldefault = shape
+        assert attnotnull is True, "the marker must be NOT NULL"
+        assert coltype == "smallint"
+        assert coldefault == "0", (
+            "the server default is what makes the ADD COLUMN metadata-only and "
+            "what gives every pre-existing row the pre-#150 value"
+        )
+        assert extraction_version_comment(url) == EXTRACTION_VERSION_MARKER
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+        assert "No new upgrade operations detected" in check.stdout
+
+
+def test_018_stamps_every_pre_existing_row_zero_and_touches_nothing_else():
+    """The whole point of the default: rows written by the old indexer read as
+    "derived by the old grammar", and neither `content_hash` nor
+    `embedded_content_hash` is disturbed — the first is the move-detection key
+    and the second is the embed backlog's predicate."""
+    with throwaway_db("schema_xv_backfill", revision="017") as url:
+        seed_pre_018_notes(url)
+        assert column_shape(url, "notes_metadata", "extraction_version") is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        rows = fetch(
+            url,
+            "SELECT id, content_hash, embedded_content_hash, extraction_version "
+            "FROM notes_metadata ORDER BY id",
+        )
+        assert [tuple(r) for r in rows] == [
+            (1, "hash-a", "hash-a", 0),
+            (2, "hash-b", None, 0),
+        ]
+
+
+def test_rerunning_018_leaves_recorded_markers_alone():
+    """Stamp-back idempotence, the shape the schema gate itself performs. The
+    migration body genuinely re-executes; a marker the indexer has since
+    advanced must survive it, or every stamp-back would re-derive the vault."""
+    with throwaway_db("schema_xv_rerun", revision="017") as url:
+        seed_pre_018_notes(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        sql(url, "UPDATE notes_metadata SET extraction_version = 1 WHERE id = 1")
+
+        _harness.run_alembic(url, "stamp", "017", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(
+            url, "SELECT extraction_version FROM notes_metadata WHERE id = 1"
+        ) == 1
+        assert extraction_version_comment(url) == EXTRACTION_VERSION_MARKER
+
+
+def test_018_refuses_an_unmarked_column_of_its_name():
+    with throwaway_db("schema_xv_unmarked", revision="017") as url:
+        sql(
+            url,
+            "ALTER TABLE notes_metadata ADD COLUMN extraction_version "
+            "smallint NOT NULL DEFAULT 0",
+        )
+        refuse_018(url, must_mention=["018's comment marker"])
+
+
+def test_018_refuses_a_nullable_or_wrongly_defaulted_column_of_its_name():
+    with throwaway_db("schema_xv_nullable", revision="017") as url:
+        sql(url, "ALTER TABLE notes_metadata ADD COLUMN extraction_version smallint")
+        sql(
+            url,
+            "COMMENT ON COLUMN notes_metadata.extraction_version IS $$"
+            + EXTRACTION_VERSION_MARKER
+            + "$$",
+        )
+        refuse_018(url, must_mention=["nullable", "server default"])
+
+
+def test_downgrade_018_drops_its_own_column_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_xv_downgrade", revision="017") as url:
+        seed_pre_018_notes(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert column_shape(url, "notes_metadata", "extraction_version") is not None
+
+        _harness.run_alembic(url, "downgrade", "017", dimensions=DIM)
+        assert column_shape(url, "notes_metadata", "extraction_version") is None
+        # Note identity survives the round trip, which is what makes the
+        # rollback bounded: `content_hash` was never touched.
+        assert fetchval(
+            url, "SELECT content_hash FROM notes_metadata WHERE id = 1"
+        ) == "hash-a"
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert fetchval(
+            url, "SELECT extraction_version FROM notes_metadata WHERE id = 1"
+        ) == 0
+
+
+def test_downgrade_018_refuses_to_drop_a_column_it_did_not_create():
+    with throwaway_db("schema_xv_downgrade_foreign", revision="017") as url:
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        sql(
+            url,
+            "COMMENT ON COLUMN notes_metadata.extraction_version IS 'somebody else'",
+        )
+        result = _harness.run_alembic(
+            url, "downgrade", "017", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "018's comment marker" in result.stdout + result.stderr
+        assert column_shape(url, "notes_metadata", "extraction_version") is not None
