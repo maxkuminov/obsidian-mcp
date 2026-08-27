@@ -244,8 +244,13 @@ def _fake_session(monkeypatch, result_rows, stale=()):
     That probe is routed by its SQL rather than by position so a test can say
     "this owner has an unfinished re-derivation" without having to know where
     in the sequence the query lands.
+
+    Returns the list every executed statement is appended to, so a test can
+    assert on the SQL the tool actually issued rather than on SQL it rebuilt
+    for itself.
     """
     calls = {"n": 0}
+    executed: list = []
 
     class Result:
         def __init__(self, rows):
@@ -262,6 +267,7 @@ def _fake_session(monkeypatch, result_rows, stale=()):
             return None
 
         async def execute(self, statement):
+            executed.append(statement)
             if "extraction_version" in str(statement.compile()):
                 return Result(list(stale))
             i = calls["n"]
@@ -272,15 +278,17 @@ def _fake_session(monkeypatch, result_rows, stale=()):
             return None
 
     monkeypatch.setattr(tools, "async_session", lambda: FakeSession())
+    return executed
 
 
 REFS_WITH_LIST_FENCE = "# Refs\n- item\n  ```\n  see [[Target]]\n\nmore\n"
 
 
 def _seed_move(offline, monkeypatch, refs_text, stale=()):
+    """Two notes and a fake session; returns the executed-statement list."""
     write(offline, "Target.md", "the moved note\n")
     write(offline, "Refs.md", refs_text)
-    _fake_session(
+    return _fake_session(
         monkeypatch,
         [
             [_Row(file_path="Target.md", id=1), _Row(file_path="Refs.md", id=2)],
@@ -390,20 +398,81 @@ async def test_every_offending_source_is_named(offline, monkeypatch):
 # 2.4 — the raw-text consumers, end to end through the tools
 # ══════════════════════════════════════════════════════════════════════════
 #
-# `extract_tags` and `move_note`'s link rewriting both scan RAW note text, so
-# they are the two consumers a fence-shaped YAML scalar could silence: with the
-# frontmatter block opaque to fence recognition they see the body, and without
-# that opacity the indented scalar would open a block swallowing everything
-# below it.
+# A fence-shaped YAML scalar must not silence extraction from the body. Two
+# mechanisms carry that, and they are NOT the same mechanism:
+#
+#   * `move_note`'s link rewriting genuinely scans RAW note text — it splices
+#     back into those bytes — so it relies on the block being **opaque** to
+#     fence recognition in `FULL_NOTE` context.
+#   * `extract_tags` does not scan raw text at all any more: it takes the
+#     already-partitioned **body**, so the block is simply not there to be
+#     scanned. Frontmatter tags come from the parsed mapping it is handed.
 
 FM_SCALAR_NOTE = "---\nliteral: |\n   ```\n---\n#real\nsee [[Target]]\n"
+
+# The same shape, but with a body line that **closes** the scalar's fence. This
+# is the discriminating input, and the reason the unmatched variant above
+# cannot stand in for it: on the unmatched note, handing `extract_tags` the raw
+# text still yields the tag (the opener matches nothing, so nothing is masked)
+# and a callsite that regressed to raw text would go unnoticed. Here the two
+# openers pair up, so raw-text scanning masks `#real` and body scanning does
+# not — the misuse is observable.
+#
+#   raw, BODY-scanned:  line 2 `   ```` opens, line 5 `   ```` closes,
+#                       `#real` is inside the span → no tag.
+#   body, BODY-scanned: the opener is gone with the block; the body's own
+#                       `   ```` is an unmatched indented opener, not a
+#                       fence → `#real` survives.
+FM_SCALAR_MATCHED_BY_BODY = "---\nliteral: |\n   ```\n---\n#real\n   ```\ntail\n"
 
 
 def test_a_fence_shaped_frontmatter_scalar_does_not_hide_the_bodys_tag():
     from src.services.vault import extract_tags, parse_frontmatter
 
-    fm, _body = parse_frontmatter(FM_SCALAR_NOTE)
-    assert "real" in extract_tags(FM_SCALAR_NOTE, fm)
+    fm, body = parse_frontmatter(FM_SCALAR_NOTE)
+    assert "real" in extract_tags(body, fm)
+
+
+def test_the_matched_scalar_shape_distinguishes_body_scanning_from_raw():
+    """The premise of the end-to-end test below, checked rather than assumed.
+
+    If this ever stops discriminating, the regression guard underneath it has
+    quietly become a tautology.
+    """
+    from src.services.vault import extract_tags, parse_frontmatter
+
+    fm, body = parse_frontmatter(FM_SCALAR_MATCHED_BY_BODY)
+    assert fm == {"literal": "```\n"}  # the block really is valid
+    assert "real" in extract_tags(body, fm)
+    # The misuse this shape exists to expose.
+    assert "real" not in extract_tags(FM_SCALAR_MATCHED_BY_BODY, fm)
+
+
+def test_read_file_extracts_the_body_tag_through_the_production_path(offline):
+    """The real callsite, not the helper: `vault.read_file` is what
+    `read_note` serves from, and it is one of the two places that decide what
+    `notes_metadata.tags` and every tag-filtered search see.
+
+    A callsite that regressed to passing the raw note would lose `#real` here
+    — the scalar's opener would pair with the body's closer and mask it — so
+    this pins the *wiring*, not the helper's behaviour.
+    """
+    from src.services.vault import read_file
+
+    write(offline, "n.md", FM_SCALAR_MATCHED_BY_BODY)
+
+    note = read_file("n.md")
+
+    assert "real" in note["tags"]
+    assert note["frontmatter"] == {"literal": "```\n"}
+    # And the block was stripped from what the reader is served, as always.
+    assert note["content"] == "#real\n   ```\ntail\n"
+
+
+# The indexer is the other production callsite, and the one whose output is
+# persisted into `notes_metadata.tags`. It is pinned end to end against a real
+# database in
+# `tests/integration/test_issue_150_extraction_version_pg.py::test_the_indexer_extracts_a_body_tag_a_frontmatter_scalar_would_have_masked`.
 
 
 async def test_a_fence_shaped_frontmatter_scalar_does_not_block_a_rewrite(
@@ -549,37 +618,100 @@ async def test_the_refusal_clears_once_every_row_is_stamped(offline, monkeypatch
     assert "[[Renamed]]" in read(offline, "Refs.md")
 
 
-async def test_another_owners_stale_marker_does_not_refuse(offline, monkeypatch):
-    """Owner-scoped: the probe carries this caller's ownership predicate, so a
-    different account's unfinished pass returns no rows here. Without that, one
-    idle vault would wedge rewrite-enabled moves for every user."""
-    captured: list[str] = []
-    _seed_move(offline, monkeypatch, "see [[Target]]\n", stale=())
+class _RecordingSession:
+    """Records every statement and answers each one with no rows.
 
-    real = tools._stale_extraction_error
+    Enough for `_stale_extraction_error`, whose whole contract is "which query
+    do you issue, and do you refuse when it returns something".
+    """
 
-    async def spy(session, uid):
-        from sqlalchemy import select
+    def __init__(self, rows=()):
+        self.statements: list = []
+        self._rows = list(rows)
 
-        from src.models.db import NoteMetadata
+    async def execute(self, statement):
+        self.statements.append(statement)
+        return type("R", (), {"all": lambda _self: list(self._rows)})()
 
-        captured.append(
-            str(
-                select(NoteMetadata.file_path)
-                .where(tools._note_owner_predicate(uid))
-                .compile()
-            )
-        )
-        return await real(session, uid)
 
-    monkeypatch.setattr(tools, "_stale_extraction_error", spy)
+def _sql_of(statement) -> str:
+    """The statement as one line of SQL with its bind values inlined.
+
+    Inlined, because the owner predicate for a named user is a *bound
+    parameter* — asserting on `:user_id_1` would pass whatever value the
+    predicate carried, including one from another account.
+    """
+    return " ".join(
+        str(statement.compile(compile_kwargs={"literal_binds": True})).split()
+    )
+
+
+OWNER_CLAUSES = {
+    None: "notes_metadata.user_id IS NULL",
+    7: "notes_metadata.user_id = 7",
+}
+
+
+@pytest.mark.parametrize("uid", sorted(OWNER_CLAUSES, key=lambda u: str(u)))
+async def test_the_stale_probe_carries_the_callers_ownership_predicate(uid):
+    """The predicate is asserted on the statement `_stale_extraction_error`
+    ACTUALLY executes, not on one the test rebuilt for itself.
+
+    An earlier version of this test built its own correctly-scoped query in a
+    spy and asserted on that, which is circular: deleting
+    `.where(_note_owner_predicate(uid))` from the probe left it green. The
+    scoping is what keeps one user's unfinished re-derivation from wedging
+    rewrite-enabled moves for every other account, so it needs a test that can
+    actually fail.
+    """
+    session = _RecordingSession()
+
+    assert await tools._stale_extraction_error(session, uid) is None
+
+    assert len(session.statements) == 1
+    sql = _sql_of(session.statements[0])
+    assert OWNER_CLAUSES[uid] in sql, sql
+    assert "extraction_version != 1" in sql, sql
+    assert "LIMIT 1" in sql, sql
+    # And no OTHER owner's clause leaked in.
+    for other_uid, clause in OWNER_CLAUSES.items():
+        if other_uid != uid:
+            assert clause not in sql, sql
+
+
+@pytest.mark.parametrize("uid", sorted(OWNER_CLAUSES, key=lambda u: str(u)))
+async def test_the_stale_probe_refuses_on_a_row_in_its_own_scope(uid):
+    """The other half: the query is scoped AND its result is acted on. Without
+    this, a probe that returned rows and ignored them would pass the scoping
+    assertion above."""
+    session = _RecordingSession(rows=[_Row(file_path="Pending.md")])
+
+    err = await tools._stale_extraction_error(session, uid)
+
+    assert err is not None
+    assert "re-derived" in err
+    assert "Pending.md" in err
+
+
+async def test_the_move_issues_the_owner_scoped_probe_before_the_rename(
+    offline, monkeypatch
+):
+    """End to end through the tool: the probe the move actually issues is the
+    scoped one, and it runs while the note is still at its old path."""
+    executed = _seed_move(offline, monkeypatch, "see [[Target]]\n", stale=())
 
     result = await tools.move_note_impl(
         "Target.md", "Moved/Renamed.md", rewrite_links=True
     )
 
     assert "Move aborted" not in result
-    assert captured and "user_id IS NULL" in captured[0]
+    probes = [
+        _sql_of(statement)
+        for statement in executed
+        if "extraction_version" in _sql_of(statement)
+    ]
+    assert len(probes) == 1, probes
+    assert "notes_metadata.user_id IS NULL" in probes[0]
 
 
 # ══════════════════════════════════════════════════════════════════════════

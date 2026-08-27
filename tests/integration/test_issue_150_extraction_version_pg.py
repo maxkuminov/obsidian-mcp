@@ -81,6 +81,10 @@ async def vault(sessionmaker, monkeypatch, tmp_path):
         await session.execute(text("DELETE FROM note_links"))
         await session.execute(text("DELETE FROM note_embeddings"))
         await session.execute(text("DELETE FROM notes_metadata"))
+        # Users too: two tests here create a named owner, and `users.username`
+        # is unique, so a survivor from a previous test makes the next one
+        # error rather than fail.
+        await session.execute(text("DELETE FROM users"))
         await session.commit()
 
     yield root
@@ -410,3 +414,133 @@ async def test_the_re_derivation_is_owner_scoped(sessionmaker, vault):
     assert theirs.extraction_version == 0
     assert theirs.embedded_content_hash == content_hash(SPANS_CHANGE)
     assert theirs.tags == ["theirs"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The two production callsites of `extract_tags` hand it the BODY
+# ══════════════════════════════════════════════════════════════════════════
+
+# A valid frontmatter block whose YAML scalar is fence-shaped, and a body line
+# that would CLOSE it. The discriminating shape: scanned as raw text the two
+# openers pair up and `#real` is masked; scanned as the body (which is what
+# `extract_tags` takes, because every caller has already partitioned) the
+# opener is gone with the block, the body's own `   ``` ` is an unmatched
+# indented opener rather than a fence, and `#real` survives.
+#
+# The unmatched variant cannot stand in for this: there, raw scanning masks
+# nothing either, so a callsite that regressed to raw text would go unnoticed.
+FM_SCALAR_MATCHED_BY_BODY = "---\nliteral: |\n   ```\n---\n#real\n   ```\ntail\n"
+
+
+async def test_the_indexer_extracts_a_body_tag_a_frontmatter_scalar_would_have_masked(
+    sessionmaker, vault
+):
+    """`notes_metadata.tags` is what every tag-filtered search reads, and the
+    indexer is what writes it. This drives the real pass against a real
+    database rather than re-calling the helper: what is pinned is the wiring —
+    that the scan loop hands `extract_tags` the body it just parsed."""
+    from src.services.vault import extract_tags, parse_frontmatter
+
+    # The premise, checked here too so this test cannot quietly become a
+    # tautology if the grammar changes underneath it.
+    fm, body = parse_frontmatter(FM_SCALAR_MATCHED_BY_BODY)
+    assert "real" in extract_tags(body, fm)
+    assert "real" not in extract_tags(FM_SCALAR_MATCHED_BY_BODY, fm)
+
+    (vault / "Scalar.md").write_text(FM_SCALAR_MATCHED_BY_BODY, encoding="utf-8")
+
+    await indexer.index_vault(user_id=None)
+
+    row = (await rows(sessionmaker))["Scalar.md"]
+    assert row.tags == ["real"]
+    assert row.extraction_version == indexer.CURRENT_EXTRACTION_VERSION
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The transition-window probe is owner-scoped, against a real database
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The unit tests assert the probe's SQL carries the caller's ownership
+# predicate. This asserts the *semantics* that predicate is there for, on real
+# rows: one owner's unfinished re-derivation must not refuse another owner's
+# rewrite-enabled move. Without it, a single idle account would wedge
+# `move_note(rewrite_links=True)` for the whole server until someone noticed.
+#
+# `_stale_extraction_error` is called directly rather than through
+# `move_note_impl`: the property under test is the query's scope, and driving
+# the whole tool under a named user would drag in vault-root resolution and
+# publication confirmation without testing anything more.
+
+
+async def _stale_probe(sessionmaker, uid):
+    import src.mcp_server.tools as tools
+
+    async with sessionmaker() as session:
+        return await tools._stale_extraction_error(session, uid)
+
+
+@pytest_asyncio.fixture(loop_scope="module")
+async def two_owners(sessionmaker, vault):
+    """A NULL-owned note and a `mallory`-owned one, both stamped current."""
+    from src.models.db import User
+
+    async with sessionmaker() as session:
+        mallory = User(username="mallory", password_hash="x", vault_path="/v/m")
+        session.add(mallory)
+        await session.flush()
+        for owner in (None, mallory.id):
+            session.add(
+                NoteMetadata(
+                    user_id=owner,
+                    file_path="Shared.md",  # same relative path, different owner
+                    title="Shared",
+                    content_hash=content_hash(PLAIN),
+                    extraction_version=indexer.CURRENT_EXTRACTION_VERSION,
+                )
+            )
+        await session.commit()
+        return mallory.id
+
+
+async def _set_marker(sessionmaker, uid, version):
+    owner = "user_id IS NULL" if uid is None else f"user_id = {uid}"
+    async with sessionmaker() as session:
+        await session.execute(
+            text(f"UPDATE notes_metadata SET extraction_version = {version} "
+                 f"WHERE {owner}")
+        )
+        await session.commit()
+
+
+async def test_neither_owner_is_refused_when_every_row_is_stamped(
+    sessionmaker, two_owners
+):
+    assert await _stale_probe(sessionmaker, None) is None
+    assert await _stale_probe(sessionmaker, two_owners) is None
+
+
+async def test_a_named_users_stale_row_does_not_refuse_the_null_owner(
+    sessionmaker, two_owners
+):
+    """The isolation direction that matters most here: single-user mode
+    (`user_id IS NULL`) is the production shape, and a leftover named account
+    mid-re-derivation must not stop it moving notes."""
+    await _set_marker(sessionmaker, two_owners, 0)
+
+    assert await _stale_probe(sessionmaker, None) is None
+    # And the account that IS mid-pass is refused, so the probe is not simply
+    # blind.
+    err = await _stale_probe(sessionmaker, two_owners)
+    assert err is not None and "Shared.md" in err
+
+
+async def test_the_null_owners_stale_row_does_not_refuse_a_named_user(
+    sessionmaker, two_owners
+):
+    """The mirror direction, so the predicate cannot be a one-sided accident
+    (e.g. a bare `IS NULL` that happens to satisfy the case above)."""
+    await _set_marker(sessionmaker, None, 0)
+
+    assert await _stale_probe(sessionmaker, two_owners) is None
+    err = await _stale_probe(sessionmaker, None)
+    assert err is not None and "Shared.md" in err

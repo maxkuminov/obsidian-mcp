@@ -235,11 +235,17 @@ FM_SCALAR_NOTE = "---\nliteral: |\n   ```\n---\n#real\n[[Old]]\n"
 
 def test_a_fence_shaped_yaml_scalar_does_not_swallow_the_body():
     """Spec scenario. In FULL_NOTE context the valid line-1 block is opaque, so
-    the indented fence-shaped scalar opens nothing and the body is extracted."""
+    the indented fence-shaped scalar opens nothing — and the raw-text consumer
+    that needs that, `move_note`'s rewriter, sees the whole body."""
+    from src.services.vault import parse_frontmatter
+
     assert spans(FM_SCALAR_NOTE, context=FULL_NOTE) == ()
     assert unmatched_indented_openers(FM_SCALAR_NOTE, context=FULL_NOTE) == ()
-    assert "real" in extract_tags(FM_SCALAR_NOTE, {})
-    body = FM_SCALAR_NOTE.split("---\n", 2)[2]
+
+    fm, body = parse_frontmatter(FM_SCALAR_NOTE)
+    # `extract_tags` takes the BODY — that is the API, and passing the raw note
+    # is the misuse the matched-shape test below is built to catch.
+    assert "real" in extract_tags(body, fm)
     assert [link.target for link in extract_links(body)] == ["Old"]
 
 
