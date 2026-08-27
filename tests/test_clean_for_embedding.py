@@ -63,3 +63,59 @@ def test_only_a_fence():
     text = "```\nthe whole file is a code block\n```"
     out = clean_for_embedding(text)
     assert "code block" not in out
+
+
+# ── #150: the shared grammar, not a private one ─────────────────────────────
+#
+# This module carried its own LF-only, column-zero, exact-closer regexes until
+# the fence-grammar change. They disagreed with the masker heading resolution
+# uses, so an indented or longer-closed block was embedded as prose while the
+# same block was invisible to `read_note(section=…)`.
+
+
+def test_strips_an_indented_fence():
+    text = "Hello\n\n   ```json\n{\"a\": 1}\n   ```\n\nMore prose."
+    out = clean_for_embedding(text)
+    assert "{" not in out
+    assert "Hello" in out and "More prose." in out
+
+
+def test_strips_a_longer_closed_fence():
+    text = "Hello\n\n```\npayload here\n`````\n\nMore prose."
+    out = clean_for_embedding(text)
+    assert "payload here" not in out
+    assert "Hello" in out and "More prose." in out
+
+
+def test_strips_a_fence_in_every_dialect():
+    for eol in ("\n", "\r\n", "\r"):
+        text = "Hello{0}~~~{0}payload{0}~~~{0}More.".format(eol)
+        out = clean_for_embedding(text)
+        assert "payload" not in out, f"not stripped with {eol!r}"
+        assert "Hello" in out and "More." in out
+
+
+def test_an_unterminated_column_zero_fence_takes_the_rest_of_the_body():
+    text = "Prose\n```\neverything below is code\n"
+    out = clean_for_embedding(text)
+    assert "everything below" not in out
+    assert "Prose" in out
+
+
+def test_an_unterminated_indented_opener_is_not_stripped():
+    """Not a fence — the flat grammar cannot decide its extent, so the text
+    below it stays in the embedding rather than silently vanishing from search."""
+    text = "Prose\n- item\n  ```\nstill prose\n"
+    assert clean_for_embedding(text) == text
+
+
+def test_a_backtick_info_string_with_a_backtick_strips_nothing():
+    text = "Prose\n```code```\nmore prose\n"
+    assert clean_for_embedding(text) == text
+
+
+def test_the_shorter_impostor_closer_does_not_end_the_block():
+    text = "Intro\n````\nfirst\n```\nsecond\n````\nEnd."
+    out = clean_for_embedding(text)
+    assert "first" not in out and "second" not in out
+    assert "Intro" in out and "End." in out
