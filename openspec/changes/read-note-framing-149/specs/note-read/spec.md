@@ -2,7 +2,11 @@
 
 ### Requirement: read_note responses are structurally framed
 
-`read_note` SHALL return a structured result — discrete fields for metadata, note content, truncation state, and errors — declared via the tool's MCP output schema and delivered as structured content alongside a JSON-serialized text rendering. No note-controlled value (title, path, tags, frontmatter keys or values, or note text) SHALL be able to alter which field any other value appears in: there SHALL be no delimiter-based envelope whose frame note content could forge. The unstructured text rendering SHALL be exactly the JSON serialization of the structured result, so recovery of any field from either form is reversible.
+`read_note` SHALL return a structured result — discrete fields for metadata, note content, truncation state, and errors — declared via the tool's MCP output schema and delivered as structured content alongside a JSON-serialized text rendering. No note-controlled value (title, path, tags, frontmatter keys or values, or note text) SHALL be able to alter which field any other value appears in: there SHALL be no delimiter-based envelope whose frame note content could forge. The unstructured text rendering and the structured content SHALL be built from the same already-JSON-safe values, so the two never diverge and recovery of any field from either form is reversible. Fields that are inapplicable to a given response SHALL be absent from both renderings, not `null`.
+
+Every note-controlled field SHALL have an explicit budget: `content` is governed by the existing response-size cap; the outline by its existing independent budget; and the metadata fields (`title`, `tags`, `frontmatter_yaml` and its JSON view, `heading`) by a shared metadata budget also bounded by `MAX_READ_RESPONSE_CHARS` — when the serialized metadata exceeds it, the oversized field SHALL be replaced by a bounded marker naming how to read the raw note instead, never emitted unbounded. Error and notice strings interpolate only bounded values. The worst-case serialized response — the sum of these budgets, doubled for the structured-plus-text duplication and multiplied by JSON string escaping's worst-case six-characters-per-character expansion of note-controlled text — SHALL be stated in the architecture documentation, replacing the previous rendered-string worst case.
+
+When more than one failure applies to a call, precedence SHALL be: path resolution (missing note) first, then parameter validation (`offset`, `limit`), then section resolution; exactly one `error` is reported and content-bearing fields are absent.
 
 #### Scenario: A multiline YAML title cannot forge the frame
 
@@ -12,17 +16,19 @@
 #### Scenario: A quoted frontmatter key cannot forge the frame
 
 - **WHEN** a note's frontmatter contains a key whose decoded value embeds `\n---\n` (issue #149 reproduction 2)
-- **THEN** the key SHALL appear only as a JSON-escaped string inside the `frontmatter` field, and the `content` field SHALL carry exactly the selected content
+- **THEN** the key SHALL appear only as JSON-escaped text inside the frontmatter fields, and the `content` field SHALL carry exactly the selected content
 
 #### Scenario: Distinct paths stay distinguishable
 
 - **WHEN** two note paths differ only by a character that a lossy rendering would collapse (e.g. a newline versus a space)
 - **THEN** the `path` field SHALL distinguish them exactly
 
-#### Scenario: Any valid frontmatter serializes
+#### Scenario: Any valid frontmatter serializes, and the raw block is authoritative
 
-- **WHEN** a note's frontmatter contains YAML values with no native JSON form (dates, nested maps, anchors)
-- **THEN** the response SHALL serialize successfully, coercing such leaves to strings, and SHALL NOT raise
+- **WHEN** a note carries a valid frontmatter block
+- **THEN** the response SHALL carry `frontmatter_yaml` — the block's text exactly as stored (fence lines excluded), subject to the metadata budget — as the authoritative, lossless representation, and a best-effort JSON view in `frontmatter`
+- **AND** the JSON view SHALL be constructed defensively: leaves with no native JSON form (dates, timestamps) become strings; construction is depth- and size-bounded so recursive aliases (`x: &X [*X]`) cannot raise or loop; when construction fails, or two YAML keys would collide onto one JSON key (`1:` and `"1":`), the JSON view SHALL be omitted and the omission stated, with `frontmatter_yaml` still present
+- **AND** the documentation SHALL direct callers that mutate frontmatter to `set_frontmatter` (or the raw block), never to a round trip through the lossy JSON view
 
 #### Scenario: Errors are in-band fields
 
@@ -49,6 +55,16 @@ The response SHALL be the structured result defined by the "read_note responses 
 - **WHEN** `read_note` is invoked on a path that does not exist
 - **THEN** the tool SHALL return an in-band error identifying the path
 - **AND** the tool SHALL NOT raise an unhandled exception
+
+#### Scenario: Admission refusals use the same structure
+
+- **WHEN** the tool-level admission gate refuses the call before the tool body runs (no vault assignment, for example)
+- **THEN** the refusal SHALL be delivered as the same structured result with `error` set — never as a bare string that fails output-schema validation and surfaces as a protocol error
+
+#### Scenario: Empty selected content is a successful read
+
+- **WHEN** the selected note or section body is empty and `offset` is 0
+- **THEN** the response SHALL be a successful read with empty `content` — the offset-at-end error applies only to continuation offsets greater than zero
 
 ### Requirement: Section selection in read_note
 
@@ -101,7 +117,7 @@ No docstring SHALL instruct a caller to recover a section body by textual manipu
 
 ### Requirement: Heading outline on a truncated whole-note read
 
-When a whole-note read is truncated and the note contains ATX headings, the response SHALL include an outline of the note's sections as a list of structured entries. Each entry SHALL carry the section's `#N` ordinal, heading depth, heading text, and size in characters, and SHALL indicate when a section itself exceeds the cap. The response's `notice` field SHALL tell the caller how to read a listed section directly.
+When a whole-note read is truncated and the note contains ATX headings, the response SHALL include an outline object carrying: `entries` (one per listed section: `#N` ordinal, heading depth, heading text, size in characters, whether it exceeds the cap, and whether its title duplicates another's), and — when the listing is incomplete — the omission state as data: the count of sections omitted and the full ordinal range. When the budget cannot accommodate even one entry, the outline SHALL degrade to its explicit truncation marker as a field, not by exceeding the budget. `size` and the exceeds-cap flag keep their existing measure (heading line plus body, per the existing outline helper); this is conservative for body-only section reads — a section whose heading-plus-body fits the cap always has a body that fits. The response's `notice` field SHALL tell the caller how to read a listed section directly.
 
 The outline SHALL NOT be included when a `section` was explicitly selected, since the caller has already chosen.
 

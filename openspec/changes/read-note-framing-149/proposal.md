@@ -22,12 +22,13 @@ Every `read_note` response is a single string: a `# <title>` / `**Path:**` / `**
 
 ### Modified Capabilities
 - `note-read`: the `read_note` tool requirement and its response contract change from "a rendered string beginning with an envelope" to "a structured result whose fields separate note-controlled content from metadata"; the section-selection, size-cap, and outline requirements are restated against fields instead of rendered text.
+- `vault-write`: the section-mode round-trip scenario ("stripped of its heading line…") and the section-mode docstring requirement are restated against the `content` field — left as-is they would instruct a caller to delete the body's first line. Authored against the post-`fence-grammar-150` text; this change archives second.
 
 ## Impact
 
 - `src/mcp_server/tools.py` — `read_note_impl` returns a typed structure; `_outline_text` gains a structured sibling (or is replaced).
 - `src/mcp_server/server.py` — `read_note` registration returns the structured type so MCP SDK 1.29 emits `structuredContent` + an `outputSchema`; the wire-visible text block becomes the SDK's JSON serialization (reversible by construction — this is the "reversible escaping" the issue demands, supplied by JSON rather than an invented scheme).
 - Consumers: agents that parsed the old envelope must read fields instead; the JSON text fallback keeps non-structured clients functional.
-- Tests over `read_note` responses (truncation, outline, section reads) are rewritten against fields.
+- Known envelope consumers, each with a migration task: `tests/test_read_response_cap.py`; `tests/test_issue_128_edit_note_frontmatter.py` (splits on `\n---\n`); `tests/test_issue_140_section_round_trip.py`; `tests/test_issue_89_tool_names_in_copy.py` (guidance producers); the `read_note`/`edit_note` docstrings in `server.py` and `tools.py`; `docs/architecture/vault-tools.md`'s worst-case-response accounting; the note-read registered-tool-guidance requirement's two producers (now the `notice` field).
 - `docs/architecture/vault-tools.md` — the read→write round-trip contract is updated.
 - Other read tools (`keyword_search`, `list_notes`, …) keep their string responses: none of them advertises a write-back round trip, so the forgery there has no destructive sink. Recorded as a non-goal.
