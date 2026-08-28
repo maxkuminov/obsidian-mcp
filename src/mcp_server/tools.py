@@ -424,7 +424,7 @@ def _response_size(result) -> int:
 def _first_unencodable_argument(bound) -> str | None:
     """The name of the first argument carrying an unpaired surrogate, or None.
 
-    A JSON-RPC argument can hold `"\ud800"`: a valid JSON string, a valid
+    A JSON-RPC argument can hold `"\\ud800"`: a valid JSON string, a valid
     Python `str`, and not a Unicode scalar value — so it cannot be encoded as
     UTF-8. Nothing good happens downstream. It cannot name a file. It cannot be
     written to one. And when a tool quotes it back in an error message — which
