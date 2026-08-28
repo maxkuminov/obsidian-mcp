@@ -357,6 +357,48 @@ everything you can build on top of that.
 Comparison reflects each project's documented features at time of
 writing; verify the specifics before betting on them.
 
+### vs. an agent with raw file access
+
+The other baseline isn't an MCP server at all: point Claude Code, a
+generic filesystem MCP, or any agent with file tools straight at the
+vault folder. That works — until a write goes wrong. An agent
+rewriting a whole file from its memory of an earlier read will
+eventually clobber a note, follow a symlink somewhere it shouldn't,
+or "tidy up" your `.obsidian` config. Nothing in a raw file API
+pushes back. This server's write path is shaped by exactly that kind
+of incident, and it assumes the caller will eventually do something
+wrong:
+
+- **Targeted edits instead of rewrites.** `edit_note` can address a
+  find-string or a single section rather than replacing the file, and
+  `dry_run=True` returns the unified diff before anything lands.
+  `set_frontmatter` mutates YAML structurally and leaves the body
+  byte-identical.
+- **No-clobber defaults.** `create_note` and `write_file` refuse to
+  overwrite an existing file; replacing one is an explicit opt-in.
+- **Atomic writes.** Content is staged and renamed into place against
+  a descriptor opened at validation time — a note is never left
+  half-written, and the file that gets replaced is the file that was
+  checked.
+- **Reversible deletes.** `delete_note` and `delete_file` soft-delete
+  into `.trash/` with a non-replacing rename; `permanent=True` is the
+  explicit escape hatch, not the default.
+- **Kernel-proved containment.** Paths resolve under the vault root
+  via `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS |
+  RESOLVE_NO_MAGICLINKS)`, writes refuse a symlink as the final
+  component, and dot-directories (`.obsidian`, `.git`, `.trash`) are
+  out of reach of every tool.
+- **Bounded responses.** Reads are capped and truncation is data
+  (`truncated`, `next_offset`, an outline) rather than silent loss,
+  so one huge note can't flood an agent's context into a bad edit.
+- **An audit trail.** Every call is attributed to a key and logged;
+  the control panel shows who touched what, and when.
+
+When an agent misbehaves through this server you get a refused call,
+a diff, a trash entry, and a usage-log line. When it misbehaves with
+raw file access you get whatever `git diff` can recover — if the
+vault was in git at all.
+
 ## Who this is for
 
 - Homelab folks who already run Postgres and Docker, or are happy
