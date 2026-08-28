@@ -361,7 +361,7 @@ def coerce_text(value) -> tuple[str | None, str | None]:
     * `title: 0x<5000 hex digits>` — PyYAML *constructs* the int happily
       (CPython's digit limit guards decimal parsing, not hex literals), and then
       `str()` on it raises `ValueError`. The value is fine; rendering it is not.
-    * `title: "\uD800"` — decodes to a lone surrogate, which is a valid Python
+    * `title: "\\uD800"` — decodes to a lone surrogate, which is a valid Python
       `str` and not a Unicode scalar value, so it cannot be encoded as UTF-8 and
       `pydantic_core` refuses to serialize it.
 
@@ -2835,7 +2835,7 @@ def _representability(value) -> str | None:
       on it raises `ValueError`. That crashed `read_note`, the control panel's
       note viewer, the indexer's batch (`_note_title`), and JSONB
       serialization of `notes_metadata.frontmatter`.
-    * `title: "\uD800"` — decodes to a lone surrogate, a valid Python `str`
+    * `title: "\\uD800"` — decodes to a lone surrogate, a valid Python `str`
       that is not a Unicode scalar value, so it cannot be UTF-8-encoded.
       `pydantic_core` raises on it, and it reaches the panel's HTML.
 
