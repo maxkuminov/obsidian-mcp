@@ -74,17 +74,24 @@
 
 <script>
 (function() {
+    // Chart colors are read from the live token values rather than written as
+    // literals, so the chart follows the theme instead of pinning the palette
+    // it happened to be built under. `tok` re-reads on every call, which is
+    // what makes the `themechange` repaint below correct.
+    const root = document.documentElement;
+    function tok(name) { return getComputedStyle(root).getPropertyValue(name).trim(); }
+
     const ctx = document.getElementById('usage-chart').getContext('2d');
     const data = {{ chart_data | tojson }};
-    new Chart(ctx, {
+    const chart = new Chart(ctx, {
         type: 'bar',
         data: {
             labels: data.labels,
             datasets: [{
                 label: 'Requests',
                 data: data.values,
-                backgroundColor: 'rgba(139,111,223,0.35)',
-                borderColor: 'rgba(139,111,223,0.8)',
+                backgroundColor: tok('--chart-bar-bg'),
+                borderColor: tok('--chart-bar-border'),
                 borderWidth: 1,
                 borderRadius: 3,
                 borderSkipped: false,
@@ -95,11 +102,11 @@
             plugins: {
                 legend: { display: false },
                 tooltip: {
-                    backgroundColor: '#12192a',
-                    borderColor: '#223050',
+                    backgroundColor: tok('--chart-tooltip-bg'),
+                    borderColor: tok('--chart-tooltip-border'),
                     borderWidth: 1,
-                    titleColor: '#d8dce8',
-                    bodyColor: '#6e7e9c',
+                    titleColor: tok('--chart-tooltip-title'),
+                    bodyColor: tok('--chart-tooltip-body'),
                     padding: 10,
                     titleFont: { family: "'DM Sans', sans-serif", size: 12 },
                     bodyFont:  { family: "'JetBrains Mono', monospace", size: 11 },
@@ -108,17 +115,37 @@
             scales: {
                 y: {
                     beginAtZero: true,
-                    ticks: { color: '#7d8ba6', font: { family: "'JetBrains Mono', monospace", size: 10 } },
-                    grid: { color: '#222c44' },
-                    border: { color: '#222c44' }
+                    ticks: { color: tok('--chart-tick'), font: { family: "'JetBrains Mono', monospace", size: 10 } },
+                    grid: { color: tok('--chart-grid') },
+                    border: { color: tok('--chart-grid') }
                 },
                 x: {
-                    ticks: { color: '#7d8ba6', font: { family: "'JetBrains Mono', monospace", size: 10 } },
+                    ticks: { color: tok('--chart-tick'), font: { family: "'JetBrains Mono', monospace", size: 10 } },
                     grid: { display: false },
-                    border: { color: '#222c44' }
+                    border: { color: tok('--chart-grid') }
                 }
             }
         }
+    });
+
+    // Re-read every color from the new theme's tokens and repaint in place.
+    // `update()` rather than destroy/rebuild: the canvas keeps its size and
+    // the bars do not re-animate from zero on every toggle.
+    window.addEventListener('themechange', function () {
+        const o = chart.options, d = chart.data.datasets[0];
+        d.backgroundColor = tok('--chart-bar-bg');
+        d.borderColor = tok('--chart-bar-border');
+        const tip = o.plugins.tooltip;
+        tip.backgroundColor = tok('--chart-tooltip-bg');
+        tip.borderColor = tok('--chart-tooltip-border');
+        tip.titleColor = tok('--chart-tooltip-title');
+        tip.bodyColor = tok('--chart-tooltip-body');
+        o.scales.y.ticks.color = tok('--chart-tick');
+        o.scales.y.grid.color = tok('--chart-grid');
+        o.scales.y.border.color = tok('--chart-grid');
+        o.scales.x.ticks.color = tok('--chart-tick');
+        o.scales.x.border.color = tok('--chart-grid');
+        chart.update();
     });
 })();
 </script>

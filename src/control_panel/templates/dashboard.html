@@ -81,7 +81,7 @@
                     {% for log in recent_usage %}
                     <div class="activity-row" style="opacity:0;transform:translateX(-6px);display:flex;align-items:center;justify-content:space-between;padding:11px 0;border-bottom:1px solid var(--border);gap:14px;transition:background 0.15s;">
                         <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1;">
-                            <span style="display:inline-flex;align-items:center;padding:3px 9px;border-radius:4px;background:var(--primary-glow);border:1px solid rgba(155,130,232,0.25);color:var(--primary-text);font-size:12px;font-weight:500;white-space:nowrap;">{{ log.tool }}</span>
+                            <span style="display:inline-flex;align-items:center;padding:3px 9px;border-radius:4px;background:var(--primary-glow);border:1px solid var(--primary-border);color:var(--primary-text);font-size:12px;font-weight:500;white-space:nowrap;">{{ log.tool }}</span>
                             {% if log.detail %}
                             <span style="color:var(--text-2);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;" title="{{ log.detail }}">{{ log.detail }}</span>
                             {% endif %}
@@ -125,7 +125,7 @@
                         {% if last_indexed_iso %}<time datetime="{{ last_indexed_iso }}" data-localize>{{ last_indexed_iso }}</time>{% else %}Never{% endif %}
                     </span>
                 </div>
-                <div style="margin-top:16px;padding:14px;border-radius:6px;background:rgba(155,130,232,0.05);border:1px solid rgba(155,130,232,0.15);font-size:13px;color:var(--text-2);line-height:1.5;">
+                <div style="margin-top:16px;padding:14px;border-radius:6px;background:var(--primary-glow-xs);border:1px solid var(--primary-border-soft);font-size:13px;color:var(--text-2);line-height:1.5;">
                     Added a note to Obsidian? Hit
                     <strong style="color:var(--primary-text);font-weight:600;">Reindex Now</strong>
                     above to pick it up immediately — or wait for the next scan (every {{ index_interval // 60 }} min).

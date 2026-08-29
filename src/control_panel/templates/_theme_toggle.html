@@ -1,0 +1,22 @@
+{#-
+  The light/dark toggle. Styles and behaviour live in `_theme.html`; this is
+  only the markup, so the panel chrome, the auth card and the OAuth consent
+  card all expose the same control instead of three copies of it.
+
+  `aria-label`/`title` start on the dark-theme wording and are corrected by
+  `syncButtons()` once the DOM is ready — the CSS icon swap is already right
+  before any script runs.
+-#}
+<button type="button" class="theme-toggle" data-theme-toggle
+        onclick="window.__themeToggle()"
+        aria-label="Switch to light theme" title="Switch to light theme">
+    <svg class="icon-sun" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+         stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+        <circle cx="8" cy="8" r="3.1"/>
+        <path d="M8 1v1.8M8 13.2V15M1 8h1.8M13.2 8H15M3.05 3.05l1.27 1.27M11.68 11.68l1.27 1.27M3.05 12.95l1.27-1.27M11.68 4.32l1.27-1.27"/>
+    </svg>
+    <svg class="icon-moon" viewBox="0 0 16 16" fill="none" stroke="currentColor"
+         stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+        <path d="M13.5 9.6A5.9 5.9 0 0 1 6.4 2.5a5.9 5.9 0 1 0 7.1 7.1Z"/>
+    </svg>
+</button>

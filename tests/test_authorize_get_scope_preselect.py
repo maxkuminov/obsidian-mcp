@@ -269,7 +269,17 @@ def test_selected_scope_option_is_visibly_highlighted():
     `:has()` support."""
     html = _get(_FakeClient(scope=WRITE_CAPABLE), requested_scope="read")
 
-    css = re.sub(r"/\*.*?\*/", " ", html[: html.index("</style>")], flags=re.S)
+    # Every <style> block, not just the first one. The consent page now
+    # includes the shared theme partial ahead of its own styles, so slicing to
+    # the first `</style>` stopped covering the rule this guard exists for —
+    # and silently, because the slice still parsed. The rule has to hold
+    # wherever it lives.
+    css = re.sub(
+        r"/\*.*?\*/",
+        " ",
+        " ".join(re.findall(r"<style\b[^>]*>(.*?)</style>", html, re.S | re.I)),
+        flags=re.S,
+    )
     rules = [
         rule for rule in re.findall(r"([^{}]+)\{[^{}]*\}", css) if ":has(" in rule
     ]
@@ -328,8 +338,16 @@ def test_hostile_client_name_is_escaped_and_cannot_add_a_control():
     hostile = '<script>alert("xss")</script>"><input type="radio" name="scope" value="readwrite" checked>'
     html = _get(_FakeClient(scope=WRITE_CAPABLE, client_name=hostile), requested_scope="read")
 
-    assert "<script>" not in html
+    # The page legitimately carries the panel's own inline scripts (the
+    # pre-paint theme bootstrap), so "no <script> anywhere" is not the
+    # property — and never was the one that mattered. What matters is that the
+    # attacker's markup arrives as inert text and contributes no control.
     assert "&lt;script&gt;" in html
+    assert "<script>alert" not in html
+    assert 'alert("xss")' not in html
+    for body in re.findall(r"<script\b[^>]*>(.*?)</script>", html, re.S | re.I):
+        assert "alert" not in body
+        assert "xss" not in body
     assert _checked_radio_values(html) == ["read"]
     assert len(_checked_inputs(html)) == 1
     assert 'name="scope"' in _checked_inputs(html)[0]

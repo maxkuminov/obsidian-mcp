@@ -3,31 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="theme-color" content="#070910">
+    <meta name="theme-color" content="#070910" data-theme-color-token="--bg">
     <title>{% block title %}Obsidian MCP{% endblock %}</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600;9..40,700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+    {# Same token source as the panel — auth pages used to carry a duplicate
+       copy of the palette, which is exactly how the two drifted apart. #}
+    {% include "_theme.html" %}
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-        :root {
-            --bg: #070910;
-            --surface: #0c1018;
-            --surface-2: #141b2c;
-            --surface-3: #1b2440;
-            --border: #222c44;
-            --border-2: #2d3a5a;
-            --primary: #9b82e8;
-            --primary-dim: #6d57c2;
-            --primary-glow: rgba(155, 130, 232, 0.12);
-            --primary-glow-strong: rgba(155, 130, 232, 0.28);
-            --primary-text: #c4b4f5;
-            --text: #eef1f8;
-            --text-2: #a8b4cc;
-            --text-3: #7d8ba6;
-            --error: #f58888;
-        }
 
         html { -webkit-text-size-adjust: 100%; }
 
@@ -61,7 +46,7 @@
             transform: translate(-50%, -50%);
             width: 700px;
             height: 700px;
-            background: radial-gradient(ellipse, rgba(155,130,232,0.07) 0%, transparent 70%);
+            background: radial-gradient(ellipse, var(--primary-glow-amb) 0%, transparent 70%);
             pointer-events: none;
         }
 
@@ -71,7 +56,7 @@
             border-radius: 12px;
             width: 100%;
             max-width: 420px;
-            box-shadow: 0 32px 80px rgba(0,0,0,0.65), 0 0 60px rgba(155,130,232,0.06);
+            box-shadow: 0 32px 80px var(--shadow-auth), 0 0 60px var(--auth-card-glow);
             position: relative;
             overflow: hidden;
             animation: in 0.35s ease;
@@ -106,8 +91,8 @@
         }
 
         @keyframes glow {
-            0%, 100% { filter: drop-shadow(0 0 4px rgba(155,130,232,0.55)); }
-            50%       { filter: drop-shadow(0 0 10px rgba(155,130,232,0.95)); }
+            0%, 100% { filter: drop-shadow(0 0 4px var(--primary-halo)); }
+            50%       { filter: drop-shadow(0 0 10px var(--primary-halo-strong)); }
         }
 
         .wordmark {
@@ -129,6 +114,12 @@
         }
 
         .auth-body { padding: 26px 32px 30px; }
+
+        .auth-foot {
+            padding: 0 32px 22px;
+            display: flex;
+            justify-content: flex-end;
+        }
 
         .auth-heading {
             font-family: 'Cormorant Garamond', serif;
@@ -161,7 +152,7 @@
             width: 100%;
             padding: 11px 13px;
             background: var(--bg);
-            border: 1px solid var(--border);
+            border: 1px solid var(--control-border);
             border-radius: 5px;
             color: var(--text);
             font-family: 'DM Sans', sans-serif;
@@ -185,7 +176,7 @@
             width: 100%;
             padding: 12px;
             background: linear-gradient(180deg, var(--primary) 0%, var(--primary-dim) 100%);
-            color: white;
+            color: var(--on-primary-strong);
             border: none;
             border-radius: 6px;
             font-family: 'DM Sans', sans-serif;
@@ -194,12 +185,12 @@
             letter-spacing: 0.02em;
             cursor: pointer;
             transition: box-shadow 0.2s, transform 0.15s;
-            box-shadow: 0 2px 12px rgba(155,130,232,0.25), inset 0 1px 0 rgba(255,255,255,0.12);
+            box-shadow: 0 2px 12px var(--primary-shadow), inset 0 1px 0 var(--inset-highlight);
             margin-top: 8px;
         }
 
         .btn-submit:hover {
-            box-shadow: 0 4px 22px rgba(155,130,232,0.45), inset 0 1px 0 rgba(255,255,255,0.2);
+            box-shadow: 0 4px 22px var(--primary-shadow-hover), inset 0 1px 0 var(--inset-highlight-strong);
             transform: translateY(-1px);
         }
         .btn-submit:active { transform: translateY(0); }
@@ -209,15 +200,15 @@
             border-radius: 6px;
             font-size: 13px;
             margin-bottom: 18px;
-            background: rgba(245,136,136,0.08);
-            border: 1px solid rgba(245,136,136,0.25);
-            color: #f5abab;
+            background: var(--error-surface-faint);
+            border: 1px solid var(--error-border);
+            color: var(--error-text);
         }
 
         .alert-info {
-            background: rgba(122,189,230,0.08);
-            border-color: rgba(122,189,230,0.25);
-            color: #a6d2ea;
+            background: var(--info-surface-faint);
+            border-color: var(--info-border);
+            color: var(--info-text);
         }
     </style>
 </head>
@@ -226,12 +217,12 @@
 <div class="auth-card">
     <div class="auth-top">
         <svg class="gem" viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke="#9b82e8" stroke-width="1.4"/>
-            <polygon points="15,2 27,10 15,8" fill="rgba(155,130,232,0.22)" stroke="none"/>
-            <polygon points="15,8 27,10 24,25 6,25 3,10" fill="rgba(155,130,232,0.06)" stroke="none"/>
-            <line x1="15" y1="2" x2="15" y2="8" stroke="#9b82e8" stroke-width="0.8" opacity="0.7"/>
-            <line x1="15" y1="8" x2="3" y2="10" stroke="#9b82e8" stroke-width="0.5" opacity="0.4"/>
-            <line x1="15" y1="8" x2="27" y2="10" stroke="#9b82e8" stroke-width="0.5" opacity="0.4"/>
+            <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke-width="1.4" style="stroke:var(--primary);"/>
+            <polygon points="15,2 27,10 15,8" style="fill:var(--gem-facet);stroke:none;"/>
+            <polygon points="15,8 27,10 24,25 6,25 3,10" style="fill:var(--gem-facet-2);stroke:none;"/>
+            <line x1="15" y1="2" x2="15" y2="8" stroke-width="0.8" opacity="0.7" style="stroke:var(--primary);"/>
+            <line x1="15" y1="8" x2="3" y2="10" stroke-width="0.5" opacity="0.4" style="stroke:var(--primary);"/>
+            <line x1="15" y1="8" x2="27" y2="10" stroke-width="0.5" opacity="0.4" style="stroke:var(--primary);"/>
         </svg>
         <div>
             <div class="wordmark">Obsidian MCP</div>
@@ -241,6 +232,10 @@
 
     <div class="auth-body">
         {% block content %}{% endblock %}
+    </div>
+
+    <div class="auth-foot">
+        {% include "_theme_toggle.html" %}
     </div>
 </div>
 

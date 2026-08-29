@@ -1,0 +1,563 @@
+{#-
+  The panel's single token source.
+
+  Included from the <head> of `base.html`, `auth_base.html` and
+  `authorize.html` — the three roots of the panel/auth surface. None of them
+  keeps a palette of its own, so they cannot drift apart again (they had:
+  auth_base carried a duplicate copy of the token block and authorize.html an
+  entirely separate set of literals, which is why every `--consent-*` token
+  below exists).
+
+  Dark is canonical. Every value in the bare `:root` block is byte-identical
+  to the literal it replaced in the pre-token templates — see
+  `openspec/changes/panel-light-mode/baseline-manifest.json` and the replay
+  check that proves it. Light is the override set.
+
+  Theme selection:
+    bare `:root`                          → dark (the tested baseline)
+    `:root[data-theme="light"]`           → explicit light
+    `prefers-color-scheme: light`,
+      guarded `:root:not([data-theme="dark"])`  → OS default
+
+  The transfer pages (`transfer_upload.html`, `transfer_download.html`) are a
+  DIFFERENT surface and deliberately do not include this partial: they serve
+  third parties under a strict per-request nonce CSP with static-response
+  discipline, so they carry their own local token block, stay OS-responsive,
+  and have no toggle and no localStorage.
+-#}
+<style>
+    :root {
+        color-scheme: dark;
+
+        /* ── Core surfaces and text ── */
+        --bg: #070910;
+        --bg-2: #1c1c20;
+        --surface: #0c1018;
+        --surface-2: #141b2c;
+        --surface-3: #1b2440;
+        --border: #222c44;
+        --border-2: #2d3a5a;
+        --control-border: #222c44;
+        --control-border-strong: #2d3a5a;
+        --scrollbar-thumb: #2d3a5a;
+        --disabled-opacity: 0.6;
+        --primary: #9b82e8;
+        --primary-dim: #6d57c2;
+        --primary-text: #c4b4f5;
+        --text: #eef1f8;
+        --text-2: #a8b4cc;
+        --text-3: #7d8ba6;
+        --success: #5fd9a0;
+        --error: #f58888;
+        --warning: #f0b555;
+        --info: #7abde6;
+
+        /* ── Accent washes, borders, glows ──
+           Given explicit per-theme values rather than derived from --primary:
+           an rgba glow that reads as a halo on a near-black ground reads as
+           dirt on a white one. */
+        --primary-glow: rgba(155, 130, 232, 0.12);
+        --primary-glow-strong: rgba(155, 130, 232, 0.28);
+        --primary-glow-xs: rgba(155,130,232,0.05);
+        --primary-glow-md: rgba(155,130,232,0.08);
+        --primary-glow-amb: rgba(155,130,232,0.07);
+        --sidebar-glow: rgba(155,130,232,0.16);
+        --primary-border: rgba(155,130,232,0.25);
+        --primary-border-soft: rgba(155,130,232,0.15);
+        --primary-border-strong: rgba(155,130,232,0.3);
+        --primary-shadow: rgba(155,130,232,0.25);
+        --primary-shadow-hover: rgba(155,130,232,0.45);
+        --primary-halo: rgba(155,130,232,0.55);
+        --primary-halo-strong: rgba(155,130,232,0.95);
+        --gem-facet: rgba(155,130,232,0.22);
+        --gem-facet-2: rgba(155,130,232,0.06);
+        --auth-card-glow: rgba(155,130,232,0.06);
+
+        /* ── Status tints, borders, text ── */
+        --success-surface: rgba(95,217,160,0.12);
+        --success-surface-soft: rgba(95,217,160,0.1);
+        --success-surface-faint: rgba(95,217,160,0.08);
+        --success-border: rgba(95,217,160,0.25);
+        --success-text: #8deabf;
+        --error-surface: rgba(245,136,136,0.12);
+        --error-surface-soft: rgba(245,136,136,0.1);
+        --error-surface-faint: rgba(245,136,136,0.08);
+        --error-surface-strong: rgba(245,136,136,0.2);
+        --error-border: rgba(245,136,136,0.25);
+        --error-border-strong: rgba(245,136,136,0.28);
+        --error-text: #f5abab;
+        --error-text-hover: #f7a5a5;
+        --warning-surface: rgba(240,181,85,0.12);
+        --warning-border: rgba(240,181,85,0.25);
+        --info-surface: rgba(122,189,230,0.12);
+        --info-surface-faint: rgba(122,189,230,0.08);
+        --info-border: rgba(122,189,230,0.25);
+        --info-text: #a6d2ea;
+        --neutral-surface: rgba(125,139,166,0.12);
+        --danger-border: rgba(240,110,110,0.25);
+        --danger-border-soft: rgba(240,110,110,0.2);
+        --key-text: #a0f0cc;
+
+        /* ── Text drawn on a filled accent ── */
+        --on-primary: #efe9ff;
+        --on-primary-strong: white;
+
+        /* ── Overlays, scrims, elevation ── */
+        --topbar-bg: rgba(12, 16, 24, 0.92);
+        --backdrop: rgba(7, 9, 16, 0.6);
+        --modal-scrim: rgba(7, 9, 16, 0.75);
+        --modal-scrim-2: rgba(0,0,0,0.55);
+        --shadow-card: rgba(0,0,0,0.35);
+        --shadow-sidebar: rgba(0,0,0,0.6);
+        --shadow-modal: rgba(0,0,0,0.7);
+        --shadow-auth: rgba(0,0,0,0.65);
+        --code-bg: rgba(0,0,0,0.3);
+        --code-bg-soft: rgba(0,0,0,0.28);
+        --inset-highlight: rgba(255,255,255,0.12);
+        --inset-highlight-strong: rgba(255,255,255,0.2);
+
+        /* Select chevron. A data-URI image cannot read a custom property, so
+           the whole url() is the token and each theme ships its own. */
+        --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%237d8ba6' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+
+        /* ── Chart.js (usage.html) ── */
+        --chart-bar-bg: rgba(139,111,223,0.35);
+        --chart-bar-border: rgba(139,111,223,0.8);
+        --chart-tooltip-bg: #12192a;
+        --chart-tooltip-border: #223050;
+        --chart-tooltip-title: #d8dce8;
+        --chart-tooltip-body: #6e7e9c;
+        --chart-tick: #7d8ba6;
+        --chart-grid: #222c44;
+
+        /* ── OAuth consent page ──
+           A palette that drifted away from the panel's years ago. Dark keeps
+           it byte-for-byte (zero-visual-diff gate); light folds it back onto
+           the panel's own light values, which is where the two surfaces
+           finally converge. */
+        --consent-text: #d8dce8;
+        --consent-text-2: #9fa8b8;
+        --consent-text-3: #6e7e9c;
+        --consent-label: #364155;
+        --consent-border: #1a2336;
+        --consent-border-hover: #223050;
+        --consent-control-border: #1a2336;
+        --consent-control-border-hover: #223050;
+        --consent-primary: #8b6fdf;
+        --consent-primary-dim: #5a45a8;
+        --consent-primary-text: #e0d9f8;
+        --consent-warn: #c9a227;
+        --consent-glow-amb: rgba(139,111,223,0.07);
+        --consent-halo: rgba(139,111,223,0.55);
+        --consent-halo-strong: rgba(139,111,223,0.9);
+        --consent-surface: rgba(139,111,223,0.07);
+        --consent-surface-border: rgba(139,111,223,0.18);
+        --consent-option-hover: rgba(139,111,223,0.04);
+        --consent-option-active: rgba(139,111,223,0.10);
+        --consent-gem-facet: rgba(139,111,223,0.18);
+        --consent-gem-facet-2: rgba(139,111,223,0.05);
+        --consent-primary-glow: rgba(139,111,223,0.3);
+        --consent-neutral-surface: rgba(110,126,156,0.1);
+        --consent-neutral-surface-hover: rgba(110,126,156,0.18);
+    }
+
+    /* ── Light palette ──
+       Selected by `data-theme="light"` on <html>, which the pre-paint
+       bootstrap below stamps from localStorage. Every token defined for dark
+       has a light value here; none falls through. */
+    :root[data-theme="light"] {
+        color-scheme: light;
+
+        /* ── Core surfaces and text ── */
+        --bg: #f5f6fa;
+        --bg-2: #ffffff;
+        --surface: #ffffff;
+        --surface-2: #eef0f6;
+        --surface-3: #e3e6ef;
+        --border: #dfe3ec;
+        --border-2: #c3c9d8;
+        --control-border: #767e91;
+        --control-border-strong: #5e677b;
+        --scrollbar-thumb: #767e91;
+        --disabled-opacity: 0.75;
+        --primary: #6440c8;
+        --primary-dim: #573ab0;
+        --primary-text: #4b2fa6;
+        --text: #14171f;
+        --text-2: #454c5e;
+        --text-3: #5d6577;
+        --success: #0a6b41;
+        --error: #b32218;
+        --warning: #7a4d00;
+        --info: #10557f;
+
+        /* ── Accent washes, borders, glows ── */
+        --primary-glow: rgba(100, 64, 200, 0.10);
+        --primary-glow-strong: rgba(100, 64, 200, 0.22);
+        --primary-glow-xs: rgba(100,64,200,0.05);
+        --primary-glow-md: rgba(100,64,200,0.10);
+        --primary-glow-amb: rgba(100,64,200,0.06);
+        --sidebar-glow: rgba(100,64,200,0.10);
+        --primary-border: rgba(100,64,200,0.32);
+        --primary-border-soft: rgba(100,64,200,0.20);
+        --primary-border-strong: rgba(100,64,200,0.40);
+        --primary-shadow: rgba(100,64,200,0.28);
+        --primary-shadow-hover: rgba(100,64,200,0.40);
+        --primary-halo: rgba(100,64,200,0.30);
+        --primary-halo-strong: rgba(100,64,200,0.50);
+        --gem-facet: rgba(100,64,200,0.30);
+        --gem-facet-2: rgba(100,64,200,0.12);
+        --auth-card-glow: rgba(100,64,200,0.08);
+
+        /* ── Status tints, borders, text ── */
+        --success-surface: rgba(10,107,65,0.10);
+        --success-surface-soft: rgba(10,107,65,0.08);
+        --success-surface-faint: rgba(10,107,65,0.07);
+        --success-border: rgba(10,107,65,0.38);
+        --success-text: #075232;
+        --error-surface: rgba(179,34,24,0.09);
+        --error-surface-soft: rgba(179,34,24,0.07);
+        --error-surface-faint: rgba(179,34,24,0.06);
+        --error-surface-strong: rgba(179,34,24,0.15);
+        --error-border: rgba(179,34,24,0.36);
+        --error-border-strong: rgba(179,34,24,0.8);
+        --error-text: #8f1b13;
+        --error-text-hover: #6f150f;
+        --warning-surface: rgba(122,77,0,0.10);
+        --warning-border: rgba(122,77,0,0.36);
+        --info-surface: rgba(16,85,127,0.10);
+        --info-surface-faint: rgba(16,85,127,0.07);
+        --info-border: rgba(16,85,127,0.36);
+        --info-text: #0c4363;
+        --neutral-surface: rgba(93,101,119,0.12);
+        --danger-border: rgba(179,34,24,0.36);
+        --danger-border-soft: rgba(179,34,24,0.26);
+        --key-text: #075232;
+
+        /* ── Text drawn on a filled accent ── */
+        --on-primary: #ffffff;
+        --on-primary-strong: #ffffff;
+
+        /* ── Overlays, scrims, elevation ──
+           Inverted deliberately: on a white ground a scrim has to darken and a
+           shadow has to be a soft neutral, not the near-opaque black that
+           reads as depth against #070910. */
+        --topbar-bg: rgba(255, 255, 255, 0.92);
+        --backdrop: rgba(20, 23, 31, 0.38);
+        --modal-scrim: rgba(20, 23, 31, 0.46);
+        --modal-scrim-2: rgba(20,23,31,0.42);
+        --shadow-card: rgba(20,23,31,0.10);
+        --shadow-sidebar: rgba(20,23,31,0.12);
+        --shadow-modal: rgba(20,23,31,0.20);
+        --shadow-auth: rgba(20,23,31,0.14);
+        --code-bg: rgba(20,23,31,0.05);
+        --code-bg-soft: rgba(20,23,31,0.04);
+        --inset-highlight: rgba(255,255,255,0.30);
+        --inset-highlight-strong: rgba(255,255,255,0.45);
+
+        --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%235d6577' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+
+        /* ── Chart.js (usage.html) ── */
+        --chart-bar-bg: rgba(100,64,200,0.42);
+        --chart-bar-border: rgba(100,64,200,0.95);
+        --chart-tooltip-bg: #ffffff;
+        --chart-tooltip-border: #c3c9d8;
+        --chart-tooltip-title: #14171f;
+        --chart-tooltip-body: #454c5e;
+        --chart-tick: #5d6577;
+        --chart-grid: #c3c9d8;
+
+        /* ── OAuth consent page ──
+           In light the consent surface stops being its own thing and folds
+           onto the panel's values. */
+        --consent-text: #14171f;
+        --consent-text-2: #454c5e;
+        --consent-text-3: #5d6577;
+        --consent-label: #5d6577;
+        --consent-border: #dfe3ec;
+        --consent-border-hover: #c3c9d8;
+        --consent-control-border: #767e91;
+        --consent-control-border-hover: #5e677b;
+        --consent-primary: #6440c8;
+        --consent-primary-dim: #573ab0;
+        --consent-primary-text: #ffffff;
+        --consent-warn: #7a4d00;
+        --consent-glow-amb: rgba(100,64,200,0.06);
+        --consent-halo: rgba(100,64,200,0.30);
+        --consent-halo-strong: rgba(100,64,200,0.50);
+        --consent-surface: rgba(100,64,200,0.07);
+        --consent-surface-border: rgba(100,64,200,0.22);
+        --consent-option-hover: rgba(100,64,200,0.05);
+        --consent-option-active: rgba(100,64,200,0.11);
+        --consent-gem-facet: rgba(100,64,200,0.28);
+        --consent-gem-facet-2: rgba(100,64,200,0.10);
+        --consent-primary-glow: rgba(100,64,200,0.30);
+        --consent-neutral-surface: rgba(93,101,119,0.10);
+        --consent-neutral-surface-hover: rgba(93,101,119,0.18);
+    }
+
+    /* OS default, for a visitor who has never chosen. Guarded on
+       `:not([data-theme="dark"])` so an explicit dark choice still wins on a
+       light machine — and so the OS default works with JavaScript off. */
+    @media (prefers-color-scheme: light) {
+        :root:not([data-theme="dark"]) {
+            color-scheme: light;
+
+/* ── Core surfaces and text ── */
+            --bg: #f5f6fa;
+            --bg-2: #ffffff;
+            --surface: #ffffff;
+            --surface-2: #eef0f6;
+            --surface-3: #e3e6ef;
+            --border: #dfe3ec;
+            --border-2: #c3c9d8;
+            --control-border: #767e91;
+            --control-border-strong: #5e677b;
+            --scrollbar-thumb: #767e91;
+            --disabled-opacity: 0.75;
+            --primary: #6440c8;
+            --primary-dim: #573ab0;
+            --primary-text: #4b2fa6;
+            --text: #14171f;
+            --text-2: #454c5e;
+            --text-3: #5d6577;
+            --success: #0a6b41;
+            --error: #b32218;
+            --warning: #7a4d00;
+            --info: #10557f;
+
+/* ── Accent washes, borders, glows ── */
+            --primary-glow: rgba(100, 64, 200, 0.10);
+            --primary-glow-strong: rgba(100, 64, 200, 0.22);
+            --primary-glow-xs: rgba(100,64,200,0.05);
+            --primary-glow-md: rgba(100,64,200,0.10);
+            --primary-glow-amb: rgba(100,64,200,0.06);
+            --sidebar-glow: rgba(100,64,200,0.10);
+            --primary-border: rgba(100,64,200,0.32);
+            --primary-border-soft: rgba(100,64,200,0.20);
+            --primary-border-strong: rgba(100,64,200,0.40);
+            --primary-shadow: rgba(100,64,200,0.28);
+            --primary-shadow-hover: rgba(100,64,200,0.40);
+            --primary-halo: rgba(100,64,200,0.30);
+            --primary-halo-strong: rgba(100,64,200,0.50);
+            --gem-facet: rgba(100,64,200,0.30);
+            --gem-facet-2: rgba(100,64,200,0.12);
+            --auth-card-glow: rgba(100,64,200,0.08);
+
+/* ── Status tints, borders, text ── */
+            --success-surface: rgba(10,107,65,0.10);
+            --success-surface-soft: rgba(10,107,65,0.08);
+            --success-surface-faint: rgba(10,107,65,0.07);
+            --success-border: rgba(10,107,65,0.38);
+            --success-text: #075232;
+            --error-surface: rgba(179,34,24,0.09);
+            --error-surface-soft: rgba(179,34,24,0.07);
+            --error-surface-faint: rgba(179,34,24,0.06);
+            --error-surface-strong: rgba(179,34,24,0.15);
+            --error-border: rgba(179,34,24,0.36);
+            --error-border-strong: rgba(179,34,24,0.8);
+            --error-text: #8f1b13;
+            --error-text-hover: #6f150f;
+            --warning-surface: rgba(122,77,0,0.10);
+            --warning-border: rgba(122,77,0,0.36);
+            --info-surface: rgba(16,85,127,0.10);
+            --info-surface-faint: rgba(16,85,127,0.07);
+            --info-border: rgba(16,85,127,0.36);
+            --info-text: #0c4363;
+            --neutral-surface: rgba(93,101,119,0.12);
+            --danger-border: rgba(179,34,24,0.36);
+            --danger-border-soft: rgba(179,34,24,0.26);
+            --key-text: #075232;
+
+/* ── Text drawn on a filled accent ── */
+            --on-primary: #ffffff;
+            --on-primary-strong: #ffffff;
+
+/* ── Overlays, scrims, elevation ──
+               Inverted deliberately: on a white ground a scrim has to darken and a
+               shadow has to be a soft neutral, not the near-opaque black that
+               reads as depth against #070910. */
+            --topbar-bg: rgba(255, 255, 255, 0.92);
+            --backdrop: rgba(20, 23, 31, 0.38);
+            --modal-scrim: rgba(20, 23, 31, 0.46);
+            --modal-scrim-2: rgba(20,23,31,0.42);
+            --shadow-card: rgba(20,23,31,0.10);
+            --shadow-sidebar: rgba(20,23,31,0.12);
+            --shadow-modal: rgba(20,23,31,0.20);
+            --shadow-auth: rgba(20,23,31,0.14);
+            --code-bg: rgba(20,23,31,0.05);
+            --code-bg-soft: rgba(20,23,31,0.04);
+            --inset-highlight: rgba(255,255,255,0.30);
+            --inset-highlight-strong: rgba(255,255,255,0.45);
+
+--select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%235d6577' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+
+/* ── Chart.js (usage.html) ── */
+            --chart-bar-bg: rgba(100,64,200,0.42);
+            --chart-bar-border: rgba(100,64,200,0.95);
+            --chart-tooltip-bg: #ffffff;
+            --chart-tooltip-border: #c3c9d8;
+            --chart-tooltip-title: #14171f;
+            --chart-tooltip-body: #454c5e;
+            --chart-tick: #5d6577;
+            --chart-grid: #c3c9d8;
+
+/* ── OAuth consent page ──
+               In light the consent surface stops being its own thing and folds
+               onto the panel's values. */
+            --consent-text: #14171f;
+            --consent-text-2: #454c5e;
+            --consent-text-3: #5d6577;
+            --consent-label: #5d6577;
+            --consent-border: #dfe3ec;
+            --consent-border-hover: #c3c9d8;
+            --consent-control-border: #767e91;
+            --consent-control-border-hover: #5e677b;
+            --consent-primary: #6440c8;
+            --consent-primary-dim: #573ab0;
+            --consent-primary-text: #ffffff;
+            --consent-warn: #7a4d00;
+            --consent-glow-amb: rgba(100,64,200,0.06);
+            --consent-halo: rgba(100,64,200,0.30);
+            --consent-halo-strong: rgba(100,64,200,0.50);
+            --consent-surface: rgba(100,64,200,0.07);
+            --consent-surface-border: rgba(100,64,200,0.22);
+            --consent-option-hover: rgba(100,64,200,0.05);
+            --consent-option-active: rgba(100,64,200,0.11);
+            --consent-gem-facet: rgba(100,64,200,0.28);
+            --consent-gem-facet-2: rgba(100,64,200,0.10);
+            --consent-primary-glow: rgba(100,64,200,0.30);
+            --consent-neutral-surface: rgba(93,101,119,0.10);
+            --consent-neutral-surface-hover: rgba(93,101,119,0.18);
+        }
+    }
+
+    /* ── Theme toggle ──
+       Markup lives in `_theme_toggle.html`; the icon swap is pure CSS on the
+       same selectors as the palette, so the right glyph is showing before any
+       script runs. */
+    .theme-toggle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 34px;
+        height: 34px;
+        flex-shrink: 0;
+        padding: 0;
+        border-radius: 7px;
+        border: 1px solid var(--control-border);
+        background: var(--surface-2);
+        color: var(--text-2);
+        cursor: pointer;
+        transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .theme-toggle:hover {
+        background: var(--surface-3);
+        border-color: var(--control-border-strong);
+        color: var(--text);
+    }
+    .theme-toggle:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
+    }
+    .theme-toggle svg { width: 16px; height: 16px; display: block; }
+    .theme-toggle .icon-moon { display: none; }
+    :root[data-theme="light"] .theme-toggle .icon-sun { display: none; }
+    :root[data-theme="light"] .theme-toggle .icon-moon { display: block; }
+    @media (prefers-color-scheme: light) {
+        :root:not([data-theme="dark"]) .theme-toggle .icon-sun { display: none; }
+        :root:not([data-theme="dark"]) .theme-toggle .icon-moon { display: block; }
+    }
+</style>
+<script>
+/* Pre-paint theme bootstrap. It runs in <head>, before the body is parsed, so
+   a stored choice is on <html> before the first paint and there is no flash of
+   the other theme.
+
+   There is deliberately no CSP on this panel (see
+   docs/architecture/control-panel.md), so this inline script needs no nonce —
+   the same reason every control here uses an inline onclick. The script is
+   kept free of Jinja delimiters so `{` and `}` never have to be escaped.
+
+   The attribute is stamped ONLY when an explicit choice is stored. With no
+   choice the attribute stays absent and the `prefers-color-scheme` block above
+   decides, which is what keeps the OS default working with JavaScript off. */
+(function () {
+    var KEY = 'omcp-theme';
+    var root = document.documentElement;
+
+    function stored() {
+        try { return localStorage.getItem(KEY); } catch (e) { return null; }
+    }
+    function osLight() {
+        return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches);
+    }
+    function effective() {
+        var set = root.getAttribute('data-theme');
+        if (set === 'light' || set === 'dark') { return set; }
+        return osLight() ? 'light' : 'dark';
+    }
+
+    var choice = stored();
+    if (choice === 'light' || choice === 'dark') {
+        root.setAttribute('data-theme', choice);
+    }
+
+    /* A <meta> cannot read a custom property, so the color is copied across by
+       script; the token name rides on the tag itself. */
+    function syncMeta() {
+        var m = document.querySelector('meta[name="theme-color"][data-theme-color-token]');
+        if (!m) { return; }
+        var v = getComputedStyle(root).getPropertyValue(m.getAttribute('data-theme-color-token')).trim();
+        if (v) { m.setAttribute('content', v); }
+    }
+
+    function label(theme) {
+        return theme === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
+    }
+    function syncButtons() {
+        var text = label(effective());
+        var all = document.querySelectorAll('[data-theme-toggle]');
+        for (var i = 0; i < all.length; i += 1) {
+            all[i].setAttribute('aria-label', text);
+            all[i].setAttribute('title', text);
+        }
+    }
+
+    window.__themeToggle = function () {
+        var next = effective() === 'light' ? 'dark' : 'light';
+        root.setAttribute('data-theme', next);
+        /* Storage may throw (private mode, blocked site data). The document
+           has already switched by this point, so the toggle still works; only
+           the persistence is lost and the next load follows the OS. */
+        try { localStorage.setItem(KEY, next); } catch (e) { /* not fatal */ }
+        syncMeta();
+        syncButtons();
+        window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: next } }));
+    };
+
+    /* With no explicit choice the palette follows the OS, and the OS can flip
+       under a page that is already open. CSS re-evaluates itself; the Chart.js
+       canvas does not, so the same event has to fire for it. An explicit
+       choice wins, so this stays quiet once the user has picked. */
+    if (window.matchMedia) {
+        var mq = window.matchMedia('(prefers-color-scheme: dark)');
+        var onSystemChange = function () {
+            var s = stored();
+            if (s === 'light' || s === 'dark') { return; }
+            syncMeta();
+            syncButtons();
+            window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: effective() } }));
+        };
+        if (mq.addEventListener) { mq.addEventListener('change', onSystemChange); }
+        else if (mq.addListener) { mq.addListener(onSystemChange); }
+    }
+
+    syncMeta();
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', syncButtons);
+    } else {
+        syncButtons();
+    }
+})();
+</script>
