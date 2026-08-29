@@ -19,7 +19,7 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
 - `src/main.py` — FastAPI app, lifespan, MCP mount
 - `src/config.py` — pydantic-settings
 - `src/database.py` — async SQLAlchemy engine/session
-- `src/models/db.py` — ORM models (api_keys, usage_logs, notes_metadata, note_embeddings, note_links, transfer_tokens, oauth_clients/codes/tokens)
+- `src/models/db.py` — ORM models (api_keys, usage_logs, notes_metadata, note_embeddings, note_links, indexer_runs, transfer_tokens, oauth_clients/codes/tokens)
 - `src/mcp_server/` — MCP server, tools, auth middleware
 - `src/services/` — vault ops, search, embeddings, indexer, transfer, anchored FS
 - `src/transfer/` — public `/transfer/*` capability-redemption routes
