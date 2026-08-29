@@ -23,10 +23,12 @@
 - [x] 4.1 Add the replay check: every migrated manifest entry resolves to its baseline literal under dark theme; keyword entries unchanged (manifest itself recorded in task 1.0)
 - [x] 4.2 Extract tokens + pre-paint bootstrap into one shared Jinja partial; include from base.html, auth_base.html, AND authorize.html; sync meta theme-color and color-scheme from the script
 - [x] 4.3 Toggle + persistence scenarios verified on /authorize as well as login and dashboard
-- [x] 4.4 Transfer pages: local token sweep only, keep OS-responsive light-first behavior, no toggle/localStorage; diff response headers before/after with each response's per-request nonce replaced by a canonical placeholder (CSP, Referrer-Policy, Cache-Control byte-identical under that canonicalization); assert every inline style/script nonce equals the CSP nonce in each response
+- [x] 4.4 Transfer pages: local token sweep only (their own `--t-*` block), keep OS-responsive light-first behavior, no toggle/localStorage, no shared partial; `src/transfer/routes.py` at zero diff, and `checks/render.py` asserts the nonce still renders and that no panel machinery leaked in. The live header diff is post-deploy — see 5.0
 - [x] 4.5 Contrast matrix per spec, covering every normative category: text/text-2 on each surface they appear on, flash/alert text on tinted surfaces, button labels, link text, form-control text (all ≥4.5:1); text-3, chart labels/tooltips, status badges, disabled labels, focus indicators, control borders (≥3:1); composite translucent colors over their actual backgrounds before measuring; record every pair and ratio in the change
 
-## 5. Screenshots (post-deploy; run under supervisor control, not by the implementation agent)
+## 5. Post-deploy (run under supervisor control, not by the implementation agent)
+
+- [ ] 5.0 Transfer header check against a live server: diff each transfer response's headers before/after with its per-request nonce replaced by a canonical placeholder (CSP, Referrer-Policy, Cache-Control byte-identical under that canonicalization), and assert every inline style/script nonce equals that response's CSP nonce. Needs a running instance, so it cannot be exercised from the implementation worktree
 
 - [ ] 5.1 Stand up a local instance seeded with fictional demo data (fake note paths/titles, fake key names, no real IPs/hostnames in settings view)
 - [ ] 5.2 Retake all six README screenshots in the light theme, same filenames (no README edit needed); privacy checklist: no internal IPs/URLs, no real note paths or project names, no infrastructure-revealing key names, no real client IDs

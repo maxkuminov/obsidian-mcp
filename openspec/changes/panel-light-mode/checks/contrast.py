@@ -231,11 +231,49 @@ def matrix(P: Palette):
          "/authorize .scope-option:checked border"),
 
         # ── control borders (>= 3:1)
+        # Enumerated per control, not per token: a boundary has to clear 3:1
+        # against the fill it encloses AND the ground it sits on, and those are
+        # different colors for almost every control in the panel.
         ("control border", AA_LARGE, "--control-border", B, ".field-input against its own fill"),
         ("control border", AA_LARGE, "--control-border", S,
-         ".field-input / .btn-ghost against the card"),
-        ("control border", AA_LARGE, "--control-border", S2, ".btn-ghost against its own fill"),
-        ("control border", AA_LARGE, "--control-border", S3, ".btn-ghost:hover fill"),
+         ".field-input / .btn-ghost / .theme-toggle against the card or sidebar"),
+        ("control border", AA_LARGE, "--control-border", S2,
+         ".btn-ghost / .theme-toggle / .topbar-toggle against their own fill"),
+        ("control border", AA_LARGE, "--control-border", ("--bg", "--topbar-bg"),
+         ".topbar-toggle against the mobile top bar"),
+        ("control border", AA_LARGE, "--control-border-strong", S3,
+         ".btn-ghost:hover / .theme-toggle:hover / .topbar-toggle:hover fill"),
+        ("control border", AA_LARGE, "--control-border-strong", S,
+         ".btn-ghost:hover / .theme-toggle:hover against the card"),
+        ("control border", AA_LARGE, "--error-border-strong", ("--surface", "--error-surface-soft"),
+         ".btn-danger against its own fill — the fill is ~1.1:1 on the card, so "
+         "the border is the only boundary"),
+        ("control border", AA_LARGE, "--error-border-strong",
+         ("--surface", "--error-surface-strong"), ".btn-danger:hover fill"),
+        ("control border", AA_LARGE, "--error-border-strong", S,
+         ".btn-danger against the card"),
+        ("control border", AA_LARGE, "--consent-control-border", S,
+         "/authorize .scope-option radio card against the card"),
+        ("control border", AA_LARGE, "--consent-control-border",
+         ("--surface", "--consent-neutral-surface"), "/authorize .btn-deny against its own fill"),
+        ("control border", AA_LARGE, "--consent-control-border",
+         ("--surface", "--consent-neutral-surface-hover"), "/authorize .btn-deny:hover fill"),
+        ("control border", AA_LARGE, "--consent-control-border-hover",
+         ("--surface", "--consent-option-hover"), "/authorize .scope-option:hover"),
+        ("control border", AA_LARGE, "--consent-control-border-hover", S,
+         "/authorize .scope-option:hover against the card"),
+        ("control border", AA_LARGE, "--consent-primary-dim",
+         ("--surface", "--consent-option-active"), "/authorize checked .scope-option"),
+        ("control border", AA_LARGE, "--scrollbar-thumb", S,
+         "::-webkit-scrollbar-thumb over a card"),
+        ("control border", AA_LARGE, "--scrollbar-thumb", B,
+         "::-webkit-scrollbar-thumb over the page ground"),
+        ("control border", AA_LARGE, "--text-3", S,
+         "::-webkit-scrollbar-thumb:hover"),
+        # A graphical object that conveys a value: what has to be legible is the
+        # filled part against the track, not the track against the card.
+        ("control border", AA_LARGE, "--primary-dim", ("--surface", "--border"),
+         "dashboard embedding-progress fill against its track"),
     ]
 
     # Disabled-state labels (>= 3:1). `.btn:disabled` sets opacity on the whole
@@ -262,9 +300,16 @@ def matrix(P: Palette):
 # recorded so a reader can see they were considered rather than missed.
 def informational(P: Palette):
     return [
-        ("--chart-grid", ("--surface",), "chart gridlines (decorative, not a control boundary)"),
-        ("--border", ("--surface",), "card / divider border (decorative, not a control boundary)"),
-        ("--border-2", ("--surface",), "raised card border, scrollbar thumb"),
+        ("--chart-grid", ("--surface",), "chart gridlines — decorative; the axis "
+         "labels that carry the meaning are in the matrix above"),
+        ("--border", ("--surface",), "card outline, table/kv divider, sidebar rule, "
+         "progress-bar track. No control boundary uses this token any more — "
+         "`.field-input`, `.btn-ghost`, `.theme-toggle` and `.topbar-toggle` were "
+         "repointed at `--control-border`"),
+        ("--border-2", ("--surface",), "`.stat-card:hover` outline, `.modal-panel` "
+         "outline, `.badge-gray` outline. No control boundary uses this token any "
+         "more — the hover borders went to `--control-border-strong` and the "
+         "scrollbar thumb to `--scrollbar-thumb`"),
     ]
 
 

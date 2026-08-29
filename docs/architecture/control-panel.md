@@ -43,14 +43,36 @@
   long (103 properties, up from 18): each distinct role and strength is its
   own token so light can move it independently.
 
-- **`--control-border` is deliberately not `--border`.** WCAG 1.4.11 governs
-  the boundary of a *control* — inputs, selects, ghost buttons — at 3:1. Card
-  outlines and table dividers are decorative and are not. Collapsing the two
-  back into one token means either failing the control-border check or
-  turning every card outline in the panel into a hard rule. Same reasoning
-  for `--disabled-opacity`: `.btn:disabled` fades the whole button, its label
-  included, so the value that reads as "disabled" on dark puts the label
-  under 3:1 on light.
+- **Control boundaries have their own tokens, deliberately separate from
+  `--border`/`--border-2`.** WCAG 1.4.11 governs the boundary of a *control*
+  at 3:1; card outlines, table dividers and progress-bar tracks are
+  decorative and are not. So `--control-border` (inputs, selects, ghost
+  buttons, both icon toggles), `--control-border-strong` (their hover
+  borders), `--consent-control-border` / `--consent-control-border-hover`
+  (the `/authorize` radio cards and Deny button) and `--scrollbar-thumb` all
+  exist to be darkened on light without turning every card outline in the
+  panel into a hard rule. `--error-border-strong` is the extreme case:
+  `.btn-danger`'s fill is about 1.1:1 against the card, so its border is the
+  only boundary the control has and has to carry the whole 3:1 by itself.
+  Same reasoning for `--disabled-opacity`: `.btn:disabled` fades the whole
+  button, its label included, so the value that reads as "disabled" on dark
+  puts the label under 3:1 on light. **Adding a control means checking its
+  boundary, not reusing `--border` because it looks right in dark** — the
+  full matrix is enumerated per control in the change's `checks/contrast.py`.
+
+- **`<meta name="theme-color">` keeps a static default *and* a
+  `data-theme-color-token` attribute.** The bootstrap overwrites the content
+  on every load, but the static value is what a JS-off visitor gets, so it
+  must equal the dark value of the token it names; `checks/token_coverage.py`
+  pins the two together. The literal there is not a stray — it is a mirror,
+  and it is checked as one.
+
+- **An OS theme flip re-dispatches `themechange`.** CSS re-evaluates a media
+  query on its own; a Chart.js canvas does not. Without the
+  `matchMedia('(prefers-color-scheme: dark)')` listener, a visitor with no
+  stored choice who flips their OS theme gets a re-themed page around a chart
+  still painted in the old palette. The listener stays quiet once an explicit
+  choice is stored, because that choice outranks the OS.
 
 - **CSS cannot share one declaration list between a selector and a
   media-guarded selector**, so the light palette is written out twice —

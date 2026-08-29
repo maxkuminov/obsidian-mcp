@@ -12,9 +12,9 @@ on before the ratio is taken (a badge tint is `rgba(...)` over
 the whole button, so its label and its fill are both faded over what is
 behind the button.
 
-**65 pairs checked, 0 failures.**
+**80 pairs checked, 0 failures.**
 
-- worst ratio at the ≥ 3.0:1 threshold — **3.26:1**
+- worst ratio at the ≥ 3.0:1 threshold — **3.18:1**
 - worst ratio at the ≥ 4.5:1 threshold — **5.11:1**
 
 | Category | Need | Ratio | Foreground | Background | Where |
@@ -78,9 +78,24 @@ behind the button.
 | focus | 3.0:1 | ✅ 5.93:1 | `--primary` | `--surface-2` | .theme-toggle:focus-visible outline |
 | focus | 3.0:1 | ✅ 7.96:1 | `--consent-primary-dim` | `--surface` | /authorize .scope-option:checked border |
 | control border | 3.0:1 | ✅ 3.77:1 | `--control-border` | `--bg` | .field-input against its own fill |
-| control border | 3.0:1 | ✅ 4.07:1 | `--control-border` | `--surface` | .field-input / .btn-ghost against the card |
-| control border | 3.0:1 | ✅ 3.57:1 | `--control-border` | `--surface-2` | .btn-ghost against its own fill |
-| control border | 3.0:1 | ✅ 3.26:1 | `--control-border` | `--surface-3` | .btn-ghost:hover fill |
+| control border | 3.0:1 | ✅ 4.07:1 | `--control-border` | `--surface` | .field-input / .btn-ghost / .theme-toggle against the card or sidebar |
+| control border | 3.0:1 | ✅ 3.57:1 | `--control-border` | `--surface-2` | .btn-ghost / .theme-toggle / .topbar-toggle against their own fill |
+| control border | 3.0:1 | ✅ 4.04:1 | `--control-border` | `--topbar-bg on --bg` | .topbar-toggle against the mobile top bar |
+| control border | 3.0:1 | ✅ 4.55:1 | `--control-border-strong` | `--surface-3` | .btn-ghost:hover / .theme-toggle:hover / .topbar-toggle:hover fill |
+| control border | 3.0:1 | ✅ 5.67:1 | `--control-border-strong` | `--surface` | .btn-ghost:hover / .theme-toggle:hover against the card |
+| control border | 3.0:1 | ✅ 4.29:1 | `--error-border-strong` | `--error-surface-soft on --surface` | .btn-danger against its own fill — the fill is ~1.1:1 on the card, so the border is the only boundary |
+| control border | 3.0:1 | ✅ 3.86:1 | `--error-border-strong` | `--error-surface-strong on --surface` | .btn-danger:hover fill |
+| control border | 3.0:1 | ✅ 4.68:1 | `--error-border-strong` | `--surface` | .btn-danger against the card |
+| control border | 3.0:1 | ✅ 4.07:1 | `--consent-control-border` | `--surface` | /authorize .scope-option radio card against the card |
+| control border | 3.0:1 | ✅ 3.55:1 | `--consent-control-border` | `--consent-neutral-surface on --surface` | /authorize .btn-deny against its own fill |
+| control border | 3.0:1 | ✅ 3.18:1 | `--consent-control-border` | `--consent-neutral-surface-hover on --surface` | /authorize .btn-deny:hover fill |
+| control border | 3.0:1 | ✅ 5.26:1 | `--consent-control-border-hover` | `--consent-option-hover on --surface` | /authorize .scope-option:hover |
+| control border | 3.0:1 | ✅ 5.67:1 | `--consent-control-border-hover` | `--surface` | /authorize .scope-option:hover against the card |
+| control border | 3.0:1 | ✅ 6.74:1 | `--consent-primary-dim` | `--consent-option-active on --surface` | /authorize checked .scope-option |
+| control border | 3.0:1 | ✅ 4.07:1 | `--scrollbar-thumb` | `--surface` | ::-webkit-scrollbar-thumb over a card |
+| control border | 3.0:1 | ✅ 3.77:1 | `--scrollbar-thumb` | `--bg` | ::-webkit-scrollbar-thumb over the page ground |
+| control border | 3.0:1 | ✅ 5.84:1 | `--text-3` | `--surface` | ::-webkit-scrollbar-thumb:hover |
+| control border | 3.0:1 | ✅ 6.19:1 | `--primary-dim` | `--border on --surface` | dashboard embedding-progress fill against its track |
 | disabled label | 3.0:1 | ✅ 4.34:1 | `(button label)` | `(faded button fill)` | .btn-primary:disabled |
 | disabled label | 3.0:1 | ✅ 3.97:1 | `(button label)` | `(faded button fill)` | .btn-ghost:disabled |
 | disabled label | 3.0:1 | ✅ 3.88:1 | `(button label)` | `(faded button fill)` | .btn-danger:disabled |
@@ -93,6 +108,6 @@ divider would read as a hard rule across every card in the panel.
 
 | Token | Against | Ratio | Note |
 | --- | --- | --- | --- |
-| `--chart-grid` | `--surface` | 1.66:1 | chart gridlines (decorative, not a control boundary) |
-| `--border` | `--surface` | 1.29:1 | card / divider border (decorative, not a control boundary) |
-| `--border-2` | `--surface` | 1.66:1 | raised card border, scrollbar thumb |
+| `--chart-grid` | `--surface` | 1.66:1 | chart gridlines — decorative; the axis labels that carry the meaning are in the matrix above |
+| `--border` | `--surface` | 1.29:1 | card outline, table/kv divider, sidebar rule, progress-bar track. No control boundary uses this token any more — `.field-input`, `.btn-ghost`, `.theme-toggle` and `.topbar-toggle` were repointed at `--control-border` |
+| `--border-2` | `--surface` | 1.66:1 | `.stat-card:hover` outline, `.modal-panel` outline, `.badge-gray` outline. No control boundary uses this token any more — the hover borders went to `--control-border-strong` and the scrollbar thumb to `--scrollbar-thumb` |

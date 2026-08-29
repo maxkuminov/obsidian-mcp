@@ -40,6 +40,7 @@ TEMPLATE_DIR = Path(__file__).resolve().parents[4] / "src" / "control_panel" / "
 # Panel/auth surface: one shared token partial, one palette.
 PANEL_TEMPLATES = [
     "_theme.html",
+    "_theme_toggle.html",
     "base.html",
     "auth_base.html",
     "authorize.html",
@@ -396,8 +397,11 @@ def scan_template(path: Path, record_all: bool = False) -> list:
         content = re.search(r'content\s*=\s*"([^"]*)"', tag)
         token = re.search(r'data-theme-color-token\s*=\s*"([^"]*)"', tag)
         value = content.group(1).strip() if content else ""
-        if not value and token:
-            # Content is stamped by the pre-paint bootstrap from this token.
+        if token:
+            # The tag is token-bound: the bootstrap stamps `content` from this
+            # token on every load, and the static value is only the no-JS
+            # default. It is therefore not a stray literal — but it could still
+            # drift, so `token_coverage.py` pins it to the token's dark value.
             value = f"var({token.group(1)})"
         add("meta", "head", "theme-color", value, m.start())
 

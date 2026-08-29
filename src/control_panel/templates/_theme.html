@@ -38,6 +38,8 @@
         --border: #222c44;
         --border-2: #2d3a5a;
         --control-border: #222c44;
+        --control-border-strong: #2d3a5a;
+        --scrollbar-thumb: #2d3a5a;
         --disabled-opacity: 0.6;
         --primary: #9b82e8;
         --primary-dim: #6d57c2;
@@ -139,6 +141,8 @@
         --consent-label: #364155;
         --consent-border: #1a2336;
         --consent-border-hover: #223050;
+        --consent-control-border: #1a2336;
+        --consent-control-border-hover: #223050;
         --consent-primary: #8b6fdf;
         --consent-primary-dim: #5a45a8;
         --consent-primary-text: #e0d9f8;
@@ -173,6 +177,8 @@
         --border: #dfe3ec;
         --border-2: #c3c9d8;
         --control-border: #767e91;
+        --control-border-strong: #5e677b;
+        --scrollbar-thumb: #767e91;
         --disabled-opacity: 0.75;
         --primary: #6440c8;
         --primary-dim: #573ab0;
@@ -214,7 +220,7 @@
         --error-surface-faint: rgba(179,34,24,0.06);
         --error-surface-strong: rgba(179,34,24,0.15);
         --error-border: rgba(179,34,24,0.36);
-        --error-border-strong: rgba(179,34,24,0.44);
+        --error-border-strong: rgba(179,34,24,0.8);
         --error-text: #8f1b13;
         --error-text-hover: #6f150f;
         --warning-surface: rgba(122,77,0,0.10);
@@ -270,6 +276,8 @@
         --consent-label: #5d6577;
         --consent-border: #dfe3ec;
         --consent-border-hover: #c3c9d8;
+        --consent-control-border: #767e91;
+        --consent-control-border-hover: #5e677b;
         --consent-primary: #6440c8;
         --consent-primary-dim: #573ab0;
         --consent-primary-text: #ffffff;
@@ -304,7 +312,9 @@
             --border: #dfe3ec;
             --border-2: #c3c9d8;
             --control-border: #767e91;
-        --disabled-opacity: 0.75;
+            --control-border-strong: #5e677b;
+            --scrollbar-thumb: #767e91;
+            --disabled-opacity: 0.75;
             --primary: #6440c8;
             --primary-dim: #573ab0;
             --primary-text: #4b2fa6;
@@ -345,7 +355,7 @@
             --error-surface-faint: rgba(179,34,24,0.06);
             --error-surface-strong: rgba(179,34,24,0.15);
             --error-border: rgba(179,34,24,0.36);
-            --error-border-strong: rgba(179,34,24,0.44);
+            --error-border-strong: rgba(179,34,24,0.8);
             --error-text: #8f1b13;
             --error-text-hover: #6f150f;
             --warning-surface: rgba(122,77,0,0.10);
@@ -401,6 +411,8 @@
             --consent-label: #5d6577;
             --consent-border: #dfe3ec;
             --consent-border-hover: #c3c9d8;
+            --consent-control-border: #767e91;
+            --consent-control-border-hover: #5e677b;
             --consent-primary: #6440c8;
             --consent-primary-dim: #573ab0;
             --consent-primary-text: #ffffff;
@@ -433,7 +445,7 @@
         flex-shrink: 0;
         padding: 0;
         border-radius: 7px;
-        border: 1px solid var(--border);
+        border: 1px solid var(--control-border);
         background: var(--surface-2);
         color: var(--text-2);
         cursor: pointer;
@@ -441,7 +453,7 @@
     }
     .theme-toggle:hover {
         background: var(--surface-3);
-        border-color: var(--border-2);
+        border-color: var(--control-border-strong);
         color: var(--text);
     }
     .theme-toggle:focus-visible {
@@ -523,6 +535,23 @@
         syncButtons();
         window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: next } }));
     };
+
+    /* With no explicit choice the palette follows the OS, and the OS can flip
+       under a page that is already open. CSS re-evaluates itself; the Chart.js
+       canvas does not, so the same event has to fire for it. An explicit
+       choice wins, so this stays quiet once the user has picked. */
+    if (window.matchMedia) {
+        var mq = window.matchMedia('(prefers-color-scheme: dark)');
+        var onSystemChange = function () {
+            var s = stored();
+            if (s === 'light' || s === 'dark') { return; }
+            syncMeta();
+            syncButtons();
+            window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: effective() } }));
+        };
+        if (mq.addEventListener) { mq.addEventListener('change', onSystemChange); }
+        else if (mq.addListener) { mq.addListener(onSystemChange); }
+    }
 
     syncMeta();
     if (document.readyState === 'loading') {

@@ -11,6 +11,10 @@ Proves the scenarios "Complete light coverage", "One physical palette" and
     this is what stops the two copies drifting;
   * `color-scheme` is declared in all three blocks, so native form controls
     follow the theme;
+  * every `<meta name="theme-color">` static default equals its token's dark
+    value — the tag is stamped by the bootstrap on every load, so the literal
+    is only the no-JS fallback, and this is what stops it drifting away from
+    the palette it claims to mirror;
   * only `_theme.html` defines a panel palette — `base.html`, `auth_base.html`
     and `authorize.html` include it and define no core tokens of their own,
     and each carries the pre-paint bootstrap through that include.
@@ -88,7 +92,29 @@ def main() -> int:
         if own:
             failures.append(f"{name} redefines palette tokens of its own: {sorted(own)}")
 
+    # The no-JS <meta name="theme-color"> default must mirror the dark token.
+    metas = 0
+    for name in PANEL_ROOTS:
+        text = (colorscan.TEMPLATE_DIR / name).read_text()
+        for m in re.finditer(r'<meta[^>]*name\s*=\s*"theme-color"[^>]*>', text, re.I):
+            tag = m.group(0)
+            token = re.search(r'data-theme-color-token\s*=\s*"([^"]*)"', tag)
+            content = re.search(r'content\s*=\s*"([^"]*)"', tag)
+            if not token:
+                failures.append(f"{name}: theme-color meta is not bound to a token")
+                continue
+            metas += 1
+            want = dark.get(token.group(1))
+            got = colorscan.normalize(content.group(1)) if content else ""
+            if want is None:
+                failures.append(f"{name}: theme-color names unknown token {token.group(1)}")
+            elif got != want:
+                failures.append(
+                    f"{name}: theme-color default {got!r} != dark {token.group(1)} {want!r}"
+                )
+
     print(f"dark tokens        : {len(dark)}")
+    print(f"theme-color metas  : {metas}")
     print(f"light tokens       : {len(light)}")
     print(f"OS-light tokens    : {len(os_light)}")
     print(f"failures           : {len(failures)}")

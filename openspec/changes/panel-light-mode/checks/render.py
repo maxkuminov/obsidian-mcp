@@ -9,6 +9,7 @@ bootstrap script land in the `<head>` of all three bases.
     python3 openspec/changes/panel-light-mode/checks/render.py
 """
 
+import re
 import sys
 from pathlib import Path
 
@@ -82,16 +83,44 @@ def main() -> int:
         except Exception as exc:                      # noqa: BLE001
             failures.append(f"{name}: {type(exc).__name__}: {exc}")
 
-    # Every base must actually carry the token layer and the pre-paint script.
+    # Every base must actually carry the token layer, the pre-paint script and
+    # the toggle. These assertions look for the *thing itself*, not for a
+    # string the thing happens to share with something else: "data-theme"
+    # matches a CSS selector and "__themeToggle" matches the bootstrap, so
+    # either would stay green with the toggle include deleted.
+    expected_toggles = {"base.html": 2, "auth_base.html": 1, "authorize.html": 1}
     for name in ("base.html", "auth_base.html", "authorize.html"):
         html = rendered.get(name, "")
         head = html[:html.find("</head>")] if "</head>" in html else ""
-        if "--primary-glow" not in head:
+
+        styles = re.findall(r"<style\b[^>]*>(.*?)</style>", head, re.S | re.I)
+        if not any(":root" in b and "--primary-glow:" in b and
+                   '[data-theme="light"]' in b for b in styles):
             failures.append(f"{name}: token partial missing from <head>")
-        if "data-theme" not in head:
+
+        scripts = re.findall(r"<script\b[^>]*>(.*?)</script>", head, re.S | re.I)
+        boot = [b for b in scripts if "omcp-theme" in b]
+        if not boot:
             failures.append(f"{name}: pre-paint theme bootstrap missing from <head>")
-        if "__themeToggle" not in html:
-            failures.append(f"{name}: theme toggle missing")
+        else:
+            body = boot[0]
+            for needed in ("localStorage", "getItem", "setAttribute('data-theme'",
+                           "themechange", "theme-color", "matchMedia"):
+                if needed not in body:
+                    failures.append(f"{name}: bootstrap does not {needed!r}")
+
+        # The rendered toggle markup, not the function name that invokes it.
+        buttons = re.findall(r"<button\b[^>]*\bdata-theme-toggle\b[^>]*>", html)
+        if len(buttons) != expected_toggles[name]:
+            failures.append(
+                f"{name}: {len(buttons)} theme toggle button(s), expected "
+                f"{expected_toggles[name]}"
+            )
+        for tag in buttons:
+            if "window.__themeToggle()" not in tag:
+                failures.append(f"{name}: toggle button does not invoke the toggle")
+        if buttons and "icon-sun" not in html:
+            failures.append(f"{name}: toggle icons missing")
 
     # The transfer surface must stay separate.
     for name in ("transfer_upload.html", "transfer_download.html"):
