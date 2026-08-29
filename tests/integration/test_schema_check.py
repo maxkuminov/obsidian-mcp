@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "020"
+HEAD_REVISION = "021"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -3514,3 +3514,277 @@ def test_downgrade_020_refuses_a_counter_table_it_did_not_create():
         assert "020's comment marker" in result.stdout + result.stderr
         # And the column it would have dropped next is still there.
         assert daily_limit_comment(url) == QUOTA_COLUMN_MARKER
+
+
+# --------------------------------------------------------------------------
+# migration 021 — the backup record (#163)
+# --------------------------------------------------------------------------
+#
+# One table, and what makes it load-bearing is not its shape but what the panel
+# says about its newest row: "your last database backup was taken N days ago".
+# That is a claim about disaster recovery, so the ways it can be quietly wrong
+# are the cases below.
+#
+#   * `created_at` must be NOT NULL. A nullable one sorts to nowhere under
+#     `ORDER BY created_at DESC`, so a NULL row can hide every later backup and
+#     the page reports the one before it — or none. `alembic check` sees the
+#     nullability, which is why the interesting cases here are the two it does
+#     not see.
+#   * `ck_backups_log_size_bytes` must be the real predicate and `convalidated`.
+#     A same-named `CHECK (true)` is issue #53 exactly, and the value it lets
+#     through — a zero-byte dump — is precisely the failure `db-backup`'s
+#     empty-dump guard exists for, rendered on the page as a backup.
+#   * `ix_backups_log_created_at` must be on `created_at`. An index of that name
+#     recreated on `filename` keeps the name an existence check looks for while
+#     the newest-first read the page and the dashboard strip both perform has
+#     nothing to lean on, and autogenerate reports no drift at all.
+
+BACKUPS_TABLE_MARKER = "one row per recorded database backup (021_backups_log)"
+BACKUPS_CHECK_NAME = "ck_backups_log_size_bytes"
+BACKUPS_INDEX = "ix_backups_log_created_at"
+
+
+def backups_log_comment(url):
+    return fetchval(
+        url,
+        "SELECT obj_description(c.oid, 'pg_class') FROM pg_class c "
+        "WHERE c.relname = 'backups_log' AND c.relkind = 'r'",
+    )
+
+
+def backups_size_check(url):
+    """`(constraintdef, convalidated)` for 021's CHECK, or None."""
+    rows = fetch(
+        url,
+        "SELECT pg_get_constraintdef(oid) AS def, convalidated "
+        "FROM pg_constraint "
+        "WHERE conrelid = 'backups_log'::regclass AND contype = 'c' "
+        "  AND conname = $1",
+        BACKUPS_CHECK_NAME,
+    )
+    if not rows:
+        return None
+    return " ".join(rows[0]["def"].split()), rows[0]["convalidated"]
+
+
+def backups_index_columns(url, name=BACKUPS_INDEX):
+    return fetchval(
+        url,
+        "SELECT array_agg(a.attname ORDER BY k.ord) "
+        "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+        "     CROSS JOIN unnest(string_to_array(i.indkey::text, ' ')) "
+        "                WITH ORDINALITY AS k(attnum, ord) "
+        "     JOIN pg_attribute a ON a.attrelid = i.indrelid "
+        "                        AND a.attnum = k.attnum::smallint "
+        "WHERE i.indrelid = 'backups_log'::regclass AND ic.relname = $1 "
+        "GROUP BY ic.relname",
+        name,
+    )
+
+
+def insert_backup(url, filename="backup_20260829_120000.sql.gz", size=4096, when=None):
+    """One `backups_log` row, the way `docker/record-backup.sh` writes it."""
+    if when is None:
+        return fetchval(
+            url,
+            "INSERT INTO backups_log (filename, size_bytes) VALUES ($1, $2) "
+            "RETURNING id",
+            filename,
+            size,
+        )
+    return fetchval(
+        url,
+        "INSERT INTO backups_log (created_at, filename, size_bytes) "
+        "VALUES ($1, $2, $3) RETURNING id",
+        when,
+        filename,
+        size,
+    )
+
+
+def refuse_021(url, *, must_mention):
+    """Stamp back to 020, re-run 021, require it to refuse, return the message.
+
+    The same stamp-back path `make test-schema` exercises for idempotence, so a
+    verifier that waved a mutation through here would wave it through on a real
+    database somebody had altered by hand.
+    """
+    _harness.run_alembic(url, "stamp", "020", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "021 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    return combined
+
+
+def test_021_creates_the_table_it_promises():
+    with throwaway_db("schema_backups_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+
+        assert backups_log_comment(url) == BACKUPS_TABLE_MARKER
+
+        # NOT NULL on `created_at` is what makes the newest-first read mean
+        # anything; the size column is bigint because a dump passes 2 GiB
+        # without anything having gone wrong.
+        assert column_shape(url, "backups_log", "created_at")[0] is True
+        assert column_shape(url, "backups_log", "filename") == (True, "text", None)
+        assert column_shape(url, "backups_log", "size_bytes")[:2] == (True, "bigint")
+
+        rendered, validated = backups_size_check(url)
+        assert validated is True
+        assert "size_bytes" in rendered
+
+        assert backups_index_columns(url) == ["created_at"]
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_the_size_check_rejects_a_zero_byte_backup():
+    """The catalog says the constraint is there; this proves it enforces.
+
+    `pg_dump` can write nothing and exit 0 when it is pointed at the wrong
+    thing — that is why `db-backup` has an empty-dump guard at all. A row of
+    size 0 is that failure recorded as a backup and rendered on the page as
+    one.
+    """
+    with throwaway_db("schema_backups_domain") as url:
+        insert_backup(url, size=1)
+        for illegal in (0, -1):
+            with pytest.raises(asyncpg.CheckViolationError):
+                insert_backup(url, filename=f"bad-{illegal}.sql.gz", size=illegal)
+
+
+def test_the_newest_row_is_what_the_page_reads():
+    """The read the health page and the dashboard strip both perform, run
+    against the real ordering rather than argued about."""
+    with throwaway_db("schema_backups_newest") as url:
+        old = datetime.datetime(2026, 1, 1, tzinfo=datetime.timezone.utc)
+        new = datetime.datetime(2026, 6, 1, tzinfo=datetime.timezone.utc)
+        insert_backup(url, filename="older.sql.gz", when=old)
+        insert_backup(url, filename="newer.sql.gz", when=new)
+        assert fetchval(
+            url,
+            "SELECT filename FROM backups_log ORDER BY created_at DESC, id DESC "
+            "LIMIT 1",
+        ) == "newer.sql.gz"
+
+
+def test_rerunning_021_adopts_its_own_table_and_keeps_the_rows():
+    """The idempotence path the gate itself performs: 021 genuinely re-executes
+    against a database already carrying its table, and no backup record is
+    lost."""
+    with throwaway_db("schema_backups_rerun") as url:
+        insert_backup(url, filename="kept.sql.gz", size=99)
+        _harness.run_alembic(url, "stamp", "020", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT filename FROM backups_log") == "kept.sql.gz"
+        assert backups_log_comment(url) == BACKUPS_TABLE_MARKER
+
+
+def test_021_refuses_an_unmarked_table_of_its_name():
+    """`IF NOT EXISTS` would adopt this — nullable `created_at`, no CHECK, no
+    index — and the panel would report its rows as backup history."""
+    with throwaway_db("schema_backups_unmarked", revision="020") as url:
+        sql(
+            url,
+            "CREATE TABLE backups_log (id serial PRIMARY KEY, "
+            " created_at timestamptz, filename text, size_bytes bigint)",
+        )
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "021's comment marker" in result.stdout + result.stderr
+
+
+def test_021_refuses_a_nullable_created_at():
+    """A NULL `created_at` sorts to nowhere under `ORDER BY created_at DESC`,
+    so one such row can hide every backup taken after it."""
+    with throwaway_db("schema_backups_nullable") as url:
+        sql(url, "ALTER TABLE backups_log ALTER COLUMN created_at DROP NOT NULL")
+        refuse_021(url, must_mention=["its columns are", "created_at"])
+
+
+def test_021_refuses_an_impostor_check_of_its_name():
+    """A same-named `CHECK (true)` satisfies a lookup by name and enforces
+    nothing (issue #53). The predicate is compared, not the name."""
+    with throwaway_db("schema_backups_impostor_check") as url:
+        sql(url, f"ALTER TABLE backups_log DROP CONSTRAINT {BACKUPS_CHECK_NAME}")
+        sql(
+            url,
+            f"ALTER TABLE backups_log ADD CONSTRAINT {BACKUPS_CHECK_NAME} CHECK (true)",
+        )
+        refuse_021(url, must_mention=["its CHECK is"])
+        # A zero-byte backup really is admitted while the impostor stands —
+        # which is the whole reason the predicate is compared, not the name.
+        insert_backup(url, filename="empty.sql.gz", size=0)
+
+
+def test_021_refuses_a_not_valid_check():
+    """`NOT VALID` enforces new rows having never checked the existing ones, so
+    the table may already record a zero-byte backup."""
+    with throwaway_db("schema_backups_notvalid_check") as url:
+        sql(url, f"ALTER TABLE backups_log DROP CONSTRAINT {BACKUPS_CHECK_NAME}")
+        sql(
+            url,
+            f"ALTER TABLE backups_log ADD CONSTRAINT {BACKUPS_CHECK_NAME} "
+            "CHECK (size_bytes >= 1) NOT VALID",
+        )
+        refuse_021(url, must_mention=["NOT VALID"])
+
+
+def test_021_refuses_a_missing_check():
+    with throwaway_db("schema_backups_no_check") as url:
+        sql(url, f"ALTER TABLE backups_log DROP CONSTRAINT {BACKUPS_CHECK_NAME}")
+        refuse_021(url, must_mention=["no size CHECK"])
+
+
+def test_021_refuses_an_index_of_its_name_on_another_column():
+    """Names are not definitions: an index of the right name on `filename`
+    leaves the newest-first read with nothing to lean on, and autogenerate
+    reports no drift at all."""
+    with throwaway_db("schema_backups_index") as url:
+        sql(url, f"DROP INDEX {BACKUPS_INDEX}")
+        sql(url, f"CREATE INDEX {BACKUPS_INDEX} ON backups_log (filename)")
+        refuse_021(url, must_mention=[BACKUPS_INDEX, "filename"])
+
+
+def test_021_refuses_a_missing_index():
+    with throwaway_db("schema_backups_no_index") as url:
+        sql(url, f"DROP INDEX {BACKUPS_INDEX}")
+        refuse_021(url, must_mention=[f"missing index {BACKUPS_INDEX}"])
+
+
+def test_downgrade_021_removes_the_table_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_backups_downgrade") as url:
+        _harness.run_alembic(url, "downgrade", "020", dimensions=DIM)
+        assert alembic_version(url) == "020"
+        assert fetchval(url, "SELECT to_regclass('backups_log')") is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert backups_log_comment(url) == BACKUPS_TABLE_MARKER
+        assert backups_index_columns(url) == ["created_at"]
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_021_refuses_a_table_it_did_not_create():
+    """013's rule on the way back down: undo *this* migration, not delete a
+    table somebody else put there under this name."""
+    with throwaway_db("schema_backups_downgrade_foreign") as url:
+        sql(url, "COMMENT ON TABLE backups_log IS 'somebody else made this'")
+        result = _harness.run_alembic(
+            url, "downgrade", "020", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "021's comment marker" in result.stdout + result.stderr
+        assert fetchval(url, "SELECT to_regclass('backups_log')") is not None
