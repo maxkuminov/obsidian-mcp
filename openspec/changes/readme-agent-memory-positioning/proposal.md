@@ -4,7 +4,7 @@
 
 ## What Changes
 
-- Switch all README image references to absolute raw.githubusercontent.com URLs so registry sites and mirrors that re-render the README stop showing broken images (screenshot files themselves unchanged; sanitized retakes belong to `panel-light-mode`).
+- Switch all six screenshot image references (badges excluded) to absolute raw.githubusercontent.com URLs so registry sites and mirrors that re-render the README stop showing broken images (screenshot files themselves unchanged; sanitized retakes belong to `panel-light-mode`).
 - Rewrite the README lead paragraph and tagline to lead with **markdown-native agent memory**: a memory system for AI agents that happens to be a folder of markdown you can open in Obsidian. Obsidian becomes the human window — audit UI, escape hatch, proof of no lock-in — not the product definition.
 - Reorder / reframe "Why this exists" so the agent-memory framing comes first and the exocortex/shared-vault narrative supports it.
 - Add a "A session away from the keyboard" companion to the existing "A session at the keyboard" section: the podcast-walk story (transcript → conversation → health decisions, date corrections, and a philosophical note land in the vault; Obsidian never opened).
