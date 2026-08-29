@@ -31,7 +31,7 @@ The panel's styling is hand-written CSS living in `<style>` blocks inside Jinja2
 - [Chart keeps stale colors after toggle] → explicit `themechange` listener requirement with its own spec scenario.
 - [Jinja `{{ }}` vs CSS/JS braces friction in the shared include] → keep the bootstrap script brace-free JS; no template interpolation inside it.
 
-7. **Transfer pages are a separate surface.** `transfer_upload.html` / `transfer_download.html` serve third parties under a strict nonce CSP with static-response discipline (`src/transfer/routes.py`) and already ship a light-first OS-responsive palette. They get only a local token sweep with the same naming convention — no shared partial (would break nonce/static discipline), no toggle, no localStorage. Their security headers must be byte-identical before/after.
+7. **Transfer pages are a separate surface.** `transfer_upload.html` / `transfer_download.html` serve third parties under a strict nonce CSP with static-response discipline (`src/transfer/routes.py`) and already ship a light-first OS-responsive palette. They get only a local token sweep with the same naming convention — no shared partial (would break nonce/static discipline), no toggle, no localStorage. Their security headers must be byte-identical before/after once each response's per-request nonce is replaced with the same canonical placeholder, and within each response every inline nonce must equal the CSP's nonce.
 
 ## Migration Plan
 
