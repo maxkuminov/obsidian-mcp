@@ -229,7 +229,12 @@ container.
   <msg>` — into the row's `error` beside a `notes_embedded` that stays truthful.
   Only genuine failures count: a note skipped by an exclude pattern, skipped
   because its bytes no longer hash to its row, or left behind by a pause is a
-  deliberate decision, not something that went wrong.
+  deliberate decision, not something that went wrong. Deliberate asymmetry:
+  these swallowed per-note failures do NOT flip `_record_index_run(ok)` — the
+  dashboard's "Last run" heartbeat (#78) stays green through a total provider
+  outage while the Performance page's run row says `failed`. The heartbeat
+  answers "is the loop alive", the run row answers "did the work succeed";
+  collapsing them would change #78's semantics, so don't.
 
 The table is display only. Nothing reads it for a decision, which is why
 dropping it in `downgrade()` costs an operator a view and nothing else. The
