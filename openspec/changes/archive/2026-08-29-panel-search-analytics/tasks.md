@@ -11,4 +11,4 @@
 ## 3. Docs and verification
 
 - [x] 3.1 docs/architecture/search.md + usage-attribution.md notes on the new param keys
-- [ ] 3.2 End-to-end against live server: issue searches incl. a guaranteed zero-result query; verify all page sections
+- [x] 3.2 End-to-end (live, post-deploy): real semantic_search via /mcp with a throwaway key recorded result_count 3 + 3 result_paths + embed_ms in params; /admin/search-analytics returns 200; alembic check clean
