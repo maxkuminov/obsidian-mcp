@@ -9,9 +9,9 @@
 
 ## Decisions
 
-1. **Aggregates computed with `percentile_cont` over `usage_logs`** at request time, window-bounded (24h/7d/30d) and grouped by tool; the `created_at` index bounds the scan. No materialized rollups until proven slow — self-hosted volumes (hundreds of requests/day) don't justify them.
+1. **Aggregates computed with `percentile_cont` over `usage_logs`** at request time, window-bounded (24h/7d/30d), grouped by tool, and filtered to executed rows — pre-body refusals (over-quota marker via its NULL-safe predicate, pre-body error markers) are excluded from latency/size math and surfaced as per-tool refusal counts. The `created_at` index bounds the scan. No materialized rollups until proven slow — self-hosted volumes (hundreds of requests/day) don't justify them.
 2. **Phase breakdown reads `params->>'embed_ms'` / `params->>'db_ms'`** filtered to rows where the keys exist; averages + p95 per phase. Missing keys (non-search tools, older rows) simply don't contribute.
-3. **`indexer_runs` table** (migration 019): `id, started_at, finished_at, trigger ('scheduled'|'manual'|'backfill'), notes_scanned, notes_indexed, notes_embedded, error (nullable text)`. Written once per pass in a `finally` block inside the pass (so a failing pass records its error); pruned to newest 500 rows in the same transaction. Alternative (log-parsing) rejected: logs rotate with containers.
+3. **`indexer_runs` table** (migration 019): `id, started_at, finished_at, trigger ('startup'|'scheduled'|'manual'|'backfill'), user_id (nullable FK, ON DELETE SET NULL), notes_scanned, notes_indexed, notes_embedded, error (nullable text)`. Written once per pass in a `finally` block inside the pass (so a failing pass records its error); pruned to newest 500 rows in the same transaction. Alternative (log-parsing) rejected: logs rotate with containers.
 4. **Chart.js reuse** with theme-token colors per the `panel-theming` contract.
 5. **Multi-tenant passes** record one row per pass (with the pass's `user_id` when per-user), matching how the indexer loops today.
 

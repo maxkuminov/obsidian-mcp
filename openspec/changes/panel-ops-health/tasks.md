@@ -4,7 +4,7 @@
 
 ## 2. Recording
 
-- [ ] 2.1 Makefile db-backup inserts the row after a successful dump; failure fails the target; DEPLOYMENT.md updated
+- [ ] 2.1 Makefile db-backup inserts the row after a successful dump, guarded by a to_regclass existence check (absent → loud warning, target still succeeds; present → insert failure fails the target); DEPLOYMENT.md updated incl. the bootstrap-deploy note
 - [ ] 2.2 Ring buffer ERROR handler (maxlen 100) attached in main.py lifespan
 
 ## 3. Panel

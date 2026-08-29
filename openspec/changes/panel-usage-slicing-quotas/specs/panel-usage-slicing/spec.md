@@ -16,4 +16,4 @@ The keys UI SHALL allow setting, changing, and clearing a key's `daily_request_l
 
 #### Scenario: Set and observe
 - **WHEN** the operator sets limit 500 on a key that has made 12 calls today
-- **THEN** the keys page shows 12/500 for it, and clearing the limit returns the key to unlimited
+- **THEN** the keys page shows 12/500 for it (read from the key's current-day counter row), and clearing the limit returns the key to unlimited

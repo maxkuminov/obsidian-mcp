@@ -1,11 +1,11 @@
 ## 1. Schema
 
-- [ ] 1.1 `daily_request_limit` nullable column + composite index (key_id, created_at); migration 020; test-schema green; alembic check clean
+- [ ] 1.1 Migration 020: `daily_request_limit` nullable column with CHECK (NULL or 1..1000000), `quota_counters(key_id, day, count)` with composite PK, plus composite index (key_id, created_at) on usage_logs; test-schema green; alembic check clean
 
 ## 2. Enforcement
 
-- [ ] 2.1 Quota check in `_tracked` after credential resolution, before tool body; structured refusal naming limit + UTC reset; over-quota marker logged; refusals excluded from the consuming count
-- [ ] 2.2 Tests: limit boundary, rollover, refusal non-consumption, null-limit no-op, cross-key isolation
+- [ ] 2.1 Atomic conditional-increment admission in `_tracked` after credential resolution, before tool body; structured refusal naming limit + UTC reset; over-quota marker `"over_quota": true` via a shared constant; refusals never increment; opportunistic pruning of counter rows older than 2 days
+- [ ] 2.2 Tests: limit boundary, CONCURRENT boundary (exactly N admitted under >N concurrent calls), rollover, refusal non-consumption, null-limit no-op, cross-key isolation, invalid limit values rejected
 
 ## 3. Panel
 

@@ -9,15 +9,15 @@
 
 ## Decisions
 
-1. **Telemetry via `timing.record`**: `result_count` (int) always; `result_paths` as the returned note paths capped at 10 per call (enough for coverage aggregation; keeps params bounded alongside `_truncate_params`). Recorded in the service layer where results are final, so the tool wrapper stays generic.
+1. **Telemetry via `timing.record`**: `result_count` (int) always; `result_paths` as the first 10 returned note paths, additionally bounded to 2048 bytes total (paths dropped from the end to fit). The budget is enforced at the record site because `_tracked` merges `timing.current()` AFTER `_truncate_params` runs — the generic truncation is not a backstop for telemetry. Recorded in the service layer where results are final, so the tool wrapper stays generic.
 2. **Zero-result = `result_count == 0`**, distinguished from errors (error-marked rows excluded).
-3. **Never-retrieved notes** = notes in `notes_metadata` (per the owning user) with no appearance in any logged `result_paths` over the window; presented with the honest caveat in-page that path caps make it an upper bound... the cap makes *most-retrieved* exact only for top-10-visible results, and never-retrieved slightly overestimates retrieval absence. Acceptable for a hygiene view; stated in the UI copy.
+3. **Coverage metrics named honestly.** The ranking is "top-logged retrievals" (appearances within each call's first 10 results) — not a claim about all retrievals — and never-retrieved is an upper bound; the cap caveat is displayed beside both. find_related, which logs a source `path` rather than a `query`, gets its own per-source-path tables and is excluded from query-frequency.
 4. **Aggregation in SQL** (jsonb_array_elements over window-bounded rows), same no-rollup stance as `panel-performance-views`.
 5. **Privacy stance:** queries can contain personal text; the page is behind the same admin OAuth as everything else and adds no new exposure. Screenshots of this page for the README must use demo data (per the `panel-light-mode` screenshot checklist).
 
 ## Risks / Trade-offs
 
-- [params bloat from result_paths] → hard cap 10 paths/call, existing truncation as backstop.
+- [params bloat from result_paths] → hard cap 10 paths and 2048 bytes per call at the record site (the generic truncation does not see merged telemetry).
 - [JSONB aggregation cost] → window-bounded via created_at index; small self-hosted volumes.
 - [Misreading "never-retrieved" as exact] → explicit caveat copy in the page.
 
