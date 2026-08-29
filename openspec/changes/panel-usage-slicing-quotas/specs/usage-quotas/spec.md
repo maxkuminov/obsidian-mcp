@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Per-key daily quota enforcement
-A key with a non-null `daily_request_limit` SHALL have tool calls admitted through an atomic per-(key, UTC-day) counter — a single conditional-increment statement that admits at most `limit` calls per UTC day under any concurrency — with over-limit calls refused before the tool body via a structured error naming the limit and the UTC reset. The admission increment SHALL run AFTER every existing pre-body gate (credential/vault resolution, argument screening) so pre-body refusals never consume a slot, and SHALL be committed in its own transaction before the tool body runs, so a body that later fails still consumes its slot. The refusal SHALL be logged with the over-quota marker `"over_quota": true` in params (one shared constant used by every writer and reader; NULL-safe exclusion predicate `COALESCE((params->>'over_quota')::boolean, false)`) and SHALL NOT increment the counter. Enforcement SHALL never affect other keys or OAuth traffic; keys with a null limit SHALL behave exactly as today.
+A key with a non-null `daily_request_limit` SHALL have tool calls admitted through an atomic per-(key, UTC-day) counter — a single conditional-increment statement that admits at most `limit` calls per UTC day under any concurrency — with over-limit calls refused before the tool body via a structured error naming the limit and the UTC reset. The admission increment SHALL run AFTER every existing pre-body gate (credential/vault resolution, argument screening) so pre-body refusals never consume a slot, and SHALL be committed in its own transaction before the tool body runs, so a body that later fails still consumes its slot. The refusal SHALL be logged with the over-quota marker `"over_quota": true` in params (one shared constant used by every writer and reader; NULL-safe exclusion predicate `COALESCE((params->>'over_quota')::boolean, false)`) and SHALL NOT increment the counter. Enforcement SHALL never affect other keys or OAuth traffic; keys with a null limit SHALL behave exactly as today. Enabling a limit on an unlimited key (NULL to value) SHALL delete the key's current-day counter row in the same transaction, so consumption restarts at zero at each enablement; changing one non-null limit to another SHALL keep the counter.
 
 #### Scenario: Limit reached
 - **WHEN** a key with limit 100 makes its 101st call of the UTC day
@@ -29,6 +29,10 @@ A key with a non-null `daily_request_limit` SHALL have tool calls admitted throu
 #### Scenario: Invalid value rejected
 - **WHEN** an admin submits a limit of 0, -5, or 10000001
 - **THEN** the submission is rejected with a visible error and the stored value is unchanged
+
+#### Scenario: Enable resets, change keeps
+- **WHEN** an admin clears a key's limit mid-day after 40 admissions and re-enables a limit of 100 an hour later, then later raises it to 200
+- **THEN** consumption shows 0/100 at re-enablement (counter reset with the enable), and the later change to 200 keeps the accumulated count
 
 #### Scenario: Unlimited default
 - **WHEN** a key has no limit set

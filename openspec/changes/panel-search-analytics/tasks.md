@@ -1,6 +1,6 @@
 ## 1. Telemetry
 
-- [ ] 1.1 timing.record result_count + result_paths (≤10 paths, ≤2048 bytes, enforced at record site) in keyword_search/semantic_search/find_related service returns; verify params in usage_logs rows incl. a long-paths case
+- [ ] 1.1 timing.record result_count + result_paths (≤10 paths, ≤2048 bytes, enforced at record site) in keyword_search/semantic_search/find_related service returns, plus find_related's `source_path` key (full path ≤1024 bytes, else sha256 hex); verify params in usage_logs rows incl. a long-paths case
 
 ## 2. Panel
 

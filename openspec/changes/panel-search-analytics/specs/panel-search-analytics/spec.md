@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Search result telemetry
-`keyword_search`, `semantic_search`, and `find_related` SHALL record into their logged params the final `result_count` and the returned note paths under an explicit telemetry contract — at most the first 10 paths and at most 2048 bytes total for the paths value, dropping paths from the end to fit, applied at the record site after any merge into logged params (the generic param truncation does not cover merged telemetry) — without altering tool responses or existing param keys.
+`keyword_search`, `semantic_search`, and `find_related` SHALL record into their logged params the final `result_count` and the returned note paths under an explicit telemetry contract — at most the first 10 paths and at most 2048 bytes total for the paths value, dropping paths from the end to fit, applied at the record site after any merge into logged params (the generic param truncation does not cover merged telemetry) — without altering tool responses or existing param keys. `find_related` SHALL additionally record its source under the telemetry key `source_path`: the full path when it is at most 1024 bytes of UTF-8, otherwise its sha256 hex digest, keeping grouping non-colliding.
 
 #### Scenario: Count and paths logged
 - **WHEN** a semantic_search returns 4 notes
