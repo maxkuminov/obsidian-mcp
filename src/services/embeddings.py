@@ -569,7 +569,7 @@ async def semantic_search(
         if len(deduped) >= limit:
             break
 
-    return [
+    results = [
         {
             "path": nm.file_path,
             "title": nm.title,
@@ -582,3 +582,9 @@ async def semantic_search(
         }
         for ne, nm in deduped
     ]
+    # Result telemetry, recorded after the dedupe so the count and the paths
+    # are what the tool actually returns (#161) — an overfetched, not-yet-
+    # deduped row list would report a note twice. Bounds are enforced inside
+    # `record_results`; no-op outside a tracked tool call.
+    timing.record_results(r["path"] for r in results)
+    return results
