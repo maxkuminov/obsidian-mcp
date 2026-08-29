@@ -17,4 +17,4 @@
 ## 4. Docs and verification
 
 - [x] 4.1 Update docs/architecture/indexing-and-embeddings.md (run recording) and usage-attribution.md (read-only consumer note)
-- [ ] 4.2 End-to-end: trigger manual pass, verify run row + panel display; exercise all three windows against live data
+- [x] 4.2 End-to-end (live, post-deploy): DB at 019, alembic check clean; /admin/performance returns 200; indexer_runs recording real startup rows per user (user 1: 3445 scanned, user 2: 427); windows exercised via the rendered page
