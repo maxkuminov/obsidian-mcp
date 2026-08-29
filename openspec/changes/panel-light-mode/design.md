@@ -33,6 +33,8 @@ The panel's styling is hand-written CSS living in `<style>` blocks inside Jinja2
 
 7. **Transfer pages are a separate surface.** `transfer_upload.html` / `transfer_download.html` serve third parties under a strict nonce CSP with static-response discipline (`src/transfer/routes.py`) and already ship a light-first OS-responsive palette. They get only a local token sweep with the same naming convention — no shared partial (would break nonce/static discipline), no toggle, no localStorage. Their security headers must be byte-identical before/after once each response's per-request nonce is replaced with the same canonical placeholder, and within each response every inline nonce must equal the CSP's nonce.
 
+**Accepted limitations (verifier advisories):** the control↔token binding is documented in the architecture note but not gated — a future control reusing `--border` regresses silently until the proposed selector-scan gate exists; `render.py`'s matchMedia assertion cannot distinguish the OS-flip listener from the OS-default read. Both recorded here rather than silently dropped.
+
 ## Migration Plan
 
 Deploy is `make deploy` (container rebuild; no migration, no schema gate). Rollback is redeploying the previous image. Existing users see dark by default unless their OS prefers light and they never chose — called out to Max at review since that flips OS-light users' default; the localStorage escape (`theme=dark`) is one click.
