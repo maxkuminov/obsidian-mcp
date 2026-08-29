@@ -32,6 +32,7 @@ a gate, and this module is the only thing that looks at the parts of the schema
 import asyncio
 import contextlib
 import datetime
+import itertools
 import os
 
 import asyncpg
@@ -59,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "019"
+HEAD_REVISION = "020"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -3064,3 +3065,452 @@ def test_019_refuses_an_unmarked_table_of_its_name():
         )
         assert result.returncode != 0
         assert "019's comment marker" in result.stdout + result.stderr
+
+
+# --------------------------------------------------------------------------
+# migration 020 — the per-key daily quota (#162)
+# --------------------------------------------------------------------------
+#
+# Three objects in one revision, and each of them is load-bearing in a way a
+# name-level check cannot see:
+#
+#   * `api_keys.daily_request_limit` must stay **nullable with no default**.
+#     NULL is the value that means "unlimited"; a `NOT NULL DEFAULT 0` column
+#     of the same name is every key on the server refusing every call, and
+#     `alembic check` would report the column as present either way.
+#   * `ck_api_keys_daily_request_limit` must be the real predicate and
+#     `convalidated`. A same-named `CHECK (true)` enforces nothing — issue #53
+#     exactly — and the value it lets through, a limit of 0, is a key that can
+#     never call anything again.
+#   * `quota_counters` must have the composite PK `(key_id, day)`. That is the
+#     arbiter `ON CONFLICT (key_id, day)` names: without it every admission
+#     raises, and with a single-column `(key_id)` PK every day collapses onto
+#     one row — a quota that never resets. Autogenerate sees a table of the
+#     right name and reports no drift.
+#
+# So these cases assert the catalog, and then prove the CHECK is actually
+# enforced by attempting the inserts it exists to reject.
+
+QUOTA_TABLE_MARKER = "per-(key, UTC day) admission counter (020_daily_request_limit)"
+QUOTA_COLUMN_MARKER = (
+    "opt-in per-key daily admission ceiling (020_daily_request_limit)"
+)
+QUOTA_CHECK_MARKER = "created by 020_daily_request_limit"
+QUOTA_CHECK_NAME = "ck_api_keys_daily_request_limit"
+USAGE_KEY_INDEX = "ix_usage_logs_key_id_created_at"
+
+
+def quota_counters_comment(url):
+    return fetchval(
+        url,
+        "SELECT obj_description(c.oid, 'pg_class') FROM pg_class c "
+        "WHERE c.relname = 'quota_counters' AND c.relkind = 'r'",
+    )
+
+
+def daily_limit_comment(url):
+    return fetchval(
+        url,
+        "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a "
+        "WHERE a.attrelid = 'api_keys'::regclass "
+        "  AND a.attname = 'daily_request_limit'",
+    )
+
+
+def daily_limit_check(url):
+    """`(constraintdef, convalidated, comment)` for 020's CHECK, or None."""
+    rows = fetch(
+        url,
+        "SELECT pg_get_constraintdef(oid) AS def, convalidated, "
+        "       obj_description(oid, 'pg_constraint') AS comment "
+        "FROM pg_constraint "
+        "WHERE conrelid = 'api_keys'::regclass AND contype = 'c' AND conname = $1",
+        QUOTA_CHECK_NAME,
+    )
+    if not rows:
+        return None
+    return " ".join(rows[0]["def"].split()), rows[0]["convalidated"], rows[0]["comment"]
+
+
+def quota_counters_pk(url):
+    return fetchval(
+        url,
+        "SELECT (SELECT array_agg(a.attname ORDER BY k.ord) "
+        "          FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          JOIN pg_attribute a ON a.attrelid = c.conrelid "
+        "                             AND a.attnum = k.attnum) "
+        "FROM pg_constraint c "
+        "WHERE c.conrelid = 'quota_counters'::regclass AND c.contype = 'p'",
+    )
+
+
+def quota_counters_fk(url):
+    """`(local, referenced_table, referenced_columns, delete, update, valid)`."""
+    rows = fetch(
+        url,
+        "SELECT (SELECT array_agg(a.attname ORDER BY k.ord) "
+        "          FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          JOIN pg_attribute a ON a.attrelid = c.conrelid "
+        "                             AND a.attnum = k.attnum) AS local_columns, "
+        "       c.confrelid::regclass::text AS referenced_table, "
+        "       (SELECT array_agg(a.attname ORDER BY k.ord) "
+        "          FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          JOIN pg_attribute a ON a.attrelid = c.confrelid "
+        "                             AND a.attnum = k.attnum) AS referenced_columns, "
+        "       c.confdeltype::text, c.confupdtype::text, c.convalidated "
+        "FROM pg_constraint c "
+        "WHERE c.conrelid = 'quota_counters'::regclass AND c.contype = 'f'",
+    )
+    return [tuple(r) for r in rows]
+
+
+def usage_index_columns(url, name):
+    return fetchval(
+        url,
+        "SELECT array_agg(a.attname ORDER BY k.ord) "
+        "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+        "     CROSS JOIN unnest(string_to_array(i.indkey::text, ' ')) "
+        "                WITH ORDINALITY AS k(attnum, ord) "
+        "     JOIN pg_attribute a ON a.attrelid = i.indrelid "
+        "                        AND a.attnum = k.attnum::smallint "
+        "WHERE i.indrelid = 'usage_logs'::regclass AND ic.relname = $1 "
+        "GROUP BY ic.relname",
+        name,
+    )
+
+
+#: Distinct `key_prefix` values for the fixtures below. The column is
+#: `varchar(12)`, so `omcp_` plus six digits is exactly at the limit; a
+#: counter rather than a hash of the name keeps the value deterministic
+#: across runs.
+_QUOTA_KEY_SEQ = itertools.count(1)
+
+
+def insert_quota_key(url, name="quota key", limit=None):
+    """One `api_keys` row, returning its id. `limit` goes through the CHECK.
+
+    Named apart from this module's other `insert_key` (the 015 fixture, which
+    takes an explicit id and prefix) because these cases want the serial id
+    back and care only about the limit column. `key_prefix` is
+    `varchar(12)`, so it is derived rather than interpolated from the name.
+    """
+    return fetchval(
+        url,
+        "INSERT INTO api_keys (name, key_hash, key_prefix, permission, "
+        "                      is_active, daily_request_limit) "
+        "VALUES ($1, $2, $3, 'read', true, $4) RETURNING id",
+        name,
+        f"hash-{name}-{limit}",
+        f"omcp_{next(_QUOTA_KEY_SEQ):06d}",
+        limit,
+    )
+
+
+def refuse_020(url, *, must_mention):
+    """Stamp back to 019, re-run 020, require it to refuse, return the message.
+
+    The same stamp-back path `make test-schema` exercises for idempotence, so a
+    verifier that waved a mutation through here would wave it through on a real
+    database somebody had altered by hand.
+    """
+    _harness.run_alembic(url, "stamp", "019", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "020 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    return combined
+
+
+def test_020_creates_the_three_objects_it_promises():
+    with throwaway_db("schema_quota_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+
+        # The column: nullable, no default, marked. NULL is "unlimited", and a
+        # NOT NULL or defaulted column has no way to say it.
+        notnull, coltype, default = column_shape(url, "api_keys", "daily_request_limit")
+        assert (notnull, coltype, default) == (False, "integer", None)
+        assert daily_limit_comment(url) == QUOTA_COLUMN_MARKER
+
+        # The CHECK: real predicate, validated, marked.
+        rendered, validated, comment = daily_limit_check(url)
+        assert validated is True
+        assert comment == QUOTA_CHECK_MARKER
+        assert "1000000" in rendered and "IS NULL" in rendered
+
+        # The counter table: marked, composite PK in order, cascading FK.
+        assert quota_counters_comment(url) == QUOTA_TABLE_MARKER
+        assert quota_counters_pk(url) == ["key_id", "day"]
+        assert quota_counters_fk(url) == [
+            (["key_id"], "api_keys", ["id"], "c", "a", True)
+        ]
+
+        # The composite index the usage page's per-key filter reads.
+        assert usage_index_columns(url, USAGE_KEY_INDEX) == ["key_id", "created_at"]
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_the_limit_check_rejects_zero_negative_and_oversized():
+    """The catalog says the constraint is there; this proves it enforces.
+
+    A limit of 0 would make the admission statement's guarded UPDATE decline
+    every call forever — a key that refuses everything, which reads to its
+    operator as an outage rather than as a setting.
+    """
+    with throwaway_db("schema_quota_domain") as url:
+        # The legal values, including the two boundaries and NULL.
+        for legal in (None, 1, 1000000):
+            insert_quota_key(url, name=f"legal {legal}", limit=legal)
+
+        for illegal in (0, -5, 1000001):
+            with pytest.raises(asyncpg.CheckViolationError):
+                insert_quota_key(url, name=f"bad {illegal}", limit=illegal)
+
+
+def test_deleting_a_key_cascades_its_counters():
+    """`ON DELETE CASCADE`, and why it is not `NO ACTION`: a counter row the
+    operator cannot see would block the panel's key delete outright."""
+    with throwaway_db("schema_quota_cascade") as url:
+        key_id = insert_quota_key(url, limit=10)
+        sql(
+            url,
+            "INSERT INTO quota_counters (key_id, day, count) "
+            "VALUES ($1, CURRENT_DATE, 4)",
+            key_id,
+        )
+        assert fetchval(url, "SELECT count(*) FROM quota_counters") == 1
+        sql(url, "DELETE FROM api_keys WHERE id = $1", key_id)
+        assert fetchval(url, "SELECT count(*) FROM quota_counters") == 0
+
+
+def test_the_composite_pk_is_what_makes_admission_atomic():
+    """`ON CONFLICT (key_id, day)` needs that exact arbiter, and the guarded
+    `DO UPDATE ... WHERE` is what refuses at the ceiling.
+
+    Run here, against the real catalog, because the property being asserted is
+    PostgreSQL's: that the conditional upsert returns no row once the count has
+    reached the limit, and that the count is left untouched by the attempt.
+    """
+    with throwaway_db("schema_quota_upsert") as url:
+        key_id = insert_quota_key(url, limit=2)
+        statement = (
+            "INSERT INTO quota_counters (key_id, day, count) "
+            "VALUES ($1, DATE '2026-08-29', 1) "
+            "ON CONFLICT (key_id, day) DO UPDATE "
+            "SET count = quota_counters.count + 1 "
+            "WHERE quota_counters.count < $2 RETURNING count"
+        )
+        assert fetchval(url, statement, key_id, 2) == 1
+        assert fetchval(url, statement, key_id, 2) == 2
+        # At the ceiling: no row, and the counter is unmoved.
+        assert fetchval(url, statement, key_id, 2) is None
+        assert fetchval(url, "SELECT count FROM quota_counters") == 2
+        # A different day is a different row.
+        assert (
+            fetchval(
+                url,
+                statement.replace("2026-08-29", "2026-08-30"),
+                key_id,
+                2,
+            )
+            == 1
+        )
+
+
+def test_rerunning_020_adopts_its_own_work_and_keeps_the_counters():
+    """The idempotence path the gate itself performs: 020 genuinely
+    re-executes against a database already carrying its three objects, and no
+    key loses its configured limit or its day's consumption."""
+    with throwaway_db("schema_quota_rerun") as url:
+        key_id = insert_quota_key(url, limit=250)
+        sql(
+            url,
+            "INSERT INTO quota_counters (key_id, day, count) "
+            "VALUES ($1, CURRENT_DATE, 37)",
+            key_id,
+        )
+        _harness.run_alembic(url, "stamp", "019", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT daily_request_limit FROM api_keys") == 250
+        assert fetchval(url, "SELECT count FROM quota_counters") == 37
+        assert quota_counters_comment(url) == QUOTA_TABLE_MARKER
+
+
+def test_020_refuses_a_not_null_defaulted_limit_column():
+    """The adversarial case: the column exists, `alembic check` is happy, and
+    every key on the server now has a limit of zero — which refuses every call
+    forever."""
+    with throwaway_db("schema_quota_notnull") as url:
+        sql(
+            url,
+            "ALTER TABLE api_keys ALTER COLUMN daily_request_limit SET DEFAULT 0",
+        )
+        sql(url, "UPDATE api_keys SET daily_request_limit = 1")
+        sql(
+            url,
+            "ALTER TABLE api_keys ALTER COLUMN daily_request_limit SET NOT NULL",
+        )
+        combined = refuse_020(url, must_mention=["NOT NULL", "server default"])
+        assert "unlimited" in combined
+
+
+def test_020_refuses_an_unmarked_limit_column():
+    with throwaway_db("schema_quota_unmarked_col") as url:
+        sql(url, "COMMENT ON COLUMN api_keys.daily_request_limit IS NULL")
+        refuse_020(url, must_mention=["020's comment marker"])
+
+
+def test_020_refuses_an_impostor_check_of_its_name():
+    """A same-named `CHECK (true)` satisfies a lookup by name and enforces
+    nothing (issue #53). The predicate is compared, not the name."""
+    with throwaway_db("schema_quota_impostor_check") as url:
+        sql(url, f"ALTER TABLE api_keys DROP CONSTRAINT {QUOTA_CHECK_NAME}")
+        sql(
+            url,
+            f"ALTER TABLE api_keys ADD CONSTRAINT {QUOTA_CHECK_NAME} CHECK (true)",
+        )
+        sql(
+            url,
+            f"COMMENT ON CONSTRAINT {QUOTA_CHECK_NAME} ON api_keys IS "
+            f"'{QUOTA_CHECK_MARKER}'",
+        )
+        refuse_020(url, must_mention=["its predicate is"])
+        # A zero limit really is admitted while the impostor stands — which is
+        # the whole reason the predicate is compared rather than the name.
+        insert_quota_key(url, name="zero", limit=0)
+
+
+def test_020_refuses_a_not_valid_check():
+    """`NOT VALID` enforces new rows having never checked the existing ones, so
+    the table may already hold a zero limit."""
+    with throwaway_db("schema_quota_notvalid_check") as url:
+        sql(url, f"ALTER TABLE api_keys DROP CONSTRAINT {QUOTA_CHECK_NAME}")
+        sql(
+            url,
+            f"ALTER TABLE api_keys ADD CONSTRAINT {QUOTA_CHECK_NAME} CHECK "
+            "(daily_request_limit IS NULL OR (daily_request_limit >= 1 AND "
+            "daily_request_limit <= 1000000)) NOT VALID",
+        )
+        sql(
+            url,
+            f"COMMENT ON CONSTRAINT {QUOTA_CHECK_NAME} ON api_keys IS "
+            f"'{QUOTA_CHECK_MARKER}'",
+        )
+        refuse_020(url, must_mention=["NOT VALID"])
+
+
+def test_020_refuses_a_single_column_primary_key_on_the_counters():
+    """The one mutation that turns the quota into a ceiling that never resets:
+    a PK on `(key_id)` alone collapses every day onto one row, and
+    `ON CONFLICT (key_id, day)` cannot even name it."""
+    with throwaway_db("schema_quota_pk") as url:
+        sql(url, "ALTER TABLE quota_counters DROP CONSTRAINT quota_counters_pkey")
+        sql(url, "ALTER TABLE quota_counters ADD PRIMARY KEY (key_id)")
+        assert quota_counters_pk(url) == ["key_id"]
+        refuse_020(url, must_mention=["primary key", "key_id", "day"])
+
+
+def test_020_refuses_a_counter_foreign_key_pointing_at_another_table():
+    """Everything a marker-and-delete-action check reads is untouched — 020's
+    comment, 020's columns, `ON DELETE CASCADE`. Only the referent moved, and
+    with it what the number counts."""
+    with throwaway_db("schema_quota_fk_target") as url:
+        constraint = fetchval(
+            url,
+            "SELECT conname FROM pg_constraint "
+            "WHERE conrelid = 'quota_counters'::regclass AND contype = 'f'",
+        )
+        sql(url, f"ALTER TABLE quota_counters DROP CONSTRAINT {constraint}")
+        sql(
+            url,
+            f"ALTER TABLE quota_counters ADD CONSTRAINT {constraint} "
+            "FOREIGN KEY (key_id) REFERENCES users(id) ON DELETE CASCADE",
+        )
+        assert quota_counters_comment(url) == QUOTA_TABLE_MARKER
+        refuse_020(url, must_mention=["users", "references"])
+
+
+def test_020_refuses_a_non_cascading_counter_foreign_key():
+    with throwaway_db("schema_quota_fk_noaction") as url:
+        constraint = fetchval(
+            url,
+            "SELECT conname FROM pg_constraint "
+            "WHERE conrelid = 'quota_counters'::regclass AND contype = 'f'",
+        )
+        sql(url, f"ALTER TABLE quota_counters DROP CONSTRAINT {constraint}")
+        refuse_020(url, must_mention=["no foreign key at all"])
+
+        sql(
+            url,
+            f"ALTER TABLE quota_counters ADD CONSTRAINT {constraint} "
+            "FOREIGN KEY (key_id) REFERENCES api_keys(id)",
+        )
+        refuse_020(url, must_mention=["CASCADE"])
+
+
+def test_020_refuses_an_unmarked_counter_table():
+    """`IF NOT EXISTS` would adopt this — including its single-column PK."""
+    with throwaway_db("schema_quota_unmarked_table", revision="019") as url:
+        sql(
+            url,
+            "CREATE TABLE quota_counters (key_id integer PRIMARY KEY "
+            " REFERENCES api_keys(id) ON DELETE CASCADE, day date NOT NULL, "
+            " count integer NOT NULL DEFAULT 0)",
+        )
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "020's comment marker" in result.stdout + result.stderr
+
+
+def test_020_refuses_a_usage_index_of_its_name_on_other_columns():
+    """Names are not definitions: an index of the right name on
+    `(key_id, duration_ms)` leaves the usage page's per-key window scan with
+    nothing to lean on, and autogenerate reports no drift at all."""
+    with throwaway_db("schema_quota_usage_index") as url:
+        sql(url, f"DROP INDEX {USAGE_KEY_INDEX}")
+        sql(
+            url,
+            f"CREATE INDEX {USAGE_KEY_INDEX} ON usage_logs (key_id, duration_ms)",
+        )
+        refuse_020(url, must_mention=[USAGE_KEY_INDEX, "duration_ms"])
+
+
+def test_downgrade_020_removes_all_three_and_upgrade_rebuilds_them():
+    with throwaway_db("schema_quota_downgrade") as url:
+        _harness.run_alembic(url, "downgrade", "019", dimensions=DIM)
+        assert alembic_version(url) == "019"
+        assert column_shape(url, "api_keys", "daily_request_limit") is None
+        assert daily_limit_check(url) is None
+        assert fetchval(url, "SELECT to_regclass('quota_counters')") is None
+        assert usage_index_columns(url, USAGE_KEY_INDEX) is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert quota_counters_pk(url) == ["key_id", "day"]
+        assert daily_limit_comment(url) == QUOTA_COLUMN_MARKER
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_020_refuses_a_counter_table_it_did_not_create():
+    """013's rule on the way back down: undo *this* migration, not delete a
+    table somebody else put there under this name."""
+    with throwaway_db("schema_quota_downgrade_foreign") as url:
+        sql(url, "COMMENT ON TABLE quota_counters IS 'somebody else made this'")
+        result = _harness.run_alembic(
+            url, "downgrade", "019", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "020's comment marker" in result.stdout + result.stderr
+        # And the column it would have dropped next is still there.
+        assert daily_limit_comment(url) == QUOTA_COLUMN_MARKER

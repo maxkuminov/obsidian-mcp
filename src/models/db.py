@@ -6,6 +6,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -195,6 +196,34 @@ class User(Base):
     )
 
 
+# Migration 020's ownership marker for `api_keys.daily_request_limit` (#162).
+# Mirrored here for 015/016/017/018's reason: `alembic check` compares column
+# comments, so a marker that drifted from the migration keying on it shows up
+# as a pending `alter_column(comment=...)` rather than as a `downgrade()` that
+# has quietly stopped recognising its own work. Must stay byte identical to
+# `COLUMN_MARKER` in `alembic/versions/020_daily_request_limit.py`.
+_DAILY_REQUEST_LIMIT_COLUMN_MARKER = (
+    "opt-in per-key daily admission ceiling (020_daily_request_limit)"
+)
+
+# The inclusive bounds the CHECK constraint and the panel's server-side
+# validation both enforce. NULL means unlimited; zero and negatives are
+# rejected on both layers, because "no calls allowed" is what revoking a key
+# is for and a key silently refusing everything reads as an outage.
+#
+# Mirrored in `020_daily_request_limit.py` (a migration must keep describing
+# the schema it created even after the model moves on) and consumed by
+# `src/services/quotas.py`, which owns the validation message.
+DAILY_REQUEST_LIMIT_MIN = 1
+DAILY_REQUEST_LIMIT_MAX = 1_000_000
+
+_DAILY_REQUEST_LIMIT_PREDICATE = (
+    "daily_request_limit IS NULL OR "
+    f"(daily_request_limit >= {DAILY_REQUEST_LIMIT_MIN} AND "
+    f"daily_request_limit <= {DAILY_REQUEST_LIMIT_MAX})"
+)
+
+
 class APIKey(Base):
     __tablename__ = "api_keys"
 
@@ -212,9 +241,29 @@ class APIKey(Base):
         DateTime(timezone=True), server_default=func.now()
     )
     last_used_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Opt-in daily ceiling (#162). NULL — the default and the shape every
+    # existing row keeps — means unlimited, and a key with it performs **no**
+    # quota accounting at all: `_tracked` issues zero quota statements for such
+    # a caller, so the feature costs nothing until somebody turns it on.
+    #
+    # The CHECK below is not decoration. `daily_request_limit = 0` would make
+    # the admission statement's guarded UPDATE decline every call forever, and
+    # a key that refuses everything reads to its operator as an outage rather
+    # than as a setting; revoking the key is the way to stop it. The upper
+    # bound exists so a fat-fingered limit stays an integer the counter column
+    # can hold and the copy can render.
+    daily_request_limit: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, comment=_DAILY_REQUEST_LIMIT_COLUMN_MARKER
+    )
 
     usage_logs: Mapped[list["UsageLog"]] = relationship(back_populates="api_key")
     user: Mapped["User | None"] = relationship(back_populates="api_keys")
+
+    __table_args__ = (
+        CheckConstraint(
+            _DAILY_REQUEST_LIMIT_PREDICATE, name="ck_api_keys_daily_request_limit"
+        ),
+    )
 
 
 # Migration 015's ownership marker for the three denormalised actor columns on
@@ -306,6 +355,13 @@ class UsageLog(Base):
     __table_args__ = (
         Index("ix_usage_logs_created_at", "created_at"),
         Index("ix_usage_logs_oauth_token_id", "oauth_token_id"),
+        # (key_id, created_at), added by 020 for the usage page's per-key
+        # filter (#162): `ix_usage_logs_created_at` alone bounds the window and
+        # then scans every actor's rows inside it to find one key's. The
+        # leading column is `key_id` because that is the equality; the window
+        # is the range, and a composite index answers `=` then `>=` in that
+        # order.
+        Index("ix_usage_logs_key_id_created_at", "key_id", "created_at"),
     )
 
 
@@ -702,3 +758,84 @@ class IndexerRun(Base):
         Index("ix_indexer_runs_started_at", "started_at"),
         {"comment": _INDEXER_RUNS_TABLE_MARKER},
     )
+
+
+# Migration 020's ownership marker for `quota_counters`, mirrored here for the
+# reason 019's is: `alembic check` compares a table comment, so a marker that
+# drifted from the migration keying on it is a dirty check rather than a
+# `downgrade()` that has quietly stopped recognising its own work. Keep byte
+# identical to `TABLE_MARKER` in `alembic/versions/020_daily_request_limit.py`.
+_QUOTA_COUNTERS_TABLE_MARKER = (
+    "per-(key, UTC day) admission counter (020_daily_request_limit)"
+)
+
+
+class QuotaCounter(Base):
+    """One row per (API key, UTC day) that has admitted at least one call.
+
+    **The row is the lock.** A quota enforced by counting `usage_logs` and then
+    deciding is raceable in the way that matters: two concurrent calls both read
+    "99 used, limit 100" and both run. So admission is a single conditional
+    upsert against this table —
+
+        INSERT INTO quota_counters (key_id, day, count) VALUES (:k, :d, 1)
+        ON CONFLICT (key_id, day)
+        DO UPDATE SET count = quota_counters.count + 1
+        WHERE quota_counters.count < :limit
+        RETURNING count
+
+    — whose `DO UPDATE ... WHERE` is evaluated by PostgreSQL while holding the
+    conflicting row's lock. A returned row is the admission; no row means the
+    ceiling is already reached and the call is refused *before* its tool body.
+    Exactly `limit` calls are admitted per UTC day under any concurrency, which
+    `tests/integration/test_issue_162_quotas_pg.py` proves with real concurrent
+    statements rather than by argument.
+
+    **`count` is admissions, not requests.** A refusal declines the guarded
+    UPDATE and therefore never increments — an agent looping on a refusal
+    cannot push the number past the limit — and an admitted call whose body
+    then raises has still consumed its slot, because the admission commits in
+    its own transaction before the body starts. Both directions are deliberate:
+    the alternative (increment on completion) admits unboundedly many
+    concurrent calls, and the other (release on failure) makes a tool that
+    always fails free.
+
+    **`day` is a UTC date, never a local one.** The server's timezone is not a
+    property anyone administering a limit can see, and a limit that resets at
+    an hour nobody can name is not a limit anybody can reason about.
+
+    `count` is what the keys page displays, not a `COUNT(*)` over `usage_logs`:
+    consumption is defined as *admissions since the limit was enabled*, and the
+    NULL-to-limited transition deletes the current-day row in the same
+    transaction as the limit write. A key that made 40 calls this morning with
+    no limit set therefore reads 0/100 the moment a limit of 100 is set — which
+    the page's copy says out loud, because the honest alternative (charging an
+    operator for traffic that was unlimited when it happened) is the surprise
+    that gets a limit turned off again.
+
+    Rows are pruned opportunistically: the first admission of a new UTC day for
+    a key (the one whose `RETURNING count` is 1, i.e. the INSERT rather than the
+    UPDATE) deletes that key's rows older than two days. Once per key per day,
+    off the conflicting path, and never in a way that can fail an admitted call.
+    """
+
+    __tablename__ = "quota_counters"
+
+    # 020's ownership marker, reachable from the class so a caller checking
+    # model/migration agreement names the table it is checking. `ClassVar` is
+    # what keeps the declarative mapper from reading it as a column.
+    _TABLE_MARKER: ClassVar[str] = _QUOTA_COUNTERS_TABLE_MARKER
+
+    # Composite primary key, and the FK is `ON DELETE CASCADE`: a counter is
+    # meaningless without the key it counts, and the panel's key delete already
+    # NULLs `usage_logs.key_id` by hand — a counter row left behind would block
+    # that delete outright.
+    key_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("api_keys.id", ondelete="CASCADE"), primary_key=True
+    )
+    day: Mapped[datetime.date] = mapped_column(Date, primary_key=True)
+    count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+
+    __table_args__ = ({"comment": _QUOTA_COUNTERS_TABLE_MARKER},)
