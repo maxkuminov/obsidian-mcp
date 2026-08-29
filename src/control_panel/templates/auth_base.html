@@ -115,6 +115,12 @@
 
         .auth-body { padding: 26px 32px 30px; }
 
+        .auth-foot {
+            padding: 0 32px 22px;
+            display: flex;
+            justify-content: flex-end;
+        }
+
         .auth-heading {
             font-family: 'Cormorant Garamond', serif;
             font-size: 24px;
@@ -146,7 +152,7 @@
             width: 100%;
             padding: 11px 13px;
             background: var(--bg);
-            border: 1px solid var(--border);
+            border: 1px solid var(--control-border);
             border-radius: 5px;
             color: var(--text);
             font-family: 'DM Sans', sans-serif;
@@ -226,6 +232,10 @@
 
     <div class="auth-body">
         {% block content %}{% endblock %}
+    </div>
+
+    <div class="auth-foot">
+        {% include "_theme_toggle.html" %}
     </div>
 </div>
 

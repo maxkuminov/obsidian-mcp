@@ -37,6 +37,8 @@
         --surface-3: #1b2440;
         --border: #222c44;
         --border-2: #2d3a5a;
+        --control-border: #222c44;
+        --disabled-opacity: 0.6;
         --primary: #9b82e8;
         --primary-dim: #6d57c2;
         --primary-text: #c4b4f5;
@@ -154,4 +156,379 @@
         --consent-neutral-surface: rgba(110,126,156,0.1);
         --consent-neutral-surface-hover: rgba(110,126,156,0.18);
     }
+
+    /* ── Light palette ──
+       Selected by `data-theme="light"` on <html>, which the pre-paint
+       bootstrap below stamps from localStorage. Every token defined for dark
+       has a light value here; none falls through. */
+    :root[data-theme="light"] {
+        color-scheme: light;
+
+        /* ── Core surfaces and text ── */
+        --bg: #f5f6fa;
+        --bg-2: #ffffff;
+        --surface: #ffffff;
+        --surface-2: #eef0f6;
+        --surface-3: #e3e6ef;
+        --border: #dfe3ec;
+        --border-2: #c3c9d8;
+        --control-border: #767e91;
+        --disabled-opacity: 0.75;
+        --primary: #6440c8;
+        --primary-dim: #573ab0;
+        --primary-text: #4b2fa6;
+        --text: #14171f;
+        --text-2: #454c5e;
+        --text-3: #5d6577;
+        --success: #0a6b41;
+        --error: #b32218;
+        --warning: #7a4d00;
+        --info: #10557f;
+
+        /* ── Accent washes, borders, glows ── */
+        --primary-glow: rgba(100, 64, 200, 0.10);
+        --primary-glow-strong: rgba(100, 64, 200, 0.22);
+        --primary-glow-xs: rgba(100,64,200,0.05);
+        --primary-glow-md: rgba(100,64,200,0.10);
+        --primary-glow-amb: rgba(100,64,200,0.06);
+        --sidebar-glow: rgba(100,64,200,0.10);
+        --primary-border: rgba(100,64,200,0.32);
+        --primary-border-soft: rgba(100,64,200,0.20);
+        --primary-border-strong: rgba(100,64,200,0.40);
+        --primary-shadow: rgba(100,64,200,0.28);
+        --primary-shadow-hover: rgba(100,64,200,0.40);
+        --primary-halo: rgba(100,64,200,0.30);
+        --primary-halo-strong: rgba(100,64,200,0.50);
+        --gem-facet: rgba(100,64,200,0.30);
+        --gem-facet-2: rgba(100,64,200,0.12);
+        --auth-card-glow: rgba(100,64,200,0.08);
+
+        /* ── Status tints, borders, text ── */
+        --success-surface: rgba(10,107,65,0.10);
+        --success-surface-soft: rgba(10,107,65,0.08);
+        --success-surface-faint: rgba(10,107,65,0.07);
+        --success-border: rgba(10,107,65,0.38);
+        --success-text: #075232;
+        --error-surface: rgba(179,34,24,0.09);
+        --error-surface-soft: rgba(179,34,24,0.07);
+        --error-surface-faint: rgba(179,34,24,0.06);
+        --error-surface-strong: rgba(179,34,24,0.15);
+        --error-border: rgba(179,34,24,0.36);
+        --error-border-strong: rgba(179,34,24,0.44);
+        --error-text: #8f1b13;
+        --error-text-hover: #6f150f;
+        --warning-surface: rgba(122,77,0,0.10);
+        --warning-border: rgba(122,77,0,0.36);
+        --info-surface: rgba(16,85,127,0.10);
+        --info-surface-faint: rgba(16,85,127,0.07);
+        --info-border: rgba(16,85,127,0.36);
+        --info-text: #0c4363;
+        --neutral-surface: rgba(93,101,119,0.12);
+        --danger-border: rgba(179,34,24,0.36);
+        --danger-border-soft: rgba(179,34,24,0.26);
+        --key-text: #075232;
+
+        /* ── Text drawn on a filled accent ── */
+        --on-primary: #ffffff;
+        --on-primary-strong: #ffffff;
+
+        /* ── Overlays, scrims, elevation ──
+           Inverted deliberately: on a white ground a scrim has to darken and a
+           shadow has to be a soft neutral, not the near-opaque black that
+           reads as depth against #070910. */
+        --topbar-bg: rgba(255, 255, 255, 0.92);
+        --backdrop: rgba(20, 23, 31, 0.38);
+        --modal-scrim: rgba(20, 23, 31, 0.46);
+        --modal-scrim-2: rgba(20,23,31,0.42);
+        --shadow-card: rgba(20,23,31,0.10);
+        --shadow-sidebar: rgba(20,23,31,0.12);
+        --shadow-modal: rgba(20,23,31,0.20);
+        --shadow-auth: rgba(20,23,31,0.14);
+        --code-bg: rgba(20,23,31,0.05);
+        --code-bg-soft: rgba(20,23,31,0.04);
+        --inset-highlight: rgba(255,255,255,0.30);
+        --inset-highlight-strong: rgba(255,255,255,0.45);
+
+        --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%235d6577' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+
+        /* ── Chart.js (usage.html) ── */
+        --chart-bar-bg: rgba(100,64,200,0.42);
+        --chart-bar-border: rgba(100,64,200,0.95);
+        --chart-tooltip-bg: #ffffff;
+        --chart-tooltip-border: #c3c9d8;
+        --chart-tooltip-title: #14171f;
+        --chart-tooltip-body: #454c5e;
+        --chart-tick: #5d6577;
+        --chart-grid: #c3c9d8;
+
+        /* ── OAuth consent page ──
+           In light the consent surface stops being its own thing and folds
+           onto the panel's values. */
+        --consent-text: #14171f;
+        --consent-text-2: #454c5e;
+        --consent-text-3: #5d6577;
+        --consent-label: #5d6577;
+        --consent-border: #dfe3ec;
+        --consent-border-hover: #c3c9d8;
+        --consent-primary: #6440c8;
+        --consent-primary-dim: #573ab0;
+        --consent-primary-text: #ffffff;
+        --consent-warn: #7a4d00;
+        --consent-glow-amb: rgba(100,64,200,0.06);
+        --consent-halo: rgba(100,64,200,0.30);
+        --consent-halo-strong: rgba(100,64,200,0.50);
+        --consent-surface: rgba(100,64,200,0.07);
+        --consent-surface-border: rgba(100,64,200,0.22);
+        --consent-option-hover: rgba(100,64,200,0.05);
+        --consent-option-active: rgba(100,64,200,0.11);
+        --consent-gem-facet: rgba(100,64,200,0.28);
+        --consent-gem-facet-2: rgba(100,64,200,0.10);
+        --consent-primary-glow: rgba(100,64,200,0.30);
+        --consent-neutral-surface: rgba(93,101,119,0.10);
+        --consent-neutral-surface-hover: rgba(93,101,119,0.18);
+    }
+
+    /* OS default, for a visitor who has never chosen. Guarded on
+       `:not([data-theme="dark"])` so an explicit dark choice still wins on a
+       light machine — and so the OS default works with JavaScript off. */
+    @media (prefers-color-scheme: light) {
+        :root:not([data-theme="dark"]) {
+            color-scheme: light;
+
+/* ── Core surfaces and text ── */
+            --bg: #f5f6fa;
+            --bg-2: #ffffff;
+            --surface: #ffffff;
+            --surface-2: #eef0f6;
+            --surface-3: #e3e6ef;
+            --border: #dfe3ec;
+            --border-2: #c3c9d8;
+            --control-border: #767e91;
+        --disabled-opacity: 0.75;
+            --primary: #6440c8;
+            --primary-dim: #573ab0;
+            --primary-text: #4b2fa6;
+            --text: #14171f;
+            --text-2: #454c5e;
+            --text-3: #5d6577;
+            --success: #0a6b41;
+            --error: #b32218;
+            --warning: #7a4d00;
+            --info: #10557f;
+
+/* ── Accent washes, borders, glows ── */
+            --primary-glow: rgba(100, 64, 200, 0.10);
+            --primary-glow-strong: rgba(100, 64, 200, 0.22);
+            --primary-glow-xs: rgba(100,64,200,0.05);
+            --primary-glow-md: rgba(100,64,200,0.10);
+            --primary-glow-amb: rgba(100,64,200,0.06);
+            --sidebar-glow: rgba(100,64,200,0.10);
+            --primary-border: rgba(100,64,200,0.32);
+            --primary-border-soft: rgba(100,64,200,0.20);
+            --primary-border-strong: rgba(100,64,200,0.40);
+            --primary-shadow: rgba(100,64,200,0.28);
+            --primary-shadow-hover: rgba(100,64,200,0.40);
+            --primary-halo: rgba(100,64,200,0.30);
+            --primary-halo-strong: rgba(100,64,200,0.50);
+            --gem-facet: rgba(100,64,200,0.30);
+            --gem-facet-2: rgba(100,64,200,0.12);
+            --auth-card-glow: rgba(100,64,200,0.08);
+
+/* ── Status tints, borders, text ── */
+            --success-surface: rgba(10,107,65,0.10);
+            --success-surface-soft: rgba(10,107,65,0.08);
+            --success-surface-faint: rgba(10,107,65,0.07);
+            --success-border: rgba(10,107,65,0.38);
+            --success-text: #075232;
+            --error-surface: rgba(179,34,24,0.09);
+            --error-surface-soft: rgba(179,34,24,0.07);
+            --error-surface-faint: rgba(179,34,24,0.06);
+            --error-surface-strong: rgba(179,34,24,0.15);
+            --error-border: rgba(179,34,24,0.36);
+            --error-border-strong: rgba(179,34,24,0.44);
+            --error-text: #8f1b13;
+            --error-text-hover: #6f150f;
+            --warning-surface: rgba(122,77,0,0.10);
+            --warning-border: rgba(122,77,0,0.36);
+            --info-surface: rgba(16,85,127,0.10);
+            --info-surface-faint: rgba(16,85,127,0.07);
+            --info-border: rgba(16,85,127,0.36);
+            --info-text: #0c4363;
+            --neutral-surface: rgba(93,101,119,0.12);
+            --danger-border: rgba(179,34,24,0.36);
+            --danger-border-soft: rgba(179,34,24,0.26);
+            --key-text: #075232;
+
+/* ── Text drawn on a filled accent ── */
+            --on-primary: #ffffff;
+            --on-primary-strong: #ffffff;
+
+/* ── Overlays, scrims, elevation ──
+               Inverted deliberately: on a white ground a scrim has to darken and a
+               shadow has to be a soft neutral, not the near-opaque black that
+               reads as depth against #070910. */
+            --topbar-bg: rgba(255, 255, 255, 0.92);
+            --backdrop: rgba(20, 23, 31, 0.38);
+            --modal-scrim: rgba(20, 23, 31, 0.46);
+            --modal-scrim-2: rgba(20,23,31,0.42);
+            --shadow-card: rgba(20,23,31,0.10);
+            --shadow-sidebar: rgba(20,23,31,0.12);
+            --shadow-modal: rgba(20,23,31,0.20);
+            --shadow-auth: rgba(20,23,31,0.14);
+            --code-bg: rgba(20,23,31,0.05);
+            --code-bg-soft: rgba(20,23,31,0.04);
+            --inset-highlight: rgba(255,255,255,0.30);
+            --inset-highlight-strong: rgba(255,255,255,0.45);
+
+--select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%235d6577' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+
+/* ── Chart.js (usage.html) ── */
+            --chart-bar-bg: rgba(100,64,200,0.42);
+            --chart-bar-border: rgba(100,64,200,0.95);
+            --chart-tooltip-bg: #ffffff;
+            --chart-tooltip-border: #c3c9d8;
+            --chart-tooltip-title: #14171f;
+            --chart-tooltip-body: #454c5e;
+            --chart-tick: #5d6577;
+            --chart-grid: #c3c9d8;
+
+/* ── OAuth consent page ──
+               In light the consent surface stops being its own thing and folds
+               onto the panel's values. */
+            --consent-text: #14171f;
+            --consent-text-2: #454c5e;
+            --consent-text-3: #5d6577;
+            --consent-label: #5d6577;
+            --consent-border: #dfe3ec;
+            --consent-border-hover: #c3c9d8;
+            --consent-primary: #6440c8;
+            --consent-primary-dim: #573ab0;
+            --consent-primary-text: #ffffff;
+            --consent-warn: #7a4d00;
+            --consent-glow-amb: rgba(100,64,200,0.06);
+            --consent-halo: rgba(100,64,200,0.30);
+            --consent-halo-strong: rgba(100,64,200,0.50);
+            --consent-surface: rgba(100,64,200,0.07);
+            --consent-surface-border: rgba(100,64,200,0.22);
+            --consent-option-hover: rgba(100,64,200,0.05);
+            --consent-option-active: rgba(100,64,200,0.11);
+            --consent-gem-facet: rgba(100,64,200,0.28);
+            --consent-gem-facet-2: rgba(100,64,200,0.10);
+            --consent-primary-glow: rgba(100,64,200,0.30);
+            --consent-neutral-surface: rgba(93,101,119,0.10);
+            --consent-neutral-surface-hover: rgba(93,101,119,0.18);
+        }
+    }
+
+    /* ── Theme toggle ──
+       Markup lives in `_theme_toggle.html`; the icon swap is pure CSS on the
+       same selectors as the palette, so the right glyph is showing before any
+       script runs. */
+    .theme-toggle {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 34px;
+        height: 34px;
+        flex-shrink: 0;
+        padding: 0;
+        border-radius: 7px;
+        border: 1px solid var(--border);
+        background: var(--surface-2);
+        color: var(--text-2);
+        cursor: pointer;
+        transition: background 0.15s, border-color 0.15s, color 0.15s;
+    }
+    .theme-toggle:hover {
+        background: var(--surface-3);
+        border-color: var(--border-2);
+        color: var(--text);
+    }
+    .theme-toggle:focus-visible {
+        outline: 2px solid var(--primary);
+        outline-offset: 2px;
+    }
+    .theme-toggle svg { width: 16px; height: 16px; display: block; }
+    .theme-toggle .icon-moon { display: none; }
+    :root[data-theme="light"] .theme-toggle .icon-sun { display: none; }
+    :root[data-theme="light"] .theme-toggle .icon-moon { display: block; }
+    @media (prefers-color-scheme: light) {
+        :root:not([data-theme="dark"]) .theme-toggle .icon-sun { display: none; }
+        :root:not([data-theme="dark"]) .theme-toggle .icon-moon { display: block; }
+    }
 </style>
+<script>
+/* Pre-paint theme bootstrap. It runs in <head>, before the body is parsed, so
+   a stored choice is on <html> before the first paint and there is no flash of
+   the other theme.
+
+   There is deliberately no CSP on this panel (see
+   docs/architecture/control-panel.md), so this inline script needs no nonce —
+   the same reason every control here uses an inline onclick. The script is
+   kept free of Jinja delimiters so `{` and `}` never have to be escaped.
+
+   The attribute is stamped ONLY when an explicit choice is stored. With no
+   choice the attribute stays absent and the `prefers-color-scheme` block above
+   decides, which is what keeps the OS default working with JavaScript off. */
+(function () {
+    var KEY = 'omcp-theme';
+    var root = document.documentElement;
+
+    function stored() {
+        try { return localStorage.getItem(KEY); } catch (e) { return null; }
+    }
+    function osLight() {
+        return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches);
+    }
+    function effective() {
+        var set = root.getAttribute('data-theme');
+        if (set === 'light' || set === 'dark') { return set; }
+        return osLight() ? 'light' : 'dark';
+    }
+
+    var choice = stored();
+    if (choice === 'light' || choice === 'dark') {
+        root.setAttribute('data-theme', choice);
+    }
+
+    /* A <meta> cannot read a custom property, so the color is copied across by
+       script; the token name rides on the tag itself. */
+    function syncMeta() {
+        var m = document.querySelector('meta[name="theme-color"][data-theme-color-token]');
+        if (!m) { return; }
+        var v = getComputedStyle(root).getPropertyValue(m.getAttribute('data-theme-color-token')).trim();
+        if (v) { m.setAttribute('content', v); }
+    }
+
+    function label(theme) {
+        return theme === 'light' ? 'Switch to dark theme' : 'Switch to light theme';
+    }
+    function syncButtons() {
+        var text = label(effective());
+        var all = document.querySelectorAll('[data-theme-toggle]');
+        for (var i = 0; i < all.length; i += 1) {
+            all[i].setAttribute('aria-label', text);
+            all[i].setAttribute('title', text);
+        }
+    }
+
+    window.__themeToggle = function () {
+        var next = effective() === 'light' ? 'dark' : 'light';
+        root.setAttribute('data-theme', next);
+        /* Storage may throw (private mode, blocked site data). The document
+           has already switched by this point, so the toggle still works; only
+           the persistence is lost and the next load follows the OS. */
+        try { localStorage.setItem(KEY, next); } catch (e) { /* not fatal */ }
+        syncMeta();
+        syncButtons();
+        window.dispatchEvent(new CustomEvent('themechange', { detail: { theme: next } }));
+    };
+
+    syncMeta();
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', syncButtons);
+    } else {
+        syncButtons();
+    }
+})();
+</script>
