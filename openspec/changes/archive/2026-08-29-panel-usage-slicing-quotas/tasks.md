@@ -15,5 +15,5 @@
 ## 4. Docs, audit, verification
 
 - [x] 4.1 docs/architecture/usage-attribution.md: quota semantics, marker, UTC boundary
-- [ ] 4.2 Adversarial Codex pass on the enforcement path (tool execution surface)
-- [ ] 4.3 End-to-end with a low-limit throwaway key against the live server
+- [x] 4.2 Adversarial Codex: 3 rounds to PASS (r1 caught the JSON-API silent-ignore + midnight refusal; r2 caught the {}-clears-quota default; r3 clean)
+- [x] 4.3 Live e2e post-deploy: limit-2 key via /mcp — calls 1-2 executed, call 3 refused in-band, counter 2, over_quota:true logged, CASCADE cleaned counters on key delete; alembic at 020, check clean
