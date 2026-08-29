@@ -5,24 +5,43 @@
 [![MCP](https://img.shields.io/badge/MCP-compatible-7C3AED)](https://modelcontextprotocol.io)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-16%20%2B%20pgvector-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 
+**A memory system for your AI agents — stored as plain markdown you
+can open in Obsidian.**
+
 A self-hosted [Model Context Protocol](https://modelcontextprotocol.io)
-server that turns your Obsidian vault into shared memory between you
-and your AI agents. Indexed, searchable, and self-describing — agents
-read what you read, link what you link, and pick up your folder
+server that gives every agent you connect a durable, shared place to
+remember things. The storage isn't a vector database you can't see
+into: it's a folder of markdown files in your Obsidian vault, backed
+by full-text and semantic search and by your own wikilink graph.
+Obsidian is the human window onto it — open a note, read exactly what
+an agent wrote about you, correct it, delete it, or take the whole
+folder somewhere else. Self-describing, too —
+agents read what you read, link what you link, and pick up your folder
 layout, frontmatter schema, and tag conventions on the first call
 instead of being briefed from scratch every session.
+
+To be precise about the scope: what the server supplies is
+MCP-accessible storage, keyword and semantic search, and graph
+operations over markdown notes, for whatever MCP clients you connect.
+The agents direct their own reads and writes. There is no automatic
+extraction, consolidation, or decay pipeline running behind them — an
+agent remembers something because it wrote a note, and forgets it
+because someone deleted one.
 
 Stack: Python 3.12, FastAPI, PostgreSQL with pgvector. Pluggable
 embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
 
-![Dashboard](screenshots/dashboard.png)
+![Dashboard](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/dashboard.png)
 
 ## Contents
 
 - [Why this exists](#why-this-exists)
 - [A session at the keyboard](#a-session-at-the-keyboard)
+- [A session away from the keyboard](#a-session-away-from-the-keyboard)
 - [What's in the box](#whats-in-the-box)
 - [vs. other Obsidian MCP servers](#vs-other-obsidian-mcp-servers)
+  - [vs. hosted memory systems](#vs-hosted-memory-systems)
+  - [vs. an agent with raw file access](#vs-an-agent-with-raw-file-access)
 - [Who this is for](#who-this-is-for)
 - [Control panel](#control-panel)
 - [Quick start](#quick-start)
@@ -40,13 +59,46 @@ embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
 There are three things going on here, and they're more interesting
 together than apart.
 
-### 1. A shared memory layer between you and your agents
+<a id="2-agent-memory-that-you-can-actually-read"></a>
 
-I think of my Obsidian vault as my exocortex. The "big me" that
-includes notes, calendars, scripts, search, and AI assistants is
-substantially more capable than the "small me" of the biological brain
-alone. It's also where I do most of my thinking, because writing
-something down is itself a form of thought.
+### 1. Agent memory that you can actually read
+
+If you let an agent run for a while, it needs memory. Most setups
+solve this with an opaque vector store, a SQLite blob, or a managed
+"memory" service that you can't see into. That works until you want to
+know what the agent thinks it knows about you, or you need to correct
+something, or you want to understand why it just made a weird
+suggestion.
+
+This server gives you a different deal. Agent memory lives as markdown
+files in your vault. Folder structure, file names, frontmatter, all
+visible. You can open the file in Obsidian and read it. You can edit
+it. You can delete it. You can grep it. The agent's "memory" is a
+human-auditable artifact that sits in the same place as your own
+notes, with the same tools available.
+
+The home lab is the use case that sold me on this. My vault has notes
+on the rack, the network, and every Home Assistant integration. I can
+say "set up a night-light mode in the master bathroom, 1% after 11pm"
+and a sysadmin agent finds the right config, makes the change, and
+updates the doc in the same pass. Six months later when I've
+forgotten how it works, the answer is in the vault, not buried in
+some chat history I can't search.
+
+The semantic search and wikilink graph still work over that material,
+so retrieval is fast and conceptual. But the substrate is files you
+own, not a black box.
+
+<a id="1-a-shared-memory-layer-between-you-and-your-agents"></a>
+
+### 2. A shared memory layer between you and your agents
+
+The other half runs the other way: the vault isn't only the agents'
+memory, it's mine. I think of my Obsidian vault as my exocortex. The
+"big me" that includes notes, calendars, scripts, search, and AI
+assistants is substantially more capable than the "small me" of the
+biological brain alone. It's also where I do most of my thinking,
+because writing something down is itself a form of thought.
 
 The problem is that until recently, the vault was passive. I had to go
 find things. Agents that wanted to help me had to be briefed from
@@ -72,34 +124,6 @@ That's the exocortex idea made concrete: one place that holds
 context, and both the human and the agents reading and writing into it
 on the same terms.
 
-### 2. Agent memory that you can actually read
-
-The other half is the inverse. If you let an agent run for a while, it
-needs memory. Most setups solve this with an opaque vector store, a
-SQLite blob, or a managed "memory" service that you can't see into.
-That works until you want to know what the agent thinks it knows about
-you, or you need to correct something, or you want to understand why
-it just made a weird suggestion.
-
-This server gives you a different deal. Agent memory lives as markdown
-files in your vault. Folder structure, file names, frontmatter, all
-visible. You can open the file in Obsidian and read it. You can edit
-it. You can delete it. You can grep it. The agent's "memory" is a
-human-auditable artifact that sits in the same place as your own
-notes, with the same tools available.
-
-The home lab is the use case that sold me on this. My vault has notes
-on the rack, the network, and every Home Assistant integration. I can
-say "set up a night-light mode in the master bathroom, 1% after 11pm"
-and a sysadmin agent finds the right config, makes the change, and
-updates the doc in the same pass. Six months later when I've
-forgotten how it works, the answer is in the vault, not buried in
-some chat history I can't search.
-
-The semantic search and wikilink graph still work over that material,
-so retrieval is fast and conceptual. But the substrate is files you
-own, not a black box.
-
 ### 3. The vault follows you
 
 The thing that still surprises me is that this is internet-facing.
@@ -114,7 +138,9 @@ out loud about it with Claude on my phone, the agent isn't starting
 cold. It can pull up what I've already written on adjacent topics,
 surface a note I half-finished six months ago, and at the end of the
 conversation suggest updates and write them in. The vault doesn't
-have to be near me to be the thing I'm working in.
+have to be near me to be the thing I'm working in. ([A session away
+from the keyboard](#a-session-away-from-the-keyboard) walks through
+exactly one of these.)
 
 ## A session at the keyboard
 
@@ -171,6 +197,40 @@ write at the end is structured (`set_frontmatter` mutating YAML, not
 a regex over the file body), so the note round-trips cleanly. The
 self-describing vault and the wikilink graph are doing the work that
 makes this feel natural.
+
+## A session away from the keyboard
+
+The transcript above is the easy case: I'm at a desk, I can see what
+the agent is doing, and Obsidian is one alt-tab away. The session that
+actually changed how I think about this server had none of that.
+
+I was out walking with a health podcast in my ears — a long one, two
+people who clearly disagreed with each other, an hour of it. I had my
+phone and no intention of going home to a laptop. So I pulled the
+episode's transcript, handed it to Claude on my phone, and we talked
+it through while I kept walking: what the actual claim was, which
+parts I already had notes on, where it cut against something I'd
+decided months ago and written down at the time.
+
+The agent had the vault the whole way. It surfaced what I'd already
+written on the topic, flagged that two dates in an older note were
+wrong, and asked whether a decision I'd recorded last year still stood
+given what the episode argued. By the time I got back it had written
+all of it in: the health-related decisions I'd actually landed on
+during the walk, the date corrections in the old note, a couple of new
+notes on the episode itself — and, because the conversation kept
+circling back to it, a durable note on how I decide which experts to
+trust on medical questions in the first place. That last one is the
+artifact I keep returning to. It wasn't about the episode at all; it
+was the reasoning underneath a whole class of decisions, and it now
+sits in the vault where the next agent will find it.
+
+I never opened Obsidian. Not on the walk, not when I got home. The
+whole session — retrieval, argument, correction, and the writing that
+came out of it — went through an agent, and the vault is simply where
+it landed. Obsidian is how I check the work afterwards, not how the
+work gets done. That inversion is most of the reason this project
+looks the way it does.
 
 ## What's in the box
 
@@ -357,6 +417,53 @@ everything you can build on top of that.
 Comparison reflects each project's documented features at time of
 writing; verify the specifics before betting on them.
 
+### vs. hosted memory systems
+
+The comparison that matters more, now that most of my vault traffic is
+agents rather than me, is against memory as a *service*: your agent
+calls an API, the service stores what it's told, and it hands back
+what it judges relevant later. mem0, Zep and Letta are the names
+people usually reach for. What follows is about that architecture —
+memory behind a service boundary — not about any one product's current
+feature list, which moves faster than a README can track.
+
+The difference is where the memory lives and who can open it.
+
+- **Readability.** When memory sits behind a service API, reading it
+  means whatever endpoint or console the service exposes, in whatever
+  shape it stores. Here the memory *is* the artifact:
+  `Health/2026-08 - Trusting expertise.md`, in a folder, in your
+  editor, in `grep`. There's no gap between what the agent stored and
+  what you can look at.
+- **Shared with you, and between agents.** A memory service is
+  generally scoped to an application and its users; the human's own
+  writing is a different system. Here it's one corpus. I write into it
+  by hand, and every connected client — Claude Desktop, Claude Code,
+  Claude on the phone, an n8n workflow — reads and writes the same
+  files on the same terms. A note I type on Sunday is context for an
+  agent on Monday with no import step.
+- **Portability.** The exit path from a folder of markdown is `cp -r`.
+  No export format, no migration script, no question about what you'd
+  be left holding if a project stopped being maintained. That's a
+  property of files, not something this server does for you.
+- **Self-description.** The rules live in the corpus rather than in
+  client config. `CLAUDE.md` at the vault root tells every agent, on
+  its first call, where things go and what frontmatter they carry, so
+  conventions are versioned next to the notes they govern.
+
+What the hosted shape buys you in exchange is real, and worth saying
+plainly. There's no Postgres to run, no pgvector version to keep
+current, no container to babysit — you get a memory layer by adding a
+dependency, which is a genuinely better trade for most people. And
+systems in that class typically do work this server deliberately
+doesn't attempt: pulling facts out of a conversation automatically,
+reconciling ones that contradict each other, and scoring relevance or
+decaying old memories so they stop crowding out new ones. Here an
+agent remembers something because it decided to write a note, and the
+judgment about what's worth keeping is the agent's, not the server's.
+If you want memory that curates itself, that's a fair reason to pick
+the other shape.
+
 ### vs. an agent with raw file access
 
 The other baseline isn't an MCP server at all: point Claude Code, a
@@ -440,7 +547,7 @@ call is recorded with the calling key, tool name, duration, and
 response size — useful for noticing a misbehaving agent burning
 tokens on something it shouldn't.
 
-![Usage](screenshots/usage.png)
+![Usage](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/usage.png)
 
 ### API keys and OAuth clients
 
@@ -456,15 +563,15 @@ so revoking really ends the session instead of leaving a refresh token
 to mint a replacement. Revoked and expired rows stay listed, dimmed, for
 a week.
 
-![API keys](screenshots/api-keys.png)
-![OAuth clients](screenshots/oauth-clients.png)
+![API keys](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/api-keys.png)
+![OAuth clients](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/oauth-clients.png)
 
 ### Vault browser
 
 A read-only file tree of the mounted vault, mostly for sanity-checking
 that the container sees what you think it sees.
 
-![Vault](screenshots/vault.png)
+![Vault](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/vault.png)
 
 ### Settings
 
@@ -481,7 +588,7 @@ whether or not anything had changed — and **Last change detected** is
 the newest `indexed_at` on any note. A quiet vault makes the second one
 old while the indexer is perfectly healthy.
 
-![Settings](screenshots/settings.png)
+![Settings](https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/screenshots/settings.png)
 
 ## Quick start
 
