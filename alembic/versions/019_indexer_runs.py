@@ -45,6 +45,18 @@ The table carries a COMMENT marker, exactly as 013/015/016/017/018 mark what
 they create, and that marker is what `downgrade()` keys on: a table of this
 name that 019 did not create is never dropped.
 
+**The verification is of definitions, not of names.** The marker is evidence of
+authorship and nothing more — a table can carry it and still have been altered
+since, and the alterations that matter are precisely the ones a name-level check
+cannot see. An FK repointed at `api_keys(id)`, still `ON DELETE SET NULL`, makes
+the column the panel labels "owner" name another table's rows; a
+`ix_indexer_runs_started_at` dropped and recreated on `error` keeps the name
+while the newest-first scan the panel and the pruner both depend on has nothing
+to lean on; a `NOT VALID` FK enforces new rows having never checked the existing
+ones. So `_verify` reads the FK's referenced table *and* column, both
+referential actions and its validated state, and each index's column list,
+uniqueness, validity and whether it is partial or over an expression.
+
 The CHECK predicate is compared against **the server's own normalization of
 the same declaration**, derived at runtime from a scratch `TEMP` table, not
 against a string pinned to one PostgreSQL major. That needs the TEMP privilege
@@ -186,29 +198,98 @@ def _live_check(bind) -> str | None:
     ).scalar()
 
 
-def _user_fk_delete_action(bind) -> str | None:
-    """`confdeltype` for the FK on `user_id`: 'n' is SET NULL, 'c' CASCADE."""
+def _regclass_text(bind, name: str) -> str:
+    """How this server renders `name` as a `regclass`, so both sides of the
+    foreign-key comparison are rendered by the same code rather than one of them
+    being a guess at whether `public.` is included."""
     return bind.execute(
-        sa.text(
-            "SELECT c.confdeltype::text FROM pg_constraint c "
-            "WHERE c.conrelid = CAST(:table AS regclass) AND c.contype = 'f' "
-            "  AND c.conkey = ARRAY[(SELECT a.attnum FROM pg_attribute a "
-            "        WHERE a.attrelid = c.conrelid AND a.attname = 'user_id')]"
-        ),
-        {"table": TABLE},
+        sa.text("SELECT CAST(CAST(:name AS regclass) AS text)"), {"name": name}
     ).scalar()
 
 
-def _index_names(bind) -> set:
+def _foreign_keys(bind):
+    """Every FK on the table, **completely** described.
+
+    The delete action alone is not the constraint. A table carrying 019's
+    comment marker, 019's columns and 019's CHECK, whose `user_id` FK points at
+    `api_keys(id)` with `ON DELETE SET NULL`, passes a delete-action check
+    unchanged — and then the panel renders its rows to an operator as the
+    history of what the indexer did while the column labelled "owner" names a
+    different table's rows. So the referenced table, the referenced column, the
+    local column, both referential actions and the validated state are all read,
+    and the count of FKs is checked too: an *extra* constraint is drift as much
+    as a wrong one.
+
+    `NOT VALID` matters for its own reason. A `NOT VALID` FK enforces new rows
+    but was never checked against existing ones, so the table may already hold
+    a `user_id` naming nobody — which is exactly the "owner" an operator would
+    read off the page.
+    """
+    return bind.execute(
+        sa.text(
+            "SELECT c.conname, "
+            "       CAST(c.confrelid AS regclass)::text AS referenced_table, "
+            "       c.confdeltype::text AS delete_action, "
+            "       c.confupdtype::text AS update_action, "
+            "       c.convalidated, "
+            "       (SELECT array_agg(a.attname ORDER BY k.ord) "
+            "          FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+            "          JOIN pg_attribute a ON a.attrelid = c.conrelid "
+            "                             AND a.attnum = k.attnum) AS local_columns, "
+            "       (SELECT array_agg(a.attname ORDER BY k.ord) "
+            "          FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord) "
+            "          JOIN pg_attribute a ON a.attrelid = c.confrelid "
+            "                             AND a.attnum = k.attnum) AS referenced_columns "
+            "FROM pg_constraint c "
+            "WHERE c.conrelid = CAST(:table AS regclass) AND c.contype = 'f' "
+            "ORDER BY c.conname"
+        ),
+        {"table": TABLE},
+    ).fetchall()
+
+
+def _index_definitions(bind) -> dict:
+    """`{name: (columns, unique, usable, restricted)}` for every index.
+
+    Names are not definitions. `ix_indexer_runs_started_at` dropped and
+    recreated on `error` keeps the name an existence check looks for while the
+    scan the panel and the pruner both depend on — newest-first over
+    `started_at` — has nothing to lean on. So the **column list** is read, along
+    with uniqueness (a UNIQUE index of that name would reject a second pass in
+    the same microsecond), validity (a failed `CONCURRENTLY` build leaves an
+    `indisvalid = false` index the planner ignores) and whether the index is
+    partial or over an expression, which the column list alone cannot show.
+
+    `indkey` is an `int2vector`, which has no direct array cast; going through
+    its text rendering is the portable idiom. An expression index has `attnum`
+    0 there and joins to nothing, which is why `restricted` is read separately
+    rather than inferred from a short column list.
+    """
+    rows = bind.execute(
+        sa.text(
+            "SELECT ic.relname AS name, "
+            "       (SELECT array_agg(a.attname ORDER BY k.ord) "
+            "          FROM unnest(string_to_array(CAST(i.indkey AS text), ' ')) "
+            "               WITH ORDINALITY AS k(attnum, ord) "
+            "          JOIN pg_attribute a ON a.attrelid = i.indrelid "
+            "                             AND a.attnum = CAST(k.attnum AS smallint)"
+            "       ) AS columns, "
+            "       i.indisunique, "
+            "       (i.indisvalid AND i.indisready) AS usable, "
+            "       (i.indpred IS NOT NULL OR i.indexprs IS NOT NULL) AS restricted "
+            "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+            "WHERE i.indrelid = CAST(:table AS regclass)"
+        ),
+        {"table": TABLE},
+    ).fetchall()
     return {
-        row[0]
-        for row in bind.execute(
-            sa.text(
-                "SELECT indexname FROM pg_indexes WHERE tablename = :table "
-                "AND schemaname = ANY (current_schemas(false))"
-            ),
-            {"table": TABLE},
-        ).fetchall()
+        row.name: (
+            list(row.columns or []),
+            row.indisunique,
+            row.usable,
+            row.restricted,
+        )
+        for row in rows
     }
 
 
@@ -248,6 +329,83 @@ def _create(bind) -> None:
     op.execute(f"COMMENT ON TABLE {TABLE} IS {_quote(MARKER)}")
 
 
+#: `(columns, unique, usable, restricted)` for the two indexes `_create` makes.
+EXPECTED_INDEXES = {
+    STARTED_INDEX: (["started_at"], False, True, False),
+    USER_INDEX: (["user_id"], False, True, False),
+}
+
+
+def _foreign_key_problems(bind) -> list:
+    """Exactly one FK, and it is `user_id -> users.id ON DELETE SET NULL`."""
+    fks = _foreign_keys(bind)
+    if len(fks) != 1:
+        return [
+            "it carries "
+            + (
+                "no foreign key at all"
+                if not fks
+                else f"{len(fks)} foreign keys ({[f.conname for f in fks]}), not one"
+            )
+        ]
+
+    fk = fks[0]
+    expected_target = _regclass_text(bind, "users")
+    problems = []
+    if list(fk.local_columns or []) != ["user_id"]:
+        problems.append(
+            f"its foreign key is on {list(fk.local_columns or [])}, not ['user_id']"
+        )
+    if fk.referenced_table != expected_target:
+        problems.append(
+            f"its foreign key references {fk.referenced_table!r}, not "
+            f"{expected_target!r} — the column the panel labels 'owner' would "
+            "name another table's rows"
+        )
+    if list(fk.referenced_columns or []) != ["id"]:
+        problems.append(
+            f"its foreign key references column(s) "
+            f"{list(fk.referenced_columns or [])}, not ['id']"
+        )
+    if fk.delete_action != "n":
+        problems.append(
+            f"its user_id foreign key deletes with {fk.delete_action!r}, not "
+            "SET NULL ('n') — deleting a user must not erase the record that "
+            "the server spent an hour indexing their vault"
+        )
+    if fk.update_action != "a":
+        problems.append(
+            f"its user_id foreign key updates with {fk.update_action!r}, not "
+            "NO ACTION ('a')"
+        )
+    if not fk.convalidated:
+        problems.append(
+            "its user_id foreign key is NOT VALID, so existing rows were never "
+            "checked and the table may already name an owner that does not exist"
+        )
+    return problems
+
+
+def _index_problems(bind) -> list:
+    """Both indexes present *and defined as 019 defines them*."""
+    live = _index_definitions(bind)
+    problems = []
+    for name, expected in EXPECTED_INDEXES.items():
+        actual = live.get(name)
+        if actual is None:
+            problems.append(f"it is missing index {name}")
+            continue
+        if actual != expected:
+            columns, unique, usable, restricted = actual
+            problems.append(
+                f"its index {name} is on {columns} "
+                f"(unique={unique}, usable={usable}, partial-or-expression="
+                f"{restricted}), not {expected[0]} as a plain, valid, "
+                "non-unique index"
+            )
+    return problems
+
+
 def _verify(bind) -> None:
     """Accept a pre-existing table only if it is exactly 019's."""
     problems = []
@@ -266,15 +424,8 @@ def _verify(bind) -> None:
             f"its CHECK is {live!r}, not the trigger predicate {canonical!r}"
         )
 
-    delete_action = _user_fk_delete_action(bind)
-    if delete_action != "n":
-        problems.append(
-            f"its user_id foreign key deletes with {delete_action!r}, not SET NULL"
-        )
-
-    missing = {STARTED_INDEX, USER_INDEX} - _index_names(bind)
-    if missing:
-        problems.append(f"it is missing index(es) {sorted(missing)}")
+    problems.extend(_foreign_key_problems(bind))
+    problems.extend(_index_problems(bind))
 
     if problems:
         raise RuntimeError(

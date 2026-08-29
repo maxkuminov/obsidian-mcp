@@ -2822,3 +2822,245 @@ def test_downgrade_018_refuses_to_drop_a_column_it_did_not_create():
         assert result.returncode != 0
         assert "018's comment marker" in result.stdout + result.stderr
         assert column_shape(url, "notes_metadata", "extraction_version") is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 019 — `indexer_runs`, and why a marker plus two index names is not a check
+# ══════════════════════════════════════════════════════════════════════════
+#
+# 019 reconciles rather than bare-CREATEs, for the reason 013 established: the
+# schema gate itself stamps back and re-runs every revision, so the migration
+# meets a database that already carries its table. The question is what it will
+# *adopt*.
+#
+# The comment marker is evidence of authorship and nothing more. A table can
+# carry it and still have been altered since, and the two alterations that
+# matter most are invisible to a name-level check:
+#
+#   * the FK repointed at `api_keys(id)`, still `ON DELETE SET NULL` — the
+#     column the panel labels "owner" then names a different table's rows, and
+#     an operator reads them as the history of what the indexer did for a user;
+#   * `ix_indexer_runs_started_at` dropped and recreated on `error` — the name
+#     an existence check looks for survives while the newest-first scan the
+#     panel and the 500-row pruner both depend on has nothing to lean on.
+#
+# Neither is visible to `alembic check` either: autogenerate does not compare a
+# FK's referenced table, and an index of the right name on the wrong column is
+# reported as no drift at all. So these cases assert the catalog.
+
+INDEXER_RUNS_MARKER = "one row per index/embed pass (019_indexer_runs)"
+
+
+def indexer_runs_comment(url):
+    return fetchval(
+        url,
+        "SELECT obj_description(c.oid, 'pg_class') FROM pg_class c "
+        "WHERE c.relname = 'indexer_runs' AND c.relkind = 'r'",
+    )
+
+
+def indexer_runs_fk(url):
+    """`(local, referenced_table, referenced_columns, delete, update, valid)`."""
+    rows = fetch(
+        url,
+        "SELECT (SELECT array_agg(a.attname ORDER BY k.ord) "
+        "          FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          JOIN pg_attribute a ON a.attrelid = c.conrelid "
+        "                             AND a.attnum = k.attnum) AS local_columns, "
+        "       c.confrelid::regclass::text AS referenced_table, "
+        "       (SELECT array_agg(a.attname ORDER BY k.ord) "
+        "          FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          JOIN pg_attribute a ON a.attrelid = c.confrelid "
+        "                             AND a.attnum = k.attnum) AS referenced_columns, "
+        "       c.confdeltype::text, c.confupdtype::text, c.convalidated "
+        "FROM pg_constraint c "
+        "WHERE c.conrelid = 'indexer_runs'::regclass AND c.contype = 'f'",
+    )
+    return [tuple(r) for r in rows]
+
+
+def indexer_runs_index_columns(url, name):
+    return fetchval(
+        url,
+        "SELECT array_agg(a.attname ORDER BY k.ord) "
+        "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+        "     CROSS JOIN unnest(string_to_array(i.indkey::text, ' ')) "
+        "                WITH ORDINALITY AS k(attnum, ord) "
+        "     JOIN pg_attribute a ON a.attrelid = i.indrelid "
+        "                        AND a.attnum = k.attnum::smallint "
+        "WHERE i.indrelid = 'indexer_runs'::regclass AND ic.relname = $1 "
+        "GROUP BY ic.relname",
+        name,
+    )
+
+
+def refuse_019(url, *, must_mention):
+    """Stamp back to 018, re-run 019, require it to refuse, return the message.
+
+    Stamping back is what makes this adversarial rather than theatrical: it is
+    the *same* path `make test-schema` exercises for idempotence, so a verifier
+    that waves the mutation through here would wave it through on a real
+    database whose table somebody had altered.
+    """
+    _harness.run_alembic(url, "stamp", "018", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "019 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    return combined
+
+
+def test_019_creates_the_table_it_promises():
+    with throwaway_db("schema_runs_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert indexer_runs_comment(url) == INDEXER_RUNS_MARKER
+        assert indexer_runs_fk(url) == [
+            (["user_id"], "users", ["id"], "n", "a", True)
+        ]
+        assert indexer_runs_index_columns(url, "ix_indexer_runs_started_at") == [
+            "started_at"
+        ]
+        assert indexer_runs_index_columns(url, "ix_indexer_runs_user_id") == ["user_id"]
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_rerunning_019_adopts_its_own_table_and_keeps_the_rows():
+    """The idempotence path the gate itself performs: 019 genuinely re-executes
+    against a database already carrying its table, and the history survives."""
+    with throwaway_db("schema_runs_rerun") as url:
+        sql(
+            url,
+            "INSERT INTO indexer_runs (started_at, finished_at, trigger, "
+            " notes_scanned) VALUES (now(), now(), 'startup', 2577)",
+        )
+        _harness.run_alembic(url, "stamp", "018", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT notes_scanned FROM indexer_runs") == 2577
+        assert indexer_runs_comment(url) == INDEXER_RUNS_MARKER
+
+
+def test_019_refuses_a_foreign_key_pointing_at_another_table():
+    """The adversarial case the name-level verifier adopted.
+
+    Everything a marker-and-delete-action check reads is untouched: 019's
+    comment, 019's columns, 019's CHECK, `ON DELETE SET NULL`. Only the
+    *referent* moved — and with it the meaning of every "owner" the panel
+    renders.
+    """
+    with throwaway_db("schema_runs_fk_target") as url:
+        constraint = fetchval(
+            url,
+            "SELECT conname FROM pg_constraint "
+            "WHERE conrelid = 'indexer_runs'::regclass AND contype = 'f'",
+        )
+        sql(url, f"ALTER TABLE indexer_runs DROP CONSTRAINT {constraint}")
+        sql(
+            url,
+            "ALTER TABLE indexer_runs ADD CONSTRAINT " + constraint + " "
+            "FOREIGN KEY (user_id) REFERENCES api_keys(id) ON DELETE SET NULL",
+        )
+        # The mutation really is invisible to the cheap gates.
+        assert indexer_runs_comment(url) == INDEXER_RUNS_MARKER
+        assert indexer_runs_fk(url)[0][1] == "api_keys"
+        assert indexer_runs_fk(url)[0][3] == "n", "still ON DELETE SET NULL"
+
+        refuse_019(url, must_mention=["api_keys", "references"])
+        # And nothing was changed on the way to refusing.
+        assert indexer_runs_fk(url)[0][1] == "api_keys"
+
+
+def test_019_refuses_a_not_valid_foreign_key():
+    """`NOT VALID` enforces new rows having never checked the existing ones, so
+    the table may already name an owner that does not exist — which is exactly
+    the value the page prints beside a pass."""
+    with throwaway_db("schema_runs_fk_notvalid") as url:
+        constraint = fetchval(
+            url,
+            "SELECT conname FROM pg_constraint "
+            "WHERE conrelid = 'indexer_runs'::regclass AND contype = 'f'",
+        )
+        sql(url, f"ALTER TABLE indexer_runs DROP CONSTRAINT {constraint}")
+        sql(
+            url,
+            "ALTER TABLE indexer_runs ADD CONSTRAINT " + constraint + " "
+            "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL NOT VALID",
+        )
+        refuse_019(url, must_mention=["NOT VALID"])
+
+
+def test_019_refuses_a_missing_or_cascading_foreign_key():
+    with throwaway_db("schema_runs_fk_cascade") as url:
+        constraint = fetchval(
+            url,
+            "SELECT conname FROM pg_constraint "
+            "WHERE conrelid = 'indexer_runs'::regclass AND contype = 'f'",
+        )
+        sql(url, f"ALTER TABLE indexer_runs DROP CONSTRAINT {constraint}")
+        refuse_019(url, must_mention=["no foreign key at all"])
+
+        sql(
+            url,
+            "ALTER TABLE indexer_runs ADD CONSTRAINT " + constraint + " "
+            "FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE",
+        )
+        refuse_019(url, must_mention=["SET NULL"])
+
+
+def test_019_refuses_an_index_of_its_name_on_another_column():
+    """The other half of the same defect: names are not definitions. The panel
+    reads this table newest-first and the pruner orders by the same column, so
+    an index of the right name on `error` is the scan silently unsupported."""
+    with throwaway_db("schema_runs_index_column") as url:
+        sql(url, "DROP INDEX ix_indexer_runs_started_at")
+        sql(url, "CREATE INDEX ix_indexer_runs_started_at ON indexer_runs (error)")
+        assert indexer_runs_index_columns(url, "ix_indexer_runs_started_at") == [
+            "error"
+        ]
+
+        refuse_019(url, must_mention=["ix_indexer_runs_started_at", "error"])
+
+
+def test_019_refuses_a_partial_index_of_its_name():
+    """A partial index answers only the queries whose predicate it implies. The
+    pruner's `ORDER BY started_at DESC` over the whole table is not one."""
+    with throwaway_db("schema_runs_index_partial") as url:
+        sql(url, "DROP INDEX ix_indexer_runs_user_id")
+        sql(
+            url,
+            "CREATE INDEX ix_indexer_runs_user_id ON indexer_runs (user_id) "
+            "WHERE trigger = 'startup'",
+        )
+        refuse_019(url, must_mention=["ix_indexer_runs_user_id"])
+
+
+def test_019_refuses_a_missing_index():
+    with throwaway_db("schema_runs_index_missing") as url:
+        sql(url, "DROP INDEX ix_indexer_runs_started_at")
+        refuse_019(url, must_mention=["missing index ix_indexer_runs_started_at"])
+
+
+def test_019_refuses_an_unmarked_table_of_its_name():
+    """`IF NOT EXISTS` would adopt this. 013's rule: reconcile a database that
+    demonstrably has our shape, refuse to guess for one that does not."""
+    with throwaway_db("schema_runs_unmarked", revision="018") as url:
+        sql(
+            url,
+            "CREATE TABLE indexer_runs (id serial PRIMARY KEY, "
+            " started_at timestamptz NOT NULL DEFAULT now(), "
+            " finished_at timestamptz, trigger varchar(16) NOT NULL, "
+            " user_id integer REFERENCES users(id) ON DELETE SET NULL, "
+            " notes_scanned integer NOT NULL DEFAULT 0, "
+            " notes_indexed integer NOT NULL DEFAULT 0, "
+            " notes_embedded integer NOT NULL DEFAULT 0, error text)",
+        )
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "019's comment marker" in result.stdout + result.stderr
