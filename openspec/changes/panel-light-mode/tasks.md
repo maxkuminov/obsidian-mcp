@@ -25,3 +25,9 @@
 - [ ] 4.3 Toggle + persistence scenarios verified on /authorize as well as login and dashboard
 - [ ] 4.4 Transfer pages: local token sweep only, keep OS-responsive light-first behavior, no toggle/localStorage; diff response headers before/after with each response's per-request nonce replaced by a canonical placeholder (CSP, Referrer-Policy, Cache-Control byte-identical under that canonicalization); assert every inline style/script nonce equals the CSP nonce in each response
 - [ ] 4.5 Contrast matrix per spec, covering every normative category: text/text-2 on each surface they appear on, flash/alert text on tinted surfaces, button labels, link text, form-control text (all ≥4.5:1); text-3, chart labels/tooltips, status badges, disabled labels, focus indicators, control borders (≥3:1); composite translucent colors over their actual backgrounds before measuring; record every pair and ratio in the change
+
+## 5. Screenshots (post-deploy; run under supervisor control, not by the implementation agent)
+
+- [ ] 5.1 Stand up a local instance seeded with fictional demo data (fake note paths/titles, fake key names, no real IPs/hostnames in settings view)
+- [ ] 5.2 Retake all six README screenshots in the light theme, same filenames (no README edit needed); privacy checklist: no internal IPs/URLs, no real note paths or project names, no infrastructure-revealing key names, no real client IDs
+- [ ] 5.3 Verify each new PNG against the checklist by reading the image before committing
