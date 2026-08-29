@@ -554,3 +554,204 @@ def test_oauth_traffic_is_exempt_because_no_branch_binds_a_limit_for_it():
     assert captured["status"] == 200
     assert captured["limit"] is None
     assert captured["key_id"] is None
+
+
+# --------------------------------------------------------------------------
+# 8. the panel pages render with the context their routes actually build
+# --------------------------------------------------------------------------
+#
+# These exist because of a bug this file caught: the usage route passed the
+# selector options as one dict and the template iterated `filter_options.keys`,
+# which Jinja resolves to the dict's **method** — attribute lookup is tried
+# before item lookup — so the key selector iterated a builtin and 500'd the
+# page. Nothing else would have found it: the route returns a context object in
+# every unit test, `TemplateResponse` is stubbed, and the template is only
+# compiled when a browser asks for it.
+#
+# So the context comes from the **real route**, and the template is the real
+# one. A renamed context key fails here rather than in production.
+
+
+def _render(route_coro, template_name, session):
+    """Run a panel route for real, then render its real template."""
+    import os as _os
+
+    from jinja2 import (
+        ChainableUndefined,
+        ChoiceLoader,
+        DictLoader,
+        Environment,
+        FileSystemLoader,
+    )
+
+    import src.control_panel.routes as panel
+
+    captured = {}
+
+    def _capture(request, name, context):
+        captured["name"] = name
+        captured["context"] = context
+        return None
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(panel.templates, "TemplateResponse", _capture)
+    mp.setattr(panel, "generate_csrf_token", lambda _r: "csrf-token")
+    try:
+        asyncio.run(route_coro(panel, session))
+    finally:
+        mp.undo()
+
+    assert captured["name"] == template_name
+
+    here = _os.path.dirname(_os.path.abspath(__file__))
+    templates = _os.path.join(here, "..", "src", "control_panel", "templates")
+    env = Environment(
+        loader=ChoiceLoader([
+            DictLoader({
+                "base.html":
+                    "{% block title %}{% endblock %}{% block content %}{% endblock %}"
+            }),
+            FileSystemLoader(templates),
+        ]),
+        undefined=ChainableUndefined,
+        autoescape=True,
+    )
+    context = dict(captured["context"])
+    context.pop("request", None)
+    return env.get_template(template_name).render(**context)
+
+
+class _Row(dict):
+    """A row that answers to attribute access, like a SQLAlchemy `Row`."""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as exc:  # pragma: no cover - a missing column is a bug
+            raise AttributeError(name) from exc
+
+
+class _PageResult:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def fetchall(self):
+        return self._rows
+
+    def all(self):
+        return self._rows
+
+
+class _UsagePageSession:
+    """Answers each statement `usage_page` issues with one plausible row."""
+
+    async def execute(self, stmt, params=None):
+        sql = str(stmt)
+        if "FROM users" in sql:
+            return _PageResult([_Row(id=1, username="max")])
+        if "FROM api_keys" in sql:
+            return _PageResult([_Row(id=4, name="nightly", key_prefix="omcp_a1b2c3")])
+        if "DISTINCT ul.tool" in sql:
+            return _PageResult([_Row(tool="read_note")])
+        if "count(*)" in sql and "GROUP BY" in sql and "actor_kind" in sql:
+            return _PageResult([
+                _Row(actor_kind="api_key", actor_label="nightly",
+                     actor_ref="omcp_a1b2c3", api_key_name=None,
+                     api_key_prefix=None, oauth_client_name=None,
+                     requests=12, last_seen=_Stamp()),
+                # The row an operator opens this page to read: no label and no
+                # join, i.e. a credential deleted before migration 015.
+                _Row(actor_kind=None, actor_label=None, actor_ref=None,
+                     api_key_name=None, api_key_prefix=None,
+                     oauth_client_name=None, requests=1, last_seen=None),
+            ])
+        if "date_trunc" in sql:
+            return _PageResult([_Row(bucket=_Stamp(), cnt=12)])
+        return _PageResult([
+            _Row(id=1, tool="read_note", duration_ms=12, created_at=_Stamp(),
+                 actor_kind="api_key", actor_label="nightly",
+                 actor_ref="omcp_a1b2c3", api_key_name=None,
+                 api_key_prefix=None, oauth_client_name=None)
+        ])
+
+
+class _Stamp:
+    def isoformat(self):
+        return "2026-08-29T10:00:00+00:00"
+
+    def strftime(self, _fmt):
+        return "10:00"
+
+
+class _KeysPageSession:
+    """The key/owner join, then the quota counters for today."""
+
+    async def execute(self, stmt, params=None):
+        if params is not None:
+            return _PageResult([_Row(key_id=4, count=7)])
+        limited = APIKey(
+            id=4, name="nightly", key_hash="x", key_prefix="omcp_a1b2c3",
+            permission="read", is_active=True, user_id=1, expires_at=None,
+            daily_request_limit=100,
+        )
+        limited.created_at = _Stamp()
+        limited.last_used_at = None
+        unlimited = APIKey(
+            id=5, name="ad hoc", key_hash="y", key_prefix="omcp_b2c3d4",
+            permission="readwrite", is_active=True, user_id=1, expires_at=None,
+            daily_request_limit=None,
+        )
+        unlimited.created_at = _Stamp()
+        unlimited.last_used_at = None
+        return _PageResult([(limited, "max", True), (unlimited, "max", True)])
+
+
+def test_the_usage_page_renders_the_context_its_route_builds():
+    from types import SimpleNamespace
+
+    async def route(panel, session):
+        return await panel.usage_page(
+            request=SimpleNamespace(session={}, scope={}),
+            session=session,
+            user=SimpleNamespace(id=1, is_admin=True, username="max"),
+        )
+
+    html = _render(route, "usage.html", _UsagePageSession())
+
+    # Every selector rendered its options — the regression this exists for is
+    # one of these loops iterating a dict method instead of a list.
+    assert 'name="user"' in html and ">max<" in html
+    assert 'name="key"' in html and "omcp_a1b2c3" in html
+    assert 'name="tool"' in html and ">read_note<" in html
+    # The per-actor totals table, including the unattributable row.
+    assert "By actor" in html
+    assert "unknown (credential deleted)" in html
+    assert ">12<" in html
+
+
+def test_the_keys_page_renders_both_a_limited_and_an_unlimited_key():
+    from types import SimpleNamespace
+
+    async def route(panel, session):
+        return await panel.keys_page(
+            request=SimpleNamespace(session={}, scope={}),
+            session=session,
+            user=SimpleNamespace(id=1, is_admin=True, username="max"),
+        )
+
+    html = _render(route, "keys.html", _KeysPageSession())
+
+    assert "7 / 100" in html, "the limited key's consumption is not rendered"
+    assert "Unlimited" in html, "the unlimited key is not labelled"
+    # The edit control carries the key's id and its current value, and both are
+    # numeric — nothing quotable is interpolated into the `onclick`, which is
+    # the trap documented for the OAuth delete's confirm().
+    assert "omcpEditLimit(4, '100')" in html
+    assert "omcpEditLimit(5, '')" in html
+    # The create form offers the field, with the domain the CHECK enforces.
+    assert 'name="daily_request_limit"' in html
+    assert 'max="1000000"' in html
+    assert 'min="1"' in html
+    # And the copy states the basis, because "43 / 100" is otherwise read as
+    # requests since midnight.
+    assert "since the limit was set" in html

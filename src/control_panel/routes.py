@@ -553,8 +553,8 @@ async def keys_page(
             "user_id": k.user_id,
             # NULL means unlimited, and an unlimited key performs no quota
             # accounting at all — so `quota_used` is only meaningful beside a
-            # limit, and the template renders an em dash without one rather
-            # than a zero that would read as a measurement.
+            # limit, and the template says "Unlimited" without one rather than
+            # printing a `0 / —` that would read as a measurement of something.
             "daily_request_limit": k.daily_request_limit,
             # Absent counter row = 0. True twice over: nothing admitted today,
             # and enabling a limit deletes the day's row so consumption is
@@ -1343,7 +1343,13 @@ async def usage_page(
             }
             for key in WINDOWS
         ],
-        "filter_options": options,
+        # Passed as three names rather than one `filter_options` dict:
+        # Jinja resolves `filter_options.keys` to the dict's **method**,
+        # because attribute lookup is tried before item lookup — so the
+        # key selector silently iterated a builtin and 500'd the page.
+        "filter_users": options["users"],
+        "filter_keys": options["keys"],
+        "filter_tools": options["tools"],
         "selected_user": filters.user_id,
         "selected_key": filters.key_id,
         "selected_tool": filters.tool,

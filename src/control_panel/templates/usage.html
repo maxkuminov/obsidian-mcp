@@ -31,12 +31,12 @@
          linkable and reloadable, and the back button does what it looks like. -->
     <form method="GET" action="/admin/usage" style="display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:20px;">
         <input type="hidden" name="window" value="{{ window }}">
-        {% if filter_options.users %}
+        {% if filter_users %}
         <div class="field" style="margin-bottom:0;">
             <label class="field-label">User</label>
             <select name="user" class="field-select" style="min-width:150px;">
                 <option value="">All users</option>
-                {% for u in filter_options.users %}
+                {% for u in filter_users %}
                 <option value="{{ u.id }}" {% if selected_user == u.id %}selected{% endif %}>{{ u.label }}</option>
                 {% endfor %}
             </select>
@@ -46,7 +46,7 @@
             <label class="field-label">API key</label>
             <select name="key" class="field-select" style="min-width:180px;">
                 <option value="">All keys</option>
-                {% for k in filter_options.keys %}
+                {% for k in filter_keys %}
                 <option value="{{ k.id }}" {% if selected_key == k.id %}selected{% endif %}>{{ k.label }} ({{ k.detail }}···)</option>
                 {% endfor %}
             </select>
@@ -55,7 +55,7 @@
             <label class="field-label">Tool</label>
             <select name="tool" class="field-select" style="min-width:170px;">
                 <option value="">All tools</option>
-                {% for t in filter_options.tools %}
+                {% for t in filter_tools %}
                 <option value="{{ t }}" {% if selected_tool == t %}selected{% endif %}>{{ t }}</option>
                 {% endfor %}
             </select>
