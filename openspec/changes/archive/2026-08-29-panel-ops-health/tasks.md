@@ -15,4 +15,4 @@
 ## 4. Docs and verification
 
 - [x] 4.1 docs/architecture/control-panel.md health section
-- [ ] 4.2 End-to-end: trigger a pass, force one logged error, run db-backup, verify page + strip against live server
+- [x] 4.2 End-to-end (live, post-deploy): 021 at head, alembic check clean; deploy's backup printed the spec'd bootstrap warning; subsequent make db-backup recorded its row (filename+121644582 bytes matching the dump); startup passes recorded per user. Authenticated page/strip render not reachable without operator credentials — covered by the verifier's real-template route-context tests; operator eyeball recommended on next panel visit
