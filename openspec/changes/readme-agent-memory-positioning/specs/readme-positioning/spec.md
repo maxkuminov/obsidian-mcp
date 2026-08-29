@@ -48,15 +48,15 @@ Outside the named edit regions — the tagline/lead, the "Why this exists" order
 
 #### Scenario: Section survey
 - **WHEN** the pre-change README's headings, image references, and badges are checked against the post-change README
-- **THEN** all are present except where a named edit region explicitly reorders them
+- **THEN** all are present except where a named edit region explicitly reorders them; each screenshot image keeps its asset and alt text, its src changed only from the relative path to the prescribed absolute URL
 
 #### Scenario: Fact preservation
 - **WHEN** the edited README is diffed against the previous version
 - **THEN** every occurrence of the tool count equals the count registered in `src/mcp_server/server.py`, and no stack claim, configuration name, or security statement is altered
 
 ### Requirement: Images render off-GitHub
-Every image in the README SHALL be referenced by an absolute `https://raw.githubusercontent.com/…` URL pinned to the `main` branch so it renders on sites that re-render the README (MCP registries, mirrors), not only on github.com.
+Each of the six repository screenshot images (`screenshots/*.png`) SHALL be referenced by an absolute `https://raw.githubusercontent.com/maxkuminov/obsidian-mcp/main/…` URL that returns HTTP 200, so it renders on sites that re-render the README (MCP registries, mirrors), not only on github.com. Shields badge images are excluded and SHALL keep their existing img.shields.io sources.
 
 #### Scenario: Registry rendering
-- **WHEN** the README's image srcs are extracted
-- **THEN** each is an absolute raw.githubusercontent.com URL that returns HTTP 200
+- **WHEN** the README's screenshot image srcs are extracted
+- **THEN** each of the six is an absolute raw.githubusercontent.com URL returning HTTP 200, and the four badges still point at img.shields.io

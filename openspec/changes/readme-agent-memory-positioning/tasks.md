@@ -11,7 +11,7 @@
 ## 3. Integrity pass
 
 - [ ] 3.1 Verify every TOC link resolves to a heading anchor in the edited file
-- [ ] 3.2 Diff against previous README: tool counts, config names, and security statements unchanged except intentional reframing; voice reads as the same author
+- [ ] 3.2 Diff against previous README: protected technical facts (tool count, config names, stack sentence, security statements) admit no exception and are unchanged/corrected only to match src/mcp_server/server.py; positioning latitude applies only to prose in the named edit regions; voice reads as the same author
 
 ## 4. Codex-review additions
 

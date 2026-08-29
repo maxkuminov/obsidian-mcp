@@ -13,7 +13,7 @@ Constraints:
 - Lead with "memory system for AI agents, stored as markdown you can open in Obsidian."
 - Reposition Obsidian as the human window (audit, edit, no lock-in) rather than the product.
 - Add the away-from-keyboard story and a hosted-memory-systems comparison.
-- Preserve voice, factual accuracy (25/27-tool counts, stack claims), and all existing anchors that external links may target.
+- Preserve voice, factual accuracy (the authoritative registered tool count — currently 25 — and stack claims), and all existing anchors that external links may target.
 
 **Non-Goals:**
 - No rename of repo, package, container, or registry entries.
