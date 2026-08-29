@@ -53,7 +53,7 @@ class _KeyRow:
     """Stand-in for an APIKey ORM row."""
 
     def __init__(self, id, user_id, is_active=True, name="k", permission="read",
-                 expires_at=None):
+                 expires_at=None, daily_request_limit=None):
         self.id = id
         self.name = name
         self.key_prefix = "omcp_abcdef"
@@ -63,6 +63,10 @@ class _KeyRow:
         self.created_at = _FixedTime()
         self.last_used_at = None
         self.expires_at = expires_at
+        # NULL is the default and means unlimited (#162). Liveness and quota
+        # are independent facts about a key — a key at its ceiling is still
+        # live, it is just refusing today — so every case here leaves it unset.
+        self.daily_request_limit = daily_request_limit
 
 
 class _FixedTime:
@@ -77,14 +81,25 @@ class _KeysResult:
     def all(self):
         return self._rows
 
+    def fetchall(self):
+        return self._rows
+
 
 class _KeysSession:
+    """The keys page issues two statements: the key/owner join, then the quota
+    counters for today (#162). The second is parameterised, which is how they
+    are told apart here — the counter read returns nothing, so every key on
+    this page renders 0 consumed, which is what a key with no counter row
+    means."""
+
     def __init__(self, rows):
         self._rows = rows
         self.statements = []
 
-    async def execute(self, stmt):
+    async def execute(self, stmt, params=None):
         self.statements.append(stmt)
+        if params is not None:
+            return _KeysResult([])
         return _KeysResult(self._rows)
 
 

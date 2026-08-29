@@ -163,7 +163,7 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   string; a new value costs nothing and a shared one mis-measures in a
   direction nobody can see from the page.
 
-  **The register, as of #161.** Pre-body: `no_vault_assigned`,
+  **The register, as of #162.** Pre-body: `no_vault_assigned`,
   `argument_not_encodable`, and the boolean `over_quota` (#162). Post-body:
   `vault_assignment_changed`, `vault_confirmation_unavailable`,
   `vault_anchor_lost_at_publish`, and `find_related`'s two operational
@@ -184,9 +184,11 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   missing key yields NULL, so without them the negation used by the executed
   filter would be NULL and PostgreSQL would drop every ordinary row on the
   floor. The marker strings are mirrored from `tools.py` rather than imported,
-  because #162's quota gate will import `usage_stats` from `tools.py` and an
-  import the other way closes the cycle;
-  `tests/test_issue_160_refusal_predicate.py` pins the two copies equal, and
+  because #162's quota gate imports `usage_stats` from `tools.py` and an
+  import the other way closes the cycle. `over_quota` therefore travels in the
+  *other* direction — imported by the writer from `usage_stats` — and is the
+  one marker in the register with a single definition rather than a pinned
+  pair; `tests/test_issue_160_refusal_predicate.py` pins the two copies equal, and
   `tests/integration/test_issue_160_performance_pg.py` seeds a row carrying
   some *other* `params.error` value and asserts it stays in the aggregates.
 
@@ -224,6 +226,164 @@ Actor attribution on the slowest-requests table is the denormalised
 `_usage_actor` reader `/admin/usage` uses, for the same reason (#77): resolving
 by join alone renders "unknown" for precisely the credential an operator has
 just deleted and come to investigate.
+
+
+## The per-key daily quota (#162)
+
+`api_keys.daily_request_limit` is a nullable integer: NULL is unlimited and is
+what every key carries until an operator sets one. Enforcement lives in
+`_tracked`, the same decorator the vault gate and the unencodable-argument
+screen live in, and the code is `src/services/quotas.py`.
+
+- **The counter row is the lock, and that is the whole design.** Migration 020
+  adds `quota_counters(key_id, day, count)` with the composite PK `(key_id,
+  day)` and an `ON DELETE CASCADE` FK to `api_keys`. Admission is one
+  statement — `INSERT … VALUES (:k, :d, 1) ON CONFLICT (key_id, day) DO UPDATE
+  SET count = quota_counters.count + 1 WHERE quota_counters.count < :limit
+  RETURNING count`. A returned row admits; no row refuses. PostgreSQL evaluates
+  that `WHERE` while holding the conflicting row's lock, so exactly `limit`
+  calls are admitted per UTC day however many arrive at once. A
+  `COUNT`-then-decide over `usage_logs` passes a sequential boundary test and
+  fails a concurrent one — two calls both read "99 used, limit 100" and both
+  run — which is why
+  `tests/integration/test_issue_162_quotas_pg.py::test_exactly_n_tool_bodies_run_under_more_than_n_concurrent_calls`
+  releases twenty tasks from one barrier onto a pool wide enough to hold them
+  and counts *tool body executions*, not admissions. The composite PK is
+  load-bearing rather than tidy: it is the arbiter `ON CONFLICT` names, and a
+  single-column PK of the same name is a quota that never resets.
+- **The gate is the last pre-body gate.** It runs after credential/vault
+  resolution and after the argument screen, so a call refused for having no
+  vault or for carrying an unpaired surrogate consumes nothing — a slot spent
+  on a call that was never going to run is a slot an operator cannot account
+  for. It commits in its **own** transaction, on its own pooled connection,
+  released before the tool body starts: holding a connection across the body
+  would turn a five-connection pool into a five-concurrent-call server.
+- **Refusals never consume; admitted failures do.** The guarded UPDATE declines
+  at the ceiling, so an agent looping on the refusal cannot push the number
+  past it, and the next UTC day admits exactly `limit` again. An admitted call
+  whose body then raises has already spent its slot and nothing gives it back.
+  Both directions are deliberate: incrementing on completion would admit
+  unboundedly many concurrent calls, and refunding a failure makes a tool that
+  always fails free.
+- **The marker is imported, not mirrored.** `over_quota` is the one `params`
+  key that is a JSON **boolean**, and `tools.py` takes it from
+  `src.services.usage_stats.OVER_QUOTA_PARAM` rather than declaring a second
+  copy. That is the direction the import can run — `usage_stats` mirrors *its*
+  two string markers from `tools.py` because the reverse would close a cycle —
+  and it means the writer and the pre-body refusal predicate cannot disagree
+  about the key's name at all. `usage_stats` enumerated it ahead of this gate
+  shipping so the two would land as one contract. It must stay a real boolean:
+  the performance page's cast is unguarded (see the reserved-keys rule above),
+  and a row carrying the string `"true"` takes `/admin/performance` down with a
+  500 for every user until it ages out.
+- **The day is UTC, computed in Python and bound as a parameter** — never
+  `now()::date`, which is the server's timezone. A limit that resets at an hour
+  nobody administering it can name is not a limit anybody can reason about, and
+  the refusal quotes the next UTC midnight verbatim so an agent can back off
+  rather than spin.
+- **Consumption is admissions since the limit was enabled, not requests since
+  midnight.** The NULL-to-limited transition deletes the key's current-day
+  counter row in the same transaction as the limit write; a limited-to-limited
+  change keeps it. So a key that made forty calls this morning with no limit set
+  reads 0/100 the moment a limit of 100 is set, and the keys page says so. The
+  alternative charges an operator for traffic that was explicitly unlimited when
+  it happened, which is the surprise that gets a limit turned off again. Raising
+  a limit keeping the count is the same rule from the other side: those calls
+  *were* admitted under a quota, and forgiving them would make "lower the limit"
+  a way to grant more calls.
+- **A key with no limit issues no quota statement at all.** The ceiling rides on
+  the request as `current_daily_request_limit`, bound by `APIKeyMiddleware` from
+  the `APIKey` row it has already loaded — the same "the row is in hand, do not
+  add a round trip" rule the actor label follows. So the common case is two
+  ContextVar reads and no SQL, and there is no query to regress on rather than a
+  query whose result happens to be permissive.
+  `tests/test_issue_162_quota_gate.py` counts statements, because nothing on any
+  page would reveal that property going wrong.
+- **OAuth is exempt by construction, not by a list.** The OAuth branch never
+  sets the limit, so the default None stands; any future credential kind is
+  exempt the same way until somebody deliberately binds a ceiling for it. v1
+  exempts OAuth because panel OAuth is the operator, and an operator locked out
+  by a ceiling they set on themselves cannot raise it.
+- **A database failure is not silently "unlimited", and not silently anything
+  else either.** If the admission statement raises, the exception is logged
+  (`quota_admission_failed`, with the key id, the accounting day and the
+  exception type) and re-raised, so the call does not run. Swallowing it would
+  mean a database blip quietly disables every configured ceiling, which is the
+  one failure mode nobody would notice; keys with no limit never reach the code,
+  so nothing that was working before can start failing because of it. The log
+  line matters because the raise happens *before* `_log_usage` — an enforcement
+  outage would otherwise leave no record anywhere naming the key it happened to.
+- **The refusal's reset instant comes from the admission, never from a second
+  clock read.** `admit()` reads the clock once to pick the accounting day and
+  returns it on the `Admission`; `quota_refusal_message` is handed
+  `Admission.reset_at` and recomputes nothing. A refusal that straddles UTC
+  midnight otherwise decides against day D and then describes day D+1's
+  midnight as though it were D+2's, telling an obedient agent to back off for
+  nearly two days when its quota was milliseconds from resetting — a
+  self-inflicted outage produced entirely by the one non-deterministic thing on
+  the path. `reset_instant` therefore takes a **date**, not a clock reading, so
+  the mistake cannot be reintroduced by passing `now`.
+- **Only tool calls consume quota; `/transfer/*` redemptions do not.** The
+  public transfer routes are served by `src/transfer/`, not by an MCP tool, so
+  they never pass through `_tracked` and never touch the counter. What consumes
+  the slot is the **mint** — `request_upload`, `request_download` and
+  `import_from_url` are ordinary `_tracked` tools — so a key that reaches its
+  ceiling can still complete uploads and downloads for capabilities it minted
+  earlier, and cannot mint new ones. That is the intended shape: a capability is
+  a promise already made, and revoking it belongs to the transfer token's own
+  expiry and to key revocation, not to a daily request ceiling. It does mean the
+  quota bounds requests to the *server*, not bytes over the wire.
+- **Zero is refused at both layers.** `daily_request_limit` is constrained to
+  NULL or 1..1,000,000 by `ck_api_keys_daily_request_limit` and by the panel's
+  own validation. Zero would make the guarded UPDATE decline every call forever,
+  and a key that refuses everything reads to its operator as an outage rather
+  than as a setting — revoking the key is the way to stop it. Both layers,
+  because a constraint is what makes the invariant true of the data and a
+  message is what makes it fixable.
+- **Counter rows are pruned opportunistically**, by the admission whose
+  `RETURNING count` is 1 — the INSERT branch, i.e. the first call of a new UTC
+  day for that key. The **trigger is per-key; the scope is global**: that one
+  call deletes *every* key's rows older than the cutoff, not just its own,
+  which is the only reason the table stays bounded — what accumulates is rows
+  belonging to keys nobody is calling any more, and a per-key prune is by
+  construction never run for those keys again. At most once per key per day,
+  never on the contended path, and its failure is swallowed: a call that has
+  already been admitted must not be turned into an error by housekeeping. The
+  accepted cost is that the request which happens to be a key's first of the
+  day pays for the housekeeping, before `admit()` returns — one indexed DELETE
+  over a table holding at most one row per key per retained day, rather than a
+  background scheduler this server does not otherwise need.
+
+
+## The filtered usage views (#162)
+
+`/admin/usage` reads through `src/services/usage_filters.py`, a peer of
+`usage_stats.py` rather than part of it: that module answers the performance
+page's question and has its own load-bearing rule about which rows count as
+executed. They share the window vocabulary by import, because two lists of
+selectable windows is how two pages start disagreeing about what "7d" means.
+
+- **The owner scope is not a filter.** `user_id` appears twice and the two are
+  different things. The scope is the viewer's tenancy — NULL for an admin, their
+  id otherwise — and it is applied unconditionally, after everything the client
+  sent; the `user=` filter is only an admin's choice of whose rows to read and is
+  not offered to a scoped viewer at all. A non-admin cannot widen their view by
+  editing the query string, which
+  `tests/test_issue_77_usage_attribution.py` and the PG module both pin.
+- **Unknown filter values clamp to "no filter"**, never to a 422 and never to a
+  value passed through to SQL — the same treatment `normalize_window` gives an
+  unknown window, for the same reason: the selectors are links and a stale
+  bookmark should render. The fallback is always the *less* specific view, and
+  the scope clause is applied on top of it either way.
+- **Deleted actors keep their line.** The per-actor totals group by the
+  denormalised `actor_*` columns and fall back to the LEFT JOINs, which is
+  `_usage_actor`'s rule verbatim: a credential the operator has just deleted and
+  come to investigate must not render as "unknown" (#77). The key selector can
+  only offer keys that still exist, so the unfiltered view is where that history
+  lives, and that is stated in the module rather than left to be discovered.
+- **`ix_usage_logs_key_id_created_at`** (migration 020) is what makes the
+  per-key filter a range scan instead of a window scan that discards most of
+  what it reads.
 
 
 ## Search result telemetry (#161)

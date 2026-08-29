@@ -8,13 +8,116 @@
 
 <div class="page-body">
 
+    {#
+      Every color on this page comes from a token defined in `_theme.html`;
+      there are no literals here. See docs/architecture/control-panel.md —
+      "one token source, dark canonical".
+    #}
+
+    <!-- Window selector. Each link carries the other filters, so changing the
+         window never silently clears them. -->
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+        <span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-2);">Window</span>
+        {% for w in windows %}
+        <a href="/admin/usage?{{ w.query }}"
+           class="btn {% if w.selected %}btn-primary{% else %}btn-ghost{% endif %}"
+           style="padding:6px 14px;font-size:12px;"
+           {% if w.selected %}aria-current="page"{% endif %}>{{ w.label }}</a>
+        {% endfor %}
+        <span style="font-size:12px;color:var(--text-3);margin-left:4px;">{{ window_label }}</span>
+    </div>
+
+    <!-- Actor filters. A GET form so the state is the URL: the page is
+         linkable and reloadable, and the back button does what it looks like. -->
+    <form method="GET" action="/admin/usage" style="display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:20px;">
+        <input type="hidden" name="window" value="{{ window }}">
+        {% if filter_users %}
+        <div class="field" style="margin-bottom:0;">
+            <label class="field-label">User</label>
+            <select name="user" class="field-select" style="min-width:150px;">
+                <option value="">All users</option>
+                {% for u in filter_users %}
+                <option value="{{ u.id }}" {% if selected_user == u.id %}selected{% endif %}>{{ u.label }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        {% endif %}
+        <div class="field" style="margin-bottom:0;">
+            <label class="field-label">API key</label>
+            <select name="key" class="field-select" style="min-width:180px;">
+                <option value="">All keys</option>
+                {% for k in filter_keys %}
+                <option value="{{ k.id }}" {% if selected_key == k.id %}selected{% endif %}>{{ k.label }} ({{ k.detail }}···)</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div class="field" style="margin-bottom:0;">
+            <label class="field-label">Tool</label>
+            <select name="tool" class="field-select" style="min-width:170px;">
+                <option value="">All tools</option>
+                {% for t in filter_tools %}
+                <option value="{{ t }}" {% if selected_tool == t %}selected{% endif %}>{{ t }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <button type="submit" class="btn btn-primary" style="padding:8px 16px;font-size:12px;">Apply</button>
+        {% if filters_active %}
+        <a href="/admin/usage?window={{ window }}" class="btn btn-ghost" style="padding:8px 16px;font-size:12px;">Clear</a>
+        {% endif %}
+    </form>
+
     <!-- Chart -->
     <div class="card anim-1" style="margin-bottom:20px;">
         <div class="card-header">
-            <span class="card-title">Requests — Last 14 Days</span>
+            <span class="card-title">Requests</span>
+            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
         </div>
         <div class="card-body" style="padding-top:18px;padding-bottom:18px;">
             <canvas id="usage-chart" height="60"></canvas>
+        </div>
+    </div>
+
+    <!-- Per-actor totals -->
+    <div class="card anim-2" style="margin-bottom:20px;">
+        <div class="card-header">
+            <span class="card-title">By actor</span>
+            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
+        </div>
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Actor</th>
+                    <th style="text-align:right;">Requests</th>
+                    <th>Last seen</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in totals %}
+                <tr>
+                    <td style="font-size:12px;line-height:1.3;">
+                        {% if row.actor_name %}
+                            <div style="color:var(--primary-text);">{{ row.actor_name }}</div>
+                            {% if row.actor_detail %}
+                                <div class="mono" style="font-size:10px;color:var(--text-3);">{{ row.actor_detail }}</div>
+                            {% endif %}
+                        {% else %}
+                            <div class="mono" style="font-size:11px;color:var(--text-3);">unknown (credential deleted)</div>
+                        {% endif %}
+                    </td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--primary-text);">{{ row.requests }}</td>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                        {% if row.last_seen %}<time datetime="{{ row.last_seen }}" data-localize>{{ row.last_seen }}</time>{% else %}—{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not totals %}
+                <tr>
+                    <td colspan="3" style="text-align:center;padding:24px;color:var(--text-3);">No requests match these filters.</td>
+                </tr>
+                {% endif %}
+            </tbody>
+        </table>
         </div>
     </div>
 
@@ -22,6 +125,7 @@
     <div class="card anim-2">
         <div class="card-header">
             <span class="card-title">Request Log</span>
+            <span class="mono" style="font-size:11px;color:var(--text-3);">newest {{ log_limit }}</span>
         </div>
         <div class="table-scroll">
         <table class="data-table">
@@ -62,7 +166,7 @@
                 {% endfor %}
                 {% if not logs %}
                 <tr>
-                    <td colspan="4" style="text-align:center;padding:32px;color:var(--text-3);">No usage data yet.</td>
+                    <td colspan="4" style="text-align:center;padding:32px;color:var(--text-3);">{% if filters_active %}No requests match these filters.{% else %}No usage data yet.{% endif %}</td>
                 </tr>
                 {% endif %}
             </tbody>

@@ -75,6 +75,11 @@ def _create(permission):
             request=_FakeRequest(),
             name="my-key",
             permission=permission,
+            # Empty is "unlimited" (#162). Passed explicitly because calling the
+            # handler directly bypasses FastAPI's form binding, so an omitted
+            # argument arrives as the `Form(...)` marker rather than as its
+            # default value.
+            daily_request_limit="",
             session=session,
             user=_FakeUser(),
         )

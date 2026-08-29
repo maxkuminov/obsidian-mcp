@@ -9,7 +9,7 @@ from typing import Any
 from urllib.parse import urlencode
 
 import httpx
-from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
@@ -23,6 +23,7 @@ from src.csrf import generate_csrf_token, verify_csrf
 from src.database import async_session, get_session
 from src.mcp_server.auth import hash_key
 from src.models.db import (
+    DAILY_REQUEST_LIMIT_MAX,
     APIKey,
     NoteEmbedding,
     NoteLink,
@@ -44,6 +45,20 @@ from src.oauth.scope import (
     token_has_write,
 )
 from src.services.indexer import invalidate_hnsw_index_cache
+from src.services.quotas import (
+    apply_daily_request_limit,
+    consumed_today,
+    parse_limit_form_value,
+    utc_day,
+)
+from src.services.usage_filters import (
+    LOG_LIMIT,
+    actor_totals,
+    chart_series,
+    filter_options,
+    recent_logs,
+    resolve_filters,
+)
 from src.services.search_analytics import (
     COVERAGE_LIMIT,
     LOGGED_RESULTS_PER_CALL,
@@ -497,10 +512,20 @@ async def keys_page(
         q = q.where(APIKey.user_id == uid)
     result = await session.execute(q)
     # One `now` for the whole page: rows compared against different instants
-    # could render two keys with the same `expires_at` differently.
+    # could render two keys with the same `expires_at` differently — and the
+    # quota day is read from the same instant, so a page rendered across a UTC
+    # midnight cannot show one key's consumption against today and another's
+    # against yesterday.
     now = datetime.now(timezone.utc)
+    rows = result.all()
+    # Today's admissions, from the counter rows rather than a COUNT over
+    # `usage_logs` (#162). The log counts refused calls and traffic from before
+    # the limit existed; neither is what "43 / 100" tells an operator. One
+    # statement for the whole page — a per-key query here is a query per row.
+    consumed = await consumed_today(session, [k.id for k, _, _ in rows], now)
+    quota_day = utc_day(now).isoformat()
     keys = []
-    for k, owner_username, owner_is_active in result.all():
+    for k, owner_username, owner_is_active in rows:
         # A key whose `user_id` has no row (owner_is_active is None) is dead
         # too — the middleware's `is True` test fails for it just the same,
         # so it must not read as live here.
@@ -527,6 +552,15 @@ async def keys_page(
             "created_at": k.created_at.isoformat(),
             "last_used_at": k.last_used_at.isoformat() if k.last_used_at else None,
             "user_id": k.user_id,
+            # NULL means unlimited, and an unlimited key performs no quota
+            # accounting at all — so `quota_used` is only meaningful beside a
+            # limit, and the template says "Unlimited" without one rather than
+            # printing a `0 / —` that would read as a measurement of something.
+            "daily_request_limit": k.daily_request_limit,
+            # Absent counter row = 0. True twice over: nothing admitted today,
+            # and enabling a limit deletes the day's row so consumption is
+            # counted from the enablement, not from midnight.
+            "quota_used": consumed.get(k.id, 0),
         })
     try:
         new_key = request.session.pop("flash_new_key", None)
@@ -536,6 +570,8 @@ async def keys_page(
         key_error = None
     return templates.TemplateResponse(request, "keys.html", _panel_context(request, user, {
         "active": "keys", "keys": keys, "new_key": new_key, "key_error": key_error,
+        "quota_day": quota_day,
+        "quota_limit_max": DAILY_REQUEST_LIMIT_MAX,
     }))
 
 
@@ -569,23 +605,39 @@ def _key_name_error(name: str) -> str | None:
     return None
 
 
+def _flash_key_error(request: Request, message: str) -> None:
+    """Carry a key-form error to the redirect target.
+
+    In the session rather than a query string: the value is the server's own
+    message, and a `?error=` the operator can be linked to lets a third party
+    choose what an authenticated admin reads.
+    """
+    try:
+        request.session["flash_key_error"] = message
+    except (AssertionError, AttributeError):
+        pass
+
+
 @router.post("/keys/create")
 async def create_key_form(
     request: Request,
     name: str = Form(...),
     permission: str = Form("read"),
+    daily_request_limit: str = Form(""),
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
     name_error = _key_name_error(name)
     if name_error is not None:
-        # Carried in the session rather than a query string: the value is the
-        # server's own message, and a `?error=` the operator can be linked to
-        # lets a third party choose what an authenticated admin reads.
-        try:
-            request.session["flash_key_error"] = name_error
-        except (AssertionError, AttributeError):
-            pass
+        _flash_key_error(request, name_error)
+        return RedirectResponse("/admin/keys", status_code=303)
+
+    # Server-side, above the DB CHECK (#162). Both layers: the constraint is
+    # what makes the invariant true of the data, and this is what makes it
+    # fixable — a violated CHECK is a 500 with no key and no explanation.
+    limit, limit_error = parse_limit_form_value(daily_request_limit)
+    if limit_error is not None:
+        _flash_key_error(request, limit_error)
         return RedirectResponse("/admin/keys", status_code=303)
 
     raw_key = f"omcp_{secrets.token_hex(24)}"
@@ -604,6 +656,7 @@ async def create_key_form(
         key_prefix=raw_key[:12],
         permission=permission,
         user_id=user.id,
+        daily_request_limit=limit,
     )
     session.add(api_key)
     await session.commit()
@@ -654,6 +707,36 @@ async def revoke_key_form(
     _assert_key_owner(api_key, user)
     api_key.is_active = False
     await session.commit()
+    return RedirectResponse("/admin/keys", status_code=303)
+
+
+@router.post("/keys/{key_id}/limit")
+async def set_key_limit_form(
+    request: Request,
+    key_id: int,
+    daily_request_limit: str = Form(""),
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    """Set, change, or clear a key's daily request limit (#162).
+
+    The enable-reset rule and its single transaction live in
+    `src.services.quotas.apply_daily_request_limit`, shared with the JSON API's
+    twin endpoint — two copies of "did this go NULL to a value" is how the two
+    surfaces start disagreeing about whether an operator is charged for traffic
+    that was unlimited when it happened, invisibly, because both would look
+    like they worked.
+    """
+    result = await session.execute(select(APIKey).where(APIKey.id == key_id))
+    api_key = result.scalar_one_or_none()
+    _assert_key_owner(api_key, user)
+
+    limit, limit_error = parse_limit_form_value(daily_request_limit)
+    if limit_error is not None:
+        _flash_key_error(request, limit_error)
+        return RedirectResponse("/admin/keys", status_code=303)
+
+    await apply_daily_request_limit(session, api_key, limit)
     return RedirectResponse("/admin/keys", status_code=303)
 
 
@@ -1174,59 +1257,40 @@ def _usage_actor(row) -> tuple[str | None, str | None]:
 @router.get("/usage", response_class=HTMLResponse)
 async def usage_page(
     request: Request,
+    window: str | None = None,
+    user_filter: str | None = Query(None, alias="user"),
+    key_filter: str | None = Query(None, alias="key"),
+    tool_filter: str | None = Query(None, alias="tool"),
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
+    """The request log, its chart, and per-actor totals — all four filters
+    applied to all three (#162).
+
+    The SQL and the reasoning for the filter composition live in
+    `src/services/usage_filters.py`. Two things belong here:
+
+    * **The owner scope is separate from the user filter.** `_scope_user_id`
+      is the viewer's tenancy — None for an admin, their own id otherwise,
+      exactly as `/admin/performance` scopes — and it is applied whatever the
+      query string says. The `user=` filter is only an admin's choice of whose
+      rows to look at; a regular user is never offered it and cannot introduce
+      it by editing the URL.
+    * **Every filter is clamped onto what the page itself offered**, and an
+      unrecognised value becomes "no filter" rather than a 422. The selectors
+      are links; a stale bookmark should render the page.
+
+    Actors are resolved through `_usage_actor` in both the log and the totals,
+    so a deleted credential is named identically in the two — and named at all,
+    which resolving by join alone would not do (#77).
+    """
     uid = _scope_user_id(user)
-    # Recent logs with attributed actor (API key name+prefix or OAuth client name)
-    if uid is None:
-        result = await session.execute(
-            text("""
-                SELECT
-                    ul.id,
-                    ul.tool,
-                    ul.duration_ms,
-                    ul.created_at,
-                    ul.actor_kind,
-                    ul.actor_label,
-                    ul.actor_ref,
-                    ak.name        AS api_key_name,
-                    ak.key_prefix  AS api_key_prefix,
-                    oc.client_name AS oauth_client_name
-                FROM usage_logs ul
-                LEFT JOIN api_keys ak ON ul.key_id = ak.id
-                LEFT JOIN oauth_tokens ot ON ul.oauth_token_id = ot.id
-                LEFT JOIN oauth_clients oc ON ot.client_id = oc.client_id
-                ORDER BY ul.created_at DESC
-                LIMIT 100
-            """)
-        )
-    else:
-        result = await session.execute(
-            text("""
-                SELECT
-                    ul.id,
-                    ul.tool,
-                    ul.duration_ms,
-                    ul.created_at,
-                    ul.actor_kind,
-                    ul.actor_label,
-                    ul.actor_ref,
-                    ak.name        AS api_key_name,
-                    ak.key_prefix  AS api_key_prefix,
-                    oc.client_name AS oauth_client_name
-                FROM usage_logs ul
-                LEFT JOIN api_keys ak ON ul.key_id = ak.id
-                LEFT JOIN oauth_tokens ot ON ul.oauth_token_id = ot.id
-                LEFT JOIN oauth_clients oc ON ot.client_id = oc.client_id
-                WHERE ul.user_id = :uid
-                ORDER BY ul.created_at DESC
-                LIMIT 100
-            """),
-            {"uid": uid},
-        )
+    window = normalize_window(window)
+    options = await filter_options(session, window, uid)
+    filters = resolve_filters(window, user_filter, key_filter, tool_filter, uid, options)
+
     logs = []
-    for r in result.fetchall():
+    for r in await recent_logs(session, filters):
         actor_name, actor_detail = _usage_actor(r)
         logs.append({
             "tool": r.tool,
@@ -1236,34 +1300,46 @@ async def usage_page(
             "actor_detail": actor_detail,
         })
 
-    # Chart data: requests per day for last 7 days
-    if uid is None:
-        chart_result = await session.execute(
-            text("""
-                SELECT date_trunc('day', created_at)::date AS day, count(*) AS cnt
-                FROM usage_logs
-                WHERE created_at >= now() - interval '7 days'
-                GROUP BY day ORDER BY day
-            """)
-        )
-    else:
-        chart_result = await session.execute(
-            text("""
-                SELECT date_trunc('day', created_at)::date AS day, count(*) AS cnt
-                FROM usage_logs
-                WHERE created_at >= now() - interval '7 days' AND user_id = :uid
-                GROUP BY day ORDER BY day
-            """),
-            {"uid": uid},
-        )
-    chart_rows = chart_result.fetchall()
-    chart_data = {
-        "labels": [r.day.strftime("%m/%d") for r in chart_rows],
-        "values": [r.cnt for r in chart_rows],
-    }
+    totals = []
+    for r in await actor_totals(session, filters):
+        actor_name, actor_detail = _usage_actor(r)
+        totals.append({
+            "actor_name": actor_name,
+            "actor_detail": actor_detail,
+            "requests": int(r.requests or 0),
+            "last_seen": r.last_seen.isoformat() if r.last_seen else None,
+        })
+
+    chart_data = await chart_series(session, filters)
 
     return templates.TemplateResponse(request, "usage.html", _panel_context(request, user, {
-        "active": "usage", "logs": logs, "chart_data": chart_data,
+        "active": "usage",
+        "logs": logs,
+        "chart_data": chart_data,
+        "totals": totals,
+        "window": filters.window,
+        "window_label": WINDOW_LABELS[filters.window],
+        "windows": [
+            {
+                "key": key,
+                "label": key,
+                "selected": key == filters.window,
+                "query": filters.query_string(window=key),
+            }
+            for key in WINDOWS
+        ],
+        # Passed as three names rather than one `filter_options` dict:
+        # Jinja resolves `filter_options.keys` to the dict's **method**,
+        # because attribute lookup is tried before item lookup — so the
+        # key selector silently iterated a builtin and 500'd the page.
+        "filter_users": options["users"],
+        "filter_keys": options["keys"],
+        "filter_tools": options["tools"],
+        "selected_user": filters.user_id,
+        "selected_key": filters.key_id,
+        "selected_tool": filters.tool,
+        "filters_active": filters.any_active,
+        "log_limit": LOG_LIMIT,
     }))
 
 
