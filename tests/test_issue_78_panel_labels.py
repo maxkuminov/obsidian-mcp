@@ -287,6 +287,12 @@ class _DashboardSession:
         text = str(stmt).lower()
         if "max(" in text:
             return _Scalar(self._last_indexed)
+        # The dashboard's health strip (#163) probes for `backups_log` before
+        # reading it, because a pre-021 database legitimately has no such
+        # table. NULL is what `to_regclass` returns then, and it is the right
+        # answer for a fake that has no tables at all.
+        if "to_regclass" in text:
+            return _Scalar(None)
         if "select" in text and "usage_logs" in text and "count" not in text:
             return _Scalar([])
         return _Scalar(0)
@@ -390,6 +396,10 @@ def _render_dashboard(**overrides) -> str:
         "index_interval": 300,
         "graph": {},
         "graph_backfill_running": False,
+        # The health strip (#163). Empty is the fresh-install state — no
+        # recorded pass, no backup, nothing observed — which every cell of the
+        # strip has to render without a value.
+        "health": {"show_ops": True, "last_run": None, "stale_after_days": 8},
     }
     context.update(overrides)
     templates = Jinja2Templates(directory=TEMPLATES_DIR)

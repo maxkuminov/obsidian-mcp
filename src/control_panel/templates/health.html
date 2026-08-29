@@ -1,0 +1,247 @@
+{% extends "base.html" %}
+{% block title %}Health — Obsidian MCP{% endblock %}
+{% block content %}
+
+{#
+  Every color on this page comes from a token defined in `_theme.html`; there
+  are no literals here. See docs/architecture/control-panel.md — "one token
+  source, dark canonical". The light-mode change's `checks/literal_sweep.py`,
+  re-run through this change's wrapper, is what enforces it.
+
+  Section order is alarms first, detail second: the backup age and the error
+  list are the two things that answer "is anything wrong", and the pass history
+  is what you read once one of them says yes. Every section has an explicit
+  empty state — a fresh install has no passes, no errors and no recorded backup,
+  and that page has to render cleanly, because it is the first thing an
+  operator opens when they are not sure the server is working.
+#}
+
+<div class="page-top">
+    <div>
+        <h1 class="page-title">Health</h1>
+        <div style="font-size:13px;color:var(--text-3);margin-top:8px;">
+            Index passes, recent errors, and backup recency.
+        </div>
+    </div>
+</div>
+
+<div class="page-body">
+
+    {% if show_ops %}
+
+    <!-- Backups -->
+    <div class="card anim-1" style="margin-bottom:20px;">
+        <div class="card-header">
+            <span class="card-title">Last backup</span>
+            {% if backup and backup.stale %}
+            <span class="badge badge-yellow">stale</span>
+            {% endif %}
+        </div>
+        <div class="card-body">
+            {% if backup %}
+            <div class="kv">
+                <span class="kv-k">Taken</span>
+                <span class="kv-v">
+                    <time datetime="{{ backup.created_at_iso }}" data-localize>{{ backup.created_at_iso }}</time>
+                    <span style="color:var(--text-3);">· {{ backup.age_rel }}</span>
+                </span>
+            </div>
+            <div class="kv">
+                <span class="kv-k">File</span>
+                <span class="kv-v mono" style="font-size:12px;">{{ backup.filename }}<span style="color:var(--text-3);"> · {{ backup.size_human }}</span></span>
+            </div>
+            {% if backup.stale %}
+            <p style="color:var(--warning);font-size:13px;line-height:1.6;margin:14px 0 0;">
+                The last recorded backup is more than {{ stale_after_days }} days
+                old. A deploy runs migrations against the live database and the
+                backup is the only way back from a bad one — take one with
+                <span class="mono">make db-backup</span> before the next deploy.
+            </p>
+            {% endif %}
+            {#
+              Age is the entire signal, and saying so is the point: the panel
+              cannot see the backups directory (that is why this is a database
+              row at all), so it cannot claim the file still exists or that it
+              restores. A page that implied otherwise would be worse than one
+              that showed nothing.
+            #}
+            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:14px 0 0;">
+                Recorded by <span class="mono">make db-backup</span> when the dump
+                completed. This is the age of that record — the panel cannot see
+                the backups directory, so it does not verify that the file is
+                still there or that it restores.
+            </p>
+            {% else %}
+            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+                No backup recorded yet.
+            </p>
+            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:10px 0 0;">
+                Backups are recorded by <span class="mono">make db-backup</span>.
+                A deploy takes its backup <em>before</em> it migrates, so the
+                deploy that first shipped this table wrote its dump without
+                recording it — that one warns and succeeds, and the next backup
+                is the first that appears here. A dump taken by hand with
+                <span class="mono">pg_dump</span> never appears here.
+            </p>
+            {% endif %}
+        </div>
+    </div>
+
+    <!-- Recent errors -->
+    <div class="card anim-2" style="margin-bottom:20px;">
+        <div class="card-header">
+            <span class="card-title">Recent errors</span>
+            <span class="mono" style="font-size:11px;color:var(--text-3);">
+                {% if errors_capped %}newest {{ error_buffer_size }}{% else %}{{ error_count }} since start{% endif %}
+            </span>
+        </div>
+        <div class="card-body">
+            {#
+              The observation window, always, and above the list rather than
+              under it. "No errors" on its own reads as "this server has been
+              healthy"; what it actually means is "this *process* has not failed
+              since it started", and a container restarted two minutes ago has an
+              empty buffer for reasons that have nothing to do with health.
+            #}
+            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0 0 12px;">
+                {% if observing_since_iso %}
+                Observing since process start,
+                <time datetime="{{ observing_since_iso }}" data-localize>{{ observing_since_iso }}</time>
+                ({{ observing_since_rel }}).
+                {% else %}
+                Observation window unknown — the buffer was never attached, so
+                this process has recorded nothing.
+                {% endif %}
+                Kept in memory only: a restart clears them, and
+                <span class="mono">make logs</span> has the full text and the
+                tracebacks.
+                {% if errors_capped %}
+                The buffer holds the newest {{ error_buffer_size }}; older errors
+                from this process have been evicted.
+                {% endif %}
+            </p>
+
+            {% if errors %}
+            <div class="table-scroll">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Logger</th>
+                        <th>Message</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for e in errors %}
+                    <tr>
+                        <td class="mono" style="font-size:11px;color:var(--text-2);white-space:nowrap;">
+                            <time datetime="{{ e.timestamp }}" data-localize>{{ e.timestamp }}</time>
+                        </td>
+                        <td class="mono" style="font-size:11px;color:var(--text-3);">
+                            {% if e.level != 'ERROR' %}<span class="badge badge-red" style="margin-right:6px;">{{ e.level }}</span>{% endif %}{{ e.logger }}
+                        </td>
+                        {# First line only. A hundred full tracebacks is a page
+                           nobody can read; this is a pointer to `make logs`. #}
+                        <td style="font-size:12px;color:var(--error);word-break:break-word;">{{ e.message }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            </div>
+            {% else %}
+            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+                No errors logged since this process started.
+            </p>
+            {% endif %}
+        </div>
+    </div>
+
+    {% else %}
+    {#
+      A non-admin sees their own pass history and nothing else. The error buffer
+      holds whatever the process logged — other tenants' paths, queries and
+      identifiers included — and the backup covers the whole database; neither
+      has an owner to scope by, so both are admin-only rather than filtered.
+    #}
+    <div class="card anim-1" style="margin-bottom:20px;">
+        <div class="card-body">
+            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+                Application errors and backup recency are server-wide and are
+                shown to administrators only. Below are the index passes over
+                your own vault.
+            </p>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Pass history -->
+    <div class="card anim-3">
+        <div class="card-header">
+            <span class="card-title">Index passes</span>
+            <span class="mono" style="font-size:11px;color:var(--text-3);">newest {{ runs_limit }}</span>
+        </div>
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Started</th>
+                    <th style="text-align:right;">Duration</th>
+                    <th>Trigger</th>
+                    <th>Owner</th>
+                    <th style="text-align:right;" title="Notes the scan walked.">Scanned</th>
+                    <th style="text-align:right;" title="Notes the scan wrote or rewrote.">Indexed</th>
+                    <th style="text-align:right;" title="Notes this pass embedded and certified.">Embedded</th>
+                    <th>Result</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in runs %}
+                {# The row is an anchor target: the dashboard's health strip
+                   links a failed pass straight to its row here. #}
+                <tr id="run-{{ r.id }}">
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                        <time datetime="{{ r.started_at }}" data-localize>{{ r.started_at }}</time>
+                    </td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if r.duration %}{{ r.duration }}{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
+                    <td style="font-size:12px;"><span class="badge badge-gray">{{ r.trigger }}</span></td>
+                    <td style="font-size:12px;line-height:1.3;">
+                        {% if r.owner %}
+                            <span style="color:var(--primary-text);">{{ r.owner }}</span>
+                        {% elif r.owner_missing %}
+                            {# A non-NULL user_id that joined to nothing. The FK
+                               forbids it, so say so rather than quietly
+                               rendering it as an ownerless pass. #}
+                            <span class="mono" style="font-size:11px;color:var(--error);">user #{{ r.user_id }} (missing)</span>
+                        {% else %}
+                            {# ON DELETE SET NULL: when the user goes, the row's
+                               claim about whose vault it indexed stops being
+                               true. Single-user and global passes land here too,
+                               and both are honestly "no owner". #}
+                            <span class="mono" style="font-size:11px;color:var(--text-3);" title="A single-user or global pass, or a pass whose user has since been deleted.">no owner</span>
+                        {% endif %}
+                    </td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_scanned }}</td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_indexed }}</td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_embedded }}</td>
+                    <td style="font-size:12px;">
+                        {% if r.error %}
+                            <div><span class="badge badge-red">failed</span></div>
+                            <div class="mono" style="font-size:10px;color:var(--text-3);white-space:pre-wrap;word-break:break-word;max-width:420px;">{{ r.error }}</div>
+                        {% else %}
+                            <span class="badge badge-green">ok</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not runs %}
+                <tr>
+                    <td colspan="8" style="text-align:center;padding:32px;color:var(--text-3);">No index or embed pass has been recorded yet. The first pass after a deploy writes the first row.</td>
+                </tr>
+                {% endif %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+</div>
+{% endblock %}

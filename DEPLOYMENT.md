@@ -471,6 +471,27 @@ deployment; on a compose-file deployment the equivalents are plain
 - **Backups.** `pg_dump` the database on a schedule; the vault itself is
   covered by whatever sync you chose in Step 4. Note that a soft delete
   moves files into `.trash/` inside the vault, so your sync sees them.
+
+  `make db-backup` also **records** each dump it takes — filename and size —
+  in a `backups_log` row, which is what the panel's Health page reads to
+  report backup age. It has to be a database row: the container cannot see
+  the backups directory, and giving it a mount into the host's backup
+  storage was the alternative rejected. So the age shown on that page is
+  the age of the last backup *taken through `make db-backup`*; a dump you
+  take by hand with `pg_dump` will not appear there, and the page will keep
+  warning after 8 days as though none had been taken.
+
+  **On the deploy that first ships this** (migration 021): `make deploy`
+  takes its backup *before* it migrates — deliberately, because the backup
+  is the only way back from a bad migration — so that one dump runs against
+  a database with no `backups_log` in it yet. The target prints
+  `WARNING: backup taken but not recorded` and **succeeds**; the dump is on
+  disk and valid. The first *recorded* backup is the next one, i.e. the next
+  deploy or a manual `make db-backup`. Until then the Health page reads "no
+  backup recorded yet", which is a fresh-table state and not a failure. Once
+  the table exists the disposition inverts: a backup that cannot record
+  itself fails the target loudly, because a missing row makes the page
+  report a staler safety net than you actually have.
 - **Dependency audit.** `make audit` (pip-audit) and `make trivy` (image
   CVE scan) work from a checkout regardless of which compose file runs
   the container.

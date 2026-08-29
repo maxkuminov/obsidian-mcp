@@ -843,3 +843,81 @@ class QuotaCounter(Base):
     )
 
     __table_args__ = ({"comment": _QUOTA_COUNTERS_TABLE_MARKER},)
+
+
+# Migration 021's ownership marker for `backups_log`, mirrored here for the
+# reason 019's and 020's are: `alembic check` compares a table comment, so a
+# marker that drifted from the migration keying on it is a dirty check rather
+# than a `downgrade()` that has quietly stopped recognising its own work. Keep
+# byte identical to `TABLE_MARKER` in `alembic/versions/021_backups_log.py`.
+_BACKUPS_LOG_TABLE_MARKER = "one row per recorded database backup (021_backups_log)"
+
+# The floor `ck_backups_log_size_bytes` enforces, mirrored into migration 021
+# as a literal. A recorded backup of zero bytes is not a backup, and the health
+# page would render it as one — `make db-backup` already refuses an empty dump
+# before it records anything, and this is that refusal made true of the
+# database rather than of one shell script.
+BACKUP_MIN_SIZE_BYTES = 1
+
+
+class BackupLog(Base):
+    """One row per successful `make db-backup` (migration 021).
+
+    **The container cannot see the backups directory, and must not be able
+    to.** Dumps are written host-side into `$(DATA_DIR)/backups` by a Makefile
+    target; mounting that path into the container would put a host-specific
+    volume into a public repo's compose file and hand the application write
+    access to its own backups. So the *record* travels through the database
+    instead: `db-backup` inserts a row through the same `docker exec … psql`
+    channel it already uses for `pg_dump`, and the panel reads backup freshness
+    without ever touching the filesystem it is reporting on.
+
+    That makes this table a claim about something the application cannot
+    verify. It is deliberately an **age** signal and nothing more: nobody here
+    checks that the file still exists, that it restores, or that its contents
+    are the database. "The last backup this server knows about was taken N days
+    ago" is the whole promise, and the page's copy says so.
+
+    `filename` is the **basename** of the dump, not its path. The directory is
+    a deployment-local constant that differs between the repo default and the
+    real host (`Makefile.local`), and writing it into a shared table would put
+    a host path in the one place the repo is careful to keep them out of.
+
+    Bootstrap: `make deploy` takes its backup *before* it migrates, so the
+    deploy that ships 021 dumps against a database with no `backups_log` in it.
+    The target warns and succeeds there (the backup is the migration's safety
+    net and must not be blocked by the bookkeeping); the first recorded backup
+    is the next one. A fresh install therefore renders "no backup recorded
+    yet", which is a state, not an error.
+    """
+
+    __tablename__ = "backups_log"
+
+    # 021's ownership marker, reachable from the class so a caller checking
+    # model/migration agreement names the table it is checking. `ClassVar` is
+    # what keeps the declarative mapper from reading it as a column.
+    _TABLE_MARKER: ClassVar[str] = _BACKUPS_LOG_TABLE_MARKER
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Free text rather than a bounded varchar: the writer supplies whatever
+    # `basename` produced, and truncating an operator's only handle on which
+    # file this row names would be worse than storing a long one.
+    filename: Mapped[str] = mapped_column(Text, nullable=False)
+    # `BigInteger`: a dump of this database gzips to megabytes today and an
+    # `integer` stops being able to hold it at 2 GiB, which is a size a vault
+    # of a few hundred thousand notes reaches without anything going wrong.
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        CheckConstraint(
+            f"size_bytes >= {BACKUP_MIN_SIZE_BYTES}",
+            name="ck_backups_log_size_bytes",
+        ),
+        # The page reads exactly one row — the newest — and the dashboard strip
+        # reads the same one on every render.
+        Index("ix_backups_log_created_at", "created_at"),
+        {"comment": _BACKUPS_LOG_TABLE_MARKER},
+    )

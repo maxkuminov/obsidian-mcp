@@ -214,10 +214,22 @@ test-schema:
 # with exit 0 (pg_dump can write nothing and still succeed when it is pointed
 # at the wrong thing), and a failed gzip. The partial file is removed so a
 # later `db-restore` cannot pick a truncated dump out of the backups directory.
+#
+# The dump is then **recorded** in `backups_log` (migration 021, #163) so the
+# panel's health page can report backup age without the container being able to
+# see the backups directory — it deliberately cannot, and mounting a host path
+# into a public repo's compose file is the alternative that was rejected. The
+# recording goes through `docker/record-backup.sh`, which uses the same
+# `docker exec … psql` channel `pg_dump` just used and carries the three-branch
+# guard the deploy ordering forces: `make deploy` backs up BEFORE it migrates,
+# so on the deploy that ships 021 the table does not exist yet and the target
+# must warn and still succeed. Its exit status is the target's: once the table
+# exists, a backup that fails to record itself fails the backup.
 db-backup:
 	@mkdir -p $(DATA_DIR)/backups
 	@TIMESTAMP=$$(date +%Y%m%d_%H%M%S); \
 	BACKUP_FILE="$(DATA_DIR)/backups/backup_$$TIMESTAMP.sql"; \
+	: "the database named here is mirrored as DB_NAME's default in docker/record-backup.sh; keep the two in step"; \
 	if ! docker exec $(DB_CONTAINER) pg_dump -U postgres obsidian_mcp > $$BACKUP_FILE; then \
 		rm -f $$BACKUP_FILE; \
 		echo "$(RED)Backup FAILED: pg_dump against container '$(DB_CONTAINER)' returned non-zero$(NC)"; \
@@ -234,7 +246,8 @@ db-backup:
 		echo "$(RED)Backup FAILED: could not gzip $$BACKUP_FILE$(NC)"; \
 		exit 1; \
 	fi; \
-	echo "$(GREEN)Backup: $$BACKUP_FILE.gz$(NC)"
+	echo "$(GREEN)Backup: $$BACKUP_FILE.gz$(NC)"; \
+	DB_CONTAINER=$(DB_CONTAINER) bash docker/record-backup.sh $$BACKUP_FILE.gz
 
 db-restore:
 	@if [ -z "$(FILE)" ]; then echo "$(RED)Usage: make db-restore FILE=<path>$(NC)"; exit 1; fi

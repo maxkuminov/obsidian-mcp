@@ -70,6 +70,18 @@ from src.services.search_analytics import (
     top_queries,
     zero_result_queries,
 )
+from src.services.error_log import (
+    ERROR_BUFFER_SIZE,
+    error_count,
+    is_full as error_buffer_full,
+    observing_since,
+    recent_errors,
+)
+from src.services.ops_health import (
+    HEALTH_RUNS_LIMIT,
+    STALE_AFTER_DAYS,
+    latest_backup,
+)
 from src.services.usage_stats import (
     RECENT_RUNS_LIMIT,
     WINDOW_LABELS,
@@ -462,6 +474,11 @@ async def dashboard(
     last_run_at = _indexer.last_index_run_at
     last_run_ok = _indexer.last_index_run_ok
 
+    # The persisted counterpart to the heartbeat above: last recorded pass,
+    # backup age, errors since process start. Survives a restart, which the
+    # heartbeat does not, and links to the full history on /admin/health.
+    health = await _health_strip_or_degraded(session, user)
+
     return templates.TemplateResponse(request, "dashboard.html", _panel_context(request, user, {
         "active": "dashboard",
         "stats": {
@@ -481,6 +498,7 @@ async def dashboard(
         "index_interval": settings.index_interval_seconds,
         "graph": graph,
         "graph_backfill_running": link_backfill_in_progress,
+        "health": health,
     }))
 
 
@@ -1409,6 +1427,175 @@ async def performance_page(
             "has_data": any(t["executed"] or t["refusals"] for t in tools),
         }),
     )
+
+
+# --- Health ---------------------------------------------------------------
+#
+# Three sections, three sources, and two of them are **admin-only**:
+#
+#   * The pass history is scoped exactly as `/admin/performance` scopes it — an
+#     admin sees every pass, a regular user only their own, and deliberately
+#     none of the ownerless single-user/global passes, which are not theirs to
+#     read (`recent_indexer_runs`' docstring has the reasoning).
+#   * The error list and the backup age are **operator concerns about the
+#     server**, not about a tenant's data, and neither has any notion of an
+#     owner to scope by. The ring buffer holds whatever the process logged,
+#     including the OAuth internals of other tenants and any path, query or
+#     identifier a failure happened to carry; the backup covers the whole
+#     database. Showing either to a non-admin would leak across tenants with no
+#     filter available to prevent it, so both are gated on `is_admin` and a
+#     regular user sees a health page consisting of their own run history.
+#
+# The dashboard strip below follows the same split.
+
+
+def _error_view(entries: list[dict]) -> list[dict]:
+    """Ring-buffer entries as template rows: ISO timestamp, logger, message."""
+    return [
+        {
+            "timestamp": entry["timestamp"].isoformat(),
+            "logger": entry["logger"],
+            "level": entry["level"],
+            "message": entry["message"],
+        }
+        for entry in entries
+    ]
+
+
+def _error_window() -> dict:
+    """The count and the window it was observed over — no records.
+
+    The window is not decoration. A container restarted five minutes ago has an
+    empty buffer, and "no errors" without "since 14:32" reads as "this server
+    has been healthy" when it means "this process has not been running long
+    enough to have failed yet".
+    """
+    since = observing_since()
+    return {
+        "error_count": error_count(),
+        "errors_capped": error_buffer_full(),
+        "error_buffer_size": ERROR_BUFFER_SIZE,
+        "observing_since_iso": since.isoformat() if since else None,
+        "observing_since_rel": _humanize_delta(since) if since else None,
+    }
+
+
+def _error_section() -> dict:
+    """`_error_window()` plus the records themselves, for the page."""
+    return {**_error_window(), "errors": _error_view(recent_errors())}
+
+
+async def _backup_view(session: AsyncSession) -> dict | None:
+    """`latest_backup` with a humanized age, or None when nothing is recorded."""
+    backup = await latest_backup(session)
+    if backup is None:
+        return None
+    return {**backup, "age_rel": _humanize_delta(backup["created_at"])}
+
+
+@router.get("/health", response_class=HTMLResponse)
+async def health_page(
+    request: Request,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    """Indexer pass history, recent application errors, and backup age.
+
+    Read-only throughout. Every section has an explicit empty state and none of
+    them is an error condition: a fresh install has no passes, no errors and no
+    recorded backup, and that page has to render cleanly — it is the first
+    thing an operator looks at when they are not sure the server is working.
+    """
+    uid = _scope_user_id(user)
+    is_admin = _is_admin(user)
+
+    runs = await recent_indexer_runs(session, uid, limit=HEALTH_RUNS_LIMIT)
+
+    backup = await _backup_view(session) if is_admin else None
+    errors = _error_section() if is_admin else None
+
+    return templates.TemplateResponse(
+        request,
+        "health.html",
+        _panel_context(request, user, {
+            "active": "health",
+            "runs": runs,
+            "runs_limit": HEALTH_RUNS_LIMIT,
+            # The two operator-only sections. False renders the note that says
+            # so, rather than silently showing a page missing two thirds of
+            # what its heading promises.
+            "show_ops": is_admin,
+            "backup": backup,
+            "stale_after_days": STALE_AFTER_DAYS,
+            **(errors or {}),
+        }),
+    )
+
+
+async def _health_strip(session: AsyncSession, user) -> dict:
+    """The dashboard's compact health summary.
+
+    Reuses the health page's own reads rather than approximating them: the last
+    pass comes from `indexer_runs` (the persisted record, not the in-process
+    heartbeat the dashboard already shows above it — a restarted container has
+    no heartbeat and still has a pass history), the backup age from
+    `backups_log`, the error count from the ring buffer.
+
+    Same admin split as the page. A non-admin gets the pass outcome and nothing
+    else, and the strip renders without the two cells rather than with empty
+    ones.
+    """
+    uid = _scope_user_id(user)
+    is_admin = _is_admin(user)
+
+    runs = await recent_indexer_runs(session, uid, limit=1)
+    last_run = runs[0] if runs else None
+
+    strip: dict[str, Any] = {
+        "show_ops": is_admin,
+        "last_run": last_run,
+        "stale_after_days": STALE_AFTER_DAYS,
+    }
+    if is_admin:
+        strip["backup"] = await _backup_view(session)
+        # The count and the window, not the hundred records — the strip links
+        # to the page, which is where they are read.
+        strip.update(_error_window())
+    return strip
+
+
+async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
+    """`_health_strip`, with a failure boundary around it.
+
+    **The dashboard is the page an operator opens when something is wrong, and
+    the strip is the newest thing on it.** Its reads are the only ones on this
+    handler that touch `indexer_runs` and `backups_log`, so a fault confined to
+    those two tables — a `NOT VALID` FK left by a hand repair, a permission
+    revoked, a 021 that has not run on a database the container was pointed at —
+    would take `/admin/` down for every user while every other query on the page
+    succeeds. Losing three cells is the right trade against losing the page.
+
+    The rollback is not optional: a failed statement poisons the session's
+    transaction, and everything after it on this request would raise
+    `InFailedSQLTransaction` instead of the original error. It runs first, so
+    the render that follows has a usable session.
+
+    The failure is logged at ERROR, which means the ring buffer catches it and
+    the health page shows an operator *why* their strip is missing.
+    """
+    try:
+        return await _health_strip(session, user)
+    except Exception:  # noqa: BLE001 - the strip must never take the page down
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 - best effort; the render is what matters
+            logger.exception("could not roll back after a failed health strip read")
+        logger.error(
+            "Dashboard health strip unavailable: its reads failed. The rest of "
+            "the dashboard is unaffected; see /admin/health.",
+            exc_info=True,
+        )
+        return {"unavailable": True, "show_ops": _is_admin(user)}
 
 
 # --- Search analytics -----------------------------------------------------
