@@ -39,10 +39,11 @@ def test_exactly_the_pre_body_markers_are_enumerated():
 
 
 def test_the_post_body_markers_are_not_in_the_predicate():
-    """`vault_assignment_changed` and `vault_confirmation_unavailable` are
-    written by tools whose bodies *ran* — they resolved a vault, did the work,
-    and then refused to publish. Excluding them would hide the slowest write
-    path in the server from the one view built to find slow paths."""
+    """`vault_assignment_changed`, `vault_confirmation_unavailable` and
+    `vault_anchor_lost_at_publish` are written by tools whose bodies *ran* —
+    they resolved a vault, did the work, and then refused to publish. Excluding
+    them would hide the slowest write path in the server from the one view built
+    to find slow paths."""
     from src.mcp_server import tools
 
     fragment = usage_stats.pre_body_refusal_sql()
@@ -50,9 +51,59 @@ def test_the_post_body_markers_are_not_in_the_predicate():
     for marker in (
         tools._VAULT_REASSIGNED_MARKER,
         tools._CONFIRMATION_UNAVAILABLE_MARKER,
+        tools._ANCHOR_LOST_AT_PUBLISH_MARKER,
     ):
         assert marker not in fragment
         assert marker not in binds.values()
+
+
+def test_a_publish_time_anchor_loss_is_an_executed_row_not_a_refusal():
+    """The regression this marker exists for.
+
+    `_confirmed_publication`'s `VaultAnchorUnavailable` branch used to log
+    `_NO_VAULT_MARKER` — the *admission gate's* value, which this module
+    enumerates as "the body never ran". But that branch is reached from inside a
+    mutating tool that has already resolved a root, read the note and computed
+    the write, so the row it produces is one of the most expensive the server
+    logs. Sharing the marker dropped it from every percentile, on the one page
+    built to find expensive calls, by exactly the path (#88's race) that makes
+    it reachable.
+    """
+    from src.mcp_server import tools
+
+    assert tools._ANCHOR_LOST_AT_PUBLISH_MARKER != tools._NO_VAULT_MARKER
+    assert (
+        tools._ANCHOR_LOST_AT_PUBLISH_MARKER
+        not in usage_stats.PRE_BODY_REFUSAL_ERROR_MARKERS
+    )
+    # And the source of the branch really writes the new value: a test that only
+    # compared constants would pass with the branch still logging the old one.
+    import inspect
+
+    recorded = re.findall(
+        r'timing\.record\(\s*"error",\s*(\w+)\s*\)',
+        inspect.getsource(tools._confirmed_publication),
+    )
+    assert recorded == ["_VAULT_REASSIGNED_MARKER", "_ANCHOR_LOST_AT_PUBLISH_MARKER"], (
+        f"_confirmed_publication records {recorded}; the anchor-loss branch must "
+        "not share the admission gate's pre-body marker"
+    )
+
+
+def test_the_four_error_markers_are_distinct():
+    """Admission, reassignment, confirmation outage and publish-time anchor
+    loss are four different facts about four different moments; an operator
+    reading `/admin/usage` after an incident has to tell them apart, and the
+    performance page has to classify each one on the right side of the
+    body/no-body line."""
+    from src.mcp_server import tools
+
+    assert len({
+        tools._NO_VAULT_MARKER,
+        tools._VAULT_REASSIGNED_MARKER,
+        tools._CONFIRMATION_UNAVAILABLE_MARKER,
+        tools._ANCHOR_LOST_AT_PUBLISH_MARKER,
+    }) == 4
 
 
 def test_the_predicate_is_not_a_broad_error_match():

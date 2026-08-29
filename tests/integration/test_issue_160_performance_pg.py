@@ -136,6 +136,42 @@ async def test_the_predicate_excludes_exactly_the_enumerated_markers(clean):
     assert row["mean_size"] == 25  # (10 + 20 + 30 + 40) / 4
 
 
+async def test_a_publish_time_anchor_loss_stays_in_the_percentiles(clean):
+    """`vault_anchor_lost_at_publish` is a post-body marker and must aggregate.
+
+    It used to be logged as `no_vault_assigned` — the admission gate's value,
+    which this predicate enumerates as "the body never started". The branch that
+    writes it sits at the *publication* step of a mutating tool: the root was
+    resolved, the note read, the write computed, and only then did the anchor go
+    missing (the #88 race). Filed under the pre-body value it was dropped from
+    the percentiles, so the single most expensive class of refusal was invisible
+    on the page built to find expensive calls.
+    """
+    from src.mcp_server import tools
+
+    async with clean() as session:
+        session.add_all([
+            _log("edit_note", duration=50, size=10),
+            _log(
+                "edit_note",
+                duration=4000,
+                size=20,
+                params={"error": tools._ANCHOR_LOST_AT_PUBLISH_MARKER},
+            ),
+        ])
+        await session.commit()
+
+        rows = await tool_aggregates(session, "24h", None)
+        slowest = await slowest_requests(session, "24h", None)
+
+    row = next(r for r in rows if r["tool"] == "edit_note")
+    assert row["executed"] == 2, "the anchor-loss row's body ran"
+    assert row["refusals"] == 0
+    assert row["p99"] >= 3000, "the expensive row must reach the percentiles"
+    # And it is visible where an operator would go looking for it.
+    assert [r.duration_ms for r in slowest] == [4000, 50]
+
+
 async def test_a_refusal_storm_does_not_move_the_percentiles(clean):
     """The spec's scenario, at a scale that would be obvious on the page: 100
     executed calls and 5,000 over-quota refusals."""

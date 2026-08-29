@@ -21,12 +21,21 @@ third marker to one of them.
 **It enumerates exactly the pre-body markers and nothing else.** A broad match
 such as `params ? 'error'` or `params->>'error' IS NOT NULL` is wrong in a way
 that is invisible on the page: `_tracked`'s post-body markers
-(`vault_assignment_changed`, `vault_confirmation_unavailable`) are written by
-tools whose bodies *ran*, did the work of resolving a vault, and then refused to
-publish. Excluding those hides the slowest write path in the server from the
-one view built to find slow paths. Every marker added to `_tracked` therefore
-has to be classified deliberately — pre-body or not — and only the pre-body ones
-belong here.
+(`vault_assignment_changed`, `vault_confirmation_unavailable`,
+`vault_anchor_lost_at_publish`) are written by tools whose bodies *ran*, did the
+work of resolving a vault, and then refused to publish. Excluding those hides
+the slowest write path in the server from the one view built to find slow paths.
+Every marker added to `_tracked` therefore has to be classified deliberately —
+pre-body or not — and only the pre-body ones belong here.
+
+`vault_anchor_lost_at_publish` is the one that had to be *split out* rather than
+merely classified. The publish-time `VaultAnchorUnavailable` branch used to log
+the admission gate's `no_vault_assigned`, so a row whose body had resolved a
+root, read a note and computed a write was filed under the value this module
+reads as "never started" — reachable through the #88 race, and dropped from
+every percentile exactly when it mattered. Sharing a marker between the two
+sides of the body/no-body line is the failure this enumeration exists to make
+impossible.
 
 The enumerated set:
 

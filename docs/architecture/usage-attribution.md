@@ -141,12 +141,27 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   land as one contract), `error = 'no_vault_assigned'`, and
   `error = 'argument_not_encodable'`. A broad match — `params ? 'error'`, or
   `params->>'error' IS NOT NULL` — is wrong in a way that is invisible on the
-  page: `_VAULT_REASSIGNED_MARKER` and `_CONFIRMATION_UNAVAILABLE_MARKER` are
-  written by tools whose bodies *ran*, resolved a vault, did the work and then
-  refused to publish. Excluding those hides the slowest write path in the server
-  from the one view built to find slow paths. **Every marker added to `_tracked`
-  has to be classified deliberately** — pre-body or not — and only the pre-body
-  ones belong in the predicate.
+  page: `_VAULT_REASSIGNED_MARKER`, `_CONFIRMATION_UNAVAILABLE_MARKER` and
+  `_ANCHOR_LOST_AT_PUBLISH_MARKER` are written by tools whose bodies *ran*,
+  resolved a vault, did the work and then refused to publish. Excluding those
+  hides the slowest write path in the server from the one view built to find
+  slow paths. **Every marker added to `_tracked` has to be classified
+  deliberately** — pre-body or not — and only the pre-body ones belong in the
+  predicate.
+
+  **The classification rule, stated once: a marker belongs to exactly one side
+  of the body/no-body line, and two branches on opposite sides may never share
+  a value.** `vault_anchor_lost_at_publish` exists because that rule was broken
+  once. `_confirmed_publication`'s `VaultAnchorUnavailable` branch logged
+  `no_vault_assigned` — reasonable-looking, since both mean "no usable vault
+  root" — but the admission gate writes that value *before* any body runs while
+  this branch is reached from inside a mutating tool that has already resolved
+  a root, read the note and computed the write. Filed under the pre-body value
+  (reachable through the #88 race) the most expensive refusal the server logs
+  was silently absent from every percentile. When a new refusal reads like an
+  existing marker, check which side of the line it is on before reusing the
+  string; a new value costs nothing and a shared one mis-measures in a
+  direction nobody can see from the page.
 
   Both halves are `COALESCE(..., false)`: `params` is nullable and `->>` on a
   missing key yields NULL, so without them the negation used by the executed
@@ -164,6 +179,19 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   `COALESCE(..., 0)`: treating a missing key as zero would drag every mean
   toward the number of tools that do not measure, which is not a fact about
   anything.
+
+  **The casts are unguarded, and that is a constraint on future writers.** The
+  page evaluates `(params->>'embed_ms')::double precision` and
+  `(params->>'over_quota')::boolean` on every row of the window that carries the
+  key. PostgreSQL raises on a value it cannot cast and the raise is not caught,
+  so a single row whose `params` carries `embed_ms: "fast"` or
+  `over_quota: "yes"` takes `/admin/performance` down with a 500 for the whole
+  window that row falls in — for every user, until it ages out. Hence the rule:
+  **`params` keys named `embed_ms`, `db_ms` and `over_quota` are reserved, and
+  anything logging them must log a number, a number, and a real boolean.** A
+  writer that wants to record something else about a phase gives it a different
+  key. (`src/services/timing.py` is the only writer today and it records floats;
+  the quota gate #162 must record a JSON boolean, not the string `"true"`.)
 
 Actor attribution on the slowest-requests table is the denormalised
 `actor_*` columns first and the LEFT JOINs as the fallback — the same
