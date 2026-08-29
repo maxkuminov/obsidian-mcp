@@ -131,8 +131,75 @@
   `performance.html`, added by #160, which is not in the recorded list
   either), and assert the scan actually saw a nonzero number of declarations
   before believing the result. Pages added since: `performance.html` (#160),
-  `search_analytics.html` (#161) — both token-only, verified that way.
+  `search_analytics.html` (#161), `health.html` (#163) — all token-only,
+  verified that way.
 
+
+## The health page (#163)
+
+- **Three sections, three sources, and only one of them is a table this
+  application writes.** `/admin/health` shows the newest 50 rows of
+  `indexer_runs` (the same `recent_indexer_runs` the performance page reads,
+  asked for a longer window rather than given a second query with its own
+  scoping rule), the in-process error ring buffer, and the age of the newest
+  `backups_log` row. The dashboard's health strip reads the same three and
+  links to the page; a failed pass links to `#run-<id>`, which is why every
+  row on the page carries that id.
+
+- **Backup recency is a database row because the container cannot see the
+  backups directory — and must not.** Dumps are written host-side by
+  `make db-backup` into `$(DATA_DIR)/backups`; mounting that path would put a
+  host-specific volume into a public repo's compose file and hand the
+  application write access to its own backups. So `docker/record-backup.sh`
+  inserts `(filename, size_bytes)` through the same `docker exec … psql`
+  channel `pg_dump` just used. `filename` is the **basename**: the directory
+  differs between the repo default and the real host's `Makefile.local`, and a
+  host path does not belong in a shared table.
+
+- **The recording guard has three branches and they do not agree, deliberately.**
+  `make deploy` runs `db-backup` *before* `db-migrate` — the backup is the only
+  way back from a bad migration, so that ordering is not negotiable — which
+  means the deploy that ships migration 021 dumps against a database with no
+  `backups_log` in it. Table absent → loud warning, **exit 0** (a bookkeeping
+  row must never block a disaster-recovery step). Table present, insert lands →
+  success. Table present, insert fails → **non-zero**, because once the table
+  exists the panel reports its newest row as the age of the last backup, and a
+  dump that silently failed to record itself makes the page claim a staler
+  safety net than the operator has. A probe that cannot answer is treated as
+  the third case: the database answered a full `pg_dump` through that channel
+  seconds earlier.
+
+- **The age is the whole signal, and the page says so.** Nothing verifies that
+  the file still exists, that it restores, or that its contents are the
+  database — the panel cannot see the filesystem it is reporting on. Staleness
+  warns at **> 8 days**, a day clear of a weekly cadence so a Sunday schedule
+  does not page every Saturday.
+
+- **Errors live in a `deque(maxlen=100)` on the root logger and nowhere else.**
+  Container logs rotate with the container, so the errors from before the last
+  deploy — usually the ones worth reading — are gone. `src/services/error_log.py`
+  attaches at ERROR in the lifespan *before* the sandbox-mode branch returns, so
+  a process that dies in a startup guard still has the record. Only four
+  strings per entry are kept, never the `LogRecord`: a record holds `exc_info`,
+  which holds a traceback, which holds every frame's locals, and a hundred of
+  those is a bounded buffer of unbounded object graphs. `emit` cannot raise —
+  it runs inside every `logger.error(...)` in the process, including the ones
+  in exception handlers.
+
+- **The observation window is rendered next to the count, always.** "No errors"
+  on its own reads as a claim about the server; what it means is "this process
+  has not failed since it started", and a container restarted two minutes ago
+  has an empty buffer for reasons unrelated to health. Same reason the copy
+  points at `make logs` for anything older or fuller.
+
+- **Errors and backup age are admin-only; the pass history is scoped.** The run
+  list follows the performance page's rule (an admin sees every pass, a regular
+  user only their own, and deliberately none of the ownerless single-user or
+  global ones). The other two sections have **no owner to scope by** — the ring
+  buffer holds whatever the process logged, other tenants' paths and identifiers
+  included, and a backup covers the whole database — so they are gated on
+  `is_admin` rather than filtered, and a non-admin gets a page of their own run
+  history with a line saying why.
 
 ## Flash messages
 
