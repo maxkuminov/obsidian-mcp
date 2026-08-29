@@ -150,6 +150,14 @@ container.
   successes would have nothing to say about the case an operator actually comes
   looking for. `CancelledError` is the one exception: that is lifespan shutdown,
   not a failed pass, and it is treated exactly as `_record_index_run` treats it.
+- **A raising pass is never a skipped one.** `PassStats.skipped` suppresses the
+  write, and the link backfill sets it **up-front**, clearing it only once every
+  guard has passed. So a guard phase that *raised* — an unreadable root, a
+  failed provenance probe, a database blip in the "does this scope already have
+  links" query — left the flag standing and the row was suppressed: the one pass
+  worth reading recorded nothing. The `except BaseException` arm clears the flag
+  before re-raising. An exception is evidence the pass ran, so nothing that
+  raised can be filed as "did no work".
 - **A swallowed stage failure still reaches the row.** `_index_pass_once`
   deliberately swallows per-stage exceptions so one user's broken vault cannot
   stop every other user's pass; those exceptions are written into `error`
@@ -191,12 +199,37 @@ container.
   a `finally`, where a raise would also replace the exception the operator needs
   to see. Instrumentation that can fail the thing it measures is worse than no
   instrumentation.
-- `index_vault` now returns `(notes_scanned, notes_indexed)` and `embed_vault`
-  the number of notes it embedded, purely so the recorder has something to
-  record. Both accumulators tolerate `None`: those two functions are replaced by
-  bare no-op coroutines throughout the test suite, and instrumentation that
-  insisted on a tuple would turn every one of those into a failure about
-  recording rather than about indexing.
+- **A user deleted mid-pass costs the owner label, not the row.** `user_id` is
+  captured when the pass starts and inserted when it finishes, and a pass over a
+  large vault runs for minutes. An administrator deleting that user in between
+  makes the FK reject the INSERT — `ON DELETE SET NULL` cannot help, because it
+  fires on rows that already exist and this one never got in. Left to the
+  handler above, the whole pass would have vanished: the longest passes are the
+  likeliest to lose the race, and "the operator just deleted a user" is exactly
+  when they open the page. An FK violation (SQLSTATE `23503`, read off the
+  driver rather than matched in a localised message) is therefore retried once
+  with a NULL owner in a **fresh session** — the first one's transaction is
+  aborted. Nothing else is retried: a connection failure retried with a NULL
+  owner is one more failed write and a lost owner label for nothing.
+- `index_vault` returns `(notes_scanned, notes_indexed)` and `embed_vault` an
+  `EmbedPassResult`, purely so the recorder has something to record. Both
+  accumulators tolerate `None`, and `record_embedded` still takes a bare int:
+  those two functions are replaced by bare no-op coroutines throughout the test
+  suite, and instrumentation that insisted on a shape would turn every one of
+  those into a failure about recording rather than about indexing.
+- **A provider outage is not a clean pass.** `embed_vault` catches every
+  per-note exception, logs a warning and carries on — the right behaviour, since
+  one poisoned note must not stop the backlog, and it used to be the pass's
+  *only* record of it. A total Ollama or OpenAI outage therefore embedded
+  nothing, raised nothing, and wrote `notes_embedded = 0, error = NULL`: byte
+  for byte the row a pass with nothing to embed writes. An operator watching the
+  history through an afternoon of a downed provider would have seen a wall of
+  healthy passes. So the failures ride back with the count in `EmbedPassResult`
+  and `record_embedded` folds a summary — `embed failures: N of M — first:
+  <msg>` — into the row's `error` beside a `notes_embedded` that stays truthful.
+  Only genuine failures count: a note skipped by an exclude pattern, skipped
+  because its bytes no longer hash to its row, or left behind by a pause is a
+  deliberate decision, not something that went wrong.
 
 The table is display only. Nothing reads it for a decision, which is why
 dropping it in `downgrade()` costs an operator a view and nothing else. The
