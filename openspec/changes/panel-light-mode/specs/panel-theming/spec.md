@@ -12,11 +12,11 @@ All colors rendered by panel and auth templates (`base.html`, `auth_base.html`, 
 - **THEN** each includes the same token partial and none contains its own full palette definition
 
 ### Requirement: Dark baseline preserved (zero-visual-diff sweep)
-Before the sweep, a baseline inventory SHALL be recorded of every color declaration in scope (template, selector/context, property, resolved color value). After the sweep, with the dark theme active, resolving every migrated declaration through its token SHALL reproduce the baseline value exactly, for pre-existing and newly introduced tokens alike.
+Before any template mutation, a baseline inventory SHALL be recorded of every literal-bearing color declaration in scope (template, selector/context, property, literal value); declarations using the permitted semantic keywords (`currentColor`, `transparent`, `inherit`) are inventoried syntactically and SHALL keep their keyword unchanged. After the sweep, with the dark theme active, resolving every migrated declaration through its token SHALL reproduce the baseline literal exactly, for pre-existing and newly introduced tokens alike.
 
 #### Scenario: Baseline replay
 - **WHEN** the post-sweep templates are evaluated against the recorded baseline inventory under the dark theme
-- **THEN** every entry resolves to its exact baseline color value
+- **THEN** every migrated entry resolves to its exact baseline literal, and every semantic-keyword entry still carries its keyword
 
 ### Requirement: Light and dark palettes
 The panel SHALL provide a complete light palette selected via `data-theme` on the root element (bare `:root` = dark; `:root[data-theme="light"]` = light; a `prefers-color-scheme: light` block guarded by `:root:not([data-theme="dark"])` supplies the OS default), and SHALL set the CSS `color-scheme` property to match the active theme so native form controls follow it.
@@ -77,8 +77,8 @@ Chart.js visualizations SHALL derive their colors from computed token values at 
 The transfer templates (`transfer_upload.html`, `transfer_download.html`) SHALL receive only a local token sweep (their own token block, same naming convention) and SHALL keep their existing OS-responsive `prefers-color-scheme` behavior with no toggle and no `localStorage`; their nonce-bearing inline styles/scripts, restrictive CSP, `no-store`/static response discipline, and absence of external origins SHALL be preserved, and they SHALL NOT include panel chrome or shared panel partials.
 
 #### Scenario: Transfer page security headers unchanged
-- **WHEN** a transfer page response is compared before and after the change
-- **THEN** its CSP, Referrer-Policy, and Cache-Control headers are byte-identical and every inline style/script still carries the nonce
+- **WHEN** a transfer page response is compared before and after the change with each response's per-request nonce value replaced by a canonical placeholder
+- **THEN** the CSP, Referrer-Policy, and Cache-Control headers are byte-identical under that canonicalization, and in each response every inline style/script nonce equals the CSP's nonce
 
 #### Scenario: Transfer page theming
 - **WHEN** a transfer page is loaded with OS set to light, then dark
