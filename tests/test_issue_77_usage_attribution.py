@@ -933,16 +933,31 @@ def _usage_page_statements(user):
 def test_a_non_admin_usage_page_is_filtered_to_their_own_rows():
     """Attribution that survives a delete must not become attribution another
     user can read. The denormalised columns changed what the SELECT list
-    carries; the WHERE clause has to be exactly as scoped as it was."""
+    carries; the WHERE clause has to be exactly as scoped as it was — and #162
+    added three more statements to the page, every one of which has to be
+    scoped the same way."""
     calls = _usage_page_statements(
         SimpleNamespace(id=42, is_admin=False, username="bob")
     )
 
     assert calls, "usage_page issued no statements"
-    for sql, params in calls:
-        assert "usage_logs" in sql
+    log_reads = [(sql, params) for sql, params in calls if "usage_logs" in sql]
+    assert log_reads, "usage_page read no usage_logs"
+    for sql, params in log_reads:
+        assert "user_id = :scope_uid" in sql or "user_id = :uid" in sql, sql
+        assert 42 in (params or {}).values(), (sql, params)
+
+    # The key selector is scoped too: a filter list naming another user's keys
+    # would leak the credential names this page exists to attribute.
+    key_reads = [(sql, params) for sql, params in calls if "FROM api_keys" in sql]
+    assert key_reads
+    for sql, params in key_reads:
         assert "user_id = :uid" in sql, sql
         assert params == {"uid": 42}
+
+    # And the user selector is not offered at all, so there is nothing to
+    # widen the scope *with*.
+    assert not [sql for sql, _ in calls if "FROM users" in sql]
 
 
 def test_an_admin_usage_page_is_unfiltered():
@@ -952,5 +967,36 @@ def test_an_admin_usage_page_is_unfiltered():
 
     assert calls
     for sql, params in calls:
-        assert "user_id = :uid" not in sql
-        assert params is None
+        assert ":scope_uid" not in sql, sql
+        assert "scope_uid" not in (params or {}), (sql, params)
+
+
+def test_a_non_admin_cannot_introduce_a_user_filter_from_the_query_string():
+    """The owner scope and the `user=` filter are different things: the scope
+    is the viewer's tenancy and is applied whatever the URL says, and the
+    filter is only an admin's choice of whose rows to read. A hand-edited
+    `?user=1` from a regular user must change nothing."""
+    import src.control_panel.routes as panel
+
+    mp = pytest.MonkeyPatch()
+    session = _ScopeProbeSession()
+    try:
+        mp.setattr(
+            panel.templates, "TemplateResponse", lambda *a, **kw: SimpleNamespace()
+        )
+        asyncio.run(
+            panel.usage_page(
+                request=SimpleNamespace(session={}),
+                session=session,
+                user=SimpleNamespace(id=42, is_admin=False, username="bob"),
+                user_filter="1",
+            )
+        )
+    finally:
+        mp.undo()
+
+    for sql, params in session.calls:
+        assert "filter_uid" not in sql, sql
+        assert "filter_uid" not in (params or {}), (sql, params)
+        if "usage_logs" in sql:
+            assert 42 in (params or {}).values(), (sql, params)

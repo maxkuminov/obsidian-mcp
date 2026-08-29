@@ -48,6 +48,7 @@
                     {% if multi_user_mode %}<th>Owner</th>{% endif %}
                     <th>Prefix</th>
                     <th>Permission</th>
+                    <th title="Tool calls admitted for this key so far today (UTC), against its daily limit. Counted from the moment the limit was set — a key that was unlimited earlier today starts at zero. Keys with no limit do no quota accounting at all.">Daily quota</th>
                     <th>Status</th>
                     <th>Last Used</th>
                     <th>Created</th>
@@ -70,6 +71,23 @@
                         {% else %}
                         <span class="badge badge-blue">read</span>
                         {% endif %}
+                    </td>
+                    <td style="white-space:nowrap;">
+                        {% if key.daily_request_limit %}
+                        {# Consumption is admissions since the limit was set, not
+                           requests since midnight — the counter row is deleted
+                           when a limit is enabled. The header spells that out;
+                           here the day is named so "today" is never the
+                           reader's local one. #}
+                        <span class="mono" style="font-size:12px;color:var(--primary-text);"
+                              title="{{ key.quota_used }} of {{ key.daily_request_limit }} calls admitted on the UTC day {{ quota_day }}, counted since the limit was set. Refused calls do not count. Resets at the next UTC midnight.">{{ key.quota_used }} / {{ key.daily_request_limit }}</span>
+                        {% else %}
+                        <span style="font-size:12px;color:var(--text-3);">Unlimited</span>
+                        {% endif %}
+                        <button type="button"
+                                class="btn btn-link"
+                                style="font-size:11px;"
+                                onclick="omcpEditLimit({{ key.id }}, '{{ key.daily_request_limit if key.daily_request_limit else '' }}')">Edit</button>
                     </td>
                     <td>
                         {% if not key.is_active %}
@@ -109,7 +127,7 @@
                 {% endfor %}
                 {% if not keys %}
                 <tr>
-                    <td colspan="{{ 8 if multi_user_mode else 7 }}" style="text-align:center;padding:32px;color:var(--text-3);">No API keys yet.</td>
+                    <td colspan="{{ 9 if multi_user_mode else 8 }}" style="text-align:center;padding:32px;color:var(--text-3);">No API keys yet.</td>
                 </tr>
                 {% endif %}
             </tbody>
@@ -136,6 +154,17 @@
                     <option value="readwrite">Read + Write</option>
                 </select>
             </div>
+            <div class="field">
+                <label class="field-label">Daily request limit</label>
+                <input type="number" name="daily_request_limit" class="field-input"
+                       min="1" max="{{ quota_limit_max }}" step="1" placeholder="Leave empty for unlimited">
+                <div style="font-size:11px;color:var(--text-3);margin-top:6px;line-height:1.5;">
+                    Tool calls this key may make per UTC day. Empty means unlimited.
+                    Calls over the limit are refused before they run and do not
+                    count toward it; the counter resets at UTC midnight. To stop a
+                    key entirely, revoke it — a limit of 0 is not accepted.
+                </div>
+            </div>
             <div class="modal-footer">
                 <button type="button" onclick="document.getElementById('create-modal').classList.remove('open')" class="btn btn-ghost">Cancel</button>
                 <button type="submit" class="btn btn-primary">Create</button>
@@ -143,5 +172,42 @@
         </form>
     </div>
 </div>
+
+<!-- Edit-limit modal. One modal reused for every row: the form's action is
+     rewritten to the key being edited, so the page carries one dialog rather
+     than one per key. -->
+<div id="limit-modal" class="modal">
+    <div class="modal-panel">
+        <div class="modal-title">Daily request limit</div>
+        <form id="limit-form" method="POST" action="/admin/keys/0/limit">
+            {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+            <div class="field">
+                <label class="field-label">Calls per UTC day</label>
+                <input type="number" id="limit-input" name="daily_request_limit" class="field-input"
+                       min="1" max="{{ quota_limit_max }}" step="1" placeholder="Leave empty for unlimited">
+                <div style="font-size:11px;color:var(--text-3);margin-top:6px;line-height:1.5;">
+                    Empty clears the limit and returns the key to unlimited.
+                    <strong>Setting a limit on an unlimited key restarts its
+                    count at zero</strong> — consumption is counted from the
+                    moment the limit is set, not from midnight. Changing an
+                    existing limit keeps the day's count.
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button type="button" onclick="document.getElementById('limit-modal').classList.remove('open')" class="btn btn-ghost">Cancel</button>
+                <button type="submit" class="btn btn-primary">Save</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<script>
+function omcpEditLimit(keyId, current) {
+    var form = document.getElementById('limit-form');
+    form.action = '/admin/keys/' + keyId + '/limit';
+    document.getElementById('limit-input').value = current;
+    document.getElementById('limit-modal').classList.add('open');
+}
+</script>
 
 {% endblock %}
