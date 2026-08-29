@@ -14,6 +14,87 @@
   for scripts — which permits exactly the injection a CSP is bought to stop.
 
 
+## Theming: one token source, dark canonical
+
+- **Every color the panel renders comes from a custom property defined in
+  `src/control_panel/templates/_theme.html`.** That partial is included from
+  the `<head>` of `base.html`, `auth_base.html` *and* `authorize.html` — the
+  three roots of this surface — and none of them keeps a palette of its own.
+  They used to: `auth_base.html` carried a second copy of the token block and
+  `authorize.html` an entirely separate set of literals a couple of shades
+  off the panel's, which is exactly how the two drifted apart. The consent
+  page's historical shades survive as the `--consent-*` group in the shared
+  partial, so there is still one physical palette; under light they fold onto
+  the panel's own values, which is where the surfaces finally converge.
+  A page template may add a scoped token; it may not define a palette.
+
+- **Dark is canonical; light is the override set.** Bare `:root` holds the
+  dark values, byte-identical to the literals they replaced —
+  `:root[data-theme="light"]` overrides, and a `prefers-color-scheme: light`
+  block guarded on `:root:not([data-theme="dark"])` supplies the OS default.
+  Inverting that (light-first tokens) would have re-based every tested page
+  for no benefit. The light-first ordering that *is* correct for the transfer
+  pages is a different surface — see below.
+
+- **Glows, overlays and shadows get explicit per-theme values; they are never
+  derived from the accent.** `rgba(155,130,232,0.16)` reads as a halo on a
+  near-black ground and as dirt on a white one, and `rgba(0,0,0,0.7)` is
+  depth on `#070910` and a smear on `#ffffff`. That is why the token list is
+  long (103 properties, up from 18): each distinct role and strength is its
+  own token so light can move it independently.
+
+- **`--control-border` is deliberately not `--border`.** WCAG 1.4.11 governs
+  the boundary of a *control* — inputs, selects, ghost buttons — at 3:1. Card
+  outlines and table dividers are decorative and are not. Collapsing the two
+  back into one token means either failing the control-border check or
+  turning every card outline in the panel into a hard rule. Same reasoning
+  for `--disabled-opacity`: `.btn:disabled` fades the whole button, its label
+  included, so the value that reads as "disabled" on dark puts the label
+  under 3:1 on light.
+
+- **CSS cannot share one declaration list between a selector and a
+  media-guarded selector**, so the light palette is written out twice —
+  once under `:root[data-theme="light"]`, once inside the
+  `prefers-color-scheme: light` block. The `panel-light-mode`
+  change ships `checks/token_coverage.py`, which asserts the two copies are identical and that every dark token has a light
+  value. Edit one, edit the other.
+
+- **The pre-paint bootstrap stamps `data-theme` only when a choice is
+  stored.** With no stored choice the attribute stays absent and the media
+  block decides, which is what keeps the OS default working with JavaScript
+  off; a stored choice is applied in `<head>` before first paint, so there is
+  no flash of the other theme. Storage access is wrapped in try/catch
+  throughout: when it throws, the toggle still switches the current document
+  and the next load simply follows the OS. The script also copies the active
+  `--bg` into `<meta name="theme-color">`, because no stylesheet can reach a
+  meta tag.
+
+- **The bootstrap is an inline `<script>` with no nonce, and that is
+  consistent, not an oversight.** There is deliberately no CSP on the panel
+  (above); every control here already runs from an inline `onclick`. A theme
+  bootstrap *must* be inline and synchronous in `<head>` — an external file
+  is a network round trip in front of first paint, which is the flash the
+  script exists to prevent. If a CSP is ever added to the panel, this script
+  needs a nonce along with every other inline handler; it is not a special
+  case.
+
+- **SVG colors ride in `style=""`, not in `fill=`/`stroke=`.** SVG2 parses
+  presentation attributes with the property's own grammar rather than as CSS
+  declarations, so `var()` substitution in them is not dependable across
+  browsers — a `fill="var(--gem-facet)"` that fails to substitute falls back
+  to black. `style=""` is real CSS and is already this panel's idiom.
+
+- **The transfer pages are a different surface and must stay one.**
+  `transfer_upload.html` and `transfer_download.html` serve third parties
+  under a strict per-request nonce CSP with static-response discipline
+  (`src/transfer/routes.py`). They carry their own local `--t-*` token block,
+  keep their light-first `prefers-color-scheme` behaviour, and have no
+  toggle, no `localStorage`, and no shared panel partial — including the
+  panel's would drag an unnonced inline script into a page whose whole point
+  is that everything inline is nonced. Their security headers must stay
+  byte-identical once each response's per-request nonce is canonicalized.
+
+
 ## Flash messages
 
 - **Panel flash messages ride the session, never the query string** (#138,
