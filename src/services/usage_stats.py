@@ -43,11 +43,13 @@ impossible.
 
 The enumerated set:
 
-* `over_quota: true` — the quota gate (#162, not yet shipped). Read NULL-safely
-  as `COALESCE((params->>'over_quota')::boolean, false)` so the overwhelming
-  majority of rows, which carry no such key, are simply not refusals. Declared
-  ahead of the gate that writes it so the two land as one contract rather than
-  as a page that silently mis-measures for a release.
+* `over_quota: true` — the quota gate (#162). Read NULL-safely as
+  `COALESCE((params->>'over_quota')::boolean, false)` so the overwhelming
+  majority of rows, which carry no such key, are simply not refusals. It was
+  declared here ahead of the gate that writes it so the two would land as one
+  contract rather than as a page that silently mis-measures for a release; the
+  gate now **imports** `OVER_QUOTA_PARAM` from this module rather than keeping a
+  copy, so the writer and this predicate cannot drift at all.
 * `error = 'no_vault_assigned'` — the admission gate: the caller has no
   resolvable vault root, so no tool body runs.
 * `error = 'argument_not_encodable'` — the unpaired-surrogate screen, which
@@ -76,7 +78,10 @@ PRE_BODY_REFUSAL_ERROR_MARKERS: tuple[str, ...] = (
     UNENCODABLE_ARG_MARKER,
 )
 
-#: The boolean `params` key the quota gate (#162) will set on a refusal.
+#: The boolean `params` key the quota gate (#162) sets on a refusal.
+#: `src/mcp_server/tools.py` imports this constant rather than declaring its
+#: own — the one direction the import can run without closing a cycle — so the
+#: writer and the predicate below cannot name different keys.
 OVER_QUOTA_PARAM = "over_quota"
 
 # The marker values travel as bind parameters, not as interpolated literals.

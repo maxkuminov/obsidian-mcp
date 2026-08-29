@@ -57,6 +57,8 @@ cases, and `ix_usage_logs_user_id` the by-user one.
 """
 from __future__ import annotations
 
+from urllib.parse import urlencode
+
 from sqlalchemy import text
 
 from src.services.usage_stats import WINDOWS, normalize_window
@@ -157,8 +159,6 @@ class Filters:
             "tool": self.tool,
         }
         state.update(overrides)
-        from urllib.parse import urlencode
-
         return urlencode({k: v for k, v in state.items() if v not in (None, "")})
 
 
