@@ -622,3 +622,83 @@ class OAuthToken(Base):
     )
 
     user: Mapped["User | None"] = relationship(back_populates="oauth_tokens")
+
+
+# The four values `indexer_runs.trigger` may carry, and the single source the
+# CHECK constraint in migration 019 is written from. Mirrored there as
+# `TRIGGERS`; keep the two byte identical or a hand-written predicate and the
+# app's notion of a legal trigger drift apart with nothing to notice.
+INDEXER_RUN_TRIGGERS = ("startup", "scheduled", "manual", "backfill")
+
+# Migration 019's ownership marker for the table, declared here so
+# `alembic check` compares it like any other attribute — a marker that drifted
+# from the migration keying on it is a dirty check rather than a migration that
+# quietly stops recognising its own work. Keep byte identical to `MARKER` in
+# `alembic/versions/019_indexer_runs.py`.
+_INDEXER_RUNS_TABLE_MARKER = "one row per index/embed pass (019_indexer_runs)"
+
+
+class IndexerRun(Base):
+    """One row per index/embed pass (migration 019).
+
+    Why a table and not the log: the dashboard's `last_index_run_at` is an
+    *in-process* heartbeat (see `src/services/indexer.py`) — it answers "is
+    this process's loop alive" and resets to None on restart, which is exactly
+    right for that question and useless for "how long has an embed pass been
+    taking lately". Container logs rotate with the container, so parsing them
+    was rejected in the design: the history has to outlive a redeploy to be
+    worth reading at all.
+
+    The row is written in a `finally` inside the pass, so a pass that raises
+    records `finished_at` and its `error` rather than vanishing — a pass that
+    dies is precisely the one an operator comes looking for. The writer prunes
+    to the newest 500 rows in the same transaction; this is an operator-facing
+    history, not an audit trail, and an unbounded table on a five-minute loop
+    grows without anyone ever asking it to.
+
+    `user_id` is nullable and `ON DELETE SET NULL`: single-user mode has no
+    `users` row at all, and a multi-user pass's history is a fact about the
+    server that must survive the user being deleted — the same reasoning that
+    keeps `usage_logs` rows alive past their credential.
+    """
+
+    __tablename__ = "indexer_runs"
+
+    # 019's ownership marker, reachable from the class so a caller checking
+    # model/migration agreement names the table it is checking. `ClassVar` is
+    # what keeps the declarative mapper from reading it as a column.
+    _TABLE_MARKER: ClassVar[str] = _INDEXER_RUNS_TABLE_MARKER
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    started_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Nullable only for the window in which the row does not exist yet: the
+    # writer sets both timestamps in one INSERT. Left nullable so a future
+    # in-flight-run row (written at pass start) needs no migration.
+    finished_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 'startup' | 'scheduled' | 'manual' | 'backfill'. Constrained in the
+    # database (`ck_indexer_runs_trigger`) rather than only in Python: the
+    # panel groups and labels by this value, and a typo'd trigger would render
+    # as a silent fourth category nobody notices.
+    trigger: Mapped[str] = mapped_column(String(16), nullable=False)
+    user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    notes_scanned: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notes_indexed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notes_embedded: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Free text, and deliberately not a code: what an operator needs from a
+    # failed pass is the exception it died of, which has no enumeration.
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            "trigger IN ('startup', 'scheduled', 'manual', 'backfill')",
+            name="ck_indexer_runs_trigger",
+        ),
+        Index("ix_indexer_runs_started_at", "started_at"),
+        {"comment": _INDEXER_RUNS_TABLE_MARKER},
+    )

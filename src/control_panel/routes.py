@@ -44,6 +44,16 @@ from src.oauth.scope import (
     token_has_write,
 )
 from src.services.indexer import invalidate_hnsw_index_cache
+from src.services.usage_stats import (
+    RECENT_RUNS_LIMIT,
+    WINDOW_LABELS,
+    WINDOWS,
+    normalize_window,
+    phase_breakdown,
+    recent_indexer_runs,
+    slowest_requests,
+    tool_aggregates,
+)
 from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
@@ -1246,6 +1256,74 @@ async def usage_page(
     }))
 
 
+# --- Performance ----------------------------------------------------------
+
+
+@router.get("/performance", response_class=HTMLResponse)
+async def performance_page(
+    request: Request,
+    window: str | None = None,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    """Per-tool latency, phase timings, the window's slowest calls, and the
+    most recent index/embed passes.
+
+    Read-only aggregation over `usage_logs`; the SQL and the one shared
+    executed/refused predicate live in `src/services/usage_stats.py`, which is
+    where the reasoning for the predicate is written down.
+
+    Scoped exactly like `/admin/usage`: an admin sees every row, a regular user
+    only their own. `window` is clamped rather than validated — the selector is
+    a set of links, and a hand-edited query string should render the page.
+    """
+    uid = _scope_user_id(user)
+    window = normalize_window(window)
+
+    tools = await tool_aggregates(session, window, uid)
+    phases = await phase_breakdown(session, window, uid)
+    slowest_rows = await slowest_requests(session, window, uid)
+    # Deliberately **not** window-bounded: the passes are what the window's
+    # latencies happened around, and a quiet 24 hours with no pass in it is
+    # exactly when an operator needs to see the last one that did run.
+    runs = await recent_indexer_runs(session, uid)
+
+    slowest = []
+    for r in slowest_rows:
+        actor_name, actor_detail = _usage_actor(r)
+        slowest.append({
+            "created_at": r.created_at.isoformat(),
+            "tool": r.tool,
+            "duration_ms": r.duration_ms,
+            "response_size": r.response_size,
+            "actor_name": actor_name,
+            "actor_detail": actor_detail,
+        })
+
+    return templates.TemplateResponse(
+        request,
+        "performance.html",
+        _panel_context(request, user, {
+            "active": "performance",
+            "window": window,
+            "window_label": WINDOW_LABELS[window],
+            "windows": [
+                {"key": key, "label": key, "selected": key == window}
+                for key in WINDOWS
+            ],
+            "tools": tools,
+            "phases": phases,
+            "slowest": slowest,
+            "runs": runs,
+            "runs_limit": RECENT_RUNS_LIMIT,
+            # A window with no executed rows at all is a real state (a fresh
+            # deploy, a quiet weekend) and gets its own copy rather than a
+            # table of zeroes that reads like a measurement.
+            "has_data": any(t["executed"] or t["refusals"] for t in tools),
+        }),
+    )
+
+
 # --- Vault browser --------------------------------------------------------
 
 
@@ -1652,20 +1730,30 @@ async def _reindex_background():
     # run index_vault/embed_vault concurrently with the periodic loop over the
     # same scope, racing on move-detection, deleted-path removal, and per-note
     # embedding delete+insert.
+    #
+    # Each pass records an `indexer_runs` row under the `manual` trigger
+    # (#160), so the history distinguishes "the operator pressed Reindex Now"
+    # from a five-minute tick — which is the first thing anyone asks when a
+    # pass in the history took ten times as long as its neighbours.
     from src.services.indexer import (
         index_vault, embed_vault, _active_user_ids, index_pass_lock,
+        record_indexer_run,
     )
     async with index_pass_lock:
         if settings.multi_user_mode:
             for uid in await _active_user_ids():
-                try:
-                    await index_vault(user_id=uid)
-                except Exception as e:
-                    logger.error(f"On-demand index failed (user_id={uid}): {e}")
-                try:
-                    await embed_vault(user_id=uid)
-                except Exception as e:
-                    logger.error(f"On-demand embedding failed (user_id={uid}): {e}")
+                async with record_indexer_run("manual", uid) as stats:
+                    try:
+                        stats.record_index(await index_vault(user_id=uid))
+                    except Exception as e:
+                        stats.record_error("index", e)
+                        logger.error(f"On-demand index failed (user_id={uid}): {e}")
+                    try:
+                        stats.record_embedded(await embed_vault(user_id=uid))
+                    except Exception as e:
+                        stats.record_error("embed", e)
+                        logger.error(f"On-demand embedding failed (user_id={uid}): {e}")
         else:
-            await index_vault()
-            await embed_vault()
+            async with record_indexer_run("manual", None) as stats:
+                stats.record_index(await index_vault())
+                stats.record_embedded(await embed_vault())

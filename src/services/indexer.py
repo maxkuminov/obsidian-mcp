@@ -8,7 +8,7 @@ import logging
 import os
 import time
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -27,7 +27,15 @@ from sqlalchemy.dialects.postgresql import ARRAY, insert
 
 from src.config import settings
 from src.database import async_session
-from src.models.db import NoteEmbedding, NoteLink, NoteMetadata, OAuthCode, OAuthToken, User
+from src.models.db import (
+    IndexerRun,
+    NoteEmbedding,
+    NoteLink,
+    NoteMetadata,
+    OAuthCode,
+    OAuthToken,
+    User,
+)
 from src.services.embeddings import (
     StaleCertification,
     certify_embedded,
@@ -71,6 +79,279 @@ def _record_index_run(ok: bool) -> None:
     global last_index_run_at, last_index_run_ok
     last_index_run_at = datetime.now(timezone.utc)
     last_index_run_ok = ok
+
+
+# ── Persistent pass history (#160, migration 019) ──────────────────────────
+#
+# The heartbeat above is in-process and answers "is this process's loop alive".
+# `indexer_runs` answers the other question — "how long have passes been taking,
+# and did any of them fail" — which has to outlive a redeploy to be worth
+# asking. Log parsing was the alternative and was rejected: logs rotate with the
+# container.
+
+#: The history is bounded because nothing ever asks for the 501st-newest pass.
+#: A five-minute loop writes ~288 rows a day per user; unbounded, this table
+#: would be the largest thing in the database inside a year, holding data no
+#: view reads.
+MAX_INDEXER_RUNS = 500
+
+# One pass's error column is for an operator to read, not for a machine to
+# parse, and a stack of per-stage failures from a multi-user pass can be long.
+MAX_RUN_ERROR_CHARS = 4000
+
+
+@dataclass
+class EmbedPassResult:
+    """What one `embed_vault` call embedded — **and what it could not**.
+
+    The count alone was a falsely clean report. `embed_vault` catches every
+    per-note exception, logs a warning and carries on, which is the right
+    behaviour (one poisoned note must not stop the backlog) and used to be the
+    pass's *only* record of it: a total Ollama or OpenAI outage embedded
+    nothing, raised nothing, and wrote a run row with `notes_embedded = 0` and
+    `error = NULL` — byte-for-byte the row a pass with nothing to embed writes.
+    An operator watching the history through a provider outage would have seen
+    a wall of healthy passes.
+
+    So the failures ride back with the count. `notes_embedded` stays truthful
+    (a pass that embedded 40 of 50 notes reports 40), and the summary lands in
+    the run row's `error` beside it.
+    """
+
+    embedded: int = 0
+    #: The backlog this pass was handed — the "of M" in the summary.
+    attempted: int = 0
+    failures: int = 0
+    #: The first failure's message. One, not all: the row's `error` is bounded
+    #: and 2,000 identical "connection refused" lines say nothing the count
+    #: does not already say.
+    first_error: str | None = None
+
+    def record_failure(self, exc: BaseException) -> None:
+        self.failures += 1
+        if self.first_error is None:
+            self.first_error = f"{type(exc).__name__}: {exc}"
+
+    @property
+    def failure_summary(self) -> str | None:
+        if not self.failures:
+            return None
+        return (
+            f"embed failures: {self.failures} of {self.attempted} — "
+            f"first: {self.first_error}"
+        )
+
+    def __int__(self) -> int:
+        return self.embedded
+
+
+@dataclass
+class PassStats:
+    """What one pass did, accumulated as its stages report.
+
+    The `record_*` methods tolerate a `None` result on purpose: `index_vault`
+    and `embed_vault` are monkeypatched with plain no-op coroutines throughout
+    the test suite, and a recorder that insisted on a tuple would turn every one
+    of those into a failure about instrumentation rather than about indexing.
+    """
+
+    notes_scanned: int = 0
+    notes_indexed: int = 0
+    notes_embedded: int = 0
+    errors: list[str] = field(default_factory=list)
+    #: Set by a pass that found there was nothing to do and never started —
+    #: today only the link backfill, whose "this scope already has link rows"
+    #: probe fires on every startup after the first. A row per startup for a
+    #: pass that did no work is noise, and noise in a 500-row history evicts
+    #: the passes an operator came to read.
+    skipped: bool = False
+
+    def record_index(self, result) -> None:
+        """Absorb `index_vault`'s `(scanned, indexed)`."""
+        if not result:
+            return
+        scanned, indexed = result
+        self.notes_scanned += int(scanned)
+        self.notes_indexed += int(indexed)
+
+    def record_embedded(self, result) -> None:
+        """Absorb `embed_vault`'s count of notes it actually embedded.
+
+        An `EmbedPassResult` brings its swallowed per-note failures with it, and
+        they go into the row's `error` — a pass that embedded nothing because
+        the embedding provider was down must not be indistinguishable from a
+        pass that had nothing to embed.
+        """
+        if isinstance(result, EmbedPassResult):
+            self.notes_embedded += result.embedded
+            summary = result.failure_summary
+            if summary is not None:
+                self.errors.append(summary)
+            return
+        if not result:
+            return
+        self.notes_embedded += int(result)
+
+    def record_error(self, stage: str, exc: BaseException) -> None:
+        self.errors.append(f"{stage}: {type(exc).__name__}: {exc}")
+
+    @property
+    def error_text(self) -> str | None:
+        if not self.errors:
+            return None
+        return "\n".join(self.errors)[:MAX_RUN_ERROR_CHARS]
+
+
+#: PostgreSQL's `foreign_key_violation`. Read off the driver's exception rather
+#: than matched in the message, which is localised.
+_FK_VIOLATION_SQLSTATE = "23503"
+
+
+def _is_fk_violation(exc: BaseException) -> bool:
+    """Is this the FK on `indexer_runs.user_id` refusing a vanished user?
+
+    asyncpg raises `ForeignKeyViolationError` with `sqlstate`; SQLAlchemy wraps
+    it in `IntegrityError` and exposes it as `.orig`. Both attribute spellings
+    are checked because psycopg names the same field `pgcode`, and the class
+    name is the last resort so a driver swap degrades to "retry once" rather
+    than to "lose the row".
+    """
+    orig = getattr(exc, "orig", None)
+    for attr in ("sqlstate", "pgcode"):
+        if getattr(orig, attr, None) == _FK_VIOLATION_SQLSTATE:
+            return True
+    return type(orig).__name__ == "ForeignKeyViolationError"
+
+
+async def _insert_run_row(
+    session, trigger: str, user_id: int | None, started_at: datetime, stats: PassStats
+) -> None:
+    """The insert and its prune, in one transaction. Raises on either."""
+    await session.execute(
+        insert(IndexerRun).values(
+            started_at=started_at,
+            finished_at=datetime.now(timezone.utc),
+            trigger=trigger,
+            user_id=user_id,
+            notes_scanned=stats.notes_scanned,
+            notes_indexed=stats.notes_indexed,
+            notes_embedded=stats.notes_embedded,
+            error=stats.error_text,
+        )
+    )
+    # `started_at DESC, id DESC` and not `id DESC` alone: passes are
+    # inserted at their *finish*, so two passes that started minutes
+    # apart can land in the other order. The history is read by start
+    # time, so it is pruned by start time.
+    await session.execute(
+        text(
+            "DELETE FROM indexer_runs WHERE id NOT IN ("
+            "  SELECT id FROM indexer_runs "
+            "  ORDER BY started_at DESC, id DESC LIMIT :keep"
+            ")"
+        ),
+        {"keep": MAX_INDEXER_RUNS},
+    )
+    await session.commit()
+
+
+async def _write_indexer_run(
+    trigger: str, user_id: int | None, started_at: datetime, stats: PassStats
+) -> None:
+    """Insert one run row and prune to the newest `MAX_INDEXER_RUNS`.
+
+    **Session discipline.** This is only ever called by the *holder* of
+    `index_pass_lock`, never by something waiting for it, and it opens and
+    closes its own short-lived session inside that call. That is the same rule
+    the panel's destructive actions follow from the other side
+    (`_pass_lock_without_a_connection` in `src/control_panel/routes.py`): a
+    waiter that keeps a pooled connection while blocking on the lock deadlocks
+    against a holder that needs one to finish. A holder taking a connection is
+    exactly what the lock exists to make safe.
+
+    The insert and the prune share one transaction, so the table is never
+    briefly over the cap and a rollback loses both.
+
+    **It never raises.** Failing to record that a pass happened must not turn a
+    successful pass into a failed one, and this runs in a `finally` where a
+    raise would replace the exception the operator actually needs to see.
+
+    **A user deleted mid-pass costs the owner label, not the row.** `user_id`
+    is captured when the pass starts and inserted when it finishes, and a pass
+    over a large vault runs for minutes; an administrator deleting that user in
+    between makes the FK reject the INSERT. `ON DELETE SET NULL` cannot help —
+    it fires on rows that already exist, and this one never got in. Swallowed
+    by the handler below, the whole pass would vanish from the history: the
+    longest passes are the likeliest to lose the race, and "the operator
+    deleted a user" is exactly the moment they open the page. So an FK
+    violation is retried once with a NULL owner, which is what the column would
+    hold a moment later anyway.
+    """
+    try:
+        async with async_session() as session:
+            await _insert_run_row(session, trigger, user_id, started_at, stats)
+        return
+    except Exception as e:  # noqa: BLE001 - recording must never fail a pass
+        if user_id is None or not _is_fk_violation(e):
+            logger.warning("Could not record indexer run (%s): %s", trigger, e)
+            return
+        logger.info(
+            "user_id=%s was deleted while its %s pass ran; recording the pass "
+            "with no owner rather than dropping it.",
+            user_id,
+            trigger,
+        )
+
+    # A fresh session: the first one's transaction is aborted, and every
+    # statement on an aborted transaction fails with the same error.
+    try:
+        async with async_session() as session:
+            await _insert_run_row(session, trigger, None, started_at, stats)
+    except Exception as e:  # noqa: BLE001 - recording must never fail a pass
+        logger.warning(
+            "Could not record indexer run (%s) even with no owner: %s", trigger, e
+        )
+
+
+@contextlib.asynccontextmanager
+async def record_indexer_run(trigger: str, user_id: int | None = None):
+    """Wrap one pass; yield the `PassStats` it fills in.
+
+    The row is written in `finally`, so **a pass that raises still records
+    one** — with its `finished_at` and its error. A failed pass is precisely
+    the one an operator goes looking for, and a scheme that only records
+    successes has nothing to say about the case it exists for.
+
+    `CancelledError` is the exception: lifespan shutdown cancels the indexer
+    task, that is not a failed pass, and awaiting a database write inside a
+    cancelled task's `finally` is not something to do on the way out. Same
+    treatment `_record_index_run` gives it.
+    """
+    stats = PassStats()
+    started_at = datetime.now(timezone.utc)
+    cancelled = False
+    try:
+        yield stats
+    except asyncio.CancelledError:
+        cancelled = True
+        raise
+    except BaseException as exc:
+        stats.record_error("pass", exc)
+        # **A raising pass is never a skipped one.** `skipped` is the link
+        # backfill's "this scope needed no backfill" answer, and it is set
+        # *up-front* and cleared only once every guard has passed. So a guard
+        # phase that raised — an unreadable root, a provenance query that
+        # failed, a database blip in the `existing`/`rows` probes — left the
+        # flag standing and the `finally` below suppressed the write. The one
+        # pass an operator would go looking for was the one that recorded
+        # nothing at all, which is the exact defect the recorder exists to
+        # remove. An exception is evidence the pass ran; clearing it here means
+        # nothing that raised can be filed as "did no work".
+        stats.skipped = False
+        raise
+    finally:
+        if not cancelled and not stats.skipped:
+            await _write_indexer_run(trigger, user_id, started_at, stats)
 
 # Serializes full index/embed passes so the periodic loop and a
 # panel-triggered on-demand reindex can never run index_vault/embed_vault
@@ -1131,18 +1412,23 @@ async def index_vault(user_id: int | None = None):
     not scan. The reconciliation lives here rather than in any one caller, so
     the startup pass, the periodic tick and an operator-triggered reindex all
     inherit it.
+
+    Returns `(notes_scanned, notes_indexed)` for the pass recorder (#160):
+    every markdown file the walk discovered, and the subset whose row this pass
+    wrote — the upserts plus the moves it repaired in place. Callers that do
+    not record a run may ignore it.
     """
     vault = _vault_root(user_id)
     log_suffix = f" (user_id={user_id})" if user_id is not None else ""
     logger.info(f"Starting vault index scan...{log_suffix}")
 
     with pinned_root(vault) as root_fd:
-        await _index_vault_pinned(user_id, vault, root_fd, log_suffix)
+        return await _index_vault_pinned(user_id, vault, root_fd, log_suffix)
 
 
 async def _index_vault_pinned(
     user_id: int | None, vault: Path, root_fd: int, log_suffix: str
-):
+) -> tuple[int, int]:
     re_derive = False
     facts: RootFacts | None = None
     if user_id is not None:
@@ -1640,6 +1926,11 @@ async def _index_vault_pinned(
         await session.commit()
 
     logger.info(f"Vault index scan complete{log_suffix}")
+    # For the run recorder: what the walk saw, and what this pass wrote. The
+    # moved paths count as indexed — the id-preserving branch rewrote those
+    # rows — and they were removed from `to_upsert` above, so the two sets are
+    # disjoint and nothing is double-counted.
+    return len(seen), len(to_upsert) + len(moved_new_paths)
 
 
 async def _update_links_for_changed(
@@ -1856,12 +2147,25 @@ async def link_backfill_pass(user_id: int | None = None):
     """
     global link_backfill_in_progress
     vault = _vault_root(user_id)
-    with pinned_root(vault) as root_fd:
-        await _link_backfill_pinned(user_id, vault, root_fd)
+    # Its own `indexer_runs` row, under the `backfill` trigger: it is a
+    # distinct kind of pass with distinct timings, and folding it into the
+    # startup row it usually runs beside would hide a slow one-shot rebuild
+    # inside a slow-looking startup. The recorder wraps the pinned body, so its
+    # write happens after that body's session has closed — never two pooled
+    # connections at once for one task.
+    async with record_indexer_run("backfill", user_id) as stats:
+        with pinned_root(vault) as root_fd:
+            await _link_backfill_pinned(user_id, vault, root_fd, stats)
 
 
-async def _link_backfill_pinned(user_id: int | None, vault: Path, root_fd: int):
+async def _link_backfill_pinned(
+    user_id: int | None, vault: Path, root_fd: int, stats: "PassStats | None" = None
+):
     global link_backfill_in_progress
+    stats = stats if stats is not None else PassStats()
+    # Every path out of the guards below is "this scope needed no backfill",
+    # which is not a pass and must not spend a row.
+    stats.skipped = True
     async with async_session() as session:
         if not await _ancillary_pass_is_permitted(
             session, user_id, vault, root_fd, "Link backfill"
@@ -1893,6 +2197,9 @@ async def _link_backfill_pinned(user_id: int | None, vault: Path, root_fd: int):
         if not rows:
             return
 
+        # Past every guard: this is a real pass and it records one.
+        stats.skipped = False
+        stats.notes_scanned = len(rows)
         link_backfill_in_progress = True
         log_suffix = f" (user_id={user_id})" if user_id is not None else ""
         logger.info(f"Starting link backfill across {len(rows)} notes{log_suffix}")
@@ -1910,6 +2217,10 @@ async def _link_backfill_pinned(user_id: int | None, vault: Path, root_fd: int):
                     raw, _stat = read_note_beneath(root_fd, row.file_path)
                 except (UnicodeDecodeError, OSError):
                     continue
+                # Counted as indexed only once its bytes were read: an
+                # unreadable note is scanned and not rebuilt, and the two
+                # numbers differing is exactly how an operator sees that.
+                stats.notes_indexed += 1
                 _, content = parse_frontmatter(raw)
                 for link in extract_links(content):
                     target_id = resolve_target(link.target, row.file_path, vault_index)
@@ -1973,16 +2284,26 @@ async def embed_vault(user_id: int | None = None):
 
     Reads are anchored beneath a root this pass pins itself, for the same
     within-pass-consistency reason the scan pins one.
+
+    Returns an `EmbedPassResult` for the pass recorder (#160): the number of
+    notes it actually embedded, and the per-note failures it swallowed. Notes
+    skipped by an exclude pattern, skipped because their bytes no longer hash to
+    their row, or left behind by a pause are **not** counted as embedded: the
+    figure answers "how much embedding work did this pass do", and a
+    reconciliation stamp is not embedding work. Nor are they counted as
+    failures — each is a deliberate decision, not something that went wrong.
     """
     vault = _vault_root(user_id)
     log_suffix = f" (user_id={user_id})" if user_id is not None else ""
     logger.info(f"Starting embedding pass...{log_suffix}")
 
     with pinned_root(vault) as root_fd:
-        await _embed_vault_pinned(user_id, root_fd, log_suffix)
+        return await _embed_vault_pinned(user_id, root_fd, log_suffix)
 
 
-async def _embed_vault_pinned(user_id: int | None, root_fd: int, log_suffix: str):
+async def _embed_vault_pinned(
+    user_id: int | None, root_fd: int, log_suffix: str
+) -> EmbedPassResult:
     async with async_session() as session:
         # Find notes without embeddings or with stale embeddings, scoped
         # to this user when set. We bind the user_id parameter even in
@@ -2018,6 +2339,11 @@ async def _embed_vault_pinned(user_id: int | None, root_fd: int, log_suffix: str
             logger.info(f"Embedding {len(unembedded)} notes...{log_suffix}")
         total_chunks = 0
         skipped_excluded = 0
+        # Notes this pass embedded and certified, plus the failures it
+        # swallowed. `embedded` is incremented only after the per-note commit
+        # lands, so a note whose certification was rolled back is not reported
+        # as embedded.
+        outcome = EmbedPassResult(attempted=len(unembedded))
         for i, row in enumerate(unembedded):
             # Re-check the pause flag every iteration so a panel-driven pause
             # (e.g. reset-embeddings) stops an in-flight embed pass promptly
@@ -2122,6 +2448,7 @@ async def _embed_vault_pinned(user_id: int | None, root_fd: int, log_suffix: str
                 )
                 total_chunks += chunks
                 await session.commit()
+                outcome.embedded += 1
 
                 if (i + 1) % 50 == 0:
                     logger.info(f"Embedded {i + 1}/{len(unembedded)} notes ({total_chunks} chunks)")
@@ -2134,8 +2461,24 @@ async def _embed_vault_pinned(user_id: int | None, root_fd: int, log_suffix: str
                 logger.info("Skipping %s: %s", row.file_path, e)
                 await session.rollback()
             except Exception as e:
+                # Swallowed on purpose — one poisoned note must not stop the
+                # backlog — but **counted**, because the log line is not a
+                # record. A provider outage fails every note here and used to
+                # produce a run row identical to "nothing to embed": zero
+                # embedded, no error. The count and the first message go into
+                # the row so the history can tell the two apart.
+                outcome.record_failure(e)
                 logger.warning(f"Failed to embed {row.file_path}: {e}")
                 await session.rollback()
+
+        if outcome.failures:
+            logger.error(
+                "Embedding pass%s swallowed %s of %s notes: %s",
+                log_suffix,
+                outcome.failures,
+                outcome.attempted,
+                outcome.first_error,
+            )
 
         if unembedded:
             logger.info(
@@ -2154,6 +2497,8 @@ async def _embed_vault_pinned(user_id: int | None, root_fd: int, log_suffix: str
         await _reconcile_exclusions(
             session, user_id, root_fd, exclude_patterns, log_suffix
         )
+
+    return outcome
 
 
 async def _reconcile_exclusions(
@@ -2775,7 +3120,7 @@ async def prewarm_search_caches() -> None:
         )
 
 
-async def _index_pass_once(user_id: int | None) -> bool:
+async def _index_pass_once(user_id: int | None, trigger: str = "scheduled") -> bool:
     """One full index + embed pass for a single user (or single-user mode).
 
     Returns True only if both stages completed. Failures are swallowed per
@@ -2784,18 +3129,26 @@ async def _index_pass_once(user_id: int | None) -> bool:
     must not stamp the heartbeat as a healthy run (#78). Swallowing and
     returning True is exactly the "reports fine, is not" defect the heartbeat
     exists to remove.
+
+    The swallowed exceptions are also written to the run row's `error` (#160).
+    A pass that swallowed a failure and recorded a clean row would reproduce
+    the same defect one layer down: the log line scrolls away, the row is what
+    survives a redeploy.
     """
     ok = True
-    try:
-        await index_vault(user_id=user_id)
-    except Exception as e:
-        ok = False
-        logger.error(f"Index failed (user_id={user_id}): {e}")
-    try:
-        await embed_vault(user_id=user_id)
-    except Exception as e:
-        ok = False
-        logger.error(f"Embedding failed (user_id={user_id}): {e}")
+    async with record_indexer_run(trigger, user_id) as stats:
+        try:
+            stats.record_index(await index_vault(user_id=user_id))
+        except Exception as e:
+            ok = False
+            stats.record_error("index", e)
+            logger.error(f"Index failed (user_id={user_id}): {e}")
+        try:
+            stats.record_embedded(await embed_vault(user_id=user_id))
+        except Exception as e:
+            ok = False
+            stats.record_error("embed", e)
+            logger.error(f"Embedding failed (user_id={user_id}): {e}")
     return ok
 
 
@@ -2811,48 +3164,63 @@ async def run_indexer_loop():
     startup_ok = True
     async with index_pass_lock:
         if settings.multi_user_mode:
-            # Initial pass per user.
-            user_ids = await _active_user_ids()
-            for uid in user_ids:
-                try:
-                    await index_vault(user_id=uid)
-                except Exception as e:
-                    startup_ok = False
-                    logger.error(f"Initial index failed (user_id={uid}): {e}")
-            try:
-                # Link backfill still uses the global "table empty" guard but
-                # runs the per-user pass when triggered. Iterate every user so
-                # each user's notes get their links resolved against their own
-                # vault_index.
-                for uid in user_ids:
-                    await link_backfill_pass(user_id=uid)
-            except Exception as e:
-                startup_ok = False
-                logger.error(f"Link backfill failed: {e}")
-            for uid in user_ids:
-                try:
-                    await embed_vault(user_id=uid)
-                except Exception as e:
-                    startup_ok = False
-                    logger.error(f"Initial embedding failed (user_id={uid}): {e}")
+            # One `indexer_runs` row per user (#160), which is why the three
+            # stages are one per-user sequence rather than three loops over
+            # every user: a run row spanning two loops would have to be held
+            # open across them, and a pass's start and finish would then
+            # describe the whole startup rather than that user's pass.
+            #
+            # Per-user ordering — index, then link backfill, then embed — is
+            # unchanged and is the ordering that matters (the backfill reads
+            # `notes_metadata`, the embed pass reads the hashes the scan
+            # wrote). What changes is that one user's failed backfill no longer
+            # aborts the backfill of every user after them; it is now isolated
+            # exactly like the index and embed stages already were.
+            for uid in await _active_user_ids():
+                async with record_indexer_run("startup", uid) as stats:
+                    try:
+                        stats.record_index(await index_vault(user_id=uid))
+                    except Exception as e:
+                        startup_ok = False
+                        stats.record_error("index", e)
+                        logger.error(f"Initial index failed (user_id={uid}): {e}")
+                    try:
+                        # The backfill writes its own `backfill` row; the note
+                        # here is so an operator reading a startup row sees
+                        # that something in that startup failed.
+                        await link_backfill_pass(user_id=uid)
+                    except Exception as e:
+                        startup_ok = False
+                        stats.record_error("link backfill", e)
+                        logger.error(f"Link backfill failed (user_id={uid}): {e}")
+                    try:
+                        stats.record_embedded(await embed_vault(user_id=uid))
+                    except Exception as e:
+                        startup_ok = False
+                        stats.record_error("embed", e)
+                        logger.error(f"Initial embedding failed (user_id={uid}): {e}")
         else:
-            try:
-                await index_vault()
-            except Exception as e:
-                startup_ok = False
-                logger.error(f"Initial index failed: {e}")
+            async with record_indexer_run("startup", None) as stats:
+                try:
+                    stats.record_index(await index_vault())
+                except Exception as e:
+                    startup_ok = False
+                    stats.record_error("index", e)
+                    logger.error(f"Initial index failed: {e}")
 
-            try:
-                await link_backfill_pass()
-            except Exception as e:
-                startup_ok = False
-                logger.error(f"Link backfill failed: {e}")
+                try:
+                    await link_backfill_pass()
+                except Exception as e:
+                    startup_ok = False
+                    stats.record_error("link backfill", e)
+                    logger.error(f"Link backfill failed: {e}")
 
-            try:
-                await embed_vault()
-            except Exception as e:
-                startup_ok = False
-                logger.error(f"Initial embedding failed: {e}")
+                try:
+                    stats.record_embedded(await embed_vault())
+                except Exception as e:
+                    startup_ok = False
+                    stats.record_error("embed", e)
+                    logger.error(f"Initial embedding failed: {e}")
 
     # The startup pass counts as a run: it does the same work a tick does, and
     # without it the dashboard would read "Never" for a whole interval after
@@ -2885,8 +3253,15 @@ async def run_indexer_loop():
                         if not await _index_pass_once(uid):
                             tick_ok = False
                 else:
-                    await index_vault()
-                    await embed_vault()
+                    # Not routed through `_index_pass_once`: that helper
+                    # swallows per-stage exceptions so one user cannot stop the
+                    # others, and in single-user mode a raising pass must reach
+                    # the outer handler so `consecutive_failures` sees it. The
+                    # run row is still written — `record_indexer_run` records
+                    # the exception on its way past.
+                    async with record_indexer_run("scheduled", None) as stats:
+                        stats.record_index(await index_vault())
+                        stats.record_embedded(await embed_vault())
                 # Still under the lock: serialised against a panel reindex and
                 # against reset-embeddings, which also takes this lock. It
                 # never raises, so `consecutive_failures` cannot react to it,

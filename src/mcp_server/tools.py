@@ -301,6 +301,24 @@ _VAULT_REASSIGNED_MARKER = "vault_assignment_changed"
 # an administrator's name on an infrastructure incident in the audit trail.
 _CONFIRMATION_UNAVAILABLE_MARKER = "vault_confirmation_unavailable"
 
+# Marker for a publication stopped because the **bound root itself** could not
+# be resolved at publish time (`VaultAnchorUnavailable`). It used to be logged
+# under `_NO_VAULT_MARKER`, and that was a classification error with a
+# consequence: `_NO_VAULT_MARKER` is a *pre-body* marker — the admission gate
+# writes it before any tool body runs, and `src/services/usage_stats.py`
+# enumerates it as one of the exact values meaning "this row's body never
+# executed". This branch is the opposite. It is reached from inside a mutating
+# tool that has already resolved a root, read the note, computed the write and
+# reached its publication step, so the row is one of the most expensive the
+# server logs. Filed under the pre-body marker it was silently dropped from
+# every latency percentile — the #88 race is the reachable path, and the one
+# view built to find slow write paths would have hidden precisely it.
+#
+# Distinct from `_CONFIRMATION_UNAVAILABLE_MARKER` too: that one says the
+# *assignment query* failed (a database outage), this one says the anchor for
+# an assignment we could read could not be named.
+_ANCHOR_LOST_AT_PUBLISH_MARKER = "vault_anchor_lost_at_publish"
+
 
 class _TrashUnusable(Exception):
     """The trash probe failed for a reason that is not `UnsupportedFilesystem`.
@@ -354,10 +372,18 @@ async def _confirmed_publication(uid: int | None, publish):
     except VaultAnchorUnavailable as exc:
         # The bound root itself could not be resolved — a cold cache, or an
         # ownerless credential in multi-user mode. The admission gate refuses
-        # both before the body runs, so this is unreachable in a normal
-        # request; a mutation whose anchor cannot be named must not publish
-        # either, and it is the *admission* marker that describes it.
-        timing.record("error", _NO_VAULT_MARKER)
+        # both before the body runs, so this is rare; the #88 race reaches it
+        # when the assignment is torn out underneath a call that had already
+        # passed admission. A mutation whose anchor cannot be named must not
+        # publish either.
+        #
+        # **Its own marker, not the admission gate's.** This row's body ran —
+        # it resolved a root, read the note and computed the write before
+        # arriving here — and `_NO_VAULT_MARKER` is enumerated by
+        # `src/services/usage_stats.py` as a value meaning "the body never
+        # started". Sharing it made the most expensive refusal in the server
+        # invisible to the latency view.
+        timing.record("error", _ANCHOR_LOST_AT_PUBLISH_MARKER)
         return str(exc), None
 
 

@@ -119,3 +119,91 @@ credential and then opens the Usage page to see what it did was shown
   016's treatment (NULL record ⇒ re-derive; NULL label ⇒ join fallback). No
   barrier and no quiesce: the window is seconds long and the fallback works.
 
+
+## The read-only consumer (#160)
+
+`/admin/performance` aggregates `usage_logs` and writes nothing. The SQL lives
+in `src/services/usage_stats.py`; two things about it are load-bearing.
+
+- **One predicate for "the body did not run", enumerated, never broad.**
+  `_tracked` refuses some calls *before* the tool body executes and logs the
+  refusal like any other call — same tool, same actor, a `duration_ms` of
+  roughly zero, a `response_size` of the refusal string. Those rows are real
+  history and stay in the log, but folding them into a latency percentile is how
+  a tool that is refusing five thousand times an hour comes out looking fast. So
+  the aggregates filter on `pre_body_refusal_sql()` and the per-tool refusal
+  count uses **the same expression**: one helper, two consumers, no drift. Two
+  hand-written predicates agree until somebody adds a third marker to one of
+  them.
+
+  It matches exactly three things and nothing else: `over_quota: true` (the
+  quota gate, #162, declared here ahead of the gate that writes it so the two
+  land as one contract), `error = 'no_vault_assigned'`, and
+  `error = 'argument_not_encodable'`. A broad match — `params ? 'error'`, or
+  `params->>'error' IS NOT NULL` — is wrong in a way that is invisible on the
+  page: `_VAULT_REASSIGNED_MARKER`, `_CONFIRMATION_UNAVAILABLE_MARKER` and
+  `_ANCHOR_LOST_AT_PUBLISH_MARKER` are written by tools whose bodies *ran*,
+  resolved a vault, did the work and then refused to publish. Excluding those
+  hides the slowest write path in the server from the one view built to find
+  slow paths. **Every marker added to `_tracked` has to be classified
+  deliberately** — pre-body or not — and only the pre-body ones belong in the
+  predicate.
+
+  **The classification rule, stated once: a marker belongs to exactly one side
+  of the body/no-body line, and two branches on opposite sides may never share
+  a value.** `vault_anchor_lost_at_publish` exists because that rule was broken
+  once. `_confirmed_publication`'s `VaultAnchorUnavailable` branch logged
+  `no_vault_assigned` — reasonable-looking, since both mean "no usable vault
+  root" — but the admission gate writes that value *before* any body runs while
+  this branch is reached from inside a mutating tool that has already resolved
+  a root, read the note and computed the write. Filed under the pre-body value
+  (reachable through the #88 race) the most expensive refusal the server logs
+  was silently absent from every percentile. When a new refusal reads like an
+  existing marker, check which side of the line it is on before reusing the
+  string; a new value costs nothing and a shared one mis-measures in a
+  direction nobody can see from the page.
+
+  Both halves are `COALESCE(..., false)`: `params` is nullable and `->>` on a
+  missing key yields NULL, so without them the negation used by the executed
+  filter would be NULL and PostgreSQL would drop every ordinary row on the
+  floor. The marker strings are mirrored from `tools.py` rather than imported,
+  because #162's quota gate will import `usage_stats` from `tools.py` and an
+  import the other way closes the cycle;
+  `tests/test_issue_160_refusal_predicate.py` pins the two copies equal, and
+  `tests/integration/test_issue_160_performance_pg.py` seeds a row carrying
+  some *other* `params.error` value and asserts it stays in the aggregates.
+
+- **Phase timings are read where they exist, never zeroed.** `embed_ms` and
+  `db_ms` come from `src/services/timing.py` and only search tools record them.
+  The breakdown filters on `(params->>'embed_ms') IS NOT NULL` rather than
+  `COALESCE(..., 0)`: treating a missing key as zero would drag every mean
+  toward the number of tools that do not measure, which is not a fact about
+  anything.
+
+  **The casts are unguarded, and that is a constraint on future writers.** The
+  page evaluates `(params->>'embed_ms')::double precision` and
+  `(params->>'over_quota')::boolean` on every row of the window that carries the
+  key. PostgreSQL raises on a value it cannot cast and the raise is not caught,
+  so a single row whose `params` carries `embed_ms: "fast"` or
+  `over_quota: "yes"` takes `/admin/performance` down with a 500 for the whole
+  window that row falls in — for every user, until it ages out. Hence the rule:
+  **`params` keys named `embed_ms`, `db_ms` and `over_quota` are reserved, and
+  anything logging them must log a number, a number, and a real boolean.** A
+  writer that wants to record something else about a phase gives it a different
+  key. (`src/services/timing.py` is the only writer today and it records floats;
+  the quota gate #162 must record a JSON boolean, not the string `"true"`.)
+
+The page's one non-`usage_logs` source is the "Recent passes" card, which reads
+`indexer_runs` (written by the indexer, see
+[indexing and embeddings](indexing-and-embeddings.md)). Its owner column is
+**joined live** from `users`, which is the opposite of the rule below and
+deliberately so: an actor is a historical fact about who made a call, so it is
+denormalised and survives the credential; an owner is a live fact about who a
+row belongs to, the FK is `ON DELETE SET NULL`, and a stored label would go on
+asserting whose vault a pass indexed after that user no longer exists.
+
+Actor attribution on the slowest-requests table is the denormalised
+`actor_*` columns first and the LEFT JOINs as the fallback — the same
+`_usage_actor` reader `/admin/usage` uses, for the same reason (#77): resolving
+by join alone renders "unknown" for precisely the credential an operator has
+just deleted and come to investigate.
