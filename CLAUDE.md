@@ -124,7 +124,7 @@ update it in the same change.** What stays here is the short list:
 
 ## MCP tools
 
-27 tools, all registered in `src/mcp_server/server.py` and all wrapped by
+25 tools, all registered in `src/mcp_server/server.py` and all wrapped by
 `_tracked`, which resolves the caller's vault root *before* the tool body runs
 — that decorator is the whole enforcement of "this user has no vault"
 ([vault roots and tenancy](docs/architecture/vault-roots-and-tenancy.md)).

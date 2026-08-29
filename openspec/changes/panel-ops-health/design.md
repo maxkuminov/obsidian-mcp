@@ -1,0 +1,29 @@
+## Context
+
+Backups are written by `make db-backup` (host-side, into `$(DATA_DIR)/backups`) — the container deliberately cannot see that directory, and the public repo must not encode host paths. `indexer_runs` arrives with `panel-performance-views` (019). Application logs go to stdout/container logs only.
+
+## Goals / Non-Goals
+
+**Goals:** one page answering "healthy?": pass history, recent errors, backup age.
+**Non-Goals:** no alerting/notifications, no log shipping or persistence of errors beyond process lifetime, no backup content verification (age only), no host-path mounts.
+
+## Decisions
+
+1. **Backup recency via DB record, not filesystem:** `backups_log(id, created_at, filename, size_bytes)` (migration 021); the `db-backup` target inserts through the same `docker exec` psql channel it already uses for `pg_dump`. **Bootstrap-safe by construction:** `make deploy` runs `db-backup` BEFORE `db-migrate`, so on the deploy that ships 021 the table does not exist yet when the backup runs. The insert is therefore guarded by a `to_regclass('public.backups_log')` existence check: table absent → skip the insert with a loud warning ("backup taken but not recorded; table arrives with migration 021"); table present → the insert MUST succeed or the target fails (backup integrity gate unweakened). The first recorded backup is the next one after 021 is live. Survives container recreation; keeps host paths out of the repo. Staleness threshold: warn at > 8 days. Alternative (mount backups read-only) rejected: host-specific compose in a public repo, and `Makefile.local` divergence.
+2. **Error surface = ring buffer handler** (`collections.deque(maxlen=100)`) attached to the root logger at ERROR level, rendered with timestamp, logger name, message (no tracebacks beyond first line — the page is a pointer, `make logs` is the tool). Process-lifetime is acceptable and stated on the page; persisting errors is observability scope creep.
+3. **Health strip on the dashboard** reuses the page's queries: last pass status from `indexer_runs`, last backup age, error count since process start.
+4. **Failure posture:** a missing `backups_log` row set renders "no backup recorded yet" (fresh installs), never an error; the page must render fully even when every section is empty.
+
+## Risks / Trade-offs
+
+- [Makefile insert fails silently] → the insert is `&&`-chained after a successful dump and its failure fails the target loudly; deploy aborts (backup is the migration safety net — CLAUDE.md already treats it as such).
+- [Ring buffer misses multi-worker errors] → single-process uvicorn today; noted in docs if that changes.
+- [Panel shows stale "healthy" after container restart clears errors] → page states the observation window ("since process start HH:MM").
+
+## Migration Plan
+
+`make test-schema`; deploy runs 021. The deploy that ships this change takes its backup BEFORE migration 021 exists, so that dump is warned-and-unrecorded; the first recorded backup is the first `db-backup` after 021 is live (the next deploy, or a manual `make db-backup`). Rollback: downgrade drops the table; page renders empty states.
+
+## Open Questions
+
+(none blocking)
