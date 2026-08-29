@@ -28,8 +28,10 @@
 
 ## 5. Post-deploy (run under supervisor control, not by the implementation agent)
 
-- [ ] 5.0 Transfer header check against a live server: diff each transfer response's headers before/after with its per-request nonce replaced by a canonical placeholder (CSP, Referrer-Policy, Cache-Control byte-identical under that canonicalization), and assert every inline style/script nonce equals that response's CSP nonce. Needs a running instance, so it cannot be exercised from the implementation worktree
+- [x] 5.0 Transfer header check against a live server: diff each transfer response's headers before/after with its per-request nonce replaced by a canonical placeholder (CSP, Referrer-Policy, Cache-Control byte-identical under that canonicalization), and assert every inline style/script nonce equals that response's CSP nonce. Needs a running instance, so it cannot be exercised from the implementation worktree
 
-- [ ] 5.1 Stand up a local instance seeded with fictional demo data (fake note paths/titles, fake key names, no real IPs/hostnames in settings view)
-- [ ] 5.2 Retake all six README screenshots in the light theme, same filenames (no README edit needed); privacy checklist: no internal IPs/URLs, no real note paths or project names, no infrastructure-revealing key names, no real client IDs
-- [ ] 5.3 Verify each new PNG against the checklist by reading the image before committing
+- [x] 5.0b Runtime browser verification of the theming machinery against a throwaway local instance (Playwright): toggle switches the document in place with no reload; an explicit choice is stamped on `<html>` before `document.body` exists, so there is no flash, and survives a reload; with no stored choice the OS preference drives the palette and an OS flip under an open page re-colors the Chart.js chart; the toggle re-colors the chart without a reload; with `localStorage` access throwing, the toggle still switches the document and logs no console error; the toggle works pre-auth on the login page and on `/authorize`. Zero console errors across every scenario
+
+- [x] 5.1 Stand up a local instance seeded with fictional demo data (fake note paths/titles, fake key names, no real IPs/hostnames in settings view)
+- [x] 5.2 Retake all six README screenshots in the light theme, same filenames (no README edit needed); privacy checklist: no internal IPs/URLs, no real note paths or project names, no infrastructure-revealing key names, no real client IDs
+- [x] 5.3 Verify each new PNG against the checklist by reading the image before committing
