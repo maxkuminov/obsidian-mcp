@@ -319,6 +319,29 @@ _CONFIRMATION_UNAVAILABLE_MARKER = "vault_confirmation_unavailable"
 # an assignment we could read could not be named.
 _ANCHOR_LOST_AT_PUBLISH_MARKER = "vault_anchor_lost_at_publish"
 
+# Markers for `find_related`'s two operational failures (#161). Both are
+# **post-body**: the body ran, resolved the vault, and queried the database —
+# so, like every other post-body marker, they must never be added to
+# `src/services/usage_stats.py`'s pre-body refusal predicate, which would drop
+# these calls out of the latency percentiles.
+#
+# They exist because those two branches used to return a plain string with no
+# marker at all, which made them indistinguishable *in the log* from a search
+# that ran and found nothing. `/admin/search-analytics` reads
+# `result_count == 0` as "the vault was asked for something it does not hold" —
+# the signature question the page exists to answer — and a source note that is
+# missing or not yet embedded is not that. It is a call that never got as far
+# as looking, and counting it as a zero-result would put the operator's own
+# typos and the indexer's backlog into the list of gaps in the vault's memory.
+#
+# Two values and not one, for the reason the classification rule gives: they
+# are different facts with different fixes. `related_source_not_found` means
+# the caller named a note that does not exist (or is not theirs);
+# `related_source_not_embedded` means the note exists and the embed pass has
+# not reached it, which resolves itself and is a fact about the indexer.
+_RELATED_SOURCE_NOT_FOUND_MARKER = "related_source_not_found"
+_RELATED_SOURCE_NOT_EMBEDDED_MARKER = "related_source_not_embedded"
+
 
 class _TrashUnusable(Exception):
     """The trash probe failed for a reason that is not `UnsupportedFilesystem`.
@@ -1727,6 +1750,13 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
     uid = current_user_id.get()
     limit = max(1, min(limit, 50))
 
+    # The grouping key for this tool's analytics, recorded before anything can
+    # return: every row this call writes — the two failures below included —
+    # has to name the source it was asked about, or the failures cannot be
+    # attributed to a note. The named `path` param is truncated at 200
+    # characters and would collapse distinct long paths onto one row.
+    timing.record_source_path(path)
+
     async with async_session() as session:
         # `db_ms` covers every database phase of this tool, the source-chunk
         # fetch included — it is accumulated, so the early returns below still
@@ -1738,6 +1768,13 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         source = (await session.execute(src_stmt)).scalar_one_or_none()
         if source is None:
             timing.add_ms("db_ms", time.monotonic() - db_start)
+            # Marked, and marked *distinctly*: this call never reached a
+            # vector query, so it is an operational failure and not a
+            # zero-result. `result_count` is still recorded so the key's type
+            # is uniform across every row this tool writes — the analytics
+            # page excludes the row on the marker, not on a missing key.
+            timing.record("error", _RELATED_SOURCE_NOT_FOUND_MARKER)
+            timing.record_results(())
             return f"Note not found: {path}"
 
         chunks = (await session.execute(
@@ -1745,6 +1782,12 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         )).scalars().all()
         timing.add_ms("db_ms", time.monotonic() - db_start)
         if not chunks:
+            # The other operational failure: the note is there, the embed pass
+            # has not reached it. A fact about the indexer, not about the
+            # vault's contents, so it carries its own marker and stays out of
+            # the zero-result view.
+            timing.record("error", _RELATED_SOURCE_NOT_EMBEDDED_MARKER)
+            timing.record_results(())
             return (
                 f"`{path}` has not been embedded yet — "
                 "the indexer is still catching up. Try again in a few minutes."
@@ -1793,6 +1836,11 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         rows = sorted(rows, key=lambda r: r.distance)
 
     if not rows:
+        # A **true** zero-result: the source exists, it is embedded, the exact
+        # fallback has already re-run the query, and the vault holds nothing
+        # near it. No marker — this is precisely the row the zero-result view
+        # is built to count.
+        timing.record_results(())
         return f"No related notes for `{path}`"
 
     # Dedupe by note_id, keeping the nearest chunk — ranked by the *same*
@@ -1816,6 +1864,9 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
             }
 
     ranked = sorted(best.values(), key=lambda x: x["distance"])[:limit]
+    # After the dedupe and the truncation to `limit`: the telemetry names what
+    # the caller was handed, not what the overfetch scanned.
+    timing.record_results(r["path"] for r in ranked)
     lines = [f"Top {len(ranked)} related notes for `{path}`:\n"]
     for r in ranked:
         tags_str = f" [{', '.join(r['tags'])}]" if r["tags"] else ""

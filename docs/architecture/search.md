@@ -126,3 +126,52 @@ lives in a service module only to avoid an import cycle (`tools` imports
 return types are unchanged — a direct call outside a tracked tool finds no
 holder and records nothing. No migration: `params` is JSONB.
 
+## Search result telemetry (#161)
+
+The same holder carries what a search *returned*, which is what
+`/admin/search-analytics` reads. Three keys, written by
+`timing.record_results` / `timing.record_source_path` in the place where each
+tool's result set is final — `full_text_search` (`src/services/search.py`),
+`semantic_search` (`src/services/embeddings.py`), and `find_related_impl`
+itself, after its dedupe and truncation to `limit`, so the telemetry names what
+the caller was handed and not what the overfetch scanned.
+
+- **`result_count`** — an int, always, and the **full** count. Not the number
+  of paths that fit the budget below: the zero-result view reads this value,
+  and a count clipped to the logging cap would report a search that found forty
+  notes as having found ten.
+- **`result_paths`** — at most the first `MAX_RESULT_PATHS` (10) paths, and at
+  most `MAX_RESULT_PATHS_BYTES` (2048) bytes of UTF-8 JSON for the value,
+  dropping paths **from the end** so what is logged stays a prefix of a ranked
+  list. A path that does not fit is dropped whole, never cut: a truncated path
+  names a note that does not exist, and it would land in the coverage ranking
+  as a real retrieval.
+- **`source_path`** (`find_related` only) — the grouping key for that tool's
+  analytics, recorded before anything can return so that the two failure
+  branches carry it too. The full path when it is at most
+  `MAX_SOURCE_PATH_BYTES` (1024) bytes, otherwise its sha256 hex digest. The
+  named `path` param cannot serve: `_truncate_params` cuts it at 200
+  characters, so two distinct long paths would collapse onto one row.
+
+**The budget is enforced at the record site, and it has to be.** `_tracked`
+builds its logged params as `_truncate_params(named args)` and *then*
+`update()`s the timing holder over the top — merged telemetry never meets the
+generic 200-character truncation, so there is no backstop downstream. A
+regression here does not fail a call; it writes a params blob orders of
+magnitude larger than every other row in `usage_logs`.
+
+**`find_related`'s two operational failures are marked** (`params.error`):
+`related_source_not_found` and `related_source_not_embedded`. Both branches
+used to return a plain string with no marker at all, which left them
+indistinguishable *in the log* from a call that ran and found nothing — and
+"the vault holds nothing near this note" is the one the analytics page exists
+to count. Both are **post-body** markers; the classification rule and what that
+implies live in [usage attribution](usage-attribution.md). A source that exists,
+is embedded, and has no neighbours after the exact fallback stays a true
+zero-result: `result_count` 0, no marker.
+
+Reading side: `src/services/search_analytics.py` and
+`/admin/search-analytics`. Its identity rule — every grouping and coverage join
+keys on `(usage_logs.user_id, path)` with `IS NOT DISTINCT FROM` — is written
+down there and in [usage attribution](usage-attribution.md).
+

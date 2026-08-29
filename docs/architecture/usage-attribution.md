@@ -163,6 +163,23 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   string; a new value costs nothing and a shared one mis-measures in a
   direction nobody can see from the page.
 
+  **The register, as of #161.** Pre-body: `no_vault_assigned`,
+  `argument_not_encodable`, and the boolean `over_quota` (#162). Post-body:
+  `vault_assignment_changed`, `vault_confirmation_unavailable`,
+  `vault_anchor_lost_at_publish`, and `find_related`'s two operational
+  failures, `related_source_not_found` and `related_source_not_embedded`.
+  Those last two were classified by the rule above and land on the post-body
+  side: the body ran, resolved the vault and queried the database before
+  either branch could be reached, so enumerating them as refusals would drop a
+  real database round trip out of the percentiles. They are two values rather
+  than one because they are different facts with different fixes — a caller
+  naming a note that does not exist, and the embed pass not having reached a
+  note that does. They exist at all because those branches used to log
+  nothing: a `find_related` that never got as far as looking was
+  indistinguishable in the log from one that looked and found nothing, and
+  `/admin/search-analytics` reads the second as the signature fact about what
+  a vault does not hold. The marker is what keeps the first out of that count.
+
   Both halves are `COALESCE(..., false)`: `params` is nullable and `->>` on a
   missing key yields NULL, so without them the negation used by the executed
   filter would be NULL and PostgreSQL would drop every ordinary row on the
@@ -207,3 +224,45 @@ Actor attribution on the slowest-requests table is the denormalised
 `_usage_actor` reader `/admin/usage` uses, for the same reason (#77): resolving
 by join alone renders "unknown" for precisely the credential an operator has
 just deleted and come to investigate.
+
+
+## Search result telemetry (#161)
+
+The search tools record three more `params` keys — `result_count`,
+`result_paths` and (`find_related` only) `source_path` — through the same
+`timing` holder the phase timings ride on. The contract, the byte budget and
+why the budget is enforced at the record site rather than downstream are
+written down in [search](search.md); what belongs here is what they mean for
+this table.
+
+- **They are reserved keys with declared types**, for the reason `embed_ms`,
+  `db_ms` and `over_quota` are: a reader casts and unnests them.
+  `result_count` is an int, `result_paths` a JSON array of strings,
+  `source_path` a string. A writer with something else to say about a result
+  set uses a different key.
+- **The reader guards its casts anyway.** The performance page's casts are
+  unguarded and that is a standing constraint on future writers; the analytics
+  page took the other half of the deal as well — it tests
+  `params->>'result_count'` against an integer pattern and
+  `jsonb_typeof(params->'result_paths') = 'array'` before reading either. Both
+  belts, because the failure mode is a 500 on the whole window for every user
+  until the bad row ages out, and the search keys are written on the hottest
+  read path in the server.
+- **`_truncate_params` does not see them.** `_tracked` truncates the *named*
+  arguments and then merges the holder over the top. That is why the paths
+  value carries its own 10-path / 2048-byte bound, and why `find_related`'s
+  grouping key is the separate `source_path` and not the named `path`, which
+  is cut at 200 characters and would collapse distinct long paths onto one row.
+
+**The identity rule for anything reading these keys: `(usage_logs.user_id,
+path)`, matched NULL-safely.** A path is unique only within an owner —
+`uq_notes_metadata_user_id_file_path` says so in the schema, with
+`NULLS NOT DISTINCT` — so `Daily/2026-08-29.md` names a different note in each
+user's vault. A grouping or coverage join on the path alone would merge two
+tenants' analytics into one row and tell each of them things about the other's
+vault. `IS NOT DISTINCT FROM` rather than `=` because both sides are nullable
+and both are NULL in exactly the shape that matters most: single-user mode
+writes NULL on every log row and every note, and `usage_logs.user_id` is
+`ON DELETE SET NULL`, so a deleted user's rows join the ownerless slice rather
+than vanishing. That is the honest reading — those rows *are* now unattributed
+— and it is the same treatment the ownerless indexer passes get.

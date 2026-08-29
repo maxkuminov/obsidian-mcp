@@ -2,6 +2,7 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.db import NoteMetadata
+from src.services import timing
 from src.services.filters import apply_note_filters
 from src.services.fts import combined_tsquery
 
@@ -50,7 +51,7 @@ async def full_text_search(
 
     result = await session.execute(stmt)
     rows = result.all()
-    return [
+    results = [
         {
             "path": nm.file_path,
             "title": nm.title,
@@ -59,3 +60,10 @@ async def full_text_search(
         }
         for nm, row_rank in rows
     ]
+    # Result telemetry, recorded where the result set is final (#161). The
+    # bounds live in `timing.record_results`, which is the record site the
+    # `_tracked` merge cannot truncate — see `src/services/timing.py`. Outside
+    # a tracked tool call (the panel, the benchmarks) there is no holder and
+    # this is a no-op.
+    timing.record_results(r["path"] for r in results)
+    return results

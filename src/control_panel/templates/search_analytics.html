@@ -1,0 +1,264 @@
+{% extends "base.html" %}
+{% block title %}Search analytics — Obsidian MCP{% endblock %}
+{% block content %}
+
+{#
+  Every color on this page comes from a token defined in `_theme.html`; there
+  are no literals here. See docs/architecture/control-panel.md — "one token
+  source, dark canonical". The light-mode change's
+  `checks/literal_sweep.py` is what enforces it.
+#}
+
+{#
+  The logging cap, written once and rendered beside *both* coverage sections.
+  It is the difference between a measurement and a claim: only the first
+  {{ logged_per_call }} results of each call reach `usage_logs`, so the ranking
+  counts appearances within that prefix and the never-retrieved list is an
+  upper bound. One `set` rather than two paragraphs so the two cannot drift —
+  a caveat that is only on one of them is worse than none, because it makes
+  the unlabelled list look exact by contrast.
+#}
+{% set cap_caveat %}
+Only the first {{ logged_per_call }} results of each call are recorded, so both
+lists below are bounded by what the log can see: the ranking counts appearances
+<em>within those first {{ logged_per_call }}</em>, not every time a note was
+returned, and a note can sit in the never-retrieved list having been returned
+further down a result list than the log keeps.
+{% endset %}
+
+{% macro group_cell(row) -%}
+    {% if row.label.is_digest %}
+        {# A source path over the telemetry contract's 1024-byte bound is
+           recorded as its sha256 digest, so the grouping stays non-colliding.
+           Rendered as 64 unmarked hex characters it would read as a note. #}
+        <span class="mono" style="font-size:11px;color:var(--text-3);"
+              title="This source path was too long to log whole, so it is grouped by its sha256 digest.">digest {{ row.label.text[:16] }}…</span>
+    {% else %}
+        <span class="mono" style="font-size:12px;color:var(--primary-text);word-break:break-word;">{{ row.label.text }}</span>
+    {% endif %}
+    {% if show_owner %}
+        <div class="mono" style="font-size:10px;color:var(--text-3);">
+            {% if row.owner %}{{ row.owner }}{% elif row.user_id %}user #{{ row.user_id }}{% else %}no owner{% endif %}
+        </div>
+    {% endif %}
+{%- endmacro %}
+
+{% macro group_tables(table, key_header) %}
+<div class="card anim-2" style="margin-bottom:20px;">
+    <div class="card-header">
+        <span class="card-title">{{ table.label }}</span>
+        <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
+    </div>
+    <div class="table-scroll">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>{{ key_header }}</th>
+                <th style="text-align:right;">Calls</th>
+                <th style="text-align:right;" title="Mean number of notes returned, over the calls that recorded a result count.">Mean results</th>
+                <th style="text-align:right;" title="Calls in this window that returned nothing.">Empty</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in table.top %}
+            <tr>
+                <td>{{ group_cell(row) }}</td>
+                <td class="mono" style="text-align:right;font-size:12px;">{{ row.calls }}</td>
+                {# NULL mean: no call in this group recorded a result count —
+                   every one predates the telemetry. An em dash says "not
+                   measured"; a 0 would say "this search finds nothing". #}
+                <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if row.mean_results is not none %}{{ row.mean_results }}{% else %}<span style="color:var(--text-3);" title="No call in this group recorded a result count.">—</span>{% endif %}</td>
+                <td class="mono" style="text-align:right;font-size:12px;">
+                    {% if row.zero_calls %}<span class="badge badge-yellow">{{ row.zero_calls }}</span>{% else %}<span style="color:var(--text-3);">0</span>{% endif %}
+                </td>
+            </tr>
+            {% endfor %}
+            {% if not table.top %}
+            <tr><td colspan="4" style="text-align:center;padding:32px;color:var(--text-3);">No {{ table.label | lower }} calls with recorded results in this window.</td></tr>
+            {% endif %}
+        </tbody>
+    </table>
+    </div>
+
+    <div class="card-body">
+        <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0 0 8px;">
+            <strong style="color:var(--text-2);">Came back empty.</strong>
+            Searches that ran to completion and found nothing — memory the vault
+            was asked for and does not hold. Calls that failed before producing
+            a result set are excluded: a refused call, and for related-notes a
+            source that is missing or not yet embedded, are not the same fact.
+        </p>
+    </div>
+    <div class="table-scroll">
+    <table class="data-table">
+        <thead>
+            <tr>
+                <th>{{ key_header }}</th>
+                <th style="text-align:right;">Empty calls</th>
+                <th style="text-align:right;">Total calls</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for row in table.zero %}
+            <tr>
+                <td>{{ group_cell(row) }}</td>
+                <td class="mono" style="text-align:right;font-size:12px;"><span class="badge badge-yellow">{{ row.zero_calls }}</span></td>
+                <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ row.calls }}</td>
+            </tr>
+            {% endfor %}
+            {% if not table.zero %}
+            <tr><td colspan="3" style="text-align:center;padding:24px;color:var(--text-3);">Nothing came back empty in this window.</td></tr>
+            {% endif %}
+        </tbody>
+    </table>
+    </div>
+</div>
+{% endmacro %}
+
+<div class="page-top">
+    <h1 class="page-title">Search analytics</h1>
+</div>
+
+<div class="page-body">
+
+    <!-- Window selector -->
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:20px;">
+        <span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-2);">Window</span>
+        {% for w in windows %}
+        <a href="/admin/search-analytics?window={{ w.key }}"
+           class="btn {% if w.selected %}btn-primary{% else %}btn-ghost{% endif %}"
+           style="padding:6px 14px;font-size:12px;"
+           {% if w.selected %}aria-current="page"{% endif %}>{{ w.label }}</a>
+        {% endfor %}
+        <span style="font-size:12px;color:var(--text-3);margin-left:4px;">{{ window_label }}</span>
+    </div>
+
+    {% if not has_data %}
+    <div class="card anim-1" style="margin-bottom:20px;">
+        <div class="card-body">
+            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+                No searches with recorded results were logged in this window.
+                Result telemetry starts at the first search after the deploy
+                that added it, so a window reaching further back than that will
+                look emptier than it was — pick a shorter window, run a search,
+                and reload.
+            </p>
+        </div>
+    </div>
+    {% endif %}
+
+    {% for table in query_tables %}
+        {{ group_tables(table, "Query") }}
+    {% endfor %}
+
+    {#
+      `find_related` takes a note, not a query, so it gets the same two tables
+      keyed by its source note. The grouping value is the `source_path`
+      telemetry key rather than the named `path` param, which is truncated at
+      200 characters in the log and would collapse distinct long paths onto one
+      row.
+    #}
+    {{ group_tables(related, "Source note") }}
+
+    <!-- Retrieval coverage -->
+    <div class="card anim-3" style="margin-bottom:20px;">
+        <div class="card-header">
+            <span class="card-title">Top-logged retrievals</span>
+            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
+        </div>
+        <div class="card-body">
+            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0;">{{ cap_caveat }}</p>
+        </div>
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Note</th>
+                    <th style="text-align:right;" title="Times this note appeared in the first {{ logged_per_call }} logged results of a call.">Logged appearances</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in retrievals %}
+                <tr>
+                    <td>
+                        <span class="mono" style="font-size:12px;color:var(--primary-text);word-break:break-word;">{{ row.path }}</span>
+                        {% if not row.indexed %}
+                            {# The path was retrieved in this window but no note
+                               with that path exists for that owner now: renamed
+                               or deleted since. Said plainly rather than shown
+                               as an ordinary row. #}
+                            <span class="badge badge-gray" title="No indexed note has this path for this owner any more — renamed or deleted since it was retrieved.">not in index</span>
+                        {% endif %}
+                        {% if show_owner %}
+                        <div class="mono" style="font-size:10px;color:var(--text-3);">
+                            {% if row.owner %}{{ row.owner }}{% elif row.user_id %}user #{{ row.user_id }}{% else %}no owner{% endif %}
+                        </div>
+                        {% endif %}
+                    </td>
+                    <td class="mono" style="text-align:right;font-size:12px;">{{ row.appearances }}</td>
+                </tr>
+                {% endfor %}
+                {% if not retrievals %}
+                <tr><td colspan="2" style="text-align:center;padding:32px;color:var(--text-3);">No search in this window logged a result path.</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+    <div class="card anim-3">
+        <div class="card-header">
+            <span class="card-title">Never retrieved</span>
+            <span class="mono" style="font-size:11px;color:var(--text-3);">
+                {% if never_retrieved_total > never_retrieved | length %}
+                    showing {{ never_retrieved | length }} of {{ never_retrieved_total }}
+                {% else %}
+                    {{ never_retrieved_total }} note{{ '' if never_retrieved_total == 1 else 's' }}
+                {% endif %}
+            </span>
+        </div>
+        <div class="card-body">
+            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0;">{{ cap_caveat }}</p>
+            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:8px 0 0;">
+                Indexed notes that appear in no logged result of this window.
+                An <strong style="color:var(--text-2);">upper bound</strong> on
+                what retrieval is missing, not a list of dead notes — the longer
+                the window, the closer it gets.
+            </p>
+        </div>
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Note</th>
+                    <th>Title</th>
+                    <th style="text-align:right;">Modified</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in never_retrieved %}
+                <tr>
+                    <td>
+                        <span class="mono" style="font-size:12px;color:var(--primary-text);word-break:break-word;">{{ row.path }}</span>
+                        {% if show_owner %}
+                        <div class="mono" style="font-size:10px;color:var(--text-3);">
+                            {% if row.owner %}{{ row.owner }}{% elif row.user_id %}user #{{ row.user_id }}{% else %}no owner{% endif %}
+                        </div>
+                        {% endif %}
+                    </td>
+                    <td style="font-size:12px;color:var(--text-2);">{{ row.title }}</td>
+                    <td class="mono" style="text-align:right;font-size:11px;color:var(--text-2);">
+                        {% if row.modified_at %}<time datetime="{{ row.modified_at }}" data-localize>{{ row.modified_at }}</time>{% else %}<span style="color:var(--text-3);">—</span>{% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not never_retrieved %}
+                <tr><td colspan="3" style="text-align:center;padding:32px;color:var(--text-3);">Every indexed note appeared in at least one logged result in this window.</td></tr>
+                {% endif %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+</div>
+{% endblock %}

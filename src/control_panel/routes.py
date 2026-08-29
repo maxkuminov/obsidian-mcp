@@ -44,6 +44,17 @@ from src.oauth.scope import (
     token_has_write,
 )
 from src.services.indexer import invalidate_hnsw_index_cache
+from src.services.search_analytics import (
+    COVERAGE_LIMIT,
+    LOGGED_RESULTS_PER_CALL,
+    QUERY_TOOLS,
+    RELATED_TOOL,
+    TABLE_LIMIT,
+    never_retrieved,
+    top_logged_retrievals,
+    top_queries,
+    zero_result_queries,
+)
 from src.services.usage_stats import (
     RECENT_RUNS_LIMIT,
     WINDOW_LABELS,
@@ -1320,6 +1331,117 @@ async def performance_page(
             # deploy, a quiet weekend) and gets its own copy rather than a
             # table of zeroes that reads like a measurement.
             "has_data": any(t["executed"] or t["refusals"] for t in tools),
+        }),
+    )
+
+
+# --- Search analytics -----------------------------------------------------
+
+
+#: How the page labels each search tool. `find_related` is kept out of
+#: `QUERY_TOOLS` and rendered separately because it has no query — its tables
+#: are grouped by source note.
+_SEARCH_TOOL_LABELS = {
+    "keyword_search": "Keyword search",
+    "semantic_search": "Semantic search",
+    "find_related": "Related notes",
+}
+
+#: A `source_path` recorded as a digest rather than a path (over the telemetry
+#: contract's 1024-byte bound). Labelled as such on the page: showing 64 hex
+#: characters in a column of note paths, unmarked, would read as a note.
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _label_group_value(tool: str, value: str) -> dict:
+    """Render one grouping value: the query text, or a source path/digest."""
+    if tool != RELATED_TOOL:
+        return {"text": value, "is_digest": False}
+    return {"text": value, "is_digest": bool(_DIGEST_RE.match(value or ""))}
+
+
+@router.get("/search-analytics", response_class=HTMLResponse)
+async def search_analytics_page(
+    request: Request,
+    window: str | None = None,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    """What agents searched for, what came back empty, and what retrieval never
+    surfaced — over a selectable window.
+
+    Read-only aggregation over the search result telemetry in
+    `usage_logs.params`; the SQL, the `(user_id, path)` identity rule and the
+    reason the error filter is broad here and enumerated on
+    `/admin/performance` all live in `src/services/search_analytics.py`.
+
+    Scoped exactly like `/admin/performance`: an admin sees every row — grouped
+    per owner, never merged, because a path names a different note in each
+    user's vault — and a regular user only their own. `window` is clamped
+    rather than validated, so a hand-edited query string renders the page.
+    """
+    uid = _scope_user_id(user)
+    window = normalize_window(window)
+
+    query_tables = []
+    for tool in QUERY_TOOLS:
+        top = await top_queries(session, window, uid, tool)
+        zero = await zero_result_queries(session, window, uid, tool)
+        query_tables.append({
+            "tool": tool,
+            "label": _SEARCH_TOOL_LABELS[tool],
+            "top": [dict(r, label=_label_group_value(tool, r["value"])) for r in top],
+            "zero": [dict(r, label=_label_group_value(tool, r["value"])) for r in zero],
+        })
+
+    related = {
+        "tool": RELATED_TOOL,
+        "label": _SEARCH_TOOL_LABELS[RELATED_TOOL],
+        "top": [
+            dict(r, label=_label_group_value(RELATED_TOOL, r["value"]))
+            for r in await top_queries(session, window, uid, RELATED_TOOL)
+        ],
+        "zero": [
+            dict(r, label=_label_group_value(RELATED_TOOL, r["value"]))
+            for r in await zero_result_queries(session, window, uid, RELATED_TOOL)
+        ],
+    }
+
+    retrievals = await top_logged_retrievals(session, window, uid)
+    missing, missing_total = await never_retrieved(session, window, uid)
+
+    tables = [*query_tables, related]
+    # The owner column earns its place only when the page is actually showing
+    # more than one owner's rows. In single-user mode every row is ownerless,
+    # and a column of "no owner" is noise that pushes the paths off the side.
+    owners = {
+        row["user_id"]
+        for table in tables
+        for row in (*table["top"], *table["zero"])
+    } | {row["user_id"] for row in (*retrievals, *missing)}
+    has_data = any(table["top"] for table in tables) or bool(retrievals)
+
+    return templates.TemplateResponse(
+        request,
+        "search_analytics.html",
+        _panel_context(request, user, {
+            "active": "search-analytics",
+            "window": window,
+            "window_label": WINDOW_LABELS[window],
+            "windows": [
+                {"key": key, "label": key, "selected": key == window}
+                for key in WINDOWS
+            ],
+            "query_tables": query_tables,
+            "related": related,
+            "retrievals": retrievals,
+            "never_retrieved": missing,
+            "never_retrieved_total": missing_total,
+            "table_limit": TABLE_LIMIT,
+            "coverage_limit": COVERAGE_LIMIT,
+            "logged_per_call": LOGGED_RESULTS_PER_CALL,
+            "show_owner": len(owners) > 1,
+            "has_data": has_data,
         }),
     )
 
