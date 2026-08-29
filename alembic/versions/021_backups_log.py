@@ -89,12 +89,29 @@ is compared against `nextval` on the sequence `pg_get_serial_sequence` says the
 column actually owns, both sides rendered by the server so neither is a guess
 about the schema prefix.
 
-**Every catalog lookup resolves `public.backups_log`, qualified.** The writer
-and the panel both name it that way, and an unqualified reference resolves
-through `search_path` — so the three could otherwise be addressing three
-different tables. `op.create_table` still takes no schema (matching 019/020),
-so `upgrade()` asserts afterwards that what it created is the object those two
-consumers address, and `downgrade()` asserts the same before it drops anything.
+## search_path
+
+The writer (`docker/record-backup.sh`) and the panel
+(`src/services/ops_health.py`) both name `public.backups_log` explicitly, so
+this revision has to put the table where those two look. Three layers, in order
+of who does the work:
+
+1. **`upgrade()` and `downgrade()` pin `SET LOCAL search_path TO public`
+   first.** That is what makes the unqualified DDL — `op.create_table`,
+   `op.create_index`, `COMMENT ON`, `op.drop_index`, `op.drop_table` — land in
+   and act on `public`. Pinning rather than passing `schema="public"` to each
+   `op.*` call is deliberate: a schema-qualified table in alembic's eyes does
+   not match a model that declares no schema, and `alembic check` would report
+   drift forever after. Both `RESET` it at the end, because alembic runs every
+   pending revision in one transaction and `SET LOCAL` would otherwise leak
+   into a later one (013 through 020 do the same for their timeouts).
+2. **Every catalog lookup here resolves the qualified name** rather than
+   trusting the pin, so what is verified is what the consumers address.
+3. **`upgrade()` asserts afterwards that what it created really is
+   `public.backups_log`, and `downgrade()` asserts it before dropping
+   anything.** Belt and braces: if the pin ever fails to take effect, this
+   fails closed instead of silently recording backups into a table the panel
+   never reads.
 
 ## Locks
 
@@ -441,6 +458,31 @@ def _check_problems(bind) -> list:
     return problems
 
 
+def _pin_search_path() -> None:
+    """Pin `search_path` to `public` for the rest of this transaction.
+
+    **This is the fix for the unqualified DDL, and it is deliberately a pin
+    rather than a set of qualified `op.*` calls.** `op.create_table`,
+    `op.create_index`, `COMMENT ON`, `op.drop_index` and `op.drop_table` all
+    resolve through `search_path`; giving each one `schema="public"` would make
+    the table a *schema-qualified* object in alembic's eyes, and the ORM model
+    declares no schema — so autogenerate would then see the model and the
+    database disagree and `alembic check` would never be clean again. Pinning
+    the path instead makes the unqualified names resolve to `public` while
+    leaving both sides schema-less, which is the state `alembic check` is
+    happy with.
+
+    `SET LOCAL` is transaction-scoped, and that is exactly how this migration
+    runs: `alembic/env.py` configures an online migration on a real connection
+    inside `context.begin_transaction()` with no `transaction_per_migration`,
+    so every pending revision executes in one transaction. That is the same
+    property 013 through 020 already depend on for `lock_timeout` — and the
+    same reason `upgrade()` and `downgrade()` `RESET` it at the end, so a later
+    revision in that shared transaction does not silently inherit it.
+    """
+    op.execute("SET LOCAL search_path TO public")
+
+
 def _assert_is_the_qualified_table(bind) -> None:
     """What `op.create_table` just made is what the writer and reader address.
 
@@ -561,6 +603,7 @@ def upgrade() -> None:
     # statement and per lock acquisition, not a budget for the transaction.
     op.execute("SET LOCAL lock_timeout = '10s'")
     op.execute("SET LOCAL statement_timeout = '60s'")
+    _pin_search_path()
 
     if _table_exists(bind):
         _verify(bind)
@@ -573,9 +616,10 @@ def upgrade() -> None:
 
     # `SET LOCAL` is scoped to the transaction and alembic runs every pending
     # revision in *one*, so without this the next revision would silently
-    # inherit these timeouts and blame its own SQL when it tripped them.
+    # inherit these settings and blame its own SQL when it tripped them.
     op.execute("RESET lock_timeout")
     op.execute("RESET statement_timeout")
+    op.execute("RESET search_path")
 
 
 def downgrade() -> None:
@@ -592,10 +636,14 @@ def downgrade() -> None:
     fresh history.
     """
     bind = op.get_bind()
+    # `op.drop_index` / `op.drop_table` resolve through `search_path`, so the
+    # path is pinned here for the same reason `upgrade()` pins it — and the
+    # identity assertion below stays as the belt-and-braces check that the pin
+    # took effect before anything is dropped.
+    _pin_search_path()
     if not _table_exists(bind):
+        op.execute("RESET search_path")
         return
-    # `op.drop_table` resolves through `search_path`; every check above resolved
-    # `public.backups_log`. Refuse rather than drop a table we did not inspect.
     _assert_is_the_qualified_table(bind)
     if _table_comment(bind) != MARKER:
         raise RuntimeError(
@@ -605,3 +653,4 @@ def downgrade() -> None:
         )
     op.drop_index(CREATED_INDEX, table_name=TABLE)
     op.drop_table(TABLE)
+    op.execute("RESET search_path")

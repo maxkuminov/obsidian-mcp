@@ -509,6 +509,26 @@ def test_the_writer_and_the_reader_name_the_same_qualified_table():
     assert '{"table": TABLE}' not in migration, (
         "every catalog lookup resolves the qualified name"
     )
+    # The DDL itself is unqualified on purpose — a schema-qualified table does
+    # not match a model that declares none, and `alembic check` would report
+    # drift forever after. What makes it land in public is the pin.
+    assert "SET LOCAL search_path TO public" in migration
+    assert migration.count("RESET search_path") >= 2, (
+        "both upgrade() and downgrade() must reset it: alembic runs every "
+        "pending revision in one transaction, so SET LOCAL would leak"
+    )
+    # No `op.*` call may carry a `schema=` keyword. Checked on the parse tree,
+    # not the text: the docstring above explains at length why it must not,
+    # and a substring search would match that explanation.
+    import ast
+
+    schema_kwargs = [
+        node
+        for node in ast.walk(ast.parse(migration))
+        if isinstance(node, ast.Call)
+        and any(kw.arg == "schema" for kw in node.keywords)
+    ]
+    assert schema_kwargs == []
 
 
 # --------------------------------------------------------------------------

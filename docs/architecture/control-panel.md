@@ -156,14 +156,20 @@
   differs between the repo default and the real host's `Makefile.local`, and a
   host path does not belong in a shared table.
 
-- **Writer, reader and migration all name `public.backups_log`, qualified.** An
-  unqualified reference resolves through `search_path`, so a role or database
+- **Writer, reader and migration all resolve `public.backups_log`.** An
+  unqualified reference goes through `search_path`, so a role or database
   pointing elsewhere would have the three addressing different tables — and the
   failure is silent in the worst direction: backups recorded into a table the
   panel never reads, so the page warns that none have been taken while one is
-  taken daily. `op.create_table` still takes no schema (matching 019/020), so
-  migration 021 asserts afterwards that what it created is the object the other
-  two address, and asserts it again before `downgrade()` drops anything.
+  taken daily. The writer's INSERT and the panel's SELECT name it explicitly.
+  Migration 021 instead **pins the path** — `SET LOCAL search_path TO public` at
+  the top of `upgrade()` and `downgrade()`, `RESET` at the end because alembic
+  runs every pending revision in one transaction. Pinning and not
+  `schema="public"` on each `op.*` call: a schema-qualified table does not match
+  an ORM model that declares no schema, and `alembic check` would then report
+  drift forever. Its catalog lookups still resolve the qualified name, and it
+  asserts after creating (and before dropping) that the object really is
+  `public.backups_log`, so a pin that failed to take effect fails closed.
 
 - **The recording guard has three branches and they do not agree, deliberately.**
   `make deploy` runs `db-backup` *before* `db-migrate` — the backup is the only

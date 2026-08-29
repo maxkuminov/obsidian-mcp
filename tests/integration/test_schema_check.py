@@ -3548,7 +3548,8 @@ def backups_log_comment(url):
     return fetchval(
         url,
         "SELECT obj_description(c.oid, 'pg_class') FROM pg_class c "
-        "WHERE c.relname = 'backups_log' AND c.relkind = 'r'",
+        "WHERE c.relname = 'backups_log' AND c.relkind = 'r' "
+        "  AND c.relnamespace = 'public'::regnamespace",
     )
 
 
@@ -3558,7 +3559,7 @@ def backups_size_check(url):
         url,
         "SELECT pg_get_constraintdef(oid) AS def, convalidated "
         "FROM pg_constraint "
-        "WHERE conrelid = 'backups_log'::regclass AND contype = 'c' "
+        "WHERE conrelid = 'public.backups_log'::regclass AND contype = 'c' "
         "  AND conname = $1",
         BACKUPS_CHECK_NAME,
     )
@@ -3589,7 +3590,7 @@ def backups_index_columns(url, name=BACKUPS_INDEX):
         "                WITH ORDINALITY AS k(attnum, ord) "
         "     JOIN pg_attribute a ON a.attrelid = i.indrelid "
         "                        AND a.attnum = k.attnum::smallint "
-        "WHERE i.indrelid = 'backups_log'::regclass AND ic.relname = $1 "
+        "WHERE i.indrelid = 'public.backups_log'::regclass AND ic.relname = $1 "
         "GROUP BY ic.relname",
         name,
     )
@@ -3826,6 +3827,61 @@ def test_021_refuses_an_id_that_no_longer_draws_from_its_sequence():
     with throwaway_db("schema_backups_id_default") as url:
         sql(url, "ALTER TABLE backups_log ALTER COLUMN id DROP DEFAULT")
         refuse_021(url, must_mention=["id"])
+
+
+def test_021_creates_in_public_under_a_redirected_search_path():
+    """The migration itself run with `search_path` pointing somewhere else.
+
+    Unqualified DDL resolves through `search_path`, so without the pin
+    `op.create_table` would put the table in `decoy` — where
+    `docker/record-backup.sh` (which INSERTs into `public.backups_log`) and the
+    panel (which SELECTs from it) would never find it. The failure is silent in
+    the worst direction: the target records backups into a table the page never
+    reads, so the page warns that none have been taken while one is taken daily.
+
+    The pin is `SET LOCAL search_path TO public`, which is transaction-scoped —
+    and `alembic/env.py` runs every pending revision inside one transaction, the
+    same property 013 through 020 rely on for `lock_timeout`. This case is what
+    proves that holds in this environment rather than asserting it.
+    """
+    with throwaway_db("schema_backups_path", revision="020") as url:
+        dbname = fetchval(url, "SELECT current_database()")
+        sql(url, "CREATE SCHEMA decoy")
+        sql(url, f'ALTER DATABASE "{dbname}" SET search_path TO decoy, public')
+        # A *new* connection is what alembic will open, so confirm the redirect
+        # is actually in force for one before believing the rest of this case.
+        assert fetchval(url, "SHOW search_path") == "decoy, public"
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT to_regclass('public.backups_log')") is not None
+        assert fetchval(url, "SELECT to_regclass('decoy.backups_log')") is None, (
+            "the table must land where the writer and the panel look, not first "
+            "on the search path"
+        )
+        # The index and the comment are separate unqualified statements, so
+        # they are checked separately rather than assumed to have followed.
+        assert backups_log_comment(url) == BACKUPS_TABLE_MARKER
+        assert backups_index_columns(url) == ["created_at"]
+        assert backups_pk(url) == ["id"]
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM pg_class c "
+            "WHERE c.relnamespace = 'decoy'::regnamespace",
+        ) == 0, "nothing at all was created in the decoy schema"
+
+        # The pin is `SET LOCAL`, so it must not have outlived the transaction.
+        assert fetchval(url, "SHOW search_path") == "decoy, public"
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+        # And the downgrade drops from public, not from wherever the path points.
+        _harness.run_alembic(url, "downgrade", "020", dimensions=DIM)
+        assert fetchval(url, "SELECT to_regclass('public.backups_log')") is None
 
 
 def test_downgrade_021_removes_the_table_and_upgrade_rebuilds_it():
