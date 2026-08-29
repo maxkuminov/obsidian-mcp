@@ -4,9 +4,9 @@
 
 ## 2. Panel
 
-- [ ] 2.1 Search-analytics page: top queries + zero-result queries for keyword/semantic search; find_related tables grouped by source path; window selector; error/refusal rows excluded
-- [ ] 2.2 Coverage section: top-logged retrievals (labeled as first-10-logged appearances) / never-retrieved, cap caveat beside both
-- [ ] 2.3 Nav entry; theme token partial
+- [x] 2.1 Search-analytics page: top queries + zero-result queries for keyword/semantic search; find_related tables grouped by source path; window selector; error/refusal rows excluded
+- [x] 2.2 Coverage section: top-logged retrievals (labeled as first-10-logged appearances) / never-retrieved, cap caveat beside both
+- [x] 2.3 Nav entry; theme token partial
 
 ## 3. Docs and verification
 
