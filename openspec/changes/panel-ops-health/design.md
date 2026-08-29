@@ -22,7 +22,7 @@ Backups are written by `make db-backup` (host-side, into `$(DATA_DIR)/backups`) 
 
 ## Migration Plan
 
-`make test-schema`; deploy runs 021. The first backup row appears on the deploy that ships this change (its own `db-backup` step). Rollback: downgrade drops the table; page renders empty states.
+`make test-schema`; deploy runs 021. The deploy that ships this change takes its backup BEFORE migration 021 exists, so that dump is warned-and-unrecorded; the first recorded backup is the first `db-backup` after 021 is live (the next deploy, or a manual `make db-backup`). Rollback: downgrade drops the table; page renders empty states.
 
 ## Open Questions
 

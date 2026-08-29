@@ -5,7 +5,7 @@ Agents are ~80% of vault traffic, but the operator has no view of what they actu
 ## What Changes
 
 - Search tools (`keyword_search`, `semantic_search`, `find_related`) additionally record `result_count` and the returned note paths (capped) into their logged params via the existing `timing` holder — no schema change.
-- New "Search analytics" panel page over a selectable window: top queries with frequency and mean result count; zero-result queries; most-retrieved notes; never-retrieved notes (indexed notes minus retrieved set); split by search tool.
+- New "Search analytics" panel page over a selectable window: top queries with frequency and mean result count; zero-result queries; top-logged retrievals (first-10-per-call basis, labeled); never-retrieved notes (upper bound, labeled); query tables per query tool, find_related grouped by source path.
 - Read-only otherwise; admin-only like the rest of the panel.
 
 ## Capabilities
@@ -16,7 +16,7 @@ Agents are ~80% of vault traffic, but the operator has no view of what they actu
 
 ### Modified Capabilities
 
-(none — `usage-attribution` and `search-quality` requirements unchanged; params gain keys, which the existing truncation contract already governs)
+(none — `usage-attribution` and `search-quality` requirements unchanged; params gain keys under their own byte-budgeted telemetry contract (the generic truncation does not govern merged telemetry))
 
 ## Impact
 

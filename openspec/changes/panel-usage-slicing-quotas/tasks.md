@@ -1,6 +1,6 @@
 ## 1. Schema
 
-- [ ] 1.1 Migration 020: `daily_request_limit` nullable column with CHECK (NULL or 1..1000000), `quota_counters(key_id, day, count)` with composite PK, plus composite index (key_id, created_at) on usage_logs; test-schema green; alembic check clean
+- [ ] 1.1 Migration 020: `daily_request_limit` nullable column with CHECK (NULL or 1..1000000), `quota_counters(key_id, day, count)` with composite PK and key_id FK ON DELETE CASCADE (key-deletion-with-counter covered by a test), plus composite index (key_id, created_at) on usage_logs; test-schema green; alembic check clean
 
 ## 2. Enforcement
 

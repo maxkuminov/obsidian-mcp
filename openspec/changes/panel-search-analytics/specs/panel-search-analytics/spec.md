@@ -8,11 +8,15 @@
 - **THEN** its usage_logs row's params include result_count 4 and those 4 paths
 
 #### Scenario: Zero-result call
-- **WHEN** a search returns nothing
+- **WHEN** a search executes successfully and returns nothing
 - **THEN** result_count 0 is logged and the row carries no error marker
 
+#### Scenario: Operational failures are not zero results
+- **WHEN** find_related is called on a missing or not-yet-embedded source note
+- **THEN** the row carries an error marker (added to those return paths, which today return plain strings unmarked) and is excluded from zero-result analytics, while a valid source with no neighbors remains a true zero-result row
+
 ### Requirement: Search analytics views
-The panel SHALL provide an admin search-analytics page over a selectable window (24 hours, 7 days, 30 days) showing: for `keyword_search` and `semantic_search`, the most frequent queries with call counts and mean result count, and the zero-result queries with counts; for `find_related`, the same tables grouped and labeled by source note path (it has no query). Error-marked and refusal-marked rows are excluded.
+The panel SHALL provide an admin search-analytics page over a selectable window (24 hours, 7 days, 30 days) showing: for `keyword_search` and `semantic_search`, the most frequent queries with call counts and mean result count, and the zero-result queries with counts; for `find_related`, the same tables grouped and labeled by source note path (it has no query), using a full source path recorded through the telemetry contract (the tool's named `path` param is truncated in logs and unsuitable for grouping). All groupings and coverage joins SHALL scope identity to (usage_logs.user_id, path) with NULL-safe owner matching, since identical paths can exist for different users. Error-marked and refusal-marked rows are excluded.
 
 #### Scenario: Top and zero-result queries
 - **WHEN** the operator selects a window containing search calls

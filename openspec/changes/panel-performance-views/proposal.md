@@ -5,7 +5,7 @@ Every MCP call already records `duration_ms`, `response_size`, and per-phase tim
 ## What Changes
 
 - New "Performance" panel page: per-tool p50/p95/p99 `duration_ms` and request counts over a selectable window (24h / 7d / 30d), slowest-requests table, `response_size` aggregates, and an embed_ms/db_ms phase breakdown for search tools (extracted from `usage_logs.params`).
-- New `indexer_runs` table (migration **019**) recording each index/embed pass: started/finished, trigger (scheduled/manual/backfill), notes scanned/indexed/embedded, error; written by the indexer at pass end, pruned to the most recent 500 rows.
+- New `indexer_runs` table (migration **019**) recording each index/embed pass: started/finished, trigger (startup/scheduled/manual/backfill), the pass's user_id when per-user, notes scanned/indexed/embedded, error; written by the indexer at pass end, pruned to the most recent 500 rows.
 - Dashboard indexer card links to pass history (full history display lands with `panel-ops-health`).
 - Read-only aggregation otherwise; no change to what tools log.
 

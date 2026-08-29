@@ -15,5 +15,5 @@ The usage page SHALL support combined filtering by user, API key, tool, and wind
 The keys UI SHALL allow setting, changing, and clearing a key's `daily_request_limit` at create and edit time, and SHALL display each limited key's consumed count for the current UTC day alongside its limit.
 
 #### Scenario: Set and observe
-- **WHEN** the operator sets limit 500 on a key that has made 12 calls today
-- **THEN** the keys page shows 12/500 for it (read from the key's current-day counter row), and clearing the limit returns the key to unlimited
+- **WHEN** the operator sets limit 500 on a key that has made 12 calls earlier today, before the limit existed
+- **THEN** the keys page shows 0/500 (consumption counts admissions since the limit was enabled — unlimited keys perform no quota accounting) with copy making the "since limit set" basis explicit, subsequent calls count up from there, and clearing the limit returns the key to unlimited

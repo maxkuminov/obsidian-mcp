@@ -1,11 +1,15 @@
 ## ADDED Requirements
 
 ### Requirement: Per-key daily quota enforcement
-A key with a non-null `daily_request_limit` SHALL have tool calls admitted through an atomic per-(key, UTC-day) counter — a single conditional-increment statement that admits at most `limit` calls per UTC day under any concurrency — with over-limit calls refused before the tool body via a structured error naming the limit and the UTC reset. The refusal SHALL be logged with the over-quota marker `"over_quota": true` in params (one shared constant used by every writer and reader; NULL-safe exclusion predicate `COALESCE((params->>'over_quota')::boolean, false)`) and SHALL NOT increment the counter. Enforcement SHALL never affect other keys or OAuth traffic; keys with a null limit SHALL behave exactly as today.
+A key with a non-null `daily_request_limit` SHALL have tool calls admitted through an atomic per-(key, UTC-day) counter — a single conditional-increment statement that admits at most `limit` calls per UTC day under any concurrency — with over-limit calls refused before the tool body via a structured error naming the limit and the UTC reset. The admission increment SHALL run AFTER every existing pre-body gate (credential/vault resolution, argument screening) so pre-body refusals never consume a slot, and SHALL be committed in its own transaction before the tool body runs, so a body that later fails still consumes its slot. The refusal SHALL be logged with the over-quota marker `"over_quota": true` in params (one shared constant used by every writer and reader; NULL-safe exclusion predicate `COALESCE((params->>'over_quota')::boolean, false)`) and SHALL NOT increment the counter. Enforcement SHALL never affect other keys or OAuth traffic; keys with a null limit SHALL behave exactly as today.
 
 #### Scenario: Limit reached
 - **WHEN** a key with limit 100 makes its 101st call of the UTC day
 - **THEN** the call is refused before the tool body runs, the refusal is logged with the over-quota marker, and a different key's calls proceed
+
+#### Scenario: Pre-body refusals consume nothing; body failures consume
+- **WHEN** a limited key sends a call refused by an existing pre-body gate, then an admitted call whose tool body raises
+- **THEN** the first consumes no slot and the second consumes exactly one
 
 #### Scenario: Concurrent boundary
 - **WHEN** a key with limit N receives more than N concurrent calls in one UTC day
