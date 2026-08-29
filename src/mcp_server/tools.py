@@ -36,7 +36,12 @@ from src.config import (
     settings,
 )
 from src.database import async_session
-from src.mcp_server.auth import current_api_key_id, current_oauth_token_id, current_permission
+from src.mcp_server.auth import (
+    current_api_key_id,
+    current_daily_request_limit,
+    current_oauth_token_id,
+    current_permission,
+)
 from src.mcp_server.read_result import (
     ReadNoteResult,
     apply_metadata_budget,
@@ -48,7 +53,9 @@ from src.models.db import UsageLog
 from src.services import timing
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
+from src.services.quotas import admit as _admit_quota, quota_refusal_message
 from src.services.search import full_text_search
+from src.services.usage_stats import OVER_QUOTA_PARAM
 from src.services import transfer, vault_fs
 from src.services.vault import (
     MAX_PATH_CHARS,
@@ -342,6 +349,27 @@ _ANCHOR_LOST_AT_PUBLISH_MARKER = "vault_anchor_lost_at_publish"
 _RELATED_SOURCE_NOT_FOUND_MARKER = "related_source_not_found"
 _RELATED_SOURCE_NOT_EMBEDDED_MARKER = "related_source_not_embedded"
 
+# The quota gate's marker (#162), and the one marker on this list that is not a
+# `params.error` string: it is the JSON **boolean** `over_quota: true`.
+#
+# It is *imported* from `src/services/usage_stats.py` rather than declared here
+# and mirrored, which is the opposite of what `_NO_VAULT_MARKER` and
+# `_UNENCODABLE_ARG_MARKER` do — and deliberately. Those two are mirrored
+# because the import can only run one way without closing a cycle, and this is
+# the direction it runs: the quota gate imports the reader's constant, so the
+# writer and every consumer of the pre-body refusal predicate cannot disagree
+# about the key's name at all. `usage_stats` enumerated it ahead of this gate
+# shipping precisely so the two would land as one contract.
+#
+# **Pre-body**, by the classification rule above: the increment happens after
+# credential resolution and argument screening and *before* the tool body, so a
+# refused call did no work and belongs out of the latency percentiles. The
+# value must stay a real JSON boolean — `/admin/performance` casts it with an
+# unguarded `(params->>'over_quota')::boolean`, and a row carrying the string
+# `"yes"` there takes the page down with a 500 for every user until it ages out
+# (see docs/architecture/usage-attribution.md, "the casts are unguarded").
+_OVER_QUOTA_MARKER = OVER_QUOTA_PARAM
+
 
 class _TrashUnusable(Exception):
     """The trash probe failed for a reason that is not `UnsupportedFilesystem`.
@@ -449,6 +477,49 @@ def _vault_admission_error() -> str | None:
         )
         return _NO_VAULT_MESSAGE
     return None
+
+
+async def _quota_admission_error() -> str | None:
+    """Consume one quota slot, or refuse the call. `None` means "carry on".
+
+    **Who this applies to.** Only a caller authenticated with an API key that
+    has a non-null `daily_request_limit`. Both facts are already bound to the
+    request by `APIKeyMiddleware` from the key row it loaded, so the common
+    case — every key today, and all OAuth traffic — is two ContextVar reads and
+    **no database statement at all**. That is the whole of "keys with a null
+    limit behave exactly as today": there is no query to regress on, not a query
+    whose result happens to be permissive.
+
+    OAuth is exempt in v1 because panel OAuth is the operator, and an operator
+    locked out of the panel by a ceiling they set on themselves cannot raise it.
+
+    **Where it sits.** After the vault admission gate and the unencodable
+    argument screen, before the tool body — so a call refused for having no
+    vault, or for carrying an unpaired surrogate, consumes nothing. It is the
+    *last* pre-body gate on purpose: a slot spent on a call that was never going
+    to run is a slot an operator cannot account for.
+
+    **What it costs when it does run.** One statement, committed in its own
+    transaction, on its own pooled connection, released before the body starts
+    (see `src/services/quotas.py`). The body never waits on it and never
+    inherits it.
+    """
+    limit = current_daily_request_limit.get()
+    if limit is None:
+        return None
+    key_id = current_api_key_id.get()
+    if key_id is None:
+        # A limit with no key is not a state the middleware produces — it binds
+        # both together — but it is the state a direct in-process caller or a
+        # half-set test fixture reaches, and counting against a key id of None
+        # would violate the counter's own NOT NULL. Exempt rather than crash.
+        return None
+    if await _admit_quota(key_id, limit) is not None:
+        return None
+    logger.warning(
+        "tool_refused_over_quota", extra={"key_id": key_id, "limit": limit}
+    )
+    return quota_refusal_message(limit)
 
 
 def _response_size(result) -> int:
@@ -563,7 +634,11 @@ def _tracked(
     structured output type (#149): a bare string from a tool FastMCP validates
     against an output schema is not an in-band error, it is a protocol error —
     the agent sees a transport failure instead of "you have no vault". Tools
-    that return strings leave it None and get the message unchanged.
+    that return strings leave it None and get the message unchanged. It maps
+    *every* pre-body refusal, not just the vault one — the unencodable-argument
+    screen and the quota gate (#162) reach the same branch, so a structured
+    tool refuses over quota in its own shape rather than by breaking the wire
+    format.
     """
     transforms = transforms or {}
 
@@ -602,6 +677,26 @@ def _tracked(
                     if offender is not None:
                         refusal = _unencodable_argument_error(offender)
                         extra = {"error": _UNENCODABLE_ARG_MARKER}
+                if refusal is None:
+                    # Third and last admission gate (#162), deliberately after
+                    # the other two: a call refused for having no vault or for
+                    # an unencodable argument must consume no quota, because
+                    # its body was never going to run. This one *does* consume
+                    # — the increment commits before the body starts, so an
+                    # admitted call that later raises has still spent its slot,
+                    # and a refusal never increments at all.
+                    #
+                    # Only an API-key caller with a non-null limit reaches a
+                    # database statement here; for everyone else this is two
+                    # ContextVar reads.
+                    over_quota = await _quota_admission_error()
+                    if over_quota is not None:
+                        refusal = over_quota
+                        # The one marker in `params` that is a JSON boolean
+                        # rather than an `error` string. `usage_stats` reads it
+                        # as `(params->>'over_quota')::boolean` with no guard,
+                        # so `True` is the only value that may ever be written.
+                        extra = {_OVER_QUOTA_MARKER: True}
                 if refusal is not None:
                     result = refusal if refusal_result is None else refusal_result(refusal)
                 else:

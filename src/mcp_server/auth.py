@@ -27,6 +27,19 @@ logger = logging.getLogger(__name__)
 current_permission: ContextVar[str] = ContextVar("current_permission", default="read")
 current_api_key_id: ContextVar[int | None] = ContextVar("current_api_key_id", default=None)
 current_oauth_token_id: ContextVar[int | None] = ContextVar("current_oauth_token_id", default=None)
+# This request's key quota ceiling, or None for "unlimited" (#162). Bound here
+# for the reason the actor label is (issue #77): the `APIKey` row is already
+# loaded, so reading the limit costs no extra query — and `_tracked` must be
+# able to decide "does this caller have a quota at all" without issuing one,
+# because the answer is None for every key today and a round trip per call to
+# learn that is a tax on a feature nobody has turned on.
+#
+# Default None, and the OAuth branch never sets it: OAuth traffic is the
+# operator's own panel session and is exempt in v1. Reset in the same `finally`
+# as the rest, so a limit can never leak into another request's calls.
+current_daily_request_limit: ContextVar[int | None] = ContextVar(
+    "current_daily_request_limit", default=None
+)
 
 
 def hash_key(key: str) -> str:
@@ -96,6 +109,10 @@ class APIKeyMiddleware:
         token_key = current_api_key_id.set(None)
         token_oauth = current_oauth_token_id.set(None)
         token_user = current_user_id.set(None)
+        # Unlimited unless an API key says otherwise (#162). Every branch that
+        # does not set it — OAuth, and any future credential — is exempt by
+        # construction rather than by a list somebody has to remember.
+        token_limit = current_daily_request_limit.set(None)
         # Bound below from the authenticated user's *own* freshly read
         # `vault_path`. It stays unset for single-user keys (no user row) so
         # `_vault_root(None)` keeps answering from settings. Resetting it in
@@ -211,6 +228,11 @@ class APIKeyMiddleware:
                     # survives the row's deletion, which the panel performs
                     # after NULLing `usage_logs.key_id` (issue #77).
                     current_actor.set(("api_key", api_key.name, api_key.key_prefix))
+                    # The key row is loaded, so the quota ceiling is free here
+                    # too (#162). NULL — every key until an operator sets one —
+                    # means unlimited, and `_tracked` then issues no quota
+                    # statement at all.
+                    current_daily_request_limit.set(api_key.daily_request_limit)
                     # In single-user mode `api_key.user_id` is None so this
                     # is skipped entirely. In multi-user mode, read the user's
                     # `vault_path` now and bind the answer to this request:
@@ -389,3 +411,4 @@ class APIKeyMiddleware:
             current_user_id.reset(token_user)
             current_vault_root.reset(token_vault)
             current_actor.reset(token_actor)
+            current_daily_request_limit.reset(token_limit)
