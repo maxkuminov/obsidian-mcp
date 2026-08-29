@@ -9,13 +9,13 @@
 can open in Obsidian.**
 
 A self-hosted [Model Context Protocol](https://modelcontextprotocol.io)
-server that gives every agent you talk to a durable, shared place to
+server that gives every agent you connect a durable, shared place to
 remember things. The storage isn't a vector database you can't see
 into: it's a folder of markdown files in your Obsidian vault, backed
 by full-text and semantic search and by your own wikilink graph.
 Obsidian is the human window onto it — open a note, read exactly what
 an agent wrote about you, correct it, delete it, or take the whole
-folder somewhere else. Indexed, searchable, and self-describing —
+folder somewhere else. Self-describing, too —
 agents read what you read, link what you link, and pick up your folder
 layout, frontmatter schema, and tag conventions on the first call
 instead of being briefed from scratch every session.
@@ -138,7 +138,9 @@ out loud about it with Claude on my phone, the agent isn't starting
 cold. It can pull up what I've already written on adjacent topics,
 surface a note I half-finished six months ago, and at the end of the
 conversation suggest updates and write them in. The vault doesn't
-have to be near me to be the thing I'm working in.
+have to be near me to be the thing I'm working in. ([A session away
+from the keyboard](#a-session-away-from-the-keyboard) walks through
+exactly one of these.)
 
 ## A session at the keyboard
 
