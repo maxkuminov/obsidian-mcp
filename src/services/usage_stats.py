@@ -1,6 +1,10 @@
-"""Read-only aggregation over `usage_logs` for the panel's performance view.
+"""Read-only aggregation for the panel's performance view.
 
-Nothing here writes. `usage_logs` is written in exactly one place — `_log_usage`
+Two sources: `usage_logs` for everything about requests, and `indexer_runs` for
+the pass history at the bottom of the page (`recent_indexer_runs`, last section
+of this file). Nothing here writes either of them.
+
+`usage_logs` is written in exactly one place — `_log_usage`
 via the `_tracked` decorator in `src/mcp_server/tools.py` — and this module is a
 consumer of what that contract already records
 (`docs/architecture/usage-attribution.md`).
@@ -288,6 +292,98 @@ async def slowest_requests(
     params = _base_params(window, user_id)
     params["limit"] = limit
     return (await session.execute(text(sql), params)).fetchall()
+
+
+# --- The pass history ------------------------------------------------------
+#
+# The page's second source, and the only one that is not `usage_logs`. It is
+# here rather than in its own module because it is read by exactly one route
+# and shares that route's scoping rule; `src/services/indexer.py` owns the
+# *writing* of these rows (see
+# `docs/architecture/indexing-and-embeddings.md`).
+
+#: How many passes the performance page shows. A summary, not the history —
+#: the full, filterable view belongs to `panel-ops-health` (#163), and the
+#: table itself keeps 500 rows.
+RECENT_RUNS_LIMIT = 20
+
+
+async def recent_indexer_runs(
+    session, user_id: int | None, limit: int = RECENT_RUNS_LIMIT
+) -> list[dict]:
+    """The newest passes, newest first, with their owner resolved live.
+
+    **The owner is joined, not denormalised.** `usage_logs` keeps `actor_*`
+    columns precisely so a deleted credential still renders (#77); this table
+    deliberately does not, because its FK is `ON DELETE SET NULL` — when the
+    user goes, the row's claim about *whose* vault this pass indexed stops being
+    true, and a denormalised label would keep asserting it. So a run whose
+    `user_id` is NULL is rendered as having no owner rather than as an owner
+    whose name we happen to remember, and the two ways a row gets there are
+    distinguished in the template's copy rather than invented here.
+
+    `owner_missing` is the third case and should not arise: a non-NULL
+    `user_id` that joins to nothing. The FK forbids it, but the FK can be
+    `NOT VALID` on a database somebody repaired by hand (which is why migration
+    019 refuses one), and rendering that as "no owner" would quietly agree with
+    the corruption.
+
+    Scoped like everything else on the page: an admin sees every pass, a
+    regular user only their own — including, deliberately, none of the
+    ownerless single-user/global passes, which are not theirs to read.
+    """
+    limit = max(1, min(int(limit), 200))
+    scope = "" if user_id is None else " WHERE r.user_id = :uid"
+    sql = f"""
+        SELECT
+            r.id, r.started_at, r.finished_at, r.trigger, r.user_id,
+            r.notes_scanned, r.notes_indexed, r.notes_embedded, r.error,
+            u.username AS owner_username,
+            EXTRACT(EPOCH FROM (r.finished_at - r.started_at)) AS duration_seconds
+        FROM indexer_runs r
+        LEFT JOIN users u ON u.id = r.user_id
+        {scope}
+        ORDER BY r.started_at DESC, r.id DESC
+        LIMIT :limit
+    """
+    params: dict = {"limit": limit}
+    if user_id is not None:
+        params["uid"] = user_id
+    rows = (await session.execute(text(sql), params)).fetchall()
+    return [
+        {
+            "id": r.id,
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "duration": _duration(r.duration_seconds),
+            "trigger": r.trigger,
+            "user_id": r.user_id,
+            "owner": r.owner_username,
+            # A non-NULL owner that joined to nothing. Named rather than folded
+            # into "no owner", so a broken FK reads as broken.
+            "owner_missing": r.user_id is not None and r.owner_username is None,
+            "notes_scanned": r.notes_scanned,
+            "notes_indexed": r.notes_indexed,
+            "notes_embedded": r.notes_embedded,
+            "error": r.error,
+        }
+        for r in rows
+    ]
+
+
+def _duration(seconds) -> str | None:
+    """A pass duration for display, or None when the row never finished.
+
+    Seconds below a minute, then minutes and seconds: a pass is measured in
+    minutes and a millisecond figure would be noise on a row whose point is
+    "this one took ten times as long as its neighbours".
+    """
+    if seconds is None:
+        return None
+    total = float(seconds)
+    if total < 60:
+        return f"{total:.1f}s"
+    minutes, remainder = divmod(int(round(total)), 60)
+    return f"{minutes}m {remainder}s"
 
 
 def _ms(value) -> float | None:

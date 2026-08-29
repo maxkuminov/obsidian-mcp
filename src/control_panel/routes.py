@@ -45,10 +45,12 @@ from src.oauth.scope import (
 )
 from src.services.indexer import invalidate_hnsw_index_cache
 from src.services.usage_stats import (
+    RECENT_RUNS_LIMIT,
     WINDOW_LABELS,
     WINDOWS,
     normalize_window,
     phase_breakdown,
+    recent_indexer_runs,
     slowest_requests,
     tool_aggregates,
 )
@@ -1264,7 +1266,8 @@ async def performance_page(
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
-    """Per-tool latency, phase timings and the window's slowest calls.
+    """Per-tool latency, phase timings, the window's slowest calls, and the
+    most recent index/embed passes.
 
     Read-only aggregation over `usage_logs`; the SQL and the one shared
     executed/refused predicate live in `src/services/usage_stats.py`, which is
@@ -1280,6 +1283,10 @@ async def performance_page(
     tools = await tool_aggregates(session, window, uid)
     phases = await phase_breakdown(session, window, uid)
     slowest_rows = await slowest_requests(session, window, uid)
+    # Deliberately **not** window-bounded: the passes are what the window's
+    # latencies happened around, and a quiet 24 hours with no pass in it is
+    # exactly when an operator needs to see the last one that did run.
+    runs = await recent_indexer_runs(session, uid)
 
     slowest = []
     for r in slowest_rows:
@@ -1307,6 +1314,8 @@ async def performance_page(
             "tools": tools,
             "phases": phases,
             "slowest": slowest,
+            "runs": runs,
+            "runs_limit": RECENT_RUNS_LIMIT,
             # A window with no executed rows at all is a real state (a fresh
             # deploy, a quiet weekend) and gets its own copy rather than a
             # table of zeroes that reads like a measurement.

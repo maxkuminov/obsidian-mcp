@@ -193,6 +193,15 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   key. (`src/services/timing.py` is the only writer today and it records floats;
   the quota gate #162 must record a JSON boolean, not the string `"true"`.)
 
+The page's one non-`usage_logs` source is the "Recent passes" card, which reads
+`indexer_runs` (written by the indexer, see
+[indexing and embeddings](indexing-and-embeddings.md)). Its owner column is
+**joined live** from `users`, which is the opposite of the rule below and
+deliberately so: an actor is a historical fact about who made a call, so it is
+denormalised and survives the credential; an owner is a live fact about who a
+row belongs to, the FK is `ON DELETE SET NULL`, and a stored label would go on
+asserting whose vault a pass indexed after that user no longer exists.
+
 Actor attribution on the slowest-requests table is the denormalised
 `actor_*` columns first and the LEFT JOINs as the fallback — the same
 `_usage_actor` reader `/admin/usage` uses, for the same reason (#77): resolving

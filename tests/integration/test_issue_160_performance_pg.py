@@ -36,6 +36,7 @@ from src.models.db import IndexerRun, UsageLog, User
 from src.services import indexer
 from src.services.usage_stats import (
     phase_breakdown,
+    recent_indexer_runs,
     slowest_requests,
     tool_aggregates,
 )
@@ -469,7 +470,12 @@ async def test_all_three_windows_render_against_seeded_data(clean):
         FileSystemLoader,
     )
 
-    from src.services.usage_stats import WINDOW_LABELS, WINDOWS
+    from src.services.usage_stats import (
+        RECENT_RUNS_LIMIT,
+        WINDOW_LABELS,
+        WINDOWS,
+        recent_indexer_runs,
+    )
 
     templates_dir = _harness.ROOT / "src" / "control_panel" / "templates"
     env = Environment(
@@ -518,6 +524,8 @@ async def test_all_three_windows_render_against_seeded_data(clean):
                     "actor_name": r.actor_label,
                     "actor_detail": r.actor_ref,
                 } for r in slowest],
+                runs=await recent_indexer_runs(session, None),
+                runs_limit=RECENT_RUNS_LIMIT,
                 has_data=any(t["executed"] or t["refusals"] for t in tools),
             )
             assert "Per-tool latency" in html
@@ -556,3 +564,148 @@ async def test_the_migration_round_trips(migrated_url):
             assert present is not None
     finally:
         await engine.dispose()
+
+
+# --------------------------------------------------------------------------
+# 6. The pass history the page renders.
+# --------------------------------------------------------------------------
+
+
+async def test_two_users_runs_come_back_with_distinct_owner_labels(clean, monkeypatch):
+    """The spec's "Run displays SHALL label per-user runs by owner", against the
+    join that produces the label. Two per-user passes an operator cannot
+    attribute look like one user's vault being indexed twice."""
+    monkeypatch.setattr(indexer, "async_session", clean)
+
+    async with clean() as session:
+        alice = User(username="alice-160", password_hash="x")
+        bob = User(username="bob-160", password_hash="x")
+        session.add_all([alice, bob])
+        await session.commit()
+        alice_id, bob_id = alice.id, bob.id
+
+    async with indexer.record_indexer_run("startup", alice_id) as stats:
+        stats.record_index((1200, 4))
+    async with indexer.record_indexer_run("scheduled", bob_id) as stats:
+        stats.record_index((340, 0))
+    # An ownerless pass: single-user or global.
+    async with indexer.record_indexer_run("backfill", None) as stats:
+        stats.record_index((7, 7))
+
+    async with clean() as session:
+        runs = await recent_indexer_runs(session, None)
+
+    assert [r["trigger"] for r in runs] == ["backfill", "scheduled", "startup"], (
+        "newest first"
+    )
+    by_owner = {r["owner"]: r for r in runs}
+    assert set(by_owner) == {"alice-160", "bob-160", None}
+    assert by_owner["alice-160"]["notes_scanned"] == 1200
+    assert by_owner["bob-160"]["notes_scanned"] == 340
+    assert by_owner[None]["user_id"] is None
+    assert all(not r["owner_missing"] for r in runs)
+    # Durations are computed, not stored.
+    assert all(r["duration"] is not None for r in runs)
+
+
+async def test_a_deleted_owner_renders_as_ownerless_not_as_a_stale_name(
+    clean, monkeypatch
+):
+    """Why the owner is joined live rather than denormalised. `usage_logs` keeps
+    `actor_*` columns so a deleted credential still renders (#77) — an actor is
+    a historical fact about who called. An owner is a live fact about who a row
+    belongs to, and the FK is ON DELETE SET NULL: when the user goes, the row's
+    claim about whose vault this pass indexed stops being true."""
+    monkeypatch.setattr(indexer, "async_session", clean)
+
+    async with clean() as session:
+        user = User(username="doomed-160", password_hash="x")
+        session.add(user)
+        await session.commit()
+        uid = user.id
+
+    async with indexer.record_indexer_run("startup", uid) as stats:
+        stats.record_index((99, 1))
+
+    async with clean() as session:
+        await session.execute(delete(User).where(User.id == uid))
+        await session.commit()
+
+    async with clean() as session:
+        runs = await recent_indexer_runs(session, None)
+
+    assert len(runs) == 1, "the pass history survives the user"
+    assert runs[0]["owner"] is None and runs[0]["user_id"] is None
+    assert runs[0]["owner_missing"] is False
+    assert runs[0]["notes_scanned"] == 99
+
+
+async def test_a_regular_user_sees_only_their_own_passes(clean, monkeypatch):
+    monkeypatch.setattr(indexer, "async_session", clean)
+
+    async with clean() as session:
+        one = User(username="scoped-a-160", password_hash="x")
+        two = User(username="scoped-b-160", password_hash="x")
+        session.add_all([one, two])
+        await session.commit()
+        one_id, two_id = one.id, two.id
+
+    for uid in (one_id, two_id):
+        async with indexer.record_indexer_run("scheduled", uid) as stats:
+            stats.record_index((5, 0))
+    async with indexer.record_indexer_run("backfill", None):
+        pass
+
+    async with clean() as session:
+        assert len(await recent_indexer_runs(session, None)) == 3, "admins see all"
+        mine = await recent_indexer_runs(session, one_id)
+
+    assert [r["user_id"] for r in mine] == [one_id]
+
+
+async def test_the_history_is_capped_at_the_limit(clean, monkeypatch):
+    monkeypatch.setattr(indexer, "async_session", clean)
+
+    for _ in range(25):
+        async with indexer.record_indexer_run("scheduled", None):
+            pass
+
+    async with clean() as session:
+        assert len(await recent_indexer_runs(session, None)) == 20
+        assert len(await recent_indexer_runs(session, None, limit=5)) == 5
+        # Clamped, never trusted: this is a display cap, not a query knob.
+        assert len(await recent_indexer_runs(session, None, limit=100000)) == 25
+
+
+async def test_a_user_deleted_mid_pass_is_recorded_with_no_owner(clean, monkeypatch):
+    """The FK race, against the real driver error.
+
+    `user_id` is captured at pass start and inserted at pass end. Deleting the
+    user in between makes the INSERT fail — `ON DELETE SET NULL` cannot help,
+    because it fires on rows that already exist and this one never got in.
+    Swallowed, the pass would vanish: the longest passes are the likeliest to
+    lose the race, and "the operator just deleted a user" is exactly when they
+    open the page.
+    """
+    monkeypatch.setattr(indexer, "async_session", clean)
+
+    async with clean() as session:
+        user = User(username="racing-160", password_hash="x")
+        session.add(user)
+        await session.commit()
+        uid = user.id
+
+    async with indexer.record_indexer_run("scheduled", uid) as stats:
+        stats.record_index((4000, 12))
+        # The administrator deletes the user while the pass is still running.
+        async with clean() as session:
+            await session.execute(delete(User).where(User.id == uid))
+            await session.commit()
+
+    async with clean() as session:
+        runs = await recent_indexer_runs(session, None)
+
+    assert len(runs) == 1, "the pass must survive its owner being deleted mid-flight"
+    assert runs[0]["user_id"] is None
+    assert runs[0]["notes_scanned"] == 4000, "the pass's own numbers survive"
+    assert runs[0]["trigger"] == "scheduled"

@@ -118,7 +118,7 @@
     </div>
 
     <!-- Slowest requests -->
-    <div class="card anim-3">
+    <div class="card anim-3" style="margin-bottom:20px;">
         <div class="card-header">
             <span class="card-title">Slowest requests</span>
             <span class="mono" style="font-size:11px;color:var(--text-3);">top {{ slowest | length }}</span>
@@ -160,7 +160,89 @@
                 {% endfor %}
                 {% if not slowest %}
                 <tr>
-                    <td colspan="5" style="text-align:center;padding:32px;color:var(--text-3);">No executed requests in this window.</td>
+                    {# "with recorded duration": `duration_ms` is nullable and
+                       the transfer routes log rows without one, so a window can
+                       hold executed requests and still have nothing to order by
+                       here. Saying "no executed requests" would be a claim the
+                       page cannot make. #}
+                    <td colspan="5" style="text-align:center;padding:32px;color:var(--text-3);">No executed requests with recorded duration in this window.</td>
+                </tr>
+                {% endif %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+    {#
+      Recent passes. The dashboard's indexer heartbeat answers "is this
+      process's loop alive" and resets on restart; this is the persisted
+      history, so it is deliberately *not* bounded by the window selector — a
+      quiet 24 hours with no pass in it is exactly when an operator needs to see
+      the last one that did run. The full, filterable history is #163's.
+    #}
+    <div class="card anim-3">
+        <div class="card-header">
+            <span class="card-title">Recent passes</span>
+            <span class="mono" style="font-size:11px;color:var(--text-3);">newest {{ runs_limit }}</span>
+        </div>
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Started</th>
+                    <th style="text-align:right;">Duration</th>
+                    <th>Trigger</th>
+                    <th>Owner</th>
+                    <th style="text-align:right;" title="Notes the scan walked.">Scanned</th>
+                    <th style="text-align:right;" title="Notes the scan wrote or rewrote.">Indexed</th>
+                    <th style="text-align:right;" title="Notes this pass embedded and certified.">Embedded</th>
+                    <th>Result</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in runs %}
+                <tr>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                        <time datetime="{{ r.started_at }}" data-localize>{{ r.started_at }}</time>
+                    </td>
+                    {# A row with no duration is a pass with no `finished_at`:
+                       the writer sets both in one INSERT, so this means a row
+                       written by something other than the recorder. #}
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if r.duration %}{{ r.duration }}{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
+                    <td style="font-size:12px;"><span class="badge badge-gray">{{ r.trigger }}</span></td>
+                    <td style="font-size:12px;line-height:1.3;">
+                        {% if r.owner %}
+                            <span style="color:var(--primary-text);">{{ r.owner }}</span>
+                        {% elif r.owner_missing %}
+                            {# A non-NULL user_id that joined to nothing. The FK
+                               forbids it, so say so rather than quietly
+                               rendering it as an ownerless pass. #}
+                            <span class="mono" style="font-size:11px;color:var(--error);">user #{{ r.user_id }} (missing)</span>
+                        {% else %}
+                            {# The owner is joined live, never denormalised: this
+                               table's FK is ON DELETE SET NULL, so when the user
+                               goes the row's claim about whose vault it indexed
+                               stops being true. Single-user and global passes
+                               land here too, and both are honestly "no owner". #}
+                            <span class="mono" style="font-size:11px;color:var(--text-3);" title="A single-user or global pass, or a pass whose user has since been deleted.">no owner</span>
+                        {% endif %}
+                    </td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_scanned }}</td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_indexed }}</td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_embedded }}</td>
+                    <td style="font-size:12px;">
+                        {% if r.error %}
+                            <div><span class="badge badge-red">failed</span></div>
+                            <div class="mono" style="font-size:10px;color:var(--text-3);white-space:pre-wrap;word-break:break-word;max-width:420px;">{{ r.error }}</div>
+                        {% else %}
+                            <span class="badge badge-green">ok</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                {% if not runs %}
+                <tr>
+                    <td colspan="8" style="text-align:center;padding:32px;color:var(--text-3);">No index or embed pass has been recorded yet. The first pass after a deploy writes the first row.</td>
                 </tr>
                 {% endif %}
             </tbody>

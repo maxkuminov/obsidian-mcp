@@ -225,6 +225,8 @@ def _empty_context():
             {"phase": "db_ms", "label": "Database", "count": 0, "mean": None, "p95": None},
         ],
         "slowest": [],
+        "runs": [],
+        "runs_limit": usage_stats.RECENT_RUNS_LIMIT,
         "has_data": False,
     }
 
@@ -233,7 +235,11 @@ def test_an_empty_window_renders_an_explicit_empty_state():
     rendered = _render("performance.html", **_empty_context())
     assert "No MCP requests were logged in this window" in rendered
     assert "No calls logged in this window." in rendered
-    assert "No executed requests in this window." in rendered
+    # Not "no executed requests": `duration_ms` is nullable (the transfer
+    # routes log rows without one), so a window can hold executed requests and
+    # still have nothing this table can order by.
+    assert "No executed requests with recorded duration in this window." in rendered
+    assert "No index or embed pass has been recorded yet." in rendered
     assert "no calls recorded this phase in this window" in rendered
 
 
@@ -265,3 +271,93 @@ def test_the_page_extends_the_shared_base_and_defines_no_palette():
         "performance.html defines a custom property; the palette lives in "
         "_theme.html and nowhere else"
     )
+
+
+# --------------------------------------------------------------------------
+# 6. The pass history card.
+# --------------------------------------------------------------------------
+
+
+def _run(**overrides):
+    row = {
+        "id": 1,
+        "started_at": "2026-08-29T10:00:00+00:00",
+        "duration": "1m 4s",
+        "trigger": "scheduled",
+        "user_id": None,
+        "owner": None,
+        "owner_missing": False,
+        "notes_scanned": 2577,
+        "notes_indexed": 3,
+        "notes_embedded": 3,
+        "error": None,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_two_users_runs_render_with_distinct_owner_labels():
+    """The spec's two-user scenario. A per-user pass's row is only useful if the
+    page says *whose* pass it was — two identical-looking rows an operator
+    cannot attribute are worse than no history, because they look like one
+    user's vault being indexed twice."""
+    ctx = _empty_context()
+    ctx["runs"] = [
+        _run(id=2, user_id=7, owner="alice", notes_scanned=1200),
+        _run(id=1, user_id=9, owner="bob", notes_scanned=340),
+    ]
+    rendered = _render("performance.html", **ctx)
+
+    assert "alice" in rendered and "bob" in rendered
+    assert rendered.index("alice") < rendered.index("bob"), "newest pass first"
+    assert "1200" in rendered and "340" in rendered
+    assert "No index or embed pass has been recorded yet." not in rendered
+
+
+def test_an_ownerless_run_says_so_rather_than_rendering_a_blank():
+    """A NULL `user_id` is a single-user or global pass, or a pass whose user
+    was deleted — the FK is ON DELETE SET NULL. Either way the honest label is
+    "no owner"; a blank cell reads as a rendering bug."""
+    rendered = _render("performance.html", **dict(_empty_context(), runs=[_run()]))
+    assert "no owner" in rendered
+
+
+def test_a_run_whose_owner_vanished_from_the_join_is_named_as_broken():
+    """A non-NULL `user_id` that joins to nothing. The FK forbids it — but a
+    hand-repaired database can carry a NOT VALID one (which is why migration 019
+    refuses that), and rendering it as an ownerless pass would quietly agree
+    with the corruption."""
+    ctx = dict(_empty_context(), runs=[_run(user_id=42, owner=None, owner_missing=True)])
+    rendered = _render("performance.html", **ctx)
+    assert "user #42 (missing)" in rendered
+
+
+def test_a_failed_run_shows_its_error():
+    ctx = dict(_empty_context(), runs=[
+        _run(error="embed failures: 12 of 12 — first: RuntimeError: connection refused"),
+    ])
+    rendered = _render("performance.html", **ctx)
+    assert "failed" in rendered
+    assert "embed failures: 12 of 12" in rendered
+    assert "connection refused" in rendered
+
+
+def test_the_runs_card_is_not_bounded_by_the_window_selector():
+    """A quiet 24 hours with no pass in it is exactly when an operator needs to
+    see the last pass that did run."""
+    import inspect
+
+    from src.control_panel import routes
+
+    source = inspect.getsource(routes.performance_page)
+    assert "recent_indexer_runs(session, uid)" in source, (
+        "the runs query must not take the window"
+    )
+
+
+def test_the_pass_duration_reads_as_a_pass_not_as_a_request():
+    assert usage_stats._duration(None) is None
+    assert usage_stats._duration(0.4) == "0.4s"
+    assert usage_stats._duration(59.9) == "59.9s"
+    assert usage_stats._duration(64) == "1m 4s"
+    assert usage_stats._duration(3600) == "60m 0s"
