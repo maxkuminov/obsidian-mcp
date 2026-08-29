@@ -43,6 +43,21 @@
     <div class="card anim-1" style="margin-bottom:20px;">
         <div class="card-body" style="padding-top:14px;padding-bottom:14px;display:flex;align-items:center;gap:26px;flex-wrap:wrap;">
 
+            {% if health.unavailable %}
+            {#
+              The strip's own reads failed and the rest of the dashboard did
+              not. Saying so beats both alternatives: rendering "ok"/"none
+              recorded" would be a claim built on a query that never returned,
+              and 500ing the page would lose the whole dashboard over three
+              cells. The failure is logged at ERROR, so the health page has it.
+            #}
+            <div style="font-size:13px;color:var(--text-3);">
+                Health summary unavailable — its queries failed. The rest of this
+                page is unaffected; the error is logged.
+            </div>
+            <a href="/admin/health" style="margin-left:auto;font-size:12px;color:var(--primary-text);text-decoration:none;">Health &rarr;</a>
+            {% else %}
+
             <div style="display:flex;align-items:center;gap:8px;font-size:13px;">
                 <span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-2);">Last pass</span>
                 {% if health.last_run and health.last_run.error %}
@@ -80,6 +95,7 @@
             {% endif %}
 
             <a href="/admin/health" style="margin-left:auto;font-size:12px;color:var(--primary-text);text-decoration:none;">Health &rarr;</a>
+            {% endif %}
         </div>
     </div>
 

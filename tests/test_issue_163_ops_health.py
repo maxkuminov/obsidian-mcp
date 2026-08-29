@@ -156,6 +156,92 @@ def test_entries_are_copies_so_a_reader_cannot_edit_the_buffer():
     assert error_log.recent_errors()[0]["message"] == "original"
 
 
+class _Probe(logging.Handler):
+    """Counts what reaches it. Used only to prove where propagation stops."""
+
+    def __init__(self):
+        super().__init__(level=logging.ERROR)
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def test_an_unhandled_asgi_500_reaches_the_buffer_under_uvicorns_config():
+    """`uvicorn.error` is where "Exception in ASGI application" is logged, and
+    uvicorn's own `dictConfig` stops that record before the root logger. So the
+    test asserts the *behaviour* — a root-only handler sees nothing, ours sees
+    it exactly once — rather than which logger in the chain happens to carry
+    `propagate: false` in this release."""
+    import copy
+    import logging.config
+
+    from uvicorn.config import LOGGING_CONFIG
+
+    names = ("uvicorn", "uvicorn.error", "uvicorn.access")
+    saved = {
+        name: (
+            logging.getLogger(name).level,
+            logging.getLogger(name).propagate,
+            list(logging.getLogger(name).handlers),
+        )
+        for name in names
+    }
+    root = logging.getLogger()
+    saved_root = (root.level, list(root.handlers))
+    probe = _Probe()
+    try:
+        logging.config.dictConfig(copy.deepcopy(LOGGING_CONFIG))
+        root.addHandler(probe)
+        error_log.attach()
+        logging.getLogger("uvicorn.error").error("Exception in ASGI application")
+
+        assert probe.records == [], (
+            "a root-only handler must NOT see this record — that is the whole "
+            "reason uvicorn.error is attached directly"
+        )
+        entries = error_log.recent_errors()
+        assert len(entries) == 1, "captured exactly once, not zero and not twice"
+        assert entries[0]["logger"] == "uvicorn.error"
+        assert entries[0]["message"] == "Exception in ASGI application"
+    finally:
+        error_log.detach()
+        root.removeHandler(probe)
+        for name, (level, propagate, handlers) in saved.items():
+            logger = logging.getLogger(name)
+            logger.handlers[:] = handlers
+            logger.propagate = propagate
+            logger.setLevel(level)
+        root.handlers[:] = saved_root[1]
+        root.setLevel(saved_root[0])
+
+
+def test_a_propagating_uvicorn_error_is_still_recorded_only_once():
+    """The same handler instance sits on `uvicorn.error` and on the root, so
+    `callHandlers` reaches it twice for one record if propagation is ever on.
+    The per-record flag is what makes that one entry."""
+    uvicorn_error = logging.getLogger("uvicorn.error")
+    saved = uvicorn_error.propagate
+    try:
+        uvicorn_error.propagate = True
+        error_log.attach()
+        uvicorn_error.error("one record, two handler visits")
+        assert len(error_log.recent_errors()) == 1
+    finally:
+        uvicorn_error.propagate = saved
+
+
+def test_detach_removes_the_handler_from_every_logger_attach_used():
+    error_log.attach()
+    error_log.detach()
+    handlers = logging.getLogger("uvicorn.error").handlers
+    assert not any(isinstance(h, error_log.RingBufferHandler) for h in handlers)
+    assert not any(
+        isinstance(h, error_log.RingBufferHandler)
+        for h in logging.getLogger().handlers
+    )
+
+
 def test_the_lifespan_attaches_the_handler_before_the_sandbox_branch():
     """A process that dies in a startup guard is exactly the one whose errors
     an operator comes looking for, so the buffer must be live before any guard
@@ -195,6 +281,16 @@ class _Result:
     def fetchall(self):
         return self._rows
 
+    def scalars(self):
+        outer = self
+
+        class _S:
+            def all(self):
+                value = outer._scalar
+                return value if isinstance(value, list) else []
+
+        return _S()
+
 
 class _BackupSession:
     """Answers the two statements `latest_backup` issues, in order."""
@@ -210,7 +306,7 @@ class _BackupSession:
         self.statements.append(text)
         if "to_regclass" in text:
             return _Result(scalar="backups_log" if self.table_present else None)
-        if "FROM backups_log" in text:
+        if "backups_log" in text:
             return _Result(first=self.row)
         if "indexer_runs" in text:
             return _Result(rows=self.runs)
@@ -235,7 +331,7 @@ def test_a_pre_021_database_reads_as_no_backup_rather_than_a_500():
     assert any("to_regclass" in s for s in session.statements), (
         "the read must probe before it selects"
     )
-    assert not any("FROM backups_log" in s for s in session.statements)
+    assert not any("FROM public.backups_log" in s for s in session.statements)
 
 
 def test_an_empty_table_reads_as_no_backup_too():
@@ -342,11 +438,14 @@ def test_db_backup_records_the_dump_and_its_status_is_the_targets():
     fails the backup."""
     make = _makefile()
     recipe = make[make.index("\ndb-backup:") : make.index("\ndb-restore:")]
-    assert "docker/record-backup.sh" in recipe
+    invocations = [
+        line for line in recipe.splitlines() if "bash docker/record-backup.sh" in line
+    ]
+    assert len(invocations) == 1, invocations
     # Passed the file that was actually written, and the container the dump
     # itself used — the same channel, not a second one.
-    assert "$$BACKUP_FILE.gz" in recipe.split("record-backup.sh")[1].split("\n")[0]
-    assert "DB_CONTAINER=$(DB_CONTAINER)" in recipe
+    assert "$$BACKUP_FILE.gz" in invocations[0]
+    assert "DB_CONTAINER=$(DB_CONTAINER)" in invocations[0]
     body = [line.strip() for line in recipe.strip().splitlines() if line.strip()]
     assert "record-backup.sh" in body[-1], (
         "the recording must be the last command in the recipe, or its failure "
@@ -369,6 +468,47 @@ def test_the_recording_script_goes_through_docker_exec_psql():
     # and is a syntax error there).
     assert ":'filename'" in script and ":'size_bytes'" in script
     assert "-c \"INSERT" not in script
+
+
+def test_the_probe_never_folds_stderr_into_the_value_it_classifies():
+    """A healthy server writes warnings to stderr — a collation-version
+    mismatch after a libc upgrade is emitted on connection. Folded into stdout,
+    the probe's value becomes `WARNING: …\\nt`, which is not `t`, and the
+    absent-table branch then exits 0 without recording anything, forever, on a
+    table that exists."""
+    with open(os.path.join(HERE, "..", "docker", "record-backup.sh")) as fh:
+        script = fh.read()
+    # Comments may discuss `2>&1`; no *command* may use it.
+    commands = [
+        line for line in script.splitlines() if not line.lstrip().startswith("#")
+    ]
+    assert not any("2>&1" in line for line in commands), (
+        "stderr must be captured separately from the value being classified"
+    )
+    assert '2>"$STDERR_FILE"' in script
+
+
+def test_the_writer_and_the_reader_name_the_same_qualified_table():
+    """An unqualified reference resolves through `search_path`, so a role
+    pointing elsewhere would have the writer recording into a table the panel
+    never reads — the page then warns that no backup has been taken while one
+    is taken daily."""
+    with open(os.path.join(HERE, "..", "docker", "record-backup.sh")) as fh:
+        script = fh.read()
+    assert "INSERT INTO public.backups_log" in script
+
+    with open(os.path.join(HERE, "..", "src", "services", "ops_health.py")) as fh:
+        reader = fh.read()
+    assert "FROM public.backups_log" in reader
+
+    with open(
+        os.path.join(HERE, "..", "alembic", "versions", "021_backups_log.py")
+    ) as fh:
+        migration = fh.read()
+    assert 'QUALIFIED = "public.backups_log"' in migration
+    assert '{"table": TABLE}' not in migration, (
+        "every catalog lookup resolves the qualified name"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -577,6 +717,106 @@ def test_a_non_admin_strip_carries_the_pass_and_neither_operator_cell():
     assert "Last pass" in strip
     assert "Backup" not in strip
     assert "Errors" not in strip
+
+
+def test_a_degraded_strip_says_so_rather_than_claiming_a_state():
+    html = _render_strip(unavailable=True)
+    strip = html[: html.index("Stat row")]
+    assert "Health summary unavailable" in strip
+    # Never "ok" or "none recorded" — those are claims built on a query that
+    # never returned.
+    assert "none recorded" not in strip
+    assert 'href="/admin/health"' in strip
+
+
+# --------------------------------------------------------------------------
+# 5b. The dashboard does not depend on the strip
+# --------------------------------------------------------------------------
+
+
+class _ExplodingStripSession:
+    """Answers the dashboard's own queries and raises on the strip's.
+
+    The realistic fault: `indexer_runs` unreadable — a `NOT VALID` FK left by a
+    hand repair, a revoked permission, a 021 that has not run on the database
+    the container was pointed at — while every other table on the page is fine.
+    """
+
+    def __init__(self):
+        self.rolled_back = False
+        self.n = 0
+
+    async def execute(self, stmt, *_a, **_k):
+        self.n += 1
+        text = str(stmt).lower()
+        if "indexer_runs" in text or "backups_log" in text or "to_regclass" in text:
+            raise RuntimeError("relation \"indexer_runs\" does not exist")
+        if "max(" in text:
+            return _Result(scalar=None)
+        if "select" in text and "usage_logs" in text and "count" not in text:
+            return _Result(scalar=[])
+        return _Result(scalar=0)
+
+    async def rollback(self):
+        self.rolled_back = True
+
+
+class _Scalars:
+    def __init__(self, value):
+        self._value = value
+
+    def all(self):
+        return self._value if isinstance(self._value, list) else []
+
+
+def _dashboard_context(monkeypatch, session):
+    captured = {}
+
+    def _fake_response(request, name, context):
+        captured["context"] = context
+        return "rendered"
+
+    monkeypatch.setattr(routes.templates, "TemplateResponse", _fake_response)
+    monkeypatch.setattr(routes, "generate_csrf_token", lambda _r: "csrf")
+
+    async def _graph(*_a, **_k):
+        return {}
+
+    monkeypatch.setattr(routes, "_graph_stats", _graph)
+    response = asyncio.run(
+        routes.dashboard(request=_Request(), session=session, user=_User(True))
+    )
+    return captured["context"], response
+
+
+def test_a_failing_strip_query_does_not_take_the_dashboard_down(monkeypatch):
+    """The dashboard is the page an operator opens *because* something is
+    wrong. Losing three cells beats losing the page."""
+    session = _ExplodingStripSession()
+    ctx, response = _dashboard_context(monkeypatch, session)
+
+    assert response == "rendered", "the page still renders"
+    assert ctx["health"] == {"unavailable": True, "show_ops": True}
+    # And the dashboard's own data is untouched.
+    assert "stats" in ctx and "graph" in ctx
+
+
+def test_the_failed_strip_transaction_is_rolled_back(monkeypatch):
+    """Without it every statement after the failure raises
+    `InFailedSQLTransaction` instead of the real error — including the ones the
+    render itself would issue."""
+    session = _ExplodingStripSession()
+    _dashboard_context(monkeypatch, session)
+    assert session.rolled_back is True
+
+
+def test_the_strip_failure_is_logged_at_error_so_the_page_shows_it(monkeypatch):
+    error_log.attach()
+    session = _ExplodingStripSession()
+    _dashboard_context(monkeypatch, session)
+
+    messages = [e["message"] for e in error_log.recent_errors()]
+    assert any("health strip unavailable" in m.lower() for m in messages), messages
 
 
 # --------------------------------------------------------------------------

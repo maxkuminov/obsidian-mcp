@@ -67,14 +67,34 @@ The table carries a COMMENT marker, exactly as 013/015/016/017/018/019/020 mark
 what they create, and that marker is what `downgrade()` keys on: a table of this
 name that 021 did not create is never dropped.
 
-**The verification is of definitions, not of names** (019's rule, verbatim). The
-CHECK predicate is compared against the server's own normalization of the same
-declaration, derived at runtime from a scratch `TEMP` table rather than pinned
-to one PostgreSQL major — which needs the TEMP privilege on the database, as
-013 already requires. The index is read as a column list plus uniqueness,
-validity and whether it is partial or over an expression: an index of this name
-recreated on `filename` keeps the name an existence check looks for while the
-newest-first read the page and the strip both perform has nothing to lean on.
+**The verification is of definitions, not of names** (019's rule, verbatim).
+The CHECK predicate and the `created_at` default are both compared against the
+server's own normalization of the same declaration, derived at runtime from a
+scratch `TEMP` table rather than pinned to one PostgreSQL major — which needs
+the TEMP privilege on the database, as 013 already requires. The index is read
+as a column list plus uniqueness, validity and whether it is partial or over an
+expression: an index of this name recreated on `filename` keeps the name an
+existence check looks for while the newest-first read the page and the strip
+both perform has nothing to lean on.
+
+The **primary key and both server defaults** are read for a reason `alembic
+check` makes necessary: autogenerate compares neither. It reports a table whose
+PK has been dropped as being in perfect agreement with the model, and it never
+looks at a server default at all. The default is the quietest of the two:
+`ALTER COLUMN created_at SET DEFAULT now() + interval '100 years'` leaves every
+column, type, nullability, constraint and index exactly as 021 made them, and
+every backup recorded afterwards reads as permanently fresh — so the staleness
+warning this whole feature exists to raise can never fire again. `id`'s default
+is compared against `nextval` on the sequence `pg_get_serial_sequence` says the
+column actually owns, both sides rendered by the server so neither is a guess
+about the schema prefix.
+
+**Every catalog lookup resolves `public.backups_log`, qualified.** The writer
+and the panel both name it that way, and an unqualified reference resolves
+through `search_path` — so the three could otherwise be addressing three
+different tables. `op.create_table` still takes no schema (matching 019/020),
+so `upgrade()` asserts afterwards that what it created is the object those two
+consumers address, and `downgrade()` asserts the same before it drops anything.
 
 ## Locks
 
@@ -101,6 +121,18 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 TABLE = "backups_log"
+
+# **Every catalog lookup below resolves this**, not the bare name. The writer
+# (`docker/record-backup.sh`) inserts into `public.backups_log` and the panel
+# (`src/services/ops_health.py`) selects from it, both qualified, because an
+# unqualified reference resolves through `search_path` — so a role or database
+# pointing somewhere else would have the writer, the reader and this migration
+# each addressing a different table of that name. `op.create_table` has no
+# schema argument here (repo convention, matching 019/020), so `upgrade()` ends
+# by asserting that what it created or adopted really is the object those two
+# address; see `_assert_is_the_qualified_table`.
+QUALIFIED = "public.backups_log"
+
 CHECK_NAME = "ck_backups_log_size_bytes"
 CREATED_INDEX = "ix_backups_log_created_at"
 
@@ -136,23 +168,21 @@ def _quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _oid(bind, name: str):
+    """The OID `name` resolves to, or None. `to_regclass` never raises."""
+    return bind.execute(
+        sa.text("SELECT CAST(to_regclass(:name) AS oid)"), {"name": name}
+    ).scalar()
+
+
 def _table_exists(bind) -> bool:
-    return bool(
-        bind.execute(
-            sa.text("SELECT to_regclass(:qualified)"), {"qualified": TABLE}
-        ).scalar()
-    )
+    return _oid(bind, QUALIFIED) is not None
 
 
 def _table_comment(bind) -> str | None:
     return bind.execute(
-        sa.text(
-            "SELECT obj_description(c.oid, 'pg_class') "
-            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE c.relname = :table AND c.relkind = 'r' "
-            "  AND n.nspname = ANY (current_schemas(false))"
-        ),
-        {"table": TABLE},
+        sa.text("SELECT obj_description(CAST(:qualified AS regclass), 'pg_class')"),
+        {"qualified": QUALIFIED},
     ).scalar()
 
 
@@ -167,9 +197,46 @@ def _columns(bind):
                 "  AND a.attnum > 0 AND NOT a.attisdropped "
                 "ORDER BY a.attnum"
             ),
-            {"table": TABLE},
+            {"table": QUALIFIED},
         ).fetchall()
     ]
+
+
+def _column_default(bind, column: str) -> str | None:
+    """The rendered server default for `column`, or None when it has none."""
+    return bind.execute(
+        sa.text(
+            "SELECT pg_get_expr(d.adbin, d.adrelid) "
+            "FROM pg_attribute a "
+            "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+            "WHERE a.attrelid = CAST(:table AS regclass) AND a.attname = :column "
+            "  AND a.attnum > 0 AND NOT a.attisdropped"
+        ),
+        {"table": QUALIFIED, "column": column},
+    ).scalar()
+
+
+def _primary_key_columns(bind):
+    """The PK's columns **in order**, or None when there is no PK.
+
+    Not tidiness. Without a primary key the `id` an operator (or a future
+    reader) uses to name one backup row is not unique, and `alembic check` does
+    not compare primary keys at all — it reports a table of the right columns as
+    perfectly in agreement with the model while the constraint the model
+    declares is simply gone.
+    """
+    row = bind.execute(
+        sa.text(
+            "SELECT (SELECT array_agg(a.attname ORDER BY k.ord) "
+            "          FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+            "          JOIN pg_attribute a ON a.attrelid = c.conrelid "
+            "                             AND a.attnum = k.attnum) AS columns "
+            "FROM pg_constraint c "
+            "WHERE c.conrelid = CAST(:table AS regclass) AND c.contype = 'p'"
+        ),
+        {"table": QUALIFIED},
+    ).first()
+    return list(row.columns) if row is not None and row.columns else None
 
 
 def _canonical_check(bind) -> str:
@@ -200,6 +267,59 @@ def _canonical_check(bind) -> str:
     return rendered
 
 
+def _canonical_created_at_default(bind) -> str:
+    """What this server renders `now()` as for a `timestamptz` column.
+
+    The CHECK's scratch-`TEMP`-table device, applied to a default. The threat it
+    closes is specific and silent: `ALTER COLUMN created_at SET DEFAULT now() +
+    interval '100 years'` leaves every column, type, nullability, constraint and
+    index exactly as 021 made them — `alembic check` does not compare server
+    defaults at all — and every backup recorded afterwards reads as permanently
+    fresh, so the staleness warning this whole feature exists to raise can never
+    fire again.
+    """
+    scratch = "_omcp_021_default_probe"
+    bind.execute(sa.text(f"DROP TABLE IF EXISTS pg_temp.{scratch}"))
+    bind.execute(
+        sa.text(
+            f"CREATE TEMP TABLE {scratch} "
+            "(created_at timestamptz NOT NULL DEFAULT now())"
+        )
+    )
+    rendered = bind.execute(
+        sa.text(
+            "SELECT pg_get_expr(d.adbin, d.adrelid) "
+            "FROM pg_attribute a "
+            "JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+            "WHERE a.attrelid = CAST(:scratch AS regclass) AND a.attname = 'created_at'"
+        ),
+        {"scratch": f"pg_temp.{scratch}"},
+    ).scalar()
+    bind.execute(sa.text(f"DROP TABLE IF EXISTS pg_temp.{scratch}"))
+    return rendered
+
+
+def _canonical_id_default(bind) -> str | None:
+    """`nextval('<this table's own id sequence>'::regclass)`, or None.
+
+    Derived, never written out: `pg_get_serial_sequence` names the sequence the
+    column actually owns, and the regclass is rendered back to text by the same
+    code path `pg_get_expr` uses — so the two sides of the comparison cannot
+    disagree about whether the schema prefix is included. None means the column
+    owns no sequence at all, which is a serial that stopped being one.
+    """
+    sequence = bind.execute(
+        sa.text("SELECT pg_get_serial_sequence(:qualified, 'id')"),
+        {"qualified": QUALIFIED},
+    ).scalar()
+    if sequence is None:
+        return None
+    rendered = bind.execute(
+        sa.text("SELECT CAST(CAST(:seq AS regclass) AS text)"), {"seq": sequence}
+    ).scalar()
+    return f"nextval('{rendered}'::regclass)"
+
+
 def _check_state(bind):
     """`(constraintdef, convalidated)` for the size CHECK, or None.
 
@@ -215,7 +335,7 @@ def _check_state(bind):
             "WHERE c.conrelid = CAST(:table AS regclass) AND c.contype = 'c' "
             "  AND c.conname = :name"
         ),
-        {"table": TABLE, "name": CHECK_NAME},
+        {"table": QUALIFIED, "name": CHECK_NAME},
     ).first()
 
 
@@ -247,7 +367,7 @@ def _index_definitions(bind) -> dict:
             "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
             "WHERE i.indrelid = CAST(:table AS regclass)"
         ),
-        {"table": TABLE},
+        {"table": QUALIFIED},
     ).fetchall()
     return {
         row.name: (
@@ -321,6 +441,89 @@ def _check_problems(bind) -> list:
     return problems
 
 
+def _assert_is_the_qualified_table(bind) -> None:
+    """What `op.create_table` just made is what the writer and reader address.
+
+    `op.create_table` takes no schema here (repo convention: 019 and 020 do the
+    same), so it creates in the first schema of `search_path`. Both consumers —
+    `docker/record-backup.sh`'s INSERT and `src/services/ops_health.py`'s
+    SELECT — name `public.backups_log` explicitly. On a database whose
+    `search_path` does not start with `public` those are two different tables,
+    and the failure is silent in the worst direction: the target records
+    backups into a table the panel never reads, so the page warns that no
+    backup has been taken while one is taken every day.
+    """
+    qualified = _oid(bind, QUALIFIED)
+    unqualified = _oid(bind, TABLE)
+    if qualified is None or qualified != unqualified:
+        raise RuntimeError(
+            f"021 created {TABLE} in a schema that is not the one "
+            f"{QUALIFIED} resolves to (search_path-relative oid "
+            f"{unqualified!r}, qualified oid {qualified!r}). `make db-backup` "
+            "writes to the qualified name and the panel reads it, so the table "
+            "just created would never be written to or read. Set the migration "
+            "role's search_path so `public` comes first, then re-run."
+        )
+
+
+def _primary_key_problems(bind) -> list:
+    """The PK is `(id)`, and it is there at all.
+
+    `alembic check` does not compare primary keys, so a table whose PK has been
+    dropped reports as being in perfect agreement with the model — while the
+    `id` the dashboard strip puts in a `#run-…`-style anchor, and the column
+    `ORDER BY created_at DESC, id DESC` breaks ties on, is no longer unique.
+    """
+    pk = _primary_key_columns(bind)
+    if pk == ["id"]:
+        return []
+    if pk is None:
+        return [
+            "it has no primary key at all, so its id is not unique and the "
+            "newest-row read has no deterministic tie-break"
+        ]
+    return [f"its primary key is {pk}, not ['id']"]
+
+
+def _default_problems(bind) -> list:
+    """Both server defaults, compared exactly against server-derived canonicals.
+
+    `alembic check` does not compare server defaults (`compare_server_default`
+    is off by default), so this comparison is the only thing that sees either
+    drift — and one of them is the quietest failure this table has:
+    `created_at DEFAULT now() + interval '100 years'` leaves every column, type,
+    constraint and index exactly as 021 made them, and every backup recorded
+    afterwards reads as permanently fresh, so the staleness warning can never
+    fire again.
+    """
+    problems = []
+
+    live_created = _column_default(bind, "created_at")
+    canonical_created = _canonical_created_at_default(bind)
+    if live_created != canonical_created:
+        problems.append(
+            f"its created_at default is {live_created!r}, not {canonical_created!r} "
+            "— a default that is not the current time makes every backup this "
+            "table records read as a different age than it is, and the "
+            "staleness warning is computed from exactly that value"
+        )
+
+    live_id = _column_default(bind, "id")
+    canonical_id = _canonical_id_default(bind)
+    if canonical_id is None:
+        problems.append(
+            "its id column owns no sequence, so it is not the serial 021 "
+            f"creates (its default is {live_id!r})"
+        )
+    elif live_id != canonical_id:
+        problems.append(
+            f"its id default is {live_id!r}, not {canonical_id!r} — the "
+            "sequence the column owns is not the one it draws from"
+        )
+
+    return problems
+
+
 def _verify(bind) -> None:
     """Accept a pre-existing table only if it is exactly 021's."""
     problems = []
@@ -332,6 +535,8 @@ def _verify(bind) -> None:
     if columns != list(EXPECTED_COLUMNS):
         problems.append(f"its columns are {columns}, not {list(EXPECTED_COLUMNS)}")
 
+    problems.extend(_primary_key_problems(bind))
+    problems.extend(_default_problems(bind))
     problems.extend(_check_problems(bind))
     problems.extend(_index_problems(bind))
 
@@ -361,6 +566,7 @@ def upgrade() -> None:
         _verify(bind)
     else:
         _create()
+        _assert_is_the_qualified_table(bind)
 
     # **No backfill**, deliberately — see the module docstring. The dumps on
     # disk live on a host this migration cannot read.
@@ -388,6 +594,9 @@ def downgrade() -> None:
     bind = op.get_bind()
     if not _table_exists(bind):
         return
+    # `op.drop_table` resolves through `search_path`; every check above resolved
+    # `public.backups_log`. Refuse rather than drop a table we did not inspect.
+    _assert_is_the_qualified_table(bind)
     if _table_comment(bind) != MARKER:
         raise RuntimeError(
             f"{TABLE} does not carry 021's comment marker ({MARKER!r}), so 021 "

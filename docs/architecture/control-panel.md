@@ -156,6 +156,15 @@
   differs between the repo default and the real host's `Makefile.local`, and a
   host path does not belong in a shared table.
 
+- **Writer, reader and migration all name `public.backups_log`, qualified.** An
+  unqualified reference resolves through `search_path`, so a role or database
+  pointing elsewhere would have the three addressing different tables — and the
+  failure is silent in the worst direction: backups recorded into a table the
+  panel never reads, so the page warns that none have been taken while one is
+  taken daily. `op.create_table` still takes no schema (matching 019/020), so
+  migration 021 asserts afterwards that what it created is the object the other
+  two address, and asserts it again before `downgrade()` drops anything.
+
 - **The recording guard has three branches and they do not agree, deliberately.**
   `make deploy` runs `db-backup` *before* `db-migrate` — the backup is the only
   way back from a bad migration, so that ordering is not negotiable — which
@@ -175,22 +184,47 @@
   warns at **> 8 days**, a day clear of a weekly cadence so a Sunday schedule
   does not page every Saturday.
 
-- **Errors live in a `deque(maxlen=100)` on the root logger and nowhere else.**
-  Container logs rotate with the container, so the errors from before the last
-  deploy — usually the ones worth reading — are gone. `src/services/error_log.py`
-  attaches at ERROR in the lifespan *before* the sandbox-mode branch returns, so
-  a process that dies in a startup guard still has the record. Only four
-  strings per entry are kept, never the `LogRecord`: a record holds `exc_info`,
-  which holds a traceback, which holds every frame's locals, and a hundred of
-  those is a bounded buffer of unbounded object graphs. `emit` cannot raise —
-  it runs inside every `logger.error(...)` in the process, including the ones
-  in exception handlers.
+- **Errors live in a `deque(maxlen=100)`, in memory, for the life of the
+  process.** Container logs rotate with the container, so the errors from before
+  the last deploy — usually the ones worth reading — are gone.
+  `src/services/error_log.py` attaches at ERROR in the lifespan *before* the
+  sandbox-mode branch returns, so a process that dies in a startup guard still
+  has the record. Only four strings per entry are kept, never the `LogRecord`:
+  a record holds `exc_info`, which holds a traceback, which holds every frame's
+  locals, and a hundred of those is a bounded buffer of unbounded object graphs.
+  `emit` cannot raise — it runs inside every `logger.error(...)` in the process,
+  including the ones in exception handlers.
+
+- **The root logger alone would miss every 500, so `uvicorn.error` is attached
+  explicitly.** uvicorn applies its own `dictConfig` at startup and it stops the
+  ascent before the root — 0.52 sets `propagate: false` on the `uvicorn` logger,
+  the *parent* of `uvicorn.error`, which is precisely where an unhandled
+  exception in the ASGI app is logged. (Which logger in that chain carries the
+  flag has moved between releases, so the test asserts the behaviour — a
+  root-only probe handler sees nothing — rather than the config key.) Attaching
+  only to the root captures the errors the application chose to log and none of
+  the ones it did not, which is the opposite of what a page headed "recent
+  errors" is for. The **same handler instance** goes on both, and `emit` stamps
+  each record so one that reaches the handler twice, on a release whose chain
+  does reach the root, is stored once. Any other logger that breaks propagation
+  has to be added to `CAPTURED_LOGGERS` or its errors will not appear.
 
 - **The observation window is rendered next to the count, always.** "No errors"
   on its own reads as a claim about the server; what it means is "this process
   has not failed since it started", and a container restarted two minutes ago
   has an empty buffer for reasons unrelated to health. Same reason the copy
   points at `make logs` for anything older or fuller.
+
+- **The dashboard strip has a failure boundary; the dashboard does not depend
+  on it.** Its reads are the only ones on `/admin/` that touch `indexer_runs`
+  and `backups_log`, so a fault confined to those two tables would take the
+  whole dashboard down for every user while every other query on the page
+  succeeds — on the page an operator opens *because* something is wrong. So
+  `_health_strip_or_degraded` rolls the failed transaction back (without it the
+  render's own queries raise `InFailedSQLTransaction` instead of the real
+  error), logs at ERROR so the ring buffer catches it, and renders a "health
+  summary unavailable" strip. Saying so beats rendering "ok" from a query that
+  never returned.
 
 - **Errors and backup age are admin-only; the pass history is scoped.** The run
   list follows the performance page's rule (an admin sees every pass, a regular

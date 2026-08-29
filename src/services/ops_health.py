@@ -65,10 +65,17 @@ async def latest_backup(session) -> dict | None:
     if present is None:
         return None
 
+    # `public.backups_log`, qualified, and the probe above asks about the same
+    # qualified name. `docker/record-backup.sh` writes to the qualified name for
+    # the same reason: an unqualified reference resolves through `search_path`,
+    # so a role or database whose `search_path` points elsewhere would have the
+    # writer and this reader addressing two different tables — the page would
+    # report a backup age from a table nothing writes, which is the one number
+    # on this page that must not be quietly wrong.
     row = (
         await session.execute(
             text(
-                "SELECT created_at, filename, size_bytes FROM backups_log "
+                "SELECT created_at, filename, size_bytes FROM public.backups_log "
                 "ORDER BY created_at DESC, id DESC LIMIT 1"
             )
         )

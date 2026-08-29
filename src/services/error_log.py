@@ -21,6 +21,24 @@ So the errors are kept in memory instead, and that is the whole design:
   HTML page is a page nobody can read and a response nobody should send. The
   first line is what identifies the error; `make logs` has the rest.
 
+## The root logger is not enough
+
+uvicorn applies its own `dictConfig` at startup, and that config sets
+`"propagate": false` on the **`uvicorn`** logger — the parent of `uvicorn.error`,
+which is exactly where an unhandled exception in the ASGI app is logged
+("Exception in ASGI application"). A record logged there therefore ascends to
+`uvicorn`, is handled, and **stops**: it never reaches a root handler. (Which
+logger in that chain carries the flag has moved between uvicorn releases —
+0.52's config puts it on `uvicorn` and leaves `uvicorn.error` alone — so what
+matters is the observed behaviour, not the key.)
+
+Attaching to the root alone would therefore capture every error the application
+chose to log and **not one of the 500s it did not**, which is the opposite of
+what a page headed "recent errors" is for. So `attach()` puts the same handler
+instance on `uvicorn.error` as well, and `emit` marks each record so one that
+reaches this handler twice — which is what happens on any release where the
+chain does propagate to the root — is stored once.
+
 ## Why it cannot raise
 
 This is a `logging.Handler` on the **root** logger, so it runs inside every
@@ -52,6 +70,29 @@ ERROR_BUFFER_SIZE = 100
 #: `CRITICAL` too — the startup guards in `src/main.py` log at that level, and
 #: those are precisely the records an operator comes looking for.
 CAPTURE_LEVEL = logging.ERROR
+
+#: Loggers the handler is attached to. The root logger is not enough, and the
+#: exception it misses is the most important one on the page.
+#:
+#: uvicorn installs its own `dictConfig` at startup, and that config stops the
+#: ascent before the root: 0.52 sets `"propagate": false` on the `uvicorn`
+#: logger, the parent of `uvicorn.error`. Every unhandled exception in an ASGI
+#: application is logged on `uvicorn.error` — "Exception in ASGI application" —
+#: so those records are handled by uvicorn and never reach a root handler at
+#: all. A page headed "recent errors" that cannot show a 500 is worse than no
+#: page.
+#:
+#: Attaching the **same handler instance** to both is what makes the
+#: double-capture guard in `emit` sufficient: on a release whose chain does
+#: propagate to the root, `callHandlers` walks `uvicorn.error` and then the
+#: root, reaches this handler twice for one record, and the second visit is
+#: dropped.
+CAPTURED_LOGGERS: tuple[str, ...] = ("uvicorn.error",)
+
+#: Set on a record the moment this handler stores it, so a second visit by the
+#: same handler (propagation plus a direct attachment) does not store it twice.
+#: `LogRecord`s are per-emit objects, so the flag cannot outlive the record.
+_SEEN_ATTR = "_omcp_error_ring_seen"
 
 # The buffer and the moment observation began. `_lock` guards both: logging
 # calls can arrive from the event loop and from any thread a library spawns,
@@ -94,6 +135,11 @@ class RingBufferHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # One record, one entry, however many loggers in the chain carry
+            # this handler. See `_SEEN_ATTR`.
+            if getattr(record, _SEEN_ATTR, False):
+                return
+            setattr(record, _SEEN_ATTR, True)
             entry = {
                 "timestamp": datetime.datetime.fromtimestamp(
                     record.created, tz=datetime.timezone.utc
@@ -108,38 +154,55 @@ class RingBufferHandler(logging.Handler):
             _buffer.append(entry)
 
 
+def _targets(root: logging.Logger | None) -> list[logging.Logger]:
+    """The root logger (or the one given) plus every logger in
+    `CAPTURED_LOGGERS`. One handler instance across all of them."""
+    base = root if root is not None else logging.getLogger()
+    return [base, *(logging.getLogger(name) for name in CAPTURED_LOGGERS)]
+
+
 def attach(root: logging.Logger | None = None) -> logging.Handler:
-    """Install the handler on the root logger. Idempotent.
+    """Install the handler on the root logger **and on `uvicorn.error`**.
+
+    Idempotent, and idempotent per logger: calling it twice (a re-entered
+    lifespan, as in tests) reuses the existing handler and never adds a second
+    copy to a logger that already has it.
 
     Called from the lifespan, before the sandbox-mode branch returns, so a
     process that skips every startup guard still records what it fails at.
-    Calling it twice (a re-entered lifespan, as in tests) reuses the existing
-    handler rather than double-recording every error.
+
+    Why `uvicorn.error` is named explicitly rather than covered by the root:
+    uvicorn's own `dictConfig` stops the ascent before the root (0.52 sets
+    `propagate: false` on `uvicorn`, its parent), and `uvicorn.error` is where
+    every unhandled ASGI exception is logged. Without this the page would show
+    the errors the application chose to log and none of the 500s it did not.
     """
     global _handler, _observing_since
 
-    target = root if root is not None else logging.getLogger()
     with _lock:
-        if _handler is not None and _handler in target.handlers:
-            return _handler
         if _handler is None:
             _handler = RingBufferHandler(level=CAPTURE_LEVEL)
         if _observing_since is None:
             _observing_since = datetime.datetime.now(datetime.timezone.utc)
         handler = _handler
-    target.addHandler(handler)
+
+    for target in _targets(root):
+        if handler not in target.handlers:
+            target.addHandler(handler)
     return handler
 
 
 def detach(root: logging.Logger | None = None) -> None:
-    """Remove the handler. The buffer's contents are left alone — a shutdown
-    that logs an error on its way out should still be readable if anything
-    renders afterwards."""
-    global _handler
-    target = root if root is not None else logging.getLogger()
+    """Remove the handler from every logger `attach` put it on.
+
+    The buffer's contents are left alone — a shutdown that logs an error on its
+    way out should still be readable if anything renders afterwards.
+    """
     with _lock:
         handler = _handler
-    if handler is not None:
+    if handler is None:
+        return
+    for target in _targets(root):
         target.removeHandler(handler)
 
 

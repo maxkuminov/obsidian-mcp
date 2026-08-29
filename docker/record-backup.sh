@@ -12,7 +12,11 @@
 #
 #   DB_CONTAINER   the PostgreSQL container (the Makefile passes its own value,
 #                  which `Makefile.local` may override)
-#   DB_NAME        the database, defaulting to the deployment's `obsidian_mcp`
+#   DB_NAME        the database, defaulting to the deployment's `obsidian_mcp`.
+#                  That default is the **same database name the Makefile's
+#                  `pg_dump -U postgres obsidian_mcp` names** — the two are
+#                  written out separately and must stay in step; the override
+#                  exists so the guard can be exercised against a throwaway.
 #
 # ## The three branches, and why they differ
 #
@@ -74,36 +78,73 @@ SIZE=$(wc -c < "$BACKUP_PATH" | tr -d '[:space:]')
 # typed, and `:'filename'` is a syntax error there — while a statement read from
 # stdin is interpolated and quoted by psql itself. That quoting is the point:
 # the filename never becomes shell text inside a SQL string.
+#
+# **stderr is kept separate from stdout, and that is load-bearing.** A perfectly
+# healthy server writes warnings to stderr — a collation-version mismatch after
+# a libc upgrade is the common one, and it is emitted on connection. Folded into
+# stdout with `2>&1` the probe's value becomes `WARNING: …\nt`, which is not the
+# string `t`, and the "table absent" branch then exits 0 without recording
+# anything. Forever, on a table that exists. So stdout is captured on its own and
+# the classification below is exact.
+STDERR_FILE=$(mktemp)
+trap 'rm -f "$STDERR_FILE"' EXIT
+
 psql_run() {
     docker exec -i "$DB_CONTAINER" psql -U postgres -d "$DB_NAME" \
-        -v ON_ERROR_STOP=1 -qtAX "$@"
+        -v ON_ERROR_STOP=1 -qtAX "$@" 2>"$STDERR_FILE"
 }
 
-if ! TABLE_PRESENT=$(psql_run <<<"SELECT to_regclass('public.backups_log') IS NOT NULL" 2>&1); then
+if ! PROBE_STDOUT=$(psql_run <<<"SELECT to_regclass('public.backups_log') IS NOT NULL"); then
     echo -e "${RED}Backup RECORDING FAILED: could not ask the database whether backups_log exists${NC}" >&2
-    echo "$TABLE_PRESENT" >&2
+    cat "$STDERR_FILE" >&2
     echo -e "${YELLOW}The dump itself is intact at $BACKUP_PATH. This is the same docker exec psql channel pg_dump just used, so a failure here is a real fault rather than a missing table.${NC}" >&2
     exit 1
 fi
 
 # `-qtAX` prints the bare value; trim in case a future psql pads it.
-TABLE_PRESENT=$(printf '%s' "$TABLE_PRESENT" | tr -d '[:space:]')
+VERDICT=$(printf '%s' "$PROBE_STDOUT" | tr -d '[:space:]')
 
-if [ "$TABLE_PRESENT" != "t" ]; then
-    echo -e "${YELLOW}WARNING: backup taken but not recorded; table arrives with migration 021.${NC}"
-    echo -e "${YELLOW}         $FILENAME is on disk and valid — backups_log does not exist on this database yet,${NC}"
-    echo -e "${YELLOW}         which is expected on the deploy that ships 021 (db-backup runs before db-migrate).${NC}"
-    echo -e "${YELLOW}         The health page will keep reporting the previous recorded backup, or none at all,${NC}"
-    echo -e "${YELLOW}         until the next db-backup after 021 is live.${NC}"
-    exit 0
-fi
+# Exactly three outcomes, and the third is a failure rather than a guess.
+# `to_regclass(...) IS NOT NULL` is a boolean and can only print `t` or `f`;
+# anything else on a *successful* exit means the value we are reading is not the
+# value we asked for — an extra NOTICE routed to stdout, a psql option changing
+# the output format, a wrapper injecting a banner. Classifying that as "absent"
+# is how a healthy database silently stops recording backups, so it is treated
+# as branch 3 and fails the target.
+case "$VERDICT" in
+    t)
+        ;;
+    f)
+        echo -e "${YELLOW}WARNING: backup taken but not recorded; table arrives with migration 021.${NC}"
+        echo -e "${YELLOW}         $FILENAME is on disk and valid — backups_log does not exist on this database yet,${NC}"
+        echo -e "${YELLOW}         which is expected on the deploy that ships 021 (db-backup runs before db-migrate).${NC}"
+        echo -e "${YELLOW}         The health page will keep reporting the previous recorded backup, or none at all,${NC}"
+        echo -e "${YELLOW}         until the next db-backup after 021 is live.${NC}"
+        if [ -s "$STDERR_FILE" ]; then
+            echo -e "${YELLOW}         The server also wrote to stderr:${NC}" >&2
+            cat "$STDERR_FILE" >&2
+        fi
+        exit 0
+        ;;
+    *)
+        echo -e "${RED}Backup RECORDING FAILED: the existence probe answered ${VERDICT@Q}, which is neither 't' nor 'f'${NC}" >&2
+        cat "$STDERR_FILE" >&2
+        echo -e "${YELLOW}The dump itself is intact at $BACKUP_PATH. Refusing to guess: reading an unrecognised answer as 'the table is absent' is how a healthy database silently stops recording backups while this target keeps exiting 0.${NC}" >&2
+        exit 1
+        ;;
+esac
 
-if ! INSERT_OUTPUT=$(psql_run -v filename="$FILENAME" -v size_bytes="$SIZE" 2>&1 <<'SQL'
-INSERT INTO backups_log (filename, size_bytes) VALUES (:'filename', :'size_bytes');
+# `public.backups_log`, qualified, and the probe above asks about the same
+# qualified name. An unqualified INSERT resolves through `search_path`, so a
+# role or database with `search_path` pointing somewhere else writes the row
+# into a *different* table of that name while this target reports success and
+# the panel — which reads `public.backups_log` — never sees it.
+if ! INSERT_STDOUT=$(psql_run -v filename="$FILENAME" -v size_bytes="$SIZE" <<'SQL'
+INSERT INTO public.backups_log (filename, size_bytes) VALUES (:'filename', :'size_bytes');
 SQL
 ); then
     echo -e "${RED}Backup RECORDING FAILED: backups_log exists but the row did not land${NC}" >&2
-    echo "$INSERT_OUTPUT" >&2
+    cat "$STDERR_FILE" >&2
     echo -e "${YELLOW}The dump itself is intact at $BACKUP_PATH. Failing loudly because the panel reads the newest backups_log row as the age of the last backup: an unrecorded backup makes it report a staler safety net than you have.${NC}" >&2
     exit 1
 fi

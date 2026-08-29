@@ -477,7 +477,7 @@ async def dashboard(
     # The persisted counterpart to the heartbeat above: last recorded pass,
     # backup age, errors since process start. Survives a restart, which the
     # heartbeat does not, and links to the full history on /admin/health.
-    health = await _health_strip(session, user)
+    health = await _health_strip_or_degraded(session, user)
 
     return templates.TemplateResponse(request, "dashboard.html", _panel_context(request, user, {
         "active": "dashboard",
@@ -1562,6 +1562,40 @@ async def _health_strip(session: AsyncSession, user) -> dict:
         # to the page, which is where they are read.
         strip.update(_error_window())
     return strip
+
+
+async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
+    """`_health_strip`, with a failure boundary around it.
+
+    **The dashboard is the page an operator opens when something is wrong, and
+    the strip is the newest thing on it.** Its reads are the only ones on this
+    handler that touch `indexer_runs` and `backups_log`, so a fault confined to
+    those two tables — a `NOT VALID` FK left by a hand repair, a permission
+    revoked, a 021 that has not run on a database the container was pointed at —
+    would take `/admin/` down for every user while every other query on the page
+    succeeds. Losing three cells is the right trade against losing the page.
+
+    The rollback is not optional: a failed statement poisons the session's
+    transaction, and everything after it on this request would raise
+    `InFailedSQLTransaction` instead of the original error. It runs first, so
+    the render that follows has a usable session.
+
+    The failure is logged at ERROR, which means the ring buffer catches it and
+    the health page shows an operator *why* their strip is missing.
+    """
+    try:
+        return await _health_strip(session, user)
+    except Exception:  # noqa: BLE001 - the strip must never take the page down
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 - best effort; the render is what matters
+            logger.exception("could not roll back after a failed health strip read")
+        logger.error(
+            "Dashboard health strip unavailable: its reads failed. The rest of "
+            "the dashboard is unaffected; see /admin/health.",
+            exc_info=True,
+        )
+        return {"unavailable": True, "show_ops": _is_admin(user)}
 
 
 # --- Search analytics -----------------------------------------------------

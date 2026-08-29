@@ -76,6 +76,29 @@ def _dbname(url: str) -> str:
     return unquote(urlsplit(url).path).lstrip("/")
 
 
+def _noisy_docker_shim(tmp_path):
+    """As `_docker_shim`, but the "server" also writes a warning to stderr.
+
+    Exactly what a healthy PostgreSQL does after a libc upgrade — the
+    collation-version mismatch notice is emitted on connection. The value on
+    stdout is still a perfectly good `t`.
+    """
+    bindir = tmp_path / "noisy-bin"
+    bindir.mkdir(exist_ok=True)
+    shim = bindir / "docker"
+    shim.write_text(
+        "#!/bin/bash\n"
+        'echo "WARNING: database \\"x\\" has a collation version mismatch" >&2\n'
+        'if [ "$1" != "exec" ]; then exit 99; fi\n'
+        "shift\n"
+        'while [ $# -gt 0 ] && [ "${1:0:1}" = "-" ]; do shift; done\n'
+        "shift\n"
+        'exec "$@"\n'
+    )
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    return bindir
+
+
 def _docker_shim(tmp_path):
     """A `docker` on PATH that runs `docker exec <name> <cmd…>` as `<cmd…>`.
 
@@ -102,11 +125,11 @@ def _docker_shim(tmp_path):
     return bindir
 
 
-def run_record(url, tmp_path, *, contents=b"fake dump bytes", db_name=None):
+def run_record(url, tmp_path, *, contents=b"fake dump bytes", db_name=None, noisy=False):
     """Run `docker/record-backup.sh` against `url`'s database."""
     dump = tmp_path / "backup_20260829_031500.sql.gz"
     dump.write_bytes(contents)
-    bindir = _docker_shim(tmp_path)
+    bindir = _noisy_docker_shim(tmp_path) if noisy else _docker_shim(tmp_path)
     env = {
         **os.environ,
         **_pg_env(url),
@@ -207,6 +230,85 @@ def test_a_failing_insert_fails_the_target_loudly(db, tmp_path):
         "a failed insert must never be reported as the benign absent-table case"
     )
     assert fetch(db, "SELECT count(*) AS n FROM backups_log")[0]["n"] == 0
+
+
+def test_a_server_warning_on_stderr_does_not_look_like_a_missing_table(db, tmp_path):
+    """The BLOCKER this guard was rewritten for. A healthy server writes
+    warnings to stderr — a collation-version mismatch after a libc upgrade is
+    emitted on connection. Folded into stdout the probe's value becomes
+    `WARNING: …\\nt`, which is not the string `t`, and the absent-table branch
+    then exits 0 without recording anything. Forever, on a table that exists."""
+    result, dump = run_record(db, tmp_path, noisy=True)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert ABSENT_WARNING not in result.stdout, (
+        "a warning on stderr must not be read as 'the table is absent'"
+    )
+    rows = fetch(db, "SELECT filename FROM backups_log")
+    assert [r["filename"] for r in rows] == [dump.name], (
+        "the row must land despite the noise on stderr"
+    )
+
+
+def test_an_unrecognised_probe_answer_fails_rather_than_being_guessed_at(db, tmp_path):
+    """Neither `t` nor `f` on a successful exit means the value being read is
+    not the value that was asked for. Classifying that as 'absent' is how a
+    healthy database silently stops recording backups while the target keeps
+    exiting 0, so it fails instead."""
+    bindir = tmp_path / "liar-bin"
+    bindir.mkdir()
+    shim = bindir / "docker"
+    shim.write_text("#!/bin/bash\necho 'surprise banner'\nexit 0\n")
+    shim.chmod(shim.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+
+    dump = tmp_path / "backup_20260829_031500.sql.gz"
+    dump.write_bytes(b"bytes")
+    result = subprocess.run(
+        ["bash", SCRIPT, str(dump)],
+        env={
+            **os.environ,
+            **_pg_env(db),
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "DB_CONTAINER": "pretend-postgres",
+            "DB_NAME": _dbname(db),
+        },
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "neither 't' nor 'f'" in combined
+    assert ABSENT_WARNING not in combined
+    assert fetch(db, "SELECT count(*) AS n FROM backups_log")[0]["n"] == 0
+
+
+def test_the_row_lands_in_public_even_when_search_path_points_elsewhere(db, tmp_path):
+    """An unqualified INSERT resolves through `search_path`. With a decoy table
+    of the same name earlier on the path, an unqualified writer records into it
+    while the panel — which reads `public.backups_log` — never sees the row, and
+    the target reports success either way."""
+    sql(db, "CREATE SCHEMA decoy")
+    sql(
+        db,
+        "CREATE TABLE decoy.backups_log (id serial PRIMARY KEY, "
+        " created_at timestamptz NOT NULL DEFAULT now(), filename text NOT NULL, "
+        " size_bytes bigint NOT NULL)",
+    )
+    sql(db, f'ALTER DATABASE "{_dbname(db)}" SET search_path TO decoy, public')
+
+    result, dump = run_record(db, tmp_path)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert fetch(db, "SELECT count(*) AS n FROM decoy.backups_log")[0]["n"] == 0, (
+        "the decoy must stay empty"
+    )
+    rows = fetch(db, "SELECT filename FROM public.backups_log")
+    assert [r["filename"] for r in rows] == [dump.name]
+
+    # And the panel's own read finds it, for the same reason.
+    assert _latest(db)["filename"] == dump.name
 
 
 def test_a_probe_that_cannot_answer_fails_rather_than_warning(db, tmp_path):

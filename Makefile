@@ -229,6 +229,7 @@ db-backup:
 	@mkdir -p $(DATA_DIR)/backups
 	@TIMESTAMP=$$(date +%Y%m%d_%H%M%S); \
 	BACKUP_FILE="$(DATA_DIR)/backups/backup_$$TIMESTAMP.sql"; \
+	: "the database named here is mirrored as DB_NAME's default in docker/record-backup.sh; keep the two in step"; \
 	if ! docker exec $(DB_CONTAINER) pg_dump -U postgres obsidian_mcp > $$BACKUP_FILE; then \
 		rm -f $$BACKUP_FILE; \
 		echo "$(RED)Backup FAILED: pg_dump against container '$(DB_CONTAINER)' returned non-zero$(NC)"; \

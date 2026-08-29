@@ -3567,6 +3567,19 @@ def backups_size_check(url):
     return " ".join(rows[0]["def"].split()), rows[0]["convalidated"]
 
 
+def backups_pk(url):
+    """The PK's columns in order, or None when there is no primary key."""
+    return fetchval(
+        url,
+        "SELECT (SELECT array_agg(a.attname ORDER BY k.ord) "
+        "          FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          JOIN pg_attribute a ON a.attrelid = c.conrelid "
+        "                             AND a.attnum = k.attnum) "
+        "FROM pg_constraint c "
+        "WHERE c.conrelid = 'public.backups_log'::regclass AND c.contype = 'p'",
+    )
+
+
 def backups_index_columns(url, name=BACKUPS_INDEX):
     return fetchval(
         url,
@@ -3636,6 +3649,15 @@ def test_021_creates_the_table_it_promises():
         assert "size_bytes" in rendered
 
         assert backups_index_columns(url) == ["created_at"]
+
+        # The primary key and both server defaults — the three things
+        # `alembic check` compares not at all (it does not look at primary
+        # keys, and `compare_server_default` is off by default), so they are
+        # asserted here or nowhere.
+        assert backups_pk(url) == ["id"]
+        assert column_shape(url, "backups_log", "created_at")[2] == "now()"
+        id_default = column_shape(url, "backups_log", "id")[2]
+        assert id_default is not None and id_default.startswith("nextval(")
 
         check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
         assert check.returncode == 0, (
@@ -3759,6 +3781,51 @@ def test_021_refuses_a_missing_index():
     with throwaway_db("schema_backups_no_index") as url:
         sql(url, f"DROP INDEX {BACKUPS_INDEX}")
         refuse_021(url, must_mention=[f"missing index {BACKUPS_INDEX}"])
+
+
+def test_021_refuses_a_tampered_created_at_default():
+    """The quietest mutation this table has. Every column, type, nullability,
+    constraint and index stays exactly as 021 made it — `alembic check` does
+    not compare server defaults at all — and every backup recorded afterwards
+    reads as permanently fresh, so the staleness warning the whole feature
+    exists to raise can never fire again."""
+    with throwaway_db("schema_backups_default") as url:
+        sql(
+            url,
+            "ALTER TABLE backups_log ALTER COLUMN created_at "
+            "SET DEFAULT now() + interval '100 years'",
+        )
+        # `alembic check` is genuinely happy with this, which is the point.
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            "if autogenerate ever starts seeing this, say so here rather than "
+            "leaving the migration's own comparison unexplained"
+        )
+        combined = refuse_021(url, must_mention=["created_at default", "now()"])
+        assert "staleness" in combined
+
+        # And it really would have made a fresh backup read as a future one.
+        insert_backup(url, filename="future.sql.gz")
+        assert fetchval(
+            url, "SELECT created_at > now() + interval '50 years' FROM backups_log"
+        ) is True
+
+
+def test_021_refuses_a_missing_primary_key():
+    """Autogenerate does not compare primary keys, so a table whose PK has been
+    dropped reports as being in perfect agreement with the model — while `id`
+    is no longer unique and the newest-row read has lost its tie-break."""
+    with throwaway_db("schema_backups_no_pk") as url:
+        sql(url, "ALTER TABLE backups_log DROP CONSTRAINT backups_log_pkey")
+        assert backups_pk(url) is None
+        combined = refuse_021(url, must_mention=["no primary key"])
+        assert "tie-break" in combined
+
+
+def test_021_refuses_an_id_that_no_longer_draws_from_its_sequence():
+    with throwaway_db("schema_backups_id_default") as url:
+        sql(url, "ALTER TABLE backups_log ALTER COLUMN id DROP DEFAULT")
+        refuse_021(url, must_mention=["id"])
 
 
 def test_downgrade_021_removes_the_table_and_upgrade_rebuilds_it():
