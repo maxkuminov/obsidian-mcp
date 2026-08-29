@@ -1,0 +1,172 @@
+{% extends "base.html" %}
+{% block title %}Performance — Obsidian MCP{% endblock %}
+{% block content %}
+
+{#
+  Every color on this page comes from a token defined in `_theme.html`; there
+  are no literals here. See docs/architecture/control-panel.md — "one token
+  source, dark canonical". The light-mode change's
+  `checks/literal_sweep.py` is what enforces it.
+#}
+
+<div class="page-top">
+    <h1 class="page-title">Performance</h1>
+</div>
+
+<div class="page-body">
+
+    <!-- Window selector -->
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:20px;">
+        <span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-2);">Window</span>
+        {% for w in windows %}
+        <a href="/admin/performance?window={{ w.key }}"
+           class="btn {% if w.selected %}btn-primary{% else %}btn-ghost{% endif %}"
+           style="padding:6px 14px;font-size:12px;"
+           {% if w.selected %}aria-current="page"{% endif %}>{{ w.label }}</a>
+        {% endfor %}
+        <span style="font-size:12px;color:var(--text-3);margin-left:4px;">{{ window_label }}</span>
+    </div>
+
+    {% if not has_data %}
+    <div class="card anim-1" style="margin-bottom:20px;">
+        <div class="card-body">
+            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+                No MCP requests were logged in this window. Percentiles need at
+                least one call to compute — pick a longer window, or make a
+                request and reload.
+            </p>
+        </div>
+    </div>
+    {% endif %}
+
+    <!-- Per-tool latency -->
+    <div class="card anim-1" style="margin-bottom:20px;">
+        <div class="card-header">
+            <span class="card-title">Per-tool latency</span>
+            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
+        </div>
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Tool</th>
+                    <th style="text-align:right;">Executed</th>
+                    <th style="text-align:right;" title="Calls refused before the tool body ran — no vault assigned, an argument that is not valid UTF-8, or (once shipped) an exhausted quota. Excluded from every figure to the left.">Refused</th>
+                    <th style="text-align:right;">p50</th>
+                    <th style="text-align:right;">p95</th>
+                    <th style="text-align:right;">p99</th>
+                    <th style="text-align:right;">Mean size</th>
+                    <th style="text-align:right;">Max size</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for t in tools %}
+                <tr>
+                    <td style="color:var(--primary-text);font-size:13px;font-weight:500;">{{ t.tool }}</td>
+                    <td class="mono" style="text-align:right;font-size:12px;">{{ t.executed }}</td>
+                    <td class="mono" style="text-align:right;font-size:12px;">
+                        {% if t.refusals %}<span class="badge badge-yellow">{{ t.refusals }}</span>{% else %}<span style="color:var(--text-3);">0</span>{% endif %}
+                    </td>
+                    {# A NULL percentile means the filtered set was empty — every
+                       row for this tool in the window was a refusal. An em dash
+                       says "not measured"; a 0 would be a measurement, and a
+                       false one. #}
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if t.p50 is not none %}{{ t.p50 }} ms{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if t.p95 is not none %}{{ t.p95 }} ms{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if t.p99 is not none %}{{ t.p99 }} ms{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if t.mean_size is not none %}{{ t.mean_size }}{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
+                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if t.max_size is not none %}{{ t.max_size }}{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
+                </tr>
+                {% endfor %}
+                {% if not tools %}
+                <tr>
+                    <td colspan="8" style="text-align:center;padding:32px;color:var(--text-3);">No calls logged in this window.</td>
+                </tr>
+                {% endif %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+    <!-- Phase breakdown -->
+    <div class="card anim-2" style="margin-bottom:20px;">
+        <div class="card-header">
+            <span class="card-title">Search phases</span>
+            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
+        </div>
+        <div class="card-body">
+            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0 0 6px;">
+                Measured inside the search tools. Calls that record no phase
+                timing — every tool that does not embed or query vectors, and
+                every row written before the timings existed — are left out
+                rather than counted as zero.
+            </p>
+            {% for p in phases %}
+            <div class="kv">
+                <span class="kv-k">{{ p.label }}</span>
+                <span class="kv-v mono" style="font-size:12px;">
+                    {% if p.count %}
+                        mean {{ p.mean }} ms · p95 {{ p.p95 }} ms
+                        <span style="color:var(--text-3);">· {{ p.count }} call{{ '' if p.count == 1 else 's' }}</span>
+                    {% else %}
+                        <span style="color:var(--text-3);">no calls recorded this phase in this window</span>
+                    {% endif %}
+                </span>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+
+    <!-- Slowest requests -->
+    <div class="card anim-3">
+        <div class="card-header">
+            <span class="card-title">Slowest requests</span>
+            <span class="mono" style="font-size:11px;color:var(--text-3);">top {{ slowest | length }}</span>
+        </div>
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Actor</th>
+                    <th>Tool</th>
+                    <th style="text-align:right;">Duration</th>
+                    <th style="text-align:right;">Response</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for r in slowest %}
+                <tr>
+                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                        <time datetime="{{ r.created_at }}" data-localize>{{ r.created_at }}</time>
+                    </td>
+                    <td style="font-size:12px;line-height:1.3;">
+                        {% if r.actor_name %}
+                            <div style="color:var(--primary-text);">{{ r.actor_name }}</div>
+                            {% if r.actor_detail %}
+                                <div class="mono" style="font-size:10px;color:var(--text-3);">{{ r.actor_detail }}</div>
+                            {% endif %}
+                        {% else %}
+                            {# Denormalised label and join both empty: the row
+                               predates migration 015 and its credential is
+                               gone. Same wording as /admin/usage. #}
+                            <div class="mono" style="font-size:11px;color:var(--text-3);">unknown (credential deleted)</div>
+                        {% endif %}
+                    </td>
+                    <td style="color:var(--primary-text);font-size:13px;font-weight:500;">{{ r.tool }}</td>
+                    <td class="mono" style="text-align:right;font-size:11px;color:var(--text-2);">{{ r.duration_ms }} ms</td>
+                    <td class="mono" style="text-align:right;font-size:11px;color:var(--text-2);">{% if r.response_size is not none %}{{ r.response_size }}{% else %}—{% endif %}</td>
+                </tr>
+                {% endfor %}
+                {% if not slowest %}
+                <tr>
+                    <td colspan="5" style="text-align:center;padding:32px;color:var(--text-3);">No executed requests in this window.</td>
+                </tr>
+                {% endif %}
+            </tbody>
+        </table>
+        </div>
+    </div>
+
+</div>
+{% endblock %}

@@ -1,0 +1,292 @@
+"""Read-only aggregation over `usage_logs` for the panel's performance view.
+
+Nothing here writes. `usage_logs` is written in exactly one place — `_log_usage`
+via the `_tracked` decorator in `src/mcp_server/tools.py` — and this module is a
+consumer of what that contract already records
+(`docs/architecture/usage-attribution.md`).
+
+## The one predicate that says "the body did not run"
+
+`_tracked` refuses some calls **before** the tool body executes, and logs the
+refusal like any other call: same tool name, same actor, a `duration_ms` of
+roughly zero and a `response_size` of the refusal string. Those rows are real
+history and must stay in the log, but folding them into a latency percentile is
+how a tool that is refusing 5,000 times an hour comes out looking fast.
+
+So the aggregates filter on `pre_body_refusal_sql()`, and the per-tool refusal
+count uses **the same expression**. One helper, two consumers, no drift — the
+alternative is two hand-written predicates that agree until somebody adds a
+third marker to one of them.
+
+**It enumerates exactly the pre-body markers and nothing else.** A broad match
+such as `params ? 'error'` or `params->>'error' IS NOT NULL` is wrong in a way
+that is invisible on the page: `_tracked`'s post-body markers
+(`vault_assignment_changed`, `vault_confirmation_unavailable`) are written by
+tools whose bodies *ran*, did the work of resolving a vault, and then refused to
+publish. Excluding those hides the slowest write path in the server from the
+one view built to find slow paths. Every marker added to `_tracked` therefore
+has to be classified deliberately — pre-body or not — and only the pre-body ones
+belong here.
+
+The enumerated set:
+
+* `over_quota: true` — the quota gate (#162, not yet shipped). Read NULL-safely
+  as `COALESCE((params->>'over_quota')::boolean, false)` so the overwhelming
+  majority of rows, which carry no such key, are simply not refusals. Declared
+  ahead of the gate that writes it so the two land as one contract rather than
+  as a page that silently mis-measures for a release.
+* `error = 'no_vault_assigned'` — the admission gate: the caller has no
+  resolvable vault root, so no tool body runs.
+* `error = 'argument_not_encodable'` — the unpaired-surrogate screen, which
+  refuses at the same altitude for the same reason.
+
+The two string values are mirrored from `_NO_VAULT_MARKER` and
+`_UNENCODABLE_ARG_MARKER` in `src/mcp_server/tools.py`. They are *mirrored*
+rather than imported because #162's quota gate will import this module from
+`tools.py`, and an import in the other direction closes the cycle.
+`tests/test_issue_160_refusal_predicate.py` asserts the two copies are equal,
+so the mirror cannot drift silently.
+"""
+from __future__ import annotations
+
+from sqlalchemy import text
+
+# Mirrored from `src.mcp_server.tools`. Pinned by
+# `tests/test_issue_160_refusal_predicate.py`; see the module docstring for why
+# this is a mirror and not an import.
+NO_VAULT_MARKER = "no_vault_assigned"
+UNENCODABLE_ARG_MARKER = "argument_not_encodable"
+
+#: The `params.error` values `_tracked` writes *before* a tool body runs.
+PRE_BODY_REFUSAL_ERROR_MARKERS: tuple[str, ...] = (
+    NO_VAULT_MARKER,
+    UNENCODABLE_ARG_MARKER,
+)
+
+#: The boolean `params` key the quota gate (#162) will set on a refusal.
+OVER_QUOTA_PARAM = "over_quota"
+
+# The marker values travel as bind parameters, not as interpolated literals.
+# They are module constants today, so quoting them would be safe — but a
+# fragment that interpolates is a fragment somebody extends with a value that
+# is not a constant.
+_BIND_PREFIX = "omcp_pre_body_refusal_"
+
+#: Merge into the parameter dict of any query using the fragment below.
+PRE_BODY_REFUSAL_BINDS: dict[str, str] = {
+    f"{_BIND_PREFIX}{i}": marker
+    for i, marker in enumerate(PRE_BODY_REFUSAL_ERROR_MARKERS)
+}
+
+
+def pre_body_refusal_sql(alias: str = "ul", params_column: str = "params") -> str:
+    """A boolean SQL fragment: this row was refused before its body ran.
+
+    Never NULL. `params` is nullable and `->>` on a missing key yields NULL, so
+    both halves are wrapped in `COALESCE(..., false)`; without that the negation
+    used by the executed-row filter would be NULL and PostgreSQL would drop
+    every ordinary row on the floor.
+
+    Bind `PRE_BODY_REFUSAL_BINDS` alongside the query's own parameters.
+    """
+    params = f"{alias}.{params_column}"
+    placeholders = ", ".join(f":{name}" for name in PRE_BODY_REFUSAL_BINDS)
+    return (
+        f"(COALESCE(({params}->>'{OVER_QUOTA_PARAM}')::boolean, false)"
+        f" OR COALESCE({params}->>'error' IN ({placeholders}), false))"
+    )
+
+
+def executed_sql(alias: str = "ul", params_column: str = "params") -> str:
+    """The complement: this row's tool body actually ran.
+
+    Includes rows whose body ran and then failed — a post-body error marker, an
+    exception surfaced in-band, a timeout. Those are the expensive calls, and a
+    latency view that hides them is worse than no latency view.
+    """
+    return f"(NOT {pre_body_refusal_sql(alias, params_column)})"
+
+
+# --- Windows --------------------------------------------------------------
+
+#: Selectable windows, in the order the page offers them, as **seconds**.
+#: Seconds and not an interval literal: asyncpg infers a parameter's type from
+#: its context, so `CAST(:window AS interval)` demands a `timedelta` and
+#: rejects the string `'24 hours'` outright. Multiplying a bound integer by
+#: `INTERVAL '1 second'` keeps the value a parameter (never interpolated) and
+#: leaves the driver inferring a number, which is what it is.
+#:
+#: Capped at 30 days by construction: `percentile_cont` over `usage_logs` is an
+#: ordered-set aggregate with no index to lean on beyond
+#: `ix_usage_logs_created_at`, and the window is what bounds the scan.
+WINDOWS: dict[str, int] = {
+    "24h": 24 * 60 * 60,
+    "7d": 7 * 24 * 60 * 60,
+    "30d": 30 * 24 * 60 * 60,
+}
+
+DEFAULT_WINDOW = "24h"
+
+WINDOW_LABELS: dict[str, str] = {
+    "24h": "Last 24 hours",
+    "7d": "Last 7 days",
+    "30d": "Last 30 days",
+}
+
+
+def normalize_window(value: str | None) -> str:
+    """Clamp a query-string window onto the offered set.
+
+    An unknown value is the default, not an error: the selector is a link, and
+    a hand-edited URL should render the page rather than a 422.
+    """
+    return value if value in WINDOWS else DEFAULT_WINDOW
+
+
+def _scope(user_id: int | None) -> str:
+    """The owner filter. Admins pass `None` and see every row, exactly as
+    `/admin/usage` does; a regular user sees only their own."""
+    return "" if user_id is None else " AND ul.user_id = :uid"
+
+
+def _base_params(window: str, user_id: int | None) -> dict:
+    params: dict = {"window_seconds": WINDOWS[window], **PRE_BODY_REFUSAL_BINDS}
+    if user_id is not None:
+        params["uid"] = user_id
+    return params
+
+
+_WINDOW_CLAUSE = "ul.created_at >= now() - (:window_seconds * INTERVAL '1 second')"
+
+
+async def tool_aggregates(session, window: str, user_id: int | None) -> list[dict]:
+    """Per-tool executed count, refusal count, duration percentiles, sizes.
+
+    Percentiles and size aggregates are `FILTER`ed to executed rows; the
+    refusal count is the same predicate un-negated, so the two always partition
+    the window's rows for that tool. A tool that only ever refused in the window
+    still appears — with `executed = 0` and NULL percentiles, which the template
+    renders as an em dash rather than a zero it would be wrong to draw.
+    """
+    executed = executed_sql()
+    refused = pre_body_refusal_sql()
+    sql = f"""
+        SELECT
+            ul.tool AS tool,
+            count(*) FILTER (WHERE {executed})                       AS executed,
+            count(*) FILTER (WHERE {refused})                        AS refusals,
+            percentile_cont(0.5) WITHIN GROUP (ORDER BY ul.duration_ms)
+                FILTER (WHERE {executed} AND ul.duration_ms IS NOT NULL) AS p50,
+            percentile_cont(0.95) WITHIN GROUP (ORDER BY ul.duration_ms)
+                FILTER (WHERE {executed} AND ul.duration_ms IS NOT NULL) AS p95,
+            percentile_cont(0.99) WITHIN GROUP (ORDER BY ul.duration_ms)
+                FILTER (WHERE {executed} AND ul.duration_ms IS NOT NULL) AS p99,
+            avg(ul.response_size)
+                FILTER (WHERE {executed} AND ul.response_size IS NOT NULL) AS mean_size,
+            max(ul.response_size)
+                FILTER (WHERE {executed} AND ul.response_size IS NOT NULL) AS max_size
+        FROM usage_logs ul
+        WHERE {_WINDOW_CLAUSE}{_scope(user_id)}
+        GROUP BY ul.tool
+        ORDER BY count(*) FILTER (WHERE {executed}) DESC, ul.tool ASC
+    """
+    rows = (await session.execute(text(sql), _base_params(window, user_id))).fetchall()
+    return [
+        {
+            "tool": r.tool,
+            "executed": int(r.executed or 0),
+            "refusals": int(r.refusals or 0),
+            "p50": _ms(r.p50),
+            "p95": _ms(r.p95),
+            "p99": _ms(r.p99),
+            "mean_size": _int(r.mean_size),
+            "max_size": _int(r.max_size),
+        }
+        for r in rows
+    ]
+
+
+async def phase_breakdown(session, window: str, user_id: int | None) -> list[dict]:
+    """Mean and p95 of the per-phase timings `src/services/timing.py` records.
+
+    Only rows that actually carry the key contribute. A note tool logs no
+    `embed_ms`, and rows written before the phase timings existed carry
+    neither; treating a missing key as a zero would drag every mean toward the
+    number of tools that do not measure, which is not a fact about anything.
+    That is why the filter is `IS NOT NULL` on the extracted text rather than a
+    `COALESCE(..., 0)`.
+    """
+    executed = executed_sql()
+    selects = []
+    for phase in ("embed_ms", "db_ms"):
+        present = f"({executed} AND (ul.params->>'{phase}') IS NOT NULL)"
+        value = f"(ul.params->>'{phase}')::double precision"
+        selects.append(
+            f"count(*) FILTER (WHERE {present}) AS {phase}_n, "
+            f"avg({value}) FILTER (WHERE {present}) AS {phase}_mean, "
+            f"percentile_cont(0.95) WITHIN GROUP (ORDER BY {value}) "
+            f"FILTER (WHERE {present}) AS {phase}_p95"
+        )
+    sql = f"""
+        SELECT {', '.join(selects)}
+        FROM usage_logs ul
+        WHERE {_WINDOW_CLAUSE}{_scope(user_id)}
+    """
+    row = (await session.execute(text(sql), _base_params(window, user_id))).first()
+    out = []
+    for phase, label in (("embed_ms", "Embedding"), ("db_ms", "Database")):
+        count = int(getattr(row, f"{phase}_n", 0) or 0) if row is not None else 0
+        out.append({
+            "phase": phase,
+            "label": label,
+            "count": count,
+            "mean": _ms(getattr(row, f"{phase}_mean", None)) if row is not None else None,
+            "p95": _ms(getattr(row, f"{phase}_p95", None)) if row is not None else None,
+        })
+    return out
+
+
+async def slowest_requests(
+    session, window: str, user_id: int | None, limit: int = 50
+) -> list:
+    """The window's slowest executed calls, newest-slowest first, capped at 50.
+
+    Actor attribution comes from the denormalised `actor_*` columns migration
+    015 writes at call time; the LEFT JOINs are the fallback for rows written
+    before it, exactly as on `/admin/usage`. Resolving by join alone renders
+    "unknown" for precisely the credential an operator has just deleted and
+    come to investigate (#77).
+    """
+    limit = max(1, min(int(limit), 50))
+    executed = executed_sql()
+    sql = f"""
+        SELECT
+            ul.created_at, ul.tool, ul.duration_ms, ul.response_size,
+            ul.actor_kind, ul.actor_label, ul.actor_ref,
+            ak.name        AS api_key_name,
+            ak.key_prefix  AS api_key_prefix,
+            oc.client_name AS oauth_client_name
+        FROM usage_logs ul
+        LEFT JOIN api_keys ak ON ul.key_id = ak.id
+        LEFT JOIN oauth_tokens ot ON ul.oauth_token_id = ot.id
+        LEFT JOIN oauth_clients oc ON ot.client_id = oc.client_id
+        WHERE {_WINDOW_CLAUSE}{_scope(user_id)}
+          AND {executed}
+          AND ul.duration_ms IS NOT NULL
+        ORDER BY ul.duration_ms DESC, ul.created_at DESC
+        LIMIT :limit
+    """
+    params = _base_params(window, user_id)
+    params["limit"] = limit
+    return (await session.execute(text(sql), params)).fetchall()
+
+
+def _ms(value) -> float | None:
+    """A millisecond figure rounded for display, or None when there was no
+    sample. `percentile_cont` returns NULL for an empty filtered set, and that
+    is rendered as "no data", never as 0."""
+    return None if value is None else round(float(value), 1)
+
+
+def _int(value) -> int | None:
+    return None if value is None else int(round(float(value)))

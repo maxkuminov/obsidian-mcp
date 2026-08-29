@@ -102,7 +102,12 @@
         <div class="card anim-3">
             <div class="card-header">
                 <span class="card-title">Indexer</span>
-                <span class="mono" style="font-size:11px;color:var(--text-3);">{{ last_run_rel }}</span>
+                {# The heartbeat beside the title is this process's; the link
+                   goes to the persisted per-pass history and timings. #}
+                <span style="display:flex;align-items:center;gap:10px;">
+                    <span class="mono" style="font-size:11px;color:var(--text-3);">{{ last_run_rel }}</span>
+                    <a href="/admin/performance" style="font-size:11px;color:var(--primary-text);text-decoration:none;">Performance →</a>
+                </span>
             </div>
             <div class="card-body">
                 <div style="display:flex;align-items:flex-end;gap:12px;padding:4px 0 22px;flex-wrap:wrap;">

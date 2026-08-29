@@ -44,6 +44,14 @@ from src.oauth.scope import (
     token_has_write,
 )
 from src.services.indexer import invalidate_hnsw_index_cache
+from src.services.usage_stats import (
+    WINDOW_LABELS,
+    WINDOWS,
+    normalize_window,
+    phase_breakdown,
+    slowest_requests,
+    tool_aggregates,
+)
 from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
@@ -1244,6 +1252,67 @@ async def usage_page(
     return templates.TemplateResponse(request, "usage.html", _panel_context(request, user, {
         "active": "usage", "logs": logs, "chart_data": chart_data,
     }))
+
+
+# --- Performance ----------------------------------------------------------
+
+
+@router.get("/performance", response_class=HTMLResponse)
+async def performance_page(
+    request: Request,
+    window: str | None = None,
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    """Per-tool latency, phase timings and the window's slowest calls.
+
+    Read-only aggregation over `usage_logs`; the SQL and the one shared
+    executed/refused predicate live in `src/services/usage_stats.py`, which is
+    where the reasoning for the predicate is written down.
+
+    Scoped exactly like `/admin/usage`: an admin sees every row, a regular user
+    only their own. `window` is clamped rather than validated — the selector is
+    a set of links, and a hand-edited query string should render the page.
+    """
+    uid = _scope_user_id(user)
+    window = normalize_window(window)
+
+    tools = await tool_aggregates(session, window, uid)
+    phases = await phase_breakdown(session, window, uid)
+    slowest_rows = await slowest_requests(session, window, uid)
+
+    slowest = []
+    for r in slowest_rows:
+        actor_name, actor_detail = _usage_actor(r)
+        slowest.append({
+            "created_at": r.created_at.isoformat(),
+            "tool": r.tool,
+            "duration_ms": r.duration_ms,
+            "response_size": r.response_size,
+            "actor_name": actor_name,
+            "actor_detail": actor_detail,
+        })
+
+    return templates.TemplateResponse(
+        request,
+        "performance.html",
+        _panel_context(request, user, {
+            "active": "performance",
+            "window": window,
+            "window_label": WINDOW_LABELS[window],
+            "windows": [
+                {"key": key, "label": key, "selected": key == window}
+                for key in WINDOWS
+            ],
+            "tools": tools,
+            "phases": phases,
+            "slowest": slowest,
+            # A window with no executed rows at all is a real state (a fresh
+            # deploy, a quiet weekend) and gets its own copy rather than a
+            # table of zeroes that reads like a measurement.
+            "has_data": any(t["executed"] or t["refusals"] for t in tools),
+        }),
+    )
 
 
 # --- Vault browser --------------------------------------------------------
