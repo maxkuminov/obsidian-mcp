@@ -16,6 +16,7 @@ The preamble matches `tests/test_issue_66_vault_unassignment_revokes_tools.py`:
 reads `./.env`, so the environment is set and the cwd moved before the import.
 """
 import asyncio
+import datetime as _dt
 import os
 import tempfile
 
@@ -27,6 +28,8 @@ os.chdir(tempfile.gettempdir())
 import pytest  # noqa: E402
 
 import src.mcp_server.auth as mcp_auth  # noqa: E402
+
+TODAY = _dt.datetime.now(_dt.timezone.utc).date()
 import src.mcp_server.tools as tools  # noqa: E402
 import src.services.quotas as quotas  # noqa: E402
 from src.models.db import APIKey  # noqa: E402
@@ -168,7 +171,7 @@ def test_an_over_quota_call_is_refused_before_the_body():
         _probe, limit=5, spy=_QuotaSpySession(admitted=None)
     )
 
-    assert result == quotas.quota_refusal_message(5)
+    assert result == quotas.quota_refusal_message(5, quotas.reset_instant(TODAY))
     assert "ran:" not in result, "the tool body ran anyway"
     assert len(_admissions(spy)) == 1
 
@@ -176,12 +179,13 @@ def test_an_over_quota_call_is_refused_before_the_body():
 def test_the_refusal_message_names_the_limit_and_the_utc_reset():
     """The reader is an agent. "Quota exceeded" gives it nothing to act on; a
     number and a timestamp let it wait or tell its operator what to raise."""
-    message = quotas.quota_refusal_message(250)
+    reset = quotas.reset_instant(TODAY)
+    message = quotas.quota_refusal_message(250, reset)
     assert "250" in message
     assert "UTC" in message
-    reset = quotas.reset_instant()
     assert reset.strftime("%Y-%m-%dT%H:%M:%SZ") in message
     assert reset.hour == 0 and reset.minute == 0 and reset.second == 0
+    assert reset.date() == TODAY + _dt.timedelta(days=1)
 
 
 def test_the_logged_marker_is_a_json_boolean_and_nothing_else():
@@ -315,7 +319,7 @@ def test_the_prune_fires_on_a_fresh_row_and_not_on_a_subsequent_one():
     fresh = _QuotaSpySession(admitted=1)
     mp.setattr(quotas, "async_session", fresh)
     try:
-        assert asyncio.run(quotas.admit(7, 100)) == 1
+        assert asyncio.run(quotas.admit(7, 100)).count == 1
     finally:
         mp.undo()
     assert [s for s, _ in fresh.statements if "DELETE FROM quota_counters" in s]
@@ -324,7 +328,7 @@ def test_the_prune_fires_on_a_fresh_row_and_not_on_a_subsequent_one():
     mp = pytest.MonkeyPatch()
     mp.setattr(quotas, "async_session", later)
     try:
-        assert asyncio.run(quotas.admit(7, 100)) == 42
+        assert asyncio.run(quotas.admit(7, 100)).count == 42
     finally:
         mp.undo()
     assert not [s for s, _ in later.statements if "DELETE FROM quota_counters" in s]
@@ -335,7 +339,7 @@ def test_a_refusal_issues_no_second_statement():
     mp = pytest.MonkeyPatch()
     mp.setattr(quotas, "async_session", refused)
     try:
-        assert asyncio.run(quotas.admit(7, 100)) is None
+        assert not asyncio.run(quotas.admit(7, 100)).admitted
     finally:
         mp.undo()
     assert len(refused.statements) == 1
@@ -755,3 +759,102 @@ def test_the_keys_page_renders_both_a_limited_and_an_unlimited_key():
     # And the copy states the basis, because "43 / 100" is otherwise read as
     # requests since midnight.
     assert "since the limit was set" in html
+
+
+# --------------------------------------------------------------------------
+# 9. the refusal's reset instant comes from the decision, not a second clock
+# --------------------------------------------------------------------------
+#
+# The failure this closes: `admit()` picks the accounting day from one clock
+# read, and the refusal message used to pick its reset from another. A call
+# whose two reads straddle UTC midnight then decides against day D (D's counter
+# is full) and reports D+2's midnight as the reset — telling an obedient agent
+# to back off for nearly forty-eight hours when its quota was milliseconds from
+# resetting. Self-inflicted, and invisible to every test that runs mid-day.
+
+
+def test_reset_instant_takes_a_day_not_a_clock_reading():
+    """The signature is the fix. A function taking `now` can always be handed a
+    second, later `now`; one taking the accounting date cannot."""
+    import inspect
+
+    params = list(inspect.signature(quotas.reset_instant).parameters)
+    assert params == ["day"]
+    assert quotas.reset_instant(_dt.date(2026, 8, 29)) == _dt.datetime(
+        2026, 8, 30, 0, 0, tzinfo=_dt.timezone.utc
+    )
+
+
+def test_an_admission_carries_the_day_it_decided_for():
+    refused = quotas.Admission(day=_dt.date(2026, 8, 29), count=None)
+    assert refused.admitted is False
+    assert refused.reset_at == _dt.datetime(
+        2026, 8, 30, 0, 0, tzinfo=_dt.timezone.utc
+    )
+    admitted = quotas.Admission(day=_dt.date(2026, 8, 29), count=7)
+    assert admitted.admitted is True
+
+
+def test_a_refusal_straddling_utc_midnight_names_the_right_midnight(monkeypatch):
+    """The normative case, with the two clock reads frozen either side of
+    midnight: the statement decides against 2026-08-29 at 23:59:59.9, and the
+    message is built after the clock has ticked over to 2026-08-30.
+
+    The reset must be **2026-08-30T00:00:00Z** — the boundary the decision was
+    actually made against — and never 2026-08-31's.
+    """
+    before = _dt.datetime(2026, 8, 29, 23, 59, 59, 900000, tzinfo=_dt.timezone.utc)
+    after = _dt.datetime(2026, 8, 30, 0, 0, 0, 100000, tzinfo=_dt.timezone.utc)
+    readings = iter([before, after, after, after])
+
+    class _FrozenClock(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return next(readings)
+
+    # Patch the clock *inside* `quotas`, so `admit` picks its day from `before`
+    # and anything that later re-read the clock would get `after`.
+    monkeypatch.setattr(quotas._dt, "datetime", _FrozenClock)
+
+    spy = _QuotaSpySession(admitted=None)
+    monkeypatch.setattr(quotas, "async_session", spy)
+
+    decision = asyncio.run(quotas.admit(7, 5))
+
+    # The statement was bound to the day the first reading fell in.
+    assert decision.day == _dt.date(2026, 8, 29)
+    assert spy.statements[0][1]["day"] == _dt.date(2026, 8, 29)
+    assert decision.admitted is False
+
+    message = quotas.quota_refusal_message(5, decision.reset_at)
+    assert "2026-08-30T00:00:00Z" in message, message
+    assert "2026-08-31" not in message, (
+        "the refusal named the day-after-next's midnight — an obedient agent "
+        "would back off for ~24h of quota it was entitled to spend"
+    )
+
+
+def test_the_gate_hands_the_decisions_reset_to_the_message(monkeypatch):
+    """End to end through `_tracked`: whatever day the admission decided for is
+    the day the caller is told about, with no clock read in between.
+
+    The decided day is deliberately **not** today. A gate that re-read the
+    clock would produce today+1 and pass this test on any day that happened to
+    match — which is how the original defect survived: mid-day, the two reads
+    agree, and only the run that straddles midnight disagrees.
+    """
+    fixed_day = _dt.date(2019, 3, 7)
+    assert fixed_day != TODAY, "the fixture must not coincide with today"
+
+    async def fake_admit(key_id, limit, now=None):
+        return quotas.Admission(day=fixed_day, count=None)
+
+    monkeypatch.setattr(tools, "_admit_quota", fake_admit)
+    result, params, _ = _run_tracked(_probe, limit=5)
+
+    assert params["over_quota"] is True
+    assert "2019-03-08T00:00:00Z" in result, result
+    today_reset = quotas.reset_instant(TODAY).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert today_reset not in result, (
+        "the gate re-read the clock instead of using the admission's day"
+    )

@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+from dataclasses import dataclass
 
 from sqlalchemy import text
 
@@ -93,7 +94,9 @@ __all__ = [
     "DAILY_REQUEST_LIMIT_MIN",
     "OVER_QUOTA_PARAM",
     "PRUNE_AFTER_DAYS",
+    "Admission",
     "admit",
+    "apply_daily_request_limit",
     "consumed_today",
     "limit_value_error",
     "parse_limit_form_value",
@@ -123,9 +126,21 @@ ADMISSION_SQL = text(
 #: The opportunistic prune. Runs only after an admission whose `RETURNING
 #: count` is 1 — the INSERT branch, i.e. the first admission of a new UTC day
 #: for that key — so it happens at most once per key per day and never on the
-#: contended path. It is global rather than per-key on purpose: what bounds the
-#: table is old rows belonging to keys nobody is calling any more, and a
-#: per-key prune never reaches those.
+#: contended path.
+#:
+#: **Its trigger is per-key; its scope is global.** One key's first call of the
+#: day deletes *every* key's rows older than the cutoff, not just its own. That
+#: is deliberate and is the only reason the table stays bounded: what
+#: accumulates is rows belonging to keys nobody is calling any more, and a
+#: per-key prune is by construction never run for those keys again.
+#:
+#: **Accepted cost:** the prune runs before `admit()` returns, so the request
+#: that happens to be a key's first of the day pays for the housekeeping. It is
+#: one indexed `DELETE` over a table holding at most one row per key per
+#: retained day, it happens at most once per key per day, and its failure is
+#: swallowed rather than charged to the caller. Moving it to a background task
+#: would buy a few milliseconds for that one request at the cost of a scheduler
+#: this server does not otherwise need.
 PRUNE_SQL = text("DELETE FROM quota_counters WHERE day < :cutoff")
 
 
@@ -137,41 +152,92 @@ def utc_day(now: _dt.datetime | None = None) -> _dt.date:
     return moment.astimezone(_dt.timezone.utc).date()
 
 
-def reset_instant(now: _dt.datetime | None = None) -> _dt.datetime:
-    """The next UTC midnight — when this key's counter starts again.
+def reset_instant(day: _dt.date) -> _dt.datetime:
+    """Midnight UTC at the end of `day` — when that day's counter starts again.
 
-    Quoted in the refusal so an agent that reads its own error can back off
-    until then instead of retrying in a loop.
+    Takes the **accounting day**, not a clock reading. That is the whole point:
+    the reset an over-quota caller is told about must be derived from the day
+    the admission statement actually decided against, never from a second look
+    at the clock. See `Admission.reset_at`.
     """
-    day = utc_day(now)
     return _dt.datetime.combine(
         day + _dt.timedelta(days=1), _dt.time.min, tzinfo=_dt.timezone.utc
     )
 
 
-def quota_refusal_message(limit: int, now: _dt.datetime | None = None) -> str:
+@dataclass(frozen=True)
+class Admission:
+    """What one admission attempt decided, and the day it decided it for.
+
+    **The day travels with the decision.** `admit()` reads the clock once to
+    pick the accounting day, binds it into the statement, and returns it here;
+    every consequence of the decision — most importantly the reset instant the
+    refusal quotes — is derived from *this* `day` rather than from a fresh
+    `datetime.now()`.
+
+    That is not fastidiousness. A refusal that straddles UTC midnight reads the
+    clock twice: the statement decides against day D (the counter for D is
+    full) and a message built from a second clock read is already in day D+1,
+    so it names D+2's midnight and tells an obedient agent to back off for
+    nearly forty-eight hours instead of the few milliseconds actually left.
+    An agent that believes its own error message would then have quota it could
+    not spend — a self-inflicted outage, caused by the one thing on this path
+    that was allowed to be non-deterministic.
+    """
+
+    #: The UTC date the admission statement was bound to.
+    day: _dt.date
+    #: The day's admission count including this call, or None when refused.
+    count: int | None
+
+    @property
+    def admitted(self) -> bool:
+        return self.count is not None
+
+    @property
+    def reset_at(self) -> _dt.datetime:
+        """When this decision stops applying. Derived from `day`, not the
+        clock, so it is correct however long the caller takes to read it."""
+        return reset_instant(self.day)
+
+
+def quota_refusal_message(limit: int, reset_at: _dt.datetime) -> str:
     """The refusal an over-quota caller receives, in place of its tool result.
 
     It names the limit and the reset instant because the reader is an agent:
     "quota exceeded" gives it nothing to act on, while a number and a timestamp
     let it either wait or tell its operator exactly what to raise.
+
+    `reset_at` is **passed in**, from `Admission.reset_at`, and is never
+    recomputed here. A message that re-read the clock could name the wrong
+    midnight for a call that crossed one between the statement and the string.
     """
-    reset = reset_instant(now)
     return (
         f"Error: this API key has used its daily request limit of {limit} "
         f"tool calls for the current UTC day. No further calls will run until "
-        f"the limit resets at {reset.strftime('%Y-%m-%dT%H:%M:%SZ')} (the next "
-        "UTC midnight). Wait for the reset, or ask an administrator to raise "
-        "this key's daily request limit in the control panel."
+        f"the limit resets at {reset_at.strftime('%Y-%m-%dT%H:%M:%SZ')} (the "
+        "next UTC midnight). Wait for the reset, or ask an administrator to "
+        "raise this key's daily request limit in the control panel."
     )
 
 
-async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> int | None:
-    """Consume one slot for `key_id` today, or return None if none is left.
+async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> Admission:
+    """Consume one slot for `key_id` today, or report that none is left.
 
-    Returns the day's admission count including this one, or None when the
-    ceiling is already reached. Commits in its own transaction and releases the
-    connection before returning, so the caller's tool body never waits on it.
+    Returns an `Admission` carrying the accounting day and the day's count
+    including this call (None when refused). Commits in its own transaction and
+    releases the connection before returning, so the caller's tool body never
+    waits on it.
+
+    **The clock is read exactly once**, here, to pick `day`; the returned
+    `Admission` carries it so the refusal's reset instant cannot drift from the
+    decision that produced it.
+
+    A failure of the admission statement itself is logged and re-raised: the
+    call does not run (fail closed, deliberately — see the module docstring),
+    but it also does not vanish. The exception would otherwise propagate past a
+    `_tracked` that never reached `_log_usage`, leaving an enforcement outage
+    with no line anywhere naming the key it happened to.
 
     The prune runs only on the INSERT branch — a `RETURNING count` of 1 is the
     row having just been created, since the `DO UPDATE` adds to a count that is
@@ -180,14 +246,29 @@ async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> int
     """
     day = utc_day(now)
     async with async_session() as session:
-        admitted = (
-            await session.execute(
-                ADMISSION_SQL, {"key_id": key_id, "day": day, "limit": limit}
+        try:
+            count = (
+                await session.execute(
+                    ADMISSION_SQL, {"key_id": key_id, "day": day, "limit": limit}
+                )
+            ).scalar()
+            await session.commit()
+        except Exception as exc:
+            # Fail closed *and* visible. Re-raised unchanged so the behaviour
+            # is exactly what it was; logged because a quota that has stopped
+            # deciding is an incident, and this is the only place that knows
+            # which key and which day it stopped deciding for.
+            logger.error(
+                "quota_admission_failed",
+                extra={
+                    "key_id": key_id,
+                    "day": day.isoformat(),
+                    "error_type": type(exc).__name__,
+                },
             )
-        ).scalar()
-        await session.commit()
+            raise
 
-        if admitted == 1:
+        if count == 1:
             try:
                 await session.execute(
                     PRUNE_SQL, {"cutoff": day - _dt.timedelta(days=PRUNE_AFTER_DAYS)}
@@ -196,7 +277,56 @@ async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> int
             except Exception as exc:  # pragma: no cover - housekeeping only
                 await session.rollback()
                 logger.warning("quota_counter_prune_failed", extra={"error": str(exc)})
-        return admitted
+        return Admission(day=day, count=count)
+
+
+#: Deletes the current day's counter for one key. Issued only on the
+#: NULL-to-limited transition, in the same transaction as the limit write.
+_CLEAR_TODAY_SQL = text(
+    "DELETE FROM quota_counters WHERE key_id = :key_id AND day = :day"
+)
+
+
+async def apply_daily_request_limit(
+    session, api_key, limit: int | None, now: _dt.datetime | None = None
+) -> bool:
+    """Write a key's limit, resetting the day's counter iff this enables one.
+
+    **The one implementation of the enable-reset rule**, shared by the panel
+    form and the JSON API. Two copies of "did this transition go NULL to a
+    value" is how the two surfaces start disagreeing about whether an operator
+    is charged for traffic that was unlimited when it happened — and the
+    disagreement would be invisible, because both would look like they worked.
+
+    Returns whether the counter was reset, for the caller's own reporting.
+
+    The rule, both halves deliberate:
+
+    * **NULL to a value resets.** Consumption is defined as admissions *since
+      the limit was enabled*, so the current UTC day's counter row is deleted
+      in the same transaction as the write. A key that made forty calls this
+      morning with no limit set reads 0/100 the moment a limit of 100 is set.
+      Charging an operator for traffic that was explicitly unlimited when it
+      happened is the surprise that gets the feature turned off again.
+    * **A value to another value keeps.** Those calls *were* admitted under a
+      quota, and forgiving them would make "lower the limit" a way to grant
+      more calls.
+
+    Clearing to NULL keeps nothing meaningful either way — an unlimited key
+    performs no accounting — so the row is left to the ordinary prune.
+
+    **One transaction for both statements.** Split, a crash between them leaves
+    a key limited with this morning's unlimited traffic already charged
+    against it.
+    """
+    enabling = api_key.daily_request_limit is None and limit is not None
+    api_key.daily_request_limit = limit
+    if enabling:
+        await session.execute(
+            _CLEAR_TODAY_SQL, {"key_id": api_key.id, "day": utc_day(now)}
+        )
+    await session.commit()
+    return enabling
 
 
 async def consumed_today(session, key_ids, now: _dt.datetime | None = None) -> dict:

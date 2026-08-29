@@ -46,6 +46,7 @@ from src.oauth.scope import (
 )
 from src.services.indexer import invalidate_hnsw_index_cache
 from src.services.quotas import (
+    apply_daily_request_limit,
     consumed_today,
     parse_limit_form_value,
     utc_day,
@@ -719,21 +720,12 @@ async def set_key_limit_form(
 ):
     """Set, change, or clear a key's daily request limit (#162).
 
-    **Enabling resets the day; changing does not.** Turning a limit on for a
-    key that had none deletes that key's counter row for the current UTC day,
-    in the same transaction as the limit write — so consumption is
-    "admissions since the limit was set", which is what the keys page says out
-    loud. The alternative charges an operator for traffic that was explicitly
-    unlimited when it happened, and a limit that reads 40/100 the second it is
-    created is the surprise that gets the feature turned off again.
-
-    Raising or lowering a limit that already existed keeps the counter: those
-    calls *were* admitted under a quota, and forgiving them would make
-    "lower the limit" a way to grant more calls.
-
-    One transaction for both statements. Split, a crash between them leaves a
-    key limited with yesterday's — or this morning's unlimited — consumption
-    already charged against it.
+    The enable-reset rule and its single transaction live in
+    `src.services.quotas.apply_daily_request_limit`, shared with the JSON API's
+    twin endpoint — two copies of "did this go NULL to a value" is how the two
+    surfaces start disagreeing about whether an operator is charged for traffic
+    that was unlimited when it happened, invisibly, because both would look
+    like they worked.
     """
     result = await session.execute(select(APIKey).where(APIKey.id == key_id))
     api_key = result.scalar_one_or_none()
@@ -744,14 +736,7 @@ async def set_key_limit_form(
         _flash_key_error(request, limit_error)
         return RedirectResponse("/admin/keys", status_code=303)
 
-    enabling = api_key.daily_request_limit is None and limit is not None
-    api_key.daily_request_limit = limit
-    if enabling:
-        await session.execute(
-            text("DELETE FROM quota_counters WHERE key_id = :key_id AND day = :day"),
-            {"key_id": key_id, "day": utc_day()},
-        )
-    await session.commit()
+    await apply_daily_request_limit(session, api_key, limit)
     return RedirectResponse("/admin/keys", status_code=303)
 
 

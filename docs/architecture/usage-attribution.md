@@ -304,11 +304,35 @@ screen live in, and the code is `src/services/quotas.py`.
   exempt the same way until somebody deliberately binds a ceiling for it. v1
   exempts OAuth because panel OAuth is the operator, and an operator locked out
   by a ceiling they set on themselves cannot raise it.
-- **A database failure is not silently "unlimited".** If the admission statement
-  raises, the exception propagates and the call does not run. Swallowing it
-  would mean a database blip quietly disables every configured ceiling, which is
-  the one failure mode nobody would notice; keys with no limit never reach the
-  code, so nothing that was working before can start failing because of it.
+- **A database failure is not silently "unlimited", and not silently anything
+  else either.** If the admission statement raises, the exception is logged
+  (`quota_admission_failed`, with the key id, the accounting day and the
+  exception type) and re-raised, so the call does not run. Swallowing it would
+  mean a database blip quietly disables every configured ceiling, which is the
+  one failure mode nobody would notice; keys with no limit never reach the code,
+  so nothing that was working before can start failing because of it. The log
+  line matters because the raise happens *before* `_log_usage` — an enforcement
+  outage would otherwise leave no record anywhere naming the key it happened to.
+- **The refusal's reset instant comes from the admission, never from a second
+  clock read.** `admit()` reads the clock once to pick the accounting day and
+  returns it on the `Admission`; `quota_refusal_message` is handed
+  `Admission.reset_at` and recomputes nothing. A refusal that straddles UTC
+  midnight otherwise decides against day D and then describes day D+1's
+  midnight as though it were D+2's, telling an obedient agent to back off for
+  nearly two days when its quota was milliseconds from resetting — a
+  self-inflicted outage produced entirely by the one non-deterministic thing on
+  the path. `reset_instant` therefore takes a **date**, not a clock reading, so
+  the mistake cannot be reintroduced by passing `now`.
+- **Only tool calls consume quota; `/transfer/*` redemptions do not.** The
+  public transfer routes are served by `src/transfer/`, not by an MCP tool, so
+  they never pass through `_tracked` and never touch the counter. What consumes
+  the slot is the **mint** — `request_upload`, `request_download` and
+  `import_from_url` are ordinary `_tracked` tools — so a key that reaches its
+  ceiling can still complete uploads and downloads for capabilities it minted
+  earlier, and cannot mint new ones. That is the intended shape: a capability is
+  a promise already made, and revoking it belongs to the transfer token's own
+  expiry and to key revocation, not to a daily request ceiling. It does mean the
+  quota bounds requests to the *server*, not bytes over the wire.
 - **Zero is refused at both layers.** `daily_request_limit` is constrained to
   NULL or 1..1,000,000 by `ck_api_keys_daily_request_limit` and by the panel's
   own validation. Zero would make the guarded UPDATE decline every call forever,
@@ -318,9 +342,17 @@ screen live in, and the code is `src/services/quotas.py`.
   message is what makes it fixable.
 - **Counter rows are pruned opportunistically**, by the admission whose
   `RETURNING count` is 1 — the INSERT branch, i.e. the first call of a new UTC
-  day for that key. Once per key per day, never on the contended path, and its
-  failure is swallowed: a call that has already been admitted must not be turned
-  into an error by housekeeping.
+  day for that key. The **trigger is per-key; the scope is global**: that one
+  call deletes *every* key's rows older than the cutoff, not just its own,
+  which is the only reason the table stays bounded — what accumulates is rows
+  belonging to keys nobody is calling any more, and a per-key prune is by
+  construction never run for those keys again. At most once per key per day,
+  never on the contended path, and its failure is swallowed: a call that has
+  already been admitted must not be turned into an error by housekeeping. The
+  accepted cost is that the request which happens to be a key's first of the
+  day pays for the housekeeping, before `admit()` returns — one indexed DELETE
+  over a table holding at most one row per key per retained day, rather than a
+  background scheduler this server does not otherwise need.
 
 
 ## The filtered usage views (#162)

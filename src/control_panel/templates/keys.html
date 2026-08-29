@@ -191,6 +191,9 @@
                     count at zero</strong> — consumption is counted from the
                     moment the limit is set, not from midnight. Changing an
                     existing limit keeps the day's count.
+                    A change takes effect from the key's <em>next</em> request:
+                    the ceiling is read once when a request authenticates, so a
+                    call already in flight finishes under the old value.
                 </div>
             </div>
             <div class="modal-footer">

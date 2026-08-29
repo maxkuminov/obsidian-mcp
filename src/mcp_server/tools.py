@@ -514,12 +514,19 @@ async def _quota_admission_error() -> str | None:
         # half-set test fixture reaches, and counting against a key id of None
         # would violate the counter's own NOT NULL. Exempt rather than crash.
         return None
-    if await _admit_quota(key_id, limit) is not None:
+    decision = await _admit_quota(key_id, limit)
+    if decision.admitted:
         return None
     logger.warning(
-        "tool_refused_over_quota", extra={"key_id": key_id, "limit": limit}
+        "tool_refused_over_quota",
+        extra={"key_id": key_id, "limit": limit, "day": decision.day.isoformat()},
     )
-    return quota_refusal_message(limit)
+    # The reset comes from the decision, not from a fresh clock read. A refusal
+    # that straddles UTC midnight would otherwise name the day-after-next's
+    # midnight and tell an obedient agent to back off for nearly two days when
+    # its quota was about to reset in milliseconds — a self-inflicted outage
+    # produced entirely by reading the clock twice.
+    return quota_refusal_message(limit, decision.reset_at)
 
 
 def _response_size(result) -> int:

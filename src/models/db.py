@@ -813,10 +813,14 @@ class QuotaCounter(Base):
     operator for traffic that was unlimited when it happened) is the surprise
     that gets a limit turned off again.
 
-    Rows are pruned opportunistically: the first admission of a new UTC day for
-    a key (the one whose `RETURNING count` is 1, i.e. the INSERT rather than the
-    UPDATE) deletes that key's rows older than two days. Once per key per day,
-    off the conflicting path, and never in a way that can fail an admitted call.
+    Rows are pruned opportunistically, and the prune's **trigger is per-key
+    while its scope is global**: the first admission of a new UTC day for any
+    key (the one whose `RETURNING count` is 1, i.e. the INSERT rather than the
+    UPDATE) deletes *every* key's rows older than two days, not just its own.
+    That is what bounds the table — what accumulates is rows belonging to keys
+    nobody is calling any more, and a per-key prune is by construction never
+    run for those keys again. At most once per key per day, off the contended
+    path, and never in a way that can fail an admitted call.
     """
 
     __tablename__ = "quota_counters"

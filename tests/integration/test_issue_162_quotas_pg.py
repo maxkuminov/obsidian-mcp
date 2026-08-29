@@ -157,7 +157,7 @@ async def counter_for(sessionmaker, key_id, day=None):
 async def test_exactly_the_limit_is_admitted_and_the_next_call_is_refused(quota_db):
     key_id = await make_key(quota_db, limit=3)
 
-    admitted = [await quotas.admit(key_id, 3) for _ in range(5)]
+    admitted = [(await quotas.admit(key_id, 3)).count for _ in range(5)]
 
     assert admitted == [1, 2, 3, None, None]
     assert await counter_for(quota_db, key_id) == 3
@@ -169,9 +169,9 @@ async def test_refusals_never_increment_the_counter(quota_db):
     key_id = await make_key(quota_db, limit=2)
 
     for _ in range(2):
-        assert await quotas.admit(key_id, 2) is not None
+        assert (await quotas.admit(key_id, 2)).admitted
     for _ in range(50):
-        assert await quotas.admit(key_id, 2) is None
+        assert not (await quotas.admit(key_id, 2)).admitted
 
     assert await counter_for(quota_db, key_id) == 2
 
@@ -180,10 +180,10 @@ async def test_a_key_with_a_limit_does_not_affect_another_key(quota_db):
     exhausted = await make_key(quota_db, name="loud", prefix="omcp_000002", limit=1)
     other = await make_key(quota_db, name="quiet", prefix="omcp_000003", limit=1)
 
-    assert await quotas.admit(exhausted, 1) == 1
-    assert await quotas.admit(exhausted, 1) is None
+    assert (await quotas.admit(exhausted, 1)).count == 1
+    assert not (await quotas.admit(exhausted, 1)).admitted
     # The other key's ceiling is its own.
-    assert await quotas.admit(other, 1) == 1
+    assert (await quotas.admit(other, 1)).count == 1
     assert await counter_for(quota_db, other) == 1
 
 
@@ -263,11 +263,13 @@ async def test_the_day_rolls_over_and_exactly_limit_many_are_admitted_again(quot
     tomorrow = today + dt.timedelta(days=1)
 
     for _ in range(4):
-        assert await quotas.admit(key_id, 4, today) is not None
+        assert (await quotas.admit(key_id, 4, today)).admitted
     for _ in range(10):
-        assert await quotas.admit(key_id, 4, today) is None
+        assert not (await quotas.admit(key_id, 4, today)).admitted
 
-    admitted_tomorrow = [await quotas.admit(key_id, 4, tomorrow) for _ in range(6)]
+    admitted_tomorrow = [
+        (await quotas.admit(key_id, 4, tomorrow)).count for _ in range(6)
+    ]
     assert admitted_tomorrow == [1, 2, 3, 4, None, None]
 
     # Two separate rows, and yesterday's is untouched by today's traffic.
@@ -307,7 +309,7 @@ async def test_rows_older_than_two_days_are_pruned_on_the_next_days_first_call(
 
     # The first admission of *today* is the INSERT branch, which is what
     # triggers the prune.
-    assert await quotas.admit(key_id, 5, today) == 1
+    assert (await quotas.admit(key_id, 5, today)).count == 1
 
     async with quota_db() as session:
         remaining = sorted(
@@ -652,3 +654,236 @@ async def test_a_scoped_viewer_cannot_widen_with_a_user_filter(clean):
         # clause is applied on top of it.
         with_foreign_key = Filters("24h", None, bob_key, None, alice)
         assert await recent_logs(session, with_foreign_key) == []
+
+
+# --------------------------------------------------------------------------
+# 8. the JSON API's limit endpoint, against the real counter (#162 MAJOR 1)
+# --------------------------------------------------------------------------
+
+
+async def test_the_api_enable_resets_the_counter_exactly_like_the_panel(quota_db):
+    """Both surfaces go through `apply_daily_request_limit`, so this asserts
+    the behaviour is identical rather than merely that both compile.
+
+    The same key is driven NULL→limited through the **API** and then through
+    the **panel**, and both must delete the day's row; a change through either
+    must keep it.
+    """
+    import src.api.routes as api
+    import src.control_panel.routes as panel
+    from types import SimpleNamespace
+
+    admin = SimpleNamespace(id=1, is_admin=True, username="admin")
+    key_id = await make_key(quota_db, "api lifecycle", "omcp_api001", limit=None)
+
+    async def seed(count):
+        async with quota_db() as session:
+            await session.execute(
+                text(
+                    "INSERT INTO quota_counters (key_id, day, count) "
+                    "VALUES (:k, :d, :c) ON CONFLICT (key_id, day) "
+                    "DO UPDATE SET count = :c"
+                ),
+                {"k": key_id, "d": quotas.utc_day(), "c": count},
+            )
+            await session.commit()
+
+    # --- enable through the API: the counter is reset.
+    await seed(40)
+    async with quota_db() as session:
+        result = await api.set_key_limit(
+            key_id=key_id,
+            req=api.SetKeyLimitRequest(daily_request_limit=100),
+            session=session,
+            user=admin,
+        )
+    assert result.daily_request_limit == 100
+    assert result.counter_reset is True
+    assert await counter_for(quota_db, key_id) is None
+
+    # --- change through the API: the counter is kept.
+    for _ in range(3):
+        await quotas.admit(key_id, 100)
+    async with quota_db() as session:
+        result = await api.set_key_limit(
+            key_id=key_id,
+            req=api.SetKeyLimitRequest(daily_request_limit=200),
+            session=session,
+            user=admin,
+        )
+    assert result.counter_reset is False
+    assert await counter_for(quota_db, key_id) == 3
+
+    # --- clear through the API, then re-enable through the *panel*: same rule.
+    async with quota_db() as session:
+        result = await api.set_key_limit(
+            key_id=key_id,
+            req=api.SetKeyLimitRequest(daily_request_limit=None),
+            session=session,
+            user=admin,
+        )
+    assert result.daily_request_limit is None
+    await seed(17)
+    async with quota_db() as session:
+        await panel.set_key_limit_form(
+            request=SimpleNamespace(session={}),
+            key_id=key_id,
+            daily_request_limit="50",
+            session=session,
+            user=admin,
+        )
+    assert await counter_for(quota_db, key_id) is None, (
+        "the panel and the API disagree about the enable-reset rule"
+    )
+
+
+async def test_a_limit_created_through_the_api_is_enforced_by_the_gate(quota_db):
+    """End to end: the field the API used to drop now reaches the tool layer.
+
+    A key created with `daily_request_limit=2` must be refused on its third
+    call — which is the whole point, and exactly what a silently-ignored field
+    would not do.
+    """
+    import src.api.routes as api
+
+    class _Session:
+        def __init__(self, inner):
+            self.inner = inner
+            self.added = []
+
+        def add(self, obj):
+            self.added.append(obj)
+            self.inner.add(obj)
+
+        async def commit(self):
+            await self.inner.commit()
+
+        async def refresh(self, obj):
+            await self.inner.refresh(obj)
+
+    from starlette.requests import Request
+
+    http = Request({
+        "type": "http", "method": "POST", "path": "/api/keys", "headers": [],
+        "query_string": b"", "client": ("127.0.0.1", 1), "state": {}, "app": None,
+    })
+
+    async with quota_db() as inner:
+        wrapper = _Session(inner)
+        response = await api.create_key(
+            request=http,
+            req=api.CreateKeyRequest(name="apikey", daily_request_limit=2),
+            session=wrapper,
+            user=SimpleNamespaceUser(),
+        )
+    assert response.daily_request_limit == 2
+
+    key_id = response.id
+    assert (await quotas.admit(key_id, 2)).count == 1
+    assert (await quotas.admit(key_id, 2)).count == 2
+    assert not (await quotas.admit(key_id, 2)).admitted
+
+
+class SimpleNamespaceUser:
+    id = None
+    is_admin = True
+    is_active = True
+    username = "admin"
+
+
+# --------------------------------------------------------------------------
+# 9. observability: a failed admission is logged, not just raised (advisory 4)
+# --------------------------------------------------------------------------
+
+
+async def test_a_failed_admission_is_logged_with_the_key_and_day_then_reraised(
+    quota_db, caplog
+):
+    """Fail-closed stays; the silence does not. The raise happens *before*
+    `_log_usage`, so without this line an enforcement outage leaves no record
+    anywhere naming the key it happened to."""
+    import logging
+
+    key_id = await make_key(quota_db, "broken", "omcp_brk001", limit=5)
+
+    class _Boom:
+        def __call__(self):
+            return self
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def execute(self, *a, **kw):
+            raise RuntimeError("database went away")
+
+        async def commit(self):
+            pass
+
+        async def rollback(self):
+            pass
+
+    import pytest as _pytest
+
+    mp = _pytest.MonkeyPatch()
+    mp.setattr(quotas, "async_session", _Boom())
+    try:
+        with caplog.at_level(logging.ERROR, logger="src.services.quotas"):
+            with _pytest.raises(RuntimeError, match="database went away"):
+                await quotas.admit(key_id, 5)
+    finally:
+        mp.undo()
+
+    records = [r for r in caplog.records if r.message == "quota_admission_failed"]
+    assert records, "an admission failure produced no log line"
+    record = records[0]
+    assert record.key_id == key_id
+    assert record.day == quotas.utc_day().isoformat()
+    assert record.error_type == "RuntimeError"
+
+
+# --------------------------------------------------------------------------
+# 10. the usage filters' window clause actually excludes (advisory 6)
+# --------------------------------------------------------------------------
+
+
+async def test_rows_outside_the_window_are_excluded_from_all_three_views(clean):
+    """Every other filter case seeds fresh rows into a 24h window, so the
+    window clause itself was only ever asserted by construction. This seeds a
+    row deliberately outside it and one inside, and checks all three
+    consumers — a window that silently matched everything would look correct on
+    a young database and wrong on a busy one."""
+    key_id = await make_key(clean, "windowed", "omcp_win001")
+
+    async with clean() as session:
+        session.add_all([
+            UsageLog(tool="read_note", key_id=key_id, actor_kind="api_key",
+                     actor_label="windowed", actor_ref="omcp_win001",
+                     duration_ms=5),
+            UsageLog(tool="read_note", key_id=key_id, actor_kind="api_key",
+                     actor_label="windowed", actor_ref="omcp_win001",
+                     duration_ms=5),
+        ])
+        await session.commit()
+        # Push one of them three days back — outside 24h, inside 7d.
+        await session.execute(
+            text(
+                "UPDATE usage_logs SET created_at = now() - interval '3 days' "
+                "WHERE id = (SELECT min(id) FROM usage_logs)"
+            )
+        )
+        await session.commit()
+
+        options = await filter_options(session, "24h", None)
+        day = resolve_filters("24h", None, None, None, None, options)
+        week = resolve_filters("7d", None, None, None, None, options)
+
+        assert len(await recent_logs(session, day)) == 1
+        assert sum(r.requests for r in await actor_totals(session, day)) == 1
+        assert sum((await chart_series(session, day))["values"]) == 1
+
+        assert len(await recent_logs(session, week)) == 2
+        assert sum(r.requests for r in await actor_totals(session, week)) == 2
+        assert sum((await chart_series(session, week))["values"]) == 2
