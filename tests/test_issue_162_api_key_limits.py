@@ -230,3 +230,64 @@ def test_the_key_listing_reports_the_limit():
     do not have."""
     assert "daily_request_limit" in api.KeyInfo.model_fields
     assert "daily_request_limit" in api.CreateKeyResponse.model_fields
+
+
+# --------------------------------------------------------------------------
+# 5. omission is not a way to say "unlimited" on the update endpoint
+# --------------------------------------------------------------------------
+#
+# The second-round defect, and the mirror image of the first: with a `None`
+# *default* on the update model, `PUT /api/keys/{id}/limit` with `{}` was a 200
+# that silently CLEARED an existing ceiling. A request that named nothing
+# removed the operator's quota and reported success.
+#
+# The two models differ deliberately, and the difference is the whole point:
+#
+#   * **create** — omission means unlimited, because that is what creating a
+#     key without a limit means, and it matches the panel form's empty box.
+#     Nothing is being taken away; the key did not exist a moment ago.
+#   * **update** — omission is a 422, because the field is the entire content
+#     of the request. Clearing a quota is destructive to an invariant an
+#     operator set on purpose, so it has to be typed: `null`, explicitly.
+
+
+def test_an_empty_update_body_is_rejected_rather_than_clearing_the_limit():
+    """The regression. `{}` used to clear the ceiling and return 200."""
+    with pytest.raises(ValidationError) as exc:
+        api.SetKeyLimitRequest()
+    assert exc.value.errors()[0]["type"] == "missing"
+    assert "daily_request_limit" in str(exc.value)
+
+
+def test_an_explicit_null_is_still_the_documented_way_to_clear():
+    """Required-but-nullable: omission 422s, `null` clears. The clearing
+    operation is unchanged — only the accidental one is gone."""
+    assert api.SetKeyLimitRequest(daily_request_limit=None).daily_request_limit is None
+
+
+def test_the_update_model_is_required_but_nullable_not_merely_optional():
+    """Pinned on the schema rather than on behaviour alone, because the
+    difference between the two is one character in a `Field(...)` call."""
+    schema = api.SetKeyLimitRequest.model_json_schema()
+    assert schema.get("required") == ["daily_request_limit"], schema
+    # Still nullable: `null` must remain a legal value.
+    field = schema["properties"]["daily_request_limit"]
+    types = {s.get("type") for s in field.get("anyOf", [field])}
+    assert "null" in types, field
+
+
+def test_create_omission_meaning_unlimited_is_deliberate_not_the_same_bug():
+    """Asserted so the asymmetry reads as a decision rather than an oversight.
+
+    Creating a key with no limit is the documented default and the panel's
+    empty box; there is no prior ceiling for an omission to destroy. Only the
+    *update* endpoint treats omission as an error.
+    """
+    assert "daily_request_limit" not in (
+        api.CreateKeyRequest.model_json_schema().get("required") or []
+    )
+    assert api.CreateKeyRequest(name="k").daily_request_limit is None
+    # And the two models really do disagree, on purpose.
+    assert api.SetKeyLimitRequest.model_json_schema()["required"] == [
+        "daily_request_limit"
+    ]

@@ -38,6 +38,7 @@ from sqlalchemy import delete, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 import _harness
+import src.api.routes as api
 import src.mcp_server.auth as mcp_auth
 import src.mcp_server.tools as tools
 import src.services.quotas as quotas
@@ -737,22 +738,27 @@ async def test_the_api_enable_resets_the_counter_exactly_like_the_panel(quota_db
     )
 
 
-async def test_a_limit_created_through_the_api_is_enforced_by_the_gate(quota_db):
-    """End to end: the field the API used to drop now reaches the tool layer.
+async def test_a_limit_created_through_the_api_is_enforced_by_the_gate(
+    quota_db, monkeypatch
+):
+    """End to end through the **real chain**: API create -> persisted column ->
+    `APIKeyMiddleware` -> ContextVar -> `_tracked` -> refusal.
 
-    A key created with `daily_request_limit=2` must be refused on its third
-    call — which is the whole point, and exactly what a silently-ignored field
-    would not do.
+    Calling `quotas.admit(key_id, 2)` with a hard-coded limit would pass even if
+    the middleware never loaded the persisted value — it would be asserting that
+    the counter works, which other cases already prove, while the thing actually
+    at risk (does the number the API wrote reach the gate?) went unchecked. So
+    the key is authenticated for real: the limit the gate uses is whatever the
+    middleware read back out of the row the API wrote, and nothing in this test
+    ever names the number 2 except the create call and the assertions.
     """
-    import src.api.routes as api
+    import src.mcp_server.auth as mcp_auth
 
     class _Session:
         def __init__(self, inner):
             self.inner = inner
-            self.added = []
 
         def add(self, obj):
-            self.added.append(obj)
             self.inner.add(obj)
 
         async def commit(self):
@@ -769,19 +775,105 @@ async def test_a_limit_created_through_the_api_is_enforced_by_the_gate(quota_db)
     })
 
     async with quota_db() as inner:
-        wrapper = _Session(inner)
         response = await api.create_key(
             request=http,
             req=api.CreateKeyRequest(name="apikey", daily_request_limit=2),
-            session=wrapper,
+            session=_Session(inner),
             user=SimpleNamespaceUser(),
         )
     assert response.daily_request_limit == 2
+    raw_key, key_id = response.key, response.id
 
-    key_id = response.id
-    assert (await quotas.admit(key_id, 2)).count == 1
-    assert (await quotas.admit(key_id, 2)).count == 2
-    assert not (await quotas.admit(key_id, 2)).admitted
+    # The gate's own dependencies point at the throwaway database; usage
+    # logging is stubbed so only the admission touches it.
+    monkeypatch.setattr(mcp_auth, "async_session", quota_db)
+    monkeypatch.setattr(tools, "_log_usage", _noop_log)
+
+    bodies = 0
+    seen_limits = []
+
+    @tools._tracked("api_created_probe", [])
+    async def probe() -> str:
+        nonlocal bodies
+        bodies += 1
+        return "ran"
+
+    async def one_authenticated_call():
+        """One real request: middleware authenticates, then the tool runs."""
+        result = {}
+
+        async def downstream(scope, receive, send):
+            # What the middleware bound, read inside the request it bound it for.
+            seen_limits.append(mcp_auth.current_daily_request_limit.get())
+            result["value"] = await probe()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
+
+        async def receive():  # pragma: no cover - never awaited
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        app = mcp_auth.APIKeyMiddleware(downstream)
+        await app(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/mcp/",
+                "headers": [(b"authorization", f"Bearer {raw_key}".encode())],
+            },
+            receive,
+            send,
+        )
+        assert sent and sent[0]["status"] == 200, "the key failed to authenticate"
+        return result["value"]
+
+    first = await one_authenticated_call()
+    second = await one_authenticated_call()
+    third = await one_authenticated_call()
+
+    # The middleware carried the *persisted* limit, not a default.
+    assert seen_limits == [2, 2, 2], seen_limits
+    # Two bodies ran; the third was refused before its body.
+    assert (first, second) == ("ran", "ran")
+    assert bodies == 2, f"{bodies} tool bodies ran against an API-created limit of 2"
+    assert "daily request limit of 2" in third, third
+    assert await counter_for(quota_db, key_id) == 2
+
+
+async def test_an_omitted_update_body_cannot_clear_a_stored_limit(quota_db):
+    """The second-round MAJOR, at the database: `PUT {}` used to be a 200 that
+    silently cleared the ceiling. The request no longer validates, so the
+    endpoint never runs and the stored value is untouched."""
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    key_id = await make_key(quota_db, "keepme", "omcp_keep01", limit=75)
+
+    with _pytest.raises(ValidationError):
+        api.SetKeyLimitRequest()
+
+    async with quota_db() as session:
+        key = (
+            await session.execute(select(APIKey).where(APIKey.id == key_id))
+        ).scalar_one()
+        assert key.daily_request_limit == 75, "an omitted body cleared the limit"
+
+    # Explicit null still clears, which is the documented operation.
+    async with quota_db() as session:
+        key = (
+            await session.execute(select(APIKey).where(APIKey.id == key_id))
+        ).scalar_one()
+        result = await api.set_key_limit(
+            key_id=key_id,
+            req=api.SetKeyLimitRequest(daily_request_limit=None),
+            session=session,
+            user=SimpleNamespaceUser(),
+        )
+    assert result.daily_request_limit is None
 
 
 class SimpleNamespaceUser:

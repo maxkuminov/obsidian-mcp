@@ -57,12 +57,24 @@ class CreateKeyRequest(BaseModel):
 
 
 class SetKeyLimitRequest(BaseModel):
-    """Set, change, or clear one key's daily limit. `null` clears it."""
+    """Set, change, or clear one key's daily limit. Explicit `null` clears it.
+
+    **The field is required-but-nullable, and the distinction is the point.**
+    With a `None` *default* this model made `PUT {}` a success that silently
+    cleared an existing ceiling — the same class of failure as the ignored
+    field above, in the opposite direction: a request that named nothing
+    removed the operator's quota and reported 200. Omission is not a way to
+    say "unlimited"; `{"daily_request_limit": null}` is, and it is the only
+    way, because clearing a quota should have to be typed.
+
+    `Field(...)` on an `int | None` means required and still nullable, so
+    omission is a 422 while the documented clearing operation is unchanged.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     daily_request_limit: int | None = Field(
-        None, ge=DAILY_REQUEST_LIMIT_MIN, le=DAILY_REQUEST_LIMIT_MAX
+        ..., ge=DAILY_REQUEST_LIMIT_MIN, le=DAILY_REQUEST_LIMIT_MAX
     )
 
 
