@@ -24,7 +24,7 @@ from src.limiter import limiter
 from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
 from src.oauth.routes import router as oauth_router
-from src.services import vault
+from src.services import error_log, vault
 from src.services.indexer import run_indexer_loop
 from src.services import vault_fs
 from src.transfer.routes import router as transfer_router
@@ -254,6 +254,12 @@ def _on_indexer_done(task: asyncio.Task) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # First, before any guard can fail: the panel's health page reads this
+    # buffer, and the records worth reading most are the ones a startup guard
+    # writes on its way to `sys.exit(1)`. Attached to the **root** logger at
+    # ERROR, so it sees every module's errors without any of them opting in;
+    # process-lifetime only, no schema — see `src/services/error_log.py`.
+    error_log.attach()
     if settings.mcp_sandbox_mode:
         logging.getLogger(__name__).warning(
             "MCP_SANDBOX_MODE active — skipping DB check and indexer. "
