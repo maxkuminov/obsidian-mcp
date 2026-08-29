@@ -133,6 +133,77 @@
   write: it answers "is *this process's* loop alive", which is a property of
   the process, and it resets to `None` on restart until the startup pass lands.
 
+## The pass record (#160, migration 019)
+
+The heartbeat above and `indexer_runs` answer different questions and neither
+replaces the other. The heartbeat is in-process and resets on restart, which is
+exactly right for "is this process's loop alive" and says nothing at all about
+"how long has an embed pass been taking lately". `indexer_runs` is the second
+question, and it has to survive a redeploy to be worth asking — which is why
+parsing container logs was rejected in the design: logs rotate with the
+container.
+
+- **One row per pass, written in a `finally`.** `record_indexer_run(trigger,
+  user_id)` wraps a pass and yields the `PassStats` its stages fill in; the row
+  goes in on the way out, **including when the pass raised**, with its
+  `finished_at` and the exception in `error`. A scheme that recorded only
+  successes would have nothing to say about the case an operator actually comes
+  looking for. `CancelledError` is the one exception: that is lifespan shutdown,
+  not a failed pass, and it is treated exactly as `_record_index_run` treats it.
+- **A swallowed stage failure still reaches the row.** `_index_pass_once`
+  deliberately swallows per-stage exceptions so one user's broken vault cannot
+  stop every other user's pass; those exceptions are written into `error`
+  anyway. A row that came out clean because the loop swallowed the failure
+  would reproduce the "reports fine, is not" defect (#78) one layer down — the
+  log line scrolls away, the row is what survives.
+- **The trigger says who asked.** `startup` (the initial pass), `scheduled` (a
+  periodic tick), `manual` (the panel's Reindex Now and re-embed, threaded from
+  `_reindex_background`), `backfill` (the one-shot link backfill, which records
+  its own row because it is a different kind of pass with different timings —
+  folding it into the startup row it usually runs beside would hide a slow
+  rebuild inside a slow-looking startup). A pass that decided there was nothing
+  to do — the backfill's "this scope already has link rows" probe, which fires
+  on every startup after the first — sets `PassStats.skipped` and records
+  nothing. Noise in a 500-row history evicts what an operator came for.
+- **The multi-user startup pass is one per-user sequence, not three loops.** It
+  was three: index every user, then backfill every user, then embed every user.
+  A run row spanning two of those loops would have to be held open across them,
+  and a pass's start and finish would then describe the whole startup rather
+  than that user's pass. Per-user ordering (index → backfill → embed) is
+  unchanged and is the ordering that matters. One consequence is deliberate: a
+  user's failed backfill no longer aborts the backfill of every user after
+  them, which is the isolation the index and embed stages already had.
+- **Pruning to the newest 500 rides in the same transaction as the insert**, so
+  the table is never briefly over the cap and a rollback loses both. It orders
+  by `started_at DESC`, not by `id`: a pass is inserted at its *finish*, so two
+  passes that started minutes apart can land in the other order, and the
+  history is read by start time.
+- **Session discipline.** The recorder is only ever called by the *holder* of
+  `index_pass_lock`, never by something waiting for it, and it opens and closes
+  its own short-lived session inside that call — after the wrapped body's
+  session has closed, so one task never holds two pooled connections. That is
+  the same rule the panel's destructive actions follow from the other side
+  (`_pass_lock_without_a_connection`, see
+  [control panel](control-panel.md)): a waiter that keeps a pooled connection
+  while blocking on the lock deadlocks against a holder that needs one to
+  finish.
+- **Recording never fails a pass.** The write is wrapped and logged; it runs in
+  a `finally`, where a raise would also replace the exception the operator needs
+  to see. Instrumentation that can fail the thing it measures is worse than no
+  instrumentation.
+- `index_vault` now returns `(notes_scanned, notes_indexed)` and `embed_vault`
+  the number of notes it embedded, purely so the recorder has something to
+  record. Both accumulators tolerate `None`: those two functions are replaced by
+  bare no-op coroutines throughout the test suite, and instrumentation that
+  insisted on a tuple would turn every one of those into a failure about
+  recording rather than about indexing.
+
+The table is display only. Nothing reads it for a decision, which is why
+dropping it in `downgrade()` costs an operator a view and nothing else. The
+panel surface that reads it is
+[usage attribution](usage-attribution.md#the-read-only-consumer-160) and
+`/admin/performance`.
+
 ## Re-deriving after a grammar change (#150)
 
 `clean_for_embedding` no longer carries its own fence regexes. It consumes the
