@@ -16,34 +16,53 @@
 <meta name="referrer" content="no-referrer">
 <title>Upload to vault</title>
 <style nonce="{{ nonce }}">
-  :root { color-scheme: light dark; }
+  :root {
+    color-scheme: light dark;
+    --t-bg: #f6f7f9;
+    --t-surface: #fff;
+    --t-text: #16191d;
+    --t-text-2: #666;
+    --t-primary: #2f6feb;
+    --t-primary-disabled: #9bb4e4;
+    --t-on-primary: #fff;
+    --t-danger: #b3261e;
+    --t-danger-disabled: #dda29e;
+    --t-ok: #1a7f37;
+    --t-shadow: rgba(0,0,0,.12);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --t-bg: #16191d;
+      --t-surface: #21262d;
+      --t-text: #e6e6e6;
+      --t-text-2: #9aa4ae;
+    }
+  }
   body {
     margin: 0; padding: 2.5rem 1.25rem;
     font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-    background: #f6f7f9; color: #16191d;
+    background: var(--t-bg); color: var(--t-text);
   }
-  main { max-width: 34rem; margin: 0 auto; background: #fff; border-radius: 12px;
-         padding: 1.75rem; box-shadow: 0 1px 3px rgba(0,0,0,.12); }
+  main { max-width: 34rem; margin: 0 auto; background: var(--t-surface); border-radius: 12px;
+         padding: 1.75rem; box-shadow: 0 1px 3px var(--t-shadow); }
   h1 { font-size: 1.15rem; margin: 0 0 1rem; }
   dl { display: grid; grid-template-columns: auto 1fr; gap: .35rem 1rem; margin: 0 0 1.25rem; }
-  dt { color: #666; }
+  dt { color: var(--t-text-2); }
   dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
   input[type=file] { width: 100%; margin-bottom: 1rem; }
   button { font: inherit; padding: .55rem 1.1rem; border: 0; border-radius: 8px;
-           background: #2f6feb; color: #fff; cursor: pointer; }
-  button[disabled] { background: #9bb4e4; cursor: default; }
-  button.destructive { background: #b3261e; }
-  button.destructive[disabled] { background: #dda29e; }
-  .warn { color: #b3261e; font-weight: 600; }
+           background: var(--t-primary); color: var(--t-on-primary); cursor: pointer; }
+  button[disabled] { background: var(--t-primary-disabled); cursor: default; }
+  button.destructive { background: var(--t-danger); }
+  button.destructive[disabled] { background: var(--t-danger-disabled); }
+  .warn { color: var(--t-danger); font-weight: 600; }
   dd.warn { font-family: inherit; }
   progress { width: 100%; margin-top: 1rem; }
   #status { margin-top: 1rem; white-space: pre-wrap; }
-  .err { color: #b3261e; }
-  .ok { color: #1a7f37; }
+  .err { color: var(--t-danger); }
+  .ok { color: var(--t-ok); }
   @media (prefers-color-scheme: dark) {
-    body { background: #16191d; color: #e6e6e6; }
-    main { background: #21262d; box-shadow: none; }
-    dt { color: #9aa4ae; }
+    main { box-shadow: none; }
   }
 </style>
 </head>

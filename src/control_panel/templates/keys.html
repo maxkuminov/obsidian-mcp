@@ -33,7 +33,7 @@
     <div class="alert alert-success anim-1">
         <div style="font-size:11px;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px;opacity:0.75;">New key created — copy now, won't be shown again</div>
         <div style="display:flex;align-items:center;gap:10px;">
-            <code id="new-key-val" class="mono" style="flex:1;background:rgba(0,0,0,0.3);padding:10px 14px;border-radius:5px;font-size:12px;word-break:break-all;color:#a0f0cc;">{{ new_key }}</code>
+            <code id="new-key-val" class="mono" style="flex:1;background:var(--code-bg);padding:10px 14px;border-radius:5px;font-size:12px;word-break:break-all;color:var(--key-text);">{{ new_key }}</code>
             <button onclick="navigator.clipboard.writeText(document.getElementById('new-key-val').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000);})" class="btn btn-ghost" style="flex-shrink:0;">Copy</button>
         </div>
     </div>

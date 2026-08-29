@@ -112,10 +112,18 @@ def main() -> int:
 
         if e.literals:
             checked += 1
-            if normalize(resolved) != normalize(e.value):
+            # The baseline value may itself hold a var() with a literal
+            # fallback (settings.html shipped `var(--bg-2,#1c1c20)` against an
+            # undefined token). Resolve it against the *pre-sweep* token set so
+            # both sides are compared as rendered colors.
+            try:
+                expected = resolve(e.value, colorscan.dark_env(baseline, e.template))
+            except Unresolved:
+                expected = e.value
+            if normalize(resolved) != normalize(expected):
                 failures.append(
                     f"CHANGED  {e.key}\n"
-                    f"           baseline: {e.value}\n"
+                    f"           baseline: {e.value}  ->  {expected}\n"
                     f"           now:      {got.value}  ->  {resolved}"
                 )
         else:

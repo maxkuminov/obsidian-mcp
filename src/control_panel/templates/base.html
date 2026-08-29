@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="theme-color" content="#070910">
+    <meta name="theme-color" content="" data-theme-color-token="--bg">
     <title>{% block title %}Obsidian MCP{% endblock %}</title>
     {#
       htmx and Chart.js are served from this app, not from a CDN: a third-party
@@ -34,29 +34,10 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600;9..40,700&family=JetBrains+Mono:wght@300;400;500&display=swap" rel="stylesheet">
+    {# The one token source for this surface — see the partial's header. #}
+    {% include "_theme.html" %}
     <style>
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-        :root {
-            --bg: #070910;
-            --surface: #0c1018;
-            --surface-2: #141b2c;
-            --surface-3: #1b2440;
-            --border: #222c44;
-            --border-2: #2d3a5a;
-            --primary: #9b82e8;
-            --primary-dim: #6d57c2;
-            --primary-glow: rgba(155, 130, 232, 0.12);
-            --primary-glow-strong: rgba(155, 130, 232, 0.28);
-            --primary-text: #c4b4f5;
-            --text: #eef1f8;
-            --text-2: #a8b4cc;
-            --text-3: #7d8ba6;
-            --success: #5fd9a0;
-            --error: #f58888;
-            --warning: #f0b555;
-            --info: #7abde6;
-        }
 
         html { -webkit-text-size-adjust: 100%; }
 
@@ -92,7 +73,7 @@
             position: sticky;
             top: 0;
             z-index: 40;
-            background: rgba(12, 16, 24, 0.92);
+            background: var(--topbar-bg);
             backdrop-filter: blur(10px);
             -webkit-backdrop-filter: blur(10px);
             border-bottom: 1px solid var(--border);
@@ -132,7 +113,7 @@
             display: none;
             position: fixed;
             inset: 0;
-            background: rgba(7, 9, 16, 0.6);
+            background: var(--backdrop);
             backdrop-filter: blur(3px);
             -webkit-backdrop-filter: blur(3px);
             z-index: 45;
@@ -161,7 +142,7 @@
             position: absolute;
             bottom: -20px; left: -20px; right: -20px;
             height: 180px;
-            background: radial-gradient(ellipse at 50% 100%, rgba(155,130,232,0.16) 0%, transparent 70%);
+            background: radial-gradient(ellipse at 50% 100%, var(--sidebar-glow) 0%, transparent 70%);
             pointer-events: none;
         }
 
@@ -179,8 +160,8 @@
         }
 
         @keyframes gem-glow {
-            0%, 100% { filter: drop-shadow(0 0 4px rgba(155,130,232,0.55)); }
-            50%       { filter: drop-shadow(0 0 10px rgba(155,130,232,0.95)); }
+            0%, 100% { filter: drop-shadow(0 0 4px var(--primary-halo)); }
+            50%       { filter: drop-shadow(0 0 10px var(--primary-halo-strong)); }
         }
 
         .brand-name {
@@ -294,7 +275,7 @@
             padding: 2px 6px;
             border-radius: 3px;
             background: var(--primary-glow);
-            border: 1px solid rgba(155,130,232,0.3);
+            border: 1px solid var(--primary-border-strong);
         }
         .logout-btn {
             background: none;
@@ -307,7 +288,7 @@
             transition: color 0.15s, background 0.15s;
             font-family: 'DM Sans', sans-serif;
         }
-        .logout-btn:hover { color: var(--error); background: rgba(245,136,136,0.08); }
+        .logout-btn:hover { color: var(--error); background: var(--error-surface-faint); }
 
         /* ── Main content ── */
         .main {
@@ -404,7 +385,7 @@
 
         .stat-card:hover {
             border-color: var(--border-2);
-            box-shadow: 0 8px 32px rgba(0,0,0,0.35), 0 0 20px rgba(155,130,232,0.08);
+            box-shadow: 0 8px 32px var(--shadow-card), 0 0 20px var(--primary-glow-md);
             transform: translateY(-2px);
         }
 
@@ -497,12 +478,12 @@
             text-transform: uppercase;
         }
 
-        .badge-green  { background: rgba(95,217,160,0.12); color: var(--success); border: 1px solid rgba(95,217,160,0.25); }
-        .badge-red    { background: rgba(245,136,136,0.12); color: var(--error);   border: 1px solid rgba(245,136,136,0.25); }
-        .badge-yellow { background: rgba(240,181,85,0.12);  color: var(--warning); border: 1px solid rgba(240,181,85,0.25); }
-        .badge-purple { background: var(--primary-glow); color: var(--primary-text); border: 1px solid rgba(155,130,232,0.3); }
-        .badge-blue   { background: rgba(122,189,230,0.12); color: var(--info);    border: 1px solid rgba(122,189,230,0.25); }
-        .badge-gray   { background: rgba(125,139,166,0.12); color: var(--text-2);  border: 1px solid var(--border-2); }
+        .badge-green  { background: var(--success-surface); color: var(--success); border: 1px solid var(--success-border); }
+        .badge-red    { background: var(--error-surface);   color: var(--error);   border: 1px solid var(--error-border); }
+        .badge-yellow { background: var(--warning-surface); color: var(--warning); border: 1px solid var(--warning-border); }
+        .badge-purple { background: var(--primary-glow); color: var(--primary-text); border: 1px solid var(--primary-border-strong); }
+        .badge-blue   { background: var(--info-surface);    color: var(--info);    border: 1px solid var(--info-border); }
+        .badge-gray   { background: var(--neutral-surface); color: var(--text-2);  border: 1px solid var(--border-2); }
 
         /* ── Buttons ── */
         .btn {
@@ -535,21 +516,21 @@
 
         .btn-primary {
             background: var(--primary-dim);
-            color: #efe9ff;
+            color: var(--on-primary);
         }
         .btn-primary:hover:not(:disabled) {
             background: var(--primary);
             box-shadow: 0 0 20px var(--primary-glow-strong);
-            color: white;
+            color: var(--on-primary-strong);
         }
 
         .btn-primary.btn-lg {
             background: linear-gradient(180deg, var(--primary) 0%, var(--primary-dim) 100%);
-            box-shadow: 0 2px 12px rgba(155,130,232,0.25), inset 0 1px 0 rgba(255,255,255,0.12);
-            color: white;
+            box-shadow: 0 2px 12px var(--primary-shadow), inset 0 1px 0 var(--inset-highlight);
+            color: var(--on-primary-strong);
         }
         .btn-primary.btn-lg:hover:not(:disabled) {
-            box-shadow: 0 4px 22px rgba(155,130,232,0.45), inset 0 1px 0 rgba(255,255,255,0.2);
+            box-shadow: 0 4px 22px var(--primary-shadow-hover), inset 0 1px 0 var(--inset-highlight-strong);
             transform: translateY(-1px);
         }
         .btn-primary.btn-lg:active:not(:disabled) { transform: translateY(0); }
@@ -566,12 +547,12 @@
         }
 
         .btn-danger {
-            background: rgba(245,136,136,0.1);
+            background: var(--error-surface-soft);
             color: var(--error);
-            border: 1px solid rgba(245,136,136,0.28);
+            border: 1px solid var(--error-border-strong);
         }
         .btn-danger:hover:not(:disabled) {
-            background: rgba(245,136,136,0.2);
+            background: var(--error-surface-strong);
         }
 
         .btn-link {
@@ -581,7 +562,7 @@
             padding: 4px 8px;
             min-height: 0;
         }
-        .btn-link:hover { color: #f7a5a5; }
+        .btn-link:hover { color: var(--error-text-hover); }
 
         /* Reindex CTA icon spin on click */
         .btn .spin { animation: spin 0.9s linear infinite; }
@@ -601,8 +582,8 @@
             transition: opacity 0.25s;
         }
         .inline-status.show { opacity: 1; }
-        .inline-status.ok  { background: rgba(95,217,160,0.1); color: var(--success); border-color: rgba(95,217,160,0.25); }
-        .inline-status.err { background: rgba(245,136,136,0.1); color: var(--error);   border-color: rgba(245,136,136,0.25); }
+        .inline-status.ok  { background: var(--success-surface-soft); color: var(--success); border-color: var(--success-border); }
+        .inline-status.err { background: var(--error-surface-soft);   color: var(--error);   border-color: var(--error-border); }
 
         /* ── Forms ── */
         .field { margin-bottom: 18px; }
@@ -637,7 +618,7 @@
         }
 
         .field-select {
-            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1l5 5 5-5' stroke='%237d8ba6' stroke-width='1.5' fill='none' stroke-linecap='round'/%3E%3C/svg%3E");
+            background-image: var(--select-arrow);
             background-repeat: no-repeat;
             background-position: right 12px center;
             padding-right: 34px;
@@ -648,7 +629,7 @@
             display: none;
             position: fixed;
             inset: 0;
-            background: rgba(7, 9, 16, 0.75);
+            background: var(--modal-scrim);
             backdrop-filter: blur(5px);
             -webkit-backdrop-filter: blur(5px);
             z-index: 60;
@@ -666,7 +647,7 @@
             padding: 28px;
             width: 100%;
             max-width: 420px;
-            box-shadow: 0 32px 80px rgba(0,0,0,0.7), 0 0 50px rgba(155,130,232,0.12);
+            box-shadow: 0 32px 80px var(--shadow-modal), 0 0 50px var(--primary-glow);
             animation: modal-in 0.2s ease;
         }
 
@@ -700,15 +681,15 @@
         }
 
         .alert-success {
-            background: rgba(95,217,160,0.08);
-            border: 1px solid rgba(95,217,160,0.25);
-            color: #8deabf;
+            background: var(--success-surface-faint);
+            border: 1px solid var(--success-border);
+            color: var(--success-text);
         }
 
         .alert-warning {
-            background: rgba(245,136,136,0.08);
-            border: 1px solid rgba(245,136,136,0.25);
-            color: #f5abab;
+            background: var(--error-surface-faint);
+            border: 1px solid var(--error-border);
+            color: var(--error-text);
         }
 
         /* ── Key-value rows ── */
@@ -747,7 +728,7 @@
                 transform: translateX(-100%);
                 transition: transform 0.25s ease;
                 width: 260px;
-                box-shadow: 24px 0 60px rgba(0,0,0,0.6);
+                box-shadow: 24px 0 60px var(--shadow-sidebar);
             }
             .sidebar.open { transform: translateX(0); }
 
@@ -792,12 +773,12 @@
 <header class="topbar">
     <div class="topbar-brand">
         <svg viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke="#9b82e8" stroke-width="1.4"/>
-            <polygon points="15,2 27,10 15,8" fill="rgba(155,130,232,0.22)" stroke="none"/>
-            <polygon points="15,8 27,10 24,25 6,25 3,10" fill="rgba(155,130,232,0.06)" stroke="none"/>
-            <line x1="15" y1="2" x2="15" y2="8" stroke="#9b82e8" stroke-width="0.8" opacity="0.7"/>
-            <line x1="15" y1="8" x2="3" y2="10" stroke="#9b82e8" stroke-width="0.5" opacity="0.4"/>
-            <line x1="15" y1="8" x2="27" y2="10" stroke="#9b82e8" stroke-width="0.5" opacity="0.4"/>
+            <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke-width="1.4" style="stroke:var(--primary);"/>
+            <polygon points="15,2 27,10 15,8" style="fill:var(--gem-facet);stroke:none;"/>
+            <polygon points="15,8 27,10 24,25 6,25 3,10" style="fill:var(--gem-facet-2);stroke:none;"/>
+            <line x1="15" y1="2" x2="15" y2="8" stroke-width="0.8" opacity="0.7" style="stroke:var(--primary);"/>
+            <line x1="15" y1="8" x2="3" y2="10" stroke-width="0.5" opacity="0.4" style="stroke:var(--primary);"/>
+            <line x1="15" y1="8" x2="27" y2="10" stroke-width="0.5" opacity="0.4" style="stroke:var(--primary);"/>
         </svg>
         Obsidian MCP
     </div>
@@ -819,14 +800,14 @@
         <div class="sidebar-brand">
             <!-- Obsidian gem icon -->
             <svg class="brand-icon" viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke="#9b82e8" stroke-width="1.4"/>
-                <polygon points="15,2 27,10 15,8"          fill="rgba(155,130,232,0.22)" stroke="none"/>
-                <polygon points="15,8 27,10 24,25 6,25 3,10" fill="rgba(155,130,232,0.06)" stroke="none"/>
-                <line x1="15" y1="2"  x2="15" y2="8"  stroke="#9b82e8" stroke-width="0.8" opacity="0.7"/>
-                <line x1="15" y1="8"  x2="3"  y2="10" stroke="#9b82e8" stroke-width="0.5" opacity="0.4"/>
-                <line x1="15" y1="8"  x2="27" y2="10" stroke="#9b82e8" stroke-width="0.5" opacity="0.4"/>
-                <line x1="15" y1="8"  x2="6"  y2="25" stroke="#9b82e8" stroke-width="0.4" opacity="0.3"/>
-                <line x1="15" y1="8"  x2="24" y2="25" stroke="#9b82e8" stroke-width="0.4" opacity="0.3"/>
+                <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke-width="1.4" style="stroke:var(--primary);"/>
+                <polygon points="15,2 27,10 15,8"          style="fill:var(--gem-facet);stroke:none;"/>
+                <polygon points="15,8 27,10 24,25 6,25 3,10" style="fill:var(--gem-facet-2);stroke:none;"/>
+                <line x1="15" y1="2"  x2="15" y2="8"  stroke-width="0.8" opacity="0.7" style="stroke:var(--primary);"/>
+                <line x1="15" y1="8"  x2="3"  y2="10" stroke-width="0.5" opacity="0.4" style="stroke:var(--primary);"/>
+                <line x1="15" y1="8"  x2="27" y2="10" stroke-width="0.5" opacity="0.4" style="stroke:var(--primary);"/>
+                <line x1="15" y1="8"  x2="6"  y2="25" stroke-width="0.4" opacity="0.3" style="stroke:var(--primary);"/>
+                <line x1="15" y1="8"  x2="24" y2="25" stroke-width="0.4" opacity="0.3" style="stroke:var(--primary);"/>
             </svg>
             <span class="brand-name">Obsidian</span>
             <span class="brand-tagline">MCP Control</span>

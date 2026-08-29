@@ -95,8 +95,8 @@
     </div>
 
     <!-- Danger zone -->
-    <div class="card anim-3" style="margin-top:24px;border-color:rgba(240,110,110,0.25);">
-        <div class="card-header" style="border-bottom-color:rgba(240,110,110,0.2);">
+    <div class="card anim-3" style="margin-top:24px;border-color:var(--danger-border);">
+        <div class="card-header" style="border-bottom-color:var(--danger-border-soft);">
             <span class="card-title" style="color:var(--error);">Danger zone</span>
         </div>
         <div class="card-body">
@@ -126,9 +126,9 @@
 
 <!-- Reset confirmation modal -->
 <div id="reset-modal"
-     style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.55);align-items:center;justify-content:center;z-index:50;"
+     style="display:none;position:fixed;inset:0;background:var(--modal-scrim-2);align-items:center;justify-content:center;z-index:50;"
      onclick="if(event.target===this)this.style.display='none';">
-    <div style="background:var(--bg-2,#1c1c20);border:1px solid var(--border);border-radius:8px;padding:22px 24px;max-width:440px;width:90%;">
+    <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:22px 24px;max-width:440px;width:90%;">
         <h3 style="margin:0 0 8px;font-size:16px;color:var(--error);">Confirm reset</h3>
         <p style="color:var(--text-2);font-size:13px;line-height:1.55;margin:0 0 18px;">
             This will delete every embedding row and clear the embedded hash

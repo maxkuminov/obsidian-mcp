@@ -76,12 +76,12 @@
             {% if note_tags %}
             <div style="padding:12px 22px 0;display:flex;flex-wrap:wrap;gap:5px;">
                 {% for tag in note_tags %}
-                <span style="display:inline-flex;align-items:center;padding:3px 8px;border-radius:3px;font-size:11px;font-weight:500;letter-spacing:0.04em;background:var(--primary-glow);color:var(--primary-text);border:1px solid rgba(155,130,232,0.25);">#{{ tag }}</span>
+                <span style="display:inline-flex;align-items:center;padding:3px 8px;border-radius:3px;font-size:11px;font-weight:500;letter-spacing:0.04em;background:var(--primary-glow);color:var(--primary-text);border:1px solid var(--primary-border);">#{{ tag }}</span>
                 {% endfor %}
             </div>
             {% endif %}
             <div style="padding:18px 22px;flex:1;overflow-y:auto;">
-                <pre style="font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--text);background:rgba(0,0,0,0.28);padding:18px;border-radius:5px;white-space:pre-wrap;line-height:1.7;border:1px solid var(--border);">{{ note_content }}</pre>
+                <pre style="font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--text);background:var(--code-bg-soft);padding:18px;border-radius:5px;white-space:pre-wrap;line-height:1.7;border:1px solid var(--border);">{{ note_content }}</pre>
             </div>
             {% else %}
             <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:var(--text-3);padding:48px 20px;min-height:200px;">
