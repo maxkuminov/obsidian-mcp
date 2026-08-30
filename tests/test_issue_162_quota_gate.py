@@ -167,11 +167,20 @@ def test_the_marker_is_read_by_the_pre_body_refusal_predicate():
 
 
 def test_an_over_quota_call_is_refused_before_the_body():
+    # Bracket the call with two clock reads: a suite running across UTC
+    # midnight (it happened — CI started 23:56Z, this test ran 00:05Z) must
+    # accept the reset for whichever day the admission actually used.
+    day_before = _dt.datetime.now(_dt.timezone.utc).date()
     result, params, spy = _run_tracked(
         _probe, limit=5, spy=_QuotaSpySession(admitted=None)
     )
+    day_after = _dt.datetime.now(_dt.timezone.utc).date()
 
-    assert result == quotas.quota_refusal_message(5, quotas.reset_instant(TODAY))
+    expected = {
+        quotas.quota_refusal_message(5, quotas.reset_instant(d))
+        for d in {day_before, day_after}
+    }
+    assert result in expected
     assert "ran:" not in result, "the tool body ran anyway"
     assert len(_admissions(spy)) == 1
 
@@ -854,7 +863,9 @@ def test_the_gate_hands_the_decisions_reset_to_the_message(monkeypatch):
 
     assert params["over_quota"] is True
     assert "2019-03-08T00:00:00Z" in result, result
-    today_reset = quotas.reset_instant(TODAY).strftime("%Y-%m-%dT%H:%M:%SZ")
+    today_reset = quotas.reset_instant(
+        _dt.datetime.now(_dt.timezone.utc).date()
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
     assert today_reset not in result, (
         "the gate re-read the clock instead of using the admission's day"
     )
