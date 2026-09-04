@@ -48,7 +48,7 @@ Link extraction (`extract_links`) and the `move_note` link-rewrite scanner SHALL
 #### Scenario: Accepted differences are enumerated
 
 - **WHEN** the grammar-difference test runs
-- **THEN** it SHALL assert exactly these changes and no others: `[[Note|see [1]]]` and `[[Note#Sec [x]]]` produce no row (previously a row with a mangled alias/anchor); `[a[b](x.md)` produces a row to `x.md` whose `link_text` is `[b](x.md)`; an href longer than 2,048 characters produces no row; `[t](Foo [draft].md)` still produces a row
+- **THEN** it SHALL assert exactly these changes and no others: `[[Note|see [1]]]` and `[[Note#Sec [x]]]` produce no row (previously a row with a mangled alias/anchor); `[a[b](x.md)` produces a row to `x.md` whose `link_text` is `[b](x.md)`; an href longer than 2,048 characters produces no row; `[[[Foo]]` produces a row whose target is `Foo` (previously `[Foo`, which could never name a note); `[t](Foo [draft].md)` still produces a row
 
 #### Scenario: Extraction and rewrite grammars agree
 
