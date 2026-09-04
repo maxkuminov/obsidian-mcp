@@ -49,6 +49,7 @@ Link extraction (`extract_links`) and the `move_note` link-rewrite scanner SHALL
 
 - **WHEN** the grammar-difference test runs
 - **THEN** it SHALL assert exactly these changes and no others: `[[Note|see [1]]]` and `[[Note#Sec [x]]]` produce no row (previously a row with a mangled alias/anchor); `[a[b](x.md)` produces a row to `x.md` whose `link_text` is `[b](x.md)`; an href longer than 2,048 characters produces no row; `[[[Foo]]` produces a row whose target is `Foo` (previously `[Foo`, which could never name a note); `[t](Foo [draft].md)` still produces a row
+- **AND** it SHALL assert the write-side consequence of the first difference: a bracketed anchor or alias such as `[[Old#Results [draft]]]` is left untouched by `move_note(rewrite_links=True)` as well as absent from `note_links`, an accepted difference recorded in `docs/architecture/vault-tools.md` and NOT to be closed by re-admitting `[`/`]` into those classes
 
 #### Scenario: Extraction and rewrite grammars agree
 
@@ -79,3 +80,17 @@ Link extraction (`extract_links`) and the `move_note` link-rewrite scanner SHALL
 
 - **WHEN** `get_links` is invoked on a note under the cap
 - **THEN** the result SHALL carry `truncated: false` (or omit the field)
+
+### Requirement: `get_links` bounds its own result
+
+`get_links` SHALL accept a `limit` (default 500, clamped to 1..500 as `get_backlinks` is) and SHALL return at most that many link rows, in document order. When more rows exist than were returned, the result SHALL say how many rows are persisted for that note, so a page is never read as the whole set.
+
+#### Scenario: A note with more link rows than the limit
+
+- **WHEN** `get_links` is invoked with a `limit` smaller than the number of link rows persisted for the note
+- **THEN** at most `limit` rows SHALL be returned and the result SHALL state both the number shown and the number of persisted rows (the persisted count, not the size of the returned page, which omits rows resolving outside the caller's own notes)
+
+#### Scenario: An out-of-range limit
+
+- **WHEN** `get_links` is invoked with a `limit` of zero, a negative number, or a number above the hard cap
+- **THEN** the limit SHALL be clamped to the 1..500 range rather than refused or honoured unbounded

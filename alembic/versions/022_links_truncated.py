@@ -203,10 +203,17 @@ def downgrade() -> None:
     somebody else put there under this name. The marker is the only evidence of
     authorship.
 
-    Downgrading discards every recorded truncation. Re-upgrading recreates the
-    column at `false`, and the next pass re-derives it: a note still over the
-    cap is re-marked the first time its links are re-extracted. Nothing else is
-    lost — the marker is derived state, not a fact only this column holds.
+    Downgrading discards every recorded truncation, and re-upgrading recreates
+    the column at `false` for every row. **Nothing re-derives it on its own:**
+    an unchanged note whose `content_hash` and `extraction_version` both still
+    match is skipped by the scan, so its links are never re-extracted and its
+    marker stays `false` while its persisted link set is still the capped one —
+    `get_links` would then report an incomplete set as complete, which is the
+    silently-wrong-answer failure the column exists to prevent. After a
+    downgrade/re-upgrade round trip the marker must be repaired by a reindex /
+    re-derive (`make reindex`) or by an `extraction_version` bump, either of
+    which makes every note changed again. Nothing else is lost — the marker is
+    derived state, not a fact only this column holds.
     """
     bind = op.get_bind()
     state = _column_state(bind)
