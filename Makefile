@@ -271,14 +271,15 @@ db-backup:
 	fi; \
 	chmod 600 $$BACKUP_FILE.gz; \
 	echo "$(GREEN)Backup: $$BACKUP_FILE.gz$(NC)"; \
-	DB_CONTAINER=$(DB_CONTAINER) bash docker/record-backup.sh $$BACKUP_FILE.gz || exit 1; \
+	: "prune BEFORE recording: the new dump is already verified above, and the recording must stay the recipe's last command so its exit status is the target's"; \
 	PRUNED=0; \
 	for OLD in $$(ls -1t $(DATA_DIR)/backups/backup_*.sql.gz 2>/dev/null | tail -n +$$(( $(BACKUP_RETAIN_MIN) + 1 ))); do \
 		if [ "$$OLD" != "$$BACKUP_FILE.gz" ] && [ -n "$$(find "$$OLD" -mtime +$(BACKUP_RETAIN_DAYS) 2>/dev/null)" ]; then \
 			rm -f "$$OLD"; PRUNED=$$((PRUNED + 1)); \
 		fi; \
 	done; \
-	if [ $$PRUNED -gt 0 ]; then echo "$(YELLOW)Pruned $$PRUNED backup(s) older than $(BACKUP_RETAIN_DAYS) days (kept at least $(BACKUP_RETAIN_MIN))$(NC)"; fi
+	if [ $$PRUNED -gt 0 ]; then echo "$(YELLOW)Pruned $$PRUNED backup(s) older than $(BACKUP_RETAIN_DAYS) days (kept at least $(BACKUP_RETAIN_MIN))$(NC)"; fi; \
+	DB_CONTAINER=$(DB_CONTAINER) bash docker/record-backup.sh $$BACKUP_FILE.gz
 
 db-restore:
 	@if [ -z "$(FILE)" ]; then echo "$(RED)Usage: make db-restore FILE=<path>$(NC)"; exit 1; fi
