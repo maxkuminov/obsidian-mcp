@@ -25,7 +25,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY, insert
 
-from src.config import settings
+from src.config import MAX_LINKS_PER_NOTE, settings
 from src.database import async_session
 from src.models.db import (
     IndexerRun,
@@ -45,7 +45,11 @@ from src.services.embeddings import (
     embed_note,
 )
 from src.services.fts import index_tsvector_sql
-from src.services.links import build_vault_index, extract_links, resolve_target
+from src.services.links import (
+    build_vault_index,
+    extract_links_bounded,
+    resolve_target,
+)
 from src.services.transfer import canonical_vault_root
 from src.services.vault import (
     _vault_root,
@@ -418,9 +422,20 @@ def _content_hash(content: str) -> str:
 # is behind this constant is treated as changed for the whole pass — parsed,
 # re-tagged, re-linked, re-tsvectored and re-stamped.
 #
-# **Bump this in the same commit as any change to the fence grammar.** A
-# grammar change without a bump leaves every unchanged note deriving from the
-# old grammar forever; a bump without a grammar change costs one no-op pass.
+# **Bump this in the same commit as any change to the fence grammar — or to
+# the link grammar.** Both are invisible to `content_hash` for the same reason
+# (the bytes on disk do not move) and both leave derived state stale in the
+# same way, so both are the marker's business. A grammar change without a bump
+# leaves every unchanged note deriving from the old grammar forever; a bump
+# without a grammar change costs one no-op pass.
+#
+# Version 2 is a **link**-grammar bump (#180/#203): the wikilink and
+# markdown-link grammars became linear and bounded, so every note's
+# `note_links` rows must be re-derived once. The *fence* grammar did not
+# change, so version 2's cleaning function is version 1's under a new key —
+# `_grammar_changed_the_embedding_text` therefore compares equal for every v1
+# row and **no note is re-embedded** on account of this bump. The pass
+# re-extracts links and tags for every note once and re-stamps the marker.
 #
 # Embedding invalidation is scoped, not blanket: the pass compares the text the
 # row's *stamped* version would have embedded against the text the current one
@@ -432,7 +447,7 @@ def _content_hash(content: str) -> str:
 # CLEARS, so it can never suppress an invalidation another rule mandates — a
 # content change, a `file_path` change, a provider change, exclusion
 # reconciliation.
-CURRENT_EXTRACTION_VERSION = 1
+CURRENT_EXTRACTION_VERSION = 2
 
 
 def _grammar_changed_the_embedding_text(stamped_version: int, body: str) -> bool:
@@ -1086,7 +1101,14 @@ def describe_recorded(recorded) -> str:
 
 
 def _format_skips(skips: list[str]) -> str:
-    """013's and 015's offender-report shape: the first N, then a count."""
+    """013's and 015's offender-report shape: the first N, then a count.
+
+    What is *not* in here: a note whose link extraction was truncated at
+    `MAX_LINKS_PER_NOTE`. A skip withholds a re-derive's certification, and a
+    capped note is not a skip — see the carve-out at the `skips` declaration in
+    `_index_vault_pinned`. Its degradation is carried on the row
+    (`notes_metadata.links_truncated`) and in an ERROR line, not here.
+    """
     shown = skips[:SKIP_REPORT_LIMIT]
     suffix = (
         f", and {len(skips) - len(shown)} more"
@@ -1443,6 +1465,18 @@ async def _index_vault_pinned(
     # it — the ordinary prune keeps a row whose relative path exists under the
     # new root, which is exactly the row a re-derive exists to replace. The
     # repairs are still performed; only the certification is withheld.
+    #
+    # **Carve-out: a note whose link extraction was truncated at
+    # `MAX_LINKS_PER_NOTE` is NOT a skip** (#203, D4). The claim A.7a makes is
+    # structural — every surviving link row was written by this pass — and a
+    # capped note does not falsify it: the truncation is deterministic, and the
+    # rows written are exactly the rows derived. Treating it as a skip would
+    # instead hold a tenant with one generated MOC in re-derive mode
+    # indefinitely, with no repair that could ever end it: a self-inflicted DoS
+    # on the very machinery that exists to detect foreign rows. The degradation
+    # is declared elsewhere and durably — `notes_metadata.links_truncated` on
+    # the row, one ERROR line per capped note per pass, and `truncated: true`
+    # from `get_links` — so it is visible without being fatal.
     skips: list[str] = []
 
     async with async_session() as session:
@@ -1529,7 +1563,15 @@ async def _index_vault_pinned(
 
                 try:
                     frontmatter, content = parse_frontmatter(raw)
-                    tags = extract_tags(content, frontmatter)
+                    # Off the loop (#180, D3). `extract_tags` is a pure
+                    # function of the body that runs regexes over the whole of
+                    # it, and this branch runs once per *changed* note — every
+                    # note of every user on the pass that follows an extraction
+                    # bump. A thread only yields between `re` calls, never
+                    # inside one, so this bounds the stall to the longest
+                    # single scan step rather than to zero; that step is short
+                    # because the grammars are linear.
+                    tags = await asyncio.to_thread(extract_tags, content, frontmatter)
                 except Exception as e:
                     logger.warning(f"Failed to parse {rel_path}: {e}")
                     skips.append(f"{rel_path} (parse: {e})")
@@ -1962,6 +2004,14 @@ async def _update_links_for_changed(
     from the buffer is recorded in `skips` rather than silently passed over: it
     means a link row this pass was supposed to write is absent.
 
+    **It writes per note.** Each changed note's rows are inserted before the
+    next note's links are extracted, so peak link-row memory is one note's
+    worth plus one insert batch rather than the whole pass's (#203). A note
+    over `MAX_LINKS_PER_NOTE` keeps its first N links in document order, has
+    `notes_metadata.links_truncated` set, and is logged at ERROR — it is
+    **not** a skip, so it does not withhold a re-derive's certification
+    (`index-integrity`, "A capped note does not withhold the record").
+
     `vault` is retained in the signature and is deliberately unused for reads.
     """
     bodies = path_to_content if path_to_content is not None else {}
@@ -1982,7 +2032,23 @@ async def _update_links_for_changed(
             await session.execute(
                 delete(NoteLink).where(NoteLink.source_note_id.in_(change_ids))
             )
-            new_rows: list[dict] = []
+            # **Per note, not per pass** (#203, D4). This used to accumulate
+            # every changed note's rows into one `new_rows` list and insert the
+            # lot at the end, so peak link-row memory was the whole pass's
+            # derived links — unbounded in the number of changed notes, and a
+            # re-derive makes *every* note changed. Each note's rows are now
+            # inserted before the next note's are extracted, so the peak is one
+            # note's worth (at most `MAX_LINKS_PER_NOTE`) plus one insert
+            # batch, whatever the vault's size.
+            #
+            # The *body* buffer (`path_to_content`) is deliberately not bounded
+            # here: the scan fills it for the tsvector loop, it is bounded by
+            # the write-side note cap times the number of changed notes, and
+            # narrowing it is a separate change (accepted residual on #203).
+            # This bounds link rows, which were the unbounded term.
+            total_rows = 0
+            truncated_ids: list[int] = []
+            complete_ids: list[int] = []
             for path in changed_paths:
                 src_id = paths_to_id.get(path)
                 if src_id is None:
@@ -2004,26 +2070,84 @@ async def _update_links_for_changed(
                     if skips is not None:
                         skips.append(f"{path} (no buffered body for the link rebuild)")
                     continue
-                for link in extract_links(content):
-                    target_id = resolve_target(link.target, path, vault_index)
-                    new_rows.append({
+                # Off the loop (#180, D3) and bounded (#203, D4). A thread only
+                # yields between `re` calls, never inside one, so this bounds
+                # the stall to the longest single scan step rather than to
+                # zero; the linear grammars are what make that step short.
+                links, truncated = await asyncio.to_thread(
+                    extract_links_bounded, content, max_links=MAX_LINKS_PER_NOTE
+                )
+                note_rows = [
+                    {
                         "source_note_id": src_id,
-                        "target_note_id": target_id,
+                        "target_note_id": resolve_target(
+                            link.target, path, vault_index
+                        ),
                         "target_path": link.target[:1024],
                         "link_text": link.link_text,
                         "kind": link.kind,
                         "position": link.position,
-                    })
-            if new_rows:
-                for batch_start in range(0, len(new_rows), 1000):
+                    }
+                    for link in links
+                ]
+                if truncated:
+                    truncated_ids.append(src_id)
+                    # ERROR, not WARNING, so it also reaches the ops-health
+                    # error buffer. One line per capped note per pass.
+                    #
+                    # The note's *true* link count is deliberately not named:
+                    # counting it requires the unbounded extraction the cap
+                    # exists to avoid. What is named is what is true and
+                    # bounded — the cap, and the rows this pass persisted.
+                    logger.error(
+                        f"Link extraction truncated for {path}: the note holds "
+                        f"more than MAX_LINKS_PER_NOTE={MAX_LINKS_PER_NOTE} "
+                        f"links; the first {len(note_rows)} in document order "
+                        "were persisted and notes_metadata.links_truncated was "
+                        "set, so `get_links` reports this note's link set as "
+                        "incomplete. This is a declared degradation, not a "
+                        "skip: the pass stays complete."
+                    )
+                else:
+                    complete_ids.append(src_id)
+                for batch_start in range(0, len(note_rows), 1000):
                     await session.execute(
                         insert(NoteLink).values(
-                            new_rows[batch_start:batch_start + 1000]
+                            note_rows[batch_start:batch_start + 1000]
                         )
                     )
+                total_rows += len(note_rows)
+                # Explicit, so the peak this block exists to bound is not held
+                # across the next note's extraction by a stale binding.
+                note_rows = []
+
+            # The marker is derived state, exactly like the rows: set where
+            # this pass capped, cleared where it did not, in the same
+            # transaction as the rows it describes. Both statements are
+            # predicated on the value actually changing, so the ordinary pass —
+            # nothing truncated, nothing previously truncated — writes no
+            # `notes_metadata` rows at all rather than rewriting one per
+            # changed note.
+            for ids, value in ((truncated_ids, True), (complete_ids, False)):
+                for start in range(0, len(ids), 1000):
+                    chunk = ids[start:start + 1000]
+                    await session.execute(
+                        update(NoteMetadata)
+                        .where(
+                            NoteMetadata.id.in_(chunk),
+                            NoteMetadata.links_truncated.is_(not value),
+                        )
+                        .values(links_truncated=value)
+                    )
+
             logger.info(
                 f"Re-extracted links for {len(change_ids)} notes "
-                f"({len(new_rows)} link rows)"
+                f"({total_rows} link rows)"
+                + (
+                    f", {len(truncated_ids)} truncated at {MAX_LINKS_PER_NOTE}"
+                    if truncated_ids
+                    else ""
+                )
             )
 
     # Re-resolution pass: any newly-arrived note may resolve previously
@@ -2211,7 +2335,14 @@ async def _link_backfill_pinned(
             await session.execute(
                 delete(NoteLink).where(NoteLink.source_note_id.in_(note_ids))
             )
+            # Same two rules as the changed-path rebuild (#180/#203): bounded
+            # extraction, dispatched off the event loop, and a buffer that
+            # never grows past one note's rows plus one insert batch — the
+            # flush below is checked after every note, so the peak is
+            # `MAX_LINKS_PER_NOTE + 999` and not the vault's total link count.
             buffer: list[dict] = []
+            truncated_ids: list[int] = []
+            complete_ids: list[int] = []
             for i, row in enumerate(rows, start=1):
                 try:
                     raw, _stat = read_note_beneath(root_fd, row.file_path)
@@ -2222,7 +2353,10 @@ async def _link_backfill_pinned(
                 # numbers differing is exactly how an operator sees that.
                 stats.notes_indexed += 1
                 _, content = parse_frontmatter(raw)
-                for link in extract_links(content):
+                links, truncated = await asyncio.to_thread(
+                    extract_links_bounded, content, max_links=MAX_LINKS_PER_NOTE
+                )
+                for link in links:
                     target_id = resolve_target(link.target, row.file_path, vault_index)
                     buffer.append({
                         "source_note_id": row.id,
@@ -2232,18 +2366,53 @@ async def _link_backfill_pinned(
                         "kind": link.kind,
                         "position": link.position,
                     })
-                if len(buffer) >= 1000:
-                    await session.execute(insert(NoteLink).values(buffer))
-                    buffer.clear()
+                if truncated:
+                    truncated_ids.append(row.id)
+                    logger.error(
+                        f"Link extraction truncated for {row.file_path}: the "
+                        f"note holds more than "
+                        f"MAX_LINKS_PER_NOTE={MAX_LINKS_PER_NOTE} links; the "
+                        f"first {len(links)} in document order were persisted "
+                        "and notes_metadata.links_truncated was set, so "
+                        "`get_links` reports this note's link set as "
+                        "incomplete."
+                    )
+                else:
+                    complete_ids.append(row.id)
+                while len(buffer) >= 1000:
+                    await session.execute(insert(NoteLink).values(buffer[:1000]))
+                    del buffer[:1000]
                 if i % 500 == 0:
                     logger.info(f"Link backfill: {i}/{len(rows)} notes")
 
             if buffer:
                 await session.execute(insert(NoteLink).values(buffer))
 
+            # Set where this backfill capped, cleared where it did not —
+            # predicated on the value changing, so an ordinary backfill writes
+            # no `notes_metadata` rows.
+            for ids, value in ((truncated_ids, True), (complete_ids, False)):
+                for start in range(0, len(ids), 1000):
+                    chunk = ids[start:start + 1000]
+                    await session.execute(
+                        update(NoteMetadata)
+                        .where(
+                            NoteMetadata.id.in_(chunk),
+                            NoteMetadata.links_truncated.is_(not value),
+                        )
+                        .values(links_truncated=value)
+                    )
+
             await session.commit()
 
-            logger.info(f"Link backfill complete: {len(rows)} notes scanned")
+            logger.info(
+                f"Link backfill complete: {len(rows)} notes scanned"
+                + (
+                    f", {len(truncated_ids)} truncated at {MAX_LINKS_PER_NOTE}"
+                    if truncated_ids
+                    else ""
+                )
+            )
         finally:
             link_backfill_in_progress = False
 

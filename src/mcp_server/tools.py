@@ -1600,9 +1600,15 @@ async def get_backlinks_impl(path: str, limit: int = 50) -> str:
 
 @_tracked("get_links", ["path"])
 async def get_links_impl(path: str) -> str:
-    """Outgoing links from `path` — both resolved and dangling."""
+    """Outgoing links from `path` — both resolved and dangling.
+
+    Reports `truncated: true` when the indexer capped this note's link
+    extraction at `MAX_LINKS_PER_NOTE`, so a capped set is never read as a
+    complete one (#203).
+    """
     from sqlalchemy import and_, or_, select
     from sqlalchemy.orm import aliased
+    from src.config import MAX_LINKS_PER_NOTE
     from src.models.db import NoteLink, NoteMetadata
 
     uid = current_user_id.get()
@@ -1659,15 +1665,25 @@ async def get_links_impl(path: str) -> str:
         )
         rows = (await session.execute(stmt)).all()
 
+    # Read off the note row the pass wrote it on, never inferred from the row
+    # count: a capped set is exactly `MAX_LINKS_PER_NOTE` rows and looks like
+    # any other complete set from here. An agent that read a truncated set as
+    # complete would act on a graph answer that is silently wrong, which is
+    # what the column exists to prevent (#203).
+    truncated = "true" if source.links_truncated else "false"
+
     if not rows:
-        return f"`{path}` has no outgoing links"
+        return f"`{path}` has no outgoing links — truncated: {truncated}"
     # Classified by what the *scoped* join resolved, never by the raw
     # `note_links.target_note_id`: that column can name a row outside the
     # owned set, and calling such a link "resolved" would print a `None` title
     # and path for it.
     resolved = [r for r in rows if r.resolved_id is not None]
     dangling = [r for r in rows if r.resolved_id is None]
-    lines = [f"`{path}` — {len(resolved)} resolved, {len(dangling)} dangling:\n"]
+    lines = [
+        f"`{path}` — {len(resolved)} resolved, {len(dangling)} dangling — "
+        f"truncated: {truncated}:\n"
+    ]
     if resolved:
         lines.append("**Resolved:**")
         for r in resolved:
@@ -1678,6 +1694,13 @@ async def get_links_impl(path: str) -> str:
         lines.append("\n**Dangling:**")
         for r in dangling:
             lines.append(f"- {r.kind} → `{r.target_path}` — `{r.link_text}`")
+    if source.links_truncated:
+        lines.append(
+            f"\n**This note's link extraction was capped at "
+            f"{MAX_LINKS_PER_NOTE} links. The {len(rows)} above are the first "
+            "in document order and the set is INCOMPLETE** — do not treat it "
+            "as the note's full outgoing-link set."
+        )
     return "\n".join(lines)
 
 
