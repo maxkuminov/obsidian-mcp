@@ -143,12 +143,21 @@ def _v1_spans(body):
 
 
 def _v0_spans(body):
-    """What the retired span-based comparator computed for version 0."""
-    from src.services.embeddings import _V0_FENCE_BACKTICK_RE, _V0_FENCE_TILDE_RE
+    """What the retired span-based comparator computed for version 0.
+
+    The two v0 regexes now live in `tests/test_asvs_v0_cleaner.py`, which
+    keeps them as the oracle the linear `_v0_clean` scanner is proved against
+    (#180); this module imports them from there rather than from the service,
+    so there is exactly one copy in the tree.
+    """
+    from tests.test_asvs_v0_cleaner import (
+        V0_FENCE_BACKTICK_RE,
+        V0_FENCE_TILDE_RE,
+    )
 
     return tuple(sorted(
         (m.start(), m.end())
-        for rx in (_V0_FENCE_BACKTICK_RE, _V0_FENCE_TILDE_RE)
+        for rx in (V0_FENCE_BACKTICK_RE, V0_FENCE_TILDE_RE)
         for m in rx.finditer(body)
     ))
 
