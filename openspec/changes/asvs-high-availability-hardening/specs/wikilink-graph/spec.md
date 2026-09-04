@@ -59,7 +59,7 @@ Link extraction (`extract_links`) and the `move_note` link-rewrite scanner SHALL
 #### Scenario: A note with more links than the cap
 
 - **WHEN** the indexer processes a note containing more than `MAX_LINKS_PER_NOTE` links
-- **THEN** exactly the first `MAX_LINKS_PER_NOTE` links in document order SHALL be persisted to `note_links`, `notes_metadata.links_truncated` SHALL be set for that note, one ERROR log line SHALL name the note path, the cap and the total count, and the pass SHALL remain complete
+- **THEN** exactly the first `MAX_LINKS_PER_NOTE` links in document order SHALL be persisted to `note_links`, `notes_metadata.links_truncated` SHALL be set for that note, one ERROR log line SHALL name the note path and the cap (the true total is not computed — counting it would require the unbounded extraction the cap exists to prevent), and the pass SHALL remain complete
 
 #### Scenario: Extraction is dispatched off the loop
 
