@@ -7,7 +7,7 @@ out of the database — path, vault root, overwrite flag, expected fingerprint,
 minting identity — and never from the request. A request may say only *which*
 token it holds.
 
-Three properties are load-bearing and easy to break by accident:
+Four properties are load-bearing and easy to break by accident:
 
 1. **The token is redeemed from the `Authorization` header only.** The
    human-facing URLs put it in the *fragment* (`…/transfer/upload#<token>`),
@@ -23,6 +23,13 @@ Three properties are load-bearing and easy to break by accident:
    whose root was reassigned — one body, one status. `_not_found()` is the only
    way to say no. (The claim is about the *response*, not about latency: the
    branches do different amounts of work and nothing here is constant-time.)
+4. **No session is held across a wait or a stream.** A pooled connection is a
+   shared, 15-deep resource on a single worker; holding one while bytes trickle
+   in from a client, or while a request queues for an upload slot, converts one
+   tenant's slow upload into every tenant's 500 (#208). `upload` therefore
+   commits and closes phase 1 before it waits or reads, and `download_file`
+   closes its session before returning the `StreamingResponse`. Every later
+   database action opens its own short-lived session.
 
 `GZipMiddleware` is app-wide, so `download/file` sets `Content-Encoding:
 identity`; Starlette's middleware leaves a response that already declares an
@@ -48,7 +55,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.templating import Jinja2Templates
 from starlette.requests import ClientDisconnect
 
-from src.config import settings
+from src.config import MAX_NOTE_BYTES, settings
 from src.database import async_session
 from src.limiter import limiter
 from src.models.db import UsageLog
@@ -258,7 +265,7 @@ async def upload_info(request: Request, token: str | None = Depends(_bearer)) ->
             return _not_found()
         payload = {
             "path": row.path,
-            "max_bytes": settings.max_file_write_bytes,
+            "max_bytes": _upload_max_bytes(row),
             "mime": mimetypes.guess_type(row.path)[0],
             "expires_at": _aware(row.expires_at).isoformat(),
             "overwrite": bool(row.overwrite),
@@ -305,6 +312,26 @@ def _upload_deadline(row) -> datetime.datetime:
     return transfer.upload_stream_deadline(row)
 
 
+def _upload_max_bytes(row) -> int:
+    """The byte cap this transfer is held to: the `.md` note cap, or the file cap.
+
+    The indexer treats *any* `.md` as a note, so the cap follows the extension
+    rather than the tool: a markdown file that lands here over `MAX_NOTE_BYTES`
+    is one `create_note`/`edit_note` would have refused, and the index then has
+    to parse it anyway. The bound is the *smaller* of the two so an operator who
+    lowers `MAX_FILE_WRITE_BYTES` below 10 MiB is not surprised by a more
+    permissive limit for markdown than for everything else.
+
+    Both `/transfer/upload/info` and `PUT /transfer/upload` read it, deliberately
+    through one function: the consent page prints "Maximum size" from the info
+    payload, and a page that advertises 25 MiB over a route that aborts at
+    10 MiB would be worse than no number at all.
+    """
+    if row.path.lower().endswith(".md"):
+        return min(MAX_NOTE_BYTES, settings.max_file_write_bytes)
+    return settings.max_file_write_bytes
+
+
 def _content_length(request: Request) -> int | None:
     raw = request.headers.get("content-length")
     if raw is None:
@@ -318,9 +345,35 @@ def _content_length(request: Request) -> int | None:
 @router.put("/upload")
 @limiter.limit(BYTES_LIMIT)
 async def upload(request: Request, token: str | None = Depends(_bearer)) -> Response:
+    """Claim, validate, *let go of the connection*, then stream.
+
+    **Phase 1 holds a pooled database connection; nothing after it does.** The
+    handler used to keep one `async_session()` open around the whole body —
+    `claim_upload` committed, but the two re-validation queries immediately
+    autobegan a fresh transaction that was never committed, so the connection
+    stayed checked out across the semaphore wait *and* the entire stream. The
+    pool is 5 + 10 on a single worker, so 15 slow uploads from one tenant pinned
+    every connection and every other caller — MCP tools, OAuth `/token`, the
+    panel — got a `TimeoutError` → 500 after `pool_timeout` (#208). A
+    `statement_timeout` cannot help: those backends are idle *in transaction*.
+
+    `download_file` already had the right shape (commit, close, then hand back
+    a `StreamingResponse`); upload was the outlier, not a considered exception.
+    The rule now, for anything under `src/transfer/`: **no session is held
+    across a wait or a stream.** Phase 1 commits and exits; the claimed row is
+    used detached afterwards and every later database action — `release_claim`,
+    `consume`, the publish gate — opens its own short-lived session.
+
+    The detached row is safe to read because `TransferToken` has no
+    relationships and no deferred columns, `claim_upload` commits under
+    `expire_on_commit=False`, and `close()` expunges without expiring; only
+    plain columns are read after phase 1. A test asserts exactly that, with the
+    session closed.
+    """
     if token is None:
         return _not_found()
 
+    # ── phase 1: claim + re-validate, then hand the connection back ─────────
     async with async_session() as session:
         # (1) Claim first. Committed, conditional, linearizable — and *before*
         # a single body byte is read.
@@ -360,125 +413,158 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
 
         token_id = row.id
 
-        @asynccontextmanager
-        async def gate():
-            """Lock, re-validate, hold the locks across `publish`, then commit.
+    # ── phase 2: no connection held from here to the response ───────────────
+    # Every handler below opens its own short session. They take the detached
+    # `row` because that is the existing signature, and they read only `row.id`
+    # from it.
 
-            The transaction opened here stays open while the bytes are linked
-            into place. That is the whole point: a revocation, a permission
-            downgrade, a root reassignment or a cascade delete all need these
-            same rows, so each either waits for us or beats us — there is no
-            interleaving where we see a valid key and then publish under a
-            revoked one.
+    async def release() -> None:
+        async with async_session() as s:
+            await transfer.release_claim(s, row)
 
-            `stream_to_vault` calls `handle.complete(result, published=…)` the
-            instant the bytes are in place and before the context closes, so
-            the completion row and the usage-log row are written by *this*
-            transaction — the one holding the locks — rather than by a later
-            one that a revocation could slip in front of.
-            """
-            async with async_session() as inner:
-                async with inner.begin():
-                    locked = await transfer.lock_for_publish(inner, token_id)
-                    ok = locked is not None and transfer.locked_rows_ok(
-                        locked, need_write=True
+    async def consume() -> None:
+        async with async_session() as s:
+            await transfer.consume(s, row)
+
+    @asynccontextmanager
+    async def gate():
+        """Lock, re-validate, hold the locks across `publish`, then commit.
+
+        The transaction opened here stays open while the bytes are linked
+        into place. That is the whole point: a revocation, a permission
+        downgrade, a root reassignment or a cascade delete all need these
+        same rows, so each either waits for us or beats us — there is no
+        interleaving where we see a valid key and then publish under a
+        revoked one.
+
+        It has always opened its own session; what changed with #208 is that
+        it is no longer *nested* inside a longer-lived one, so a streaming
+        upload now pins one connection for the length of the gate rather than
+        two for the length of the request.
+
+        `stream_to_vault` calls `handle.complete(result, published=…)` the
+        instant the bytes are in place and before the context closes, so
+        the completion row and the usage-log row are written by *this*
+        transaction — the one holding the locks — rather than by a later
+        one that a revocation could slip in front of.
+        """
+        async with async_session() as inner:
+            async with inner.begin():
+                locked = await transfer.lock_for_publish(inner, token_id)
+                ok = locked is not None and transfer.locked_rows_ok(
+                    locked, need_write=True
+                )
+
+                async def record(result: dict, published: bool) -> None:
+                    if not published:  # pragma: no cover - defensive
+                        return
+                    await transfer.complete_upload(
+                        inner,
+                        locked.token,
+                        result["size"],
+                        result["sha256"],
+                        result["mime"],
+                        commit=False,
                     )
-
-                    async def record(result: dict, published: bool) -> None:
-                        if not published:  # pragma: no cover - defensive
-                            return
-                        await transfer.complete_upload(
-                            inner,
+                    inner.add(
+                        _log_row(
                             locked.token,
-                            result["size"],
-                            result["sha256"],
-                            result["mime"],
-                            commit=False,
+                            "upload_file",
+                            {"path": locked.token.path, "size": result["size"]},
+                            response_size=result["size"],
                         )
-                        inner.add(
-                            _log_row(
-                                locked.token,
-                                "upload_file",
-                                {"path": locked.token.path, "size": result["size"]},
-                                response_size=result["size"],
-                            )
-                        )
-
-                    yield transfer.GateHandle(
-                        ok=ok, session=inner, on_complete=record if ok else None
                     )
 
-        try:
-            result = await transfer.stream_to_vault(
-                row,
-                request.stream(),
-                max_bytes=settings.max_file_write_bytes,
-                content_length=_content_length(request),
-                deadline=_upload_deadline(row),
-                idle_timeout=30.0,
-                before_publish=gate,
-            )
-        except transfer.TooLarge as exc:
-            await transfer.release_claim(session, row)
-            return JSONResponse({"error": str(exc)}, status_code=413)
-        except transfer.Timeout as exc:
-            # The stream was terminated mid-flight; a retry must mint afresh.
-            await transfer.consume(session, row)
-            return JSONResponse({"error": str(exc)}, status_code=408)
-        except transfer.PrePublishAborted:
-            await transfer.release_claim(session, row)
-            return _not_found()
-        except transfer.PostPublishFailure:
-            # The bytes landed; only the bookkeeping failed. Releasing here
-            # would hand back a replayable token over a path that is already
-            # written, so the claim stands until the TTL expires.
-            logger.exception("Upload published but not recorded (token left claimed)")
-            raise
-        except vault_fs.Conflict as exc:
-            await transfer.release_claim(session, row)
-            return JSONResponse({"error": str(exc)}, status_code=409)
-        except vault_fs.UnsafePath as exc:
-            await transfer.release_claim(session, row)
-            return JSONResponse({"error": str(exc)}, status_code=409)
-        except vault_fs.MountBoundary as exc:
-            # The in-gate check, or the residual `EXDEV`/`EBUSY` from the
-            # publish itself. Pre-publication either way, so the claim is
-            # released and the same link may be retried once the mount is gone.
-            # **Must stay above the `UnsupportedFilesystem` branch** — it is a
-            # subclass, and Python takes the first match.
-            logger.error("Transfer refused at a mount boundary: %s", exc)
-            await transfer.release_claim(session, row)
-            return JSONResponse(dict(MOUNT_BOUNDARY_BODY), status_code=503)
-        except vault_fs.UnsupportedFilesystem:
-            await transfer.release_claim(session, row)
-            return JSONResponse(dict(UNSUPPORTED_FS_BODY), status_code=503)
-        except ClientDisconnect:
-            await transfer.release_claim(session, row)
-            raise
-        except Exception:
-            # Everything else out of `stream_to_vault` is *demonstrably*
-            # pre-publication: a full disk while writing the staged body, a
-            # database error opening the gate, a walk that failed. The helper
-            # raises `PostPublishFailure` — handled above — for every failure
-            # once the bytes are in place, so reaching here means nothing was
-            # published and no temp file survives. Releasing is then the
-            # correct answer: the human gets to retry the same link instead of
-            # holding a capability that is stuck until its TTL for a transfer
-            # that never touched the vault.
-            logger.exception("Upload failed before publication (claim released)")
-            await transfer.release_claim(session, row)
-            raise
+                yield transfer.GateHandle(
+                    ok=ok, session=inner, on_complete=record if ok else None
+                )
 
-        # Reaching here means the gate recorded `result` and its transaction
-        # committed: `stream_to_vault` raises `PostPublishFailure` otherwise.
-        return JSONResponse(
-            {
-                "path": row.path,
-                "size": result["size"],
-                "sha256": result["sha256"],
-                "mime": result["mime"],
-            }
+    try:
+        result = await transfer.stream_to_vault(
+            row,
+            request.stream(),
+            max_bytes=_upload_max_bytes(row),
+            content_length=_content_length(request),
+            deadline=_upload_deadline(row),
+            idle_timeout=30.0,
+            before_publish=gate,
         )
+    except transfer.TooLarge as exc:
+        await release()
+        return JSONResponse({"error": str(exc)}, status_code=413)
+    except transfer.QueueTimeout as exc:
+        # The server was busy, not the capability expired. Nothing was staged
+        # and the token's own window is still open, so the claim goes back to
+        # `pending` and the *same* link may be retried — which is why this is
+        # not the 408/`consumed` path. `Retry-After` is a hint, not a promise:
+        # the queue is shared and the next attempt races like the first.
+        #
+        # Reached only after the claim and the re-validation succeeded, so it
+        # says nothing about a token that was never usable — the uniform 404
+        # still covers every one of those.
+        await release()
+        return JSONResponse(
+            {"error": str(exc)}, status_code=503, headers={"Retry-After": "5"}
+        )
+    except transfer.Timeout as exc:
+        # The stream was terminated mid-flight — or never started, because the
+        # deadline ran out while it queued. Either way a retry must mint afresh.
+        await consume()
+        return JSONResponse({"error": str(exc)}, status_code=408)
+    except transfer.PrePublishAborted:
+        await release()
+        return _not_found()
+    except transfer.PostPublishFailure:
+        # The bytes landed; only the bookkeeping failed. Releasing here
+        # would hand back a replayable token over a path that is already
+        # written, so the claim stands until the TTL expires.
+        logger.exception("Upload published but not recorded (token left claimed)")
+        raise
+    except vault_fs.Conflict as exc:
+        await release()
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    except vault_fs.UnsafePath as exc:
+        await release()
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    except vault_fs.MountBoundary as exc:
+        # The in-gate check, or the residual `EXDEV`/`EBUSY` from the
+        # publish itself. Pre-publication either way, so the claim is
+        # released and the same link may be retried once the mount is gone.
+        # **Must stay above the `UnsupportedFilesystem` branch** — it is a
+        # subclass, and Python takes the first match.
+        logger.error("Transfer refused at a mount boundary: %s", exc)
+        await release()
+        return JSONResponse(dict(MOUNT_BOUNDARY_BODY), status_code=503)
+    except vault_fs.UnsupportedFilesystem:
+        await release()
+        return JSONResponse(dict(UNSUPPORTED_FS_BODY), status_code=503)
+    except ClientDisconnect:
+        await release()
+        raise
+    except Exception:
+        # Everything else out of `stream_to_vault` is *demonstrably*
+        # pre-publication: a full disk while writing the staged body, a
+        # database error opening the gate, a walk that failed. The helper
+        # raises `PostPublishFailure` — handled above — for every failure
+        # once the bytes are in place, so reaching here means nothing was
+        # published and no temp file survives. Releasing is then the
+        # correct answer: the human gets to retry the same link instead of
+        # holding a capability that is stuck until its TTL for a transfer
+        # that never touched the vault.
+        logger.exception("Upload failed before publication (claim released)")
+        await release()
+        raise
+
+    # Reaching here means the gate recorded `result` and its transaction
+    # committed: `stream_to_vault` raises `PostPublishFailure` otherwise.
+    return JSONResponse(
+        {
+            "path": row.path,
+            "size": result["size"],
+            "sha256": result["sha256"],
+            "mime": result["mime"],
+        }
+    )
 
 
 # ── download ────────────────────────────────────────────────────────────────

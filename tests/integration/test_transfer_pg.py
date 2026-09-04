@@ -28,6 +28,7 @@ import datetime
 import os
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
@@ -2060,3 +2061,124 @@ async def test_import_completes_under_an_untouched_identity(
     result = await asyncio.wait_for(task, timeout=20)
     assert "Imported" in result
     assert (vault_root / "Attachments" / "a.png").read_bytes() == PAYLOAD
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 4.8 — the pool (#208)
+#
+# The one property in this change that a fake session cannot express at all:
+# `FakeSession` has no pool to check out of, so "the queued upload holds no
+# connection" is only a claim until a real `QueuePool` is asked how many are
+# checked out. The failure it guards against was measured, not theorised — a
+# tenant with ~15 minted links and a slow client took every other tenant's tool
+# calls, OAuth and the panel down with 500s.
+# ════════════════════════════════════════════════════════════════════════════
+
+
+@pytest.fixture
+def one_upload_slot(monkeypatch):
+    """`TRANSFER_MAX_CONCURRENT_UPLOADS = 1`, with the per-loop semaphore reset.
+
+    The semaphore is cached per event loop and built from the setting the first
+    time it is asked for, so the setting must change *and* the cache must be
+    cleared — on the way in (this test's bound) and on the way out (everybody
+    else's).
+    """
+    monkeypatch.setattr(transfer.settings, "transfer_max_concurrent_uploads", 1)
+    transfer._upload_semaphores.clear()
+    yield
+    transfer._upload_semaphores.clear()
+
+
+async def test_a_streaming_and_a_queued_upload_hold_no_pooled_connection(
+    clean, vault_root, wired, engine, one_upload_slot
+):
+    """The regression test #208 asks for, against the real engine.
+
+    One upload is mid-body holding the only streaming slot; a second is queued
+    behind it. Before the fix each of them held a connection checked out and
+    idle-in-transaction — the first across its whole stream, the second across
+    an *unbounded* wait — so 15 of them emptied the pool. Now neither does, and
+    an unrelated caller is served while both are in flight.
+    """
+    async with clean() as session:
+        *_, token_a, _row_a = await _mint_upload(
+            session, vault_root, path="Attachments/streaming.png"
+        )
+        *_, token_b, _row_b = await _mint_upload(
+            session, vault_root, path="Attachments/queued.png"
+        )
+
+    gate, started = asyncio.Event(), asyncio.Event()
+
+    async def put(token: str, ip: str, content):
+        async with _client(ip) as client:
+            return await client.put(
+                "/transfer/upload",
+                headers={"Authorization": f"Bearer {token}"},
+                content=content,
+            )
+
+    streaming = asyncio.create_task(
+        put(token_a, "203.0.113.60", _gated_body(gate, started))
+    )
+    # Paused between its first and last chunk: the slot is held, the body is not
+    # finished, and (before the fix) a connection was pinned right here.
+    await asyncio.wait_for(started.wait(), timeout=10)
+
+    queued = asyncio.create_task(put(token_b, "203.0.113.61", PAYLOAD))
+    await asyncio.sleep(0.5)
+    assert not queued.done(), "the second upload was not queued; test proves nothing"
+
+    assert engine.pool.checkedout() == 0, (
+        "an in-flight upload is holding a pooled connection"
+    )
+
+    # And the pool is not merely accounted-for empty — it actually serves.
+    async with asyncio.timeout(5):
+        async with wired() as probe:
+            assert (
+                await probe.execute(select(func.count()).select_from(TransferToken))
+            ).scalar_one() == 2
+
+    gate.set()
+    first, second = await asyncio.gather(
+        asyncio.wait_for(streaming, timeout=30),
+        asyncio.wait_for(queued, timeout=30),
+    )
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert (vault_root / "Attachments" / "streaming.png").exists()
+    assert (vault_root / "Attachments" / "queued.png").exists()
+
+
+async def test_pool_exhaustion_fails_after_the_configured_pool_timeout(
+    migrated_database,
+):
+    """`pool_timeout` is the bound an exhaustion failure is measured against.
+
+    `src/database.py` writes 30 s down rather than inheriting it, because that
+    number decides how long a cross-tenant outage takes to surface as 500s. Here
+    it is set to a fraction of a second against a one-connection pool so the
+    behaviour — wait, then `sqlalchemy.exc.TimeoutError`, not a hang — is
+    asserted rather than assumed.
+    """
+    from sqlalchemy.exc import TimeoutError as PoolTimeoutError
+
+    small = create_async_engine(
+        migrated_database, pool_size=1, max_overflow=0, pool_timeout=0.5
+    )
+    try:
+        assert small.pool.timeout() == 0.5
+        held = await small.connect()
+        try:
+            started = time.monotonic()
+            with pytest.raises(PoolTimeoutError):
+                await small.connect()
+            waited = time.monotonic() - started
+        finally:
+            await held.close()
+    finally:
+        await small.dispose()
+
+    assert 0.4 <= waited < 10, waited

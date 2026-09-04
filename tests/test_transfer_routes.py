@@ -1044,6 +1044,281 @@ async def test_no_token_ever_reaches_the_logs(client, harness, vault, caplog):
     assert harness.token not in response.text
 
 
+# ── the session scope, the queue, and the markdown cap (#208) ───────────────
+#
+# The route used to keep one session open around the whole handler: the claim
+# committed, but the two re-validation queries immediately autobegan a fresh
+# transaction that was never committed, so a pooled connection stayed checked
+# out across the semaphore wait *and* the whole body stream. 15 slow uploads
+# from one tenant then pinned all 5 + 10 connections and every other caller got
+# a 500. The pool arithmetic itself is only provable against a real engine and
+# lives in `tests/integration/test_transfer_pg.py`; what is provable here is the
+# route's half — what it reads off the detached row, and how it answers the two
+# new ways a slot wait can end.
+
+
+@pytest.fixture(autouse=True)
+def _clear_upload_semaphores():
+    transfer._upload_semaphores.clear()
+    yield
+    transfer._upload_semaphores.clear()
+
+
+async def _hold_every_slot(monkeypatch) -> asyncio.Semaphore:
+    """Occupy the loop's upload semaphore so the next stream must queue."""
+    monkeypatch.setattr(settings, "transfer_max_concurrent_uploads", 1)
+    transfer._upload_semaphores.clear()
+    sem = transfer.upload_semaphore()
+    await sem.acquire()
+    assert sem.locked()
+    return sem
+
+
+def _with_slot_timeout(monkeypatch, seconds: float) -> None:
+    """Shorten the route's (defaulted) slot timeout without faking the wait.
+
+    The route deliberately does not pass `slot_timeout` — 30 s is the service's
+    default and the route has no business overriding it — so the only honest way
+    to test the real wait in under 30 s is to inject the shorter bound at the
+    call. Everything else about the wait, including which exception comes back,
+    is the production path.
+    """
+    real = transfer.stream_to_vault
+
+    async def quick(*args, **kwargs):
+        kwargs["slot_timeout"] = seconds
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(transfer, "stream_to_vault", quick)
+
+
+async def test_a_full_queue_is_a_503_that_releases_the_claim(
+    client, harness, vault, monkeypatch
+):
+    """Busy, not expired: `Retry-After`, `pending` again, nothing staged.
+
+    The distinction from the 408 below is the whole point. Nothing was streamed
+    and the capability's own window is still open, so the very same link may be
+    retried — which is what `release_claim` says and what `consume` would have
+    made impossible.
+    """
+    await _hold_every_slot(monkeypatch)
+    _with_slot_timeout(monkeypatch, 0.1)
+
+    response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "5"
+    assert harness.released == 1
+    assert harness.consumed == 0
+    assert harness.row.state == "pending"
+    assert not (vault / "Attachments" / "shot.png").exists()
+    assert temp_files(vault / "Attachments") == []
+    # A 503 is only ever reached *after* the claim and the re-validation
+    # succeeded, so it tells an attacker nothing a 404 was hiding.
+    assert response.json() != {"error": "not found"}
+
+
+async def test_a_deadline_already_overrun_before_the_wait_consumes_the_token(
+    client, harness, vault, monkeypatch
+):
+    """408 beats 503, and no slot is taken on the way out.
+
+    Unreachable in production — `claim_upload` guarantees a positive remainder
+    the instant phase 1 ends — so it is produced the endorsed way, by advancing
+    `transfer.now_utc`, the single clock every transfer deadline is measured
+    against. A monotonic stand-in could not express it at all.
+    """
+    sem = await _hold_every_slot(monkeypatch)
+    stepped = _now() + datetime.timedelta(hours=1)
+    monkeypatch.setattr(transfer, "now_utc", lambda: stepped)
+
+    response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+
+    assert response.status_code == 408
+    assert harness.consumed == 1
+    assert harness.released == 0
+    assert harness.row.state == "consumed"
+    assert not (vault / "Attachments" / "shot.png").exists()
+    assert temp_files(vault / "Attachments") == []
+    # It never queued for, nor took, a streaming slot.
+    assert sem.locked()
+
+
+@pytest.mark.parametrize("suffix", [".md", ".MD", ".Md"])
+async def test_a_markdown_upload_is_held_to_the_note_cap(
+    client, harness, vault, monkeypatch, suffix
+):
+    """No transport may land a `.md` the note tools would refuse.
+
+    The indexer treats any `.md` as a note, so the cap follows the extension and
+    not the tool. Case-insensitively: `Notes/Big.MD` is a note on every
+    filesystem this runs on.
+    """
+    monkeypatch.setattr(transfer_routes, "MAX_NOTE_BYTES", 64)
+    monkeypatch.setattr(settings, "max_file_write_bytes", 1_000_000)
+    harness.row.path = f"Attachments/note{suffix}"
+
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=b"m" * 4096
+    )
+
+    assert response.status_code == 413
+    assert "64" in response.json()["error"]
+    assert harness.released == 1
+    assert harness.row.state == "pending"
+    assert not (vault / "Attachments" / f"note{suffix}").exists()
+    assert temp_files(vault / "Attachments") == []
+
+
+async def test_the_note_cap_binds_only_markdown(client, harness, vault, monkeypatch):
+    """The same body at the same settings, to a `.png`, is fine."""
+    monkeypatch.setattr(transfer_routes, "MAX_NOTE_BYTES", 64)
+    monkeypatch.setattr(settings, "max_file_write_bytes", 1_000_000)
+
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+    assert response.status_code == 200
+    assert (vault / "Attachments" / "shot.png").read_bytes() == PNG
+
+
+async def test_a_lowered_file_cap_still_wins_for_markdown(
+    client, harness, vault, monkeypatch
+):
+    """`min(MAX_NOTE_BYTES, MAX_FILE_WRITE_BYTES)` — the smaller one binds.
+
+    An operator who lowers `MAX_FILE_WRITE_BYTES` below the note cap must not
+    discover that markdown became the *more* permissive destination.
+    """
+    monkeypatch.setattr(transfer_routes, "MAX_NOTE_BYTES", 1_000_000)
+    monkeypatch.setattr(settings, "max_file_write_bytes", 64)
+    harness.row.path = "Attachments/note.md"
+
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=b"m" * 4096
+    )
+    assert response.status_code == 413
+    assert "64" in response.json()["error"]
+
+
+async def test_upload_info_advertises_the_cap_the_route_enforces(
+    client, harness, monkeypatch
+):
+    """The consent page prints this number; it must be the one that binds."""
+    monkeypatch.setattr(transfer_routes, "MAX_NOTE_BYTES", 64)
+    monkeypatch.setattr(settings, "max_file_write_bytes", 1_000_000)
+
+    harness.row.path = "Attachments/note.md"
+    payload = (await client.get("/transfer/upload/info", headers=auth(harness))).json()
+    assert payload["max_bytes"] == 64
+
+    harness.row.path = "Attachments/shot.png"
+    payload = (await client.get("/transfer/upload/info", headers=auth(harness))).json()
+    assert payload["max_bytes"] == 1_000_000
+
+
+async def test_the_engine_writes_its_pool_timeout_down():
+    """The bound a pool-exhaustion outage is measured against is in the config.
+
+    30 s is SQLAlchemy's own default, so this asserts documentation rather than
+    behaviour — which is the point. An assessment of #208 had to read
+    SQLAlchemy's source to learn how long every other tenant waits before the
+    500s start; a number that load-bearing does not belong in another library's
+    defaults. The behaviour that the value actually binds is asserted against a
+    real pool in `tests/integration/test_transfer_pg.py`.
+    """
+    from src.database import engine as app_engine
+
+    assert app_engine.pool.timeout() == 30
+
+
+class _DetachedRow:
+    """A `FakeRow` proxy that records every read made after phase 1 closes.
+
+    Standing in for the real thing: after phase 1 commits and exits, the route
+    holds a **detached** ORM instance. Reads of plain columns are fine
+    (`expire_on_commit=False` leaves them populated and `close()` expunges
+    without expiring); a read of anything lazy would raise
+    `DetachedInstanceError` in production and 500 the request. A fake session
+    cannot raise that, so the reads are recorded instead and checked against the
+    real mapper.
+    """
+
+    def __init__(self, row):
+        object.__setattr__(self, "_row", row)
+        object.__setattr__(self, "detached", False)
+        object.__setattr__(self, "reads_after_detach", set())
+
+    def __getattr__(self, name):
+        if object.__getattribute__(self, "detached"):
+            object.__getattribute__(self, "reads_after_detach").add(name)
+        return getattr(object.__getattribute__(self, "_row"), name)
+
+    def __setattr__(self, name, value):
+        if name == "detached":
+            object.__setattr__(self, name, value)
+        else:
+            setattr(object.__getattribute__(self, "_row"), name, value)
+
+
+async def test_the_transfer_token_row_carries_nothing_lazy():
+    """The premise of using the claimed row detached, asserted on the model.
+
+    Add a relationship or a deferred column to `TransferToken` and the upload
+    route starts issuing a lazy load on a closed session — a 500 on the write
+    path, from a model edit that looks unrelated. This is the tripwire.
+    """
+    import sqlalchemy as sa
+    from sqlalchemy.orm import ColumnProperty
+
+    from src.models.db import TransferToken
+
+    mapper = sa.inspect(TransferToken)
+    assert not mapper.relationships
+    for prop in mapper.attrs:
+        assert isinstance(prop, ColumnProperty), prop
+        assert prop.deferred is False, prop
+
+
+async def test_only_plain_loaded_columns_are_read_after_phase_one(
+    client, harness, vault, monkeypatch
+):
+    """Whatever the route touches after the session closes must be a column."""
+    import sqlalchemy as sa
+
+    from src.models.db import TransferToken
+
+    watched = _DetachedRow(harness.row)
+
+    async def claim_upload(session, token):
+        if token != harness.token or not harness.claimable:
+            return None
+        harness.row.state = "claimed"
+        harness.row.claimed_at = _now()
+        return watched
+
+    class ClosingSession(FakeSession):
+        async def __aexit__(self, *exc):
+            watched.detached = True
+            return await super().__aexit__(*exc)
+
+    monkeypatch.setattr(transfer, "claim_upload", claim_upload)
+    monkeypatch.setattr(
+        transfer_routes, "async_session", lambda: ClosingSession(harness)
+    )
+
+    response = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+    assert response.status_code == 200, response.text
+    assert (vault / "Attachments" / "shot.png").read_bytes() == PNG
+
+    reads = watched.reads_after_detach
+    # It really did keep using the row after the session went away.
+    assert {"path", "vault_root"} <= reads, reads
+    columns = set(sa.inspect(TransferToken).columns.keys())
+    assert reads <= columns, reads - columns
+
+
 # ── 4.5 download ────────────────────────────────────────────────────────────
 
 
