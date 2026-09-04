@@ -281,18 +281,94 @@ async def test_get_links_says_nothing_about_paging_when_the_page_holds_it_all(
     assert "truncated: false" in out
 
 
-@pytest.mark.parametrize("asked,shown", [(0, 1), (-5, 1), (99999, CAP)])
-async def test_get_links_clamps_its_limit_like_get_backlinks(
-    sessionmaker, vault, asked, shown
-):
+@pytest.mark.parametrize("asked", [0, -5])
+async def test_get_links_clamps_a_low_limit_up_to_one(sessionmaker, vault, asked):
     """Same clamp as `get_backlinks`: `max(1, min(limit, 500))`. A zero or a
-    negative must not turn into "no rows" or into an unbounded select."""
+    negative must not turn into "no rows" or into an unbounded select.
+
+    Asserted on the `limit=` the notice **emits**, not only on the row count:
+    with the row count alone this passed with the clamp deleted, because
+    SQLAlchemy's `.limit(0)` and `.limit(-5)` happen to land on a page this
+    fixture cannot distinguish from a clamped one.
+    """
     (vault / "MOC.md").write_text(over_cap_body(), encoding="utf-8")
     await indexer.index_vault(user_id=None)
 
     out = await tools.get_links_impl("MOC.md", limit=asked)
 
-    assert out.count("\n- ") == shown, out
+    assert out.count("\n- ") == 1, out
+    assert "limit=1" in out, out
+
+
+async def test_get_links_clamps_a_high_limit_down_to_the_hard_cap(
+    sessionmaker, vault, monkeypatch
+):
+    """The upper half of the same clamp, on a note with more rows than the cap.
+
+    A five-row fixture cannot fail this: 5 rows come back whether the limit
+    is 500 or 99,999. The clamp only becomes observable above 500 rows, so
+    the extraction cap is lifted for this one note and the assertion reads
+    the `limit=` the notice emits.
+    """
+    monkeypatch.setattr(indexer, "MAX_LINKS_PER_NOTE", 10_000)
+    (vault / "Huge.md").write_text(over_cap_body(pairs=300), encoding="utf-8")
+    await indexer.index_vault(user_id=None)
+
+    row = await note_row(sessionmaker, "Huge.md")
+    persisted = await link_count(sessionmaker, row.id)
+    assert persisted == 600
+
+    out = await tools.get_links_impl("Huge.md", limit=99999)
+
+    assert out.count("\n- ") == 500, out
+    assert "limit=500" in out, out
+    # At the hard cap "raise `limit`" is not a move the caller can make, and
+    # the remainder is stated as unreachable rather than dressed up as paging.
+    assert "Raise `limit`" not in out, out
+    assert "NOT reachable through this tool" in out, out
+
+
+async def test_get_links_defaults_to_a_limit_below_the_hard_cap(
+    sessionmaker, vault, monkeypatch
+):
+    """A default equal to the hard cap makes the paging advice unactionable.
+
+    The notice used to say "Raise `limit` to see more" on a call that was
+    already at the ceiling, so rows 501..N were unreachable *and* the tool
+    told the agent to retry for them.
+    """
+    monkeypatch.setattr(indexer, "MAX_LINKS_PER_NOTE", 10_000)
+    (vault / "Huge.md").write_text(over_cap_body(pairs=300), encoding="utf-8")
+    await indexer.index_vault(user_id=None)
+
+    out = await tools.get_links_impl("Huge.md")
+
+    assert out.count("\n- ") == 100, out
+    assert "limit=100" in out, out
+    assert "Raise `limit` (hard cap 500) to see more." in out, out
+    assert "NOT reachable through this tool" in out, out
+
+
+async def test_get_links_clips_a_long_link_text_per_row(sessionmaker, vault):
+    """A row is bounded like the response is.
+
+    `link_text` is stored verbatim and a wikilink alias is caller-controlled,
+    so one row could carry a megabyte of it into a tool result — model input
+    — past every response-level cap. `get_backlinks` has always clipped at
+    120; this did not.
+    """
+    alias = "z" * 400
+    (vault / "Long.md").write_text(f"[[W0|{alias}]]\n", encoding="utf-8")
+    await indexer.index_vault(user_id=None)
+
+    out = await tools.get_links_impl("Long.md")
+
+    bullet = next(ln for ln in out.splitlines() if ln.startswith("- "))
+    excerpt = bullet.rsplit("`", 2)[1]
+    assert excerpt.startswith("[[W0|z")
+    assert excerpt.endswith("…")
+    assert len(excerpt) == 121, excerpt  # 120 characters plus the ellipsis
+    assert alias not in out
 
 
 # ── a capped note does not withhold the re-derive's certification ─────────

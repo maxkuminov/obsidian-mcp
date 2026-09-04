@@ -1545,6 +1545,24 @@ async def create_note_impl(path: str, content: str) -> str:
             return f"Failed to write {path}: {e}"
 
 
+# Row-level excerpt bound for the graph tools. `link_text` is note text the
+# indexer stored verbatim — a wikilink alias is caller-controlled and can be
+# thousands of characters — and a tool result is model input, so a row is
+# bounded the same way the response as a whole is. Newlines collapse because a
+# multi-line alias would otherwise break the bullet list it sits in.
+_LINK_EXCERPT_CHARS = 120
+
+
+def _link_excerpt(link_text: str | None) -> str:
+    """`link_text` flattened to one line and clipped, with an ellipsis when
+    it was actually clipped (silent truncation reads as the note's real
+    text)."""
+    flat = (link_text or "").replace("\n", " ")
+    if len(flat) <= _LINK_EXCERPT_CHARS:
+        return flat
+    return flat[:_LINK_EXCERPT_CHARS] + "…"
+
+
 @_tracked("get_backlinks", ["path", "limit"])
 async def get_backlinks_impl(path: str, limit: int = 50) -> str:
     """Notes that link TO `path` (resolved links only)."""
@@ -1600,7 +1618,7 @@ async def get_backlinks_impl(path: str, limit: int = 50) -> str:
 
 
 @_tracked("get_links", ["path", "limit"])
-async def get_links_impl(path: str, limit: int = 500) -> str:
+async def get_links_impl(path: str, limit: int = 100) -> str:
     """Outgoing links from `path` — both resolved and dangling.
 
     Reports `truncated: true` when the indexer capped this note's link
@@ -1612,10 +1630,16 @@ async def get_links_impl(path: str, limit: int = 500) -> str:
     had, which for a note the indexer capped is up to `MAX_LINKS_PER_NOTE`
     (10,000) rows rendered into one tool result — the answer an agent least
     wants and the payload the read caps exist to prevent.
+
+    **The default is below the hard cap on purpose.** A default equal to the
+    cap makes the over-limit notice's "raise `limit`" advice unactionable —
+    the caller is already at the ceiling — so the notice would be telling an
+    agent to retry a call that cannot return anything new. 100 leaves that
+    advice a real move, and the notice says plainly that rows past 500 are
+    not reachable through this tool at all.
     """
     from sqlalchemy import and_, func, or_, select
     from sqlalchemy.orm import aliased
-    from src.config import MAX_LINKS_PER_NOTE
     from src.models.db import NoteLink, NoteMetadata
 
     uid = current_user_id.get()
@@ -1716,17 +1740,25 @@ async def get_links_impl(path: str, limit: int = 500) -> str:
         lines.append("**Resolved:**")
         for r in resolved:
             lines.append(
-                f"- {r.kind} → **{r.title}** (`{r.file_path}`) — `{r.link_text}`"
+                f"- {r.kind} → **{r.title}** (`{r.file_path}`) — "
+                f"`{_link_excerpt(r.link_text)}`"
             )
     if dangling:
         lines.append("\n**Dangling:**")
         for r in dangling:
-            lines.append(f"- {r.kind} → `{r.target_path}` — `{r.link_text}`")
+            lines.append(
+                f"- {r.kind} → `{r.target_path}` — `{_link_excerpt(r.link_text)}`"
+            )
     if over_limit:
+        # "Raise `limit`" only while raising it can do something. At the hard
+        # cap it cannot, and the remainder is stated as unreachable rather
+        # than dressed up as a paging step the caller could take.
+        advice = "Raise `limit` (hard cap 500) to see more. " if limit < 500 else ""
         lines.append(
             f"\n… showing {len(rows)} of {persisted:,} link rows persisted for "
             f"this note (limit={limit}, hard cap 500), in document order. "
-            "Raise `limit` to see more."
+            f"{advice}Rows past the first 500 are NOT reachable through this "
+            "tool — read the note itself if you need them."
         )
     if source.links_truncated:
         lines.append(
