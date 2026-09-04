@@ -411,6 +411,17 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
             await transfer.release_claim(session, row)
             return _not_found()
 
+        # **Commit before the session closes.** `claim_upload` commits, but the
+        # `resolve_identity_ok` / `resolve_root_ok` / `lock_for_publish`-free
+        # reads after it autobegan a fresh read transaction that nothing ever
+        # ended, so the connection went back to the pool having its rollback
+        # issued by `close()` rather than by this handler. The behaviour is the
+        # same either way; what changes is that the code now says what the spec
+        # says — phase 1 *commits* and exits — so a future reader cannot mistake
+        # the implicit rollback for a considered choice. Safe for the detached
+        # row: the sessionmaker is `expire_on_commit=False`.
+        await session.commit()
+
         token_id = row.id
 
     # ── phase 2: no connection held from here to the response ───────────────
