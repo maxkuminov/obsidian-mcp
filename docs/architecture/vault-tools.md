@@ -475,12 +475,12 @@ mechanism in
 
 ### The link grammar every link consumer shares (#180)
 
-Four regexes parse links, and they must agree:
+Four grammars parse links, and they must agree:
 
-| Regex | Where | Used by |
+| Grammar | Where | Used by |
 | --- | --- | --- |
-| `_WIKILINK_RE`, `_MDLINK_RE` | `src/services/links.py` | `extract_links` → `note_links`, `get_links`, `get_backlinks` |
-| `_WIKILINK_REWRITE_RE`, `_MDLINK_REWRITE_RE` | `src/mcp_server/tools.py` | `move_note(rewrite_links=True)` |
+| `_WIKILINK_RE` (regex), `scan_md_links()` | `src/services/links.py` | `extract_links` → `note_links`, `get_links`, `get_backlinks` |
+| `_WIKILINK_REWRITE_RE` (regex), `scan_md_links(**MDLINK_REWRITE_FLAGS)` | `src/mcp_server/tools.py` | `move_note(rewrite_links=True)` |
 
 **Every character class in all four is closed.** Not "the two that were
 reported": an open class that can swallow the rest of a line before the tail
@@ -495,13 +495,37 @@ can write. The rules:
 - **Markdown link text excludes `[`** (it already excluded `]`).
 - **Markdown hrefs cannot exclude brackets** — `[t](Foo [draft].md)` is a legal
   link to a legal filename; Obsidian forbids brackets in wikilink syntax, not
-  in filenames. They are **length-bounded** instead: `{1,2048}?`, which
-  exceeds `MAX_PATH_CHARS` (1,024) plus any anchor. That is O(n × 2048) rather
-  than O(n²) — linear, with a real constant: ~4.7 s for 512 KiB of `[a](` on
-  the development host. Do not read the bound as "fast"; read it as "not
-  quadratic".
+  in filenames. They are **length-bounded** instead, at `MDLINK_HREF_MAX`
+  (2,048), which exceeds `MAX_PATH_CHARS` (1,024) plus any anchor.
 - **Every quantifier is possessive** (`++`, `*+`), so no class can be
   re-entered by backtracking.
+
+**The markdown half is a hand-written scanner, not a regex, and that is a
+an availability fix rather than a style choice.** Closing the classes made the
+markdown regex linear — but linear *with a 2,048× constant*, because every
+`](` re-scanned up to 2 KiB looking for a `.md` that was not there: ~4.7 s per
+512 KiB of `[a](`, so ≈ 90 s for a 10 MiB note, from a body any authenticated
+tenant can write.
+
+**`asyncio.to_thread` does not fix that, and it is important to know why.**
+CPython releases the GIL *between* `re` steps, never inside one, and a scan
+that matches nothing is a single step. So all 90 s ran with the GIL held and
+every other tenant's request stopped dead anyway. Dispatching off the loop
+bounds the stall at the longest single scan; **the linear scan time is the
+real bound**, and shortening it is the actual fix.
+
+`scan_md_links()` in `src/services/links.py` is that scanner. It reproduces
+the two retired regexes exactly — they are kept as differential oracles and
+fuzzed against it in `tests/test_asvs_mdlink_scanner.py` — while answering
+every "where is the next `)` / newline / `>` / `.md#`" question from a
+**monotone cursor**, so the total scanning is one forward pass rather than
+O(n × 2048), and pruning the whole candidate loop on a `.md#`/`.md)`/`.md>`
+tetragram prefilter. Measured after: **1 MiB of `[a](` in 0.8 ms and of
+`[a](.md` in 2.9 ms**, against ~9.4 s for the first of those before. The
+scanner's own worst case — a body dense in *both* `](` candidates and `.md`
+tetragrams, where nothing can be pruned and each `](` costs one loop
+iteration — is ~200 ms per MiB, and is pinned with its own ceiling in that
+test file rather than left unmeasured.
 
 **The accepted differences**, enumerated and asserted in
 `tests/test_asvs_link_grammar.py`, which is where any future change to this
@@ -526,6 +550,15 @@ needs its own change and its own adversarial pass:
 2. its anchor class is `[^)]` where extraction's is `[^)\n]`, so a `#anchor`
    running past a line break is rewritable but not extractable.
 
+Since both markdown halves are now one scanner, those two are its only two
+keyword arguments — `angle=False` and `anchor_crosses_newlines=True`, spelled
+once as `MDLINK_REWRITE_FLAGS` in `src/mcp_server/tools.py`. They were
+reproduced rather than closed on purpose: healing either would make
+`move_note` rewrite links it currently leaves broken, which is a change to
+what a destructive tool mutates on disk and needs its own proposal and its own
+adversarial pass. Keeping them exact is what makes the scanner swap a pure
+performance change with an empty behaviour delta.
+
 **Extraction is bounded per note** at `MAX_LINKS_PER_NOTE` (10,000), applied in
 **document order** — the two extraction loops (wikilinks, then markdown links)
 are merged by position before the cut, so a note with 20,000 wikilinks does not
@@ -541,7 +574,9 @@ refuses until the re-derivation completes, which is the correct disposition.
 
 `move_note`'s rewrite computation runs through `asyncio.to_thread`: it is a
 pure function of a string, and a hub note's backlink sources are processed one
-after another.
+after another. That dispatch bounds the stall at the longest single scan step,
+**not at zero** — see the GIL note above — which is why the scan itself had to
+get fast.
 
 ### Where a section's body begins, and what a section write destroys (#140)
 

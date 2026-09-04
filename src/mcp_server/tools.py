@@ -2352,13 +2352,23 @@ async def edit_note_impl(
 #      never rewritten;
 #   2. the anchor class is `[^)]` (crosses newlines) where extraction's is
 #      `[^)\n]`.
+#
+# The markdown half is no longer a regex at all. `{1,2048}?` is linear but
+# with a 2,048× constant — 4.7 s per 512 KiB of `[a](`, ≈ 90 s for a 10 MiB
+# note — and `asyncio.to_thread` cannot shorten it, because CPython holds the
+# GIL for the whole of one `re` step and a scan that matches nothing is a
+# single step. `scan_md_links` is a hand-written linear scanner with EXACTLY
+# these semantics; the two divergences above are its two keyword arguments,
+# and the retired pattern is kept as a differential oracle in
+# `tests/test_asvs_mdlink_scanner.py`. See the long comment in
+# `src/services/links.py`.
 _WIKILINK_REWRITE_RE = re.compile(
     r"(?P<embed>!)?\[\[(?P<target>[^\[\]\|#\n]++)"
     r"(?P<rest>(?:#[^\[\]\|\n]*+)?(?:\|[^\[\]\n]*+)?)\]\]"
 )
-_MDLINK_REWRITE_RE = re.compile(
-    r"\[(?P<text>[^\[\]\n]++)\]\((?P<href>[^)\n]{1,2048}?\.md)(?P<anchor>#[^)]*+)?\)"
-)
+# The rewrite grammar's markdown scan, as keyword arguments: no `<href>`
+# alternative (divergence 1), anchor crosses newlines (divergence 2).
+MDLINK_REWRITE_FLAGS = {"angle": False, "anchor_crosses_newlines": True}
 
 
 def _rewrite_links_in_text(
@@ -2382,7 +2392,13 @@ def _rewrite_links_in_text(
     exact `content` — the preflight has one, and passing it keeps the
     frontmatter partition to one run per note. Omitted, this scans for itself.
     """
-    from src.services.links import FULL_NOTE, apply_fence_mask, resolve_target, scan_fences
+    from src.services.links import (
+        FULL_NOTE,
+        apply_fence_mask,
+        resolve_target,
+        scan_fences,
+        scan_md_links,
+    )
 
     paths = pre_move_index.get("paths", {})
     from_id = paths.get(from_rel)
@@ -2416,14 +2432,14 @@ def _rewrite_links_in_text(
         rest = m.group("rest") or ""
         rewrites.append((m.start(), m.end(), f"{embed_prefix}[[{new_target}{rest}]]"))
 
-    for m in _MDLINK_REWRITE_RE.finditer(masked):
-        href = m.group("href").strip()
+    for link in scan_md_links(masked, **MDLINK_REWRITE_FLAGS):
+        href = link.href.strip()
         if not href:
             continue
         target_for_resolve = href[:-3] if href.endswith(".md") else href
         if resolve_target(target_for_resolve, source_path, pre_move_index) != from_id:
             continue
-        anchor = m.group("anchor") or ""
+        anchor = link.anchor
         # Resolve against the original source location, but generate the new
         # href relative to where that source lives after the move. These differ
         # for a moved note rewriting its own Markdown self-link.
@@ -2431,9 +2447,9 @@ def _rewrite_links_in_text(
         source_dir = PurePosixPath(output_path).parent.as_posix()
         relative_target = posixpath.relpath(to_rel, source_dir)
         rewrites.append((
-            m.start(),
-            m.end(),
-            f"[{m.group('text')}]({relative_target}{anchor})",
+            link.start,
+            link.end,
+            f"[{link.text}]({relative_target}{anchor})",
         ))
 
     if not rewrites:

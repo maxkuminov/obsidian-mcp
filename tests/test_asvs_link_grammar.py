@@ -1,12 +1,19 @@
 """The link grammar is linear, bounded, and off the loop — issue #180, ASVS.
 
-Four regexes parse links: `_WIKILINK_RE` / `_MDLINK_RE` in
-`src/services/links.py` (extraction, run by the indexer) and
-`_WIKILINK_REWRITE_RE` / `_MDLINK_REWRITE_RE` in `src/mcp_server/tools.py`
-(the `move_note` rewrite scanner). All four ran on the single event loop with
-character classes that could swallow the rest of a line before the tail
-failed, which made ordinary in-cap input — 20 KB of `[[` — an 18-second stall
-for every other tenant on the server.
+Four grammars parse links: wikilink and markdown-link extraction in
+`src/services/links.py` (run by the indexer) and the wikilink and markdown
+halves of the `move_note` rewrite scanner in `src/mcp_server/tools.py`. All
+four were regexes running on the single event loop with character classes that
+could swallow the rest of a line before the tail failed, which made ordinary
+in-cap input — 20 KB of `[[` — an 18-second stall for every other tenant on
+the server.
+
+The two wikilink halves are still regexes, with every class closed. The two
+markdown halves are now one hand-written scanner, `scan_md_links`: closing the
+classes made them linear but left a 2,048× constant, ≈ 90 s for a 10 MiB note.
+That replacement's exactness against the retired regexes is pinned in
+`tests/test_asvs_mdlink_scanner.py`; what is pinned HERE is the behaviour the
+two grammars share, which did not change.
 
 This module pins the three things that fix has to be:
 
@@ -28,12 +35,22 @@ from src.auth.session import current_user_id
 from src.mcp_server.auth import current_permission
 from src.services import vault as vault_service
 from src.services.links import (
-    _MDLINK_RE,
     _WIKILINK_RE,
     build_vault_index,
     extract_links,
     extract_links_bounded,
+    scan_md_links,
 )
+
+
+def _md_extract(text):
+    """The extraction grammar's markdown half."""
+    return next(iter(scan_md_links(text)), None)
+
+
+def _md_rewrite(text):
+    """The `move_note` rewrite grammar's markdown half."""
+    return next(iter(scan_md_links(text, **tools.MDLINK_REWRITE_FLAGS)), None)
 
 # ── the seven shapes, and the two entry points ──────────────────────────────
 #
@@ -43,12 +60,24 @@ from src.services.links import (
 PATHOLOGICAL_UNITS = ["[[", "]]", "[[a", "[[a#", "[[a|", "[a](", "[a](x"]
 
 BENCH_N = 512 * 1024
-# Generous by design. The markdown href cannot exclude brackets (they are legal
-# in filenames), so it is LENGTH-bounded at 2,048 instead — O(n × 2048) rather
-# than O(n²). That constant is real: ~4.7 s for 512 KiB of `[a](` on the
-# development host. The ratio is what proves linearity; this is only a
-# backstop against a regression to quadratic.
-BENCH_CEILING_SECONDS = 60.0
+# The wikilink rows measure ~180 ms at 1 MiB on the development host. The
+# ceiling is loose because a shared CI runner is not the development host and
+# the RATIO is what proves linearity; this only has to fail on a return to
+# quadratic, which was seconds at 40 KB.
+BENCH_CEILING_SECONDS = 20.0
+# The markdown rows get a far tighter one. They used to sit under the same
+# 60 s because the bounded regex really did take ~4.7 s per 512 KiB of `[a](`
+# — linear, but with a 2,048× constant. `scan_md_links` removed the constant:
+# these rows now measure ~130 ms at 1 MiB END TO END, nearly all of it the
+# wikilink pass and the fence mask that run first. 2 s is ~15× headroom for CI
+# and still fails instantly on any return to the old constant.
+#
+# This bounds `extract_links` as a whole. The scanner's own DoS bound — 1 MiB
+# of `[a](` and of `[a](.md` each under 200 ms — is asserted against the
+# scanner directly in `tests/test_asvs_mdlink_scanner.py`, where the wikilink
+# pass is not in the way of the measurement.
+MD_BENCH_CEILING_SECONDS = 2.0
+MD_UNITS = {"[a](", "[a](x"}
 
 
 def _repeat(unit: str, size: int) -> str:
@@ -118,8 +147,10 @@ def test_pathological_input_is_parsed_in_linear_time(scanner, unit):
     assert found_small == 0, f"{unit!r} produced {found_small} links"
     assert found_large == 0, f"{unit!r} produced {found_large} links"
 
-    assert t_large < BENCH_CEILING_SECONDS, (
-        f"{scanner} on {unit!r}: {t_large:.2f}s at {2 * BENCH_N} bytes"
+    ceiling = MD_BENCH_CEILING_SECONDS if unit in MD_UNITS else BENCH_CEILING_SECONDS
+    assert t_large < ceiling, (
+        f"{scanner} on {unit!r}: {t_large:.2f}s at {2 * BENCH_N} bytes "
+        f"(ceiling {ceiling}s)"
     )
     ratio = t_large / max(t_small, 1e-6)
     assert ratio < 4, (
@@ -230,10 +261,9 @@ AGREEMENT_CORPUS = [
 def test_extraction_and_rewrite_grammars_accept_the_same_members(text):
     """One line at a time, bare-href form only — the two known gaps below are
     exactly the cases this corpus must avoid."""
-    extracted = bool(_WIKILINK_RE.search(text) or _MDLINK_RE.search(text))
+    extracted = bool(_WIKILINK_RE.search(text) or _md_extract(text))
     rewritten = bool(
-        tools._WIKILINK_REWRITE_RE.search(text)
-        or tools._MDLINK_REWRITE_RE.search(text)
+        tools._WIKILINK_REWRITE_RE.search(text) or _md_rewrite(text)
     )
     assert extracted == rewritten, (
         f"{text!r}: extraction={extracted} rewrite={rewritten}"
@@ -241,23 +271,25 @@ def test_extraction_and_rewrite_grammars_accept_the_same_members(text):
 
 
 def test_known_gap_the_rewrite_scanner_does_not_see_the_angle_bracket_href():
-    """PRE-EXISTING, and deliberately not closed here: `_MDLINK_RE` has a
-    CommonMark `<href>` alternative, `_MDLINK_REWRITE_RE` has none. So
+    """PRE-EXISTING, and deliberately not closed here: extraction has a
+    CommonMark `<href>` alternative, the rewrite grammar has none. So
     `[a](<Old.md>)` is indexed as a link but `move_note` never rewrites it.
     Closing it changes what `move_note` mutates, which needs its own change
-    and its own adversarial pass."""
+    and its own adversarial pass — so `scan_md_links` reproduces the gap
+    under `angle=False` rather than quietly healing it."""
     text = "[a](<Old.md>)"
-    assert _MDLINK_RE.search(text) is not None
-    assert tools._MDLINK_REWRITE_RE.search(text) is None
+    assert _md_extract(text) is not None
+    assert _md_rewrite(text) is None
 
 
 def test_known_gap_the_rewrite_anchor_class_crosses_newlines():
     """PRE-EXISTING: extraction's anchor class is `[^)\\n]`, the rewrite
     scanner's is `[^)]`. A `#anchor` that runs past a line break is therefore
-    rewritable but not extractable. Also untouched by this change."""
+    rewritable but not extractable. Also untouched by this change —
+    `scan_md_links(anchor_crosses_newlines=True)` is the rewrite half."""
     text = "[a](Old.md#sec\nmore)"
-    assert _MDLINK_RE.search(text) is None
-    assert tools._MDLINK_REWRITE_RE.search(text) is not None
+    assert _md_extract(text) is None
+    assert _md_rewrite(text) is not None
 
 
 # ── the per-note cap, in document order ─────────────────────────────────────
