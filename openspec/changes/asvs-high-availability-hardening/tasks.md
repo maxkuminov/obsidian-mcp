@@ -43,8 +43,8 @@
 ## 4. Integration
 
 - [x] 4.1a Merge A and C, run the full suite (2922 passed).
-- [ ] 4.1 Merge B and A2, run the full suite again, `make audit`, `make test-schema`, `make db-check`.
-- [ ] 4.2 `openspec validate --strict`; `openspec-verifier` pass; adversarial review of the merged diff (Codex only if no other Codex thread is running, otherwise a Claude adversarial verifier — say which in the report).
+- [x] 4.1 Merge B and A2, run the full suite again (3065 passed), `pip-audit` clean, `make test-schema` green (141 passed); `make db-check` after deploy.
+- [x] 4.2 `openspec validate --strict` valid; `openspec-verifier` pass (36/38 covered → fixes merged); adversarial review round 1 (Claude — Codex thread reserved for a parallel agent): 3 MAJOR + 5 MINOR, all fixed in `wt-fix-round1`; round 2 in progress.
 - [ ] 4.3 `make deploy`; confirm `alembic check` clean; wait for the version-2 re-extraction pass to complete (`indexer_runs`, `move_note(rewrite_links=True)` no longer refuses).
 - [ ] 4.4 Post-deploy end-to-end exercise via the live MCP tools: `list_files` with a 2,000-char pattern (refused naming the limit); `create_note` with a 1 MiB `[[a]] ` body, then `get_links` (10,000 rows, `truncated: true`, ERROR line in the ops-health buffer, an unrelated `read_note` served during the pass); `write_file` of an 11 MiB `.md` (refused); `request_upload` for a `.md` and stream 11 MiB (413); one upload while a second is queued (health and an unrelated tool call succeed throughout). Delete the test notes afterwards.
 - [ ] 4.5 Archive the change; PR with `Closes #180`, `Closes #203`, `Closes #204`, `Closes #208`; update the vault report's issue rows and the accepted residual on #203.
