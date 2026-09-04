@@ -78,6 +78,20 @@ class Timeout(TransferError):
     """The stream stalled past the idle timeout or ran past its deadline."""
 
 
+class QueueTimeout(TransferError):
+    """No upload slot became free within `slot_timeout`, deadline still open.
+
+    Deliberately **not** a `Timeout`. The two are different verdicts about the
+    same request and the state machine treats them differently: a deadline
+    overrun means the capability's window is gone, so the token is *consumed*
+    and a retry must mint afresh; a full queue means the server was busy while
+    the capability's window was still open and nothing was staged, so the claim
+    is *released* and the very same link may be retried. The route maps this to
+    503 + `Retry-After`, which is the honest status for "come back shortly" —
+    408 would tell the caller their link had expired when it had not.
+    """
+
+
 class PrePublishAborted(TransferError):
     """The locked pre-publication re-validation refused; nothing was published."""
 
@@ -954,6 +968,70 @@ def upload_semaphore() -> asyncio.Semaphore:
     return sem
 
 
+# How long one wait for the slot may block before the deadline is re-read. Small
+# enough that a realtime step is noticed within a second, large enough that a
+# 30 s queue wait is ~30 wake-ups rather than a spin.
+SLOT_WAIT_SLICE = 1.0
+
+#: Default bound on how long a request may queue for an upload slot.
+DEFAULT_SLOT_TIMEOUT = 30.0
+
+
+async def _acquire_upload_slot(
+    sem: asyncio.Semaphore,
+    *,
+    deadline: float | datetime.datetime,
+    slot_timeout: float,
+) -> None:
+    """Wait for an upload slot, bounded twice, in the deadline's own clock.
+
+    Two bounds, because the queue and the capability answer different
+    questions. `slot_timeout` bounds *this request's* patience — it is a
+    duration nothing else reports on, so it is measured with `time.monotonic()`
+    exactly as `idle_timeout` is. The stream `deadline` is an instant
+    `check_upload` also reads, so it is re-derived through
+    `_deadline_remaining` on **every slice** rather than converted once into a
+    monotonic budget: a single `asyncio.wait_for(sem.acquire(), remaining)`
+    would freeze the wall-clock deadline into the monotonic domain at the top of
+    the wait, which is precisely the clock split `now_utc` exists to prevent.
+    Sliced at `SLOT_WAIT_SLICE`, a realtime step moves this wait and the status
+    tool together.
+
+    Before #208 there was no bound at all here and the deadline was consulted
+    only *after* the slot was won, so a queued upload's wait was unbounded — and
+    it held a pooled database connection while it waited.
+
+    **Precedence when the wait ends without a slot: deadline first.** An
+    overrun raises the existing `Timeout`, which the route maps to `consume` /
+    408 — the same verdict as an overrun during the body, which is what the
+    state machine says about a request that outlived its capability. Only a wait
+    cut short by `slot_timeout` *with deadline remaining* is a `QueueTimeout`
+    (503, claim released): there the capability is still good and the server was
+    merely busy. Getting this the wrong way round would tell a caller whose link
+    had genuinely expired to retry it, and tell a caller whose link was fine
+    that it had expired.
+    """
+    started = time.monotonic()
+    while True:
+        # Deadline first, on both the entry and the retry path.
+        remaining_deadline = _deadline_remaining(deadline)
+        if remaining_deadline <= 0:
+            raise Timeout("Upload exceeded its deadline while waiting for an upload slot")
+        remaining_slot = slot_timeout - (time.monotonic() - started)
+        if remaining_slot <= 0:
+            raise QueueTimeout(
+                f"No upload slot became free within {slot_timeout:g}s; retry shortly"
+            )
+        try:
+            await asyncio.wait_for(
+                sem.acquire(),
+                timeout=min(SLOT_WAIT_SLICE, remaining_slot, remaining_deadline),
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            continue
+        return
+
+
 @dataclass
 class GateHandle:
     """What `before_publish()` yields: the verdict, plus a way to record.
@@ -1182,6 +1260,7 @@ async def stream_to_vault(
     content_length: int | None = None,
     deadline: float | datetime.datetime,
     idle_timeout: float = 30.0,
+    slot_timeout: float = DEFAULT_SLOT_TIMEOUT,
     before_publish: PrePublishGate | None = None,
 ) -> dict:
     """Stream a body into the vault at `row.path`, capped, anchored, atomic.
@@ -1197,9 +1276,16 @@ async def stream_to_vault(
     passes a `time.monotonic()` float, because its fetch budget is private and
     keeps the monotonic guarantee. See `_deadline_remaining`.
 
+    `slot_timeout` bounds the wait for one of the
+    `TRANSFER_MAX_CONCURRENT_UPLOADS` streaming slots. See
+    `_acquire_upload_slot` for the two-bound rule and the 408-before-503
+    precedence; the caller must hold **no database connection** across this
+    call, because the wait can last the whole `slot_timeout` (#208).
+
     Returns `{"size", "sha256", "mime"}`. Raises `TooLarge`, `Timeout`,
-    `PrePublishAborted`, or `vault_fs.Conflict` / `vault_fs.UnsafePath` — and
-    in every case leaves no staged file and nothing at the target path.
+    `QueueTimeout`, `PrePublishAborted`, or `vault_fs.Conflict` /
+    `vault_fs.UnsafePath` — and in every case leaves no staged file and nothing
+    at the target path.
 
     **Staging holds no directory entry** (#92 item 1). The body streams into an
     `O_TMPFILE` inode in `.transfer-tmp`, and a no-clobber publish links that
@@ -1243,7 +1329,14 @@ async def stream_to_vault(
             f"{max_bytes:,}-byte limit"
         )
 
-    async with upload_semaphore():
+    # The acquire stays *here*, inside `stream_to_vault`, so `import_from_url`
+    # and every direct caller inherit the same bound. Do not lift it into the
+    # upload route: at `TRANSFER_MAX_CONCURRENT_UPLOADS=1` a route-side acquire
+    # plus this one is a self-deadlock, and the parameter is the wrong place to
+    # express a process-wide concurrency ceiling.
+    sem = upload_semaphore()
+    await _acquire_upload_slot(sem, deadline=deadline, slot_timeout=slot_timeout)
+    try:
         return await _stream_locked(
             row,
             chunks,
@@ -1252,6 +1345,8 @@ async def stream_to_vault(
             idle_timeout=idle_timeout,
             before_publish=before_publish,
         )
+    finally:
+        sem.release()
 
 
 def _refuse_if_past_deadline(deadline: float | datetime.datetime) -> None:
