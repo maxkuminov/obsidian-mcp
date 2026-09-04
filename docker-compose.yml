@@ -3,7 +3,11 @@
 # To adapt to your environment, set in `.env`:
 #   MCP_HOSTNAME       -- public hostname Traefik routes to
 #   VAULT_HOST_PATH    -- host path to your Obsidian vault
-#   BACKUPS_HOST_PATH  -- host path for database backups (optional)
+#
+# Backups are written host-side by `make db-backup` into $(DATA_DIR)/backups
+# and are deliberately NOT mounted into the container (see
+# docs/architecture/control-panel.md, "Backup recency"); `make deploy`
+# refuses a container that has a mount at /app/backups.
 #
 # The Traefik labels assume an external `t2_proxy` network and a
 # `chain-oauth@file` middleware; adjust the network/middleware names
@@ -44,7 +48,6 @@ services:
     volumes:
       # Max (admin) — bootstraps to vault_path=/obsidian after the flag flip.
       - ${VAULT_HOST_PATH:-./vault}:/obsidian
-      - ${BACKUPS_HOST_PATH:-./backups}:/app/backups
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
 

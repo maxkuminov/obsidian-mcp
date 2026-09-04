@@ -99,3 +99,38 @@ directly — one family per `(client_id, user_id)`, never a family spanning two
 users, never a user's rows split across two families — plus stamp-back
 idempotence (which must not re-stamp existing `grant_id`s) and the downgrade.
 
+## Backups are protected data, not just a rollback tool
+
+A `pg_dump` of this database is the complete text of every tenant's notes
+(`note_embeddings.chunk_text`), every search query ever logged, and every
+password, API-key, OAuth and transfer-token hash. Before 2026-09-04 the
+dumps were written with the caller's umask (0664) into a 0775 directory, were
+never pruned (95 files, 7.4 GB, back to March), and the directory was
+bind-mounted read-write into the application container in direct
+contradiction of the "container cannot see backups" invariant that
+`control-panel.md` documents for `backups_log` (ASVS assessment findings
+#181, #186, #187). The rules now:
+
+- **`make db-backup` runs under `umask 077`, `chmod 600`s the dump, keeps the
+  directory `0700`, and verifies the archive (`gzip -t`) before recording
+  it.** A dump that does not verify is deleted and the target fails, so
+  `make deploy` refuses to migrate.
+- **Retention is bounded:** dumps older than `BACKUP_RETAIN_DAYS` (30) are
+  pruned after the new one is verified and recorded, never below
+  `BACKUP_RETAIN_MIN` (7) most-recent files and never the one just taken.
+  Retention is the operator's, not the container's: nothing in `src/`
+  touches the directory.
+- **The directory is never mounted into the container.** `docker-compose.yml`
+  carries no `/app/backups` volume, and `make deploy` / `make status` run
+  `check-no-backups-mount`, which fails if `docker inspect` shows one. This
+  is the enforcement of the invariant `control-panel.md` states; do not add
+  the mount back "for convenience" — `docker/record-backup.sh` exists
+  precisely so the container never needs it.
+- **`.env` is `0600`.** It carries `DATABASE_URL` (with the password) and
+  `SECRET_KEY`; `make init` sets the mode, and a second local account on the
+  host is the reason this matters.
+
+Encryption at rest for the dumps is not implemented; if it is added, keep a
+restore-tested copy with separately managed keys before switching it on, or
+the backup stops being a backup.
+

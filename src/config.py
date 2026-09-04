@@ -108,7 +108,8 @@ class _FieldFilteredSource(PydanticBaseSettingsSource):
 
     Used for the **dotenv source only**. The repo-root `.env` is shared with
     `docker-compose.yml` and legitimately carries compose-only keys
-    (`VAULT_HOST_PATH`, `BACKUPS_HOST_PATH`) that are not settings; with
+    (`VAULT_HOST_PATH`, and the retired `BACKUPS_HOST_PATH` still present in
+    older `.env` files) that are not settings; with
     pydantic-settings' `extra="forbid"` they make `Settings()` — and therefore
     a single-file `pytest` run from a checkout — fail at import.
 
@@ -330,8 +331,8 @@ class Settings(BaseSettings):
         """Default source order, with the dotenv source filtered to known fields.
 
         The repo-root `.env` doubles as the compose env file and carries
-        compose-only keys (`VAULT_HOST_PATH`, `BACKUPS_HOST_PATH`) that are not
-        `Settings` fields. Under `extra="forbid"` those abort `Settings()` at
+        compose-only keys (`VAULT_HOST_PATH`, or a retired `BACKUPS_HOST_PATH` in
+        an older `.env`) that are not `Settings` fields. Under `extra="forbid"` those abort `Settings()` at
         import time. Dropping them from the dotenv source only keeps every other
         surface strict.
         """
