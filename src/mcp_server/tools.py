@@ -3631,6 +3631,26 @@ async def read_file_impl(
     return _base64_payload(path, data, mime)
 
 
+def _write_cap_for(path: str) -> tuple[int, str]:
+    """The byte cap for a raw-transport write to `path`, and its name.
+
+    The note tools cap every note at `MAX_NOTE_BYTES`, but `write_file`, the
+    transfer upload and `import_from_url` are byte transport with no extension
+    allowlist — so a 25 MiB `.md` could be landed by the tool the note tools
+    would have refused, and the indexer then reads it as a note. The cap
+    follows the EXTENSION, not the tool.
+
+    It is the *smaller* of the two limits so an operator who lowers
+    `MAX_FILE_WRITE_BYTES` below 10 MiB is not surprised by a more permissive
+    markdown limit, and the name that comes back is whichever one actually
+    applied — a caller told "max 10,485,760" without being told which knob
+    that is cannot act on it.
+    """
+    if path.lower().endswith(".md") and MAX_NOTE_BYTES < settings.max_file_write_bytes:
+        return MAX_NOTE_BYTES, "MAX_NOTE_BYTES"
+    return settings.max_file_write_bytes, "MAX_FILE_WRITE_BYTES"
+
+
 @_tracked("write_file", ["path", "encoding", "overwrite"])
 async def write_file_impl(
     path: str,
@@ -3685,10 +3705,11 @@ async def write_file_impl(
         else:
             data = content.encode("utf-8")
 
-        if len(data) > settings.max_file_write_bytes:
+        cap, cap_name = _write_cap_for(path)
+        if len(data) > cap:
             return (
                 f"Content too large ({len(data):,} bytes, "
-                f"max {settings.max_file_write_bytes:,}). No file was written."
+                f"max {cap:,} — {cap_name}). No file was written."
             )
 
         try:
@@ -4245,7 +4266,9 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
         overwrite=overwrite,
         expected_fingerprint=fingerprint if overwrite else None,
     )
-    cap = settings.max_file_write_bytes
+    # `.md`-aware (#203): the same cap `write_file` applies, so an import
+    # cannot land a markdown file the note tools would refuse.
+    cap, cap_name = _write_cap_for(rel)
     identity = _transfer_identity()
 
     @asynccontextmanager
@@ -4277,7 +4300,7 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
     except transfer.SSRFError as e:
         return f"Refused to fetch that URL: {e}"
     except transfer.TooLarge as e:
-        return f"{e}. Nothing was written."
+        return f"{e} ({cap_name}). Nothing was written."
     except transfer.Timeout as e:
         return f"{e}. Nothing was written."
     except transfer.PrePublishAborted:
