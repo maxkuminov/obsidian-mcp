@@ -30,23 +30,63 @@ class ExtractedLink:
     position: int  # byte offset in the (un-stripped) source
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# The link grammar — every class is closed (issue #180)
+# ────────────────────────────────────────────────────────────────────────────
+#
+# These two regexes, and the two rewrite regexes in `src/mcp_server/tools.py`
+# that must apply the SAME rules, run synchronously on the one event loop this
+# server has, over any note body a tenant can write (up to `MAX_NOTE_BYTES`).
+# A character class that can swallow the rest of a line before the tail fails
+# is therefore not a performance detail: it is a cross-tenant availability
+# bug. 20 KB of `[[` held the loop for 18 seconds; `[[a#`, `[[a|`, `[a](` and
+# `[a](x` were the same shape at 11.8 s, 4.9 s, 3.6 s and 2.4 s. Closing only
+# some of the classes moves the burn to the next one, so ALL of them are
+# closed, and the quantifiers are possessive so no class can be re-entered by
+# backtracking:
+#
+# * WIKILINK target/anchor/alias exclude `[` and `]`. Obsidian's *link syntax*
+#   forbids both inside `[[...]]`, so no well-formed wikilink changes.
+# * MARKDOWN link text excludes `[` (it already excluded `]`).
+# * MARKDOWN hrefs cannot exclude brackets — `[t](Foo [draft].md)` is a legal
+#   link to a legal filename — so they are LENGTH-bounded instead:
+#   `{1,2048}?`, which exceeds `MAX_PATH_CHARS` (1,024) plus any anchor. The
+#   lazy scan is O(n × 2048) rather than O(n²).
+#
+# The accepted differences, each pinned in `tests/test_asvs_link_grammar.py`:
+#
+#   `[[Note|see [1]]]`, `[[Note#Sec [x]]]`   → no row at all (before: a row
+#                                              with a mangled alias/anchor)
+#   `[[[Foo]]`                               → target `Foo` (before: `[Foo`) —
+#                                              the same rule seen from the
+#                                              other side: the match now
+#                                              starts at the second `[`
+#   `[a[b](x.md)`                            → still a row to `x.md`, but
+#                                              `link_text` is `[b](x.md)`
+#   an href longer than 2,048 characters     → no row (it cannot name a note)
+#
+# Anything that changes here changes what `note_links` holds, so it needs a
+# `CURRENT_EXTRACTION_VERSION` bump in the same change — the same rule the
+# fence grammar below carries.
+
 # Wikilink: optional `!` for embeds, then `[[Target(#Anchor)?(|Alias)?]]`.
-# Target is "anything but ], |, #" so anchors and aliases peel cleanly.
+# Target is "anything but [, ], |, #" so anchors and aliases peel cleanly.
 _WIKILINK_RE = re.compile(
-    r"(?P<embed>!)?\[\[(?P<target>[^\]\|#\n]+)"
-    r"(?:#(?P<anchor>[^\]\|\n]*))?"
-    r"(?:\|(?P<alias>[^\]\n]*))?\]\]"
+    r"(?P<embed>!)?\[\[(?P<target>[^\[\]\|#\n]++)"
+    r"(?:#(?P<anchor>[^\[\]\|\n]*+))?"
+    r"(?:\|(?P<alias>[^\[\]\n]*+))?\]\]"
 )
 
 # Markdown link: `[text](href.md)`, `[text](href.md#anchor)`, or the
 # CommonMark angle-bracket form `[text](<href.md>)`. Href must end in `.md`
 # (with optional `#anchor`) — we ignore non-note links here. The href class
 # forbids only newlines (not all whitespace), so raw-space note names like
-# `My Note.md` and `folder/My Note.md` are captured.
+# `My Note.md` and `folder/My Note.md` are captured; it is length-bounded
+# rather than bracket-free because brackets are legal in filenames.
 _MDLINK_RE = re.compile(
-    r"\[(?P<text>[^\]\n]+)\]\("
-    r"(?:<(?P<href_ab>[^>\n]+?\.md)(?:#[^>]*)?>"
-    r"|(?P<href>[^)\n]+?\.md)(?:#[^)\n]*)?)\)"
+    r"\[(?P<text>[^\[\]\n]++)\]\("
+    r"(?:<(?P<href_ab>[^>\n]{1,2048}?\.md)(?:#[^>]*+)?>"
+    r"|(?P<href>[^)\n]{1,2048}?\.md)(?:#[^)\n]*+)?)\)"
 )
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -366,7 +406,7 @@ def apply_fence_mask(text: str, scan: FenceScan) -> str:
 
 
 def extract_links(
-    content: str, *, context: FenceContext = BODY
+    content: str, *, context: FenceContext = BODY, max_links: int | None = None
 ) -> list[ExtractedLink]:
     """Extract every wikilink/embed/markdown-link from a note body.
 
@@ -374,16 +414,49 @@ def extract_links(
     post-frontmatter body the indexer already parsed. A caller with raw note
     text must say `context=FULL_NOTE` so the frontmatter block stays opaque to
     fence recognition.
+
+    `max_links` bounds the result to the first N links in DOCUMENT order (see
+    `extract_links_bounded`, which also reports whether the bound bit).
+    `None` — the default, and what every pre-existing caller passes — is
+    unbounded.
+    """
+    links, _ = extract_links_bounded(content, context=context, max_links=max_links)
+    return links
+
+
+def extract_links_bounded(
+    content: str, *, context: FenceContext = BODY, max_links: int | None = None
+) -> tuple[list[ExtractedLink], bool]:
+    """`extract_links`, plus whether `max_links` truncated the result.
+
+    Returns `(links, truncated)`. `truncated` is True only when the note
+    genuinely holds more links than `max_links`; a caller that persists a
+    truncated set must record that fact durably, because a capped set read as
+    a complete one is a silently-wrong graph answer.
+
+    **Document order, not scan order.** Extraction runs two sequential loops
+    (wikilinks, then markdown links), so "the first N" is meaningless per
+    loop: a note with 20,000 wikilinks would otherwise lose every markdown
+    link in the file. The two loops are merged by `position` and cut to N
+    against that merged order. Each loop is itself capped at N first — a link
+    in the merged first N is necessarily within the first N of its own kind —
+    so peak memory is bounded at 2N links rather than at the note's true link
+    count (one 10 MiB note of `[[a]] ` yields 1.75 M links unbounded).
     """
     masked = _mask_code(content, context=context)
-    out: list[ExtractedLink] = []
+    wiki: list[ExtractedLink] = []
+    md: list[ExtractedLink] = []
+    overflowed = False
 
     for m in _WIKILINK_RE.finditer(masked):
         target = m.group("target").strip()
         if not target:
             continue
+        if max_links is not None and len(wiki) >= max_links:
+            overflowed = True
+            break
         kind = "embed" if m.group("embed") else "link"
-        out.append(ExtractedLink(
+        wiki.append(ExtractedLink(
             target=target,
             link_text=m.group(0),
             kind=kind,
@@ -394,6 +467,9 @@ def extract_links(
         href = (m.group("href_ab") or m.group("href") or "").strip()
         if not href:
             continue
+        if max_links is not None and len(md) >= max_links:
+            overflowed = True
+            break
         # Decode percent-encoded characters (e.g. `%20` → space).
         try:
             decoded = urllib.parse.unquote(href)
@@ -402,14 +478,27 @@ def extract_links(
         # Strip a trailing `.md` for resolver consistency — resolver tries
         # both with and without the extension.
         target = decoded[:-3] if decoded.endswith(".md") else decoded
-        out.append(ExtractedLink(
+        md.append(ExtractedLink(
             target=target,
             link_text=m.group(0),
             kind="markdown",
             position=m.start(),
         ))
 
-    return out
+    if max_links is None:
+        # Unbounded: the historical scan order (every wikilink, then every
+        # markdown link). Callers that predate the cap depend on it, and with
+        # no cut to make there is no selection for document order to inform.
+        return wiki + md, False
+
+    if not md:
+        out = wiki
+    elif not wiki:
+        out = md
+    else:
+        out = sorted(wiki + md, key=lambda link: link.position)
+    truncated = overflowed or len(out) > max_links
+    return out[:max_links], truncated
 
 
 # ────────────────────────────────────────────────────────────────────────────

@@ -2336,12 +2336,28 @@ async def edit_note_impl(
 # ────────────────────────────────────────────────────────────────────────────
 
 
+# The rewrite grammar. It MUST apply the same closed-class rules as the
+# extraction grammar in `src/services/links.py` (see the long comment there):
+# wikilink target/anchor/alias exclude `[` and `]`, markdown link text
+# excludes `[`, the markdown href is length-bounded to 2,048 rather than
+# bracket-free, and every quantifier is possessive. A class that can swallow
+# the rest of a line before the tail fails makes `move_note(rewrite_links=…)`
+# a quadratic stall for every other tenant, exactly as it did in extraction.
+#
+# Two divergences from `_MDLINK_RE` are PRE-EXISTING and deliberately left
+# alone here — fixing either changes what `move_note` rewrites, which is its
+# own change with its own audit. Both are recorded as known gaps in
+# `tests/test_asvs_link_grammar.py`:
+#   1. no CommonMark `<href>` alternative, so `[t](<a.md>)` is extracted but
+#      never rewritten;
+#   2. the anchor class is `[^)]` (crosses newlines) where extraction's is
+#      `[^)\n]`.
 _WIKILINK_REWRITE_RE = re.compile(
-    r"(?P<embed>!)?\[\[(?P<target>[^\]\|#\n]+)"
-    r"(?P<rest>(?:#[^\]\|\n]*)?(?:\|[^\]\n]*)?)\]\]"
+    r"(?P<embed>!)?\[\[(?P<target>[^\[\]\|#\n]++)"
+    r"(?P<rest>(?:#[^\[\]\|\n]*+)?(?:\|[^\[\]\n]*+)?)\]\]"
 )
 _MDLINK_REWRITE_RE = re.compile(
-    r"\[(?P<text>[^\]\n]+)\]\((?P<href>[^)\n]+?\.md)(?P<anchor>#[^)]*)?\)"
+    r"\[(?P<text>[^\[\]\n]++)\]\((?P<href>[^)\n]{1,2048}?\.md)(?P<anchor>#[^)]*+)?\)"
 )
 
 
@@ -2804,7 +2820,12 @@ async def _move_note_locked(
                         undecidable_sources.append(
                             (original_src_path, fence_scan.unmatched_indented_openers)
                         )
-                    new_content, n = _rewrite_links_in_text(
+                    # Off the loop (#180). The rewrite is a pure function of a
+                    # string, and a hub note's backlink sources are read one
+                    # after another — linear work on a near-cap note is still
+                    # dead air for every other tenant if it runs here.
+                    new_content, n = await asyncio.to_thread(
+                        _rewrite_links_in_text,
                         content,
                         from_rel,
                         to_rel,
@@ -3610,6 +3631,26 @@ async def read_file_impl(
     return _base64_payload(path, data, mime)
 
 
+def _write_cap_for(path: str) -> tuple[int, str]:
+    """The byte cap for a raw-transport write to `path`, and its name.
+
+    The note tools cap every note at `MAX_NOTE_BYTES`, but `write_file`, the
+    transfer upload and `import_from_url` are byte transport with no extension
+    allowlist — so a 25 MiB `.md` could be landed by the tool the note tools
+    would have refused, and the indexer then reads it as a note. The cap
+    follows the EXTENSION, not the tool.
+
+    It is the *smaller* of the two limits so an operator who lowers
+    `MAX_FILE_WRITE_BYTES` below 10 MiB is not surprised by a more permissive
+    markdown limit, and the name that comes back is whichever one actually
+    applied — a caller told "max 10,485,760" without being told which knob
+    that is cannot act on it.
+    """
+    if path.lower().endswith(".md") and MAX_NOTE_BYTES < settings.max_file_write_bytes:
+        return MAX_NOTE_BYTES, "MAX_NOTE_BYTES"
+    return settings.max_file_write_bytes, "MAX_FILE_WRITE_BYTES"
+
+
 @_tracked("write_file", ["path", "encoding", "overwrite"])
 async def write_file_impl(
     path: str,
@@ -3664,10 +3705,11 @@ async def write_file_impl(
         else:
             data = content.encode("utf-8")
 
-        if len(data) > settings.max_file_write_bytes:
+        cap, cap_name = _write_cap_for(path)
+        if len(data) > cap:
             return (
                 f"Content too large ({len(data):,} bytes, "
-                f"max {settings.max_file_write_bytes:,}). No file was written."
+                f"max {cap:,} — {cap_name}). No file was written."
             )
 
         try:
@@ -4224,7 +4266,9 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
         overwrite=overwrite,
         expected_fingerprint=fingerprint if overwrite else None,
     )
-    cap = settings.max_file_write_bytes
+    # `.md`-aware (#203): the same cap `write_file` applies, so an import
+    # cannot land a markdown file the note tools would refuse.
+    cap, cap_name = _write_cap_for(rel)
     identity = _transfer_identity()
 
     @asynccontextmanager
@@ -4256,7 +4300,7 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
     except transfer.SSRFError as e:
         return f"Refused to fetch that URL: {e}"
     except transfer.TooLarge as e:
-        return f"{e}. Nothing was written."
+        return f"{e} ({cap_name}). Nothing was written."
     except transfer.Timeout as e:
         return f"{e}. Nothing was written."
     except transfer.PrePublishAborted:

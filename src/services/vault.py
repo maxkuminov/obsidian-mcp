@@ -103,7 +103,7 @@ import yaml
 from sqlalchemy import select
 
 from src.auth.session import _UnsetVaultRoot, current_vault_root
-from src.config import settings
+from src.config import MAX_LIST_PATTERN_CHARS, settings
 from src.services import vault_fs
 
 logger = logging.getLogger(__name__)
@@ -2674,8 +2674,24 @@ def list_dir(
     and files whose name matches `pattern`. Recursive: files matching `pattern`
     beneath `folder`, pruning dot-directories. At most `limit` entries are
     returned; `truncated` is True when more matched.
+
+    Refuses a `pattern` longer than `MAX_LIST_PATTERN_CHARS` with a
+    `ValueError` — which the tool already maps to an in-band refusal — BEFORE
+    the folder is validated and before `fnmatch` compiles anything. The order
+    is deliberate: `fnmatch.translate` + `re.compile` is linear at ~10 µs/char
+    and runs on the single event loop, so the compile itself is the stall
+    (issue #204), and a caller who passes a 500 KB pattern to a folder that
+    does not exist must still be told about the pattern rather than sent off
+    to fix the folder and try the same stall again.
     """
     import fnmatch
+
+    if pattern is not None and len(pattern) > MAX_LIST_PATTERN_CHARS:
+        raise ValueError(
+            f"Pattern too long ({len(pattern):,} characters, max "
+            f"{MAX_LIST_PATTERN_CHARS:,} — MAX_LIST_PATTERN_CHARS). "
+            "Nothing was listed."
+        )
 
     base = validate_visible_path(folder or ".", user_id=user_id)
     if not base.is_dir():
