@@ -469,6 +469,95 @@ async def test_move_note_within_the_aggregate_bound_still_rewrites(
     assert journal.commits == 1
 
 
+# ── move_note: one source's rewrites are bounded too ────────────────────────
+
+
+async def test_move_note_aborts_when_one_source_holds_too_many_rewrites(
+    offline, monkeypatch
+):
+    """`MAX_LINKS_PER_NOTE` applies to the write side, not only extraction.
+
+    The aggregate byte bound above is about the *number of sources*; this is
+    about one source. Nothing capped how many links a single note could have
+    rewritten, so a note of `[[Old]] ` at `MAX_NOTE_BYTES` planned ~1.7
+    million of them — and the indexer would then persist only the first
+    10,000, leaving the graph asserting a link set the bytes contradict.
+
+    Refused, not truncated, and refused *before* phase 2, exactly as the
+    `MAX_NOTE_BYTES` and `MAX_MOVE_REWRITE_BYTES` preflights are: rewriting
+    the first N and stopping leaves the rest of the note pointing at the path
+    the move just vacated and reports the move as a success.
+    """
+    monkeypatch.setattr(tools, "MAX_LINKS_PER_NOTE", 3)
+
+    from_rel = "old/target.md"
+    to_rel = "new/renamed.md"
+    (offline / "old").mkdir()
+    (offline / from_rel).write_text("moved note\n", encoding="utf-8")
+
+    hub = offline / "hub.md"
+    hub.write_text("[[old/target]] " * 4, encoding="utf-8")
+    before = hub.read_bytes()
+
+    factory, journal = _fake_session_returning(
+        [_Row(file_path=from_rel, id=1), _Row(file_path="hub.md", id=2)],
+        [_Row(file_path="hub.md")],
+    )
+    monkeypatch.setattr(tools, "async_session", factory)
+
+    seen: list[bytes | None] = []
+    real_write = tools.write_file_at
+
+    def spy(path, content, **kwargs):
+        seen.append(kwargs.get("expected"))
+        return real_write(path, content, **kwargs)
+
+    monkeypatch.setattr(tools, "write_file_at", spy)
+
+    result = await tools.move_note_impl(from_rel, to_rel, rewrite_links=True)
+
+    # Names the source and the cap, so the agent knows which note to split.
+    assert "Move aborted" in result, result
+    assert "hub.md" in result, result
+    assert "MAX_LINKS_PER_NOTE=3" in result, result
+    assert "4 links" in result, result
+    assert "Moved" not in result
+
+    # Nothing moved, nothing rewritten, nothing written at all.
+    assert (offline / from_rel).read_text(encoding="utf-8") == "moved note\n"
+    assert not (offline / to_rel).exists()
+    assert hub.read_bytes() == before
+    assert seen == []
+
+    # And the DB saw only the two preflight SELECTs — no UPDATE, no commit.
+    assert journal.mutating() == []
+    assert journal.commits == 0
+
+
+async def test_move_note_at_the_rewrite_cap_still_goes_through(offline, monkeypatch):
+    """The refusal is "more than the cap", not "at" it."""
+    monkeypatch.setattr(tools, "MAX_LINKS_PER_NOTE", 4)
+
+    from_rel = "old/target.md"
+    to_rel = "new/renamed.md"
+    (offline / "old").mkdir()
+    (offline / from_rel).write_text("moved note\n", encoding="utf-8")
+    hub = offline / "hub.md"
+    hub.write_text("[[old/target]] " * 4, encoding="utf-8")
+
+    factory, journal = _fake_session_returning(
+        [_Row(file_path=from_rel, id=1), _Row(file_path="hub.md", id=2)],
+        [_Row(file_path="hub.md")],
+    )
+    monkeypatch.setattr(tools, "async_session", factory)
+
+    result = await tools.move_note_impl(from_rel, to_rel, rewrite_links=True)
+
+    assert "rewrote 4 link(s)" in result, result
+    assert hub.read_text(encoding="utf-8") == "[[new/renamed]] " * 4
+    assert journal.commits == 1
+
+
 # ── the size check must not displace the conflict check ─────────────────────
 
 

@@ -30,6 +30,7 @@ from src.auth.session import (
     current_user_id,
 )
 from src.config import (
+    MAX_LINKS_PER_NOTE,
     MAX_MOVE_REWRITE_BYTES,
     MAX_NOTE_BYTES,
     max_move_rewrite_sources,
@@ -2427,6 +2428,83 @@ _WIKILINK_REWRITE_RE = re.compile(
 MDLINK_REWRITE_FLAGS = {"angle": False, "anchor_crosses_newlines": True}
 
 
+class MoveRewriteCapExceeded(Exception):
+    """One `move_note` source carries more rewrites than the per-note cap.
+
+    The same bound the indexer applies to extraction (`MAX_LINKS_PER_NOTE`),
+    applied to the *write* side, and for the same reason: a 10 MiB note of
+    `[[Old]] ` holds ~1.7 million rewritable links, and rewriting them all
+    would build a note whose `note_links` set the indexer then truncates at
+    10,000 — the graph would assert a link set the vault bytes contradict.
+    Raised out of the pure rewrite function and turned into an in-band
+    refusal by `_move_note_locked`, which aborts the move **before any
+    mutation**, exactly as the `MAX_NOTE_BYTES` and `MAX_MOVE_REWRITE_BYTES`
+    preflight refusals do.
+    """
+
+    def __init__(self, source_path: str, count: int, cap: int):
+        self.source_path = source_path
+        self.count = count
+        self.cap = cap
+        super().__init__(
+            f"{source_path} holds {count} links to rewrite, more than "
+            f"MAX_LINKS_PER_NOTE={cap}"
+        )
+
+
+def _splice_rewrites(content: str, rewrites: list[tuple[int, int, str]]) -> str:
+    """Apply `(start, end, replacement)` spans to `content` in one pass.
+
+    **Linear, and byte-for-byte what the retired reverse-splice produced.**
+    The old shape was `out = out[:start] + repl + out[end:]` per rewrite over
+    a descending sort — a fresh copy of the whole note per link, so a note of
+    `[[Old]] ` cost 0.07 / 0.18 / 0.72 / 5.3 s at 64 / 128 / 256 / 512 KiB
+    (clean O(n²), ~35 minutes at `MAX_NOTE_BYTES`) while holding the
+    process-wide `_MOVE_REWRITE_LOCK` — one caller's move stalling every
+    other tenant's, which is the exact shape of the extraction stall this
+    change exists to close.
+
+    The spans come from two non-overlapping scans (`_WIKILINK_REWRITE_RE`
+    leftmost-non-overlapping, `scan_md_links` resuming at each match's end),
+    and they cannot overlap **each other** either: a markdown link's text
+    class excludes `[` and `]`, so no `[text](` can begin inside a wikilink
+    span and run past its `]]`. That is what makes the cursor walk equivalent
+    — but it is a property of two grammars in another module, so it is
+    *checked* rather than assumed, and a violation falls back to the old
+    splice rather than silently producing different bytes. The fallback is
+    unreachable through the scanners; it is reachable, and tested, through
+    this function directly.
+    """
+    if not rewrites:
+        return content
+    ordered = sorted(rewrites, key=lambda r: r[0])
+    cursor = 0
+    parts: list[str] = []
+    for start, end, replacement in ordered:
+        if start < cursor:
+            return _splice_rewrites_overlapping(content, rewrites)
+        parts.append(content[cursor:start])
+        parts.append(replacement)
+        cursor = end
+    parts.append(content[cursor:])
+    return "".join(parts)
+
+
+def _splice_rewrites_overlapping(
+    content: str, rewrites: list[tuple[int, int, str]]
+) -> str:
+    """The retired reverse splice, kept verbatim for overlapping spans.
+
+    Quadratic, and deliberately so: it is the *definition* of what overlapping
+    spans mean here, and nothing the scanners can produce reaches it.
+    """
+    ordered = sorted(rewrites, key=lambda r: r[0], reverse=True)
+    out = content
+    for start, end, replacement in ordered:
+        out = out[:start] + replacement + out[end:]
+    return out
+
+
 def _rewrite_links_in_text(
     content: str,
     from_rel: str,
@@ -2510,11 +2588,12 @@ def _rewrite_links_in_text(
 
     if not rewrites:
         return content, 0
-    rewrites.sort(key=lambda r: r[0], reverse=True)
-    out = content
-    for start, end, replacement in rewrites:
-        out = out[:start] + replacement + out[end:]
-    return out, len(rewrites)
+    # Bounded per source by the same cap the indexer applies to extraction.
+    # Raised, not truncated: a partial rewrite would leave some links pointing
+    # at a path the move is about to vacate, reported as a success.
+    if len(rewrites) > MAX_LINKS_PER_NOTE:
+        raise MoveRewriteCapExceeded(source_path, len(rewrites), MAX_LINKS_PER_NOTE)
+    return _splice_rewrites(content, rewrites), len(rewrites)
 
 
 def _rewrite_failure_warning(
@@ -2887,7 +2966,15 @@ async def _move_note_locked(
                     # ONCE and handed on to the rewriter, because the
                     # recognizer's contract is that the frontmatter partition
                     # runs at most once per note.
-                    fence_scan = _scan_rewrite_source(content)
+                    #
+                    # Off the loop for the same reason as the rewrite below
+                    # (#180): the scan is linear but over up to
+                    # `MAX_NOTE_BYTES` of text, seconds of solid CPU on a
+                    # near-cap note, and it runs once per backlink source
+                    # while the process-wide `_MOVE_REWRITE_LOCK` is held.
+                    # Dispatching only the rewrite left the larger half of the
+                    # per-source work on the loop.
+                    fence_scan = await asyncio.to_thread(_scan_rewrite_source, content)
                     if fence_scan.unmatched_indented_openers:
                         undecidable_sources.append(
                             (original_src_path, fence_scan.unmatched_indented_openers)
@@ -2938,6 +3025,21 @@ async def _move_note_locked(
                     return (
                         f"Move aborted: {e} Nothing was moved, rewritten or "
                         "reindexed."
+                    )
+                except MoveRewriteCapExceeded as e:
+                    # Not a per-source failure either: rewriting all but this
+                    # source would move the note and leave this one pointing
+                    # at the vacated path, reported as success. Same
+                    # disposition as the `MAX_NOTE_BYTES` and
+                    # `MAX_MOVE_REWRITE_BYTES` refusals above — abort before
+                    # phase 2, while that is still free.
+                    drop(read_target)
+                    return (
+                        f"Move aborted: rewriting links in {e.source_path} would "
+                        f"change {e.count} links, more than the per-note limit "
+                        f"(MAX_LINKS_PER_NOTE={e.cap}). Nothing was moved, "
+                        "rewritten or reindexed. Move without rewrite_links and "
+                        "update that note's links in batches instead."
                     )
                 except Exception as e:
                     logger.warning(
