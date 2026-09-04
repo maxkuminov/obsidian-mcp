@@ -37,6 +37,24 @@ def _is_loopback_host(host: str) -> bool:
 # below can reference it without a circular import.
 MAX_NOTE_BYTES = 10 * 1024 * 1024  # 10 MB
 
+# Links extracted and persisted for a single note. Unbounded, one 10 MiB note
+# of `[[a]] ` yields 1.75 M `ExtractedLink` objects — an 802 MiB peak against
+# a 2 GB container, multiplied by every such note in one index pass. The cap
+# is applied in DOCUMENT order (see `extract_links_bounded`) so a note does
+# not lose one whole link kind, and a capped note is a *declared* degradation:
+# the first N rows are kept, `notes_metadata.links_truncated` is set, and
+# `get_links` says `truncated: true`. 10,000 outgoing links is far beyond any
+# real note, including a generated MOC.
+MAX_LINKS_PER_NOTE = 10_000
+
+# Longest `pattern` `list_files` will accept. `fnmatch.translate` +
+# `re.compile` is linear at ~10 µs/char and runs on the event loop, so a
+# 500 KB pattern was a 5.4 s stall for every other tenant; the transport body
+# cap admitted ~10 minutes of it. 1,024 characters compiles in ~5 ms and is
+# far more than any real glob. Enforced in `vault.list_dir` — before the
+# pattern is compiled and before the folder is validated or read.
+MAX_LIST_PATTERN_CHARS = 1024
+
 # Aggregate bound on the preflight of `move_note(rewrite_links=True)`. That
 # preflight holds, for every backlink source, both the original bytes and the
 # rewritten content in memory before a single byte is mutated — the price of

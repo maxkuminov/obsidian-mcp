@@ -2336,12 +2336,28 @@ async def edit_note_impl(
 # ────────────────────────────────────────────────────────────────────────────
 
 
+# The rewrite grammar. It MUST apply the same closed-class rules as the
+# extraction grammar in `src/services/links.py` (see the long comment there):
+# wikilink target/anchor/alias exclude `[` and `]`, markdown link text
+# excludes `[`, the markdown href is length-bounded to 2,048 rather than
+# bracket-free, and every quantifier is possessive. A class that can swallow
+# the rest of a line before the tail fails makes `move_note(rewrite_links=…)`
+# a quadratic stall for every other tenant, exactly as it did in extraction.
+#
+# Two divergences from `_MDLINK_RE` are PRE-EXISTING and deliberately left
+# alone here — fixing either changes what `move_note` rewrites, which is its
+# own change with its own audit. Both are recorded as known gaps in
+# `tests/test_asvs_link_grammar.py`:
+#   1. no CommonMark `<href>` alternative, so `[t](<a.md>)` is extracted but
+#      never rewritten;
+#   2. the anchor class is `[^)]` (crosses newlines) where extraction's is
+#      `[^)\n]`.
 _WIKILINK_REWRITE_RE = re.compile(
-    r"(?P<embed>!)?\[\[(?P<target>[^\]\|#\n]+)"
-    r"(?P<rest>(?:#[^\]\|\n]*)?(?:\|[^\]\n]*)?)\]\]"
+    r"(?P<embed>!)?\[\[(?P<target>[^\[\]\|#\n]++)"
+    r"(?P<rest>(?:#[^\[\]\|\n]*+)?(?:\|[^\[\]\n]*+)?)\]\]"
 )
 _MDLINK_REWRITE_RE = re.compile(
-    r"\[(?P<text>[^\]\n]+)\]\((?P<href>[^)\n]+?\.md)(?P<anchor>#[^)]*)?\)"
+    r"\[(?P<text>[^\[\]\n]++)\]\((?P<href>[^)\n]{1,2048}?\.md)(?P<anchor>#[^)]*+)?\)"
 )
 
 
@@ -2804,7 +2820,12 @@ async def _move_note_locked(
                         undecidable_sources.append(
                             (original_src_path, fence_scan.unmatched_indented_openers)
                         )
-                    new_content, n = _rewrite_links_in_text(
+                    # Off the loop (#180). The rewrite is a pure function of a
+                    # string, and a hub note's backlink sources are read one
+                    # after another — linear work on a near-cap note is still
+                    # dead air for every other tenant if it runs here.
+                    new_content, n = await asyncio.to_thread(
+                        _rewrite_links_in_text,
                         content,
                         from_rel,
                         to_rel,

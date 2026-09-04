@@ -81,8 +81,11 @@ def test_extract_regex_matches_raw_space_directly():
 # so this assertion runs without importing the MCP tools module (which has
 # heavier deps); if the source regex drifts, update this copy too.
 
+# Kept in step with `tools._MDLINK_REWRITE_RE` by the literal-equality test at
+# the bottom of this module. The closed classes and the 2,048-char href bound
+# are #180's linear grammar — see `src/services/links.py`.
 _MDLINK_REWRITE_RE = re.compile(
-    r"\[(?P<text>[^\]\n]+)\]\((?P<href>[^)\n]+?\.md)(?P<anchor>#[^)]*)?\)"
+    r"\[(?P<text>[^\[\]\n]++)\]\((?P<href>[^)\n]{1,2048}?\.md)(?P<anchor>#[^)]*+)?\)"
 )
 
 
