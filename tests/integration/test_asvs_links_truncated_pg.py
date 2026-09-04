@@ -233,3 +233,144 @@ async def test_the_pass_stamps_the_current_extraction_version(sessionmaker, vaul
 
     row = await note_row(sessionmaker, "Stamped.md")
     assert row.extraction_version == indexer.CURRENT_EXTRACTION_VERSION == 2
+
+
+# ── get_links is bounded, and says what it is bounding ────────────────────
+
+
+async def test_get_links_pages_a_capped_note_and_names_the_persisted_total(
+    sessionmaker, vault
+):
+    """`get_links` selected every row a note had. For a note the indexer
+    capped, that is up to `MAX_LINKS_PER_NOTE` (10,000 in production) rows
+    rendered into a single tool result — the payload the read caps exist to
+    prevent, on the one tool guaranteed to meet the biggest note in the vault.
+
+    The truncation notice quotes the **persisted** row count, not `len(rows)`:
+    the scoped join omits any row that resolved to a note outside the owned
+    set, so a number taken from the page would be neither the page size nor
+    the total and would silently understate how much the caller has not seen.
+    """
+    (vault / "MOC.md").write_text(over_cap_body(), encoding="utf-8")
+    await indexer.index_vault(user_id=None)
+
+    row = await note_row(sessionmaker, "MOC.md")
+    persisted = await link_count(sessionmaker, row.id)
+    assert persisted == CAP
+
+    out = await tools.get_links_impl("MOC.md", limit=2)
+
+    # Two link bullets, not five.
+    assert out.count("\n- ") == 2, out
+    assert f"showing 2 of {persisted:,} link rows" in out, out
+    assert "limit=2" in out
+    # The extraction-cap notice quotes the persisted total, not the page.
+    assert f"The {persisted:,} rows persisted for it" in out, out
+    assert "INCOMPLETE" in out
+
+
+async def test_get_links_says_nothing_about_paging_when_the_page_holds_it_all(
+    sessionmaker, vault
+):
+    (vault / "Small.md").write_text(UNDER_CAP_BODY, encoding="utf-8")
+    await indexer.index_vault(user_id=None)
+
+    out = await tools.get_links_impl("Small.md")
+
+    assert "showing" not in out, out
+    assert "truncated: false" in out
+
+
+@pytest.mark.parametrize("asked,shown", [(0, 1), (-5, 1), (99999, CAP)])
+async def test_get_links_clamps_its_limit_like_get_backlinks(
+    sessionmaker, vault, asked, shown
+):
+    """Same clamp as `get_backlinks`: `max(1, min(limit, 500))`. A zero or a
+    negative must not turn into "no rows" or into an unbounded select."""
+    (vault / "MOC.md").write_text(over_cap_body(), encoding="utf-8")
+    await indexer.index_vault(user_id=None)
+
+    out = await tools.get_links_impl("MOC.md", limit=asked)
+
+    assert out.count("\n- ") == shown, out
+
+
+# ── a capped note does not withhold the re-derive's certification ─────────
+
+
+async def test_a_capped_note_still_lets_the_re_derive_record_its_provenance(
+    sessionmaker, vault, monkeypatch
+):
+    """D4's load-bearing carve-out, end to end against the real pass.
+
+    A.7a withholds a re-derive's provenance stamp when the pass skipped any
+    discovered path — the re-derive's whole claim is that every surviving row
+    was written by it. A truncated note is deliberately **not** a skip: the
+    truncation is deterministic and the rows written are exactly the rows
+    derived, so the structural claim still holds. Treating it as one would
+    park a tenant with a single generated MOC in re-derive mode for ever, with
+    no repair that could ever end it — a self-inflicted DoS on the
+    index-integrity machinery, which is precisely the failure this carve-out
+    exists to prevent.
+
+    The unit tests assert the carve-out at the call site. This runs
+    `index_vault` for a real user with no recorded provenance (which
+    classifies as `provenance_unresolved` → re-derive) over a vault whose only
+    note is over the cap, and reads `users.indexed_vault_*` afterwards.
+    """
+    from src.models.db import User
+    from src.services import vault as vault_service
+    from src.services.transfer import canonical_vault_root
+
+    root = vault / "tenant"
+    root.mkdir()
+    (root / "MOC.md").write_text(over_cap_body(), encoding="utf-8")
+
+    async with sessionmaker() as session:
+        user = User(username="capped", password_hash="x", vault_path=str(root))
+        session.add(user)
+        await session.commit()
+        uid = user.id
+        # The indexer resolves the root through the process cache, exactly as
+        # the production pass does after its own bulk warm.
+        await vault_service.warm_user_vault_cache(session, user_id=uid)
+
+    try:
+        async with sessionmaker() as session:
+            before = (
+                await session.execute(
+                    select(
+                        User.indexed_vault_assignment,
+                        User.indexed_vault_realpath,
+                    ).where(User.id == uid)
+                )
+            ).one()
+        assert before == (None, None), "no provenance yet — this is a re-derive"
+
+        await indexer.index_vault(user_id=uid)
+
+        async with sessionmaker() as session:
+            after = (
+                await session.execute(
+                    select(
+                        User.indexed_vault_assignment,
+                        User.indexed_vault_realpath,
+                    ).where(User.id == uid)
+                )
+            ).one()
+            capped = (
+                await session.execute(
+                    select(NoteMetadata.links_truncated).where(
+                        NoteMetadata.user_id == uid,
+                        NoteMetadata.file_path == "MOC.md",
+                    )
+                )
+            ).scalar_one()
+
+        assert capped is True, "the fixture must actually exercise the cap"
+        assert after.indexed_vault_assignment == canonical_vault_root(root), (
+            "the capped note withheld the re-derive's certification"
+        )
+        assert after.indexed_vault_realpath is not None
+    finally:
+        vault_service.clear_user_vault_cache(user_id=uid)
