@@ -1585,12 +1585,22 @@ async def _index_vault_pinned(
                 # changed hash already invalidates through the ordinary
                 # predicate. Clearing is additive — it never suppresses an
                 # invalidation another rule mandates.
+                #
+                # Off the loop for the same reason `extract_tags` above is: it
+                # runs both versions' whole cleaning function over the body,
+                # and the v0 cleaner is a Python line scanner — which, unlike a
+                # single `re` step, yields the GIL as it goes, so the thread
+                # actually buys concurrency here rather than merely bounding
+                # the stall. The `await` sits last in the chain, so the three
+                # cheap predicates still short-circuit before any dispatch.
                 if (
                     marker_stale
                     and rel_path in existing
                     and existing[rel_path] == h
-                    and _grammar_changed_the_embedding_text(
-                        stamped_version[rel_path], content
+                    and await asyncio.to_thread(
+                        _grammar_changed_the_embedding_text,
+                        stamped_version[rel_path],
+                        content,
                     )
                 ):
                     grammar_invalidated.append(rel_path)

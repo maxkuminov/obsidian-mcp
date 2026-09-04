@@ -533,10 +533,25 @@ grammar has to argue its case:
 
 | Input | Before | Now |
 | --- | --- | --- |
-| `[[Note\|see [1]]]`, `[[Note#Sec [x]]]` | a row with a mangled alias/anchor | no row |
+| `[[Note\|see [1]]]`, `[[Note#Sec [x]]]` | a row with a mangled alias/anchor | no row — **and `move_note(rewrite_links=True)` no longer rewrites it either** |
 | `[[[Foo]]` | target `[Foo` | target `Foo` (the match starts at the second `[`) |
 | `[a[b](x.md)` | `link_text` `[a[b](x.md)` | still a row to `x.md`; `link_text` is `[b](x.md)` |
 | an href over 2,048 characters | a row | no row — it cannot name a note |
+
+The first row's second half is the one accepted difference with a **write**
+consequence, so it is spelled out rather than left to be inferred: the rewrite
+grammar closed the same classes as extraction, so a link like
+`[[Old#Results [draft]]]` is invisible to `move_note` as well as to the index.
+Move `Old.md` and that link is left on disk still naming `Old`, with no
+warning — the rewrite reports the number of links it changed, and this one was
+never a candidate. Accepted because the open anchor and alias classes were two
+of the five quadratic blowups (`[[a#` 11.8 s and `[[a|` 4.9 s at 40 KB),
+because Obsidian's wikilink syntax forbids `[`/`]` inside `[[...]]` so nothing
+well-formed is affected, and because the previous behaviour was not *correct*
+either — it extracted the link with a mangled anchor and rewrote that. The
+difference is that both halves now agree. **Do not close it by re-admitting
+brackets into those classes**; the fix for a link that must survive a move is
+to rename the anchor. Pinned in `tests/test_asvs_link_grammar.py`.
 
 **Parity between the two grammars is a rule, not a coincidence.** A corpus of
 single-line links is run through both in the same test, and both must accept

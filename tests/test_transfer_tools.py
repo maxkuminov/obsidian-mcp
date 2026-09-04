@@ -264,6 +264,55 @@ async def test_request_upload_rejects_hidden_and_traversing_paths(
     assert minted == []
 
 
+async def test_request_upload_advertises_the_markdown_cap_the_route_enforces(
+    vault, readwrite, minted
+):
+    """The number the agent is told must be the number the route aborts at.
+
+    `/transfer/upload/info` and `PUT /transfer/upload` derive their cap from
+    the token's stored path through `_upload_max_bytes`, so a `.md`
+    destination is held to `MAX_NOTE_BYTES` (#203, D5) — while this tool
+    printed `MAX_FILE_WRITE_BYTES` unconditionally. Promising 25 MiB over a
+    route that refuses at 10 MiB is worse than printing no number at all: the
+    human uploads the file and the link burns."""
+    from src.config import MAX_NOTE_BYTES
+    from src.transfer.routes import _upload_max_bytes
+
+    result = await tools.request_upload_impl("Notes/draft.md")
+
+    (row,) = minted
+    assert f"max_bytes: {MAX_NOTE_BYTES:,} (MAX_NOTE_BYTES)" in result, result
+    assert _upload_max_bytes(row) == MAX_NOTE_BYTES
+
+
+async def test_request_upload_still_advertises_the_file_cap_for_everything_else(
+    vault, readwrite, minted
+):
+    from src.transfer.routes import _upload_max_bytes
+
+    cap = tools.settings.max_file_write_bytes
+    result = await tools.request_upload_impl("Attachments/report.pdf")
+
+    (row,) = minted
+    assert f"max_bytes: {cap:,} (MAX_FILE_WRITE_BYTES)" in result, result
+    assert _upload_max_bytes(row) == cap
+
+
+async def test_request_upload_takes_the_cap_from_the_normalised_path(
+    vault, readwrite, minted
+):
+    """The same normalisation that defeated `write_file`'s raw-string cap:
+    `"Notes/draft.md/."` is minted as `Notes/draft.md`, so both the advertised
+    number and the enforced one have to follow the stored path."""
+    from src.config import MAX_NOTE_BYTES
+
+    result = await tools.request_upload_impl("Notes/draft.md/.")
+
+    (row,) = minted
+    assert row.path == "Notes/draft.md"
+    assert f"max_bytes: {MAX_NOTE_BYTES:,} (MAX_NOTE_BYTES)" in result, result
+
+
 async def test_request_upload_needs_a_public_origin(vault, readwrite, minted, monkeypatch):
     monkeypatch.setattr(tools.settings, "_public_origin_explicit", False)
     result = await tools.request_upload_impl("Attachments/shot.png")

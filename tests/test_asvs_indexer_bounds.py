@@ -363,6 +363,20 @@ def test_the_scan_dispatches_tag_extraction_off_the_loop():
     assert "extract_tags" in _to_thread_targets(indexer._index_vault_pinned)
 
 
+def test_the_scan_dispatches_the_grammar_predicate_off_the_loop():
+    """`_grammar_changed_the_embedding_text` runs BOTH versions' whole cleaning
+    function over the body, once per note whose extraction marker is stale —
+    i.e. every note of every user on the pass that follows a bump, which is
+    exactly the pass this change ships. It sat on the loop while `extract_tags`
+    and `extract_links_bounded` two lines away were dispatched.
+
+    It is also the one of the three that a thread genuinely helps: the v0
+    cleaner is a Python line scanner, and Python bytecode yields the GIL, where
+    a single `re` step does not."""
+    targets = _to_thread_targets(indexer._index_vault_pinned)
+    assert "_grammar_changed_the_embedding_text" in targets, targets
+
+
 def test_the_backfill_dispatches_bounded_extraction_off_the_loop():
     """The one-shot backfill walks the whole vault in a single pass, so it is
     the longest-running holder of the loop in the process."""

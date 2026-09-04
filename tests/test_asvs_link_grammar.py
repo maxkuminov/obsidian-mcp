@@ -179,6 +179,54 @@ def test_a_bracket_inside_an_anchor_is_no_longer_a_link():
     assert _targets("[[Note#Sec [x]]]") == []
 
 
+def test_a_bracketed_anchor_is_also_no_longer_rewritten_by_move_note():
+    """The CONSEQUENCE of the two differences above, stated on purpose.
+
+    The rewrite grammar closed the same classes as extraction, so
+    `[[Old#Results [draft]]]` is not only absent from `note_links` — it is also
+    left alone by `move_note(rewrite_links=True)`. The on-disk link keeps
+    naming `Old` after the note moves, and nothing warns: the rewrite reports
+    the count of links it changed, and this one was never a candidate.
+
+    ACCEPTED, and not fixed by re-admitting `[` / `]` into the anchor and alias
+    classes — those open classes were the `[[a#` and `[[a|` quadratic blowups
+    (11.8 s and 4.9 s at 40 KB), and a bracketed anchor is malformed under
+    Obsidian's own wikilink syntax, which forbids brackets inside `[[...]]`.
+    Before this change the link was not rewritten *correctly* either: it was
+    extracted with a mangled anchor. What changed is that it is now uniformly
+    invisible to both halves rather than half-seen by each.
+
+    Recorded in `docs/architecture/vault-tools.md`'s accepted-differences
+    table. Anyone who wants the link rewritten renames the anchor first."""
+    text = "See [[Old#Results [draft]]] and [[Old#Results]] for the numbers."
+
+    rewritten, count = tools._rewrite_links_in_text(
+        text, "Old.md", "New.md", "src.md", _rewrite_index()
+    )
+
+    # The well-formed neighbour on the same line still moves — this is a
+    # grammar difference, not a dead rewrite path.
+    assert count == 1
+    assert "[[New#Results]]" in rewritten
+    # The bracketed one is untouched, and still names the old note.
+    assert "[[Old#Results [draft]]]" in rewritten
+    # And extraction agrees: neither half sees it, so there is no row to go
+    # stale in the index either.
+    assert _targets("[[Old#Results [draft]]]") == []
+
+
+def test_a_bracketed_alias_is_also_no_longer_rewritten_by_move_note():
+    """The alias half of the same consequence."""
+    text = "[[Old|see [1]]]"
+
+    rewritten, count = tools._rewrite_links_in_text(
+        text, "Old.md", "New.md", "src.md", _rewrite_index()
+    )
+
+    assert count == 0
+    assert rewritten == text
+
+
 def test_a_stray_leading_bracket_now_starts_the_match_one_character_later():
     """The same rule seen from the other side, and the only *incidental*
     difference: `[[[Foo]]` used to yield the target `[Foo` (a note name that
