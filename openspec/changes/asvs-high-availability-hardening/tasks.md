@@ -40,6 +40,17 @@
 - [x] 5.4 Ratio benchmark (n vs 2n) plus an absolute ceiling that IS a DoS bound: 1 MiB of `[a](` and of `[a](.md` under 200 ms.
 - [x] 5.5 Docs: `vault-tools.md` — the scanner replaces the bounded regex; note that `asyncio.to_thread` does not release the GIL inside one `re` call, so linear scan time is the real stall bound.
 
+## 6. Review fixes — round 2 (owns `src/mcp_server/tools.py`, `src/mcp_server/server.py`, `tests/test_asvs_link_grammar.py`, `tests/test_note_size_caps.py`, `tests/integration/test_asvs_links_truncated_pg.py`, `docs/architecture/vault-tools.md`)
+
+- [x] 6.1 `tools.py` `move_note`: dispatch the per-source `_scan_rewrite_source` fence scan through `asyncio.to_thread` too — it is the larger half of the per-source work and ran on the loop nine lines above the rewrite's dispatch. Extend the existing dispatch test to assert both names.
+- [x] 6.2 `tools.py` `_rewrite_links_in_text`: replace the per-rewrite whole-string rebuild with `_splice_rewrites`, a single cursor walk and one `"".join()`, with an equivalence check that falls back to the retired reverse splice on overlapping spans. Tests: ratio benchmark on match-dense input, a 1 MiB absolute bound on the splice itself, a randomized byte-identity oracle against the retired implementation, and the fallback.
+- [x] 6.3 `tools.py`: bound one source's rewrites at `MAX_LINKS_PER_NOTE` (`MoveRewriteCapExceeded`), refused before any mutation and naming the source and the cap, alongside the existing `MAX_NOTE_BYTES` / `MAX_MOVE_REWRITE_BYTES` preflight refusals. New `specs/vault-write/spec.md` delta.
+- [x] 6.4 `get_links`: default `limit` 100 (below the 500 hard cap, so "raise `limit`" is actionable); the over-limit notice states the effective limit, drops the advice at the cap, and says rows past 500 are unreachable through this tool. `server.py` signature and docstring follow.
+- [x] 6.5 `get_links`: clip each row's `link_text` to 120 characters with an ellipsis, as `get_backlinks` clips its excerpt.
+- [x] 6.6 `tests/integration/test_asvs_links_truncated_pg.py`: the clamp test asserted only a row count a five-row fixture could not distinguish, so it passed with the clamp deleted. Assert the emitted `limit=` instead, and add a >500-row note for the upper clamp.
+- [x] 6.7 `tools.py`: correct the `QueueTimeout` clause comment — it needs its own clause because it is not a `Timeout` subclass; the two are siblings, so clause order is irrelevant.
+- [x] 6.8 Docs: `docs/architecture/vault-tools.md` — the linear splice and its overlap check, the off-loop fence scan, the per-source rewrite cap. Spec: the rewrite-splice linearity scenario and the `get_links` paging/clipping requirements.
+
 ## 4. Integration
 
 - [x] 4.1a Merge A and C, run the full suite (2922 passed).
