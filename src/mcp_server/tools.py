@@ -4525,14 +4525,16 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
     except transfer.TooLarge as e:
         return f"{e} ({cap_name}). Nothing was written."
     except transfer.QueueTimeout as e:
-        # **Above `Timeout`, and it has to be its own clause**: `QueueTimeout`
-        # is deliberately not a `Timeout` subclass (the two are different
-        # verdicts about the same request — see `transfer.QueueTimeout`), so
-        # without this it left the tool as an exception rather than an in-band
-        # refusal. An MCP tool that raises returns a protocol error to the
-        # agent instead of a sentence it can act on, and `_tracked` records the
-        # call as a server fault. Nothing was staged and nothing was fetched;
-        # the same call may simply be retried.
+        # **Needs its own clause**: `QueueTimeout` is deliberately not a
+        # `Timeout` subclass (the two are different verdicts about the same
+        # request — see `transfer.QueueTimeout`), so without this it left the
+        # tool as an exception rather than an in-band refusal. They are
+        # siblings, not parent and child, so the order of the two clauses is
+        # irrelevant — neither can shadow the other. An MCP tool that raises
+        # returns a protocol error to the agent instead of a sentence it can
+        # act on, and `_tracked` records the call as a server fault. Nothing
+        # was staged and nothing was fetched; the same call may simply be
+        # retried.
         return f"{e}. Nothing was written."
     except transfer.Timeout as e:
         return f"{e}. Nothing was written."
