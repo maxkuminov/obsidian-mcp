@@ -226,14 +226,59 @@ An in-vault `..` (`Folder/../note.md`) is also refused by `validate_mutable_path
 ## File-access tools (non-markdown)
 Raw read/write/browse of arbitrary vault files, distinct peers to the note tools (note tools stay markdown-only). Pure byte transport — no server-side PDF/text extraction, no embedding or indexing of non-markdown files.
 - `read_file(path, encoding="auto", offset=0, limit=None)` — `auto` resolves text-like MIME → text, image → inline MCP image content block (renders in-client), everything else → base64 string. `text` forces UTF-8 decode (errors on non-UTF-8); `base64` forces raw-bytes base64. Capped by `MAX_FILE_READ_BYTES` (default 10 MB), checked against on-disk size before reading. Text results are additionally bounded by `MAX_READ_RESPONSE_CHARS` and page via `offset`; base64 and image results are not windowed. Base64 reads are token-heavy — check size with `list_files` first.
-- `write_file(path, content, encoding="base64", overwrite=False)` — `base64` decodes `content` to raw bytes; `text` writes UTF-8. No-clobber by default (`overwrite=True` to replace), auto-creates parent dirs, atomic via `vault.write_file`. Capped by `MAX_FILE_WRITE_BYTES` (default 25 MB) on decoded length.
-- `list_files(folder=".", pattern="*", recursive=False, limit=200)` — `ls`-style: immediate children (subdirs + files) by default, each file with size + mtime; glob-filterable; capped at `limit` with a truncation note.
+- `write_file(path, content, encoding="base64", overwrite=False)` — `base64` decodes `content` to raw bytes; `text` writes UTF-8. No-clobber by default (`overwrite=True` to replace), auto-creates parent dirs, atomic via `vault.write_file`. Capped by `MAX_FILE_WRITE_BYTES` (default 25 MB) on decoded length — **except for a `.md` destination**, which is capped at `min(MAX_NOTE_BYTES, MAX_FILE_WRITE_BYTES)`; see "The `.md` cap follows the extension, not the tool" below.
+- `list_files(folder=".", pattern="*", recursive=False, limit=200)` — `ls`-style: immediate children (subdirs + files) by default, each file with size + mtime; glob-filterable; capped at `limit` with a truncation note. `pattern` is refused over `MAX_LIST_PATTERN_CHARS` (1,024) — see "The `list_files` pattern cap" below.
 
 - `delete_file(path, permanent=False)` — soft-deletes to `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` through the anchored helper; `permanent=True` unlinks. Refuses `.md` (pointing at `delete_note`), directories and symlinks. The `.md` refusal runs on the **canonical** final component, so `note.md/.`, `a//note.md` and `NOTE.MD` are refused too — the caller's string is not the path.
 
 `write_file` additionally goes through `validate_mutable_path`, so it refuses a symlinked final component the way the note tools do (see "Mutations act on the path as named" above) — `overwrite=True` cannot clobber a file through an alias. `read_file` and `list_files` still follow links.
 
 All four enforce the same traversal guard and the same dot-dir guard (`is_hidden_path`, rejecting any path component starting with `.` — the indexer's visibility rule, keeping `.obsidian`/`.git`/`.trash`/`.smart-env` out of reach), but **not through the same validator**: `read_file` and `list_files` use `validate_visible_path` (which resolves, so links are followed), `write_file` uses `validate_mutable_path` (parent resolved, symlinked leaf refused), and `delete_file` canonicalises lexically and resolves through `vault_fs`'s beneath-root lookup. Vault helpers (`read_bytes`, `write_bytes`, `list_dir`, MIME classification) live in `src/services/vault.py`. MIME detection uses stdlib `mimetypes` plus a magic-byte sniff for PNG/JPEG/GIF/WebP. `read_file` is the first tool returning a non-`str` MCP content object.
+
+### The `list_files` pattern cap (#204)
+
+`list_dir` refuses a `pattern` longer than `MAX_LIST_PATTERN_CHARS` (1,024)
+with a `ValueError` — the exception `list_files_impl` already maps to an
+in-band refusal — and the message names the constant.
+
+Two things about that check are load-bearing and must not be "tidied":
+
+- **It runs before `fnmatch` is touched.** The cost is the compile itself.
+  `fnmatch.translate` + `re.compile` is linear at ~10 µs/char (Python 3.12
+  emits atomic groups, so there is no backtracking to cap), and it runs
+  synchronously on the one event loop this server has: a 500 KB pattern was a
+  5.4-second stall for every other tenant, and the transport body limit
+  admitted about ten minutes of one. A cap applied after the compile caps
+  nothing.
+- **It runs before `validate_visible_path` and before `is_dir`.** An over-long
+  pattern against a folder that does not exist must still be refused *for the
+  pattern*. Told "Not a directory" instead, a caller fixes the folder and
+  repeats the same stall with a valid one.
+
+1,024 characters is far beyond any real glob and compiles in about 5 ms. A
+separate wildcard-count cap would be redundant; running the walk in a thread
+is defence in depth and is deliberately not part of this.
+
+### The `.md` cap follows the extension, not the tool (#203)
+
+Every *note*-writing path is capped at `MAX_NOTE_BYTES`. `write_file`, the
+`PUT /transfer/upload` route and `import_from_url` were the exceptions,
+because they are byte transport with no extension allowlist — so a 25 MiB
+`.md` could be landed by a tool the note tools would have refused, and the
+indexer then reads it as a note. All three now cap a `.md` destination
+(case-insensitive) at
+
+    min(MAX_NOTE_BYTES, MAX_FILE_WRITE_BYTES)
+
+and the refusal **names the limit that applied** — `MAX_NOTE_BYTES` or
+`MAX_FILE_WRITE_BYTES`. The smaller of the two, so an operator who lowers
+`MAX_FILE_WRITE_BYTES` below 10 MiB is not surprised by a *more* permissive
+markdown limit; and named, because a caller told only "max 10,485,760" cannot
+tell which knob to reach for. Non-markdown destinations keep
+`MAX_FILE_WRITE_BYTES` unchanged. `src/mcp_server/tools.py:_write_cap_for` is
+the one place that decides; the transfer route applies the same bound where it
+applies the stream cap, so an oversized `.md` upload aborts with 413 at cap+1
+exactly as an oversized file does.
 
 ## Three kinds of size cap — don't confuse them
 
@@ -427,6 +472,76 @@ Derived state does not heal on its own — the bytes on disk are unchanged, so
 `content_hash` cannot see the grammar move. See the `extraction_version`
 mechanism in
 [indexing and embeddings](indexing-and-embeddings.md#re-deriving-after-a-grammar-change-150).
+
+### The link grammar every link consumer shares (#180)
+
+Four regexes parse links, and they must agree:
+
+| Regex | Where | Used by |
+| --- | --- | --- |
+| `_WIKILINK_RE`, `_MDLINK_RE` | `src/services/links.py` | `extract_links` → `note_links`, `get_links`, `get_backlinks` |
+| `_WIKILINK_REWRITE_RE`, `_MDLINK_REWRITE_RE` | `src/mcp_server/tools.py` | `move_note(rewrite_links=True)` |
+
+**Every character class in all four is closed.** Not "the two that were
+reported": an open class that can swallow the rest of a line before the tail
+fails is quadratic, and closing only some of them moves the burn to the next
+one. Measured at 40 KB before the fix, on the production host: `[[` 18 s,
+`[[a#` 11.8 s, `[[a|` 4.9 s, `[a](` 3.6 s, `[a](x` 2.4 s — all of it on the
+single event loop, inside the indexer, from a note any authenticated tenant
+can write. The rules:
+
+- **Wikilink target, anchor and alias exclude `[` and `]`** — Obsidian's link
+  *syntax* forbids both inside `[[...]]`, so no well-formed wikilink changes.
+- **Markdown link text excludes `[`** (it already excluded `]`).
+- **Markdown hrefs cannot exclude brackets** — `[t](Foo [draft].md)` is a legal
+  link to a legal filename; Obsidian forbids brackets in wikilink syntax, not
+  in filenames. They are **length-bounded** instead: `{1,2048}?`, which
+  exceeds `MAX_PATH_CHARS` (1,024) plus any anchor. That is O(n × 2048) rather
+  than O(n²) — linear, with a real constant: ~4.7 s for 512 KiB of `[a](` on
+  the development host. Do not read the bound as "fast"; read it as "not
+  quadratic".
+- **Every quantifier is possessive** (`++`, `*+`), so no class can be
+  re-entered by backtracking.
+
+**The accepted differences**, enumerated and asserted in
+`tests/test_asvs_link_grammar.py`, which is where any future change to this
+grammar has to argue its case:
+
+| Input | Before | Now |
+| --- | --- | --- |
+| `[[Note\|see [1]]]`, `[[Note#Sec [x]]]` | a row with a mangled alias/anchor | no row |
+| `[[[Foo]]` | target `[Foo` | target `Foo` (the match starts at the second `[`) |
+| `[a[b](x.md)` | `link_text` `[a[b](x.md)` | still a row to `x.md`; `link_text` is `[b](x.md)` |
+| an href over 2,048 characters | a row | no row — it cannot name a note |
+
+**Parity between the two grammars is a rule, not a coincidence.** A corpus of
+single-line links is run through both in the same test, and both must accept
+and reject the same members. Two divergences are **pre-existing** and
+deliberately left alone, recorded in that test as known gaps rather than
+silently inherited — closing either changes what `move_note` mutates, which
+needs its own change and its own adversarial pass:
+
+1. the rewrite scanner has no CommonMark `<href>` alternative, so
+   `[a](<Old.md>)` is indexed but never rewritten;
+2. its anchor class is `[^)]` where extraction's is `[^)\n]`, so a `#anchor`
+   running past a line break is rewritable but not extractable.
+
+**Extraction is bounded per note** at `MAX_LINKS_PER_NOTE` (10,000), applied in
+**document order** — the two extraction loops (wikilinks, then markdown links)
+are merged by position before the cut, so a note with 20,000 wikilinks does not
+lose every markdown link in the file. A capped note is a *declared*
+degradation, not a skip: see the link cap in
+[indexing and embeddings](indexing-and-embeddings.md).
+
+**A link-grammar change has the same staleness mechanics as a fence-grammar
+change.** The bytes on disk do not move, so `content_hash` cannot see it and
+stale `note_links` rows would persist until each note is next edited. Bump
+`CURRENT_EXTRACTION_VERSION` in the same change — and `move_note(rewrite_links=True)`
+refuses until the re-derivation completes, which is the correct disposition.
+
+`move_note`'s rewrite computation runs through `asyncio.to_thread`: it is a
+pure function of a string, and a hub note's backlink sources are processed one
+after another.
 
 ### Where a section's body begins, and what a section write destroys (#140)
 
