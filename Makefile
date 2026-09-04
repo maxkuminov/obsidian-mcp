@@ -16,6 +16,8 @@ DATA_DIR ?= ./data
 # `obsidian-mcp-postgres`; a shared host instance is usually just `postgres`.
 # Override in Makefile.local to match the deployment.
 DB_CONTAINER ?= postgres
+# The application container, as named in docker-compose.yml.
+CONTAINER ?= obsidian-mcp
 COMPOSE_FILE := $(DEPLOY_DIR)/docker-compose.yml
 ENV_FILE := $(DEPLOY_DIR)/.env
 COMPOSE := docker compose --project-directory $(DEPLOY_DIR) -f $(COMPOSE_FILE)
@@ -30,7 +32,7 @@ SCHEMA_TEST_CONTAINER ?= obsidian-mcp-schema-test
 SCHEMA_TEST_PORT ?= 55438
 SCHEMA_TEST_IMAGE ?= pgvector/pgvector:pg16
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -75,7 +77,11 @@ init:
 	@echo "$(GREEN)Setting up Obsidian MCP...$(NC)"
 	@sudo mkdir -p $(DATA_DIR)/backups
 	@sudo chown -R $(shell id -u):$(shell id -g) $(DATA_DIR)
-	@sudo chmod -R 775 $(DATA_DIR)
+	# Owner-only: `.env` carries the DB password and SECRET_KEY, and the dumps
+	# under backups/ carry every tenant's note text. Nothing but the deploying
+	# user (and root) needs to read either, so no group/world bits (#187).
+	@sudo chmod 750 $(DATA_DIR)
+	@sudo chmod 700 $(DATA_DIR)/backups
 	@if [ ! -f "$(ENV_FILE)" ]; then \
 		echo "$(GREEN)Creating $(ENV_FILE) from template...$(NC)"; \
 		cp .env.example $(ENV_FILE); \
@@ -83,6 +89,7 @@ init:
 		SECRET=$$(openssl rand -hex 32); \
 		sed -i "s/CHANGE_ME/$$DB_PASS/" $(ENV_FILE); \
 		sed -i "s/SECRET_KEY=.*/SECRET_KEY=$$SECRET/" $(ENV_FILE); \
+		chmod 600 $(ENV_FILE); \
 		echo "$(GREEN)$(ENV_FILE) created with random secrets$(NC)"; \
 	else \
 		echo "$(YELLOW)$(ENV_FILE) already exists$(NC)"; \
@@ -132,6 +139,7 @@ deploy: image
 	# against the old schema (and matching README's documented deploy behavior).
 	$(COMPOSE) run --rm obsidian-mcp alembic upgrade head
 	$(COMPOSE) up -d --force-recreate
+	@$(MAKE) check-no-backups-mount
 	@docker image prune -f
 	@docker builder prune -f --filter until=168h
 	@HOST=$$(grep -E '^MCP_HOSTNAME=' $(ENV_FILE) 2>/dev/null | cut -d= -f2); \
@@ -225,9 +233,19 @@ test-schema:
 # so on the deploy that ships 021 the table does not exist yet and the target
 # must warn and still succeed. Its exit status is the target's: once the table
 # exists, a backup that fails to record itself fails the backup.
+# Dumps are created under `umask 077` so they are never readable by another
+# local account (they hold every tenant's note text and every credential
+# hash), and the directory is kept 0700. After a dump is verified (`gzip -t`)
+# and recorded, dumps older than BACKUP_RETAIN_DAYS are pruned — but never
+# below BACKUP_RETAIN_MIN most-recent files, and never the one just taken, so
+# a long gap between deploys cannot leave the directory empty (#181).
+BACKUP_RETAIN_DAYS ?= 30
+BACKUP_RETAIN_MIN ?= 7
+
 db-backup:
 	@mkdir -p $(DATA_DIR)/backups
-	@TIMESTAMP=$$(date +%Y%m%d_%H%M%S); \
+	@chmod 700 $(DATA_DIR)/backups
+	@umask 077; TIMESTAMP=$$(date +%Y%m%d_%H%M%S); \
 	BACKUP_FILE="$(DATA_DIR)/backups/backup_$$TIMESTAMP.sql"; \
 	: "the database named here is mirrored as DB_NAME's default in docker/record-backup.sh; keep the two in step"; \
 	if ! docker exec $(DB_CONTAINER) pg_dump -U postgres obsidian_mcp > $$BACKUP_FILE; then \
@@ -246,8 +264,21 @@ db-backup:
 		echo "$(RED)Backup FAILED: could not gzip $$BACKUP_FILE$(NC)"; \
 		exit 1; \
 	fi; \
+	if ! gzip -t $$BACKUP_FILE.gz; then \
+		rm -f $$BACKUP_FILE.gz; \
+		echo "$(RED)Backup FAILED: $$BACKUP_FILE.gz did not verify$(NC)"; \
+		exit 1; \
+	fi; \
+	chmod 600 $$BACKUP_FILE.gz; \
 	echo "$(GREEN)Backup: $$BACKUP_FILE.gz$(NC)"; \
-	DB_CONTAINER=$(DB_CONTAINER) bash docker/record-backup.sh $$BACKUP_FILE.gz
+	DB_CONTAINER=$(DB_CONTAINER) bash docker/record-backup.sh $$BACKUP_FILE.gz || exit 1; \
+	PRUNED=0; \
+	for OLD in $$(ls -1t $(DATA_DIR)/backups/backup_*.sql.gz 2>/dev/null | tail -n +$$(( $(BACKUP_RETAIN_MIN) + 1 ))); do \
+		if [ "$$OLD" != "$$BACKUP_FILE.gz" ] && [ -n "$$(find "$$OLD" -mtime +$(BACKUP_RETAIN_DAYS) 2>/dev/null)" ]; then \
+			rm -f "$$OLD"; PRUNED=$$((PRUNED + 1)); \
+		fi; \
+	done; \
+	if [ $$PRUNED -gt 0 ]; then echo "$(YELLOW)Pruned $$PRUNED backup(s) older than $(BACKUP_RETAIN_DAYS) days (kept at least $(BACKUP_RETAIN_MIN))$(NC)"; fi
 
 db-restore:
 	@if [ -z "$(FILE)" ]; then echo "$(RED)Usage: make db-restore FILE=<path>$(NC)"; exit 1; fi
@@ -301,9 +332,20 @@ rebuild-tsvectors:
 	$(COMPOSE) run --rm obsidian-mcp python -m scripts.rebuild_tsvectors
 	@echo "$(GREEN)Done. Keyword search now reflects FTS_CONFIGS (embeddings untouched, no API calls).$(NC)"
 
+# Invariant: the application container must not be able to see the backups
+# directory (docs/architecture/control-panel.md, "Backup recency"). The mount
+# once crept back into the compose file (#186); this refuses a deploy that
+# reintroduces it under any host path.
+check-no-backups-mount:
+	@if docker inspect $(CONTAINER) --format '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' 2>/dev/null | grep -qx '/app/backups'; then \
+		echo "$(RED)INVARIANT VIOLATED: $(CONTAINER) has a mount at /app/backups — the container must not see the backups directory (#186).$(NC)"; \
+		exit 1; \
+	fi
+
 status:
 	@echo "$(GREEN)Obsidian MCP Status:$(NC)"
 	@$(COMPOSE) ps
+	@$(MAKE) check-no-backups-mount
 	@echo ""
 	@echo "$(GREEN)Health:$(NC)"
 	@HOST=$$(grep -E '^MCP_HOSTNAME=' $(ENV_FILE) 2>/dev/null | cut -d= -f2); \

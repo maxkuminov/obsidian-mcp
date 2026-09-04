@@ -481,6 +481,15 @@ deployment; on a compose-file deployment the equivalents are plain
   take by hand with `pg_dump` will not appear there, and the page will keep
   warning after 8 days as though none had been taken.
 
+  Dumps hold every tenant's note text and every credential hash, so
+  `make db-backup` writes them under `umask 077` into a `0700` directory,
+  verifies each one with `gzip -t`, and then prunes dumps older than
+  `BACKUP_RETAIN_DAYS` (default 30) while always keeping the newest
+  `BACKUP_RETAIN_MIN` (default 7). Override either on the command line or in
+  `Makefile.local`. The backups directory is **never** mounted into the
+  container — `make deploy` and `make status` fail if a mount at
+  `/app/backups` exists — and `.env` should be `0600` (`make init` sets it).
+
   **On the deploy that first ships this** (migration 021): `make deploy`
   takes its backup *before* it migrates — deliberately, because the backup
   is the only way back from a bad migration — so that one dump runs against
