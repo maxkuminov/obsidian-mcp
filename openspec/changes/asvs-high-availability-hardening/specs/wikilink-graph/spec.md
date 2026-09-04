@@ -33,12 +33,19 @@ The system SHALL extract `[[wikilinks]]`, `![[embeds]]`, and `[label](path.md)` 
 
 ### Requirement: Link extraction is linear-time and bounded per note
 
-Link extraction (`extract_links`) and the `move_note` link-rewrite scanner SHALL run in time linear in the length of the input for every input, including adversarial ones. Every unbounded character class in the four link regexes SHALL be closed: wikilink target, anchor and alias classes SHALL exclude `[` and `]`; markdown link text SHALL exclude `[`; markdown href classes SHALL be bounded to 2,048 characters. The extraction grammar in `links.py` and the rewrite grammar in `tools.py` SHALL apply these rules identically. Extraction SHALL stop after `MAX_LINKS_PER_NOTE` (10,000) links, selected as the first N by document position across both link kinds, and SHALL report that the note was truncated. The indexer and the `move_note` rewrite planner SHALL invoke extraction through `asyncio.to_thread`.
+Link extraction (`extract_links`) and the whole of `move_note`'s link rewrite — the scanners that find the links AND the splice that applies them — SHALL run in time linear in the length of the input for every input, including adversarial ones. Every unbounded character class in the four link regexes SHALL be closed: wikilink target, anchor and alias classes SHALL exclude `[` and `]`; markdown link text SHALL exclude `[`; markdown href classes SHALL be bounded to 2,048 characters. The extraction grammar in `links.py` and the rewrite grammar in `tools.py` SHALL apply these rules identically. Extraction SHALL stop after `MAX_LINKS_PER_NOTE` (10,000) links, selected as the first N by document position across both link kinds, and SHALL report that the note was truncated. The indexer and the `move_note` rewrite planner SHALL invoke extraction through `asyncio.to_thread`, and the planner SHALL do the same for the per-source fence scan it hands the rewriter: both halves of the per-source work are CPU-bound over up to `MAX_NOTE_BYTES`, and they run once per backlink source while the process-wide `move_note` rewrite lock is held.
 
 #### Scenario: Pathological inputs are parsed in linear time
 
 - **WHEN** `extract_links` and the rewrite scanner are invoked on n and 2n bytes of each of `[[`, `]]`, `[[a`, `[[a#`, `[[a|`, `[a](`, `[a](x` (n = 512 KiB)
 - **THEN** each SHALL find no links, the 2n time divided by the n time SHALL be below 4, and each run SHALL complete under a generous absolute ceiling
+
+#### Scenario: The rewrite splice is linear on match-dense input
+
+- **WHEN** the `move_note` rewrite runs over n and 2n bytes of `[[Old]] ` (n = 256 KiB), every occurrence of which resolves to the moved note and is rewritten
+- **THEN** the 2n time divided by the n time SHALL be below 4
+- **AND** the splice alone SHALL apply the 131,072 rewrites of a 1 MiB body in under 500 ms — the retired per-rewrite whole-string rebuild takes ~25 s on the same input
+- **AND** the spliced output SHALL be byte-for-byte what that retired implementation produced, asserted against it as an oracle over a randomized corpus of spans
 
 #### Scenario: Valid links are unchanged by the grammar
 
@@ -66,6 +73,7 @@ Link extraction (`extract_links`) and the `move_note` link-rewrite scanner SHALL
 
 - **WHEN** the indexer extracts links and tags from a note, or `move_note` plans a rewrite
 - **THEN** the extraction call SHALL be dispatched through `asyncio.to_thread` (a test asserts the dispatch)
+- **AND** for `move_note` the per-source fence scan SHALL be dispatched the same way (the same test asserts both, so dispatching only the rewrite does not pass)
 
 ### Requirement: `get_links` reports a truncated extraction
 
@@ -83,7 +91,11 @@ Link extraction (`extract_links`) and the `move_note` link-rewrite scanner SHALL
 
 ### Requirement: `get_links` bounds its own result
 
-`get_links` SHALL accept a `limit` (default 500, clamped to 1..500 as `get_backlinks` is) and SHALL return at most that many link rows, in document order. When more rows exist than were returned, the result SHALL say how many rows are persisted for that note, so a page is never read as the whole set.
+`get_links` SHALL accept a `limit` (default 100, clamped to 1..500 as `get_backlinks` is) and SHALL return at most that many link rows, in document order. When more rows exist than were returned, the result SHALL say how many rows are persisted for that note, so a page is never read as the whole set, SHALL state the effective `limit` it applied, and SHALL state that rows past the hard cap of 500 are not reachable through this tool.
+
+The default SHALL be strictly below the hard cap. A default equal to the cap makes the over-limit notice's "raise `limit`" advice unactionable — the caller is already at the ceiling — so the notice would be instructing an agent to retry a call that cannot return anything new; the notice SHALL therefore offer that advice only while `limit` is below the cap.
+
+Each returned row's `link_text` SHALL be clipped to 120 characters with an ellipsis, as `get_backlinks` clips its excerpt. `link_text` is stored verbatim and a wikilink alias is caller-controlled, so an unclipped row can carry arbitrary text into a tool result — model input — past the response-level caps.
 
 #### Scenario: A note with more link rows than the limit
 
@@ -94,3 +106,14 @@ Link extraction (`extract_links`) and the `move_note` link-rewrite scanner SHALL
 
 - **WHEN** `get_links` is invoked with a `limit` of zero, a negative number, or a number above the hard cap
 - **THEN** the limit SHALL be clamped to the 1..500 range rather than refused or honoured unbounded
+- **AND** the effective limit SHALL be observable in the result's notice, so the clamp is asserted on what the tool applied and not only on a row count a fixture cannot distinguish
+
+#### Scenario: A note with more rows than the hard cap
+
+- **WHEN** `get_links` is invoked at the hard cap on a note with more than 500 persisted link rows
+- **THEN** the result SHALL NOT advise raising `limit`, and SHALL say that the rows past the first 500 are not reachable through this tool
+
+#### Scenario: A row with a very long link text
+
+- **WHEN** a returned link row's `link_text` is longer than 120 characters
+- **THEN** the rendered row SHALL carry the first 120 characters followed by an ellipsis, and SHALL NOT carry the remainder

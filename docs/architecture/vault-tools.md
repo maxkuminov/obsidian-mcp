@@ -593,6 +593,49 @@ after another. That dispatch bounds the stall at the longest single scan step,
 **not at zero** — see the GIL note above — which is why the scan itself had to
 get fast.
 
+**Both halves of the per-source work are dispatched, not just the rewrite.**
+The preflight takes one `FULL_NOTE` fence scan per source and hands it to the
+rewriter (`_scan_rewrite_source`); that scan is the *larger* half — a full pass
+over up to `MAX_NOTE_BYTES`, 1.6–11.3 s per 10 MiB — and it originally ran on
+the loop nine lines above the `to_thread` that dispatched the rewrite. Both go
+through `to_thread`, and the dispatch test asserts both names: asserting only
+`_rewrite_links_in_text` is what let the larger half sit on the loop.
+
+**The splice that applies the rewrites is linear, and that is load-bearing.**
+It used to be `out = out[:start] + replacement + out[end:]` per rewrite over a
+descending sort — a fresh copy of the whole note per link. Measured on
+`[[Old]] ` repeated: 0.072 s at 64 KiB, 0.176 s at 128 KiB, 0.723 s at 256 KiB,
+5.315 s at 512 KiB. Clean O(n²), ≈ 35 minutes extrapolated to `MAX_NOTE_BYTES`
+— **while holding `_MOVE_REWRITE_LOCK`**, so every other tenant's
+link-rewriting move waits behind it. That is the same cross-tenant stall the
+scanner work removed from the other half of the same function, reintroduced
+after the scan finished. `_splice_rewrites` walks the spans once with a cursor
+and joins once: 0.04 s for the 131,072 rewrites of a 1 MiB body, against ~25 s
+for the retired shape.
+
+The cursor walk is equivalent to the reverse splice **only while the spans do
+not overlap**, and they cannot: a markdown link's text class excludes `[` and
+`]`, so no `[text](` can begin inside a wikilink span and run past its `]]`,
+and each scanner is already non-overlapping within itself. That is a property
+of two grammars in another module, so `_splice_rewrites` *checks* it and falls
+back to the retired splice rather than silently writing different bytes — a
+rewrite that is fast but writes different bytes is a destructive write, not a
+speed-up. The fallback is unreachable through the scanners and is tested by
+calling the splice directly; the equality itself is tested against the retired
+implementation as an oracle over a randomized corpus.
+
+**One source's rewrites are bounded at `MAX_LINKS_PER_NOTE`, and over the cap
+is a refusal.** The read side has always been bounded — extraction stops at
+10,000 links — and the write side was not, so a 10 MiB note of `[[Old]] `
+planned ~1.7 million rewrites in a single source. Refused rather than
+truncated, and refused *before the rename*, the same disposition as the
+`MAX_NOTE_BYTES` per-source and `MAX_MOVE_REWRITE_BYTES` aggregate preflights:
+rewriting the first N and stopping leaves the remainder pointing at the path
+the move just vacated, and reports the move as a success. The error names the
+source and the cap so the agent knows which note to split. Note that the cap
+does **not** make the splice's linearity redundant — 10,000 rewrites of a
+10 MiB note is still 100 GB of copying under the old shape.
+
 ### Where a section's body begins, and what a section write destroys (#140)
 
 **A section's body begins at the first byte of the line immediately after the

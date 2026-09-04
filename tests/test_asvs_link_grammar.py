@@ -449,7 +449,13 @@ async def test_move_note_dispatches_the_rewrite_through_to_thread(
 ):
     """The rewrite is a pure function of a string, and a hub note's backlink
     sources are read one after another — linear work on near-cap notes is
-    still dead air for every other tenant if it runs on the loop."""
+    still dead air for every other tenant if it runs on the loop.
+
+    **Both halves of the per-source work, not just the rewrite.** The fence
+    scan is the larger half — a full `FULL_NOTE` pass over up to
+    `MAX_NOTE_BYTES` — and it ran on the loop nine lines above the dispatch,
+    once per backlink source, with the process-wide `_MOVE_REWRITE_LOCK`
+    held. Asserting only `_rewrite_links_in_text` let that stand."""
     (rewrite_vault / "Old.md").write_text("moved\n", encoding="utf-8")
     (rewrite_vault / "src.md").write_text("see [[Old]]\n", encoding="utf-8")
     monkeypatch.setattr(
@@ -474,4 +480,189 @@ async def test_move_note_dispatches_the_rewrite_through_to_thread(
 
     assert "Moved Old.md → New.md" in result, result
     assert "_rewrite_links_in_text" in dispatched, dispatched
+    assert "_scan_rewrite_source" in dispatched, dispatched
     assert (rewrite_vault / "src.md").read_text(encoding="utf-8") == "see [[New]]\n"
+
+
+# ── the rewrite splice is linear too ────────────────────────────────────────
+#
+# The scanners were the first half of #180. The *splice* that applies what
+# they found was the other half and stayed quadratic: one
+# `out[:start] + repl + out[end:]` per rewrite over a descending sort is a
+# fresh copy of the whole note per link. Measured on the development host
+# before the fix, on `[[Old]] ` repeated: 0.072 s at 64 KiB, 0.176 s at
+# 128 KiB, 0.723 s at 256 KiB, 5.315 s at 512 KiB — clean O(n²), and roughly
+# 35 minutes extrapolated to `MAX_NOTE_BYTES`, all of it with the
+# process-wide `_MOVE_REWRITE_LOCK` held. Every other tenant's move waits
+# behind it, which is the exact stall the scanner work removed from the other
+# half of the same function.
+#
+# These rows are match-DENSE. The pathological rows above all find zero
+# links, so none of them ever reached the splice at all: they could not have
+# failed on it, which is why this benchmark exists separately rather than as
+# another entry in `PATHOLOGICAL_UNITS`.
+
+SPLICE_UNIT = "[[Old]] "
+SPLICE_N = 256 * 1024
+# 1 MiB of `[[Old]] ` is 131,072 rewrites. The new splice measures ~0.04 s
+# for that; the retired one measures ~25 s, a 600× gap, so a bound at 0.5 s
+# is a real bound and not a formality — it fails the old shape by fifty times
+# while leaving the new one twelve times its measured cost for CI noise.
+SPLICE_ABSOLUTE_CEILING_SECONDS = 0.5
+
+
+def _dense(size: int) -> str:
+    return SPLICE_UNIT * (size // len(SPLICE_UNIT))
+
+
+def _spans_for(text: str):
+    """`(start, end, replacement)` for every `[[Old]]` in a dense body."""
+    step = len(SPLICE_UNIT)
+    return [
+        (i * step, i * step + len("[[Old]]"), "[[New]]")
+        for i in range(len(text) // step)
+    ]
+
+
+def _reverse_splice(content, rewrites):
+    """The retired implementation, kept here as the differential oracle.
+
+    Byte-for-byte what `move_note` used to write. A rewrite that is fast but
+    produces different bytes is a destructive write, not a speed-up.
+    """
+    ordered = sorted(rewrites, key=lambda r: r[0], reverse=True)
+    out = content
+    for start, end, replacement in ordered:
+        out = out[:start] + replacement + out[end:]
+    return out
+
+
+def test_the_rewrite_splice_is_linear_in_the_note(monkeypatch):
+    """n against 2n of match-dense text, through the whole rewrite path.
+
+    The per-source cap is lifted for the measurement: the cap bounds the
+    production blast radius, but linearity has to hold on its own — 10,000
+    rewrites of a 10 MiB note is still 100 GB of copying under the old
+    splice, and a future change to the cap must not be what keeps this fast.
+    """
+    monkeypatch.setattr(tools, "MAX_LINKS_PER_NOTE", 10_000_000)
+    small = _dense(SPLICE_N)
+    large = _dense(2 * SPLICE_N)
+
+    _run_rewrite(small[:4096])  # warm the interpreter, not the measurement
+    t_small, n_small = _measure(_run_rewrite, small)
+    t_large, n_large = _measure(_run_rewrite, large)
+
+    # Dense, not pathological: every unit is a rewrite. A run that suddenly
+    # found nothing would be fast for the wrong reason.
+    assert n_small == len(small) // len(SPLICE_UNIT)
+    assert n_large == 2 * n_small
+
+    ratio = t_large / max(t_small, 1e-6)
+    assert ratio < 4, (
+        f"rewrite splice: ratio {ratio:.2f} "
+        f"(n={t_small:.4f}s, 2n={t_large:.4f}s) — superlinear"
+    )
+    assert t_large < 4.0, f"rewrite splice: {t_large:.2f}s at {2 * SPLICE_N} bytes"
+
+
+def test_the_splice_itself_holds_a_real_absolute_bound():
+    """1 MiB, 131,072 rewrites, under half a second.
+
+    Asserted against `_splice_rewrites` rather than end to end, so the bound
+    measures the splice and not the scanners and `resolve_target` calls in
+    front of it. The retired splice takes ~25 s on the same input.
+    """
+    text = _dense(1024 * 1024)
+    spans = _spans_for(text)
+    assert len(spans) == 131_072
+
+    tools._splice_rewrites(text[:4096], _spans_for(text[:4096]))
+    start = time.perf_counter()
+    out = tools._splice_rewrites(text, spans)
+    elapsed = time.perf_counter() - start
+
+    assert out == "[[New]] " * len(spans)
+    assert elapsed < SPLICE_ABSOLUTE_CEILING_SECONDS, (
+        f"splice took {elapsed:.3f}s for {len(spans)} rewrites over "
+        f"{len(text)} bytes (ceiling {SPLICE_ABSOLUTE_CEILING_SECONDS}s)"
+    )
+
+
+def test_the_linear_splice_is_byte_identical_to_the_retired_one():
+    """A randomized corpus of non-overlapping spans, both implementations.
+
+    Randomized over the shapes that differ between them — replacements
+    shorter and longer than what they replace, spans touching end to end,
+    spans at position 0 and at the very end, gaps of every size — because the
+    thing that would go wrong is an off-by-one in the cursor, and a fixed
+    example is exactly what an off-by-one survives.
+    """
+    import random
+
+    rng = random.Random(20260904)
+    for _ in range(400):
+        content = "".join(rng.choice("abcdef\n[]|#(). ") for _ in range(rng.randint(0, 300)))
+        spans = []
+        cursor = 0
+        while cursor < len(content):
+            gap = rng.randint(0, 6)
+            start = cursor + gap
+            if start >= len(content):
+                break
+            end = min(len(content), start + rng.randint(1, 8))
+            spans.append((start, end, "R" * rng.randint(0, 12)))
+            cursor = end
+        rng.shuffle(spans)  # the scanners hand them over kind by kind
+        assert tools._splice_rewrites(content, spans) == _reverse_splice(
+            content, spans
+        ), (content, spans)
+
+
+def test_overlapping_spans_fall_back_to_the_retired_splice():
+    """The cursor walk is only equivalent while spans do not overlap.
+
+    They cannot overlap coming out of the two scanners — a markdown link's
+    text class excludes `[` and `]`, so no `[text](` can begin inside a
+    wikilink span and run past its `]]` — but that is a property of two
+    grammars in another module, so the splice checks rather than assumes it.
+    Reached only by calling the splice directly, which is what this does.
+    """
+    content = "0123456789"
+    overlapping = [(0, 6, "AA"), (3, 10, "BBB")]
+    assert tools._splice_rewrites(content, overlapping) == _reverse_splice(
+        content, overlapping
+    )
+    # And it is the fallback's answer, not the cursor walk's: the cursor walk
+    # would emit "AA" then "BBB" with nothing dropped.
+    assert tools._splice_rewrites(content, overlapping) != "AABBB"
+
+
+# ── the per-source rewrite cap ──────────────────────────────────────────────
+
+
+def test_a_source_over_the_rewrite_cap_is_refused_not_truncated(monkeypatch):
+    """The write side gets the bound the read side has always had.
+
+    `MAX_LINKS_PER_NOTE` caps what the indexer *extracts*; nothing capped
+    what `move_note` *rewrote*, so a 10 MiB note of `[[Old]] ` planned ~1.7
+    million rewrites in one source. Refused rather than truncated: a partial
+    rewrite leaves the rest of the note pointing at the path the move is
+    about to vacate, and reports success.
+    """
+    monkeypatch.setattr(tools, "MAX_LINKS_PER_NOTE", 4)
+    body = "[[Old]] " * 5
+
+    with pytest.raises(tools.MoveRewriteCapExceeded) as excinfo:
+        tools._rewrite_links_in_text(body, "Old.md", "New.md", "src.md", _rewrite_index())
+
+    assert excinfo.value.source_path == "src.md"
+    assert excinfo.value.count == 5
+    assert excinfo.value.cap == 4
+
+    # At the cap it goes through — the refusal is "more than", not "at".
+    rewritten, n = tools._rewrite_links_in_text(
+        "[[Old]] " * 4, "Old.md", "New.md", "src.md", _rewrite_index()
+    )
+    assert n == 4
+    assert rewritten == "[[New]] " * 4
