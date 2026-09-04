@@ -520,6 +520,11 @@ async def get_links(path: str) -> str:
     Useful for "what does this note depend on?" or finding broken references
     that need follow-up notes.
 
+    The result carries a `truncated` field. `truncated: true` means this note
+    holds more links than the indexer's per-note cap and the list is the first
+    N in document order only — treat it as incomplete rather than as the
+    note's full outgoing-link set.
+
     Args:
         path: Vault-relative path to the source note.
     """
