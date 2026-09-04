@@ -140,13 +140,28 @@ async def test_write_file_still_accepts_ordinary_markdown(vault, readwrite):
     assert (vault / "ok.md").stat().st_size == 4096
 
 
-@pytest.mark.parametrize("name", ["big.MD", "big.Md"])
-async def test_the_markdown_cap_is_case_insensitive(vault, readwrite, name):
+@pytest.mark.parametrize(
+    "name", ["big.MD", "big.Md", "big.md/.", "./big.md/.", "./big.MD/."]
+)
+async def test_the_markdown_cap_binds_every_spelling_of_the_same_file(
+    vault, readwrite, name
+):
+    """Case *and* normalisation, because the cap is a property of the file the
+    bytes land on and not of the string the caller typed.
+
+    `open_mutable` drops empty and `.` components, so `"big.md/."` opens
+    `big.md` — while `"big.md/.".lower().endswith(".md")` is False. Deriving
+    the cap from the raw argument therefore let a 25 MiB markdown note through
+    the tool whose job is to refuse one, and the indexer then read it as a
+    note. Every spelling here writes the same path; every one must be refused
+    by the same limit."""
     result = await tools.write_file_impl(
         name, "x" * (MAX_NOTE_BYTES + 1), encoding="text"
     )
-    assert "MAX_NOTE_BYTES" in result
+    assert "MAX_NOTE_BYTES" in result, result
     assert not (vault / name).exists()
+    # Belt and braces: nothing landed under the *normalised* name either.
+    assert sorted(p.name for p in vault.iterdir()) == []
 
 
 async def test_a_large_non_markdown_file_is_unaffected(vault, readwrite):
@@ -261,3 +276,101 @@ async def test_import_of_a_markdown_target_is_capped_case_insensitively(
     await tools.import_from_url_impl("https://example.com/a.MD", "a.MD")
 
     assert recording_fetch["max_bytes"] == 4
+
+
+async def test_an_ordinary_markdown_write_through_a_normalised_path_still_lands(
+    vault, readwrite
+):
+    """The guard is a cap, not a new refusal: `"ok.md/."` still writes."""
+    result = await tools.write_file_impl("ok.md/.", "x" * 4096, encoding="text")
+
+    assert "Wrote" in result, result
+    assert (vault / "ok.md").stat().st_size == 4096
+
+
+# ── the two transfer ingresses decide from the normalised path too ──────────
+
+
+@pytest.mark.parametrize("raw", ["big.md", "big.md/.", "./big.md/.", "./big.MD/."])
+def test_the_transfer_paths_derive_the_cap_from_the_normalised_name(vault, raw):
+    """`request_upload`/`import_from_url` freeze `_vault_context`'s *canonical*
+    relative path into the token, and `/transfer/upload/info` and
+    `PUT /transfer/upload` both read the cap off that stored path. So the
+    normalisation that defeated `write_file` cannot reach them — proved here,
+    end to end, rather than asserted from the call site."""
+    from types import SimpleNamespace
+
+    from src.transfer.routes import _upload_max_bytes
+
+    _root, rel = tools._vault_context(raw, None)
+
+    assert rel.lower() == "big.md"
+    assert tools._write_cap_for(rel) == (MAX_NOTE_BYTES, "MAX_NOTE_BYTES")
+    assert _upload_max_bytes(SimpleNamespace(path=rel)) == MAX_NOTE_BYTES
+
+
+async def test_import_of_a_normalised_markdown_target_is_capped(
+    vault, readwrite, recording_fetch, monkeypatch
+):
+    monkeypatch.setattr(tools, "MAX_NOTE_BYTES", 4)
+    recording_fetch["payload"] = b"x" * 5
+
+    result = await tools.import_from_url_impl("https://example.com/a", "a.md/.")
+
+    assert recording_fetch["max_bytes"] == 4
+    assert "MAX_NOTE_BYTES" in result, result
+    assert not (vault / "a.md").exists()
+
+
+# ── import_from_url: a full upload queue is an answer, not an exception ─────
+
+
+async def test_import_reports_a_full_upload_queue_in_band(
+    vault, readwrite, recording_fetch, monkeypatch
+):
+    """`transfer.QueueTimeout` is deliberately NOT a `Timeout` subclass — the
+    two are different verdicts about the same request — so the tool's `except
+    transfer.Timeout` clause never caught it and it escaped `import_from_url`
+    as an exception. An MCP tool that raises hands the agent a protocol error
+    instead of a sentence it can act on, and the call is recorded as a server
+    fault rather than as a refusal."""
+    logged: list[tuple] = []
+
+    async def capture(tool, params, duration_ms, response_size):
+        logged.append((tool, params))
+
+    monkeypatch.setattr(tools, "_log_usage", capture)
+
+    async def raise_queue_timeout(*a, **k):
+        raise transfer.QueueTimeout(
+            "No upload slot became free within 30s; retry shortly"
+        )
+
+    monkeypatch.setattr(transfer, "stream_to_vault", raise_queue_timeout)
+
+    result = await tools.import_from_url_impl("https://example.com/a.md", "a.md")
+
+    assert isinstance(result, str)
+    assert "No upload slot became free" in result
+    assert "Nothing was written." in result
+    assert not (vault / "a.md").exists()
+    # `_tracked` logs only on the non-exception path, so this is the assertion
+    # that the refusal really was in band.
+    assert [tool for tool, _ in logged] == ["import_from_url"]
+
+
+async def test_a_deadline_overrun_is_still_the_timeout_refusal(
+    vault, readwrite, recording_fetch, monkeypatch
+):
+    """The clause added above sits ABOVE `except transfer.Timeout` and must not
+    swallow it: a genuine deadline overrun keeps its own wording."""
+
+    async def raise_timeout(*a, **k):
+        raise transfer.Timeout("Fetch exceeded its deadline")
+
+    monkeypatch.setattr(transfer, "stream_to_vault", raise_timeout)
+
+    result = await tools.import_from_url_impl("https://example.com/a.md", "a.md")
+
+    assert "Fetch exceeded its deadline" in result
+    assert "Nothing was written." in result

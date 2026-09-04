@@ -1598,20 +1598,27 @@ async def get_backlinks_impl(path: str, limit: int = 50) -> str:
     return "\n".join(lines)
 
 
-@_tracked("get_links", ["path"])
-async def get_links_impl(path: str) -> str:
+@_tracked("get_links", ["path", "limit"])
+async def get_links_impl(path: str, limit: int = 500) -> str:
     """Outgoing links from `path` — both resolved and dangling.
 
     Reports `truncated: true` when the indexer capped this note's link
     extraction at `MAX_LINKS_PER_NOTE`, so a capped set is never read as a
     complete one (#203).
+
+    **Bounded like every other list tool.** `get_backlinks` and
+    `get_neighborhood` have always clamped; this one selected every row a note
+    had, which for a note the indexer capped is up to `MAX_LINKS_PER_NOTE`
+    (10,000) rows rendered into one tool result — the answer an agent least
+    wants and the payload the read caps exist to prevent.
     """
-    from sqlalchemy import and_, or_, select
+    from sqlalchemy import and_, func, or_, select
     from sqlalchemy.orm import aliased
     from src.config import MAX_LINKS_PER_NOTE
     from src.models.db import NoteLink, NoteMetadata
 
     uid = current_user_id.get()
+    limit = max(1, min(limit, 500))
     async with async_session() as session:
         src_stmt = select(NoteMetadata).where(
             NoteMetadata.file_path == path, _note_owner_predicate(uid)
@@ -1662,8 +1669,28 @@ async def get_links_impl(path: str) -> str:
                 ),
             )
             .order_by(NoteLink.position)
+            # One over the limit, so "there are more" is read off the result
+            # rather than guessed from a full page.
+            .limit(limit + 1)
         )
         rows = (await session.execute(stmt)).all()
+        over_limit = len(rows) > limit
+        if over_limit:
+            rows = rows[:limit]
+
+        # **How many rows the pass actually persisted for this note**, counted
+        # only when a notice is going to quote it. `len(rows)` is not that
+        # number: the scoped join above omits any row that resolved to a note
+        # outside the owned set, so a notice built from it would tell the
+        # caller "the N above are the first in document order" about an N that
+        # is neither the page size nor the persisted total.
+        persisted: int | None = None
+        if over_limit or source.links_truncated:
+            persisted = await session.scalar(
+                select(func.count())
+                .select_from(NoteLink)
+                .where(NoteLink.source_note_id == source.id)
+            )
 
     # Read off the note row the pass wrote it on, never inferred from the row
     # count: a capped set is exactly `MAX_LINKS_PER_NOTE` rows and looks like
@@ -1694,12 +1721,18 @@ async def get_links_impl(path: str) -> str:
         lines.append("\n**Dangling:**")
         for r in dangling:
             lines.append(f"- {r.kind} → `{r.target_path}` — `{r.link_text}`")
+    if over_limit:
+        lines.append(
+            f"\n… showing {len(rows)} of {persisted:,} link rows persisted for "
+            f"this note (limit={limit}, hard cap 500), in document order. "
+            "Raise `limit` to see more."
+        )
     if source.links_truncated:
         lines.append(
             f"\n**This note's link extraction was capped at "
-            f"{MAX_LINKS_PER_NOTE} links. The {len(rows)} above are the first "
-            "in document order and the set is INCOMPLETE** — do not treat it "
-            "as the note's full outgoing-link set."
+            f"{MAX_LINKS_PER_NOTE} links. The {persisted:,} rows persisted for "
+            "it are the first in document order and the set is INCOMPLETE** — "
+            "do not treat it as the note's full outgoing-link set."
         )
     return "\n".join(lines)
 
@@ -3744,7 +3777,14 @@ async def write_file_impl(
         else:
             data = content.encode("utf-8")
 
-        cap, cap_name = _write_cap_for(path)
+        # **The cap follows the NORMALISED name, not the caller's string.**
+        # `open_mutable` drops empty and `.` components, so `"big.md/."` is
+        # written to `big.md` — while `"big.md/.".lower().endswith(".md")` is
+        # False. Testing the raw argument therefore admitted a 25 MiB markdown
+        # note through the tool whose whole job here is to refuse one, and the
+        # indexer then read it as a note. `target.rel` is the path the bytes
+        # actually land on, which is the only path a cap may be derived from.
+        cap, cap_name = _write_cap_for(target.rel)
         if len(data) > cap:
             return (
                 f"Content too large ({len(data):,} bytes, "
@@ -4004,6 +4044,16 @@ async def request_upload_impl(
             "the upload). Nothing was minted."
         )
 
+    # The number the agent is told **must be the number the route enforces**.
+    # `/transfer/upload/info` and `PUT /transfer/upload` both derive their cap
+    # from the token's stored (normalised) path via `_upload_max_bytes`, so a
+    # markdown destination aborts at `MAX_NOTE_BYTES`; printing
+    # `MAX_FILE_WRITE_BYTES` here promised 25 MiB over a route that refuses at
+    # 10 MiB, which is worse than printing no number at all. `rel` is the
+    # normalised path frozen into the token, so this is the same decision the
+    # route makes, taken from the same string (#203).
+    cap, cap_name = _write_cap_for(rel)
+
     async with async_session() as session:
         try:
             # `mint_token` reads the credential and decides the deadline itself,
@@ -4030,7 +4080,7 @@ async def request_upload_impl(
         f"{base}/transfer/upload#{token}\n\n"
         f"{_clamp_note(window)}"
         f"upload_id: {row.public_id}\n"
-        f"max_bytes: {settings.max_file_write_bytes:,}\n"
+        f"max_bytes: {cap:,} ({cap_name})\n"
         f"overwrite: {overwrite}\n\n"
         "Give the URL to the person you are helping and ask them to open it — "
         "it is a page with a file picker. Treat it as a secret: anyone holding "
@@ -4340,6 +4390,16 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
         return f"Refused to fetch that URL: {e}"
     except transfer.TooLarge as e:
         return f"{e} ({cap_name}). Nothing was written."
+    except transfer.QueueTimeout as e:
+        # **Above `Timeout`, and it has to be its own clause**: `QueueTimeout`
+        # is deliberately not a `Timeout` subclass (the two are different
+        # verdicts about the same request — see `transfer.QueueTimeout`), so
+        # without this it left the tool as an exception rather than an in-band
+        # refusal. An MCP tool that raises returns a protocol error to the
+        # agent instead of a sentence it can act on, and `_tracked` records the
+        # call as a server fault. Nothing was staged and nothing was fetched;
+        # the same call may simply be retried.
+        return f"{e}. Nothing was written."
     except transfer.Timeout as e:
         return f"{e}. Nothing was written."
     except transfer.PrePublishAborted:
