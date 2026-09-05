@@ -30,13 +30,45 @@ In single-user mode there is no account row and no local password, so the handle
 - **THEN** hashing SHALL succeed under the same truncation the server has always applied
 - **AND** the resulting hash SHALL verify with that password
 
-### Requirement: A password change SHALL be refused without the correct current password, and the refusal SHALL be throttled
+### Requirement: The password change SHALL verify and write against a locked, freshly read account row
 
-The handler SHALL refuse the change when the submitted current password does not verify against the stored hash, when the new password and its confirmation differ, when the new password is shorter than the server's minimum length, when it contains a NUL byte, or when it is identical to the current password. A refusal SHALL leave the stored hash, the account-wide session version and every session row untouched.
+The handler SHALL take the same account-guard advisory lock the administrative user-management handlers take — the same constant, because two different keys do not exclude each other — and SHALL then re-read the acting user's row `FOR UPDATE` before it verifies the submitted current password and before it writes anything. The re-read SHALL force the loaded object's attributes to be replaced by the values read under the lock; an object already in the request's identity map otherwise returns its pre-lock attribute values, and the re-read would prove nothing.
 
-The handler SHALL be rate limited at the login handler's rate under a key composed of the client address **and** the authenticated session's user, so that repeated guessing of the current password is bounded per account as well as per address. Successful and refused attempts SHALL be counted against the same limit, so the limit cannot be drained by guessing.
+Verification SHALL use the hash read under the lock, never the hash loaded by the request's authentication dependency. Without this, an administrator's password reset or deactivation that commits between the dependency's read and this handler's write is silently overwritten: the user's change would be verified against a hash the administrator has already replaced, and would restore access the administrator had just removed.
 
-The minimum password length SHALL be defined once and applied by every path that sets a password — this handler, bootstrap registration and the administrator reset — so that an administrator cannot set a password its owner is then forbidden from setting again. There SHALL be no composition rules. Existing stored passwords SHALL NOT be re-checked against the minimum at login, so raising it does not lock anyone out.
+If the row is gone, or its active flag is not exactly true when read under the lock, the handler SHALL refuse, write nothing, revoke nothing, and end the acting session. Nothing SHALL commit between the lock being taken and the protected write, so the lock's critical section stays atomic.
+
+#### Scenario: A concurrent administrative reset is not overwritten
+
+- **WHEN** an administrator's password reset commits after the change handler's request began but before it takes the lock
+- **THEN** the change SHALL be refused because the submitted current password no longer verifies against the stored hash
+- **AND** the administrator's newly set hash SHALL remain in place
+- **AND** no session SHALL be minted for the acting browser
+
+#### Scenario: A concurrent deactivation is not overwritten
+
+- **WHEN** an administrator deactivates the account after the change handler's request began but before it takes the lock
+- **THEN** the change SHALL be refused
+- **AND** the stored hash SHALL be unchanged and the account SHALL remain inactive
+- **AND** no session SHALL be minted for the acting browser
+
+#### Scenario: The re-read is authoritative
+
+- **WHEN** the acting user's row is modified and committed by another transaction before the lock is taken
+- **THEN** the verification SHALL use the values read under the lock, not those loaded earlier in the request
+
+#### Scenario: A deleted account cannot change its password
+
+- **WHEN** the acting user's row no longer exists when read under the lock
+- **THEN** the change SHALL be refused and nothing SHALL be written
+
+### Requirement: A password change SHALL be refused without the correct current password, and refusals SHALL be throttled per account and per address
+
+The handler SHALL refuse the change when the submitted current password does not verify against the hash read under the lock, when the new password and its confirmation differ, when the new password is shorter than the server's minimum length, when it contains a NUL byte, or when it is identical to the current password. A refusal SHALL leave the stored hash, the account-wide session version and every session row untouched.
+
+The handler SHALL carry **two independent** rate limits at the login handler's rate: one keyed on the authenticated session's account and one keyed on the client address. Neither subsumes the other — an account-only key lets one address walk many accounts, and a key that mixes the address in gives an attacker a fresh allowance for every address they rotate through, which is why a single composite key does not bound guessing against one account. Successful and refused attempts SHALL count against the same limits, so the allowance cannot be drained by guessing.
+
+The minimum password length SHALL be defined once and applied by **every** path that sets a password — this handler, bootstrap registration, the administrator reset, and administrative user creation — so that an administrator cannot set a password its owner is then forbidden from setting again. There SHALL be no composition rules. Existing stored passwords SHALL NOT be re-checked against the minimum at login, so raising it does not lock anyone out.
 
 #### Scenario: Wrong current password is refused and changes nothing
 
@@ -44,11 +76,20 @@ The minimum password length SHALL be defined once and applied by every path that
 - **THEN** the change SHALL be refused
 - **AND** the stored hash, the session version and every session row SHALL be unchanged
 
-#### Scenario: Repeated wrong-password attempts are throttled
+#### Scenario: Guessing against one account is bounded across addresses
 
-- **WHEN** the change handler is submitted with an incorrect current password more times than the limit allows within the window, from one browser session
-- **THEN** the excess requests SHALL be rejected by the rate limiter
-- **AND** the throttle SHALL apply even if the requests arrive from different client addresses under the same session
+- **WHEN** more attempts than the limit allows are made against one account within the window from a series of different client addresses
+- **THEN** the excess requests SHALL be rejected by the account-keyed limit
+
+#### Scenario: Guessing from one address is bounded across accounts
+
+- **WHEN** more attempts than the limit allows are made from one client address within the window against a series of different accounts
+- **THEN** the excess requests SHALL be rejected by the address-keyed limit
+
+#### Scenario: Successes count against the limit
+
+- **WHEN** attempts within the window include successful changes
+- **THEN** those successes SHALL count against the same limits as the refusals
 
 #### Scenario: Confirmation mismatch is refused
 
@@ -62,7 +103,7 @@ The minimum password length SHALL be defined once and applied by every path that
 
 #### Scenario: A NUL byte is a form error, not a server error
 
-- **WHEN** a new password containing a NUL byte is submitted here, at bootstrap registration, or at the administrator reset
+- **WHEN** a new password containing a NUL byte is submitted here, at bootstrap registration, at the administrator reset, or at administrative user creation
 - **THEN** the request SHALL be refused with a form-level message
 - **AND** the server SHALL NOT answer with an unhandled error
 
@@ -73,12 +114,12 @@ The minimum password length SHALL be defined once and applied by every path that
 
 #### Scenario: The minimum is shared by every setter
 
-- **WHEN** bootstrap registration or the administrator reset is given a password shorter than the configured minimum
+- **WHEN** bootstrap registration, the administrator reset, or administrative user creation is given a password shorter than the configured minimum
 - **THEN** it SHALL be refused by the same rule as the self-service handler
 
 ### Requirement: A successful password change SHALL end the user's other sessions and keep the current one
 
-On success the handler SHALL, in one transaction, write the new hash, increment the account-wide session version and revoke every session row belonging to that user — the one that made the request included — and SHALL then mint a fresh session for the requesting browser. The user-visible effect SHALL be that every other device is signed out and the browser that performed the change remains signed in under a new session identifier.
+On success the handler SHALL, in the transaction that holds the account guard, write the new hash, increment the account-wide session version and revoke every session row belonging to that user — the one that made the request included — and SHALL then, in a second transaction, mint a fresh session for the requesting browser. The user-visible effect SHALL be that every other device is signed out and the browser that performed the change remains signed in under a new session identifier.
 
 Rotating the identifier rather than retaining it is deliberate: the cookie that was live while the old password was live SHALL stop being a credential too.
 
@@ -104,6 +145,12 @@ If the re-issue fails after the change has committed, the user SHALL be signed o
 
 - **WHEN** the transaction that carries the new hash fails
 - **THEN** the stored hash SHALL be unchanged and no session SHALL have been revoked
+
+#### Scenario: A failed re-issue does not undo the change
+
+- **WHEN** the mint that follows a committed change fails
+- **THEN** the new password SHALL still be in force
+- **AND** the acting browser SHALL be signed out rather than left holding a cookie with no row
 
 ### Requirement: The password-change handler SHALL be CSRF-protected and SHALL report through the session, not the URL
 

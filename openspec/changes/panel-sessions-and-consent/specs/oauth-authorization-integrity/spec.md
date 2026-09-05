@@ -111,3 +111,32 @@ An empty list SHALL mean that every client is unrecognised, so clearing the sett
 
 - **WHEN** the operator configures an entry containing a wildcard, a path separator, an at-sign or whitespace
 - **THEN** configuration SHALL fail with a message saying patterns are not supported
+
+### Requirement: Client registration SHALL require a redirect URI with a resolvable ASCII host
+
+Dynamic client registration SHALL reject a redirect URI whose host component is empty, and SHALL reject one whose host cannot be converted to its ASCII (IDNA A-label) form; a host that converts SHALL be stored in that converted form. The existing requirements — HTTPS scheme, no fragment — are unchanged and are not sufficient on their own.
+
+The current check accepts any non-empty authority, so `https://@/cb` registers: its authority is `"@"` and truthy while its host is empty, and the consent screen would then have no destination to disclose at all — defeating the identification requirement above at registration time rather than at display time. Normalising to the A-label at registration also ensures a host cannot be stored in two forms that render alike and compare differently.
+
+Because rows registered before this requirement may hold an empty or non-ASCII host, the consent screen SHALL degrade safely rather than assume: a redirect URI whose host cannot be determined SHALL be shown as such, SHALL take the unverified-warning branch, and SHALL NOT be eligible for the known-client badge under any configuration.
+
+#### Scenario: A redirect URI with no host is refused at registration
+
+- **WHEN** a client registers with a redirect URI of the form `https://@/cb`
+- **THEN** registration SHALL be refused as an invalid redirect URI
+
+#### Scenario: A non-ASCII host is normalised at registration
+
+- **WHEN** a client registers with a redirect URI whose host is not ASCII and does convert
+- **THEN** registration SHALL succeed and the stored redirect URI's host SHALL be its ASCII form
+
+#### Scenario: A host that cannot be converted is refused
+
+- **WHEN** a client registers with a redirect URI whose host cannot be converted to an ASCII form
+- **THEN** registration SHALL be refused as an invalid redirect URI
+
+#### Scenario: A pre-existing hostless redirect never earns the badge
+
+- **WHEN** the consent screen is rendered for a client registered before this requirement whose redirect URI has no determinable host
+- **THEN** the destination SHALL be shown as undetermined
+- **AND** the unverified warning SHALL be shown and the known-client badge SHALL NOT be
