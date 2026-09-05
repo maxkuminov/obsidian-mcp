@@ -47,7 +47,7 @@ A GitHub issue is filed for it at archive time (task 6.9).
 | 6 | Daily quota (existing #162) | `_tracked`, last pre-body gate | api key | 5,000 for new keys (`DEFAULT_DAILY_REQUEST_LIMIT`) | in-band | `over_quota` |
 | 7 | Provider input rejection | inside the body, on the provider's answer | argument | provider's own limit | in-band, `argument_too_long` **code** | `provider_input_rejected` — **post-body** |
 
-Write tools (L3): `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url` — every `_tracked` tool that changes vault bytes and therefore amplifies into the next indexer pass.
+Write tools (L3): `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url` — every `_tracked` tool that changes vault bytes and therefore amplifies into the next indexer pass — **plus `PUT /transfer/upload`**, which changes vault bytes without being a tool call at all (D5a).
 
 ## Decisions
 
@@ -66,6 +66,10 @@ Because L2/L3 sit *above* the vault gate, a call can be refused before its vault
 > **Accepted limitation, owner-approved.** OAuth principals and pre-existing NULL-limit API keys have **velocity bounds only** — no durable ceiling on total destructive work in a day. Closing it would mean a quota for OAuth (rejected in #162: panel OAuth is the operator, and an operator locked out by their own ceiling cannot raise it) or a backfill onto existing keys (rejected here: grandfathering is the whole point of D9). The operator lever is to set a limit on the five live keys after deploy (task 6.8); the mitigations that remain are `permanent=False` trash recovery and the write bucket.
 
 Rate limiting also never prevents a *single* destructive write, which is what the `vault-tools` disciplines are for. The 60/15 numbers are an owner decision (Open Questions).
+
+**D5a. The write bucket follows the bytes, not the decorator.** `PUT /transfer/upload` publishes into the vault by redeeming a capability and never passes through `_tracked`, so bounding only the eight tools would leave the write rate escapable: mint capabilities at the general rate, then redeem them without limit. Redemption therefore consumes the write bucket of the principal **that minted the token**, which costs nothing to obtain — the transfer row already carries `key_id` / `oauth_token_id` (migration 017, with `ck_transfer_tokens_one_credential` guaranteeing at most one), and `resolve_identity_ok` already loads the minting `OAuthToken` row, whose `grant_id` is NOT NULL. So `("api_key", key_id)` or `("oauth", grant_id)` is derivable at redemption with **no additional query and no schema change**.
+
+The refusal is a **429 with `Retry-After`** and it **releases the claim** rather than consuming it — deliberately mirroring the 503 queue-timeout path #208 established, and for the same reason: a capability the server declined to serve right now is a promise still outstanding, so it must remain redeemable once the bucket refills. Minting is not charged (`request_upload` / `request_download` / `check_upload` touch capability rows only, and billing both ends would count one write twice) and `import_from_url` keeps consuming the bucket at its tool call, as an ordinary write tool. Like L1's 429, this is a transport refusal outside the in-band refusal contract of D5 — there is no tool call to answer.
 
 **D5. One caller-visible refusal shape — for refusals raised inside `_tracked`.** `params.error` is an operator's field, invisible to the caller, so "typed, actionable refusal" has to mean something the agent can parse. A new `src/services/refusals.py` — importing nothing from the app, so `tools.py`, `quotas.py`, `embeddings.py` and `rate_limits.py` can all use it without a cycle — defines a `Refusal` carrying `code`, `scope`, `limit`, `limit_unit`, `retry_after_seconds`, the closed `code` set, **and the provider input-limit exception type** (see D6), and one renderer appending a final line to the existing prose:
 
@@ -88,10 +92,14 @@ Note what the cap is *not* for: #194's verification withdrew the cost-amplificat
 
 **D7. Refusal recording is bounded by coalescing, and the coalescer owns a complete row.** A refusal is cheap to produce, so before this the cheapest thing an agent could do was generate database writes — and unlike an admitted call, a `rate_limited` refusal occurs at the caller's *arrival* rate, which is precisely the rate nothing bounds. So `rate_limited` rows are coalesced on `(principal, tool, marker, scope)`:
 
-- First refusal for a key: write a row now with `suppressed = 0` and open a window.
-- Refusal inside an open window: `pending += 1`, **no INSERT and no UPDATE** — no statement of any kind.
-- Refusal after the window closed: write one row carrying `suppressed = pending`, reset.
-- **Flush**: a key whose window has closed with `pending > 0` is written by the next row for that key, by the indexer's periodic tick, or at lifespan shutdown **before `engine.dispose()`** — whichever comes first.
+`pending` counts the refusals since the last written row that **no row yet represents**, and every reader takes a row to stand for `1 + suppressed` refusals. The two flush paths are not symmetric, and getting that wrong double-counts:
+
+- **Window opening.** The first refusal for a key writes its own row with `suppressed = 0` and sets `pending = 0`; that row represents exactly itself.
+- **Inside an open window.** `pending += 1`, **no INSERT and no UPDATE** — no statement of any kind.
+- **Rollover, triggered by a new refusal** after the window closed: write one row with `suppressed = pending`, **the arriving refusal being the row's base**, then reset the window and `pending = 0`.
+- **Standalone flush**, driven by the indexer's periodic tick or by lifespan shutdown **before `engine.dispose()`**: there is no new refusal to serve as a base, so the row must stand for one of the pending refusals itself and carries `suppressed = pending − 1`. A closed window with `pending == 0` writes **nothing** — the refusal that opened it already has a row.
+
+Σ `(1 + suppressed)` over a key's rows therefore equals the refusals observed for it, exactly, on any interleaving of rollovers and flushes.
 
 **The entry stores the complete, immutable attribution of the row it will write** — owner `user_id`, `key_id` / `oauth_token_id`, the denormalised `actor_*` triple, tool, marker, scope and the bounded params — captured at the moment of the first refusal. A deferred flush therefore reads **no ContextVar** and depends on **no live credential**: by flush time the request is long gone and the key may have been deleted, and `_log_usage`'s existing 23503 recovery (clear the FK ids, keep `actor_*`) is exactly the path that makes such a row land anyway. That recovery exists because #77 needed the label to survive the credential; here it does double duty.
 
@@ -99,7 +107,7 @@ Note what the cap is *not* for: #194's verification withdrew the cost-amplificat
 
 **`argument_too_long` is deliberately NOT coalesced.** It sits *below* the general bucket, so a principal can produce at most `MCP_RATE_LIMIT_PER_MINUTE` of them per minute — the same bound as any admitted call's row, and therefore already bounded without a mechanism. Adding coalescing there would buy nothing and cost a second code path. Spec and design say the same thing.
 
-Cardinality is bounded by the same registry cap as the buckets: past `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` entries, further keys fold into a **single shared overflow entry per marker**, whose flushed row carries scope `overflow` and no per-principal attribution.
+Cardinality is bounded by the same registry cap as the buckets: past `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` entries, further keys fold into shared overflow entries keyed on **`(tool, marker, scope)`** — the principal is the only component dropped, so an overflowed row still names the tool, the marker and the control that fired, and loses per-principal attribution alone rather than collapsing every tool onto one line.
 
 > **Accepted limitations.** (a) An abrupt process termination (SIGKILL, OOM) loses the pending counts of open windows — at most one interval's worth per active key; the alternative is a durable write per refusal, which is the amplification this exists to stop. (b) Past the registry cap, refusal rows lose per-principal attribution but **not** their count.
 

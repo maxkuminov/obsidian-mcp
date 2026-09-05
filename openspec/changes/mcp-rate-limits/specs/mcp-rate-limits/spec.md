@@ -67,6 +67,18 @@
 
 Every `_tracked` tool call SHALL pass a per-principal general token bucket before any other gate in the decorator, refilling at `MCP_RATE_LIMIT_PER_MINUTE` tokens per minute with capacity `MCP_RATE_LIMIT_BURST`. Every call to a vault-mutating tool — `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file`, `delete_file`, `import_from_url` — SHALL additionally pass a second per-principal bucket refilling at `MCP_WRITE_RATE_LIMIT_PER_MINUTE` with capacity `MCP_WRITE_RATE_LIMIT_BURST`, checked immediately after the general bucket. Each bucket SHALL be updated synchronously with no `await` between reading and writing its state, SHALL issue no database statement, and SHALL hold no lock. A token SHALL be consumed by every call that reaches a bucket, including calls a later gate then refuses — a token refills and a durable quota slot does not. Both buckets SHALL be **velocity** bounds and SHALL NOT be claimed to bound the total work a credential can do in a day, which is bounded only by the daily quota and only for the credentials that quota reaches. Either bucket's rate and burst SHALL be set together or be null together; null SHALL disable that bucket and zero SHALL be rejected as a configuration value.
 
+**The write bucket SHALL also be consumed where vault bytes are written outside a tool call.** `PUT /transfer/upload` publishes into the vault by redeeming a capability and never passes through the tool decorator, so bounding only the eight tools would leave the write rate escapable by minting capabilities and redeeming them. Redemption SHALL therefore consume the write bucket of the principal **that minted the token** — `("api_key", key_id)` when the transfer row names a key, and `("oauth", grant_id)` taken from the minting token row that identity resolution already loads, so no additional query is required and no schema change is needed. `request_upload`, `request_download` and `check_upload` only mint or read capability rows and SHALL NOT consume the write bucket; `import_from_url` SHALL continue to consume it at the tool call, as an ordinary write tool, and SHALL NOT be charged again.
+
+#### Scenario: A capability redemption consumes the minting principal's write bucket
+
+- **WHEN** a principal mints upload capabilities and redeems them through `PUT /transfer/upload` faster than `MCP_WRITE_RATE_LIMIT_PER_MINUTE`
+- **THEN** the excess redemptions SHALL be refused, and the write rate SHALL NOT be escapable by moving writes from the tools onto the transfer route
+
+#### Scenario: Minting is not double-charged
+
+- **WHEN** a principal calls `request_upload` and later redeems the capability
+- **THEN** the write bucket SHALL be consumed once, at redemption, and `import_from_url` SHALL continue to consume it once, at its tool call
+
 #### Scenario: A burst from one principal does not delay another principal's call
 
 - **WHEN** principal A exhausts its burst capacity and continues calling, while principal B issues a single ordinary tool call
@@ -150,11 +162,19 @@ The retry interval quoted by an over-quota refusal SHALL be derived from the sin
 
 A call refused by either token bucket SHALL be recorded in `usage_logs` with the `rate_limited` marker and a `rate_limit_scope` string naming which bucket fired; a call refused by the argument length cap SHALL be recorded with the `argument_too_long` marker. Both markers SHALL be classified **pre-body** and SHALL be enumerated by the shared pre-body-refusal predicate, so refused calls are counted as refusals rather than folded into latency percentiles.
 
-Because a rate refusal occurs at the caller's arrival rate — the very rate nothing else bounds — `rate_limited` rows SHALL be **coalesced** on the key `(principal, tool, marker, scope)`, the scope included so a write-bucket refusal is never attributed to the general one. At most one row SHALL be written per key per `MCP_REFUSAL_LOG_INTERVAL_SECONDS`; refusals arriving inside an open window SHALL increment an in-memory pending count and SHALL issue no statement of any kind, neither an INSERT nor an UPDATE. A pending count SHALL be flushed as `suppressed` on the next row written for that key, by the periodic indexer tick, or at process shutdown before the database engine is disposed — whichever comes first.
+Because a rate refusal occurs at the caller's arrival rate — the very rate nothing else bounds — `rate_limited` rows SHALL be **coalesced** on the key `(principal, tool, marker, scope)`, the scope included so a write-bucket refusal is never attributed to the general one. At most one row SHALL be written per key per `MCP_REFUSAL_LOG_INTERVAL_SECONDS`; refusals arriving inside an open window SHALL increment an in-memory pending count and SHALL issue no statement of any kind, neither an INSERT nor an UPDATE.
+
+**The arithmetic SHALL be exact, and the two flush paths differ.** `pending` SHALL count the refusals observed since the last row was written that no row yet represents, and every reader SHALL take a row to represent `1 + suppressed` refusals.
+
+- **Window opening.** The first refusal for a key SHALL write its own row with `suppressed = 0` and set `pending` to zero — that row represents exactly itself.
+- **Rollover, triggered by a new refusal.** A refusal arriving after the window has closed SHALL write a row with `suppressed = pending`, **the new refusal being that row's base**, and SHALL then reset the window and set `pending` to zero.
+- **Standalone flush, triggered by the periodic indexer tick or by shutdown.** A closed window with `pending` greater than zero SHALL write a row with `suppressed = pending − 1`, because there is no new refusal to serve as the row's base and the row itself must stand for one of the pending refusals. A closed window with `pending` of zero SHALL write **no** row, because the refusal that opened it already has one.
+
+The sum of `1 + suppressed` across every row written for a key SHALL therefore equal the number of refusals observed for that key, with no double counting at a rollover and no double counting at a flush.
 
 **The coalescer entry SHALL hold the complete, immutable attribution of the row it will write** — the owning user, the credential identifiers, the denormalised actor triple, the tool, the marker, the scope and the bounded params — captured when the window opened. A deferred flush SHALL therefore read no request-scoped context variable and SHALL NOT depend on the credential still existing; a flush whose foreign key no longer resolves SHALL land through the existing usage-log recovery that clears the credential identifiers and keeps the denormalised actor columns.
 
-`argument_too_long` SHALL NOT be coalesced: it is refused below the general bucket, so its rate is already bounded by that bucket, and a second mechanism would buy nothing. Coalescer cardinality SHALL be bounded by the same registry cap as the buckets, with keys beyond the cap folded into a single shared overflow entry per marker whose flushed row carries an overflow scope and no per-principal attribution. `rate_limit_scope` SHALL be a JSON string that no reader casts; `suppressed` SHALL be a JSON integer read with a guarded cast.
+`argument_too_long` SHALL NOT be coalesced: it is refused below the general bucket, so its rate is already bounded by that bucket, and a second mechanism would buy nothing. Coalescer cardinality SHALL be bounded by the same registry cap as the buckets, with keys beyond the cap folded into shared overflow entries keyed on `(tool, marker, scope)` — dropping only the principal from the key, so an overflowed row still names the tool, the marker and the control that fired and loses per-principal attribution alone. `rate_limit_scope` SHALL be a JSON string that no reader casts; `suppressed` SHALL be a JSON integer read with a guarded cast.
 
 #### Scenario: A refused call leaves a marked usage row
 
@@ -171,10 +191,25 @@ Because a rate refusal occurs at the caller's arrival rate — the very rate not
 - **WHEN** a pending count is flushed by the periodic tick or at shutdown, after every request-scoped context variable has been cleared and after the credential that produced the refusals has been deleted
 - **THEN** the row SHALL still be written with the attribution captured when the window opened, SHALL carry the denormalised actor columns, and SHALL NOT raise
 
+#### Scenario: A single refusal followed by a flush writes exactly one row
+
+- **WHEN** exactly one refusal occurs for a key and the window later closes with no further refusal, and the tick or shutdown flush runs
+- **THEN** the flush SHALL write **no** row, only the opening row SHALL exist, its `suppressed` SHALL be 0, and the sum of `1 + suppressed` SHALL be 1
+
+#### Scenario: A standalone flush does not double-count the opening refusal
+
+- **WHEN** five refusals occur for a key inside one window and the tick or shutdown flush then runs
+- **THEN** two rows SHALL exist — the opening row with `suppressed` 0 and the flush row with `suppressed` 3 — and the sum of `1 + suppressed` SHALL be exactly 5
+
+#### Scenario: A rollover counts the triggering refusal as the row's base
+
+- **WHEN** five refusals occur for a key inside one window, the window closes, and a sixth refusal then arrives
+- **THEN** the rollover row SHALL carry `suppressed` 4 with the sixth refusal as its base, the sum of `1 + suppressed` across both rows SHALL be exactly 6, and the pending count SHALL be reset to zero
+
 #### Scenario: Pending counts are flushed and the totals are exact
 
-- **WHEN** many refusals occur for one key across several intervals and the traffic then stops
-- **THEN** the pending count SHALL be flushed by the next row for that key, the periodic tick or shutdown, and the sum of `1 + suppressed` across the written rows SHALL equal the number of refusals
+- **WHEN** many refusals occur for one key across several windows, mixing rollovers with a final tick or shutdown flush
+- **THEN** every refusal SHALL be represented exactly once, and the sum of `1 + suppressed` across every written row SHALL equal the number of refusals
 
 #### Scenario: Scopes are not merged
 
@@ -228,7 +263,7 @@ When an embedding provider rejects a request because its input exceeds the provi
 
 ### Requirement: Limiter state is bounded in cardinality and reclaimed safely
 
-Every limiter registry SHALL be bounded in memory by construction or by an enforced cap, and SHALL declare its overflow behaviour. State keyed on something a caller can mint freely — the client address — SHALL use a **fixed-size table** of counters (`MCP_AUTH_FAILURE_TABLE_SIZE`) indexed by a **per-process randomly salted** hash, so memory is bounded with nothing to evict; collisions SHALL only make the control stricter, and the salt SHALL be per-process and random so that a caller cannot choose to collide with another address. Principal-keyed bucket and coalescer state SHALL be held in a registry capped at `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` entries with time-to-live eviction swept amortised on insert, performing a bounded amount of eviction work per admission and never requiring a background task. An entry SHALL be evicted only when it is **full and idle**: an entry whose bucket is depleted SHALL NOT be evicted, because a fresh entry starts full and evicting it would grant free capacity, and an entry holding an unflushed pending refusal count SHALL NOT be evicted, because that count would be lost. Past the cap, further principals SHALL share a single overflow bucket and a single overflow coalescer entry per marker.
+Every limiter registry SHALL be bounded in memory by construction or by an enforced cap, and SHALL declare its overflow behaviour. State keyed on something a caller can mint freely — the client address — SHALL use a **fixed-size table** of counters (`MCP_AUTH_FAILURE_TABLE_SIZE`) indexed by a **per-process randomly salted** hash, so memory is bounded with nothing to evict; collisions SHALL only make the control stricter, and the salt SHALL be per-process and random so that a caller cannot choose to collide with another address. Principal-keyed bucket and coalescer state SHALL be held in a registry capped at `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` entries with time-to-live eviction swept amortised on insert, performing a bounded amount of eviction work per admission and never requiring a background task. An entry SHALL be evicted only when it is **full and idle**: an entry whose bucket is depleted SHALL NOT be evicted, because a fresh entry starts full and evicting it would grant free capacity, and an entry holding an unflushed pending refusal count SHALL NOT be evicted, because that count would be lost. Past the cap, further principals SHALL share a single overflow bucket, and their coalescer entries SHALL fold onto shared entries keyed on `(tool, marker, scope)` so that only the principal is dropped from the key.
 
 The shared overflow entries SHALL be documented as an accepted limitation: while they are in use, one overflowing principal's traffic can cause an unrelated overflowing principal to be refused, and coalesced rows written from the overflow entry lose per-principal attribution while keeping their count. This is the bounded-memory trade-off, it applies only beyond the registry cap, and it is preferred to failing open (which would let a flood succeed) and to failing closed (which would turn a bookkeeping cap into an outage for a legitimate credential).
 
