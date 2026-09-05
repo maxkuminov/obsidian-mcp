@@ -9,6 +9,8 @@ The embedding fingerprint's `model` field SHALL be the model of the **active** p
 
 **The per-note chunk cap SHALL be part of the embedding fingerprint.** It determines what a note's stored vector set *is*: at one cap a long note holds N chunks and its tail is absent, and at another it holds a different set. Lowering it leaves rows beyond the new bound; raising it leaves rows that are silently incomplete against the new policy and that nothing will ever re-select, because their content hash still matches. Including it makes a cap change a declared reset rather than a permanent, invisible under-embedding.
 
+**Endpoint identity SHALL be excluded from the fingerprint** — neither the local provider's URL nor the hosted provider's base URL is part of it. Repointing at another host or proxy is an infrastructure change that usually serves the identical artifact, and including it would demand a full vault re-embed for it. The consequence SHALL be recorded as an accepted limitation rather than partially mitigated: **the fingerprint records the configuration, not the model artifact**, so replacing the weights behind a mutable model tag, or pointing at a host serving different weights under the same tag, mixes vector spaces undetected. No value available to the process distinguishes those cases, and a probe of the endpoint would have to trust the endpoint it is checking. The operator rule that stands in its place SHALL be documented beside the model keys: a change of model artifact requires the embedding reset, and nothing will detect it if that step is skipped.
+
 The keyword fingerprint's config list SHALL be compared **order-insensitively**, because a note's stored vector is the concatenation of one vector per config and a query is the disjunction of one query per config; reordering the list changes neither, so refusing on it would be a false alarm.
 
 Comparison SHALL be by byte equality of a canonical rendering that admits exactly one spelling per configuration, and the rendering SHALL be parseable so that a mismatch can be reported field by field rather than as two opaque strings. The rendering SHALL carry a format version.
@@ -94,16 +96,26 @@ The dimension check SHALL remain in place alongside the embedding fingerprint. I
 - **THEN** the fingerprint SHALL name the active provider's model
 - **AND** changing only the inactive backend's model setting SHALL NOT cause a mismatch
 
+#### Scenario: A changed endpoint alone does not refuse
+
+- **WHEN** only the provider's URL or base URL changes, with every other fingerprinted setting unchanged
+- **THEN** startup SHALL proceed, because endpoint identity is not fingerprinted
+- **AND** the limitation that a differently-weighted model behind the same name is undetected SHALL be recorded as accepted, with the operator rule documented beside the model keys
+
 ### Requirement: The keyword fingerprint is written only by an operation that rebuilt every retained row
 The keyword-vector rebuild SHALL record the keyword fingerprint only as part of an operation that rebuilt **every `notes_metadata` row retained in the database**, and SHALL write the fingerprint and every rebuilt row in one transaction, so that a fingerprint can never certify a row that is still on the previous configuration.
 
 The rebuild is per owner. A fingerprint written inside a per-owner rebuild claims something a per-owner rebuild cannot establish, and two ordinary shapes falsify it: a second owner's rebuild that raises after the first has already written the fingerprint, and an owner scope holding rows that the driver never visits at all — an inactive or unassigned user, or the ownerless scope in a database that also holds named users. In either case the stored fingerprint certifies rows still carrying the previous configuration, and a startup that refuses on that fingerprint would pass while keyword search is exactly as wrong as before.
 
-The operation SHALL therefore determine its scopes from the **rows that exist** — every distinct owner value present in `notes_metadata`, the null owner included — rather than from the set of active users, SHALL rebuild each of them, and SHALL write the fingerprint only after all of them have succeeded. A scope that raises, or whose vault root cannot be pinned, SHALL roll the entire operation back, SHALL leave the stored fingerprint unchanged, and SHALL name the scope that stopped it.
+The operation SHALL therefore determine its scopes from the **rows that exist** — every distinct owner value present in `notes_metadata`, the null owner included — rather than from the set of active users, SHALL rebuild each of them, and SHALL write the fingerprint only after every one of them reported a **completed** rebuild.
+
+**The per-scope rebuild SHALL return a typed outcome distinguishing "completed" from every kind of skip, and SHALL NOT report both as a row count.** It returns a count today, and `0` means both "this scope had nothing to do" and "this scope was skipped because its provenance is not settled" — the gate that already forbids the keyword rebuild from writing for a user whose index provenance is unresolved. A driver reading `0` as success would record a fingerprint certifying a scope the rebuild deliberately declined to touch, which is precisely the false claim this requirement exists to remove. Any retained scope whose outcome is not "completed" — provenance unsettled, root unpinnable, or any other named skip — SHALL abort the driver, SHALL prevent the fingerprint write, and SHALL be named with its reason.
+
+**A retained scope with a null owner SHALL abort the operation while multi-user mode is enabled.** The ownerless scope has no vault root to pin in that mode, and substituting the process-wide configured vault path would read one tenant's notes under an unowned scope — a tenancy violation performed to satisfy a bookkeeping row. Nor may such rows be quietly excluded from the coverage proof: they are retained rows that keyword search can return. The operation SHALL therefore name them and their count and write nothing, and the operator's prerequisite — deleting or reassigning them — SHALL be stated in the refusal and in the deploy checklist rather than first discovered as a refusing startup. In single-user mode the ownerless scope is the only scope and rebuilds normally.
 
 The cost — a multi-tenant rebuild becomes all-or-nothing rather than per tenant — SHALL be accepted and documented. The rebuild touches no embeddings and makes no provider calls, and the alternative is a fingerprint that does not mean what it says.
 
-Where a scope holds rows whose vault cannot be read, the operation cannot complete and the refusal at startup therefore persists. The remedy SHALL be stated in both the refusal and the operator documentation: assign or delete that scope's user, or restore the previous configuration, which clears the refusal with no rebuild at all.
+Where a scope cannot be rebuilt, the operation cannot complete and the refusal at startup therefore persists. Three remedies SHALL be stated in both the refusal and the operator documentation: settle the scope (assign or delete its user, or let an in-progress re-derive complete), delete or reassign ownerless rows, or restore the previous configuration, which clears the refusal immediately with no rebuild at all.
 
 #### Scenario: One failing scope writes no fingerprint
 
@@ -130,31 +142,85 @@ Where a scope holds rows whose vault cannot be read, the operation cannot comple
 - **THEN** the operation SHALL roll back, write no fingerprint, and name that scope
 - **AND** the message SHALL state that assigning or deleting that user, or restoring the previous configuration, is the way forward
 
-### Requirement: The embedding reset's ordering is specified and enforced by the pass
-The embedding reset workflow SHALL be documented as running while the service is **not embedding**, and the system SHALL enforce that rather than rely on the documentation: an embed pass SHALL read the stored embedding fingerprint at the start of each user's embedding stage and SHALL embed nothing for any user when it differs from the fingerprint of the configuration the process itself is running, logging the refusal and recording nothing.
+#### Scenario: A skipped scope is not read as a completed one
 
-The hole this closes is created by the reset's own design. The reset runs as a one-off container so that it reads the edited configuration, which also means it runs happily while the previous container is still serving. In that ordering the reset wipes the column and records the **new** fingerprint, and the old container's next pass embeds the backlog with the **old** model and stamps the notes as embedded — old-model vectors under a fingerprint claiming the new model, permanently, with every later startup silent because the stored value already matches.
+- **WHEN** a retained scope's rebuild is skipped because that user's index provenance is not settled
+- **THEN** the driver SHALL treat it as not completed, roll back, and write no fingerprint
+- **AND** it SHALL name the scope and the reason, rather than reading the skip's zero row count as success
 
-The documented ordering for any change to the embedding configuration SHALL be: edit the configuration, deploy — at which point the new image refuses at the fingerprint or the dimension guard and stays down, embedding nothing — run the reset while it is down, then start. The refusal is what creates the quiescent window, so the guard pays for its own runbook. This inverts the previous advice to reset before recreating the container, which was safe only while nothing depended on a stored claim.
+#### Scenario: Ownerless rows abort the rebuild under multi-user mode
 
-The pass-level re-check is the backstop for an operator who does not follow that ordering: a live process running the previous configuration stops embedding within one pass of any reset. It SHALL NOT interfere with an in-process reset, which writes the very value the process then compares against.
+- **WHEN** multi-user mode is enabled and `notes_metadata` retains rows with a null owner
+- **THEN** the operation SHALL abort, naming those rows and their count, and SHALL write no fingerprint
+- **AND** it SHALL NOT rebuild them against the process-wide configured vault path
+- **AND** it SHALL NOT exclude them from the coverage proof
 
-#### Scenario: A live process stops embedding after an external reset
+#### Scenario: Ownerless rows are the normal case in single-user mode
 
-- **WHEN** the stored embedding fingerprint is changed by a one-off reset while a process running the previous configuration is serving
-- **THEN** that process's next embed stage SHALL embed no note for any user
-- **AND** it SHALL log the refusal naming both fingerprints
+- **WHEN** multi-user mode is disabled and every retained row has a null owner
+- **THEN** that scope SHALL be rebuilt normally and the fingerprint SHALL be recorded
 
-#### Scenario: The in-process reset does not block the pass
+### Requirement: A generation lock makes the fingerprint an interlock, not merely a startup check
+The system SHALL hold a single, transaction-scoped, database-level advisory lock — one fixed key, the **index generation lock** — across every mutation whose correctness depends on the configuration the stored derived rows were built under, so that a configuration change and a derived-row write cannot interleave.
+
+**A check at the head of a pass is not sufficient, and SHALL NOT be relied on as the enforcement.** A pass that reads the fingerprint, then issues an embedding provider call taking seconds to minutes, then certifies, has separated the check from the act by a network round trip: a reset that commits in that window leaves the pass certifying previous-configuration vectors under the new fingerprint, permanently, with every later startup silent because the stored value already matches. The reset is designed to run as a one-off container reading the edited configuration, so it can and does run while a previous container is still serving.
+
+The lock's rules:
+
+- **Every maintenance operation that changes the generation SHALL take the lock before it mutates anything** — before the embedding wipe, before the keyword rebuild reads its first row, and before either records a fingerprint.
+- **Every transaction that writes a configuration-dependent derived row SHALL take the lock, re-read the corresponding fingerprint under it, and refuse on a mismatch.** For the embedding path the lock SHALL be acquired **after** the provider call and **before** the certification — the window the existing certification requirement already reserves, so that no lock of any kind is held across a network request. On a mismatch the transaction SHALL certify nothing, insert nothing and delete nothing, leaving the row for a later pass, which is the disposition a failed certification already has.
+- **Every writer of a note's keyword vector SHALL take the same lock and make the same re-read**, including the incremental index pass. A rebuild can otherwise complete and record its fingerprint while an old-configuration pass writes one note's keyword vector under the previous configuration — and because a keyword vector is rewritten only when a note's content hash changes, that row then stays on the previous configuration indefinitely behind a fingerprint claiming otherwise. A refusal there SHALL abort that pass with nothing committed, as a floor failure already does.
+- **The lock SHALL be transaction-scoped, never session-scoped**, so it is released by commit or rollback and a crashed pass cannot strand it in a pooled connection.
+- **The lock SHALL be acquired before any row or table lock** in every transaction that takes it, so that one ordering holds everywhere and the new lock cannot close a cycle with the row locks the pass, the panel and the index-discard branch already contend for.
+- **The key SHALL be a single declared constant**, defined in one place and not derived at runtime from a value that could differ between builds.
+
+**The exclusion branch is exempt**, and the exemption is by argument rather than omission: it issues no provider call, writes no vector, and stamps a row to record that an *excluded* note has been dealt with — a claim true under any configuration, because the correct vector set for an excluded note is the empty one. It has nothing a generation change can invalidate.
+
+A per-pass fingerprint re-read MAY additionally be performed as a cheap early exit, so that a process running the previous configuration abandons the stage instead of grinding through a backlog whose every certification the lock will refuse. It is an optimisation and SHALL NOT be described as the guarantee.
+
+The documented ordering for any change to the embedding configuration SHALL still be: edit the configuration, deploy — at which point the new image refuses at the fingerprint or the dimension guard and stays down, embedding nothing — run the reset while it is down, then start. This inverts the previous advice to reset before recreating the container, which was safe only while nothing depended on a stored claim. The lock is what makes an operator who does not follow that ordering lose time rather than correctness.
+
+#### Scenario: A reset committing during a provider call cannot be overwritten
+
+- **WHEN** an embed pass reads a matching fingerprint, issues its provider call, a one-off reset commits a wipe and a new fingerprint while that call is in flight, and the pass then reaches its certification
+- **THEN** the certification SHALL be refused under the generation lock
+- **AND** no embedding row SHALL be inserted or deleted for that note, and its `embedded_content_hash` SHALL be left unchanged
+- **AND** a later pass running the new configuration SHALL embed that note
+
+#### Scenario: An old-configuration keyword write cannot land after a rebuild
+
+- **WHEN** the keyword rebuild completes every retained scope and records its fingerprint, and a process running the previous config then attempts to write one note's keyword vector in its incremental pass
+- **THEN** that write SHALL be refused under the generation lock
+- **AND** that pass SHALL abort with nothing committed
+- **AND** the rebuilt row SHALL NOT be overwritten with a vector built under the previous configuration
+
+#### Scenario: The rebuild takes the lock before it reads
+
+- **WHEN** the keyword rebuild driver runs
+- **THEN** it SHALL hold the generation lock before it reads the first row it intends to rebuild
+- **AND** no keyword-vector write by any process SHALL commit between that read and the fingerprint record
+
+#### Scenario: No lock is held across a provider call
+
+- **WHEN** an embed pass embeds a note
+- **THEN** the generation lock SHALL be acquired after the provider call returns and before the certification
+- **AND** it SHALL NOT be held while the provider call is in flight
+
+#### Scenario: The exclusion branch does not take the lock
+
+- **WHEN** the pass certifies a note whose path matches an exclusion pattern and deletes its vectors
+- **THEN** it SHALL proceed without the generation lock, because it writes no vector and its claim is configuration-independent
+
+#### Scenario: The in-process reset does not deadlock against its own pass
 
 - **WHEN** the reset is performed by the running process itself
-- **THEN** the following embed stage SHALL proceed normally
+- **THEN** it SHALL acquire the generation lock and complete
+- **AND** the following embed stage SHALL proceed normally against the fingerprint that reset recorded
 
-#### Scenario: The documented ordering leaves nothing embedding during the reset
+#### Scenario: A crashed holder does not strand the lock
 
-- **WHEN** an operator changes the embedding model, deploys, and the new container refuses at the fingerprint guard
-- **THEN** no process SHALL be embedding while the reset runs
-- **AND** the restart after the reset SHALL start silently
+- **WHEN** a transaction holding the generation lock fails or its connection drops
+- **THEN** the lock SHALL be released without operator action, and the next taker SHALL acquire it
 
 ### Requirement: A fingerprint write that fails aborts the maintenance operation
 A failure to record a fingerprint SHALL roll back the maintenance operation that was recording it and SHALL surface to the operator who invoked it. It SHALL NOT be logged and swallowed.
@@ -187,6 +253,12 @@ Documenting the remedy is not made redundant by the startup guard. The guard tel
 - **WHEN** an operator reads the documentation section on changing embedding backends
 - **THEN** it SHALL state that changing the model within one provider requires the same reset as switching providers
 - **AND** it SHALL state that the deploy comes before the reset, and why
+
+#### Scenario: The artifact rule is documented where the model is set
+
+- **WHEN** an operator reads the configuration example or the reference documentation at either model key
+- **THEN** it SHALL state that replacing the artifact behind an unchanged model name — re-pulling a mutable tag, or pointing at a host serving different weights — also requires the embedding reset
+- **AND** it SHALL state that no startup check detects that case
 
 ## MODIFIED Requirements
 

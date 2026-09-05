@@ -84,7 +84,7 @@ Asserting the catalogue directly is required because `alembic check` does not co
 ## MODIFIED Requirements
 
 ### Requirement: The schema gate covers both migrations of this wave before deploy
-The schema gate SHALL exercise every migration whose behaviour it asserts on a throwaway database, in the same run, and SHALL assert `alembic check` clean at the resulting head. The head revision the gate asserts SHALL be **updated to `023`**, so a later migration added without updating the gate fails loudly rather than silently widening what "head" means.
+The schema gate SHALL exercise every migration whose behaviour it asserts on a throwaway database, in the same run, and SHALL assert `alembic check` clean at the resulting head. **The head revision the gate asserts SHALL be raised from `017` to `023`** — the literal `017` in the gate module is replaced by the literal `023` — so a later migration added without updating the gate fails loudly rather than silently widening what "head" means.
 
 Raising the asserted head is a required part of adding a migration, not a chore that accompanies it. The assertion is the only thing that makes "head" a value somebody chose; left at `017` it would pass on a database migrated to `023`, and the gate's guarantee — that the revisions it exercises are the revisions that will run — would quietly become a guarantee about a prefix of them.
 

@@ -81,9 +81,15 @@ An embed pass SHALL count into `notes_embedded` only the notes it actually certi
 
 **The exclusion-reconciliation sweep SHALL report into the same accumulator as the hash-mismatch backlog.** On a fully-indexed vault the backlog is empty and the sweep is the only stage making provider calls, so a sweep that swallowed its own failures would reproduce this defect in the one code path a backlog-only fix does not touch.
 
-**`attempted` SHALL be the number of backlog rows the pass selected plus the number of reconciliation rows the sweep actually attempted to embed** — the included-and-vectorless rows whose bytes verified and which reached the provider. It SHALL NOT count rows the sweep merely considered: the sweep scans every certification-current row in the scope and decides about almost all of them without a provider call, so counting those would render three failures out of three attempts as "3 of 16,700".
+**`attempted` SHALL be incremented exactly once per note for which an embedding provider call is issued, at that call site and nowhere else.** It SHALL NOT be initialised from the size of the backlog the pass selected, and it SHALL NOT count rows the pass or the sweep decided about without calling the provider.
 
-A note skipped by an exclusion pattern, a note skipped because its bytes no longer hash to its row, a note whose cleaned content produces no chunks, a certification that matched no row, and a note left behind by a pause or a budget stop SHALL NOT be counted as failures or as attempts: each is a deliberate decision rather than something that went wrong.
+That single rule determines every case, and the cases SHALL NOT be enumerated as independent exceptions that could drift apart from it:
+
+- a note whose cleaned content produces no chunks is certified without a provider call, so it counts into `notes_embedded` and **not** into `attempted`;
+- a sweep row whose stored vectors already agree with the current configuration is decided without a call, so it is not an attempt — the sweep scans every certification-current row in the scope, so counting those would render three failures out of three calls as "3 of 16,700";
+- a note skipped by an exclusion pattern, a note whose bytes no longer hash to its row, a note left behind by a pause or a budget stop, and a certification that matched no row all issue no call for that note, so none of them moves the denominator.
+
+None of those SHALL be counted as failures either: each is a deliberate decision rather than something that went wrong.
 
 The in-process "last run" heartbeat SHALL remain unaffected by these swallowed per-note failures. The heartbeat answers "is this process's loop alive" and the run record answers "did the work succeed"; a provider outage leaves the first green and the second failed, and collapsing them would change the heartbeat's meaning.
 
@@ -99,6 +105,12 @@ The in-process "last run" heartbeat SHALL remain unaffected by these swallowed p
 - **WHEN** a pass's backlog is empty, the reconciliation sweep attempts to re-embed notes whose exclusion pattern was removed, and every one of those provider calls fails
 - **THEN** the pass's record SHALL carry a non-null `error`
 - **AND** its attempted count SHALL be the number of notes the sweep actually sent to the provider, not the number of rows it scanned
+
+#### Scenario: A zero-chunk note is embedded but not attempted
+
+- **WHEN** a pass selects 400 backlog rows of which 50 clean to zero chunks and the remaining 350 all embed successfully
+- **THEN** `notes_embedded` SHALL be 400
+- **AND** the attempted count SHALL be 350, because 50 of the notes issued no provider call
 
 #### Scenario: One failing note among many does not suppress the rest
 
@@ -176,6 +188,19 @@ Persisting it is the requirement, not an implementation detail. Rotating a list 
 Operator-triggered reindex paths SHALL NOT consume or advance the cursor, so that a panel action cannot move the periodic pass's rotation.
 
 The cursor is scheduling instrumentation: a failure to write it SHALL be logged and swallowed and SHALL NOT fail the pass.
+
+**A stored cursor value the pass cannot use SHALL be logged once and ignored, and the cycle SHALL begin at the first user in the deterministic order.** The value lives as text in a key/value table, so it can be non-numeric, negative, or larger than any live id through drift, a hand-edited row, or a downgrade. This disposition is deliberately the opposite of the settings fingerprints': a cursor is scheduling state whose worst consequence is an order, while a fingerprint is a claim about what the stored rows *are* and whose worst consequence is a permanently wrong answer. Failing closed on a stray character in a bookkeeping row would stop every tenant's indexing to protect nothing. An out-of-range numeric value needs no separate rule — "the smallest id strictly greater than N" selects nothing and wraps to the first — but it SHALL reach the same outcome rather than raising.
+
+#### Scenario: A malformed cursor does not fail the pass
+
+- **WHEN** the stored rotation cursor is not a valid user id — non-numeric, negative, or otherwise unusable
+- **THEN** the pass SHALL log it once and begin the cycle at the first user in the deterministic order
+- **AND** the pass SHALL complete normally and SHALL NOT raise
+
+#### Scenario: An out-of-range cursor wraps
+
+- **WHEN** the stored cursor is a number larger than every active user id
+- **THEN** the cycle SHALL begin at the first user in the deterministic order
 
 #### Scenario: A truncated pass resumes where it stopped
 
