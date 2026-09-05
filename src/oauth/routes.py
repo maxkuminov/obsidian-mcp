@@ -811,23 +811,40 @@ async def _handle_refresh(form):
             # Ordering matters more than precision here: both sides take this
             # one lock before any row lock, so the acquisition order is total
             # and cannot deadlock.
-            token_query = select(OAuthToken).where(
+            grant_query = select(OAuthToken.grant_id).where(
                 OAuthToken.token_hash == token_hash,
                 OAuthToken.token_type == "refresh",
             )
-            found = (await session.execute(token_query)).scalars().all()
-            if not found:
+            grant_ids = (await session.execute(grant_query)).scalars().all()
+            if not grant_ids:
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
-            grant_id = found[0].grant_id
+            grant_id = grant_ids[0]
             await lock_grant(session, grant_id)
 
-            # Re-read under the lock. The second statement takes a fresh
-            # snapshot, so a rotation or revocation that committed while this
-            # transaction waited for the lock is visible — this row, not the
-            # pre-lock one, is authoritative for both decisions below.
-            locked = (
-                await session.execute(token_query.with_for_update())
-            ).scalars().all()
+            # Re-read under the lock. The statement takes a fresh snapshot, so
+            # a rotation or revocation that committed while this transaction
+            # waited for the lock is visible — this row, not anything read
+            # before the lock, is authoritative for both decisions below.
+            #
+            # `populate_existing` is not decoration. A `SELECT ... FOR UPDATE`
+            # whose row is already in the session's identity map returns the
+            # *loaded* object with its old attribute values; SQLAlchemy will
+            # not overwrite them without being told to. The reuse decision
+            # reads `revoked` off this object in Python, so a stale attribute
+            # would mean deciding on a pre-lock snapshot — precisely what the
+            # lock exists to prevent. (The family lookup above deliberately
+            # selects the `grant_id` column rather than the entity, so it does
+            # not populate the identity map in the first place.)
+            token_query = (
+                select(OAuthToken)
+                .where(
+                    OAuthToken.token_hash == token_hash,
+                    OAuthToken.token_type == "refresh",
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            locked = (await session.execute(token_query)).scalars().all()
             old_token = locked[0] if locked else None
 
             if old_token is None:

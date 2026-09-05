@@ -60,6 +60,15 @@ vanished from the page, so the operator saw a blank space that read as success.
     result set means "no row matched *some* predicate"; only `row.revoked`
     means "rotated away". Inferring the flag from emptiness is what let an
     unrelated predicate silently disable the whole detection.
+  - **Reading a flag in Python makes `populate_existing` load-bearing.** A
+    `SELECT … FOR UPDATE` whose row is already in the session's identity map
+    hands back the *loaded* object with its pre-lock attribute values —
+    SQLAlchemy does not overwrite them unless told to. The old shape was
+    immune by accident (the `revoked` predicate lived in the WHERE clause, so
+    the database decided); reading the attribute is not. The locked re-read
+    therefore sets `execution_options(populate_existing=True)`, and the
+    family lookup before the lock selects the `grant_id` **column**, not the
+    entity, so it never populates the identity map to begin with.
   - **The lock is what makes it correct, not an optimization.** The grant lock
     is held from before the authoritative re-read, so nothing can rotate a new
     pair into the family between that read and this UPDATE. "Every live token"
