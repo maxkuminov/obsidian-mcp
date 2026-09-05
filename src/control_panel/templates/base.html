@@ -901,7 +901,13 @@
                 </svg>
                 Settings
             </a>
+            {% endif %}
 
+            {# Users is the only entry under Admin, and in single-user mode the
+               list can only ever hold the sentinel operator — so the heading
+               goes with it. `multi_user_mode` is in every panel context via
+               `_panel_context` (#177). #}
+            {% if is_admin and multi_user_mode %}
             <div class="nav-section">Admin</div>
             <a href="/admin/users/" class="nav-item {% if active == 'users' %}active{% endif %}">
                 <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
