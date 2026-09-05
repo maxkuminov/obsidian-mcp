@@ -192,6 +192,24 @@ def attach(root: logging.Logger | None = None) -> logging.Handler:
     return handler
 
 
+def installed_handler() -> logging.Handler | None:
+    """The handler instance `attach()` installed, or `None` before it has run.
+
+    Exists for exactly one caller: `src/logging_setup.configure_logging()`,
+    which removes and closes every root handler **except** this one. The
+    reconfiguration has to take the root back from the MCP SDK, and
+    `basicConfig(force=True)` would close the ring buffer's handler along with
+    Rich's — silently ending the health page, in a way no test would notice
+    until an operator opened it. Naming the exception here makes "the buffer
+    survives" a property of the code rather than of an import order.
+
+    Does not attach anything: a process that has never called `attach()` gets
+    `None`, and the reconfiguration then simply has nothing to exempt.
+    """
+    with _lock:
+        return _handler
+
+
 def detach(root: logging.Logger | None = None) -> None:
     """Remove the handler from every logger `attach` put it on.
 

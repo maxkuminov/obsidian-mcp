@@ -1,0 +1,325 @@
+# Security event logging
+
+What this server can tell an operator about what happened to it. Read it before
+touching `src/logging_setup.py`, `src/services/security_events.py`, or any call
+site that logs a refusal.
+
+The short version: **one configuration applied after the SDK has had its way,
+one allow-list of fields, one allowance check per record, one redaction
+function.** Everything below is why each of those is one and not several.
+
+## The SDK wins the import race, so the fix has to run late
+
+`src/main.py` imports `src.mcp_server.server`, whose module-level
+`FastMCP(...)` calls the MCP SDK's own `configure_logging()`, which runs
+`logging.basicConfig(handlers=[RichHandler(...)], format="%(message)s")` on the
+**root** logger — at import time. `basicConfig` is a documented no-op once the
+root has a handler, so the `logging.basicConfig(...)` that used to sit below
+that import block never applied.
+
+The consequences were the whole of #190: every `extra=` this server passed was
+dropped on the floor, timestamps were local with no offset, long records wrapped
+at console width and tracebacks were boxed, so Alloy's per-line Docker ingestion
+put fragments into Loki. An operator watching a credential-stuffing burst saw N
+identical `WARNING auth_failure auth.py:143` lines with no reason, no token tag
+and no user id.
+
+`src/logging_setup.configure_logging()` therefore runs **after** the import
+block in `src/main.py`, and again from `src/mcp_stdio.py` — where the handler's
+stderr destination matters most, because stdout is the MCP protocol channel.
+
+### Why not `basicConfig(force=True)`
+
+`force=True` removes **and closes** every handler already on the root. That
+includes the one `src/services/error_log.py` owns: the 100-entry ERROR ring
+buffer behind the panel's health page. Today the ordering happens to save us —
+the SDK configures at import time, `error_log.attach()` runs in the lifespan —
+but "happens to" is not a guarantee, the lifespan is re-entered in tests, and
+the failure would be silent: the health page would simply stop filling.
+
+So the reconfiguration is an explicit loop that removes and closes every root
+handler **except** the instance `error_log.installed_handler()` returns. Same
+effect, with the exception written down. Either call order is safe,
+`error_log.attach()` stays idempotent, and "the health page keeps working" is a
+property of the code rather than of an import order. Both orders are tested.
+
+## The field policy: three disjoint name spaces
+
+`extra` is attacker-influenced — one of the ten `auth_failure` sites derives its
+value from a *presented bearer token* — so the formatter never serialises
+`record.__dict__` minus the standard keys. One careless `extra={"path": path}`
+away, that design puts one tenant's vault paths into a shared sink.
+
+* **`FORMATTER_OWNED`** = `ts`, `level`, `logger`, `msg`, `stack`. Produced by
+  the formatter from the `LogRecord`. A call site that passes one has it
+  dropped (and `security_events` raises under the test suite's strict flag), so
+  a caller cannot forge a timestamp, a level or a traceback.
+* **`EMITTER_CONTROL`** = `permit`, `event`, `subject`, `level`, `exc_info`.
+  Consumed by `acquire`/`emit`, never rendered as data. `level` is deliberately
+  in both sets: it is a control keyword the formatter renders from the record,
+  and is never a field.
+* **`ALLOWED_FIELDS`** — everything a call site may pass, each with a declared
+  type and, for strings, a maximum length. The list lives in
+  `src/logging_setup.py`.
+
+**A value that fails its type check is dropped, never converted.**
+`user_id="not-an-int"` yields a record with *no* `user_id`, not one whose
+`user_id` is a string: a reader who has to ask "is this integer field an integer
+today?" cannot query the field at all, and a silent type change is how a Loki
+dashboard starts lying. Truncating an over-long string is not a conversion and
+stays. Booleans are not integers here, whatever `isinstance` says.
+
+`key_prefix` is deliberately **absent** from the allow-list: the name invites
+logging a raw `omcp_` prefix of a presented token, and dropping the field is a
+safer failure than shipping it. Nothing free-text is allow-listed except
+`reason`, which is a closed vocabulary per event. There is no field a path, a
+query string or a request body could ride in — `route` is `request.url.path`
+only.
+
+`error_type` is the one dual name: the formatter derives it whenever `exc_info`
+is set and a call site may pass it otherwise; **when both are present the
+exception wins**, because the class of the exception being logged is a fact and
+the passed value is a claim.
+
+### Provenance is a property of the (event, field) pair
+
+A *successful* login logs a username that resolved; a failed one logs a username
+that did not. So the name carries the role:
+
+* an **unsuffixed** identifier (`user_id`, `username`, `client_id`, `key_id`,
+  `oauth_token_id`, `grant_id`, `scope`, `actor_kind`, `actor_ref`) may hold
+  only a value read from a database row;
+* a **`_submitted`** name (`username_submitted`, `client_id_submitted`,
+  `client_name_submitted`) is the only place a caller-supplied identifier
+  appears, is truncated, and is **never** a suppression subject;
+* a **`_session`** name (`user_id_session`, `username_session`) is the only
+  place a value copied from the session cookie without a database read appears
+  — which is exactly what a logout record can honestly say, because the account
+  may have been renamed or deleted since sign-in and a logout must not pay for a
+  lookup to notice;
+* `key_id` names an `api_keys` row and `oauth_token_id` an `oauth_tokens` row.
+  The OAuth branches of `auth_failure` used to put the latter in the former,
+  which made the two indistinguishable in a query.
+
+**`actor_user_id` is who acted; `user_id` is who the record is about.** On every
+surface where one account can act on another's resource — panel user
+administration, OAuth grant/client/token administration, key administration, the
+cross-user refusals — `actor_user_id` is present *even when the two are equal*,
+so a query for "everything this administrator did" is complete rather than
+silently missing self-actions. Where the subject *is* the actor (login, logout,
+consent, a token exchange, a tool call) only `user_id` is emitted.
+
+**Every field is optional.** `EVENT_FIELDS` declares the *permitted* set per
+event, not a required one: a record missing a field means the emitting path did
+not have it, and absence is meaningful.
+
+### The single redaction
+
+`security_events.redacted_token_tag(value)` — `"sha:" + sha256(value)[:8]` — is
+the only function that turns a presented credential into something loggable, and
+`token_tag` is the only field it may occupy. `src/mcp_server/auth.py`'s
+`_redacted_prefix` delegates to it so there is one definition and one test.
+
+When no credential was presented the field is **absent**, not `sha:` of the
+empty string: a constant that looks like a tag on every credential-less request
+is worse than nothing, because an operator would correlate on it.
+
+### Messages and tracebacks have their own rule
+
+They are not structured fields:
+
+* **`msg`** is a developer-authored constant or format string. It MAY
+  interpolate operational context, including a vault-relative path, exactly as
+  the existing `move_note` warnings do. It MUST NOT interpolate credential
+  material — a password, secret, code, token, verifier, cookie or CSRF token.
+  It is bounded (`MAX_MESSAGE_CHARS`).
+* **`stack`** appears only with `exc_info`. An exception message is not under
+  this change's control and is accepted as operational text under the same rule.
+* **Bounding is head-and-tail, not truncation.** "The whole traceback, bounded"
+  is a contradiction. `stack` keeps the first 4 KiB and the last 3 KiB with a
+  marker naming the dropped byte count between them, and the exception's **type
+  line and the traceback's final line are guaranteed present**: if elision would
+  have removed them they are appended after the tail. Each appended line is
+  itself bounded (`STACK_GUARANTEED_LINE_BYTES`, 1 KiB) — otherwise a
+  megabyte-long exception message would unbound the record through the very
+  guarantee that exists to keep it readable. A traceback under the budget is
+  emitted whole.
+
+Compliance is verified against real request paths with high-entropy canaries,
+not by inspection: **submitted** canaries planted in every caller-controlled
+credential position, and **captured** secrets the server itself generated (a
+generated secret cannot be planted). See `tests/test_issue_191_secret_canaries.py`.
+
+### The allow-list cannot drift from the call sites
+
+An AST sweep (`tests/test_issue_190_field_allowlist.py`) parses every module
+under `src/` and collects field names from `logger.<level>(..., extra={...})`
+and from `security_events.emit(...)` keywords — excluding the emitter's control
+keywords, rejecting formatter-owned names, and failing on any name outside
+`ALLOWED_FIELDS` or outside that event's `EVENT_FIELDS` where the event name is
+a literal. **A dynamic field set fails too**: `extra=some_dict`,
+`extra={**base}` and `emit(**fields)` are rejected outright, because a field set
+the sweep cannot read is a field set the allow-list cannot police. A regex over
+`extra={...}` would have missed the emitter's keywords entirely.
+
+`src/services/security_events.py` is the one exempt module: it is the emitter,
+its single `logger.log(..., extra=fields)` passes a dict it has already policed
+at runtime, and the rest of that test file is the check on it.
+
+## The event catalogue
+
+`EVENT_FIELDS` in `src/services/security_events.py` mirrors this table, one
+entry per row, and a test asserts neither side has a row the other lacks. Four
+fields are on every record and are not repeated below: `ts`, `level`, `logger`,
+`msg` (the event name). `stack` rides on `exc_info`, not as a field.
+
+`client_ip` is listed per event rather than assumed. The MCP tool events omit
+it: `_tracked` and `_require_write` run below `ProxyHeadersMiddleware` and
+nothing binds the request address into a ContextVar (residual R8).
+
+| Event | Level | Fields | Emitted where |
+| --- | --- | --- | --- |
+| `panel_login_succeeded` | INFO | `client_ip`, `route`, `user_id`, `username` | `src/auth/routes.py`, after the `last_login_at` commit |
+| `panel_login_failed` | WARNING | `client_ip`, `reason`, `route`, `user_id`, `username_submitted` | `src/auth/routes.py`; `reason` is `unknown_user` / `inactive_user` / `bad_password`, and the 401 is byte-identical across all three |
+| `panel_logout` | INFO | `client_ip`, `user_id_session`, `username_session` | `src/auth/routes.py`, read before `request.session.clear()` |
+| `panel_bootstrap_admin_created` | INFO | `client_ip`, `user_id`, `username` | `src/auth/routes.py`, after the commit |
+| `panel_bootstrap_refused` | WARNING | `client_ip`, `reason` | `src/auth/routes.py`, each refusal branch |
+| `panel_password_reset` | INFO | `actor_user_id`, `client_ip`, `route`, `user_id`, `username` | `src/control_panel/users.py`, after the commit |
+| `password_hash_malformed` | WARNING | `user_id` | `src/auth/passwords.py` — a caller can drive it through the login form |
+| `oauth_token_issued` | INFO | `client_id`, `client_ip`, `grant_id`, `reason`, `scope`, `user_id` | `src/oauth/routes.py` `/token`, after the mint's commit |
+| `oauth_token_refreshed` | INFO | `client_id`, `client_ip`, `grant_id`, `scope`, `user_id` | `src/oauth/routes.py` `/token`, after the rotation's commit |
+| `oauth_token_refused` | WARNING | `client_id`, `client_id_submitted`, `client_ip`, `grant_id`, `reason`, `user_id` | every `/token` refusal; `reason` is `<rfc_code>.<sub_reason>` |
+| `oauth_token_rotation_failed` | ERROR | `client_id`, `client_ip`, `error_type`, `grant_id` | the `except Exception` whose traceback is discarded behind a 500 |
+| `oauth_consent_granted` | INFO | `client_id`, `client_ip`, `scope`, `user_id` | `/authorize`, after the code row commits |
+| `oauth_consent_denied` | INFO | `client_id`, `client_id_submitted`, `client_ip`, `user_id` | `/authorize` deny |
+| `oauth_authorize_refused` | WARNING | `client_id`, `client_id_submitted`, `client_ip`, `reason`, `user_id` | every `/authorize` refusal |
+| `oauth_cross_user_client_refused` | WARNING | `actor_user_id`, `client_id`, `client_ip`, `route`, `user_id` | `_cross_user_client_error`, the one helper both call sites return |
+| `oauth_client_registered` | INFO | `client_id`, `client_ip`, `client_name_submitted`, `count`, `scope` | DCR, after the commit. **Never** the client secret |
+| `oauth_client_registration_refused` | WARNING | `client_ip`, `reason` | DCR refusals |
+| `oauth_grant_revoked` | INFO | `actor_user_id`, `client_id`, `client_ip`, `count`, `grant_id`, `route`, `user_id` | each HTTP caller, after **its own** commit — never inside `revoke_grant_family` |
+| `oauth_revoke_noop` | INFO | `client_id_submitted`, `client_ip`, `reason` | RFC 7009 §2.2 — the response says nothing, so the log must |
+| `oauth_revoke_refused` | WARNING | `client_id`, `client_ip`, `reason` | `/revoke` client-auth failure |
+| `rate_limit_exceeded` | WARNING | `client_ip`, `limit_count`, `method`, `route`, `window_seconds` | `src/main.py`, a local wrapper around slowapi's handler — the one hook every 429 passes through |
+| `auth_failure` | WARNING | `client_ip`, `key_id`, `oauth_token_id`, `reason`, `route`, `token_tag` | `src/mcp_server/auth.py`, all ten sites |
+| `tool_write_refused` | WARNING | `actor_kind`, `actor_ref`, `key_id`, `oauth_token_id`, `tool`, `user_id` | `_require_write`, the single definition all nine call sites reach |
+| `tool_exception` | ERROR | `actor_kind`, `actor_ref`, `duration_ms`, `error_type`, `tool`, `user_id` | `_tracked`'s `except Exception` around **only** `await fn(...)` |
+| `tool_usage_log_failed` | WARNING | `error_type`, `tool` | the same handler, when the best-effort `usage_logs` write reports failure |
+| `tool_refused_no_vault` | WARNING | `tool`, `user_id` | the vault admission gate |
+| `tool_refused_over_quota` | WARNING | `day`, `key_id`, `limit`, `tool`, `user_id` | the quota admission gate |
+| `usage_log_credential_gone` | WARNING | `cleared_user_id`, `tool` | the FK-recovery retry in `_log_usage` |
+| `usage_log_failed` | WARNING | `error_type`, `reason`, `tool` | `_log_usage` giving up; `reason` is `initial` or `after_clearing_fks` |
+| `tool_result_measure_failed` | WARNING | `error_type`, `tool` | result telemetry |
+| `move_rewrite_failed` | WARNING | `error_type`, `tool` | `move_note`'s link rewrite; the path stays in `msg` |
+| `quota_admission_failed` | ERROR | `day`, `error_type`, `key_id` | `src/services/quotas.py` — re-raised unchanged; a quota that has stopped deciding is an incident |
+| `quota_counter_prune_failed` | WARNING | `error_type` | the same module's housekeeping prune |
+| `publication_refused_confirmation_unavailable` | WARNING | `error_type`, `user_id` | `src/services/vault.py` — the assignment is *unknown*, which is not "changed" |
+| `publication_refused_vault_assignment_changed` | WARNING | `reason`, `user_id` | `src/services/vault.py` |
+| `transfer_refused` | WARNING | `client_ip`, `error_type`, `key_id`, `method`, `oauth_token_id`, `reason`, `route`, `token_tag`, `user_id` | every `_not_found()` in `src/transfer/routes.py`; the 404 stays byte-identical |
+| `transfer_refused_mount_boundary` | ERROR | `error_type`, `method`, `route` | `src/transfer/routes.py` |
+| `transfer_refused_unsupported_fs` | ERROR | `error_type`, `method`, `route` | `src/transfer/routes.py` |
+| `transfer_root_unusable` | ERROR | `error_type`, `method`, `route`, `user_id` | `src/transfer/routes.py` |
+| `transfer_post_publish_failure` | ERROR | `error_type`, `route`, `user_id` | published but not recorded |
+| `transfer_prepublish_failure` | ERROR | `error_type`, `route`, `user_id` | failed before publication |
+| `panel_forbidden` | WARNING | `actor_user_id`, `actor_username`, `method`, `reason`, `route`, `user_id` | the panel's 403 guards, the REST duplicate ownership check, and the actor re-checks |
+| `csrf_refused` | WARNING | `client_ip`, `method`, `route`, `user_id` | `src/csrf.py` `verify_csrf` |
+| `panel_ondemand_index_failed` | ERROR | `error_type`, `user_id` | the panel's on-demand index action |
+| `panel_ondemand_embed_failed` | ERROR | `error_type`, `user_id` | the panel's on-demand embed action |
+| `panel_health_strip_failed` | ERROR | `error_type` | the dashboard health strip's read and rollback failures |
+| `events_suppressed` | *the suppressed event's own level* | `count`, `reason`, `window_seconds` | the suppressor itself; `reason` names the suppressed event |
+
+### What stays on the bare logger, and why
+
+A site emits through `security_events` when **a caller can trigger it
+repeatedly, on demand, through a request** — otherwise a direct `logger.*` call
+is an unbounded flood channel beside the bounded one. Everything driven by the
+indexer, the embed pass, `vault_fs` housekeeping and startup stays on the bare
+logger: those are background or once-per-pass, they are not refusals, and
+suppressing them would hide the one class of error the health page exists to
+show.
+
+## The suppressor: one allowance check, on a subject a caller cannot mint
+
+```
+permit = security_events.acquire(event, subject)   # charges the allowance ONCE
+security_events.emit(permit, **fields)             # consumes it; no second check
+security_events.emit(event, subject=…, **fields)   # acquire + consume, the usual form
+```
+
+There is no `should_emit`. An earlier design had one, and a caller that
+consulted it and then emitted was charged **twice**, so the flood bound was
+either doubled or violated depending on which check won. The permit form exists
+for the one call site that must do work to build its fields — the transfer
+refusal diagnosis, which runs a read-only query *after* the refusal decision and
+only when the record will actually be emitted.
+
+**A caller that acquires a permit and does not spend it has spent its slot
+anyway.** That is the fail-safe direction: it can only make the log quieter,
+never noisier.
+
+* **The subject** is the resolved `user_id` when the request already has one,
+  otherwise the **trusted** client address (`request.client.host`, after
+  `ProxyHeadersMiddleware`, never a header), otherwise `-`. It must be
+  computable *before* any work the permit gates, which is why `transfer_refused`
+  always keys on the address even where a row later resolves: the owner is
+  knowable only after the diagnosis the permit is supposed to gate.
+* **Caller-supplied values are never subjects** — not `token_tag`, not
+  `username_submitted`, not `client_id_submitted`. Rotating credentials must not
+  mint fresh allowances, which is exactly what a per-token subject would do.
+* **Two caps.** `MAX_EVENTS_PER_WINDOW` = 10 per `(event, subject)` per 60 s,
+  and `MAX_EVENTS_PER_SUBJECT_PER_WINDOW` = 50 per subject across all events, so
+  a source cycling through twenty refusal events cannot multiply its allowance
+  by twenty.
+* **Every level is accounted, INFO included.** Bounded volume beats audit
+  completeness: a summary carrying an exact count still answers "how many logins
+  succeeded", while a quiet log answers nothing. Unauthenticated INFO paths — a
+  replayed consent, a logout, a CSRF-failing form — are otherwise unbounded on
+  routes no rate limit covers.
+* **No count is lost.** A window's summary is emitted lazily when the next
+  `acquire` for that key arrives after the window closed; **an entry holding a
+  nonzero withheld count emits its summary before it is evicted**; and anything
+  outstanding is flushed at shutdown (the lifespan for the app, `atexit` for the
+  stdio entry point). No timer task.
+* **A summary carries the suppressed event's own level**, so an operator
+  filtering at WARNING still sees that warnings were withheld. It is never
+  itself suppressed and never counted.
+* **Bounded and safe.** At most 512 keys per map, evicted oldest-window-first
+  under the rule above; a `threading.Lock` guards both; `acquire` catches
+  everything and **fails open** — an internal error returns a permit, so the
+  record is emitted — and never raises into a request path.
+
+### What the suppressor is not
+
+* It bounds **log records**, never a `usage_logs` row. A refused or failed tool
+  call always writes its row.
+* It does not bound how many events a caller can **cause**. Nothing here does;
+  admission control is the sibling change `mcp-rate-limits` (#188/#194).
+* It is **per process**, like the error ring buffer. Single-worker today
+  (`--workers 1`); under multiple workers each keeps its own counters and the
+  effective cap multiplies by the worker count.
+
+## Why WARNING events do not reach the health page
+
+`error_log.CAPTURE_LEVEL` stays at ERROR. The page is "recent errors", not
+"recent refusals": a credential-stuffing burst would evict every real error from
+a 100-entry buffer, which is the opposite of what the page is for. Auth failures
+and every other refusal stay at WARNING and reach Loki only. `tool_exception`
+and the quota/transfer/panel ERROR events do reach the buffer, which is the
+point of logging them at that level.
+
+## Residuals
+
+* **Nothing bounds event admission** — `mcp-rate-limits` (#188/#194). Log
+  retention, shipping and Loki cardinality are operator concerns.
+* **Per-process suppression** under multiple workers (above).
+* **uvicorn's own loggers keep their format.** `uvicorn`/`uvicorn.access`/
+  `uvicorn.error` carry their own handlers with `propagate: false` — which is
+  exactly why `error_log` attaches to `uvicorn.error` by name — so the container
+  log is mixed JSON and text. Clearing their handlers would give a uniform
+  stream and would change the shape of the highest-volume lines in an existing
+  Loki pipeline for no security benefit.
+* **Shared source addresses share an allowance.** Two tenants behind one NAT
+  share one bucket, so a noisy neighbour can suppress a co-located tenant's
+  *records*. It cannot affect their responses, their `usage_logs` rows or their
+  ability to redeem, and the summary states the withheld count. The alternative
+  — per-token subjects — is the unbounded-allowance hole.
+* **MCP tool events carry no `client_ip`** (R8, above).

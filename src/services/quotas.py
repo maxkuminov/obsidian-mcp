@@ -82,8 +82,10 @@ from dataclasses import dataclass
 
 from sqlalchemy import text
 
+from src.auth.session import current_user_id
 from src.database import async_session
 from src.models.db import DAILY_REQUEST_LIMIT_MAX, DAILY_REQUEST_LIMIT_MIN
+from src.services import security_events
 from src.services.usage_stats import OVER_QUOTA_PARAM
 
 logger = logging.getLogger(__name__)
@@ -258,13 +260,13 @@ async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> Adm
             # is exactly what it was; logged because a quota that has stopped
             # deciding is an incident, and this is the only place that knows
             # which key and which day it stopped deciding for.
-            logger.error(
+            security_events.emit(
                 "quota_admission_failed",
-                extra={
-                    "key_id": key_id,
-                    "day": day.isoformat(),
-                    "error_type": type(exc).__name__,
-                },
+                level=logging.ERROR,
+                subject=security_events.subject_for(user_id=current_user_id.get()),
+                key_id=key_id,
+                day=day.isoformat(),
+                error_type=type(exc).__name__,
             )
             raise
 
@@ -276,7 +278,11 @@ async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> Adm
                 await session.commit()
             except Exception as exc:  # pragma: no cover - housekeeping only
                 await session.rollback()
-                logger.warning("quota_counter_prune_failed", extra={"error": str(exc)})
+                security_events.emit(
+                    "quota_counter_prune_failed",
+                    subject=security_events.subject_for(user_id=current_user_id.get()),
+                    error_type=type(exc).__name__,
+                )
         return Admission(day=day, count=count)
 
 

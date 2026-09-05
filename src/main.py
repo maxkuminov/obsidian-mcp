@@ -24,14 +24,20 @@ from src.limiter import limiter
 from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
 from src.oauth.routes import router as oauth_router
-from src.services import error_log, vault
+from src.services import error_log, security_events, vault
 from src.services.indexer import run_indexer_loop
 from src.services import vault_fs
+from src.logging_setup import configure_logging
 from src.transfer.routes import router as transfer_router
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("httpcore").setLevel(logging.WARNING)
+# **After** the import block, deliberately. `src.mcp_server.server` constructs
+# `FastMCP` at import time, and the SDK's own `configure_logging()` installs a
+# `RichHandler` on the root logger — after which `logging.basicConfig(...)`,
+# which is what used to stand here, is a documented no-op. Every structured
+# field this server passed was silently dropped for as long as that was true
+# (#190). This call runs late and removes the SDK's handler explicitly; see
+# `src/logging_setup.py` for why it is not `basicConfig(force=True)`.
+configure_logging()
 
 # Initialize the MCP app (creates session manager lazily)
 _mcp_starlette = mcp.streamable_http_app()
@@ -260,43 +266,81 @@ async def lifespan(app: FastAPI):
     # ERROR, so it sees every module's errors without any of them opting in;
     # process-lifetime only, no schema — see `src/services/error_log.py`.
     error_log.attach()
-    if settings.mcp_sandbox_mode:
-        logging.getLogger(__name__).warning(
-            "MCP_SANDBOX_MODE active — skipping DB check and indexer. "
-            "Tools are registered but cannot run. Registry-eval only."
-        )
-        async with mcp.session_manager.run():
-            yield
-        return
-    _check_openat2_support()
-    _check_mount_identity_support()
-    await _check_embedding_dim()
-    await _check_pgvector_version()
-    await _validate_fts_configs()
-    # Fire-and-forget so a ~15s cold load doesn't block the app from serving.
-    # The lifespan frame stays suspended at `yield`, keeping this referenced.
-    warmup_task = asyncio.create_task(_warm_embedding_model())
-    indexer_task = asyncio.create_task(run_indexer_loop())
-    indexer_task.add_done_callback(_on_indexer_done)
+    # Wrapped so the suppressor's outstanding counts are flushed on **every**
+    # exit path, the sandbox-mode early return included. A window still holding
+    # a withheld count when the process stops takes the count with it, and the
+    # log then under-reports for good.
     try:
-        async with mcp.session_manager.run():
-            yield
-    finally:
-        warmup_task.cancel()
-        indexer_task.cancel()
+        if settings.mcp_sandbox_mode:
+            logging.getLogger(__name__).warning(
+                "MCP_SANDBOX_MODE active — skipping DB check and indexer. "
+                "Tools are registered but cannot run. Registry-eval only."
+            )
+            async with mcp.session_manager.run():
+                yield
+            return
+        _check_openat2_support()
+        _check_mount_identity_support()
+        await _check_embedding_dim()
+        await _check_pgvector_version()
+        await _validate_fts_configs()
+        # Fire-and-forget so a ~15s cold load doesn't block the app from serving.
+        # The lifespan frame stays suspended at `yield`, keeping this referenced.
+        warmup_task = asyncio.create_task(_warm_embedding_model())
+        indexer_task = asyncio.create_task(run_indexer_loop())
+        indexer_task.add_done_callback(_on_indexer_done)
         try:
-            await asyncio.wait_for(asyncio.shield(indexer_task), timeout=10.0)
-        except (asyncio.CancelledError, asyncio.TimeoutError):
-            pass
-        # Explicitly close pooled database connections during application
-        # shutdown (important for reloads and test/application lifecycles).
-        await engine.dispose()
+            async with mcp.session_manager.run():
+                yield
+        finally:
+            warmup_task.cancel()
+            indexer_task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(indexer_task), timeout=10.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            # Explicitly close pooled database connections during application
+            # shutdown (important for reloads and test/application lifecycles).
+            await engine.dispose()
+    finally:
+        security_events.flush_suppression_summaries()
 
 
 app = FastAPI(title="Obsidian MCP", lifespan=lifespan)
 
+def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """Record the 429, then answer exactly as slowapi would have.
+
+    This is the one hook every rate-limited route in the app passes through, so
+    it is the only place a 429 has to be recorded — a per-route record would be
+    N chances to forget one and would miss the next route somebody adds. The
+    response is slowapi's own, returned unchanged: the record is a side effect
+    and may not alter what the caller sees, and if the delegate's signature ever
+    changes the app fails at startup rather than at the first 429.
+    """
+    limit_count = None
+    window_seconds = None
+    try:
+        item = getattr(getattr(exc, "limit", None), "limit", None)
+        limit_count = getattr(item, "amount", None)
+        window_seconds = item.get_expiry() if item is not None else None
+    except Exception:  # noqa: BLE001 - never let telemetry break a 429
+        pass
+    address = security_events.client_ip(request)
+    security_events.emit(
+        "rate_limit_exceeded",
+        subject=security_events.subject_for(ip=address),
+        route=request.url.path,
+        method=request.method,
+        client_ip=address,
+        limit_count=limit_count,
+        window_seconds=window_seconds,
+    )
+    return _rate_limit_exceeded_handler(request, exc)
+
+
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
 # Honor X-Forwarded-Proto/For from upstream reverse proxy so that scheme-aware
 # redirects (e.g. trailing-slash on /mcp) keep the https:// scheme.

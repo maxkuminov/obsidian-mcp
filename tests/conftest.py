@@ -53,6 +53,8 @@ SETTINGS_ENV_KEYS = (
     "SESSION_MAX_AGE",
     "SESSION_COOKIE_NAME",
     "MCP_SANDBOX_MODE",
+    "LOG_LEVEL",
+    "LOG_FORMAT",
 )
 
 # The values the singleton is built from. Everything else in SETTINGS_ENV_KEYS

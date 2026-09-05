@@ -19,6 +19,7 @@ from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthClient, OAuthToken, User
 from src.oauth.scope import has_vault_scope, token_has_write
+from src.services import security_events
 from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
@@ -53,8 +54,49 @@ def _redacted_prefix(token: str) -> str:
     without writing raw credential material to logs, unlike the previous
     `token[:8]` which leaked the first 8 chars of an attacker-supplied
     (or, worst case, valid) token.
+
+    Delegates to `security_events.redacted_token_tag`, which is now the single
+    definition: a second copy of "how a credential may appear in a log" is a
+    second place for it to be got wrong. Kept as a name here because it is the
+    one this module has always exported.
     """
-    return "sha:" + hashlib.sha256(token.encode()).hexdigest()[:8]
+    return security_events.redacted_token_tag(token) or ""
+
+
+def _emit_auth_failure(
+    request: Request,
+    reason: str,
+    *,
+    token: str | None = None,
+    key_id: int | None = None,
+    oauth_token_id: int | None = None,
+    user_id: int | None = None,
+) -> None:
+    """One `auth_failure` record, through the suppressor.
+
+    These are the highest-volume caller-triggerable refusals in the server — a
+    credential-stuffing burst is N of them a second — so they go through
+    `security_events.emit` rather than straight to a logger: a direct call would
+    be an unbounded flood channel beside the bounded one.
+
+    `token_tag` is the only form a presented credential may take, and it is
+    absent when nothing was presented. `key_id` names an `api_keys` row and
+    `oauth_token_id` an `oauth_tokens` row — the OAuth branches used to put the
+    latter in the former, which made the two indistinguishable in a query.
+    The suppression subject is the resolved user where there is one and the
+    trusted client address otherwise; never the token tag, or every rotated
+    bogus token would mint itself a fresh allowance.
+    """
+    security_events.emit(
+        "auth_failure",
+        subject=security_events.subject_for(user_id=user_id, request=request),
+        reason=reason,
+        token_tag=security_events.redacted_token_tag(token),
+        key_id=key_id,
+        oauth_token_id=oauth_token_id,
+        client_ip=security_events.client_ip(request),
+        route=request.url.path,
+    )
 
 
 def _www_authenticate(error: str | None = None) -> str:
@@ -140,7 +182,7 @@ class APIKeyMiddleware:
                     api_key = result.scalar_one_or_none()
 
                     if api_key is None:
-                        logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": _redacted_prefix(token)})
+                        _emit_auth_failure(request, "invalid_key", token=token)
                         response = JSONResponse(
                             {"error": "Invalid or revoked key"},
                             status_code=401,
@@ -162,12 +204,8 @@ class APIKeyMiddleware:
                         # ownerless readwrite key could edit the whole vault.
                         # Refuse it here, with the same body as any other
                         # rejected key.
-                        logger.warning(
-                            "auth_failure",
-                            extra={
-                                "reason": "ownerless_credential",
-                                "key_id": api_key.id,
-                            },
+                        _emit_auth_failure(
+                            request, "ownerless_credential", key_id=api_key.id
                         )
                         response = JSONResponse(
                             {"error": "Invalid or revoked key"},
@@ -182,9 +220,11 @@ class APIKeyMiddleware:
                             select(User.is_active).where(User.id == api_key.user_id)
                         )
                         if result.scalar_one_or_none() is not True:
-                            logger.warning(
-                                "auth_failure",
-                                extra={"reason": "inactive_user", "key_id": api_key.id},
+                            _emit_auth_failure(
+                                request,
+                                "inactive_user",
+                                key_id=api_key.id,
+                                user_id=api_key.user_id,
                             )
                             response = JSONResponse(
                                 {"error": "Invalid or revoked key"},
@@ -196,7 +236,12 @@ class APIKeyMiddleware:
 
                     # Check expiry
                     if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
-                        logger.warning("auth_failure", extra={"reason": "key_expired", "key_id": api_key.id})
+                        _emit_auth_failure(
+                            request,
+                            "key_expired",
+                            key_id=api_key.id,
+                            user_id=api_key.user_id,
+                        )
                         response = JSONResponse(
                             {"error": "Key expired"},
                             status_code=401,
@@ -284,7 +329,7 @@ class APIKeyMiddleware:
                     )
 
                     if oauth_token is None:
-                        logger.warning("auth_failure", extra={"reason": "invalid_key", "key_prefix": _redacted_prefix(token)})
+                        _emit_auth_failure(request, "invalid_key", token=token)
                         response = JSONResponse(
                             {"error": "Invalid or revoked token"},
                             status_code=401,
@@ -297,12 +342,10 @@ class APIKeyMiddleware:
                     if oauth_token.user_id is None and settings.multi_user_mode:
                         # Same as the API-key branch above: an ownerless token
                         # in multi-user mode would resolve the global vault.
-                        logger.warning(
-                            "auth_failure",
-                            extra={
-                                "reason": "ownerless_credential",
-                                "key_id": oauth_token.id,
-                            },
+                        _emit_auth_failure(
+                            request,
+                            "ownerless_credential",
+                            oauth_token_id=oauth_token.id,
                         )
                         response = JSONResponse(
                             {"error": "Invalid or revoked token"},
@@ -317,9 +360,11 @@ class APIKeyMiddleware:
                             select(User.is_active).where(User.id == oauth_token.user_id)
                         )
                         if result.scalar_one_or_none() is not True:
-                            logger.warning(
-                                "auth_failure",
-                                extra={"reason": "inactive_user", "key_id": oauth_token.id},
+                            _emit_auth_failure(
+                                request,
+                                "inactive_user",
+                                oauth_token_id=oauth_token.id,
+                                user_id=oauth_token.user_id,
                             )
                             response = JSONResponse(
                                 {"error": "Invalid or revoked token"},
@@ -337,9 +382,11 @@ class APIKeyMiddleware:
                     # not a conflict — it has simply never been claimed.
                     if oauth_token.user_id is not None:
                         if client_owner is not None and client_owner != oauth_token.user_id:
-                            logger.warning(
-                                "auth_failure",
-                                extra={"reason": "cross_user_grant", "key_id": oauth_token.id},
+                            _emit_auth_failure(
+                                request,
+                                "cross_user_grant",
+                                oauth_token_id=oauth_token.id,
+                                user_id=oauth_token.user_id,
                             )
                             response = JSONResponse(
                                 {"error": "Invalid or revoked token"},
@@ -350,7 +397,12 @@ class APIKeyMiddleware:
                             return
 
                     if oauth_token.expires_at < datetime.now(timezone.utc):
-                        logger.warning("auth_failure", extra={"reason": "key_expired", "key_id": oauth_token.id})
+                        _emit_auth_failure(
+                            request,
+                            "key_expired",
+                            oauth_token_id=oauth_token.id,
+                            user_id=oauth_token.user_id,
+                        )
                         response = JSONResponse(
                             {"error": "Token expired"},
                             status_code=401,
@@ -368,9 +420,11 @@ class APIKeyMiddleware:
                     # could already hold one, and this is the boundary that
                     # decides what it may do.
                     if not has_vault_scope(oauth_token.scope):
-                        logger.warning(
-                            "auth_failure",
-                            extra={"reason": "no_vault_scope", "key_id": oauth_token.id},
+                        _emit_auth_failure(
+                            request,
+                            "no_vault_scope",
+                            oauth_token_id=oauth_token.id,
+                            user_id=oauth_token.user_id,
                         )
                         response = JSONResponse(
                             {"error": "Invalid or revoked token"},
