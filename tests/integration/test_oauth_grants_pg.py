@@ -26,6 +26,7 @@ Skipped unless `PGVECTOR_TEST_ADMIN_URL` names a throwaway Postgres *server*
     docker rm -f pgvector-test
 """
 import asyncio
+import json
 import os
 import secrets
 import subprocess
@@ -376,6 +377,60 @@ async def test_an_uncontended_refresh_still_rotates(clean):
     assert response.status_code == 200
     # Old access token + the new pair; the old refresh token is revoked.
     assert await live_count(sessionmaker) == 3
+
+
+# ── refresh-token reuse detection (issue #182) ────────────────────────────
+
+
+async def test_replaying_a_rotated_refresh_token_revokes_the_family(clean):
+    """The real UPDATE, under the lock the handler already holds.
+
+    The fake-session version of this lives in
+    `tests/test_issue_182_refresh_reuse.py`; what Postgres adds is that the
+    family-wide UPDATE and its commit are real, so "no live token left"
+    is read back out of the table rather than out of an in-memory double.
+    """
+    sessionmaker = clean
+    await seed_client(sessionmaker)
+    refresh_value = await seed_grant(sessionmaker)
+
+    first = await oauth._handle_refresh(
+        {"refresh_token": refresh_value, "client_id": "c1"}
+    )
+    assert first.status_code == 200
+    rotated_refresh = json.loads(first.body)["refresh_token"]
+    assert await live_count(sessionmaker) == 3
+
+    replay = await oauth._handle_refresh(
+        {"refresh_token": refresh_value, "client_id": "c1"}
+    )
+
+    assert replay.status_code == 400
+    assert json.loads(replay.body) == {"error": "invalid_grant"}
+    assert await live_count(sessionmaker) == 0, (
+        "a replayed refresh token must leave no usable token in the family"
+    )
+
+    # Including the pair the *first* redemption rotated into — the thief's.
+    reuse = await oauth._handle_refresh(
+        {"refresh_token": rotated_refresh, "client_id": "c1"}
+    )
+    assert reuse.status_code == 400
+    assert await live_count(sessionmaker) == 0
+
+
+async def test_an_unknown_refresh_token_leaves_every_family_alone(clean):
+    sessionmaker = clean
+    await seed_client(sessionmaker)
+    await seed_grant(sessionmaker)
+
+    response = await oauth._handle_refresh(
+        {"refresh_token": secrets.token_hex(32), "client_id": "c1"}
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body) == {"error": "invalid_grant"}
+    assert await live_count(sessionmaker) == 2
 
 
 # ── concurrent first consent ──────────────────────────────────────────────

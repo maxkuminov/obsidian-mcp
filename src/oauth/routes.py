@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 import re
 import secrets
@@ -28,6 +29,8 @@ from src.oauth.scope import VALID_SCOPES, clamp_scope, has_vault_scope
 # `client_can_write` (the consent template reads that key) without shadowing
 # the helper.
 from src.oauth.scope import client_can_write as _client_can_write
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["oauth"])
 templates = Jinja2Templates(
@@ -819,6 +822,79 @@ async def _handle_refresh(form):
             old_token = result.scalar_one_or_none()
 
             if not old_token:
+                # Refresh-token reuse (issue #182, ASVS V10.4.5). The
+                # unfiltered lookup above resolved a family from *this* hash,
+                # so the row exists and the only predicate it can have failed
+                # is `revoked == False`: the caller is replaying a refresh
+                # token that was already rotated away (or revoked outright).
+                #
+                # Rotation alone is only half the requirement. A replayed
+                # refresh token is evidence the token leaked — the thief and
+                # the legitimate client cannot both hold the current one — and
+                # RFC 6819 §5.2.1.1 / OAuth 2.1 answer that by killing the
+                # whole family. Without this, the thief who redeems first keeps
+                # a live, identically-scoped pair (up to `readwrite` over the
+                # vault) for the 30-day sliding window while the legitimate
+                # client sees `invalid_grant` and quietly re-authorizes.
+                #
+                # Race-safe because the grant lock is already held: nothing can
+                # rotate a new pair into this family between the select above
+                # and this UPDATE, so "every live token" cannot be stale.
+                # `revoke_grant_family` re-takes the same transaction-scoped
+                # advisory lock, which is re-entrant.
+                #
+                # The response is byte-identical to the not-found refusal
+                # above (`grant_id is None`), deliberately: the caller must not learn whether it
+                # named a live family, whether anything was revoked, or that
+                # reuse detection exists at all. That is also why the write is
+                # guarded here rather than left to the outer handler — a
+                # failure to revoke must not turn into a 500 on this path.
+                try:
+                    reused = (
+                        (
+                            await session.execute(
+                                select(OAuthToken).where(
+                                    OAuthToken.token_hash == token_hash,
+                                    OAuthToken.token_type == "refresh",
+                                )
+                            )
+                        )
+                        .scalars()
+                        .all()
+                    )
+                    revoked_count = await revoke_grant_family(session, grant_id)
+                    if revoked_count:
+                        await session.commit()
+                        # One record, on the path that actually killed live
+                        # tokens. A family that was already fully revoked (an
+                        # operator revocation the client has not noticed yet,
+                        # or a second replay after the first one closed it) is
+                        # a no-op with nothing new to report, and the plain
+                        # not-found path is not reuse at all. Never any
+                        # token material — the family identifier only.
+                        logger.warning(
+                            "oauth.refresh_reuse_detected",
+                            extra={
+                                "event": "oauth.refresh_reuse_detected",
+                                "client_id": (
+                                    reused[0].client_id if reused else client_id
+                                ),
+                                "grant_id": grant_id,
+                                "user_id": reused[0].user_id if reused else None,
+                                "revoked_tokens": revoked_count,
+                            },
+                        )
+                    else:
+                        await session.rollback()
+                except Exception:
+                    await session.rollback()
+                    logger.exception(
+                        "oauth.refresh_reuse_revocation_failed",
+                        extra={
+                            "event": "oauth.refresh_reuse_revocation_failed",
+                            "grant_id": grant_id,
+                        },
+                    )
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
             result = await session.execute(

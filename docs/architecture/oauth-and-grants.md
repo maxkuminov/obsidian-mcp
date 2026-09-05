@@ -36,6 +36,42 @@ vanished from the page, so the operator saw a blank space that read as success.
   replaced access token run to its expiry is right for rotation and wrong for
   revocation — an hour of surviving write access after the operator clicked
   Revoke is exactly the defect.
+- **A replayed refresh token revokes the family (#182).** Rotation is only
+  half of ASVS V10.4.5. After a rotation exactly one party can hold the
+  current refresh token, so a *second* presentation of one that was already
+  rotated away means two parties hold the same credential — and the
+  production clients register `token_endpoint_auth_method: none`, where
+  possession is the entire credential. Without reuse detection the thief who
+  redeems first keeps an identically-scoped, silently-renewing pair for the
+  30-day sliding window while the legitimate client sees `invalid_grant` and
+  quietly re-authorizes; the theft signal RFC 6819 §5.2.1.1 defines is thrown
+  away. `_handle_refresh` therefore calls `revoke_grant_family` at exactly the
+  point where the unfiltered lookup resolved a `grant_id` but the
+  `revoked == False` select returned nothing — that combination *is* "the row
+  exists and is revoked", i.e. a replay.
+  - **The lock is what makes it correct, not an optimization.** The grant lock
+    is already held from the unfiltered lookup onwards, so nothing can rotate
+    a new pair into the family between that select and this UPDATE. "Every
+    live token" cannot be stale. `revoke_grant_family` re-takes the same
+    transaction-scoped advisory lock, which is re-entrant.
+  - **The response stays constant.** The reuse path returns the byte-identical
+    `invalid_grant` body and status the not-found path returns — the caller
+    must not learn whether it named a live family, whether anything died, or
+    that detection exists at all. That is also why the revocation is wrapped:
+    a failure to write must not surface as a 500 on this path only.
+  - **Boundaries.** An *expired* refresh token that was never rotated is not
+    reuse — its row is still `revoked == False`, so the handler reaches the
+    expiry check and revokes nothing; a token dying of old age must not kill
+    the family's live access token. A token hash that matches no row revokes
+    nothing (there is no family to name). A family that is already fully
+    revoked is a harmless no-op: `revoke_grant_family` flips zero rows,
+    nothing is committed.
+  - **One WARNING, on the path that killed something.** `event =
+    "oauth.refresh_reuse_detected"` with `client_id`, `grant_id`, `user_id`
+    and the number of rows revoked — never any token or hash material. It is
+    emitted only when live tokens were actually revoked: the plain not-found
+    path is not reuse, and a second replay against an already-dead family has
+    nothing new to report, so neither may drown the real alarm.
 - **Revocation takes effect at the next authenticated request; a request
   already in flight completes.** `APIKeyMiddleware` resolves the token once, at
   the start of the request, so a tool call authenticated microseconds before a
