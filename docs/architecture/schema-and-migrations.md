@@ -99,6 +99,75 @@ directly — one family per `(client_id, user_id)`, never a family spanning two
 users, never a user's rows split across two families — plus stamp-back
 idempotence (which must not re-stamp existing `grant_id`s) and the downgrade.
 
+## 023: `indexer_state`, `chunks_truncated`, and why the CHECK is not tidiness
+
+Migration 023 owns two units and backfills neither.
+
+**`indexer_state (key varchar(64) PK, value text NOT NULL, updated_at
+timestamptz NOT NULL DEFAULT now())`** holds three facts about the index as a
+whole: the embedding fingerprint, the keyword fingerprint, and the embed
+rotation cursor. A table rather than columns on an existing row because there
+is no singleton row to hang them on — `users` is per tenant, `notes_metadata`
+is per note, and `indexer_runs` is an append-only display history nothing reads
+for a decision.
+
+**The `ck_indexer_state_key` CHECK closes the key set, and that is a
+correctness constraint rather than hygiene.** A key read from this table that
+does not exist reads as *absent*, and absent is precisely the state that makes
+the startup fingerprint guard **adopt** the current configuration instead of
+refusing. So one mistyped key silently disables, for ever and on every start,
+the guard whose entire job is to stop a same-dimension model swap from mixing
+two vector spaces in one column. `ck_indexer_runs_trigger` exists for the
+weaker version of the same argument, where a typo produces a mislabelled row.
+Adding a key is therefore a migration, which is correct: every key here has a
+startup or a scheduling consequence.
+
+The constraint is resolved through `pg_constraint` — `conrelid`, `contype`,
+`convalidated`, and `pg_get_constraintdef` against the server's own rendering
+derived from a scratch `TEMP` table — **never by name**, per 013's rule, and it
+carries 023's marker as its constraint comment. `alembic check` does not
+compare CHECK predicates at all, so a same-named `CHECK (true)` would satisfy
+every name-level lookup while enforcing nothing.
+
+**Nothing is backfilled, and that is 016's argument.** Deriving a fingerprint
+at migration time would assert that the stored vectors and tsvectors were
+produced by the configuration the `.env` carries *now* — which is exactly the
+claim the fingerprint exists to test, and exactly the reassignment-lag mistake
+016 refuses to make with vault provenance. An absent fingerprint means
+"unknown", the only true statement available at migration time, and the
+application's startup adoption rule owns it from there. Because 023 writes no
+row, a stamp-back re-run cannot erase a fingerprint the application has since
+recorded.
+
+**`notes_metadata.chunks_truncated BOOLEAN NOT NULL DEFAULT FALSE`** is 022's
+shape for 022's reasons: the constant server default keeps it a catalogue-only
+`ADD COLUMN` on a table carrying a `tsvector` and two GIN indexes, and `false`
+is the *true* value for every pre-existing row, because every row that exists
+when 023 runs was embedded by a chunker that had no cap and could not truncate.
+A pre-existing object of either name is refused, not adopted, for the reason
+022 refuses one: the vector tools read the column as whether a note's embedding
+covers the whole note, and a wrong value either hides a capped note from an
+agent or invents a cap that never happened.
+
+**023 pins `SET LOCAL search_path TO public`** and asserts afterwards that the
+unqualified name really resolves to `public.indexer_state`. 021 introduced the
+pin and `RESET`s its own at the end of `upgrade()`, so a later revision in the
+same transaction inherits nothing — the gate's redirected-`search_path` case
+found 023 creating its table in the decoy schema before the pin was added.
+Pinning rather than passing `schema="public"` to each `op.*` call is
+deliberate: a schema-qualified table in alembic's eyes does not match a model
+that declares no schema, and `alembic check` would report drift for ever after.
+
+**The gate's asserted head moves from `022` to `023`.** Raising it is a
+required part of adding a migration, not a chore beside it: the assertion is
+the only thing that makes "head" a value somebody chose. Left at `022` the
+module would pass on a database migrated to `023`, and its guarantee — that the
+revisions it exercises are the revisions that will run — would quietly become a
+guarantee about a *prefix* of them. **The earlier waves' cases stay.** 013's,
+014's, 016's, 017's and 022's cases assert facts about those migrations' bodies
+that no later revision restates; a gate rewritten around only the newest wave
+stops testing the reconciliations the earlier ones exist to perform.
+
 ## Backups are protected data, not just a rollback tool
 
 A `pg_dump` of this database is the complete text of every tenant's notes
