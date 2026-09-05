@@ -9,7 +9,9 @@ The comparison SHALL be `IS DISTINCT FROM`, so a note that has never been embedd
 
 Each tool's result SHALL carry a count of stale rows **whenever it returns any rows at all, including when that count is zero**, so that a caller can distinguish "nothing here is stale" from a build that does not report staleness. Per-row marking SHALL identify which rows are stale.
 
-`find_related` SHALL additionally state, once, when the **source** note is itself stale, because in that case the averaged query vector describes the source's previous content and every neighbour answers a superseded question — a fact no per-row marker can express.
+`find_related` SHALL additionally state, once, when the **source** note is itself stale, because in that case the averaged query vector describes the source's previous content and every neighbour answers a superseded question — a fact no per-row marker can express. It SHALL state it on **every return path on which the source row was loaded, the empty one included**. "No related notes for this note" from a stale source is the reading a consumer acts on — that the note has no neighbours — when the truth is that the vector searched with describes content the note no longer has, so the empty result is where the statement matters most. The distinct "the source has not been embedded yet" refusal keeps its own message: a source with no vectors at all is a different fact with a different fix.
+
+**The guarantee is scoped to what the index has committed, and the residual is declared rather than closed.** Staleness is derived from the metadata row, so a note reads as stale only once the scan has committed its new content hash. Between an edit landing on disk and the next scan reaching that note — bounded by the index interval plus the pass in flight — the row's two hashes still agree while the stored chunk text is already superseded, and the result is presented as fresh. Closing that would require hashing the file on disk for every returned row, putting a filesystem read on the hot path of every search and still racing the writer. The system SHALL therefore state the guarantee as *"no result presents text the index knows to be superseded"*, SHALL document the residual window where the tools are described, and SHALL NOT restate it as a stronger claim.
 
 #### Scenario: A stale note is still returned, and is marked
 
@@ -34,6 +36,24 @@ Each tool's result SHALL carry a count of stale rows **whenever it returns any r
 - **WHEN** `find_related` is called on a note whose own `embedded_content_hash` differs from its `content_hash`
 - **THEN** the result SHALL state that the source note changed after it was embedded and that the neighbours were computed from its previous content
 - **AND** the neighbours SHALL still be returned
+
+#### Scenario: A stale source is stated on the empty result too
+
+- **WHEN** `find_related` is called on a stale source that has vectors and the query returns no neighbour after the exact fallback
+- **THEN** the result SHALL still state that the source changed after it was embedded
+- **AND** it SHALL NOT present the empty result as a bare statement that the note has no related notes
+
+#### Scenario: An unembedded source keeps its own refusal
+
+- **WHEN** `find_related` is called on a note that has no vectors at all
+- **THEN** the existing "not embedded yet" message and its usage marker SHALL be returned unchanged
+- **AND** it SHALL NOT be replaced by the stale-source statement
+
+#### Scenario: An edit the scan has not yet seen is not marked, and that bound is declared
+
+- **WHEN** a note is edited on disk and a vector search returns it before the next index pass has committed its new content hash
+- **THEN** the row SHALL NOT be marked stale, because the index does not yet know the note changed
+- **AND** this SHALL be documented as the declared bound of the staleness signal rather than described as a case the signal covers
 
 #### Scenario: No query predicate changes
 

@@ -65,8 +65,8 @@ The deploy migrates before the container is recreated, so the previous build ser
 - **AND** an object of either name that lacks the marker SHALL be left in place instead
 - **AND** no other table, column or constraint SHALL be altered
 
-### Requirement: The schema gate covers migration 023 before deploy
-`make test-schema` SHALL exercise migration 023 on a throwaway pgvector container before the deploy that carries it, asserting `alembic check` clean at head and asserting the catalogue directly for both units — the table's columns, its primary key, its CHECK definition, validation and marker, the table comment, and the column's type, nullability, default and comment — across the fresh, stamp-back, impostor-object, impostor-constraint and downgrade paths, and asserting that a disallowed key is actually rejected on insert.
+### Requirement: 023's units are exercised by the schema gate before deploy
+The schema gate SHALL exercise migration 023 on a throwaway pgvector container before the deploy that carries it, asserting the catalogue **directly** for both units — the table's columns, its primary key, its CHECK definition, validation and marker, the table comment, and the column's type, nullability, default and comment — across the fresh, stamp-back, impostor-object, impostor-constraint and downgrade paths, and asserting that a disallowed key is actually rejected on insert.
 
 Asserting the catalogue directly is required because `alembic check` does not compare CHECK constraint predicates at all, and a `CHECK (true)` of the right name would satisfy every name-based lookup while enforcing nothing — which for this constraint means a mistyped key silently disabling the fingerprint guard.
 
@@ -80,3 +80,31 @@ Asserting the catalogue directly is required because `alembic check` does not co
 
 - **WHEN** the gate inserts a row into `indexer_state` with a key outside the closed set
 - **THEN** the insert SHALL be rejected by the database
+
+## MODIFIED Requirements
+
+### Requirement: The schema gate covers both migrations of this wave before deploy
+The schema gate SHALL exercise every migration whose behaviour it asserts on a throwaway database, in the same run, and SHALL assert `alembic check` clean at the resulting head. The head revision the gate asserts SHALL be **updated to `023`**, so a later migration added without updating the gate fails loudly rather than silently widening what "head" means.
+
+Raising the asserted head is a required part of adding a migration, not a chore that accompanies it. The assertion is the only thing that makes "head" a value somebody chose; left at `017` it would pass on a database migrated to `023`, and the gate's guarantee — that the revisions it exercises are the revisions that will run — would quietly become a guarantee about a prefix of them.
+
+The historical checks SHALL be kept, not replaced. 016's and 017's cases assert facts about those migrations' bodies that no later revision restates, and 013's and 014's before them; a gate rewritten around only the newest wave stops testing the reconciliations the earlier ones exist to perform.
+
+Idempotence SHALL be exercised by stamping the revision back and upgrading again, not by a second `upgrade head` — the latter is a no-op at the alembic level and proves nothing about the migration body.
+
+#### Scenario: Head at 023
+
+- **WHEN** a throwaway database is migrated to head
+- **THEN** `alembic_version` SHALL read `023`
+- **AND** `alembic check` SHALL report no new upgrade operations
+
+#### Scenario: The earlier waves' cases still run
+
+- **WHEN** the gate runs at the new head
+- **THEN** the cases covering 013, 014, 016, 017 and 022 SHALL all execute and pass
+- **AND** none SHALL have been removed in the course of raising the head
+
+#### Scenario: Idempotence is exercised by stamping back
+
+- **WHEN** the gate tests that any covered migration can re-run
+- **THEN** it SHALL stamp the database to the preceding revision and upgrade again, so the migration body genuinely re-executes
