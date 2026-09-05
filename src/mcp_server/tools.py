@@ -2484,10 +2484,50 @@ class MoveRewriteCapExceeded(Exception):
         )
 
 
-def _splice_rewrites(content: str, rewrites: list[tuple[int, int, str]]) -> str:
+class MoveRewriteOverlap(Exception):
+    """Two of one source's rewrites claim overlapping spans of the note.
+
+    Sibling of `MoveRewriteCapExceeded`, with the same disposition: raised out
+    of the pure rewrite function, turned into a whole-move refusal by
+    `_move_note_locked` **before any mutation**.
+
+    The spans come from two scans that are each non-overlapping, and they were
+    believed unable to overlap *each other*. They can: a markdown link's
+    ANCHOR class is `[^)]`, so `[x](Old.md#anchor[[Old]])` is one markdown
+    link whose anchor contains a whole wikilink, and when both halves resolve
+    to the moved note both are planned. There is no correct way to apply two
+    replacements to one region — the retired reverse splice applied the inner
+    one first and then used the outer one's now-stale `end`, deleting bytes
+    *outside* the link (`…[[Old]])TAIL` came back as `…[[Old]])IL`) and
+    reporting two successful rewrites — so this is refused rather than
+    resolved. The agent renames the anchor, or moves without `rewrite_links`.
+    """
+
+    def __init__(
+        self,
+        source_path: str | None,
+        first: tuple[int, int],
+        second: tuple[int, int],
+    ):
+        self.source_path = source_path
+        self.first = first
+        self.second = second
+        where = source_path or "the rewrite input"
+        super().__init__(
+            f"{where} holds two overlapping link rewrites: "
+            f"{first[0]}–{first[1]} and {second[0]}–{second[1]}"
+        )
+
+
+def _splice_rewrites(
+    content: str,
+    rewrites: list[tuple[int, int, str]],
+    source_path: str | None = None,
+) -> str:
     """Apply `(start, end, replacement)` spans to `content` in one pass.
 
-    **Linear, and byte-for-byte what the retired reverse-splice produced.**
+    **Linear, and byte-for-byte what the retired reverse-splice produced**
+    for every plan it now accepts (overlapping ones are refused, below).
     The old shape was `out = out[:start] + repl + out[end:]` per rewrite over
     a descending sort — a fresh copy of the whole note per link, so a note of
     `[[Old]] ` cost 0.07 / 0.18 / 0.72 / 5.3 s at 64 / 128 / 256 / 512 KiB
@@ -2498,43 +2538,37 @@ def _splice_rewrites(content: str, rewrites: list[tuple[int, int, str]]) -> str:
 
     The spans come from two non-overlapping scans (`_WIKILINK_REWRITE_RE`
     leftmost-non-overlapping, `scan_md_links` resuming at each match's end),
-    and they cannot overlap **each other** either: a markdown link's text
-    class excludes `[` and `]`, so no `[text](` can begin inside a wikilink
-    span and run past its `]]`. That is what makes the cursor walk equivalent
-    — but it is a property of two grammars in another module, so it is
-    *checked* rather than assumed, and a violation falls back to the old
-    splice rather than silently producing different bytes. The fallback is
-    unreachable through the scanners; it is reachable, and tested, through
-    this function directly.
+    and the cursor walk is equivalent to any per-span splice only while they
+    do not overlap **each other**. They can: a markdown link's anchor class is
+    `[^)]`, so a wikilink can sit inside a markdown link's anchor and both
+    halves can resolve to the moved note.
+
+    That is a **refusal**, not a fallback. This function used to hand such a
+    plan to a reverse splice, on the theory that the retired implementation
+    defined the answer. It does not define a correct one: applying the inner
+    replacement first changes the string's length, so the outer one then
+    splices at a stale `end` and deletes bytes *outside* the link, while the
+    tool reports both rewrites as successes — a silent destructive write, the
+    exact class this whole area exists to prevent. There is no right way to
+    apply two replacements to one region, so an overlap raises
+    `MoveRewriteOverlap` and `_move_note_locked` aborts the move before
+    anything is renamed or written.
     """
     if not rewrites:
         return content
     ordered = sorted(rewrites, key=lambda r: r[0])
     cursor = 0
+    previous = (0, 0)
     parts: list[str] = []
     for start, end, replacement in ordered:
         if start < cursor:
-            return _splice_rewrites_overlapping(content, rewrites)
+            raise MoveRewriteOverlap(source_path, previous, (start, end))
         parts.append(content[cursor:start])
         parts.append(replacement)
         cursor = end
+        previous = (start, end)
     parts.append(content[cursor:])
     return "".join(parts)
-
-
-def _splice_rewrites_overlapping(
-    content: str, rewrites: list[tuple[int, int, str]]
-) -> str:
-    """The retired reverse splice, kept verbatim for overlapping spans.
-
-    Quadratic, and deliberately so: it is the *definition* of what overlapping
-    spans mean here, and nothing the scanners can produce reaches it.
-    """
-    ordered = sorted(rewrites, key=lambda r: r[0], reverse=True)
-    out = content
-    for start, end, replacement in ordered:
-        out = out[:start] + replacement + out[end:]
-    return out
 
 
 def _rewrite_links_in_text(
@@ -2581,8 +2615,42 @@ def _rewrite_links_in_text(
     masked = apply_fence_mask(content, fence_scan)
     rewrites: list[tuple[int, int, str]] = []
 
+    def _kept(start: int, masked_slice: str) -> str:
+        """The bytes at a match's span, taken from `content`, not `masked`.
+
+        The recognizers below run over `masked` — links inside code must not
+        be rewritten, and that is the whole reason the mask exists. But every
+        byte this function *writes back* has to come from the unmasked
+        `content`: masking is a same-length substitution, so a span found in
+        `masked` indexes the identical region of `content`, and splicing the
+        masked slice instead replaced any inline code inside a link's alias,
+        anchor or text with spaces — a silent destructive write on every
+        `move_note(rewrite_links=True)` over a source like
+        ``See [the `foo` option](Old.md)`` (#211).
+        """
+        return content[start:start + len(masked_slice)]
+
+    def _unmasked_target(start: int, masked_slice: str) -> bool:
+        """Is the part that DECIDES the rewrite free of masked bytes?
+
+        The other half of #211. Slicing the written-back bytes out of
+        `content` fixes what a rewrite publishes; it does not fix *which*
+        links are rewritten, and that is decided from the masked target or
+        href. The mask's filler is spaces, so ``[[`x`Old]]`` reaches
+        `resolve_target` as `"   Old"`, strips to `Old`, and a move of
+        `Old.md` rewrote a link that names a *different* note — publishing
+        `[[New]]` over a link the author never pointed at the moved note.
+        A candidate whose deciding span differs between `masked` and
+        `content` is therefore skipped outright: this server cannot know what
+        note the masked bytes were naming, and the safe answer on a
+        destructive path is to leave the link exactly as written.
+        """
+        return content[start:start + len(masked_slice)] == masked_slice
+
     for m in _WIKILINK_REWRITE_RE.finditer(masked):
         target_raw = m.group("target")
+        if not _unmasked_target(m.start("target"), target_raw):
+            continue
         target = target_raw.strip()
         if not target:
             continue
@@ -2595,17 +2663,20 @@ def _rewrite_links_in_text(
         else:
             new_target = to_stem
         embed_prefix = "!" if m.group("embed") else ""
-        rest = m.group("rest") or ""
+        rest = _kept(m.start("rest"), m.group("rest") or "")
         rewrites.append((m.start(), m.end(), f"{embed_prefix}[[{new_target}{rest}]]"))
 
     for link in scan_md_links(masked, **MDLINK_REWRITE_FLAGS):
+        if not _unmasked_target(link.href_start, link.href):
+            continue
         href = link.href.strip()
         if not href:
             continue
         target_for_resolve = href[:-3] if href.endswith(".md") else href
         if resolve_target(target_for_resolve, source_path, pre_move_index) != from_id:
             continue
-        anchor = link.anchor
+        anchor = _kept(link.anchor_start, link.anchor)
+        text = _kept(link.text_start, link.text)
         # Resolve against the original source location, but generate the new
         # href relative to where that source lives after the move. These differ
         # for a moved note rewriting its own Markdown self-link.
@@ -2615,7 +2686,7 @@ def _rewrite_links_in_text(
         rewrites.append((
             link.start,
             link.end,
-            f"[{link.text}]({relative_target}{anchor})",
+            f"[{text}]({relative_target}{anchor})",
         ))
 
     if not rewrites:
@@ -2625,7 +2696,7 @@ def _rewrite_links_in_text(
     # at a path the move is about to vacate, reported as a success.
     if len(rewrites) > MAX_LINKS_PER_NOTE:
         raise MoveRewriteCapExceeded(source_path, len(rewrites), MAX_LINKS_PER_NOTE)
-    return _splice_rewrites(content, rewrites), len(rewrites)
+    return _splice_rewrites(content, rewrites, source_path), len(rewrites)
 
 
 def _rewrite_failure_warning(
@@ -3072,6 +3143,24 @@ async def _move_note_locked(
                         f"(MAX_LINKS_PER_NOTE={e.cap}). Nothing was moved, "
                         "rewritten or reindexed. Move without rewrite_links and "
                         "update that note's links in batches instead."
+                    )
+                except MoveRewriteOverlap as e:
+                    # Same disposition, and for a stronger reason: this source
+                    # has no correct rewritten form at all. One link nests
+                    # inside another — a wikilink inside a markdown link's
+                    # anchor — and both name the note being moved, so applying
+                    # either replacement destroys the other's span. Refused
+                    # here, before phase 2, rather than published as two
+                    # "successful" rewrites over mangled bytes (#211).
+                    logger.warning("Overlapping link rewrites: %s", e)
+                    drop(read_target)
+                    return (
+                        f"Move aborted: {original_src_path} holds a link to "
+                        f"{from_rel} nested inside another link to it, and "
+                        "rewriting either would corrupt the other. Nothing was "
+                        "moved, rewritten or reindexed. Move without "
+                        "rewrite_links, or rewrite that note's nested link by "
+                        "hand first."
                     )
                 except Exception as e:
                     logger.warning(

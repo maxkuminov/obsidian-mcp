@@ -619,23 +619,31 @@ def test_the_linear_splice_is_byte_identical_to_the_retired_one():
         ), (content, spans)
 
 
-def test_overlapping_spans_fall_back_to_the_retired_splice():
-    """The cursor walk is only equivalent while spans do not overlap.
+def test_overlapping_spans_are_refused_not_spliced():
+    """The cursor walk is only equivalent while spans do not overlap — and
+    when they do, there is no correct answer to fall back to.
 
-    They cannot overlap coming out of the two scanners — a markdown link's
-    text class excludes `[` and `]`, so no `[text](` can begin inside a
-    wikilink span and run past its `]]` — but that is a property of two
-    grammars in another module, so the splice checks rather than assumes it.
-    Reached only by calling the splice directly, which is what this does.
+    This assertion used to say the opposite: overlapping spans fell back to
+    the retired reverse splice, on the theory that the retired implementation
+    *defined* the answer. It defined a wrong one. The reverse splice applies
+    the inner replacement first, which changes the string's length, so the
+    outer one then splices at a stale `end` and eats bytes outside the link
+    while the tool reports both rewrites as successes. Overlap is now a typed
+    refusal that aborts the whole move before any mutation (#211); the reach
+    from the scanners is `tests/test_issue_211_masked_splice.py`.
     """
     content = "0123456789"
     overlapping = [(0, 6, "AA"), (3, 10, "BBB")]
-    assert tools._splice_rewrites(content, overlapping) == _reverse_splice(
-        content, overlapping
-    )
-    # And it is the fallback's answer, not the cursor walk's: the cursor walk
-    # would emit "AA" then "BBB" with nothing dropped.
-    assert tools._splice_rewrites(content, overlapping) != "AABBB"
+
+    with pytest.raises(tools.MoveRewriteOverlap) as excinfo:
+        tools._splice_rewrites(content, overlapping)
+
+    assert excinfo.value.first == (0, 6)
+    assert excinfo.value.second == (3, 10)
+    # What the retired splice would have produced, for the record: it is not
+    # the cursor walk's "AABBB" either, and neither of them is `content` with
+    # two links renamed.
+    assert _reverse_splice(content, overlapping) == "AA"
 
 
 # ── the per-source rewrite cap ──────────────────────────────────────────────

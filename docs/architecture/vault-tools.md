@@ -446,6 +446,12 @@ grammar closes.
   link under such an opener may be inside a list item's code block.
   `rewrite_links=False` is unaffected and is the way to move such a note.
 
+`move_note(rewrite_links=True)` also refuses, before the rename and naming the
+source, when one source plans two rewrites over **overlapping spans** — a
+wikilink to the moved note sitting inside a markdown link's anchor that also
+names it. That note has no correct rewritten form; see the splice section
+below.
+
 `move_note(rewrite_links=True)` carries a **third**, unrelated refusal from the
 same change: it aborts while any note in the caller's owner scope still carries
 a stale `extraction_version`, because its rewrite-source inventory is
@@ -613,16 +619,66 @@ after the scan finished. `_splice_rewrites` walks the spans once with a cursor
 and joins once: 0.04 s for the 131,072 rewrites of a 1 MiB body, against ~25 s
 for the retired shape.
 
-The cursor walk is equivalent to the reverse splice **only while the spans do
-not overlap**, and they cannot: a markdown link's text class excludes `[` and
-`]`, so no `[text](` can begin inside a wikilink span and run past its `]]`,
-and each scanner is already non-overlapping within itself. That is a property
-of two grammars in another module, so `_splice_rewrites` *checks* it and falls
-back to the retired splice rather than silently writing different bytes — a
-rewrite that is fast but writes different bytes is a destructive write, not a
-speed-up. The fallback is unreachable through the scanners and is tested by
-calling the splice directly; the equality itself is tested against the retired
-implementation as an oracle over a randomized corpus.
+The cursor walk is equivalent to any per-span splice **only while the spans do
+not overlap**, and each scanner is already non-overlapping within itself. They
+were believed unable to overlap *each other* — a markdown link's text class
+excludes `[` and `]`, so no `[text](` can begin inside a wikilink span and run
+past its `]]` — and that is wrong, because the markdown **anchor** class is
+`[^)]`: `[x](Old.md#anchor[[Old]])` is one markdown link whose anchor contains
+a whole wikilink, and a move of `Old.md` plans both. `_splice_rewrites`
+therefore still *checks*, and an overlap is now a **refusal**
+(`MoveRewriteOverlap`), handled by `_move_note_locked` exactly as
+`MoveRewriteCapExceeded` is: the whole move aborts before the rename, naming
+the source note.
+
+It used to fall back to the retired reverse splice instead, on the theory that
+the retired implementation defined the answer. It does not define a *correct*
+one, which is the whole lesson of this hunk (#211): applying the inner
+replacement first changes the string's length, so the outer one then splices
+at a stale `end`. `[x](Old.md#anchor[[Old]])TAIL` came back as
+`[x](N.md#anchor[[Old]])IL` — two characters eaten past the end of the link,
+reported as two successful rewrites. A fallback that produces *some* bytes is
+worse than a refusal whenever nobody can say those bytes are right. The
+equality of the cursor walk with the retired splice is still tested as an
+oracle over a randomized corpus of non-overlapping spans; the overlap path is
+tested both through the splice directly and through `move_note` end to end,
+where the assertion is that nothing was renamed and nothing was written.
+
+**The recognizers read the masked copy; every byte written back is sliced from
+the unmasked note (#211).** The two scans run over `apply_fence_mask(content,
+…)` because a link inside a fence or inside backticks is text *about* a link
+and must not be rewritten — that is the whole reason the mask exists. But the
+replacement text is spliced into `content`, and it used to be assembled from
+pieces read off the mask: the wikilink `rest` (`#anchor|alias`) and the
+markdown link's text and anchor. Inline code inside any of those is a run of
+spaces in the mask, so ``See [the `foo` option](Old.md)`` was published as
+`See [the       option](New.md)` — a silent destructive write on an ordinary
+note, on the path whose entire job is to leave everything except the target
+alone. The fix is the same property the masker already promises everywhere
+else: masking is a **same-length** substitution, so a span found in the masked
+copy indexes the identical region of `content`, and the rewriter re-slices
+`rest`, `text` and `anchor` out of `content` at that span
+(`MdLinkMatch.text_start` / `anchor_start` exist for exactly this). What the
+recognizers *see* is unchanged. Anything later added to the replacement — a
+new alias form, a title, a display component — takes its bytes from `content`
+too, never from `masked`.
+
+**And a candidate whose deciding span carries masked bytes is skipped.** The
+same bug has a second half, on the read side of the same loop: *which* links
+get rewritten was still decided from the masked wikilink target and markdown
+href, where the filler is spaces. ``[[`x`Old]]`` reached `resolve_target` as
+`"   Old"`, stripped to `Old`, and a move of `Old.md` published `[[New]]` over
+a link that named a different note — the destructive write again, this time on
+a link the author never pointed at the moved note. So each candidate's target
+or href span is compared between `masked` and `content` first
+(`MdLinkMatch.href_start` is there for the markdown half), and a difference
+skips it. Not "unmask it and resolve that": the mask exists because this server
+does not know what the hidden bytes mean, and on a destructive path the safe
+answer is to leave the link exactly as written. **Extraction is deliberately
+NOT changed to match** — it records a slightly wrong target for such a link,
+which is a graph inaccuracy the reindex can correct, not bytes lost from a
+note; changing it would need a `CURRENT_EXTRACTION_VERSION` bump and a full
+re-derivation of every note's links.
 
 **One source's rewrites are bounded at `MAX_LINKS_PER_NOTE`, and over the cap
 is a refusal.** The read side has always been bounded — extraction stops at
