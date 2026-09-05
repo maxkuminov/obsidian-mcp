@@ -1,41 +1,50 @@
 ## ADDED Requirements
 
-### Requirement: A detected vault-root overlap SHALL be surfaced to administrators
-The dashboard's health strip and the health page SHALL show, to administrators, that a vault-root overlap has been detected, naming every user in the overlap set and the root each of them is assigned. The surface SHALL be visible while the condition stands and SHALL disappear once a pass publishes an empty overlap set; it SHALL NOT be a transient flash message.
+### Requirement: A vault-root quarantine SHALL be surfaced to administrators, with each reason worded apart
+The dashboard's health strip and the health page SHALL show, to administrators, that the published quarantine snapshot names one or more accounts, naming each account, the root it is assigned, and its reason — for an overlap, the conflicting account and the relation found; for a root that could not be examined, the error number and the explicit statement that no conflicting account was observed. The surface SHALL be visible while the condition stands and SHALL disappear once a later snapshot no longer names the account; it SHALL NOT be a transient flash message.
 
-An overlap is a misconfiguration that persists until an operator acts, and every other record of it decays. The container log rotates with the container; the in-process error ring buffer holds a hundred entries for the life of the process, so the line naming the overlap is gone after a restart while the two roots are still overlapping. The panel is the surface an operator opens when something is wrong, and the strip is the newest thing on it — a condition that has silently disabled two tenants' tools has to be legible there, not reconstructed from a run row.
+A quarantine is a misconfiguration that persists until an operator acts, and every other record of it decays. The container log rotates with the container; the in-process error ring buffer holds a hundred entries for the life of the process, so the line naming the condition is gone after a restart while the two roots are still overlapping. The panel is the surface an operator opens when something is wrong, and the strip is the newest thing on it — a condition that has silently disabled a tenant's tools has to be legible there, not reconstructed from a run row.
 
-Naming both users and both roots is correct here and only here: this surface is admin-only, the operator has to know which two assignments to look at, and the same detail is deliberately withheld from the tool-facing refusal, whose reader is a tenant's agent.
+The two reasons are worded apart because they need different fixes and the wrong wording sends the operator to the wrong place: an overlap is corrected by changing an assignment or a mount, while an unexaminable root is corrected by restoring a mount, and describing the latter as an overlap sends an administrator hunting for a second account that does not exist.
 
-The condition SHALL be read from the same published overlap set the pass computes, not recomputed by the request handler — the panel must not open directories on a page render, and two independent computations of "do these roots overlap" is how the panel and the enforcement come to disagree.
+Naming the accounts and the roots is correct here and only here: this surface is admin-only, the operator has to know which assignments to look at, and the same detail is deliberately withheld from the tool-facing refusal, whose reader is a tenant's agent.
 
-#### Scenario: The strip names the affected users
+The condition SHALL be read from the published snapshot, not recomputed by the request handler — the panel must not open directories or parse a mount table on a page render, and two independent computations of "do these roots overlap" is how the panel and the enforcement come to disagree.
 
-- **WHEN** an administrator opens the dashboard while two users' roots overlap
-- **THEN** the health strip SHALL state that a vault-root overlap has been detected
-- **AND** SHALL name both users and both assigned roots
+#### Scenario: The strip names each affected account and its reason
+
+- **WHEN** an administrator opens the dashboard while the snapshot names two accounts for an overlap
+- **THEN** the health strip SHALL state that a vault-root quarantine is in force
+- **AND** SHALL name both accounts, both assigned roots, and the relation found
+
+#### Scenario: An unexaminable root is not described as an overlap
+
+- **WHEN** an administrator opens the dashboard while the snapshot names one account because its root could not be examined
+- **THEN** the surface SHALL state that the root could not be examined, with the error number
+- **AND** SHALL NOT name a conflicting account or describe the account as overlapping another
 
 #### Scenario: The health page carries the same condition
 
-- **WHEN** an administrator opens the health page while the overlap stands
+- **WHEN** an administrator opens the health page while the condition stands
 - **THEN** the page SHALL show the same condition alongside the run history, the error buffer and the backup age
 
 #### Scenario: A non-administrator does not see the operator detail
 
-- **WHEN** a regular panel user opens the dashboard while an overlap stands
-- **THEN** the page SHALL NOT name another user or another user's vault path, consistent with the existing operator-only split on the strip
+- **WHEN** a regular panel user opens the dashboard while the condition stands
+- **THEN** the page SHALL NOT name another account or another account's vault path, consistent with the existing operator-only split on the strip
 
-#### Scenario: The surface clears when the overlap is corrected
+#### Scenario: The surface clears when the condition is corrected
 
-- **WHEN** an administrator corrects one of the two assignments and the next pass publishes an empty overlap set
-- **THEN** the strip and the page SHALL stop showing the condition, with no operator dismissal required
+- **WHEN** an administrator corrects the condition and a later snapshot names neither account
+- **THEN** the strip and the page SHALL stop showing it, with no operator dismissal required
 
-#### Scenario: No overlap renders nothing
+#### Scenario: An empty snapshot renders nothing, and an unpublished one says so
 
-- **WHEN** no overlap has been detected — including on a freshly started process that has not yet completed a pass
+- **WHEN** the published snapshot is empty
 - **THEN** neither surface SHALL show the condition, and neither SHALL treat its absence as an error state
+- **AND WHEN** no snapshot has been published in this process, the surfaces SHALL say that the roots have not been checked yet rather than rendering an all-clear
 
 #### Scenario: The panel opens no directories
 
 - **WHEN** the dashboard or the health page renders the condition
-- **THEN** the handler SHALL read the set the indexer published and SHALL NOT itself open, stat or resolve any vault root
+- **THEN** the handler SHALL read the published snapshot and SHALL NOT itself open, stat or resolve any vault root, nor read the process's mount table

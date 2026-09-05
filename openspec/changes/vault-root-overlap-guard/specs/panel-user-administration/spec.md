@@ -1,13 +1,17 @@
 ## ADDED Requirements
 
 ### Requirement: A vault-root assignment SHALL be refused when it overlaps an active assignment
-The control panel's user-edit handler SHALL refuse a `vault_path` assignment whose root overlaps the root of any *other* active user holding an assignment, and SHALL name the conflicting user in the refusal. Two roots overlap when either of two independent conditions holds, and both SHALL be evaluated: **identity**, where an opened directory descriptor for each root reports the same `(st_dev, st_ino)`; and **containment**, where the canonical real path of one root is an ancestor of the canonical real path of the other, tested in both directions and compared on whole path components rather than as a string prefix. A refusal SHALL leave `users.vault_path` unchanged.
+The control panel's user-edit handler SHALL refuse a `vault_path` assignment whose root overlaps the root of any *other* active user holding an assignment, and SHALL name the conflicting user in the refusal. Three independent conditions each constitute an overlap and all three SHALL be evaluated: **identity**, where an opened directory descriptor for each root reports the same `(st_dev, st_ino)`; **containment**, where the canonical real path of one root is an ancestor of the canonical real path of the other, tested in both directions and compared on whole path components rather than as a string prefix; and **mount grafting**, where the process's mount table reports a mount point strictly inside one root whose device and filesystem-relative root place the other tenant's directory inside it. A refusal SHALL leave `users.vault_path` unchanged.
 
-Equality of the two normalised assignment strings — the whole of the check that exists today — is the degenerate case of both conditions, and its existing wording SHALL be preserved for that case. It is kept as a message, not as a second implementation: two functions answering "do these roots collide" is how the two answers drift apart.
+Equality of the two normalised assignment strings — the whole of the check that exists today — is the degenerate case of the first two conditions, and its existing wording SHALL be preserved for that case. The check SHALL therefore be given the canonical assignment strings alongside the descriptors, so an equal pair can still be described as a duplicate rather than as a containment. It is kept as a message, not as a second implementation: two functions answering "do these roots collide" is how the two answers drift apart.
 
-The two conditions are complementary and neither implies the other. Identity proves the two assignments name one directory object, which is what catches a symlink alias or a same-filesystem bind mount of one directory under two pathnames; it proves nothing about nesting, because two distinct inodes nest freely. Containment proves one root's canonical pathname lies inside the other's, which is what catches `/vaults/team` against `/vaults/team/private` and an ancestor reached through a symlinked component; it proves nothing about aliasing, because two unrelated pathnames can name one directory. Device numbers SHALL NOT be used to infer a mount relation in either direction: equal `st_dev` does not prove one mount, and unequal `st_dev` does not prove unrelated directories — a filesystem mounted inside another tenant's root gives different devices and total overlap.
+The three conditions are complementary and none implies another. Identity proves the two assignments name one directory object, which catches a symlink alias or a same-filesystem bind mount of one directory under two pathnames; it proves nothing about nesting, because two distinct inodes nest freely. Containment proves one root's canonical pathname lies inside the other's, which catches `/vaults/team` against `/vaults/team/private` and an ancestor reached through a symlinked component; it proves nothing about aliasing. Mount grafting proves the kernel has attached one tenant's directory inside the other's tree at a path neither canonical name expresses — `mount --bind /vaults/b /vaults/a/inner`, which the first two conditions both miss because the root inodes stay distinct and both real paths stay outside each other.
+
+Device numbers SHALL NOT be used to infer a mount relation in either direction: equal `st_dev` does not prove one mount, and unequal `st_dev` does not prove unrelated directories — a filesystem mounted inside another tenant's root gives different devices and total overlap.
 
 Component-wise comparison is load-bearing. A raw string prefix test reports `/vaults/team` as an ancestor of `/vaults/team-2`, which refuses an assignment that overlaps nothing.
+
+The mount-grafting condition SHALL be best-effort in the refusing direction only: where the mount table cannot be read, it SHALL be skipped and SHALL NOT by itself refuse an assignment, and the other two conditions SHALL still decide.
 
 #### Scenario: A descendant of another user's root is refused
 
@@ -19,7 +23,7 @@ Component-wise comparison is load-bearing. A raw string prefix test reports `/va
 #### Scenario: An ancestor of another user's root is refused
 
 - **WHEN** an administrator assigns `/vaults/team` to one user while another active user holds `/vaults/team/private`
-- **THEN** the assignment SHALL be refused by the same check, tested in the other direction
+- **THEN** the assignment SHALL be refused by the same condition, tested in the other direction
 - **AND** the refusal SHALL name the user holding `/vaults/team/private`
 
 #### Scenario: A symlink alias of another user's root is refused
@@ -27,6 +31,18 @@ Component-wise comparison is load-bearing. A raw string prefix test reports `/va
 - **WHEN** an administrator assigns a path that is a symbolic link to — or a bind mount of — the directory another active user is assigned, so that the two path strings differ and an opened descriptor for each reports the same `(st_dev, st_ino)`
 - **THEN** the assignment SHALL be refused
 - **AND** the refusal SHALL name the other user
+
+#### Scenario: Another user's vault grafted inside the candidate is refused
+
+- **WHEN** an administrator assigns a root inside which the mount table reports another active user's vault directory bind-mounted, while the two root inodes differ and neither canonical real path is inside the other
+- **THEN** the assignment SHALL be refused
+- **AND** the refusal SHALL name the other user and state that their vault is mounted inside the candidate root
+
+#### Scenario: An unreadable mount table does not refuse on its own
+
+- **WHEN** the process cannot read its mount table and a candidate root is neither identical to nor nested with any other active user's root
+- **THEN** the mount-grafting condition SHALL be skipped
+- **AND** the assignment SHALL be accepted on the strength of the other two conditions
 
 #### Scenario: Two sibling directories are accepted
 
@@ -43,7 +59,7 @@ Component-wise comparison is load-bearing. A raw string prefix test reports `/va
 
 - **WHEN** an administrator assigns a path exactly equal to another active user's assignment
 - **THEN** the assignment SHALL be refused
-- **AND** the message SHALL state that the path is already assigned to that user, as it does today
+- **AND** the message SHALL state that the path is already assigned to that user, as it does today, rather than describing the pair as a containment
 
 #### Scenario: An inactive or unassigned user is not a conflict
 
@@ -59,7 +75,7 @@ Component-wise comparison is load-bearing. A raw string prefix test reports `/va
 
 - **WHEN** the check cannot open a directory descriptor for another active user's assigned root — the directory is missing, or unreadable
 - **THEN** the assignment SHALL be refused, naming the root that could not be examined
-- **AND** the refusal SHALL state that the overlap could not be ruled out, rather than reporting an overlap that was not observed
+- **AND** the refusal SHALL state that the overlap could not be ruled out, rather than reporting an overlap that was not observed or naming a peer relation that was not established
 
 #### Scenario: Single-user mode is unaffected
 

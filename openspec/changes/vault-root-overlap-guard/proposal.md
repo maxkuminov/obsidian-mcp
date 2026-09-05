@@ -4,7 +4,7 @@ The vault-root uniqueness check is string equality. `_check_vault_path_unique`
 (`src/control_panel/users.py:68-81`) rejects only an *identical* `vault_path`
 among active users, and `validate_vault_root_path`
 (`src/services/vault.py:266-299`) rejects only empty input, a `..` component, a
-prefix outside `/vaults/`, and a non-directory. Two shapes get through:
+prefix outside `/vaults/`, and a non-directory. Three shapes get through:
 
 - **Ancestor / descendant.** `/vaults/team` for user A and `/vaults/team/private`
   for user B are two different strings, so both are accepted. Every path lookup
@@ -16,9 +16,13 @@ prefix outside `/vaults/`, and a non-directory. Two shapes get through:
   return B's content to A's agent.
 - **Aliases.** A symlink or a bind mount that makes two different pathnames name
   one directory passes the same string comparison, because the strings differ.
+- **Grafts.** `mount --bind /vaults/b /vaults/a/inner` puts B's whole vault
+  inside A's tree while both root inodes stay distinct and both canonical
+  pathnames stay outside each other — invisible to a path check *and* to an
+  inode check.
 
-Both require an administrator to hand-type a path into the custom-path field —
-the dropdown offers top-level `/vaults/*` only — so no untrusted actor crosses a
+All three require an administrator to hand-type a path or edit a mount — the
+dropdown offers top-level `/vaults/*` only — so no untrusted actor crosses a
 boundary. What makes it worth fixing anyway is that the exact-duplicate
 rejection is a **false assurance that collisions are checked**, and the blast
 radius under this product's framing is maximal: a cross-tenant destructive write
@@ -30,47 +34,61 @@ omission a containment non-issue — true for one tenant, false the moment two
 tenants nest. There are zero tests referencing either function.
 
 An assignment-time check alone is not enough: an assignment is validated once
-and the filesystem keeps moving. A symlink created after the assignment, or a
-bind mount repointed by a compose edit, produces the same overlap with no
-administrator action to intercept.
+and the filesystem keeps moving. A symlink created after the assignment, a bind
+mount repointed by a compose edit, or a `vault_path` written directly in psql
+produces the same overlap with no administrator action to intercept.
 
 ## What Changes
 
 - **At assignment (`edit_user_submit`), inside the existing `_lock_admin_guard`
-  transaction:** two checks against every *other* active assignment — the
-  `(st_dev, st_ino)` identity of an opened directory descriptor (aliases) and a
-  component-wise realpath prefix test in both directions (ancestor/descendant).
-  A conflict is refused, naming the conflicting user. `_check_vault_path_unique`
-  is subsumed: exact-string equality is the degenerate case of both checks and
-  its message wording is preserved.
-- **At every indexer pass (which includes the startup pass):** the same two
-  checks across all active assignments, before any user is indexed. Every user
-  in a detected overlap relation is **quarantined**: the pass indexes none of
-  them (index, link backfill and embed all skipped), and their MCP tool calls,
-  transfer redemptions and panel vault browser are refused through the existing
-  "this user has no vault" paths. Unrelated tenants are untouched.
-- **Fail closed for the pair, not for the deployment.** Quarantine refuses
-  reads *and* writes for exactly the users in the overlap, because index refusal
-  alone leaves the outer tenant's write tools able to clobber the inner tenant's
-  notes and leaves already-indexed foreign rows queryable. No index rows are
-  deleted — a corrected assignment must not cost a full re-embed.
-- **Not in `_vault_root`.** The gate stays free of database and filesystem work;
-  it consults one process-global, refuse-only set. Detection happens where a
-  pass already opens roots and already holds a session.
-- **Surfaced.** The overlap is logged at ERROR (so the ops-health ring buffer
-  catches it), written to the affected users' `indexer_runs.error` (so it
-  survives a restart, which the ring buffer does not), and rendered as an
-  admin-only banner on the dashboard health strip and the health page naming
-  both users and both roots.
+  transaction:** three checks against every *other* active assignment — the
+  `(st_dev, st_ino)` identity of an opened directory descriptor (aliases), a
+  component-wise realpath prefix test in both directions (ancestor/descendant),
+  and a best-effort `/proc/self/mountinfo` scan for a mount of one tenant's
+  filesystem-relative root grafted inside another's tree. A conflict is refused,
+  naming the conflicting user; an equal pair keeps today's wording.
+- **One `detect_and_publish()`, called from every entry point that can begin a
+  pass** — the lifespan, the indexer's startup block, each periodic tick, the
+  panel's `_reindex_background` (Reindex Now, re-embed, reset embeddings) and
+  the standalone `scripts/rebuild_tsvectors.py` process. Detection installed in
+  the indexer loop alone would be bypassed by the last two, one of which is a
+  different process entirely.
+- **Fail closed until the first snapshot.** The lifespan runs the detection
+  **synchronously before the app serves**. Until a snapshot has been published
+  in this process, `_vault_root` refuses every multi-user caller with a typed
+  not-ready refusal. Publication is atomic; a later detection that fails retains
+  the previous snapshot and logs at ERROR rather than clearing it.
+- **Structured quarantine reasons.** The snapshot maps a user id to
+  `overlap(peer, relation)` or `root_unexaminable(errno)` — an unopenable root
+  is not an overlap and must not be reported as one. The two are worded
+  separately in the panel, the log line, the `indexer_runs` row and the
+  `usage_logs` marker (`vault_root_overlap` / `vault_root_unexaminable`); both
+  markers join the shared pre-body-refusal predicate so they are excluded from
+  latency aggregates and counted as refusals.
+- **Fail closed for the pair, not for the deployment.** A quarantined user is
+  skipped by every pass stage and refused by every MCP tool, by transfer
+  redemption and by the panel vault browser; the users list shows a
+  quarantined-not-served state instead of a note count the tools will not serve.
+  Unrelated tenants are untouched. No index rows are deleted — a corrected
+  assignment must not cost a full re-embed.
+- **Not in `_vault_root`.** The gate stays free of database work, filesystem
+  work and mount-table parsing; it reads one immutable published snapshot,
+  refuse-only.
+- **Surfaced.** Logged at ERROR (so the ops-health ring buffer catches it),
+  written to the affected users' `indexer_runs.error` (so it survives a restart,
+  which the ring buffer does not — and a **paused** iteration still logs and
+  still writes those rows), and rendered as an admin-only condition on the
+  dashboard health strip and the health page naming every affected account, its
+  reason and its root.
 - **Documented.** `docs/architecture/vault-roots-and-tenancy.md` gains the guard
   and the refuse-only exception to "`_vault_root` is a pure cache lookup";
   `docs/architecture/vault-tools.md`'s `RESOLVE_NO_XDEV` paragraph is corrected;
   the README's existing "the validator does not resolve symlinks" paragraph
   gains the residual that survives.
 
-No migration. The quarantine is derived from the filesystem every pass;
-persisting it would create a second source of truth that can disagree with the
-directory it describes.
+No migration. The quarantine is derived from the filesystem at every entry
+point; persisting it would create a second source of truth that can disagree
+with the directory it describes.
 
 ## Capabilities
 
@@ -81,25 +99,37 @@ directory it describes.
 ### Modified Capabilities
 
 - `panel-user-administration`: the assignment-time overlap refusal.
-- `index-integrity`: per-pass overlap detection and the index refusal.
-- `mcp-request-routing`: the tool refusal for a quarantined caller, and the
-  existing "the admission gate performs no database work" requirement widened to
-  cover filesystem work.
-- `file-transfer`: a capability minted before the overlap is refused at
+- `index-integrity`: detection at every pass entry point, the published
+  snapshot's lifecycle, and the index refusal.
+- `mcp-request-routing`: the tool refusal for a quarantined caller and the
+  not-ready refusal; the existing "the admission gate performs no database work"
+  requirement widened to cover filesystem and mount-table work; the existing
+  users-list requirement widened to the quarantined state.
+- `panel-performance-views`: the two new markers join the shared
+  pre-body-refusal predicate.
+- `file-transfer`: a capability minted before the quarantine is refused at
   redemption.
-- `panel-ops-health`: the operator surface for a detected overlap.
+- `panel-ops-health`: the operator surface, with the two reasons worded apart.
 
 ## Impact
 
-- `src/control_panel/users.py` (assignment check), `src/services/vault.py`
-  (the quarantine set, `_vault_root`'s refuse-only test, the shared root-pair
-  predicate), `src/services/indexer.py` (per-pass detection, pass skip, run-row
-  recording), `src/services/transfer.py` (redemption gate),
-  `src/control_panel/routes.py` + `dashboard.html` / `health.html` (surface),
-  `src/mcp_server/tools.py` (distinct refusal marker).
+- `src/services/vault_overlap.py` (new — the three checks, the snapshot, the
+  orchestration), `src/services/vault.py` (the exception types, the gate's
+  refuse-only lookup), `src/control_panel/users.py` + `users.html` (assignment
+  check, quarantined state), `src/auth/routes.py` (a comment at the bootstrap
+  path), `src/services/indexer.py` + `scripts/rebuild_tsvectors.py` +
+  `src/main.py` (detection at every entry point, pass skip, run-row recording),
+  `src/mcp_server/tools.py` + `src/services/usage_stats.py` (markers and the
+  pre-body predicate), `src/services/transfer.py` (redemption gate),
+  `src/control_panel/routes.py` + `dashboard.html` / `health.html` (surface,
+  `vault_page`, the `_reindex_background` entry point).
+- Reuses `src/services/vault_fs.py`'s mount-identity support state rather than
+  inventing a second notion of "can this kernel talk about mounts".
 - Docs: `docs/architecture/vault-roots-and-tenancy.md`,
-  `docs/architecture/vault-tools.md`, `docs/architecture/control-panel.md`,
-  `README.md`, `CLAUDE.md` (one line under Key decisions).
+  `docs/architecture/vault-tools.md`,
+  `docs/architecture/indexing-and-embeddings.md`,
+  `docs/architecture/control-panel.md`,
+  `docs/architecture/usage-attribution.md`, `README.md`, `CLAUDE.md`.
 - No schema change, no migration, no `alembic check` movement.
 - Production runs `multi_user_mode=True` with two users at sibling roots, so the
   guard is expected to be inert on the live deployment; the live check is that
