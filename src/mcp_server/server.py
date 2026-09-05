@@ -445,12 +445,19 @@ async def edit_note(
 
     Writes are atomic: the composed result is staged in the note's own directory,
     flushed to disk, and published with a single same-directory rename, so a
-    crash mid-write cannot truncate the destination. The publish is optimistic,
-    not locked — the bytes this call read are compared against the file
-    immediately before that rename, so a note somebody else changed in the
-    meantime fails with `File changed while editing: <name>` and nothing is
-    written; re-read and retry. Structured frontmatter mutation is better done via
-    `set_frontmatter` — PyYAML serialization there discards YAML comments. A
+    crash mid-write cannot truncate the destination. The publish is guarded,
+    but only against a change landing inside **this call**: the file is read
+    here and re-compared immediately before the rename, so a writer racing this
+    tool's own read-modify-write fails with `File changed while editing:
+    <name>` and nothing is written. **That is not a guard on your read.** No
+    write tool takes an expected hash or version, so `content` computed from an
+    earlier `read_note` silently overwrites whatever changed the note in
+    between — the whole note under full replacement and
+    `replace_frontmatter=True`, only the touched region under
+    `append`/`find`/`section`. Re-read immediately before editing when a
+    concurrent writer is possible. Structured frontmatter mutation is better
+    done via `set_frontmatter` — PyYAML serialization there discards YAML
+    comments. A
     path whose final component is a symlink is refused in every mode
     (`dry_run` included), naming the link's target; symlinked folders inside
     the vault work normally.
