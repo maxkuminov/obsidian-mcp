@@ -1,4 +1,5 @@
 import hashlib
+import logging
 import os
 import re
 import secrets
@@ -28,6 +29,8 @@ from src.oauth.scope import VALID_SCOPES, clamp_scope, has_vault_scope
 # `client_can_write` (the consent template reads that key) without shadowing
 # the helper.
 from src.oauth.scope import client_can_write as _client_can_write
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["oauth"])
 templates = Jinja2Templates(
@@ -791,34 +794,185 @@ async def _handle_refresh(form):
             # rotated into a moment later. Locking the family, not the row,
             # is what closes that: see `src/oauth/grants.py`.
             #
-            # The lookup that finds the family deliberately does not filter on
-            # `revoked` — a revoked token still names its family, and the
-            # authoritative locking select below is what decides whether this
-            # refresh is allowed. Ordering matters more than precision here:
-            # both sides take this one lock before any row lock, so the
-            # acquisition order is total and cannot deadlock.
+            # The lookup that finds the family filters on the token hash and
+            # type **alone**. Both of the predicates it does not carry are
+            # load-bearing:
+            #
+            # * no `revoked` filter — a revoked row still names its family,
+            #   and the locked re-read below is what decides whether this
+            #   refresh is allowed;
+            # * no caller-supplied `client_id` filter — folding the caller's
+            #   claimed identity into the lookup makes a *replayed* token
+            #   presented with somebody else's (or a garbage) `client_id` look
+            #   unknown, so the live family would survive the very replay that
+            #   proves the token leaked. Identity is checked against the row,
+            #   on the rotation path below, where a mismatch is a refusal.
+            #
+            # Ordering matters more than precision here: both sides take this
+            # one lock before any row lock, so the acquisition order is total
+            # and cannot deadlock.
             grant_query = select(OAuthToken.grant_id).where(
                 OAuthToken.token_hash == token_hash,
                 OAuthToken.token_type == "refresh",
             )
-            if client_id:
-                grant_query = grant_query.where(OAuthToken.client_id == client_id)
-            grant_id = (await session.execute(grant_query)).scalar_one_or_none()
-            if grant_id is None:
+            grant_ids = (await session.execute(grant_query)).scalars().all()
+            if not grant_ids:
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
+            grant_id = grant_ids[0]
             await lock_grant(session, grant_id)
 
-            token_query = select(OAuthToken).where(
-                OAuthToken.token_hash == token_hash,
-                OAuthToken.token_type == "refresh",
-                OAuthToken.revoked == False,
-            ).with_for_update()
-            if client_id:
-                token_query = token_query.where(OAuthToken.client_id == client_id)
-            result = await session.execute(token_query)
-            old_token = result.scalar_one_or_none()
+            # Re-read under the lock. The statement takes a fresh snapshot, so
+            # a rotation or revocation that committed while this transaction
+            # waited for the lock is visible — this row, not anything read
+            # before the lock, is authoritative for both decisions below.
+            #
+            # `populate_existing` is not decoration. A `SELECT ... FOR UPDATE`
+            # whose row is already in the session's identity map returns the
+            # *loaded* object with its old attribute values; SQLAlchemy will
+            # not overwrite them without being told to. The reuse decision
+            # reads `revoked` off this object in Python, so a stale attribute
+            # would mean deciding on a pre-lock snapshot — precisely what the
+            # lock exists to prevent. (The family lookup above deliberately
+            # selects the `grant_id` column rather than the entity, so it does
+            # not populate the identity map in the first place.)
+            token_query = (
+                select(OAuthToken)
+                .where(
+                    OAuthToken.token_hash == token_hash,
+                    OAuthToken.token_type == "refresh",
+                )
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+            locked = (await session.execute(token_query)).scalars().all()
+            old_token = locked[0] if locked else None
 
-            if not old_token:
+            if old_token is None:
+                # The row was deleted while we waited (`cleanup_expired_tokens`
+                # retires long-dead rows). Nothing left says it was ever
+                # rotated, so this is a not-found refusal, not reuse.
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+            if old_token.revoked:
+                # Refresh-token reuse (issue #182, ASVS V10.4.5). The row
+                # exists and is revoked: the caller is replaying a refresh
+                # token that was already rotated away (or revoked outright).
+                # The flag is read off the locked row itself rather than
+                # inferred from an empty result, so no other predicate can
+                # ever be mistaken for it.
+                #
+                # Rotation alone is only half the requirement. A replayed
+                # refresh token is evidence the token leaked — the thief and
+                # the legitimate client cannot both hold the current one — and
+                # RFC 6819 §5.2.1.1 / OAuth 2.1 answer that by killing the
+                # whole family. Without this, the thief who redeems first keeps
+                # a live, identically-scoped pair (up to `readwrite` over the
+                # vault) for the 30-day sliding window while the legitimate
+                # client sees `invalid_grant` and quietly re-authorizes.
+                #
+                # Race-safe because the grant lock is already held: nothing can
+                # rotate a new pair into this family between the select above
+                # and this UPDATE, so "every live token" cannot be stale.
+                # `revoke_grant_family` re-takes the same transaction-scoped
+                # advisory lock, which is re-entrant.
+                #
+                # The refusal carries the same error code, status, headers and
+                # body as the not-found refusal above, deliberately: the caller
+                # must not learn whether it named a live family, whether
+                # anything was revoked, or that reuse detection exists at all.
+                # (Timing is not covered — this path does strictly more work
+                # and is measurably slower. Accepted residual, recorded in
+                # `docs/architecture/oauth-and-grants.md`.)
+                #
+                # Every database call below is therefore guarded, including the
+                # rollbacks: the response is decided *here*, by this branch,
+                # and must not depend on whether the session survived. An
+                # unguarded failure would escape to the outer handler and
+                # answer 500 on the reuse path only — which is the disclosure
+                # the constant response exists to prevent.
+                #
+                # The identifiers are read before the write so the record does
+                # not depend on the row surviving the commit.
+                reused_client_id = old_token.client_id
+                reused_user_id = old_token.user_id
+                revoked_count = 0
+                failure: str | None = None
+                try:
+                    revoked_count = await revoke_grant_family(session, grant_id)
+                    if revoked_count:
+                        await session.commit()
+                    else:
+                        # Already fully revoked: nothing was flipped, so there
+                        # is nothing to commit.
+                        await session.rollback()
+                except Exception as exc:
+                    # Only the exception's class name is ever recorded. A
+                    # SQLAlchemy error renders the failing statement *and its
+                    # bound parameters* in `str(exc)`, and one of those
+                    # parameters is the token hash — so neither the text nor
+                    # `exc_info` may reach the log.
+                    failure = type(exc).__name__
+                    revoked_count = 0
+                    try:
+                        await session.rollback()
+                    except Exception as rollback_exc:
+                        failure = f"{failure}+{type(rollback_exc).__name__}"
+
+                # The identifiers go in the message text, not only in `extra`:
+                # the process formatter is `%(message)s`, so anything left in
+                # `extra` alone never reaches the operator. None of them is a
+                # secret; no token value or hash is ever among them.
+                if failure is not None:
+                    logger.warning(
+                        "oauth.refresh_reuse_revocation_failed "
+                        "client_id=%s grant_id=%s user_id=%s error=%s",
+                        reused_client_id,
+                        grant_id,
+                        reused_user_id,
+                        failure,
+                        extra={
+                            "event": "oauth.refresh_reuse_revocation_failed",
+                            "client_id": reused_client_id,
+                            "grant_id": grant_id,
+                            "user_id": reused_user_id,
+                            "error": failure,
+                        },
+                    )
+                elif revoked_count:
+                    # One record, on the path that actually killed live tokens.
+                    # A family that was already fully revoked (an operator
+                    # revocation the client has not noticed yet, or a second
+                    # replay after the first one closed it) is a no-op with
+                    # nothing new to report, and the not-found refusals are not
+                    # reuse at all.
+                    #
+                    # The record is written after the commit, so a crash in
+                    # between loses the alarm while keeping the revocation.
+                    # Accepted: the safe half is the one that persists, and an
+                    # outbox for one WARNING is not worth its own failure mode.
+                    logger.warning(
+                        "oauth.refresh_reuse_detected "
+                        "client_id=%s grant_id=%s user_id=%s revoked_tokens=%s",
+                        reused_client_id,
+                        grant_id,
+                        reused_user_id,
+                        revoked_count,
+                        extra={
+                            "event": "oauth.refresh_reuse_detected",
+                            "client_id": reused_client_id,
+                            "grant_id": grant_id,
+                            "user_id": reused_user_id,
+                            "revoked_tokens": revoked_count,
+                        },
+                    )
+                return JSONResponse({"error": "invalid_grant"}, status_code=400)
+
+            # The caller's claimed identity is checked against the row it
+            # named, now that the row is known to be live. A mismatch is the
+            # same refusal it has always been, and revokes nothing: a *live*
+            # token presented with the wrong `client_id` is a misconfigured or
+            # confused client, not evidence that the token leaked.
+            if client_id and old_token.client_id != client_id:
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
             result = await session.execute(
