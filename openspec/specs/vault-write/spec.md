@@ -733,7 +733,12 @@ the source note, inside the rewritten link and outside it, SHALL be preserved
 exactly as written. An implementation that recognises links in a
 code-masked copy of the note SHALL take the bytes it writes back from the
 unmasked note, so masked code inside a link's text, alias or anchor is never
-published as the mask's filler.
+published as the mask's filler, and SHALL NOT rewrite a link whose target or
+href differs between the masked copy and the note, because the mask, not the
+author, chose the note that link appears to name. When one source's links
+cannot all be rewritten without one replacement destroying another's span,
+the whole move SHALL be refused before any rename or write, naming that
+source, rather than published as a set of successful rewrites.
 
 #### Scenario: Default leaves source-note bodies untouched
 
@@ -769,6 +774,23 @@ published as the mask's filler.
   alias and anchor unchanged, backticks and all
 - **AND** no character of the source note outside the rewritten link spans
   SHALL differ from what was there before the move
+
+#### Scenario: A link whose target is hidden by code masking is left alone
+
+- **WHEN** a source note contains ``[[`x`Old]]`` or ``[t](`x`Old.md)`` and
+  `move_note(from_path="Old.md", …, rewrite_links=True)` runs
+- **THEN** neither link SHALL be rewritten, because the note each names is
+  not known once its inline code is masked
+- **AND** both SHALL be left byte-identical
+
+#### Scenario: A link nested inside another link to the moved note is refused
+
+- **WHEN** a source note contains `[x](Old.md#anchor[[Old]])`, in which both
+  the markdown link and the wikilink inside its anchor name the moved note,
+  and `rewrite_links=True`
+- **THEN** the whole move SHALL be aborted before the rename, with an error
+  naming that source note
+- **AND** nothing SHALL be moved, rewritten or reindexed
 
 #### Scenario: Path-style wikilinks updated when used
 
