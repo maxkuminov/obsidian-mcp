@@ -1,7 +1,7 @@
 ## MODIFIED Requirements
 
 ### Requirement: Quota administration
-The keys UI SHALL allow setting, changing, and clearing a key's `daily_request_limit` at create and edit time, SHALL display each limited key's consumed count for the current UTC day alongside its limit, and SHALL pre-fill the create form's limit field with the configured `DEFAULT_DAILY_REQUEST_LIMIT` (leaving the field empty when no default is configured) with help text stating that the value is a default the operator may change or clear and that clearing it means unlimited. The edit path SHALL be unchanged and SHALL NOT apply the default to an existing key.
+The keys UI SHALL allow setting, changing, and clearing a key's `daily_request_limit` at create and edit time, SHALL display each limited key's consumed count for the current UTC day alongside its limit, and SHALL pre-fill the create form's limit field with the configured `DEFAULT_DAILY_REQUEST_LIMIT` — the keys page handler passing that value to the template, leaving the field empty when no default is configured — with help text stating that the value is a default the operator may change or clear and that an empty field means unlimited. A **blank submitted field SHALL create an unlimited key**, and the create handler SHALL NOT substitute the configured default for a blank submission: the pre-filled form is the only place the default is applied, so the operator's last view of the field is what the key receives. The edit path SHALL be unchanged and SHALL NOT apply the default to an existing key.
 
 #### Scenario: Set and observe
 - **WHEN** the operator sets limit 500 on a key that has made 12 calls earlier today, before the limit existed
@@ -13,7 +13,11 @@ The keys UI SHALL allow setting, changing, and clearing a key's `daily_request_l
 
 #### Scenario: Clearing the pre-filled default creates an unlimited key
 - **WHEN** the operator clears the pre-filled limit field and submits
-- **THEN** the created key is unlimited
+- **THEN** the created key is unlimited and no default is substituted on the server side
+
+#### Scenario: No default configured leaves the field empty
+- **WHEN** `DEFAULT_DAILY_REQUEST_LIMIT` is null and the operator opens the create form
+- **THEN** the limit field is empty and submitting it unchanged creates an unlimited key
 
 #### Scenario: Editing an existing key never applies the default
 - **WHEN** the operator opens the limit editor for an existing unlimited key and cancels, or clears the field and saves
