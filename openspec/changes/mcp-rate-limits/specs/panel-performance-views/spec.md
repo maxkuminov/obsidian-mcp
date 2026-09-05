@@ -28,5 +28,5 @@ The panel SHALL provide a performance view showing, per tool over a user-selecta
 - **THEN** the view renders the window without raising, because the cast is guarded
 
 #### Scenario: Post-body errors still count as executed
-- **WHEN** a window holds rows carrying `vault_assignment_changed` or `related_source_not_found`
-- **THEN** those rows remain inside the latency and size aggregates, because their tool bodies ran
+- **WHEN** a window holds rows carrying `vault_assignment_changed`, `related_source_not_found`, or the provider-input-rejection marker written after an embedding round trip
+- **THEN** those rows remain inside the latency and size aggregates, because their tool bodies ran — the provider rejection in particular SHALL NOT be enumerated as a pre-body refusal, or a real network round trip would be dropped out of the percentiles
