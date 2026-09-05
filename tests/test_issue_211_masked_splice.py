@@ -18,7 +18,11 @@ for this product, because an agent never sees the bytes it just lost.
 The fix is one property: masking is a **same-length** substitution, so a span
 discovered in `masked` indexes the identical region of `content`, and every
 byte written back is sliced from `content` at that span. What the recognizers
-*see* is unchanged, so which links get rewritten is unchanged too — the
+*see* is unchanged (they still run over the mask), but a post-recognition
+eligibility filter is new: a candidate whose *deciding* span — the wikilink
+target or the markdown href — contains masked bytes is skipped rather than
+rewritten, and overlapping rewrite spans refuse the whole move instead of
+falling back to a splice that corrupted bytes outside the link. The
 fenced-code and inline-code exclusions below are the same assertions they were
 before, kept here so a future "just splice from the mask, it is simpler"
 cannot pass.
