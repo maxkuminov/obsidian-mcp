@@ -41,12 +41,15 @@ produces the same overlap with no administrator action to intercept.
 ## What Changes
 
 - **At assignment (`edit_user_submit`), inside the existing `_lock_admin_guard`
-  transaction:** three checks against every *other* active assignment — the
+  transaction and only when the edit's *resulting* state is active and
+  assigned** — deactivating or unassigning an account is the operator's remedy
+  for a quarantine and must not be refused by the guard — **three checks against
+  every *other* active assignment — the
   `(st_dev, st_ino)` identity of an opened directory descriptor (aliases), a
   component-wise realpath prefix test in both directions (ancestor/descendant),
   and a best-effort `/proc/self/mountinfo` scan for a mount of one tenant's
-  filesystem-relative root grafted inside another's tree. A conflict is refused,
-  naming the conflicting user; an equal pair keeps today's wording.
+  filesystem-relative root grafted inside another's tree.** A conflict is
+  refused, naming the conflicting user; an equal pair keeps today's wording.
 - **One `detect_and_publish()`, called from every entry point that can begin a
   pass** — the lifespan, the indexer's startup block, each periodic tick, the
   panel's `_reindex_background` (Reindex Now, re-embed, reset embeddings) and
@@ -58,9 +61,20 @@ produces the same overlap with no administrator action to intercept.
   in this process, `_vault_root` refuses every multi-user caller with a typed
   not-ready refusal. Publication is atomic; a later detection that fails retains
   the previous snapshot and logs at ERROR rather than clearing it.
-- **Structured quarantine reasons.** The snapshot maps a user id to
-  `overlap(peer, relation)` or `root_unexaminable(errno)` — an unopenable root
-  is not an overlap and must not be reported as one. The two are worded
+- **One detection at a time, and a publication that cannot go backwards.** The
+  entry points call detection before taking the pass lock, so a periodic tick
+  and a panel reindex overlap trivially — and a detection stalled on a slow root
+  could otherwise publish its own *empty* result over a newer quarantine and
+  re-admit both tenants. Observation, the checks and the publication all run
+  inside **one process-global `asyncio.Lock`**, and each snapshot carries a
+  **monotonic sequence** taken under that lock, so an older result is dropped
+  rather than published.
+- **Structured quarantine reasons that preserve what was observed.** The
+  snapshot maps a user id to `overlap(peer, relation)` or
+  `root_unexaminable(errno)` — an unopenable root is not an overlap and must not
+  be reported as one — and each entry carries the usernames, canonical
+  assignments and detection time **as observed**, so the panel can still name
+  the pair after the operator edits or deletes one of them. The two are worded
   separately in the panel, the log line, the `indexer_runs` row and the
   `usage_logs` marker (`vault_root_overlap` / `vault_root_unexaminable`); both
   markers join the shared pre-body-refusal predicate so they are excluded from
@@ -123,8 +137,13 @@ with the directory it describes.
   pre-body predicate), `src/services/transfer.py` (redemption gate),
   `src/control_panel/routes.py` + `dashboard.html` / `health.html` (surface,
   `vault_page`, the `_reindex_background` entry point).
-- Reuses `src/services/vault_fs.py`'s mount-identity support state rather than
-  inventing a second notion of "can this kernel talk about mounts".
+- Mountinfo availability is tracked as **its own state** in the new module and
+  is deliberately *not* folded into `src/services/vault_fs.py`'s
+  `mount_identity_available()`: `STATX_MNT_ID` is Linux 5.8 while reading
+  `/proc/self/mountinfo` needs neither that extension nor that kernel, so
+  reusing the flag would disable the graft check on kernels that can perform it
+  and would make its failure masquerade as a transfer-write outage on
+  `/health`. `transfer_mount_check_available`'s semantics are untouched.
 - Docs: `docs/architecture/vault-roots-and-tenancy.md`,
   `docs/architecture/vault-tools.md`,
   `docs/architecture/indexing-and-embeddings.md`,

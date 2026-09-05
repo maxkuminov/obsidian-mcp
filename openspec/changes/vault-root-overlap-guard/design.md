@@ -82,15 +82,28 @@ reads the process's mount table.
 | --- | --- | --- |
 | **1. Identity.** `os.fstat(fd_a)[st_dev, st_ino] == os.fstat(fd_b)[st_dev, st_ino]`, each `fd` from `os.open(root, O_RDONLY \| O_DIRECTORY \| O_CLOEXEC)`. | The two assignments name **one directory object** at this instant: same superblock, same inode. Every entry reachable under one is the same entry under the other. Catches a symlink alias, a same-filesystem bind mount of one directory to two pathnames, and a directory hard link where the kernel permits one. | **Nothing about containment.** Two distinct inodes nest all the time — that is check 2's job, and identity is blind to it. **Equal `st_dev` is not proof of one mount**: a bind mount of a subtree of the same filesystem reports the same `st_dev` while being a different mount, which is exactly why transfer publication uses `statx`'s `STATX_MNT_ID` and `_check_mount_identity_support` warns rather than comparing `st_dev` (`src/main.py:167`). **Unequal `st_dev` is not proof of unrelated directories**: a separate filesystem mounted *inside* another tenant's root gives `/vaults/a` and `/vaults/a/sub` different devices and total overlap. Different `st_dev` says "a `rename(2)` between these two would fail `EXDEV`" — it says nothing about who can read whom. |
 | **2. Containment.** Component-wise prefix test over `os.path.realpath(root)` in **both** directions (`PurePosixPath.is_relative_to` / a `parts` prefix), never over the raw string. | One root's **canonical pathname lies inside** the other's, right now, in this container's namespace. `realpath` resolves every component, so an ancestor reached through a symlink (`/vaults/b -> /vaults/a/inner`) canonicalises to the containing form and is caught. Complement to check 1: identity answers "same object", containment answers "one inside the other", and neither implies the other. | It is a **pathname** fact about this mount namespace at this instant. It cannot see a future mount or symlink (which is why the checks re-run at every pass, not only at assignment). And it cannot see an overlap that neither canonical name expresses — which is check 3's job. Component-wise comparison is load-bearing: a raw string prefix test reports `/vaults/team` as an ancestor of `/vaults/team-2` and refuses an assignment that overlaps nothing. |
-| **3. Mount grafting.** Parse `/proc/self/mountinfo`. For every entry whose **mount point** is strictly inside `realpath(A)`, treat it as an overlap of A with B when the entry's `major:minor` equals B's root device **and** the entry's **mount root** (the path *within that filesystem*) is equal to, or an ancestor of, or a descendant of, B's own filesystem-relative root path. B's filesystem-relative root is computed from B's own longest-matching mountinfo entry: `entry.root` joined with `realpath(B)` relative to `entry.mount_point`. | The kernel has **grafted B's directory (or a part of it, or a container of it) into A's tree** at a path that neither canonical name expresses — `mount --bind /vaults/b /vaults/a/inner`, which checks 1 and 2 both miss because the two root inodes stay distinct and both realpaths stay outside each other. This is the case that makes an unhandled residual a *permanent* cross-tenant destructive-write hole rather than a window. | It is the mount table of **this** process's namespace: a mount visible only in another namespace is invisible here, and by the same token cannot be traversed by this process either. It does not model **shadowing** — an entry later overmounted at the same mount point is still listed, so a stale entry can produce a refusing verdict for a graft that is no longer reachable. It is **Linux-and-`/proc`-only**: where `/proc/self/mountinfo` cannot be read the check is skipped, logged **once**, and reported through the existing mount-identity health surface. |
+| **3. Mount grafting.** Parse `/proc/self/mountinfo`. For every entry whose **mount point** is strictly inside `realpath(A)`, treat it as an overlap of A with B when the entry's `major:minor` equals B's root device **and** the entry's **mount root** (the path *within that filesystem*) is equal to, or an ancestor of, or a descendant of, B's own filesystem-relative root path. B's filesystem-relative root is computed from B's own longest-matching mountinfo entry: `entry.root` joined with `realpath(B)` relative to `entry.mount_point`. | The kernel has **grafted B's directory (or a part of it, or a container of it) into A's tree** at a path that neither canonical name expresses — `mount --bind /vaults/b /vaults/a/inner`, which checks 1 and 2 both miss because the two root inodes stay distinct and both realpaths stay outside each other. This is the case that makes an unhandled residual a *permanent* cross-tenant destructive-write hole rather than a window. | It is the mount table of **this** process's namespace: a mount visible only in another namespace is invisible here, and by the same token cannot be traversed by this process either. It does not model **shadowing** — an entry later overmounted at the same mount point is still listed, so a stale entry can produce a refusing verdict for a graft that is no longer reachable. It is **Linux-and-`/proc`-only**: where `/proc/self/mountinfo` cannot be read or parsed, the check is skipped, logged **once**, and the reduced coverage is stated on the health page. |
 
 **Check 3's failure posture is the `read_dir_handle` posture, verbatim:
 best-effort, in the refusing direction only.** It can *add* an overlap; it can
 never clear one; and its absence is not a degraded mode, not a quarantine and
 not a startup refusal. That is what makes it safe to ship a check that some
-kernels and some sandboxes cannot answer. It reuses `vault_fs`'s mount-identity
-support state (`mount_identity_available()`, `record_mount_identity_support`)
-rather than inventing a second notion of "can this kernel talk about mounts".
+kernels and some sandboxes cannot answer.
+
+**Its availability is its own state, and must not be folded into
+`vault_fs.mount_identity_available()`.** That flag records whether `statx`
+reports `STATX_MNT_ID`, which is Linux **5.8**; reading and parsing
+`/proc/self/mountinfo` needs neither that syscall extension nor that kernel.
+The two are independent in both directions — a 5.6/5.7 kernel (this server's
+`openat2` floor) has mountinfo and no `STATX_MNT_ID`, and a `/proc`-less or
+hardened sandbox can have `STATX_MNT_ID` and no mountinfo. Reusing the flag
+would therefore disable check 3 on kernels that can perform it, and — worse in
+the other direction — would let a mountinfo failure change what `/health`
+reports as `transfer_mount_check_available`, i.e. make a tenancy check's
+coverage look like a transfer-write outage. So `vault_overlap` keeps
+`_mountinfo_available: bool | None`, probes it on first use, logs once, and
+leaves `transfer_mount_check_available`'s semantics exactly as they are. Check 3
+is attempted independently of the transfer probe's verdict.
 
 Equality of the two normalised assignment strings — today's whole check — is the
 degenerate case of checks 1 and 2. The predicate therefore takes the two
@@ -104,6 +117,16 @@ In `edit_user_submit`, after `_validate_vault_path` returns a normalised path
 and while the `_lock_admin_guard` advisory lock is still held, in the same
 transaction that will write `users.vault_path`:
 
+0. **Only when the edit's *resulting* state is active and assigned.** The
+   handler has already computed `new_active` and the normalised path by this
+   point, so the condition is `normalized and new_active`. An edit whose result
+   is inactive, or whose result clears the assignment, can create no overlap —
+   the detector and the peer query both scope to active users holding an
+   assignment — and refusing it would trap the operator in the one state they
+   most need to leave: the panel's own remedy for a quarantined account is to
+   deactivate or unassign it, and a guard that refuses *that* because the
+   account still overlaps is a guard with no exit. Reactivating or reassigning
+   runs the full check, which is where it belongs.
 1. `SELECT id, username, vault_path FROM users WHERE is_active AND vault_path IS NOT NULL AND id != :target`.
 2. Open the candidate root and each peer root; run checks 1, 2 and 3 for each pair.
 3. First conflict wins; refuse with `_back_with_error`, naming the other user and the relation found ("… is inside the vault of user 'bob'", "… is the same directory as the vault of user 'bob'", "… has user 'bob''s vault mounted inside it"). Admin-facing, so naming is correct — the existing message already names the other user. An equal pair keeps today's wording.
@@ -146,6 +169,41 @@ by this orchestration". A sixth entry point added later inherits the guard by
 routing through the same helper, which is why the per-user stage skip lives in
 the shared pass helpers rather than in each loop.
 
+### One detection at a time, and a publication that cannot go backwards
+
+Every entry point calls the detection *before* taking `index_pass_lock`, which
+is correct — the check must not wait behind a pass it exists to gate — and it
+means two detections can be in flight at once: a periodic tick (E3) and a
+panel-triggered reindex (E4) overlap trivially, and E4 fires three times over
+from Reindex Now, re-embed and reset-embeddings. The failure that buys is not
+theoretical and it fails **open**: a detection that started before an overlap
+appeared, stalled on a slow `open` of an NFS or FUSE root, and completed after a
+newer detection had already published the quarantine, would publish its own
+**empty** result over the newer one and re-admit both tenants until the next
+entry point. Atomicity of the swap does not help — both writes are individually
+atomic and the wrong one is last.
+
+Two mechanisms, and they are not redundant:
+
+- **One process-global `asyncio.Lock` around the whole operation.** Observation,
+  the pairwise checks *and* the publication are inside the same critical
+  section, so a second detection cannot begin until the first has published.
+  Holding the lock only across the publication would leave exactly the
+  interleaving above. Detection is cheap — N `open`s plus one mountinfo read —
+  so a waiter costs a bounded stall, and a waiter is what we want: an entry
+  point that finds a detection in flight is entitled to the answer it produces.
+- **A monotonic sequence number, taken under the lock.** Each snapshot carries a
+  sequence assigned when its detection began, and publication drops a snapshot
+  whose sequence is not greater than the published one. The lock is the
+  mechanism; the sequence is the *invariant*, and it is what survives a future
+  caller — a test, a fixture, a sixth entry point — that publishes without
+  taking the lock. A property enforced only by a lock somebody has to remember
+  to take is a property that regresses silently.
+
+The standalone rebuild process (E5) has its own event loop and its own lock, and
+that is correct: it is a different process with a different snapshot, and it
+consumes only what it published itself.
+
 ### Fail closed until the first snapshot
 
 An asynchronously-published snapshot is not startup enforcement. Between the app
@@ -175,9 +233,11 @@ are down anyway. So the server logs at ERROR, keeps serving the panel, and
 retries at the next entry point rather than exiting — the same
 partial-capability posture `_check_mount_identity_support` takes.
 
-**Publication is atomic and never regresses on failure.** The snapshot is one
-immutable object swapped in with a single assignment, so no reader ever sees a
-half-built set. A detection that raises after a snapshot already exists
+**Publication is atomic, monotonic, and never regresses on failure.** The
+snapshot is one immutable object swapped in with a single assignment, so no
+reader ever sees a half-built set; it carries the sequence number above, so an
+older detection's result is dropped rather than published. A detection that
+raises after a snapshot already exists
 **retains the previous snapshot** and logs at ERROR; it does not clear it, and
 clearing it back to "never published" is explicitly forbidden — a transient
 database blip must not become a deployment-wide refusal, and a stale snapshot
@@ -189,14 +249,28 @@ filesystem: it has no users, it skips the indexer, and the readiness invariant
 must still hold or every registered tool would refuse for a reason the sandbox
 cannot fix.
 
-### Structured quarantine reasons
+### Structured quarantine reasons, and the facts they preserve
 
-The snapshot is not a set of ids; it is a mapping from user id to a reason:
+The snapshot is not a set of ids; it is a mapping from user id to a reason, and
+**each entry carries the facts as observed at detection time** — the subject's
+username and canonical assignment, the peer's username and canonical assignment
+for an overlap, and the moment the detection ran. Those are immutable in the
+snapshot and are what every operator surface renders.
+
+The alternative — record ids and let the panel resolve names at render time —
+loses the display in exactly the situation it is needed. The operator's first
+move on reading "vault root overlaps <peer>" is to *edit or delete* one of the
+two accounts; the moment they do, and until the next detection publishes, a
+render-time resolution shows a changed path, or a blank where a deleted peer
+was, beside a condition that is still in force. Recording the facts also makes
+the staleness honest: the surfaces label them "as at last check", so a name that
+no longer exists is legible as a fact about the past rather than presented as
+the current state.
 
 | Reason | Meaning | Wording |
 | --- | --- | --- |
-| `overlap(peer_user_id, relation)` | This root and that user's root are the same directory, nested, or grafted. `relation` is one of `identical`, `contains`, `contained_by`, `mount_graft`. | Panel: "vault root overlaps <peer>'s (<relation>)". Run row and log: names both users and both roots. |
-| `root_unexaminable(errno)` | The root could not be opened, so no overlap could be ruled out. **Not an overlap** — no peer is named, because none was observed. | Panel: "vault root could not be examined (<errno>) — not served". Run row and log: names the one user, the root and the errno. |
+| `overlap(peer_user_id, peer_username, peer_assignment, relation)` | This root and that user's root are the same directory, nested, or grafted. `relation` is one of `identical`, `contains`, `contained_by`, `mount_graft`. | Panel: "vault root overlaps <peer>'s (<relation>), as at last check". Run row and log: names both users and both roots, from the recorded facts. |
+| `root_unexaminable(errno)` | The root could not be opened, so no overlap could be ruled out. **Not an overlap** — no peer is named, because none was observed. | Panel: "vault root could not be examined (<errno>) — not served". Run row and log: names the one user, the recorded assignment and the errno. |
 
 Calling an unopenable root an "overlap" would send an operator looking for a
 second account that does not exist. The two reasons are separately worded in the
@@ -381,7 +455,7 @@ precisely the case string equality could not see.
 | --- | --- | --- |
 | L1 | Check 3 sees only **this process's mount namespace**. A graft performed in another namespace is invisible. | It is also untraversable from here: a mount this process cannot see is a mount this process cannot walk into, so the containment it would create does not exist for this server. |
 | L2 | Check 3 does not model **shadowing**. An entry later overmounted at the same mount point is still listed, so a stale graft can produce a refusing verdict for an overlap that is no longer reachable. | The refusing direction, admin-visible, named in the panel with both roots, and cleared by removing the stale mount. Modelling shadowing means reimplementing the kernel's mount-tree resolution from a text file. |
-| L3 | Check 3 is **Linux-and-`/proc`-only**. Where `/proc/self/mountinfo` cannot be read it is skipped, logged once, and reported through the mount-identity health surface. | Best-effort in the refusing direction only, exactly like `read_dir_handle`: it can add an overlap and can never clear one, so its absence degrades coverage and nothing else. It never quarantines anyone by being unavailable. |
+| L3 | Check 3 is **Linux-and-`/proc`-only**. Where `/proc/self/mountinfo` cannot be read or parsed it is skipped, logged once, and the health page states that graft coverage is unavailable. Its availability is tracked separately from `STATX_MNT_ID`, which is a different capability on a different kernel version. | Best-effort in the refusing direction only, exactly like `read_dir_handle`: it can add an overlap and can never clear one, so its absence degrades coverage and nothing else. It never quarantines anyone by being unavailable. |
 | L4 | All three checks are **point-in-time**. Between two entry points a root can be aliased and un-aliased with no record. | The window is one index interval (300 s); the assignment-time check closes the administrator-initiated case entirely; and continuous detection needs an inotify/fanotify watch on paths the container may not be able to watch. |
 | L5 | The guard **refuses the configuration; it does not un-index what a previous configuration indexed.** Rows the outer tenant's pass already wrote for the inner tenant's notes remain until a corrected assignment drives `classify_provenance` to discard/re-derive or the ordinary prune removes them. | They are unreachable while the quarantine stands (the admission gate is total), and a blanket delete is a second deletion path over index contents with a worse failure mode than the one it fixes. |
 | L6 | The snapshot is **process-global**; under multiple uvicorn workers a worker converges only at its next entry point. | Same boundary as `_user_vault_cache`, `clear_user_vault_cache` and the ops-health ring buffer; single-process today, and each worker's lifespan publishes before it serves. |
@@ -428,10 +502,15 @@ touching the rest of the design.
 7. **Fail closed until the first snapshot, with the lifespan publishing
    synchronously before serving; a later detector failure retains the previous
    snapshot and logs ERROR.** *Default taken.*
-8. **Check 3 is best-effort in the refusing direction only**, reusing
-   `vault_fs`'s mount-identity support state. *Default taken.* Alternative:
-   make it a startup requirement — rejected as the whole-server-outage direction
-   `_check_mount_identity_support` already refused.
+8. **Check 3 is best-effort in the refusing direction only, with its own
+   availability state.** *Default taken.* Alternatives both rejected: making it
+   a startup requirement is the whole-server-outage direction
+   `_check_mount_identity_support` already refused; and gating it on
+   `vault_fs.mount_identity_available()` conflates two independent
+   capabilities — mountinfo needs no `STATX_MNT_ID` (5.8) and a 5.6/5.7 kernel
+   has one without the other — which would both disable the check where it
+   works and make its failure masquerade as a transfer-write outage on
+   `/health`.
 9. **The tool-facing refusal names no other user or path for any reason; the
    panel, the log and the run row name everything.** *Default taken.*
 10. **`_check_vault_path_unique` is subsumed by the shared predicate**, with its
@@ -441,8 +520,22 @@ touching the rest of the design.
 11. **The quarantined state replaces the note count on the users list**, with its
     own wording and reason, mirroring the existing unassigned treatment.
     *Default taken.*
-12. **No migration, no persisted quarantine.** *Default taken.*
-13. **The `/vaults/*` dropdown is left as it is** (limitation L9). *Default
+12. **The whole detect-and-publish is serialized under one process-global
+    `asyncio.Lock`, and publication is monotonic by a sequence number taken
+    under that lock.** *Default taken.* The lock alone would be enough today;
+    the sequence is what keeps the invariant true for a caller that publishes
+    without it. Alternative: hold the lock only across the publication —
+    rejected, it leaves precisely the stale-overwrite interleaving.
+13. **The assignment-time check runs only when the edit's resulting state is
+    active and assigned.** *Default taken.* Alternative: check unconditionally
+    — rejected, it refuses the deactivation that is the operator's remedy.
+14. **The snapshot records the observed usernames, canonical assignments and
+    the detection time, and the surfaces render those rather than re-reading
+    `users`.** *Default taken.* Alternative: resolve names at render time —
+    rejected, it blanks the display exactly when the operator edits or deletes
+    the peer the condition names.
+15. **No migration, no persisted quarantine.** *Default taken.*
+16. **The `/vaults/*` dropdown is left as it is** (limitation L9). *Default
     taken.*
 
 ## Review history
@@ -461,6 +554,16 @@ in, none rejected.
 | MAJOR — slices not disjoint | Complete file ownership restated per slice; 1.6 moved to slice 2, `auth/routes.py` declared in slice 2, `usage_stats.py` in slice 4, `main.py` + `scripts/` in slice 3, `routes.py` wholly in slice 6 |
 | MINOR — carry canonical assignment strings | Predicate signature takes them; exact-duplicate wording preserved |
 | MINOR — a paused iteration must still log and record | Stated in the disposition and pinned as an `index-integrity` scenario with its own task |
+
+Round 2 (Codex): FAIL — 2 BLOCKER, 1 MAJOR, 1 MINOR, round-1 items accepted as
+resolved. All four folded in, none rejected.
+
+| Finding | Where it landed |
+| --- | --- |
+| BLOCKER — a stalled older detection can publish an empty result over a newer quarantine | "One detection at a time, and a publication that cannot go backwards": one process-global `asyncio.Lock` around observation, checks *and* publication, plus a monotonic sequence taken under it; `index-integrity` requirement + concurrent stale-overwrite scenario; tasks 1.10, 1.11 and the concurrency test in 1.16 |
+| BLOCKER — mountinfo availability must not reuse `vault_fs.mount_identity_available()` | Its own `_mountinfo_available` state, probed on first use, logged once, surfaced on the health page; `transfer_mount_check_available` untouched; the independence of `STATX_MNT_ID` (5.8) and `/proc/self/mountinfo` written out in the check-3 paragraph, L3 and owner decision 8 |
+| MAJOR — the assignment check must gate on the *resulting* state | Step 0 of enforcement point 1 (`normalized and new_active`), owner decision 13, `panel-user-administration` requirement text + deactivation, unassignment and reactivation scenarios, tasks 2.1/2.2 |
+| MINOR — the snapshot must carry the observed names and assignments | "Structured quarantine reasons, and the facts they preserve"; reason payloads carry peer username and canonical assignment plus a detection timestamp; surfaces render them labelled "as at last check" and re-read no `users` row; owner decision 14 |
 
 ## Open Questions
 

@@ -40,8 +40,31 @@ The startup entry point SHALL run the detection **synchronously before the appli
 - **WHEN** the server runs in single-user mode, where the root comes from settings and no `users` row carries an assignment
 - **THEN** the published snapshot SHALL be empty and every pass SHALL behave exactly as it does today
 
+### Requirement: Detection SHALL be serialized, and a publication SHALL NOT replace a newer one
+The whole detect-and-publish operation — observing the roots, evaluating the conditions and publishing the result — SHALL run inside one process-global critical section, so that a second detection cannot begin until the first has published. Each snapshot SHALL carry a sequence number assigned when its detection begins, taken inside that critical section, and publication SHALL discard a snapshot whose sequence is not greater than the sequence of the snapshot already published.
+
+Every entry point calls the detection *before* taking the pass lock, which is correct — the check must not queue behind the pass it exists to gate — and it means two detections are trivially concurrent: a periodic iteration and a panel-triggered reindex overlap, and the panel path is reached from three separate controls. The resulting failure is not theoretical and it fails **open**. A detection that began before an overlap appeared, stalled on a slow `open` of a network or FUSE-backed root, and finished after a newer detection had published the quarantine would publish its own **empty** result over it and re-admit both tenants until some later entry point ran. Atomicity of the swap does not address this: both writes are individually atomic and the wrong one is last.
+
+Holding the critical section across the publication alone is insufficient and MUST NOT be substituted, because it permits exactly that interleaving. The sequence number is not redundant with the critical section: the section is the mechanism and the sequence is the invariant, and the invariant is what remains true for a future caller — a test, a fixture, an entry point added later — that publishes without entering the section.
+
+#### Scenario: A stalled older detection does not overwrite a newer quarantine
+
+- **WHEN** one detection begins, is delayed while observing a root, and completes after a second detection has already published a snapshot naming two overlapping users
+- **THEN** the published snapshot SHALL still name those two users
+- **AND** the older detection's result SHALL NOT replace it
+
+#### Scenario: Detections do not interleave
+
+- **WHEN** two entry points call the detection concurrently
+- **THEN** the second SHALL NOT begin observing roots until the first has published
+
+#### Scenario: An out-of-order publication is discarded
+
+- **WHEN** a snapshot is published whose sequence is not greater than that of the snapshot already published
+- **THEN** it SHALL be discarded and the published snapshot SHALL be unchanged
+
 ### Requirement: The published snapshot SHALL be atomic, tri-state, and SHALL NOT regress on a failed detection
-Publication SHALL replace the snapshot with one immutable value in a single assignment, so no reader observes a partially built snapshot. The snapshot SHALL be tri-state — never published, published and empty, or published with quarantine reasons — and a detection that raises **after** a snapshot has been published SHALL retain the previous snapshot and log at ERROR. It MUST NOT clear the snapshot back to the never-published state.
+Publication SHALL replace the snapshot with one immutable value in a single assignment, so no reader observes a partially built snapshot, and SHALL be monotonic in the sequence number described above. The snapshot SHALL be tri-state — never published, published and empty, or published with quarantine reasons — and a detection that raises **after** a snapshot has been published SHALL retain the previous snapshot and log at ERROR. It MUST NOT clear the snapshot back to the never-published state.
 
 The three states answer three different questions and collapsing any two is a defect. "Never published" means nothing has been checked and the correct response is to refuse; "published and empty" means everything was checked and nothing overlaps; and a failed re-detection means the last complete answer is the best available one. Clearing on failure would turn a transient database blip into a deployment-wide refusal, and treating a failure as an all-clear would serve overlapping roots on the strength of a query that never returned.
 
@@ -70,9 +93,11 @@ A detection failure is not a per-root failure: a root that cannot be opened is a
 - **THEN** an empty snapshot SHALL be published without opening any root
 
 ### Requirement: The snapshot SHALL record why each user is quarantined, and an unexaminable root SHALL NOT be reported as an overlap
-The snapshot SHALL map each quarantined user to a structured reason: an **overlap** carrying the peer user and the relation found (identical, contains, contained by, or mount graft), or a **root unexaminable** carrying the error number and naming no peer. Each reason SHALL be worded separately wherever it is surfaced — the control panel, the log line, the `indexer_runs` row and the usage-log marker.
+The snapshot SHALL map each quarantined user to a structured reason: an **overlap** carrying the peer user and the relation found (identical, contains, contained by, or mount graft), or a **root unexaminable** carrying the error number and naming no peer. Each entry SHALL additionally carry, as immutable facts observed at detection time, the subject's username and canonical assignment, the peer's username and canonical assignment for an overlap, and the moment the detection ran. Each reason SHALL be worded separately wherever it is surfaced — the control panel, the log line, the `indexer_runs` row and the usage-log marker.
 
 A root that could not be opened is not an overlap. Reporting it as one sends an operator looking for a second account that does not exist, and reporting it under the overlap marker makes the two indistinguishable in the usage log. The user is quarantined because their status could not be established, which is a different fact requiring a different fix.
+
+Recording the facts rather than the ids alone is what keeps the condition legible while the operator acts on it. The first response to "this root overlaps that account's" is to edit or delete one of the two accounts, and between that edit and the next detection a surface that resolved names at render time would show a changed path — or a blank, where a deleted peer was — beside a condition still in force. The recorded facts also make the staleness honest, because a surface can label them as of the last check rather than presenting them as the present state.
 
 An unexaminable root SHALL quarantine **only that user**. The peers it could not be compared against SHALL keep being indexed and served — fail closed for the user whose status is unknown, fail open for users against whom nothing was observed, so that one broken mount does not take the deployment offline.
 
@@ -86,6 +111,12 @@ An unexaminable root SHALL quarantine **only that user**. The peers it could not
 - **WHEN** a user's assigned root cannot be opened
 - **THEN** that user's reason SHALL record that the root could not be examined, with the error number
 - **AND** SHALL NOT name any peer user or claim an overlap was observed
+
+#### Scenario: The pair stays nameable after the peer is changed
+
+- **WHEN** an overlap is published and an administrator then corrects or deletes one of the two accounts, before a later detection publishes
+- **THEN** the surfaces SHALL still name both accounts and both roots from the facts recorded in the snapshot
+- **AND** SHALL present them as observed at the last check rather than as the current state
 
 #### Scenario: An unexaminable root quarantines only its own user
 
@@ -127,7 +158,8 @@ Nothing is deleted for the same reason unassignment deletes nothing: preserving 
 
 - **WHEN** one user's vault directory is bind-mounted to a path inside another active user's root, leaving both root inodes distinct and both canonical real paths outside each other
 - **THEN** the mount-grafting condition SHALL name both users
-- **AND** where the mount table cannot be read, the condition SHALL be skipped and logged once rather than reported as an overlap
+- **AND** where the mount table cannot be read the condition SHALL be skipped and logged once rather than reported as an overlap
+- **AND** its availability SHALL be tracked independently of whether this kernel can report a descriptor's mount identity, which is a different capability on a different kernel version
 
 #### Scenario: A corrected condition resumes indexing
 
