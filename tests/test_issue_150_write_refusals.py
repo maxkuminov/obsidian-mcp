@@ -17,6 +17,7 @@ import asyncio
 import pytest
 
 import src.mcp_server.tools as tools
+import src.services.indexer as indexer
 from src.mcp_server.auth import current_permission
 from src.services.vault import (
     extract_section,
@@ -671,7 +672,13 @@ async def test_the_stale_probe_carries_the_callers_ownership_predicate(uid):
     assert len(session.statements) == 1
     sql = _sql_of(session.statements[0])
     assert OWNER_CLAUSES[uid] in sql, sql
-    assert "extraction_version != 1" in sql, sql
+    # Bound to the constant, not to a literal: the marker moves whenever a
+    # grammar changes (version 2 is the link-grammar bump, #203), and a test
+    # that pins the number turns every legitimate bump into a spurious
+    # failure while proving nothing about the probe.
+    assert (
+        f"extraction_version != {indexer.CURRENT_EXTRACTION_VERSION}" in sql
+    ), sql
     assert "LIMIT 1" in sql, sql
     # And no OTHER owner's clause leaked in.
     for other_uid, clause in OWNER_CLAUSES.items():

@@ -514,16 +514,30 @@ async def get_backlinks(path: str, limit: int = 50) -> str:
 
 
 @mcp.tool()
-async def get_links(path: str) -> str:
+async def get_links(path: str, limit: int = 100) -> str:
     """Outgoing links from `path` — both resolved and dangling.
 
     Useful for "what does this note depend on?" or finding broken references
     that need follow-up notes.
 
+    The result carries a `truncated` field. `truncated: true` means this note
+    holds more links than the indexer's per-note cap and the list is the first
+    N in document order only — treat it as incomplete rather than as the
+    note's full outgoing-link set.
+
+    Links come back in document order and are capped by `limit`; when more rows
+    exist the result says how many of them were persisted, so a partial page is
+    never read as the whole set. `limit` raises the page up to a hard cap of
+    500 — this tool has no paging beyond that, so a note with more than 500
+    link rows can only be read in full from the note itself.
+
+    Each row's link text is clipped to 120 characters.
+
     Args:
         path: Vault-relative path to the source note.
+        limit: Maximum links returned (default 100, hard cap 500).
     """
-    return await get_links_impl(path)
+    return await get_links_impl(path, limit=limit)
 
 
 @mcp.tool()

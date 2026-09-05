@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "021"
+HEAD_REVISION = "022"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -3911,3 +3911,156 @@ def test_downgrade_021_refuses_a_table_it_did_not_create():
         assert result.returncode != 0
         assert "021's comment marker" in result.stdout + result.stderr
         assert fetchval(url, "SELECT to_regclass('backups_log')") is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 022 — notes_metadata.links_truncated (#203)
+# ══════════════════════════════════════════════════════════════════════════
+
+LINKS_TRUNCATED_MARKER = "link-extraction truncation marker (022_links_truncated)"
+
+
+def links_truncated_comment(url):
+    return fetchval(
+        url,
+        "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a "
+        "WHERE a.attrelid = 'notes_metadata'::regclass "
+        "  AND a.attname = 'links_truncated'",
+    )
+
+
+def seed_pre_022_notes(url):
+    """Two notes written before the cap existed: no marker column at all."""
+    insert_user(url, 1, "alice")
+    sql(
+        url,
+        "INSERT INTO notes_metadata "
+        "(id, user_id, file_path, title, content_hash, embedded_content_hash) "
+        "VALUES (1, 1, 'A.md', 'A', 'hash-a', 'hash-a'), "
+        "       (2, 1, 'B.md', 'B', 'hash-b', NULL)",
+    )
+
+
+def test_the_truncation_marker_is_not_null_defaulted_and_marked_on_a_fresh_db():
+    with throwaway_db("schema_lt_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        shape = column_shape(url, "notes_metadata", "links_truncated")
+        assert shape is not None, "notes_metadata.links_truncated is missing"
+        attnotnull, coltype, coldefault = shape
+        assert attnotnull is True, (
+            "the marker must be NOT NULL — a nullable column would let "
+            "`get_links` read NULL as 'not truncated' for a note whose links "
+            "ARE truncated, which is the silently-wrong answer it exists to "
+            "prevent"
+        )
+        assert coltype == "boolean"
+        assert coldefault == "false", (
+            "the server default is what makes the ADD COLUMN metadata-only on "
+            "a table carrying a tsvector and two GIN indexes, and what gives "
+            "every pre-existing row the one correct value"
+        )
+        assert links_truncated_comment(url) == LINKS_TRUNCATED_MARKER
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+        assert "No new upgrade operations detected" in check.stdout
+
+
+def test_022_reads_every_pre_existing_row_as_untruncated_and_touches_nothing_else():
+    """The whole point of the default. Every row that exists when 022 runs was
+    written by the *unbounded* extractor, which could not truncate, so `false`
+    is not a placeholder — it is the truth. And neither `content_hash` (the
+    move-detection key) nor `embedded_content_hash` (the embed backlog's
+    predicate) is disturbed."""
+    with throwaway_db("schema_lt_backfill", revision="021") as url:
+        seed_pre_022_notes(url)
+        assert column_shape(url, "notes_metadata", "links_truncated") is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        rows = fetch(
+            url,
+            "SELECT id, content_hash, embedded_content_hash, links_truncated "
+            "FROM notes_metadata ORDER BY id",
+        )
+        assert [tuple(r) for r in rows] == [
+            (1, "hash-a", "hash-a", False),
+            (2, "hash-b", None, False),
+        ]
+
+
+def test_rerunning_022_leaves_recorded_truncations_alone():
+    """Stamp-back idempotence, the shape the schema gate itself performs. The
+    migration body genuinely re-executes; a truncation the indexer has since
+    recorded must survive it, or every stamp-back would silently tell an agent
+    that a capped note's link set is complete."""
+    with throwaway_db("schema_lt_rerun", revision="021") as url:
+        seed_pre_022_notes(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        sql(url, "UPDATE notes_metadata SET links_truncated = true WHERE id = 1")
+
+        _harness.run_alembic(url, "stamp", "021", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(
+            url, "SELECT links_truncated FROM notes_metadata WHERE id = 1"
+        ) is True
+        assert fetchval(
+            url, "SELECT links_truncated FROM notes_metadata WHERE id = 2"
+        ) is False
+        assert links_truncated_comment(url) == LINKS_TRUNCATED_MARKER
+
+
+def test_022_refuses_a_column_of_unknown_provenance():
+    """013's philosophy: reconcile a database that demonstrably has our shape,
+    refuse to guess for one that does not. A `links_truncated` somebody else
+    created — nullable, or defaulting to true — is not adoptable: `get_links`
+    reads this column as whether a note's link set is complete, and a wrong
+    value either hides a truncation or invents one."""
+    with throwaway_db("schema_lt_foreign", revision="021") as url:
+        sql(
+            url,
+            "ALTER TABLE notes_metadata ADD COLUMN links_truncated BOOLEAN",
+        )
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0, "022 should have refused"
+        combined = result.stdout + result.stderr
+        assert "it is nullable" in combined, combined
+        assert "022's comment marker" in combined, combined
+        assert alembic_version(url) == "021", "nothing should have been recorded"
+
+
+def test_downgrade_022_drops_the_marked_column_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_lt_downgrade") as url:
+        _harness.run_alembic(url, "downgrade", "021", dimensions=DIM)
+        assert alembic_version(url) == "021"
+        assert column_shape(url, "notes_metadata", "links_truncated") is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert links_truncated_comment(url) == LINKS_TRUNCATED_MARKER
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_022_refuses_a_column_it_did_not_create():
+    """013's rule on the way back down: undo *this* migration, not delete a
+    column somebody else put there under this name."""
+    with throwaway_db("schema_lt_downgrade_foreign") as url:
+        sql(
+            url,
+            "COMMENT ON COLUMN notes_metadata.links_truncated IS "
+            "'somebody else made this'",
+        )
+        result = _harness.run_alembic(
+            url, "downgrade", "021", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "022's comment marker" in result.stdout + result.stderr
+        assert column_shape(url, "notes_metadata", "links_truncated") is not None

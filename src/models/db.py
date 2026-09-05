@@ -291,6 +291,12 @@ _EXTRACTION_VERSION_COLUMN_MARKER = (
     "fence-grammar derivation marker (018_extraction_version)"
 )
 
+# Same device, same rule: byte identical to `MARKER` in
+# `alembic/versions/022_links_truncated.py`.
+_LINKS_TRUNCATED_COLUMN_MARKER = (
+    "link-extraction truncation marker (022_links_truncated)"
+)
+
 
 class UsageLog(Base):
     __tablename__ = "usage_logs"
@@ -391,6 +397,22 @@ class NoteMetadata(Base):
         nullable=False,
         server_default=text("0"),
         comment=_EXTRACTION_VERSION_COLUMN_MARKER,
+    )
+    # Set when this note's link extraction hit `MAX_LINKS_PER_NOTE` and the
+    # pass persisted only the first N links in document order; cleared when a
+    # later extraction of the note completes under the cap. A column and not
+    # merely a log line because the ERROR ring buffer is 100 entries and
+    # process-lifetime, while the graph tools would go on reporting a capped
+    # set as a complete one — the silently-wrong-answer failure this server
+    # ranks highest. Read by `get_links`, which says `truncated: true`. Server
+    # default false so migration 022 is metadata-only and every pre-existing
+    # row reads as "not truncated", which is true of every row written under
+    # the unbounded extractor that could not truncate.
+    links_truncated: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        comment=_LINKS_TRUNCATED_COLUMN_MARKER,
     )
     content_tsvector: Mapped[str | None] = mapped_column(TSVECTOR, nullable=True)
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)

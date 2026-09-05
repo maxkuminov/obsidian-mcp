@@ -226,14 +226,59 @@ An in-vault `..` (`Folder/../note.md`) is also refused by `validate_mutable_path
 ## File-access tools (non-markdown)
 Raw read/write/browse of arbitrary vault files, distinct peers to the note tools (note tools stay markdown-only). Pure byte transport — no server-side PDF/text extraction, no embedding or indexing of non-markdown files.
 - `read_file(path, encoding="auto", offset=0, limit=None)` — `auto` resolves text-like MIME → text, image → inline MCP image content block (renders in-client), everything else → base64 string. `text` forces UTF-8 decode (errors on non-UTF-8); `base64` forces raw-bytes base64. Capped by `MAX_FILE_READ_BYTES` (default 10 MB), checked against on-disk size before reading. Text results are additionally bounded by `MAX_READ_RESPONSE_CHARS` and page via `offset`; base64 and image results are not windowed. Base64 reads are token-heavy — check size with `list_files` first.
-- `write_file(path, content, encoding="base64", overwrite=False)` — `base64` decodes `content` to raw bytes; `text` writes UTF-8. No-clobber by default (`overwrite=True` to replace), auto-creates parent dirs, atomic via `vault.write_file`. Capped by `MAX_FILE_WRITE_BYTES` (default 25 MB) on decoded length.
-- `list_files(folder=".", pattern="*", recursive=False, limit=200)` — `ls`-style: immediate children (subdirs + files) by default, each file with size + mtime; glob-filterable; capped at `limit` with a truncation note.
+- `write_file(path, content, encoding="base64", overwrite=False)` — `base64` decodes `content` to raw bytes; `text` writes UTF-8. No-clobber by default (`overwrite=True` to replace), auto-creates parent dirs, atomic via `vault.write_file`. Capped by `MAX_FILE_WRITE_BYTES` (default 25 MB) on decoded length — **except for a `.md` destination**, which is capped at `min(MAX_NOTE_BYTES, MAX_FILE_WRITE_BYTES)`; see "The `.md` cap follows the extension, not the tool" below.
+- `list_files(folder=".", pattern="*", recursive=False, limit=200)` — `ls`-style: immediate children (subdirs + files) by default, each file with size + mtime; glob-filterable; capped at `limit` with a truncation note. `pattern` is refused over `MAX_LIST_PATTERN_CHARS` (1,024) — see "The `list_files` pattern cap" below.
 
 - `delete_file(path, permanent=False)` — soft-deletes to `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` through the anchored helper; `permanent=True` unlinks. Refuses `.md` (pointing at `delete_note`), directories and symlinks. The `.md` refusal runs on the **canonical** final component, so `note.md/.`, `a//note.md` and `NOTE.MD` are refused too — the caller's string is not the path.
 
 `write_file` additionally goes through `validate_mutable_path`, so it refuses a symlinked final component the way the note tools do (see "Mutations act on the path as named" above) — `overwrite=True` cannot clobber a file through an alias. `read_file` and `list_files` still follow links.
 
 All four enforce the same traversal guard and the same dot-dir guard (`is_hidden_path`, rejecting any path component starting with `.` — the indexer's visibility rule, keeping `.obsidian`/`.git`/`.trash`/`.smart-env` out of reach), but **not through the same validator**: `read_file` and `list_files` use `validate_visible_path` (which resolves, so links are followed), `write_file` uses `validate_mutable_path` (parent resolved, symlinked leaf refused), and `delete_file` canonicalises lexically and resolves through `vault_fs`'s beneath-root lookup. Vault helpers (`read_bytes`, `write_bytes`, `list_dir`, MIME classification) live in `src/services/vault.py`. MIME detection uses stdlib `mimetypes` plus a magic-byte sniff for PNG/JPEG/GIF/WebP. `read_file` is the first tool returning a non-`str` MCP content object.
+
+### The `list_files` pattern cap (#204)
+
+`list_dir` refuses a `pattern` longer than `MAX_LIST_PATTERN_CHARS` (1,024)
+with a `ValueError` — the exception `list_files_impl` already maps to an
+in-band refusal — and the message names the constant.
+
+Two things about that check are load-bearing and must not be "tidied":
+
+- **It runs before `fnmatch` is touched.** The cost is the compile itself.
+  `fnmatch.translate` + `re.compile` is linear at ~10 µs/char (Python 3.12
+  emits atomic groups, so there is no backtracking to cap), and it runs
+  synchronously on the one event loop this server has: a 500 KB pattern was a
+  5.4-second stall for every other tenant, and the transport body limit
+  admitted about ten minutes of one. A cap applied after the compile caps
+  nothing.
+- **It runs before `validate_visible_path` and before `is_dir`.** An over-long
+  pattern against a folder that does not exist must still be refused *for the
+  pattern*. Told "Not a directory" instead, a caller fixes the folder and
+  repeats the same stall with a valid one.
+
+1,024 characters is far beyond any real glob and compiles in about 5 ms. A
+separate wildcard-count cap would be redundant; running the walk in a thread
+is defence in depth and is deliberately not part of this.
+
+### The `.md` cap follows the extension, not the tool (#203)
+
+Every *note*-writing path is capped at `MAX_NOTE_BYTES`. `write_file`, the
+`PUT /transfer/upload` route and `import_from_url` were the exceptions,
+because they are byte transport with no extension allowlist — so a 25 MiB
+`.md` could be landed by a tool the note tools would have refused, and the
+indexer then reads it as a note. All three now cap a `.md` destination
+(case-insensitive) at
+
+    min(MAX_NOTE_BYTES, MAX_FILE_WRITE_BYTES)
+
+and the refusal **names the limit that applied** — `MAX_NOTE_BYTES` or
+`MAX_FILE_WRITE_BYTES`. The smaller of the two, so an operator who lowers
+`MAX_FILE_WRITE_BYTES` below 10 MiB is not surprised by a *more* permissive
+markdown limit; and named, because a caller told only "max 10,485,760" cannot
+tell which knob to reach for. Non-markdown destinations keep
+`MAX_FILE_WRITE_BYTES` unchanged. `src/mcp_server/tools.py:_write_cap_for` is
+the one place that decides; the transfer route applies the same bound where it
+applies the stream cap, so an oversized `.md` upload aborts with 413 at cap+1
+exactly as an oversized file does.
 
 ## Three kinds of size cap — don't confuse them
 
@@ -427,6 +472,169 @@ Derived state does not heal on its own — the bytes on disk are unchanged, so
 `content_hash` cannot see the grammar move. See the `extraction_version`
 mechanism in
 [indexing and embeddings](indexing-and-embeddings.md#re-deriving-after-a-grammar-change-150).
+
+### The link grammar every link consumer shares (#180)
+
+Four grammars parse links, and they must agree:
+
+| Grammar | Where | Used by |
+| --- | --- | --- |
+| `_WIKILINK_RE` (regex), `scan_md_links()` | `src/services/links.py` | `extract_links` → `note_links`, `get_links`, `get_backlinks` |
+| `_WIKILINK_REWRITE_RE` (regex), `scan_md_links(**MDLINK_REWRITE_FLAGS)` | `src/mcp_server/tools.py` | `move_note(rewrite_links=True)` |
+
+**Every character class in all four is closed.** Not "the two that were
+reported": an open class that can swallow the rest of a line before the tail
+fails is quadratic, and closing only some of them moves the burn to the next
+one. Measured at 40 KB before the fix, on the production host: `[[` 18 s,
+`[[a#` 11.8 s, `[[a|` 4.9 s, `[a](` 3.6 s, `[a](x` 2.4 s — all of it on the
+single event loop, inside the indexer, from a note any authenticated tenant
+can write. The rules:
+
+- **Wikilink target, anchor and alias exclude `[` and `]`** — Obsidian's link
+  *syntax* forbids both inside `[[...]]`, so no well-formed wikilink changes.
+- **Markdown link text excludes `[`** (it already excluded `]`).
+- **Markdown hrefs cannot exclude brackets** — `[t](Foo [draft].md)` is a legal
+  link to a legal filename; Obsidian forbids brackets in wikilink syntax, not
+  in filenames. They are **length-bounded** instead, at `MDLINK_HREF_MAX`
+  (2,048), which exceeds `MAX_PATH_CHARS` (1,024) plus any anchor.
+- **Every quantifier is possessive** (`++`, `*+`), so no class can be
+  re-entered by backtracking.
+
+**The markdown half is a hand-written scanner, not a regex, and that is a
+an availability fix rather than a style choice.** Closing the classes made the
+markdown regex linear — but linear *with a 2,048× constant*, because every
+`](` re-scanned up to 2 KiB looking for a `.md` that was not there: ~4.7 s per
+512 KiB of `[a](`, so ≈ 90 s for a 10 MiB note, from a body any authenticated
+tenant can write.
+
+**`asyncio.to_thread` does not fix that, and it is important to know why.**
+CPython releases the GIL *between* `re` steps, never inside one, and a scan
+that matches nothing is a single step. So all 90 s ran with the GIL held and
+every other tenant's request stopped dead anyway. Dispatching off the loop
+bounds the stall at the longest single scan; **the linear scan time is the
+real bound**, and shortening it is the actual fix.
+
+`scan_md_links()` in `src/services/links.py` is that scanner. It reproduces
+the two retired regexes exactly — they are kept as differential oracles and
+fuzzed against it in `tests/test_asvs_mdlink_scanner.py` — while answering
+every "where is the next `)` / newline / `>` / `.md#`" question from a
+**monotone cursor**, so the total scanning is one forward pass rather than
+O(n × 2048), and pruning the whole candidate loop on a `.md#`/`.md)`/`.md>`
+tetragram prefilter. Measured after: **1 MiB of `[a](` in 0.8 ms and of
+`[a](.md` in 2.9 ms**, against ~9.4 s for the first of those before. The
+scanner's own worst case — a body dense in *both* `](` candidates and `.md`
+tetragrams, where nothing can be pruned and each `](` costs one loop
+iteration — is ~200 ms per MiB, and is pinned with its own ceiling in that
+test file rather than left unmeasured.
+
+**The accepted differences**, enumerated and asserted in
+`tests/test_asvs_link_grammar.py`, which is where any future change to this
+grammar has to argue its case:
+
+| Input | Before | Now |
+| --- | --- | --- |
+| `[[Note\|see [1]]]`, `[[Note#Sec [x]]]` | a row with a mangled alias/anchor | no row — **and `move_note(rewrite_links=True)` no longer rewrites it either** |
+| `[[[Foo]]` | target `[Foo` | target `Foo` (the match starts at the second `[`) |
+| `[a[b](x.md)` | `link_text` `[a[b](x.md)` | still a row to `x.md`; `link_text` is `[b](x.md)` |
+| an href over 2,048 characters | a row | no row — it cannot name a note |
+
+The first row's second half is the one accepted difference with a **write**
+consequence, so it is spelled out rather than left to be inferred: the rewrite
+grammar closed the same classes as extraction, so a link like
+`[[Old#Results [draft]]]` is invisible to `move_note` as well as to the index.
+Move `Old.md` and that link is left on disk still naming `Old`, with no
+warning — the rewrite reports the number of links it changed, and this one was
+never a candidate. Accepted because the open anchor and alias classes were two
+of the five quadratic blowups (`[[a#` 11.8 s and `[[a|` 4.9 s at 40 KB),
+because Obsidian's wikilink syntax forbids `[`/`]` inside `[[...]]` so nothing
+well-formed is affected, and because the previous behaviour was not *correct*
+either — it extracted the link with a mangled anchor and rewrote that. The
+difference is that both halves now agree. **Do not close it by re-admitting
+brackets into those classes**; the fix for a link that must survive a move is
+to rename the anchor. Pinned in `tests/test_asvs_link_grammar.py`.
+
+**Parity between the two grammars is a rule, not a coincidence.** A corpus of
+single-line links is run through both in the same test, and both must accept
+and reject the same members. Two divergences are **pre-existing** and
+deliberately left alone, recorded in that test as known gaps rather than
+silently inherited — closing either changes what `move_note` mutates, which
+needs its own change and its own adversarial pass:
+
+1. the rewrite scanner has no CommonMark `<href>` alternative, so
+   `[a](<Old.md>)` is indexed but never rewritten;
+2. its anchor class is `[^)]` where extraction's is `[^)\n]`, so a `#anchor`
+   running past a line break is rewritable but not extractable.
+
+Since both markdown halves are now one scanner, those two are its only two
+keyword arguments — `angle=False` and `anchor_crosses_newlines=True`, spelled
+once as `MDLINK_REWRITE_FLAGS` in `src/mcp_server/tools.py`. They were
+reproduced rather than closed on purpose: healing either would make
+`move_note` rewrite links it currently leaves broken, which is a change to
+what a destructive tool mutates on disk and needs its own proposal and its own
+adversarial pass. Keeping them exact is what makes the scanner swap a pure
+performance change with an empty behaviour delta.
+
+**Extraction is bounded per note** at `MAX_LINKS_PER_NOTE` (10,000), applied in
+**document order** — the two extraction loops (wikilinks, then markdown links)
+are merged by position before the cut, so a note with 20,000 wikilinks does not
+lose every markdown link in the file. A capped note is a *declared*
+degradation, not a skip: see the link cap in
+[indexing and embeddings](indexing-and-embeddings.md).
+
+**A link-grammar change has the same staleness mechanics as a fence-grammar
+change.** The bytes on disk do not move, so `content_hash` cannot see it and
+stale `note_links` rows would persist until each note is next edited. Bump
+`CURRENT_EXTRACTION_VERSION` in the same change — and `move_note(rewrite_links=True)`
+refuses until the re-derivation completes, which is the correct disposition.
+
+`move_note`'s rewrite computation runs through `asyncio.to_thread`: it is a
+pure function of a string, and a hub note's backlink sources are processed one
+after another. That dispatch bounds the stall at the longest single scan step,
+**not at zero** — see the GIL note above — which is why the scan itself had to
+get fast.
+
+**Both halves of the per-source work are dispatched, not just the rewrite.**
+The preflight takes one `FULL_NOTE` fence scan per source and hands it to the
+rewriter (`_scan_rewrite_source`); that scan is the *larger* half — a full pass
+over up to `MAX_NOTE_BYTES`, 1.6–11.3 s per 10 MiB — and it originally ran on
+the loop nine lines above the `to_thread` that dispatched the rewrite. Both go
+through `to_thread`, and the dispatch test asserts both names: asserting only
+`_rewrite_links_in_text` is what let the larger half sit on the loop.
+
+**The splice that applies the rewrites is linear, and that is load-bearing.**
+It used to be `out = out[:start] + replacement + out[end:]` per rewrite over a
+descending sort — a fresh copy of the whole note per link. Measured on
+`[[Old]] ` repeated: 0.072 s at 64 KiB, 0.176 s at 128 KiB, 0.723 s at 256 KiB,
+5.315 s at 512 KiB. Clean O(n²), ≈ 35 minutes extrapolated to `MAX_NOTE_BYTES`
+— **while holding `_MOVE_REWRITE_LOCK`**, so every other tenant's
+link-rewriting move waits behind it. That is the same cross-tenant stall the
+scanner work removed from the other half of the same function, reintroduced
+after the scan finished. `_splice_rewrites` walks the spans once with a cursor
+and joins once: 0.04 s for the 131,072 rewrites of a 1 MiB body, against ~25 s
+for the retired shape.
+
+The cursor walk is equivalent to the reverse splice **only while the spans do
+not overlap**, and they cannot: a markdown link's text class excludes `[` and
+`]`, so no `[text](` can begin inside a wikilink span and run past its `]]`,
+and each scanner is already non-overlapping within itself. That is a property
+of two grammars in another module, so `_splice_rewrites` *checks* it and falls
+back to the retired splice rather than silently writing different bytes — a
+rewrite that is fast but writes different bytes is a destructive write, not a
+speed-up. The fallback is unreachable through the scanners and is tested by
+calling the splice directly; the equality itself is tested against the retired
+implementation as an oracle over a randomized corpus.
+
+**One source's rewrites are bounded at `MAX_LINKS_PER_NOTE`, and over the cap
+is a refusal.** The read side has always been bounded — extraction stops at
+10,000 links — and the write side was not, so a 10 MiB note of `[[Old]] `
+planned ~1.7 million rewrites in a single source. Refused rather than
+truncated, and refused *before the rename*, the same disposition as the
+`MAX_NOTE_BYTES` per-source and `MAX_MOVE_REWRITE_BYTES` aggregate preflights:
+rewriting the first N and stopping leaves the remainder pointing at the path
+the move just vacated, and reports the move as a success. The error names the
+source and the cap so the agent knows which note to split. Note that the cap
+does **not** make the splice's linearity redundant — 10,000 rewrites of a
+10 MiB note is still 100 GB of copying under the old shape.
 
 ### Where a section's body begins, and what a section write destroys (#140)
 

@@ -18,8 +18,9 @@ from __future__ import annotations
 import os
 import re
 import urllib.parse
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, NamedTuple
 
 
 @dataclass(frozen=True)
@@ -30,24 +31,309 @@ class ExtractedLink:
     position: int  # byte offset in the (un-stripped) source
 
 
+# ────────────────────────────────────────────────────────────────────────────
+# The link grammar — every class is closed (issue #180)
+# ────────────────────────────────────────────────────────────────────────────
+#
+# These two regexes, and the two rewrite regexes in `src/mcp_server/tools.py`
+# that must apply the SAME rules, run synchronously on the one event loop this
+# server has, over any note body a tenant can write (up to `MAX_NOTE_BYTES`).
+# A character class that can swallow the rest of a line before the tail fails
+# is therefore not a performance detail: it is a cross-tenant availability
+# bug. 20 KB of `[[` held the loop for 18 seconds; `[[a#`, `[[a|`, `[a](` and
+# `[a](x` were the same shape at 11.8 s, 4.9 s, 3.6 s and 2.4 s. Closing only
+# some of the classes moves the burn to the next one, so ALL of them are
+# closed, and the quantifiers are possessive so no class can be re-entered by
+# backtracking:
+#
+# * WIKILINK target/anchor/alias exclude `[` and `]`. Obsidian's *link syntax*
+#   forbids both inside `[[...]]`, so no well-formed wikilink changes.
+# * MARKDOWN link text excludes `[` (it already excluded `]`).
+# * MARKDOWN hrefs cannot exclude brackets — `[t](Foo [draft].md)` is a legal
+#   link to a legal filename — so they are LENGTH-bounded instead:
+#   `{1,2048}?`, which exceeds `MAX_PATH_CHARS` (1,024) plus any anchor. The
+#   lazy scan is O(n × 2048) rather than O(n²).
+#
+# The accepted differences, each pinned in `tests/test_asvs_link_grammar.py`:
+#
+#   `[[Note|see [1]]]`, `[[Note#Sec [x]]]`   → no row at all (before: a row
+#                                              with a mangled alias/anchor)
+#   `[[[Foo]]`                               → target `Foo` (before: `[Foo`) —
+#                                              the same rule seen from the
+#                                              other side: the match now
+#                                              starts at the second `[`
+#   `[a[b](x.md)`                            → still a row to `x.md`, but
+#                                              `link_text` is `[b](x.md)`
+#   an href longer than 2,048 characters     → no row (it cannot name a note)
+#
+# Anything that changes here changes what `note_links` holds, so it needs a
+# `CURRENT_EXTRACTION_VERSION` bump in the same change — the same rule the
+# fence grammar below carries.
+
 # Wikilink: optional `!` for embeds, then `[[Target(#Anchor)?(|Alias)?]]`.
-# Target is "anything but ], |, #" so anchors and aliases peel cleanly.
+# Target is "anything but [, ], |, #" so anchors and aliases peel cleanly.
 _WIKILINK_RE = re.compile(
-    r"(?P<embed>!)?\[\[(?P<target>[^\]\|#\n]+)"
-    r"(?:#(?P<anchor>[^\]\|\n]*))?"
-    r"(?:\|(?P<alias>[^\]\n]*))?\]\]"
+    r"(?P<embed>!)?\[\[(?P<target>[^\[\]\|#\n]++)"
+    r"(?:#(?P<anchor>[^\[\]\|\n]*+))?"
+    r"(?:\|(?P<alias>[^\[\]\n]*+))?\]\]"
 )
 
 # Markdown link: `[text](href.md)`, `[text](href.md#anchor)`, or the
 # CommonMark angle-bracket form `[text](<href.md>)`. Href must end in `.md`
 # (with optional `#anchor`) — we ignore non-note links here. The href class
 # forbids only newlines (not all whitespace), so raw-space note names like
-# `My Note.md` and `folder/My Note.md` are captured.
-_MDLINK_RE = re.compile(
-    r"\[(?P<text>[^\]\n]+)\]\("
-    r"(?:<(?P<href_ab>[^>\n]+?\.md)(?:#[^>]*)?>"
-    r"|(?P<href>[^)\n]+?\.md)(?:#[^)\n]*)?)\)"
-)
+# `My Note.md` and `folder/My Note.md` are captured; it is length-bounded
+# rather than bracket-free because brackets are legal in filenames.
+#
+# ## Why this is a hand-written scanner and not a regex (#180, slice A2)
+#
+# The regex form of this grammar was
+#
+#   \[(?P<text>[^\[\]\n]++)\]\(
+#     (?:<(?P<href_ab>[^>\n]{1,2048}?\.md)(?:#[^>]*+)?>
+#      |(?P<href>[^)\n]{1,2048}?\.md)(?:#[^)\n]*+)?)\)
+#
+# and it is *linear* — the `{1,2048}?` bound is what stopped the quadratic
+# blow-up — but linear with a 2,048× constant: every `](` re-scans up to
+# 2 KiB looking for a `.md` that is not there. Measured on the development
+# host: 4.7 s for 512 KiB of `[a](`, so ≈ 90 s for a 10 MiB note, from a body
+# any authenticated tenant can write.
+#
+# `asyncio.to_thread` does not rescue that. CPython releases the GIL *between*
+# `re` steps, never inside one, and a scan that matches nothing is a single
+# step — so the whole 90 s runs with the GIL held and every other tenant's
+# request stops dead. Dispatching off the loop bounds the stall at the longest
+# single scan; making that scan short is the actual fix.
+#
+# The scanner below reproduces the two regexes EXACTLY (the retired patterns
+# are kept as oracles in `tests/test_asvs_mdlink_scanner.py` and fuzzed
+# against it) while touching each character a bounded number of times:
+#
+# * candidates come from `_MDLINK_PREFIX_RE`, the unchanged `[text](` prefix,
+#   which is possessive and therefore linear on its own;
+# * every "where is the next X" question is answered by a MONOTONE cursor —
+#   `str.find` from a low-water mark that only moves forward — so the sum of
+#   all forward scans is O(len(content)), not O(len(content) × 2048);
+# * a candidate can only match if a `.md#`, `.md)` or `.md>` tetragram starts
+#   within `[p+1, p+2049]` of the href start, so `_MDLINK_TAIL_RE` prunes the
+#   whole loop before any per-candidate work: 1 MiB of `[a](` or of `[a](.md`
+#   contains none, and the scan ends after one C-level pass.
+#
+# The grammar it implements, derived from the regexes rather than described
+# alongside them:
+#
+# * A candidate is a `](` whose nearest preceding `[`, with no `[`, `]` or
+#   newline in between and at least one character of link text, is at or after
+#   the previous match's end. That `[` is the match start.
+# * BARE form. Let `q` be the first `)` or newline at or after the href start
+#   `p`. The lazy `[^)\n]{1,2048}?\.md` picks the SMALLEST split of
+#   `content[p:q]` into `H + ".md" + R` with `1 <= len(H) <= 2048` and `R`
+#   empty or starting with `#`. So there are exactly two shapes to test and
+#   the first wins: the earliest `.md#` at or after `p+1` (anchor case), else
+#   a `.md` sitting immediately before `q` (bare case). Both need
+#   `content[q] == ")"` — except for the anchor case under
+#   `anchor_crosses_newlines`, below.
+# * ANGLE form, tried first and only when `content[p] == "<"`. Same split
+#   against `r`, the first `>` or newline after `p`; the closing `>` for an
+#   anchored href is the first `>` after `p` wherever it is, because that
+#   anchor class is `[^>]` and crosses newlines. A failed angle attempt falls
+#   through to the bare form with `<` as the first character of the href,
+#   exactly as the regex alternation did.
+#
+# ## The two parameters, and why they exist
+#
+# `move_note`'s rewrite grammar (`src/mcp_server/tools.py`) differs from
+# extraction's in two PRE-EXISTING ways, recorded as known gaps in
+# `tests/test_asvs_link_grammar.py`. They are reproduced here rather than
+# closed, because closing either changes what `move_note` mutates on disk and
+# that needs its own change and its own adversarial pass:
+#
+#   `angle=False`                  the rewrite grammar has no `<href>`
+#                                  alternative, so `[a](<Old.md>)` is indexed
+#                                  but never rewritten.
+#   `anchor_crosses_newlines=True` the rewrite anchor class is `[^)]` where
+#                                  extraction's is `[^)\n]`, so a `#anchor`
+#                                  running past a line break is rewritable but
+#                                  not extractable.
+#
+# Each costs one branch. Reproducing them exactly keeps slice A2 a pure
+# performance change with a provably empty behaviour delta on the destructive
+# path — worth more than the two branches cost.
+
+# The href length bound. Exceeds `MAX_PATH_CHARS` (1,024) plus any anchor, so
+# nothing that can name a note is excluded; see the accepted differences.
+MDLINK_HREF_MAX = 2048
+
+# The `[text](` prefix, unchanged from the retired regexes: link text excludes
+# `[`, `]` and newline, is possessive, and must be non-empty.
+_MDLINK_PREFIX_RE = re.compile(r"\[(?P<text>[^\[\]\n]++)\]\(")
+
+# The necessary condition for ANY match: the href's terminating `.md` is
+# always followed by `#`, `)` or `>`. Used only to prune candidates — every
+# hit is then re-checked precisely.
+_MDLINK_TAIL_RE = re.compile(r"\.md[#)>]")
+
+
+class MdLinkMatch(NamedTuple):
+    """One markdown link, in the shape the retired regexes reported it.
+
+    `start`/`end` are the full match span (so `content[start:end]` is what
+    `m.group(0)` was), `href` carries the trailing `.md` and NOT the angle
+    brackets, and `anchor` is `"#..."` or `""`.
+    """
+
+    start: int
+    end: int
+    text: str
+    href: str
+    anchor: str
+    angle: bool
+
+
+def scan_md_links(
+    content: str,
+    *,
+    angle: bool = True,
+    anchor_crosses_newlines: bool = False,
+) -> Iterator[MdLinkMatch]:
+    """Yield every `[text](href.md#anchor)` in `content`, left to right.
+
+    Exactly the retired `_MDLINK_RE` (`angle=True`,
+    `anchor_crosses_newlines=False`) or `_MDLINK_REWRITE_RE` (`angle=False`,
+    `anchor_crosses_newlines=True`), in time linear in `len(content)` with a
+    small constant. Matches never overlap: the scan resumes at the end of each
+    one, which is what makes a `[` inside a matched href unable to start a
+    second link — the regexes' leftmost-non-overlapping rule.
+
+    Read the comment above before changing anything here; the retired regexes
+    are kept as differential oracles in `tests/test_asvs_mdlink_scanner.py`.
+    """
+    n = len(content)
+    find = content.find
+    search_prefix = _MDLINK_PREFIX_RE.search
+    search_tail = _MDLINK_TAIL_RE.search
+    bound = MDLINK_HREF_MAX
+
+    def _from(sub: str, start: int) -> int:
+        i = find(sub, start)
+        return n if i < 0 else i
+
+    # Monotone cursors. Each holds "the first index at or after the low-water
+    # mark it was last refreshed from", `n` meaning none. Every refresh moves
+    # that mark forward, so the total scanning across the whole loop is one
+    # pass per cursor — this is the whole reason the scanner is linear rather
+    # than O(n × 2048).
+    nl_at = _from("\n", 0)      # newline: ends the bare and angle segments
+    rp_at = _from(")", 0)       # `)`: ditto, and the only way to close
+    gt_at = _from(">", 0)       # `>`: the angle form's closer
+    hash_at = _from(".md#", 0)  # the anchored-href split point
+    close_at = rp_at            # `)` again, tracked from the anchor's start
+    tail = search_tail(content)
+    tail_at = tail.start() if tail else n
+
+    pos = 0
+    while True:
+        m = search_prefix(content, pos)
+        if m is None:
+            return
+        p = m.end()
+        # A failed candidate resumes here, not at `m.start() + 1`: the link
+        # text holds no `[`, and `]` and `(` cannot start one, so no match can
+        # begin in between.
+        pos = p
+
+        if tail_at < p + 1:
+            tail = search_tail(content, p + 1)
+            tail_at = tail.start() if tail else n
+        if tail_at >= n:
+            return  # no `.md` tetragram left anywhere: nothing can match
+        if tail_at > p + bound + 1:
+            continue  # none within reach of this href start
+
+        if nl_at < p:
+            nl_at = _from("\n", p)
+        if rp_at < p:
+            rp_at = _from(")", p)
+        if hash_at < p + 1:
+            hash_at = _from(".md#", p + 1)
+
+        q = rp_at if rp_at < nl_at else nl_at
+        closes = rp_at < nl_at  # `content[q] == ")"`
+        # Captured before the angle branch may advance the cursor past it: a
+        # failed angle attempt falls through to the BARE form, whose split
+        # point starts one character earlier.
+        j = hash_at
+        found = None
+
+        if angle and p < n and content[p] == "<":
+            if gt_at < p:
+                gt_at = _from(">", p)
+            r = gt_at if gt_at < nl_at else nl_at
+            # The angle href starts at p+1, so its split point is at p+2 or
+            # later. Advancing the shared cursor is safe for later candidates:
+            # the next one asks from p'+1 >= p+2.
+            ja = j
+            if ja < p + 2:
+                ja = hash_at = _from(".md#", p + 2)
+            if (
+                ja + 3 < r
+                and ja - p - 1 <= bound
+                and gt_at + 1 < n
+                and content[gt_at + 1] == ")"
+            ):
+                # `[t](<href.md#anchor>)` — that anchor may cross newlines, so
+                # the closing `>` is the first one anywhere after `p`.
+                found = MdLinkMatch(
+                    m.start(), gt_at + 2, m.group("text"),
+                    content[p + 1:ja + 3], content[ja + 3:gt_at], True,
+                )
+            elif (
+                gt_at < nl_at
+                and gt_at + 1 < n
+                and content[gt_at + 1] == ")"
+                and gt_at - 3 >= p + 2
+                and gt_at - p - 4 <= bound
+                and content[gt_at - 3:gt_at] == ".md"
+            ):
+                # `[t](<href.md>)`
+                found = MdLinkMatch(
+                    m.start(), gt_at + 2, m.group("text"),
+                    content[p + 1:gt_at], "", True,
+                )
+
+        if found is None:
+            if j < n and j + 3 < q and j - p <= bound:
+                # `[t](href.md#anchor)` — the earliest `.md#` wins, and if it
+                # cannot close then no later one can either (they share one
+                # terminating `)`), so this is the only split to test.
+                if anchor_crosses_newlines:
+                    if close_at < j + 4:
+                        close_at = _from(")", j + 4)
+                    if close_at < n:
+                        found = MdLinkMatch(
+                            m.start(), close_at + 1, m.group("text"),
+                            content[p:j + 3], content[j + 3:close_at], False,
+                        )
+                elif closes:
+                    found = MdLinkMatch(
+                        m.start(), q + 1, m.group("text"),
+                        content[p:j + 3], content[j + 3:q], False,
+                    )
+            if (
+                found is None
+                and closes
+                and q - 3 >= p + 1
+                and q - p - 3 <= bound
+                and content[q - 3:q] == ".md"
+            ):
+                # `[t](href.md)`
+                found = MdLinkMatch(
+                    m.start(), q + 1, m.group("text"), content[p:q], "", False,
+                )
+
+        if found is not None:
+            yield found
+            pos = found.end
 
 # ────────────────────────────────────────────────────────────────────────────
 # The fence grammar (capability `code-masking`)
@@ -366,7 +652,7 @@ def apply_fence_mask(text: str, scan: FenceScan) -> str:
 
 
 def extract_links(
-    content: str, *, context: FenceContext = BODY
+    content: str, *, context: FenceContext = BODY, max_links: int | None = None
 ) -> list[ExtractedLink]:
     """Extract every wikilink/embed/markdown-link from a note body.
 
@@ -374,26 +660,62 @@ def extract_links(
     post-frontmatter body the indexer already parsed. A caller with raw note
     text must say `context=FULL_NOTE` so the frontmatter block stays opaque to
     fence recognition.
+
+    `max_links` bounds the result to the first N links in DOCUMENT order (see
+    `extract_links_bounded`, which also reports whether the bound bit).
+    `None` — the default, and what every pre-existing caller passes — is
+    unbounded.
+    """
+    links, _ = extract_links_bounded(content, context=context, max_links=max_links)
+    return links
+
+
+def extract_links_bounded(
+    content: str, *, context: FenceContext = BODY, max_links: int | None = None
+) -> tuple[list[ExtractedLink], bool]:
+    """`extract_links`, plus whether `max_links` truncated the result.
+
+    Returns `(links, truncated)`. `truncated` is True only when the note
+    genuinely holds more links than `max_links`; a caller that persists a
+    truncated set must record that fact durably, because a capped set read as
+    a complete one is a silently-wrong graph answer.
+
+    **Document order, not scan order.** Extraction runs two sequential loops
+    (wikilinks, then markdown links), so "the first N" is meaningless per
+    loop: a note with 20,000 wikilinks would otherwise lose every markdown
+    link in the file. The two loops are merged by `position` and cut to N
+    against that merged order. Each loop is itself capped at N first — a link
+    in the merged first N is necessarily within the first N of its own kind —
+    so peak memory is bounded at 2N links rather than at the note's true link
+    count (one 10 MiB note of `[[a]] ` yields 1.75 M links unbounded).
     """
     masked = _mask_code(content, context=context)
-    out: list[ExtractedLink] = []
+    wiki: list[ExtractedLink] = []
+    md: list[ExtractedLink] = []
+    overflowed = False
 
     for m in _WIKILINK_RE.finditer(masked):
         target = m.group("target").strip()
         if not target:
             continue
+        if max_links is not None and len(wiki) >= max_links:
+            overflowed = True
+            break
         kind = "embed" if m.group("embed") else "link"
-        out.append(ExtractedLink(
+        wiki.append(ExtractedLink(
             target=target,
             link_text=m.group(0),
             kind=kind,
             position=m.start(),
         ))
 
-    for m in _MDLINK_RE.finditer(masked):
-        href = (m.group("href_ab") or m.group("href") or "").strip()
+    for link in scan_md_links(masked):
+        href = link.href.strip()
         if not href:
             continue
+        if max_links is not None and len(md) >= max_links:
+            overflowed = True
+            break
         # Decode percent-encoded characters (e.g. `%20` → space).
         try:
             decoded = urllib.parse.unquote(href)
@@ -402,14 +724,27 @@ def extract_links(
         # Strip a trailing `.md` for resolver consistency — resolver tries
         # both with and without the extension.
         target = decoded[:-3] if decoded.endswith(".md") else decoded
-        out.append(ExtractedLink(
+        md.append(ExtractedLink(
             target=target,
-            link_text=m.group(0),
+            link_text=masked[link.start:link.end],
             kind="markdown",
-            position=m.start(),
+            position=link.start,
         ))
 
-    return out
+    if max_links is None:
+        # Unbounded: the historical scan order (every wikilink, then every
+        # markdown link). Callers that predate the cap depend on it, and with
+        # no cut to make there is no selection for document order to inform.
+        return wiki + md, False
+
+    if not md:
+        out = wiki
+    elif not wiki:
+        out = md
+    else:
+        out = sorted(wiki + md, key=lambda link: link.position)
+    truncated = overflowed or len(out) > max_links
+    return out[:max_links], truncated
 
 
 # ────────────────────────────────────────────────────────────────────────────

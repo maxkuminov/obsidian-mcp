@@ -88,25 +88,122 @@ def _remove_spans(text: str, spans) -> str:
 # v1-stamped row compares frozen v1 against the restored cleaner and
 # invalidates exactly the notes that change — see the rollback recipe in
 # `docs/architecture/indexing-and-embeddings.md`.
-_V0_FENCE_BACKTICK_RE = re.compile(r"^```[^\n]*\n.*?\n```\s*$", re.MULTILINE | re.DOTALL)
-_V0_FENCE_TILDE_RE = re.compile(r"^~~~[^\n]*\n.*?\n~~~\s*$", re.MULTILINE | re.DOTALL)
+# The v0 cleaner WAS this pair of regexes, applied sequentially:
+#
+#   _V0_FENCE_BACKTICK_RE = r"^```[^\n]*\n.*?\n```\s*$"   MULTILINE | DOTALL
+#   _V0_FENCE_TILDE_RE    = r"^~~~[^\n]*\n.*?\n~~~\s*$"   MULTILINE | DOTALL
+#
+# Both are quadratic in the number of UNCLOSED openers: each `.*?` walks to
+# the end of the input before the attempt at that opener fails, and `^` then
+# retries at the next line (issue #180). A note of `` ```x\n `` repeated is
+# ordinary, in-cap input, and this cleaner runs on the event loop inside the
+# indexer, so that is a cross-tenant stall.
+#
+# `_v0_clean` below is a LINE SCANNER whose output must stay byte-identical to
+# that pair forever — `extraction_version` comparisons and the documented
+# rollback recipe depend on it. The regexes themselves now live in
+# `tests/test_asvs_v0_cleaner.py` as the differential test's ORACLE; the test
+# is the proof, not this comment. What the scanner has to reproduce, in the
+# regex's terms rather than CommonMark's — every clause below was established
+# empirically against the oracle, and several are the opposite of the v1
+# fence grammar above:
+#
+# * `^`/`$` under `re.MULTILINE` anchor on `\n` and NOTHING else. Split on
+#   `\n` only — never `str.splitlines()` (which breaks on `\v`, `\f`, `\x1c`,
+#   ` `, …), never the fence recognizer's `_LINE_BREAK_RE` (which treats
+#   a lone `\r` as a terminator). A lone `\r` is an ordinary character here.
+# * OPENER — a line whose first three characters are the fence run. No
+#   indent is allowed, and the rest of the line is an unrestricted info
+#   string (so a 4-backtick line IS an opener, with `` ` `` as its info).
+# * CLOSER — the NEAREST following line, at least two lines below the opener,
+#   whose first three characters are the same fence run and whose remainder
+#   is entirely `\s` under **Unicode** semantics. So `` ```\xa0 ``,
+#   `` ```\x0b `` and `` ```  `` all close — the exact opposite of the
+#   v1 grammar, which admits only U+0020 and U+0009. A run LONGER than three
+#   (`` ```` ``) leaves a backtick in the remainder and does not close.
+# * EMPTY BLOCK — an opener immediately followed by a closer is NOT removed.
+#   `.*?` sits between two `\n`s, so the closer must be at least two lines
+#   below the opener; `` ```\n``` `` survives untouched.
+# * TRAILING RUN — `\s*$` after the closer's fence run is greedy and then
+#   backtracks to the LAST position where `$` holds, so it swallows whole
+#   blank lines after the closer, stopping at the newline before the first
+#   line that has a non-`\s` character (or running to end of input). In line
+#   terms: the removal covers the opener line through the last all-`\s` line
+#   after the closer, and the newline that ends it is what survives — which
+#   is exactly "replace those lines with one empty line".
+# * ORDER — backtick pass, then tilde pass, over the FIRST pass's output. The
+#   two patterns' `$`-anchored spans can overlap, so the order is part of the
+#   behaviour, not an implementation detail (see the two pinned inputs above).
+_V0_NON_WS_RE = re.compile(r"[^\s]")
+
+
+def _v0_sub_fences(body: str, fence: str) -> str:
+    """One frozen-v0 pass, linear in `len(body)`.
+
+    Byte-identical to `re.sub(rf"^{fence}[^\\n]*\\n.*?\\n{fence}\\s*$", "",
+    body, flags=MULTILINE | DOTALL)` — see the comment above for the clause
+    list and `tests/test_asvs_v0_cleaner.py` for the differential proof.
+    """
+    if fence not in body:
+        return body
+    lines = body.split("\n")
+    n = len(lines)
+
+    # A line that would satisfy `\n{fence}\s*$` — i.e. a legal closer.
+    is_closer = [
+        line.startswith(fence) and _V0_NON_WS_RE.search(line, len(fence)) is None
+        for line in lines
+    ]
+    # `next_closer[k]` — the smallest closer index >= k, or n for "none". One
+    # backward pass, so an opener never rescans the tail: that rescan is the
+    # quadratic step this function exists to remove.
+    next_closer = [n] * (n + 1)
+    for k in range(n - 1, -1, -1):
+        next_closer[k] = k if is_closer[k] else next_closer[k + 1]
+
+    out: list[str] = []
+    i = 0
+    while i < n:
+        # `.*?` spans at least one line boundary, so the closer sits at least
+        # two lines below the opener.
+        if lines[i].startswith(fence) and i + 2 < n and next_closer[i + 2] < n:
+            j = next_closer[i + 2]
+            # `\s*$` swallows every wholly-blank line after the closer.
+            m = j + 1
+            while m < n and _V0_NON_WS_RE.search(lines[m]) is None:
+                m += 1
+            out.append("")
+            i = m
+            continue
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
 
 
 def _v0_clean(body: str) -> str:
     """`clean_for_embedding` exactly as it stood before #150. Frozen.
 
-    Copied verbatim, **sequential** substitution included: the order is part of
-    the behaviour being reproduced, not an implementation detail. Do not
-    "simplify" it into one pass or into a span set.
+    **Sequential** substitution included: the order is part of the behaviour
+    being reproduced, not an implementation detail. Do not "simplify" it into
+    one pass or into a span set. The two passes are line scanners rather than
+    the original regexes only because the regexes were quadratic; the OUTPUT
+    is frozen and any change to it is a data-integrity bug.
     """
-    body = _V0_FENCE_BACKTICK_RE.sub("", body)
-    body = _V0_FENCE_TILDE_RE.sub("", body)
+    body = _v0_sub_fences(body, "```")
+    body = _v0_sub_fences(body, "~~~")
     return body
 
 
 _EXTRACTION_CLEANERS = {
     0: _v0_clean,
     1: clean_for_embedding,
+    # Version 2 is the version-1 grammar under a new key. The link grammar
+    # changed (#180), so `CURRENT_EXTRACTION_VERSION` has to move for the
+    # indexer to re-derive `note_links` — but the *embedding* text is
+    # untouched, so a v1-stamped row must compare equal here and NOT be
+    # re-embedded. Binding the same function is what makes that true by
+    # construction rather than by inspection.
+    2: clean_for_embedding,
 }
 
 

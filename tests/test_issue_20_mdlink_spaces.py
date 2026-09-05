@@ -5,13 +5,17 @@ Raw-space markdown links to notes (`[a](My Note.md)`, `[a](folder/My Note.md)`,
 dropped by the markdown-link extractor and rewriter because the href character
 class forbade ALL whitespace (`[^)\s]`). Only the `%20`-encoded form matched.
 
-These tests run fully offline: they exercise the pure regex / extraction code
-in src/services/links.py and the rewrite regex in src/mcp_server/tools.py
+These tests run fully offline: they exercise the pure extraction code in
+src/services/links.py and the rewrite grammar used by src/mcp_server/tools.py
 without any DB, network, or embedding provider.
+
+Both grammars are now `scan_md_links` (#180 slice A2) rather than a pair of
+regexes; the probes below call it directly where they used to call a compiled
+pattern. Its exactness against the retired regexes is pinned separately, in
+tests/test_asvs_mdlink_scanner.py.
 """
 
 import os
-import re
 import tempfile
 
 # The autouse fixture in conftest imports `src.services.embeddings`, which pulls
@@ -23,7 +27,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/
 os.environ.setdefault("VAULT_PATH", "/tmp/test-vault")
 os.chdir(tempfile.gettempdir())
 
-from src.services.links import _MDLINK_RE, extract_links  # noqa: E402
+from src.services.links import extract_links, scan_md_links  # noqa: E402
 
 
 def _markdown_targets(content: str) -> list[str]:
@@ -70,38 +74,39 @@ def test_non_md_href_still_rejected():
     assert _markdown_targets("[ext](https://example.com/page) text") == []
 
 
-def test_extract_regex_matches_raw_space_directly():
-    # Direct probe of the compiled module-level regex.
-    assert _MDLINK_RE.search("[a](My Note.md)") is not None
-    assert _MDLINK_RE.search("[a](folder/My Note.md)") is not None
+def test_extract_scanner_matches_raw_space_directly():
+    # Direct probe of the extraction grammar, under the extraction flags.
+    assert list(scan_md_links("[a](My Note.md)"))
+    assert list(scan_md_links("[a](folder/My Note.md)"))
 
 
-# ── Rewrite regex used by move_note(rewrite_links=True) ──────────────────────
-# Mirrors src/mcp_server/tools.py::_MDLINK_REWRITE_RE. Kept as a local literal
-# so this assertion runs without importing the MCP tools module (which has
-# heavier deps); if the source regex drifts, update this copy too.
-
-_MDLINK_REWRITE_RE = re.compile(
-    r"\[(?P<text>[^\]\n]+)\]\((?P<href>[^)\n]+?\.md)(?P<anchor>#[^)]*)?\)"
-)
-
-
-def test_rewrite_regex_matches_raw_space_href():
-    # Before the fix the href group's `[^)\s]` made this return None.
-    m = _MDLINK_REWRITE_RE.search("[a](My Note.md)")
-    assert m is not None
-    assert m.group("href") == "My Note.md"
+# ── Rewrite grammar used by move_note(rewrite_links=True) ────────────────────
+# The same scanner under the two flags that reproduce the rewrite grammar's
+# PRE-EXISTING divergences from extraction (no `<href>` alternative; the anchor
+# class crosses newlines). Kept as a local literal so these assertions run
+# without importing the MCP tools module, which has heavier deps; the
+# literal-equality test at the bottom keeps the copy honest.
+_REWRITE_FLAGS = {"angle": False, "anchor_crosses_newlines": True}
 
 
-def test_rewrite_regex_matches_raw_space_href_with_folder_and_anchor():
-    m = _MDLINK_REWRITE_RE.search("[a](folder/My Note.md#anchor)")
-    assert m is not None
-    assert m.group("href") == "folder/My Note.md"
-    assert m.group("anchor") == "#anchor"
+def _rewrite_scan(content):
+    return list(scan_md_links(content, **_REWRITE_FLAGS))
 
 
-def test_rewrite_regex_matches_source_module_literal():
-    # Guard against the in-test copy diverging from the real source regex.
+def test_rewrite_scanner_matches_raw_space_href():
+    # Before the fix the href group's `[^)\s]` made this return nothing.
+    (link,) = _rewrite_scan("[a](My Note.md)")
+    assert link.href == "My Note.md"
+
+
+def test_rewrite_scanner_matches_raw_space_href_with_folder_and_anchor():
+    (link,) = _rewrite_scan("[a](folder/My Note.md#anchor)")
+    assert link.href == "folder/My Note.md"
+    assert link.anchor == "#anchor"
+
+
+def test_rewrite_scanner_flags_match_source_module_literal():
+    # Guard against the in-test copy diverging from the real source flags.
     from src.mcp_server import tools
 
-    assert tools._MDLINK_REWRITE_RE.pattern == _MDLINK_REWRITE_RE.pattern
+    assert tools.MDLINK_REWRITE_FLAGS == _REWRITE_FLAGS

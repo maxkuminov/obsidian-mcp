@@ -133,6 +133,60 @@
   write: it answers "is *this process's* loop alive", which is a property of
   the process, and it resets to `None` on restart until the startup pass lands.
 
+- **Link extraction is capped per note, and a capped note says so** (#203).
+  Extraction was unbounded: one 10 MiB note of `[[a]] ` yields 1.75 M
+  `ExtractedLink` objects, an 802 MiB peak against a 2 GB container, multiplied
+  by every such note in one pass. `MAX_LINKS_PER_NOTE` (10,000, in
+  `src/config.py`) bounds it. The cap is applied in **document order** across
+  both link kinds — the extractor runs two sequential loops, so "the first N"
+  taken per loop would make a note of 20,000 wikilinks lose every markdown link
+  in the file — and the same retreat philosophy as the keyword vector applies:
+  the degradation is *declared*, never silent. A capped note keeps its first N
+  rows, gets `notes_metadata.links_truncated` set (migration 022), is logged
+  once at ERROR naming the path and the cap, and `get_links` answers
+  `truncated: true`. **The column is the point, not the log line.** The
+  ops-health error buffer is 100 entries and process-lifetime, so the line
+  naming a note capped at deploy time is gone by the next restart while the
+  capped rows persist — and `get_links`/`get_backlinks`/`get_neighborhood`
+  would go on reporting the capped set as complete, which is the
+  silently-wrong-answer failure this server ranks highest. **A capped note is
+  NOT a skip**, and that is deliberate: A.7a's skip list withholds a
+  re-derive's certification, so a tenant with one generated MOC would be held
+  in re-derive mode indefinitely with no repair that could ever end it — a
+  self-inflicted DoS on the machinery that exists to detect foreign rows. The
+  claim A.7a makes is structural, and a capped note does not falsify it: the
+  truncation is deterministic and the rows written are exactly the rows
+  derived. The carve-out is written at the `skips` declaration in
+  `_index_vault_pinned` and in `_format_skips`, which are the two places a
+  future reader would look.
+- **The link rebuild writes per note; the body buffer is a separate,
+  documented residual** (#203). `_update_links_for_changed` used to accumulate
+  every changed note's rows into one `new_rows` list and insert the lot at the
+  end, so peak link-row memory scaled with the number of *changed notes* — and
+  a re-derive makes every note changed. Each note's rows are now inserted
+  before the next note's are extracted, so the peak is one note's worth (at
+  most `MAX_LINKS_PER_NOTE`) plus one 1,000-row insert batch, whatever the
+  vault's size; the one-shot backfill flushes on the same rule, checked after
+  every note. Measured by the instrumented test in
+  `tests/test_asvs_indexer_bounds.py`: four notes of 2,500 links each peak at
+  2,500 buffered rows, against 10,000 for the old shape. What this does **not**
+  bound is `path_to_content`, the buffer the scan fills for the tsvector loop
+  and the link rebuild reads: it holds every changed note's parsed body for the
+  pass, and a re-derive holds the whole vault's. That is bounded by the
+  write-side note cap times the number of changed notes and is unchanged here —
+  an accepted residual on #203, recorded rather than quietly conflated with the
+  link-row bound this fixed.
+- **Extraction runs off the event loop.** The indexer's changed-path rebuild,
+  the one-shot backfill and the scan's `extract_tags` all dispatch through
+  `asyncio.to_thread`. The honest caveat, which the tests state rather than
+  hide: a thread only yields between `re` calls, never inside one, so this
+  bounds the stall to the longest *single* scan step, not to zero. The linear,
+  bounded grammars are what make that step short; `to_thread` on a quadratic
+  grammar would have moved a multi-minute burn off the loop without shortening
+  it. The observable the tests assert is the dispatch itself — a timing
+  assertion against a concurrent request is a flake generator on a shared
+  runner.
+
 ## The pass record (#160, migration 019)
 
 The heartbeat above and `indexer_runs` answer different questions and neither
@@ -344,6 +398,50 @@ the pass completes; `rewrite_links=False` is untouched and is the way through.
 `edit_note(section=…)` needs no such control: it resolves headings from the
 note's own bytes, never from `note_links`.
 
+### Version 2 is a LINK-grammar bump (#203), and it re-embeds nothing
+
+The rule above generalises, and version 2 is the case that showed it: **bump
+the constant in the same commit as any change to the fence grammar *or the link
+grammar*.** Both are invisible to `content_hash` for exactly the same reason —
+the bytes on disk do not move — and both leave derived state stale in exactly
+the same way. The marker is the mechanism the index already has for this; there
+is no second one, and there should not be.
+
+Version 2 ships the linear, bounded wikilink and markdown-link grammars, so
+every note's `note_links` rows have to be re-derived once. The **fence** grammar
+did not change, so version 2's entry in `_EXTRACTION_CLEANERS` is version 1's
+function under a new key. That is not redundancy: it is what makes
+`_grammar_changed_the_embedding_text` compare equal for every v1-stamped row, so
+the pass that re-extracts links and tags for the whole vault makes **no embedding
+call on account of the bump**. The cost is one long link-and-tag pass, not a
+re-embed of 2,577 notes. `move_note(rewrite_links=True)` is refused for that
+user until the pass completes, per the existing requirement — which is the
+correct disposition for a grammar change, since the rewrite planner and the
+extractor must agree about what a link is.
+
+### The frozen v0 cleaner is a line scanner with the regexes as its oracle
+
+`_v0_clean` must keep producing byte-identical output forever — the
+`extraction_version` comparison above and the rollback recipe below both depend
+on it — and it was quadratic in the number of unclosed fence openers, because
+each `.*?` walked to end of input before the attempt failed and `^` retried at
+the next line. A note of ```` ```x\n ```` repeated is ordinary, in-cap input,
+and this ran on the event loop inside the indexer.
+
+It is now a line scanner (`_v0_sub_fences`), and the **original regexes live in
+`tests/test_asvs_v0_cleaner.py` as the differential test's oracle** — the test
+is the proof of equivalence, not the comment. Two clauses are worth repeating
+here because they are the opposite of the v1 fence grammar and a future reader
+will otherwise "fix" them:
+
+- **Split on `\n` only.** Never `str.splitlines()` (which breaks on `\v`,
+  `\f`, `\x1c`, ` `, …) and never the shared recognizer's `_LINE_BREAK_RE`
+  (which treats a lone `\r` as a terminator). Under `re.MULTILINE` a lone `\r`
+  is an ordinary character, so it must stay one here.
+- **A closer's trailing run is `\s` under Unicode semantics.** ```` ```\xa0 ````
+  and ```` ```\x0b ```` *do* close a v0 block — where the v1 grammar admits
+  only U+0020 and U+0009.
+
 ### Rollback is roll-forward, and the plan says so
 
 **A bare redeploy of the previous image does NOT restore derived state.** Old
@@ -354,7 +452,8 @@ the same silent staleness, pointing the other way.
 The rollback procedure is:
 
 1. revert the grammar commits on a branch;
-2. **bump `CURRENT_EXTRACTION_VERSION`** in that build (to 2, then 3, …) and
+2. **bump `CURRENT_EXTRACTION_VERSION`** in that build (to the next unused
+   number — 2 is taken by the link-grammar bump above) and
    keep the versioned mechanism and the frozen per-version registry — the
    registry is what lets the pass compare each row's stamped grammar against
    the restored one;

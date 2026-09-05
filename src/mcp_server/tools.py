@@ -30,6 +30,7 @@ from src.auth.session import (
     current_user_id,
 )
 from src.config import (
+    MAX_LINKS_PER_NOTE,
     MAX_MOVE_REWRITE_BYTES,
     MAX_NOTE_BYTES,
     max_move_rewrite_sources,
@@ -1544,6 +1545,24 @@ async def create_note_impl(path: str, content: str) -> str:
             return f"Failed to write {path}: {e}"
 
 
+# Row-level excerpt bound for the graph tools. `link_text` is note text the
+# indexer stored verbatim — a wikilink alias is caller-controlled and can be
+# thousands of characters — and a tool result is model input, so a row is
+# bounded the same way the response as a whole is. Newlines collapse because a
+# multi-line alias would otherwise break the bullet list it sits in.
+_LINK_EXCERPT_CHARS = 120
+
+
+def _link_excerpt(link_text: str | None) -> str:
+    """`link_text` flattened to one line and clipped, with an ellipsis when
+    it was actually clipped (silent truncation reads as the note's real
+    text)."""
+    flat = (link_text or "").replace("\n", " ")
+    if len(flat) <= _LINK_EXCERPT_CHARS:
+        return flat
+    return flat[:_LINK_EXCERPT_CHARS] + "…"
+
+
 @_tracked("get_backlinks", ["path", "limit"])
 async def get_backlinks_impl(path: str, limit: int = 50) -> str:
     """Notes that link TO `path` (resolved links only)."""
@@ -1598,14 +1617,33 @@ async def get_backlinks_impl(path: str, limit: int = 50) -> str:
     return "\n".join(lines)
 
 
-@_tracked("get_links", ["path"])
-async def get_links_impl(path: str) -> str:
-    """Outgoing links from `path` — both resolved and dangling."""
-    from sqlalchemy import and_, or_, select
+@_tracked("get_links", ["path", "limit"])
+async def get_links_impl(path: str, limit: int = 100) -> str:
+    """Outgoing links from `path` — both resolved and dangling.
+
+    Reports `truncated: true` when the indexer capped this note's link
+    extraction at `MAX_LINKS_PER_NOTE`, so a capped set is never read as a
+    complete one (#203).
+
+    **Bounded like every other list tool.** `get_backlinks` and
+    `get_neighborhood` have always clamped; this one selected every row a note
+    had, which for a note the indexer capped is up to `MAX_LINKS_PER_NOTE`
+    (10,000) rows rendered into one tool result — the answer an agent least
+    wants and the payload the read caps exist to prevent.
+
+    **The default is below the hard cap on purpose.** A default equal to the
+    cap makes the over-limit notice's "raise `limit`" advice unactionable —
+    the caller is already at the ceiling — so the notice would be telling an
+    agent to retry a call that cannot return anything new. 100 leaves that
+    advice a real move, and the notice says plainly that rows past 500 are
+    not reachable through this tool at all.
+    """
+    from sqlalchemy import and_, func, or_, select
     from sqlalchemy.orm import aliased
     from src.models.db import NoteLink, NoteMetadata
 
     uid = current_user_id.get()
+    limit = max(1, min(limit, 500))
     async with async_session() as session:
         src_stmt = select(NoteMetadata).where(
             NoteMetadata.file_path == path, _note_owner_predicate(uid)
@@ -1656,28 +1694,79 @@ async def get_links_impl(path: str) -> str:
                 ),
             )
             .order_by(NoteLink.position)
+            # One over the limit, so "there are more" is read off the result
+            # rather than guessed from a full page.
+            .limit(limit + 1)
         )
         rows = (await session.execute(stmt)).all()
+        over_limit = len(rows) > limit
+        if over_limit:
+            rows = rows[:limit]
+
+        # **How many rows the pass actually persisted for this note**, counted
+        # only when a notice is going to quote it. `len(rows)` is not that
+        # number: the scoped join above omits any row that resolved to a note
+        # outside the owned set, so a notice built from it would tell the
+        # caller "the N above are the first in document order" about an N that
+        # is neither the page size nor the persisted total.
+        persisted: int | None = None
+        if over_limit or source.links_truncated:
+            persisted = await session.scalar(
+                select(func.count())
+                .select_from(NoteLink)
+                .where(NoteLink.source_note_id == source.id)
+            )
+
+    # Read off the note row the pass wrote it on, never inferred from the row
+    # count: a capped set is exactly `MAX_LINKS_PER_NOTE` rows and looks like
+    # any other complete set from here. An agent that read a truncated set as
+    # complete would act on a graph answer that is silently wrong, which is
+    # what the column exists to prevent (#203).
+    truncated = "true" if source.links_truncated else "false"
 
     if not rows:
-        return f"`{path}` has no outgoing links"
+        return f"`{path}` has no outgoing links — truncated: {truncated}"
     # Classified by what the *scoped* join resolved, never by the raw
     # `note_links.target_note_id`: that column can name a row outside the
     # owned set, and calling such a link "resolved" would print a `None` title
     # and path for it.
     resolved = [r for r in rows if r.resolved_id is not None]
     dangling = [r for r in rows if r.resolved_id is None]
-    lines = [f"`{path}` — {len(resolved)} resolved, {len(dangling)} dangling:\n"]
+    lines = [
+        f"`{path}` — {len(resolved)} resolved, {len(dangling)} dangling — "
+        f"truncated: {truncated}:\n"
+    ]
     if resolved:
         lines.append("**Resolved:**")
         for r in resolved:
             lines.append(
-                f"- {r.kind} → **{r.title}** (`{r.file_path}`) — `{r.link_text}`"
+                f"- {r.kind} → **{r.title}** (`{r.file_path}`) — "
+                f"`{_link_excerpt(r.link_text)}`"
             )
     if dangling:
         lines.append("\n**Dangling:**")
         for r in dangling:
-            lines.append(f"- {r.kind} → `{r.target_path}` — `{r.link_text}`")
+            lines.append(
+                f"- {r.kind} → `{r.target_path}` — `{_link_excerpt(r.link_text)}`"
+            )
+    if over_limit:
+        # "Raise `limit`" only while raising it can do something. At the hard
+        # cap it cannot, and the remainder is stated as unreachable rather
+        # than dressed up as a paging step the caller could take.
+        advice = "Raise `limit` (hard cap 500) to see more. " if limit < 500 else ""
+        lines.append(
+            f"\n… showing {len(rows)} of {persisted:,} link rows persisted for "
+            f"this note (limit={limit}, hard cap 500), in document order. "
+            f"{advice}Rows past the first 500 are NOT reachable through this "
+            "tool — read the note itself if you need them."
+        )
+    if source.links_truncated:
+        lines.append(
+            f"\n**This note's link extraction was capped at "
+            f"{MAX_LINKS_PER_NOTE} links. The {persisted:,} rows persisted for "
+            "it are the first in document order and the set is INCOMPLETE** — "
+            "do not treat it as the note's full outgoing-link set."
+        )
     return "\n".join(lines)
 
 
@@ -2336,13 +2425,116 @@ async def edit_note_impl(
 # ────────────────────────────────────────────────────────────────────────────
 
 
+# The rewrite grammar. It MUST apply the same closed-class rules as the
+# extraction grammar in `src/services/links.py` (see the long comment there):
+# wikilink target/anchor/alias exclude `[` and `]`, markdown link text
+# excludes `[`, the markdown href is length-bounded to 2,048 rather than
+# bracket-free, and every quantifier is possessive. A class that can swallow
+# the rest of a line before the tail fails makes `move_note(rewrite_links=…)`
+# a quadratic stall for every other tenant, exactly as it did in extraction.
+#
+# Two divergences from `_MDLINK_RE` are PRE-EXISTING and deliberately left
+# alone here — fixing either changes what `move_note` rewrites, which is its
+# own change with its own audit. Both are recorded as known gaps in
+# `tests/test_asvs_link_grammar.py`:
+#   1. no CommonMark `<href>` alternative, so `[t](<a.md>)` is extracted but
+#      never rewritten;
+#   2. the anchor class is `[^)]` (crosses newlines) where extraction's is
+#      `[^)\n]`.
+#
+# The markdown half is no longer a regex at all. `{1,2048}?` is linear but
+# with a 2,048× constant — 4.7 s per 512 KiB of `[a](`, ≈ 90 s for a 10 MiB
+# note — and `asyncio.to_thread` cannot shorten it, because CPython holds the
+# GIL for the whole of one `re` step and a scan that matches nothing is a
+# single step. `scan_md_links` is a hand-written linear scanner with EXACTLY
+# these semantics; the two divergences above are its two keyword arguments,
+# and the retired pattern is kept as a differential oracle in
+# `tests/test_asvs_mdlink_scanner.py`. See the long comment in
+# `src/services/links.py`.
 _WIKILINK_REWRITE_RE = re.compile(
-    r"(?P<embed>!)?\[\[(?P<target>[^\]\|#\n]+)"
-    r"(?P<rest>(?:#[^\]\|\n]*)?(?:\|[^\]\n]*)?)\]\]"
+    r"(?P<embed>!)?\[\[(?P<target>[^\[\]\|#\n]++)"
+    r"(?P<rest>(?:#[^\[\]\|\n]*+)?(?:\|[^\[\]\n]*+)?)\]\]"
 )
-_MDLINK_REWRITE_RE = re.compile(
-    r"\[(?P<text>[^\]\n]+)\]\((?P<href>[^)\n]+?\.md)(?P<anchor>#[^)]*)?\)"
-)
+# The rewrite grammar's markdown scan, as keyword arguments: no `<href>`
+# alternative (divergence 1), anchor crosses newlines (divergence 2).
+MDLINK_REWRITE_FLAGS = {"angle": False, "anchor_crosses_newlines": True}
+
+
+class MoveRewriteCapExceeded(Exception):
+    """One `move_note` source carries more rewrites than the per-note cap.
+
+    The same bound the indexer applies to extraction (`MAX_LINKS_PER_NOTE`),
+    applied to the *write* side, and for the same reason: a 10 MiB note of
+    `[[Old]] ` holds ~1.7 million rewritable links, and rewriting them all
+    would build a note whose `note_links` set the indexer then truncates at
+    10,000 — the graph would assert a link set the vault bytes contradict.
+    Raised out of the pure rewrite function and turned into an in-band
+    refusal by `_move_note_locked`, which aborts the move **before any
+    mutation**, exactly as the `MAX_NOTE_BYTES` and `MAX_MOVE_REWRITE_BYTES`
+    preflight refusals do.
+    """
+
+    def __init__(self, source_path: str, count: int, cap: int):
+        self.source_path = source_path
+        self.count = count
+        self.cap = cap
+        super().__init__(
+            f"{source_path} holds {count} links to rewrite, more than "
+            f"MAX_LINKS_PER_NOTE={cap}"
+        )
+
+
+def _splice_rewrites(content: str, rewrites: list[tuple[int, int, str]]) -> str:
+    """Apply `(start, end, replacement)` spans to `content` in one pass.
+
+    **Linear, and byte-for-byte what the retired reverse-splice produced.**
+    The old shape was `out = out[:start] + repl + out[end:]` per rewrite over
+    a descending sort — a fresh copy of the whole note per link, so a note of
+    `[[Old]] ` cost 0.07 / 0.18 / 0.72 / 5.3 s at 64 / 128 / 256 / 512 KiB
+    (clean O(n²), ~35 minutes at `MAX_NOTE_BYTES`) while holding the
+    process-wide `_MOVE_REWRITE_LOCK` — one caller's move stalling every
+    other tenant's, which is the exact shape of the extraction stall this
+    change exists to close.
+
+    The spans come from two non-overlapping scans (`_WIKILINK_REWRITE_RE`
+    leftmost-non-overlapping, `scan_md_links` resuming at each match's end),
+    and they cannot overlap **each other** either: a markdown link's text
+    class excludes `[` and `]`, so no `[text](` can begin inside a wikilink
+    span and run past its `]]`. That is what makes the cursor walk equivalent
+    — but it is a property of two grammars in another module, so it is
+    *checked* rather than assumed, and a violation falls back to the old
+    splice rather than silently producing different bytes. The fallback is
+    unreachable through the scanners; it is reachable, and tested, through
+    this function directly.
+    """
+    if not rewrites:
+        return content
+    ordered = sorted(rewrites, key=lambda r: r[0])
+    cursor = 0
+    parts: list[str] = []
+    for start, end, replacement in ordered:
+        if start < cursor:
+            return _splice_rewrites_overlapping(content, rewrites)
+        parts.append(content[cursor:start])
+        parts.append(replacement)
+        cursor = end
+    parts.append(content[cursor:])
+    return "".join(parts)
+
+
+def _splice_rewrites_overlapping(
+    content: str, rewrites: list[tuple[int, int, str]]
+) -> str:
+    """The retired reverse splice, kept verbatim for overlapping spans.
+
+    Quadratic, and deliberately so: it is the *definition* of what overlapping
+    spans mean here, and nothing the scanners can produce reaches it.
+    """
+    ordered = sorted(rewrites, key=lambda r: r[0], reverse=True)
+    out = content
+    for start, end, replacement in ordered:
+        out = out[:start] + replacement + out[end:]
+    return out
 
 
 def _rewrite_links_in_text(
@@ -2366,7 +2558,13 @@ def _rewrite_links_in_text(
     exact `content` — the preflight has one, and passing it keeps the
     frontmatter partition to one run per note. Omitted, this scans for itself.
     """
-    from src.services.links import FULL_NOTE, apply_fence_mask, resolve_target, scan_fences
+    from src.services.links import (
+        FULL_NOTE,
+        apply_fence_mask,
+        resolve_target,
+        scan_fences,
+        scan_md_links,
+    )
 
     paths = pre_move_index.get("paths", {})
     from_id = paths.get(from_rel)
@@ -2400,14 +2598,14 @@ def _rewrite_links_in_text(
         rest = m.group("rest") or ""
         rewrites.append((m.start(), m.end(), f"{embed_prefix}[[{new_target}{rest}]]"))
 
-    for m in _MDLINK_REWRITE_RE.finditer(masked):
-        href = m.group("href").strip()
+    for link in scan_md_links(masked, **MDLINK_REWRITE_FLAGS):
+        href = link.href.strip()
         if not href:
             continue
         target_for_resolve = href[:-3] if href.endswith(".md") else href
         if resolve_target(target_for_resolve, source_path, pre_move_index) != from_id:
             continue
-        anchor = m.group("anchor") or ""
+        anchor = link.anchor
         # Resolve against the original source location, but generate the new
         # href relative to where that source lives after the move. These differ
         # for a moved note rewriting its own Markdown self-link.
@@ -2415,18 +2613,19 @@ def _rewrite_links_in_text(
         source_dir = PurePosixPath(output_path).parent.as_posix()
         relative_target = posixpath.relpath(to_rel, source_dir)
         rewrites.append((
-            m.start(),
-            m.end(),
-            f"[{m.group('text')}]({relative_target}{anchor})",
+            link.start,
+            link.end,
+            f"[{link.text}]({relative_target}{anchor})",
         ))
 
     if not rewrites:
         return content, 0
-    rewrites.sort(key=lambda r: r[0], reverse=True)
-    out = content
-    for start, end, replacement in rewrites:
-        out = out[:start] + replacement + out[end:]
-    return out, len(rewrites)
+    # Bounded per source by the same cap the indexer applies to extraction.
+    # Raised, not truncated: a partial rewrite would leave some links pointing
+    # at a path the move is about to vacate, reported as a success.
+    if len(rewrites) > MAX_LINKS_PER_NOTE:
+        raise MoveRewriteCapExceeded(source_path, len(rewrites), MAX_LINKS_PER_NOTE)
+    return _splice_rewrites(content, rewrites), len(rewrites)
 
 
 def _rewrite_failure_warning(
@@ -2799,12 +2998,25 @@ async def _move_note_locked(
                     # ONCE and handed on to the rewriter, because the
                     # recognizer's contract is that the frontmatter partition
                     # runs at most once per note.
-                    fence_scan = _scan_rewrite_source(content)
+                    #
+                    # Off the loop for the same reason as the rewrite below
+                    # (#180): the scan is linear but over up to
+                    # `MAX_NOTE_BYTES` of text, seconds of solid CPU on a
+                    # near-cap note, and it runs once per backlink source
+                    # while the process-wide `_MOVE_REWRITE_LOCK` is held.
+                    # Dispatching only the rewrite left the larger half of the
+                    # per-source work on the loop.
+                    fence_scan = await asyncio.to_thread(_scan_rewrite_source, content)
                     if fence_scan.unmatched_indented_openers:
                         undecidable_sources.append(
                             (original_src_path, fence_scan.unmatched_indented_openers)
                         )
-                    new_content, n = _rewrite_links_in_text(
+                    # Off the loop (#180). The rewrite is a pure function of a
+                    # string, and a hub note's backlink sources are read one
+                    # after another — linear work on a near-cap note is still
+                    # dead air for every other tenant if it runs here.
+                    new_content, n = await asyncio.to_thread(
+                        _rewrite_links_in_text,
                         content,
                         from_rel,
                         to_rel,
@@ -2845,6 +3057,21 @@ async def _move_note_locked(
                     return (
                         f"Move aborted: {e} Nothing was moved, rewritten or "
                         "reindexed."
+                    )
+                except MoveRewriteCapExceeded as e:
+                    # Not a per-source failure either: rewriting all but this
+                    # source would move the note and leave this one pointing
+                    # at the vacated path, reported as success. Same
+                    # disposition as the `MAX_NOTE_BYTES` and
+                    # `MAX_MOVE_REWRITE_BYTES` refusals above — abort before
+                    # phase 2, while that is still free.
+                    drop(read_target)
+                    return (
+                        f"Move aborted: rewriting links in {e.source_path} would "
+                        f"change {e.count} links, more than the per-note limit "
+                        f"(MAX_LINKS_PER_NOTE={e.cap}). Nothing was moved, "
+                        "rewritten or reindexed. Move without rewrite_links and "
+                        "update that note's links in batches instead."
                     )
                 except Exception as e:
                     logger.warning(
@@ -3610,6 +3837,26 @@ async def read_file_impl(
     return _base64_payload(path, data, mime)
 
 
+def _write_cap_for(path: str) -> tuple[int, str]:
+    """The byte cap for a raw-transport write to `path`, and its name.
+
+    The note tools cap every note at `MAX_NOTE_BYTES`, but `write_file`, the
+    transfer upload and `import_from_url` are byte transport with no extension
+    allowlist — so a 25 MiB `.md` could be landed by the tool the note tools
+    would have refused, and the indexer then reads it as a note. The cap
+    follows the EXTENSION, not the tool.
+
+    It is the *smaller* of the two limits so an operator who lowers
+    `MAX_FILE_WRITE_BYTES` below 10 MiB is not surprised by a more permissive
+    markdown limit, and the name that comes back is whichever one actually
+    applied — a caller told "max 10,485,760" without being told which knob
+    that is cannot act on it.
+    """
+    if path.lower().endswith(".md") and MAX_NOTE_BYTES < settings.max_file_write_bytes:
+        return MAX_NOTE_BYTES, "MAX_NOTE_BYTES"
+    return settings.max_file_write_bytes, "MAX_FILE_WRITE_BYTES"
+
+
 @_tracked("write_file", ["path", "encoding", "overwrite"])
 async def write_file_impl(
     path: str,
@@ -3664,10 +3911,18 @@ async def write_file_impl(
         else:
             data = content.encode("utf-8")
 
-        if len(data) > settings.max_file_write_bytes:
+        # **The cap follows the NORMALISED name, not the caller's string.**
+        # `open_mutable` drops empty and `.` components, so `"big.md/."` is
+        # written to `big.md` — while `"big.md/.".lower().endswith(".md")` is
+        # False. Testing the raw argument therefore admitted a 25 MiB markdown
+        # note through the tool whose whole job here is to refuse one, and the
+        # indexer then read it as a note. `target.rel` is the path the bytes
+        # actually land on, which is the only path a cap may be derived from.
+        cap, cap_name = _write_cap_for(target.rel)
+        if len(data) > cap:
             return (
                 f"Content too large ({len(data):,} bytes, "
-                f"max {settings.max_file_write_bytes:,}). No file was written."
+                f"max {cap:,} — {cap_name}). No file was written."
             )
 
         try:
@@ -3923,6 +4178,16 @@ async def request_upload_impl(
             "the upload). Nothing was minted."
         )
 
+    # The number the agent is told **must be the number the route enforces**.
+    # `/transfer/upload/info` and `PUT /transfer/upload` both derive their cap
+    # from the token's stored (normalised) path via `_upload_max_bytes`, so a
+    # markdown destination aborts at `MAX_NOTE_BYTES`; printing
+    # `MAX_FILE_WRITE_BYTES` here promised 25 MiB over a route that refuses at
+    # 10 MiB, which is worse than printing no number at all. `rel` is the
+    # normalised path frozen into the token, so this is the same decision the
+    # route makes, taken from the same string (#203).
+    cap, cap_name = _write_cap_for(rel)
+
     async with async_session() as session:
         try:
             # `mint_token` reads the credential and decides the deadline itself,
@@ -3949,7 +4214,7 @@ async def request_upload_impl(
         f"{base}/transfer/upload#{token}\n\n"
         f"{_clamp_note(window)}"
         f"upload_id: {row.public_id}\n"
-        f"max_bytes: {settings.max_file_write_bytes:,}\n"
+        f"max_bytes: {cap:,} ({cap_name})\n"
         f"overwrite: {overwrite}\n\n"
         "Give the URL to the person you are helping and ask them to open it — "
         "it is a page with a file picker. Treat it as a secret: anyone holding "
@@ -4224,7 +4489,9 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
         overwrite=overwrite,
         expected_fingerprint=fingerprint if overwrite else None,
     )
-    cap = settings.max_file_write_bytes
+    # `.md`-aware (#203): the same cap `write_file` applies, so an import
+    # cannot land a markdown file the note tools would refuse.
+    cap, cap_name = _write_cap_for(rel)
     identity = _transfer_identity()
 
     @asynccontextmanager
@@ -4256,6 +4523,18 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
     except transfer.SSRFError as e:
         return f"Refused to fetch that URL: {e}"
     except transfer.TooLarge as e:
+        return f"{e} ({cap_name}). Nothing was written."
+    except transfer.QueueTimeout as e:
+        # **Needs its own clause**: `QueueTimeout` is deliberately not a
+        # `Timeout` subclass (the two are different verdicts about the same
+        # request — see `transfer.QueueTimeout`), so without this it left the
+        # tool as an exception rather than an in-band refusal. They are
+        # siblings, not parent and child, so the order of the two clauses is
+        # irrelevant — neither can shadow the other. An MCP tool that raises
+        # returns a protocol error to the agent instead of a sentence it can
+        # act on, and `_tracked` records the call as a server fault. Nothing
+        # was staged and nothing was fetched; the same call may simply be
+        # retried.
         return f"{e}. Nothing was written."
     except transfer.Timeout as e:
         return f"{e}. Nothing was written."

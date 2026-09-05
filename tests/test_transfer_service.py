@@ -17,6 +17,7 @@ Two properties get more attention than their line count suggests:
   certificate verification into a no-op.
 """
 import asyncio
+import datetime
 import hashlib
 import http.server
 import os
@@ -827,6 +828,202 @@ async def test_concurrent_streams_are_bounded_by_the_semaphore(vault, monkeypatc
     for i in range(5):
         assert (vault / "Attachments" / f"f{i}.bin").exists()
     transfer._upload_semaphores.clear()
+
+
+# ── the bounded, deadline-aware slot wait (#208) ────────────────────────────
+#
+# Before this, the wait for a streaming slot was `async with
+# upload_semaphore():` — unbounded, and with the deadline consulted only after
+# the slot had been won. A queued upload therefore waited forever *and* (in the
+# route) held a pooled database connection while it did. Two bounds now apply
+# and they are not interchangeable: an overrun deadline is the capability's
+# window closing (408, token consumed, mint afresh), a full queue is the server
+# being busy while the window is still open (503, claim released, retry the
+# same link). The precedence between them is the part a refactor breaks
+# silently, so it is asserted from both sides.
+
+
+@pytest.fixture(autouse=True)
+def _clear_upload_semaphores():
+    """Reset the per-loop semaphore around every test in this module.
+
+    The dictionary is keyed by event loop, so a leaked *permit* — not a leaked
+    semaphore — is what would leak between cases: `stream_to_vault` releases in
+    a `finally`, and a regression there would show up as an unrelated later
+    test hanging on the queue rather than as a failure here.
+    """
+    transfer._upload_semaphores.clear()
+    yield
+    transfer._upload_semaphores.clear()
+
+
+def _aware_deadline(seconds: float) -> datetime.datetime:
+    """An absolute UTC instant, the form the upload route passes."""
+    return datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        seconds=seconds
+    )
+
+
+async def test_the_slot_wait_rereads_the_wall_clock_deadline_on_every_slice(monkeypatch):
+    """A realtime step during the wait must end the wait.
+
+    This is the whole reason the acquire is sliced rather than one
+    `asyncio.wait_for(sem.acquire(), remaining)`: a single `wait_for` converts
+    the wall-clock deadline into a monotonic budget at the top of the wait, and
+    the deadline then stops agreeing with the instant `check_upload` reports —
+    the exact clock split `now_utc` exists to prevent. Here the queue is full
+    and the slot timeout is 30 s, so the *only* way out inside a second is a
+    re-read of `now_utc` from inside the wait.
+    """
+    monkeypatch.setattr(transfer, "SLOT_WAIT_SLICE", 0.02)
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()  # the only slot is taken and never released
+
+    base = datetime.datetime.now(datetime.timezone.utc)
+    deadline = base + datetime.timedelta(seconds=300)
+    reads = 0
+
+    def stepping_now():
+        nonlocal reads
+        reads += 1
+        # A few slices in, the wall clock jumps an hour — as an NTP correction
+        # or a suspended host would.
+        return base if reads < 4 else base + datetime.timedelta(hours=1)
+
+    monkeypatch.setattr(transfer, "now_utc", stepping_now)
+
+    started = time.monotonic()
+    with pytest.raises(Timeout) as exc:
+        await transfer._acquire_upload_slot(sem, deadline=deadline, slot_timeout=30.0)
+    elapsed = time.monotonic() - started
+
+    assert "deadline" in str(exc.value)
+    assert reads >= 4, "the deadline was read once, not once per slice"
+    assert elapsed < 5, "the wait ran to the slot timeout instead of the deadline"
+
+
+async def test_a_full_queue_with_the_deadline_still_open_is_a_queue_timeout():
+    """Busy is not expired. The token's window is untouched, so this is a 503."""
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+
+    with pytest.raises(transfer.QueueTimeout) as exc:
+        await transfer._acquire_upload_slot(
+            sem, deadline=_aware_deadline(3600), slot_timeout=0.1
+        )
+    assert "slot" in str(exc.value)
+    # Not a `Timeout`: the route branches on the type, and mapping this to 408
+    # would tell a caller whose link is perfectly good that it had expired.
+    assert not isinstance(exc.value, Timeout)
+    assert isinstance(exc.value, transfer.TransferError)
+
+
+async def test_an_overrun_deadline_beats_a_full_queue():
+    """Precedence: the deadline is re-checked *first* when the wait ends.
+
+    Both bounds are exhausted here — the queue is full and the deadline has
+    already passed. The verdict must be the deadline's, because that is the one
+    the state machine has an answer for (`consumed`); calling it a queue
+    timeout would release a claim whose capability window is gone and invite a
+    retry that can only 404.
+    """
+    sem = asyncio.Semaphore(1)
+    await sem.acquire()
+
+    with pytest.raises(Timeout):
+        await transfer._acquire_upload_slot(
+            sem, deadline=_aware_deadline(-1), slot_timeout=0.05
+        )
+
+
+async def test_the_deadline_is_checked_before_a_free_slot_is_taken():
+    """An already-overrun request does not consume a slot on its way out."""
+    sem = asyncio.Semaphore(1)
+
+    with pytest.raises(Timeout):
+        await transfer._acquire_upload_slot(
+            sem, deadline=_aware_deadline(-1), slot_timeout=30.0
+        )
+    assert not sem.locked(), "an expired upload took a streaming slot"
+
+
+def test_the_default_slot_timeout_is_thirty_seconds():
+    import inspect
+
+    default = inspect.signature(stream_to_vault).parameters["slot_timeout"].default
+    assert default == 30.0 == transfer.DEFAULT_SLOT_TIMEOUT
+
+
+async def test_a_queued_stream_gives_up_without_staging_anything(vault, monkeypatch):
+    """End to end through `stream_to_vault`, with a real occupied semaphore."""
+    monkeypatch.setattr(transfer.settings, "transfer_max_concurrent_uploads", 1)
+    transfer._upload_semaphores.clear()
+
+    holder_released = asyncio.Event()
+
+    async def holds(marker: bytes):
+        yield marker
+        await holder_released.wait()
+
+    holder = asyncio.create_task(
+        stream_to_vault(
+            FakeRow(str(vault), "Attachments/holder.bin"),
+            holds(b"x"),
+            max_bytes=1000,
+            deadline=_aware_deadline(600),
+            idle_timeout=30,
+        )
+    )
+    await asyncio.sleep(0.05)
+
+    with pytest.raises(transfer.QueueTimeout):
+        await stream_to_vault(
+            FakeRow(str(vault), "Attachments/queued.bin"),
+            chunks_of(b"y" * 32),
+            max_bytes=1000,
+            deadline=_aware_deadline(600),
+            idle_timeout=30,
+            slot_timeout=0.1,
+        )
+
+    assert not (vault / "Attachments" / "queued.bin").exists()
+    assert temps_under(vault) == []
+
+    holder_released.set()
+    await holder
+    assert (vault / "Attachments" / "holder.bin").exists()
+
+
+async def test_a_failed_stream_hands_its_slot_back(vault, monkeypatch):
+    """The acquire is no longer an `async with`; the release must still happen.
+
+    A leaked permit is invisible until the *next* upload queues behind nothing,
+    so it is asserted directly: `TRANSFER_MAX_CONCURRENT_UPLOADS` failures in a
+    row must leave every slot free.
+    """
+    monkeypatch.setattr(transfer.settings, "transfer_max_concurrent_uploads", 1)
+    transfer._upload_semaphores.clear()
+
+    for i in range(3):
+        with pytest.raises(TooLarge):
+            await stream_to_vault(
+                FakeRow(str(vault), f"Attachments/over{i}.bin"),
+                chunks_of(b"z" * 64),
+                max_bytes=8,
+                deadline=_aware_deadline(600),
+                idle_timeout=30,
+            )
+
+    # Whatever the semaphore is now, a fresh stream must not have to wait for it.
+    await stream_to_vault(
+        FakeRow(str(vault), "Attachments/after.bin"),
+        chunks_of(b"ok"),
+        max_bytes=1000,
+        deadline=_aware_deadline(600),
+        idle_timeout=30,
+        slot_timeout=0.05,
+    )
+    assert (vault / "Attachments" / "after.bin").read_bytes() == b"ok"
 
 
 # ════════════════════════════════════════════════════════════════════════════

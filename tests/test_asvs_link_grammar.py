@@ -1,0 +1,668 @@
+"""The link grammar is linear, bounded, and off the loop — issue #180, ASVS.
+
+Four grammars parse links: wikilink and markdown-link extraction in
+`src/services/links.py` (run by the indexer) and the wikilink and markdown
+halves of the `move_note` rewrite scanner in `src/mcp_server/tools.py`. All
+four were regexes running on the single event loop with character classes that
+could swallow the rest of a line before the tail failed, which made ordinary
+in-cap input — 20 KB of `[[` — an 18-second stall for every other tenant on
+the server.
+
+The two wikilink halves are still regexes, with every class closed. The two
+markdown halves are now one hand-written scanner, `scan_md_links`: closing the
+classes made them linear but left a 2,048× constant, ≈ 90 s for a 10 MiB note.
+That replacement's exactness against the retired regexes is pinned in
+`tests/test_asvs_mdlink_scanner.py`; what is pinned HERE is the behaviour the
+two grammars share, which did not change.
+
+This module pins the three things that fix has to be:
+
+1. **Linear** — a ratio benchmark (2n ÷ n < 4) over every pathological shape,
+   not a single wall-clock assertion, because a shared CI runner will flake
+   one of those sooner or later.
+2. **Behaviour-preserving except where enumerated** — the accepted
+   differences are listed once, here, and asserted exactly.
+3. **Agreed between the two grammars** — with the two PRE-EXISTING
+   divergences recorded as known gaps rather than silently inherited.
+"""
+import asyncio
+import time
+
+import pytest
+
+import src.mcp_server.tools as tools
+from src.auth.session import current_user_id
+from src.mcp_server.auth import current_permission
+from src.services import vault as vault_service
+from src.services.links import (
+    _WIKILINK_RE,
+    build_vault_index,
+    extract_links,
+    extract_links_bounded,
+    scan_md_links,
+)
+
+
+def _md_extract(text):
+    """The extraction grammar's markdown half."""
+    return next(iter(scan_md_links(text)), None)
+
+
+def _md_rewrite(text):
+    """The `move_note` rewrite grammar's markdown half."""
+    return next(iter(scan_md_links(text, **tools.MDLINK_REWRITE_FLAGS)), None)
+
+# ── the seven shapes, and the two entry points ──────────────────────────────
+#
+# Each is a run where a class consumed the rest of the line and the tail then
+# failed. Measured before the fix at 40 KB: `[[` 18 s, `[[a#` 11.8 s, `[[a|`
+# 4.9 s, `[a](` 3.6 s, `[a](x` 2.4 s.
+PATHOLOGICAL_UNITS = ["[[", "]]", "[[a", "[[a#", "[[a|", "[a](", "[a](x"]
+
+BENCH_N = 512 * 1024
+# The wikilink rows measure ~180 ms at 1 MiB on the development host. The
+# ceiling is loose because a shared CI runner is not the development host and
+# the RATIO is what proves linearity; this only has to fail on a return to
+# quadratic, which was seconds at 40 KB.
+BENCH_CEILING_SECONDS = 20.0
+# The markdown rows get a far tighter one. They used to sit under the same
+# 60 s because the bounded regex really did take ~4.7 s per 512 KiB of `[a](`
+# — linear, but with a 2,048× constant. `scan_md_links` removed the constant:
+# these rows now measure ~130 ms at 1 MiB END TO END, nearly all of it the
+# wikilink pass and the fence mask that run first. 2 s is ~15× headroom for CI
+# and still fails instantly on any return to the old constant.
+#
+# This bounds `extract_links` as a whole. The scanner's own DoS bound — 1 MiB
+# of `[a](` and of `[a](.md` each under 200 ms — is asserted against the
+# scanner directly in `tests/test_asvs_mdlink_scanner.py`, where the wikilink
+# pass is not in the way of the measurement.
+MD_BENCH_CEILING_SECONDS = 2.0
+MD_UNITS = {"[a](", "[a](x"}
+
+
+def _repeat(unit: str, size: int) -> str:
+    return (unit * (size // len(unit) + 1))[:size]
+
+
+def _rewrite_index():
+    """The smallest `pre_move_index` that makes the rewrite scanner run its
+    regexes rather than return early on a missing `from_rel`."""
+    return build_vault_index([("Old.md", 1), ("New.md", 2)])
+
+
+def _run_extraction(text: str) -> int:
+    return len(extract_links(text))
+
+
+def _run_rewrite(text: str) -> int:
+    _, n = tools._rewrite_links_in_text(
+        text, "Old.md", "New.md", "src.md", _rewrite_index()
+    )
+    return n
+
+
+SCANNERS = {"extract_links": _run_extraction, "rewrite_scanner": _run_rewrite}
+
+
+def _measure(fn, arg):
+    """Best of up to five runs, stopping once a second has been spent.
+
+    A single wall-clock sample of a 50 ms run on a shared runner is mostly
+    scheduler noise — three-times spreads between the fastest and slowest of
+    five identical runs are routine here — and that noise is exactly what
+    turns a ratio assertion into a flaky test. Taking the minimum measures it
+    away instead of papering over it with a looser bound. The one-second
+    budget matters as much as the count: with a smaller budget the 2n size
+    gets one noisy sample where n gets five, and the *asymmetry* alone can
+    manufacture a ratio above 4. The expensive shapes exceed the budget on
+    their first run and are sampled once, which is fine — they are seconds
+    long, well clear of the noise floor."""
+    best = None
+    spent = 0.0
+    found = 0
+    for _ in range(5):
+        start = time.perf_counter()
+        found = fn(arg)
+        elapsed = time.perf_counter() - start
+        best = elapsed if best is None else min(best, elapsed)
+        spent += elapsed
+        if spent >= 1.0:
+            break
+    return best, found
+
+
+@pytest.mark.parametrize("unit", PATHOLOGICAL_UNITS)
+@pytest.mark.parametrize("scanner", sorted(SCANNERS))
+def test_pathological_input_is_parsed_in_linear_time(scanner, unit):
+    fn = SCANNERS[scanner]
+    small = _repeat(unit, BENCH_N)
+    large = _repeat(unit, 2 * BENCH_N)
+
+    fn(small[:4096])  # warm the interpreter, not the measurement
+    t_small, found_small = _measure(fn, small)
+    t_large, found_large = _measure(fn, large)
+
+    # None of these shapes is a link. A "fast" run that started finding
+    # millions of them would be a different bug wearing this test's clothes.
+    assert found_small == 0, f"{unit!r} produced {found_small} links"
+    assert found_large == 0, f"{unit!r} produced {found_large} links"
+
+    ceiling = MD_BENCH_CEILING_SECONDS if unit in MD_UNITS else BENCH_CEILING_SECONDS
+    assert t_large < ceiling, (
+        f"{scanner} on {unit!r}: {t_large:.2f}s at {2 * BENCH_N} bytes "
+        f"(ceiling {ceiling}s)"
+    )
+    ratio = t_large / max(t_small, 1e-6)
+    assert ratio < 4, (
+        f"{scanner} on {unit!r}: ratio {ratio:.2f} "
+        f"(n={t_small:.4f}s, 2n={t_large:.4f}s) — superlinear"
+    )
+
+
+# ── the accepted differences, enumerated ────────────────────────────────────
+
+
+def _targets(text):
+    return [(link.kind, link.target, link.link_text) for link in extract_links(text)]
+
+
+def test_a_bracket_inside_an_alias_is_no_longer_a_link():
+    """Was: a row whose alias was mangled at the first `]`. Now: no row.
+
+    `[` and `]` are forbidden by Obsidian's own wikilink syntax, so nothing
+    well-formed is lost — and leaving the class open is what made 20 KB of
+    `[[a|` a 4.9-second stall."""
+    assert _targets("[[Note|see [1]]]") == []
+
+
+def test_a_bracket_inside_an_anchor_is_no_longer_a_link():
+    assert _targets("[[Note#Sec [x]]]") == []
+
+
+def test_a_bracketed_anchor_is_also_no_longer_rewritten_by_move_note():
+    """The CONSEQUENCE of the two differences above, stated on purpose.
+
+    The rewrite grammar closed the same classes as extraction, so
+    `[[Old#Results [draft]]]` is not only absent from `note_links` — it is also
+    left alone by `move_note(rewrite_links=True)`. The on-disk link keeps
+    naming `Old` after the note moves, and nothing warns: the rewrite reports
+    the count of links it changed, and this one was never a candidate.
+
+    ACCEPTED, and not fixed by re-admitting `[` / `]` into the anchor and alias
+    classes — those open classes were the `[[a#` and `[[a|` quadratic blowups
+    (11.8 s and 4.9 s at 40 KB), and a bracketed anchor is malformed under
+    Obsidian's own wikilink syntax, which forbids brackets inside `[[...]]`.
+    Before this change the link was not rewritten *correctly* either: it was
+    extracted with a mangled anchor. What changed is that it is now uniformly
+    invisible to both halves rather than half-seen by each.
+
+    Recorded in `docs/architecture/vault-tools.md`'s accepted-differences
+    table. Anyone who wants the link rewritten renames the anchor first."""
+    text = "See [[Old#Results [draft]]] and [[Old#Results]] for the numbers."
+
+    rewritten, count = tools._rewrite_links_in_text(
+        text, "Old.md", "New.md", "src.md", _rewrite_index()
+    )
+
+    # The well-formed neighbour on the same line still moves — this is a
+    # grammar difference, not a dead rewrite path.
+    assert count == 1
+    assert "[[New#Results]]" in rewritten
+    # The bracketed one is untouched, and still names the old note.
+    assert "[[Old#Results [draft]]]" in rewritten
+    # And extraction agrees: neither half sees it, so there is no row to go
+    # stale in the index either.
+    assert _targets("[[Old#Results [draft]]]") == []
+
+
+def test_a_bracketed_alias_is_also_no_longer_rewritten_by_move_note():
+    """The alias half of the same consequence."""
+    text = "[[Old|see [1]]]"
+
+    rewritten, count = tools._rewrite_links_in_text(
+        text, "Old.md", "New.md", "src.md", _rewrite_index()
+    )
+
+    assert count == 0
+    assert rewritten == text
+
+
+def test_a_stray_leading_bracket_now_starts_the_match_one_character_later():
+    """The same rule seen from the other side, and the only *incidental*
+    difference: `[[[Foo]]` used to yield the target `[Foo` (a note name that
+    cannot exist). The match now begins at the second `[`, so the target is
+    `Foo`."""
+    assert _targets("[[[Foo]]") == [("link", "Foo", "[[Foo]]")]
+
+
+def test_a_bracket_in_markdown_link_text_shortens_link_text():
+    """Still a link to `x.md` — but `link_text`, which is the field
+    `get_links` returns and `move_note` splices on, is now the inner form."""
+    assert _targets("[a[b](x.md)") == [("markdown", "x", "[b](x.md)")]
+
+
+def test_an_href_longer_than_the_bound_is_not_extracted():
+    """It cannot name a note: `MAX_PATH_CHARS` is 1,024."""
+    assert _targets("[t](" + "a" * 2100 + ".md)") == []
+
+
+def test_an_href_within_the_bound_is_extracted():
+    href = "a" * 2040
+    assert _targets(f"[t]({href}.md)") == [("markdown", href, f"[t]({href}.md)")]
+
+
+def test_brackets_in_a_filename_still_extract():
+    """The href is length-bounded rather than bracket-free precisely because
+    `Foo [draft].md` is a legal file name."""
+    assert _targets("[t](Foo [draft].md)") == [
+        ("markdown", "Foo [draft]", "[t](Foo [draft].md)")
+    ]
+
+
+UNCHANGED_FORMS = [
+    ("[[Note]]", [("link", "Note", "[[Note]]")]),
+    ("[[Folder/Other Note|alias]]", [("link", "Folder/Other Note", "[[Folder/Other Note|alias]]")]),
+    ("[[Note#Section]]", [("link", "Note", "[[Note#Section]]")]),
+    ("[[Note#Section|alias]]", [("link", "Note", "[[Note#Section|alias]]")]),
+    ("![[Diagram.md]]", [("embed", "Diagram.md", "![[Diagram.md]]")]),
+    ("[See also](./Subfolder/Note.md)", [("markdown", "./Subfolder/Note", "[See also](./Subfolder/Note.md)")]),
+    ("[a](My Note.md)", [("markdown", "My Note", "[a](My Note.md)")]),
+    ("[a](folder/My Note.md#anchor)", [("markdown", "folder/My Note", "[a](folder/My Note.md#anchor)")]),
+    ("[a](<My Note.md>)", [("markdown", "My Note", "[a](<My Note.md>)")]),
+    ("[a](x.md.md)", [("markdown", "x.md", "[a](x.md.md)")]),
+]
+
+
+@pytest.mark.parametrize("text,expected", UNCHANGED_FORMS)
+def test_well_formed_links_are_untouched_by_the_closed_classes(text, expected):
+    assert _targets(text) == expected
+
+
+# ── extraction and rewrite agree ────────────────────────────────────────────
+
+AGREEMENT_CORPUS = [
+    "[[Old]]",
+    "![[Old]]",
+    "[[Old|alias]]",
+    "[[Old#Sec]]",
+    "[[Old#Sec|alias]]",
+    "[[Folder/Old.md]]",
+    "[[Old|see [1]]]",
+    "[[Old#Sec [x]]]",
+    "[[[Old]]",
+    "[[]]",
+    "[[ ]]",
+    "[a](Old.md)",
+    "[a](Old.md#anchor)",
+    "[a](folder/My Note.md)",
+    "[a](Foo [draft].md)",
+    "[a[b](Old.md)",
+    "[a](" + "z" * 2100 + ".md)",
+    "[a](" + "z" * 2040 + ".md)",
+    "[a](Old.txt)",
+    "[a]()",
+    "text with no link at all",
+]
+
+
+@pytest.mark.parametrize("text", AGREEMENT_CORPUS)
+def test_extraction_and_rewrite_grammars_accept_the_same_members(text):
+    """One line at a time, bare-href form only — the two known gaps below are
+    exactly the cases this corpus must avoid."""
+    extracted = bool(_WIKILINK_RE.search(text) or _md_extract(text))
+    rewritten = bool(
+        tools._WIKILINK_REWRITE_RE.search(text) or _md_rewrite(text)
+    )
+    assert extracted == rewritten, (
+        f"{text!r}: extraction={extracted} rewrite={rewritten}"
+    )
+
+
+def test_known_gap_the_rewrite_scanner_does_not_see_the_angle_bracket_href():
+    """PRE-EXISTING, and deliberately not closed here: extraction has a
+    CommonMark `<href>` alternative, the rewrite grammar has none. So
+    `[a](<Old.md>)` is indexed as a link but `move_note` never rewrites it.
+    Closing it changes what `move_note` mutates, which needs its own change
+    and its own adversarial pass — so `scan_md_links` reproduces the gap
+    under `angle=False` rather than quietly healing it."""
+    text = "[a](<Old.md>)"
+    assert _md_extract(text) is not None
+    assert _md_rewrite(text) is None
+
+
+def test_known_gap_the_rewrite_anchor_class_crosses_newlines():
+    """PRE-EXISTING: extraction's anchor class is `[^)\\n]`, the rewrite
+    scanner's is `[^)]`. A `#anchor` that runs past a line break is therefore
+    rewritable but not extractable. Also untouched by this change —
+    `scan_md_links(anchor_crosses_newlines=True)` is the rewrite half."""
+    text = "[a](Old.md#sec\nmore)"
+    assert _md_extract(text) is None
+    assert _md_rewrite(text) is not None
+
+
+# ── the per-note cap, in document order ─────────────────────────────────────
+
+
+def test_the_cap_selects_the_first_n_links_in_document_order():
+    """Not the first N wikilinks then the first N markdown links: extraction
+    runs two sequential loops, so a note with thousands of wikilinks would
+    otherwise lose every markdown link in the file."""
+    body = "".join(f"[[W{i}]] [m{i}](M{i}.md)\n" for i in range(50))
+
+    links, truncated = extract_links_bounded(body, max_links=10)
+
+    assert truncated is True
+    assert len(links) == 10
+    assert [link.position for link in links] == sorted(
+        link.position for link in links
+    )
+    # Five of each — they alternate in the document.
+    assert [link.kind for link in links].count("link") == 5
+    assert [link.kind for link in links].count("markdown") == 5
+    assert [link.target for link in links][:4] == ["W0", "M0", "W1", "M1"]
+
+
+def test_a_note_under_the_cap_is_not_reported_as_truncated():
+    body = "".join(f"[[W{i}]]\n" for i in range(10))
+    links, truncated = extract_links_bounded(body, max_links=10)
+    assert truncated is False
+    assert len(links) == 10
+
+
+def test_the_cap_reports_truncation_when_one_kind_alone_overflows():
+    body = "".join(f"[[W{i}]]\n" for i in range(25))
+    links, truncated = extract_links_bounded(body, max_links=10)
+    assert truncated is True
+    assert [link.target for link in links] == [f"W{i}" for i in range(10)]
+
+
+def test_an_uncapped_call_keeps_the_historical_scan_order():
+    """Every pre-existing caller passes no cap and depends on this."""
+    body = "[m](M.md) [[W]]"
+    assert [link.kind for link in extract_links(body)] == ["link", "markdown"]
+    assert extract_links_bounded(body) == (extract_links(body), False)
+
+
+def test_the_cap_bounds_peak_memory_not_just_the_result():
+    """Two loops, each cut at N first: a link in the merged first N is
+    necessarily within the first N of its own kind, so the intermediate lists
+    never grow past 2N even for a note with 1.75 M links."""
+    body = "[[a]] " * 60_000
+    links, truncated = extract_links_bounded(body, max_links=100)
+    assert truncated is True
+    assert len(links) == 100
+
+
+# ── the dispatch off the event loop ─────────────────────────────────────────
+
+
+class _Row:
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+
+def _fake_session(*result_rows):
+    class Result:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def all(self):
+            return self._rows
+
+    calls = {"n": 0}
+
+    class FakeSession:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def execute(self, statement):
+            i = calls["n"]
+            calls["n"] += 1
+            return Result(result_rows[i] if i < len(result_rows) else [])
+
+        async def commit(self):
+            return None
+
+    return FakeSession
+
+
+@pytest.fixture
+def rewrite_vault(monkeypatch, tmp_path):
+    monkeypatch.setattr(vault_service.settings, "vault_path", str(tmp_path))
+
+    async def noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(tools, "_log_usage", noop)
+    perm = current_permission.set("readwrite")
+    uid = current_user_id.set(None)
+    yield tmp_path
+    current_user_id.reset(uid)
+    current_permission.reset(perm)
+
+
+async def test_move_note_dispatches_the_rewrite_through_to_thread(
+    rewrite_vault, monkeypatch
+):
+    """The rewrite is a pure function of a string, and a hub note's backlink
+    sources are read one after another — linear work on near-cap notes is
+    still dead air for every other tenant if it runs on the loop.
+
+    **Both halves of the per-source work, not just the rewrite.** The fence
+    scan is the larger half — a full `FULL_NOTE` pass over up to
+    `MAX_NOTE_BYTES` — and it ran on the loop nine lines above the dispatch,
+    once per backlink source, with the process-wide `_MOVE_REWRITE_LOCK`
+    held. Asserting only `_rewrite_links_in_text` let that stand."""
+    (rewrite_vault / "Old.md").write_text("moved\n", encoding="utf-8")
+    (rewrite_vault / "src.md").write_text("see [[Old]]\n", encoding="utf-8")
+    monkeypatch.setattr(
+        tools,
+        "async_session",
+        _fake_session(
+            [_Row(file_path="Old.md", id=1), _Row(file_path="src.md", id=2)],
+            [_Row(file_path="src.md")],
+        ),
+    )
+
+    dispatched = []
+    real_to_thread = asyncio.to_thread
+
+    async def spy(fn, /, *args, **kwargs):
+        dispatched.append(getattr(fn, "__name__", repr(fn)))
+        return await real_to_thread(fn, *args, **kwargs)
+
+    monkeypatch.setattr(tools.asyncio, "to_thread", spy)
+
+    result = await tools.move_note_impl("Old.md", "New.md", rewrite_links=True)
+
+    assert "Moved Old.md → New.md" in result, result
+    assert "_rewrite_links_in_text" in dispatched, dispatched
+    assert "_scan_rewrite_source" in dispatched, dispatched
+    assert (rewrite_vault / "src.md").read_text(encoding="utf-8") == "see [[New]]\n"
+
+
+# ── the rewrite splice is linear too ────────────────────────────────────────
+#
+# The scanners were the first half of #180. The *splice* that applies what
+# they found was the other half and stayed quadratic: one
+# `out[:start] + repl + out[end:]` per rewrite over a descending sort is a
+# fresh copy of the whole note per link. Measured on the development host
+# before the fix, on `[[Old]] ` repeated: 0.072 s at 64 KiB, 0.176 s at
+# 128 KiB, 0.723 s at 256 KiB, 5.315 s at 512 KiB — clean O(n²), and roughly
+# 35 minutes extrapolated to `MAX_NOTE_BYTES`, all of it with the
+# process-wide `_MOVE_REWRITE_LOCK` held. Every other tenant's move waits
+# behind it, which is the exact stall the scanner work removed from the other
+# half of the same function.
+#
+# These rows are match-DENSE. The pathological rows above all find zero
+# links, so none of them ever reached the splice at all: they could not have
+# failed on it, which is why this benchmark exists separately rather than as
+# another entry in `PATHOLOGICAL_UNITS`.
+
+SPLICE_UNIT = "[[Old]] "
+SPLICE_N = 256 * 1024
+# 1 MiB of `[[Old]] ` is 131,072 rewrites. The new splice measures ~0.04 s
+# for that; the retired one measures ~25 s, a 600× gap, so a bound at 0.5 s
+# is a real bound and not a formality — it fails the old shape by fifty times
+# while leaving the new one twelve times its measured cost for CI noise.
+SPLICE_ABSOLUTE_CEILING_SECONDS = 0.5
+
+
+def _dense(size: int) -> str:
+    return SPLICE_UNIT * (size // len(SPLICE_UNIT))
+
+
+def _spans_for(text: str):
+    """`(start, end, replacement)` for every `[[Old]]` in a dense body."""
+    step = len(SPLICE_UNIT)
+    return [
+        (i * step, i * step + len("[[Old]]"), "[[New]]")
+        for i in range(len(text) // step)
+    ]
+
+
+def _reverse_splice(content, rewrites):
+    """The retired implementation, kept here as the differential oracle.
+
+    Byte-for-byte what `move_note` used to write. A rewrite that is fast but
+    produces different bytes is a destructive write, not a speed-up.
+    """
+    ordered = sorted(rewrites, key=lambda r: r[0], reverse=True)
+    out = content
+    for start, end, replacement in ordered:
+        out = out[:start] + replacement + out[end:]
+    return out
+
+
+def test_the_rewrite_splice_is_linear_in_the_note(monkeypatch):
+    """n against 2n of match-dense text, through the whole rewrite path.
+
+    The per-source cap is lifted for the measurement: the cap bounds the
+    production blast radius, but linearity has to hold on its own — 10,000
+    rewrites of a 10 MiB note is still 100 GB of copying under the old
+    splice, and a future change to the cap must not be what keeps this fast.
+    """
+    monkeypatch.setattr(tools, "MAX_LINKS_PER_NOTE", 10_000_000)
+    small = _dense(SPLICE_N)
+    large = _dense(2 * SPLICE_N)
+
+    _run_rewrite(small[:4096])  # warm the interpreter, not the measurement
+    t_small, n_small = _measure(_run_rewrite, small)
+    t_large, n_large = _measure(_run_rewrite, large)
+
+    # Dense, not pathological: every unit is a rewrite. A run that suddenly
+    # found nothing would be fast for the wrong reason.
+    assert n_small == len(small) // len(SPLICE_UNIT)
+    assert n_large == 2 * n_small
+
+    ratio = t_large / max(t_small, 1e-6)
+    assert ratio < 4, (
+        f"rewrite splice: ratio {ratio:.2f} "
+        f"(n={t_small:.4f}s, 2n={t_large:.4f}s) — superlinear"
+    )
+    assert t_large < 4.0, f"rewrite splice: {t_large:.2f}s at {2 * SPLICE_N} bytes"
+
+
+def test_the_splice_itself_holds_a_real_absolute_bound():
+    """1 MiB, 131,072 rewrites, under half a second.
+
+    Asserted against `_splice_rewrites` rather than end to end, so the bound
+    measures the splice and not the scanners and `resolve_target` calls in
+    front of it. The retired splice takes ~25 s on the same input.
+    """
+    text = _dense(1024 * 1024)
+    spans = _spans_for(text)
+    assert len(spans) == 131_072
+
+    tools._splice_rewrites(text[:4096], _spans_for(text[:4096]))
+    start = time.perf_counter()
+    out = tools._splice_rewrites(text, spans)
+    elapsed = time.perf_counter() - start
+
+    assert out == "[[New]] " * len(spans)
+    assert elapsed < SPLICE_ABSOLUTE_CEILING_SECONDS, (
+        f"splice took {elapsed:.3f}s for {len(spans)} rewrites over "
+        f"{len(text)} bytes (ceiling {SPLICE_ABSOLUTE_CEILING_SECONDS}s)"
+    )
+
+
+def test_the_linear_splice_is_byte_identical_to_the_retired_one():
+    """A randomized corpus of non-overlapping spans, both implementations.
+
+    Randomized over the shapes that differ between them — replacements
+    shorter and longer than what they replace, spans touching end to end,
+    spans at position 0 and at the very end, gaps of every size — because the
+    thing that would go wrong is an off-by-one in the cursor, and a fixed
+    example is exactly what an off-by-one survives.
+    """
+    import random
+
+    rng = random.Random(20260904)
+    for _ in range(400):
+        content = "".join(rng.choice("abcdef\n[]|#(). ") for _ in range(rng.randint(0, 300)))
+        spans = []
+        cursor = 0
+        while cursor < len(content):
+            gap = rng.randint(0, 6)
+            start = cursor + gap
+            if start >= len(content):
+                break
+            end = min(len(content), start + rng.randint(1, 8))
+            spans.append((start, end, "R" * rng.randint(0, 12)))
+            cursor = end
+        rng.shuffle(spans)  # the scanners hand them over kind by kind
+        assert tools._splice_rewrites(content, spans) == _reverse_splice(
+            content, spans
+        ), (content, spans)
+
+
+def test_overlapping_spans_fall_back_to_the_retired_splice():
+    """The cursor walk is only equivalent while spans do not overlap.
+
+    They cannot overlap coming out of the two scanners — a markdown link's
+    text class excludes `[` and `]`, so no `[text](` can begin inside a
+    wikilink span and run past its `]]` — but that is a property of two
+    grammars in another module, so the splice checks rather than assumes it.
+    Reached only by calling the splice directly, which is what this does.
+    """
+    content = "0123456789"
+    overlapping = [(0, 6, "AA"), (3, 10, "BBB")]
+    assert tools._splice_rewrites(content, overlapping) == _reverse_splice(
+        content, overlapping
+    )
+    # And it is the fallback's answer, not the cursor walk's: the cursor walk
+    # would emit "AA" then "BBB" with nothing dropped.
+    assert tools._splice_rewrites(content, overlapping) != "AABBB"
+
+
+# ── the per-source rewrite cap ──────────────────────────────────────────────
+
+
+def test_a_source_over_the_rewrite_cap_is_refused_not_truncated(monkeypatch):
+    """The write side gets the bound the read side has always had.
+
+    `MAX_LINKS_PER_NOTE` caps what the indexer *extracts*; nothing capped
+    what `move_note` *rewrote*, so a 10 MiB note of `[[Old]] ` planned ~1.7
+    million rewrites in one source. Refused rather than truncated: a partial
+    rewrite leaves the rest of the note pointing at the path the move is
+    about to vacate, and reports success.
+    """
+    monkeypatch.setattr(tools, "MAX_LINKS_PER_NOTE", 4)
+    body = "[[Old]] " * 5
+
+    with pytest.raises(tools.MoveRewriteCapExceeded) as excinfo:
+        tools._rewrite_links_in_text(body, "Old.md", "New.md", "src.md", _rewrite_index())
+
+    assert excinfo.value.source_path == "src.md"
+    assert excinfo.value.count == 5
+    assert excinfo.value.cap == 4
+
+    # At the cap it goes through — the refusal is "more than", not "at".
+    rewritten, n = tools._rewrite_links_in_text(
+        "[[Old]] " * 4, "Old.md", "New.md", "src.md", _rewrite_index()
+    )
+    assert n == 4
+    assert rewritten == "[[New]] " * 4
