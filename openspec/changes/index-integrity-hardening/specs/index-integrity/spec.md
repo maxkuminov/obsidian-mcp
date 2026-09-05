@@ -74,6 +74,76 @@ The Ollama (local, sequential) embedding batch SHALL have no aggregate deadline:
 - **WHEN** a note is capped at N chunks and the provider returns N-1 vectors
 - **THEN** the note SHALL NOT be certified and its previous vectors SHALL remain in place
 
+### Requirement: The unverified ancillary passes do nothing for a user whose provenance is not settled
+The one-shot link backfill and the keyword-vector rebuild SHALL each run, for a given user, only when that user's provenance is recorded and the classification for the assigned root at that moment is **same assignment**. For any other classification they SHALL skip that user, SHALL write no row for that user, and SHALL log the skip once, leaving the work to a later pass once the scan has settled the provenance.
+
+The skip SHALL be **per user**, not global: a user whose provenance is unsettled SHALL NOT prevent these passes from running for every other user.
+
+**One narrow exception: the operator-invoked keyword rebuild that records a global configuration fingerprint.** That operation asserts, in one stored row, that *every retained row in the database* was rebuilt under the current text-search configuration — a claim that cannot be established one user at a time. When it runs, a scope it must skip SHALL abort the whole operation: no fingerprint is recorded, every scope's rebuild is rolled back, and the skipped scope and its reason are named to the operator.
+
+The exception SHALL be read narrowly, and its three limits are what keep it from swallowing the rule:
+
+- It applies **only** to that operator-invoked, fingerprint-recording operation. The one-shot link backfill is untouched, and no pass on the periodic loop is covered.
+- It does **not** weaken the per-user gate itself. The skipped user still gets nothing written — which is exactly what the rule above demands — and the gate is still computed by the same classification function.
+- The rule's purpose is preserved. What "per user, not global" protects against is one tenant's unsettled provenance blocking another tenant's *ongoing* indexing; this operation is a one-shot an operator invoked, not the loop that keeps the index fresh, and it makes no claim about any user until it can make the claim about all of them.
+
+**The maintenance operation SHALL be able to rebuild an inactive owner's scope.** Eligibility here is a question about *retained rows*, not about which users the periodic pass serves: an inactive user's rows are as present in the index, and as returnable by keyword search, as anyone's. The operation SHALL therefore resolve that owner's assigned vault path directly and read-only, within the operation, and pin it as any file-reading pass pins a root. It SHALL NOT widen the active-user root resolution or the active-user cache to do so. A scope with **no** assigned vault path, or one whose path cannot be pinned, remains a skip — and the provenance gate applies to an inactive owner exactly as it applies to an active one.
+
+The classification SHALL be computed by the same function the scan uses, so that "settled" cannot come to mean two different things in two places.
+
+**The embedding pass is deliberately not among them**, and the reason is stated in "The embedding pass is not gated on provenance, because it verifies every hash it certifies" below: it is the only one of the three that binds what it writes to the content the metadata row records, so it is safe by construction against the root mixing this gate exists to prevent, and gating it is the one gate whose cost is unbounded.
+
+These two passes read vault files and write rows the provenance is a claim about — link rows and keyword vectors — with **no verification of any kind** that the bytes they read are the bytes the row they write against describes. They cannot assume the scan settled the provenance a moment ago: a user whose notes contain no links leaves the link backfill eligible on every startup, and a reassignment can commit between the scan and either of them. Allowing them to write under an unresolved provenance is what lets a link row extracted from one root be committed against a metadata row from another.
+
+Verification is not merely unimplemented for the link backfill: a link row's *resolution* is a function of the whole set of notes under a root rather than of one file's bytes, so no per-file check could license it. The keyword-vector rebuild could in principle be verified the way the embedding pass is, and is still gated, because it records nothing that would let a later pass notice a vector built from foreign bytes — there is no keyword analogue of `embedded_content_hash`.
+
+Skipping costs those two passes nothing even for a user whose provenance never settles, which is why it is the specified outcome rather than a per-file content check. The re-derive branch does both passes' work itself on every pass: it deletes and re-extracts every one of that user's link rows, and it rewrites every note's keyword vector, because it treats every note as changed. A delayed link backfill of a table the re-derive is filling anyway, and a delayed rebuild of vectors the re-derive is rewriting anyway, cost latency and write nothing wrong.
+
+#### Scenario: An unsettled user is skipped by both gated passes
+
+- **WHEN** a user has no recorded provenance, or the classification for their assigned root is anything other than same assignment, and the link backfill or the keyword-vector rebuild runs
+- **THEN** that pass SHALL write no `note_links` or keyword-vector row for that user
+- **AND** SHALL log the skip once
+
+#### Scenario: The skip does not stop the pass for other users
+
+- **WHEN** one user's provenance is unsettled and another user's is settled, and a gated pass runs
+- **THEN** the settled user's work SHALL be performed in that same pass
+
+#### Scenario: The fingerprint-recording rebuild is the exception
+
+- **WHEN** the operator-invoked keyword rebuild that records the configuration fingerprint reaches a retained scope it must skip
+- **THEN** it SHALL record no fingerprint, SHALL roll back every scope it had rebuilt, and SHALL name the skipped scope and its reason
+- **AND** the skipped scope SHALL still have had no row written for it
+
+#### Scenario: The exception does not reach the link backfill
+
+- **WHEN** the one-shot link backfill encounters an unsettled user alongside settled ones
+- **THEN** it SHALL skip that user and complete for the others, exactly as before
+
+#### Scenario: An inactive but assigned owner is rebuilt
+
+- **WHEN** the fingerprint-recording rebuild reaches a scope whose owner is inactive, has an assigned vault path, and whose provenance classification is same assignment
+- **THEN** that scope SHALL be rebuilt
+- **AND** the operation SHALL resolve and pin that owner's assigned path itself, without changing which users the periodic pass serves
+
+#### Scenario: An unassigned owner remains a skip
+
+- **WHEN** a retained scope's owner has no assigned vault path
+- **THEN** it SHALL be a skip with its own named reason
+- **AND** in the fingerprint-recording rebuild that skip SHALL abort the operation
+
+#### Scenario: A reassignment between the scan and a later pass writes nothing
+
+- **WHEN** the scan settles a user's provenance and the user is then reassigned to a different vault before the link backfill runs
+- **THEN** the link backfill SHALL classify that user as reassigned rather than same assignment, and SHALL write no link row for them
+- **AND** the next scan SHALL perform the reconciliation for that user
+
+#### Scenario: A settled user proceeds unchanged
+
+- **WHEN** a user's recorded provenance matches the assigned root and a gated pass runs
+- **THEN** it SHALL do exactly the work it does today
+
 ## ADDED Requirements
 
 ### Requirement: A provider failure is excluded from the pass's embedded count and marks the run
@@ -231,6 +301,8 @@ The cursor is scheduling instrumentation: a failure to write it SHALL be logged 
 ### Requirement: A per-tenant embed budget is checked only at a note boundary
 The embed pass SHALL bound the work it performs for one user in one pass by a configurable chunk budget and a configurable wall-clock budget, and SHALL evaluate that bound **only between notes**, at the same points the pause flag is already checked. It SHALL NOT abandon a note that has already begun embedding.
 
+**The chunk budget SHALL be debited by the chunks a note *submitted* to the provider, never by the chunks it stored.** Every provider call debits what it sent, whatever came back: a call that raised and a call that returned the wrong number of vectors debit exactly as a successful one does. A budget debited by stored chunks is not debited at all when the provider fails, so a tenant whose notes all fail would consume the whole pass, every pass, without ever reaching its bound — the starvation this requirement exists to stop, reappearing inside it. The wall-clock budget does not cover that case, because an operator may disable it and keep only the chunk budget.
+
 Mid-note preemption is forbidden because a note is certified only on full coverage of its requested chunks: a note abandoned between chunks is left uncertified, is re-selected by the backlog on the next pass, and re-performs every provider call it already made — a burn that repeats for as long as the note stays over budget and that no pass can ever finish. Bounding at the note boundary means the overrun is at most one note, which the per-note chunk cap has already bounded.
 
 **The bound this provides SHALL be stated as the budget plus one note's embedding time**, and one note's embedding time is bounded by the chunk cap multiplied by the provider's per-call timeout, not by any aggregate deadline. That arithmetic worst case is hours on a provider answering every call at the edge of its timeout, and it is an **accepted limitation**: the alternative is an aggregate deadline, which is the construct that produced a note the pass could never finish and which SHALL NOT be reintroduced.
@@ -262,6 +334,17 @@ Both the hash-mismatch backlog and the exclusion-reconciliation sweep SHALL draw
 - **WHEN** a user's first note alone consumes more than the entire chunk budget
 - **THEN** that note SHALL be embedded and certified in that pass
 - **AND** the user SHALL advance by one note per pass rather than being blocked indefinitely
+
+#### Scenario: A failing provider still debits the budget
+
+- **WHEN** the wall-clock budget is disabled, a user's notes each submit chunks to the provider, and every one of those calls fails
+- **THEN** the chunk budget SHALL be debited by the chunks each call submitted
+- **AND** the user's embedding SHALL stop at a note boundary once the budget is exhausted, rather than continuing for the whole pass
+
+#### Scenario: A cardinality mismatch debits the budget
+
+- **WHEN** a provider call returns the wrong number of vectors for a note
+- **THEN** the chunks that call submitted SHALL be debited from the budget
 
 #### Scenario: A budget stop is not an error
 

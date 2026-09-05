@@ -109,6 +109,8 @@ The rebuild is per owner. A fingerprint written inside a per-owner rebuild claim
 
 The operation SHALL therefore determine its scopes from the **rows that exist** — every distinct owner value present in `notes_metadata`, the null owner included — rather than from the set of active users, SHALL rebuild each of them, and SHALL write the fingerprint only after every one of them reported a **completed** rebuild.
 
+**An inactive owner with an assigned vault SHALL be rebuilt, not skipped.** The active-user set answers "whom does the periodic pass serve"; this operation answers "which rows exist", and an inactive owner's rows are as retained, and as returnable by keyword search, as anyone's. The operation SHALL resolve that owner's assigned vault path directly and read-only within itself and pin it as any file-reading pass pins a root, without widening the active-user root resolution or the active-user cache. Only an owner with **no** assigned path, or one whose path cannot be pinned, is a skip — and the provenance gate applies to an inactive owner exactly as to an active one.
+
 **The per-scope rebuild SHALL return a typed outcome distinguishing "completed" from every kind of skip, and SHALL NOT report both as a row count.** It returns a count today, and `0` means both "this scope had nothing to do" and "this scope was skipped because its provenance is not settled" — the gate that already forbids the keyword rebuild from writing for a user whose index provenance is unresolved. A driver reading `0` as success would record a fingerprint certifying a scope the rebuild deliberately declined to touch, which is precisely the false claim this requirement exists to remove. Any retained scope whose outcome is not "completed" — provenance unsettled, root unpinnable, or any other named skip — SHALL abort the driver, SHALL prevent the fingerprint write, and SHALL be named with its reason.
 
 **A retained scope with a null owner SHALL abort the operation while multi-user mode is enabled.** The ownerless scope has no vault root to pin in that mode, and substituting the process-wide configured vault path would read one tenant's notes under an unowned scope — a tenancy violation performed to satisfy a bookkeeping row. Nor may such rows be quietly excluded from the coverage proof: they are retained rows that keyword search can return. The operation SHALL therefore name them and their count and write nothing, and the operator's prerequisite — deleting or reassigning them — SHALL be stated in the refusal and in the deploy checklist rather than first discovered as a refusing startup. In single-user mode the ownerless scope is the only scope and rebuilds normally.
@@ -126,9 +128,15 @@ Where a scope cannot be rebuilt, the operation cannot complete and the refusal a
 
 #### Scenario: A scope holding rows but not in the active set is rebuilt
 
-- **WHEN** `notes_metadata` holds rows owned by an inactive user, and rows with a null owner, alongside active users' rows
-- **THEN** the rebuild SHALL attempt every one of those scopes
-- **AND** SHALL NOT write the fingerprint while any of them is unrebuilt
+- **WHEN** `notes_metadata` holds rows owned by an inactive user who has an assigned vault path and settled provenance
+- **THEN** the rebuild SHALL rebuild that scope, resolving and pinning that owner's assigned path within the operation
+- **AND** it SHALL NOT be reported as a skip, and SHALL NOT block the fingerprint
+
+#### Scenario: The active-user machinery is unchanged
+
+- **WHEN** the rebuild resolves an inactive owner's root
+- **THEN** the set of users the periodic index pass serves SHALL be unchanged
+- **AND** the active-user root resolution and cache SHALL be unchanged
 
 #### Scenario: A complete rebuild records the fingerprint atomically
 
@@ -169,9 +177,13 @@ The lock's rules:
 
 - **Every maintenance operation that changes the generation SHALL take the lock before it mutates anything** — before the embedding wipe, before the keyword rebuild reads its first row, and before either records a fingerprint.
 - **Every transaction that writes a configuration-dependent derived row SHALL take the lock, re-read the corresponding fingerprint under it, and refuse on a mismatch.** For the embedding path the lock SHALL be acquired **after** the provider call and **before** the certification — the window the existing certification requirement already reserves, so that no lock of any kind is held across a network request. On a mismatch the transaction SHALL certify nothing, insert nothing and delete nothing, leaving the row for a later pass, which is the disposition a failed certification already has.
+- **On the embedding path that acquisition SHALL live in the function that owns both statements.** The provider call and the certification are two statements of one function; no caller sits between them, so the lock and the fingerprint re-read SHALL be performed there rather than by the pass that invokes it. A mismatch SHALL be reported to the pass as its own outcome, distinct from a provider failure and from a successful embed: it SHALL NOT count as a note the pass embedded, SHALL NOT count as a failure — nothing went wrong with the provider — and SHALL count as an attempt, because a provider call was issued.
 - **Every writer of a note's keyword vector SHALL take the same lock and make the same re-read**, including the incremental index pass. A rebuild can otherwise complete and record its fingerprint while an old-configuration pass writes one note's keyword vector under the previous configuration — and because a keyword vector is rewritten only when a note's content hash changes, that row then stays on the previous configuration indefinitely behind a fingerprint claiming otherwise. A refusal there SHALL abort that pass with nothing committed, as a floor failure already does.
 - **The lock SHALL be transaction-scoped, never session-scoped**, so it is released by commit or rollback and a crashed pass cannot strand it in a pooled connection.
 - **The lock SHALL be acquired before any row or table lock** in every transaction that takes it, so that one ordering holds everywhere and the new lock cannot close a cycle with the row locks the pass, the panel and the index-discard branch already contend for.
+- **That ordering is a property of the transaction, not of the statement that needs the fingerprint.** A transaction that will write any configuration-dependent derived row SHALL acquire the lock and re-validate the fingerprint **before its first row-locking mutation**, and the implementation SHALL audit every mutation earlier in that transaction rather than reason backwards from the write that consumes the fingerprint. The index pass is one transaction that mutates note metadata — upserts, move updates, prunes, link rows, certification invalidation — long before it reaches its keyword-vector write; acquiring the lock at that write would leave the pass holding row locks while it waits for the lock, and the rebuild holding the lock while it waits for those rows, which is a deadlock and a direct violation of the ordering rule. The acquisition therefore belongs at the head of that transaction.
+
+Holding the lock for the duration of a long pass is accepted: the maintenance operations then **wait** for an in-flight pass rather than interleaving with it, which is the required behaviour, and those operations SHALL NOT defeat it with a short lock timeout.
 - **The key SHALL be a single declared constant**, defined in one place and not derived at runtime from a value that could differ between builds.
 
 **The exclusion branch is exempt**, and the exemption is by argument rather than omission: it issues no provider call, writes no vector, and stamps a row to record that an *excluded* note has been dealt with — a claim true under any configuration, because the correct vector set for an excluded note is the empty one. It has nothing a generation change can invalidate.
@@ -199,6 +211,17 @@ The documented ordering for any change to the embedding configuration SHALL stil
 - **WHEN** the keyword rebuild driver runs
 - **THEN** it SHALL hold the generation lock before it reads the first row it intends to rebuild
 - **AND** no keyword-vector write by any process SHALL commit between that read and the fingerprint record
+
+#### Scenario: The index pass and the rebuild do not deadlock
+
+- **WHEN** an index pass has begun its transaction and mutated note metadata rows, and the keyword rebuild driver starts concurrently on another connection
+- **THEN** neither transaction SHALL be aborted by the database as a deadlock victim
+- **AND** the pass SHALL have acquired the generation lock before its first row-locking mutation, so the rebuild waits for the pass rather than the two waiting on each other
+
+#### Scenario: A maintenance operation waits for an in-flight pass
+
+- **WHEN** a reset or a rebuild starts while an index pass holds the generation lock
+- **THEN** it SHALL wait for the pass to commit or roll back rather than failing fast or proceeding alongside it
 
 #### Scenario: No lock is held across a provider call
 
