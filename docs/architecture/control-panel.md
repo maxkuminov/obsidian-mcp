@@ -116,23 +116,38 @@
   is that everything inline is nonced. Their security headers must stay
   byte-identical once each response's per-request nonce is canonicalized.
 
-- **A new page has to be added to the sweep's template list, and the sweep
-  has to be pointed at the templates.** `checks/literal_sweep.py` in the
-  light-mode change (now under `openspec/changes/archive/`) is what proves
-  "no color literal outside a token definition", but it scans a *recorded*
-  list — `colorscan.PANEL_TEMPLATES` — which is the set of templates that
-  existed when the sweep was written, and it resolves the templates directory
-  from `__file__` assuming the change still sits at
+- **The sweep discovers its own templates now, and refuses to report a
+  vacuous pass.** `checks/literal_sweep.py` in the light-mode change (under
+  `openspec/changes/archive/`) is what proves "no color literal outside a
+  token definition". It used to scan a *recorded* list —
+  `colorscan.PANEL_TEMPLATES`, the templates that existed when the sweep was
+  written — and to resolve the templates directory as `parents[4]` of
+  `__file__`, which assumed the change still sat at
   `openspec/changes/<id>/checks/`. Archiving moved it one level deeper, so an
-  unmodified run now finds no files and reports **zero declarations, zero
-  literals, exit 0** — a clean bill of health for a directory it never read.
-  Run it from a wrapper that repoints `colorscan.TEMPLATE_DIR` at
-  `src/control_panel/templates` and appends the new page (and
-  `performance.html`, added by #160, which is not in the recorded list
-  either), and assert the scan actually saw a nonzero number of declarations
-  before believing the result. Pages added since: `performance.html` (#160),
-  `search_analytics.html` (#161), `health.html` (#163) — all token-only,
-  verified that way.
+  unmodified run found no files and reported **zero declarations, zero
+  literals, exit 0** — a clean bill of health for a directory it never read
+  (#170). `colorscan` now finds the repo root by walking up from `__file__`
+  to the nearest directory holding `pyproject.toml` / `Makefile` / `.git`
+  (falling back to `git rev-parse --show-toplevel`), globs
+  `src/control_panel/templates/*.html` instead of carrying a list, and makes
+  `scan_all` raise `SystemExit` — non-zero, with the directory named — when
+  it reads zero templates, is asked for a template that is not there, or
+  finds zero in-scope declarations. So **a new page needs no registration**:
+  add the template and it is swept. `PANEL_TEMPLATES` survives as a snapshot
+  of the glob for `replay.py`, but the panel-vs-transfer distinction is a
+  predicate (`is_panel_template`), not membership in a list that can go
+  stale. Running `colorscan.py` itself prints the root, the directory, the
+  file count and the per-template declaration counts — the cheapest way to
+  confirm it is reading anything at all. Pages added since the light-mode
+  change: `performance.html` (#160), `search_analytics.html` (#161),
+  `health.html` (#163) — all token-only, and the glob confirms it.
+
+  Two sibling wrappers in other archived changes
+  (`2026-08-29-panel-ops-health/checks/literal_sweep.py`,
+  `2026-08-29-panel-usage-slicing-quotas/checks/literal_sweep.py`) still
+  derive `REPO` as their own `parents[4]` and so cannot even import
+  `colorscan` from the archive; they are the same bug one level up and are
+  not fixed here.
 
 
 ## The health page (#163)

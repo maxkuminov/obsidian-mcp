@@ -32,35 +32,81 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
-TEMPLATE_DIR = Path(__file__).resolve().parents[4] / "src" / "control_panel" / "templates"
+TEMPLATE_REL = Path("src") / "control_panel" / "templates"
 
-# Panel/auth surface: one shared token partial, one palette.
-PANEL_TEMPLATES = [
-    "_theme.html",
-    "_theme_toggle.html",
-    "base.html",
-    "auth_base.html",
-    "authorize.html",
-    "dashboard.html",
-    "keys.html",
-    "login.html",
-    "oauth.html",
-    "reembed_confirm.html",
-    "register.html",
-    "settings.html",
-    "usage.html",
-    "user_edit.html",
-    "users.html",
-    "vault.html",
-]
+# Markers that identify the repo root.  Any one of them is enough.
+_ROOT_MARKERS = ("pyproject.toml", "Makefile", ".git")
+
+
+def repo_root() -> Path:
+    """Locate the repository root without assuming this file's depth.
+
+    The original derived it as ``parents[4]`` of ``__file__``, which was true
+    only while the change lived at ``openspec/changes/<id>/checks/``. Archiving
+    added a path level, so the derived directory did not exist, every template
+    was silently skipped by ``scan_all``'s ``p.exists()`` guard, and the sweep
+    reported zero declarations and exit 0 — a clean bill of health for a
+    directory it never opened (#170).  Walk up looking for a root marker
+    instead, so the script survives being moved again; fall back to git.
+    """
+    here = Path(__file__).resolve()
+    for candidate in here.parents:
+        if any((candidate / marker).exists() for marker in _ROOT_MARKERS):
+            if (candidate / TEMPLATE_REL).is_dir():
+                return candidate
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(here.parent), "rev-parse", "--show-toplevel"],
+            check=True, capture_output=True, text=True).stdout.strip()
+        if out:
+            return Path(out)
+    except (OSError, subprocess.CalledProcessError):
+        pass
+    raise SystemExit(
+        f"colorscan: cannot locate the repository root above {here} "
+        f"(looked for {', '.join(_ROOT_MARKERS)} with a {TEMPLATE_REL} beneath it)"
+    )
+
+
+TEMPLATE_DIR = repo_root() / TEMPLATE_REL
 
 # Transfer surface: distinct, locally tokenized, OS-responsive, no toggle.
 TRANSFER_TEMPLATES = ["transfer_upload.html", "transfer_download.html"]
 
-ALL_TEMPLATES = PANEL_TEMPLATES + TRANSFER_TEMPLATES
+
+def all_templates(directory: Path | None = None) -> list:
+    """Every template in the directory, discovered rather than recorded.
+
+    The original hard-coded the panel list, so pages added later
+    (``performance.html`` #160, ``search_analytics.html`` #161,
+    ``health.html`` #163) were never scanned even when the directory was found.
+    A glob cannot go stale (#170).
+    """
+    directory = TEMPLATE_DIR if directory is None else directory
+    return sorted(p.name for p in directory.glob("*.html"))
+
+
+def panel_templates(directory: Path | None = None) -> list:
+    """The panel/auth surface: everything that is not a transfer page."""
+    return [n for n in all_templates(directory) if n not in TRANSFER_TEMPLATES]
+
+
+def is_panel_template(name: str) -> bool:
+    """Panel templates read the shared `_theme.html` token partial.
+
+    A predicate, not a membership test against a snapshot list, so it stays
+    correct when ``TEMPLATE_DIR`` is repointed after import.
+    """
+    return name not in TRANSFER_TEMPLATES
+
+
+# Snapshots of the discovered lists, for callers that import them as constants.
+PANEL_TEMPLATES = panel_templates() if TEMPLATE_DIR.is_dir() else []
+ALL_TEMPLATES = all_templates() if TEMPLATE_DIR.is_dir() else []
 
 SEMANTIC_KEYWORDS = {"currentcolor", "transparent", "inherit"}
 
@@ -409,11 +455,40 @@ def scan_template(path: Path, record_all: bool = False) -> list:
 
 
 def scan_all(templates=None, record_all: bool = False) -> list:
+    """Scan the templates and refuse to report a vacuous clean pass.
+
+    Zero files read or zero declarations found is a broken scanner, not a
+    tidy codebase — that is exactly the failure #170 filed. Raise instead of
+    returning an empty list so every caller exits non-zero with a reason.
+    ``templates`` is resolved against ``TEMPLATE_DIR`` at call time, so a
+    wrapper that repoints the directory gets that directory's files.
+    """
+    if not TEMPLATE_DIR.is_dir():
+        raise SystemExit(f"colorscan: template directory does not exist: {TEMPLATE_DIR}")
+
+    names = list(templates) if templates is not None else all_templates()
+    missing = [n for n in names if not (TEMPLATE_DIR / n).exists()]
+    present = [n for n in names if (TEMPLATE_DIR / n).exists()]
+    if not present:
+        raise SystemExit(
+            f"colorscan: read 0 templates from {TEMPLATE_DIR} "
+            f"(asked for {len(names)}: {', '.join(names) or '<none>'})"
+        )
+    if missing:
+        raise SystemExit(
+            f"colorscan: {len(missing)} named template(s) missing from "
+            f"{TEMPLATE_DIR}: {', '.join(missing)}"
+        )
+
     out = []
-    for name in (templates or ALL_TEMPLATES):
-        p = TEMPLATE_DIR / name
-        if p.exists():
-            out.extend(scan_template(p, record_all=record_all))
+    for name in present:
+        out.extend(scan_template(TEMPLATE_DIR / name, record_all=record_all))
+    if not out:
+        raise SystemExit(
+            f"colorscan: read {len(present)} template(s) from {TEMPLATE_DIR} "
+            "but found 0 in-scope color declarations — the scanner is broken, "
+            "not the templates"
+        )
     return out
 
 
@@ -444,7 +519,7 @@ def dark_env(entries: list, template: str) -> dict:
     """
     tables = token_tables(entries)
     env: dict = {}
-    sources = ["_theme.html", template] if template in PANEL_TEMPLATES else [template]
+    sources = ["_theme.html", template] if is_panel_template(template) else [template]
     for src in sources:
         for (tpl, media, selector), toks in tables.items():
             if tpl == src and media == "" and selector in (":root", "html", ":root, html"):
@@ -499,3 +574,31 @@ def dump(entries: list, path: Path, note: str) -> None:
         {"note": note, "count": len(entries),
          "entries": [asdict(e) for e in entries]},
         indent=1, sort_keys=True) + "\n")
+
+
+def main() -> int:
+    """Self-check: prove the scanner actually reads the templates (#170).
+
+        python3 openspec/changes/archive/2026-08-29-panel-light-mode/checks/colorscan.py
+
+    `scan_all` raises `SystemExit` on zero templates or zero declarations, so
+    reaching the summary at all is the guarantee this entry point exists for.
+    """
+    names = all_templates()
+    entries = scan_all()
+    print(f"repo root                   : {repo_root()}")
+    print(f"template dir                : {TEMPLATE_DIR}")
+    print(f"templates read              : {len(names)}")
+    print(f"in-scope color declarations : {len(entries)}")
+    per: dict = {}
+    for e in entries:
+        per[e.template] = per.get(e.template, 0) + 1
+    for name in names:
+        print(f"  {name:<26} {per.get(name, 0)}")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(main())
