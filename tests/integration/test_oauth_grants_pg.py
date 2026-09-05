@@ -419,6 +419,46 @@ async def test_replaying_a_rotated_refresh_token_revokes_the_family(clean):
     assert await live_count(sessionmaker) == 0
 
 
+async def test_a_replay_with_a_wrong_client_id_still_revokes_the_family(clean):
+    """The caller's claimed identity must not filter the evidence away.
+
+    With `client_id` folded into the lookup, a thief presenting the stolen
+    token under any other client_id looked *unknown* and the live family
+    survived.
+    """
+    sessionmaker = clean
+    await seed_client(sessionmaker)
+    refresh_value = await seed_grant(sessionmaker)
+
+    first = await oauth._handle_refresh(
+        {"refresh_token": refresh_value, "client_id": "c1"}
+    )
+    assert first.status_code == 200
+
+    replay = await oauth._handle_refresh(
+        {"refresh_token": refresh_value, "client_id": "not-the-client"}
+    )
+
+    assert replay.status_code == 400
+    assert json.loads(replay.body) == {"error": "invalid_grant"}
+    assert await live_count(sessionmaker) == 0
+
+
+async def test_a_live_token_with_a_wrong_client_id_is_refused_intact(clean):
+    """A live token named by the wrong client is refused, never revoked."""
+    sessionmaker = clean
+    await seed_client(sessionmaker)
+    refresh_value = await seed_grant(sessionmaker)
+
+    response = await oauth._handle_refresh(
+        {"refresh_token": refresh_value, "client_id": "not-the-client"}
+    )
+
+    assert response.status_code == 400
+    assert json.loads(response.body) == {"error": "invalid_grant"}
+    assert await live_count(sessionmaker) == 2
+
+
 async def test_an_unknown_refresh_token_leaves_every_family_alone(clean):
     sessionmaker = clean
     await seed_client(sessionmaker)

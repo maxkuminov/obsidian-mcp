@@ -45,33 +45,66 @@ vanished from the page, so the operator saw a blank space that read as success.
   redeems first keeps an identically-scoped, silently-renewing pair for the
   30-day sliding window while the legitimate client sees `invalid_grant` and
   quietly re-authorizes; the theft signal RFC 6819 §5.2.1.1 defines is thrown
-  away. `_handle_refresh` therefore calls `revoke_grant_family` at exactly the
-  point where the unfiltered lookup resolved a `grant_id` but the
-  `revoked == False` select returned nothing — that combination *is* "the row
-  exists and is revoked", i.e. a replay.
+  away. `_handle_refresh` therefore re-reads the row under the family lock and
+  calls `revoke_grant_family` when that row's `revoked` flag is set.
+  - **The evidence is the token hash, never the caller's `client_id`.** Both
+    lookups used to append `client_id` when the caller supplied one, so a
+    thief replaying the stolen token under *any other* `client_id` — or a
+    garbage one — made the row look unknown, and the live family survived the
+    very replay that proved the token had leaked. The lookup therefore filters
+    on token hash and type alone. The caller's claimed identity is checked
+    against the row afterwards, on the rotation path: a mismatch on a **live**
+    token is the refusal it has always been and revokes nothing (a confused
+    client must not be able to end someone's grant by guessing a `client_id`).
+  - **The reuse decision reads the flag, it does not infer it.** An empty
+    result set means "no row matched *some* predicate"; only `row.revoked`
+    means "rotated away". Inferring the flag from emptiness is what let an
+    unrelated predicate silently disable the whole detection.
   - **The lock is what makes it correct, not an optimization.** The grant lock
-    is already held from the unfiltered lookup onwards, so nothing can rotate
-    a new pair into the family between that select and this UPDATE. "Every
-    live token" cannot be stale. `revoke_grant_family` re-takes the same
+    is held from before the authoritative re-read, so nothing can rotate a new
+    pair into the family between that read and this UPDATE. "Every live token"
+    cannot be stale. `revoke_grant_family` re-takes the same
     transaction-scoped advisory lock, which is re-entrant.
-  - **The response stays constant.** The reuse path returns the byte-identical
-    `invalid_grant` body and status the not-found path returns — the caller
-    must not learn whether it named a live family, whether anything died, or
-    that detection exists at all. That is also why the revocation is wrapped:
-    a failure to write must not surface as a 500 on this path only.
+  - **The response is constant in status, headers and body.** The reuse path
+    returns the byte-identical `invalid_grant` body, the same 400, and the
+    same headers as the not-found refusal — the caller must not learn whether
+    it named a live family, whether anything died, or that detection exists.
+    That is also why *every* database call on this path is guarded, rollbacks
+    included: a failure after detection must not escape to the outer handler
+    and answer 500 on the reuse path only.
+    **Timing is not covered, and is an accepted residual**: the detection path
+    takes the lock, reads twice and writes, so it is measurably slower than
+    the not-found refusal. Equalizing it would mean doing the same work for
+    every unknown token — a write path any unauthenticated caller could drive.
   - **Boundaries.** An *expired* refresh token that was never rotated is not
     reuse — its row is still `revoked == False`, so the handler reaches the
     expiry check and revokes nothing; a token dying of old age must not kill
-    the family's live access token. A token hash that matches no row revokes
-    nothing (there is no family to name). A family that is already fully
-    revoked is a harmless no-op: `revoke_grant_family` flips zero rows,
-    nothing is committed.
-  - **One WARNING, on the path that killed something.** `event =
-    "oauth.refresh_reuse_detected"` with `client_id`, `grant_id`, `user_id`
-    and the number of rows revoked — never any token or hash material. It is
-    emitted only when live tokens were actually revoked: the plain not-found
-    path is not reuse, and a second replay against an already-dead family has
-    nothing new to report, so neither may drown the real alarm.
+    the family's live access token. An expired token that *was* rotated is
+    still reuse: the flag is read before the expiry check, or a patient thief
+    could simply wait out the 30 days. A token hash that matches no row
+    revokes nothing (there is no family to name), and neither does a row that
+    the cleanup deleted while this transaction waited for the lock. A family
+    that is already fully revoked is a harmless no-op: `revoke_grant_family`
+    flips zero rows, nothing is committed.
+  - **One WARNING, on the path that killed something.**
+    `oauth.refresh_reuse_detected` with `client_id`, `grant_id`, `user_id` and
+    the number of rows revoked. Those identifiers go in the **message text**,
+    not only in `extra`: the process formatter is `%(message)s`
+    (`src/main.py`), so an identifier left in `extra` alone never reaches the
+    operator who has to act on the alarm. None of them is a secret and no
+    token value or hash is ever among them. It is emitted only when live
+    tokens were actually revoked: the not-found refusals are not reuse, and a
+    second replay against an already-dead family has nothing new to report, so
+    neither may drown the real alarm.
+  - **A failed revocation logs the exception's class name and nothing else.**
+    Not `logger.exception`, not `str(exc)`: SQLAlchemy renders the failing
+    statement *and its bound parameters* into the error text, the engine does
+    not set `hide_parameters`, and one of those parameters is the token hash.
+    A log line is not a safe place for it.
+  - **Residual: the record is written after the commit.** A crash in between
+    keeps the revocation and loses the alarm. That is the right half to lose —
+    the tokens are dead either way — and an outbox for one WARNING would add a
+    failure mode larger than the one it closes.
 - **Revocation takes effect at the next authenticated request; a request
   already in flight completes.** `APIKeyMiddleware` resolves the token once, at
   the start of the request, so a tool call authenticated microseconds before a
