@@ -180,6 +180,15 @@ class MdLinkMatch(NamedTuple):
     `start`/`end` are the full match span (so `content[start:end]` is what
     `m.group(0)` was), `href` carries the trailing `.md` and NOT the angle
     brackets, and `anchor` is `"#..."` or `""`.
+
+    `text_start` and `anchor_start` are where those two slices were taken
+    from, so a caller that scanned a *masked* copy can re-slice the same
+    bytes out of the unmasked original: `text` is
+    `content[text_start:text_start + len(text)]` and `anchor` is
+    `content[anchor_start:anchor_start + len(anchor)]`, both contiguous.
+    Masking is a same-length substitution, so the offsets are valid against
+    either string — `move_note`'s rewriter depends on exactly that (#211).
+    An empty `anchor` still carries the position it would have occupied.
     """
 
     start: int
@@ -188,6 +197,8 @@ class MdLinkMatch(NamedTuple):
     href: str
     anchor: str
     angle: bool
+    text_start: int
+    anchor_start: int
 
 
 def scan_md_links(
@@ -286,6 +297,7 @@ def scan_md_links(
                 found = MdLinkMatch(
                     m.start(), gt_at + 2, m.group("text"),
                     content[p + 1:ja + 3], content[ja + 3:gt_at], True,
+                    m.start() + 1, ja + 3,
                 )
             elif (
                 gt_at < nl_at
@@ -299,6 +311,7 @@ def scan_md_links(
                 found = MdLinkMatch(
                     m.start(), gt_at + 2, m.group("text"),
                     content[p + 1:gt_at], "", True,
+                    m.start() + 1, gt_at,
                 )
 
         if found is None:
@@ -313,11 +326,13 @@ def scan_md_links(
                         found = MdLinkMatch(
                             m.start(), close_at + 1, m.group("text"),
                             content[p:j + 3], content[j + 3:close_at], False,
+                            m.start() + 1, j + 3,
                         )
                 elif closes:
                     found = MdLinkMatch(
                         m.start(), q + 1, m.group("text"),
                         content[p:j + 3], content[j + 3:q], False,
+                        m.start() + 1, j + 3,
                     )
             if (
                 found is None
@@ -329,6 +344,7 @@ def scan_md_links(
                 # `[t](href.md)`
                 found = MdLinkMatch(
                     m.start(), q + 1, m.group("text"), content[p:q], "", False,
+                    m.start() + 1, q,
                 )
 
         if found is not None:

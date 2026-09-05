@@ -728,7 +728,12 @@ incoming `[[wikilinks]]` and `![[embeds]]` in source notes to point at
 the new title/path. The set of source notes SHALL be the same set
 returned by `get_backlinks(from_path)` prior to the move. When
 `rewrite_links=False` (default), source-note bodies SHALL NOT be
-modified.
+modified. A rewrite SHALL change only the link target: every other byte of
+the source note, inside the rewritten link and outside it, SHALL be preserved
+exactly as written. An implementation that recognises links in a
+code-masked copy of the note SHALL take the bytes it writes back from the
+unmasked note, so masked code inside a link's text, alias or anchor is never
+published as the mask's filler.
 
 #### Scenario: Default leaves source-note bodies untouched
 
@@ -754,6 +759,16 @@ modified.
 - **WHEN** a source note contains `[[Foo|Display Text]]` and
   `rewrite_links=True`
 - **THEN** the link SHALL be rewritten to `[[Bar|Display Text]]`
+
+#### Scenario: Inline code inside a rewritten link is preserved byte-for-byte
+
+- **WHEN** a source note contains ``[the `foo` option](Old.md)``,
+  ``[[Old|the `foo` option]]`` or ``[[Old#the `foo` section]]`` and
+  `rewrite_links=True`
+- **THEN** each link SHALL be rewritten to name the new path with its text,
+  alias and anchor unchanged, backticks and all
+- **AND** no character of the source note outside the rewritten link spans
+  SHALL differ from what was there before the move
 
 #### Scenario: Path-style wikilinks updated when used
 

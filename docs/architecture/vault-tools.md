@@ -624,6 +624,26 @@ speed-up. The fallback is unreachable through the scanners and is tested by
 calling the splice directly; the equality itself is tested against the retired
 implementation as an oracle over a randomized corpus.
 
+**The recognizers read the masked copy; every byte written back is sliced from
+the unmasked note (#211).** The two scans run over `apply_fence_mask(content,
+…)` because a link inside a fence or inside backticks is text *about* a link
+and must not be rewritten — that is the whole reason the mask exists. But the
+replacement text is spliced into `content`, and it used to be assembled from
+pieces read off the mask: the wikilink `rest` (`#anchor|alias`) and the
+markdown link's text and anchor. Inline code inside any of those is a run of
+spaces in the mask, so ``See [the `foo` option](Old.md)`` was published as
+`See [the       option](New.md)` — a silent destructive write on an ordinary
+note, on the path whose entire job is to leave everything except the target
+alone. The fix is the same property the masker already promises everywhere
+else: masking is a **same-length** substitution, so a span found in the masked
+copy indexes the identical region of `content`, and the rewriter re-slices
+`rest`, `text` and `anchor` out of `content` at that span
+(`MdLinkMatch.text_start` / `anchor_start` exist for exactly this). What the
+recognizers *see* is unchanged, so which links are rewritten is unchanged; only
+where the written bytes come from changed. Anything later added to the
+replacement — a new alias form, a title, a display component — takes its bytes
+from `content` too, never from `masked`.
+
 **One source's rewrites are bounded at `MAX_LINKS_PER_NOTE`, and over the cap
 is a refusal.** The read side has always been bounded — extraction stops at
 10,000 links — and the write side was not, so a 10 MiB note of `[[Old]] `

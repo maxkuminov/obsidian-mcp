@@ -2581,6 +2581,21 @@ def _rewrite_links_in_text(
     masked = apply_fence_mask(content, fence_scan)
     rewrites: list[tuple[int, int, str]] = []
 
+    def _kept(start: int, masked_slice: str) -> str:
+        """The bytes at a match's span, taken from `content`, not `masked`.
+
+        The recognizers below run over `masked` — links inside code must not
+        be rewritten, and that is the whole reason the mask exists. But every
+        byte this function *writes back* has to come from the unmasked
+        `content`: masking is a same-length substitution, so a span found in
+        `masked` indexes the identical region of `content`, and splicing the
+        masked slice instead replaced any inline code inside a link's alias,
+        anchor or text with spaces — a silent destructive write on every
+        `move_note(rewrite_links=True)` over a source like
+        ``See [the `foo` option](Old.md)`` (#211).
+        """
+        return content[start:start + len(masked_slice)]
+
     for m in _WIKILINK_REWRITE_RE.finditer(masked):
         target_raw = m.group("target")
         target = target_raw.strip()
@@ -2595,7 +2610,7 @@ def _rewrite_links_in_text(
         else:
             new_target = to_stem
         embed_prefix = "!" if m.group("embed") else ""
-        rest = m.group("rest") or ""
+        rest = _kept(m.start("rest"), m.group("rest") or "")
         rewrites.append((m.start(), m.end(), f"{embed_prefix}[[{new_target}{rest}]]"))
 
     for link in scan_md_links(masked, **MDLINK_REWRITE_FLAGS):
@@ -2605,7 +2620,8 @@ def _rewrite_links_in_text(
         target_for_resolve = href[:-3] if href.endswith(".md") else href
         if resolve_target(target_for_resolve, source_path, pre_move_index) != from_id:
             continue
-        anchor = link.anchor
+        anchor = _kept(link.anchor_start, link.anchor)
+        text = _kept(link.text_start, link.text)
         # Resolve against the original source location, but generate the new
         # href relative to where that source lives after the move. These differ
         # for a moved note rewriting its own Markdown self-link.
@@ -2615,7 +2631,7 @@ def _rewrite_links_in_text(
         rewrites.append((
             link.start,
             link.end,
-            f"[{link.text}]({relative_target}{anchor})",
+            f"[{text}]({relative_target}{anchor})",
         ))
 
     if not rewrites:
