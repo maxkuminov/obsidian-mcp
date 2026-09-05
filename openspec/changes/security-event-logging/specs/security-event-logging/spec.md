@@ -34,14 +34,24 @@ The application SHALL configure the root logger from a single entry point (`conf
 - **WHEN** the stdio entry point configures logging and a record is emitted
 - **THEN** the record SHALL be written to stderr and stdout SHALL carry only MCP protocol traffic
 
-### Requirement: Structured log fields SHALL be allow-listed, typed, bounded, and declared by provenance
+### Requirement: Structured log fields SHALL be allow-listed, typed, bounded, optional, and declared per event
 
-The log formatter SHALL emit only a fixed set of field names declared in one module, each with a declared type, a maximum length and a declared provenance class, and SHALL drop any field a call site passes that is not in that set. No **structured field** SHALL carry a password, a client secret, an authorization code, an access or refresh token, a PKCE verifier, a session cookie, a CSRF token, a request body, a query string, or a filesystem path. A value presented by a caller as a credential SHALL reach the log in exactly one form — a stable, non-reversible `token_tag` computed as a truncated SHA-256 digest by exactly one function in the codebase — and SHALL be **absent** rather than empty when no credential was presented. Fields of the **resolved** class SHALL carry only values read from a database row the server loaded, and `key_id` SHALL name an API key row while `oauth_token_id` SHALL name an OAuth token row; fields of the **submitted** class SHALL be the only place a caller-supplied identifier appears. The record's message and traceback are not structured fields and are governed by the next requirement.
+The log formatter SHALL emit only a fixed set of field names declared in one module, each with a declared type and — for strings — a maximum length, and SHALL drop any field a call site passes that is not in that set or that the emitting event does not declare. Every field SHALL be optional: a record SHALL omit a field whose value the emitting path does not have, and absence SHALL be meaningful rather than an error. A value whose type does not match its declaration SHALL be **dropped**, never converted to another type, and the emitting call SHALL NOT raise; truncating an over-long string SHALL NOT count as a conversion. No **structured field** SHALL carry a password, a client secret, an authorization code, an access or refresh token, a PKCE verifier, a session cookie, a CSRF token, a request body, a query string, or a filesystem path. A value presented by a caller as a credential SHALL reach the log in exactly one form — a stable, non-reversible `token_tag` computed as a truncated SHA-256 digest by exactly one function in the codebase — and SHALL be **absent** rather than empty when no credential was presented. Provenance SHALL be carried by the field name and SHALL be a property of the event-field pair: an unsuffixed identifier field SHALL hold only a value read from a database row, a `_submitted`-suffixed field SHALL be the only place a caller-supplied identifier that did not resolve appears, and `key_id` SHALL name an API key row while `oauth_token_id` SHALL name an OAuth token row. The record's message and traceback are not structured fields and are governed by the next requirement.
 
 #### Scenario: An unknown field is dropped
 
 - **WHEN** a call site logs with a field name outside the allow-list
 - **THEN** the emitted record SHALL NOT contain that field and SHALL still contain the allow-listed fields and the message
+
+#### Scenario: A field the event does not declare is dropped
+
+- **WHEN** a call site passes an allow-listed field that the emitted event's declared set does not include
+- **THEN** the record SHALL omit that field, and under the test suite's strict mode the call SHALL fail loudly instead
+
+#### Scenario: A mistyped value is dropped, not converted
+
+- **WHEN** a call site passes a non-integer value for an integer field
+- **THEN** the record SHALL omit that field, SHALL NOT contain it as a string or any other type, SHALL still contain the event's other fields, and the call SHALL NOT raise
 
 #### Scenario: A presented token appears only as a tag
 
@@ -56,7 +66,17 @@ The log formatter SHALL emit only a fixed set of field names declared in one mod
 #### Scenario: An unresolved identifier is still recorded, in a submitted field
 
 - **WHEN** a login names a user that does not exist and a token request names a client that does not exist
-- **THEN** each record SHALL carry the submitted identifier in its declared submitted-class field, and no resolved-class field SHALL be populated for it
+- **THEN** each record SHALL carry the submitted identifier in the correspondingly suffixed field, and the unsuffixed field SHALL be absent from that record
+
+#### Scenario: The same field name is resolved on the success path
+
+- **WHEN** a login succeeds and a token exchange succeeds
+- **THEN** each record SHALL carry the identifier in the unsuffixed field, read from the row the server loaded, and SHALL NOT carry the suffixed one
+
+#### Scenario: A field the emitting path lacks is simply absent
+
+- **WHEN** a refresh-token request is refused before any grant or client row resolves
+- **THEN** the record SHALL carry its reason and the submitted client id, SHALL omit the grant and user fields, and SHALL NOT carry placeholder or empty values for them
 
 #### Scenario: An OAuth credential is not recorded as an API key
 
@@ -70,12 +90,17 @@ The log formatter SHALL emit only a fixed set of field names declared in one mod
 
 ### Requirement: Messages and tracebacks MUST NOT carry credential material
 
-A record's message SHALL be a developer-authored constant or format string, and it MAY interpolate operational context such as a vault-relative path exactly as existing messages do, but it MUST NOT interpolate a password, a client secret, an authorization code, an access or refresh token, a PKCE verifier, a session cookie or a CSRF token. The same prohibition SHALL apply to any value a call site places in an exception it logs. Compliance SHALL be verified with unique high-entropy canary values submitted through the real request paths, not by inspection.
+A record's message SHALL be a developer-authored constant or format string, and it MAY interpolate operational context such as a vault-relative path exactly as existing messages do, but it MUST NOT interpolate a password, a client secret, an authorization code, an access or refresh token, a PKCE verifier, a session cookie or a CSRF token. The same prohibition SHALL apply to any value a call site places in an exception it logs. Compliance SHALL be verified against real request paths with two kinds of high-entropy value, not by inspection: **submitted** canaries planted in every credential position a caller controls, and **captured** secrets that the server itself generated and therefore cannot be planted.
 
-#### Scenario: No secret material anywhere in the record
+#### Scenario: No submitted secret anywhere in the record
 
-- **WHEN** the panel login, the OAuth token endpoint, the OAuth registration endpoint, the revocation endpoint and a transfer redemption are each exercised with a distinct 32-character random canary in the credential position, and the whole log output is captured
+- **WHEN** the panel login, the OAuth token endpoint, the OAuth revocation endpoint, an MCP tool call and a transfer redemption are each exercised with a distinct 32-character random canary in every caller-controlled credential position — password, client secret, authorization code, refresh token, PKCE verifier, session cookie, CSRF token, MCP bearer token and transfer bearer token — and the whole log output is captured
 - **THEN** no emitted record SHALL contain any canary value, nor any substring of one twelve characters or longer, in any field, message or traceback
+
+#### Scenario: No server-generated secret anywhere in the record
+
+- **WHEN** dynamic client registration, an authorization-code grant, a refresh rotation, API key creation and a transfer mint are each performed and the secrets **the server generated** are captured from their responses — the client secret, the authorization code, the access and refresh tokens, the `omcp_` key and the transfer token
+- **THEN** no emitted record SHALL contain any of those values, nor any substring of one twelve characters or longer, in any field, message or traceback
 
 #### Scenario: Operational context is still allowed
 
@@ -84,7 +109,7 @@ A record's message SHALL be a developer-authored constant or format string, and 
 
 ### Requirement: Every authentication outcome SHALL cause exactly one emission, with a reason code
 
-The server SHALL call the event emitter exactly once — never zero times and never twice for one decision — for each of: panel login success, panel login failure, panel logout, first-administrator bootstrap and its refusals, an administrator's password reset of another account, OAuth authorization-code issuance, OAuth refresh-token rotation, every token-endpoint refusal, every `/authorize` refusal, consent granted, consent denied, dynamic client registration and its refusals, token revocation together with the number of tokens revoked, each revocation no-op the RFC requires the response to conceal, and every rate-limit rejection. A failure record SHALL carry a reason code distinguishing the cause. Informational outcomes SHALL always reach the log sink; warning and error outcomes SHALL reach it subject to the suppression requirement below, which accounts for what it withholds. The externally visible response SHALL be unchanged by the presence of logging — in particular the panel login failure SHALL remain a single indistinguishable response across all of its causes, and the revocation endpoint SHALL remain non-disclosing. A revocation record SHALL be emitted by the request handler after its own transaction has committed, never by the shared helper that performs the revocation, so that a rolled-back transaction leaves no record and every record carries the acting identity and request context.
+The server SHALL attempt exactly one emission — never zero, never twice for one decision — for each of: panel login success, panel login failure, panel logout, first-administrator bootstrap and its refusals, an administrator's password reset of another account, OAuth authorization-code issuance, OAuth refresh-token rotation, every token-endpoint refusal, every `/authorize` refusal, consent granted, consent denied, dynamic client registration and its refusals, token revocation together with the number of tokens revoked, each revocation no-op the RFC requires the response to conceal, and every rate-limit rejection. A failure record SHALL carry a reason code distinguishing the cause. Whether a given attempt reaches the log sink is governed by the suppression requirement below, which applies to every level and accounts for what it withholds. **A record asserting that something succeeded SHALL be emitted only after the transaction that made it true has committed**, so that a failed commit leaves no record claiming otherwise; a revocation record SHALL further be emitted by the request handler itself, never by the shared helper that performs the revocation, so that every record carries the acting identity and request context. The externally visible response SHALL be unchanged by the presence of logging — in particular the panel login failure SHALL remain a single indistinguishable response across all of its causes, and the revocation endpoint SHALL remain non-disclosing.
 
 #### Scenario: Login failure reasons are distinguished in the log only
 
@@ -106,6 +131,11 @@ The server SHALL call the event emitter exactly once — never zero times and ne
 - **WHEN** a revocation's transaction fails to commit after the family was updated in memory
 - **THEN** no revocation record SHALL be emitted
 
+#### Scenario: A failed commit leaves no success record
+
+- **WHEN** the first-administrator bootstrap inserts its user and the commit then raises, and separately when a successful login's `last_login_at` commit raises
+- **THEN** no success record SHALL be emitted for either, and the failure SHALL surface as it does today
+
 #### Scenario: Rate-limit rejections are recorded centrally
 
 - **WHEN** any rate-limited endpoint rejects a request with HTTP 429
@@ -118,7 +148,7 @@ The server SHALL call the event emitter exactly once — never zero times and ne
 
 ### Requirement: Every authorization refusal SHALL be recorded, and write-tool refusals SHALL also be marked in the usage log
 
-The server SHALL emit one record for each authorization refusal: a write tool refused for a read-only credential, a transfer capability-token refusal, a panel permission refusal (including the duplicate ownership check on the REST key-revocation route), a CSRF validation failure, and the OAuth cross-user client refusal. The write-tool refusal SHALL be recorded at the single shared permission check so that every calling tool inherits it, and it SHALL additionally write the marker `permission_denied` into the call's `usage_logs` row. A transfer refusal SHALL carry a reason code, the redacted token tag where a token was presented, and the trusted client identity, and the response SHALL remain byte-identical across every refusal cause; the reason SHALL be derived after the refusal decision has been taken, by a read-only diagnosis that SHALL NOT alter which tokens are accepted and SHALL NOT be performed for a request that is not refused. A panel or CSRF refusal SHALL carry the route, the method and the acting user id where a session resolves one.
+The server SHALL emit one record for each authorization refusal: a write tool refused for a read-only credential, a transfer capability-token refusal, a panel permission refusal (including the duplicate ownership check on the REST key-revocation route), a CSRF validation failure, and the OAuth cross-user client refusal. The write-tool refusal SHALL be recorded at the single shared permission check so that every calling tool inherits it, and it SHALL additionally write the marker `permission_denied` into the call's `usage_logs` row. A transfer refusal SHALL carry a reason code, the redacted token tag where a token was presented, and the trusted client identity, and the response SHALL remain byte-identical across every refusal cause; the reason SHALL be derived after the refusal decision has been taken, by a read-only diagnosis that SHALL NOT alter which tokens are accepted, SHALL NOT be performed for a request that is not refused, and SHALL be performed only once a suppression permit for that record has been acquired — the permit's subject being the trusted client address, which is known before the diagnosis, rather than an identity the diagnosis itself would have to resolve. A panel or CSRF refusal SHALL carry the route, the method and the acting user id where a session resolves one.
 
 #### Scenario: A refused write is distinguishable from a successful one
 
@@ -135,10 +165,10 @@ The server SHALL emit one record for each authorization refusal: a write tool re
 - **WHEN** a transfer endpoint is exercised with no credential, an unknown token, an expired token, a completed upload token, a token whose credential was revoked, and a token whose vault root was reassigned
 - **THEN** every response SHALL be identical in status, headers and body, and six records SHALL be emitted carrying six distinct reason codes, of which the first SHALL carry no token tag
 
-#### Scenario: Diagnosis costs nothing on the accepted path
+#### Scenario: Diagnosis costs nothing on the accepted or suppressed path
 
-- **WHEN** a transfer redemption succeeds
-- **THEN** no diagnosis read SHALL be issued for it
+- **WHEN** a transfer redemption succeeds, and separately when a refusal's permit is denied because the source is already at its allowance
+- **THEN** no diagnosis read SHALL be issued in either case, and the refused request SHALL still return its uniform response
 
 #### Scenario: An unresolved token invents no identity
 
@@ -184,9 +214,9 @@ The tool tracking decorator SHALL guard **only the invocation of the tool body**
 - **WHEN** a tool body records a post-body marker and then raises
 - **THEN** the written row's `error` value SHALL be `tool_exception` and the exception's class name SHALL be present
 
-### Requirement: Warning and error events SHALL be rate-limited on a subject a caller cannot mint
+### Requirement: Every event SHALL pass exactly one allowance check, on a subject a caller cannot mint
 
-The server SHALL bound the number of warning and error records that reach the log sink, per event and subject within a time window and per subject across all events, SHALL count what it withholds, and SHALL emit one summary record naming the event and the suppressed count. The subject SHALL be the authenticated user id when one resolved and otherwise the trusted client address; a caller-supplied or caller-derived value — a token tag, a submitted username, a submitted client id — SHALL NOT be used as a subject, so that rotating credentials cannot mint fresh allowances. A summary SHALL be emitted when the next event for that key arrives after its window closed and any outstanding counts SHALL be flushed at shutdown; a summary SHALL NOT itself be suppressed. Suppression state SHALL be bounded in size, SHALL fail open, SHALL never raise into a request path, and SHALL apply to log records only: a `usage_logs` row for a refused or failed tool call SHALL always be written. Informational events SHALL NOT be suppressed.
+The server SHALL bound the number of records that reach the log sink at **every level, informational records included**, per event and subject within a time window and per subject across all events, SHALL count what it withholds, and SHALL emit one summary record naming the event and the suppressed count. The allowance SHALL be checked **exactly once per emission attempt**: a caller SHALL acquire a permit for an event and subject, which charges the allowance, and the emitting call SHALL consume that permit **without performing a second check**, so that a caller that must do work to build its fields cannot be charged twice or escape the bound. The subject SHALL be computable before any work the permit gates, and SHALL be the authenticated user id when the request already resolved one and otherwise the trusted client address; a caller-supplied or caller-derived value — a token tag, a submitted username, a submitted client id — SHALL NOT be used as a subject, so that rotating credentials cannot mint fresh allowances. A summary SHALL be emitted when the next attempt for that key arrives after its window closed, **before any entry carrying a nonzero withheld count is evicted**, and for any outstanding count at shutdown; a summary SHALL carry the suppressed event's own level and SHALL NOT itself be suppressed or counted. Suppression state SHALL be bounded in size, SHALL fail open, SHALL never raise into a request path, and SHALL apply to log records only: a `usage_logs` row for a refused or failed tool call SHALL always be written.
 
 #### Scenario: A refusal flood is bounded and accounted
 
@@ -212,6 +242,26 @@ The server SHALL bound the number of warning and error records that reach the lo
 
 - **WHEN** a window holds a nonzero suppressed count and the process shuts down before the next event for that key
 - **THEN** a summary record SHALL be emitted during shutdown
+
+#### Scenario: Outstanding counts are not lost to eviction
+
+- **WHEN** the suppression state is at its size bound and an entry holding a nonzero withheld count is the one chosen for eviction
+- **THEN** that entry's summary SHALL be emitted before it is evicted, so the withheld count is never lost
+
+#### Scenario: An informational flood is bounded and accounted
+
+- **WHEN** one subject drives an informational outcome — such as a replayed consent or a logout — far more times than the per-window limit on a route no rate limit covers
+- **THEN** at most the configured number of informational records SHALL reach the sink in that window and one summary SHALL name the exact number withheld
+
+#### Scenario: The allowance is charged once, not twice
+
+- **WHEN** a call site acquires a permit and then emits with it
+- **THEN** exactly one unit of that subject's allowance SHALL be consumed for that outcome, and the emitting call SHALL NOT re-evaluate the limit
+
+#### Scenario: An acquired permit that is never spent is still charged
+
+- **WHEN** a call site acquires a permit and then fails to emit
+- **THEN** the allowance SHALL remain charged, so the failure direction is a quieter log rather than an unbounded one
 
 #### Scenario: The audit row is never suppressed
 
