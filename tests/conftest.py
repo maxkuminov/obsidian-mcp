@@ -245,6 +245,23 @@ def _reset_provider_cache():
 
 
 @pytest.fixture(autouse=True)
+def _reset_concurrency_controller():
+    """Give each test its own explicit process-controller boundary (#261).
+
+    Lifespan tests intentionally close admissions and writers. That shutdown
+    must persist for the rest of that test, but must not turn unrelated later
+    middleware calls into 429s or suppress their usage inserts. Production
+    requests never reset the controller; tests and lifespan own that boundary.
+    Captured leases still release their original controller after replacement.
+    """
+    from src.services import concurrency
+
+    concurrency.reset_controller()
+    yield
+    concurrency.get_controller().shutdown(close_writers=True)
+
+
+@pytest.fixture(autouse=True)
 def _reset_rate_limiter_state():
     """Start every test with full buckets and an empty failure table (#194).
 
