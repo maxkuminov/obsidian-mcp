@@ -39,6 +39,15 @@ contain the string `The last-admin guard`, and `alembic/versions/` must contain
 - [x] 1.6 `src/config.py`: `session_touch_interval_seconds: int = Field(60, ge=1)` and `session_purge_retain_days: int = Field(7, ge=1)`. The bounds are enforced, not assumed: a zero touch interval turns a throttled hint into a write on every request, and a zero retention window deletes a revocation the moment it is made.
 - [x] 1.7 `src/config.py`: `oauth_known_redirect_hosts: Annotated[list[str], NoDecode] = ["claude.ai", "chatgpt.com"]` with a `field_validator(mode="before")` mirroring `_parse_fts_configs` — JSON list or comma-separated string, **outer whitespace stripped** per entry, lower-cased, deduped order-preservingly. **A bare `list[str]` is JSON-decoded by pydantic-settings**, which is why `NoDecode` is there. The validator **rejects** an entry containing `*`, `/`, `@` or **internal** whitespace, with a message saying patterns are not supported; an empty list is accepted and means "nothing is recognised".
 - [x] 1.8 `src/auth/passwords.py`: `MIN_PASSWORD_LENGTH = 12` and `validate_new_password(new: str, confirm: str | None = None) -> str | None` returning a user-facing message or `None` — length, confirmation match, NUL byte. The NUL check is here because `hash_password` **raises `ValueError`** on an embedded NUL, and four handlers currently pass user input straight into it. **Do not touch the 72-byte truncation or the NUL rejection themselves**: both reproduce passlib's semantics and every stored hash depends on them.
+  - **All four setters now call it.** Three landed with the validator; the
+    fourth, `register_submit`, kept its own `len(password) < 8`, its own
+    confirmation compare and no NUL check until the verifier pass — so the
+    bootstrap admin sat under the weakest minimum on the server and a NUL in
+    that field was still a 500. It is routed through `validate_new_password`
+    ahead of the advisory-lock section, and `register.html` reads
+    `MIN_PASSWORD_LENGTH` for both `minlength` attributes and the hint rather
+    than restating a number. `tests/test_issue_197_bootstrap_policy.py` covers
+    it.
 - [x] 1.9 `src/limiter.py`: `session_user_key(request) -> str` returning the authenticated session's user (a constant when there is none), and keep `get_remote_address` for the address-keyed limit. Both must stay **synchronous** — slowapi computes the key before the handler and cannot await the body — and a missing `SessionMiddleware` (test harnesses) must degrade rather than raise.
 - [x] 1.10 `src/oauth/grants.py`: move the account-guard advisory key and add `lock_account_guard(session)`. This module already owns this codebase's advisory-lock primitives (`USER_BOOTSTRAP_LOCK_KEY`, `lock_user_bootstrap`, `lock_grant`) and is importable from both `src/control_panel/routes.py` and `users.py`, which cannot import each other (users.py already imports routes.py). **The key's value is unchanged** — it is a wire constant, and changing it un-serializes the guard during a rolling deploy.
 - [x] 1.11 `tests/test_password_policy.py`: one constant; 11 chars refused / 12 accepted; mismatch refused; NUL returns a message rather than raising; a >72-byte password still accepted and still verifying; no message echoes the submitted password. Config: `SESSION_TOUCH_INTERVAL_SECONDS=0` and `SESSION_PURGE_RETAIN_DAYS=0` each fail settings construction; allow-list entries with `*`, `/`, `@` or internal whitespace fail; `"claude.ai, chatgpt.com"` parses to two hosts.
@@ -68,6 +77,12 @@ contain the string `The last-admin guard`, and `alembic/versions/` must contain
 - [x] 3.3 `delete_user`: on the soft delete, revoke before the commit. On the permanent delete add **nothing** — the database cascade removes the rows and `passive_deletes=True` is what makes it the mechanism that fires.
 - [x] 3.4 `_lock_admin_guard` delegates to `lock_account_guard` from `src/oauth/grants.py`, **same key value**, so the self-service password change serializes against these handlers. Two keys do not exclude each other.
 - [x] 3.5 `create_user` and `reset_password` route their password input through `validate_new_password` — `create_user` accepts 8 characters today and passes its input straight to `hash_password`, so a NUL in the initial-password field is an unhandled `ValueError` and a 500.
+  - **Scope note, closed.** This item names the two administrator setters
+    because they are the two `src/control_panel/users.py` owns. The fourth,
+    bootstrap `register_submit` in `src/auth/routes.py`, is **also covered**
+    now (see 1.8) — it was the one setter no slice owned, which is how it kept
+    its own eight-character rule through the whole change. All four of D10's
+    setters go through the one validator.
 - [x] 3.6 Verify every refusal path still writes nothing: the last-administrator guard, the self-target refusal and the `_actor_still_privileged` re-check all return before the revocation.
 - [x] 3.7 Emit `panel_sessions_revoked` with the reason (`admin_password_reset` | `user_deactivated` | `user_deleted`) and the row count, **after** the commit that makes it true.
 - [x] 3.8 `src/services/indexer.py` `cleanup_expired_tokens`: add `DELETE FROM user_sessions WHERE expires_at < cutoff AND (revoked_at IS NULL OR revoked_at < cutoff)`, `cutoff = now() - settings.session_purge_retain_days`. **The `expires_at`-only predicate is wrong here**, unlike the OAuth half: an administrative reset revokes every unrevoked row of a user *including already-expired ones*, and such a row would be purged on the next tick — deleting the record of a revocation minutes after an operator performed it. Take the later of the two timestamps. Extend the docstring and the summary log line; keep the function's name; the purge runs in **both** modes.
@@ -116,7 +131,7 @@ sessions, which several slices would otherwise all have to touch.
   - **Slice 2 registered the two session events**, and **slice 4 added the two password events** (`panel_password_changed`: `user_id`, `username`, `client_ip`, `route`; `panel_password_change_refused`: `reason`, `user_id`, `client_ip`, `route`) alongside the handler that emits them, plus a **third**, `panel_session_reissue_failed` (`reason` = `password_change`, `user_id`, `error_type`, `route`, `client_ip`, ERROR): the mint that follows a committed change may raise, the spec requires that failure to leave the change in force and the browser signed out rather than 500 silently, and the sibling change's D18 guard forbids recording it with a bare `logger.error` in a request-path module. It is modelled on `panel_session_revocation_failed`, including the no-`str(exc)` rule, and adds no field. So this item is now complete. Two further deviations from D19's literal field lists, both to satisfy the sibling change's provenance rule rather than to widen anything: `panel_sessions_revoked` also declares `user_id_session`, because on the **logout** path the id is copied from the cookie with no row read (the account-event callers hold a row and pass `user_id`); and a third event, **`panel_session_revocation_failed`** (`reason`, `user_id_session`, `error_type`, `route`, `client_ip`, ERROR), carries the failed-logout record — the spec requires that record to name the exception's class *and* requires every event the session path emits to be declared here, and no D19 event has an `error_type`. It is modelled on `oauth_refresh_reuse_revocation_failed`. Both are mirrored in the two catalogue tables.
 - [x] 7.3 Extend that change's canary/secret-absence test to cover the session identifier **and its stored SHA-256**, asserting neither appears in any record in any form, nor any substring twelve characters or longer.
 - [x] 7.4 Create `tests/session_helpers.py` — **one** shared helper that mints a session the way the application does (guard, re-read, insert, commit, cookie), so the suite has a single definition rather than fifteen hand-built cookies that can drift from the validator. This file is slice 7's and no other slice creates it.
-- [ ] 7.5 Update the existing modules that mint or assert a browser session, all of which construct a cookie by hand or drive `login_submit` and will fail once a `sid` and a row are required: `tests/test_auth_routes_real_hasher.py`, `tests/test_issue_4_authorize_post_redirect_validation.py`, `tests/test_security_review_followups.py`, `tests/test_followon_auth_routing.py`, `tests/test_issue_138_session_flash.py`, `tests/test_authorize_get_scope_preselect.py`, `tests/test_issue_21_registered_scope_enforced.py`, `tests/test_issue_64_ownerless_token_mint.py`, `tests/test_issue_67_offline_access_only_client.py`, `tests/test_issue_67_panel_scope_clamp.py`, `tests/test_issue_68_cross_user_client.py`, `tests/test_issue_92_oauth_error_headers.py`, `tests/integration/test_oauth_grants_pg.py`.
+- [x] 7.5 Update the existing modules that mint or assert a browser session, all of which construct a cookie by hand or drive `login_submit` and will fail once a `sid` and a row are required: `tests/test_auth_routes_real_hasher.py`, `tests/test_issue_4_authorize_post_redirect_validation.py`, `tests/test_security_review_followups.py`, `tests/test_followon_auth_routing.py`, `tests/test_issue_138_session_flash.py`, `tests/test_authorize_get_scope_preselect.py`, `tests/test_issue_21_registered_scope_enforced.py`, `tests/test_issue_64_ownerless_token_mint.py`, `tests/test_issue_67_offline_access_only_client.py`, `tests/test_issue_67_panel_scope_clamp.py`, `tests/test_issue_68_cross_user_client.py`, `tests/test_issue_92_oauth_error_headers.py`, `tests/integration/test_oauth_grants_pg.py`.
   - **Slice 3 repaired three of these, plus two the inventory misses.** The
     revocation `UPDATE` these handlers now issue makes
     `revoke_user_sessions` read `rowcount` off a result the panel fakes
@@ -128,13 +143,48 @@ sessions, which several slices would otherwise all have to touch.
     inventory above and are recorded here rather than silently touched.
     All three are one-attribute fixture repairs. The rest of the list is
     still slice 7's.
+  - **The inventory is now reconciled, module by module.** It was written
+    ahead of the implementation as "everything that might break", and eight of
+    the thirteen never did. Each is either repaired here or struck with its
+    reason:
+    - `tests/test_security_review_followups.py` — **needed it**, imports
+      `session_helpers`; repaired by slice 2 (its two `get_current_user` cases
+      mint through `sign_in`) and again by slice 3 (the fourth statement).
+    - `tests/test_followon_auth_routing.py` — **needed it**, imports
+      `session_helpers`. Its deactivated-user case built a cookie with no
+      `sid`, so after the registry it was answered by the `no_session_id`
+      branch and passed without ever reading the account. It now mints through
+      `sign_in` (7.7).
+    - `tests/test_auth_routes_real_hasher.py` — **struck**: it drives the real
+      `login_submit`, so `start_session` already runs and the mint is genuine;
+      the helper would replace a stronger path with a weaker one. It needed a
+      one-attribute fixture repair instead (`session.add` is synchronous on a
+      real `AsyncSession`).
+    - `tests/test_issue_4_authorize_post_redirect_validation.py` — **struck**:
+      it monkeypatches `get_active_session_user`, so the cookie's shape is
+      never read by anything.
+    - `tests/test_issue_68_cross_user_client.py` — **struck**: same, the
+      resolver is stubbed.
+    - `tests/integration/test_oauth_grants_pg.py` — **struck**: same, the
+      resolver is stubbed.
+    - `tests/test_issue_138_session_flash.py` — **struck**: it overrides the
+      `require_admin_panel` dependency, so no browser session is resolved.
+    - `tests/test_authorize_get_scope_preselect.py`,
+      `tests/test_issue_67_offline_access_only_client.py`,
+      `tests/test_issue_67_panel_scope_clamp.py`,
+      `tests/test_issue_92_oauth_error_headers.py` — **struck**: none of them
+      carries a browser session at all.
+    - `tests/test_issue_21_registered_scope_enforced.py`,
+      `tests/test_issue_64_ownerless_token_mint.py` — **struck**: their
+      `user_id` is the `oauth_clients` / `oauth_tokens` column, not a cookie;
+      neither drives the browser-session validator.
 - [x] 7.6 Update the two modules broken by the **guard-key move** and by `revoke_user_sessions` returning a row count: `tests/test_issue_69_self_edit_role_lock.py` and `tests/test_issue_90_self_delete_refused.py`. Both drive `edit_user_submit` / `delete_user` against fake sessions whose shapes encode what those handlers execute, so `_lock_admin_guard` delegating to `lock_account_guard` and the added revocation `UPDATE` change what the fakes must accept and return. Keep them asserting the guarded behaviour they were written for (#69's self-edit role lock, #90's self-delete refusal) — this is a fixture repair, not a rewrite.
   - Done by **slice 3**, which is what broke them. In the event only the row
     count bit: `_lock_admin_guard` delegating to `lock_account_guard` issues
     the identical statement under the identical bind name, so the fakes could
     not tell the difference. Each module's canned `_Result` grew
     `rowcount = 0` and nothing else — the guard assertions are untouched.
-- [ ] 7.7 Sweep for any remaining test that sets `session["user_id"]` without a `sid` and either fix it or assert it is a deliberate negative case.
+- [x] 7.7 Sweep for any remaining test that sets `session["user_id"]` without a `sid` and either fix it or assert it is a deliberate negative case.
   - Slice 2 repaired the **one** module the registry actually broke,
     `tests/test_security_review_followups.py` (its two `get_current_user` cases
     now mint through `session_helpers.sign_in`, so the `session_version`
@@ -143,12 +193,32 @@ sessions, which several slices would otherwise all have to touch.
     the merged-with-slice-2 tree, because they hand a resolved user to the
     handler rather than driving the validator — 7.5 and 7.7 remain open for the
     slices that change what those handlers execute.
+  - **Swept, and one real defect found.** The only module whose assertion had
+    gone vacuous was `tests/test_followon_auth_routing.py::test_active_session_resolver_clears_deactivated_user`,
+    which is fixed above. Every other `session["user_id"]` without a `sid` in
+    the suite is deliberate, and each is one of four kinds: the resolver is
+    monkeypatched (`test_issue_4_…`, `test_issue_68_…`,
+    `integration/test_oauth_grants_pg.py`); the cookie is read for a *record*
+    rather than an identity decision, which is the `logout` and `verify_csrf`
+    case the design calls out (`test_issue_191_panel_auth_events.py`,
+    `test_issue_191_secret_canaries.py`, `test_issue_192_panel_forbidden.py`);
+    it feeds the limiter's `session_user_key`
+    (`test_issue_197_password_change.py`); or it *is* the negative case — a
+    pre-registry cookie the validator must refuse
+    (`test_issue_198_session_registry.py`).
 
 ## 8. Verification
 
 - [ ] 8.1 `make test-schema` — throwaway pgvector container, the 024 cases, the moved `HEAD_REVISION`.
-- [ ] 8.2 Full suite: `OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1 pytest tests/` on the **merged** tree, not per worktree.
-- [ ] 8.3 `npx -y @fission-ai/openspec@1.3.1 validate --all --strict` clean.
+- [x] 8.2 Full suite: `OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1 pytest tests/` on the **merged** tree, not per worktree.
+  - **3903 passed, 515 skipped**, up from 3895/515 before the verifier fixes
+    (five bootstrap-policy cases, three consent-revalidation cases). Run under
+    `-W error::RuntimeWarning`, which is the gate for the four
+    `coroutine … never awaited` warnings the panel-auth fakes were emitting
+    from `src/auth/session.py:301`: `session.add` is synchronous on a real
+    `AsyncSession` and an `AsyncMock` attribute returned an un-awaited
+    coroutine. Zero such warnings now.
+- [x] 8.3 `npx -y @fission-ai/openspec@1.3.1 validate --all --strict` clean — **32 passed, 0 failed**.
 - [ ] 8.4 Grep for production callers of every new export (`start_session`, `revoke_session`, `revoke_user_sessions`, `touch_session`, `validate_new_password`, `session_user_key`, `lock_account_guard`, `known_redirect_host`, `redirect_display_host`) — fan-out ships green-but-unwired code.
 - [ ] 8.5 Confirm the enumeration holds on the merged tree: exactly **three** mint sites, exactly **four** validate entry points, no remaining raw `request.session.get("user_id")` used as an identity decision (`src/csrf.py`'s nonce read is not one), and **no path that opens a second `AsyncSession` while the request's own is open**.
 - [ ] 8.6 Confirm the `schema-integrity` MODIFIED block lands on the **existing** requirement at archive time rather than adding a second one of a similar name.

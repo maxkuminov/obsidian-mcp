@@ -145,6 +145,11 @@ def _session_returning(user, commit_error: Exception | None = None):
     result.scalar_one_or_none.return_value = user
     session = AsyncMock()
     session.execute.return_value = result
+    # `add` is synchronous on a real `AsyncSession`, and `start_session` calls
+    # it to insert the session row. Left as an `AsyncMock` attribute it returns
+    # a coroutine nobody awaits, which is a `RuntimeWarning` the suite runs
+    # under `-W error` to keep out.
+    session.add = MagicMock()
     if commit_error is not None:
         session.commit.side_effect = commit_error
     return session

@@ -23,7 +23,12 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.passwords import hash_password, verify_password
+from src.auth.passwords import (
+    MIN_PASSWORD_LENGTH,
+    hash_password,
+    validate_new_password,
+    verify_password,
+)
 from src.auth.session import (
     SESSION_ID_KEY,
     get_active_session_user,
@@ -111,6 +116,23 @@ def _bootstrap_refused(request: Request, reason: str) -> None:
     )
 
 
+def _bootstrap_password_reason(new: str, confirm: str) -> str:
+    """The `panel_bootstrap_refused` reason behind a `validate_new_password` message.
+
+    Called **only** once the validator has already refused, and it mirrors that
+    function's order of checks — mismatch, then NUL, then length — so the
+    record and the message rendered back into the form can never name
+    different rules. The message is always the validator's own; this is only
+    the log's word for it, which is why the two pre-existing reason strings
+    are kept verbatim rather than renamed to match the panel's own catalogue.
+    """
+    if new != confirm:
+        return "password_mismatch"
+    if "\x00" in new:
+        return "password_nul_byte"
+    return "weak_password"
+
+
 async def _users_table_empty(session: AsyncSession) -> bool:
     count = (await session.execute(select(func.count(User.id)))).scalar() or 0
     return count == 0
@@ -160,6 +182,9 @@ def _render_register(
             "username": username if username is not None else default_username,
             "vault_path": vault_path if vault_path is not None else settings.vault_path,
             "csrf_token": generate_csrf_token(request),
+            # `minlength` and the hint read the server's constant rather than
+            # restating a number that has already drifted once.
+            "min_password_length": MIN_PASSWORD_LENGTH,
         },
         status_code=status_code,
     )
@@ -408,20 +433,20 @@ async def register_submit(
             vault_path=vault_path,
             status_code=status.HTTP_400_BAD_REQUEST,
         )
-    if len(password) < 8:
-        _bootstrap_refused(request, "weak_password")
+    # The shared password policy (#197, D10). Bootstrap is the **fourth**
+    # setter, and it used to carry its own eight-character rule, its own
+    # confirmation compare, and no NUL check at all — so the most privileged
+    # account on the server sat under the weakest minimum, and a NUL byte in
+    # the field went straight into `hash_password`, which raises `ValueError`,
+    # and came back as a 500. One validator, one minimum, and it runs here,
+    # before the advisory-lock section: a refusal must not have taken the
+    # bootstrap lock.
+    message = validate_new_password(password, password_confirm)
+    if message is not None:
+        _bootstrap_refused(request, _bootstrap_password_reason(password, password_confirm))
         return _render_register(
             request,
-            error="Password must be at least 8 characters.",
-            username=normalized,
-            vault_path=vault_path,
-            status_code=status.HTTP_400_BAD_REQUEST,
-        )
-    if password != password_confirm:
-        _bootstrap_refused(request, "password_mismatch")
-        return _render_register(
-            request,
-            error="Passwords do not match.",
+            error=message,
             username=normalized,
             vault_path=vault_path,
             status_code=status.HTTP_400_BAD_REQUEST,

@@ -320,6 +320,7 @@ def browser_request(
     query: str = "",
     user_agent: str = "pytest",
     client: tuple[str, int] = ("203.0.113.9", 44444),
+    cookies: dict[str, str] | None = None,
 ):
     """A **real** `starlette.requests.Request` carrying a session dict.
 
@@ -328,6 +329,9 @@ def browser_request(
     one under `clear()`; `request.url.path` parses the way it does in
     production; and slowapi's decorator on `login_submit` refuses anything that
     is not a `Request` at all.
+
+    `cookies` is rendered into a real `Cookie` header, so `request.cookies` is
+    whatever Starlette parses rather than a dict a test asserted into place.
     """
     from starlette.requests import Request
 
@@ -345,7 +349,20 @@ def browser_request(
             "headers": [
                 (b"host", b"testserver"),
                 (b"user-agent", user_agent.encode()),
-            ],
+            ]
+            + (
+                # Real `Cookie` header rather than a `cookies` attribute, so
+                # Starlette's own parser produces `request.cookies` — the
+                # OAuth consent POST reads its signed state from there.
+                [
+                    (
+                        b"cookie",
+                        "; ".join(f"{k}={v}" for k, v in cookies.items()).encode(),
+                    )
+                ]
+                if cookies
+                else []
+            ),
             "client": client,
             "server": ("testserver", 80),
             "session": {} if session is None else session,
