@@ -243,7 +243,7 @@ bypassed by two of the five, one of which is a different process entirely.
 path may begin a pass over a vault root without a snapshot published in this
 process by this orchestration*. That is why the per-user skip lives in the
 shared pass helpers rather than in each loop: `index_vault`,
-`link_backfill_pass`, `embed_vault` and `rebuild_tsvectors` each call
+`link_backfill_pass`, `embed_vault` and `_rebuild_tsvectors_single_scope_for_tests` each call
 `_refuse_quarantined_pass` **ahead of resolving the root**, so a sixth entry
 point added later inherits the guard by routing through the same helper. A skip
 re-implemented per loop is a skip one loop will be missing.
@@ -326,7 +326,7 @@ populations answering two questions — *whom does this server serve* and *whose
 bytes will this command read* — and a single answer would be wrong for one of
 them.
 
-**It also runs before `acquire_generation_lock`, and it keeps the
+**It also runs before the generation lock is taken, and it keeps the
 descriptors.** `survey_rebuild_roots` calls
 `vault_overlap.observe_root_blocking_retaining` through
 `indexer._observe_root_retaining` — same bound, same per-root verdict, but the
@@ -370,14 +370,15 @@ the survey and is seen by it.
 | # | Lock | Who takes it |
 | --- | --- | --- |
 | 1 | `ACCOUNT_GUARD_LOCK_KEY` | `users._lock_admin_guard` (admin handlers), `routes.change_password`, `session.start_session` (mint) — each **alone**; and `indexer.rebuild_tsvectors_all_scopes`, which then takes 2. |
-| 2 | `INDEX_GENERATION_LOCK_KEY` | `indexer._index_vault_pinned`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` — each **alone**; and `indexer._rebuild_all_scopes_locked`, reached only from 1's holder. |
+| 2 | `INDEX_GENERATION_LOCK_KEY` (via `acquire_generation_lock_unbounded` on the waiting paths) | `indexer._index_vault_pinned`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` — each **alone**; and `indexer._rebuild_all_scopes_locked`, reached only from 1's holder. |
 | 3 | row locks | inside each per-scope rebuild. |
 
 **One direction everywhere.** The maintenance rebuild is the only holder of the
 pair, and it takes them in that order; no path anywhere takes them in the
 opposite one. If you add a path that needs both, **take the account guard
 first**. The rule is written at both lock definitions
-(`oauth/grants.py::lock_account_guard`, `index_state.py::acquire_generation_lock`)
+(`oauth/grants.py::lock_account_guard`, `index_state.py::acquire_generation_lock`,
+which `acquire_generation_lock_unbounded` delegates to)
 as well as here.
 
 **The cost, stated rather than discovered:** a running `make rebuild-tsvectors`

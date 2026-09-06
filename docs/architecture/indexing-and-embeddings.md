@@ -73,7 +73,7 @@
   unwinds through the context manager's rollback and leaves the outer
   transaction usable. A floor failure propagates, exactly as before: the
   incremental pass aborts with nothing committed and retries next tick, and
-  `rebuild_tsvectors` is now **atomic** — its every-500 intermediate commits
+  `_rebuild_tsvectors_single_scope_for_tests` is now **atomic** — its every-500 intermediate commits
   are gone, so a floor failure rolls the whole rebuild back instead of leaving
   a keyword index half-built under two FTS configs that no periodic pass would
   repair. Verified against a real PostgreSQL
@@ -200,7 +200,7 @@ where the pass calls them and what it records.
   pass — and the loop alone was not enough.** `run_indexer_loop` is two of the
   five: the startup block (`detect_root_overlaps("startup")`) and each periodic
   tick (`detect_root_overlaps("periodic")`). The other three reach
-  `index_vault` / `embed_vault` / `rebuild_tsvectors` without going through it
+  `index_vault` / `embed_vault` / `_rebuild_tsvectors_single_scope_for_tests` without going through it
   at all — `src/main.py::lifespan` (`_publish_first_root_snapshot`, run
   **synchronously before the app serves**), the panel's `_reindex_background`
   (Reindex Now, re-embed and reset embeddings, which mirrors the loop and
@@ -227,7 +227,7 @@ where the pass calls them and what it records.
   suppressed. The row cadence is unchanged — a running deployment already
   writes one row per user per tick.
 - **The skip lives in the shared pass helpers, not in each loop.**
-  `index_vault`, `link_backfill_pass`, `embed_vault` and `rebuild_tsvectors`
+  `index_vault`, `link_backfill_pass`, `embed_vault` and `_rebuild_tsvectors_single_scope_for_tests`
   each call `_refuse_quarantined_pass(user_id, stage)` **ahead of resolving the
   root**, so every caller inherits it and a sixth entry point added later gets
   it by routing through the same helper. A skip re-implemented per loop is a
@@ -458,9 +458,8 @@ embedded count, which the recorder still reads as a number.)
 > **`attempted` is incremented exactly once per note for which an embedding
 > provider call is issued** — at the `embed_note` call sites, and nowhere else.
 
-`EmbedPassResult.record_attempt()` is the only writer, called for a note whose
-`chunks_submitted` is non-zero. Three things follow, and they are stated
-because they change what the run row used to say:
+`EmbedPassResult.record_attempt()` is the only writer. Three things follow, and
+they are stated because they change what the run row used to say:
 
 - **It is no longer initialised from the backlog's size.** `attempted` counted
   work *contemplated*; it now counts work done.
@@ -474,11 +473,38 @@ because they change what the run row used to say:
   `3 of 16,700`.
 
 Everything else follows from the same rule rather than needing its own clause:
-an excluded note, a hash-mismatched note, a note left behind by a pause or a
-budget stop, and a certification that matched no row all issue no provider
-call, so none of them moves the denominator. One sentence with derived
-consequences is what lets the design, the requirement, the tasks and the tests
-agree.
+an excluded note, a hash-mismatched note and a note left behind by a pause or a
+budget stop all issue no provider call, so none of them moves the denominator.
+One sentence with derived consequences is what lets the design, the
+requirement, the tasks and the tests agree.
+
+**"At the call site" means at issuance, not at the return** — and that is the
+half the first implementation got wrong. Both loops read
+`EmbedNoteResult.chunks_submitted` *after* `embed_note` returned, which is
+correct for every path that returns and counts nothing at all for every path
+that **raises after the provider call**. `certify_embedded` raises
+`StaleCertification` when the row moved under the call, and a database error
+can escape anywhere between the two: the call had been made, the provider's
+time was spent, and neither `attempted` nor the tenant's chunk budget knew. A
+tenant losing that race on every note issued provider calls for the whole
+stage, every stage, and never became budget-exhaustible — #202's starvation
+surviving inside the fix for it, and an `indexer_runs` row reading `2 of 0`.
+
+So `embed_note` takes an `on_provider_call` callback and invokes it
+immediately **before** the await, and `_ProviderCallAccounting` is what both
+loops hand it: `issued()` records the attempt and debits the budget, exactly
+once per note, on every subsequent path including the ones that never produce a
+result. `reconcile()` is the backstop in the other direction — a return whose
+call nothing announced is still counted — so a future provider-calling path
+that forgets the callback under-reports nothing; `_counted` makes the pair
+idempotent per note. And `budget.note_finished()` moved into a `finally`, so a
+note that reached `embed_note` and then raised still counts as having reached a
+note boundary; without that, `exhausted()`'s "at least one note completed"
+guard could never be satisfied by exactly the notes burning the provider time.
+
+A certification that matched no row is therefore an **attempt** (its call was
+made) and still not a failure and not embedded — the same disposition it always
+had, now with a truthful denominator.
 
 **The reconciliation sweep feeds the same accumulator.** It re-embeds
 re-included notes and used to swallow their failures into its own
@@ -489,6 +515,15 @@ still wrote a clean run row. That is #201 surviving in the one code path a
 narrower fix would not have touched. The sweep now takes the same
 `EmbedPassResult` and calls the same `record_attempt` /
 `record_failure_detail`.
+
+**And it increments `embedded`, which it did not at first.** The sweep commits
+its vectors through the same `certify_embedded` predicate the backlog uses, so
+a note it re-embedded is a note the pass embedded. Leaving the counter alone
+made `notes_embedded` under-report exactly the pass whose whole output was the
+sweep's — the fully-indexed steady state again, from the other side: an
+operator watching a healthy vault repair itself saw `notes_embedded = 0`. Like
+the backlog's, the increment is after the per-note commit, so a certification
+that rolled back is not reported as embedded.
 
 The **#160 asymmetry is unchanged**: none of this flips the in-process
 `_record_index_run` heartbeat. "Is the loop alive" and "did the work succeed"
@@ -870,8 +905,10 @@ scope rebuilt so far back, and records nothing.
   ran rather than the loop that keeps the index fresh. The cost is L5, and the
   rebuild is already the cheap path — keyword index only, no provider calls,
   seconds for a few thousand notes.
-- `rebuild_tsvectors(session, user_id)` stays as the single-scope entry point
-  and records **no** fingerprint, for the reason this whole subsection exists.
+- `_rebuild_tsvectors_single_scope_for_tests(session, user_id)` stays as the
+  single-scope entry point and records **no** fingerprint, for the reason this
+  whole subsection exists. It is private, and the name says who it is for —
+  see the generation-lock section below.
 
 ## The index generation lock (#206)
 
@@ -938,8 +975,9 @@ pass:    pg_advisory_xact_lock at the write  -> waits on the rebuild's advisory
 ```
 
 — a cycle the database resolves by killing one side. So the pass calls
-`acquire_generation_lock(session)` and `_assert_fts_generation_current(session)`
-as the **first two statements of `_index_vault_pinned`'s transaction**, and
+`acquire_generation_lock_unbounded(session)` and `_assert_fts_generation_current(session)`
+at the **head of `_index_vault_pinned`'s transaction** — ahead of every lock it
+takes, with only that helper's own `SET LOCAL statement_timeout` before it — and
 anyone adding a mutation to that function must keep it below that line: the
 requirement is to audit what the transaction touches, not to reason backwards
 from the write that consumes the fingerprint. A mismatch raises
@@ -962,9 +1000,18 @@ note's `content_hash` changes, so that row would stay on the old configuration
 for ever behind a fingerprint claiming otherwise. In the tree that is the
 incremental pass (at the head of its transaction) and the per-owner rebuild
 (through its driver, which takes the lock before its first read);
-`rebuild_tsvectors(session, user_id)` survives as a single-scope entry point
-with **no production caller** — it keeps its `int` contract for the tests that
-hold it — so anything that gives it one must take the lock first.
+the single-scope entry point is **private and named for its only caller**,
+`_rebuild_tsvectors_single_scope_for_tests`. It was `rebuild_tsvectors`, a
+public export that commits keyword vectors without taking the lock and without
+re-reading the fingerprint under it. It had no production caller, so nothing in
+the tree was wrong — but "no caller today" is a fact about today, and a
+plausible-looking public function that writes outside the interlock is an
+invitation to add one. It survives at all because the tests hold its `int`
+contract over a single scope (atomicity, the certified UPDATE predicate, the
+provenance gate), and `tests/test_issue_206_verifier_gaps.py` fails if anything
+under `src/` or `scripts/` calls it. Anything that does give it a caller must
+take the lock at the head of that transaction — and should call the driver
+instead.
 
 ### On the embed path the window exists only inside `embed_note`
 
@@ -1009,12 +1056,39 @@ minutes on a large vault — so `make reset-embeddings` and
 `make rebuild-tsvectors` **wait** for an in-flight pass instead of interleaving
 with it. That is the behaviour we want: a reset must not land mid-pass. The
 maintenance paths therefore deliberately do **not** set a short `lock_timeout`
-to defeat it. (`scripts/reset_embeddings.py` takes the lock as the first
-statement of its transaction and only then raises `statement_timeout` to
-`5min`, because a `SET LOCAL` ahead of the acquisition would put a statement
-before the lock and break the ordering rule; the wait therefore runs under the
-engine's 60 s statement timeout, and an operator who resets against a live
-service may have to retry — time, not correctness.)
+to defeat it.
+
+**And `lock_timeout` was never the only way to defeat it.** `src/database.py`
+sets `statement_timeout` to 60 s in the engine's `server_settings`, and
+`pg_advisory_xact_lock` is a statement like any other: a wait longer than a
+minute is cancelled with a `QueryCanceledError`. Since the pass holds the lock
+for minutes, the plain acquisition did not *wait* for it at all — it aborted,
+and the operator saw a query-cancelled error that reads as a broken command
+rather than as a busy index. An earlier revision of this note argued that the
+raise had to come *after* the acquisition, "because a `SET LOCAL` ahead of it
+would put a statement before the lock and break the ordering rule". That was
+wrong, and it is the reasoning the fix corrects: **the ordering rule is about
+row and table locks**, and a `SET LOCAL` takes neither — it is a
+session-variable assignment the lock graph cannot see. So every path whose
+contract is "it waits" calls `acquire_generation_lock_unbounded`
+(`index_state.py`), which lifts `statement_timeout` for the acquisition alone
+and puts it back the moment the lock is held — `SET LOCAL statement_timeout =
+DEFAULT`, which resets to the *session* default, i.e. the value the engine
+delivered in the connection's startup packet, so nothing has to know what that
+value is in order to restore the right one. The callers are the two
+maintenance commands, both panel Danger-zone resets, and the incremental pass
+itself. `scripts/reset_embeddings.py` then raises `statement_timeout` to `5min`
+over its destructive DDL, which is the bound those statements were always meant
+to run under.
+
+The pass is on that list for the symmetric reason. Its failure direction was
+safe — a cancelled acquisition aborts the pass, which commits nothing and
+retries next tick — but "waits" is the documented contract on both sides of
+this lock, and a pass that abandons every tick for the duration of a long
+rebuild writes an `indexer_runs` error row per tick about a database that is
+merely busy. `embed_note`'s per-note acquisition keeps the plain, capped form
+deliberately: that transaction must not sit on a lock for minutes, and its
+`GENERATION_MISMATCH`/retry disposition is already the right answer there.
 
 **The runbook, and why it inverts the old advice.** For any change to the
 embedding provider, model, dimensions, chunk size, chunk overlap or the chunk

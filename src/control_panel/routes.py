@@ -60,7 +60,7 @@ from src.oauth.scope import (
 from src.services import security_events, vault_overlap
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
-    acquire_generation_lock,
+    acquire_generation_lock_unbounded,
     embedding_fingerprint,
     set_state,
 )
@@ -2692,8 +2692,8 @@ async def _record_embedding_fingerprint(
     recoverable state, instead of losing them under a lying fingerprint, which
     is not.
 
-    The caller has already taken `acquire_generation_lock(fresh)` as the first
-    statement of this transaction, so the value written here cannot be
+    The caller has already taken `acquire_generation_lock_unbounded(fresh)` as
+    the first lock of this transaction, so the value written here cannot be
     interleaved with another process's.
     """
     try:
@@ -2768,7 +2768,14 @@ async def trigger_reembed(
                 # workflow deliberately runs as a one-off `docker compose run`
                 # against a live service (#142), so the process-local lock
                 # excludes nobody that matters.
-                await acquire_generation_lock(fresh)
+                #
+                # The unbounded form: another container's pass holds this lock
+                # for its whole transaction, and the engine's 60s
+                # `statement_timeout` would cancel the wait instead of serving
+                # it. `SET LOCAL` takes no row or table lock, so the raise sits
+                # ahead of the acquisition without disturbing the ordering
+                # rule, and it is restored before the first mutation.
+                await acquire_generation_lock_unbounded(fresh)
                 await fresh.execute(delete(NoteEmbedding))
                 # Deleting the vectors is not enough: `embed_vault` selects
                 # notes whose `embedded_content_hash` differs from
@@ -2828,9 +2835,10 @@ async def reset_embeddings(
                 #  * the wait here is *meant* to be long. It is a wait for an
                 #    in-flight pass in another container to commit, and the
                 #    maintenance paths must not defeat it with a short timeout.
-                #    `statement_timeout` would apply to this statement too, so
-                #    it is set only afterwards, over the destructive DDL it was
-                #    written for.
+                #    `statement_timeout` applies to the acquisition too, so the
+                #    unbounded helper lifts it for the wait alone and restores
+                #    it; the `5min` below is then the bound the destructive DDL
+                #    it was written for actually runs under.
                 #
                 # This is a different lock from the `index_pass_lock` taken
                 # above and both are needed: that one is process-local and
@@ -2838,7 +2846,7 @@ async def reset_embeddings(
                 # stops another container's, which is the whole hole — the
                 # reset is designed to run as a one-off container while the
                 # service is still up (#142).
-                await acquire_generation_lock(fresh)
+                await acquire_generation_lock_unbounded(fresh)
                 await fresh.execute(text("SET LOCAL statement_timeout = '5min'"))
                 await fresh.execute(
                     text("DROP INDEX IF EXISTS ix_note_embeddings_embedding_hnsw")

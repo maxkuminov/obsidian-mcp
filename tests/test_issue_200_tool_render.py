@@ -372,6 +372,58 @@ async def test_find_related_marks_a_stale_neighbour_and_withholds_it(
 
 
 @pytest.mark.asyncio
+async def test_find_related_marks_stale_neighbours_through_the_exact_fallback(
+    monkeypatch, captured
+):
+    """The same annotation on the rare path, with a mixed result.
+
+    `find_related` has its own zero-row safety net: an empty result re-runs the
+    identical statement with index scans off. The staleness annotation runs
+    after it, so nothing is supposed to know which run produced the rows — and
+    that is exactly the kind of "supposed to" that a later change breaks
+    without any ordinary test noticing, because every other case here drives
+    the fast path.
+    """
+    source = _Note(1, "Source.md")
+    rows = [
+        _related_row(
+            2, "Fresh.md", text="a current neighbour excerpt", distance=0.1
+        ),
+        _related_row(
+            3, "Edited.md", embedded_content_hash="old", distance=0.2
+        ),
+        _related_row(
+            4, "Never.md", embedded_content_hash=None, distance=0.3
+        ),
+    ]
+    sessions: list[_FindRelatedSession] = []
+
+    def _session():
+        # An empty first batch arms the fallback; the second is what the
+        # re-run with index scans off returns.
+        sessions.append(_FindRelatedSession(source, [[1.0, 0.0, 0.0]], [[], rows]))
+        return sessions[-1]
+
+    monkeypatch.setattr(tools, "async_session", _session)
+
+    out = await tools.find_related_impl("Source.md", limit=5)
+
+    assert sessions[0]._batches == [], (
+        "the re-run never happened, so this exercised the fast path with an "
+        "empty result rather than the exact fallback"
+    )
+    # Membership and order are the fast path's — same statement, same ORDER BY.
+    assert out.index("Fresh.md") < out.index("Edited.md") < out.index("Never.md")
+    assert "2 stale" in out
+    assert out.count("stale: true") == 2
+    assert "a current neighbour excerpt" in out
+    assert "SUPERSEDED" not in out
+    assert out.count("preview withheld") == 2
+    # The source is fresh, so the source line stays off.
+    assert "`Source.md` changed after it was embedded" not in out
+
+
+@pytest.mark.asyncio
 async def test_find_related_states_a_stale_source_on_the_ranked_path(
     monkeypatch, captured
 ):

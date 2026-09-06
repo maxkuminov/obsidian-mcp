@@ -43,10 +43,12 @@ class _Session:
         return False
 
     #: Statements the index pass now issues at the head of its transaction —
-    #: the generation lock and the `indexer_state` existence probe (D7c3).
-    #: They are recorded but must not consume the queued results, which are
-    #: positional and belong to the owner-scoped queries this module is about.
-    _PREAMBLE = ("pg_advisory_xact_lock", "to_regclass")
+    #: the `statement_timeout` raise that keeps the acquisition from being
+    #: cancelled at 60 s, the generation lock itself, the restore, and the
+    #: `indexer_state` existence probe (D7c3). They are recorded but must not
+    #: consume the queued results, which are positional and belong to the
+    #: owner-scoped queries this module is about.
+    _PREAMBLE = ("statement_timeout", "pg_advisory_xact_lock", "to_regclass")
 
     async def execute(self, stmt, _params=None):
         self.statements.append(stmt)
@@ -128,5 +130,5 @@ async def test_embed_vault_selection_is_null_owned(monkeypatch, tmp_path):
 async def test_rebuild_tsvectors_selection_is_null_owned(monkeypatch, tmp_path):
     session = _Session()
     monkeypatch.setattr(indexer, "_vault_root", lambda _uid: tmp_path)
-    assert await indexer.rebuild_tsvectors(session, user_id=None) == 0
+    assert await indexer._rebuild_tsvectors_single_scope_for_tests(session, user_id=None) == 0
     assert "notes_metadata.user_id IS NULL" in _sql(session.statements[0])

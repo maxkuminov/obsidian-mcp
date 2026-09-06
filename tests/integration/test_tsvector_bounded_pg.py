@@ -249,7 +249,7 @@ async def _seed_many(
 async def test_a_floor_failure_past_the_old_commit_boundary_rolls_everything_back(
     sessionmaker, vault
 ):
-    """`rebuild_tsvectors` is atomic (D4).
+    """`_rebuild_tsvectors_single_scope_for_tests` is atomic (D4).
 
     It used to commit every 500 notes, so a floor failure a thousand notes in
     left the keyword index half-rebuilt: the first N notes under the new
@@ -262,7 +262,7 @@ async def test_a_floor_failure_past_the_old_commit_boundary_rolls_everything_bac
 
     async with sessionmaker() as session:
         with pytest.raises(Exception):
-            await indexer.rebuild_tsvectors(session, user_id=None)
+            await indexer._rebuild_tsvectors_single_scope_for_tests(session, user_id=None)
 
     async with sessionmaker() as session:
         written = (await session.execute(text(
@@ -281,7 +281,7 @@ async def test_a_successful_rebuild_commits_every_note(sessionmaker, vault):
     await _seed_many(sessionmaker, vault, 600, bad_index=None)
 
     async with sessionmaker() as session:
-        updated = await indexer.rebuild_tsvectors(session, user_id=None)
+        updated = await indexer._rebuild_tsvectors_single_scope_for_tests(session, user_id=None)
     assert updated == 600
 
     async with sessionmaker() as session:
@@ -303,7 +303,7 @@ async def test_the_rebuild_retreats_per_note_and_still_commits_the_rest(
 
     with caplog.at_level("WARNING", logger="src.services.indexer"):
         async with sessionmaker() as session:
-            updated = await indexer.rebuild_tsvectors(session, user_id=None)
+            updated = await indexer._rebuild_tsvectors_single_scope_for_tests(session, user_id=None)
 
     assert updated == 3
     assert [r for r in caplog.records if "retreating to a" in r.getMessage()]
@@ -328,7 +328,7 @@ async def test_the_rebuild_retreats_per_note_and_still_commits_the_rest(
 
 async def _rebuild(sessionmaker):
     async with sessionmaker() as session:
-        return await indexer.rebuild_tsvectors(session, user_id=None)
+        return await indexer._rebuild_tsvectors_single_scope_for_tests(session, user_id=None)
 
 
 def _commit_concurrently(migrated_url, statements):

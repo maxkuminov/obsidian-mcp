@@ -87,8 +87,10 @@ caller named, in the directory that was validated.
 
 import contextlib
 import errno
+import hashlib
 import inspect
 import logging
+import math
 import mimetypes
 import os
 import posixpath
@@ -1813,12 +1815,223 @@ def _link_target_label(target: "MutableTarget", vault_resolved: Path) -> str:
         return "outside the vault"
 
 
+# ── The write-precondition digest (#205) ────────────────────────────────────
+
+#: The one accepted algorithm prefix. A prefix rather than a bare hex string so
+#: the value cannot be confused with `notes_metadata.content_hash` (see
+#: `content_hash_for_bytes`) and so a future algorithm needs no second field.
+CONTENT_HASH_PREFIX = "sha256:"
+
+#: `sha256:` plus 64 hexadecimal characters. Fixed width, which is what lets
+#: `read_note` account for the field as a constant allocation rather than
+#: entering it into the metadata budget.
+CONTENT_HASH_CHARS = len(CONTENT_HASH_PREFIX) + 64
+
+_CANONICAL_CONTENT_HASH = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
+
+
+def content_hash_for_bytes(data: bytes) -> str:
+    """The `content_hash` of `data`: `"sha256:" + lowercase hex SHA-256`.
+
+    **The definition, stated once.** A file's `content_hash` is this function
+    applied to *the complete raw bytes of that file as stored on disk* — every
+    byte, in file order, with no universal-newline translation, no frontmatter
+    stripping, no windowing and no re-encoding. Those are exactly the bytes
+    `_atomic_write_at(expected=…)` compares immediately before its publishing
+    rename, and exactly the digest `vault_fs._hash_regular` computes for the
+    transfer fingerprint. Every producer and consumer of the value on this
+    server goes through here.
+
+    **It is deliberately not `notes_metadata.content_hash`.** That column is
+    `sha256(text)` over the universal-newline-*translated* text of a note
+    (`indexer._content_hash`), so for any file whose terminators are not LF the
+    two digests differ — same algorithm, different input. The column hashes
+    translated text on purpose: redefining it would mark every CRLF note
+    changed and re-embed the vault. The two therefore coexist, and the canonical
+    input form below is what keeps a caller from mistaking one for the other:
+    the column's bare-hex value is refused as *malformed*, not reported as a
+    conflict.
+
+    **It is not a hash of any body either.** A note carrying frontmatter, or
+    CRLF terminators, has a `content_hash` that a hash of the `content` field a
+    read returned cannot reproduce. The value is a token to hand back to a
+    write tool, not a checksum of the text the caller received.
+    """
+    return CONTENT_HASH_PREFIX + hashlib.sha256(data).hexdigest()
+
+
+def is_canonical_content_hash(value: object) -> bool:
+    """Is `value` the one accepted input form, `sha256:<64 lowercase hex>`?
+
+    The **only** accepted form. A bare hexadecimal string, uppercase hex,
+    surrounding whitespace, another algorithm prefix, or a wrong length is not
+    a hash this server will compare — it is a malformed argument, and the
+    difference matters: "you sent the wrong kind of thing" and "the file
+    changed" call for different actions from the caller. Tolerating bare hex
+    would make `notes_metadata.content_hash` a syntactically valid precondition
+    that fails as a mismatch on every LF note, which a caller cannot tell from
+    a real conflict.
+
+    A pure predicate over the argument: no filesystem, no path, no descriptor.
+    That is what lets the syntax check run at a tool's entry, ahead of path
+    resolution, so a malformed hash outranks "not found".
+    """
+    return isinstance(value, str) and _CANONICAL_CONTENT_HASH.match(value) is not None
+
+
+# ── Non-finite frontmatter numbers, and the one title rule (#154) ───────────
+
+#: YAML's own spellings. Python renders the same three floats as `nan`, `inf`
+#: and `-inf`, which is a form no note contains: rendering YAML's keeps the
+#: indexed value, the read view, the note's own block and what an operator
+#: would type into `keyword_search(frontmatter=…)` in agreement.
+NAN_TOKEN = ".nan"
+INF_TOKEN = ".inf"
+NEGATIVE_INF_TOKEN = "-.inf"
+
+
+def non_finite_token(value: object) -> str | None:
+    """`.nan` / `.inf` / `-.inf` for a non-finite float, else `None`.
+
+    The single boundary helper for #154, shared by the indexer's JSONB
+    sanitiser, the indexer's title coercion, this module's title coercion (which
+    `read_note` and the control panel inherit) and `read_note`'s frontmatter
+    view. One function so a change made for one boundary cannot leave another
+    spelling a NaN differently.
+
+    **The token is canonical whatever the note spelled.** YAML 1.1 accepts
+    `.nan`, `.NaN`, `.NAN`, `.inf`, `.Inf`, `.INF`, `+.inf` and their negatives,
+    and the parse preserves none of it — by the time any consumer sees the
+    value it is a Python float. `frontmatter_yaml` still carries the note's own
+    spelling, LF-normalized.
+
+    `bool` is excluded deliberately: `isinstance(True, int)` is true and a
+    future edit that widened this to "numbers" would otherwise coerce booleans.
+    """
+    if isinstance(value, bool) or not isinstance(value, float):
+        return None
+    if math.isnan(value):
+        return NAN_TOKEN
+    if math.isinf(value):
+        return INF_TOKEN if value > 0 else NEGATIVE_INF_TOKEN
+    return None
+
+
+def canonical_scalar(value):
+    """`value` with a non-finite float replaced by its canonical YAML token.
+
+    Everything else is returned untouched: this is a *rendering* boundary, not
+    a normalisation. `_scrub_frontmatter` deliberately keeps the float in the
+    parsed mapping — both YAML and Python render it — so that `set_frontmatter`,
+    which re-serialises that mapping, still round-trips `x: .nan` byte for byte.
+    Coercing at the parse instead would rewrite a note's own bytes as a side
+    effect of setting an unrelated key, which is the destructive-write class.
+    """
+    token = non_finite_token(value)
+    return value if token is None else token
+
+
+def canonical_key(key: object) -> str:
+    """A mapping key rendered as a string, non-finite floats as their token.
+
+    A YAML mapping may be *keyed* by a number, non-finite ones included
+    (`.nan: 1`), and every consumer that renders a mapping stringifies its keys.
+    Without this the key would come back as Python's `nan` in a place the note
+    spells `.nan`. Collision handling after coercion belongs to each consumer:
+    the index takes first-key-wins because it has no channel to report a loss;
+    the read view omits the whole view, because a partial view is
+    indistinguishable from a complete one.
+    """
+    token = non_finite_token(key)
+    if token is not None:
+        return token
+    return key if isinstance(key, str) else str(key)
+
+
+#: `notes_metadata.title` is VARCHAR(512), and the bound is part of the shared
+#: rule rather than a column detail: a title that is one string in the index
+#: and a longer one in `read_note` is two answers to one question.
+TITLE_MAX_CHARS = 512
+
+
+def _title_value(value):
+    """Recursively render a title value the way the index column does.
+
+    Non-string mapping keys and non-JSON scalars (a YAML date, say) are
+    stringified *inside* a container before the outer `str()` runs, so a list
+    of dates renders as `['2026-08-25']` rather than as a list of Python
+    `repr`s. Non-finite floats take their YAML token here as everywhere.
+    """
+    value = canonical_scalar(value)
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    if isinstance(value, list):
+        return [_title_value(item) for item in value]
+    if isinstance(value, dict):
+        return {canonical_key(k): _title_value(v) for k, v in value.items()}
+    return str(value)
+
+
+def note_title(frontmatter: dict | None, filename: str) -> str:
+    """What a note is called, by the one rule every surface uses (#154, D10b).
+
+    **The canonical rule is the indexer's `_note_title`**: the sanitised
+    frontmatter `title`, falling back to the filename stem when it is falsy,
+    rendered with `str()` and bounded to `TITLE_MAX_CHARS` — with the single
+    exception that a non-finite number renders as its canonical YAML token.
+    The indexer's is the rule to standardise on because it is already the value
+    `keyword_search`, `list_notes`, `get_recent` and the panel's listings show,
+    it is bounded to the column's width, and it is the one of the three that a
+    titling incident (#126) has already hardened.
+
+    `filename` may be a bare name or a path; its extension is dropped, exactly
+    as the indexer does.
+
+    Safe by the scrub's invariant: `_partition_frontmatter` has already removed
+    anything `str()` would refuse, so nothing here can raise.
+    """
+    value = _title_value((frontmatter or {}).get("title"))
+    stem = os.path.splitext(filename)[0]
+    return str(value or stem)[:TITLE_MAX_CHARS]
+
+
+def _decode_note_bytes(data: bytes) -> str:
+    """`data` as `Path.read_text(encoding="utf-8")` would have returned it.
+
+    Strict UTF-8, then universal-newline translation: `\\r\\n` → `\\n`, then a
+    lone `\\r` → `\\n`. Reproducing the translation explicitly is what lets
+    `read_file` read the note's **bytes** once and serve both the text and the
+    hash from that one read — #149's D3 refused a second read for
+    `frontmatter_yaml` because two reads of one note can disagree, and a hash
+    is the stronger case for the same rule: the whole point of the field is
+    that it identifies the bytes in *this* response.
+
+    A BOM is left alone, as `read_text` leaves it: the codec is `utf-8`, not
+    `utf-8-sig`, so the file's leading `\\ufeff` is a character of the text.
+    """
+    return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def read_file(relative_path: str, user_id: int | None = None) -> dict:
-    """Read a note, returning frontmatter + content."""
+    """Read a note, returning frontmatter + content + the file's digest.
+
+    The note's **bytes** are read once. The text every field below is derived
+    from is that same buffer, decoded and universal-newline-translated by
+    `_decode_note_bytes`, and `content_hash` is `content_hash_for_bytes` over
+    it — so the digest describes exactly the bytes this response was built
+    from, with no second open that could describe a different file (#149's D3,
+    #205's D6).
+    """
     path = validate_visible_path(relative_path, user_id=user_id)
     if not path.is_file():
         raise FileNotFoundError(f"Note not found: {relative_path}")
-    raw = path.read_text(encoding="utf-8")
+    # One read, one stat, one hash — of provably the same bytes. `content_hash`
+    # below describes the file this response was built from; a second open to
+    # serve it could describe a different one.
+    with path.open("rb") as stream:
+        data = stream.read()
+        info = os.fstat(stream.fileno())
+    raw = _decode_note_bytes(data)
     frontmatter, content, diagnosis = parse_frontmatter_diagnose(raw)
     # `frontmatter` is already scrubbed — `_partition_frontmatter` removed
     # anything unrenderable before this function ever saw it — so nothing here
@@ -1827,11 +2040,13 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
     # key, so `read_note` can omit the affected response fields whole and name
     # the reason. Consumers that only need to not crash (the indexer, the
     # control panel) ignore it and take the scrubbed mapping as-is.
-    title = frontmatter.get("title") or path.stem
     # `title:` is whatever YAML says it is — a list, a date, a mapping — and
-    # every consumer wants a string. Safe by the invariant above: the scrub has
+    # every consumer wants a string. `note_title` is the **one** rule for that
+    # (#154, design D10b): the indexer's, so `notes_metadata.title`, this
+    # response's `title` and the control panel's note viewer cannot disagree
+    # about what a note is called. Safe by the invariant above: the scrub has
     # already removed anything `str()` would refuse.
-    title = title if isinstance(title, str) else str(title)
+    title = note_title(frontmatter, path.name)
     tags = extract_tags(content, frontmatter)
     return {
         "path": relative_path,
@@ -1843,14 +2058,19 @@ def read_file(relative_path: str, user_id: int | None = None) -> dict:
         # frontmatter representation (#149) and the parsed mapping above only
         # as a lossy view beside it. `""` (a valid empty block) and `None` (no
         # block) are different answers and must stay distinguishable.
-        # `read_text` above has already normalized terminators, so this is
-        # LF-normalized rather than byte-exact — the declared residual, stated
-        # in both `read_note` docstrings.
+        # `_decode_note_bytes` above has already normalized terminators, so
+        # this is LF-normalized rather than byte-exact — the declared residual,
+        # stated in both `read_note` docstrings, with `read_file` (base64) named
+        # as the byte-exact route.
         "frontmatter_yaml": diagnosis.yaml_text if diagnosis.valid else None,
         "tags": tags,
         "content": content,
-        "size": path.stat().st_size,
-        "modified": path.stat().st_mtime,
+        # The digest of the bytes read above — the whole file's, never the
+        # body's and never `content`'s. `read_note` hands it back as
+        # `content_hash` and the write tools take it as `expected_hash`.
+        "content_hash": content_hash_for_bytes(data),
+        "size": info.st_size,
+        "modified": info.st_mtime,
     }
 
 

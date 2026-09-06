@@ -21,9 +21,11 @@ decision that could plausibly have gone the other way:
 - and the keyword side's disposition is byte-for-byte the embedding side's,
   because the draft that let it warn and serve was wrong.
 
-The reset cases pin the other half: the lock is the first statement of the
-transaction, the fingerprint is recorded in the same transaction as the wipe,
-and a failed record takes the whole reset with it.
+The reset cases pin the other half: the generation lock is the first *lock* of
+the transaction — only the `statement_timeout` raise that keeps the wait from
+being cancelled at 60 s precedes it, and a `SET LOCAL` takes no lock at all —
+the fingerprint is recorded in the same transaction as the wipe, and a failed
+record takes the whole reset with it.
 """
 import json
 
@@ -508,9 +510,17 @@ async def test_the_reset_takes_the_generation_lock_first(ollama, monkeypatch):
     await reset_module.reset()
 
     statements = sessions[0].statements
-    assert statements[0] == "SELECT pg_advisory_xact_lock(:key)"
-    assert "DROP INDEX" in statements[1] or "statement_timeout" in statements[1]
     lock_at = statements.index("SELECT pg_advisory_xact_lock(:key)")
+    # "First" means first *lock*. The statements ahead of the acquisition are
+    # the `SET LOCAL`s that lift the engine's 60 s `statement_timeout` off the
+    # wait, and a `SET LOCAL` takes no row or table lock — it is a
+    # session-variable assignment, invisible to the lock graph. Left capped,
+    # the reset did not wait for an in-flight pass at all; it was cancelled
+    # after a minute, which is the opposite of the specified behaviour.
+    assert all("statement_timeout" in sql for sql in statements[:lock_at]), (
+        f"something that takes a lock ran first: {statements[:lock_at]!r}"
+    )
+    assert statements[lock_at - 1].endswith("statement_timeout = 0")
     drop_at = next(i for i, sql in enumerate(statements) if "DROP INDEX" in sql)
     assert lock_at < drop_at
 

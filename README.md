@@ -947,6 +947,16 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
 | `CHUNK_OVERLAP` | `0` | Token overlap between chunks |
 | `EMBEDDING_EXCLUDE_PATTERNS` | `["*.excalidraw.md","Excalidraw/*"]` | Globs skipped by the embedder. Excluded files stay keyword-searchable. |
+| `MCP_AUTH_FAILURE_LIMIT` | `60` | Failed `/mcp` authentications one client address may make per window before a 429. Checked before the credential lookup, so a refused probe costs no query. Null disables. See [Rate limits](#rate-limits). |
+| `MCP_AUTH_FAILURE_WINDOW_SECONDS` | `300` | The window that budget is counted over. |
+| `MCP_AUTH_FAILURE_TABLE_SIZE` | `4096` | Counter slots in the fixed-size, per-process-salted address table. Memory is O(size); collisions only make the control stricter. |
+| `MCP_RATE_LIMIT_PER_MINUTE` | `120` | Sustained tool calls per minute per principal (an API key, or an OAuth *grant*). Null — with the burst — disables the general bucket. |
+| `MCP_RATE_LIMIT_BURST` | `30` | Capacity of the general bucket. Must be set together with its rate or nulled together with it. |
+| `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `60` | Sustained vault-mutating calls per minute per principal — the eight write tools, plus `PUT /transfer/upload` charged to the principal that minted the capability. |
+| `MCP_WRITE_RATE_LIMIT_BURST` | `15` | Capacity of the write bucket. |
+| `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` | `10000` | Principals holding their own limiter entry before further ones share one overflow entry. |
+| `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one rate-refusal coalescing window stays open. Inside it a refusal writes nothing; the row that lands stands for `1 + suppressed` refusals. |
+| `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** API key receives when the caller does not say otherwise. Existing keys are untouched; an explicit null (or a blank panel field) still means unlimited. |
 | `MCP_SANDBOX_MODE` | `false` | Registry-eval only. Skips DB, indexer, embedding provider, and `/mcp` auth so introspection works without external deps. Do not enable in production. |
 
 See `.env.example` for the full set with comments. For first-index
@@ -1013,7 +1023,12 @@ than interleaving with it. That wait is the required behaviour, not a
 stall to work around: a reset that landed mid-pass is precisely the
 interleaving that stores vectors from one configuration under a
 fingerprint naming another. Neither command sets a short lock timeout,
-and neither should be given one.
+and neither should be given one — and because the server sets a 60-second
+`statement_timeout` on every connection, both commands (and the panel's
+Danger-zone resets) lift that timeout for the acquisition itself and
+restore it once the lock is theirs. Without that, a command started
+against a live service was cancelled after a minute rather than waiting,
+which reads as a broken command instead of a busy index.
 
 You can also use Settings → Danger zone → Reset embeddings in the
 control panel, which performs the same SQL — including the fingerprint
@@ -1213,6 +1228,73 @@ deployment.
 > days after the fix shipped. Sign in again; there is nothing to
 > migrate.
 
+### Rate limits
+
+The consumer of this server is an agent, and a retry-storming or
+prompt-injected agent is an ordinary input. Three controls bound how
+fast one credential can create work.
+
+- **A general bucket** — `MCP_RATE_LIMIT_PER_MINUTE` (120) sustained,
+  `MCP_RATE_LIMIT_BURST` (30) capacity — on every tool call.
+- **A write bucket** — 60/min, burst 15 — that the eight vault-mutating
+  tools must pass in addition, and that `PUT /transfer/upload` consumes
+  too, charged to the principal that **minted** the capability so the
+  write rate cannot be escaped by minting links and redeeming them.
+- **A per-address budget on failed `/mcp` authentication** — 60 failures
+  per 5 minutes — checked before the credential lookup, so a refused
+  probe costs no database query.
+
+The bucket is per **principal**: an API key, or an OAuth **grant**.
+Refreshing an access token continues the same allowance rather than
+minting a fresh one, and two separate `/authorize` approvals for the same
+client hold independent allowances.
+
+**What an agent actually sees.** A refusal is an ordinary tool result —
+never a protocol error, never a silent empty result set — and it ends
+with one machine-readable line:
+
+```
+Error: this credential exceeded its general rate limit of 120 calls per minute, so the call was refused before it ran. Nothing was read, written, or counted against the daily quota. Retry in 3 seconds, or slow the calling loop down.
+MCP-REFUSAL {"code":"rate_limited","scope":"principal","limit":120,"limit_unit":"calls_per_minute","retry_after_seconds":3}
+```
+
+The `MCP-REFUSAL` sentinel is line-initial and the JSON is one line, so
+it survives being quoted into a transcript. A structured tool returns the
+identical text in its declared error field. `retry_after_seconds` is
+present only where waiting can actually help — a refusal for an
+unassigned vault or an unencodable argument omits it rather than invite a
+loop that cannot end. The same shape covers the daily quota
+(`over_quota`) and the query length cap (`argument_too_long`).
+
+The two **transport** refusals are outside that contract, because there
+is no tool call to answer: an over-budget unauthenticated request gets an
+HTTP 429 with `Retry-After`, and so does an over-rate `PUT
+/transfer/upload` — which **releases** its claim rather than consuming
+it, so the same link is still redeemable once the bucket refills.
+
+**Operational notes.**
+
+- Limiter state is in-process and is not persisted, so a restart begins
+  with every bucket full. That is sound only because the container runs
+  `--workers 1`; raising the worker count multiplies every rate above by
+  the worker count.
+- Refusals appear on `/admin/performance` as refusal counts, not in the
+  latency percentiles. Repeated rate refusals are **coalesced** — one row
+  per credential/tool/scope per `MCP_REFUSAL_LOG_INTERVAL_SECONDS`, each
+  standing for `1 + suppressed` refusals — so that a refusal loop cannot
+  make writing the log the load.
+- Every one of the defaults is a guess against a small sample. Read
+  `/admin/performance` for a week before treating any as settled, and
+  disable one by setting it empty, `null` or `none` (zero is refused at
+  startup).
+- The daily quota is the durable ceiling and it is separate: keys created
+  from now on get `DEFAULT_DAILY_REQUEST_LIMIT` (5,000), keys that
+  already existed keep whatever they had, and OAuth grants have no daily
+  ceiling at all — velocity bounds only.
+
+The rationale lives in
+[`docs/architecture/rate-limits.md`](docs/architecture/rate-limits.md).
+
 ## Architecture
 
 ```
@@ -1402,6 +1484,14 @@ backup, `alembic upgrade head`, then recreate the container. Run
   authenticated `check_upload` tool.
 - `import_from_url` fetches only genuinely public addresses, under an
   explicit deny list re-applied at every redirect.
+- Failed `/mcp` authentication is budgeted per client address, counted
+  before the credential lookup so a refused probe costs no database
+  session and no query. The address comes from the proxy headers the app
+  trusts, never from a header read directly, and a request with no
+  resolvable address is charged to a shared slot rather than exempted.
+  What it bounds is the database work an unauthenticated caller can
+  force; it is not a defence against guessing a 256-bit key. See
+  [Rate limits](#rate-limits).
 - Parameterized queries everywhere. No string interpolation into SQL.
 - Response headers include HSTS, `X-Content-Type-Options: nosniff`,
   and `X-Frame-Options: DENY`.

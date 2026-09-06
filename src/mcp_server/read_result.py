@@ -86,6 +86,56 @@ class MetadataOmission(_OmitNone):
     detail: str
 
 
+# ── metadata coercions ──────────────────────────────────────────────────────
+#
+# An omission and a coercion are different facts and must not share a list.
+# `metadata_omissions` names a field this response **dropped whole**; a value
+# the server rendered in a form the note does not literally contain is a
+# different statement about a field that is still there. Reporting the second
+# through the first would make "the entry names a field you did not receive"
+# false, and a caller cannot act on a list whose entries mean two things.
+
+#: The one reason code for a non-finite YAML number rendered as its canonical
+#: token (#154). The literal is the contract — the spec, this module and the
+#: tests use this same string.
+COERCED_NON_FINITE_FLOAT = "non_finite_float"
+
+
+class MetadataCoercion(_OmitNone):
+    """One metadata value this response rendered in a canonicalized form.
+
+    Server-authored, every field of it, exactly as `MetadataOmission` is: the
+    channel is out of band precisely so that nothing has to be signalled inside
+    the note-controlled field itself.
+    """
+
+    field: str
+    reason: str
+    detail: str
+
+
+def non_finite_coercion(field: str) -> MetadataCoercion:
+    """The one wording for "a non-finite number was rendered as a YAML token".
+
+    `NaN`, `Infinity` and `-Infinity` are not JSON, and Python's `nan` / `inf`
+    spelling is not a form any note contains, so the view renders YAML's own
+    `.nan` / `.inf` / `-.inf`. The coercion is not reversible from the view —
+    `x: .nan` and `x: ".nan"` render identically, and `.NaN` renders as `.nan`
+    — so the entry points at the block's own text.
+    """
+    return MetadataCoercion(
+        field=field,
+        reason=COERCED_NON_FINITE_FLOAT,
+        detail=(
+            f"The note's {field} carries a non-finite number, rendered here as "
+            "its canonical YAML token (`.nan`, `.inf`, `-.inf`) because JSON "
+            "has no form for it. The value itself is unchanged in the note. "
+            "Read `frontmatter_yaml`, or the note's raw text with `read_file`, "
+            "to see the spelling the note uses."
+        ),
+    )
+
+
 _UNRENDERABLE_DETAIL = {
     OMITTED_UNPAIRED_SURROGATE: (
         "contains an unpaired surrogate code point, which is not valid UTF-8 "
@@ -460,6 +510,21 @@ class ReadNoteResult(_OmitNone):
     # Bounded instead at admission, by `vault.MAX_PATH_CHARS`.
     path: str | None = None
 
+    # The whole file's digest, `sha256:<64 lowercase hex>`, from the same read
+    # that built this response (`vault.content_hash_for_bytes`). Server-
+    # controlled and of fixed width (`vault.CONTENT_HASH_CHARS`), so it is a
+    # **fixed allocation beside `path`** in the worst-case arithmetic and does
+    # not enter the metadata budget: it is never dropped and never appears in
+    # `metadata_omissions`. Dropping it would silently disable the caller's
+    # only write precondition on exactly the notes large enough to be worth
+    # guarding.
+    #
+    # It is the whole file's in every mode — a section read's and a truncated
+    # read's alike — so the token means one thing wherever it came from, and it
+    # is **not** a hash of `content`: a note with frontmatter, or with CRLF
+    # terminators, has a digest the returned text cannot reproduce.
+    content_hash: str | None = None
+
     title: str | None = None
     tags: list[str] | None = None
 
@@ -486,6 +551,10 @@ class ReadNoteResult(_OmitNone):
 
     outline: NoteOutline | None = None
     metadata_omissions: list[MetadataOmission] | None = None
+    # Retained-but-altered values, never drops. Sibling to the list above and
+    # never a substitute for it: each list is used only for its own case, and
+    # one response may carry both.
+    metadata_coercions: list[MetadataCoercion] | None = None
     notice: str | None = None
     error: str | None = None
 
@@ -594,6 +663,13 @@ def apply_metadata_budget(
     `carried` holds omissions decided before the budget ran — the JSON view's
     own construction failures, and the unencodable-value screen — so the list
     the caller sees is in decision order.
+
+    **`path` and `content_hash` are not in the drop order and not in the
+    cost.** Both are server-controlled and of fixed width, and both are
+    accounted for as fixed allocations in the worst-case arithmetic instead.
+    Dropping the hash under pressure would disable the caller's write
+    precondition on precisely the notes big enough to need one — a budget is
+    not a reason to hand back a response that silently cannot be written back.
     """
     omissions = list(carried)
 

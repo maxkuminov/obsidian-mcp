@@ -136,7 +136,7 @@ class FakeSession:
         self.link_count = link_count
         self.existing = dict(existing or {})
         self.note_ids = dict(note_ids or {})
-        # The owner `rebuild_tsvectors` retains in its snapshot and names in
+        # The owner `_rebuild_tsvectors_single_scope_for_tests` retains in its snapshot and names in
         # its certified UPDATE (#127). Nothing here executes SQL, so the value
         # only has to be the one the rebuild would have read.
         self.note_owner = note_owner
@@ -199,7 +199,7 @@ class FakeSession:
             self.timeline.append("raise")
             raise RuntimeError("injected failure")
 
-        # `rebuild_tsvectors` addresses its UPDATE by a certified predicate and
+        # `_rebuild_tsvectors_single_scope_for_tests` addresses its UPDATE by a certified predicate and
         # requires exactly one row (#127); zero means "the row moved or its
         # content advanced", which sends it down the re-read path. This stub
         # executes nothing, so it answers for the row it handed out.
@@ -262,7 +262,7 @@ class FakeSession:
             # recognised before the vault-index branch below.
             if rendered.startswith("SELECT count("):
                 return _Result([self.link_count])
-            # `rebuild_tsvectors`'s snapshot names id, owner, path *and* hash
+            # `_rebuild_tsvectors_single_scope_for_tests`'s snapshot names id, owner, path *and* hash
             # since #127, so it has to be matched before the scan's
             # path+hash select — both mention `content_hash`.
             if "notes_metadata.id" in rendered:
@@ -1655,7 +1655,7 @@ async def test_a_substituted_root_behind_an_unchanged_assignment_is_kept(
 # The gated ancillary passes
 # ══════════════════════════════════════════════════════════════════════════
 #
-# `link_backfill_pass` and `rebuild_tsvectors` both read `vault / file_path`
+# `link_backfill_pass` and `_rebuild_tsvectors_single_scope_for_tests` both read `vault / file_path`
 # and write rows the provenance is a claim about — `note_links`,
 # `content_tsvector` — with **no verification of any kind** that the bytes they
 # read belong to the row they write against. Neither may assume the scan
@@ -1759,7 +1759,7 @@ async def test_rebuild_tsvectors_writes_nothing_for_an_unsettled_user(
     monkeypatch.setattr(indexer, "_vault_root", lambda _uid: vault)
 
     with caplog.at_level("INFO"):
-        updated = await indexer.rebuild_tsvectors(session, user_id=7)
+        updated = await indexer._rebuild_tsvectors_single_scope_for_tests(session, user_id=7)
 
     assert updated == 0
     assert not any(isinstance(s, TextClause) for s in session.statements)
@@ -1781,7 +1781,7 @@ async def test_rebuild_tsvectors_proceeds_for_a_settled_user(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(indexer, "_vault_root", lambda _uid: vault)
 
-    updated = await indexer.rebuild_tsvectors(session, user_id=7)
+    updated = await indexer._rebuild_tsvectors_single_scope_for_tests(session, user_id=7)
 
     assert updated == 1
 

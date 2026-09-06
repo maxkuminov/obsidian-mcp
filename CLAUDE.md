@@ -84,7 +84,17 @@ specific to this MCP server.
 | Migrations | `make db-migrate` (alembic) |
 | Schema drift | `make db-check` (`docker exec obsidian-mcp alembic check`) |
 | Schema gate (any change carrying a migration) | `make test-schema` |
+| Integration suite (real Postgres) | `make test-integration` |
 | Deploy | `make deploy` (build, backup, migrate, deploy) |
+
+**`tests/integration/` skips itself without a database.** Those modules are
+guarded on `PGVECTOR_TEST_ADMIN_URL`, so a local `pytest tests` reports green
+having executed none of them. CI's `tests` job sets it against a
+`pgvector/pgvector:pg16` service, so they do run on every push — but any local
+claim that "the suite passes" is a claim about the offline subset unless
+`make test-integration` ran, which stands up the throwaway container and sets
+the URL. It shares `SCHEMA_TEST_CONTAINER` / `SCHEMA_TEST_PORT` with
+`test-schema`, so do not run the two concurrently.
 
 **`alembic check` must be clean** — "No new upgrade operations detected." Run
 it after any migration and after any deploy that ran one (`make db-check`, or
@@ -129,6 +139,29 @@ update it in the same change.** What stays here is the short list:
   A bind-mount *graft* is still undetected (L1/L2, owner decision pending) and
   the consequence is cross-tenant read/overwrite/delete — see
   [vault roots and tenancy](docs/architecture/vault-roots-and-tenancy.md).
+- **`/mcp` rate control is in-process, and `--workers 1` is part of the
+  contract.** Two per-principal token buckets in `_tracked` (general 120/min
+  burst 30; write 60/min burst 15 on the eight vault-mutating tools *and*
+  `PUT /transfer/upload`, charged to the principal that **minted** the
+  capability) plus a per-address budget on failed `/mcp` authentication. The
+  principal is `("api_key", id)` or `("oauth", grant_id)` — the **grant**, so a
+  refresh does not mint a fresh allowance. State is in the worker's memory and
+  deliberately not persisted; a second uvicorn worker multiplies every rate by
+  the worker count. See [rate limits](docs/architecture/rate-limits.md).
+- **The buckets are the first gates; the daily quota stays the last pre-body
+  gate.** Nothing durable is consumed by a call that does not run — a
+  rate-refused call spends no `quota_counters` slot. Every refusal raised
+  inside `_tracked` ends with one parseable line,
+  `MCP-REFUSAL {"code":…,"retry_after_seconds":…}`, carried identically into a
+  structured tool's error field; the transport 429s (failed-auth budget,
+  transfer redemption) are deliberately outside that contract. `rate_limited`
+  rows are coalesced — a row stands for `1 + suppressed` refusals.
+- **New API keys get `DEFAULT_DAILY_REQUEST_LIMIT` (5,000); existing keys are
+  grandfathered** — applied in application code, never as a column default, and
+  an explicit `null` (or a blank panel field) still means unlimited. OAuth
+  grants and pre-existing NULL-limit keys therefore have **velocity bounds
+  only**, owner-accepted. **Concurrency is not bounded at all** — deferred to
+  `mcp-concurrency-slots`, which ships in shadow mode first.
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
@@ -178,10 +211,11 @@ summaries.
 | [oauth-and-grants.md](docs/architecture/oauth-and-grants.md) | `src/oauth/`, the consent page, anything minting/rotating/revoking a token |
 | [vault-roots-and-tenancy.md](docs/architecture/vault-roots-and-tenancy.md) | `APIKeyMiddleware`, `_vault_root`, owner predicates, publication confirmation, the vault-root overlap guard (`src/services/vault_overlap.py`, the snapshot, the five pass entry points) |
 | [vault-tools.md](docs/architecture/vault-tools.md) | any note or file tool: frontmatter, symlinks, anchored writes, section addressing, size caps |
-| [file-transfer.md](docs/architecture/file-transfer.md) | `src/transfer/`, `src/services/vault_fs.py`, the publish gate, SSRF policy |
+| [file-transfer.md](docs/architecture/file-transfer.md) | `src/transfer/`, `src/services/vault_fs.py`, the publish gate, SSRF policy, the write-bucket charge at redemption |
 | [search.md](docs/architecture/search.md) | `semantic_search` / `keyword_search` / `find_related` and every `SET LOCAL` they issue |
 | [indexing-and-embeddings.md](docs/architecture/indexing-and-embeddings.md) | the indexer loop, the embed pass, tsvector writers, provider abstraction |
 | [security-event-logging.md](docs/architecture/security-event-logging.md) | `src/logging_setup.py`, `src/services/security_events.py`, and any call site that logs a refusal: the field allow-list, the event catalogue, the suppressor |
+| [rate-limits.md](docs/architecture/rate-limits.md) | `src/services/rate_limits.py`, `src/services/refusals.py`, the failed-auth budget in `APIKeyMiddleware`, the gate order in `_tracked`, the worker count, and every `MCP_RATE_LIMIT_*` / `MCP_AUTH_FAILURE_*` / `DEFAULT_DAILY_REQUEST_LIMIT` setting |
 | [usage-attribution.md](docs/architecture/usage-attribution.md) | `usage_logs`, `_log_usage`, actor columns |
 | [control-panel.md](docs/architecture/control-panel.md) | panel templates, flash messages, admin guards, the Danger zone |
 

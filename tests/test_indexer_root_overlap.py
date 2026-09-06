@@ -409,7 +409,7 @@ async def test_the_tsvector_rebuild_helper_refuses_a_quarantined_user(monkeypatc
 
     monkeypatch.setattr(indexer, "_vault_root", _never)
     with pytest.raises(indexer.VaultRootQuarantined):
-        await indexer.rebuild_tsvectors(object(), user_id=1)
+        await indexer._rebuild_tsvectors_single_scope_for_tests(object(), user_id=1)
 
 
 @pytest.mark.parametrize(
@@ -533,7 +533,12 @@ def test_e4_the_panel_reindex_calls_the_guarded_helpers():
     source = inspect.getsource(routes._reindex_background)
     assert "index_vault" in source
     assert "embed_vault" in source
-    for name in ("index_vault", "link_backfill_pass", "embed_vault", "rebuild_tsvectors"):
+    for name in (
+        "index_vault",
+        "link_backfill_pass",
+        "embed_vault",
+        "_rebuild_tsvectors_single_scope_for_tests",
+    ):
         assert "_refuse_quarantined_pass" in inspect.getsource(
             getattr(indexer, name)
         ), f"{name} must carry the shared skip"
@@ -922,11 +927,17 @@ async def test_the_survey_observes_off_the_loop_under_the_deadline(
     generation lock for as long as the kernel likes."""
     import threading
 
+    # Released after the assertions, so the parked thread finishes inside the
+    # test rather than outliving the event loop. The *production* residual is
+    # unchanged — a thread blocked in `open(2)` cannot be cancelled (L4) — but
+    # a suite that leaves one pending prints an asyncio "Task was destroyed"
+    # for every run, which trains a reader to ignore that message.
     release = threading.Event()
+    entered = threading.Event()
 
     def _blocking(assignment, **kwargs):
-        release.set()
-        threading.Event().wait(30)
+        entered.set()
+        release.wait(30)
         raise AssertionError("the deadline did not abandon the wait")
 
     monkeypatch.setattr(
@@ -936,11 +947,20 @@ async def test_the_survey_observes_off_the_loop_under_the_deadline(
         vault_overlap.settings, "vault_root_observe_timeout_seconds", 0.05
     )
 
-    survey = await asyncio.wait_for(
-        indexer.survey_rebuild_roots([_scope(1, tmp_path / "team")]), 5
-    )
-    assert survey.failures[1].skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
-    assert "not answering" in survey.failures[1].describe()
+    try:
+        survey = await asyncio.wait_for(
+            indexer.survey_rebuild_roots([_scope(1, tmp_path / "team")]), 5
+        )
+        assert survey.failures[1].skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
+        assert "not answering" in survey.failures[1].describe()
+        assert entered.is_set(), "the observation never reached the thread"
+    finally:
+        release.set()
+        # Let the abandoned task finish and its done-callback run.
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]:
+                break
 
 
 async def test_the_scope_survey_runs_before_the_generation_lock(monkeypatch, tmp_path):
@@ -974,7 +994,12 @@ async def test_the_scope_survey_runs_before_the_generation_lock(monkeypatch, tmp
     monkeypatch.setattr(indexer, "lock_account_guard", _guard)
     monkeypatch.setattr(indexer, "_rebuild_root_participants", _participants)
     monkeypatch.setattr(indexer, "survey_rebuild_roots", _survey)
-    monkeypatch.setattr(indexer, "acquire_generation_lock", _lock)
+    # The *unbounded* acquisition: the driver lifts the engine's 60 s
+    # `statement_timeout` off the wait and restores it, because the pass holds
+    # this lock for its whole transaction and a capped wait was cancelled
+    # rather than served. Where it sits is what this test is about, and that is
+    # unchanged.
+    monkeypatch.setattr(indexer, "acquire_generation_lock_unbounded", _lock)
     monkeypatch.setattr(indexer, "pinned_root", _never)
 
     with pytest.raises(indexer.RebuildCoverageAborted) as excinfo:
@@ -1354,7 +1379,7 @@ async def test_an_abort_after_the_survey_still_closes_every_descriptor(
     monkeypatch.setattr(indexer, "lock_account_guard", _guard)
     monkeypatch.setattr(indexer, "_rebuild_root_participants", _participants)
     monkeypatch.setattr(indexer, "survey_rebuild_roots", _survey)
-    monkeypatch.setattr(indexer, "acquire_generation_lock", _lock)
+    monkeypatch.setattr(indexer, "acquire_generation_lock_unbounded", _lock)
 
     with pytest.raises(RuntimeError, match="lock wait"):
         await indexer.rebuild_tsvectors_all_scopes(object())

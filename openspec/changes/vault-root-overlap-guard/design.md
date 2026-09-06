@@ -266,7 +266,7 @@ them would be wrong in both directions at once.
 **And it runs before the generation lock, keeping the descriptors.** The
 observation is the same bounded, off-loop one under
 `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`, completed before
-`acquire_generation_lock` — but it uses
+the generation lock — but it uses
 `observe_root_blocking_retaining`, which hands back the open directory instead
 of closing it, and `_rebuild_scope` reads through *that descriptor*. Under the
 lock this command resolves **no pathname at all**; its only filesystem call on
@@ -298,7 +298,7 @@ enumeration, and holds it to the commit.
 | # | Lock | Taken alone by | Taken in sequence by |
 | --- | --- | --- | --- |
 | 1 | `ACCOUNT_GUARD_LOCK_KEY` | `users._lock_admin_guard`, `routes.change_password`, `session.start_session` | `indexer.rebuild_tsvectors_all_scopes` |
-| 2 | `INDEX_GENERATION_LOCK_KEY` | `indexer._index_vault_pinned`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` | `indexer._rebuild_all_scopes_locked` (reached only from 1's holder) |
+| 2 | `INDEX_GENERATION_LOCK_KEY` (`acquire_generation_lock_unbounded` on the waiting paths) | `indexer._index_vault_pinned`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` | `indexer._rebuild_all_scopes_locked` (reached only from 1's holder) |
 | 3 | row locks | every pass | the per-scope rebuild |
 
 One direction everywhere; the maintenance rebuild is the only holder of the

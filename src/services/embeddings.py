@@ -5,7 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Protocol
+from typing import Callable, Protocol
 
 import httpx
 import numpy as np
@@ -919,6 +919,7 @@ async def embed_note(
     *,
     certified_hash: str | None = None,
     certified_path: str | None = None,
+    on_provider_call: Callable[[int], None] | None = None,
 ) -> EmbedNoteResult:
     """Chunk a note's content, embed, and store in note_embeddings.
 
@@ -986,6 +987,28 @@ async def embed_note(
             truncated=False,
         )
 
+    # ── The accounting boundary, and it is *here* ────────────────────────
+    # The caller used to account for the provider call from the returned
+    # `chunks_submitted`, which is correct for every path that returns — and
+    # silently wrong for every path that raises after this point.
+    # `certify_embedded` raises `StaleCertification` on a moved row, and the
+    # database can raise anywhere below; the call had been made, the provider
+    # time had been spent, and none of it was recorded as an attempt or debited
+    # from the tenant's chunk budget. A tenant whose every note lost its
+    # certification race could therefore issue provider calls for ever without
+    # becoming budget-exhaustible — the starvation #202 exists to bound,
+    # surviving inside the fix for it.
+    #
+    # So issuance is announced at the moment of issuance, before the await, and
+    # the callback is the caller's own accumulator. It fires exactly once per
+    # note that reaches the provider, on every subsequent path: the swallowed
+    # failure below, the cardinality refusal, the generation mismatch, the
+    # successful embed, and every exception that escapes this function.
+    # `CERTIFIED_EMPTY` never reaches it, because it makes no provider call —
+    # which is the same rule stated once rather than reconstructed by the
+    # caller from a field on a result it may never receive.
+    if on_provider_call is not None:
+        on_provider_call(len(chunks))
     try:
         embeddings = await get_embeddings_batch(chunks)
     except Exception as e:

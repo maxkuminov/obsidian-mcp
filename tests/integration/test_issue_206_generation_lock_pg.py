@@ -395,14 +395,21 @@ async def test_the_rebuild_takes_the_lock_before_it_reads(engines, world):
 
     # Nothing in the guarded half reads a row of its own, and nothing in it
     # takes the generation lock: the survey's observation must not be under it.
-    assert "acquire_generation_lock(session)" not in head
+    assert "acquire_generation_lock" not in head.replace(
+        "acquire_generation_lock`", ""
+    )
     assert "session.execute(" not in head
     assert "notes_metadata" not in head
     # And the descriptors it now owns are released on every path.
     assert "finally:" in head and "survey.close()" in head
 
     # ── the locked half, in order
-    lock_at = body.index("acquire_generation_lock(session)")
+    # `acquire_generation_lock_unbounded` — the same acquisition with the
+    # engine's 60 s `statement_timeout` lifted off the wait, since the pass
+    # holds this lock for its whole transaction and a capped wait was cancelled
+    # rather than served. What is asserted here is unchanged: where it sits.
+    lock_at = body.index("acquire_generation_lock_unbounded(session)")
+    # The locked section's first statement, and the authoritative scope list.
     read_at = body.index("_retained_scopes(session)")
     rebuild_at = body.index("_rebuild_scope(session, owner, survey)")
     write_at = body.index("set_state(session, KEY_FTS_FINGERPRINT")

@@ -277,6 +277,48 @@ sessions, which several slices would otherwise all have to touch.
       the facts #246 could not have known are carried forward: the mint's
       `expected_session_version`, the three added replay-refusal reasons, and
       the four-setter `minlength`.
+  - **Round 2 returned FAIL: 2 MAJOR, no BLOCKER; round 1's items all
+    accepted. Both applied.**
+    - *MAJOR — the touch's failure path cost the request its identity.* The
+      `last_seen_at` `UPDATE` ran on the request's own `AsyncSession` and its
+      failure was recovered with `session.rollback()`. That rollback restores
+      the identity map to the transaction's start, which **expunges every
+      object that became persistent inside it** — including the authenticated
+      `User` the validator is about to return. The `UPDATE` now runs inside a
+      **savepoint** (`begin_nested`), so the ordinary failure rolls back that
+      savepoint alone and the enclosing transaction, and everything loaded in
+      it, is untouched; the rarer failed-*commit* path detaches the instances
+      named in the new `protect=` argument before the unavoidable rollback, so
+      their columns stay readable.
+      **The reported mechanism was wrong and the finding was still right.** The
+      review said the user is *expired* and the next attribute read raises
+      `MissingGreenlet`. Measured against a real `AsyncSession` it is
+      **detached**, not expired: every loaded column still reads and nothing
+      raises. The real consequence is worse for being quiet — a write through
+      that object is no longer in the session's unit of work, so `commit()`
+      reports success and persists **nothing**. A refused telemetry write
+      turned any later write through the request's own user into a **silent
+      lost update**. `tests/integration/test_issue_198_touch_failure_isolation.py`
+      pins that against a real engine with a `BEFORE UPDATE` trigger rejecting
+      the write, driving `get_current_user` and `require_user_panel` end to
+      end; it fails on the pre-fix tree and passes on this one.
+    - *MAJOR — 024 reconciled a marked-but-altered table.* The shape check
+      verified the columns, primary key, foreign key and named indexes but
+      compared neither the constraint set nor the index set as *sets*, so a
+      table carrying everything 024 makes **plus** `UNIQUE (user_id)` was
+      adopted — and then the second session a user opens, and every re-issue
+      after their own password change, fails on a constraint no handler has a
+      branch for. Reconciliation now enumerates `pg_constraint` for `u`/`c`/`x`
+      and every index on the table, permitting only the two 024 creates and the
+      primary key's own (read from the catalogue, not assumed by name), and
+      refuses naming what it found. Five schema-gate cases: the extra UNIQUE
+      constraint, the same with rows present (a refusal must still write and
+      revoke nothing), the extra CHECK, a bare `CREATE UNIQUE INDEX` carrying
+      no constraint row at all, and the clean stamp-back that must still
+      reconcile. All five fail with the checks removed.
+      `docs/architecture/schema-and-migrations.md` now says the check is
+      complete rather than minimal, and why a subset check is the dangerous
+      one.
 - [ ] 8.9 `make deploy`, then `make db-check` (`alembic check` must read "No new upgrade operations detected").
 - [ ] 8.10 Browser pass on the live panel: sign in; open a second browser and confirm both work; log out of the first and **replay its cookie** — expect a redirect to login; change the password from the second and confirm the first is signed out while the second is not; sign in with the new password; open an `/authorize` URL for a self-registered test client with a non-allow-listed redirect host and confirm the warning and the host; confirm an allow-listed client shows the badge **and still shows the self-registration notice**. There is no `user-representative` gate on this project — record which flows were actually exercised.
 - [ ] 8.11 Confirm the deploy's one-time logout happened as designed and both production users can sign in.

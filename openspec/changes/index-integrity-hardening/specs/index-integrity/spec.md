@@ -153,6 +153,8 @@ An embed pass SHALL count into `notes_embedded` only the notes it actually certi
 
 **`attempted` SHALL be incremented exactly once per note for which an embedding provider call is issued, at that call site and nowhere else.** It SHALL NOT be initialised from the size of the backlog the pass selected, and it SHALL NOT count rows the pass or the sweep decided about without calling the provider.
 
+**"At that call site" means at the point of issuance, not at the point a result is read.** The certification runs after the provider call and can raise — the row moved under it — and a database error can escape anywhere between the two, so a pass that increments from a returned value counts nothing for a note whose call was made, whose provider time was spent, and whose outcome never came back as a result. A stage in which every note lost that race reported an attempted count of zero while consuming the whole stage. The same point SHALL debit the per-tenant chunk budget, and the note SHALL count as having reached a note boundary, so that a tenant losing that race on every note still becomes budget-exhaustible.
+
 That single rule determines every case, and the cases SHALL NOT be enumerated as independent exceptions that could drift apart from it:
 
 - a note whose cleaned content produces no chunks is certified without a provider call, so it counts into `notes_embedded` and **not** into `attempted`;
@@ -175,6 +177,19 @@ The in-process "last run" heartbeat SHALL remain unaffected by these swallowed p
 - **WHEN** a pass's backlog is empty, the reconciliation sweep attempts to re-embed notes whose exclusion pattern was removed, and every one of those provider calls fails
 - **THEN** the pass's record SHALL carry a non-null `error`
 - **AND** its attempted count SHALL be the number of notes the sweep actually sent to the provider, not the number of rows it scanned
+
+#### Scenario: A certification that raises after the provider call is still an attempt
+
+- **WHEN** a note's provider call returns and its certification then raises because the row moved
+- **THEN** that note SHALL be counted as an attempt and its submitted chunks SHALL be debited from the tenant's budget
+- **AND** it SHALL NOT be counted as embedded and SHALL NOT be counted as a failure
+- **AND** the note SHALL count as having reached a note boundary
+
+#### Scenario: A repairing sweep counts the notes it certified
+
+- **WHEN** a pass's backlog is empty and the reconciliation sweep re-embeds and certifies two notes whose exclusion pattern was removed, alongside rows that need no call
+- **THEN** `notes_embedded` on that pass's record SHALL be 2
+- **AND** the attempted count SHALL be 2
 
 #### Scenario: A zero-chunk note is embedded but not attempted
 
@@ -339,6 +354,12 @@ Both the hash-mismatch backlog and the exclusion-reconciliation sweep SHALL draw
 
 - **WHEN** the wall-clock budget is disabled, a user's notes each submit chunks to the provider, and every one of those calls fails
 - **THEN** the chunk budget SHALL be debited by the chunks each call submitted
+- **AND** the user's embedding SHALL stop at a note boundary once the budget is exhausted, rather than continuing for the whole pass
+
+#### Scenario: A certification race still debits the budget
+
+- **WHEN** the wall-clock budget is disabled and every one of a user's notes has its certification raise after the provider call returned
+- **THEN** the chunk budget SHALL be debited by the chunks each of those calls submitted
 - **AND** the user's embedding SHALL stop at a note boundary once the budget is exhausted, rather than continuing for the whole pass
 
 #### Scenario: A cardinality mismatch debits the budget

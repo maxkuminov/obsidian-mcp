@@ -98,6 +98,62 @@ def test_a_tenant_over_budget_stops_at_a_note_boundary(monkeypatch, tmp_path):
     assert result.embedded == 1
     assert result.failures == 0
 
+    # ── The other half of the claim: the *cycle* continues ─────────────────
+    # Stopping tenant A is only fairness if tenant B is then served in that
+    # same cycle. The per-user sequence is driven by `run_indexer_loop`, which
+    # calls the three stages per user id in turn, so what has to hold at this
+    # level is that A's stop is a **return**, not a raise, and that B's stage
+    # gets a budget of its own rather than inheriting A's exhausted one — the
+    # budget is constructed per `embed_vault` call, and a budget hoisted to the
+    # pass would silently starve every tenant after the first.
+    calls.clear()
+    # A fresh backlog for tenant B — the fake session serves each query once,
+    # so re-fixturing is how a second tenant's stage is presented.
+    _fixture(monkeypatch, tmp_path, _vault_of(10), active_scopes=2)
+    tenant_b = asyncio.run(indexer.embed_vault(user_id=9))
+    assert calls == ["n0.md"], (
+        "tenant B inherited tenant A's exhausted budget instead of its own"
+    )
+    assert tenant_b.embedded == 1
+    assert tenant_b.failures == 0, "A's budget stop was recorded against B"
+    # And neither stop reached the run row as an error: a budget stop is a
+    # decision, not an outage (#201 would otherwise fire on a healthy server).
+    assert (result.failure_summary, tenant_b.failure_summary) == (None, None)
+
+
+def test_a_certification_race_still_debits_the_budget(monkeypatch, tmp_path):
+    """The budget is debited at the provider call, not at the return.
+
+    `certify_embedded` raises `StaleCertification` when the row moved under the
+    call, and the call had already been made. Debiting from the returned
+    `chunks_submitted` therefore never debited this path at all: a tenant
+    losing that race on every note issued provider calls for the whole stage,
+    every stage, and never became budget-exhaustible — #202 surviving inside
+    its own fix. The provider time is spent either way, which is the only thing
+    the budget is about.
+    """
+    _fixture(monkeypatch, tmp_path, _vault_of(10), active_scopes=2)
+    _no_sweep(monkeypatch)
+    _budgets(monkeypatch, chunks=5)
+
+    calls = []
+
+    async def _moved(_session, note, _content, *, on_provider_call=None, **_kw):
+        calls.append(note.file_path)
+        if on_provider_call is not None:
+            on_provider_call(5)
+        raise indexer.StaleCertification(f"{note.file_path} moved")
+
+    monkeypatch.setattr(indexer, "embed_note", _moved)
+
+    result = asyncio.run(indexer.embed_vault(user_id=7))
+    assert calls == ["n0.md"], (
+        "the tenant kept calling the provider without ever exhausting its "
+        "budget"
+    )
+    assert result.attempted == 1
+    assert (result.embedded, result.failures) == (0, 0)
+
 
 def test_a_note_in_flight_is_finished_and_certified(monkeypatch, tmp_path):
     """The budget is exhausted partway through the first note's chunks.

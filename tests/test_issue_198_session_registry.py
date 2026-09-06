@@ -755,7 +755,15 @@ async def test_a_raising_touch_still_serves_the_page(records):
 
     replay = sh.browser_request(session=dict(request.session))
     assert await get_active_session_user(replay, registry) is user
-    assert registry.rolled_back == 1
+    # **The savepoint absorbed it; the request's own transaction did not move.**
+    # `Session.rollback()` expires every object loaded in the transaction, and
+    # the object loaded in this one is the authenticated user just returned —
+    # so rolling back to recover from a failed *telemetry* write handed the
+    # panel an expired instance, and the next attribute read became lazy I/O on
+    # an async session: `MissingGreenlet` instead of the page. A `GET` that
+    # would have worked failed **because** the optional write failed.
+    assert registry.savepoint_rollbacks == 1
+    assert registry.rolled_back == 0, "the enclosing transaction must be untouched"
 
     # Through the emitter, not the bare logger (design D23): the touch
     # interval gates the *write*, and a failing write records no new
@@ -770,18 +778,55 @@ async def test_a_raising_touch_still_serves_the_page(records):
     assert "the last-seen write failed" not in _rendered(records)
 
 
-async def test_a_touch_whose_rollback_also_fails_still_serves_the_page(records):
-    user = sh.fake_user(7)
+async def test_a_failing_touch_leaves_the_user_usable_not_expired(records):
+    """The property the savepoint exists for, stated as the caller sees it.
+
+    The returned user must still answer for its columns after the touch has
+    failed. Against a real `AsyncSession` an outer rollback would have expired
+    it and the next read would raise `MissingGreenlet`; here the assertion is
+    that the transaction was never rolled back at all, so nothing could have
+    been expired.
+    """
+    user = sh.fake_user(7, username="alice", is_admin=True)
     _sid, request, registry = await sh.sign_in(user)
     registry.sessions[0].last_seen_at = sh.utcnow() - datetime.timedelta(hours=1)
     registry.fail_on = "UPDATE user_sessions SET last_seen_at"
-    registry.fail_with = RuntimeError("write failed")
+    registry.fail_with = RuntimeError("the last-seen write failed")
+
+    replay = sh.browser_request(session=dict(request.session))
+    resolved = await get_active_session_user(replay, registry)
+
+    assert resolved is user
+    assert (resolved.id, resolved.username, resolved.is_admin) == (7, "alice", True)
+    assert registry.rolled_back == 0
+    assert registry.expunged == [], "nothing had to be detached; nothing expired"
+    assert [r.reason for r in _touch_failures(records)] == ["touch"]
+
+
+async def test_a_touch_whose_commit_fails_detaches_the_user_before_rolling_back(records):
+    """The rarer half: the savepoint released and the *commit* then failed.
+
+    A failed commit leaves the session unusable and its rollback expires what
+    is loaded, savepoint or not — so the authenticated user is detached first.
+    A detached instance keeps every column it has already loaded, which is what
+    the panel reads; an expired one goes back to the database for them, and
+    there is no database left to go to.
+    """
+    user = sh.fake_user(7, username="alice")
+    _sid, request, registry = await sh.sign_in(user)
+    registry.sessions[0].last_seen_at = sh.utcnow() - datetime.timedelta(hours=1)
+    registry.fail_commit = RuntimeError("commit failed")
     registry.fail_rollback = RuntimeError("rollback failed")
 
     replay = sh.browser_request(session=dict(request.session))
-    assert await get_active_session_user(replay, registry) is user
+    resolved = await get_active_session_user(replay, registry)
 
-    # Both stages, named apart: a failing update with a working rollback is a
+    assert resolved is user
+    assert resolved.username == "alice"
+    assert registry.savepoint_rollbacks == 0, "the write itself succeeded"
+    assert registry.expunged == [user], "detached before the rollback, not after"
+
+    # Both stages, named apart: a failing write with a working rollback is a
     # database refusing one statement; a failing rollback is a connection that
     # is gone. Same request, two different pages for the operator.
     stages = [r.reason for r in _touch_failures(records)]
