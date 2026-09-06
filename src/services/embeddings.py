@@ -18,7 +18,7 @@ from src.config import (
     settings,
 )
 from src.models.db import NoteEmbedding, NoteMetadata
-from src.services import timing
+from src.services import refusals, timing
 from src.services.filters import apply_note_filters
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
@@ -340,6 +340,157 @@ def _coerce_keep_alive(value: str):
         return value
 
 
+# ── Provider input-limit translation (#194) ─────────────────────────────────
+#
+# A provider can refuse a request because the input exceeds *its* limit, and
+# that limit is a token limit, not the character cap `_tracked` enforces before
+# the tool body: 8,192 characters of a densely-tokenizing script still exceed
+# 8,192 tokens. `MAX_SEARCH_QUERY_CHARS` is therefore necessary and **not
+# sufficient**, and the second half of that pair lives here — each provider
+# recognises its own input-limit rejection and raises
+# `refusals.ProviderInputTooLarge`, which `semantic_search_impl` renders as the
+# ordinary `argument_too_long` refusal carrying the provider's stated reason.
+# The agent then sees one actionable failure mode for "the query was too large"
+# whichever limit actually applied, instead of a raw provider error.
+#
+# The exception type is declared in `src/services/refusals.py`, which imports
+# nothing from the application, so the module that raises it and the module
+# that handles it share one dependency-free contract and neither depends on the
+# other's module.
+#
+# **An input-limit rejection is never retried.** It is a fact about the bytes
+# we sent, not about the provider's health — the same input fails identically
+# on every attempt — so both checks below sit *before* the retry decision.
+# #127's 429/5xx backoff is untouched for every other error, and a generic
+# provider error still propagates exactly as it did.
+#
+# **The indexer is not a caller that can shorten its input.** `embed_note`
+# catches this exception along with every other provider exception and records
+# the ordinary `PROVIDER_FAILED` outcome carrying the class name; only a search
+# caller can act on the refusal, so only the search tools translate it.
+
+#: Truncation bound for the provider's own message. The reason reaches two
+#: places a vendor's text must not be able to flood — the caller-facing refusal
+#: `semantic_search_impl` renders, and the `usage_logs` row beside it — and a
+#: provider that echoes the offending input back inside its error message is a
+#: real shape. So the bound is applied **at capture**, the
+#: `MAX_EMBED_FAILURE_MESSAGE_CHARS` precedent, rather than trusted to whoever
+#: renders it later.
+MAX_PROVIDER_REASON_CHARS = 300
+
+#: The HTTP statuses an input-limit rejection is looked for on. 400 is the
+#: documented one for both providers; 413 and 422 are what an
+#: OpenAI-compatible gateway in front of a model may answer instead. **429 is
+#: deliberately absent**: a rate limit is a fact about velocity, it is
+#: retryable, and translating it into "your query was too long" would both lie
+#: to the caller and skip the backoff that makes it succeed.
+_INPUT_LIMIT_STATUSES = frozenset({400, 413, 422})
+
+#: OpenAI `error.code` / `error.type` values that mean the input was too large.
+#: `context_length_exceeded` is the long-standing one; `max_tokens_per_request`
+#: is the per-request token ceiling the embeddings endpoint enforces;
+#: `string_above_max_length` is the raw character bound on a single input
+#: element.
+_OPENAI_INPUT_LIMIT_CODES = frozenset(
+    {
+        "context_length_exceeded",
+        "max_tokens_per_request",
+        "string_above_max_length",
+    }
+)
+
+#: Ollama sends a bare `{"error": "..."}` string with no machine-readable
+#: code, so its detection rests entirely on the phrase test below. Named rather
+#: than written inline so the two providers' branches read identically and a
+#: future Ollama error code has one obvious place to go.
+_OLLAMA_INPUT_LIMIT_CODES: frozenset[str] = frozenset()
+
+#: The message phrases that identify an input-limit rejection where the vendor
+#: sends no code to match on. Prose matching is the **fallback**, not the
+#: primary rule — a code is preferred wherever one is sent — and it is applied
+#: only on the statuses above, so a generic 400 (an unknown model, a malformed
+#: body) still propagates as the provider error it is.
+_INPUT_LIMIT_PHRASES = re.compile(
+    r"maximum context length"
+    r"|context length"
+    r"|context_length_exceeded"
+    r"|maximum (?:input )?(?:number of )?tokens"
+    r"|tokens per request"
+    r"|too many tokens"
+    r"|reduce your (?:prompt|input|message)"
+    r"|input (?:length |size )?(?:is )?too (?:long|large)"
+    r"|string too long"
+    r"|maximum length",
+    re.IGNORECASE,
+)
+
+
+def _bounded_reason(message: str) -> str:
+    """The provider's own words, whitespace-collapsed, bounded, never empty.
+
+    Never empty because the reason is interpolated into a sentence the caller
+    reads: an empty one would render "…refused this query as too large for its
+    own input limit: . The query is under…".
+    """
+    text = " ".join((message or "").split())
+    if not text:
+        return "the provider stated no reason"
+    if len(text) > MAX_PROVIDER_REASON_CHARS:
+        return text[: MAX_PROVIDER_REASON_CHARS - 1].rstrip() + "…"
+    return text
+
+
+def _error_message_and_code(response: httpx.Response) -> tuple[str, str]:
+    """`(message, code)` from an error body in either provider's shape.
+
+    OpenAI answers `{"error": {"message": …, "type": …, "code": …}}`; Ollama
+    answers `{"error": "…"}`. Anything else — HTML from a proxy, an empty body,
+    a truncated stream — yields the raw text and no code, so the phrase test
+    still gets its chance and **nothing on this path may raise**: a detection
+    helper that threw would convert a provider error into an internal one.
+    """
+    try:
+        payload = response.json()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        err = payload.get("error")
+        if isinstance(err, dict):
+            message = err.get("message")
+            code = err.get("code") or err.get("type") or ""
+            return (
+                message if isinstance(message, str) else "",
+                code if isinstance(code, str) else "",
+            )
+        if isinstance(err, str):
+            return err, ""
+        if isinstance(payload.get("message"), str):
+            return payload["message"], ""
+    try:
+        return response.text or "", ""
+    except Exception:
+        return "", ""
+
+
+def _input_limit_reason(
+    response: httpx.Response, *, codes: frozenset[str]
+) -> str | None:
+    """The provider's stated reason when this response is an input-limit
+    rejection, else `None`.
+
+    `None` is the "nothing changed" answer: the caller must go on handling the
+    response exactly as it did before this function existed, retries and all.
+    """
+    if response.status_code not in _INPUT_LIMIT_STATUSES:
+        return None
+    message, code = _error_message_and_code(response)
+    if code and code in codes:
+        return _bounded_reason(message or code)
+    if message and _INPUT_LIMIT_PHRASES.search(message):
+        return _bounded_reason(message)
+    return None
+
+
 class OllamaProvider:
     """Default provider — POSTs to a self-hosted Ollama instance, one input
     per request. Sends `keep_alive` so the model stays resident between
@@ -355,6 +506,19 @@ class OllamaProvider:
                     "keep_alive": _coerce_keep_alive(settings.ollama_keep_alive),
                 },
             )
+            if response.status_code >= 400:
+                # Ollama **truncates** rather than rejecting on the ordinary
+                # path: `/api/embed` takes a `truncate` flag that defaults to
+                # true and we do not send it, so an over-long input normally
+                # comes back as a vector computed over the model's context
+                # window. This branch is for the deployments and models that
+                # report the limit instead of silently shortening the input;
+                # where it is not taken, nothing about this call changes.
+                reason = _input_limit_reason(
+                    response, codes=_OLLAMA_INPUT_LIMIT_CODES
+                )
+                if reason is not None:
+                    raise refusals.ProviderInputTooLarge(reason, provider="ollama")
             response.raise_for_status()
             data = response.json()
             return data["embeddings"][0]
@@ -423,6 +587,19 @@ class OpenAIProvider:
                     data = response.json()
                     rows = sorted(data["data"], key=lambda r: r["index"])
                     return [r["embedding"] for r in rows]
+
+                # Decided **before** `retryable`, deliberately: an input
+                # the provider will not accept fails identically on every
+                # attempt, so retrying it would turn one refusal into three
+                # provider round trips and three times the latency before the
+                # caller hears the one thing it can act on. No status in
+                # `_INPUT_LIMIT_STATUSES` is retryable today — this ordering is
+                # what keeps that true if one ever becomes so.
+                reason = _input_limit_reason(
+                    response, codes=_OPENAI_INPUT_LIMIT_CODES
+                )
+                if reason is not None:
+                    raise refusals.ProviderInputTooLarge(reason, provider="openai")
 
                 retryable = status == 429 or 500 <= status < 600
                 if retryable and attempt < self.MAX_ATTEMPTS:
@@ -819,6 +996,14 @@ async def embed_note(
         # provider blip indistinguishable from a database error at the call
         # site, which is the conflation the typed outcome exists to remove.
         # Nothing is written, so the note's previous vectors survive (#11).
+        #
+        # `refusals.ProviderInputTooLarge` lands here with every other provider
+        # exception, deliberately (#194): the indexer is not a caller that can
+        # shorten its input, so there is nobody to translate the refusal for.
+        # The pass record is the ordinary `PROVIDER_FAILED` carrying the class
+        # name, which is the honest one — nothing certified, previous vectors
+        # intact, the note retried next pass. Only the search tools translate
+        # this exception into a caller-facing refusal.
         logger.warning(f"Failed to embed {note.file_path}: {e}")
         return EmbedNoteResult(
             outcome=NoteEmbedOutcome.PROVIDER_FAILED,
