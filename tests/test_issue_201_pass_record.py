@@ -638,6 +638,145 @@ def test_a_sweep_that_repairs_records_no_failure(monkeypatch, tmp_path):
     assert calls == ["s1.md"]
     assert (result.failures, result.attempted) == (0, 1)
     assert result.failure_summary is None
+    # **And it is counted as embedded** (adversarial review). The sweep commits
+    # its vectors through the same `certify_embedded` predicate the backlog
+    # uses, and on a fully indexed vault it is the only stage making provider
+    # calls — so leaving `embedded` at zero here made `notes_embedded`
+    # under-report exactly the pass whose entire output was the sweep's.
+    assert result.embedded == 1, (
+        "the sweep committed vectors that the run row did not count"
+    )
+
+
+def test_a_sweep_that_repairs_several_notes_counts_every_one(
+    monkeypatch, tmp_path
+):
+    """Two repairs and two rows that need none: `embedded` is 2, not 4.
+
+    The counterpart to the failure case above — the denominator must still be
+    the calls the sweep made, and now the numerator must be the notes it
+    actually certified.
+    """
+    sweep = [
+        ("s1.md", "one\n", False),
+        ("s2.md", "two\n", False),
+        ("ok1.md", "three\n", True),
+        ("ok2.md", "four\n", True),
+    ]
+    _fixture(monkeypatch, tmp_path, {}, sweep=sweep)
+
+    async def _ok(_session, note, _content, **_kw):
+        return embedded(2)
+
+    monkeypatch.setattr(indexer, "embed_note", _ok)
+
+    result = asyncio.run(indexer.embed_vault(user_id=7))
+    assert (result.embedded, result.attempted, result.failures) == (2, 2, 0)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The accounting boundary is the provider call, not the return
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _announces_then_raises(exc_factory, *, chunks: int, calls: list):
+    """A fake `embed_note` shaped like the real one's dangerous path.
+
+    The real function issues the provider call and *then* certifies, and
+    `certify_embedded` raises `StaleCertification` when the row moved under it.
+    Everything between the provider call and the return can therefore raise
+    with the call already made and its time already spent — which is why the
+    attempt and the chunk debit are announced through `on_provider_call` at
+    issuance rather than reconstructed from a result the caller may never see.
+    """
+
+    async def _fake(_session, note, _content, *, on_provider_call=None, **_kw):
+        calls.append(note.file_path)
+        if on_provider_call is not None:
+            on_provider_call(chunks)
+        raise exc_factory(note.file_path)
+
+    return _fake
+
+
+def test_a_certification_that_raises_after_the_provider_call_is_attempted(
+    monkeypatch, tmp_path
+):
+    """`StaleCertification` is not a failure, but it *is* an attempt.
+
+    The row moved between the byte verification and the certification, so the
+    vectors are discarded and the note is left for a later pass — correctly not
+    a failure of this note. But the provider call was made, and a pass whose
+    every note lost that race used to report `attempted = 0` while burning the
+    whole stage's provider time. `3 of 0` is not a denominator.
+    """
+    _fixture(monkeypatch, tmp_path, {
+        "A.md": "alpha\n", "B.md": "beta\n", "C.md": "gamma\n",
+    })
+    _no_sweep(monkeypatch)
+
+    calls: list[str] = []
+    monkeypatch.setattr(indexer, "embed_note", _announces_then_raises(
+        lambda path: indexer.StaleCertification(f"{path} moved"),
+        chunks=4,
+        calls=calls,
+    ))
+
+    result = asyncio.run(indexer.embed_vault(user_id=7))
+
+    assert calls == ["A.md", "B.md", "C.md"], "the backlog stopped early"
+    assert result.attempted == 3, (
+        "three provider calls were made and none of them was counted"
+    )
+    assert result.embedded == 0
+    assert result.failures == 0, "a lost certification race is not a failure"
+
+
+def test_a_database_error_after_the_provider_call_is_attempted_and_failed(
+    monkeypatch, tmp_path
+):
+    """The other escaping path: counted as an attempt *and* as a failure.
+
+    The generic handler already recorded the failure; what it could not do was
+    know that a provider call had been issued, because that fact only ever
+    reached it on the returned result.
+    """
+    _fixture(monkeypatch, tmp_path, {"A.md": "alpha\n", "B.md": "beta\n"})
+    _no_sweep(monkeypatch)
+
+    calls: list[str] = []
+    monkeypatch.setattr(indexer, "embed_note", _announces_then_raises(
+        lambda path: RuntimeError(f"deadlock detected writing {path}"),
+        chunks=6,
+        calls=calls,
+    ))
+
+    result = asyncio.run(indexer.embed_vault(user_id=7))
+
+    assert (result.attempted, result.failures, result.embedded) == (2, 2, 0)
+    assert "embed failures: 2 of 2" in result.failure_summary
+
+
+def test_the_announced_call_is_not_counted_twice(monkeypatch, tmp_path):
+    """The reconciling backstop is idempotent per note.
+
+    `embed_note` announces at issuance and the loop reconciles from the result
+    afterwards, so the ordinary path reports the same call from both sides. It
+    must land on the counters exactly once.
+    """
+    _fixture(monkeypatch, tmp_path, {"A.md": "alpha\n", "B.md": "beta\n"})
+    _no_sweep(monkeypatch)
+
+    async def _both(_session, _note, _content, *, on_provider_call=None, **_kw):
+        if on_provider_call is not None:
+            on_provider_call(5)
+        return embedded(5)
+
+    monkeypatch.setattr(indexer, "embed_note", _both)
+
+    result = asyncio.run(indexer.embed_vault(user_id=7))
+    assert result.attempted == 2, "the provider call was counted twice"
+    assert result.embedded == 2
 
 
 # ══════════════════════════════════════════════════════════════════════════

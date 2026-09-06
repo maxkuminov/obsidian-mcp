@@ -185,6 +185,7 @@ The lock's rules:
 
 Holding the lock for the duration of a long pass is accepted: the maintenance operations then **wait** for an in-flight pass rather than interleaving with it, which is the required behaviour, and those operations SHALL NOT defeat it with a short lock timeout — **nor with any other timeout that applies to the acquisition**. The connection carries a statement timeout and the advisory-lock acquisition is a statement, so every path whose contract is "it waits" SHALL lift that timeout for the acquisition alone and restore the previous value once the lock is held. Lifting it beforehand SHALL NOT be treated as a violation of the ordering rule: a session-variable assignment takes no row or table lock and is invisible to the lock graph. The waiting side includes the incremental index pass whenever a maintenance operation holds the lock first; only the per-note embedding acquisition keeps the connection's timeout, because that transaction must not sit on a lock for minutes and its mismatch disposition is already to leave the note for a later pass.
 - **The key SHALL be a single declared constant**, defined in one place and not derived at runtime from a value that could differ between builds.
+- **Any keyword-vector writer retained outside the interlock SHALL be private and SHALL have no production caller**, and that SHALL be enforced by a test rather than by a comment. The single-scope keyword rebuild kept for the tests that hold its per-scope contract writes `content_tsvector` without taking the lock or re-reading the fingerprint; exported under a plausible public name beside the operational driver, it reads like the per-user version of it, and one row written through it under a superseded configuration keeps that vector indefinitely behind a fingerprint claiming otherwise.
 
 **The exclusion branch is exempt**, and the exemption is by argument rather than omission: it issues no provider call, writes no vector, and stamps a row to record that an *excluded* note has been dealt with — a claim true under any configuration, because the correct vector set for an excluded note is the empty one. It has nothing a generation change can invalidate.
 
@@ -205,6 +206,12 @@ The documented ordering for any change to the embedding configuration SHALL stil
 - **THEN** that write SHALL be refused under the generation lock
 - **AND** that pass SHALL abort with nothing committed
 - **AND** the rebuilt row SHALL NOT be overwritten with a vector built under the previous configuration
+
+#### Scenario: The single-scope rebuild is private and uncalled
+
+- **WHEN** the tree is searched for callers of the single-scope keyword rebuild under the application and script trees
+- **THEN** there SHALL be none, and the function SHALL NOT be exported under a public name
+- **AND** a test SHALL fail if either changes
 
 #### Scenario: The rebuild takes the lock before it reads
 

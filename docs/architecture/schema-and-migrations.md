@@ -149,6 +149,21 @@ A pre-existing object of either name is refused, not adopted, for the reason
 covers the whole note, and a wrong value either hides a capped note from an
 agent or invents a cap that never happened.
 
+**On the way *down*, the two units are decided independently.** `upgrade()`
+refuses as a whole — an unrecognised object of either name means the database
+is not what 023 assumes and nothing should be created against it. `downgrade()`
+does not: it drops each unit only if that unit carries 023's marker, prints
+which unmarked object it is leaving and why, and completes. The first
+implementation raised there too, which rolled the whole downgrade back — so a
+foreign `chunks_truncated` also preserved the `indexer_state` table 023 *did*
+create, and the downgrade could not run at all until an operator deleted
+somebody else's column by hand. One unit's provenance is not a veto over the
+other's; the two share a revision, not a lifecycle. The skip is `print`ed
+rather than logged because `alembic/env.py` never calls `fileConfig`, so
+`alembic.ini`'s logger configuration is not applied and a `logger.warning` from
+a migration body reaches nothing — and a silent skip is indistinguishable from
+a completed drop.
+
 **023 pins `SET LOCAL search_path TO public`** and asserts afterwards that the
 unqualified name really resolves to `public.indexer_state`. 021 introduced the
 pin and `RESET`s its own at the end of `upgrade()`, so a later revision in the

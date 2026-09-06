@@ -545,12 +545,43 @@ def upgrade() -> None:
     op.execute("RESET search_path")
 
 
+def _skip_unmarked(what: str, found: str | None, expected: str) -> None:
+    """Leave an object of one of 023's names that 023 did not create.
+
+    **A skip, not a refusal, and the distinction is per unit** (adversarial
+    review). The first implementation raised, which rolled the whole downgrade
+    back — so a foreign `chunks_truncated` also preserved the `indexer_state`
+    table that 023 *did* create, and the downgrade could not complete at all
+    until an operator removed somebody else's column by hand. That makes one
+    unit's provenance a veto over the other's, which is neither what the
+    requirement says ("drop each unit only if it carries the marker,
+    all-or-nothing **per unit**") nor useful: the two units share a revision,
+    not a lifecycle. Each is decided on its own marker, the unmarked one is
+    left exactly as it was found, and the operator is told which and why.
+    """
+    # `print`, not `logging`. `alembic/env.py` never calls `fileConfig`, so
+    # `alembic.ini`'s `[loggers]` section is not applied and a `logger.warning`
+    # from a migration body reaches nothing — the skip would be silent, and a
+    # silent skip is indistinguishable from a completed drop. stdout of
+    # `alembic downgrade` is where an operator is already looking.
+    print(
+        f"023 downgrade: leaving {what} in place. It does not carry 023's "
+        f"comment marker ({expected!r}) — its comment is {found!r} — so 023 "
+        "did not create it and will not drop it. Remove it by hand if you "
+        "mean to. The other unit of this revision is decided on its own "
+        "marker.",
+        flush=True,
+    )
+
+
 def downgrade() -> None:
     """Drop each unit only if it carries 023's marker.
 
     013's rule: a downgrade must undo *this* migration, not delete a table or a
     column somebody else put there under these names. The marker is the only
-    evidence of authorship, and each unit is decided on its own marker.
+    evidence of authorship, and **each unit is decided on its own marker** — an
+    unmarked one is left in place and logged, and it does not veto the other's
+    removal. See `_skip_unmarked`.
 
     Dropping `indexer_state` discards both fingerprints and the rotation
     cursor. Nothing is lost that cannot be re-derived: the previous build reads
@@ -576,22 +607,17 @@ def downgrade() -> None:
     state = _column_state(bind)
     if state is not None:
         if state[3] != COLUMN_MARKER:
-            raise RuntimeError(
-                f"{NOTES_TABLE}.{CHUNKS_COLUMN} does not carry 023's comment "
-                f"marker ({COLUMN_MARKER!r}), so 023 did not create it and "
-                "will not drop it. Nothing has been changed. Remove it by hand "
-                "if you mean to."
+            _skip_unmarked(
+                f"{NOTES_TABLE}.{CHUNKS_COLUMN}", state[3], COLUMN_MARKER
             )
-        op.drop_column(NOTES_TABLE, CHUNKS_COLUMN)
+        else:
+            op.drop_column(NOTES_TABLE, CHUNKS_COLUMN)
 
     if _table_exists(bind):
-        if _table_comment(bind) != TABLE_MARKER:
-            raise RuntimeError(
-                f"{STATE_TABLE} does not carry 023's comment marker "
-                f"({TABLE_MARKER!r}), so 023 did not create it and will not "
-                "drop it. Nothing has been changed. Remove it by hand if you "
-                "mean to."
-            )
-        op.drop_table(STATE_TABLE)
+        comment = _table_comment(bind)
+        if comment != TABLE_MARKER:
+            _skip_unmarked(STATE_TABLE, comment, TABLE_MARKER)
+        else:
+            op.drop_table(STATE_TABLE)
 
     op.execute("RESET search_path")

@@ -4435,9 +4435,17 @@ def test_downgrade_023_drops_the_marked_units_and_upgrade_rebuilds_them():
         )
 
 
-def test_downgrade_023_refuses_a_table_it_did_not_create():
+def test_downgrade_023_leaves_a_table_it_did_not_create_and_drops_the_column():
     """013's rule on the way back down: undo *this* migration, not delete
-    somebody else's table of the same name."""
+    somebody else's table of the same name.
+
+    **Decided per unit** (adversarial review). The first implementation raised,
+    which rolled the whole downgrade back — so a foreign `indexer_state` also
+    preserved the column 023 *did* create, and the downgrade could not complete
+    until an operator removed somebody else's table by hand. One unit's
+    provenance is not a veto over the other's; the requirement says
+    "all-or-nothing per unit", and the two share a revision, not a lifecycle.
+    """
     with throwaway_db("schema_is_downgrade_foreign_table") as url:
         sql(
             url,
@@ -4446,15 +4454,25 @@ def test_downgrade_023_refuses_a_table_it_did_not_create():
         result = _harness.run_alembic(
             url, "downgrade", "022", dimensions=DIM, check=False
         )
-        assert result.returncode != 0
-        assert "023's comment marker" in result.stdout + result.stderr
+        assert result.returncode == 0, (
+            f"the downgrade refused instead of skipping\n{result.stdout}\n"
+            f"{result.stderr}"
+        )
+        assert "023's comment marker" in result.stdout + result.stderr, (
+            "the skip was silent — an operator must be told which object was "
+            "left and why"
+        )
+        assert alembic_version(url) == "022"
+        # The unmarked table is left exactly as it was found …
         assert fetchval(url, "SELECT to_regclass('indexer_state')") is not None
-        # Per-unit all-or-nothing: the refusal rolls the whole downgrade back,
-        # so the column 023 *did* create is still there too.
-        assert column_shape(url, "notes_metadata", "chunks_truncated") is not None
+        assert indexer_state_table_comment(url) == "somebody else made this"
+        # … and the column 023 really did create is still dropped.
+        assert column_shape(url, "notes_metadata", "chunks_truncated") is None
 
 
-def test_downgrade_023_refuses_a_column_it_did_not_create():
+def test_downgrade_023_leaves_a_column_it_did_not_create_and_drops_the_table():
+    """The mirror image, so neither unit can veto the other in either
+    direction."""
     with throwaway_db("schema_is_downgrade_foreign_column") as url:
         sql(
             url,
@@ -4464,10 +4482,15 @@ def test_downgrade_023_refuses_a_column_it_did_not_create():
         result = _harness.run_alembic(
             url, "downgrade", "022", dimensions=DIM, check=False
         )
-        assert result.returncode != 0
+        assert result.returncode == 0, (
+            f"the downgrade refused instead of skipping\n{result.stdout}\n"
+            f"{result.stderr}"
+        )
         assert "023's comment marker" in result.stdout + result.stderr
+        assert alembic_version(url) == "022"
         assert column_shape(url, "notes_metadata", "chunks_truncated") is not None
-        assert fetchval(url, "SELECT to_regclass('indexer_state')") is not None
+        assert chunks_truncated_comment(url) == "somebody else made this"
+        assert fetchval(url, "SELECT to_regclass('indexer_state')") is None
 
 
 # ══════════════════════════════════════════════════════════════════════════

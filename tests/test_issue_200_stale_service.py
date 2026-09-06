@@ -240,6 +240,81 @@ async def test_an_all_stale_corpus_returns_its_usual_results_without_a_fallback(
     assert timing.current()["exact_fallback"] is False
 
 
+# --------------------------------------------------------------------------- #
+# The exact fallback annotates identically
+# --------------------------------------------------------------------------- #
+#
+# The zero-row safety net re-runs the *identical* statement with index scans
+# off, and staleness is computed after it, from the already-hydrated
+# `NoteMetadata`. Nothing in the annotation is supposed to know which of the
+# two runs produced the rows — but "supposed to" is the part a later change
+# breaks silently, because the fallback path is the rare one and every ordinary
+# test drives the fast one. These pin the annotation on the path an agent hits
+# exactly when the index is least able to help it.
+
+
+@pytest.mark.asyncio
+async def test_the_exact_fallback_annotates_a_mixed_result_identically(holder):
+    """Fresh, stale-by-hash and never-embedded, in one fallback result.
+
+    Order and membership are the fast path's — the fallback is the same
+    statement — and the markers are per row rather than per path.
+    """
+    fresh = _Note(1, "Fresh.md", content_hash="h2", embedded_content_hash="h2")
+    edited = _Note(2, "Edited.md", content_hash="h2", embedded_content_hash="h1")
+    never = _Note(3, "Never.md", content_hash="h9", embedded_content_hash=None)
+    rows = [
+        _row(fresh, text="a current excerpt", distance=0.1),
+        _row(edited, text="SUPERSEDED text", distance=0.2),
+        _row(never, text="SUPERSEDED text", distance=0.3),
+    ]
+    # The first run comes back empty, which is what arms the fallback.
+    session = _Session([[], rows])
+
+    results = await semantic_search(session, "q", limit=10)
+
+    assert "SET LOCAL enable_indexscan = off" in " | ".join(session.statements)
+    assert timing.current()["exact_fallback"] is True
+    assert [r["path"] for r in results] == [
+        "Fresh.md", "Edited.md", "Never.md"
+    ], "the fallback changed the order or the membership of the result"
+    assert [r["stale"] for r in results] == [False, True, True], (
+        "`IS DISTINCT FROM`: a NULL `embedded_content_hash` is stale, not fresh"
+    )
+    assert results[0]["chunk"] == "a current excerpt"
+    assert [r["chunk"] for r in results[1:]] == [None, None]
+    assert "SUPERSEDED" not in repr(results)
+
+
+@pytest.mark.asyncio
+async def test_the_exact_fallback_withholds_every_preview_when_all_are_stale(
+    holder,
+):
+    """The outage shape, reached through the fallback.
+
+    A provider outage eventually makes every row stale, and an outage is also
+    when the HNSW window is most likely to come back empty and arm the exact
+    re-run. The two compose: every row is returned, ranked and named, and not
+    one of them quotes superseded text.
+    """
+    rows = [
+        _row(
+            _Note(i, f"n{i}.md", embedded_content_hash="old"),
+            text="SUPERSEDED text",
+            distance=i / 10,
+        )
+        for i in range(1, 4)
+    ]
+    session = _Session([[], rows])
+
+    results = await semantic_search(session, "q", limit=10)
+
+    assert timing.current()["exact_fallback"] is True
+    assert [r["path"] for r in results] == ["n1.md", "n2.md", "n3.md"]
+    assert all(r["stale"] is True for r in results)
+    assert all(r["chunk"] is None for r in results)
+
+
 @pytest.mark.asyncio
 async def test_no_predicate_or_set_local_changed(holder):
     """D2 adds columns and post-processing only. The `SET LOCAL`s are

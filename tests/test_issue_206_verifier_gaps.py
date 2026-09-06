@@ -18,9 +18,9 @@ without noticing, because nothing fails.
 - **The rebuild driver's all-or-nothing abort does not reach the link
   backfill** (`index-integrity`, "The exception does not reach the link
   backfill").
-- **`rebuild_tsvectors(session, user_id)` has no production caller** — the
-  single-scope entry point the architecture note says anything acquiring a
-  caller must first take the generation lock for.
+- **The single-scope keyword rebuild is private and has no production
+  caller** — it writes `content_tsvector` outside the generation-lock
+  interlock, so both its name and its caller set are guarded.
 
 Fully offline.
 """
@@ -297,12 +297,51 @@ def test_the_rebuild_drivers_abort_is_not_reachable_from_the_backfill():
 
 
 # --------------------------------------------------------------------------- #
-# (5) The single-scope keyword rebuild has no production caller
+# The lock wait needs the raise because the engine caps every statement
+# --------------------------------------------------------------------------- #
+
+
+def test_the_engine_still_caps_every_statement():
+    """The premise of `acquire_generation_lock_unbounded`, asserted.
+
+    `pg_advisory_xact_lock` is a statement, so the connection's
+    `statement_timeout` bounds the *wait* for the generation lock — which is
+    why every path whose contract is "it waits for an in-flight pass" lifts it
+    for the acquisition and restores it afterwards. The integration test that
+    proves the raise works lowers the timeout to one second, because waiting
+    out the production sixty would cost a minute per case and prove the same
+    thing.
+
+    That scale model is only faithful while production actually sets a cap. If
+    `server_settings` ever stopped setting `statement_timeout`, the raise would
+    become dead code protecting nothing, the integration test would still pass
+    against its own lowered value, and nobody would learn that the reason for
+    the helper had gone away. So the premise is pinned here, in the one place
+    that reads it as a premise rather than as tuning.
+    """
+    source = (ROOT / "src" / "database.py").read_text()
+    assert '"statement_timeout"' in source, (
+        "src/database.py no longer sets a per-connection statement_timeout. "
+        "If that is deliberate, `acquire_generation_lock_unbounded` no longer "
+        "has anything to lift and the integration test that lowers the "
+        "timeout to 1s is testing a scale model of nothing — revisit both "
+        "before deleting this test."
+    )
+    assert '"statement_timeout": "0"' not in source, (
+        "the engine's statement_timeout was set to 0 (no cap); see above"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# (5) The single-scope keyword rebuild is private and has no production caller
 # --------------------------------------------------------------------------- #
 
 #: Where a production caller could appear. Tests are excluded deliberately:
-#: `rebuild_tsvectors` keeps its `int` contract *for* them.
+#: the single-scope rebuild keeps its `int` contract *for* them.
 PRODUCTION_TREES = ("src", "scripts")
+
+#: The single-scope keyword rebuild, named for its only legitimate caller.
+SINGLE_SCOPE_REBUILD = "_rebuild_tsvectors_single_scope_for_tests"
 
 
 def _calls_named(name: str) -> list[str]:
@@ -325,30 +364,57 @@ def _calls_named(name: str) -> list[str]:
     return hits
 
 
-def test_rebuild_tsvectors_still_has_no_production_caller():
+def test_the_single_scope_rebuild_stays_private():
+    """No public `rebuild_tsvectors` may reappear on the indexer.
+
+    The name is half the guard. This function commits keyword vectors without
+    taking the index generation lock and without re-reading the keyword
+    fingerprint under it, which every other production writer of
+    `content_tsvector` does — the incremental pass at the head of its
+    transaction, the all-scopes driver before its first read. A public
+    `rebuild_tsvectors` sitting beside `rebuild_tsvectors_all_scopes` reads
+    like the cheap per-user version of it, and picking the wrong one writes a
+    row outside the interlock.
+    """
+    assert hasattr(indexer, SINGLE_SCOPE_REBUILD), (
+        f"{SINGLE_SCOPE_REBUILD} is gone; if the single-scope rebuild was "
+        "removed outright, remove these two tests with it"
+    )
+    assert not hasattr(indexer, "rebuild_tsvectors"), (
+        "a public `rebuild_tsvectors` is back on the indexer. It writes "
+        "`content_tsvector` outside the generation-lock interlock, and beside "
+        "`rebuild_tsvectors_all_scopes` it reads like the per-user version of "
+        "the operational entry point."
+    )
+
+
+def test_the_single_scope_rebuild_has_no_production_caller():
     """A caller would need the generation lock, and would not have it.
 
-    `rebuild_tsvectors(session, user_id)` survives as a single-scope entry
-    point for the tests that hold its `int` contract. Every *production*
-    writer of `content_tsvector` takes the index generation lock at the head of
-    its transaction and re-reads the keyword fingerprint under it — the
-    incremental pass does, and the all-scopes driver does before it reads its
-    first row. This one does neither, because nothing calls it.
+    The single-scope rebuild survives for the tests that hold its `int`
+    contract — atomicity, the certified UPDATE predicate, the provenance gate.
+    Every *production* writer of `content_tsvector` takes the index generation
+    lock at the head of its transaction and re-reads the keyword fingerprint
+    under it. This one does neither, because nothing in `src/` or `scripts/`
+    calls it.
 
     Giving it a caller is therefore not a small change: it introduces a
     keyword-vector writer outside the interlock, and a keyword vector is
     rewritten only when a note's content hash changes, so a row written under
     a superseded `FTS_CONFIGS` would keep that vector indefinitely behind a
-    fingerprint claiming otherwise. Whoever adds the caller must take the lock
-    first — and must delete this test on purpose rather than discover the
-    requirement afterwards.
+    fingerprint claiming otherwise — a keyword hit on a note that does not
+    contain the word, acted on by an agent unseen. Whoever adds the caller must
+    take the lock first, and must delete this test on purpose rather than
+    discover the requirement afterwards.
     """
-    callers = _calls_named("rebuild_tsvectors")
+    callers = _calls_named(SINGLE_SCOPE_REBUILD) + _calls_named(
+        "rebuild_tsvectors"
+    )
     assert callers == [], (
-        "`rebuild_tsvectors` gained a production caller at "
+        "the single-scope keyword rebuild gained a production caller at "
         f"{', '.join(callers)}. Take `acquire_generation_lock` (or the "
         "unbounded form) at the head of that transaction and re-read the "
         "keyword fingerprint under it before removing this test — see "
         "docs/architecture/indexing-and-embeddings.md, 'The index generation "
-        "lock'."
+        "lock'. `rebuild_tsvectors_all_scopes` already does both."
     )

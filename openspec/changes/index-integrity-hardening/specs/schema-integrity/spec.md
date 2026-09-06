@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Migration 023 owns the indexer state table and the chunk-truncation column as two marked units
-Migration 023 SHALL create the `indexer_state` table — `key` as the primary key, a non-null `value`, and a non-null `updated_at` defaulting to the transaction timestamp — stamped with 023's ownership marker as its table comment, and SHALL add `notes_metadata.chunks_truncated` as `BOOLEAN NOT NULL DEFAULT FALSE` stamped with 023's column marker as its column comment. It SHALL write no row into `indexer_state` and SHALL backfill no value into the column. `downgrade()` SHALL drop each unit only if it carries the marker, all-or-nothing per unit. After migrating to head, `alembic check` SHALL report no pending operations, and the same marker strings SHALL be declared on the ORM table and column so the check compares them.
+Migration 023 SHALL create the `indexer_state` table — `key` as the primary key, a non-null `value`, and a non-null `updated_at` defaulting to the transaction timestamp — stamped with 023's ownership marker as its table comment, and SHALL add `notes_metadata.chunks_truncated` as `BOOLEAN NOT NULL DEFAULT FALSE` stamped with 023's column marker as its column comment. It SHALL write no row into `indexer_state` and SHALL backfill no value into the column. `downgrade()` SHALL drop each unit only if it carries the marker, all-or-nothing **per unit**: an unmarked unit SHALL be left in place and named on the operator's output, and SHALL NOT prevent the other unit's removal — a refusal that rolled both back would make one unit's provenance a veto over the other's, and the two share a revision rather than a lifecycle. `upgrade()` refuses as a whole, which is the opposite disposition and the right one there: an unrecognised object of either name means the database is not what 023 assumes, so nothing may be created against it. After migrating to head, `alembic check` SHALL report no pending operations, and the same marker strings SHALL be declared on the ORM table and column so the check compares them.
 
 **`indexer_state` SHALL carry a CHECK constraint restricting `key` to the closed set of keys the application uses**, resolved through the catalogue rather than by name — a same-named `CHECK (true)` satisfies a lookup by name while enforcing nothing — with its definition compared against the server's own rendering of the canonical predicate, required to be validated, and required to carry 023's marker as its constraint comment.
 
@@ -64,6 +64,12 @@ The deploy migrates before the container is recreated, so the previous build ser
 - **THEN** a marked `indexer_state` SHALL be dropped and a marked `chunks_truncated` SHALL be dropped
 - **AND** an object of either name that lacks the marker SHALL be left in place instead
 - **AND** no other table, column or constraint SHALL be altered
+
+#### Scenario: An unmarked unit does not veto the other unit's removal
+
+- **WHEN** exactly one of the two units lacks 023's marker and the database is downgraded to 022
+- **THEN** the downgrade SHALL complete, dropping the marked unit and leaving the unmarked one exactly as it was found
+- **AND** it SHALL name the unit it left and why, on the operator's output rather than only in a log record
 
 ### Requirement: 023's units are exercised by the schema gate before deploy
 The schema gate SHALL exercise migration 023 on a throwaway pgvector container before the deploy that carries it, asserting the catalogue **directly** for both units — the table's columns, its primary key, its CHECK definition, validation and marker, the table comment, and the column's type, nullability, default and comment — across the fresh, stamp-back, impostor-object, impostor-constraint and downgrade paths, and asserting that a disallowed key is actually rejected on insert.
