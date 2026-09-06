@@ -62,11 +62,17 @@ from src.services.usage_stats import OVER_QUOTA_PARAM
 from src.services import transfer, vault_fs
 from src.services.vault import (
     MAX_PATH_CHARS,
+    VAULT_ROOT_NOT_READY_ERROR,
+    VAULT_ROOT_OVERLAP_ERROR,
+    VAULT_ROOT_UNEXAMINABLE_ERROR,
     UnconfirmedPublication,
     VaultAnchorUnavailable,
     VaultAssignmentChanged,
     VaultConfirmationUnavailable,
     VaultRootMismatch,
+    VaultRootNotReady,
+    VaultRootOverlap,
+    VaultRootUnexaminable,
     _vault_root,
     classify_bytes,
     confirmed_publication,
@@ -350,6 +356,39 @@ _NO_VAULT_MESSAGE = (
 # Marker written into `usage_logs.params` for a call refused by the gate. It
 # carries no new information — the user id and tool name are already columns.
 _NO_VAULT_MARKER = "no_vault_assigned"
+
+# The three vault-root **quarantine** markers (#199), one per reason the
+# admission gate can refuse for once a quarantine snapshot is in play. All
+# three are *pre-body* — the gate writes them before any tool body runs — so
+# all three are enumerated by `src/services/usage_stats.py`'s pre-body refusal
+# predicate alongside `_NO_VAULT_MARKER` and `_UNENCODABLE_ARG_MARKER`. A
+# marker the predicate does not enumerate is wrong in both directions at once:
+# its `duration_ms` is folded into the tool's latency percentiles as though the
+# body had executed, and the refusal itself is never counted.
+#
+# Three values and not one, because each says what the other two do not, and an
+# operator acts differently on each:
+#
+# * `vault_root_overlap` — this account's configured root collides with another
+#   active account's (same directory, or one nested inside the other). The fix
+#   is an **assignment or a mount corrected**, and there is a second account
+#   involved. Reusing `_NO_VAULT_MARKER` here would tell an operator that an
+#   administrator unassigned a user whose users page plainly shows one.
+_VAULT_ROOT_OVERLAP_MARKER = "vault_root_overlap"
+
+# * `vault_root_unexaminable` — this account's root could not be opened, so no
+#   overlap could be ruled out. The fix is a **mount restored**, and no second
+#   account exists. Recording it as an overlap would send an operator looking
+#   for a peer that was never observed.
+_VAULT_ROOT_UNEXAMINABLE_MARKER = "vault_root_unexaminable"
+
+# * `vault_root_not_ready` — no snapshot has been published in this process
+#   yet. Nothing about *this* account is wrong: it is the startup window or a
+#   detector that is failing. The lifespan publishes synchronously before the
+#   app serves, so a burst of this value in the usage log is the signal that
+#   detection is not completing — a fact neither of the other two markers can
+#   carry.
+_VAULT_ROOT_NOT_READY_MARKER = "vault_root_not_ready"
 
 # Marker for a *publication* refused because the assignment changed while the
 # call was in flight (#88). Deliberately distinct from `_NO_VAULT_MARKER`: the
@@ -639,6 +678,61 @@ async def _confirmed_publication(uid: int | None, publish):
         return str(exc), None
 
 
+#: Exception type -> `(caller-facing message, usage_logs marker, event reason)`
+#: for the three quarantine refusals `_vault_root` can raise.
+#:
+#: **The message is taken from this table, not from the exception instance.**
+#: `str(exc)` would be the same string today, and the day somebody raises one
+#: of these with a path or a peer's name in it — debugging, a richer operator
+#: log — that string would go straight out to the tenant's agent. Reading the
+#: wording from a fixed table makes "the refusal names no other user, no other
+#: vault path and no note path" a property of this module rather than a
+#: property of every future `raise` site.
+_QUARANTINE_REFUSALS: dict[type, tuple[str, str, str]] = {
+    VaultRootOverlap: (
+        VAULT_ROOT_OVERLAP_ERROR,
+        _VAULT_ROOT_OVERLAP_MARKER,
+        "overlap",
+    ),
+    VaultRootUnexaminable: (
+        VAULT_ROOT_UNEXAMINABLE_ERROR,
+        _VAULT_ROOT_UNEXAMINABLE_MARKER,
+        "root_unexaminable",
+    ),
+    VaultRootNotReady: (
+        VAULT_ROOT_NOT_READY_ERROR,
+        _VAULT_ROOT_NOT_READY_MARKER,
+        "snapshot_not_ready",
+    ),
+}
+
+
+class _MarkedRefusal(str):
+    """A pre-body refusal message that carries its own `usage_logs` marker.
+
+    A `str` subclass on purpose. Every existing consumer of a refusal treats it
+    as the message it is — `refusal_result` maps it onto a structured tool's
+    shape, `_log_usage` measures it as the response, the caller reads it — and
+    a subclass keeps all of that unchanged, including the tests that
+    monkeypatch `_vault_admission_error` with a plain string. What it adds is
+    the one thing `_tracked` cannot otherwise know: **which** pre-body marker
+    this refusal is. Before the quarantine reasons there was one refusal here
+    and the decorator could hard-code `_NO_VAULT_MARKER`; there are four now,
+    and deriving the marker from the message text would tie the audit
+    vocabulary to prose that gets reworded.
+
+    A refusal that arrives without a marker (a plain `str`) is the
+    no-assignment one, which is what `_tracked`'s `getattr` default says.
+    """
+
+    __slots__ = ("marker",)
+
+    def __new__(cls, message: str, marker: str) -> "_MarkedRefusal":
+        refusal = super().__new__(cls, message)
+        refusal.marker = marker
+        return refusal
+
+
 def _vault_admission_error() -> str | None:
     """Refuse the call when the caller has no resolvable vault root.
 
@@ -669,6 +763,28 @@ def _vault_admission_error() -> str | None:
     uid = current_user_id.get()
     try:
         _vault_root(uid)
+    except (VaultRootOverlap, VaultRootUnexaminable, VaultRootNotReady) as exc:
+        # The vault-root quarantine (#199), ahead of the generic branch below
+        # because these three are `RuntimeError` subclasses and would otherwise
+        # be swallowed by it and filed under `no_vault_assigned`. They are
+        # ordered first for that reason alone; the generic branch is unchanged.
+        #
+        # The wording comes from `src/services/vault.py` and **names no other
+        # user, no other vault path and no note path, for any reason**. The
+        # caller is a tenant's agent, and the whole point of the quarantine is
+        # that two tenants were about to be able to see each other; a refusal
+        # that says whose root it collided with would be the leak in miniature.
+        # The panel, the log line and the `indexer_runs` row are where the
+        # affected accounts, reasons and roots are named.
+        message, marker, reason = _QUARANTINE_REFUSALS[type(exc)]
+        security_events.emit(
+            "tool_refused_vault_quarantined",
+            subject=_security_subject(),
+            user_id=uid,
+            tool=_current_tool_name.get(),
+            reason=reason,
+        )
+        return _MarkedRefusal(message, marker)
     except RuntimeError:
         # Unassigned, deactivated, or a cold cache. All three mean the same
         # thing to the caller and all three must refuse: a cold cache is not
@@ -984,7 +1100,19 @@ def _tracked(
                 # reaches the tool body, including the DB-only ones. The
                 # refusal is still logged, like any other tool error.
                 refusal = _vault_admission_error()
-                extra = {"error": _NO_VAULT_MARKER} if refusal is not None else {}
+                # **The refusal names its own marker.** The gate has four
+                # reasons now — no assignment, and the three vault-root
+                # quarantine reasons (#199) — and each is a different fact an
+                # operator acts on differently, so each gets its own value in
+                # `usage_logs.params["error"]`. A plain `str` is the
+                # no-assignment refusal, which keeps the historical default
+                # and keeps a monkeypatched gate returning a bare message
+                # working.
+                extra = (
+                    {"error": getattr(refusal, "marker", _NO_VAULT_MARKER)}
+                    if refusal is not None
+                    else {}
+                )
                 if refusal is None:
                     # Second admission gate, same altitude: an argument that
                     # cannot be encoded as UTF-8 never reaches a tool body,

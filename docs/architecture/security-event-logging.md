@@ -241,6 +241,7 @@ nothing binds the request address into a ContextVar (residual R8).
 | `tool_usage_log_failed` | WARNING | `error_type`, `tool` | the same handler, when the best-effort `usage_logs` write reports failure |
 | `tool_telemetry_failed` | WARNING | `error_type`, `tool` | `_tracked`'s post-body tail — `named_params`, result sizing, the `usage_logs` await — when it raises **after** the body completed. The completed result is returned unchanged; never `tool_exception`, because the call succeeded |
 | `tool_refused_no_vault` | WARNING | `tool`, `user_id` | the vault admission gate |
+| `tool_refused_vault_quarantined` | WARNING | `reason`, `tool`, `user_id` | the same admission gate, for a vault-root quarantine (#199); `reason` is `overlap`, `root_unexaminable` or `snapshot_not_ready`. Distinct from `tool_refused_no_vault` because that one says the credential has no vault and this one says it has one the server will not serve. No peer username and no path in any field — the caller-facing refusal names no other tenant, and the operator surfaces are where the pair is named |
 | `tool_refused_over_quota` | WARNING | `day`, `key_id`, `limit`, `tool`, `user_id` | the quota admission gate |
 | `usage_log_credential_gone` | WARNING | `cleared_user_id`, `tool` | the FK-recovery retry in `_log_usage` |
 | `usage_log_failed` | WARNING | `error_type`, `reason`, `tool` | `_log_usage` giving up; `reason` is `initial` or `after_clearing_fks` |
