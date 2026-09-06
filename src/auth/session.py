@@ -389,9 +389,19 @@ async def touch_session(
       `last_seen_at`; a write per request buys nothing and costs a commit.
 
     Any failure is swallowed: the transaction is returned to a clean state, a
-    WARNING is logged, and the request is served. The exception's **class name
-    only** reaches the log — SQLAlchemy renders bound parameters into an
-    error's text, and one of them here is the stored session hash.
+    `panel_session_touch_failed` record is emitted, and the request is served.
+    The exception's **class name only** reaches the log — SQLAlchemy renders
+    bound parameters into an error's text, and one of them here is the stored
+    session hash (the engine also sets `hide_parameters=True`; this is the
+    second layer).
+
+    **Through the permit, not through the bare logger.** A stale browser
+    hammering `GET` against a database that is refusing this `UPDATE` drives
+    one record per request, throttled by nothing — the touch interval gates the
+    *write*, and a failing write never records a new `last_seen_at` to throttle
+    against, so the interval check passes every time. That is the unbounded
+    flood channel D18 exists to close, and the subject is the resolved user,
+    who is the party actually generating it.
     """
     method = (getattr(request, "method", "") or "").upper()
     if method not in ("GET", "HEAD"):
@@ -411,14 +421,37 @@ async def touch_session(
         await session.commit()
         return True
     except Exception as exc:  # noqa: BLE001 - telemetry may not fail a request
-        logger.warning("session last-seen update failed: %s", type(exc).__name__)
+        _touch_failed(request, row, "touch", exc)
         try:
             await session.rollback()
         except Exception as rollback_exc:  # noqa: BLE001 - nor may the recovery
-            logger.warning(
-                "session last-seen rollback failed: %s", type(rollback_exc).__name__
-            )
+            _touch_failed(request, row, "rollback", rollback_exc)
         return False
+
+
+def _touch_failed(request, row, stage: str, exc: BaseException) -> None:
+    """One `panel_session_touch_failed`, bounded and class-only.
+
+    `stage` is `touch` (the `UPDATE`/commit) or `rollback` (the recovery that
+    follows it), and it rides in `reason` because that is the allow-list's one
+    closed-vocabulary field. The pair matters: a failing update with a working
+    rollback is a database refusing one statement, while a failing rollback is
+    a connection that is gone — the same request, two different pages.
+
+    Never the exception's text and never a traceback: this failure is a
+    statement binding `user_sessions.session_hash`, and rendering it is how the
+    registry's own key would reach a shared sink.
+    """
+    security_events.emit(
+        "panel_session_touch_failed",
+        subject=security_events.subject_for(
+            user_id=getattr(row, "user_id", None), request=request
+        ),
+        reason=stage,
+        user_id=getattr(row, "user_id", None),
+        error_type=type(exc).__name__,
+        route=getattr(getattr(request, "url", None), "path", None),
+    )
 
 
 def _replay_refused(

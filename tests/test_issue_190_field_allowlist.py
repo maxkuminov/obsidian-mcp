@@ -471,11 +471,23 @@ def test_the_sweep_checks_the_field_against_the_named_event(tmp_path, monkeypatc
 # below the sink's default level, they are not refusals, and pulling them in
 # would make every diagnostic breadcrumb in these files a catalogue decision.
 
+# Every module a *request* can reach, not every module in a request-shaped
+# directory. Round 2 of the adversarial review found three unbounded records
+# and all three arrived the same way — a sibling change added a call to a
+# module this list did not name — so the unit is the call site (design D23).
+# `src/auth/routes.py`, `src/control_panel/users.py` and `src/csrf.py` are
+# clean today and are listed so they stay that way.
 _GUARDED_MODULES = (
     "src/mcp_server/auth.py",
     "src/mcp_server/tools.py",
     "src/transfer/routes.py",
     "src/control_panel/routes.py",
+    "src/control_panel/users.py",
+    "src/auth/routes.py",
+    "src/auth/session.py",
+    "src/csrf.py",
+    "src/services/transfer.py",
+    "src/services/vault_overlap.py",
 )
 
 _GUARDED_METHODS = {"warning", "error", "exception", "critical"}
@@ -486,15 +498,14 @@ _GUARDED_METHODS = {"warning", "error", "exception", "critical"}
 #: exemption survives every reformatting and cannot silently widen to cover a
 #: new call that drifts onto the same line.
 #:
-#: Every entry is one shape: the panel's **Danger zone**. Those routes sit
-#: behind `require_admin_panel` (one of them behind a signed one-time
-#: confirmation token as well), they fire at most once per action, and what
-#: they report is the operational fact the health page exists to show. D18
-#: keeps exactly that class on the bare logger — not a refusal, not
-#: caller-driven, and suppression there would hide the failure of a
-#: destructive action rather than bound a flood. Anything a *credential* can
-#: drive belongs in the catalogue instead; an entry here is a claim that no
-#: such caller exists, and it has to say why.
+#: Two shapes, and both are D18's own line rather than an escape from it: the
+#: panel's **Danger zone** (admin-guarded, once per action, reporting the
+#: operational fact the health page exists to show) and **background work**
+#: (the indexer's detection pass, a descriptor close) that no request drives at
+#: all. Suppressing either would hide the failure of a rare, important
+#: operation rather than bound a flood. Anything a *credential* can drive
+#: belongs in the catalogue instead; an entry here is a claim that no such
+#: caller exists, and it has to say why.
 _BARE_LOGGER_EXEMPTIONS: dict[str, dict[str, str]] = {
     "src/control_panel/routes.py": {
         "Skipping HNSW index": (
@@ -525,6 +536,50 @@ _BARE_LOGGER_EXEMPTIONS: dict[str, dict[str, str]] = {
             "on the same admin-only path. If it ever fires, the reset could "
             "neither record nor undo itself, which is the one state an "
             "operator must not have to infer from silence."
+        ),
+    },
+    "src/services/transfer.py": {
+        "Could not close the": (
+            "The descriptor-close warning design D18 names by hand as staying "
+            "on the bare logger. It is `close_quietly` housekeeping in a "
+            "`finally`, it reports a leaked file descriptor — an operational "
+            "fact with no caller and no refusal attached — and it fires at "
+            "most once per descriptor the process has already finished with."
+        )
+    },
+    "src/services/vault_overlap.py": {
+        # The detection pass. Its entry points are startup, the indexer tick,
+        # an administrator saving an assignment and an administrator starting
+        # a reindex — background or admin-guarded and once per action, never a
+        # credential in a loop. And it is the module whose ERROR lines the
+        # health page exists to surface: bounding them would hide the
+        # cross-tenant misconfiguration they exist to report.
+        "failed to close vault-root descriptor": (
+            "Housekeeping in a `finally` after the observation is already "
+            "made; the same class as the transfer descriptor close."
+        ),
+        "vault-root snapshot seq=": (
+            "One line per out-of-order publish, from the detection pass. "
+            "Sequence numbers come from the pass, not from a request, so the "
+            "rate is the pass's and nothing a caller does changes it."
+        ),
+        "vault-root overlap detection failed and no snapshot has": (
+            "The pass could not run and nothing has ever been published, so "
+            "every multi-user tool call stays refused. It re-raises. This is "
+            "the loudest thing the server can say about its own readiness, "
+            "and withholding it under a bound would leave an operator staring "
+            "at a vault that refuses everything for no stated reason."
+        ),
+        "vault-root overlap detection failed; retaining the snapshot": (
+            "The same failure with a previous snapshot to fall back on. Once "
+            "per detection pass, and the traceback is the diagnosis."
+        ),
+        "vault root quarantine: ": (
+            "`_log_snapshot`, one ERROR per quarantined user per pass, "
+            "written *for* the ops-health ring buffer. It is the operator "
+            "detail that `transfer_refused`'s `owner_quarantined` reason "
+            "deliberately does not carry (D23) — so suppressing it would "
+            "leave the bounded record naming a condition nothing explains."
         ),
     },
 }
@@ -577,28 +632,57 @@ def test_no_bare_refusal_logger_survives_in_a_request_path_module():
     assert _bare_logger_sweep() == []
 
 
-def test_every_exemption_is_an_admin_triggered_danger_zone_notice():
+def test_the_exemption_list_is_exactly_what_the_design_says_it_is():
     """Pinned so the list cannot grow quietly, and so a removed call cannot
     leave a stale licence behind for the next warning that lands nearby.
 
-    All three are the panel's Danger zone: admin-guarded, once per action, and
-    reporting the operational fact the health page exists to show. A new entry
-    is a decision — assert it here, with the reason, or migrate the call.
+    Two shapes and no others (design D23): the panel's Danger zone, and
+    background work no request drives. A new entry is a decision — assert it
+    here, with its reason, or migrate the call.
     """
-    assert set(_BARE_LOGGER_EXEMPTIONS) == {"src/control_panel/routes.py"}
+    assert set(_BARE_LOGGER_EXEMPTIONS) == {
+        "src/control_panel/routes.py",
+        "src/services/transfer.py",
+        "src/services/vault_overlap.py",
+    }
     assert set(_BARE_LOGGER_EXEMPTIONS["src/control_panel/routes.py"]) == {
         "Skipping HNSW index",
         "Embedding reset aborted",
         "Rollback after the failed fingerprint record failed",
     }
-    source = (ROOT / "src" / "control_panel" / "routes.py").read_text()
-    for prefix in _BARE_LOGGER_EXEMPTIONS["src/control_panel/routes.py"]:
-        assert f'"{prefix}' in source, (
-            f"the exemption for {prefix!r} outlived the call it exempts — "
-            "delete it"
-        )
-    for reason in _BARE_LOGGER_EXEMPTIONS["src/control_panel/routes.py"].values():
-        assert len(reason) > 80, "an exemption without a reason is a hole"
+    assert set(_BARE_LOGGER_EXEMPTIONS["src/services/transfer.py"]) == {
+        "Could not close the"
+    }
+    assert len(_BARE_LOGGER_EXEMPTIONS["src/services/vault_overlap.py"]) == 5
+
+
+def test_every_exemption_names_a_call_that_still_exists_and_says_why():
+    """An exemption for a deleted call is a licence waiting for the next
+    warning that lands near it, and one without a reason is just a hole."""
+    for rel, entries in _BARE_LOGGER_EXEMPTIONS.items():
+        source = (ROOT / rel).read_text()
+        for prefix, reason in entries.items():
+            assert f'"{prefix}' in source, (
+                f"{rel}: the exemption for {prefix!r} outlived the call it "
+                "exempts — delete it"
+            )
+            assert len(reason) > 80, (
+                f"{rel}: {prefix!r} is exempted without a reason"
+            )
+
+
+def test_the_guard_covers_every_module_a_request_can_reach():
+    """The scope itself, pinned — because round 2's three findings were all
+    "a sibling change added a call to a module the list did not name"."""
+    for rel in _GUARDED_MODULES:
+        assert (ROOT / rel).is_file(), f"{rel} is guarded but does not exist"
+    for rel in (
+        "src/auth/session.py",
+        "src/services/transfer.py",
+        "src/services/vault_overlap.py",
+        "src/csrf.py",
+    ):
+        assert rel in _GUARDED_MODULES, f"{rel} must stay in the guard (D23)"
 
 
 def test_the_guard_catches_a_new_bare_warning(tmp_path):

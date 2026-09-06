@@ -102,6 +102,17 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
         {"actor_user_id", "user_id", "username", "client_ip", "route"}
     ),
     "password_hash_malformed": frozenset({"user_id"}),
+    # The session registry's `last_seen_at` write, which is telemetry and may
+    # never fail a request. Bounded because the touch interval gates the
+    # *write*: a failing update records no new `last_seen_at`, so the interval
+    # check passes on every retry and a stale browser drives one record per
+    # `GET`. `reason` is the stage — `touch` or `rollback` — because a failing
+    # update with a working rollback is a database refusing one statement,
+    # while a failing rollback is a connection that is gone. Class only: the
+    # statement binds `user_sessions.session_hash`.
+    "panel_session_touch_failed": frozenset(
+        {"reason", "user_id", "error_type", "route"}
+    ),
     # ── The panel session registry (#198) ──
     #
     # **No credential material, ever** — not the cookie's session identifier,
