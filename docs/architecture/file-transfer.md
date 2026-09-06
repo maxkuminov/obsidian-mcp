@@ -104,6 +104,78 @@ Unknown, expired, consumed, claimed, revoked credential, downgraded permission, 
 
 **`user_id IS NULL` is normal in single-user mode and is nobody in multi-user mode.** `_credential_ok` compares `cred.user_id == row.user_id`, and `None == None` passed; `resolve_root_ok` and `locked_rows_ok` then authorised `settings.vault_path` outright. So a capability minted by an ownerless key *before* an operator enabled multi-user mode stayed redeemable afterwards — able to replace a file in whatever vault that setting names — even once `APIKeyMiddleware` had started rejecting the same key. `_ownerless_in_multi_user` is consulted in all three predicates, not just the credential one: the two root checks are the other half of a defensive pair, so neither is the only thing standing between a stale capability and the global root. Single-user behaviour is unchanged. `_not_found()` is the only way for a bearer-protected endpoint to say no. Precise status comes from the *authenticated* side, via `check_upload`. The uniformity is of the *response*; the branches do different amounts of work and none of this is constant-time, so do not claim timing indistinguishability for it.
 
+### The refusal is recorded even though the response never says why (#192)
+
+**The log is the only place the reason exists.** The response stays the sole
+external answer, byte-identical in status, headers and body across every cause,
+and `_not_found()` / `NOT_FOUND_BODY` are untouched. Adding a reason to the
+response would hand an unauthenticated caller the oracle the uniform 404 exists
+to withhold; withholding it from the *operator* as well is how token
+enumeration stayed invisible on this surface. So every `_not_found()` return
+goes through `_refuse`, which emits one `transfer_refused` record carrying the
+reason, the route, the method, the trusted client address, and — only where a
+token was actually presented — `redacted_token_tag(token)`, the `sha:` plus
+eight hex characters that correlates a burst without writing credential
+material. A request with no `Authorization` header carries **no tag at all**:
+`sha:` of the empty string is a constant that reads like a tag, and an operator
+would correlate on it.
+
+**The diagnosis runs after the decision, behind the permit, and never touches
+the admission path.** `lookup_token` and `claim_upload` are each one filtered
+query — hash, direction, `state = pending`, `expires_at > now` — and that is
+the linearizability argument for single-use redemption. **They were
+deliberately not re-shaped.** Splitting either into a sequence of probes so the
+route could name the reason would rewrite that argument for a log line. Instead
+`transfer.classify_token_refusal` is a separate, **read-only** helper that
+selects by token hash alone and derives the reason under a total precedence —
+`unknown_token` → `wrong_direction` → state (`already_claimed` /
+`already_completed` / `already_consumed`) → `expired` → `claim_lost` — so a row
+matching several conditions always yields the same one. State beats expiry on
+purpose: a consumed token that has since aged out was *used*, which is the more
+interesting of the two true facts.
+
+The order in `_refuse` is the contract:
+
+1. the caller has **already** decided to refuse, and nothing below can change
+   that;
+2. acquire the suppression permit first, keyed on the **trusted client
+   address** — the only subject computable before the diagnosis, and the one a
+   caller cannot mint by rotating bogus bearer tokens. Two tenants behind one
+   NAT share that bucket; that affects records only, never responses or
+   `usage_logs` rows, and the summary states the withheld count;
+3. only with a permit, and only when the reason is not already known, issue the
+   diagnosis read.
+
+So an **accepted** redemption issues no diagnosis query at all, and a refusal
+whose source is already at its allowance issues none either — the extra read
+cannot amplify a flood, because it is bounded by the same budget as the record
+it exists to fill in.
+
+**A diagnosis failure may not change the response.** That read happens on a
+path whose entire contract is a fixed 404, so a dead connection or an exhausted
+pool there must not turn a refusal into a 500. It is wrapped in its own
+`try/except Exception` *outside* the admission decision: on failure the record
+is emitted best-effort with `reason = "diagnosis_failed"` and the exception's
+class in `error_type`, and the endpoint returns the same `_not_found()` it
+would have returned anyway.
+
+**Two reasons are known without a read.** `_load_valid` returns a
+`TransferRefusal` for the three predicates it evaluates itself
+(`credential_invalid`, `root_reassigned`, `path_invalid`) instead of collapsing
+them into a bare `None`, and the upload route's re-validation splits its `or`
+chain into the same three; evaluation order and short-circuiting are unchanged,
+only the value carrying "no" got more specific. The post-claim gate at the
+publish barrier is the opposite case: `GateHandle` exposes only `ok`, so it
+emits the single generic `prepublish_revalidation_failed` and nothing finer.
+**Accepted limitation:** for the seconds-long window between claim and publish
+an operator cannot tell a key revocation from a permission downgrade from a
+root reassignment. Giving `GateHandle` a typed cause means touching the locked
+publish gate, which is a change of its own.
+
+The 503 refusals — mount boundary, unsupported filesystem — keep their own
+bodies and their own records; they are not part of the uniform 404 and never
+were.
+
 ### Fingerprint binding — and its two honest limits
 An overwrite upload and every download record `{dev, inode, size, mtime_ns, ctime_ns, sha256}` of the target at mint. At publish (or before a download's first byte) the incumbent is `fstat`ed and, when the mint recorded a hash, re-hashed **from the descriptor**. Mismatch → 409 / 404.
 - **Optimistic, not linearizable.** `stat` → `replace` is check-then-act; a writer landing in that window is still overwritten. Same guarantee level as `edit_note(expected=…)`, declared rather than implied. The no-clobber path (`overwrite=False`) *is* kernel-linearizable — it is `link()`.

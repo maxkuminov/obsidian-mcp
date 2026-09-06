@@ -831,12 +831,21 @@ def test_the_failed_strip_transaction_is_rolled_back(monkeypatch):
 
 
 def test_the_strip_failure_is_logged_at_error_so_the_page_shows_it(monkeypatch):
+    """The record still reaches the ring buffer; only its shape changed.
+
+    `security-event-logging` (#192) moved this site onto
+    `security_events.emit`, so the message is now the event name and the
+    exception class is a structured field — the point of that migration is
+    that a caller-triggerable failure passes the suppressor instead of going
+    straight to the sink. What must not change is that the health page still
+    sees it, which is what this asserts.
+    """
     error_log.attach()
     session = _ExplodingStripSession()
     _dashboard_context(monkeypatch, session)
 
     messages = [e["message"] for e in error_log.recent_errors()]
-    assert any("health strip unavailable" in m.lower() for m in messages), messages
+    assert any("panel_health_strip_failed" in m for m in messages), messages
 
 
 # --------------------------------------------------------------------------

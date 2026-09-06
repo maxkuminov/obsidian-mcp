@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.auth.session import _SingleUserSentinel
 from src.control_panel.routes import (
     _assert_key_owner,
+    _log_panel_forbidden,
     require_admin_panel,
     require_user_panel,
 )
@@ -179,6 +180,11 @@ async def list_keys(
 async def set_key_limit(
     key_id: int,
     req: SetKeyLimitRequest,
+    # Defaulted, like the panel's own handlers: `request` is here so the
+    # ownership refusal can be *recorded* with its route and method, and a
+    # caller that has none must not thereby change who is allowed through.
+    # `_assert_key_owner` takes it keyword-only and tolerates `None`.
+    request: Request = None,
     session: AsyncSession = Depends(get_session),
     user: User | _SingleUserSentinel = Depends(require_user_panel),
 ):
@@ -199,7 +205,7 @@ async def set_key_limit(
     """
     result = await session.execute(select(APIKey).where(APIKey.id == key_id))
     api_key = result.scalar_one_or_none()
-    _assert_key_owner(api_key, user)
+    _assert_key_owner(api_key, user, request=request)
 
     counter_reset = await apply_daily_request_limit(
         session, api_key, req.daily_request_limit
@@ -214,6 +220,7 @@ async def set_key_limit(
 @router.delete("/keys/{key_id}")
 async def revoke_key(
     key_id: int,
+    request: Request = None,
     session: AsyncSession = Depends(get_session),
     user: User | _SingleUserSentinel = Depends(require_user_panel),
 ):
@@ -221,7 +228,12 @@ async def revoke_key(
     api_key = result.scalar_one_or_none()
     if not api_key:
         raise HTTPException(404, "Key not found")
+    # An inline duplicate of `_assert_key_owner`'s predicate, kept as it is
+    # rather than folded into the helper — narrowing this route's 404/403
+    # ordering is not what this change is for — but it refuses just as the
+    # helper does, so it records just as the helper does.
     if not user.is_admin and api_key.user_id != user.id:
+        _log_panel_forbidden(request, "not_your_key", user, api_key.user_id)
         raise HTTPException(403, "Not your key")
     api_key.is_active = False
     await session.commit()

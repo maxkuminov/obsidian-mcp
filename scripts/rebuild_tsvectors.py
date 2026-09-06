@@ -15,12 +15,12 @@ flow, which it must not be confused with).
 all-or-nothing.** The fingerprint it writes is one stored row asserting
 something about *every* retained row in the database, and that is not a claim
 that can be established one tenant at a time: a scope the rebuild skipped —
-provenance unsettled, no assigned vault path, ownerless rows under
-`MULTI_USER_MODE` — keeps its previous-configuration vectors, and a startup
-that fails closed on the fingerprint would then pass while keyword search was
-exactly as wrong as before. So a skipped scope aborts the whole operation,
-names itself and its reason, rolls every rebuilt scope back and records
-nothing.
+provenance unsettled, no assigned vault path, a quarantined root, or ownerless
+rows under `MULTI_USER_MODE` — keeps its previous-configuration vectors, and a
+startup that fails closed on the fingerprint would then pass while keyword
+search was exactly as wrong as before. So a skipped scope aborts the whole
+operation, names itself and its reason, rolls every rebuilt scope back and
+records nothing.
 
 **It waits for an in-flight index pass.** The rebuild takes the index
 generation lock before it reads its first row, and the periodic pass holds that
@@ -28,11 +28,11 @@ lock for the duration of its transaction — so this command blocks until the
 pass commits rather than interleaving with it. That is the required behaviour,
 and it is why nothing here sets a short `lock_timeout`.
 
-Three ways forward when it refuses, in order of preference: settle the scope
-(assign or delete that user, or let an in-progress re-derive finish), delete or
-reassign ownerless rows, or put `FTS_CONFIGS` back to the value the stored
-fingerprint names — which clears the startup refusal immediately with no
-rebuild at all.
+Four ways forward when it refuses, in order of preference: settle the scope
+(assign or delete that user, or let an in-progress re-derive finish), resolve
+the root overlap that quarantined it, delete or reassign ownerless rows, or put
+`FTS_CONFIGS` back to the value the stored fingerprint names — which clears the
+startup refusal immediately with no rebuild at all.
 """
 import asyncio
 import sys
@@ -41,10 +41,20 @@ from src.config import settings
 from src.database import async_session, engine
 from src.services.fts import validate_fts_configs
 from src.services.indexer import rebuild_tsvectors_all_scopes
+from src.services.vault_overlap import detect_and_publish
 
 
 async def main() -> None:
     print(f"Rebuilding tsvectors for FTS_CONFIGS={settings.fts_configs}...")
+    # E5 — this is a **separate process**: no lifespan, no indexer loop, and it
+    # reaches a pass without touching either. A detection installed in the
+    # indexer loop would not be installed here, so it publishes its own
+    # snapshot and consumes only what it published. A detection that raises
+    # here is fatal by design: the caller is an operator at a terminal who can
+    # read the error and re-run, and rewriting every keyword vector in the
+    # vault against roots nothing has checked is exactly the pass this guard
+    # exists to stop.
+    await detect_and_publish()
     print(
         "Waiting for any in-flight index pass to commit before the first row "
         "is read (the generation lock)."

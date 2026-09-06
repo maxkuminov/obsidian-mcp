@@ -245,12 +245,28 @@ def resolve_filters(
 
 
 async def recent_logs(session, filters: Filters, limit: int = LOG_LIMIT):
-    """The newest matching calls, with the columns `_usage_actor` reads."""
+    """The newest matching calls, with the columns `_usage_actor` reads.
+
+    Three outcome markers ride along, **all three as raw text and none of them
+    cast**. `params` is `JSONB` and `->>` always yields `text`; a `::boolean`
+    on `over_quota` would 500 the whole page for every user the moment one row
+    carried something that is not `true`/`false`, and it would keep doing so
+    until that row aged out of the window. `/admin/performance`'s unguarded
+    casts are the standing example of that hazard, and this query deliberately
+    does not join it.
+
+    Nothing is discarded between here and the template either: the mapping to
+    a displayed outcome happens once, in the route (design D9), and a value the
+    mapping does not recognise is *shown*, not dropped.
+    """
     where, params = filters._clauses()
     params["limit"] = max(1, min(int(limit), LOG_LIMIT))
     sql = f"""
         SELECT
             ul.id, ul.tool, ul.duration_ms, ul.created_at,
+            ul.params->>'error'      AS error_marker,
+            ul.params->>'error_type' AS error_type,
+            ul.params->>'over_quota' AS over_quota,
 {_ACTOR_COLUMNS}
         FROM usage_logs ul
 {_ACTOR_JOINS}

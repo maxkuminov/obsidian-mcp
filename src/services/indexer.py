@@ -68,6 +68,7 @@ from src.services.links import (
     extract_links_bounded,
     resolve_target,
 )
+from src.services import vault_overlap
 from src.services.transfer import canonical_vault_root
 from src.services.vault import (
     _vault_root,
@@ -428,6 +429,125 @@ async def record_indexer_run(trigger: str, user_id: int | None = None):
 # delete+insert (duplicate-key errors, lost/duplicated rows). Both
 # `run_indexer_loop` and `_reindex_background` acquire this before doing work.
 index_pass_lock: asyncio.Lock = asyncio.Lock()
+
+
+class VaultRootQuarantined(RuntimeError):
+    """A pass stage refused to run for a user the overlap snapshot names.
+
+    Carries the **operator-facing** wording — both accounts, both roots, the
+    relation or the errno — because the two places it lands are the ERROR log
+    and `indexer_runs.error`, and both are read by the person who has to fix the
+    configuration. The agent-facing refusals (`vault.VaultRootOverlap` and its
+    siblings) name nothing at all; these are the other half of that split.
+
+    A `RuntimeError`, so the per-stage `except Exception` in `_index_pass_once`
+    and in the startup block record it on the run row and mark the pass failed
+    without any of them learning a new type.
+    """
+
+
+async def detect_root_overlaps(where: str) -> None:
+    """Publish a quarantine snapshot before this entry point begins a pass.
+
+    **Called before `index_pass_lock` is taken**, deliberately: the check must
+    not queue behind the pass it exists to gate. `detect_and_publish` serializes
+    itself and its publication is monotonic, so two entry points overlapping
+    here is ordinary rather than a race.
+
+    A detection failure is logged and swallowed rather than aborting the caller.
+    It is not a per-root failure — a root that cannot be opened is a per-user
+    verdict — so the only way it raises is that the user enumeration failed,
+    which means the database is unavailable and the pass is going to fail
+    anyway. Swallowing it does not open the gate: either a previous snapshot
+    still stands (retained, never cleared) or nothing has been published and
+    `_refuse_quarantined_pass` refuses every multi-user stage until some later
+    entry point publishes one.
+    """
+    try:
+        await vault_overlap.detect_and_publish()
+    except Exception as e:  # noqa: BLE001 - detection must not abort the caller
+        logger.error(
+            "Vault-root overlap detection failed before the %s pass "
+            "(no pass will run for any assigned user until one publishes): %s",
+            where,
+            e,
+        )
+
+
+def _refuse_quarantined_pass(user_id: int | None, stage: str) -> None:
+    """Refuse `stage` for a user the published snapshot names. **The one skip.**
+
+    It lives in the shared pass helpers — `index_vault`, `link_backfill_pass`,
+    `embed_vault`, `rebuild_tsvectors` — rather than in each loop, so that every
+    caller inherits it: the periodic tick, the startup block, the panel's
+    on-demand reindex and the standalone tsvector rebuild are four entry points
+    today and a fifth added later must not have to remember this. A skip
+    re-implemented per loop is a skip one loop will be missing.
+
+    Placed **ahead of `_vault_root`**, which refuses a quarantined caller too:
+    that refusal carries the agent-facing wording that names nothing, and what
+    the log line and the run row need is the operator-facing one that names both
+    accounts and both roots.
+
+    Never applies to `user_id is None`. Single-user mode has one root and no
+    second assignment, so there is nothing to detect and nothing to be ready
+    for, and a pass there behaves exactly as it did before this guard existed.
+    """
+    if user_id is None:
+        return
+    snapshot = vault_overlap.published_snapshot()
+    if snapshot is None:
+        # No pass may begin over a vault root that nothing has checked. This is
+        # reachable only when a detection raised before publishing anything, so
+        # the correct answer is to refuse and retry at the next entry point.
+        raise VaultRootQuarantined(
+            f"{stage} skipped for user_id={user_id}: no vault-root overlap "
+            "snapshot has been published in this process, so no root has been "
+            "checked."
+        )
+    entry = snapshot.entry_for(user_id)
+    if entry is None:
+        return
+    raise VaultRootQuarantined(
+        f"{stage} skipped: {vault_overlap.operator_text(entry)}"
+    )
+
+
+async def record_quarantined_runs(trigger: str) -> None:
+    """Write one `indexer_runs` row per quarantined user without running a pass.
+
+    The path a **paused** iteration takes. A pause suppresses index and embed
+    work, and it must not suppress the record: a pause is entered precisely when
+    an operator is doing something destructive and watching the panel, which is
+    the worst moment for a quarantine to become invisible.
+
+    **Both records, not one.** The ERROR log reaches the in-process error ring
+    buffer, which is 100 entries and process-lifetime — the line naming a
+    quarantine at deploy time is gone by the next restart while the
+    misconfiguration persists. The run row is what an operator reads *after* a
+    restart, and a pass that quietly did no work for a user is otherwise
+    indistinguishable from a pass that found nothing to do. The log line is
+    emitted here rather than left to the detection so that the paused path is
+    self-sufficient: a caller that publishes without logging still records.
+
+    Reads the snapshot's own recorded facts and re-reads no `users` row, so a
+    peer the operator has just edited or deleted is still named.
+    """
+    snapshot = vault_overlap.published_snapshot()
+    if snapshot is None or not snapshot.entries:
+        return
+    for entry in snapshot.entries.values():
+        text_ = vault_overlap.operator_text(entry)
+        logger.error("No pass run (%s): %s", trigger, text_)
+        try:
+            async with record_indexer_run(trigger, entry.user_id) as stats:
+                stats.record_error("vault root", VaultRootQuarantined(text_))
+        except Exception as e:  # noqa: BLE001 - a record must not stop the loop
+            logger.error(
+                "Failed to record the vault-root quarantine of user_id=%s: %s",
+                entry.user_id,
+                e,
+            )
 
 
 def _sanitize_value(v):
@@ -1503,7 +1623,13 @@ async def index_vault(user_id: int | None = None):
     every markdown file the walk discovered, and the subset whose row this pass
     wrote — the upserts plus the moves it repaired in place. Callers that do
     not record a run may ignore it.
+
+    Refuses outright for a user the published overlap snapshot names — see
+    `_refuse_quarantined_pass`. Nothing is read, written, pruned or
+    provenance-stamped for such a user; the refusal happens before the root is
+    resolved.
     """
+    _refuse_quarantined_pass(user_id, "index")
     vault = _vault_root(user_id)
     log_suffix = f" (user_id={user_id})" if user_id is not None else ""
     logger.info(f"Starting vault index scan...{log_suffix}")
@@ -2377,6 +2503,10 @@ async def link_backfill_pass(user_id: int | None = None):
     own `notes_metadata` rows and replaces only links sourced by those rows.
     """
     global link_backfill_in_progress
+    # Ahead of the root resolution and ahead of the run row: a quarantined user
+    # gets no backfill row, because the pass that called us records the refusal
+    # on the row it already opened.
+    _refuse_quarantined_pass(user_id, "link backfill")
     vault = _vault_root(user_id)
     # Its own `indexer_runs` row, under the `backfill` trigger: it is a
     # distinct kind of pass with distinct timings, and folding it into the
@@ -2824,7 +2954,11 @@ async def embed_vault(user_id: int | None = None):
     figure answers "how much embedding work did this pass do", and a
     reconciliation stamp is not embedding work. Nor are they counted as
     failures — each is a deliberate decision, not something that went wrong.
+
+    Refuses outright for a quarantined user, before any row is selected and
+    before any vector is written or deleted.
     """
+    _refuse_quarantined_pass(user_id, "embed")
     vault = _vault_root(user_id)
     log_suffix = f" (user_id={user_id})" if user_id is not None else ""
     logger.info(f"Starting embedding pass...{log_suffix}")
@@ -3380,6 +3514,11 @@ class RebuildSkip(enum.Enum):
     #: The owner has no assigned `vault_path`, or the assigned path could not
     #: be pinned.
     ROOT_UNPINNABLE = "root unpinnable"
+    #: The published overlap snapshot names this owner's root, so no pass may
+    #: read or write for them at all. A skip like any other here: the scope
+    #: keeps its previous-configuration vectors, so the coverage claim cannot
+    #: be made.
+    ROOT_QUARANTINED = "root quarantined"
 
 
 @dataclass(frozen=True)
@@ -3465,6 +3604,17 @@ async def _scope_vault_path(session, owner: int | None) -> Path | None:
 async def _rebuild_scope(session, owner: int | None) -> RebuildOutcome:
     """Rebuild one retained owner scope. Does **not** commit."""
     log_suffix = f" (user_id={owner})" if owner is not None else ""
+    try:
+        # The same guard `rebuild_tsvectors` applies, applied here because the
+        # driver calls the pinned rebuild directly. A quarantined root is a
+        # skip like the others, not an exception the driver may step over: the
+        # scope keeps its previous-configuration vectors, and the fingerprint
+        # would certify them.
+        _refuse_quarantined_pass(owner, "tsvector rebuild")
+    except VaultRootQuarantined as exc:
+        return RebuildOutcome(
+            skip=RebuildSkip.ROOT_QUARANTINED, detail=str(exc)
+        )
     try:
         vault = await _scope_vault_path(session, owner)
     except Exception as exc:
@@ -3566,10 +3716,10 @@ async def rebuild_tsvectors_all_scopes(session) -> dict:
                 "not a completed rebuild. Nothing has been committed: every "
                 "scope rebuilt so far is rolled back and no fingerprint was "
                 "recorded. Settle the scope (assign or delete that user, or "
-                "let an in-progress re-derive finish), delete or reassign its "
-                "rows, or restore the FTS_CONFIGS the stored fingerprint "
-                "names, which clears the startup refusal with no rebuild at "
-                "all."
+                "let an in-progress re-derive finish), resolve the root "
+                "overlap if it is quarantined, delete or reassign its rows, or "
+                "restore the FTS_CONFIGS the stored fingerprint names, which "
+                "clears the startup refusal with no rebuild at all."
             )
 
     # Same transaction as every row above. A failure here is **not** swallowed
@@ -3612,7 +3762,12 @@ async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
     pins itself — see `_ancillary_pass_is_permitted` for why an unverified
     writer of rows the provenance is a claim about may not run under an
     unresolved one. A skipped user is logged once and returns zero.
+
+    Refuses outright for a quarantined user — the standalone rebuild process
+    reaches a pass without touching the indexer loop, so the guard has to be
+    here rather than in any caller.
     """
+    _refuse_quarantined_pass(user_id, "tsvector rebuild")
     vault = _vault_root(user_id)
     log_suffix = f" (user_id={user_id})" if user_id is not None else ""
     with pinned_root(vault) as root_fd:
@@ -4224,6 +4379,12 @@ async def run_indexer_loop():
     parallelism can come later). Single-user mode runs one legacy pass with
     `user_id=None`.
     """
+    # E2 — the startup pass. Before `index_pass_lock`, so the check does not
+    # queue behind the pass it gates. The lifespan (E1) has normally published
+    # one already; this is not redundant, because `run_indexer_loop` is started
+    # by paths that are not the lifespan in tests and could be in future, and a
+    # second detection here costs N bounded root observations.
+    await detect_root_overlaps("startup")
     # Hold `index_pass_lock` for the initial pass too, so a panel-triggered
     # `_reindex_background` fired during startup is serialized against it.
     startup_ok = True
@@ -4308,8 +4469,19 @@ async def run_indexer_loop():
     while True:
         await asyncio.sleep(settings.index_interval_seconds)
         logger.info("Periodic indexer tick")
+        # E3 — every periodic iteration, **before** the pause check and before
+        # `index_pass_lock`. Before the pause check because a pause suppresses
+        # index and embed work and must not suppress detection: the pause is
+        # entered precisely when an operator is doing something destructive and
+        # watching the panel, which is the worst moment for a quarantine to go
+        # unpublished and unrecorded.
+        await detect_root_overlaps("periodic")
         if _is_paused():
             logger.info("Periodic tick skipped (paused)")
+            # The snapshot has been published and the ERROR logged; the run rows
+            # are the half that survives a restart, so a paused iteration writes
+            # them before it returns. No index or embed work is performed.
+            await record_quarantined_runs("scheduled")
             continue
         try:
             # Hold `index_pass_lock` for the whole index/embed pass so a
