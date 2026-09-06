@@ -213,6 +213,12 @@ class FakeRegistry:
         #: apart and a test can tell which happened.
         self.savepoints = 0
         self.savepoint_rollbacks = 0
+        #: Called at the top of `rollback`, before `fail_rollback` fires. Models
+        #: the one thing a real session does that matters to the touch's
+        #: recovery: it **expires what it is holding before re-raising**, so a
+        #: mapped instance read afterwards is a refresh against a dead
+        #: connection rather than an attribute read.
+        self.on_rollback = None
         #: Instances detached with `expunge`, in order.
         self.expunged: list = []
         # The state a rollback before the first commit returns to.
@@ -267,6 +273,8 @@ class FakeRegistry:
     async def rollback(self):
         self.rolled_back += 1
         self.events.append(("rollback",))
+        if self.on_rollback is not None:
+            self.on_rollback()
         if self.restore_on_rollback:
             for user in self.users:
                 snapshot = self._user_snapshot.get(id(user))
