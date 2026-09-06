@@ -520,3 +520,83 @@ async def test_the_key_is_one_declared_constant():
     # And both fingerprints are guarded by the same key, so the ordering rule
     # is trivially total.
     assert KEY_EMBEDDING_FINGERPRINT != KEY_FTS_FINGERPRINT
+
+
+@pytest.mark.parametrize("source", ["backlog", "reconciliation"])
+async def test_real_reset_ddl_during_provider_has_no_discovery_lock_cycle(
+    engines, world, monkeypatch, source
+):
+    """Reset's real DROP INDEX/ALTER TABLE must not meet retained read locks.
+
+    The earlier fingerprint-only race cannot expose this: a sweep's EXISTS
+    holds AccessShareLock on note_embeddings, while reset holds the generation
+    advisory lock and needs AccessExclusiveLock there. Once the provider
+    returns, the sweep waits for that advisory lock and PostgreSQL aborts one
+    transaction as deadlocked. Run the actual reset driver on another engine,
+    releasing the provider as its first DDL is issued, to exercise that cycle.
+    """
+    import asyncio
+    from sqlalchemy import event
+    from scripts import reset_embeddings
+
+    maker_a, maker_b = engines
+    monkeypatch.setattr(settings, "embedding_dimensions", DIM)
+    monkeypatch.setattr(settings, "embedding_exclude_patterns", [])
+    config_b = _fingerprint_with_model(OTHER_MODEL)
+    async with maker_a() as session:
+        await index_state.set_state(
+            session, KEY_EMBEDDING_FINGERPRINT, index_state.embedding_fingerprint()
+        )
+        if source == "backlog":
+            await session.execute(text(
+                "UPDATE notes_metadata SET embedded_content_hash = NULL"
+            ))
+        else:
+            await session.execute(text("DELETE FROM note_embeddings"))
+        await session.commit()
+
+    reset_engine = maker_b.kw["bind"]
+    monkeypatch.setattr(reset_embeddings, "async_session", maker_b)
+    monkeypatch.setattr(reset_embeddings, "engine", reset_engine)
+    monkeypatch.setattr(reset_embeddings, "embedding_fingerprint", lambda: config_b)
+    ddl_started = asyncio.Event()
+    statements = []
+    reset_task = None
+
+    def before_statement(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+        if statement.startswith("DROP INDEX IF EXISTS ix_note_embeddings_embedding_hnsw"):
+            ddl_started.set()
+
+    event.listen(reset_engine.sync_engine, "before_cursor_execute", before_statement)
+
+    async def provider(chunks):
+        nonlocal reset_task
+        assert reset_task is None, "one note should issue one provider call"
+        reset_task = asyncio.create_task(reset_embeddings.reset())
+        await asyncio.wait_for(ddl_started.wait(), timeout=5)
+        return [[0.1] * DIM for _ in chunks]
+
+    monkeypatch.setattr(embeddings_service, "get_embeddings_batch", provider)
+    try:
+        outcome = await asyncio.wait_for(indexer.embed_vault(), timeout=15)
+        assert reset_task is not None, "the provider/reset interleaving was not reached"
+        await asyncio.wait_for(reset_task, timeout=15)
+    finally:
+        if reset_task is not None and not reset_task.done():
+            reset_task.cancel()
+            await asyncio.gather(reset_task, return_exceptions=True)
+        event.remove(reset_engine.sync_engine, "before_cursor_execute", before_statement)
+
+    assert any("ALTER TABLE note_embeddings ALTER COLUMN embedding TYPE" in sql for sql in statements)
+    assert any("CREATE INDEX ix_note_embeddings_embedding_hnsw" in sql for sql in statements)
+    assert outcome.attempted == 1
+    assert outcome.embedded == 0
+    assert outcome.failures == 0, outcome.failure_summary
+    assert await _vectors(maker_a) == []
+    async with maker_a() as session:
+        assert await index_state.get_state(session, KEY_EMBEDDING_FINGERPRINT) == config_b
+        stamp = (await session.execute(text(
+            "SELECT embedded_content_hash FROM notes_metadata WHERE id = :id"
+        ), {"id": world["note_id"]})).scalar()
+        assert stamp is None, "old provider output was certified after reset"

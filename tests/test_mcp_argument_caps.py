@@ -247,8 +247,18 @@ def test_a_provider_input_rejection_becomes_the_same_caller_facing_code(
     rows = []
     out = _run(tools.semantic_search_impl, query="dense but short", rows=rows)
 
-    payload = _sentinel(out)
-    assert payload["code"] == refusals.ARGUMENT_TOO_LONG
+    # **The whole payload**, because the interesting part is what it does not
+    # claim. The limit that fired is the provider's, it is a *token* limit, and
+    # this server does not know its value — so quoting `MAX_SEARCH_QUERY_CHARS`
+    # here (the shape this used to have) told a parsing agent that an
+    # 8,192-character bound had been exceeded by a query well under it. An
+    # agent trimming to that number is refused again, identically, forever.
+    assert _sentinel(out) == {
+        "code": refusals.ARGUMENT_TOO_LONG,
+        "scope": "provider",
+        "limit": None,
+        "limit_unit": None,
+    }
     assert reason in out, "the provider's stated reason must reach the caller"
     assert "Traceback" not in out
 

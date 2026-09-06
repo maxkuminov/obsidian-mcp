@@ -21,7 +21,7 @@ import base64
 import errno
 import os
 import stat
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from pathlib import Path
 
 import pytest
@@ -1398,21 +1398,20 @@ async def test_a_source_replaced_by_a_non_file_is_moved_back(
     (vault / "elsewhere.md").write_text("elsewhere\n", encoding="utf-8")
     executed = _no_db(monkeypatch)
 
-    real = vault_fs.rename_noreplace
+    real = tools._pin_source_inode
     fired: list[bool] = []
 
-    def swap_then_rename(src_dir_fd, src_name, dst_dir_fd, dst_name):
-        if not fired:
-            fired.append(True)
-            os.unlink(source)
-            if kind == "directory":
-                source.mkdir()
-                (source / "inner.md").write_text("inner\n", encoding="utf-8")
-            else:
-                source.symlink_to(vault / "elsewhere.md")
-        return real(src_dir_fd, src_name, dst_dir_fd, dst_name)
+    def swap_before_capture(target):
+        fired.append(True)
+        os.unlink(source)
+        if kind == "directory":
+            source.mkdir()
+            (source / "inner.md").write_text("inner\n", encoding="utf-8")
+        else:
+            source.symlink_to(vault / "elsewhere.md")
+        return real(target)
 
-    monkeypatch.setattr(vault_fs, "rename_noreplace", swap_then_rename)
+    monkeypatch.setattr(tools, "_pin_source_inode", swap_before_capture)
 
     result = await tools.move_note_impl("source.md", "moved.md")
 
@@ -1435,19 +1434,23 @@ async def test_a_failed_rollback_names_the_recovery_location(vault, monkeypatch)
     source.write_text("note\n", encoding="utf-8")
     executed = _no_db(monkeypatch)
 
-    real = vault_fs.rename_noreplace
+    real_pin = tools._pin_source_inode
+    real_rename = vault_fs.rename_noreplace
     calls: list[int] = []
 
-    def swap_then_rename(src_dir_fd, src_name, dst_dir_fd, dst_name):
+    def swap_before_capture(target):
+        os.unlink(source)
+        source.mkdir()
+        return real_pin(target)
+
+    def fail_rollback(src_dir_fd, src_name, dst_dir_fd, dst_name):
         calls.append(1)
         if len(calls) == 1:
-            os.unlink(source)
-            source.mkdir()
-            return real(src_dir_fd, src_name, dst_dir_fd, dst_name)
-        # The rollback: somebody took the source name over in the meantime.
+            return real_rename(src_dir_fd, src_name, dst_dir_fd, dst_name)
         raise FileExistsError(17, "File exists", dst_name)
 
-    monkeypatch.setattr(vault_fs, "rename_noreplace", swap_then_rename)
+    monkeypatch.setattr(tools, "_pin_source_inode", swap_before_capture)
+    monkeypatch.setattr(vault_fs, "rename_noreplace", fail_rollback)
 
     result = await tools.move_note_impl("source.md", "moved.md")
 
@@ -1488,11 +1491,7 @@ async def test_a_destination_taken_over_after_the_move_is_not_rolled_back(
         return result
 
     monkeypatch.setattr(vault_fs, "rename_noreplace", steal_the_destination)
-    # Pinned to something the destination can never be, so the branch under
-    # test is reached deterministically: unlink-then-mkdir can reuse the very
-    # inode number we just freed, which would make the identities compare equal
-    # for reasons that have nothing to do with the rule.
-    monkeypatch.setattr(tools, "_pin_source_inode", lambda target: (-1, -1))
+    # The retained source witness prevents reuse without a fake identity.
 
     result = await tools.move_note_impl("source.md", "moved.md")
 
@@ -1546,7 +1545,7 @@ async def test_an_unpinnable_source_is_reported_rather_than_assumed(
 ):
     (vault / "source.md").write_text("note\n", encoding="utf-8")
     executed = _no_db(monkeypatch)
-    monkeypatch.setattr(tools, "_pin_source_inode", lambda target: None)
+    monkeypatch.setattr(tools, "_pin_source_inode", lambda target: nullcontext(None))
 
     result = await tools.move_note_impl("source.md", "moved.md")
 
@@ -1874,3 +1873,129 @@ def test_an_unrelated_replace_errno_still_propagates(vault, monkeypatch):
     assert not isinstance(caught.value, vault_fs.VaultFSError)
     assert caught.value.errno == errno.EIO
     assert (vault / "blob.bin").read_bytes() == b"old"
+
+
+@pytest.mark.parametrize("kind", ["directory", "symlink"])
+async def test_source_replaced_after_capture_is_not_guessed_to_be_our_inode(vault, monkeypatch, kind):
+    source = vault / "source.md"
+    source.write_text("original\n")
+    (vault / "elsewhere.md").write_text("elsewhere\n")
+    executed = _no_db(monkeypatch)
+    original = vault_fs.rename_noreplace
+    calls = []
+
+    def replace_after_capture(src_fd, src_name, dst_fd, dst_name):
+        calls.append((src_name, dst_name))
+        if len(calls) == 1:
+            source.unlink()
+            if kind == "directory":
+                source.mkdir()
+            else:
+                source.symlink_to(vault / "elsewhere.md")
+        return original(src_fd, src_name, dst_fd, dst_name)
+
+    monkeypatch.setattr(vault_fs, "rename_noreplace", replace_after_capture)
+    result = await tools.move_note_impl("source.md", "moved.md")
+    assert "not the file that was moved" in result
+    assert "nothing was moved back" in result
+    assert len(calls) == 1
+    assert not source.exists()
+    assert (vault / "moved.md").is_dir() if kind == "directory" else (vault / "moved.md").is_symlink()
+    assert (vault / "elsewhere.md").read_text() == "elsewhere\n"
+    assert executed == []
+
+
+@pytest.mark.parametrize("outcome", ["success", "rename_error", "verify_error", "rollback", "rollback_error"])
+async def test_move_witness_stays_open_through_commit_and_closes_on_exit(vault, monkeypatch, outcome):
+    source = vault / "source.md"
+    source.write_text("original\n")
+    _no_db(monkeypatch)
+    real_open = os.open
+    real_pin = tools._pin_source_inode
+    real_move = tools.move_file_no_clobber
+    real_verify = tools._verify_the_moved_inode
+    witnesses = []
+    stages = []
+
+    def observe_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if path == "source.md" and flags & os.O_PATH:
+            witnesses.append(fd)
+        return fd
+
+    def assert_alive():
+        assert len(witnesses) == 1
+        os.fstat(witnesses[0])
+
+    def pin(target):
+        if outcome.startswith("rollback"):
+            source.unlink()
+            source.mkdir()
+        return real_pin(target)
+
+    def move(*args, **kwargs):
+        assert_alive()
+        stage = "rollback" if kwargs.get("permit") is not None else "rename"
+        stages.append(stage)
+        if (stage == "rename" and outcome == "rename_error") or (stage == "rollback" and outcome == "rollback_error"):
+            raise OSError(errno.EIO, "test failure")
+        return real_move(*args, **kwargs)
+
+    def verify(*args, **kwargs):
+        assert_alive()
+        stages.append("verify")
+        if outcome == "verify_error":
+            raise OSError(errno.EIO, "test failure")
+        result = real_verify(*args, **kwargs)
+        assert_alive()
+        if outcome == "success":
+            assert result is None
+            # Stop before unrelated index SQL; the synchronous commit succeeded.
+            return "verified-success"
+        return result
+
+    monkeypatch.setattr(tools.os, "open", observe_open)
+    monkeypatch.setattr(tools, "_pin_source_inode", pin)
+    monkeypatch.setattr(tools, "move_file_no_clobber", move)
+    monkeypatch.setattr(tools, "_verify_the_moved_inode", verify)
+    result = await tools.move_note_impl("source.md", "moved.md")
+    assert len(witnesses) == 1
+    with pytest.raises(OSError) as closed:
+        os.fstat(witnesses[0])
+    assert closed.value.errno == errno.EBADF
+    if outcome == "success":
+        assert result == "verified-success"
+        assert (vault / "moved.md").read_text() == "original\n"
+    elif outcome.startswith("rollback"):
+        assert stages == ["rename", "verify", "rollback"]
+        assert "Move refused" in result
+    else:
+        assert "Move failed" in result
+
+
+def test_witness_stat_failure_yields_none_and_closes_descriptor(vault, monkeypatch):
+    (vault / "source.md").write_text("original\n")
+    real_stat = os.stat
+    real_open = os.open
+    witnesses = []
+
+    def observe_open(path, flags, *args, **kwargs):
+        fd = real_open(path, flags, *args, **kwargs)
+        if path == "source.md" and flags & os.O_PATH:
+            witnesses.append(fd)
+        return fd
+
+    def fail_witness_stat(path, *args, **kwargs):
+        if isinstance(path, int) and path in witnesses:
+            raise OSError(errno.EIO, "test stat failure")
+        return real_stat(path, *args, **kwargs)
+
+    with tools.open_mutable("source.md") as target:
+        monkeypatch.setattr(tools.os, "open", observe_open)
+        monkeypatch.setattr(tools.os, "stat", fail_witness_stat)
+        with tools._pin_source_inode(target) as identity:
+            assert identity is None
+            assert len(witnesses) == 1
+        with pytest.raises(OSError) as closed:
+            os.fstat(witnesses[0])
+        assert closed.value.errno == errno.EBADF

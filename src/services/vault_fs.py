@@ -2183,18 +2183,29 @@ def remove(root_fd: int, rel_path: str | Path) -> None:
     """
     dir_fd, name = _open_parent(root_fd, rel_path, create=False)
     try:
-        st = _lstat(dir_fd, name)
-        if st is None:
-            raise FileNotFoundError(f"File not found: {rel_path}")
-        _require_regular(st, str(rel_path))
-        os.unlink(name, dir_fd=dir_fd)
-        # An unlink is a directory operation like any other publication: an
-        # entry that survives a crash resurrects a file the caller was told is
-        # gone. Swallowed on failure — the file *is* unlinked, and reporting a
-        # failure would invite a retry of a delete that already happened (#97).
-        flush_dir_quietly(dir_fd, f"parent directory of {rel_path}")
+        remove_at(dir_fd, name, label=rel_path)
     finally:
         os.close(dir_fd)
+
+
+def remove_at(
+    dir_fd: int, name: str, *, label: str | Path | None = None
+) -> None:
+    """`remove` through a parent descriptor the caller already validated.
+
+    The caller owns the descriptor and has already authorized the operation.
+    Keep its regular-file check, unlink and durability flush in one primitive,
+    without re-resolving the parent between a precondition and deletion.
+    """
+    rel_path = name if label is None else label
+    st = _lstat(dir_fd, name)
+    if st is None:
+        raise FileNotFoundError(f"File not found: {rel_path}")
+    _require_regular(st, str(rel_path))
+    os.unlink(name, dir_fd=dir_fd)
+    # A successful unlink must not be reported as failed merely because its
+    # directory flush failed: retrying could delete a replacement file (#97).
+    flush_dir_quietly(dir_fd, f"parent directory of {rel_path}")
 
 
 def _trash_mount_boundary(

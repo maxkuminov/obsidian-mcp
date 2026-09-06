@@ -116,6 +116,11 @@
   is that everything inline is nonced. Their security headers must stay
   byte-identical once each response's per-request nonce is canonicalized.
 
+- The archived ops-health and usage-slicing sweep wrappers locate their
+  shared `colorscan` module by walking ancestors, then use its `repo_root()`
+  helper (#220). They must not assume a fixed `parents[N]` depth; archiving
+  changes that depth and previously broke the import before any scan ran.
+
 - **The sweep discovers its own templates now, and refuses to report a
   vacuous pass.** `checks/literal_sweep.py` in the light-mode change (under
   `openspec/changes/archive/`) is what proves "no color literal outside a
@@ -670,6 +675,12 @@ The lifecycle, in one table — one implementation per phase:
   logs a WARNING carrying the exception's class name, and serves the page:
   `last_seen_at` is telemetry throttled to once a minute and nothing authorizes
   on it.
+
+  Failure reporting captures the actor's `user_id` and route as primitives
+  before database work. A failed commit followed by a failed rollback can
+  expire the ORM row; reading its attributes to log that failure would attempt
+  another database refresh and fail the request. Both failure records use the
+  captured values and carry no session identifier, including its stored hash.
 
 - **`user_agent_hash` is forensic and is never an authorization input.** It is
   useful when reconstructing an incident. As a *binding* it is bad: whoever

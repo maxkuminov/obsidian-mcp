@@ -1488,6 +1488,91 @@ async def test_redemptions_above_the_write_rate_are_refused(
     assert harness.token not in str(carried)
 
 
+@pytest.mark.parametrize("release_raises", [True, False])
+async def test_a_rate_refusal_whose_release_fails_is_not_a_retryable_429(
+    harness, vault, write_bucket, events, monkeypatch, release_raises
+):
+    """A 429 with `Retry-After` promises the link still works. Only a confirmed
+    release can support that promise.
+
+    `claim_upload` commits *before* this gate, so when the release fails the
+    token stays claimed until its TTL — several minutes during which the same
+    link answers the uniform 404. Answering 429 anyway told an obedient agent
+    "retry in N seconds" about a capability that would refuse it, and gave it
+    no way to tell the refusal it was handed from the one it then got. So when
+    the claim cannot be put back the route falls through to its ordinary
+    non-retryable answer, which is what a retry would in fact receive, and
+    `transfer_claim_release_failed` records the cause class-only.
+    """
+    # The release branch runs before any upload I/O; spend its allowance
+    # directly so this regression exercises only the refused request.
+    for _ in range(2):
+        assert rate_limits.take(("api_key", 7), refusals.SCOPE_PRINCIPAL_WRITE)[0]
+
+    async def failing_release(_session, _row):
+        harness.released += 1
+        if release_raises:
+            raise RuntimeError("the pool is gone")
+        return False
+
+    monkeypatch.setattr(transfer, "release_claim", failing_release)
+
+    _rearm(harness, "third")
+    from starlette.requests import Request
+
+    async def unexpected_body():
+        pytest.fail("a refused upload must not read its body")
+
+    request = Request(
+        {"type": "http", "method": "PUT", "path": "/transfer/upload",
+         "headers": [], "client": ("203.0.113.7", 4242), "scheme": "http",
+         "server": ("localhost", 8000)},
+        receive=unexpected_body,
+    )
+    response = await transfer_routes.upload.__wrapped__(request, token=harness.token)
+
+    assert response.status_code == 404
+    assert response.body == b'{"error":"not found"}'
+    assert "retry-after" not in {k.lower() for k in response.headers}
+
+    # The claim really is still held — which is exactly why the 429 would have
+    # been a lie — and nothing was written.
+    assert harness.row.state == "claimed"
+    assert harness.consumed == 0
+    assert not (vault / "Attachments" / "third.png").exists()
+    assert temp_files(vault / "Attachments") == []
+
+    # The cause is recorded, class-only, and no rate-limit record claims a
+    # refusal the caller was never told about in those terms.
+    failures = events.named("transfer_claim_release_failed")
+    assert len(failures) == (1 if release_raises else 0)
+    if release_raises:
+        assert _fields(failures[0])["error_type"] == "RuntimeError"
+    assert events.named("transfer_refused_rate_limited") == []
+
+
+async def test_a_rate_refusal_whose_release_succeeds_is_still_a_429(
+    client, harness, vault, write_bucket, events
+):
+    """The counterpart, so the fallback above cannot quietly become the rule:
+    a release that lands keeps the retryable answer and the link redeemable."""
+    for name in ("first", "second"):
+        _rearm(harness, name)
+        assert (
+            await client.put(
+                "/transfer/upload", headers=auth(harness), content=PNG
+            )
+        ).status_code == 200
+
+    _rearm(harness, "third")
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+    assert response.status_code == 429
+    assert harness.row.state == "pending"
+    assert len(events.named("transfer_refused_rate_limited")) == 1
+
+
 async def test_the_charge_happens_before_a_single_body_byte_is_read(
     client, harness, vault, write_bucket
 ):

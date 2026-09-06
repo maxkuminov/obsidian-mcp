@@ -208,8 +208,34 @@ class EmbedPassResult:
 
     @property
     def failure_summary(self) -> str | None:
+        """The one line an operator reads for a failed pass.
+
+        **"N of M" is only meaningful while every failure came from a note that
+        issued a provider call**, and not every one does. `record_failure` also
+        catches what escapes *around* the call — a database error opening the
+        note's row, a rollback that itself failed, a byte read that raised
+        after the backlog selected the row — and those move `failures` without
+        moving `attempted`. Rendered as a ratio, one such error on a pass whose
+        provider was never reached reads `1 of 0`, which is not a small
+        infelicity: `of 0` says the pass made no calls, so the natural reading
+        of `1 of 0` is that the counter is broken, and an operator who
+        concludes that stops trusting the number that would have told them
+        about a real outage.
+
+        So when the failures outnumber the calls, the count and the call count
+        are stated as two separate facts instead of as a ratio. The ordinary
+        case — every failure from a note that called the provider — keeps the
+        ratio it always had, because that is the shape an outage produces and
+        the one the existing history is full of.
+        """
         if not self.failures:
             return None
+        if self.failures > self.attempted:
+            return (
+                f"embed failures: {self.failures} "
+                f"({self.attempted} provider call(s) issued) — "
+                f"first: {self.first_error}"
+            )
         return (
             f"embed failures: {self.failures} of {self.attempted} — "
             f"first: {self.first_error}"
@@ -3144,6 +3170,10 @@ async def _embed_vault_pinned(
         result = await session.execute(text(sql), params)
         unembedded = result.fetchall()
         budget = await _budget_for_pass(session, log_suffix)
+        # Discovery is a read-only transaction. Its table locks must end before
+        # filesystem/provider work or a later generation-lock acquisition.
+        # SQL result rows retain the hash/path snapshot after the commit.
+        await session.commit()
 
         exclude_patterns = settings.embedding_exclude_patterns or []
         if not unembedded:
@@ -3266,6 +3296,10 @@ async def _embed_vault_pinned(
                     select(NoteMetadata).where(NoteMetadata.id == row.id)
                 )
                 note = note_result.scalar_one()
+                # The session uses expire_on_commit=False: keep the loaded note
+                # writable, but release this SELECT's AccessShareLock before
+                # provider I/O and the advisory lock taken by embed_note.
+                await session.commit()
 
                 # ── Certify against what was verified, not what was re-read ──
                 # The `select` above is a *second* database read, in a later
@@ -3397,12 +3431,12 @@ async def _embed_vault_pinned(
                     budget.note_finished()
 
         if outcome.failures:
+            # The same rendering as the run row's, from the same property, so
+            # the log line and the `error` column cannot disagree about what a
+            # pass did — and so neither can print "1 of 0" when the one thing
+            # that failed never reached the provider.
             logger.error(
-                "Embedding pass%s swallowed %s of %s notes: %s",
-                log_suffix,
-                outcome.failures,
-                outcome.attempted,
-                outcome.first_error,
+                "Embedding pass%s: %s", log_suffix, outcome.failure_summary
             )
 
         if unembedded:
@@ -3494,6 +3528,12 @@ async def _reconcile_exclusions(
           AND nm.embedded_content_hash IS NOT DISTINCT FROM nm.content_hash
         ORDER BY nm.modified_at DESC
     """), params)).fetchall()
+    # EXISTS read note_embeddings and holds AccessShareLock until transaction
+    # end. Reset takes the generation advisory lock then DROP INDEX requests
+    # AccessExclusiveLock on that table. Carrying this discovery transaction
+    # into embed_note's advisory wait closes a real deadlock cycle. Retain the
+    # immutable result-row snapshots, and release their discovery locks now.
+    await session.commit()
 
     if not rows:
         return
@@ -3589,6 +3629,10 @@ async def _reconcile_exclusions(
             note = (await session.execute(
                 select(NoteMetadata).where(NoteMetadata.id == row.id)
             )).scalar_one()
+            # End the per-note read transaction too. The verified hash/path
+            # remain row's snapshots; embed_note rechecks generation and uses
+            # the certified predicate in a fresh transaction after provider I/O.
+            await session.commit()
             was_truncated = bool(getattr(note, "chunks_truncated", False))
             # Past this line the note has reached the provider path, so it has
             # reached a note boundary whatever happens next.
@@ -5236,83 +5280,97 @@ async def run_indexer_loop():
     while True:
         await asyncio.sleep(settings.index_interval_seconds)
         logger.info("Periodic indexer tick")
-        # E3 — every periodic iteration, **before** the pause check and before
-        # `index_pass_lock`. Before the pause check because a pause suppresses
-        # index and embed work and must not suppress detection: the pause is
-        # entered precisely when an operator is doing something destructive and
-        # watching the panel, which is the worst moment for a quarantine to go
-        # unpublished and unrecorded.
-        await detect_root_overlaps("periodic")
-        if _is_paused():
-            logger.info("Periodic tick skipped (paused)")
-            # The snapshot has been published and the ERROR logged; the run rows
-            # are the half that survives a restart, so a paused iteration writes
-            # them before it returns. No index or embed work is performed.
-            await record_quarantined_runs("scheduled")
-            continue
+        # The whole tick body is guarded so the refusal flush below runs on
+        # **every** path out of it — see the `finally`.
         try:
-            # Hold `index_pass_lock` for the whole index/embed pass so a
-            # concurrent panel-triggered `_reindex_background` cannot run a
-            # second index_vault/embed_vault over the same scope.
-            tick_ok = True
-            async with index_pass_lock:
-                if settings.multi_user_mode:
-                    # Re-fetch the user list every cycle so newly-added or
-                    # newly-deactivated users are picked up without a restart.
-                    # One user's failure does not abort the others, but it
-                    # does make the whole tick a failed run.
-                    for uid in await _rotated_user_ids():
-                        if not await _index_pass_once(uid):
-                            tick_ok = False
-                        # Advanced whether the pass succeeded or failed: the
-                        # cursor records where the cycle got to, not whether it
-                        # went well, and a failing tenant that pinned it would
-                        # starve every tenant after them.
-                        await _advance_rotation_cursor(uid)
-                else:
-                    # Not routed through `_index_pass_once`: that helper
-                    # swallows per-stage exceptions so one user cannot stop the
-                    # others, and in single-user mode a raising pass must reach
-                    # the outer handler so `consecutive_failures` sees it. The
-                    # run row is still written — `record_indexer_run` records
-                    # the exception on its way past.
-                    async with record_indexer_run("scheduled", None) as stats:
-                        stats.record_index(await index_vault())
-                        stats.record_embedded(await embed_vault())
-                # Still under the lock: serialised against a panel reindex and
-                # against reset-embeddings, which also takes this lock. It
-                # never raises, so `consecutive_failures` cannot react to it,
-                # and it delays the next tick by at most PREWARM_TIMEOUT_SECONDS.
-                await prewarm_search_caches()
-            await cleanup_expired_tokens()
+            # E3 — every periodic iteration, **before** the pause check and
+            # before `index_pass_lock`. Before the pause check because a pause
+            # suppresses index and embed work and must not suppress detection:
+            # the pause is entered precisely when an operator is doing
+            # something destructive and watching the panel, which is the worst
+            # moment for a quarantine to go unpublished and unrecorded.
+            await detect_root_overlaps("periodic")
+            if _is_paused():
+                logger.info("Periodic tick skipped (paused)")
+                # The snapshot has been published and the ERROR logged; the run
+                # rows are the half that survives a restart, so a paused
+                # iteration writes them before it returns. No index or embed
+                # work is performed.
+                await record_quarantined_runs("scheduled")
+                continue
+            try:
+                # Hold `index_pass_lock` for the whole index/embed pass so a
+                # concurrent panel-triggered `_reindex_background` cannot run a
+                # second index_vault/embed_vault over the same scope.
+                tick_ok = True
+                async with index_pass_lock:
+                    if settings.multi_user_mode:
+                        # Re-fetch the user list every cycle so newly-added or
+                        # newly-deactivated users are picked up without a restart.
+                        # One user's failure does not abort the others, but it
+                        # does make the whole tick a failed run.
+                        for uid in await _rotated_user_ids():
+                            if not await _index_pass_once(uid):
+                                tick_ok = False
+                            # Advanced whether the pass succeeded or failed: the
+                            # cursor records where the cycle got to, not whether it
+                            # went well, and a failing tenant that pinned it would
+                            # starve every tenant after them.
+                            await _advance_rotation_cursor(uid)
+                    else:
+                        # Not routed through `_index_pass_once`: that helper
+                        # swallows per-stage exceptions so one user cannot stop the
+                        # others, and in single-user mode a raising pass must reach
+                        # the outer handler so `consecutive_failures` sees it. The
+                        # run row is still written — `record_indexer_run` records
+                        # the exception on its way past.
+                        async with record_indexer_run("scheduled", None) as stats:
+                            stats.record_index(await index_vault())
+                            stats.record_embedded(await embed_vault())
+                    # Still under the lock: serialised against a panel reindex and
+                    # against reset-embeddings, which also takes this lock. It
+                    # never raises, so `consecutive_failures` cannot react to it,
+                    # and it delays the next tick by at most PREWARM_TIMEOUT_SECONDS.
+                    await prewarm_search_caches()
+                await cleanup_expired_tokens()
+                consecutive_failures = 0
+                # Heartbeat: the tick completed. Recorded whether or not the pass
+                # found anything to index — that is the whole point (#78) — but
+                # `tick_ok` is False if any per-user pass swallowed an exception,
+                # so a multi-user tick that failed for every user is not stamped
+                # healthy just because the loop itself survived.
+                _record_index_run(tick_ok)
+            except Exception as e:
+                consecutive_failures += 1
+                # A tick that raised still *ran*; the dashboard says so and marks
+                # it failed rather than showing a stale-looking success.
+                # `CancelledError` is a BaseException and does not land here, so
+                # lifespan shutdown is not recorded as a failed pass.
+                _record_index_run(False)
+                logger.error(f"Periodic task failed ({consecutive_failures} consecutive): {e}")
+                if consecutive_failures >= 5:
+                    logger.critical("Indexer has failed 5+ consecutive times — manual intervention required")
+        finally:
             # The refusal coalescer's standalone flush: any window that closed
             # since the last tick writes the row it owes, so a principal that
             # was refused in a burst and then went quiet still has its count
             # land — otherwise the last window of every burst would wait for
             # the *next* refusal, which by definition may never come.
             #
+            # **In the `finally`, so every path out of the tick reaches it.**
+            # It used to sit after `cleanup_expired_tokens()`, which only a
+            # *healthy* tick reaches: a paused tick `continue`s above it and a
+            # failing tick jumps past it into the handler, so on a deployment
+            # that was paused, or failing, the counts accumulated in memory and
+            # were written only if the process happened to shut down cleanly.
+            # Those are exactly the two states an operator is most likely to be
+            # investigating with `/admin/performance` open.
+            #
             # Housekeeping, so a failure here may never fail a pass — the
             # `quota_counters` prune precedent. Every row's own failure is
-            # already swallowed and recorded by the usage writer; this guard
-            # covers the flush itself.
+            # already swallowed by the writer and its weight requeued into the
+            # coalescer; this guard covers the flush itself.
             try:
                 await flush_expired()
             except Exception as e:  # noqa: BLE001 - housekeeping, never fatal
                 logger.error(f"Refusal flush failed: {e}")
-            consecutive_failures = 0
-            # Heartbeat: the tick completed. Recorded whether or not the pass
-            # found anything to index — that is the whole point (#78) — but
-            # `tick_ok` is False if any per-user pass swallowed an exception,
-            # so a multi-user tick that failed for every user is not stamped
-            # healthy just because the loop itself survived.
-            _record_index_run(tick_ok)
-        except Exception as e:
-            consecutive_failures += 1
-            # A tick that raised still *ran*; the dashboard says so and marks
-            # it failed rather than showing a stale-looking success.
-            # `CancelledError` is a BaseException and does not land here, so
-            # lifespan shutdown is not recorded as a failed pass.
-            _record_index_run(False)
-            logger.error(f"Periodic task failed ({consecutive_failures} consecutive): {e}")
-            if consecutive_failures >= 5:
-                logger.critical("Indexer has failed 5+ consecutive times — manual intervention required")

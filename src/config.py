@@ -34,8 +34,46 @@ def _off_means_none(value: Any) -> Any:
     return value
 
 
-#: A whole number of at least one, or the documented "off".
+#: Upper bound on every limiter *count* — the rates, the bursts and the
+#: registry caps. A ceiling and not merely a floor, because "no upper bound"
+#: is not the same as "no limit": pydantic accepts an arbitrarily long integer
+#: literal from the environment, so `MCP_RATE_LIMIT_BURST` set to a 401-digit
+#: number booted cleanly and then handed one principal a bucket whose capacity
+#: no real traffic could ever exhaust — a control that is *configured* and does
+#: nothing, which is the failure mode an operator cannot see. A million calls a
+#: minute is already three orders of magnitude beyond anything this server can
+#: serve, so a value above it is a typo or a misunderstanding either way.
+LIMITER_COUNT_MAX = 1_000_000
+
+#: Upper bound on a limiter *window*. One day: a failure budget that spans
+#: longer than that stops being a burst control and becomes an unattended ban
+#: nobody remembers setting.
+LIMITER_WINDOW_SECONDS_MAX = 86_400
+
+#: Upper bound on the coalescing interval. One hour, for the same reason in the
+#: other direction: past it a `usage_logs` row stands for so many refusals that
+#: `/admin/performance` stops being a view of what happened and becomes a view
+#: of what was summarised.
+REFUSAL_INTERVAL_SECONDS_MAX = 3_600
+
+#: Upper bound on the failed-authentication table. The table is allocated in
+#: full at first use, so this is a direct memory bound: 1,048,576 slots is a
+#: few tens of MB of counters and far past the point where collisions matter.
+AUTH_FAILURE_TABLE_SIZE_MAX = 1_048_576
+
+#: A whole number of at least one and at most `LIMITER_COUNT_MAX`, or the
+#: documented "off".
 NullableLimit = Annotated[
+    Annotated[int, Field(ge=1, le=LIMITER_COUNT_MAX)] | None,
+    BeforeValidator(_off_means_none),
+]
+
+#: The same, without the field-level ceiling: `DEFAULT_DAILY_REQUEST_LIMIT`'s
+#: domain is `ck_api_keys_daily_request_limit`'s, and the model validator below
+#: enforces it so the boot failure names that domain rather than a bare field
+#: bound. Its ceiling is therefore identical, just stated once, where the
+#: operator-facing message is.
+NullableDailyLimit = Annotated[
     Annotated[int, Field(ge=1)] | None, BeforeValidator(_off_means_none)
 ]
 
@@ -504,12 +542,16 @@ class Settings(BaseSettings):
     # egresses from shared addresses, and no working client fails 60 times in
     # five minutes.
     mcp_auth_failure_limit: NullableLimit = 60
-    mcp_auth_failure_window_seconds: int = Field(300, ge=1)
+    mcp_auth_failure_window_seconds: int = Field(
+        300, ge=1, le=LIMITER_WINDOW_SECONDS_MAX
+    )
     # Counters, not addresses: memory is O(size) with nothing to evict, and the
     # per-process random salt means nobody can choose to collide with a victim.
     # Collisions merge two addresses into one budget, which only ever makes the
     # control stricter.
-    mcp_auth_failure_table_size: int = Field(4096, ge=1)
+    mcp_auth_failure_table_size: int = Field(
+        4096, ge=1, le=AUTH_FAILURE_TABLE_SIZE_MAX
+    )
 
     # L2 — the general velocity bucket, on every tool call. Far above observed
     # usage (~1,600 calls per 30 days across all credentials), and it stops a
@@ -530,14 +572,18 @@ class Settings(BaseSettings):
     # credentials; the shared entry is the bounded-memory trade-off, preferred
     # to failing open (which lets a flood succeed) and to failing closed (which
     # turns a bookkeeping cap into an outage for a legitimate credential).
-    mcp_limiter_max_tracked_principals: int = Field(10_000, ge=1)
+    mcp_limiter_max_tracked_principals: int = Field(
+        10_000, ge=1, le=LIMITER_COUNT_MAX
+    )
 
     # How long one `(principal, tool, marker, scope)` coalescing window stays
     # open. Inside it a refusal issues **no statement of any kind** — a rate
     # refusal occurs at the caller's arrival rate, which is precisely the rate
     # nothing else bounds, so uncoalesced refusal rows would be the
     # amplification this control exists to stop.
-    mcp_refusal_log_interval_seconds: int = Field(10, ge=1)
+    mcp_refusal_log_interval_seconds: int = Field(
+        10, ge=1, le=REFUSAL_INTERVAL_SECONDS_MAX
+    )
 
     # The daily quota a **newly created** key receives when the caller does not
     # say otherwise. Applied by the key-creation paths and never as a column
@@ -545,7 +591,7 @@ class Settings(BaseSettings):
     # means unlimited. ~1,600 calls per 30 days across every credential, so
     # 5,000/day cannot interrupt a real session while a runaway stops the same
     # day.
-    default_daily_request_limit: NullableLimit = 5000
+    default_daily_request_limit: NullableDailyLimit = 5000
 
     multi_user_mode: bool = False
     session_max_age: int = 60 * 60 * 24 * 7

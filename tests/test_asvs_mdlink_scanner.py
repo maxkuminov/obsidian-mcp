@@ -267,16 +267,16 @@ def _repeat(unit, size):
     return (unit * (size // len(unit) + 1))[:size]
 
 
-def _measure(fn, arg):
+def _measure(fn, arg, *, clock=time.perf_counter):
     """Best of five, stopping after a second — the same noise discipline as
     `tests/test_asvs_link_grammar.py`, for the same reason."""
     best = None
     spent = 0.0
     found = 0
     for _ in range(5):
-        start = time.perf_counter()
+        start = clock()
         found = fn(arg)
-        elapsed = time.perf_counter() - start
+        elapsed = clock() - start
         best = elapsed if best is None else min(best, elapsed)
         spent += elapsed
         if spent >= 1.0:
@@ -292,8 +292,11 @@ def test_pathological_input_is_scanned_in_linear_time(scanner, unit):
     large = _repeat(unit, 2 * BENCH_N)
 
     fn(small[:4096])  # warm the interpreter, not the measurement
-    t_small, found_small = _measure(fn, small)
-    t_large, found_large = _measure(fn, large)
+    # CPU time measures algorithmic growth without counting scheduler delays
+    # from other test/agent processes (#244). Absolute DoS ceilings below
+    # deliberately keep the default wall clock.
+    t_small, found_small = _measure(fn, small, clock=time.process_time)
+    t_large, found_large = _measure(fn, large, clock=time.process_time)
 
     # None of these is a link. A "fast" run that started finding millions of
     # them would be a different bug wearing this test's clothes.

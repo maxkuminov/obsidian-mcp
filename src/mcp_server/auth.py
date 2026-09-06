@@ -138,6 +138,13 @@ class APIKeyMiddleware:
             await self.app(scope, receive, send)
             return
 
+        # Registry-eval only, and it short-circuits **everything** below —
+        # including the failed-authentication budget, which is therefore never
+        # reached in sandbox mode. That is not an exemption with a hole in it:
+        # authentication is bypassed entirely here, so there are no failures to
+        # budget and no credential lookup to protect. Nothing untrusted may
+        # ever reach a sandbox deployment, which is why `Settings` refuses to
+        # boot one with a public hostname at all.
         if settings.mcp_sandbox_mode:
             await self.app(scope, receive, send)
             return

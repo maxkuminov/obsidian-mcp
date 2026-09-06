@@ -157,8 +157,12 @@ class _Entry:
     write: TokenBucket | None
     last_seen: float
     windows: dict[tuple[str, str, str], _Window] = field(default_factory=dict)
+    # Planned rows still belong to this registered entry until acknowledged.
+    in_flight: int = 0
 
     def idle_and_full(self, now: float) -> bool:
+        if self.in_flight:
+            return False
         if now - self.last_seen < ENTRY_TTL_SECONDS:
             return False
         if any(window.pending for window in self.windows.values()):
@@ -179,6 +183,10 @@ class _Entry:
 
 _entries: dict[Principal, _Entry] = {}
 _overflow: _Entry | None = None
+
+#: The sweep's rotating cursor: a snapshot of the registry's keys, consumed
+#: `SWEEP_SCAN` at a time and rebuilt when it empties. See `_sweep`.
+_sweep_queue: list[Principal] = []
 
 #: Per-process and random, so that a caller cannot compute which addresses
 #: share a slot with a victim's. Never derived from a setting or a secret an
@@ -201,9 +209,10 @@ def reset_state_for_tests() -> None:
     test-suite hazard: one test's depleted bucket refusing the next test's
     first call. Production never calls this.
     """
-    global _overflow, _address_salt, _address_table
+    global _overflow, _address_salt, _address_table, _sweep_queue
     _entries.clear()
     _overflow = None
+    _sweep_queue = []
     _address_salt = secrets.token_bytes(16)
     _address_table = []
 
@@ -254,18 +263,29 @@ def _new_entry(now: float) -> _Entry:
 def _sweep(now: float) -> None:
     """Reclaim at most `SWEEP_SCAN` full-and-idle entries. Bounded work.
 
-    Insertion order, which is the order the dict iterates: the oldest entries
-    are examined first, and a re-used entry is not moved, so the scan sees the
-    candidates most likely to be reclaimable without paying for an LRU.
+    **A rotating cursor, not a fixed prefix.** The first version scanned the
+    first `SWEEP_SCAN` entries in insertion order, which meant that with more
+    than `SWEEP_SCAN` live entries the tail of the registry was *never*
+    examined: on a deployment sitting just above the scan width, the entries
+    inserted last could only ever be reclaimed by a restart, so the registry
+    ratcheted towards its cap and the overflow entry with it. The cursor is a
+    snapshot of the keys, consumed `SWEEP_SCAN` at a time and rebuilt when it
+    empties — one O(n) rebuild per full rotation, so the work per sweep is
+    still bounded amortised, and every entry is eventually examined.
+
+    A key that has been deleted or re-created since the snapshot is simply
+    looked up again: the queue is a scan order, never a source of truth.
     """
-    doomed = []
-    for index, (key, entry) in enumerate(_entries.items()):
-        if index >= SWEEP_SCAN:
-            break
-        if entry.idle_and_full(now):
-            doomed.append(key)
-    for key in doomed:
-        _entries.pop(key, None)
+    global _sweep_queue
+    if not _sweep_queue:
+        _sweep_queue = list(_entries.keys())
+    examined = 0
+    while _sweep_queue and examined < SWEEP_SCAN:
+        key = _sweep_queue.pop()
+        examined += 1
+        entry = _entries.get(key)
+        if entry is not None and entry.idle_and_full(now):
+            del _entries[key]
 
 
 def _entry_for(principal: Principal, now: float) -> _Entry:
@@ -317,11 +337,80 @@ def take(principal: Principal | None, scope: str) -> tuple[bool, int]:
 
 
 def tracked_principals() -> int:
-    """How many principals hold their own entry. For the panel and the tests."""
+    """How many principals hold their own entry. **Tests only.**
+
+    Deliberately not wired to any operator surface: the panel reads durable
+    facts out of `usage_logs`, and this number is a property of one process's
+    memory that a restart resets to zero. It exists so the registry's cap and
+    its overflow behaviour can be asserted rather than inferred.
+    """
     return len(_entries)
 
 
 # ── The refusal coalescer ───────────────────────────────────────────────────
+
+
+#: The `usage_logs` columns a row written from the **shared overflow** entry
+#: must not carry. Past the registry cap many principals coalesce onto one
+#: entry keyed `(tool, marker, scope)`, so the row stands for traffic from
+#: several credentials at once; stamping it with whichever of them happened to
+#: open the window would attribute an aggregate to one member — a false fact
+#: about a specific credential, which is worse than the missing attribution the
+#: overflow already accepts. The count survives; the name does not.
+_ATTRIBUTION_COLUMNS = (
+    "user_id",
+    "key_id",
+    "oauth_token_id",
+    "actor_kind",
+    "actor_label",
+    "actor_ref",
+)
+
+
+#: The `usage_logs.params` key carrying how many refusals a row stands behind.
+#: **One definition**, here, because this module is the only writer: `tools.py`
+#: re-exports it under its private name for the marker register, and a second
+#: literal is how the writer and the reader start disagreeing about a key that
+#: is read with a cast.
+SUPPRESSED_PARAM = "suppressed"
+
+
+def _unattributed(template: dict) -> dict:
+    """`template` with every attribution column explicitly NULL."""
+    stripped = dict(template)
+    for column in _ATTRIBUTION_COLUMNS:
+        stripped[column] = None
+    return stripped
+
+
+@dataclass
+class PlannedRow:
+    """One `usage_logs` row the coalescer has decided to write, **not yet
+    known durable**.
+
+    This type is the whole of the acknowledgement contract. The coalescer's
+    state advances when a row is *planned*, and the count that row carries only
+    stops being the coalescer's responsibility when the write is **confirmed**:
+    until then a failure has to put the weight back, or the refusals the row
+    represents are lost with no trace anywhere — the state advanced, the row
+    never landed, and `Σ (1 + suppressed)` silently undercounts.
+
+    `weight` is `1 + suppressed`: the number of observed refusals this row
+    stands for, which is exactly what must return to `pending` if it does not
+    land.
+    """
+
+    #: The complete row, ready for `write_usage_row`.
+    values: dict
+    #: `1 + suppressed` — the refusals this row represents.
+    weight: int
+    #: Where to put the weight back, and under which key.
+    entry: "_Entry"
+    key: tuple[str, str, str]
+    #: The template and window start to restore when the window has since been
+    #: retired (the flush path deletes it before awaiting).
+    template: dict
+    started: float
 
 
 def record_rate_refusal(
@@ -330,23 +419,28 @@ def record_rate_refusal(
     marker: str,
     scope: str,
     template_factory: Callable[[], dict],
-) -> int | None:
+) -> PlannedRow | None:
     """Account for one rate refusal.
 
-    Returns the `suppressed` count for a row that must be written **now**, or
-    `None` when this refusal is folded into an open window and no statement of
-    any kind may be issued for it.
+    Returns the `PlannedRow` the caller must write **and acknowledge** through
+    `write_planned_row`, or `None` when this refusal is folded into an open
+    window and no statement of any kind may be issued for it.
 
-    * **Window opening.** The first refusal for a key writes its own row with
+    * **Window opening.** The first refusal for a key plans its own row with
       `suppressed = 0` and sets `pending = 0`; that row represents exactly
       itself.
     * **Inside an open window.** `pending += 1`, no INSERT and no UPDATE.
-    * **Rollover.** A refusal arriving after the window closed writes
-      `suppressed = pending` with *itself* as the row's base, then resets.
+    * **Rollover.** A refusal arriving after the window closed plans a row with
+      `suppressed = pending` and *itself* as that row's base, then resets.
 
     `template_factory` is called **only** when a window opens or rolls over, so
     an agent looping inside one window pays neither a statement nor the cost of
     building a row it will not write.
+
+    The row is planned from the **captured template**, never from the request
+    context at write time: one code path builds every `rate_limited` row,
+    immediate and deferred alike, so a deferred flush cannot be the only path
+    anybody has checked.
     """
     now = time.monotonic()
     entry = _entry_for(principal, now) if principal is not None else _entry_for(
@@ -355,19 +449,111 @@ def record_rate_refusal(
     key = (tool, marker, scope)
     window = entry.windows.get(key)
     interval = settings.mcp_refusal_log_interval_seconds
+
+    def capture() -> dict:
+        template = template_factory()
+        # The shared overflow entry serves many principals, so its rows are
+        # explicitly unattributed rather than stamped with whichever one
+        # opened the window.
+        return _unattributed(template) if entry is _overflow else template
+
     if window is None:
-        entry.windows[key] = _Window(
-            started=now, pending=0, template=template_factory()
-        )
-        return 0
+        template = capture()
+        entry.windows[key] = _Window(started=now, pending=0, template=template)
+        return _planned(entry, key, template, now, suppressed=0)
     if now - window.started < interval:
         window.pending += 1
         return None
     suppressed = window.pending
+    template = capture()
     window.started = now
     window.pending = 0
-    window.template = template_factory()
-    return suppressed
+    window.template = template
+    return _planned(entry, key, template, now, suppressed=suppressed)
+
+
+def _planned(
+    entry: "_Entry",
+    key: tuple[str, str, str],
+    template: dict,
+    started: float,
+    *,
+    suppressed: int,
+) -> PlannedRow:
+    """One row, with `suppressed` stamped into a copy of the template."""
+    values = dict(template)
+    params = dict(values.get("params") or {})
+    params[SUPPRESSED_PARAM] = suppressed
+    values["params"] = params
+    entry.in_flight += 1
+    return PlannedRow(
+        values=values,
+        weight=1 + suppressed,
+        entry=entry,
+        key=key,
+        template=template,
+        started=started,
+    )
+
+
+def requeue(planned: PlannedRow) -> None:
+    """Put an unwritten row's whole weight back into the coalescer.
+
+    Called when `write_usage_row` answered `False` or raised. The row
+    represented `1 + suppressed` observed refusals and none of them is recorded
+    anywhere, so all of them go back into `pending` — the count that means
+    "refusals no row yet represents", which is precisely what they now are.
+
+    Two shapes, because the two write paths leave the window differently:
+
+    * The window still exists (the immediate path, where planning only reset
+      it): add the weight to whatever has accumulated since.
+    * The window is gone (the flush path deletes before it awaits, so a
+      concurrent refusal cannot be counted on both sides): re-create it with
+      the captured template and its **original** start, so the row is due again
+      on the very next tick rather than after another whole interval.
+    """
+    planned.entry.in_flight -= 1
+    window = planned.entry.windows.get(planned.key)
+    if window is None:
+        planned.entry.windows[planned.key] = _Window(
+            started=planned.started,
+            pending=planned.weight,
+            template=planned.template,
+        )
+        return
+    window.pending += planned.weight
+
+
+async def write_planned_row(planned: PlannedRow) -> bool:
+    """Write one planned row, and acknowledge or requeue it.
+
+    Returns whether the row landed. A `False` is not an error the caller has to
+    handle — the count is back in the coalescer and the next rollover or tick
+    will carry it — which is what makes this safe to call from the request path
+    and from housekeeping alike.
+    """
+    # Deferred import, not a cycle: `tools.py` imports this module at load
+    # time, so the reverse edge can only exist inside a function body. The
+    # writer lives there because it is the one that already knows how to land
+    # a row whose credential has been deleted — the 23503 recovery that clears
+    # the foreign keys and keeps the denormalised actor columns (#77), which is
+    # exactly the path a deferred flush needs.
+    from src.mcp_server.tools import write_usage_row
+
+    try:
+        landed = await write_usage_row(planned.values)
+    except Exception:  # noqa: BLE001 - a failed row must not fail its caller
+        landed = False
+    except BaseException:
+        # Cancellation must propagate, but the unconfirmed weight survives.
+        requeue(planned)
+        raise
+    if not landed:
+        requeue(planned)
+    else:
+        planned.entry.in_flight -= 1
+    return landed
 
 
 #: The principal a refusal is coalesced under when there is none. Unreachable
@@ -377,69 +563,98 @@ def record_rate_refusal(
 _NO_PRINCIPAL: Principal = ("none", None)
 
 
-def _due_rows(now: float) -> list[dict]:
-    """Pop every closed window and return the rows they owe. Synchronous.
+def _due_rows(now: float, *, every_window: bool = False) -> list[PlannedRow]:
+    """Retire the windows that owe a row and plan those rows. Synchronous.
 
-    Popping before the first `await` is what makes the flush safe against a
-    refusal arriving mid-flush: the window is either already retired (and the
-    arriving refusal opens a fresh one, writing its own row) or untouched.
+    Retiring before the first `await` is what makes the flush safe against a
+    refusal arriving mid-flush: the window is either already gone (and the
+    arriving refusal opens a fresh one, planning its own row) or untouched.
     Deciding and then awaiting *before* mutating would let one refusal be
-    counted on both sides.
+    counted on both sides — and a row that then fails to land is re-created by
+    `requeue`, with its original start, so it is due again immediately rather
+    than lost.
+
+    `every_window` retires the open ones too. That is the shutdown rule and
+    only the shutdown rule: a window that is still open holds refusals no row
+    represents, and at shutdown there is no later tick to collect them.
     """
     interval = settings.mcp_refusal_log_interval_seconds
-    rows: list[dict] = []
+    planned: list[PlannedRow] = []
     entries = list(_entries.values())
     if _overflow is not None:
         entries.append(_overflow)
     for entry in entries:
         for key, window in list(entry.windows.items()):
-            if now - window.started < interval:
+            if not every_window and now - window.started < interval:
                 continue
             del entry.windows[key]
             if window.pending == 0:
                 # The refusal that opened this window already has its row.
                 # Writing here would count it twice.
                 continue
-            values = dict(window.template)
-            params = dict(values.get("params") or {})
             # A standalone flush has no arriving refusal to serve as the row's
             # base, so this row must stand for one of the pending refusals
             # itself: `pending - 1` are suppressed behind it.
-            params["suppressed"] = window.pending - 1
-            values["params"] = params
-            rows.append(values)
-    return rows
+            planned.append(
+                _planned(
+                    entry,
+                    key,
+                    window.template,
+                    window.started,
+                    suppressed=window.pending - 1,
+                )
+            )
+    return planned
+
+
+async def _write_all(planned: list[PlannedRow]) -> int:
+    """Write each planned row, acknowledging or requeueing it. Returns the
+    number that landed."""
+    written = 0
+    for index, row in enumerate(planned):
+        try:
+            if await write_planned_row(row):
+                written += 1
+        except BaseException:
+            # The active writer restores its own row. Every later row was
+            # also retired by _due_rows and has not reached a writer yet.
+            for unattempted in planned[index + 1:]:
+                requeue(unattempted)
+            raise
+    return written
 
 
 async def flush_expired(now: float | None = None) -> int:
-    """Write the rows every closed coalescing window still owes.
+    """Write the rows every **closed** coalescing window still owes.
 
-    Driven from two places, and both matter: the indexer's periodic tick (so a
-    quiet principal's last window lands within a tick rather than never) and
-    the lifespan shutdown **before `engine.dispose()`** (so the last window's
-    counts land while a connection is still obtainable).
+    Driven from the indexer's periodic tick, so a principal that was refused in
+    a burst and then went quiet still has its count land — otherwise the last
+    window of every burst would wait for the *next* refusal, which by
+    definition may never come.
 
     Returns the number of rows written. Never raises for a row that failed:
-    the writer already records that as `usage_log_failed`, and losing the rest
-    of the batch because one row's credential vanished is the opposite of what
-    the recovery exists for.
+    the writer already records that as `usage_log_failed`, the count goes back
+    into the coalescer, and the next tick tries again with the exact same
+    weight.
     """
-    rows = _due_rows(time.monotonic() if now is None else now)
-    if not rows:
-        return 0
-    # Deferred import, not a cycle: `tools.py` imports this module at load
-    # time, so the reverse edge can only exist inside a function body. The
-    # writer lives there because it is the one that already knows how to land
-    # a row whose credential has been deleted — the 23503 recovery that clears
-    # the foreign keys and keeps the denormalised actor columns (#77), which is
-    # exactly the path a deferred flush needs.
-    from src.mcp_server.tools import write_usage_row
+    return await _write_all(_due_rows(time.monotonic() if now is None else now))
 
-    written = 0
-    for values in rows:
-        if await write_usage_row(values):
-            written += 1
-    return written
+
+async def flush_all() -> int:
+    """Write what **every** window owes, open or closed. The shutdown flush.
+
+    `flush_expired` deliberately leaves an open window alone: inside its
+    interval more refusals may still arrive, and coalescing them is the whole
+    point. At shutdown that reasoning inverts — there is no next tick and no
+    next refusal, so an open window's pending count is simply lost unless it is
+    retired now. Called from the lifespan **before `engine.dispose()`**, while
+    a connection is still obtainable.
+
+    A row that fails here is requeued like any other; the process is going away
+    and the count goes with it, which is the accepted limitation an abrupt kill
+    has anyway.
+    """
+    return await _write_all(_due_rows(time.monotonic(), every_window=True))
 
 
 # ── The failed-authentication budget ────────────────────────────────────────

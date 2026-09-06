@@ -39,6 +39,13 @@ class _FakeNote:
         self.embedded_content_hash = "oldhash"
 
 
+class _TableResult:
+    """The to_regclass probe finds the table; its fingerprint row is separate."""
+
+    def scalar(self):
+        return "indexer_state"
+
+
 class _StateResult:
     """What `get_state`'s SELECT hands back: an absent row."""
 
@@ -52,7 +59,7 @@ class _RecordingSession:
     We don't simulate a real DB — we only need to know whether embed_note
     issued the DELETE of existing embeddings, and what rows it tried to add.
 
-    It also answers the two textual statements of the generation interlock
+    It also answers the table-presence probe and two textual statements of the generation interlock
     (#206): `pg_advisory_xact_lock`, whose result is never read, and the
     `indexer_state` fingerprint read, which answers **absent**. Absent is not a
     mismatch — nothing has been claimed about the stored rows — so these tests
@@ -66,9 +73,13 @@ class _RecordingSession:
         self.flushed = False
         self.lock_taken = False
         self.fingerprint_read = False
+        self.table_probed = False
 
     async def execute(self, stmt, params=None):
         if isinstance(stmt, TextClause):
+            if "to_regclass" in stmt.text:
+                self.table_probed = True
+                return _TableResult()
             if "pg_advisory_xact_lock" in stmt.text:
                 self.lock_taken = True
             elif "indexer_state" in stmt.text:
@@ -143,6 +154,7 @@ async def test_provider_success_replaces_embeddings(monkeypatch):
     # provider call and before anything was written.
     assert session.lock_taken is True
     assert session.fingerprint_read is True
+    assert session.table_probed is True
 
 
 @pytest.mark.asyncio

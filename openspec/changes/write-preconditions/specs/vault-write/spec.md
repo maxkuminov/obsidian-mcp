@@ -196,6 +196,13 @@ The comparison SHALL run immediately after the read of the incumbent bytes and *
 
 **Every read this capability adds is bounded, and the bound is the one that already governs that tool's content**: `MAX_NOTE_BYTES` for a note tool, `MAX_FILE_READ_BYTES` for a raw-file tool. The size SHALL be established from the descriptor the tool has already opened — `fstat` first, then a bounded read through that same descriptor, never a second pathname resolution — so the bytes measured are the bytes hashed. A file over the bound is `precondition_unavailable`.
 
+The final in-call byte comparison SHALL also be bounded by the expected bytes' length: a size larger than that length SHALL refuse without a full read, and growth after the size check SHALL be detected with at most one extra byte. This refusal SHALL retain the existing `concurrent_write` code and prose, since the incumbent changed after preflight. Missing and non-regular leaves SHALL retain their existing error behavior.
+
+#### Scenario: The incumbent grows after preflight
+
+- **WHEN** a guarded raw overwrite or note edit sees the incumbent grow after its initial read, including growth after the final comparison's `fstat`
+- **THEN** the final comparison SHALL read at most the expected length plus one byte, refuse as `concurrent_write`, and leave the concurrent writer's bytes untouched
+
 **The compatibility rule for an over-cap file:** when no `expected_hash` was supplied and required mode is off, the tool SHALL proceed exactly as it does today and simply report no `content_hash`. This capability SHALL NOT make a call fail that succeeds today merely because the file is too large to hash.
 
 #### Scenario: A dry run against a stale base refuses instead of diffing

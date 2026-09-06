@@ -293,6 +293,20 @@ retry mints afresh): there the capability's own window is gone, so there is
 nothing left to hand back. Getting these two backwards tells a caller whose
 link is perfectly good that it expired.
 
+**The 429 is conditional on the release actually landing.** `claim_upload`
+commits before this gate, so a `release_claim` that fails leaves the token
+**claimed until its TTL** — and `Retry-After` would then be a lie the caller
+acts on: it says "this link works again in N seconds" about a link that will
+answer 404 for the next several minutes, so an obedient agent retries on
+schedule, is refused, and has no way to tell the refusal it was given from the
+one it now gets. When the claim cannot be restored the route falls back to this
+route's ordinary non-retryable answer — which is what a retry would in fact
+receive — and an exception emits `transfer_claim_release_failed` with its
+class only. A
+retryable refusal is a promise, and only a confirmed release can support it. The helper
+returns the conditional UPDATE's actual boolean: zero affected rows is an
+unconfirmed release too, even when the database raised no exception.
+
 The answer is **429 with `Retry-After`**, with its own body rather than the
 uniform 404 — the token is fine and stays claimable, and telling a legitimate
 redeemer their link had died would make them mint another, which is more load,
@@ -374,6 +388,14 @@ The `lstat` symlink/directory refusal still runs first. A **symlink** swapped in
 **A link rewrite is a publication and owes the same chain — which is what makes `move_note`'s descriptor budget load-bearing here.** `move_note(rewrite_links=True)` pins one target per backlink source from its preflight read until its post-move write, and the source count is unbounded, so each target used to hand back its root descriptor to hold one fd instead of two. But a target with no root cannot look its ancestors up: `_flush_target_dirs` caught the missing-root `RuntimeError`, logged it, and flushed only the leaf's parent — every backlink rewrite silently exempt from the chain rule. The fix is **one shared root descriptor for the whole rewrite phase** (`MutableTarget.share_root`), `dup`ed from a root the kernel already proved rather than opened from the root *pathname* — re-resolving that name is the substitution surface #59 closes, and a `dup` resolves nothing. `share_root` verifies the shared descriptor names the same inode the target's parent was proved beneath **before** swapping, which is why it must be called *instead of* `release_root` and never after it: a target whose root is already gone cannot prove which root it was validated against. A mismatch means the vault root was repointed mid-call (`VaultRootMismatch`) and aborts the whole move while that is still free — the preflight has not mutated anything. The budget arithmetic is explicit in `max_move_rewrite_sources()`: one fd per planned rewrite plus `MOVE_REWRITE_SHARED_ROOT_FDS` (1) for the phase. **Giving each target its own root is the trap** — same correctness, but two descriptors per source, which halves the cap (384 rather than 767 planned rewrites at a 1024 soft limit) to hold N duplicate descriptors of one directory. `release_root` survives only for a target that will not publish. `check_trash_support(root, root_fd=…)` takes the caller's anchored root so the probe cannot create `.trash` in a directory the root pathname has since been repointed at. `vault` keeps its own staging — a `.tmp-<name>-…` file in the *destination* directory rather than `.transfer-tmp/` — because a note write completes in one call: there is no minutes-long stream to survive, and staging beside the destination keeps the publish a same-directory rename.
 
 **Follow-up:** `usage_logs.key_id` still has no `ON DELETE` — a usage-log row written by an upload blocks its key's delete. Pre-existing, not regressed here.
+
+**Permanent raw-file deletion shares one anchored primitive.**
+`vault_fs.remove_at` performs the regular-file check, unlink and quiet parent
+flush; `remove` resolves a parent and delegates to it. A guarded `delete_file`
+passes the parent it held while checking the incumbent hash, inside the step
+that already consumed its root confirmation. It never re-resolves that parent
+and never issues a bare mutating syscall from the tool layer. This preserves
+both the descriptor guarantee and the shared-publication structural gate.
 
 ### Path canonicalisation — do not "simplify" this
 `validate_visible_path` runs (it is the shared traversal and dot-dir guard, and it is what refuses a link pointing out of the vault) but its **return value is the resolved path, and resolving follows symlinks**. The vault-relative path a transfer acts on is normalised *lexically* in `tools._vault_context`. Taking it from the resolved result silently retargets the operation: `delete_file("Attachments/alias.png")` where `alias.png` links to `secret.png` resolved to `secret.png` and deleted **that**, reporting success for a path nobody named. Keeping the caller's own components means the anchored walk is what meets the symlink — and refuses it.

@@ -482,8 +482,9 @@ def test_a_capped_note_is_marked_certified_and_logged_after_the_commit(
     real_commit = session.commit
 
     async def _watch_commit():
+        result = await real_commit()
         order.append("commit")
-        return await real_commit()
+        return result
 
     session.commit = _watch_commit
 
@@ -496,6 +497,7 @@ def test_a_capped_note_is_marked_certified_and_logged_after_the_commit(
     indexer.logger.addHandler(handler)
 
     async def _capped(*_a, **_k):
+        order.append("embed returned")
         return _truncated()
 
     monkeypatch.setattr(indexer, "embed_note", _capped)
@@ -506,7 +508,13 @@ def test_a_capped_note_is_marked_certified_and_logged_after_the_commit(
 
     assert result.embedded == 1, "a capped note was not certified"
     assert result.failures == 0, "a capped note was reported as a failure"
-    assert order == ["commit", "error line"], (
+    # Discovery commits precede the provider and certify nothing. Anchor the
+    # assertion to the embed result so only its publishing commit can satisfy
+    # the ordering; the watch records completion, not merely commit entry.
+    assert order.count("embed returned") == 1
+    assert order[order.index("embed returned"):] == [
+        "embed returned", "commit", "error line"
+    ], (
         "the truncation was logged before the transaction that carries it "
         "committed"
     )
@@ -800,6 +808,76 @@ def test_the_summary_reaches_the_run_row(monkeypatch, tmp_path):
     assert stats.error_text is not None, "a total outage recorded a clean pass"
     assert "embed failures: 2 of 2" in stats.error_text
     assert "connection refused" in stats.error_text
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# "N of M" is a ratio only while every failure came from a provider call
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def test_a_failure_with_no_provider_call_is_not_rendered_as_a_ratio():
+    """`1 of 0` is not a small infelicity.
+
+    `record_failure` also catches what escapes *around* the call — a database
+    error loading the note's row, a byte read that raised after the backlog
+    selected it, a rollback that itself failed. Those move `failures` without
+    moving `attempted`, and "of 0" says the pass made no provider calls, so the
+    natural reading of "1 of 0" is that the counter is broken. An operator who
+    concludes that stops trusting the number that would have told them about a
+    real outage.
+    """
+    outcome = indexer.EmbedPassResult()
+    outcome.record_failure(RuntimeError("could not load the row"))
+
+    assert outcome.failure_summary == (
+        "embed failures: 1 (0 provider call(s) issued) — "
+        "first: RuntimeError: could not load the row"
+    )
+    assert " of 0" not in outcome.failure_summary
+
+
+def test_the_ordinary_outage_keeps_its_ratio():
+    """The shape the history is full of is unchanged.
+
+    Every failure here came from a note that called the provider, so the ratio
+    means what it says and stays exactly as it was — this rendering is not a
+    blanket replacement.
+    """
+    outcome = indexer.EmbedPassResult()
+    for _ in range(3):
+        outcome.record_attempt()
+        outcome.record_failure(ConnectionError("Ollama: connection refused"))
+
+    assert outcome.failure_summary == (
+        "embed failures: 3 of 3 — first: ConnectionError: Ollama: connection "
+        "refused"
+    )
+
+
+def test_a_pre_call_error_reaches_the_run_row_without_a_false_ratio(
+    monkeypatch, tmp_path
+):
+    """End to end, through the pass that writes the row.
+
+    The fake raises *before* it would have reached the provider, which is
+    exactly the class of error the generic handler exists for: the row is
+    counted as a failure and nothing is counted as an attempt.
+    """
+    _fixture(monkeypatch, tmp_path, {"A.md": "alpha\n", "B.md": "beta\n"})
+    _no_sweep(monkeypatch)
+
+    async def _pre_call(*_a, **_k):
+        raise RuntimeError("deadlock detected loading the note row")
+
+    monkeypatch.setattr(indexer, "embed_note", _pre_call)
+
+    result = asyncio.run(indexer.embed_vault(user_id=7))
+
+    assert (result.failures, result.attempted, result.embedded) == (2, 0, 0)
+    stats = indexer.PassStats()
+    stats.record_embedded(result)
+    assert "embed failures: 2 (0 provider call(s) issued)" in stats.error_text
+    assert " of 0" not in stats.error_text
 
 
 def test_the_heartbeat_stays_green_through_the_outage(monkeypatch, tmp_path):

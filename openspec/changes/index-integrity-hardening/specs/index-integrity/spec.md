@@ -163,6 +163,8 @@ That single rule determines every case, and the cases SHALL NOT be enumerated as
 
 None of those SHALL be counted as failures either: each is a deliberate decision rather than something that went wrong.
 
+**The failure summary SHALL NOT present a ratio it cannot support.** Failures that reach the accumulator without a provider call having been issued — a database error around the call, a rollback that itself failed — move the failure count and not the attempted count, so a pass that never reached the provider would otherwise report "1 of 0". "Of 0" asserts that no call was made, which makes the whole line read as a broken counter and costs the operator their trust in the number that reports a real outage. When the failures outnumber the calls, the summary SHALL state the failure count and the call count as two separate facts; otherwise it SHALL keep the ratio.
+
 The in-process "last run" heartbeat SHALL remain unaffected by these swallowed per-note failures. The heartbeat answers "is this process's loop alive" and the run record answers "did the work succeed"; a provider outage leaves the first green and the second failed, and collapsing them would change the heartbeat's meaning.
 
 #### Scenario: A total provider outage marks the run as failed
@@ -203,6 +205,12 @@ The in-process "last run" heartbeat SHALL remain unaffected by these swallowed p
 - **THEN** `notes_embedded` SHALL count only the successful notes
 - **AND** the record's `error` SHALL name one failure out of the attempted count
 - **AND** the pass SHALL continue to the end of the backlog
+
+#### Scenario: A failure with no provider call is not rendered as a ratio
+
+- **WHEN** a pass records a failure for a note whose provider call was never issued
+- **THEN** the summary SHALL name the failure count and the number of provider calls issued as separate facts
+- **AND** it SHALL NOT read as "of 0"
 
 #### Scenario: Deliberate decisions are not failures
 

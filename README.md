@@ -290,7 +290,9 @@ no embedding or indexing of non-markdown files.
   in-client, and other binaries as a base64 string. `text`/`base64`
   force the form. Refuses files over `MAX_FILE_READ_BYTES` (default
   10 MB); text results are additionally bounded by
-  `MAX_READ_RESPONSE_CHARS` and continue via `offset`.
+  `MAX_READ_RESPONSE_CHARS` and continue via `offset`. `hash_only=True`
+  returns the whole file's `content_hash` without content; base64 results
+  include that hash in their header. Text results remain plain text.
 - `write_file(path, content, encoding="base64", overwrite=False)`,
   lands a file in the vault; base64 for binary, `text` for UTF-8.
   No-clobber by default, auto-creates parent dirs, atomic write.
@@ -307,6 +309,27 @@ All four reuse the path-traversal guard and exclude any path with a
 component starting with `.` (dot-directories and dot-files)
 (`.obsidian`, `.git`, `.trash`, …), matching the indexer's visibility
 rule.
+
+### Guarding edits against stale reads
+
+Pass a read's `content_hash` as `expected_hash` when editing, updating
+frontmatter, moving or deleting a note, overwriting a raw file, or deleting
+a raw file. The canonical token is `sha256:<64 lowercase hex>`, computed
+over the complete raw file bytes; a section or truncated `read_note` still
+returns the whole-file hash. For raw files, use `read_file(hash_only=True)`
+or the base64 header. Do not hash the returned text yourself.
+
+A stale token refuses the operation before mutation, with a final
+`MCP-REFUSAL` JSON line naming `stale_precondition` and the current hash.
+Re-read and reconsider the edit before retrying. Moves bind the source
+note only; moves and deletes still allow an in-place edit after their
+preflight comparison. Overwrites retain their separate in-call byte check.
+Successful publishing writes report a new hash when available.
+
+The argument is optional by default. `WRITE_PRECONDITION_REQUIRED=true`
+requires it on the supported destructive calls; enable this only after
+clients supply tokens. Creation is exempt and refuses a supplied token
+as `no_incumbent`. Files above their read cap cannot be guarded.
 
 ### File transfer
 No MCP client can hand a tool the bytes of a file the user is looking
@@ -936,6 +959,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `TRANSFER_MAX_CONCURRENT_UPLOADS` | `4` | Simultaneous upload streams |
 | `IMPORT_ALLOW_HTTP` | `false` | Let `import_from_url` fetch plain http. Off by default. |
 | `VAULT_ALLOW_NAMED_STAGING_FALLBACK` | `false` | Accept named staging on filesystems without `O_TMPFILE`. One flag, both write paths. See [System requirements](#system-requirements). |
+| `WRITE_PRECONDITION_REQUIRED` | `false` | Require `expected_hash` on supported destructive calls. Creation is exempt; enable after clients adopt read hashes. |
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | — | Used when provider is Ollama |

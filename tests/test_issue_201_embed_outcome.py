@@ -17,6 +17,7 @@ Fully offline: the session and the provider are both faked.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -50,6 +51,13 @@ class _StateResult:
     def scalar_one_or_none(self):
         return self._value
 
+    def scalar(self):
+        # `state_table_exists`'s `to_regclass('indexer_state')`. The fakes
+        # answer it separately from the fingerprint read, because the two are
+        # different questions with different dispositions: "has 023 run" and
+        # "what does it say".
+        return self._value
+
 
 class _RowcountResult:
     def __init__(self, rowcount):
@@ -65,9 +73,17 @@ class _Session:
     new fingerprint while this process's provider call is in flight.
     """
 
-    def __init__(self, *, fingerprint=None, certify_rowcount=1):
+    def __init__(
+        self, *, fingerprint=None, certify_rowcount=1, state_table=True
+    ):
         self.fingerprint = fingerprint
         self.certify_rowcount = certify_rowcount
+        #: Whether the state table exists. `False` models that table alone, where
+        #: a `SELECT` against `indexer_state` would raise `UndefinedTableError`
+        #: and abort the transaction — which is why the guard asks
+        #: `to_regclass` first.
+        self.state_table = state_table
+        self.state_table_probes = 0
         self.statements: list[str] = []
         self.certified: list[str] = []
         self.vector_deletes = 0
@@ -82,7 +98,20 @@ class _Session:
             if "pg_advisory_xact_lock" in clause.text:
                 self.lock_taken = True
                 return None
+            # Ordered before the fingerprint branch: both statements name
+            # `indexer_state`, and only this one answers when the table is
+            # absent.
+            if "to_regclass" in clause.text:
+                self.state_table_probes += 1
+                return _StateResult("indexer_state" if self.state_table else None)
             if "indexer_state" in clause.text:
+                if not self.state_table:
+                    raise AssertionError(
+                        "a fingerprint SELECT was issued against a database "
+                        "where `indexer_state` does not exist — that is the "
+                        "`UndefinedTableError` that aborts the whole "
+                        "transaction, after the provider call"
+                    )
                 self.fingerprint_reads += 1
                 return _StateResult(self.fingerprint)
             return None
@@ -416,6 +445,200 @@ async def test_a_stale_certification_still_raises_through_the_new_return(
 
     assert session.vector_deletes == 0
     assert session.added == []
+
+
+# --------------------------------------------------------------------------- #
+# An absent state table does not abort the certification transaction
+# --------------------------------------------------------------------------- #
+@pytest.mark.asyncio
+async def test_the_embed_path_proceeds_when_indexer_state_is_absent(
+    monkeypatch, two_chunks
+):
+    """An absent state table does not trigger a failing fingerprint SELECT.
+
+    This is a unit test of the guard, using an otherwise usable session double;
+    it does not prove that a full revision-022 schema can run the embed pass.
+    """
+    session = _Session(state_table=False)
+    note = _Note()
+
+    async def ok(chunks):
+        return [[0.0, 1.0] for _ in chunks]
+
+    monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
+
+    result = await embeddings.embed_note(
+        session, note, CONTENT,
+        certified_hash="h-new", certified_path="Projects/Big.md",
+    )
+
+    assert result.outcome is NoteEmbedOutcome.EMBEDDED
+    assert session.added, "nothing was stored with the state table absent"
+    assert session.state_table_probes == 1, (
+        "the guard must ask `to_regclass` exactly once per note"
+    )
+    assert session.fingerprint_reads == 0, (
+        "a fingerprint SELECT was issued against a table that does not exist"
+    )
+    assert session.lock_taken is False, (
+        "there is nothing to serialise against when nothing is claimed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_migrated_database_still_takes_the_lock_and_reads(
+    monkeypatch, two_chunks
+):
+    """The contrast, so the guard cannot swallow the interlock wholesale."""
+    session = _Session(fingerprint=embedding_fingerprint())
+    note = _Note()
+
+    async def ok(chunks):
+        return [[0.0, 1.0] for _ in chunks]
+
+    monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
+
+    result = await embeddings.embed_note(
+        session, note, CONTENT,
+        certified_hash="h-new", certified_path="Projects/Big.md",
+    )
+
+    assert result.outcome is NoteEmbedOutcome.EMBEDDED
+    assert session.state_table_probes == 1
+    assert session.fingerprint_reads == 1
+    assert session.lock_taken is True
+
+
+# --------------------------------------------------------------------------- #
+# The provider call is announced at issuance, not at the return
+# --------------------------------------------------------------------------- #
+#
+# `on_provider_call` is the pass's accounting hook, and the whole reason it
+# exists is that a note can reach the provider and never produce a result: the
+# certification raises when the row moved, a database error can escape anywhere
+# below, and a cancelled pass abandons the await outright. Each of those spent
+# the provider's time, and the pass has to know.
+#
+# These drive the **real** `embed_note` and the **real** `certify_embedded` —
+# `certify_rowcount=0` is what makes the row look moved — so moving the
+# invocation below the await, or into the success path, fails them.
+
+
+def _order_recorder():
+    """A callback and a shared order list, so "before" is read off the order."""
+    order: list = []
+
+    def announce(chunks_submitted: int) -> None:
+        order.append(("announced", chunks_submitted))
+
+    return announce, order
+
+
+@pytest.mark.asyncio
+async def test_the_call_is_announced_before_a_certification_that_raises(
+    monkeypatch, two_chunks
+):
+    """Codex's case: the row moved, so nothing returns — and the call counted.
+
+    `StaleCertification` is not a failure of this note (the vectors describe
+    content the row no longer claims, so they are discarded and a later pass
+    embeds it as it then stands), but it *is* an attempt, and its chunks were
+    submitted. Reconstructing that from the return counts nothing at all here.
+    """
+    session = _Session(
+        fingerprint=embedding_fingerprint(), certify_rowcount=0
+    )
+    note = _Note()
+    announce, order = _order_recorder()
+
+    async def ok(chunks):
+        order.append(("provider", len(chunks)))
+        return [[0.0, 1.0] for _ in chunks]
+
+    monkeypatch.setattr(embeddings, "get_embeddings_batch", ok)
+
+    with pytest.raises(StaleCertification):
+        await embeddings.embed_note(
+            session, note, CONTENT,
+            certified_hash="h-new", certified_path="Projects/Big.md",
+            on_provider_call=announce,
+        )
+
+    assert [step for step, _ in order] == ["announced", "provider"], (
+        "the call was announced after the await, so a path that never returns "
+        f"never announces it: {order}"
+    )
+    announced = [n for step, n in order if step == "announced"]
+    submitted = [n for step, n in order if step == "provider"]
+    assert len(announced) == 1, "the call was announced more than once"
+    assert announced == submitted, (
+        "the announced count is not the number of chunks actually submitted"
+    )
+    # Nothing was written, exactly as before.
+    assert session.vector_deletes == 0
+    assert session.added == []
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_provider_call_is_still_announced(
+    monkeypatch, two_chunks
+):
+    """The case that pins "before the await" rather than "before the return".
+
+    A pass cancelled at shutdown, or a provider call killed by a timeout,
+    raises a `BaseException` that `embed_note`'s `except Exception` does not
+    catch — so there is no result, no swallowed failure, and no second chance
+    to notice. The chunks were still handed over. Announcing anywhere below the
+    await loses this one.
+    """
+    session = _Session(fingerprint=embedding_fingerprint())
+    note = _Note()
+    announce, order = _order_recorder()
+
+    async def abandoned(_chunks):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(embeddings, "get_embeddings_batch", abandoned)
+
+    with pytest.raises(asyncio.CancelledError):
+        await embeddings.embed_note(
+            session, note, CONTENT,
+            certified_hash="h-new", certified_path="Projects/Big.md",
+            on_provider_call=announce,
+        )
+
+    assert [step for step, _ in order] == ["announced"], (
+        "a provider call this pass paid for was never announced"
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_zero_chunk_note_announces_nothing(monkeypatch):
+    """No call, no announcement — the rule stated once, not enumerated.
+
+    A note that cleans to zero chunks is certified with no vectors and makes no
+    provider call, so it counts into `notes_embedded` and **not** into
+    `attempted`. If it announced, a vault of empty notes would report a
+    denominator of provider calls that were never made.
+    """
+    session = _Session(fingerprint=embedding_fingerprint())
+    note = _Note()
+    announce, order = _order_recorder()
+
+    async def never(_chunks):  # pragma: no cover - asserted by not being called
+        raise AssertionError("a zero-chunk note called the provider")
+
+    monkeypatch.setattr(embeddings, "get_embeddings_batch", never)
+
+    result = await embeddings.embed_note(
+        session, note, "```\ncode only\n```\n",
+        certified_hash="h-new", certified_path="Projects/Big.md",
+        on_provider_call=announce,
+    )
+
+    assert result.outcome is NoteEmbedOutcome.CERTIFIED_EMPTY
+    assert result.chunks_submitted == 0
+    assert order == [], "a note that issued no provider call announced one"
 
 
 # --------------------------------------------------------------------------- #

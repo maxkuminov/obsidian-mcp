@@ -833,6 +833,131 @@ async def test_a_touch_whose_commit_fails_detaches_the_user_before_rolling_back(
     assert stages == ["touch", "rollback"]
 
 
+class _ExpiresWhenTheConnectionDies:
+    """A `user_sessions` row that behaves like an **expired** ORM instance.
+
+    What SQLAlchemy does when a `commit()` fails and the `rollback()` after it
+    also raises: it expires the instances it is holding *before* re-raising. An
+    expired instance has no values — every mapped column read goes back to the
+    database — and the database here is reachable only through the connection
+    that just died. So the read raises.
+
+    That is the whole shape of the round-3 finding: the failure *record*
+    dereferenced this object, on the one path whose contract is that it cannot
+    fail. Modelled rather than mocked, because a `MagicMock` answers `user_id`
+    cheerfully and would prove the opposite of what this asserts.
+    """
+
+    #: The columns the lifecycle reads off a row.
+    COLUMNS = ("id", "user_id", "created_at", "last_seen_at", "expires_at", "revoked_at")
+
+    def __init__(self, **values):
+        self.__dict__["_values"] = dict(values)
+        self.__dict__["_expired"] = False
+        self.__dict__["reads_after_expiry"] = 0
+
+    def expire(self):
+        self.__dict__["_expired"] = True
+
+    def __getattr__(self, name):
+        if name in self.COLUMNS:
+            if self.__dict__["_expired"]:
+                self.__dict__["reads_after_expiry"] += 1
+                raise RuntimeError(
+                    f"cannot refresh {name}: the connection this instance would "
+                    "reload from is gone"
+                )
+            return self.__dict__["_values"].get(name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        if name in self.COLUMNS:
+            self.__dict__["_values"][name] = value
+        else:
+            self.__dict__[name] = value
+
+
+async def test_a_dead_connection_during_the_touch_still_serves_the_page(records):
+    """Round 3. Both halves of the recovery fail, and the page is still served.
+
+    `commit()` raises because the connection is gone; the `rollback()` that
+    follows raises for the same reason, and — as a real session does — expires
+    the row on its way out. Everything the two failure records need was read
+    **before** the commit was attempted, so neither of them touches the expired
+    instance and neither turns a served page into a 500.
+
+    The row counts its own post-expiry reads, so this cannot pass by the
+    expiry quietly never happening.
+    """
+    user = sh.fake_user(7, username="alice")
+    sid, request, registry = await sh.sign_in(user)
+
+    row = _ExpiresWhenTheConnectionDies(
+        id=hash_session_id(sid),
+        user_id=user.id,
+        created_at=sh.utcnow() - datetime.timedelta(hours=2),
+        last_seen_at=sh.utcnow() - datetime.timedelta(hours=1),
+        expires_at=sh.utcnow() + datetime.timedelta(days=7),
+        revoked_at=None,
+    )
+    registry.sessions = [row]
+    registry.fail_commit = RuntimeError("the connection is gone")
+    registry.fail_rollback = RuntimeError("and so is the recovery")
+    registry.on_rollback = row.expire
+
+    replay = sh.browser_request(
+        method="GET", path="/admin/", session=dict(request.session)
+    )
+
+    # The panel GET, through the dependency chain a route actually sits on.
+    # It must return the user, not raise.
+    from src.control_panel.routes import require_user_panel
+
+    resolved = await get_active_session_user(replay, registry)
+    assert resolved is user
+    assert replay.session["user_id"] == 7, "the cookie is intact; nothing was cleared"
+    gated = await require_user_panel(request=replay, user=resolved, session=registry)
+    assert gated is user, "the page still renders"
+
+    # Both stages recorded, both carrying the id captured before the failure.
+    failures = _touch_failures(records)
+    assert [r.reason for r in failures] == ["touch", "rollback"]
+    assert [r.user_id for r in failures] == [7, 7]
+    assert [r.route for r in failures] == ["/admin/", "/admin/"]
+    assert [r.error_type for r in failures] == ["RuntimeError", "RuntimeError"]
+
+    # Non-vacuity, both directions: the instance really was expired, and
+    # nothing read it afterwards.
+    assert registry.rolled_back == 1
+    assert row.reads_after_expiry == 0, (
+        "the failure record dereferenced an expired instance — the one read "
+        "that can turn this best-effort path into a 500"
+    )
+    with pytest.raises(RuntimeError):
+        row.user_id  # noqa: B018 - proving the expiry is real
+
+
+async def test_the_captured_ids_are_read_before_the_first_statement():
+    """The narrower guarantee, stated where it cannot drift.
+
+    A future edit that moves the capture below the `begin_nested` would pass
+    every assertion above — the savepoint path does not expire anything — and
+    reintroduce the defect on the path that does. So the order is asserted
+    against the source.
+    """
+    import inspect
+
+    source = inspect.getsource(auth_session.touch_session)
+    capture = source.index("row_user_id = getattr(row, \"user_id\", None)")
+    first_statement = source.index("session.begin_nested()")
+    assert capture < first_statement, (
+        "the primitives must be captured before anything that can fail"
+    )
+    # And no `_touch_failed` call reads off the row.
+    assert "_touch_failed(request, row," not in source
+    assert source.count("user_id=row_user_id") == 3
+
+
 async def test_a_hammering_stale_browser_cannot_flood_the_sink():
     """The reason this had to leave the bare logger.
 

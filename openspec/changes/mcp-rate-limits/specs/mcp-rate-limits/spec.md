@@ -176,6 +176,16 @@ The sum of `1 + suppressed` across every row written for a key SHALL therefore e
 
 `argument_too_long` SHALL NOT be coalesced: it is refused below the general bucket, so its rate is already bounded by that bucket, and a second mechanism would buy nothing. Coalescer cardinality SHALL be bounded by the same registry cap as the buckets, with keys beyond the cap folded into shared overflow entries keyed on `(tool, marker, scope)` — dropping only the principal from the key, so an overflowed row still names the tool, the marker and the control that fired and loses per-principal attribution alone. `rate_limit_scope` SHALL be a JSON string that no reader casts; `suppressed` SHALL be a JSON integer read with a guarded cast.
 
+#### Scenario: Cancellation preserves rows for the shutdown flush
+
+- **WHEN** an immediate refusal write or periodic flush is cancelled before its write is confirmed
+- **THEN** its unconfirmed weight and every retired but unattempted row SHALL return to pending state before cancellation propagates, allowing the shutdown flush to record them
+
+#### Scenario: Planned rows retain registered ownership
+
+- **WHEN** a planned row awaits persistence and its entry becomes full and idle
+- **THEN** the sweep SHALL retain the entry until acknowledgement or requeue, and new principals SHALL use the existing overflow behavior when the registry is at its cap
+
 #### Scenario: A refused call leaves a marked usage row
 
 - **WHEN** a principal's first refusal for a key occurs
