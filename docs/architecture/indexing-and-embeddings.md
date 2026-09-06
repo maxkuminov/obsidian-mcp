@@ -64,6 +64,12 @@
   every falsy title (`false`, `0`, `[]`, `{}`, `""` all fall back to the stem)
   and trusted a copy that can be older than the file. The JSONB derivation
   survives only as the read/parse-failure fallback, declared best-effort.
+- **A non-finite frontmatter number is converted at each JSON boundary, never
+  at the parse** (#154). It is valid YAML and invalid JSON, so left alone it
+  aborts the whole batch; coerced at the parse it would rewrite the note's own
+  bytes through `set_frontmatter`. One shared token helper, `.nan` / `.inf` /
+  `-.inf`, keys included — see [the section below](#non-finite-frontmatter-numbers-and-the-one-title-rule-154),
+  which also names the one title rule every surface shares.
 - **The keyword vector attempts the full note and retreats per note** (#127).
   Both writers bound `content[:100000]`, so every term past that was invisible
   to `keyword_search` on a note the tool still reported. `write_tsvector_bounded`
@@ -186,6 +192,107 @@
   it. The observable the tests assert is the dispatch itself — a timing
   assertion against a concurrent request is a flake generator on a shared
   runner.
+
+## Non-finite frontmatter numbers, and the one title rule (#154)
+
+`x: .nan` is valid YAML. `NaN`, `Infinity` and `-Infinity` are not valid JSON,
+and PostgreSQL's `jsonb` parser rejects all three. Between those two facts sits
+this boundary.
+
+**The failure it closes was total, not per-note.** SQLAlchemy sets no
+`json_serializer` on the engine, so a `float('nan')` reaching
+`notes_metadata.frontmatter` is serialized by stock `json.dumps`, which emits
+the bare token. The batch upsert has no per-note retreat (unlike the keyword
+vector's halving): the insert raises, the pass's single transaction aborts,
+**nothing** commits, no `content_hash` advances, and every subsequent tick
+retries the same fatal batch. One note takes indexing down for the whole owner
+— #126's failure mode reached by a new route. Pinned against a real column, in
+both halves (the column's own rejection, and the whole-pass outage reproduced
+with the pre-fix sanitiser restored), in
+`tests/integration/test_issue_154_non_finite_frontmatter_pg.py`.
+
+**The scrub is deliberately not where this is fixed.** `_scrub_frontmatter`'s
+predicate is "nothing can render this" — see [the representability
+boundary](vault-tools.md#the-representability-boundary-scrub-once-at-the-parse-149),
+which this section does not restate — and both YAML and Python render a
+non-finite float perfectly well. More decisively, the parsed mapping the scrub
+produces is what `set_frontmatter` re-serialises: a coerced `".nan"` string in
+it would rewrite `x: .nan` to `x: '.nan'` in the note's own bytes as a side
+effect of setting an unrelated key, which is the destructive-write class this
+project ranks first. Recording it as `lossy` instead would make
+`set_frontmatter` refuse outright on a note whose only defect is a NaN. So the
+float stays in the mapping, and **each JSON boundary converts** instead.
+
+**One token helper, four boundaries.** `vault.non_finite_token` renders the
+canonical YAML spelling — `.nan`, `.inf`, `-.inf` — and is the only place that
+decides it. Its consumers: this module's `_jsonb_value` (the JSONB column),
+this module's `_note_title`, `vault.read_file`'s title (which `read_note` and
+the control panel both inherit), and `read_note`'s frontmatter view
+(`read_result._view_leaf` / `_view_key`). **The token is canonical whatever the
+note spelled**: YAML 1.1 accepts `.nan`, `.NaN`, `.NAN`, `.inf`, `.Inf`,
+`.INF`, `+.inf` and their negatives, and the parse preserves none of it — by
+the time any consumer sees the value it is a Python float. `frontmatter_yaml`
+still carries the note's own spelling (LF-normalized), which is where a caller
+goes to see it.
+
+**Mapping keys take the token too, and the collision rules differ by
+boundary.** A YAML mapping may be *keyed* by a non-finite number (`.nan: 1`),
+and both key paths stringify. Coercion can then make two distinct YAML keys
+land on one string (`.nan: 1` beside `".nan": 2`):
+
+- **The JSONB sanitiser takes the first key in document order**, stated rather
+  than inherited — the dict comprehension it replaced silently kept the *last*,
+  an accident of iteration order. The index has no channel through which to
+  report a loss and must never fail the pass, so a deterministic, documented
+  winner is the whole available remedy.
+- **The read view omits the whole view** with a duplicate-key omission whose
+  reason code (`duplicate_json_key_after_coercion`) distinguishes it from a
+  native `1:` / `"1":` collision. First-wins there would emit a partial mapping,
+  and a caller cannot tell a pruned view from a complete one. The two
+  boundaries differ because one can report a loss and the other cannot.
+
+The view also records the *value* coercion — reason code `non_finite_float`,
+in `metadata_coercions`, a list that is a sibling to `metadata_omissions` and
+never a substitute for it: an omission names a field dropped whole, and a
+retained-but-altered value is a different fact about a field that is still
+there.
+
+**`_sanitize_value` is split, and that is the point of the change, not a
+tidy-up.** It served two consumers — the JSONB column *and* `_note_title` — so
+one return value silently answered two different questions and a change made
+for the column re-keyed titles. It is now `_jsonb_value` ("what may this become
+inside a JSON document?") and `_note_title` ("what is this note called?"), each
+over the shared token helper.
+
+**One title rule, and it is this module's.** `vault.note_title` is the single
+implementation of the indexer's present behaviour — the sanitised value,
+falling back to the filename stem when falsy, rendered with `str()` and bounded
+to 512 characters, with non-string mapping keys and non-JSON scalars
+stringified *inside* a container first — **plus the one exception that a
+non-finite number renders as its YAML token.** `read_note` and the control
+panel adopt it; `indexer._note_title` is this module's name for it. The
+indexer's is the rule to standardise on because it is already the value
+`keyword_search`, `list_notes`, `get_recent` and the panel's listings show, it
+is bounded to the column's width, and it is the one of the three that a titling
+incident (#126) has already hardened.
+
+Adopting it changes what `read_note` and the panel show in three non-NaN cases,
+listed rather than discovered — a date inside a container (`['2026-08-25']`,
+not a Python `repr` of a date object), a non-string mapping key (`{'1': 'a'}`),
+and a title over 512 characters (its first 512). A top-level date, a list of
+strings, a numeric title and every falsy title (which falls back to the stem)
+are unchanged. The indexed title is unchanged except for the non-finite case.
+
+**Nothing here ever reaches a note's bytes.** The only thing that rewrites a
+block is `set_frontmatter`, which serialises the mapping the parse produced —
+still a float, which PyYAML dumps back as `.nan` — so setting an unrelated key
+on such a note leaves `x: .nan` byte-identical. That is asserted, not assumed.
+
+*Rejected:* `json_serializer=partial(json.dumps, allow_nan=False)` on the
+engine. It converts an invalid-JSON write into a `ValueError` instead of a
+driver error — still a fatal pass — and spreads the boundary from one function
+into the engine configuration, which is the per-consumer screening the #149
+boundary doctrine exists to avoid.
 
 ## Every pass entry point publishes a vault-root snapshot first (#199)
 

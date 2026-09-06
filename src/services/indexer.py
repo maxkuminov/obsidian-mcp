@@ -73,7 +73,10 @@ from src.services import vault_overlap
 from src.services.transfer import canonical_vault_root
 from src.services.vault import (
     _vault_root,
+    canonical_key,
     extract_tags,
+    non_finite_token,
+    note_title,
     parse_frontmatter,
     warm_user_vault_cache,
 )
@@ -551,32 +554,83 @@ async def record_quarantined_runs(trigger: str) -> None:
             )
 
 
-def _sanitize_value(v):
+# ── the two questions `_sanitize_value` used to answer at once (#154) ───────
+#
+# One function fed both `notes_metadata.frontmatter` (JSONB) and `_note_title`
+# (VARCHAR(512)), so its return value silently decided two different
+# questions — "what may this value become inside a JSON document?" and "what
+# is this note called?" — and a change made for the column re-keyed titles.
+# They are separate functions now, over the one shared token helper in
+# `vault`, and each says which question it answers.
+#
+# **Why the coercion is here and not at the parse.** `_scrub_frontmatter`'s
+# predicate is "nothing can render this"; both YAML and Python render a
+# non-finite float, so it keeps the float — and it must, because that parsed
+# mapping is what `set_frontmatter` re-serialises. A `".nan"` string in the
+# mapping would rewrite `x: .nan` to `x: '.nan'` in the note's own bytes as a
+# side effect of setting an unrelated key, which is the destructive-write
+# class. So each *boundary* converts instead: this module's JSONB write, this
+# module's title, `vault.read_file`'s title (which `read_note` and the panel
+# inherit) and `read_note`'s frontmatter view. See design D10 and
+# `docs/architecture/indexing-and-embeddings.md`.
+
+
+def _jsonb_value(v):
     """Recursively coerce a frontmatter value into a JSON-serializable form.
 
-    Lists and dicts are walked element-by-element; non-string dict keys and
-    any non-serializable scalar (e.g. a YAML date/datetime) are stringified.
+    The answer to "what may this value become inside the `frontmatter` JSONB
+    document?", and nothing else. Lists and dicts are walked
+    element-by-element; non-string dict keys and any non-serializable scalar
+    (e.g. a YAML date/datetime) are stringified.
+
+    **A non-finite float becomes its canonical YAML token here, ahead of the
+    finite-float passthrough.** `json.dumps` — which is what SQLAlchemy hands
+    the driver, with no `json_serializer` set on the engine — emits the bare
+    tokens `NaN` / `Infinity` / `-Infinity`, none of which is JSON and all of
+    which PostgreSQL's `jsonb` parser rejects. The batch upsert has no per-note
+    retreat, so one such note raised inside the batch, aborted the pass's
+    single transaction, committed nothing, left every `content_hash` where it
+    was and made every subsequent tick retry the same fatal batch: indexing
+    dead for the whole owner because of one note (#154, #126's failure mode by
+    a new route).
+
+    **Keys take the same token, and the first key wins a post-coercion
+    collision.** `.nan: 1` beside `".nan": 2` renders one JSON key; today's
+    dict comprehension silently kept the *last*, which is an accident of
+    iteration order rather than a decision. The index has no channel through
+    which to report the loss and must never fail the pass, so a deterministic,
+    documented winner is the whole available remedy. The read view, which
+    *can* report a loss, omits the view whole instead (design D10, L14).
     """
+    token = non_finite_token(v)
+    if token is not None:
+        return token
     if isinstance(v, (str, int, float, bool, type(None))):
         return v
     elif isinstance(v, list):
-        return [_sanitize_value(i) for i in v]
+        return [_jsonb_value(i) for i in v]
     elif isinstance(v, dict):
-        return {
-            (k if isinstance(k, str) else str(k)): _sanitize_value(val)
-            for k, val in v.items()
-        }
+        out: dict = {}
+        for k, val in v.items():
+            rendered = canonical_key(k)
+            if rendered in out:
+                continue  # first key wins, stated rather than inherited
+            out[rendered] = _jsonb_value(val)
+        return out
     else:
         return str(v)
 
 
 def _sanitize_frontmatter(fm: dict) -> dict:
-    """Convert non-JSON-serializable values (dates, etc) to strings."""
-    return _sanitize_value(fm)
+    """Convert non-JSON-serializable values (dates, non-finite floats) to strings."""
+    return _jsonb_value(fm)
 
 
 def _note_title(frontmatter: dict, filename: str) -> str:
     """Frontmatter `title` coerced to a bounded string, or the filename stem.
+
+    The answer to "what is this note called?", and nothing else — the other
+    half of the split above.
 
     YAML parses `title: 2026-08-25` into a date and `title: [a, b]` into a
     list, and nothing bounds the length; `notes_metadata.title` is
@@ -584,9 +638,15 @@ def _note_title(frontmatter: dict, filename: str) -> str:
     aborting the pass transaction — and since nothing commits, the content
     hash never advances and every subsequent tick retries the same fatal
     batch forever (#126).
+
+    The rule itself lives in `vault.note_title` (#154, design D10b) because it
+    is shared: **this** behaviour — the container stringification, the falsy
+    fallback to the stem, the 512-character bound, plus the non-finite token —
+    is the canonical one, and `read_note` and the control panel adopt it from
+    there. This function stays as the indexer's name for it, so both move
+    paths and the batch keep one call site each.
     """
-    value = _sanitize_value(frontmatter.get("title"))
-    return str(value or os.path.splitext(filename)[0])[:512]
+    return note_title(frontmatter, filename)
 
 logger = logging.getLogger(__name__)
 

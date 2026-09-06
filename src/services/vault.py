@@ -3187,7 +3187,7 @@ _SCRUB_MIN_NODES = 1_024
 # This is not an implementation shortcut for the walk below — that walk is
 # iterative and needs no limit. It is part of the predicate, because the
 # consumers this boundary protects are recursive and always will be:
-# `indexer._sanitize_value`, `_note_title`, `copy.deepcopy` and
+# `indexer._jsonb_value`, `note_title`, `copy.deepcopy` and
 # `yaml.safe_dump` all descend a frontmatter value frame by frame. A structure
 # deeper than they can descend is a structure *nothing can render*, which is
 # exactly what this scrub removes. Converting those consumers to iterative
@@ -3198,9 +3198,9 @@ _SCRUB_MIN_NODES = 1_024
 # The node budget does NOT imply a depth bound, which is what made this a bug
 # rather than a theoretical gap. Size and depth are independent axes: a
 # 550 KB alias chain passes the budget with a 1,045-deep subtree intact, and
-# `_sanitize_value` then raises `RecursionError` on every index pass, forever,
-# because nothing commits and the content hash never advances (#126's failure
-# mode).
+# `indexer._jsonb_value` then raises `RecursionError` on every index pass,
+# forever, because nothing commits and the content hash never advances (#126's
+# failure mode).
 #
 # 64 is generous for a real vault — Obsidian's own frontmatter is flat, and the
 # deepest thing anyone writes by hand is a few levels of nested mapping — and
@@ -3219,7 +3219,7 @@ def _representability(value) -> str | None:
     * `title: 0x<5000 hex digits>` — PyYAML constructs the int (CPython's
       digit limit guards decimal parsing, not hex literals) and then `str()`
       on it raises `ValueError`. That crashed `read_note`, the control panel's
-      note viewer, the indexer's batch (`_note_title`), and JSONB
+      note viewer, the indexer's batch (`note_title`), and JSONB
       serialization of `notes_metadata.frontmatter`.
     * `title: "\\uD800"` — decodes to a lone surrogate, a valid Python `str`
       that is not a Unicode scalar value, so it cannot be UTF-8-encoded.
@@ -3346,7 +3346,7 @@ def _scrub_frontmatter(fm: dict, budget: int) -> tuple[dict, dict[str, str]]:
                 # Deeper than the recursive consumers can descend, so nothing
                 # can render it — the same verdict as an unencodable string,
                 # reached structurally instead of scalar by scalar. Pruned here
-                # rather than left for `_sanitize_value` to hit as a
+                # rather than left for `indexer._jsonb_value` to hit as a
                 # `RecursionError` on every index pass.
                 note_loss(here, TEXT_TOO_DEEP)
                 continue
