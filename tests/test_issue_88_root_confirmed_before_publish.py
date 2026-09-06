@@ -1059,8 +1059,14 @@ async def test_a_confirmation_outage_before_the_move_fails_the_call(
     assert (ctx.vault / "Old.md").read_text(encoding="utf-8") == "the moved note\n"
     assert not (ctx.vault / "New.md").exists()
     assert ctx.metadata["commits"] == 0
-    # `_tracked` never built a result, so nothing was logged for it.
-    assert ctx.logged == {}
+    # `_tracked` builds no *result* for a raising body, but since #193 it does
+    # write the audit row: a write tool that fails halfway used to leave no row
+    # and no log line at all. The row says the body raised and names the class,
+    # and it is deliberately not one of the pre-body refusal markers — the body
+    # ran, read the note and computed the write before the confirmation failed.
+    assert ctx.logged["tool"] == "move_note"
+    assert ctx.logged["params"]["error"] == tools._TOOL_EXCEPTION_MARKER
+    assert ctx.logged["params"]["error_type"] == "VaultConfirmationUnavailable"
 
 
 async def test_a_confirmation_outage_after_the_move_reports_the_partial_outcome(

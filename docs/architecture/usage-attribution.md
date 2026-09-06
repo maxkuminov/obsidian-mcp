@@ -40,8 +40,15 @@ credential and then opens the Usage page to see what it did was shown
   retries **once** with `key_id`/`oauth_token_id` cleared and `actor_*` kept;
   that is the same end state the panel's own key delete produces, so the reader
   already handles it. `user_id` is dropped only when it is the constraint that
-  failed, because the panel scopes a non-admin's page by `user_id`. The error
-  arrives wrapped twice and the layers carry different things: SQLAlchemy's
+  failed, because the panel scopes a non-admin's page by `user_id`. Since #193
+  it also **returns whether the row landed** — `True` inserted, `False` gave
+  up. Swallowing every failure is still right for the success path (a call that
+  has already written to disk must not be failed by its own bookkeeping), but
+  the one caller that has to *report* the audit could not otherwise tell:
+  `_tracked`'s exception handler emits `tool_usage_log_failed` on `False`, so
+  the log distinguishes "the tool failed and here is its row" from "the tool
+  failed and the row is missing". Every other caller ignores the value. The
+  error arrives wrapped twice and the layers carry different things: SQLAlchemy's
   `.orig` is the asyncpg *dialect's* error (SQLSTATE, no constraint name),
   whose `__cause__` is asyncpg's own (constraint name). `_error_chain` walks
   both and falls back to the message text — reading `orig.constraint_name`
@@ -163,13 +170,15 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   string; a new value costs nothing and a shared one mis-measures in a
   direction nobody can see from the page.
 
-  **The register, as of #162.** Pre-body: `no_vault_assigned`,
+  **The register, as of #192/#193.** Pre-body: `no_vault_assigned`,
   `argument_not_encodable`, and the boolean `over_quota` (#162). Post-body:
   `vault_assignment_changed`, `vault_confirmation_unavailable`,
-  `vault_anchor_lost_at_publish`, and `find_related`'s two operational
-  failures, `related_source_not_found` and `related_source_not_embedded`.
-  Those last two were classified by the rule above and land on the post-body
-  side: the body ran, resolved the vault and queried the database before
+  `vault_anchor_lost_at_publish`, `find_related`'s two operational
+  failures, `related_source_not_found` and `related_source_not_embedded`, and
+  the two the security-event change added — `permission_denied` (#192) and
+  `tool_exception` (#193).
+  `related_source_not_found` and `related_source_not_embedded` were classified
+  by the rule above and land on the post-body side: the body ran, resolved the vault and queried the database before
   either branch could be reached, so enumerating them as refusals would drop a
   real database round trip out of the percentiles. They are two values rather
   than one because they are different facts with different fixes — a caller
@@ -179,6 +188,53 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   indistinguishable in the log from one that looked and found nothing, and
   `/admin/search-analytics` reads the second as the signature fact about what
   a vault does not hold. The marker is what keeps the first out of that count.
+
+  **`permission_denied` and `tool_exception` are post-body, and that is a
+  decision, not an oversight.** Both are written by `_tracked`'s own code
+  rather than by a tool body, which is exactly the shape that reads like a
+  pre-body refusal, so the reasoning is recorded here rather than re-derived:
+
+  * `permission_denied` is recorded at `_require_write`'s single definition, so
+    all nine gated call sites inherit it — and `_require_write` is called from
+    *inside* a tool body that has already passed the vault gate, the argument
+    screen and the quota gate, and has already **spent its quota slot**. A
+    refusal that consumed a slot and ran three gates did not have "no body".
+    The accepted cost, stated because it is visible on the page: a read-only
+    credential probing `create_note` five thousand times contributes five
+    thousand near-zero rows to that tool's percentiles (residual R5). The
+    honest fix is to move the write gate up into `_tracked`, which changes
+    quota accounting and refusal ordering for nine tools; instead the refusal
+    was made *visible* on `/admin/usage`, where an operator can see a
+    read-only credential apparently writing for what it is.
+  * `tool_exception` is by definition a body that ran — it is written by the
+    handler that guards `await fn(...)` and nothing else. A tool that raises
+    after eight seconds of I/O is the slowest path there is, and the one view
+    built to find slow paths must see it. It also **wins over any post-body
+    marker the body recorded before raising**: a `find_related` that recorded
+    `related_source_not_found` and then raised is logged as `tool_exception`,
+    because the exception is the outcome.
+
+  Neither is in `PRE_BODY_REFUSAL_ERROR_MARKERS`, and adding either is not a
+  tuning knob: it would drop those rows out of every percentile and move them
+  into the refusal count, silently.
+
+  **`error_type` is a reserved `params` key of type string** — the exception's
+  class name, written only beside `error = 'tool_exception'`. It is reserved
+  for the same reason `embed_ms`, `db_ms` and `over_quota` are: a reader reads
+  it. Unlike those three, **no reader casts it** — `/admin/usage` selects it as
+  text and renders it, so a row carrying nonsense there degrades to a nonsense
+  label rather than a 500. It is still a class name and nothing else: a writer
+  with something else to say about a failure uses a different key. Note that
+  `error` (the marker) and `error_type` (the class) are two keys, never one —
+  the marker is a closed vocabulary this register enumerates, and the class
+  name is not.
+
+  **In-band refusals outside this register stay unmarked** (residual R1).
+  `create_note` on an existing path, a path-validation refusal, a size refusal
+  and a write conflict each return a message and write an ordinary row, exactly
+  as they did before #192. That is deliberate: a typed outcome for every tool
+  return is a change of its own, and half-marking the set would leave the
+  register looking complete when it is not.
 
   Both halves are `COALESCE(..., false)`: `params` is nullable and `->>` on a
   missing key yields NULL, so without them the negation used by the executed
