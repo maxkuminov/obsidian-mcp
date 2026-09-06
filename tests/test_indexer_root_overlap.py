@@ -971,3 +971,134 @@ async def test_the_scope_survey_runs_before_the_generation_lock(monkeypatch, tmp
     assert order == ["participants", "survey"], order
     assert "before the generation lock" in str(excinfo.value)
     assert str(outer) in str(excinfo.value) and str(inner) in str(excinfo.value)
+
+
+# ── The verdict carried into the locked section ──────────────────────────────
+#
+# The survey happens before `acquire_generation_lock`; the read happens after.
+# In between, a pathname can be retargeted and a scope can be reassigned — and
+# a verdict that no longer describes what is about to be opened is not a
+# verdict. So `_rebuild_scope` opens nothing the survey did not examine: the
+# assignment must still be the one that was observed, and the directory the pin
+# lands on must still be the inode that was observed.
+
+
+def _survey_of(owner, assignment, observation):
+    return indexer.RebuildRootSurvey(
+        observations={owner: observation},
+        assignments={owner: str(assignment)},
+        failures={},
+    )
+
+
+async def test_a_scope_missing_from_the_survey_is_never_opened(monkeypatch, tmp_path):
+    """A scope that appeared between the survey and the lock is a root nobody
+    examined. Re-running is cheap; opening it on a survey that did not include
+    it is the hole the survey exists to close."""
+    root = tmp_path / "team"
+    root.mkdir()
+
+    async def _path(_session, _owner):
+        return root
+
+    def _never(*_a, **_k):
+        raise AssertionError("an unexamined root was opened under the lock")
+
+    monkeypatch.setattr(indexer, "_scope_vault_path", _path)
+    monkeypatch.setattr(indexer, "pinned_root", _never)
+
+    empty = indexer.RebuildRootSurvey(observations={}, assignments={}, failures={})
+    outcome = await indexer._rebuild_scope(object(), 7, empty)
+
+    assert outcome.skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
+    assert "not in the pre-lock root survey" in outcome.describe()
+
+
+async def test_a_reassignment_between_the_survey_and_the_lock_refuses(
+    monkeypatch, tmp_path
+):
+    """The scope's `users.vault_path` changed after it was observed, so the
+    verdict describes a directory this rebuild is no longer going to read."""
+    surveyed = tmp_path / "team"
+    surveyed.mkdir()
+    moved = tmp_path / "elsewhere"
+    moved.mkdir()
+
+    async def _path(_session, _owner):
+        return moved
+
+    def _never(*_a, **_k):
+        raise AssertionError("an unexamined root was opened under the lock")
+
+    monkeypatch.setattr(indexer, "_scope_vault_path", _path)
+    monkeypatch.setattr(indexer, "pinned_root", _never)
+
+    survey = _survey_of(7, surveyed, vault_overlap.observe_root_blocking(str(surveyed)))
+    outcome = await indexer._rebuild_scope(object(), 7, survey)
+
+    assert outcome.skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
+    assert str(surveyed) in outcome.describe()
+    assert str(moved) in outcome.describe()
+
+
+async def test_a_pathname_retargeted_after_the_survey_refuses_at_the_pin(
+    monkeypatch, tmp_path
+):
+    """The assignment is unchanged and the *directory it names* is not.
+
+    This is the check-then-act interval `pinned_root` closes for the rest of
+    the pass, applied to the survey's own verdict: the pin lands on an inode
+    nobody examined, and `(st_dev, st_ino)` is what notices.
+    """
+    root = tmp_path / "team"
+    root.mkdir()
+
+    async def _path(_session, _owner):
+        return root
+
+    monkeypatch.setattr(indexer, "_scope_vault_path", _path)
+
+    observed = vault_overlap.observe_root_blocking(str(root))
+    # The same assignment, observed as a *different* inode — exactly what a
+    # symlink retargeted between the survey and the lock produces.
+    stale = vault_overlap.RootObservation(
+        assignment=observed.assignment,
+        st_dev=observed.st_dev,
+        st_ino=observed.st_ino + 1,
+        realpath=observed.realpath,
+    )
+
+    async def _never_rebuilt(*_a, **_k):
+        raise AssertionError("the scope was rebuilt through an unexamined inode")
+
+    monkeypatch.setattr(indexer, "_rebuild_tsvectors_pinned", _never_rebuilt)
+
+    outcome = await indexer._rebuild_scope(object(), 7, _survey_of(7, root, stale))
+
+    assert outcome.skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
+    assert "changed between the root survey and the rebuild" in outcome.describe()
+
+
+async def test_a_matching_verdict_proceeds_to_the_rebuild(monkeypatch, tmp_path):
+    """The negative control: same assignment, same inode, and the scope is
+    rebuilt exactly as it was before the survey existed."""
+    root = tmp_path / "team"
+    root.mkdir()
+
+    async def _path(_session, _owner):
+        return root
+
+    seen = {}
+
+    async def _rebuilt(session, user_id, vault, root_fd, log_suffix):
+        seen["user_id"] = user_id
+        return indexer.RebuildOutcome(rows=3)
+
+    monkeypatch.setattr(indexer, "_scope_vault_path", _path)
+    monkeypatch.setattr(indexer, "_rebuild_tsvectors_pinned", _rebuilt)
+
+    survey = _survey_of(7, root, vault_overlap.observe_root_blocking(str(root)))
+    outcome = await indexer._rebuild_scope(object(), 7, survey)
+
+    assert outcome.completed and outcome.rows == 3
+    assert seen["user_id"] == 7
