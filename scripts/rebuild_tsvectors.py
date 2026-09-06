@@ -34,11 +34,18 @@ driver runs the same two checks over its own read set first
 bounded and off the loop and happens **before** the generation lock, so a hung
 mount cannot hold that lock while an `open` waits on it.
 
-**It waits for an in-flight index pass.** The rebuild takes the index
-generation lock before it reads its first row, and the periodic pass holds that
-lock for the duration of its transaction — so this command blocks until the
-pass commits rather than interleaving with it. That is the required behaviour,
-and it is why nothing here sets a short `lock_timeout`.
+**It waits for an in-flight index pass, for as long as that takes.** The
+rebuild takes the index generation lock before it reads its first row, and the
+periodic pass holds that lock for the duration of its transaction — so this
+command blocks until the pass commits rather than interleaving with it. That is
+the required behaviour, and it is why nothing here sets a short `lock_timeout`.
+It is also why the driver lifts `statement_timeout` off the acquisition
+(`acquire_generation_lock_unbounded`) and restores it immediately afterwards:
+the engine caps every statement at 60 s, and `pg_advisory_xact_lock` is a
+statement, so without the raise a rebuild started against a live service was
+cancelled after a minute instead of waiting. A `SET LOCAL` takes no row or
+table lock, so the raise sits ahead of the acquisition without disturbing the
+"advisory lock before any row or table lock" ordering rule.
 
 Five ways forward when it refuses, in order of preference: settle the scope
 (assign or delete that user, or let an in-progress re-derive finish), correct

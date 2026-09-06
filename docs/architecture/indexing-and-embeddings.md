@@ -1009,12 +1009,39 @@ minutes on a large vault — so `make reset-embeddings` and
 `make rebuild-tsvectors` **wait** for an in-flight pass instead of interleaving
 with it. That is the behaviour we want: a reset must not land mid-pass. The
 maintenance paths therefore deliberately do **not** set a short `lock_timeout`
-to defeat it. (`scripts/reset_embeddings.py` takes the lock as the first
-statement of its transaction and only then raises `statement_timeout` to
-`5min`, because a `SET LOCAL` ahead of the acquisition would put a statement
-before the lock and break the ordering rule; the wait therefore runs under the
-engine's 60 s statement timeout, and an operator who resets against a live
-service may have to retry — time, not correctness.)
+to defeat it.
+
+**And `lock_timeout` was never the only way to defeat it.** `src/database.py`
+sets `statement_timeout` to 60 s in the engine's `server_settings`, and
+`pg_advisory_xact_lock` is a statement like any other: a wait longer than a
+minute is cancelled with a `QueryCanceledError`. Since the pass holds the lock
+for minutes, the plain acquisition did not *wait* for it at all — it aborted,
+and the operator saw a query-cancelled error that reads as a broken command
+rather than as a busy index. An earlier revision of this note argued that the
+raise had to come *after* the acquisition, "because a `SET LOCAL` ahead of it
+would put a statement before the lock and break the ordering rule". That was
+wrong, and it is the reasoning the fix corrects: **the ordering rule is about
+row and table locks**, and a `SET LOCAL` takes neither — it is a
+session-variable assignment the lock graph cannot see. So every path whose
+contract is "it waits" calls `acquire_generation_lock_unbounded`
+(`index_state.py`), which lifts `statement_timeout` for the acquisition alone
+and puts it back the moment the lock is held — `SET LOCAL statement_timeout =
+DEFAULT`, which resets to the *session* default, i.e. the value the engine
+delivered in the connection's startup packet, so nothing has to know what that
+value is in order to restore the right one. The callers are the two
+maintenance commands, both panel Danger-zone resets, and the incremental pass
+itself. `scripts/reset_embeddings.py` then raises `statement_timeout` to `5min`
+over its destructive DDL, which is the bound those statements were always meant
+to run under.
+
+The pass is on that list for the symmetric reason. Its failure direction was
+safe — a cancelled acquisition aborts the pass, which commits nothing and
+retries next tick — but "waits" is the documented contract on both sides of
+this lock, and a pass that abandons every tick for the duration of a long
+rebuild writes an `indexer_runs` error row per tick about a database that is
+merely busy. `embed_note`'s per-note acquisition keeps the plain, capped form
+deliberately: that transaction must not sit on a lock for minutes, and its
+`GENERATION_MISMATCH`/retry disposition is already the right answer there.
 
 **The runbook, and why it inverts the old advice.** For any change to the
 embedding provider, model, dimensions, chunk size, chunk overlap or the chunk

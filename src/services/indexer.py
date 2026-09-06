@@ -55,7 +55,7 @@ from src.services.index_state import (
     KEY_FTS_FINGERPRINT,
     KEY_ROTATION_CURSOR,
     FingerprintStatus,
-    acquire_generation_lock,
+    acquire_generation_lock_unbounded,
     compare_fingerprint,
     embedding_fingerprint,
     fts_fingerprint,
@@ -1701,7 +1701,20 @@ async def _index_vault_pinned(
         # in-flight pass instead of interleaving with it. That is the required
         # behaviour, and those paths deliberately do not defeat it with a short
         # `lock_timeout`.
-        await acquire_generation_lock(session)
+        #
+        # The *unbounded* form, and it is the same argument in the other
+        # direction: this pass is on the waiting side whenever a rebuild or a
+        # reset already holds the lock, and under the engine's 60s
+        # `statement_timeout` the wait was cancelled rather than served. That
+        # failure direction was safe — the pass aborts, commits nothing and
+        # retries next tick — but "waits" is the documented contract on both
+        # sides of this lock, and a pass that abandons every tick for the
+        # duration of a long rebuild writes an `indexer_runs` error row per
+        # tick for a database that is merely busy. The raise is a `SET LOCAL`,
+        # which takes no row or table lock, so it sits ahead of the acquisition
+        # without touching the ordering rule; the timeout is restored before
+        # the first mutation below.
+        await acquire_generation_lock_unbounded(session)
         await _assert_fts_generation_current(session)
 
         # Get existing hashes (scoped to this user when set)
@@ -3992,8 +4005,15 @@ async def rebuild_tsvectors_all_scopes(session) -> dict:
 
     # Before the first row is read, so nothing can commit a keyword vector
     # between this snapshot and the record. A wait here is a wait for an
-    # in-flight index pass to commit, which is the intended behaviour.
-    await acquire_generation_lock(session)
+    # in-flight index pass to commit, which is the intended behaviour — and
+    # the *unbounded* form, because the engine caps a statement at 60s and the
+    # pass holds this lock for its whole transaction (L5b). Capped, this
+    # command did not wait for a pass at all: it was cancelled after a minute
+    # with a query-cancelled error that reads as a broken command rather than
+    # as a busy index. The raise is a `SET LOCAL`, which takes no row or table
+    # lock, so it precedes the acquisition without disturbing the ordering
+    # rule, and it is restored the moment the lock is ours.
+    await acquire_generation_lock_unbounded(session)
 
     # Re-enumerated under the lock, and deliberately not assumed equal to the
     # surveyed set: the survey ran before the lock, so a scope could have

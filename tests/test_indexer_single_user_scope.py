@@ -43,10 +43,12 @@ class _Session:
         return False
 
     #: Statements the index pass now issues at the head of its transaction —
-    #: the generation lock and the `indexer_state` existence probe (D7c3).
-    #: They are recorded but must not consume the queued results, which are
-    #: positional and belong to the owner-scoped queries this module is about.
-    _PREAMBLE = ("pg_advisory_xact_lock", "to_regclass")
+    #: the `statement_timeout` raise that keeps the acquisition from being
+    #: cancelled at 60 s, the generation lock itself, the restore, and the
+    #: `indexer_state` existence probe (D7c3). They are recorded but must not
+    #: consume the queued results, which are positional and belong to the
+    #: owner-scoped queries this module is about.
+    _PREAMBLE = ("statement_timeout", "pg_advisory_xact_lock", "to_regclass")
 
     async def execute(self, stmt, _params=None):
         self.statements.append(stmt)

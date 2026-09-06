@@ -33,15 +33,24 @@ consistent.
 
 ## Ordering
 
-`acquire_generation_lock` is the **first statement of the transaction**, before
-the `DROP INDEX` and before any other lock (design D7c). The rule is a property
-of the transaction, not of the statement that happens to need the fingerprint:
-the advisory lock is taken before any row or table lock, in one direction
-everywhere, so it cannot close a cycle with the locks the index pass and the
-panel already contend for. It is also what makes this reset an interlock rather
-than a hope — an old-configuration container's certification cannot commit
-between this wipe and this record, because it takes the same lock and re-reads
-the fingerprint under it.
+`acquire_generation_lock_unbounded` is the **first lock of the transaction**,
+before the `DROP INDEX` and before any row or table lock (design D7c). The rule
+is a property of the transaction, not of the statement that happens to need the
+fingerprint: the advisory lock is taken before any row or table lock, in one
+direction everywhere, so it cannot close a cycle with the locks the index pass
+and the panel already contend for. It is also what makes this reset an
+interlock rather than a hope — an old-configuration container's certification
+cannot commit between this wipe and this record, because it takes the same lock
+and re-reads the fingerprint under it.
+
+The one statement ahead of the acquisition is the `SET LOCAL statement_timeout`
+that lifts the engine's 60 s cap off the *wait itself*, and it is ahead of it
+deliberately: **a `SET LOCAL` takes no row or table lock**, so it is invisible
+to the lock graph and the ordering rule is untouched. Without it this reset does
+not wait for an in-flight pass at all — it is cancelled after a minute with a
+query-cancelled error that reads to an operator as a broken command rather than
+as a busy index. The timeout is restored immediately after the lock is ours, so
+the exemption covers the wait and nothing else.
 
 The documented runbook is deploy-then-reset: edit `.env` → `make deploy` (the
 new image refuses at the fingerprint or dimension guard and stays down,
@@ -59,7 +68,7 @@ from src.config import settings
 from src.database import async_session, engine
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
-    acquire_generation_lock,
+    acquire_generation_lock_unbounded,
     embedding_fingerprint,
     set_state,
 )
@@ -82,17 +91,25 @@ async def reset() -> None:
         # FIRST — before the DROP INDEX, before the DELETE, before any row or
         # table lock this transaction takes (design D7c's ordering rule).
         #
-        # It runs under the engine's 60s `statement_timeout`, because raising
-        # that with `SET LOCAL` would put a statement ahead of the lock. In the
-        # documented deploy-then-reset order nothing holds the lock, so there
-        # is nothing to wait for; an operator resetting against a live service
-        # may have to wait for an in-flight pass to commit and, past 60s, is
-        # told so and can retry. Deliberately no short `lock_timeout`: waiting
-        # for a pass is the behaviour we want, since a reset must not land
-        # mid-pass.
-        await acquire_generation_lock(session)
+        # It lifts the engine's 60s `statement_timeout` off the wait and then
+        # restores it. An earlier revision of this comment claimed the raise
+        # had to come *after* the acquisition because a `SET LOCAL` "would put
+        # a statement ahead of the lock" — that was wrong. The ordering rule is
+        # about row and table locks, and a `SET LOCAL` takes neither; it is a
+        # session-variable assignment the lock graph cannot see. Left capped,
+        # the documented behaviour ("a maintenance operation waits for an
+        # in-flight pass") was not what happened: past 60s the wait was
+        # cancelled. In the documented deploy-then-reset order nothing holds
+        # the lock and there is nothing to wait for anyway; an operator
+        # resetting against a live service now waits out the pass, which is the
+        # specified outcome. Deliberately no short `lock_timeout` either:
+        # waiting for a pass is the behaviour we want, since a reset must not
+        # land mid-pass.
+        await acquire_generation_lock_unbounded(session)
         # The app's per-connection statement_timeout is too tight for the
-        # CREATE INDEX step. Lift it for the rest of this transaction.
+        # CREATE INDEX step. Lift it for the rest of this transaction — the
+        # helper above restored it, so this is the bound the destructive
+        # statements actually run under.
         await session.execute(text("SET LOCAL statement_timeout = '5min'"))
         # ALTER COLUMN TYPE on a vector column with a dependent HNSW index
         # is unsafe across pgvector versions — drop and recreate explicitly.

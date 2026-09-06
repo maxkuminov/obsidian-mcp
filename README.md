@@ -1013,7 +1013,12 @@ than interleaving with it. That wait is the required behaviour, not a
 stall to work around: a reset that landed mid-pass is precisely the
 interleaving that stores vectors from one configuration under a
 fingerprint naming another. Neither command sets a short lock timeout,
-and neither should be given one.
+and neither should be given one — and because the server sets a 60-second
+`statement_timeout` on every connection, both commands (and the panel's
+Danger-zone resets) lift that timeout for the acquisition itself and
+restore it once the lock is theirs. Without that, a command started
+against a live service was cancelled after a minute rather than waiting,
+which reads as a broken command instead of a busy index.
 
 You can also use Settings → Danger zone → Reset embeddings in the
 control panel, which performs the same SQL — including the fingerprint

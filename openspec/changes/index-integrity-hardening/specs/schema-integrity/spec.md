@@ -84,18 +84,21 @@ Asserting the catalogue directly is required because `alembic check` does not co
 ## MODIFIED Requirements
 
 ### Requirement: The schema gate covers both migrations of this wave before deploy
-The schema gate SHALL exercise every migration whose behaviour it asserts on a throwaway database, in the same run, and SHALL assert `alembic check` clean at the resulting head. **The head revision the gate asserts SHALL be raised from `017` to `023`** — the literal `017` in the gate module is replaced by the literal `023` — so a later migration added without updating the gate fails loudly rather than silently widening what "head" means.
+The schema gate SHALL exercise every migration whose behaviour it asserts on a throwaway database, in the same run, and SHALL assert `alembic check` clean at the resulting head. **The gate SHALL carry a single literal naming the current head revision and SHALL assert that a migrated database reads exactly that**, and it SHALL assert that **`023` is present in the applied chain** — so a later migration added without updating the gate fails loudly rather than silently widening what "head" means.
 
-Raising the asserted head is a required part of adding a migration, not a chore that accompanies it. The assertion is the only thing that makes "head" a value somebody chose; left at `017` it would pass on a database migrated to `023`, and the gate's guarantee — that the revisions it exercises are the revisions that will run — would quietly become a guarantee about a prefix of them.
+The head literal is named as "whatever the chain's last revision is at the time", not as `023`. `023` is this change's migration and is not the head for long: the sibling `panel-sessions-and-consent` change chains `024` (`user_sessions`) from it, so a requirement pinning the gate's literal to `023` would be false the moment either change merged after the other, and would put two changes in conflict over one line for no behavioural reason. What must hold is the property, and it does not name a number: the gate asserts a head somebody chose, and this change's revision is in the chain that leads to it.
+
+Raising the asserted head is a required part of adding a migration, not a chore that accompanies it. The assertion is the only thing that makes "head" a value somebody chose; left at an earlier revision it would pass on a database migrated past it, and the gate's guarantee — that the revisions it exercises are the revisions that will run — would quietly become a guarantee about a prefix of them.
 
 The historical checks SHALL be kept, not replaced. 016's and 017's cases assert facts about those migrations' bodies that no later revision restates, and 013's and 014's before them; a gate rewritten around only the newest wave stops testing the reconciliations the earlier ones exist to perform.
 
 Idempotence SHALL be exercised by stamping the revision back and upgrading again, not by a second `upgrade head` — the latter is a no-op at the alembic level and proves nothing about the migration body.
 
-#### Scenario: Head at 023
+#### Scenario: The gate asserts the current head and 023 is in the chain
 
 - **WHEN** a throwaway database is migrated to head
-- **THEN** `alembic_version` SHALL read `023`
+- **THEN** `alembic_version` SHALL read the single head revision the gate module names
+- **AND** `023` SHALL be one of the revisions that ran to reach it
 - **AND** `alembic check` SHALL report no new upgrade operations
 
 #### Scenario: The earlier waves' cases still run

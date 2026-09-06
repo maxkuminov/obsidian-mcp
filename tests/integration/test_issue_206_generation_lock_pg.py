@@ -377,7 +377,11 @@ async def test_the_rebuild_takes_the_lock_before_it_reads(engines, world):
     )[2]
     participants_at = body.index("_rebuild_root_participants(session)")
     survey_at = body.index("survey_rebuild_roots(participants)")
-    lock_at = body.index("acquire_generation_lock(session)")
+    # `acquire_generation_lock_unbounded` — the same acquisition with the
+    # engine's 60 s `statement_timeout` lifted off the wait, since the pass
+    # holds this lock for its whole transaction and a capped wait was cancelled
+    # rather than served. What is asserted here is unchanged: where it sits.
+    lock_at = body.index("acquire_generation_lock_unbounded(session)")
     # The locked section's first statement, and the authoritative scope list.
     read_at = body.index("_retained_scopes(session)")
     rebuild_at = body.index("_rebuild_scope(session, owner, survey)")

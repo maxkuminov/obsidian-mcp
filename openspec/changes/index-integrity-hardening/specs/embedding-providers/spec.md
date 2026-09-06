@@ -183,7 +183,7 @@ The lock's rules:
 - **The lock SHALL be acquired before any row or table lock** in every transaction that takes it, so that one ordering holds everywhere and the new lock cannot close a cycle with the row locks the pass, the panel and the index-discard branch already contend for.
 - **That ordering is a property of the transaction, not of the statement that needs the fingerprint.** A transaction that will write any configuration-dependent derived row SHALL acquire the lock and re-validate the fingerprint **before its first row-locking mutation**, and the implementation SHALL audit every mutation earlier in that transaction rather than reason backwards from the write that consumes the fingerprint. The index pass is one transaction that mutates note metadata — upserts, move updates, prunes, link rows, certification invalidation — long before it reaches its keyword-vector write; acquiring the lock at that write would leave the pass holding row locks while it waits for the lock, and the rebuild holding the lock while it waits for those rows, which is a deadlock and a direct violation of the ordering rule. The acquisition therefore belongs at the head of that transaction.
 
-Holding the lock for the duration of a long pass is accepted: the maintenance operations then **wait** for an in-flight pass rather than interleaving with it, which is the required behaviour, and those operations SHALL NOT defeat it with a short lock timeout.
+Holding the lock for the duration of a long pass is accepted: the maintenance operations then **wait** for an in-flight pass rather than interleaving with it, which is the required behaviour, and those operations SHALL NOT defeat it with a short lock timeout — **nor with any other timeout that applies to the acquisition**. The connection carries a statement timeout and the advisory-lock acquisition is a statement, so every path whose contract is "it waits" SHALL lift that timeout for the acquisition alone and restore the previous value once the lock is held. Lifting it beforehand SHALL NOT be treated as a violation of the ordering rule: a session-variable assignment takes no row or table lock and is invisible to the lock graph. The waiting side includes the incremental index pass whenever a maintenance operation holds the lock first; only the per-note embedding acquisition keeps the connection's timeout, because that transaction must not sit on a lock for minutes and its mismatch disposition is already to leave the note for a later pass.
 - **The key SHALL be a single declared constant**, defined in one place and not derived at runtime from a value that could differ between builds.
 
 **The exclusion branch is exempt**, and the exemption is by argument rather than omission: it issues no provider call, writes no vector, and stamps a row to record that an *excluded* note has been dealt with — a claim true under any configuration, because the correct vector set for an excluded note is the empty one. It has nothing a generation change can invalidate.
@@ -222,6 +222,12 @@ The documented ordering for any change to the embedding configuration SHALL stil
 
 - **WHEN** a reset or a rebuild starts while an index pass holds the generation lock
 - **THEN** it SHALL wait for the pass to commit or roll back rather than failing fast or proceeding alongside it
+- **AND** the wait SHALL complete even when the pass holds the lock for longer than the connection's statement timeout
+
+#### Scenario: The index pass waits for an in-flight maintenance operation
+
+- **WHEN** an incremental index pass starts while a rebuild holds the generation lock for longer than the connection's statement timeout
+- **THEN** the pass SHALL wait for the rebuild to commit or roll back rather than being cancelled
 
 #### Scenario: No lock is held across a provider call
 

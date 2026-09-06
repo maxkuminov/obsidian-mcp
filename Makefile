@@ -32,7 +32,7 @@ SCHEMA_TEST_CONTAINER ?= obsidian-mcp-schema-test
 SCHEMA_TEST_PORT ?= 55438
 SCHEMA_TEST_IMAGE ?= pgvector/pgvector:pg16
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -59,6 +59,7 @@ help:
 	@echo "  make db-migrate   - Run Alembic migrations"
 	@echo "  make db-check     - Verify the schema matches the ORM models"
 	@echo "  make test-schema  - Schema gate: migrations vs. models on a throwaway pgvector"
+	@echo "  make test-integration - Run tests/integration against a throwaway pgvector (they skip without one)"
 	@echo "  make db-backup    - Backup database"
 	@echo "  make db-restore FILE=<path> - Restore from backup"
 	@echo ""
@@ -217,6 +218,44 @@ test-schema:
 	fi; \
 	if [ $$status -eq 0 ]; then echo "$(GREEN)Schema gate passed$(NC)"; \
 	else echo "$(RED)Schema gate FAILED — do not deploy$(NC)"; fi; \
+	exit $$status
+
+# `tests/integration/` **skips itself** when `PGVECTOR_TEST_ADMIN_URL` is unset,
+# which is the default on a workstation. CI's `tests` job sets it against its
+# `pgvector/pgvector:pg16` service, so those modules do run on every push — but
+# a local `pytest tests` reports green having executed none of them, and the
+# facts they hold are the ones nothing else can produce: lock ordering, "the
+# rebuild was not chosen as a deadlock victim", real tsvector and vector
+# behaviour. A gate whose local form silently skips is a gate you find out
+# about from CI.
+#
+# Same container recipe as `test-schema`, and deliberately the same overridable
+# variables: an operator who moved `SCHEMA_TEST_PORT` in `Makefile.local`
+# because 55438 was taken has moved this one too. The consequence is that the
+# two targets share a container name and must not be run concurrently —
+# `test-schema` starts by `docker rm -f`ing that name.
+test-integration:
+	@echo "$(GREEN)Integration suite: throwaway $(SCHEMA_TEST_IMAGE) on :$(SCHEMA_TEST_PORT)$(NC)"
+	@docker rm -f $(SCHEMA_TEST_CONTAINER) >/dev/null 2>&1 || true; \
+	docker run --rm -d --name $(SCHEMA_TEST_CONTAINER) \
+		-e POSTGRES_PASSWORD=test -p 127.0.0.1:$(SCHEMA_TEST_PORT):5432 \
+		$(SCHEMA_TEST_IMAGE) >/dev/null || exit 1; \
+	trap 'docker rm -f $(SCHEMA_TEST_CONTAINER) >/dev/null 2>&1' EXIT INT TERM; \
+	ready=0; \
+	for i in $$(seq 1 60); do \
+		if docker exec $(SCHEMA_TEST_CONTAINER) pg_isready -U postgres -q 2>/dev/null; then ready=1; break; fi; \
+		sleep 1; \
+	done; \
+	if [ "$$ready" -eq 1 ]; then \
+		OMCP_REQUIRE_SCHEMA_INTEGRATION=1 \
+		PGVECTOR_TEST_ADMIN_URL=postgresql+asyncpg://postgres:test@127.0.0.1:$(SCHEMA_TEST_PORT)/postgres \
+		$(PYTHON) -m pytest -q -rs tests/integration; \
+		status=$$?; \
+	else \
+		echo "$(RED)$(SCHEMA_TEST_CONTAINER) never became ready$(NC)"; status=1; \
+	fi; \
+	if [ $$status -eq 0 ]; then echo "$(GREEN)Integration suite passed$(NC)"; \
+	else echo "$(RED)Integration suite FAILED$(NC)"; fi; \
 	exit $$status
 
 # The pre-migration safety net, so it must fail loudly. The previous recipe
