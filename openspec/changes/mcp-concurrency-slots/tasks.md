@@ -1,6 +1,6 @@
 - [x] 1. Investigate auth/tool/logger lifetimes, shadow semantics and pool arithmetic.
 - [x] 2. Independent proposal review — PASS after fixing sticky overflow ownership across active leases and pending waiters.
-- [ ] 3. Implement controller/config/shared pool constants and deterministic tests.
+- [x] 3. Implement controller/config/shared pool constants and deterministic tests.
 - [ ] 4. Integrate request/auth lifetimes and bounded writer/tool admission with #263.
 - [ ] 5. Update docs/settings and add real-PostgreSQL occupancy/outcome regressions.
 - [ ] 6. Independent spec/defensive implementation reviews; resolve blocking findings.

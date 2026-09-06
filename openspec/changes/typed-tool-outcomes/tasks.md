@@ -1,7 +1,7 @@
 - [x] 1. Inventory all 25 tools, nested/shared helpers, successes and partial outcomes.
 - [x] 2. Independent proposal review — PASS, no findings; compound partial-write precedence regression requested.
-- [ ] 3. Implement pure typed outcomes, closed codes, structured adapter and terminal telemetry.
-- [ ] 4. Migrate every refusal and partial branch in the inventory; preserve successes and precedence.
-- [ ] 5. Add meaningful unit/integration regressions and update architecture notes.
-- [ ] 6. Independent implementation/spec and defensive write-safety reviews; resolve blocking findings.
+- [x] 3. Implement pure typed outcomes, closed codes, structured adapter and terminal telemetry.
+- [x] 4. Migrate every refusal and partial branch in the inventory; preserve successes and precedence.
+- [x] 5. Add meaningful unit/integration regressions and update architecture notes.
+- [x] 6. Independent implementation/spec and defensive write-safety reviews; resolve blocking findings.
 - [ ] 7. Combined offline/PostgreSQL/OpenSpec/audit/build gates and PR to main with #261.
