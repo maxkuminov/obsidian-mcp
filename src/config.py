@@ -5,9 +5,46 @@ import sys
 from typing import Annotated, Any, Literal
 from urllib.parse import urlparse
 
-from pydantic import Field, PrivateAttr, field_validator, model_validator
+from pydantic import (
+    BeforeValidator,
+    Field,
+    PrivateAttr,
+    field_validator,
+    model_validator,
+)
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
+
+
+# ── One representation for "off" ────────────────────────────────────────────
+#
+# `.env` has no JSON `null`, so every nullable limiter setting needs a textual
+# spelling for "this control is disabled". **One** validator supplies it for
+# all of them rather than a per-field variant, so no two controls can end up
+# disabled differently: an empty value, or the literal `null` or `none`,
+# stripped and case-insensitive. Null is the only disable — zero is rejected
+# everywhere by `ge=1`, because a control that refuses every call reads to an
+# operator as an outage rather than as a setting (#162's reason).
+_OFF_SPELLINGS = frozenset({"", "null", "none"})
+
+
+def _off_means_none(value: Any) -> Any:
+    if isinstance(value, str) and value.strip().casefold() in _OFF_SPELLINGS:
+        return None
+    return value
+
+
+#: A whole number of at least one, or the documented "off".
+NullableLimit = Annotated[
+    Annotated[int, Field(ge=1)] | None, BeforeValidator(_off_means_none)
+]
+
+# The domain every `daily_request_limit` obeys, mirrored from
+# `src/models/db.py` — which cannot be imported here, because it imports this
+# module. `tests/test_limiter_settings_env.py` pins the two definitions equal,
+# the way the `usage_stats` / `tools` marker pairs are pinned.
+_DAILY_REQUEST_LIMIT_MIN = 1
+_DAILY_REQUEST_LIMIT_MAX = 1_000_000
 
 
 # Hostnames that can only ever name this machine. Used by the sandbox guard
@@ -92,6 +129,23 @@ MAX_EMBED_FAILURE_MESSAGE_CHARS = 200
 # far more than any real glob. Enforced in `vault.list_dir` — before the
 # pattern is compiled and before the folder is validated or read.
 MAX_LIST_PATTERN_CHARS = 1024
+
+# Longest `query` `keyword_search` and `semantic_search` will accept. Enforced
+# declaratively on the shared tool decorator (`arg_char_caps`), beside the
+# unencodable-argument screen — so before the embedding-provider call, before
+# the `tsquery` parse, before any search or quota statement, and before the
+# value is interpolated into a server-authored string like
+# `f"No results for '{query}'"` (the #149 discipline; `tsquery` parsing on the
+# single event loop is the #204 class).
+#
+# **A character cap does not guarantee the provider's token limit.** 8,192
+# characters of a densely-tokenizing script can still exceed what an embedding
+# provider will accept, so the provider's own input-limit rejection is
+# translated *inside the body* into the same caller-facing `argument_too_long`
+# code, carrying the provider's reason (design D6). The two halves sit on
+# opposite sides of the body/no-body line and carry different usage markers on
+# purpose.
+MAX_SEARCH_QUERY_CHARS = 8192
 
 # Aggregate bound on the preflight of `move_note(rewrite_links=True)`. That
 # preflight holds, for every backlink source, both the original bytes and the
@@ -409,6 +463,68 @@ class Settings(BaseSettings):
     # blowing the caller's context window. ~40k chars ≈ 10k tokens.
     # Env: MAX_READ_RESPONSE_CHARS.
     max_read_response_chars: int = Field(40_000, ge=1_000)
+
+    # ── The /mcp rate controls (#188, #194) ────────────────────────────────
+    #
+    # In-process, not persisted, and sound only at `--workers 1`: a second
+    # worker multiplies every rate here by the worker count. See
+    # `docs/architecture/rate-limits.md` and the comment at the `Dockerfile`'s
+    # `CMD`. **No pool-related setting appears here and `src/database.py` is
+    # untouched** — this change bounds *rate*, which needs no arithmetic
+    # against the connection pool; concurrency is deferred to
+    # `mcp-concurrency-slots`.
+    #
+    # Every nullable one below is disabled by null (`NullableLimit`), and every
+    # one rejects zero.
+
+    # L1 — the per-address budget on *failed* `/mcp` authentication, charged
+    # before the credential lookup so a refused probe costs no session and no
+    # query. 60 failures per 5 minutes is generous on purpose: claude.ai
+    # egresses from shared addresses, and no working client fails 60 times in
+    # five minutes.
+    mcp_auth_failure_limit: NullableLimit = 60
+    mcp_auth_failure_window_seconds: int = Field(300, ge=1)
+    # Counters, not addresses: memory is O(size) with nothing to evict, and the
+    # per-process random salt means nobody can choose to collide with a victim.
+    # Collisions merge two addresses into one budget, which only ever makes the
+    # control stricter.
+    mcp_auth_failure_table_size: int = Field(4096, ge=1)
+
+    # L2 — the general velocity bucket, on every tool call. Far above observed
+    # usage (~1,600 calls per 30 days across all credentials), and it stops a
+    # hot loop within a second; the burst covers a post-search fan-out.
+    mcp_rate_limit_per_minute: NullableLimit = 120
+    mcp_rate_limit_burst: NullableLimit = 30
+
+    # L3 — the write bucket, which the eight vault-mutating tools must pass in
+    # addition (and `PUT /transfer/upload`, which writes vault bytes without
+    # being a tool call at all). A **velocity** bound, not a blast-radius one:
+    # neither bucket bounds the total work a credential can do in a day, which
+    # only the daily quota does and only for the credentials it reaches.
+    mcp_write_rate_limit_per_minute: NullableLimit = 60
+    mcp_write_rate_limit_burst: NullableLimit = 15
+
+    # Principal-keyed limiter entries held before further principals fold onto
+    # one shared overflow entry. Reaching it needs more than ten thousand live
+    # credentials; the shared entry is the bounded-memory trade-off, preferred
+    # to failing open (which lets a flood succeed) and to failing closed (which
+    # turns a bookkeeping cap into an outage for a legitimate credential).
+    mcp_limiter_max_tracked_principals: int = Field(10_000, ge=1)
+
+    # How long one `(principal, tool, marker, scope)` coalescing window stays
+    # open. Inside it a refusal issues **no statement of any kind** — a rate
+    # refusal occurs at the caller's arrival rate, which is precisely the rate
+    # nothing else bounds, so uncoalesced refusal rows would be the
+    # amplification this control exists to stop.
+    mcp_refusal_log_interval_seconds: int = Field(10, ge=1)
+
+    # The daily quota a **newly created** key receives when the caller does not
+    # say otherwise. Applied by the key-creation paths and never as a column
+    # default: existing keys are grandfathered, and an explicit null still
+    # means unlimited. ~1,600 calls per 30 days across every credential, so
+    # 5,000/day cannot interrupt a real session while a runaway stops the same
+    # day.
+    default_daily_request_limit: NullableLimit = 5000
 
     multi_user_mode: bool = False
     session_max_age: int = 60 * 60 * 24 * 7
@@ -810,6 +926,66 @@ class Settings(BaseSettings):
                 "chunker's step collapses to one character, so a few kilobytes "
                 "of prose becomes thousands of chunks and every note hits "
                 f"MAX_CHUNKS_PER_NOTE ({MAX_CHUNKS_PER_NOTE})."
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_limiter_settings(self) -> "Settings":
+        """Refuse a limiter configuration whose parts contradict each other.
+
+        Two rules, and both exist because the failure they prevent is silent.
+
+        **A bucket's rate and burst are set together or null together.** A rate
+        with no burst is not "a bucket with a default burst" — there is no
+        default, so it would be a control an operator believes is on and that
+        admits everything, which is worse than one they know is off. The error
+        names *both* settings, because the one that is missing is the one the
+        operator has to write.
+
+        **`DEFAULT_DAILY_REQUEST_LIMIT` lies inside the same domain as every
+        other daily limit.** A value outside 1..1,000,000 would be accepted
+        here and then rejected by `ck_api_keys_daily_request_limit` at the
+        first key creation — a boot that looks healthy and a panel that fails
+        on the operator's next action.
+
+        Zero is refused by `ge=1` on every field rather than here, so the
+        message names the field pydantic already knows about. Nothing in this
+        validator reads a connection-pool constant: this change bounds rate,
+        and rate needs no arithmetic against the pool.
+        """
+        for rate_name, rate, burst_name, burst in (
+            (
+                "MCP_RATE_LIMIT_PER_MINUTE",
+                self.mcp_rate_limit_per_minute,
+                "MCP_RATE_LIMIT_BURST",
+                self.mcp_rate_limit_burst,
+            ),
+            (
+                "MCP_WRITE_RATE_LIMIT_PER_MINUTE",
+                self.mcp_write_rate_limit_per_minute,
+                "MCP_WRITE_RATE_LIMIT_BURST",
+                self.mcp_write_rate_limit_burst,
+            ),
+        ):
+            if (rate is None) != (burst is None):
+                raise ValueError(
+                    f"{rate_name} and {burst_name} must be set together or "
+                    "null together: a bucket with only one of its rate and "
+                    f"burst configured admits every call. {rate_name} is "
+                    f"{'null' if rate is None else rate} and {burst_name} is "
+                    f"{'null' if burst is None else burst}. Set both, or null "
+                    "both to disable that bucket."
+                )
+        limit = self.default_daily_request_limit
+        if limit is not None and not (
+            _DAILY_REQUEST_LIMIT_MIN <= limit <= _DAILY_REQUEST_LIMIT_MAX
+        ):
+            raise ValueError(
+                f"DEFAULT_DAILY_REQUEST_LIMIT ({limit}) must be within "
+                f"{_DAILY_REQUEST_LIMIT_MIN}..{_DAILY_REQUEST_LIMIT_MAX}, the "
+                "domain every daily request limit obeys "
+                "(ck_api_keys_daily_request_limit). Null means new keys are "
+                "created unlimited."
             )
         return self
 

@@ -49,6 +49,7 @@ from src.services.embeddings import (
     embed_note,
 )
 from src.services.fts import index_tsvector_sql
+from src.services.rate_limits import flush_expired
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
     KEY_FTS_FINGERPRINT,
@@ -4562,6 +4563,20 @@ async def run_indexer_loop():
                 # and it delays the next tick by at most PREWARM_TIMEOUT_SECONDS.
                 await prewarm_search_caches()
             await cleanup_expired_tokens()
+            # The refusal coalescer's standalone flush: any window that closed
+            # since the last tick writes the row it owes, so a principal that
+            # was refused in a burst and then went quiet still has its count
+            # land — otherwise the last window of every burst would wait for
+            # the *next* refusal, which by definition may never come.
+            #
+            # Housekeeping, so a failure here may never fail a pass — the
+            # `quota_counters` prune precedent. Every row's own failure is
+            # already swallowed and recorded by the usage writer; this guard
+            # covers the flush itself.
+            try:
+                await flush_expired()
+            except Exception as e:  # noqa: BLE001 - housekeeping, never fatal
+                logger.error(f"Refusal flush failed: {e}")
             consecutive_failures = 0
             # Heartbeat: the tick completed. Recorded whether or not the pass
             # found anything to index — that is the whole point (#78) — but

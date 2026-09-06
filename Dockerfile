@@ -24,6 +24,15 @@ USER appuser
 
 EXPOSE 8000
 
+# --workers 1 is load-bearing, not a default nobody revisited. Every /mcp rate
+# control is IN-PROCESS state: the two per-principal token buckets, the
+# per-address failed-authentication table and the refusal coalescer all live in
+# this worker's memory and are deliberately not persisted or shared. A second
+# worker therefore does not split the configured rates between them — it gives
+# each worker a full set, multiplying every effective rate by the worker count,
+# and splits the coalescer so the same key writes a row per worker. Raising it
+# means revisiting docs/architecture/rate-limits.md first.
+#
 # --forwarded-allow-ips: trust X-Forwarded-* only from private ranges (the
 # reverse proxy lives in the Docker network), not from "*" which would let any
 # client spoof its forwarded IP. Narrow to the specific compose subnet CIDR if

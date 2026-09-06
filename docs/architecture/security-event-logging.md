@@ -240,6 +240,7 @@ nothing binds the request address into a ContextVar (residual R8).
 | `oauth_revoke_refused` | WARNING | `client_id`, `client_ip`, `reason` | `/revoke` client-auth failure |
 | `rate_limit_exceeded` | WARNING | `client_ip`, `limit_count`, `method`, `route`, `window_seconds` | `src/main.py`, a local wrapper around slowapi's handler — the one hook every 429 passes through |
 | `auth_failure` | WARNING | `client_ip`, `key_id`, `oauth_token_id`, `reason`, `route`, `token_tag` | `src/mcp_server/auth.py`, all ten sites |
+| `auth_failure_rate_limited` | WARNING | `client_ip`, `limit_count`, `route`, `window_seconds` | `APIKeyMiddleware`, when an address is over its failed-authentication budget (#194). **One per slot per window**, on the first refusal: every later one in the same window is the same fact. No `token_tag` and no `reason` — nothing was looked up and no credential was read |
 | `tool_write_refused` | WARNING | `actor_kind`, `key_id`, `oauth_token_id`, `tool`, `user_id` | `_require_write`, the single definition all nine call sites reach |
 | `tool_exception` | ERROR | `actor_kind`, `duration_ms`, `error_type`, `key_id`, `oauth_token_id`, `tool`, `user_id` | `_tracked`'s `except Exception` around **only** `await fn(...)` |
 | `tool_usage_log_failed` | WARNING | `error_type`, `tool` | the same handler, when the best-effort `usage_logs` write reports failure |
@@ -247,6 +248,7 @@ nothing binds the request address into a ContextVar (residual R8).
 | `tool_refused_no_vault` | WARNING | `tool`, `user_id` | the vault admission gate |
 | `tool_refused_vault_quarantined` | WARNING | `reason`, `tool`, `user_id` | the same admission gate, for a vault-root quarantine (#199); `reason` is `overlap`, `root_unexaminable` or `snapshot_not_ready`. Distinct from `tool_refused_no_vault` because that one says the credential has no vault and this one says it has one the server will not serve. No peer username and no path in any field — the caller-facing refusal names no other tenant, and the operator surfaces are where the pair is named |
 | `tool_refused_over_quota` | WARNING | `day`, `key_id`, `limit`, `tool`, `user_id` | the quota admission gate |
+| `tool_refused_rate_limited` | WARNING | `key_id`, `limit`, `oauth_token_id`, `reason`, `tool`, `user_id` | either per-principal token bucket (#188, #194); `reason` is the bucket — `principal` or `principal_write` — and is the same string the caller-facing refusal carries as its `scope`, so the log and the agent name one control. The `usage_logs` half of the same refusal is coalesced separately; the two bounds are independent |
 | `usage_log_credential_gone` | WARNING | `cleared_user_id`, `tool` | the FK-recovery retry in `_log_usage` |
 | `usage_log_failed` | WARNING | `error_type`, `reason`, `tool` | `_log_usage` giving up; `reason` is `initial` or `after_clearing_fks` |
 | `tool_result_measure_failed` | WARNING | `error_type`, `tool` | result telemetry |

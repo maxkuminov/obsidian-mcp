@@ -93,6 +93,32 @@ current_actor: ContextVar[tuple[str, str | None, str | None] | None] = ContextVa
 )
 
 
+# The identity every per-principal rate control is keyed on:
+# `("api_key", api_keys.id)` or `("oauth", oauth_tokens.grant_id)`, bound by
+# `APIKeyMiddleware` from the credential row it has already loaded — so it
+# costs no query, exactly like `current_actor` beside it — and `reset()` in the
+# same `finally` as the rest, so an allowance can never leak into another
+# request's calls.
+#
+# **The OAuth key is the grant, never the access token and never
+# `(client_id, user_id)`.** `oauth_tokens.grant_id` is NOT NULL and indexed
+# (migration 014, issue #64), and every rotation of one `/authorize` approval
+# inherits it, so a refreshing agent continues from its existing allowance
+# instead of being handed a fresh one every hour. `(client_id, user_id)` would
+# merge two grants that #64 deliberately made independently revocable: revoking
+# one would not free the other's allowance, and the operator's stop would look
+# like it had not worked.
+#
+# `None` — sandbox mode, or a direct in-process caller that never passed the
+# middleware — means **exempt from every per-principal control**, not refused:
+# the same shape as the quota gate's "a limit with no key is exempt rather than
+# a crash". Nothing untrusted reaches that path. The failed-authentication
+# budget is not keyed on this and applies regardless.
+current_principal: ContextVar[tuple[str, object] | None] = ContextVar(
+    "current_principal", default=None
+)
+
+
 # Widths of the denormalised actor columns, on `usage_logs` (migration 015) and
 # on `transfer_tokens` (migration 017). The values are truncated to them rather
 # than left to overflow: an over-long label raises inside the writer, and on the

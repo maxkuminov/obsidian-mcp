@@ -59,6 +59,20 @@ SETTINGS_ENV_KEYS = (
     "SESSION_PURGE_RETAIN_DAYS",
     "OAUTH_KNOWN_REDIRECT_HOSTS",
     "MCP_SANDBOX_MODE",
+    # The /mcp rate controls (#188, #194). Every one is a `Settings` field, so
+    # a developer with any of them exported would otherwise change what the
+    # suite measures — which for a *limiter* means a green run on a machine
+    # whose buckets are off.
+    "MCP_AUTH_FAILURE_LIMIT",
+    "MCP_AUTH_FAILURE_WINDOW_SECONDS",
+    "MCP_AUTH_FAILURE_TABLE_SIZE",
+    "MCP_RATE_LIMIT_PER_MINUTE",
+    "MCP_RATE_LIMIT_BURST",
+    "MCP_WRITE_RATE_LIMIT_PER_MINUTE",
+    "MCP_WRITE_RATE_LIMIT_BURST",
+    "MCP_LIMITER_MAX_TRACKED_PRINCIPALS",
+    "MCP_REFUSAL_LOG_INTERVAL_SECONDS",
+    "DEFAULT_DAILY_REQUEST_LIMIT",
     "LOG_LEVEL",
     "LOG_FORMAT",
 )
@@ -208,3 +222,26 @@ def _reset_provider_cache():
     embeddings.get_provider.cache_clear()
     yield
     embeddings.get_provider.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter_state():
+    """Start every test with full buckets and an empty failure table (#194).
+
+    The /mcp rate controls are deliberately in-process and deliberately not
+    persisted, which makes them the one kind of state a test suite can leak
+    through: one test that drives a credential past its burst would refuse the
+    next test's first call, and one that produces authentication failures
+    charges the same address slot every other middleware test uses — a request
+    with no client address is charged to the *shared reserved* slot, on
+    purpose, so "no address" cannot be a bypass. Across a few hundred
+    middleware tests that slot would eventually cross the budget and turn an
+    unrelated 401 assertion into a 429, in an order-dependent way.
+
+    Resetting between tests is therefore hermeticity, not convenience.
+    """
+    from src.services import rate_limits
+
+    rate_limits.reset_state_for_tests()
+    yield
+    rate_limits.reset_state_for_tests()

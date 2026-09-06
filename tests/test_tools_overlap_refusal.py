@@ -70,23 +70,53 @@ NOTE_PATH = "Projects/Alpha.md"
 
 #: `(reason label, marker, caller-facing message)` per quarantine reason. The
 #: labels match the `reason` field on the security event.
+#:
+#: The message is read from `_QUARANTINE_REFUSALS` rather than from
+#: `src/services/vault.py` directly, because since #194 what the caller
+#: receives is that wording **plus** the one machine-readable sentinel line
+#: every refusal raised inside `_tracked` ends with. The prose is unchanged —
+#: `test_the_wording_is_additive_to_the_vault_module` below pins that — and the
+#: line is appended.
 REASONS = [
     (
         "overlap",
         tools._VAULT_ROOT_OVERLAP_MARKER,
-        vault.VAULT_ROOT_OVERLAP_ERROR,
+        tools._QUARANTINE_REFUSALS[vault.VaultRootOverlap][0],
     ),
     (
         "root_unexaminable",
         tools._VAULT_ROOT_UNEXAMINABLE_MARKER,
-        vault.VAULT_ROOT_UNEXAMINABLE_ERROR,
+        tools._QUARANTINE_REFUSALS[vault.VaultRootUnexaminable][0],
     ),
     (
         "snapshot_not_ready",
         tools._VAULT_ROOT_NOT_READY_MARKER,
-        vault.VAULT_ROOT_NOT_READY_ERROR,
+        tools._QUARANTINE_REFUSALS[vault.VaultRootNotReady][0],
     ),
 ]
+
+
+def test_the_wording_is_additive_to_the_vault_module():
+    """The sentinel line is appended; the prose is byte-identical (#194).
+
+    The three messages an agent reads are the three `src/services/vault.py`
+    authored, plus one final line — so every assertion written against that
+    wording, here and everywhere else, still holds.
+    """
+    for prose, (message, _marker, _reason) in zip(
+        (
+            vault.VAULT_ROOT_OVERLAP_ERROR,
+            vault.VAULT_ROOT_UNEXAMINABLE_ERROR,
+            vault.VAULT_ROOT_NOT_READY_ERROR,
+        ),
+        (
+            tools._QUARANTINE_REFUSALS[vault.VaultRootOverlap],
+            tools._QUARANTINE_REFUSALS[vault.VaultRootUnexaminable],
+            tools._QUARANTINE_REFUSALS[vault.VaultRootNotReady],
+        ),
+    ):
+        assert message.startswith(prose)
+        assert message.splitlines()[-1].startswith("MCP-REFUSAL ")
 REASON_IDS = [reason for reason, _, _ in REASONS]
 
 
@@ -325,7 +355,8 @@ async def test_the_message_is_read_from_the_table_not_the_exception(
     monkeypatch.setattr(tools, "_vault_root", _leaky)
     result = await tools.list_notes_impl()
 
-    assert result == vault.VAULT_ROOT_OVERLAP_ERROR
+    assert result == tools._QUARANTINE_REFUSALS[vault.VaultRootOverlap][0]
+    assert result.startswith(vault.VAULT_ROOT_OVERLAP_ERROR)
     assert PEER_USERNAME not in result
     assert PEER_ASSIGNMENT not in result
 

@@ -37,6 +37,7 @@ from src.services.index_state import (
     state_table_exists,
 )
 from src.services.indexer import run_indexer_loop
+from src.services.rate_limits import flush_expired
 from src.services import vault_fs
 from src.logging_setup import configure_logging
 from src.transfer.routes import router as transfer_router
@@ -496,6 +497,20 @@ async def lifespan(app: FastAPI):
                 await asyncio.wait_for(asyncio.shield(indexer_task), timeout=10.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+            # The refusal coalescer's last flush, **before `engine.dispose()`**:
+            # every window still holding a pending count writes the row it owes
+            # while a connection is still obtainable. After the dispose there
+            # is nothing to write with, and the counts — at most one coalescing
+            # interval per active key — would simply be lost.
+            #
+            # Best-effort, like every other shutdown step: a database already
+            # going away must not turn a clean shutdown into a traceback.
+            try:
+                await flush_expired()
+            except Exception as e:  # noqa: BLE001 - shutdown, never fatal
+                logging.getLogger(__name__).error(
+                    f"Refusal flush at shutdown failed: {e}"
+                )
             # Explicitly close pooled database connections during application
             # shutdown (important for reloads and test/application lifecycles).
             await engine.dispose()
