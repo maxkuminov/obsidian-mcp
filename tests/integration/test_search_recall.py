@@ -226,6 +226,13 @@ async def corpus(sessionmaker, queries):
             tags=tags or [],
             frontmatter=frontmatter or {},
             content_hash=path,
+            # Equal to `content_hash`, so every corpus note is **fresh**. A
+            # NULL here is `IS DISTINCT FROM` and would make the whole
+            # benchmark corpus stale (#200) — a shape the recall SLO is not
+            # about, and one where the tool render would withhold every
+            # preview. Staleness is exercised in
+            # `tests/test_issue_200_tool_render.py`.
+            embedded_content_hash=path,
         )
         session.add(note)
         return note
@@ -942,6 +949,13 @@ async def test_find_related_statement_uses_the_hnsw_index(sessionmaker, corpus):
         await session.execute(text("SET LOCAL hnsw.iterative_scan = 'relaxed_order'"))
         plan = await _harness.explain(session, stmt)
     assert HNSW_INDEX in plan, plan
+    # The three degradation columns (#200 / #202) are **projected, never
+    # filtered on**, so they cannot move this plan — asserted here rather than
+    # argued, because the statement this benchmark measures is the one the tool
+    # issues and a predicate smuggled in later would change what is measured.
+    selected = {c.name for c in stmt.selected_columns}
+    assert {"content_hash", "embedded_content_hash", "chunks_truncated"} <= selected
+    assert "embedded_content_hash" not in str(stmt.whereclause)
 
 
 async def test_pgvector_is_new_enough_for_iterative_scan(sessionmaker):
