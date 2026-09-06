@@ -55,7 +55,7 @@ from src.auth.session import actor_columns
 from src.config import settings
 from src.models.db import APIKey, OAuthToken, TransferToken, User
 from src.oauth.scope import token_has_write
-from src.services import vault_fs
+from src.services import vault_fs, vault_overlap
 from src.services.vault import classify_bytes
 
 logger = logging.getLogger(__name__)
@@ -853,6 +853,58 @@ def _ownerless_in_multi_user(*user_ids) -> bool:
     return settings.multi_user_mode and any(uid is None for uid in user_ids)
 
 
+def owner_quarantined(user_id: int | None) -> bool:
+    """Is this capability's owner named by the published vault-root snapshot?
+
+    A capability is a **delayed** write — or a delayed read — into a root:
+    authorised at mint and redeemed later on the public `/transfer/*` routes,
+    which carry no OAuth chain and never call `vault._vault_root`. A token
+    minted before an overlap appeared pins a `vault_root` that is still, byte
+    for byte, the owner's current assignment, so every existing predicate here
+    agrees and the redemption would proceed into a directory the server has just
+    determined is shared with another tenant — or into one whose status it could
+    not establish. Refusing every MCP tool while leaving an outstanding
+    capability redeemable would leave the cross-tenant write reachable through
+    the one path designed to outlive the session that created it.
+
+    Both quarantine reasons refuse, and so does the **never-published** state,
+    for the same reason `_vault_root` refuses in it: a redemption served before
+    the first detection is served against roots nothing has checked.
+
+    **Single-user mode is untouched.** There is one root, no second assignment
+    and nothing to detect, so the snapshot is empty and the readiness state is
+    never consulted — redemption behaves exactly as it does today. In
+    multi-user mode an ownerless row is nobody and is already refused by
+    `_ownerless_in_multi_user`; there is no user to name, so this answers False
+    and lets that pair keep being the refusal.
+
+    Refuse-only, and one attribute read plus a dict lookup: no session, no
+    statement, no syscall. The *response* is unchanged — `_not_found()` is
+    byte-identical for every cause, which is the anti-oracle the whole surface
+    rests on — so only the server-side record says which condition refused.
+    """
+    if not settings.multi_user_mode:
+        return False
+    snapshot = vault_overlap.published_snapshot()
+    if snapshot is None:
+        logger.warning(
+            "transfer redemption refused: no vault-root overlap snapshot has "
+            "been published in this process, so the owner's root has not been "
+            "checked"
+        )
+        return True
+    if user_id is None:
+        return False
+    entry = snapshot.entry_for(user_id)
+    if entry is None:
+        return False
+    logger.warning(
+        "transfer redemption refused: owner is quarantined — %s",
+        vault_overlap.operator_text(entry),
+    )
+    return True
+
+
 def _credential_ok(cred, *, need_write: bool, row: TransferToken) -> bool:
     """Exact predicates from D4 — kept in one place so the pre-publication
     re-check and the entry check cannot drift apart."""
@@ -932,6 +984,12 @@ async def resolve_root_ok(session, row: TransferToken) -> bool:
     which is why this returns a bool rather than raising — the route must not
     turn a reassignment into a 500.
     """
+    if owner_quarantined(row.user_id):
+        # The pinned root still matches, and that is exactly the problem: the
+        # assignment did not change, the *directory* did (#199). Refused here,
+        # with the inactive owner and the reassigned root, because this is the
+        # gate that already fails closed on what the owner row says.
+        return False
     if row.user_id is None:
         # Defence in depth — `_credential_ok` already refuses this row in
         # multi-user mode, and this is the other half of the pair, so neither
@@ -996,6 +1054,12 @@ async def lock_for_publish(session, token_id: int) -> LockedRows | None:
 def locked_rows_ok(locked: LockedRows, *, need_write: bool) -> bool:
     """Re-run D4's predicates against rows that are held `FOR UPDATE`."""
     if not _credential_ok(locked.credential, need_write=need_write, row=locked.token):
+        return False
+    if owner_quarantined(locked.token.user_id):
+        # The locked half of the pair. The entry check runs before the body is
+        # read; a quarantine published while the bytes were streaming is caught
+        # only here, and it is caught *before* the link or rename, so nothing
+        # is published.
         return False
     if locked.token.user_id is not None:
         if locked.user is None or not locked.user.is_active:
@@ -1167,6 +1231,13 @@ async def _identity_publish_ok(
     if not _credential_ok(
         cred, need_write=need_write, row=_IdentityRow(user_id=identity.user_id)
     ):
+        return False
+    if owner_quarantined(identity.user_id):
+        # `import_from_url` holds a network stream open for up to 30 s. The
+        # tool admission gate already refuses a quarantined caller before the
+        # body runs; this is the same fact re-checked against the locked rows
+        # at the moment of publication, for a condition that can appear while
+        # the bytes are still arriving.
         return False
     expected = canonical_vault_root(vault_root)
     if identity.user_id is None:

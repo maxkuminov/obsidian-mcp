@@ -74,15 +74,35 @@
                       state and the reason instead of the number. Nothing is
                       deleted to make the display true; the display was what
                       was wrong.
+
+                      A **quarantined** account is in that position and worse:
+                      it is assigned, it is indexed, its row count is real, and
+                      the admission gate refuses every tool call from it
+                      because its vault root overlaps another account's or
+                      could not be examined (#199). Unqualified beside a
+                      healthy-looking assignment, that number is the most
+                      misleading of the three states — the operator has no
+                      other cue on this page that the account is dark. The
+                      reason comes from the published snapshot's **recorded**
+                      facts, so it still names the peer after the operator
+                      edits or deletes it; "as at" is what makes that honest
+                      rather than presented as the present state.
                     #}
                     <td class="mono" style="font-size:11px;color:var(--text-2);">
-                        {% if u.vault_path %}
-                        {{ u.notes }}
-                        {% else %}
+                        {% if not u.vault_path %}
                         <span style="color:var(--warning);">(not served)</span>
                         <span style="color:var(--text-3);display:block;margin-top:2px;">
                             every MCP tool refuses; index kept for reassignment
                         </span>
+                        {% elif u.quarantine %}
+                        <span style="color:var(--error);">(quarantined — not served)</span>
+                        <span style="color:var(--text-3);display:block;margin-top:2px;">
+                            {{ u.quarantine.detail }}; every MCP tool refuses;
+                            index retained — as at
+                            <time datetime="{{ u.quarantine.detected_at }}" data-localize>{{ u.quarantine.detected_at }}</time>
+                        </span>
+                        {% else %}
+                        {{ u.notes }}
                         {% endif %}
                     </td>
                     <td class="mono" style="font-size:11px;color:var(--text-2);">
