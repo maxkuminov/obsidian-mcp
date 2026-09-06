@@ -1605,7 +1605,19 @@ async def _handle_refresh(form, request=None):
             security_events.emit(
                 "oauth_token_rotation_failed",
                 level=logging.ERROR,
-                exc_info=exc,
+                # **Class only, no `exc_info`** — the same rule as
+                # `oauth_refresh_reuse_revocation_failed` two branches away,
+                # and for the same reason. This transaction binds
+                # `_hash(new_access)` and `_hash(new_refresh)` in its INSERTs
+                # and the presented token's hash in its lookup, so a
+                # `StatementError` here renders credential hashes into
+                # `str(exc)` and into every frame of the traceback. The engine
+                # now sets `hide_parameters=True` (`src/database.py`), which
+                # closes it at the source; withholding the traceback on the one
+                # catalogue event that sits on a credential-bound write is the
+                # second layer, because a record's `stack` reaches a shared log
+                # sink and the health page's ring buffer alike.
+                error_type=type(exc).__name__,
                 subject=security_events.subject_for(
                     user_id=resolved_user_id, request=request
                 ),

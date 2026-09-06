@@ -189,6 +189,13 @@ async def test_a_completed_body_is_never_reported_as_failed(sink, monkeypatch):
     failed *after* the bytes reached the disk is precisely the silently wrong
     record this change exists to prevent — and it is the failure the first draft
     of the handler had, because it wrapped the whole wrapper body.
+
+    Being outside the classifier stopped the failure being *reported* as a tool
+    failure. It did not stop it **being** one — the exception still escaped, so
+    the caller saw an error for a write that stood, which is the same wrong
+    answer from the other side (design D21). The tail is now failure-isolated:
+    the completed result comes back, and the bookkeeping failure is recorded as
+    itself.
     """
     monkeypatch.setattr(tools, "_vault_admission_error", lambda: None)
 
@@ -197,10 +204,63 @@ async def test_a_completed_body_is_never_reported_as_failed(sink, monkeypatch):
 
     monkeypatch.setattr(tools, "_log_usage", exploding_log)
 
-    with pytest.raises(RuntimeError, match="after the body completed"):
+    result = await probe_ok("done")
+
+    assert result == "ran:done", "the body completed; its result is the answer"
+    assert _events(sink, "tool_exception") == []
+    failures = _events(sink, "tool_telemetry_failed")
+    assert len(failures) == 1
+    payload = build_payload(failures[0])
+    assert payload["tool"] == "probe_ok"
+    assert payload["error_type"] == "RuntimeError"
+    # Class only: a `transforms` or serialisation failure quotes the arguments
+    # or the result, which are note content and vault paths (design D2).
+    assert "after the body completed" not in repr(payload)
+
+
+async def test_a_failing_transform_in_the_tail_still_returns_the_result(
+    sink, monkeypatch
+):
+    """The other two ways the tail can raise, and the more dangerous pair.
+
+    `named_params()` runs each tool's own `transforms` and `_response_size`
+    serialises the result — both touch caller data, both run *after* a write
+    has landed, and neither has any business failing the call.
+    """
+    monkeypatch.setattr(tools, "_vault_admission_error", lambda: None)
+
+    def exploding_size(_result):
+        raise ValueError("the result would not serialise")
+
+    monkeypatch.setattr(tools, "_response_size", exploding_size)
+
+    result = await probe_ok("done")
+
+    assert result == "ran:done"
+    assert _events(sink, "tool_exception") == []
+    (failure,) = _events(sink, "tool_telemetry_failed")
+    assert build_payload(failure)["error_type"] == "ValueError"
+
+
+async def test_a_cancelled_tail_still_unwinds(sink, monkeypatch):
+    """`BaseException` is deliberately not caught in the tail.
+
+    A cancellation there is a client that went away or a shutdown; swallowing
+    it into a returned result would defeat the cancellation, which is a
+    different bug from the one D21 fixes.
+    """
+    monkeypatch.setattr(tools, "_vault_admission_error", lambda: None)
+
+    async def cancelled_log(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(tools, "_log_usage", cancelled_log)
+
+    with pytest.raises(asyncio.CancelledError):
         await probe_ok("done")
 
     assert _events(sink, "tool_exception") == []
+    assert _events(sink, "tool_telemetry_failed") == []
 
 
 async def test_a_gate_failure_before_the_body_is_not_a_tool_exception(
