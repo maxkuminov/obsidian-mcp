@@ -319,6 +319,33 @@ sessions, which several slices would otherwise all have to touch.
       `docs/architecture/schema-and-migrations.md` now says the check is
       complete rather than minimal, and why a subset check is the dangerous
       one.
+  - **Round 3 returned FAIL: 1 MAJOR, nothing else; rounds 1-2 accepted.
+    Applied, and the review is closed here.**
+    - *MAJOR — the failure record could itself fail.* `touch_session`'s
+      commit-failure path called `_touch_failed(request, row, ...)`, which read
+      `row.user_id` off the mapped instance. When the connection dies during
+      `commit()` and the `rollback()` after it also raises, SQLAlchemy expires
+      what it is holding **before** re-raising — so that read is a refresh
+      against a dead connection, not an attribute read, and it raises. The one
+      path whose entire contract is "this may never fail a request" had a way
+      to fail one, on the branch reached only when everything else already has.
+      `user_id` and `route` are now captured as primitives **before the first
+      statement runs**, and `_touch_failed` takes them as keyword arguments;
+      nothing after the capture dereferences a mapped instance. (`row.id` is
+      deliberately not captured — it is the stored digest of the cookie's
+      identifier, and this event carries no session identifier in any form.)
+    - Two cases in `tests/test_issue_198_session_registry.py`. The first drives
+      a panel `GET` through `get_active_session_user` and `require_user_panel`
+      against a session double whose `commit` raises, whose `rollback` raises,
+      and whose row **expires on the way out** — modelled, not mocked, since a
+      `MagicMock` would answer `user_id` cheerfully and prove the opposite. It
+      asserts the page still renders, that both records carry the captured id
+      and route, and — counting the row's own post-expiry reads — that nothing
+      dereferenced it. The second pins the capture *above* the first statement
+      against the source, because moving it below the savepoint would pass
+      every other assertion and restore the defect on the only path that
+      expires anything. Both fail on the pre-fix tree, with the row's
+      `RuntimeError` escaping the request.
 - [ ] 8.9 `make deploy`, then `make db-check` (`alembic check` must read "No new upgrade operations detected").
 - [ ] 8.10 Browser pass on the live panel: sign in; open a second browser and confirm both work; log out of the first and **replay its cookie** — expect a redirect to login; change the password from the second and confirm the first is signed out while the second is not; sign in with the new password; open an `/authorize` URL for a self-registered test client with a non-allow-listed redirect host and confirm the warning and the host; confirm an allow-listed client shows the badge **and still shows the self-registration notice**. There is no `user-representative` gate on this project — record which flows were actually exercised.
 - [ ] 8.11 Confirm the deploy's one-time logout happened as designed and both production users can sign in.

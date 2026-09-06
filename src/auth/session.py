@@ -454,15 +454,23 @@ async def touch_session(
     * **Throttled to `session_touch_interval_seconds`.** Nothing authorizes on
       `last_seen_at`; a write per request buys nothing and costs a commit.
 
-    Any failure is swallowed: a `panel_session_touch_failed` record is emitted
-    and the request is served. **The `UPDATE` runs inside a savepoint**, so the
-    ordinary failure — the write refused while the reads succeed — rolls back
-    that savepoint alone and leaves the enclosing transaction, and every object
-    loaded in it, **attached and writable**. That last word is the point: a
-    plain rollback here detached the authenticated user, and a write through a
-    detached instance commits nothing and says nothing. `protect` names the
-    instances whose loaded state must survive the rarer case where the *commit*
-    fails and a real rollback is unavoidable.
+    Any failure is swallowed and a `panel_session_touch_failed` record is
+    emitted: the request is served either way. **The `UPDATE` runs inside a
+    savepoint**, so the ordinary failure — the write refused while the reads
+    succeed — rolls back that savepoint alone and leaves the enclosing
+    transaction, and every object loaded in it, **attached and writable**. That
+    last word is the point: a plain rollback here detached the authenticated
+    user, and a write through a detached instance commits nothing and says
+    nothing. `protect` names the instances whose loaded state must survive the
+    rarer case where the *commit* fails and a real rollback is unavoidable.
+
+    **The record itself cannot fail either.** Everything it needs is captured
+    as a primitive before the first statement runs, because a `commit()` and a
+    `rollback()` that both raise leave SQLAlchemy's instances expired — and a
+    read of `row.user_id` after that is a refresh against a dead connection,
+    not an attribute read. Nothing below the capture dereferences a mapped
+    instance.
+
     The exception's **class name only** reaches the log — SQLAlchemy renders
     bound parameters into an error's text, and one of them here is the stored
     session hash (the engine also sets `hide_parameters=True`; this is the
@@ -509,6 +517,22 @@ async def touch_session(
     # `user_sessions`, a trigger rejecting the write, a check constraint added
     # by hand. A savepoint rollback restores the connection and leaves the
     # enclosing transaction, and everything loaded in it, exactly as it was.
+    # **Everything the failure record needs, read now, as primitives.**
+    # `row` is a mapped instance, and the recovery below can leave it expired:
+    # when a connection dies during `commit()` and the `rollback()` that
+    # follows also raises, SQLAlchemy expires what it is holding before
+    # re-raising. A read of `row.user_id` after that is not a read at all — it
+    # is a refresh, against the connection that just died — so it raises, and
+    # the *record of the failure* becomes a second failure on a path whose
+    # entire contract is that it cannot fail. Two ints and a string, captured
+    # here, close that: nothing below dereferences a mapped instance.
+    #
+    # (`row.id` is deliberately **not** among them. It is the stored SHA-256 of
+    # the cookie's identifier, and this event does not carry a session
+    # identifier in any form — see `_touch_failed`.)
+    row_user_id = getattr(row, "user_id", None)
+    route = getattr(getattr(request, "url", None), "path", None)
+
     try:
         async with session.begin_nested():
             await session.execute(
@@ -519,14 +543,14 @@ async def touch_session(
     except Exception as exc:  # noqa: BLE001 - telemetry may not fail a request
         # The savepoint is gone; the outer transaction is untouched and there
         # is deliberately nothing else to undo.
-        _touch_failed(request, row, "touch", exc)
+        _touch_failed(request, "touch", exc, user_id=row_user_id, route=route)
         return False
 
     try:
         await session.commit()
         return True
     except Exception as exc:  # noqa: BLE001 - nor may the commit
-        _touch_failed(request, row, "touch", exc)
+        _touch_failed(request, "touch", exc, user_id=row_user_id, route=route)
         # A failed commit leaves the session unusable, and its rollback will
         # evict what is loaded whether or not a savepoint was used. `protect`
         # names the instances whose already-loaded state the caller still
@@ -541,11 +565,22 @@ async def touch_session(
         try:
             await session.rollback()
         except Exception as rollback_exc:  # noqa: BLE001 - nor may the recovery
-            _touch_failed(request, row, "rollback", rollback_exc)
+            # `row` may well be expired by now, which is exactly why this line
+            # passes the ints captured before the commit rather than reading it.
+            _touch_failed(
+                request, "rollback", rollback_exc, user_id=row_user_id, route=route
+            )
         return False
 
 
-def _touch_failed(request, row, stage: str, exc: BaseException) -> None:
+def _touch_failed(
+    request,
+    stage: str,
+    exc: BaseException,
+    *,
+    user_id: int | None,
+    route: str | None,
+) -> None:
     """One `panel_session_touch_failed`, bounded and class-only.
 
     `stage` is `touch` (the `UPDATE`/commit) or `rollback` (the recovery that
@@ -554,19 +589,26 @@ def _touch_failed(request, row, stage: str, exc: BaseException) -> None:
     rollback is a database refusing one statement, while a failing rollback is
     a connection that is gone — the same request, two different pages.
 
+    **`user_id` and `route` arrive as values, never as a mapped instance to
+    read them off.** The second call site runs after a `commit()` and a
+    `rollback()` have both raised, and SQLAlchemy expires what it holds before
+    re-raising — so `row.user_id` there is a refresh against a dead connection,
+    not an attribute read. Taking the primitives closes the one way this
+    best-effort record could itself raise and turn a served page into a 500.
+
     Never the exception's text and never a traceback: this failure is a
     statement binding `user_sessions.session_hash`, and rendering it is how the
-    registry's own key would reach a shared sink.
+    registry's own key would reach a shared sink. No session identifier in any
+    form either — not the cookie's, and not the stored digest that is the
+    table's primary key.
     """
     security_events.emit(
         "panel_session_touch_failed",
-        subject=security_events.subject_for(
-            user_id=getattr(row, "user_id", None), request=request
-        ),
+        subject=security_events.subject_for(user_id=user_id, request=request),
         reason=stage,
-        user_id=getattr(row, "user_id", None),
+        user_id=user_id,
         error_type=type(exc).__name__,
-        route=getattr(getattr(request, "url", None), "path", None),
+        route=route,
     )
 
 
