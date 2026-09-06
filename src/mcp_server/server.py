@@ -177,6 +177,21 @@ async def read_note(
       carries the guidance in prose.
     - `metadata_omissions` — any metadata field this response had to drop, and
       why. Nothing is ever signalled by a marker inside a field.
+    - `content_hash` — this note's file digest, `sha256:<64 lowercase hex>`,
+      and the token the write tools accept as `expected_hash` to bind a write
+      to the bytes you actually read. Three things about it:
+      it is the **whole file's** hash in every mode — a section read and a
+      truncated read return the same value a whole-note read of the unchanged
+      file returns, so a section write guarded with it is refused when
+      *anything* in the file changed (that is the trade, and it is why the
+      argument is optional: bind when you reasoned about what you read, omit
+      when you are appending to a log); it comes from the same read that built
+      this response, never a second one; and it is **not** a hash of `content`
+      — a note with frontmatter, or with CRLF terminators, has a digest the
+      returned text cannot reproduce, so never compute it yourself, hand this
+      value back verbatim. `read_file` on the same path is the byte-exact
+      route to the file itself, `frontmatter_yaml` here being authoritative
+      but LF-normalized.
     - `error` — set when the read failed (missing note, bad `offset`/`limit`,
       unknown section). It is a normal result, not a transport error, and the
       content-bearing fields are absent beside it.

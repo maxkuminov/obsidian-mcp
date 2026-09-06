@@ -457,6 +457,27 @@ class Settings(BaseSettings):
             + _MCP_ENVELOPE_ALLOWANCE_BYTES
         )
 
+    # ── The write precondition (#205) ──────────────────────────────────────
+    #
+    # `expected_hash` is optional on every write tool, which is what keeps
+    # every deployed client working — and is also the whole limitation: an
+    # agent that never sends one is exactly as exposed to a lost update as it
+    # is today. This is the lever for a deployment that would rather refuse an
+    # unguarded write than take that risk. When true, every tool that can
+    # honour a precondition refuses a call that supplies none, with the typed
+    # `precondition_required` refusal and nothing written.
+    #
+    # **A deployment decision, never a per-call one.** An agent cannot turn it
+    # off, and a client that does not send hashes is broken by it deliberately
+    # and visibly rather than silently exposed. `create_note` and
+    # `write_file(overwrite=False)` are exempt whatever this says: they have no
+    # incumbent bytes to bind, so requiring a hash there would make creation
+    # impossible.
+    #
+    # Default **false**, so enabling this change is a no-op for every existing
+    # client. Env: WRITE_PRECONDITION_REQUIRED.
+    write_precondition_required: bool = False
+
     # Cap on how much note/file text a single read_note / read_file call may
     # return to the model. The byte caps above stop the server from reading a
     # huge file into memory; this one stops a legitimately-read file from
