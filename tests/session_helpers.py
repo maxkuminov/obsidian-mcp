@@ -138,6 +138,31 @@ def _advisory_lock_param(stmt) -> str | None:
     return ADVISORY_LOCK_STATEMENTS.get(_normalized_sql(stmt))
 
 
+class _Savepoint:
+    """What `AsyncSession.begin_nested()` hands back, for `FakeRegistry`.
+
+    Propagates the exception (returns False from `__aexit__`) because the
+    production code catches it *outside* the `async with` — swallowing it here
+    would make the failure path untestable.
+    """
+
+    def __init__(self, registry):
+        self.registry = registry
+
+    async def __aenter__(self):
+        self.registry.savepoints += 1
+        self.registry.events.append(("savepoint",))
+        return self
+
+    async def __aexit__(self, exc_type, _exc, _tb):
+        if exc_type is not None:
+            self.registry.savepoint_rollbacks += 1
+            self.registry.events.append(("savepoint_rollback",))
+        else:
+            self.registry.events.append(("savepoint_release",))
+        return False
+
+
 class FakeRegistry:
     """An `AsyncSession` double for the session lifecycle. Interprets, not canned.
 
@@ -179,6 +204,17 @@ class FakeRegistry:
         self.fail_on: str | None = None
         self.fail_with: Exception | None = None
         self.fail_rollback: Exception | None = None
+        #: Set to raise from `commit`, so a test can exercise the path where
+        #: the savepoint released cleanly and the transaction still died.
+        self.fail_commit: Exception | None = None
+        #: Savepoints opened and rolled back. The touch's `UPDATE` runs inside
+        #: one, and the whole point of it is that a failure rolls back **the
+        #: savepoint** and not the transaction — so the two counters are kept
+        #: apart and a test can tell which happened.
+        self.savepoints = 0
+        self.savepoint_rollbacks = 0
+        #: Instances detached with `expunge`, in order.
+        self.expunged: list = []
         # The state a rollback before the first commit returns to.
         self._snapshot_users()
 
@@ -206,7 +242,23 @@ class FakeRegistry:
         if self.restore_on_rollback:
             self._user_snapshot = {id(u): dict(vars(u)) for u in self.users}
 
+    def begin_nested(self):
+        """A SAVEPOINT, as an async context manager.
+
+        Modelled rather than stubbed, because the property under test is
+        precisely that a failure inside one does **not** reach the enclosing
+        transaction: this records the savepoint's own rollback and touches
+        nothing else, so a test asserting `rolled_back == 0` is asserting
+        something real.
+        """
+        return _Savepoint(self)
+
+    def expunge(self, instance):
+        self.expunged.append(instance)
+
     async def commit(self):
+        if self.fail_commit is not None:
+            raise self.fail_commit
         self.committed += 1
         self.events.append(("commit",))
         # What survives a later rollback is what was committed.

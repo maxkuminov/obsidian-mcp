@@ -336,6 +336,56 @@ def _index_definitions(bind) -> dict:
     }
 
 
+def _pk_index_name(bind) -> str | None:
+    """The index PostgreSQL built to back the primary key.
+
+    Read rather than assumed: `op.create_table` names it `<table>_pkey` today,
+    but the point of the check below is that the index set is *complete*, and a
+    hard-coded name would make a renamed PK index read as an unexpected one.
+    """
+    return bind.execute(
+        sa.text(
+            "SELECT ic.relname FROM pg_constraint c "
+            "JOIN pg_class ic ON ic.oid = c.conindid "
+            "WHERE c.conrelid = CAST(:table AS regclass) AND c.contype = 'p'"
+        ),
+        {"table": QUALIFIED},
+    ).scalar()
+
+
+def _extra_constraints(bind):
+    """Every UNIQUE, CHECK and EXCLUSION constraint on the table.
+
+    024 creates none of these, so **any** of them is somebody else's. They are
+    enumerated rather than ignored because the damaging one is silent: a
+    `UNIQUE (user_id)` added by hand leaves the columns, the primary key, the
+    foreign key and both named indexes exactly as 024 made them, so every other
+    check here passes — and then the second session a user opens, or the
+    re-issue that follows their own password change, fails on a constraint
+    violation the application has no branch for. A CHECK is the same shape of
+    trap one layer down (`revoked_at IS NULL`, say, would make revocation
+    itself raise), and an EXCLUSION constraint is a UNIQUE with more reach.
+
+    `conname` and the rendered definition are both returned: an operator has to
+    be able to find the thing, and `pg_get_constraintdef` is what names it.
+    """
+    return bind.execute(
+        sa.text(
+            # `contype` is PostgreSQL's `"char"`, which the driver hands back
+            # as a one-byte `bytes`. Cast in SQL rather than decoding in
+            # Python, so the value that reaches the lookup below is a `str`
+            # whatever driver is underneath.
+            "SELECT c.conname, CAST(c.contype AS text) AS contype, "
+            "       pg_get_constraintdef(c.oid) AS definition "
+            "FROM pg_constraint c "
+            "WHERE c.conrelid = CAST(:table AS regclass) "
+            "  AND c.contype IN ('u', 'c', 'x') "
+            "ORDER BY c.conname"
+        ),
+        {"table": QUALIFIED},
+    ).fetchall()
+
+
 def _canonical_created_at_default(bind) -> str:
     """What this server renders `now()` as for a `timestamptz` column.
 
@@ -529,8 +579,33 @@ def _foreign_key_problems(bind) -> list:
     return problems
 
 
+def _constraint_problems(bind) -> list:
+    """024 creates no UNIQUE, CHECK or EXCLUSION constraint, so there are none.
+
+    The complete set is required, not a subset: a check that only looks for
+    what 024 *made* adopts a table that also carries something 024 did not,
+    and the additions that matter here are the ones every other check passes.
+    """
+    problems = []
+    for row in _extra_constraints(bind):
+        kind = {"u": "UNIQUE", "c": "CHECK", "x": "EXCLUSION"}[row.contype]
+        problems.append(
+            f"it carries an unexpected {kind} constraint {row.conname!r} "
+            f"({row.definition}) that 024 does not create"
+        )
+    return problems
+
+
 def _index_problems(bind) -> list:
-    """Each index present *and defined as 024 defines it*."""
+    """Each index present *and defined as 024 defines it*, **and no others**.
+
+    The second half is the one that was missing. An extra index is not merely
+    untidy here: a unique one changes what the table permits, and since a
+    `UNIQUE` constraint is implemented as an index this is also the backstop
+    for `_constraint_problems` — a bare `CREATE UNIQUE INDEX ... (user_id)`
+    creates no constraint row at all and would otherwise be invisible to every
+    check in this module while breaking the second session a user opens.
+    """
     live = _index_definitions(bind)
     problems = []
     for name, expected in EXPECTED_INDEXES.items():
@@ -546,11 +621,30 @@ def _index_problems(bind) -> list:
                 f"{restricted}), not {expected[0]} as a plain, valid, "
                 "non-unique index"
             )
+
+    permitted = set(EXPECTED_INDEXES)
+    pk_index = _pk_index_name(bind)
+    if pk_index is not None:
+        permitted.add(pk_index)
+    for name in sorted(set(live) - permitted):
+        columns, unique, _usable, _restricted = live[name]
+        problems.append(
+            f"it carries an unexpected index {name!r} on {columns} "
+            f"(unique={unique}) that 024 does not create"
+        )
     return problems
 
 
 def _verify(bind) -> None:
     """Accept a pre-existing table only if it is exactly 024's.
+
+    **Complete, not minimal.** Every column, the primary key, the default, the
+    foreign key, the constraint set and the index set are all checked, and the
+    last two are checked as *sets* — a shape that has everything 024 makes
+    **plus** something it does not is not 024's shape. That is not pedantry: a
+    hand-added `UNIQUE (user_id)` passes a subset check unchanged and then
+    breaks the second session a user opens and every post-password-change
+    re-issue, on a constraint no handler expects.
 
     013's philosophy: reconcile a database that demonstrably has our shape,
     refuse to guess for one that does not — and **name what disagreed**, so an
@@ -571,6 +665,7 @@ def _verify(bind) -> None:
     problems.extend(_primary_key_problems(bind))
     problems.extend(_default_problems(bind))
     problems.extend(_foreign_key_problems(bind))
+    problems.extend(_constraint_problems(bind))
     problems.extend(_index_problems(bind))
 
     if problems:
