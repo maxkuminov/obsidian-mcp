@@ -1,9 +1,9 @@
 - [x] 1. Investigate auth/tool/logger lifetimes, shadow semantics and pool arithmetic.
 - [x] 2. Independent proposal review — PASS after fixing sticky overflow ownership across active leases and pending waiters.
 - [x] 3. Implement controller/config/shared pool constants and deterministic tests.
-- [ ] 4. Integrate request/auth lifetimes and bounded writer/tool admission with #263.
-- [ ] 5. Update docs/settings and add real-PostgreSQL occupancy/outcome regressions.
-- [ ] 6. Independent spec/defensive implementation reviews; resolve blocking findings.
+- [x] 4. Integrate request/auth lifetimes and bounded writer/tool admission with #263.
+- [x] 5. Update docs/settings and add real-PostgreSQL occupancy/outcome regressions.
+- [x] 6. Independent spec/defensive implementation reviews; resolve blocking findings.
 - [ ] 7. Combined offline/PostgreSQL/OpenSpec/audit/build/scan validation.
 - [ ] 8. Deploy default shadow mode, db-check, live owned-fixture MCP exercise and cleanup.
 - [ ] 9. Archive completed changes and publish tested PR to main for #263/#261.
