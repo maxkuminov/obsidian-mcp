@@ -504,16 +504,49 @@ def test_one_hundred_thousand_addresses_stay_proportional_to_the_table():
     assert sum(1 for slot in table if slot is not None) <= size
 
 
-def test_colliding_addresses_share_a_budget_rather_than_escape_one():
-    size = 16  # small on purpose, so a collision is quick to find
+def test_colliding_addresses_share_a_budget_rather_than_escape_one(monkeypatch):
+    """Two addresses in one slot share one budget — **driven through the real
+    middleware**, not inferred from the index function.
+
+    The table is fixed-size because addresses are free to mint, so collisions
+    are not an edge case: they are the design. What has to be true is that a
+    collision makes the control *stricter* — the second address inherits the
+    first's spent budget — rather than handing anyone a way out of it. A test
+    that only showed `_slot_index` maps two strings to the same integer proved
+    the arithmetic and not the behaviour, and the behaviour is the claim.
+    """
+    monkeypatch.setattr(mcp_auth.settings, "mcp_auth_failure_limit", 2)
+    monkeypatch.setattr(mcp_auth.settings, "mcp_auth_failure_table_size", 8)
+    rate_limits.reset_state_for_tests()
+
+    size = len(rate_limits._table())
     first = "203.0.113.1"
     target = rate_limits._slot_index(first, size)
     partner = next(
         candidate
-        for candidate in (f"203.0.113.{n}" for n in range(2, 4000))
+        for candidate in (f"198.51.100.{n}" for n in range(1, 4000))
         if rate_limits._slot_index(candidate, size) == target
     )
-    assert partner != first
+
+    # The whole budget is spent by the *first* address.
+    for _ in range(2):
+        assert _drive(token=None, client=(first, 1111))[0] == 401
+    refused_first = _drive(token=None, client=(first, 1111))
+    assert refused_first[0] == 429
+
+    # The partner, which has failed nothing, inherits the refusal — and pays
+    # no authentication work for it.
+    sessions = []
+    status, headers, served = _drive(
+        token="omcp_x",
+        session=_Session(api_key=_key()),
+        client=(partner, 2222),
+        count_sessions=sessions,
+    )
+    assert status == 429
+    assert not served
+    assert sessions == [], "a collided refusal still reached the credential lookup"
+    assert headers["retry-after"] == refused_first[1]["retry-after"]
 
 
 def test_the_salt_is_per_process_and_random():

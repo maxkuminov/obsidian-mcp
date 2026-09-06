@@ -27,7 +27,11 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-PYTHON ?= python3
+# The repo's virtualenv is where the dev tooling (pytest, pip-audit) actually
+# lives, so `make audit` has to work from a shell that has not activated it —
+# a gate nobody can run without remembering a preamble is a gate that stops
+# being run. Overridable, and it falls back to `python3` when there is no venv.
+PYTHON ?= $(if $(wildcard .venv/bin/python),.venv/bin/python,python3)
 SCHEMA_TEST_CONTAINER ?= obsidian-mcp-schema-test
 SCHEMA_TEST_PORT ?= 55438
 SCHEMA_TEST_IMAGE ?= pgvector/pgvector:pg16
@@ -367,4 +371,4 @@ clean: down
 	@echo "$(GREEN)Cleaned. Data in $(DATA_DIR) preserved.$(NC)"
 
 audit:
-	pip-audit -r requirements.txt
+	$(PYTHON) -m pip_audit -r requirements.txt

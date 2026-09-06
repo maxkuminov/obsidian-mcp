@@ -147,6 +147,17 @@ the bucket refills. It gets its own body rather than the uniform 404 — the
 token is fine and stays claimable, and telling a legitimate redeemer their link
 had died would make them mint another.
 
+**The 429 is conditional on the release actually landing.** `claim_upload`
+commits before this gate, so a `release_claim` that fails leaves the token
+**claimed until its TTL** — and `Retry-After` would then be a lie the caller
+acts on: it says "this link works again in N seconds" about a link that will
+answer 404 for the next several minutes, so an obedient agent retries on
+schedule, is refused, and has no way to tell the refusal it was given from the
+one it now gets. When the claim cannot be restored the route falls back to this
+route's ordinary non-retryable answer — which is what a retry would in fact
+receive — and `transfer_claim_release_failed` records the cause class-only. A
+retryable refusal is a promise, and only a confirmed release can support it.
+
 The full rule, beside the #208 phase-one session discipline it lives inside,
 is in [file transfer](file-transfer.md).
 
@@ -227,6 +238,16 @@ translates it into the same caller-facing `argument_too_long` code carrying the
 provider's stated reason. The agent sees **one** actionable failure mode for
 "the query was too large", whichever limit actually applied.
 
+**Its sentinel line carries `limit: null` and `limit_unit: null`.** The limit
+that fired is the provider's, it is a *token* limit, and this server does not
+know its value — the provider states it in prose or not at all. Quoting
+`MAX_SEARCH_QUERY_CHARS` there (the first shape) told a parsing agent that an
+8,192-**character** bound had been exceeded by a query that was under it: a
+machine-readable falsehood, and one an obedient agent acts on by trimming to
+that number, retrying, and being refused identically forever. The prose still
+explains why the character cap did not catch it; the payload asserts nothing it
+cannot support.
+
 **The usage marker is different on purpose.** `provider_input_rejected` is
 classified **post-body** and is deliberately *not* in
 `pre_body_refusal_sql()`, because the body ran, resolved a vault and made a
@@ -279,6 +300,48 @@ mid-flush: the window is either already retired (and the arriving refusal opens
 a fresh one, writing its own row) or untouched. Deciding and then awaiting
 before mutating would let one refusal be counted on both sides.
 
+### A planned row is acknowledged, and a failed one is requeued
+
+Advancing the window when a row is *planned* is the only workable order — the
+alternative is holding a lock across a database write on the hottest path in
+the server — but it means the count that row carries is in flight, owned by
+nobody, until the write is confirmed. So every row the coalescer decides to
+write is a **`PlannedRow`** carrying its own `weight` (`1 + suppressed`), and
+`write_planned_row` either sees `write_usage_row` return `True` or **requeues
+the whole weight** into the window's `pending`.
+
+That is not defensive coding; it is the arithmetic. Without it a write that
+answered `False` — the credential deleted mid-call, the pool exhausted, the
+insert rejected — left the window already advanced and the row never written,
+so `1 + suppressed` observed refusals vanished with no trace on any surface and
+Σ `(1 + suppressed)` silently undercounted, which is the one thing this
+arithmetic exists to make exact. A requeue after a *flush* failure restores the
+window with its **original start**, so the row is due again on the very next
+tick rather than after another whole interval; a requeue after an *immediate*
+failure adds to whatever has accumulated since. Exceptions count as failures:
+an exception is not evidence the row landed.
+
+The immediate row is written from the captured template too, through the same
+`write_planned_row`. One code path builds every `rate_limited` row, so the
+deferred one is not the only path anybody has exercised end to end.
+
+### Two flushes, and why shutdown needs the other one
+
+`flush_expired()` retires only **closed** windows: inside its interval more
+refusals may still arrive and coalescing them is the entire point. `flush_all()`
+retires **every** window, open ones included, and is what the lifespan calls
+before `engine.dispose()` — at shutdown there is no next tick and no next
+refusal, so an open window's pending count is simply lost unless it is retired
+now. Using the periodic flush at shutdown dropped the current interval on every
+clean restart.
+
+The tick's flush sits in the loop's **`finally`**, reached by the paused branch
+and the failure branch as well as the healthy one. It used to sit after
+`cleanup_expired_tokens()`, which only a healthy tick reaches: a paused
+deployment (`continue`) and a failing one (the exception handler) both jumped
+past it, so exactly the two states an operator investigates with
+`/admin/performance` open were the two that never wrote their counts.
+
 **The entry stores the complete, immutable attribution of the row it will
 write** — owner `user_id`, `key_id` / `oauth_token_id`, the denormalised
 `actor_*` triple, tool, marker, scope and the bounded params — captured at the
@@ -306,6 +369,15 @@ Cardinality is bounded by the same registry cap as the buckets: past
 entries keyed on **`(tool, marker, scope)`** — the principal is the only
 component dropped, so an overflowed row still names the tool, the marker and
 the control that fired.
+
+**A row written from the overflow entry is explicitly UNATTRIBUTED**: its
+`user_id`, `key_id`, `oauth_token_id` and `actor_*` columns are NULL. The entry
+is shared, so its row stands for traffic from several credentials at once, and
+stamping it with whichever member happened to open the window would attribute
+an aggregate to one specific credential — a false fact about a named key on the
+surface an operator uses to decide whose key to revoke, which is worse than the
+missing attribution the overflow already accepts. The count survives; the name
+does not.
 
 > **Accepted limitations.** (a) An abrupt process termination (SIGKILL, OOM)
 > loses the pending counts of open windows — **at most one interval's worth per
@@ -440,6 +512,15 @@ against credential guessing; #194's own verification withdrew that (256-bit
   background task, which would be a second thing to start, stop and reason
   about at shutdown for a dictionary.
 
+  The sweep walks a **rotating cursor**: a snapshot of the registry's keys,
+  consumed `SWEEP_SCAN` at a time and rebuilt when it empties, so one O(n)
+  rebuild per full rotation keeps the per-sweep work bounded *and* every entry
+  eventually examined. A fixed insertion-order prefix — the first shape —
+  never reached the tail of a registry holding more than one scan's worth of
+  entries, so those entries could only be reclaimed by a restart and the
+  registry ratcheted towards its cap, and into the shared overflow entry,
+  permanently.
+
 **An entry is evictable only when it is full and idle.** A depleted bucket must
 not be evicted (a fresh entry starts full, so eviction would grant free
 capacity — idling through the sweep would be a way to reset a spent bucket),
@@ -488,6 +569,20 @@ constructing the settings object with a Python `None`.
 **Null is the only disable. Zero is rejected everywhere** (`ge=1`), for #162's
 reason: a control that refuses every call reads to an operator as an outage
 rather than as a setting.
+
+**Every limiter setting also has a ceiling**, and for the mirror-image reason.
+"No upper bound" is not "no limit": pydantic accepts an arbitrarily long
+integer literal from the environment, so a burst set to a 401-digit number
+booted cleanly and handed one principal a bucket no real traffic could ever
+exhaust — a control that is *configured* and does nothing, which is the failure
+an operator cannot see from any surface. `LIMITER_COUNT_MAX` (1,000,000) bounds
+the rates, bursts and registry caps; `LIMITER_WINDOW_SECONDS_MAX` (one day) the
+failure window; `REFUSAL_INTERVAL_SECONDS_MAX` (one hour) the coalescing
+interval; `AUTH_FAILURE_TABLE_SIZE_MAX` (1,048,576) the address table, which is
+allocated in full and is therefore a direct memory bound.
+`DEFAULT_DAILY_REQUEST_LIMIT` keeps its domain in the model validator instead,
+so the boot failure names `ck_api_keys_daily_request_limit`'s 1..1,000,000
+rather than a bare field bound — the domain is what an operator has to satisfy.
 
 With the concurrency lattice deferred there is no pool equation and no
 class-sum rule left to check, and `src/database.py` is untouched. Settings

@@ -417,6 +417,99 @@ async def test_a_dense_non_ascii_query_under_the_cap_reaches_the_provider(
 # ── The detection rule itself ───────────────────────────────────────────────
 
 
+# ── A specific code the provider chose is evidence *against* this branch ───
+
+
+@pytest.mark.parametrize(
+    "code,message",
+    [
+        # The finding: OpenAI answers an unknown deployment with a 400 whose
+        # message happens to contain a size complaint. Read as an input limit,
+        # it told the agent to shorten a query that was never the problem —
+        # and no amount of shortening would ever succeed, while the real fault
+        # (a misconfigured model name, an operator's problem) never surfaced.
+        ("invalid_model", "identifier exceeds maximum length"),
+        ("model_not_found", "The model `nonesuch` does not exist"),
+        ("invalid_api_key", "Incorrect API key provided: sk-***. Maximum length"),
+        ("unsupported_value", "input must be a string of maximum length 64"),
+    ],
+)
+def test_an_unrecognised_code_is_never_read_as_an_input_limit(code, message):
+    """A code is the provider naming the fault. One we do not recognise is a
+    positive statement that this is something else, so the prose fallback must
+    not overrule it."""
+    response = Response(400, json={"error": {"message": message, "code": code}})
+    assert (
+        embeddings._input_limit_reason(
+            response, codes=embeddings._OPENAI_INPUT_LIMIT_CODES
+        )
+        is None
+    )
+
+
+def test_a_coarse_type_alone_does_not_suppress_the_prose_fallback():
+    """`type` is a bucket (`invalid_request_error`) that accompanies input
+    limits and unknown models alike, so it says nothing either way — and
+    treating it as a code would silence every gateway that sends only a type.
+    The distinction between `code` and `type` is what makes both true."""
+    response = Response(
+        422,
+        json={
+            "error": {
+                "message": "input is too long for this model's context length",
+                "type": "invalid_request_error",
+            }
+        },
+    )
+    assert embeddings._input_limit_reason(
+        response, codes=embeddings._OPENAI_INPUT_LIMIT_CODES
+    ) == "input is too long for this model's context length"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        # Code-less bodies (the Ollama shape) whose prose is a size complaint
+        # about something that is not the input.
+        "identifier exceeds maximum length",
+        "name is too long",
+        "the requested adapter exceeds the maximum length",
+        "file too large",
+    ],
+)
+def test_a_size_complaint_about_something_else_is_not_an_input_limit(message):
+    """Every phrase must pair the complaint with what was too large. A bare
+    `maximum length` — which the pattern list used to carry — matches sentences
+    that have nothing to do with the caller's query."""
+    assert (
+        embeddings._input_limit_reason(
+            Response(400, json={"error": message}), codes=frozenset()
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "input length exceeds maximum context length",
+        "prompt is too long",
+        "too many tokens in the request",
+        "reduce your input and try again",
+        "the query exceeds the maximum for this model",
+    ],
+)
+def test_a_size_complaint_about_the_input_still_matches(message):
+    """The other direction, so the tightening cannot silently become a
+    refusal to translate anything."""
+    assert (
+        embeddings._input_limit_reason(
+            Response(400, json={"error": message}), codes=frozenset()
+        )
+        is not None
+    )
+
+
 def test_a_429_is_never_read_as_an_input_limit():
     """Belt and braces on the status gate: even a 429 whose prose names the
     context length is not an input-limit rejection. It is retryable, and the

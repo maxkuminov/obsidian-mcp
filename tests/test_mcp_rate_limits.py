@@ -104,12 +104,21 @@ def _run(
     quota_spy=None,
     rows=None,
     user_id=None,
+    writes_fail=False,
     **kwargs,
 ):
     """Call a `_tracked` function with a bound principal. Returns the result.
 
     `rows` collects every `usage_logs` row the call writes, so "no statement of
-    any kind" is checked by its emptiness rather than by inspection.
+    any kind" is checked by its emptiness rather than by inspection. **Both**
+    writers are captured: the decorator's own tail (`_log_usage`) and the
+    coalescer's (`write_usage_row`), which is the one every `rate_limited` row
+    goes through — immediate and deferred alike.
+
+    `writes_fail` makes the coalescer's writer answer `False`, which is how the
+    acknowledgement contract is exercised: a row that does not land must put
+    its whole weight back rather than disappear between an advanced counter and
+    a failed insert.
     """
     rows = [] if rows is None else rows
     quota_spy = quota_spy or _QuotaSpySession()
@@ -118,8 +127,15 @@ def _run(
         rows.append({"tool": tool, "params": params})
         return True
 
+    async def fake_write_usage_row(values):
+        if writes_fail:
+            return False
+        rows.append({"tool": values.get("tool"), "params": values.get("params"), **values})
+        return True
+
     mp = pytest.MonkeyPatch()
     mp.setattr(tools, "_log_usage", fake_log_usage)
+    mp.setattr(tools, "write_usage_row", fake_write_usage_row)
     mp.setattr(quotas, "async_session", quota_spy)
 
     async def run():
@@ -424,13 +440,20 @@ def test_the_code_set_is_closed():
 # ── 6. coalescing ───────────────────────────────────────────────────────────
 
 
-def _refuse(times=1, rows=None, tool=_probe, user_id=None):
+def _refuse(times=1, rows=None, tool=_probe, user_id=None, writes_fail=False):
     rows = [] if rows is None else rows
     out = []
     for _ in range(times):
         _drain()
-        out.append(_run(tool, rows=rows, user_id=user_id))
+        out.append(
+            _run(tool, rows=rows, user_id=user_id, writes_fail=writes_fail)
+        )
     return rows, out
+
+
+def _weight(row) -> int:
+    """What a written row stands for: `1 + suppressed`."""
+    return 1 + row["params"][tools._SUPPRESSED_PARAM]
 
 
 def test_the_first_refusal_writes_its_own_row_and_the_rest_write_nothing():
@@ -457,18 +480,26 @@ def test_one_refusal_then_a_flush_writes_no_second_row(monkeypatch):
     assert sum(1 + row["params"][tools._SUPPRESSED_PARAM] for row in rows) == 1
 
 
-def _flush(monkeypatched_rows=None):
-    """Run `flush_expired` with the row writer captured. Returns the rows."""
+def _flush(*, fails=False, every_window=False):
+    """Run a flush with the row writer captured. Returns the rows it wrote.
+
+    `fails` makes every write answer `False`, which must leave the coalescer
+    holding the exact same weight for the next attempt rather than dropping it.
+    """
     written = []
 
     async def fake_write(values):
+        if fails:
+            return False
         written.append(values)
         return True
 
     mp = pytest.MonkeyPatch()
     mp.setattr(tools, "write_usage_row", fake_write)
     try:
-        asyncio.run(rate_limits.flush_expired())
+        asyncio.run(
+            rate_limits.flush_all() if every_window else rate_limits.flush_expired()
+        )
     finally:
         mp.undo()
     return written
@@ -528,6 +559,170 @@ def test_a_mixed_run_of_rollovers_and_a_final_flush_sums_exactly(monkeypatch):
         1 + row["params"][tools._SUPPRESSED_PARAM] for row in rows + flushed
     )
     assert total == observed
+
+
+# ── 6b. the acknowledgement contract ───────────────────────────────────────
+#
+# The coalescer's state advances when a row is *planned*. That is the only
+# workable order — the alternative is holding a lock across a database write on
+# the hottest path in the server — but it means the count a planned row carries
+# is in flight, owned by nobody, until the write is confirmed. Before the
+# acknowledgement existed, a write that answered `False` (the credential was
+# deleted mid-call, the pool was exhausted, the row was rejected) left the
+# window already advanced and the row never written: `1 + suppressed` observed
+# refusals disappeared with no trace on any surface, and `Σ (1 + suppressed)`
+# undercounted silently — the one thing this arithmetic exists to make exact.
+
+
+def test_a_failed_opening_write_is_not_lost(monkeypatch):
+    """The opening row fails, one more refusal folds in, and the later flush
+    represents **both** — the failed row's weight went back into `pending`."""
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    rows, _ = _refuse(times=1, writes_fail=True)
+    assert rows == [], "the write was made to fail"
+
+    _refuse(times=1, rows=rows)  # a second refusal, inside the same window
+    assert rows == [], "still inside the window: no statement"
+
+    clock.now += 100
+    flushed = _flush()
+    assert len(flushed) == 1
+    assert flushed[0]["params"][tools._SUPPRESSED_PARAM] == 1
+    assert sum(_weight(row) for row in flushed) == 2
+
+
+def test_a_failed_opening_write_alone_is_still_represented(monkeypatch):
+    """No second refusal: the requeued weight is one, and the flush writes a
+    row for exactly one refusal rather than nothing."""
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    rows, _ = _refuse(times=1, writes_fail=True)
+    assert rows == []
+    clock.now += 100
+    flushed = _flush()
+    assert len(flushed) == 1
+    assert flushed[0]["params"][tools._SUPPRESSED_PARAM] == 0
+    assert sum(_weight(row) for row in flushed) == 1
+
+
+def test_a_failed_rollover_write_keeps_the_whole_weight(monkeypatch):
+    """A rollover row stands for `1 + pending` refusals. When it does not land,
+    all of them go back — losing them would be the largest single undercount
+    the coalescer can produce."""
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    rows, _ = _refuse(times=5)              # opening row + 4 pending
+    assert len(rows) == 1
+    clock.now += 100
+    _refuse(times=1, rows=rows, writes_fail=True)  # the rollover row fails
+    assert len(rows) == 1, "the rollover write was made to fail"
+
+    clock.now += 100
+    flushed = _flush()
+    assert len(flushed) == 1
+    # The rollover would have carried `suppressed = 4` (weight 5); all five go
+    # back, so the flush row stands for five and the total is six.
+    assert flushed[0]["params"][tools._SUPPRESSED_PARAM] == 4
+    assert sum(_weight(row) for row in rows + flushed) == 6
+
+
+def test_a_failed_flush_is_retried_on_the_next_tick_with_the_exact_count(
+    monkeypatch,
+):
+    """A closed window whose flush fails is due again **immediately**, not
+    after another interval, and carries the same weight it did."""
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    rows, _ = _refuse(times=5)
+    clock.now += 100
+
+    assert _flush(fails=True) == []
+    # The very next tick, with no time passing at all, finds it due again.
+    flushed = _flush()
+    assert len(flushed) == 1
+    assert flushed[0]["params"][tools._SUPPRESSED_PARAM] == 3
+    assert sum(_weight(row) for row in rows + flushed) == 5
+
+
+def test_a_write_that_raises_is_requeued_like_one_that_returns_false(
+    monkeypatch,
+):
+    """`write_usage_row` is best-effort and does not raise today. If it ever
+    does — a pool that is gone, a driver that throws before its own handler —
+    the count must survive that too, because an exception is not evidence the
+    row landed."""
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    _refuse(times=3)
+    clock.now += 100
+
+    async def exploding_write(_values):
+        raise RuntimeError("the pool is gone")
+
+    mp = pytest.MonkeyPatch()
+    mp.setattr(tools, "write_usage_row", exploding_write)
+    try:
+        assert asyncio.run(rate_limits.flush_expired()) == 0
+    finally:
+        mp.undo()
+
+    flushed = _flush()
+    assert len(flushed) == 1
+    assert flushed[0]["params"][tools._SUPPRESSED_PARAM] == 1
+
+
+def test_a_requeued_flush_row_merges_with_refusals_that_arrived_meanwhile(
+    monkeypatch,
+):
+    """The flush retires the window before it awaits, so a refusal arriving
+    mid-flush opens a fresh one. Requeueing must then *add* to that window
+    rather than overwrite it — otherwise the arriving refusal, or the failed
+    row, is lost depending on the order."""
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    rows, _ = _refuse(times=3)          # opening row + 2 pending
+    clock.now += 100
+
+    planned = rate_limits._due_rows(clock.now)
+    assert len(planned) == 1 and planned[0].weight == 2
+
+    # A refusal lands while the row is "in flight": a new window opens and
+    # writes its own row.
+    _refuse(times=1, rows=rows)
+    assert len(rows) == 2
+
+    rate_limits.requeue(planned[0])
+    clock.now += 100
+    flushed = _flush()
+    assert len(flushed) == 1
+    assert sum(_weight(row) for row in rows + flushed) == 4
+
+
+def test_the_immediate_row_is_written_from_the_captured_template():
+    """One code path builds every `rate_limited` row. The immediate one used to
+    be assembled in the decorator's tail from the request context instead,
+    which meant the deferred path — the one with no request context at all —
+    was the only one anybody had exercised end to end."""
+    rows, _ = _refuse(times=1, user_id=1)
+    assert len(rows) == 1
+    # Template-shaped: the full row values, not just `(tool, params)`.
+    assert rows[0]["duration_ms"] == 0
+    assert rows[0]["response_size"] == 0
+    assert rows[0]["tool"] == "rate_probe"
+    assert rows[0]["params"][tools._SUPPRESSED_PARAM] == 0
 
 
 def test_the_two_scopes_are_not_merged():
@@ -628,24 +823,138 @@ def test_argument_too_long_is_not_coalesced():
 # ── 7. the flush is actually driven ─────────────────────────────────────────
 
 
-def test_the_indexer_tick_flushes_and_swallows_its_failure():
+def _drive_one_tick(monkeypatch, *, paused=False, index_raises=False, flush_raises=False):
+    """Run exactly one iteration of the periodic loop. Returns the flush count.
+
+    The startup half runs first and is neutered; the tick then takes whichever
+    path the arguments ask for, and the second `sleep` cancels the loop.
+    """
     from src.services import indexer
 
+    calls = {"flush": 0}
+
+    async def _noop(*_a, **_k):
+        return None
+
+    async def _index(*_a, **_k):
+        if index_raises:
+            raise RuntimeError("the pass blew up")
+        return (0, 0)
+
+    async def _flush_counter(*_a, **_k):
+        calls["flush"] += 1
+        if flush_raises:
+            raise RuntimeError("the flush itself failed")
+        return 0
+
+    sleeps = {"n": 0}
+
+    async def _sleep(*_a, **_k):
+        sleeps["n"] += 1
+        if sleeps["n"] > 1:
+            raise asyncio.CancelledError
+
+    class _FakeSession:
+        async def execute(self, *_a, **_k):
+            return None
+
+        async def commit(self):
+            return None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    monkeypatch.setattr(indexer, "async_session", lambda: _FakeSession())
+    monkeypatch.setattr(indexer.settings, "multi_user_mode", False)
+    monkeypatch.setattr(indexer.settings, "index_interval_seconds", 0)
+    monkeypatch.setattr(indexer, "_is_paused", lambda: paused)
+    monkeypatch.setattr(indexer, "detect_root_overlaps", _noop)
+    monkeypatch.setattr(indexer, "record_quarantined_runs", _noop)
+    monkeypatch.setattr(indexer, "link_backfill_pass", _noop)
+    monkeypatch.setattr(indexer, "prewarm_search_caches", _noop)
+    monkeypatch.setattr(indexer, "cleanup_expired_tokens", _noop)
+    monkeypatch.setattr(indexer, "embed_vault", _noop)
+    monkeypatch.setattr(indexer, "index_vault", _index)
+    monkeypatch.setattr(indexer, "flush_expired", _flush_counter)
+    monkeypatch.setattr(indexer.asyncio, "sleep", _sleep)
+
+    try:
+        asyncio.run(indexer.run_indexer_loop())
+    except asyncio.CancelledError:
+        pass
+    return calls["flush"]
+
+
+def test_the_indexer_tick_flushes_on_a_healthy_pass(monkeypatch):
+    assert _drive_one_tick(monkeypatch) == 1
+
+
+def test_a_paused_tick_still_flushes(monkeypatch):
+    """A pause suppresses index and embed work. It must not suppress the
+    coalescer's flush: the flush used to sit after `cleanup_expired_tokens()`,
+    which a paused tick `continue`s straight past, so a deployment left paused
+    accumulated refusal counts in memory and wrote them only if it happened to
+    shut down cleanly — and a pause is entered precisely when an operator is
+    doing something they will want the log of."""
+    assert _drive_one_tick(monkeypatch, paused=True) == 1
+
+
+def test_a_failing_tick_still_flushes(monkeypatch):
+    """Same for the failure branch, which jumps past the old position into the
+    exception handler. A failing indexer is the other state an operator reads
+    `/admin/performance` in."""
+    assert _drive_one_tick(monkeypatch, index_raises=True) == 1
+
+
+def test_the_flush_failure_is_swallowed_by_the_tick(monkeypatch):
+    """Housekeeping may never fail a pass — the `quota_counters` prune
+    precedent."""
+    from src.services import indexer
+
+    # Reaching the end of the loop without the tick raising is the assertion:
+    # the flush was attempted, it blew up, and the loop carried on.
+    assert _drive_one_tick(monkeypatch, flush_raises=True) == 1
+
     source = inspect.getsource(indexer.run_indexer_loop)
-    assert "await flush_expired()" in source
     guarded = source[source.index("await flush_expired()") :]
     assert "except Exception" in guarded[:400]
 
 
-def test_the_shutdown_flush_runs_before_the_engine_is_disposed():
-    """After `engine.dispose()` there is nothing to write with, and the last
-    window's counts would simply be lost."""
+def test_the_shutdown_flush_retires_the_open_window_too(monkeypatch):
+    """`flush_expired` deliberately leaves an **open** window alone — inside its
+    interval more refusals may arrive and coalescing them is the point. At
+    shutdown that reasoning inverts: there is no next tick and no next refusal,
+    so an open window's pending count is lost unless it is retired now. Using
+    the periodic flush at shutdown dropped the current interval on every clean
+    restart.
+    """
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    rows, _ = _refuse(times=4)  # one row, then three folded into the open window
+
+    # The window is still open, so the periodic flush writes nothing…
+    assert _flush() == []
+    # …and the shutdown flush writes the row those three refusals are owed.
+    flushed = _flush(every_window=True)
+    assert len(flushed) == 1
+    assert flushed[0]["params"][tools._SUPPRESSED_PARAM] == 2
+    assert sum(_weight(row) for row in rows + flushed) == 4
+
+
+def test_the_lifespan_shutdown_calls_the_all_windows_flush():
+    """The wiring, since the behaviour above cannot see which one main calls."""
     from src import main
 
     source = inspect.getsource(main.lifespan)
-    assert source.index("await flush_expired()") < source.index(
+    assert source.index("await flush_all()") < source.index(
         "await engine.dispose()"
     )
+    assert "await flush_expired()" not in source
 
 
 # ── 8. bounded registries ───────────────────────────────────────────────────
@@ -676,13 +985,22 @@ def test_overflow_coalescer_entries_drop_only_the_principal(monkeypatch):
     rate_limits.reset_state_for_tests()
     rate_limits.take(("api_key", 1), refusals.SCOPE_PRINCIPAL)
 
-    template = lambda: {"tool": "t", "params": {}}  # noqa: E731
-    assert (
-        rate_limits.record_rate_refusal(
-            ("api_key", 50), "t", "rate_limited", "principal", template
-        )
-        == 0
+    def template():
+        return {
+            "tool": "t",
+            "params": {},
+            "user_id": 4,
+            "key_id": 50,
+            "oauth_token_id": None,
+            "actor_kind": "api_key",
+            "actor_label": "one member of the overflow",
+            "actor_ref": "omcp_aaaa",
+        }
+
+    planned = rate_limits.record_rate_refusal(
+        ("api_key", 50), "t", "rate_limited", "principal", template
     )
+    assert planned is not None and planned.weight == 1
     # A different overflowed principal, same `(tool, marker, scope)`: it folds
     # onto the same entry rather than opening a second window, so the row still
     # names the tool, the marker and the control that fired.
@@ -694,6 +1012,66 @@ def test_overflow_coalescer_entries_drop_only_the_principal(monkeypatch):
     )
     assert rate_limits._overflow is not None
     assert list(rate_limits._overflow.windows) == [("t", "rate_limited", "principal")]
+
+
+def test_an_overflow_row_is_written_unattributed(monkeypatch):
+    """Past the cap the entry is **shared**, so its row stands for traffic from
+    several credentials at once. Stamping it with whichever member happened to
+    open the window would attribute an aggregate to one specific credential —
+    a false fact about a named key, which is worse than the missing attribution
+    the overflow already accepts. The count survives; the name does not.
+    """
+    monkeypatch.setattr(mcp_auth.settings, "mcp_limiter_max_tracked_principals", 1)
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    rate_limits.reset_state_for_tests()
+    rate_limits.take(("api_key", 1), refusals.SCOPE_PRINCIPAL)  # fills the cap
+
+    def template():
+        return {
+            "tool": "t",
+            "params": {"error": "rate_limited"},
+            "user_id": 4,
+            "key_id": 50,
+            "oauth_token_id": None,
+            "actor_kind": "api_key",
+            "actor_label": "one member of the overflow",
+            "actor_ref": "omcp_aaaa",
+        }
+
+    planned = rate_limits.record_rate_refusal(
+        ("api_key", 50), "t", "rate_limited", "principal", template
+    )
+    assert planned is not None
+    for column in rate_limits._ATTRIBUTION_COLUMNS:
+        assert planned.values[column] is None, column
+    # The row still names what fired, which is the whole point of keeping it.
+    assert planned.values["tool"] == "t"
+    assert planned.values["params"]["error"] == "rate_limited"
+
+    # And the deferred half is unattributed too: a second refusal folds in, the
+    # window closes, and the flushed row carries the same nulls.
+    rate_limits.record_rate_refusal(
+        ("api_key", 51), "t", "rate_limited", "principal", template
+    )
+    clock.now += 100
+    flushed = _flush()
+    assert len(flushed) == 1
+    for column in rate_limits._ATTRIBUTION_COLUMNS:
+        assert flushed[0][column] is None, column
+
+
+def test_an_in_cap_principals_row_keeps_its_attribution():
+    """The counterpart: below the cap the entry belongs to one principal, so
+    its row carries the whole `usage_logs` attribution as it always did."""
+    rows, _ = _refuse(times=1, user_id=1)
+    assert len(rows) == 1
+    assert rows[0]["user_id"] == 1
+    assert rows[0]["key_id"] == 7
+    assert rows[0]["actor_kind"] == "api_key"
+    assert rows[0]["actor_label"] == "probe key"
 
 
 def test_a_depleted_or_unflushed_entry_is_never_evicted(monkeypatch):
@@ -731,6 +1109,60 @@ def test_a_depleted_or_unflushed_entry_is_never_evicted(monkeypatch):
     )
     clock.now += rate_limits.ENTRY_TTL_SECONDS * 10
     assert not rate_limits._entries[unflushed].idle_and_full(clock.now)
+
+
+def test_the_sweep_eventually_examines_every_entry(monkeypatch):
+    """A fixed insertion-order prefix never reaches the tail of the registry.
+
+    With `SWEEP_SCAN` = 32 and 33 live entries, the 33rd could only ever be
+    reclaimed by a restart: every sweep re-examined the same first 32, so a
+    deployment sitting just above the scan width ratcheted towards its cap and
+    into the shared overflow entry, permanently. The rotating cursor is what
+    makes "bounded work per admission" and "every entry is eventually
+    examined" both true.
+    """
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    monkeypatch.setattr(
+        mcp_auth.settings, "mcp_limiter_max_tracked_principals", 1_000
+    )
+    rate_limits.reset_state_for_tests()
+
+    population = rate_limits.SWEEP_SCAN + 1
+    for index in range(population):
+        rate_limits.take(("api_key", index), refusals.SCOPE_PRINCIPAL)
+    assert rate_limits.tracked_principals() == population
+
+    # Every entry is now idle and refilled. Sweeping repeatedly must reclaim
+    # all of them, the last-inserted included.
+    clock.now += rate_limits.ENTRY_TTL_SECONDS * 10
+    for _ in range(10):
+        rate_limits._sweep(clock.now)
+        if not rate_limits.tracked_principals():
+            break
+    assert rate_limits.tracked_principals() == 0
+
+
+def test_the_sweep_does_a_bounded_amount_of_work_per_call(monkeypatch):
+    """The cursor is a rotation, not a full scan: one call examines at most
+    `SWEEP_SCAN` entries, so the amortised cost per admission stays bounded."""
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(
+        rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    monkeypatch.setattr(
+        mcp_auth.settings, "mcp_limiter_max_tracked_principals", 1_000
+    )
+    rate_limits.reset_state_for_tests()
+    for index in range(rate_limits.SWEEP_SCAN * 3):
+        rate_limits.take(("api_key", index), refusals.SCOPE_PRINCIPAL)
+
+    clock.now += rate_limits.ENTRY_TTL_SECONDS * 10
+    before = rate_limits.tracked_principals()
+    rate_limits._sweep(clock.now)
+    assert before - rate_limits.tracked_principals() <= rate_limits.SWEEP_SCAN
 
 
 def test_a_full_and_idle_entry_is_reclaimed(monkeypatch):

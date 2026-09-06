@@ -682,7 +682,7 @@ _RATE_LIMIT_SCOPE_PARAM = "rate_limit_scope"
 # `suppressed` is an **integer** and is read with a *guarded* cast: a row
 # stands for `1 + suppressed` refusals, so a reader that summed rows would
 # undercount every coalesced window.
-_SUPPRESSED_PARAM = "suppressed"
+_SUPPRESSED_PARAM = rate_limits.SUPPRESSED_PARAM
 
 #: Which setting an over-long argument names in its refusal. Keyed by argument
 #: name rather than by the cap's value, because two caps may one day share a
@@ -1433,21 +1433,27 @@ def _tracked(
                             params = {}
                         return _rate_refusal_template(tool_name, params, scope)
 
-                    suppressed = rate_limits.record_rate_refusal(
+                    planned = rate_limits.record_rate_refusal(
                         current_principal.get(),
                         tool_name,
                         _RATE_LIMITED_MARKER,
                         scope,
                         refusal_template,
                     )
-                    if suppressed is None:
-                        log_row = False
-                    else:
-                        extra = {
-                            "error": _RATE_LIMITED_MARKER,
-                            _RATE_LIMIT_SCOPE_PARAM: scope,
-                            _SUPPRESSED_PARAM: suppressed,
-                        }
+                    # **The coalescer owns every `rate_limited` row**, this one
+                    # included, and it writes them all from the template it
+                    # captured. Two reasons, and the second is the one that was
+                    # a bug: one code path builds every such row, immediate and
+                    # deferred alike, so the deferred one is not the only path
+                    # anybody has checked — and the write is *acknowledged*, so
+                    # a row that does not land puts its whole weight
+                    # (`1 + suppressed`) back into the window instead of
+                    # vanishing between an advanced counter and a failed
+                    # insert. The decorator's own tail therefore writes nothing
+                    # here.
+                    log_row = False
+                    if planned is not None:
+                        await rate_limits.write_planned_row(planned)
 
                 if refusal is None:
                     # L4 — admission gate: a caller with no resolvable vault
@@ -2105,8 +2111,18 @@ async def semantic_search_impl(
             refusals.Refusal(
                 code=refusals.ARGUMENT_TOO_LONG,
                 scope="provider",
-                limit=MAX_SEARCH_QUERY_CHARS,
-                limit_unit=refusals.CHARACTERS,
+                # **No `limit` and no `limit_unit`.** The limit that actually
+                # fired is the provider's, it is a *token* limit, and this
+                # server does not know its value — the provider states it in
+                # prose or not at all. Quoting `MAX_SEARCH_QUERY_CHARS` here
+                # (the previous shape) told a parsing agent that a
+                # 8,192-character bound had been exceeded by a query that was
+                # under it, which is a machine-readable falsehood: an agent
+                # trimming to that number would be refused again, identically.
+                # The prose still explains *why* the character cap did not
+                # catch it; the payload asserts nothing it cannot support.
+                limit=None,
+                limit_unit=None,
             ),
         )
     if not results:

@@ -374,8 +374,14 @@ def _log_row(row, tool: str, params: dict, response_size: int | None = None) -> 
     )
 
 
-async def _release_quietly(session, row, request: Request) -> None:
+async def _release_quietly(session, row, request: Request) -> bool:
     """Put a claimed token back to `pending`, and never change the answer.
+
+    **Returns whether the claim actually went back.** Every caller but one
+    ignores it, because their answer is already decided and unaffected: a 404
+    is a 404 whether or not the row returned to `pending`. The exception is the
+    write-rate refusal, whose 429 *promises the caller the link is still
+    redeemable* — a promise only this return value can support (see `upload`).
 
     Every caller has **already decided** its response — a 404 from `_refuse`, a
     413, a 503, a 409 — and is releasing the claim so the same link can be
@@ -394,6 +400,7 @@ async def _release_quietly(session, row, request: Request) -> None:
     """
     try:
         await transfer.release_claim(session, row)
+        return True
     except Exception as exc:  # noqa: BLE001 - the response is already decided
         security_events.emit(
             "transfer_claim_release_failed",
@@ -404,6 +411,7 @@ async def _release_quietly(session, row, request: Request) -> None:
             route=request.url.path,
             method=request.method,
         )
+        return False
 
 
 # ── static pages ────────────────────────────────────────────────────────────
@@ -640,7 +648,21 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
             # to serve *right now* is a promise still outstanding, so the same
             # link must be redeemable once the bucket refills. Nothing has been
             # read, staged or published at this point.
-            await _release_quietly(session, row, request)
+            #
+            # **The 429 is conditional on the release actually landing.** The
+            # claim was committed by `claim_upload` before this gate, so if the
+            # release fails the token stays claimed until its TTL — and a 429
+            # with `Retry-After` would then be a lie the caller acts on: it
+            # says "this link works again in N seconds" about a link that will
+            # answer 404 for the next several minutes, so an obedient agent
+            # retries on schedule, fails, and has no way to tell that the
+            # refusal it was given was not the refusal it now gets. When the
+            # claim cannot be restored we fall back to this route's
+            # non-retryable answer, which is what a retry would in fact
+            # receive. `_release_quietly` has already recorded the failure
+            # class-only as `transfer_claim_release_failed`.
+            if not await _release_quietly(session, row, request):
+                return _not_found()
             return _rate_limited(request, row, retry_after)
 
         try:

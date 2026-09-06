@@ -37,7 +37,7 @@ from src.services.index_state import (
     state_table_exists,
 )
 from src.services.indexer import run_indexer_loop
-from src.services.rate_limits import flush_expired
+from src.services.rate_limits import flush_all
 from src.services import vault_fs
 from src.logging_setup import configure_logging
 from src.transfer.routes import router as transfer_router
@@ -500,13 +500,20 @@ async def lifespan(app: FastAPI):
             # The refusal coalescer's last flush, **before `engine.dispose()`**:
             # every window still holding a pending count writes the row it owes
             # while a connection is still obtainable. After the dispose there
-            # is nothing to write with, and the counts — at most one coalescing
-            # interval per active key — would simply be lost.
+            # is nothing to write with, and the counts would simply be lost.
+            #
+            # `flush_all`, not `flush_expired`: the periodic one deliberately
+            # leaves a window that is still *open* alone, because inside its
+            # interval more refusals may arrive and coalescing them is the
+            # point. At shutdown that reasoning inverts — there is no next tick
+            # and no next refusal — so an open window's pending count is lost
+            # unless it is retired now. Using the periodic flush here silently
+            # dropped the current interval on every clean restart.
             #
             # Best-effort, like every other shutdown step: a database already
             # going away must not turn a clean shutdown into a traceback.
             try:
-                await flush_expired()
+                await flush_all()
             except Exception as e:  # noqa: BLE001 - shutdown, never fatal
                 logging.getLogger(__name__).error(
                     f"Refusal flush at shutdown failed: {e}"
