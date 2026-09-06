@@ -426,12 +426,14 @@ async def test_the_rebuild_takes_the_lock_before_it_reads(engines, world):
     )
     scope_source = inspect.getsource(indexer._rebuild_scope)
     assert "not in the pre-lock root survey" in scope_source
-    # And it reads through the retained descriptor rather than reopening: the
-    # `pinned_root` fallback is reachable only when there is no survey at all.
+    # And it reads through the retained descriptor **and nothing else**: the
+    # `survey` parameter is required and there is no `pinned_root` fallback.
+    # An optional survey would be a bypass parameter on a guarantee, which is
+    # a guarantee until the next caller.
     assert "no retained descriptor" in scope_source
-    assert scope_source.index("descriptor_for(owner)") < scope_source.index(
-        "with pinned_root(vault)"
-    )
+    assert "with pinned_root(" not in scope_source
+    assert "survey: RebuildRootSurvey," in scope_source
+    assert "survey: RebuildRootSurvey | None = None" not in scope_source
 
 
 async def test_the_locked_half_is_reached_only_through_the_guarded_half(

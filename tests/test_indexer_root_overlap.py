@@ -610,7 +610,10 @@ async def test_e5_a_quarantined_scope_blocks_the_fingerprint(
     provenance or an unpinnable root.
     """
     _quarantine(_entry(4))
-    outcome = await indexer._rebuild_scope(object(), 4)
+    empty = indexer.RebuildRootSurvey(
+        observations={}, assignments={}, failures={}, descriptors={}
+    )
+    outcome = await indexer._rebuild_scope(object(), 4, empty)
     assert not outcome.completed
     assert outcome.skip is indexer.RebuildSkip.ROOT_QUARANTINED
     assert "4" in outcome.describe()

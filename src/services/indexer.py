@@ -3784,11 +3784,13 @@ async def survey_rebuild_roots(
 
     **The moment.** The observation is bounded and off the event loop
     (`vault_overlap.observe_root`, `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`) and it
-    happens **before `acquire_generation_lock`**. Opening a root synchronously
-    after the lock — which is what `pinned_root` did, and still does, only now
-    against a root already proved openable — means one hung NFS or FUSE mount
-    holds the index generation lock for as long as the kernel likes, and every
-    index pass in the process queues behind it.
+    happens **before `acquire_generation_lock`** — and the descriptor it opens
+    is **kept**, so the locked rebuild reads through it and resolves no
+    pathname at all. Opening a root synchronously after the lock, which is what
+    `pinned_root` did, means one hung NFS or FUSE mount holds the index
+    generation lock for as long as the kernel likes with every index pass in
+    the process queued behind it, and it is a second lookup that can land on an
+    inode nobody examined.
 
     **This changes the serving snapshot not at all.** It publishes nothing,
     quarantines nobody, and no tool call consults it: it is a maintenance
@@ -3936,7 +3938,7 @@ async def _rebuild_root_participants(session) -> list[_RootParticipant]:
 async def _rebuild_scope(
     session,
     owner: int | None,
-    survey: RebuildRootSurvey | None = None,
+    survey: RebuildRootSurvey,
 ) -> RebuildOutcome:
     """Rebuild one retained owner scope. Does **not** commit.
 
@@ -3957,8 +3959,12 @@ async def _rebuild_scope(
     directory to rebuild — correct in identity, wrong in tenancy — and the
     coverage claim is about the root the user holds now.
 
-    With no `survey` (the single-scope callers) it falls back to `pinned_root`,
-    which opens the pathname itself.
+    **`survey` is required, and there is deliberately no fallback.** It had a
+    `None` default and a `pinned_root` branch behind it; with one caller, which
+    always passes a survey, that branch was unreachable in production and was
+    an `os.open` of a vault root sitting inside the locked section waiting for
+    somebody to reach it. A guarantee with a bypass parameter is a guarantee
+    until the next caller.
     """
     log_suffix = f" (user_id={owner})" if owner is not None else ""
     try:
@@ -3987,76 +3993,66 @@ async def _rebuild_scope(
                 "assigned vault_path"
             ),
         )
-    if survey is not None:
-        observed = survey.observations.get(owner)
-        surveyed_assignment = survey.assignments.get(owner)
-        retained = survey.descriptor_for(owner)
-        canonical = vault_overlap.canonical_assignment(vault)
-        if observed is None or surveyed_assignment is None:
-            return RebuildOutcome(
-                skip=RebuildSkip.ROOT_UNEXAMINABLE,
-                detail=(
-                    f"user_id={owner} was not in the pre-lock root survey, so "
-                    "its root has not been examined; nothing may be opened "
-                    "under the generation lock on that basis. Re-run."
-                ),
-            )
-        if canonical != surveyed_assignment:
-            return RebuildOutcome(
-                skip=RebuildSkip.ROOT_UNEXAMINABLE,
-                detail=(
-                    f"user_id={owner} was assigned '{surveyed_assignment}' "
-                    f"when the roots were surveyed and '{canonical}' now, so "
-                    "the verdict does not describe the root about to be read. "
-                    "Re-run."
-                ),
-            )
-        if retained is None:
-            # The survey examined this scope but is not holding its directory
-            # open — a timed-out or unopenable root, which is already a
-            # failure, or a survey that was closed. Reopening the pathname is
-            # exactly what must not happen here.
-            return RebuildOutcome(
-                skip=RebuildSkip.ROOT_UNEXAMINABLE,
-                detail=(
-                    f"user_id={owner} has no retained descriptor from the "
-                    "pre-lock survey, and this command does not reopen a "
-                    "pathname under the generation lock. Re-run."
-                ),
-            )
-        try:
-            # The only filesystem call this makes on the root, and it is on the
-            # descriptor rather than the name. It cannot fail the way a second
-            # `open` can — there is no lookup — so what it actually guards is
-            # the bookkeeping: that the fd handed over is the fd whose facts
-            # the survey recorded.
-            pinned = os.fstat(retained)
-        except OSError as exc:
-            return RebuildOutcome(
-                skip=RebuildSkip.ROOT_UNEXAMINABLE,
-                detail=f"{vault}: the retained root descriptor is unusable: {exc}",
-            )
-        if (pinned.st_dev, pinned.st_ino) != (observed.st_dev, observed.st_ino):
-            return RebuildOutcome(
-                skip=RebuildSkip.ROOT_UNEXAMINABLE,
-                detail=(
-                    f"{vault}: the retained descriptor does not report the "
-                    "facts the survey recorded for it, so the examined root is "
-                    "not the one about to be read. Re-run."
-                ),
-            )
-        return await _rebuild_tsvectors_pinned(
-            session, owner, vault, retained, log_suffix
+    observed = survey.observations.get(owner)
+    surveyed_assignment = survey.assignments.get(owner)
+    retained = survey.descriptor_for(owner)
+    canonical = vault_overlap.canonical_assignment(vault)
+    if observed is None or surveyed_assignment is None:
+        return RebuildOutcome(
+            skip=RebuildSkip.ROOT_UNEXAMINABLE,
+            detail=(
+                f"user_id={owner} was not in the pre-lock root survey, so "
+                "its root has not been examined; nothing may be opened "
+                "under the generation lock on that basis. Re-run."
+            ),
+        )
+    if canonical != surveyed_assignment:
+        return RebuildOutcome(
+            skip=RebuildSkip.ROOT_UNEXAMINABLE,
+            detail=(
+                f"user_id={owner} was assigned '{surveyed_assignment}' "
+                f"when the roots were surveyed and '{canonical}' now, so "
+                "the verdict does not describe the root about to be read. "
+                "Re-run."
+            ),
+        )
+    if retained is None:
+        # The survey examined this scope but is not holding its directory
+        # open — a timed-out or unopenable root, which is already a
+        # failure, or a survey that was closed. Reopening the pathname is
+        # exactly what must not happen here.
+        return RebuildOutcome(
+            skip=RebuildSkip.ROOT_UNEXAMINABLE,
+            detail=(
+                f"user_id={owner} has no retained descriptor from the "
+                "pre-lock survey, and this command does not reopen a "
+                "pathname under the generation lock. Re-run."
+            ),
         )
     try:
-        with pinned_root(vault) as root_fd:
-            return await _rebuild_tsvectors_pinned(
-                session, owner, vault, root_fd, log_suffix
-            )
+        # The only filesystem call this makes on the root, and it is on the
+        # descriptor rather than the name. It cannot fail the way a second
+        # `open` can — there is no lookup — so what it actually guards is
+        # the bookkeeping: that the fd handed over is the fd whose facts
+        # the survey recorded.
+        pinned = os.fstat(retained)
     except OSError as exc:
         return RebuildOutcome(
-            skip=RebuildSkip.ROOT_UNPINNABLE, detail=f"{vault}: {exc}"
+            skip=RebuildSkip.ROOT_UNEXAMINABLE,
+            detail=f"{vault}: the retained root descriptor is unusable: {exc}",
         )
+    if (pinned.st_dev, pinned.st_ino) != (observed.st_dev, observed.st_ino):
+        return RebuildOutcome(
+            skip=RebuildSkip.ROOT_UNEXAMINABLE,
+            detail=(
+                f"{vault}: the retained descriptor does not report the "
+                "facts the survey recorded for it, so the examined root is "
+                "not the one about to be read. Re-run."
+            ),
+        )
+    return await _rebuild_tsvectors_pinned(
+        session, owner, vault, retained, log_suffix
+    )
 
 
 async def rebuild_tsvectors_all_scopes(session) -> dict:
