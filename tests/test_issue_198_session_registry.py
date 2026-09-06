@@ -559,6 +559,10 @@ async def test_more_concurrent_stale_sessions_than_the_pool_holds_all_complete(
     assert results == [user] * 25
 
 
+def _touch_failures(records):
+    return [r for r in records if r.getMessage() == "panel_session_touch_failed"]
+
+
 async def test_a_raising_touch_still_serves_the_page(records):
     user = sh.fake_user(7)
     _sid, request, registry = await sh.sign_in(user)
@@ -569,10 +573,21 @@ async def test_a_raising_touch_still_serves_the_page(records):
     replay = sh.browser_request(session=dict(request.session))
     assert await get_active_session_user(replay, registry) is user
     assert registry.rolled_back == 1
-    assert any("last-seen" in r.getMessage() for r in records)
+
+    # Through the emitter, not the bare logger (design D23): the touch
+    # interval gates the *write*, and a failing write records no new
+    # `last_seen_at` to throttle against, so a stale browser on `GET` drives
+    # one of these per request forever.
+    (failure,) = _touch_failures(records)
+    assert failure.reason == "touch"
+    assert failure.user_id == 7
+    assert failure.error_type == "RuntimeError"
+    # Class only. The statement binds `user_sessions.session_hash`, and
+    # SQLAlchemy renders bound parameters into an error's text.
+    assert "the last-seen write failed" not in _rendered(records)
 
 
-async def test_a_touch_whose_rollback_also_fails_still_serves_the_page():
+async def test_a_touch_whose_rollback_also_fails_still_serves_the_page(records):
     user = sh.fake_user(7)
     _sid, request, registry = await sh.sign_in(user)
     registry.sessions[0].last_seen_at = sh.utcnow() - datetime.timedelta(hours=1)
@@ -582,6 +597,74 @@ async def test_a_touch_whose_rollback_also_fails_still_serves_the_page():
 
     replay = sh.browser_request(session=dict(request.session))
     assert await get_active_session_user(replay, registry) is user
+
+    # Both stages, named apart: a failing update with a working rollback is a
+    # database refusing one statement; a failing rollback is a connection that
+    # is gone. Same request, two different pages for the operator.
+    stages = [r.reason for r in _touch_failures(records)]
+    assert stages == ["touch", "rollback"]
+
+
+async def test_a_hammering_stale_browser_cannot_flood_the_sink():
+    """The reason this had to leave the bare logger.
+
+    Twenty-five `GET`s against a database that refuses the touch used to be
+    twenty-five WARNING lines, bounded by nothing — the interval throttles the
+    *write*, and a write that never lands never moves the timestamp the
+    interval is measured against. Under the permit the same burst is capped
+    and the withheld count is stated rather than silently dropped.
+
+    Its own capture, with the **real** suppressor in the path: the `records`
+    fixture forces the suppressor open, which is right for every test that
+    asks *what* was recorded and wrong for the one that asks how many.
+    """
+    from src.services import security_events
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__(level=logging.DEBUG)
+            self.records: list[logging.LogRecord] = []
+
+        def emit(self, record):
+            self.records.append(record)
+
+    handler = _Capture()
+    events = security_events.logger
+    events.addHandler(handler)
+    previous, propagate = events.level, events.propagate
+    events.setLevel(logging.DEBUG)
+    events.propagate = False
+    security_events.reset_state()
+    try:
+        user = sh.fake_user(7)
+        _sid, request, registry = await sh.sign_in(user)
+        registry.sessions[0].last_seen_at = sh.utcnow() - datetime.timedelta(hours=1)
+        registry.fail_on = "UPDATE user_sessions SET last_seen_at"
+        registry.fail_with = RuntimeError("write failed")
+
+        for _ in range(25):
+            replay = sh.browser_request(session=dict(request.session))
+            assert await get_active_session_user(replay, registry) is user
+
+        emitted = _touch_failures(handler.records)
+        assert len(emitted) == security_events.MAX_EVENTS_PER_WINDOW, (
+            "the burst was not bounded"
+        )
+
+        security_events.flush_suppression_summaries()
+        summaries = [
+            r
+            for r in handler.records
+            if r.getMessage() == security_events.SUMMARY_EVENT
+        ]
+        assert summaries, "a withheld count must be stated, never silently dropped"
+        assert summaries[-1].reason == "panel_session_touch_failed"
+        assert summaries[-1].count == 25 - security_events.MAX_EVENTS_PER_WINDOW
+    finally:
+        events.removeHandler(handler)
+        events.setLevel(previous)
+        events.propagate = propagate
+        security_events.reset_state()
 
 
 async def test_touch_returns_false_on_an_unsafe_method_without_touching():

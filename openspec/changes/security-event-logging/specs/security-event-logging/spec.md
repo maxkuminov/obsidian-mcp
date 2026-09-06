@@ -190,6 +190,16 @@ The server SHALL emit one record for each authorization refusal: a write tool re
 - **WHEN** a transfer redemption succeeds, and separately when a refusal's permit is denied because the source is already at its allowance
 - **THEN** no diagnosis read SHALL be issued in either case, and the refused request SHALL still return its uniform response
 
+#### Scenario: A refusal names the condition that caused it, not the one it collapses into
+
+- **WHEN** a transfer redemption is refused because the capability owner's vault root is quarantined, or because this process has published no vault-root snapshot yet
+- **THEN** the refusal record SHALL carry a reason naming that condition rather than the reassignment reason the underlying predicate collapses to, the two conditions SHALL be distinguishable from each other, and the response SHALL remain the same uniform not-found
+
+#### Scenario: A filesystem that changes after admission is still recorded
+
+- **WHEN** the vault root's filesystem is found to be unsupported by the re-probe that runs after the token has been admitted and the upload is in flight, rather than by the admission probe
+- **THEN** the same unsupported-filesystem record SHALL be emitted as for the admission probe, and the response SHALL be the unchanged 503
+
 #### Scenario: A failed claim cleanup changes neither the response nor the record
 
 - **WHEN** a transfer upload is refused after its token has been claimed, and returning that claim to its pending state then fails
@@ -252,6 +262,11 @@ The server SHALL bound the number of records that reach the log sink at **every 
 
 - **WHEN** a caller drives an existing caller-triggerable refusal — a tool call with no vault assignment, an over-quota tool call, an authentication failure, or a transfer publication refusal — far more times than the per-window limit
 - **THEN** those records SHALL be bounded and accounted exactly as the new events are, and SHALL NOT reach the sink unbounded by way of a direct logger call
+
+#### Scenario: A failing session-activity write is bounded
+
+- **WHEN** the server's periodic session-activity write fails repeatedly for one signed-in browser, so that the interval which throttles that write never advances
+- **THEN** the resulting records SHALL be bounded by the same allowance as every other event, keyed on the resolved user, SHALL carry the failing stage and the exception's class without its text, and the withheld count SHALL be stated
 
 #### Scenario: Background work is not suppressed
 

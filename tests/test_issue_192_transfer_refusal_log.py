@@ -897,3 +897,152 @@ async def test_a_failed_release_after_the_gate_refuses_still_answers_404(
     assert response.status_code == 404
     assert reason_of(captured) == "prepublish_revalidation_failed"
     assert len(captured.named("transfer_claim_release_failed")) == 1
+
+
+# ── the post-admission probe, and the quarantine reason ────────────────────
+
+
+@pytest.mark.parametrize(
+    "raised,event",
+    [
+        (vault_fs.MountBoundary, "transfer_refused_mount_boundary"),
+        (vault_fs.UnsupportedFilesystem, "transfer_refused_unsupported_fs"),
+    ],
+)
+async def test_a_filesystem_that_changed_mid_upload_is_recorded_too(
+    client, harness, monkeypatch, captured, raised, event
+):
+    """The *post-admission* half, raised by `stream_to_vault`'s re-probe.
+
+    Phase one's probe already emitted these; the copy raised after admission —
+    a remount, a bind swapped under the vault while the bytes were in
+    flight — took the same 503 out of the handler in silence. That is the more
+    interesting occurrence of the two: the first says a deployment is
+    misconfigured, this one says it changed **while a write was running**.
+    """
+
+    async def stream_to_vault(*args, **kwargs):
+        raise raised("the mount moved under us")
+
+    monkeypatch.setattr(transfer, "stream_to_vault", stream_to_vault)
+
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+
+    assert response.status_code == 503, "the 503 body must not move"
+    records = captured.named(event)
+    assert len(records) == 1, "the post-admission probe was silent"
+    assert records[0].levelno == logging.ERROR
+    carried = fields(records[0])
+    assert carried["route"] == "/transfer/upload"
+    assert carried["method"] == "PUT"
+    assert carried["error_type"] == raised.__name__
+    # The claim goes back so the same link can be retried once the mount is
+    # gone; the refusal ledger is not involved in a 503.
+    assert harness.released == 1
+    assert captured.named("transfer_refused") == []
+
+
+async def test_a_quarantined_owner_is_not_reported_as_a_reassignment(
+    client, harness, monkeypatch, captured
+):
+    """The reason the bounded record used to get wrong.
+
+    `resolve_root_ok` collapses "the owner is quarantined" and "the assignment
+    changed" into one `False`, and the route named that `root_reassigned` — so
+    an operator went looking at a `vault_path` column nobody had touched. The
+    predicate is unchanged (the 404 and the accepted-token set do not move);
+    only the name of its "no" is now accurate.
+    """
+    entry = object()
+
+    class _Snapshot:
+        def entry_for(self, user_id):
+            return entry if user_id == harness.row.user_id else None
+
+    monkeypatch.setattr(transfer.settings, "multi_user_mode", True, raising=False)
+    monkeypatch.setattr(
+        transfer.vault_overlap, "published_snapshot", lambda: _Snapshot()
+    )
+    harness.root_ok = False
+
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"error": "not found"}
+    assert reason_of(captured) == "owner_quarantined"
+
+
+async def test_an_unpublished_snapshot_is_not_a_quarantined_owner(
+    client, harness, monkeypatch, captured
+):
+    """Two conditions, two names.
+
+    "This process has not finished looking yet" and "this tenant's root is
+    shared" send an operator to entirely different places, so collapsing them
+    would just move the wrong-reason bug rather than fix it.
+    """
+    monkeypatch.setattr(transfer.settings, "multi_user_mode", True, raising=False)
+    monkeypatch.setattr(transfer.vault_overlap, "published_snapshot", lambda: None)
+    harness.root_ok = False
+
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+
+    assert response.status_code == 404
+    assert reason_of(captured) == "root_unverified"
+
+
+async def test_a_plain_reassignment_still_says_so(client, harness, captured):
+    """Single-user mode, no snapshot consulted: the original reason stands."""
+    harness.root_ok = False
+
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+
+    assert response.status_code == 404
+    assert reason_of(captured) == "root_reassigned"
+
+
+async def test_the_quarantine_refusal_logs_nothing_of_its_own(caplog, monkeypatch):
+    """It used to log two `logger.warning` lines from a service helper on the
+    redemption path — one per replay of one dead capability, bounded by
+    nothing. Now it only answers, and the answer travels to the permit."""
+    monkeypatch.setattr(transfer.settings, "multi_user_mode", True, raising=False)
+    monkeypatch.setattr(transfer.vault_overlap, "published_snapshot", lambda: None)
+
+    with caplog.at_level(logging.DEBUG, logger="src.services.transfer"):
+        for _ in range(50):
+            assert transfer.quarantine_refusal(7) == "root_unverified"
+            assert transfer.owner_quarantined(7) is True
+
+    assert caplog.records == []
+
+
+async def test_the_root_refusal_precedence_puts_quarantine_first(monkeypatch):
+    """Both conditions true at once: the quarantine is the answer.
+
+    A quarantined owner whose assignment also changed is still a quarantine —
+    the root is shared or unverifiable, and reporting the reassignment would
+    send an operator to a column that is doing its job.
+    """
+
+    class _Snapshot:
+        def entry_for(self, user_id):
+            return object()
+
+    monkeypatch.setattr(transfer.settings, "multi_user_mode", True, raising=False)
+    monkeypatch.setattr(
+        transfer.vault_overlap, "published_snapshot", lambda: _Snapshot()
+    )
+    row = _Row(user_id=11)
+
+    refusal = transfer.root_refusal(row)
+
+    assert refusal.reason == "owner_quarantined"
+    assert refusal.row is row
