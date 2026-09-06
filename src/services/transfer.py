@@ -1008,13 +1008,29 @@ async def _load_credential(session, ref: TransferToken | Identity, *, lock: bool
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
-async def resolve_identity_ok(session, row: TransferToken, *, need_write: bool) -> bool:
-    """Is the minting identity still valid, right now, per D4's predicates?"""
+async def resolve_identity(
+    session, row: TransferToken, *, need_write: bool
+) -> tuple[bool, object | None]:
+    """D4's predicates, **and** the credential row they were evaluated against.
+
+    The credential comes back rather than being dropped on the floor because
+    one caller needs a fact that only this lookup has already paid for: the
+    **grant** behind an OAuth-minted capability, which is the principal whose
+    write bucket a redemption spends (`minting_principal`, design D5a). The
+    rate control on `PUT /transfer/upload` must cost **no additional query** —
+    adding a round trip to phase one is the opposite of what #208 shortened
+    that window for — so the row travels back with the verdict instead of
+    being loaded a second time.
+
+    The credential is meaningful only when the verdict is `True`; a refusal
+    returns `None` so no caller can act on a row this function has just said
+    is not usable.
+    """
     cred = await _load_credential(session, row)
     if cred is None:
-        return False
+        return False, None
     if not _credential_ok(cred, need_write=need_write, row=row):
-        return False
+        return False, None
     if row.user_id is not None:
         user = (
             await session.execute(
@@ -1024,8 +1040,66 @@ async def resolve_identity_ok(session, row: TransferToken, *, need_write: bool) 
             )
         ).scalar_one_or_none()
         if user is None or not user.is_active:
-            return False
-    return True
+            return False, None
+    return True, cred
+
+
+async def resolve_identity_ok(session, row: TransferToken, *, need_write: bool) -> bool:
+    """Is the minting identity still valid, right now, per D4's predicates?
+
+    The verdict half of `resolve_identity`, which is all every caller but the
+    upload redemption wants. One implementation, so the predicate cannot come
+    to mean two different things depending on which entry point asked.
+    """
+    ok, _ = await resolve_identity(session, row, need_write=need_write)
+    return ok
+
+
+def minting_principal(row, credential) -> tuple[str, object] | None:
+    """The rate-limit principal that **minted** this capability, or `None`.
+
+    `PUT /transfer/upload` writes vault bytes without ever passing through
+    `_tracked`, so bounding only the write *tools* would leave the write rate
+    escapable: mint capabilities at the general rate, then redeem them without
+    limit. The write bucket therefore follows the bytes and is charged to
+    whoever minted the token, never to whoever presents it — a capability
+    cannot be used to spend someone else's allowance (design D5a).
+
+    Deriving that costs nothing. Migration 017 put `key_id` / `oauth_token_id`
+    on the row and `ck_transfer_tokens_one_credential` guarantees at most one
+    of them is set, so the two branches are exclusive; the OAuth branch's
+    `grant_id` (NOT NULL) is read off the `OAuthToken` row `resolve_identity`
+    has already loaded. No extra query, no schema change.
+
+    The OAuth key is the **grant**, not the access token: a refresh must not
+    hand out a fresh allowance (issue #64, design D1). That is the same key
+    `src/auth/session.py` binds for a tool call, which is what makes the two
+    surfaces share one bucket rather than two.
+
+    `None` means **exempt**, not refused — `_tracked`'s rule for a caller with
+    no principal, and the same shape as the quota gate's "a limit with no key
+    is exempt rather than a crash". It covers a row naming neither credential
+    (the single-user / sandbox shape). Such a row is already unusable for a
+    different reason — `_load_credential` cannot resolve it, so
+    `resolve_identity` refuses it before any caller reaches the bucket — and
+    the branch exists so this is a total function rather than one whose
+    safety depends on that ordering.
+    """
+    key_id = getattr(row, "key_id", None)
+    if key_id is not None:
+        return ("api_key", key_id)
+    if getattr(row, "oauth_token_id", None) is None:
+        return None
+    grant_id = getattr(credential, "grant_id", None)
+    if grant_id is None:
+        # Unreachable through the route: `oauth_tokens.grant_id` is NOT NULL
+        # and the only caller derives the principal *after* `resolve_identity`
+        # returned this row's own credential. Reachable only by passing a
+        # credential that is not the token's, which is a programming error, not
+        # a caller-controllable state — and "we cannot say whose allowance this
+        # is" is not a licence to charge somebody else's.
+        return None
+    return ("oauth", grant_id)
 
 
 async def resolve_root_ok(session, row: TransferToken) -> bool:

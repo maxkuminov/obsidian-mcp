@@ -260,6 +260,7 @@ nothing binds the request address into a ContextVar (residual R8).
 | `publication_refused_confirmation_unavailable` | WARNING | `error_type`, `user_id` | `src/services/vault.py` — the assignment is *unknown*, which is not "changed" |
 | `publication_refused_vault_assignment_changed` | WARNING | `reason`, `user_id` | `src/services/vault.py` |
 | `transfer_refused` | WARNING | `client_ip`, `error_type`, `key_id`, `method`, `oauth_token_id`, `reason`, `route`, `token_tag`, `user_id` | every `_not_found()` in `src/transfer/routes.py`; the 404 stays byte-identical. `reason` includes `owner_quarantined` and `root_unverified`, which the root check used to collapse into `root_reassigned` — a different fault with a different fix |
+| `transfer_refused_rate_limited` | WARNING | `key_id`, `limit`, `method`, `oauth_token_id`, `reason`, `route`, `user_id` | `PUT /transfer/upload` refused by the **minting** principal's write bucket (#194). Not a `transfer_refused` reason: that one accompanies the uniform 404 and means the token is unusable, this one means it is usable and the minter's write rate is spent — a 429 the same link survives. `reason` is the bucket scope, the same string `tool_refused_rate_limited` carries |
 | `transfer_refused_mount_boundary` | ERROR | `error_type`, `method`, `route` | `src/transfer/routes.py` |
 | `transfer_refused_unsupported_fs` | ERROR | `error_type`, `method`, `route` | `src/transfer/routes.py` |
 | `transfer_root_unusable` | ERROR | `error_type`, `method`, `route`, `user_id` | `src/transfer/routes.py` |

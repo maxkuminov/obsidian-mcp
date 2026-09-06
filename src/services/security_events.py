@@ -329,6 +329,19 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
             "error_type",
         }
     ),
+    # `PUT /transfer/upload` refused by the **minting** principal's write
+    # bucket (#194). Its own event rather than a `reason` on `transfer_refused`
+    # for the reason that one exists: `transfer_refused` accompanies the
+    # uniform 404 and means "this token is not usable", while this one means
+    # the token is perfectly usable and the minter's write rate is spent — a
+    # 429 the same link survives. `reason` is the bucket scope, the same closed
+    # vocabulary `tool_refused_rate_limited` carries, so the two surfaces of
+    # one control read as one control. No `client_ip`: the request carried a
+    # capability, and the identity that matters is the minter's, which the
+    # token row names.
+    "transfer_refused_rate_limited": frozenset(
+        {"reason", "limit", "route", "method", "user_id", "key_id", "oauth_token_id"}
+    ),
     "transfer_refused_mount_boundary": frozenset({"error_type", "route", "method"}),
     "transfer_refused_unsupported_fs": frozenset({"error_type", "route", "method"}),
     "transfer_root_unusable": frozenset({"error_type", "user_id", "route", "method"}),
