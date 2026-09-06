@@ -97,6 +97,65 @@
             <a href="/admin/health" style="margin-left:auto;font-size:12px;color:var(--primary-text);text-decoration:none;">Health &rarr;</a>
             {% endif %}
         </div>
+
+        {#
+          Vault-root quarantine. Administrators only — `_quarantine_view`
+          returns None for everyone else, so this whole block is absent for a
+          regular user rather than rendered empty; it names another account and
+          another account's vault path, which is exactly what the tool-facing
+          refusal withholds because its reader is a tenant's agent.
+
+          It is a block of its own rather than a cell in the row above because
+          it is several lines of prose naming two accounts and two paths, not a
+          badge. A degraded strip carries no `quarantine` key at all and this
+          renders nothing; the condition is still on the health page, which
+          reads the snapshot itself and shares none of the strip's queries.
+
+          Not a flash. Nothing is dismissed and nothing has to be: it stands
+          while the condition stands and disappears on its own once a later
+          snapshot no longer names the account. An empty snapshot renders
+          nothing at all — the healthy state is silence, not an all-clear
+          badge — and the never-published state gets its own note rather than
+          being mistaken for one.
+        #}
+        {% if health.quarantine and (not health.quarantine.checked or health.quarantine.accounts) %}
+        <div class="card-body" style="border-top:1px solid var(--border);padding-top:14px;padding-bottom:14px;">
+            {% if not health.quarantine.checked %}
+            <div style="font-size:13px;color:var(--text-2);line-height:1.6;">
+                <span class="badge badge-yellow" style="margin-right:8px;">not yet checked</span>
+                The vault roots have not been checked in this process yet, so no
+                account has been cleared. Startup publishes the first check
+                before the server accepts a request, so this normally never
+                shows; while it does, every multi-user tool call is refused.
+                A detection that failed is logged — see
+                <a href="/admin/health" style="color:var(--primary-text);text-decoration:none;">Health</a>.
+            </div>
+            {% else %}
+            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+                <span class="badge badge-red">vault-root quarantine</span>
+                <span style="font-size:12px;color:var(--text-3);">
+                    Facts as at the last check{% if health.quarantine.detected_at_iso %},
+                    <time datetime="{{ health.quarantine.detected_at_iso }}" data-localize>{{ health.quarantine.detected_at_iso }}</time>{% endif %}
+                    — recorded when the roots were observed, not re-read now.
+                </span>
+            </div>
+            <ul style="margin:0;padding-left:18px;">
+                {% for a in health.quarantine.accounts %}
+                <li style="font-size:13px;color:var(--text-2);line-height:1.6;margin-bottom:6px;word-break:break-word;">
+                    <span class="badge {% if a.overlap %}badge-red{% else %}badge-yellow{% endif %}" style="margin-right:6px;">{% if a.overlap %}overlap{% else %}root unexaminable{% endif %}</span>
+                    {{ a.text }}
+                </li>
+                {% endfor %}
+            </ul>
+            <p style="font-size:12px;color:var(--text-3);line-height:1.6;margin:10px 0 0;">
+                No tool call is served for these accounts and no pass indexes
+                them; nothing was deleted. Correct the assignment on
+                <a href="/admin/users/" style="color:var(--primary-text);text-decoration:none;">Users</a>,
+                or restore the mount, and the next check clears it.
+            </p>
+            {% endif %}
+        </div>
+        {% endif %}
     </div>
 
     <!-- Stat row -->

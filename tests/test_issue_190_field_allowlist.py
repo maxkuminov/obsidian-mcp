@@ -455,3 +455,170 @@ def test_the_sweep_checks_the_field_against_the_named_event(tmp_path, monkeypatc
     monkeypatch.setitem(globals(), "ROOT", tmp_path)
     problems = _sweep()
     assert len(problems) == 1 and "does not declare" in problems[0]
+
+
+# ── The bare-logger guard (design D18, task 5.0) ────────────────────────────
+#
+# The sweep above polices the *fields* a call site passes. It says nothing
+# about a call site that passes none — and a bare `logger.warning("...")` in a
+# request-path module is the hole D18 exists to close: it reaches the sink
+# whatever the suppressor says, so one caller driving one branch on demand is an
+# unbounded flood channel beside the bounded one. Four modules are covered,
+# because those are the four the design names as request paths where a caller
+# can trigger a refusal repeatedly.
+#
+# `logger.info` and `logger.debug` are deliberately out of scope: they are
+# below the sink's default level, they are not refusals, and pulling them in
+# would make every diagnostic breadcrumb in these files a catalogue decision.
+
+_GUARDED_MODULES = (
+    "src/mcp_server/auth.py",
+    "src/mcp_server/tools.py",
+    "src/transfer/routes.py",
+    "src/control_panel/routes.py",
+)
+
+_GUARDED_METHODS = {"warning", "error", "exception", "critical"}
+
+#: `{module: {message prefix: why it is allowed to stay}}`.
+#:
+#: Matched on the *literal first argument* rather than a line number, so the
+#: exemption survives every reformatting and cannot silently widen to cover a
+#: new call that drifts onto the same line.
+#:
+#: Every entry is one shape: the panel's **Danger zone**. Those routes sit
+#: behind `require_admin_panel` (one of them behind a signed one-time
+#: confirmation token as well), they fire at most once per action, and what
+#: they report is the operational fact the health page exists to show. D18
+#: keeps exactly that class on the bare logger — not a refusal, not
+#: caller-driven, and suppression there would hide the failure of a
+#: destructive action rather than bound a flood. Anything a *credential* can
+#: drive belongs in the catalogue instead; an entry here is a claim that no
+#: such caller exists, and it has to say why.
+_BARE_LOGGER_EXEMPTIONS: dict[str, dict[str, str]] = {
+    "src/control_panel/routes.py": {
+        "Skipping HNSW index": (
+            "Admin-triggered and once per action, not caller-triggerable: it "
+            "is reached only from `reset_embeddings`, which is behind the "
+            "panel's admin guard, and it fires at most once per reset. It is "
+            "also an operational notice the health page exists to show — "
+            "semantic_search has silently fallen back to a sequential scan — "
+            "and D18 keeps exactly this class (background, once-per-pass, "
+            "not a refusal) on the bare logger so suppression can never hide "
+            "it. There is no caller who can drive it in a loop."
+        ),
+        "Embedding reset aborted": (
+            "`_record_embedding_fingerprint` (#201/#206), reached only from "
+            "the two Danger-zone reset routes — both behind "
+            "`require_admin_panel`, one behind a signed one-time token as "
+            "well — and at most once per action. It is the abort notice for a "
+            "**destructive** operation that has just rolled itself back, so "
+            "it is the single most important line the health page's ERROR "
+            "ring buffer can hold: withholding it under a flood bound would "
+            "leave an administrator with a flash message and no diagnosis. "
+            "`logger.exception` rather than the catalogue is also what keeps "
+            "the traceback, and the traceback is the whole value here — the "
+            "record has to say *why* `set_state` failed."
+        ),
+        "Rollback after the failed fingerprint record failed": (
+            "The second-order half of the same abort, in the same helper and "
+            "on the same admin-only path. If it ever fires, the reset could "
+            "neither record nor undo itself, which is the one state an "
+            "operator must not have to infer from silence."
+        ),
+    },
+}
+
+
+def _bare_logger_sweep(root=None, modules=None) -> list[str]:
+    """Every `logger.warning/error/exception/critical` in the guarded modules
+    that is not an explicit exemption, as `path:line: message` strings."""
+    root = pathlib.Path(root) if root is not None else ROOT
+    modules = _GUARDED_MODULES if modules is None else modules
+    problems: list[str] = []
+    for rel in modules:
+        path = root / rel
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr not in _GUARDED_METHODS:
+                continue
+            base = func.value
+            name = base.id if isinstance(base, ast.Name) else getattr(base, "attr", "")
+            if "log" not in name.lower():
+                continue
+            first = node.args[0] if node.args else None
+            message = first.value if isinstance(first, ast.Constant) else None
+            exempt = _BARE_LOGGER_EXEMPTIONS.get(rel, {})
+            if isinstance(message, str) and any(
+                message.startswith(prefix) for prefix in exempt
+            ):
+                continue
+            problems.append(
+                f"{rel}:{node.lineno}: bare logger.{func.attr}(...) — migrate it "
+                "to security_events.emit or add an exemption saying why not"
+            )
+    return problems
+
+
+def test_no_bare_refusal_logger_survives_in_a_request_path_module():
+    """D18's rule, as a test rather than as a paragraph.
+
+    Every record a caller can drive has to pass the permit, so a direct
+    `logger.warning` in one of these four modules is a bypass of the bound —
+    not a style question. The four `move_note` sites this caught are now
+    `move_rewrite_overlap_refused`, `move_post_rename_failed` (twice) and a
+    reuse of `move_rewrite_failed`.
+    """
+    assert _bare_logger_sweep() == []
+
+
+def test_every_exemption_is_an_admin_triggered_danger_zone_notice():
+    """Pinned so the list cannot grow quietly, and so a removed call cannot
+    leave a stale licence behind for the next warning that lands nearby.
+
+    All three are the panel's Danger zone: admin-guarded, once per action, and
+    reporting the operational fact the health page exists to show. A new entry
+    is a decision — assert it here, with the reason, or migrate the call.
+    """
+    assert set(_BARE_LOGGER_EXEMPTIONS) == {"src/control_panel/routes.py"}
+    assert set(_BARE_LOGGER_EXEMPTIONS["src/control_panel/routes.py"]) == {
+        "Skipping HNSW index",
+        "Embedding reset aborted",
+        "Rollback after the failed fingerprint record failed",
+    }
+    source = (ROOT / "src" / "control_panel" / "routes.py").read_text()
+    for prefix in _BARE_LOGGER_EXEMPTIONS["src/control_panel/routes.py"]:
+        assert f'"{prefix}' in source, (
+            f"the exemption for {prefix!r} outlived the call it exempts — "
+            "delete it"
+        )
+    for reason in _BARE_LOGGER_EXEMPTIONS["src/control_panel/routes.py"].values():
+        assert len(reason) > 80, "an exemption without a reason is a hole"
+
+
+def test_the_guard_catches_a_new_bare_warning(tmp_path):
+    module = tmp_path / "src" / "transfer"
+    module.mkdir(parents=True)
+    (module / "routes.py").write_text(
+        'logger.warning("a caller can drive this on demand")\n'
+        'logger.info("out of scope, and stays out")\n'
+    )
+    problems = _bare_logger_sweep(root=tmp_path, modules=("src/transfer/routes.py",))
+    assert len(problems) == 1 and "bare logger.warning" in problems[0]
+
+
+def test_the_guard_honours_an_exemption_prefix(tmp_path):
+    module = tmp_path / "src" / "control_panel"
+    module.mkdir(parents=True)
+    (module / "routes.py").write_text(
+        'logger.warning("Skipping HNSW index: %d exceeds the limit", dim)\n'
+    )
+    problems = _bare_logger_sweep(
+        root=tmp_path, modules=("src/control_panel/routes.py",)
+    )
+    assert problems == []

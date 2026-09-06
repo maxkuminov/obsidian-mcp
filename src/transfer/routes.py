@@ -313,6 +313,38 @@ def _log_row(row, tool: str, params: dict, response_size: int | None = None) -> 
     )
 
 
+async def _release_quietly(session, row, request: Request) -> None:
+    """Put a claimed token back to `pending`, and never change the answer.
+
+    Every caller has **already decided** its response — a 404 from `_refuse`, a
+    413, a 503, a 409 — and is releasing the claim so the same link can be
+    retried. `release_claim` is one conditional UPDATE, but it takes a pooled
+    connection, and a pool that is exhausted (or a database that went away
+    between the decision and the cleanup) turned the decided answer into a 500
+    and took the `transfer_refused` record with it: the caller learned *more*
+    from a failure than from the refusal, which is the one thing the uniform
+    404 exists to prevent.
+
+    So the cleanup is best-effort and response-neutral. The claim then stands
+    until its TTL — the same disposition as `PostPublishFailure`, and the safe
+    direction: a token that stays claimed refuses, it does not over-permit.
+    The failure is recorded class-only (a SQLAlchemy error's text quotes the
+    statement, and the engine hides its parameters — belt and braces).
+    """
+    try:
+        await transfer.release_claim(session, row)
+    except Exception as exc:  # noqa: BLE001 - the response is already decided
+        security_events.emit(
+            "transfer_claim_release_failed",
+            level=logging.ERROR,
+            subject=security_events.subject_for(user_id=row.user_id, request=request),
+            error_type=type(exc).__name__,
+            user_id=row.user_id,
+            route=request.url.path,
+            method=request.method,
+        )
+
+
 # ── static pages ────────────────────────────────────────────────────────────
 
 
@@ -512,7 +544,7 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
         elif not _path_ok(row.vault_root, row.path):
             revalidation = "path_invalid"
         if revalidation is not None:
-            await transfer.release_claim(session, row)
+            await _release_quietly(session, row, request)
             return await _refuse(
                 request, reason=revalidation, token=token, row=row
             )
@@ -536,7 +568,7 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
                 route=request.url.path,
                 method=request.method,
             )
-            await transfer.release_claim(session, row)
+            await _release_quietly(session, row, request)
             return JSONResponse(dict(MOUNT_BOUNDARY_BODY), status_code=503)
         except vault_fs.UnsupportedFilesystem as exc:
             security_events.emit(
@@ -549,7 +581,7 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
                 route=request.url.path,
                 method=request.method,
             )
-            await transfer.release_claim(session, row)
+            await _release_quietly(session, row, request)
             return JSONResponse(dict(UNSUPPORTED_FS_BODY), status_code=503)
         except (OSError, vault_fs.VaultFSError) as exc:
             security_events.emit(
@@ -563,7 +595,7 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
                 route=request.url.path,
                 method=request.method,
             )
-            await transfer.release_claim(session, row)
+            await _release_quietly(session, row, request)
             return await _refuse(
                 request, reason="publication_unsupported", token=token, row=row
             )
@@ -587,8 +619,25 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
     # from it.
 
     async def release() -> None:
-        async with async_session() as s:
-            await transfer.release_claim(s, row)
+        # Best-effort, like phase 1's: every caller below has already chosen
+        # its status code, and `PrePublishAborted` in particular releases and
+        # *then* emits `transfer_refused` — a raise here would lose the record
+        # and answer 500 where the design promises a fixed 404.
+        try:
+            async with async_session() as s:
+                await _release_quietly(s, row, request)
+        except Exception as exc:  # noqa: BLE001 - even opening a session
+            security_events.emit(
+                "transfer_claim_release_failed",
+                level=logging.ERROR,
+                subject=security_events.subject_for(
+                    user_id=row.user_id, request=request
+                ),
+                error_type=type(exc).__name__,
+                user_id=row.user_id,
+                route=request.url.path,
+                method=request.method,
+            )
 
     async def consume() -> None:
         async with async_session() as s:

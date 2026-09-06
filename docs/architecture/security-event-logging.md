@@ -71,7 +71,15 @@ stays. Booleans are not integers here, whatever `isinstance` says.
 
 `key_prefix` is deliberately **absent** from the allow-list: the name invites
 logging a raw `omcp_` prefix of a presented token, and dropping the field is a
-safer failure than shipping it. Nothing free-text is allow-listed except
+safer failure than shipping it. **`actor_ref` is absent for the same reason**,
+and was removed after it shipped: `usage_logs.actor_ref` holds
+`api_keys.key_prefix` for an API-key caller — the first twelve characters of the
+live key — and `tool_write_refused` / `tool_exception` were emitting it beside a
+traceback. The rule is now absolute: **no security record carries a substring of
+a credential**, only `token_tag` (a SHA-256 prefix of a *presented* value) and
+row ids (`key_id`, `oauth_token_id`, `grant_id`). `usage_logs` keeps its actor
+columns unchanged — that is the #77 attribution design, and those rows are read
+behind the panel's own authentication rather than shipped to a log sink. Nothing free-text is allow-listed except
 `reason`, which is a closed vocabulary per event. There is no field a path, a
 query string or a request body could ride in — `route` is `request.url.path`
 only.
@@ -87,11 +95,17 @@ A *successful* login logs a username that resolved; a failed one logs a username
 that did not. So the name carries the role:
 
 * an **unsuffixed** identifier (`user_id`, `username`, `client_id`, `key_id`,
-  `oauth_token_id`, `grant_id`, `scope`, `actor_kind`, `actor_ref`) may hold
-  only a value read from a database row;
+  `oauth_token_id`, `grant_id`, `scope`, `actor_kind`) may hold only a value
+  read from a database row;
 * a **`_submitted`** name (`username_submitted`, `client_id_submitted`,
   `client_name_submitted`) is the only place a caller-supplied identifier
-  appears, is truncated, and is **never** a suppression subject;
+  appears, is truncated **to 64 characters**, and is **never** a suppression
+  subject. The bound is a written-down accepted limitation, not a guarantee: a
+  caller who pastes a live credential into a username, a client id or a client
+  name field has up to 64 characters of it logged. The fields stay because an
+  operator watching a credential-stuffing burst has to see what was *tried* —
+  a refusal record that withheld the attempted username answers none of the
+  questions such a burst raises — and the bound is the mitigation;
 * a **`_session`** name (`user_id_session`, `username_session`) is the only
   place a value copied from the session cookie without a database read appears
   — which is exactly what a logout record can honestly say, because the account
@@ -134,7 +148,23 @@ They are not structured fields:
   material — a password, secret, code, token, verifier, cookie or CSRF token.
   It is bounded (`MAX_MESSAGE_CHARS`).
 * **`stack`** appears only with `exc_info`. An exception message is not under
-  this change's control and is accepted as operational text under the same rule.
+  this change's control and is accepted as operational text under the same rule
+  — which is exactly why **`src/database.py` sets `hide_parameters=True`**.
+  SQLAlchemy renders a failing statement's bound parameters into
+  `StatementError.__str__`, and this server binds credential material on half a
+  dozen hot paths: the API-key and OAuth-token lookups bind a SHA-256 key hash,
+  the transfer admission binds a token hash, DCR binds a client-secret hash, the
+  authorization-code exchange binds a code hash, and the refresh rotation binds
+  the hash of the pair it is minting. Without that flag a pool timeout or a
+  statement timeout on any of them put the hash into the record's `stack` and
+  into the health page's ERROR ring buffer. It is a security setting, not a
+  debugging one: do not turn it off to inspect a query.
+* **A catalogue event on a credential-bound write does not carry `exc_info` at
+  all.** `oauth_token_rotation_failed` and
+  `oauth_refresh_reuse_revocation_failed` are class-only for that reason —
+  belt to `hide_parameters`' braces. The events that *do* carry a traceback
+  (`tool_exception`, the two transfer publish failures, the panel's health
+  strip) sit on paths that bind row ids and note content, never a credential.
 * **Bounding is head-and-tail, not truncation.** "The whole traceback, bounded"
   is a contradiction. `stack` keeps the first 4 KiB and the last 3 KiB with a
   marker naming the dropped byte count between them, and the exception's **type
@@ -186,6 +216,9 @@ nothing binds the request address into a ContextVar (residual R8).
 | `panel_bootstrap_refused` | WARNING | `client_ip`, `reason` | `src/auth/routes.py`, each refusal branch |
 | `panel_password_reset` | INFO | `actor_user_id`, `client_ip`, `route`, `user_id`, `username` | `src/control_panel/users.py`, after the commit |
 | `password_hash_malformed` | WARNING | `user_id` | `src/auth/passwords.py` — a caller can drive it through the login form |
+| `panel_session_replay_refused` | WARNING | `client_ip`, `reason`, `route`, `token_tag`, `user_id` | `src/auth/session.py` `get_active_session_user`, every refusal branch; `reason` is `no_session_id` / `unknown_session` / `revoked_session` / `expired_session` / `user_mismatch`. **Never** the cookie's session identifier and **never its stored SHA-256** — that digest is `user_sessions.id`, so a record carrying it names a specific live session. `token_tag` is the only form a session may appear in |
+| `panel_sessions_revoked` | INFO | `count`, `reason`, `user_id`, `user_id_session` | after the commit that made it true; `reason` is `logout` / `password_change` / `admin_password_reset` / `user_deactivated` / `user_deleted`. Logout passes `user_id_session` (copied from the cookie, no row read); the account-event callers hold a row and pass `user_id` |
+| `panel_session_revocation_failed` | ERROR | `client_ip`, `error_type`, `reason`, `route`, `user_id_session` | `src/auth/routes.py` `logout`, when the revocation write or the rollback after it failed. The cookie is still cleared and the redirect still happens. **No `exc_info` and no `str(exc)`**: a SQLAlchemy error renders the failing statement and its bound parameters, one of which is the stored session hash |
 | `oauth_token_issued` | INFO | `client_id`, `client_ip`, `grant_id`, `reason`, `scope`, `user_id` | `src/oauth/routes.py` `/token`, after the mint's commit |
 | `oauth_token_refreshed` | INFO | `client_id`, `client_ip`, `grant_id`, `scope`, `user_id` | `src/oauth/routes.py` `/token`, after the rotation's commit |
 | `oauth_token_refused` | WARNING | `client_id`, `client_id_submitted`, `client_ip`, `grant_id`, `reason`, `user_id` | every `/token` refusal; `reason` is `<rfc_code>.<sub_reason>` |
@@ -203,15 +236,18 @@ nothing binds the request address into a ContextVar (residual R8).
 | `oauth_revoke_refused` | WARNING | `client_id`, `client_ip`, `reason` | `/revoke` client-auth failure |
 | `rate_limit_exceeded` | WARNING | `client_ip`, `limit_count`, `method`, `route`, `window_seconds` | `src/main.py`, a local wrapper around slowapi's handler — the one hook every 429 passes through |
 | `auth_failure` | WARNING | `client_ip`, `key_id`, `oauth_token_id`, `reason`, `route`, `token_tag` | `src/mcp_server/auth.py`, all ten sites |
-| `tool_write_refused` | WARNING | `actor_kind`, `actor_ref`, `key_id`, `oauth_token_id`, `tool`, `user_id` | `_require_write`, the single definition all nine call sites reach |
-| `tool_exception` | ERROR | `actor_kind`, `actor_ref`, `duration_ms`, `error_type`, `tool`, `user_id` | `_tracked`'s `except Exception` around **only** `await fn(...)` |
+| `tool_write_refused` | WARNING | `actor_kind`, `key_id`, `oauth_token_id`, `tool`, `user_id` | `_require_write`, the single definition all nine call sites reach |
+| `tool_exception` | ERROR | `actor_kind`, `duration_ms`, `error_type`, `key_id`, `oauth_token_id`, `tool`, `user_id` | `_tracked`'s `except Exception` around **only** `await fn(...)` |
 | `tool_usage_log_failed` | WARNING | `error_type`, `tool` | the same handler, when the best-effort `usage_logs` write reports failure |
+| `tool_telemetry_failed` | WARNING | `error_type`, `tool` | `_tracked`'s post-body tail — `named_params`, result sizing, the `usage_logs` await — when it raises **after** the body completed. The completed result is returned unchanged; never `tool_exception`, because the call succeeded |
 | `tool_refused_no_vault` | WARNING | `tool`, `user_id` | the vault admission gate |
 | `tool_refused_over_quota` | WARNING | `day`, `key_id`, `limit`, `tool`, `user_id` | the quota admission gate |
 | `usage_log_credential_gone` | WARNING | `cleared_user_id`, `tool` | the FK-recovery retry in `_log_usage` |
 | `usage_log_failed` | WARNING | `error_type`, `reason`, `tool` | `_log_usage` giving up; `reason` is `initial` or `after_clearing_fks` |
 | `tool_result_measure_failed` | WARNING | `error_type`, `tool` | result telemetry |
-| `move_rewrite_failed` | WARNING | `error_type`, `tool` | `move_note`'s link rewrite; the path stays in `msg` |
+| `move_rewrite_failed` | WARNING | `error_type`, `tool` | `move_note`'s link rewrite failing for one source, and the confirmation outage that stops the remaining ones; the move carries on or stops, but the rename stands. The path is named in the tool's reply and in the move's `params`, not in a field |
+| `move_rewrite_overlap_refused` | WARNING | `error_type`, `tool` | `move_note` aborting the **whole** move because one source holds a link nested inside another link to the same note (#211). Distinct from `move_rewrite_failed`: nothing was mutated |
+| `move_post_rename_failed` | WARNING | `error_type`, `reason`, `tool` | the two best-effort failures after the rename has stood; `reason` is `title_read_failed` or `db_update_failed`. Neither fails the call |
 | `quota_admission_failed` | ERROR | `day`, `error_type`, `key_id` | `src/services/quotas.py` — re-raised unchanged; a quota that has stopped deciding is an incident |
 | `quota_counter_prune_failed` | WARNING | `error_type` | the same module's housekeeping prune |
 | `publication_refused_confirmation_unavailable` | WARNING | `error_type`, `user_id` | `src/services/vault.py` — the assignment is *unknown*, which is not "changed" |
@@ -222,6 +258,7 @@ nothing binds the request address into a ContextVar (residual R8).
 | `transfer_root_unusable` | ERROR | `error_type`, `method`, `route`, `user_id` | `src/transfer/routes.py` |
 | `transfer_post_publish_failure` | ERROR | `error_type`, `route`, `user_id` | published but not recorded |
 | `transfer_prepublish_failure` | ERROR | `error_type`, `route`, `user_id` | failed before publication |
+| `transfer_claim_release_failed` | ERROR | `error_type`, `method`, `route`, `user_id` | returning a claimed token to `pending` failed. Best-effort by construction: the response was already decided, so it goes out unchanged and the claim stands until its TTL |
 | `panel_forbidden` | WARNING | `actor_user_id`, `actor_username`, `method`, `reason`, `route`, `user_id` | the panel's 403 guards, the REST duplicate ownership check, and the actor re-checks |
 | `csrf_refused` | WARNING | `client_ip`, `method`, `route`, `user_id` | `src/csrf.py` `verify_csrf` |
 | `panel_ondemand_index_failed` | ERROR | `error_type`, `user_id` | the panel's on-demand index action |
@@ -238,6 +275,33 @@ indexer, the embed pass, `vault_fs` housekeeping and startup stays on the bare
 logger: those are background or once-per-pass, they are not refusals, and
 suppressing them would hide the one class of error the health page exists to
 show.
+
+**A test enforces this in the four request-path modules** —
+`src/mcp_server/auth.py`, `src/mcp_server/tools.py`, `src/transfer/routes.py`
+and `src/control_panel/routes.py`. `tests/test_issue_190_field_allowlist.py`
+parses each of them and fails on any `logger.warning`, `logger.error`,
+`logger.exception` or `logger.critical` call, matched on the literal message so
+the exemption list survives reformatting. `logger.info` and `logger.debug` are
+out of scope: they sit below the sink's default level and they are not
+refusals.
+
+The exemptions are all **one shape**, and that shape is the rule rather than a
+hole in it: the panel's **Danger zone**. The "Skipping HNSW index" notice in
+`reset_embeddings`, and the two abort notices in
+`_record_embedding_fingerprint`, are each reached only through
+`require_admin_panel` (the re-embed route additionally through a signed
+one-time confirmation token), fire at most once per action, and report exactly
+the operational fact the health page exists to show — that `semantic_search`
+has silently fallen back to a sequential scan, or that a destructive reset
+aborted and rolled itself back. No credential can drive any of them in a loop,
+so there is no flood to bound; and the abort notices keep `logger.exception`
+deliberately, because the traceback saying *why* the fingerprint write failed
+is the whole value of the record, and a bound that withheld it would leave an
+administrator with a flash message and nothing else.
+
+Each entry carries its justification in the test, and the list itself is
+asserted — a new exemption is a decision somebody has to write down, not a
+line somebody can add.
 
 ## The suppressor: one allowance check, on a subject a caller cannot mint
 
@@ -284,7 +348,13 @@ never noisier.
 * **A summary carries the suppressed event's own level**, so an operator
   filtering at WARNING still sees that warnings were withheld. It is never
   itself suppressed and never counted.
-* **Bounded and safe.** At most 512 keys per map, evicted oldest-window-first
+* **Bounded and safe.** At most 512 keys per map, evicted **least recently
+  used** — every `acquire` moves its key to the end of an `OrderedDict` and
+  eviction pops from the front, so what goes is the key nobody has touched for
+  longest, which is not the same as the oldest *window* (a key acquired
+  steadily keeps a fresh window and never reaches the front). The guarantee
+  that matters is unchanged and is asserted separately: **an entry holding a
+  nonzero withheld count emits its summary before it is evicted**
   under the rule above; a `threading.Lock` guards both; `acquire` catches
   everything and **fails open** — an internal error returns a permit, so the
   record is emitted — and never raises into a request path.

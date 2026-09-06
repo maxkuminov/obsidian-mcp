@@ -102,6 +102,34 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
         {"actor_user_id", "user_id", "username", "client_ip", "route"}
     ),
     "password_hash_malformed": frozenset({"user_id"}),
+    # ── The panel session registry (#198) ──
+    #
+    # **No credential material, ever** — not the cookie's session identifier,
+    # and **not its stored SHA-256**. That digest is `user_sessions.id`, so a
+    # record carrying it names one specific live session; it is as much a
+    # secret as the identifier for the purpose of a log. Where a record must
+    # identify a session it uses `token_tag`, which is `sha:` plus eight hex
+    # characters — four short of the twelve-character fragment the canary test
+    # forbids.
+    "panel_session_replay_refused": frozenset(
+        {"reason", "user_id", "token_tag", "route", "client_ip"}
+    ),
+    # `user_id_session` is the logout path's provenance: there the id is copied
+    # from the session cookie and no row was read. The account-event callers
+    # (an administrative reset, a deactivation, a delete, a password change)
+    # revoke against a row they hold and pass `user_id`.
+    "panel_sessions_revoked": frozenset(
+        {"reason", "user_id", "user_id_session", "count"}
+    ),
+    # The logout whose revocation write — or whose rollback — failed. The
+    # cookie is still cleared and the redirect still happens: failing closed
+    # would leave the user signed in *and* the cookie alive. No `exc_info` and
+    # no `str(exc)`, for `oauth_refresh_reuse_revocation_failed`'s reason: a
+    # SQLAlchemy error renders the failing statement *and its bound
+    # parameters*, one of which here is the stored session hash.
+    "panel_session_revocation_failed": frozenset(
+        {"reason", "user_id_session", "error_type", "route", "client_ip"}
+    ),
     # ── OAuth (Slice B) ──
     "oauth_token_issued": frozenset(
         {"client_id", "user_id", "grant_id", "scope", "client_ip", "reason"}
@@ -172,13 +200,27 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     # No `client_ip`: `_tracked` and `_require_write` run below
     # `ProxyHeadersMiddleware` and nothing binds the request address into a
     # ContextVar, so these records identify the *credential*, not the address
-    # (residual R8).
+    # (residual R8). They identify it by **row id**: `actor_ref` — the key's
+    # `omcp_` prefix — is a substring of the live credential and has no field
+    # in the allow-list any more.
     "tool_write_refused": frozenset(
-        {"tool", "user_id", "actor_kind", "actor_ref", "key_id", "oauth_token_id"}
+        {"tool", "user_id", "actor_kind", "key_id", "oauth_token_id"}
     ),
     "tool_exception": frozenset(
-        {"tool", "error_type", "user_id", "actor_kind", "actor_ref", "duration_ms"}
+        {
+            "tool",
+            "error_type",
+            "user_id",
+            "actor_kind",
+            "key_id",
+            "oauth_token_id",
+            "duration_ms",
+        }
     ),
+    # The post-body telemetry tail, which runs after the tool has already
+    # returned. Structurally distinct from `tool_exception` on purpose: the
+    # call succeeded, and an operator filtering for failures must not find it.
+    "tool_telemetry_failed": frozenset({"tool", "error_type"}),
     "tool_usage_log_failed": frozenset({"tool", "error_type"}),
     "tool_refused_no_vault": frozenset({"user_id", "tool"}),
     "tool_refused_over_quota": frozenset({"key_id", "limit", "day", "user_id", "tool"}),
@@ -186,6 +228,16 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "usage_log_failed": frozenset({"tool", "error_type", "reason"}),
     "tool_result_measure_failed": frozenset({"tool", "error_type"}),
     "move_rewrite_failed": frozenset({"tool", "error_type"}),
+    # `move_note` aborting the whole move because one source holds a link
+    # nested inside another link to the same note (#211). Its own event rather
+    # than `move_rewrite_failed`: that one skips a source and carries on, this
+    # one mutates nothing at all.
+    "move_rewrite_overlap_refused": frozenset({"tool", "error_type"}),
+    # The two best-effort failures *after* the rename has already stood, told
+    # apart by `reason` (`title_read_failed` | `db_update_failed`) because an
+    # operator seeing a burst needs to know whether the file or the database is
+    # the one misbehaving. Neither fails the call.
+    "move_post_rename_failed": frozenset({"tool", "error_type", "reason"}),
     # ── Vault and quota admission (Slice A) ──
     "quota_admission_failed": frozenset({"key_id", "day", "error_type"}),
     "quota_counter_prune_failed": frozenset({"error_type"}),
@@ -212,6 +264,14 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "transfer_root_unusable": frozenset({"error_type", "user_id", "route", "method"}),
     "transfer_post_publish_failure": frozenset({"error_type", "user_id", "route"}),
     "transfer_prepublish_failure": frozenset({"error_type", "user_id", "route"}),
+    # Returning a claimed upload token to `pending` is bookkeeping, and it runs
+    # on paths that have *already decided* their response — a 404, a 413, a
+    # 503. A failure there may not turn the decided answer into a 500 or take
+    # the refusal record with it, so it is caught, recorded class-only, and the
+    # response goes out unchanged.
+    "transfer_claim_release_failed": frozenset(
+        {"error_type", "user_id", "route", "method"}
+    ),
     # ── Panel authorization and operations (Slice D) ──
     "panel_forbidden": frozenset(
         {"reason", "actor_user_id", "actor_username", "user_id", "route", "method"}
@@ -383,7 +443,14 @@ def _roll(window: _Window | None, now: float) -> tuple[_Window, tuple | None]:
 
 
 def _evict_locked() -> list[tuple]:
-    """Trim both maps to their bound, oldest first, keeping every count.
+    """Trim both maps to their bound, **least recently used first**, keeping
+    every count.
+
+    Least recently *used*, not oldest *window*: `acquire` moves each key to the
+    end, so eviction pops the key nobody has touched for longest. Evicting by
+    window start would throw away the busiest key — one acquired steadily
+    inside a single 60-second window keeps its original start time — which is
+    the opposite of what a bound on memory should do.
 
     An entry holding a nonzero withheld count emits its summary **before** it
     goes: otherwise the count vanishes and the log silently under-reports, which

@@ -25,6 +25,20 @@ engine = create_async_engine(
     # `asvs-high-availability-hardening` design.
     pool_timeout=30,
     pool_pre_ping=True,
+    # **Security posture, not debuggability.** SQLAlchemy renders the bound
+    # parameters of a failing statement into `StatementError.__str__`, and this
+    # server binds credential material on half a dozen hot paths: the API-key
+    # and OAuth-token lookups bind a SHA-256 key hash, the transfer admission
+    # binds a token hash, DCR binds a client-secret hash, the authorization-code
+    # exchange binds a code hash, and the refresh rotation binds the hash of the
+    # pair it is minting. A `StatementError` on any of them used to render that
+    # hash into the exception's message — and from there into the `stack` field
+    # of any security record carrying `exc_info`, and into the health page's
+    # ERROR ring buffer. The parameters are worth less than the credential is:
+    # every one of those statements is a single filtered lookup whose shape is
+    # in the source, and the record still names the statement and the exception
+    # class. Do not turn this off to debug a query; log the query.
+    hide_parameters=True,
     connect_args={
         # 60s — embedding INSERTs into a vector(1024) column with an HNSW
         # index can take a few seconds each on a large vault. 10s (the old
