@@ -7,19 +7,25 @@ registry that cookie was still a credential — `logout()` cleared it and nothin
 else, and a signed cookie cannot be un-signed — so the abandoned form could
 still mint an authorization code minutes after the browser was "signed out".
 
-The two scenarios below are the ones the `oauth-authorization-integrity` delta
-added for exactly that:
+The `oauth-authorization-integrity` delta says both the display **and** the
+approval resolve identity through the one validator, and that a cookie killed
+by *any* of the four invalidating actions is unable to do either. So every
+action is driven end to end against both handlers rather than one example of
+each:
 
-* *A logged-out cookie cannot approve a grant* — the **real** `logout` handler
-  revokes the row, and the pre-logout copy of the cookie is then submitted to
-  `authorize_post`.
-* *A revoked session cannot open the consent screen* — an administrator's
-  revocation, and then `authorize_get` with the cookie that revocation killed.
+| action | what it does to the session |
+| --- | --- |
+| logout | the real handler revokes this row |
+| administrator reset | bumps `session_version` **and** revokes every row |
+| deactivation | clears `is_active` and revokes every row |
+| revocation | revokes every row, account untouched |
 
 Nothing here stubs `get_active_session_user`. The sibling tests in
 `test_followon_auth_routing.py` monkeypatch the resolver to prove the handlers
 *call* it; these drive the production resolver against
-`session_helpers.FakeRegistry` so the refusal comes from a real revoked row.
+`session_helpers.FakeRegistry` so each refusal comes from a real dead row —
+and each asserts the cookie is left **empty**, which is what stops the same
+form being resubmitted against a different route.
 """
 from __future__ import annotations
 
@@ -54,8 +60,8 @@ def registry_backed(monkeypatch):
 
     `FakeRegistry` is its own async context manager, so it stands in for the
     session factory directly. It raises on any statement it does not
-    recognise — which is the assertion that these refusals happen *before* the
-    client lookup, since it never learns what an `oauth_clients` row is.
+    recognise — which is what proves these refusals happen *before* the client
+    lookup, since it never learns what an `oauth_clients` row is.
     """
 
     def _install(registry):
@@ -65,68 +71,53 @@ def registry_backed(monkeypatch):
     return _install
 
 
-async def test_a_logged_out_cookie_cannot_approve_a_grant(multi_user, registry_backed):
-    user = sh.fake_user(user_id=7)
-    sid, request, registry = await sh.sign_in(user)
-    registry_backed(registry)
+# --- the four ways a session dies -----------------------------------------
 
-    # The copy the abandoned consent form still holds, taken while it works.
-    stolen = dict(request.session)
-    assert stolen[SESSION_ID_KEY] == sid
 
-    # ...and then the user signs out in another tab. The real handler.
+async def _logout(user, registry, request):
     await auth_routes.logout(request=request, session=registry)
-    assert registry.sessions[0].revoked_at is not None
-
-    server_state = "server-state"
-    signed_state = oauth_routes._state_serializer().dumps(server_state)
-    replay = sh.browser_request(
-        method="POST",
-        path="/authorize",
-        session=stolen,
-        cookies={"oauth_state": signed_state},
-    )
-
-    response = await oauth_routes.authorize_post(
-        request=replay,
-        action="approve",
-        client_id=CLIENT_ID,
-        redirect_uri=REDIRECT_URI,
-        code_challenge=CHALLENGE,
-        code_challenge_method="S256",
-        scope="read",
-        state=server_state,
-        client_state="client-state",
-    )
-
-    assert response.status_code == 401
-    assert b"login_required" in response.body
-    # No code minted — and the refusal took the cookie with it, so the same
-    # form cannot be resubmitted against a different route either.
-    assert [obj for obj in registry.added if type(obj).__name__ == "OAuthCode"] == []
-    assert replay.session == {}
 
 
-async def test_a_revoked_session_cannot_open_the_consent_screen(
-    multi_user, registry_backed
-):
-    user = sh.fake_user(user_id=7)
+async def _admin_reset(user, registry, request):
+    """`reset_password`: a new hash, a bumped generation, every row revoked."""
+    user.password_hash = "$2b$12$" + "z" * 53
+    user.session_version = (user.session_version or 0) + 1
+    await revoke_user_sessions(registry, user.id)
+    await registry.commit()
+
+
+async def _deactivation(user, registry, request):
+    user.is_active = False
+    await revoke_user_sessions(registry, user.id)
+    await registry.commit()
+
+
+async def _revocation(user, registry, request):
+    """The sweep on its own — the account itself is untouched."""
+    assert await revoke_user_sessions(registry, user.id) == 1
+    await registry.commit()
+
+
+INVALIDATORS = {
+    "logout": _logout,
+    "admin_reset": _admin_reset,
+    "deactivation": _deactivation,
+    "revocation": _revocation,
+}
+
+
+async def _signed_in(registry_backed):
+    user = sh.fake_user(user_id=7, session_version=3)
     sid, request, registry = await sh.sign_in(user)
     registry_backed(registry)
+    assert request.session[SESSION_ID_KEY] == sid
+    return user, request, registry
 
-    held = dict(request.session)
 
-    # An administrator resets the password / deactivates the account: every
-    # row of this user's is revoked.
-    assert await revoke_user_sessions(registry, user.id) == 1
-
+async def _authorize_get(session_cookie):
     opening = sh.browser_request(
-        method="GET",
-        path="/authorize",
-        query=AUTHORIZE_QUERY,
-        session=held,
+        method="GET", path="/authorize", query=AUTHORIZE_QUERY, session=session_cookie
     )
-
     response = await oauth_routes.authorize_get(
         request=opening,
         response_type="code",
@@ -137,44 +128,100 @@ async def test_a_revoked_session_cannot_open_the_consent_screen(
         scope="read",
         state="client-state",
     )
+    return opening, response
+
+
+async def _authorize_post(session_cookie):
+    server_state = "server-state"
+    signed_state = oauth_routes._state_serializer().dumps(server_state)
+    submitting = sh.browser_request(
+        method="POST",
+        path="/authorize",
+        session=session_cookie,
+        cookies={"oauth_state": signed_state},
+    )
+    response = await oauth_routes.authorize_post(
+        request=submitting,
+        action="approve",
+        client_id=CLIENT_ID,
+        redirect_uri=REDIRECT_URI,
+        code_challenge=CHALLENGE,
+        code_challenge_method="S256",
+        scope="read",
+        state=server_state,
+        client_state="client-state",
+    )
+    return submitting, response
+
+
+def _codes(registry):
+    return [obj for obj in registry.added if type(obj).__name__ == "OAuthCode"]
+
+
+# --- the approval half ----------------------------------------------------
+
+
+@pytest.mark.parametrize("action", sorted(INVALIDATORS))
+async def test_a_dead_cookie_cannot_approve_a_grant(multi_user, registry_backed, action):
+    """The scenario "A logged-out cookie cannot approve a grant", for each of
+    the four actions that can kill the session under an open consent form."""
+    user, request, registry = await _signed_in(registry_backed)
+
+    # The copy the abandoned form still holds, taken while it works.
+    held = dict(request.session)
+
+    await INVALIDATORS[action](user, registry, request)
+
+    submitting, response = await _authorize_post(held)
+
+    assert response.status_code == 401
+    assert b"login_required" in response.body
+    assert _codes(registry) == [], "no authorization code was minted"
+    # The refusal takes the cookie with it, so the same form cannot be
+    # resubmitted against a different route either.
+    assert submitting.session == {}
+
+
+# --- the display half -----------------------------------------------------
+
+
+@pytest.mark.parametrize("action", sorted(INVALIDATORS))
+async def test_a_dead_cookie_cannot_open_the_consent_screen(
+    multi_user, registry_backed, action
+):
+    """The scenario "A revoked session cannot open the consent screen" — the
+    GET is not merely unable to reach the panel, it cannot render consent."""
+    user, request, registry = await _signed_in(registry_backed)
+    held = dict(request.session)
+
+    await INVALIDATORS[action](user, registry, request)
+
+    opening, response = await _authorize_get(held)
 
     assert response.status_code == 302
     location = response.headers["location"]
     assert location.startswith("/admin/auth/login?")
     # The whole /authorize URL is preserved so the client need not re-issue it.
     assert "%2Fauthorize" in location
+    assert _codes(registry) == []
     assert opening.session == {}
 
 
-async def test_the_live_cookie_still_reaches_the_client_lookup(
-    multi_user, registry_backed
+# --- the negative controls ------------------------------------------------
+
+
+@pytest.mark.parametrize("handler", [_authorize_get, _authorize_post])
+async def test_a_live_session_still_reaches_the_client_lookup(
+    multi_user, registry_backed, handler
 ):
-    """The negative control: an unrevoked session is *not* what refuses.
+    """Without this the sixteen cases above pass just as well against handlers
+    that refuse every consent request.
 
-    Without this the two tests above pass just as well against a handler that
-    refuses every consent request. `FakeRegistry` does not model
-    `oauth_clients`, so a live session gets past the identity check and dies on
-    the client lookup instead — which is the next thing `authorize_get` does.
+    `FakeRegistry` does not model `oauth_clients`, so a live session gets past
+    the identity check and dies on the client lookup instead — which is the
+    next thing either handler does.
     """
-    user = sh.fake_user(user_id=7)
-    _sid, request, registry = await sh.sign_in(user)
-    registry_backed(registry)
-
-    opening = sh.browser_request(
-        method="GET",
-        path="/authorize",
-        query=AUTHORIZE_QUERY,
-        session=dict(request.session),
-    )
+    _user, request, _registry = await _signed_in(registry_backed)
 
     with pytest.raises(AssertionError, match="unexpected statement"):
-        await oauth_routes.authorize_get(
-            request=opening,
-            response_type="code",
-            client_id=CLIENT_ID,
-            redirect_uri=REDIRECT_URI,
-            code_challenge=CHALLENGE,
-            code_challenge_method="S256",
-            scope="read",
-            state="client-state",
-        )
+        await handler(dict(request.session))

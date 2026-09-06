@@ -856,12 +856,16 @@ to multi-user later resumes where you left off without re-bootstrapping
 
 - The indexer iterates active users sequentially each cycle. Fine for
   tens of users; hundreds would need parallelization.
-- Password reset is admin-driven only — there's no email-based
-  self-service flow.
-- No rate limiting on `/admin/auth/login`. The Traefik OAuth gate in
-  front of the panel is the main brute-force defense; if you expose
-  `/admin/auth/login` to the open internet, put a rate-limit
-  middleware in front of it.
+- There's no email-based password recovery. A signed-in user changes
+  their own password from **Account** (multi-user mode only), and an
+  administrator can reset any user's from the user-edit page — so a
+  forgotten password is recovered by an administrator, not by email. Both
+  paths apply the same minimum, and both sign every other device out.
+- `/admin/auth/login` and the password-change route are rate-limited at
+  five attempts a minute — the login by address, the password change by
+  **both** the account and the address, since neither key bounds the other
+  on its own. The Traefik OAuth gate in front of the panel is still the
+  outer brute-force defense.
 - The `vault_path` validator does not resolve symlinks, so an admin
   can technically point a user at host files via a symlinked
   `/vaults/<name>`. Treat `/vaults/` as an admin-trust boundary.
@@ -879,8 +883,11 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `BASE_URL` | derived | Explicit public origin. HTTPS except on loopback. |
 | `ALLOWED_ORIGINS` | derived | CORS origins, JSON list |
 | `ALLOWED_HOSTS` | derived | Accepted `Host` headers, JSON list. `localhost` is always added. |
-| `SESSION_MAX_AGE` | `604800` | Panel session cookie lifetime, seconds (multi-user mode) |
+| `SESSION_MAX_AGE` | `604800` | Panel session lifetime, seconds (multi-user mode). Absolute — the server-side row is never extended, so a session used daily still expires |
 | `SESSION_COOKIE_NAME` | `omcp_session` | Panel session cookie name |
+| `SESSION_TOUCH_INTERVAL_SECONDS` | `60` | How stale a session's `last_seen_at` may be before a read request refreshes it. Must be ≥ 1: zero turns a throttled hint into a write on every request |
+| `SESSION_PURGE_RETAIN_DAYS` | `7` | How long dead session rows are kept before the maintenance tick deletes them. Must be ≥ 1: zero deletes a revocation the moment it is made |
+| `OAUTH_KNOWN_REDIRECT_HOSTS` | `claude.ai,chatgpt.com` | Hosts whose OAuth clients show a "recognised" badge on the consent screen. Exact-host equality, JSON list or comma-separated; wildcards and paths are refused at startup, and an empty list means nothing is recognised. Every client still carries the self-registration notice |
 | `MAX_FILE_READ_BYTES` | `10485760` | `read_file` cap (10 MB); bounds what the server reads from disk |
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
 | `MAX_READ_RESPONSE_CHARS` | `40000` | `read_note` / `read_file` cap on what is returned to the caller (≈10K tokens). See [Response size limits](#response-size-limits). |
@@ -1159,6 +1166,13 @@ deployment.
 > parsed the old envelope must read `content` (and, for section reads,
 > `heading`) instead; clients that ignore `structuredContent` still get
 > an unambiguous JSON text block.
+>
+> **Panel sessions are now server-side rows, so everyone is signed out
+> once at that upgrade.** A cookie issued before it carries no session
+> identifier, and such a cookie is refused rather than grandfathered —
+> accepting it would keep the old replay window open for another seven
+> days after the fix shipped. Sign in again; there is nothing to
+> migrate.
 
 ## Architecture
 

@@ -27,6 +27,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from starlette.requests import Request
 
+import session_helpers as sh
 from src.auth import routes as auth_routes
 from src.auth.passwords import hash_password
 from src.limiter import limiter
@@ -290,6 +291,44 @@ async def test_a_failed_last_login_commit_leaves_no_success_record(events):
 
     assert events.named("panel_login_succeeded") == []
     assert events.acquires == []
+
+
+async def test_a_refused_mint_leaves_no_success_record(events, monkeypatch):
+    """D17 again, one step later: the mint is the durable half of a sign-in.
+
+    The `last_login_at` commit is not what makes somebody signed in — the
+    session row is. An administrator's reset committing between the password
+    check and the mint's guard makes `start_session` refuse, and a
+    `panel_login_succeeded` written before it would assert a sign-in that never
+    happened. The attempt is still recorded, as a failure with its own reason,
+    so a correct credential that did not sign in is never silently absent.
+    """
+    monkeypatch.setattr(auth_routes, "verify_password", lambda *_a, **_k: True)
+    user = sh.fake_user(1, username=USERNAME, session_version=3)
+    registry = sh.FakeRegistry(users=[user])
+    registry.on_lock = lambda _key: setattr(user, "session_version", 4)
+    request = sh.browser_request(
+        method="POST", path="/admin/auth/login", client=(f"10.0.0.{next(_client_ips) % 250 + 1}", 5555)
+    )
+
+    response = await auth_routes.login_submit(
+        request=request,
+        username=USERNAME,
+        password=PASSWORD,
+        next="/admin/",
+        session=registry,
+    )
+
+    assert response.status_code == 401
+    assert events.named("panel_login_succeeded") == []
+    record = events.one("panel_login_failed")
+    assert record.reason == "session_mint_refused"
+    assert record.user_id == 1
+    assert record.levelno == logging.WARNING
+    # The subject is the address, as on every other login failure: keying on
+    # the resolved row would hand an attacker one fresh allowance per account.
+    assert events.acquires == [("panel_login_failed", events.acquires[0][1])]
+    assert events.acquires[0][1] != "user:1", "the subject is the address, not the row"
 
 
 async def test_the_password_is_never_in_any_login_record(events):

@@ -438,6 +438,103 @@
   per-pass budget, which is deliberately *not* written into the pass record's
   `error` because it is a decision rather than a fault.
 
+
+## The browser session is a row, not just a cookie (#198)
+
+- **A signed cookie cannot be un-signed, which is why `logout()` clearing it
+  logged nobody out.** Before the registry, `request.session.clear()` sent an
+  expiring `Set-Cookie` while the copy an attacker already held stayed
+  correctly signed until its itsdangerous timestamp aged out — seven more days
+  of access after the user believed they had signed out. The panel has no CSP
+  and will not get one, so "an XSS steals the cookie" is a live path here
+  rather than a theoretical one, and the fix has to be server-side. Every
+  session is now a `user_sessions` row, and revoking the row is what makes
+  "signed out" true for every holder of that cookie.
+- **The table stores `sha256(sid)`, never `sid`.** The identifier in the
+  cookie is a bearer credential for seven days, and a `pg_dump` is taken
+  before every migration and kept for thirty days; storing it verbatim would
+  turn every retained dump into a file full of live sessions. The digest is
+  unkeyed on purpose — 256 bits of CSPRNG output has nothing to brute-force,
+  and keying it with `SECRET_KEY` would make the table unreadable after a
+  rotation an operator may need to perform. `hash_session_id` is the one
+  definition; no record ever carries either form (`token_tag`, `sha:` plus
+  eight hex characters, is the only shape a session may appear in a log).
+- **The lifecycle, one row per stage:**
+
+  | Stage | When | What it does | Where |
+  | --- | --- | --- | --- |
+  | Mint | login, bootstrap, the post-change re-issue — **exactly three sites** | one guarded critical section: account guard, `SELECT … FOR UPDATE` with `populate_existing=True`, refuse unless the row is active **and** on `expected_session_version`, insert, **commit**, then write the cookie | `start_session()` |
+  | Validate | every request that resolves a browser identity | cookie must carry **both** `user_id` and `sid`; row read by `sha256(sid)`; refused when the row is absent, revoked, expired, owned by a different user, or the account is missing, inactive or on another `session_version`. Every refusal clears the cookie **and** records `panel_session_replay_refused` | `get_active_session_user()`, reached only from `require_user_panel`, `login_form`, `authorize_get`, `authorize_post` |
+  | Touch | a validated `GET`/`HEAD`, at most every `SESSION_TOUCH_INTERVAL_SECONDS` | `last_seen_at` on the **request's own** session; failure is logged and skipped, never fatal | `touch_session()` |
+  | Revoke | logout, password change, admin reset, deactivation, soft delete | `UPDATE … SET revoked_at = now() WHERE revoked_at IS NULL`; **does not commit** | `revoke_session()`, `revoke_user_sessions()` |
+  | Purge | the maintenance tick, in **both** modes | deletes rows past `expires_at` **and** past `revoked_at`, both older than `SESSION_PURGE_RETAIN_DAYS` | `cleanup_expired_tokens()` |
+
+- **The mint commits and the revoke helpers deliberately do not.** `get_session`
+  neither commits nor rolls back, so an insert left to a caller's discretion is
+  an insert that may never happen — and the cookie handed to the browser beside
+  it would authenticate nothing, which is a hard logout loop on the very next
+  request. The revocations are the opposite case: they ride the account guard's
+  existing transaction, whose atomicity is the whole point, so a commit inside
+  one would break the check-then-act above.
+- **A mint is bound to the credential generation that authorized it.**
+  `start_session` takes `expected_session_version` and refuses when the locked
+  re-read disagrees. `is_active` alone is not enough: an administrator's reset
+  bumps `session_version` and revokes every row it can see, and it can commit
+  in the window between a caller verifying a password and the mint taking the
+  guard. Adopting whatever version the re-read happened to see would hand the
+  **superseded** password a brand-new valid session, inserted after the reset's
+  sweep — both invalidators defeated by the very race the guard exists to
+  close. The three callers each pass what they hold: the version `login_submit`
+  verified against, the row `register_submit` just created, and the bumped
+  version `change_password` has just committed.
+- **`populate_existing=True` on that re-read is load-bearing**, for the same
+  reason it is on the OAuth rotation re-read: a `SELECT … FOR UPDATE` whose row
+  is already in the session's identity map hands back the *loaded* object with
+  its pre-lock attribute values, and both `is_active` and `session_version` are
+  read in Python. Every caller arrives with that row already loaded, so without
+  it the two checks prove nothing.
+- **The touch never opens a second `AsyncSession`.** The pool is
+  `pool_size=5, max_overflow=10, pool_timeout=30`: fifteen concurrent checkouts
+  is the ceiling, and a request holding two leases at once halves it. Fifteen
+  concurrent requests with stale sessions would take thirty, and everything
+  else on the process — MCP tool calls, `/token`, the indexer — would wait
+  thirty seconds and then 500. A telemetry field must not be able to take the
+  server down. It is also **safe-method-only**: a write path already holds the
+  account guard on some routes, and a touch inside that transaction is a
+  deadlock waiting for a name.
+- **`login_form` must not read `request.session["user_id"]` directly.** It did,
+  and that was a fifth validation entry point drifting away from the other
+  four; the already-signed-in short-circuit now goes through
+  `get_active_session_user` like everything else. A new entry point reading the
+  cookie itself is the shape of this function's regression.
+- **A failing logout still signs the browser out**, and records only the
+  exception's class name. The revocation write can fail, and so can the
+  rollback after it; neither may leave the browser holding a working cookie, so
+  the clear happens regardless. The class name and nothing else because a
+  SQLAlchemy error renders the failing statement *and* its bound parameters,
+  one of which here is a stored session hash.
+- **`user_agent_hash` is forensic and never enforced.** It helps reconstruct an
+  incident. As a *binding* it is bad: trivially replayed by whoever has the
+  cookie, since the same theft yields the header, and it signs users out on
+  every browser auto-update — training them to re-authenticate after an
+  unexplained logout, which is the habit phishing depends on.
+- **Cookies minted before the deploy are refused, not grandfathered.** A cookie
+  with `user_id` and no `sid` is a pre-registry cookie; accepting it would keep
+  the replay window open for another seven days after the fix shipped. The cost
+  is one forced logout at deploy.
+- **The account page's password change re-reads under the guard.** `GET
+  /admin/account` and its POST are 404 in single-user mode — there is no
+  account row and no local password there. The handler takes the account guard,
+  re-reads the acting user `FOR UPDATE` with `populate_existing=True`, and
+  verifies the current password against the **freshly read** hash: verifying
+  against the dependency-loaded one is how a concurrent administrative reset
+  gets silently overwritten and access the administrator just removed comes
+  back. The change, the `session_version` bump and the revocation of every row
+  ride one transaction; the re-issue is a second one, so the browser that made
+  the change stays signed in under a **new** identifier while every other
+  device is signed out. If that re-issue refuses or raises, the change still
+  stands and this browser is signed out — the change is the durable half.
+
 ## The last-admin guard
 
 - **Every panel handler that can change `users.is_admin` / `users.is_active`

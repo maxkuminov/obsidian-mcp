@@ -4660,6 +4660,61 @@ def test_024_creates_the_registry_it_promises():
         assert "No new upgrade operations detected" in check.stdout
 
 
+def test_024_creates_in_public_under_a_redirected_search_path():
+    """The migration run with `search_path` pointing somewhere else.
+
+    021's case, repeated for 024 because the exposure is the same and the
+    consequence is worse. Every `op.*` call in 024 is unqualified and resolves
+    through `search_path`, so without the pin the registry would be created in
+    `decoy` — and the ORM, which declares no schema, would resolve
+    `user_sessions` through whatever path the *application's* role has. The
+    day those two differ, the validator finds no row for any cookie and every
+    user is locked out of the panel with a correctly signed cookie in hand.
+
+    021 and 023 both `RESET` the path at the end of their own `upgrade()`, so a
+    later revision in the same transaction inherits nothing: 024 needs its own
+    pin, and this is what proves it has one.
+    """
+    with throwaway_db("schema_sessions_path", revision="023") as url:
+        dbname = fetchval(url, "SELECT current_database()")
+        sql(url, "CREATE SCHEMA decoy")
+        sql(url, f'ALTER DATABASE "{dbname}" SET search_path TO decoy, public')
+        # A *new* connection is what alembic opens, so confirm the redirect is
+        # in force for one before believing the rest of this case.
+        assert fetchval(url, "SHOW search_path") == "decoy, public"
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT to_regclass('public.user_sessions')") is not None
+        assert fetchval(url, "SELECT to_regclass('decoy.user_sessions')") is None, (
+            "the registry must land where the ORM looks, not first on the "
+            "search path"
+        )
+        # The comment and both indexes are separate unqualified statements, so
+        # each is checked rather than assumed to have followed the table.
+        assert user_sessions_comment(url) == USER_SESSIONS_MARKER
+        assert user_sessions_index_columns(url, SESSIONS_USER_INDEX) == ["user_id"]
+        assert user_sessions_index_columns(url, SESSIONS_EXPIRES_INDEX) == ["expires_at"]
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM pg_class c "
+            "WHERE c.relnamespace = 'decoy'::regnamespace",
+        ) == 0, "nothing at all was created in the decoy schema"
+
+        # The pin is `SET LOCAL`, so it must not have outlived the transaction.
+        assert fetchval(url, "SHOW search_path") == "decoy, public"
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+        # And the downgrade drops from public, not from wherever the path points.
+        _harness.run_alembic(url, "downgrade", "023", dimensions=DIM)
+        assert fetchval(url, "SELECT to_regclass('public.user_sessions')") is None
+
+
 def test_024_chains_from_023_and_023_is_applied_first():
     """The stated merge precondition, asserted rather than assumed: 024 must
     not migrate ahead of the sibling `index-integrity-hardening` migration."""

@@ -57,6 +57,17 @@ contain the string `The last-admin guard`, and `alembic/versions/` must contain
 ## 2. Session lifecycle — mint, validate, touch, revoke
 
 - [x] 2.1 `src/auth/session.py`: `start_session(request, session, user_id)` — **one guarded critical section**: `lock_account_guard(session)`; re-read the user `SELECT … FOR UPDATE` with `execution_options(populate_existing=True)`; refuse unless the row exists and `is_active` is exactly true; `sid = secrets.token_urlsafe(32)`; insert keyed on `sha256(sid).hexdigest()` with `expires_at = now + settings.session_max_age` and `user_agent_hash`; **commit** (releasing the guard); then write `sid` into the cookie.
+  - **Revised after the adversarial review: the mint takes
+    `expected_session_version` and refuses when the locked re-read disagrees.**
+    `is_active` alone left a hole the guard was supposed to close — an
+    administrator's reset bumps the version and revokes every row it can see,
+    and it can commit between a caller verifying a credential and the mint
+    taking the lock. Adopting whatever version the re-read saw would then hand
+    the **superseded** password a fresh valid session inserted *after* that
+    sweep, defeating both invalidators at once. The three call sites pass what
+    they hold: `login_submit` the version it verified against,
+    `register_submit` the row it just created, `change_password` the bumped
+    version it just committed.
   - **The mint helper commits and the revoke helpers do not; that asymmetry is the contract.** `get_session` neither commits nor rolls back, so an insert left to the caller is an insert that may never happen — and the cookie would then authenticate nothing.
   - **The guard and the re-read are not belt-and-braces.** A mint that runs after its caller's guard has been released can be overtaken by an administrator's deactivation and will then insert a **live row for a just-disabled account**. Validation refuses that row while the account is inactive, which hides it; on reactivation it becomes a working credential nobody granted. Serializing against the deactivating handlers is what removes the window.
   - Refusing to mint is not an error the caller recovers from: the user is simply not signed in.
@@ -114,10 +125,14 @@ contain the string `The last-admin guard`, and `alembic/versions/` must contain
 
 ## 6. Documentation
 
-- [ ] 6.1 `docs/architecture/control-panel.md`: a session section — why the cookie alone was not enough; why the identifier is stored hashed; the mint/validate/touch/revoke/purge table; **why the mint helper commits and the revoke helpers do not**; why the touch never opens a second session and is safe-method-only (pool capacity, and the deadlock against the account guard); why `login_form` must not read the cookie directly; why a failing logout still signs the browser out and logs a class name only; why the user-agent hash is forensic; the account page and its locked re-read.
+- [x] 6.1 `docs/architecture/control-panel.md`: a session section — why the cookie alone was not enough; why the identifier is stored hashed; the mint/validate/touch/revoke/purge table; **why the mint helper commits and the revoke helpers do not**; why the touch never opens a second session and is safe-method-only (pool capacity, and the deadlock against the account guard); why `login_form` must not read the cookie directly; why a failing logout still signs the browser out and logs a class name only; why the user-agent hash is forensic; the account page and its locked re-read.
 - [ ] 6.2 `docs/architecture/oauth-and-grants.md`: the consent card — what it discloses, why `hostname` beats `netloc`, why the host is never Unicode-decoded, why registration now requires a resolvable ASCII host, why the notice is unconditional, and why the allow-list is exact equality with pattern entries rejected at configuration time.
 - [ ] 6.3 `docs/architecture/schema-and-migrations.md`: 024 — marker-owned, reconcile-or-refuse, marker-guarded downgrade, no backfill, the cascade, rows preserved across a stamp-back, and why grandfathering existing cookies was rejected.
-- [ ] 6.4 `README.md`: replace the "Password reset is admin-driven only" limitation with the self-service flow and the retained admin recovery path; correct the adjacent "No rate limiting on `/admin/auth/login`" bullet, false since `login_submit` gained `@limiter.limit("5/minute")`. Document `OAUTH_KNOWN_REDIRECT_HOSTS`, `SESSION_TOUCH_INTERVAL_SECONDS` and `SESSION_PURGE_RETAIN_DAYS`, and the one-time logout at deploy.
+- [x] 6.4 `README.md`: replace the "Password reset is admin-driven only" limitation with the self-service flow and the retained admin recovery path; correct the adjacent "No rate limiting on `/admin/auth/login`" bullet, false since `login_submit` gained `@limiter.limit("5/minute")`. Document `OAUTH_KNOWN_REDIRECT_HOSTS`, `SESSION_TOUCH_INTERVAL_SECONDS` and `SESSION_PURGE_RETAIN_DAYS`, and the one-time logout at deploy.
+  - Done in the verifier/adversarial-review pass, which found 6.1–6.4 all
+    open on the merged tree. **6.2 and 6.3 remain open** — the consent card in
+    `oauth-and-grants.md` and 024 in `schema-and-migrations.md` — and are the
+    two documentation items still outstanding before archive.
 
 ## 7. Integration — the event catalogue and the existing tests
 
@@ -211,19 +226,57 @@ sessions, which several slices would otherwise all have to touch.
 
 - [ ] 8.1 `make test-schema` — throwaway pgvector container, the 024 cases, the moved `HEAD_REVISION`.
 - [x] 8.2 Full suite: `OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1 pytest tests/` on the **merged** tree, not per worktree.
-  - **3903 passed, 515 skipped**, up from 3895/515 before the verifier fixes
-    (five bootstrap-policy cases, three consent-revalidation cases). Run under
-    `-W error::RuntimeWarning`, which is the gate for the four
-    `coroutine … never awaited` warnings the panel-auth fakes were emitting
-    from `src/auth/session.py:301`: `session.add` is synchronous on a real
-    `AsyncSession` and an `AsyncMock` attribute returned an un-awaited
-    coroutine. Zero such warnings now.
+  - **3925 passed, 518 skipped**, up from 3895/515 before the verifier and
+    adversarial-review fixes. Run under `-W error::RuntimeWarning`, which is
+    the gate for the four `coroutine … never awaited` warnings the panel-auth
+    fakes were emitting from `src/auth/session.py`: `session.add` is
+    synchronous on a real `AsyncSession` and an `AsyncMock` attribute returned
+    an un-awaited coroutine. Zero such warnings now. The three added skips are
+    the database-backed cases (the pool-capacity module and 024's redirected
+    `search_path` decoy), which the schema gate runs and the plain suite skips.
 - [x] 8.3 `npx -y @fission-ai/openspec@1.3.1 validate --all --strict` clean — **32 passed, 0 failed**.
 - [ ] 8.4 Grep for production callers of every new export (`start_session`, `revoke_session`, `revoke_user_sessions`, `touch_session`, `validate_new_password`, `session_user_key`, `lock_account_guard`, `known_redirect_host`, `redirect_display_host`) — fan-out ships green-but-unwired code.
 - [ ] 8.5 Confirm the enumeration holds on the merged tree: exactly **three** mint sites, exactly **four** validate entry points, no remaining raw `request.session.get("user_id")` used as an identity decision (`src/csrf.py`'s nonce read is not one), and **no path that opens a second `AsyncSession` while the request's own is open**.
 - [ ] 8.6 Confirm the `schema-integrity` MODIFIED block lands on the **existing** requirement at archive time rather than adding a second one of a similar name.
 - [ ] 8.7 `openspec-verifier` subagent against proposal, deltas and tree. Iterate to zero blocking gaps.
 - [ ] 8.8 Adversarial Codex review of the **implementation** — mandatory: authentication, session lifetime, a consent screen, and a migration. Frame as a defensive PASS/FAIL control review; commit first, `--sandbox read-only`, stdin from a file, background. Fix BLOCKER/MAJOR before deploying.
+  - **Round 1 returned FAIL: 1 BLOCKER, 1 MAJOR, 5 MINOR, 3 NIT. All applied.**
+    - *BLOCKER* — the mint adopted the current `session_version` instead of
+      binding to the one that authorized it, so a reset racing a login (or the
+      post-change re-issue) minted a valid session for the superseded
+      credential. Fixed at 2.1; two race tests plus a source assertion that
+      `populate_existing=True` is still on the locked re-read.
+    - *MAJOR* — bootstrap outside the shared policy (also the verifier's gap;
+      see 1.8/3.5), **and** the create-user and reset forms still hard-coding
+      `minlength="8"` against a server that refuses under twelve. All four
+      forms now render `MIN_PASSWORD_LENGTH`, asserted both in the markup and
+      at each handler's context.
+    - *MINOR a* — `panel_login_succeeded` moved **after** the mint, and a
+      refused mint now records `panel_login_failed` with reason
+      `session_mint_refused` rather than nothing at all.
+    - *MINOR b* — `tests/integration/test_issue_198_session_pool_capacity.py`:
+      twenty-five concurrent stale-session validations against a **real**
+      engine at `pool_size=5, max_overflow=10`, with a companion assertion that
+      all twenty-five touches actually wrote (otherwise the capacity result is
+      vacuous). Added to `make test-schema`, the only job with a database. The
+      fake-semaphore unit test stays.
+    - *MINOR c* — the consent regressions now drive **all four** invalidating
+      actions (logout, administrator reset, deactivation, revocation) through
+      `authorize_get` **and** `authorize_post`, each asserting the refusal, no
+      code minted, and an empty cookie — with a live-session control per
+      handler so the sixteen cases cannot pass against a handler that refuses
+      everything.
+    - *MINOR d* — the failed-write case runs inside the session's context
+      manager against a rollback-capable fake, and asserts the persisted hash,
+      the generation and every session row are unchanged.
+    - *NIT e* — `panel_session_replay_refused` gained `user_missing`,
+      `user_inactive` and `version_mismatch`: every branch that clears the
+      cookie now records why, checked by a test that closes the vocabulary in
+      both directions and asserts `cookie.clear()` and `_replay_refused(` occur
+      the same number of times. Catalogue tables updated.
+    - *NIT f* — 024's redirected-`search_path` decoy case, mirroring 021's.
+    - *NIT g* — the docs were **not** merged: 6.1–6.4 were all open on this
+      tree. 6.1 and 6.4 are done here; **6.2 and 6.3 remain**.
 - [ ] 8.9 `make deploy`, then `make db-check` (`alembic check` must read "No new upgrade operations detected").
 - [ ] 8.10 Browser pass on the live panel: sign in; open a second browser and confirm both work; log out of the first and **replay its cookie** — expect a redirect to login; change the password from the second and confirm the first is signed out while the second is not; sign in with the new password; open an `/authorize` URL for a self-registered test client with a non-allow-listed redirect host and confirm the warning and the host; confirm an allow-listed client shows the badge **and still shows the self-registration notice**. There is no `user-representative` gate on this project — record which flows were actually exercised.
 - [ ] 8.11 Confirm the deploy's one-time logout happened as designed and both production users can sign in.

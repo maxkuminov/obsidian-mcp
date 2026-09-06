@@ -472,17 +472,39 @@ async def test_every_row_of_that_user_is_revoked_including_this_one(records):
 
 async def test_a_failing_write_revokes_nothing(records):
     """The revocation and the hash ride one transaction: a failure in it leaves
-    the stored hash alone and no row revoked."""
+    the stored hash alone, the generation alone, and no row revoked.
+
+    The registry is armed with `restore_on_rollback`, and the handler is driven
+    **inside the session's context manager** — which is where the undo actually
+    happens in production, since `change_password` does not catch this and
+    `get_session`'s `async with` is what rolls the transaction back. Without
+    both, the assertions below would only be checking that a fake never applied
+    an `UPDATE` it was told to raise on, and would say nothing about the hash
+    and the version, which the handler writes onto the ORM object in Python
+    before the statement that fails.
+    """
     user = account_user()
-    _sid, request, registry = await sh.sign_in(user)
+    registry = sh.FakeRegistry(users=[user], restore_on_rollback=True)
+    _sid, request, registry = await sh.sign_in(user, registry=registry)
+    hash_before = user.password_hash
+    version_before = user.session_version
+    assert verify_password(OLD, hash_before), "the fixture's premise"
+
     registry.fail_on = "UPDATE user_sessions SET revoked_at"
     registry.fail_with = RuntimeError("the write failed")
     committed = registry.committed
 
     with pytest.raises(RuntimeError):
-        await change(request, registry, user)
+        async with registry:
+            await change(request, registry, user)
 
     assert registry.committed == committed, "nothing was committed"
+    assert registry.rolled_back >= 1, "the transaction was undone"
+    # The three things the transaction was carrying, all as they were.
+    assert user.password_hash == hash_before, "the stored hash is untouched"
+    assert verify_password(OLD, user.password_hash), "and still verifies"
+    assert not verify_password(NEW, user.password_hash)
+    assert user.session_version == version_before
     assert [r.revoked_at for r in registry.sessions] == [None]
     assert _events(records, "panel_password_changed") == []
 

@@ -271,8 +271,56 @@ async def login_submit(
     )
     await session.commit()
 
-    # After the commit, never before it (D17): a commit that then fails would
-    # otherwise leave a record asserting a sign-in that did not happen.
+    # Warm the per-user vault-path cache so any subsequent panel route /
+    # vault tool call in this process can resolve `_vault_root(user.id)`
+    # without a sync DB miss. Skips users with no vault_path assigned
+    # (warm_user_vault_cache filters them out).
+    await warm_user_vault_cache(session, user.id)
+
+    # The mint, **after** the `last_login_at` commit above: `start_session`
+    # owns its own guarded transaction, and it commits the row before the
+    # cookie carrying its identifier leaves. `expected_session_version` is the
+    # generation `verify_password` just ran against, so a reset that commits in
+    # the window between that check and the guard refuses this mint instead of
+    # handing the superseded password a fresh session. A refusal here means
+    # exactly one of those two races was lost — a deactivation or a reset — and
+    # either way nobody is signed in and no row exists to come back to life.
+    if (
+        await start_session(
+            request,
+            session,
+            user.id,
+            expected_session_version=user.session_version,
+        )
+        is None
+    ):
+        request.session.clear()
+        # The credential was correct and the sign-in still did not happen, so
+        # the attempt cannot go unrecorded — and it is not a success. The
+        # subject is the client address, like every other `panel_login_failed`.
+        security_events.emit(
+            "panel_login_failed",
+            subject=security_events.subject_for(request=request),
+            reason="session_mint_refused",
+            username_submitted=normalized,
+            user_id=user.id,
+            client_ip=security_events.client_ip(request),
+            route=request.url.path,
+        )
+        return _render_login(
+            request,
+            error=invalid_msg,
+            next_url=target,
+            username=normalized,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
+
+    # **After the mint**, never before it (D17, sharpened): the record must
+    # assert something durable, and until `start_session` has committed a row
+    # and returned its identifier there is no session to have succeeded. The
+    # `last_login_at` commit alone was never enough — a mint refused by the
+    # reset race above would otherwise have left a `panel_login_succeeded`
+    # behind it.
     security_events.emit(
         "panel_login_succeeded",
         level=logging.INFO,
@@ -282,28 +330,6 @@ async def login_submit(
         client_ip=security_events.client_ip(request),
         route=request.url.path,
     )
-
-    # Warm the per-user vault-path cache so any subsequent panel route /
-    # vault tool call in this process can resolve `_vault_root(user.id)`
-    # without a sync DB miss. Skips users with no vault_path assigned
-    # (warm_user_vault_cache filters them out).
-    await warm_user_vault_cache(session, user.id)
-
-    # The mint, **after** the `last_login_at` commit above: `start_session`
-    # owns its own guarded transaction, and it commits the row before the
-    # cookie carrying its identifier leaves. A refusal here means an
-    # administrator's deactivation committed in the window between the password
-    # check and the guard — the account is disabled, so nobody is signed in and
-    # no row exists to come back to life if it is re-enabled.
-    if await start_session(request, session, user.id) is None:
-        request.session.clear()
-        return _render_login(
-            request,
-            error=invalid_msg,
-            next_url=target,
-            username=normalized,
-            status_code=status.HTTP_401_UNAUTHORIZED,
-        )
 
     return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
 
@@ -564,7 +590,15 @@ async def register_submit(
     # transaction. The two keys are therefore taken **sequentially, never
     # nested**, so no path holds one while asking for the other and no cycle is
     # introduced.
-    if await start_session(request, session, uid) is None:
+    if (
+        await start_session(
+            request,
+            session,
+            uid,
+            expected_session_version=new_user.session_version,
+        )
+        is None
+    ):
         # The account it just created is gone or disabled — only reachable if
         # another administrator acted in that window. Nobody is signed in.
         request.session.clear()
