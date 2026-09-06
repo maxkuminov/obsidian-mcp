@@ -893,11 +893,11 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
 | `OLLAMA_URL` | — | Used when provider is Ollama |
-| `EMBEDDING_MODEL` | `bge-m3` | Ollama model name |
+| `EMBEDDING_MODEL` | `bge-m3` | Ollama model name. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident. `-1` pins it; a Go duration (`30m`) frees VRAM when idle. Ollama only. |
 | `OPENAI_API_KEY` | — | Required when provider is OpenAI |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies |
-| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model |
+| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
 | `CHUNK_OVERLAP` | `0` | Token overlap between chunks |
 | `EMBEDDING_EXCLUDE_PATTERNS` | `["*.excalidraw.md","Excalidraw/*"]` | Globs skipped by the embedder. Excluded files stay keyword-searchable. |
@@ -913,35 +913,70 @@ write is refused by the tool — with an actionable message — rather than
 by the transport with a bare HTTP 413. Raise `MAX_FILE_WRITE_BYTES` and
 the transport limit follows.
 
-### Switching providers
+### Switching providers or models
 
-Different models produce non-comparable vectors, so a provider switch
-requires reindexing.
+Different models produce vectors in different spaces, and cosine
+distance between two spaces is meaningless. So **any** change to what
+produced the stored vectors requires a full re-embed — not only a
+provider switch. That is every one of:
 
-Whether or not `EMBEDDING_DIMENSIONS` changes, the steps are the same:
+- `EMBEDDING_PROVIDER`
+- `EMBEDDING_MODEL` (Ollama) or `OPENAI_EMBEDDING_MODEL` (OpenAI) —
+  **including a swap between two models of the same dimension**, which
+  the dimension guard cannot see
+- `EMBEDDING_DIMENSIONS`
+- `CHUNK_SIZE` and `CHUNK_OVERLAP`
 
-1. Update `.env` — `EMBEDDING_PROVIDER`, credentials, model name, and
-   `EMBEDDING_DIMENSIONS` if it differs.
-2. `make reset-embeddings`. The target is `docker compose run --rm`, so
-   it starts a one-off container that reads your edited `.env` — it
-   works whether the service is up or down, and recreates the column at
-   the *new* dimension.
-3. `make deploy` (or `docker compose up -d --force-recreate`). The next
-   indexer pass re-embeds the vault.
+The server stores a fingerprint of that configuration and compares it at
+startup. On a mismatch it logs both fingerprints and the fields that
+differ, names the repair, and exits non-zero — so a model swap that used
+to mix two vector spaces in one column silently, for ever, now stops the
+process instead.
 
-When changing `EMBEDDING_DIMENSIONS`, run the reset **before**
-recreating the container: the startup dimension guard compares the live
-column width against `EMBEDDING_DIMENSIONS` and `sys.exit(1)`s on a
-mismatch, so a recreated-first container just exits until the reset has
-run.
+The steps, in this order:
+
+1. Update `.env`.
+2. `make deploy` (or `docker compose up -d --force-recreate`). **The new
+   container will refuse to start** — at the fingerprint guard, or at
+   the dimension guard if the width changed — and that refusal is the
+   point: a container that will not start embeds nothing while the reset
+   runs.
+3. `make reset-embeddings` while it is down. The target is `docker
+   compose run --rm`, so it starts a one-off container that reads your
+   edited `.env`: it recreates the column at the *new* dimension, clears
+   every `embedded_content_hash`, and records the new fingerprint in the
+   same transaction.
+4. Restart the service. It starts silently, because the stored rows
+   really were produced under the configuration it is now running, and
+   the next indexer pass re-embeds the vault.
+
+**This inverts the older reset-before-recreate advice.** That ordering
+was safe only while nothing depended on a stored claim about the
+configuration; now the reset is what *writes* that claim, so it has to
+run with the new `.env` in place and with no old-configuration container
+able to embed against it. Skipping a step costs time rather than
+correctness — a database-level generation lock makes an
+old-configuration container's certifications refuse rather than land —
+but the ordering above is the one that never has to rely on it.
 
 You can also use Settings → Danger zone → Reset embeddings in the
-control panel, which performs the same SQL while the server is running
-(pauses the indexer, runs the SQL, resumes).
+control panel, which performs the same SQL — including the fingerprint
+record — while the server is running (pauses the indexer, runs the SQL,
+resumes).
 
-If you change `EMBEDDING_DIMENSIONS` without running the reset, the
-server detects the mismatch at startup and exits non-zero with a
-pointer to the reset target.
+> **The fingerprint records the configuration, not the model artifact.**
+> `bge-m3` is a mutable Ollama tag, so `ollama pull` can replace the
+> weights behind it, and `OLLAMA_URL` / `OPENAI_BASE_URL` are
+> deliberately excluded from the fingerprint — repointing at another host
+> or proxy is usually an infrastructure move that serves the identical
+> artifact, and including it would demand a full re-embed for one.
+> The consequence is an **accepted limitation**: replacing the artifact
+> behind an unchanged model name — re-pulling a tag, or pointing at a
+> host serving different weights under the same name — mixes vector
+> spaces undetected. **It requires `make reset-embeddings`, and no
+> startup check will catch it if you skip that.** No value available to
+> the server distinguishes the two cases, and a probe would have to trust
+> the endpoint it is checking.
 
 ### Full-text search language(s)
 
@@ -973,19 +1008,51 @@ A typo'd or uninstalled config name fails fast at startup with a message
 listing the configs available in your Postgres instance, rather than
 producing silent zero-result searches.
 
-**Changing `FTS_CONFIGS` requires a rebuild.** Stored tsvectors are
-computed at index time, so they go stale when the config list changes.
-After editing `.env` and redeploying, run:
+**Changing `FTS_CONFIGS` requires a rebuild, and the server refuses to
+start until it has run.** Stored tsvectors are computed at index time,
+so they go stale when the config list changes — and a stale stemmer is
+not merely incomplete. Under `english` the token `running` is stored as
+the lexeme `run`, so a query under `simple` for `run` **matches a note
+that does not contain the word** — a false positive, indistinguishable
+from a real hit. Keyword vectors therefore fail closed exactly as
+embeddings do: the server stores a fingerprint of `FTS_CONFIGS`, compares
+it at startup, and on a membership change logs both lists and the
+differing entries, names the rebuild, and exits non-zero. (Reordering the
+same names is *not* a change: a note is indexed under every config and a
+query matches if any hits, so order changes nothing and is not compared.)
 
-```
-make rebuild-tsvectors
-```
+The runbook:
 
-This re-reads each note and recomputes its `content_tsvector` under the
-new config(s). It rebuilds the **keyword index only** — it does **not**
-touch embeddings/vectors and makes **no API calls**, so it finishes in
-seconds for a few thousand notes. (Do not confuse it with the expensive
-`make reset-embeddings` flow.)
+1. Edit `FTS_CONFIGS` in `.env`.
+2. `make deploy`. The new container refuses at the keyword fingerprint
+   guard and stays down.
+3. `make rebuild-tsvectors`. It rebuilds **every scope that holds rows**
+   — every owner, including rows with no owner in single-user mode — in
+   one transaction, and records the new fingerprint only if every one of
+   them reported a completed rebuild. It is **all-or-nothing**: one scope
+   it cannot rebuild rolls the whole thing back, names the scope and the
+   reason, and writes no fingerprint, because the fingerprint is a single
+   claim about *every* retained row.
+4. Restart. It starts silently.
+
+If step 3 names a scope it could not rebuild — a user whose vault is not
+assigned, a tenant still re-deriving its provenance, or ownerless rows
+under multi-user mode — there are three recourses, in order of
+preference:
+
+- **Settle the scope**: assign or delete the user, or let the re-derive
+  finish, then re-run the rebuild.
+- **Delete or reassign the ownerless rows**, then re-run the rebuild.
+- **Put `FTS_CONFIGS` back** to its previous value. That clears the
+  refusal immediately, with no rebuild at all — a configuration edit is
+  always reversible, which is what keeps this refusal from being an
+  outage.
+
+The rebuild re-reads each note and recomputes its `content_tsvector`
+under the new config(s). It rebuilds the **keyword index only** — it does
+**not** touch embeddings/vectors and makes **no API calls**, so it
+finishes in seconds for a few thousand notes. (Do not confuse it with the
+expensive `make reset-embeddings` flow.)
 
 > **Tokenization caveat:** the tsvector *parser* still splits on
 > punctuation and hyphens regardless of config, so `bge-m3` tokenizes to

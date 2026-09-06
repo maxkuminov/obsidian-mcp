@@ -25,6 +25,17 @@ from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
 from src.oauth.routes import router as oauth_router
 from src.services import error_log, security_events, vault
+from src.services.index_state import (
+    KEY_EMBEDDING_FINGERPRINT,
+    KEY_FTS_FINGERPRINT,
+    FingerprintStatus,
+    compare_fingerprint,
+    embedding_fingerprint,
+    fts_fingerprint,
+    get_state,
+    set_state,
+    state_table_exists,
+)
 from src.services.indexer import run_indexer_loop
 from src.services import vault_fs
 from src.logging_setup import configure_logging
@@ -223,6 +234,144 @@ async def _validate_fts_configs() -> None:
         await validate_fts_configs(session)
 
 
+async def _check_settings_fingerprint(
+    *, key: str, current: str, kind: str, repair: str
+) -> None:
+    """The one body both fingerprint guards run, so their dispositions cannot
+    drift apart.
+
+    Two fingerprints, one comparison rule, **one implementation**. The first
+    draft of this change gave keyword vectors a warn-and-serve branch on the
+    reasoning that a stale stemmer is merely *incomplete*; that reasoning does
+    not survive the actual failure. Under `english` the token `running` is
+    stored as the lexeme `run`, so a `simple` query for `run` matches a note
+    that does not contain the word — a false positive, indistinguishable from a
+    real hit, handed to an agent that acts on it without a human ever seeing
+    the query. Both kinds therefore fail closed, and sharing the body is what
+    makes "identical disposition" a structural fact rather than a coincidence
+    two functions happen to preserve.
+
+    The dispositions (design D7):
+
+    - **table absent** — return, deferring to alembic, exactly as
+      `_check_embedding_dim` defers when its column is not there yet.
+      `state_table_exists` asks with `to_regclass` rather than selecting from
+      the table, because a `SELECT` against a missing relation aborts the
+      transaction and the guard could then not go on to defer.
+    - **ABSENT** — adopt: record the current fingerprint and warn that it was
+      *assumed, not verified*. Refusing here would take every existing
+      deployment down on upgrade over a configuration nobody changed.
+    - **MATCH** — silent.
+    - **DIFFERS** — CRITICAL naming both fingerprints and the fields that
+      differ, pointing at the workflow that repairs that kind of row, then
+      `sys.exit(1)`.
+    - **UNREADABLE** — the same refusal, saying the stored value could not be
+      interpreted, and **writing nothing**. Overwriting a claim this build
+      cannot read would convert it into a confident false one.
+
+    Startup never rewrites a fingerprint it has just refused on: only the
+    maintenance workflows write one after the initial adoption. A guard that
+    can clear its own refusal is not a guard.
+    """
+    log = logging.getLogger(__name__)
+    async with async_session() as session:
+        if not await state_table_exists(session):
+            # Not migrated yet (023). Alembic owns the table; deciding now
+            # would mean adopting a fingerprint into a database that has
+            # nowhere to keep it.
+            return
+        verdict = compare_fingerprint(await get_state(session, key), current)
+
+        if verdict.status is FingerprintStatus.MATCH:
+            return
+
+        if verdict.status is FingerprintStatus.ABSENT:
+            await set_state(session, key, current)
+            await session.commit()
+            log.warning(
+                "No %s fingerprint was stored, so the current one was adopted: "
+                "%s. It is assumed, not verified — nothing checked that the "
+                "existing rows were produced under this configuration. If you "
+                "changed it in this same deploy, run `%s` now.",
+                kind,
+                current,
+                repair,
+            )
+            return
+
+        if verdict.status is FingerprintStatus.DIFFERS:
+            log.critical(
+                "Stored %s fingerprint does not match this configuration. "
+                "stored=%s current=%s differing_fields=%s. The stored rows "
+                "were produced under the stored configuration and nothing "
+                "will re-derive them on its own, so serving them under this "
+                "one would answer wrongly with nothing to notice. Run `%s` to "
+                "rebuild them under the new configuration, or restore the "
+                "configuration the stored fingerprint names.",
+                kind,
+                verdict.stored,
+                verdict.current,
+                ", ".join(verdict.fields),
+                repair,
+            )
+        else:  # FingerprintStatus.UNREADABLE
+            log.critical(
+                "Stored %s fingerprint could not be interpreted: %s "
+                "stored=%s current=%s. It is left exactly as it is — a value "
+                "this build cannot read must not be overwritten with a "
+                "confident one. Run `%s` to rebuild the rows and record this "
+                "configuration, or start a build that understands the stored "
+                "value.",
+                kind,
+                verdict.reason,
+                verdict.stored,
+                verdict.current,
+                repair,
+            )
+    sys.exit(1)
+
+
+async def _check_embedding_fingerprint() -> None:
+    """Refuse to start when the stored vectors were built under a different
+    embedding configuration than this process is running (#206).
+
+    The dimension guard above reads the live column width from `pg_attribute`
+    — a *physical* fact about the table — so it catches a dump restored into a
+    differently configured deployment and cannot catch a **same-dimension model
+    swap**. bge-m3 for another 1024-dim model mixes two vector spaces in one
+    column permanently and makes cosine distance meaningless, silently, with
+    every startup after it clean. Both guards stay: they answer different
+    questions.
+    """
+    await _check_settings_fingerprint(
+        key=KEY_EMBEDDING_FINGERPRINT,
+        current=embedding_fingerprint(),
+        kind="embedding",
+        repair="make reset-embeddings",
+    )
+
+
+async def _check_fts_fingerprint() -> None:
+    """Refuse to start when the stored tsvectors were built under a different
+    `FTS_CONFIGS` than this process is running (#206).
+
+    Runs after `_validate_fts_configs()`, deliberately, so a *misspelled*
+    config name still fails with that check's own message listing the
+    configurations the database has, rather than as an opaque fingerprint
+    diff. This refusal is only reached by a name that exists.
+
+    There is always a second exit, which is what distinguishes this from an
+    outage: putting `FTS_CONFIGS` back to the value the stored fingerprint
+    names clears the refusal immediately, with no rebuild at all.
+    """
+    await _check_settings_fingerprint(
+        key=KEY_FTS_FINGERPRINT,
+        current=fts_fingerprint(),
+        kind="keyword (FTS)",
+        repair="make rebuild-tsvectors",
+    )
+
+
 async def _warm_embedding_model() -> None:
     """Pre-load the embedding model so the first semantic_search after startup
     isn't a cold reload. Combined with OLLAMA_KEEP_ALIVE the model then stays
@@ -284,6 +433,13 @@ async def lifespan(app: FastAPI):
         await _check_embedding_dim()
         await _check_pgvector_version()
         await _validate_fts_configs()
+        # After `_validate_fts_configs()`, deliberately: a misspelled config
+        # name must fail with that check's own message listing what the
+        # database has, not as an opaque fingerprint diff. Both sit below the
+        # sandbox short-circuit, so `MCP_SANDBOX_MODE` skips them — it has no
+        # database to read a fingerprint from and nothing it could verify.
+        await _check_embedding_fingerprint()
+        await _check_fts_fingerprint()
         # Fire-and-forget so a ~15s cold load doesn't block the app from serving.
         # The lifespan frame stays suspended at `yield`, keeping this referenced.
         warmup_task = asyncio.create_task(_warm_embedding_model())
