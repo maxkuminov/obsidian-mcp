@@ -297,6 +297,10 @@ _LINKS_TRUNCATED_COLUMN_MARKER = (
     "link-extraction truncation marker (022_links_truncated)"
 )
 
+# Same device, same rule: byte identical to `COLUMN_MARKER` in
+# `alembic/versions/023_indexer_state.py`.
+_CHUNKS_TRUNCATED_COLUMN_MARKER = "chunk-cap truncation marker (023_indexer_state)"
+
 
 class UsageLog(Base):
     __tablename__ = "usage_logs"
@@ -413,6 +417,30 @@ class NoteMetadata(Base):
         nullable=False,
         server_default=text("false"),
         comment=_LINKS_TRUNCATED_COLUMN_MARKER,
+    )
+    # Set when this note's chunking hit `MAX_CHUNKS_PER_NOTE` and the embed
+    # pass submitted only the first N chunks in document order; cleared when a
+    # later embed of the note fits under the cap, and on the two paths that
+    # leave it with no vectors at all (the exclusion branch and a note that
+    # cleaned to zero chunks). Exactly `links_truncated`'s lifecycle.
+    #
+    # A column and not merely a log line, for the reason `links_truncated` is
+    # one: the ERROR ring buffer the ops-health page reads is 100 entries and
+    # process-lifetime, so the line naming a note capped at deploy time is gone
+    # by the next restart, while the capped vector set persists indefinitely.
+    # Without the marker `semantic_search` and `find_related` would present a
+    # match against the *head* of a 2 MB note as a match against the note —
+    # the tail is not semantically searchable at all — which is the
+    # silently-wrong answer this server ranks highest. Read by both vector
+    # paths, which say `embedding_truncated: true`, and counted on the
+    # dashboard. Server default false so migration 023 is metadata-only and
+    # every pre-existing row reads as "not truncated", which is true of every
+    # row written under the uncapped chunker that could not truncate.
+    chunks_truncated: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        server_default=text("false"),
+        comment=_CHUNKS_TRUNCATED_COLUMN_MARKER,
     )
     content_tsvector: Mapped[str | None] = mapped_column(TSVECTOR, nullable=True)
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -779,6 +807,92 @@ class IndexerRun(Base):
         ),
         Index("ix_indexer_runs_started_at", "started_at"),
         {"comment": _INDEXER_RUNS_TABLE_MARKER},
+    )
+
+
+# The three keys `indexer_state.key` may carry, and the single source the CHECK
+# constraint below is written from. Mirrored in migration 023 as `STATE_KEYS`
+# and named again in `src.services.index_state` as the three `KEY_*` constants;
+# keep all three in step or a hand-written predicate and the application's
+# notion of a legal key drift apart with nothing to notice. A key the CHECK
+# rejects is an insert that fails loudly; a key the *application* misspells
+# reads as absent, and absent is what makes the startup fingerprint guard adopt
+# rather than refuse — which is why the closed set is in the database at all.
+INDEXER_STATE_KEYS = (
+    "embedding_fingerprint",
+    "fts_fingerprint",
+    "embed_rotation_cursor",
+)
+
+# Migration 023's ownership marker for the table, declared here so
+# `alembic check` compares it like any other attribute. Keep byte identical to
+# `TABLE_MARKER` in `alembic/versions/023_indexer_state.py`.
+_INDEXER_STATE_TABLE_MARKER = "state about the index as a whole (023_indexer_state)"
+
+
+class IndexerState(Base):
+    """Key/value state about the index as a whole (migration 023).
+
+    Three facts live here: the **embedding fingerprint** and the **keyword
+    fingerprint** — canonical JSON recording the configuration the stored
+    vectors and the stored tsvectors were generated under, compared at startup
+    and refused on a mismatch — and the **embed rotation cursor**, the user id
+    the last pass finished, so a restart does not send the tenants at the tail
+    of the order to the tail again.
+
+    Why a table and not columns on an existing row: there is no singleton row
+    to hang them on. `users` is per tenant, `notes_metadata` is per note (and a
+    per-note copy of a global setting is one identical string per chunk), and
+    `indexer_runs` is an append-only display history nothing reads for a
+    decision. The three facts share one lifecycle — state about the index as a
+    whole, written by the pass or by a maintenance command — and differ in
+    shape, which is what a key/value table is for.
+
+    The dispositions of the three values are deliberately different, and the
+    difference is the point. A fingerprint is a claim about what the stored
+    rows *are*: unreadable or unrecognised, it is refused and never
+    overwritten, because overwriting converts a claim this build cannot read
+    into a confident false one. The cursor is scheduling state whose worst
+    consequence is an order: unusable, it is logged once and ignored, and the
+    cycle starts at the first tenant.
+
+    Accessors, the fingerprint renderers and the generation lock live in
+    `src.services.index_state` — a separate module so `embeddings.py` and
+    `indexer.py` can both import them without a cycle.
+    """
+
+    __tablename__ = "indexer_state"
+
+    # 023's ownership marker, reachable from the class so a caller checking
+    # model/migration agreement names the table it is checking. `ClassVar` is
+    # what keeps the declarative mapper from reading it as a column.
+    _TABLE_MARKER: ClassVar[str] = _INDEXER_STATE_TABLE_MARKER
+
+    # 64 characters is far beyond the three keys the CHECK admits; the bound
+    # exists so the primary key is a fixed-width index rather than open text.
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # Free text because the three values have three shapes: two canonical JSON
+    # documents and a decimal integer. Typing it further would mean a column
+    # per key, which is the singleton-row design this table exists instead of.
+    value: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        # Constrained in the database rather than only in Python: a key this
+        # table does not hold reads as *absent*, and absent is the state that
+        # makes the startup fingerprint check adopt the current configuration
+        # rather than refuse it. One mistyped key would therefore disable the
+        # guard permanently and silently. Resolved by 023 through
+        # `pg_constraint`, never by name — a same-named `CHECK (true)` would
+        # satisfy a name lookup while enforcing nothing.
+        CheckConstraint(
+            "key IN ('embedding_fingerprint', 'fts_fingerprint', "
+            "'embed_rotation_cursor')",
+            name="ck_indexer_state_key",
+        ),
+        {"comment": _INDEXER_STATE_TABLE_MARKER},
     )
 
 

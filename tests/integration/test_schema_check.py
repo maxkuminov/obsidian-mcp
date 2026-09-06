@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "022"
+HEAD_REVISION = "023"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -4064,3 +4064,407 @@ def test_downgrade_022_refuses_a_column_it_did_not_create():
         assert result.returncode != 0
         assert "022's comment marker" in result.stdout + result.stderr
         assert column_shape(url, "notes_metadata", "links_truncated") is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 023 — indexer_state and notes_metadata.chunks_truncated (#206, #202)
+# ══════════════════════════════════════════════════════════════════════════
+
+INDEXER_STATE_TABLE_MARKER = "state about the index as a whole (023_indexer_state)"
+INDEXER_STATE_CHECK_MARKER = "closed key set for indexer_state (023_indexer_state)"
+CHUNKS_TRUNCATED_MARKER = "chunk-cap truncation marker (023_indexer_state)"
+
+STATE_CHECK_NAME = "ck_indexer_state_key"
+
+# What PostgreSQL 16 prints for the key predicate migration 023 (and the
+# model's `CheckConstraint`) declares. Measured on a freshly migrated database
+# rather than hand-written, so it is the server's own normalization of
+# `IN (...)` — casts made explicit, rewritten to `= ANY (...)`. The migration
+# derives the same string at runtime from a scratch TEMP table instead of
+# hard-coding it; this constant is the pin that tells us if either side moves.
+#
+# It is asserted here and nowhere else: `alembic check` does not compare CHECK
+# predicates **at all**, so a `CHECK (true)` of this name would satisfy every
+# name-level lookup while enforcing nothing — and what it would stop enforcing
+# is the closed key set that keeps a mistyped key from reading as "no
+# fingerprint stored", which is the state that makes the startup guard adopt
+# instead of refuse.
+CANONICAL_STATE_CHECK = (
+    "CHECK (((key)::text = ANY "
+    "((ARRAY['embedding_fingerprint'::character varying, "
+    "'fts_fingerprint'::character varying, "
+    "'embed_rotation_cursor'::character varying])::text[])))"
+)
+
+
+def indexer_state_table_comment(url):
+    return fetchval(
+        url,
+        "SELECT obj_description(c.oid, 'pg_class') FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE c.relname = 'indexer_state' AND c.relkind = 'r' "
+        "  AND n.nspname = ANY (current_schemas(false))",
+    )
+
+
+def indexer_state_checks(url):
+    """Every CHECK on `indexer_state`, `(definition, convalidated, comment)`.
+
+    Read through `conrelid`/`contype` rather than by name, exactly as the
+    migration does and for the same reason.
+    """
+    rows = fetch(
+        url,
+        "SELECT pg_get_constraintdef(oid) AS def, convalidated, "
+        "       obj_description(oid, 'pg_constraint') AS comment "
+        "FROM pg_constraint "
+        "WHERE conrelid = 'indexer_state'::regclass AND contype = 'c' "
+        "ORDER BY conname",
+    )
+    return [
+        (" ".join(r["def"].split()), r["convalidated"], r["comment"]) for r in rows
+    ]
+
+
+def indexer_state_pk_columns(url):
+    return fetchval(
+        url,
+        "SELECT (SELECT array_agg(a.attname ORDER BY k.ord) "
+        "          FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          JOIN pg_attribute a ON a.attrelid = c.conrelid "
+        "                             AND a.attnum = k.attnum) "
+        "FROM pg_constraint c "
+        "WHERE c.conrelid = 'indexer_state'::regclass AND c.contype = 'p'",
+    )
+
+
+def chunks_truncated_comment(url):
+    return fetchval(
+        url,
+        "SELECT col_description(a.attrelid, a.attnum) FROM pg_attribute a "
+        "WHERE a.attrelid = 'notes_metadata'::regclass "
+        "  AND a.attname = 'chunks_truncated'",
+    )
+
+
+def seed_pre_023_notes(url):
+    """Two notes embedded before the chunk cap existed: no marker column."""
+    insert_user(url, 1, "alice")
+    sql(
+        url,
+        "INSERT INTO notes_metadata "
+        "(id, user_id, file_path, title, content_hash, embedded_content_hash) "
+        "VALUES (1, 1, 'A.md', 'A', 'hash-a', 'hash-a'), "
+        "       (2, 1, 'B.md', 'B', 'hash-b', NULL)",
+    )
+
+
+def test_023_creates_both_units_typed_marked_and_enforced_on_a_fresh_db():
+    with throwaway_db("schema_is_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+
+        # --- the table ---
+        assert fetchval(url, "SELECT to_regclass('indexer_state')") is not None
+        assert indexer_state_table_comment(url) == INDEXER_STATE_TABLE_MARKER
+        assert list(indexer_state_pk_columns(url) or []) == ["key"], (
+            "the primary key must be on `key`: two rows claiming one key would "
+            "make `get_state` return an arbitrary one of them"
+        )
+
+        for column, expected in (
+            ("key", (True, "character varying(64)", None)),
+            ("value", (True, "text", None)),
+            ("updated_at", (True, "timestamp with time zone", "now()")),
+        ):
+            shape = column_shape(url, "indexer_state", column)
+            assert shape is not None, f"indexer_state.{column} is missing"
+            assert (shape[0], shape[1], shape[2]) == expected, (
+                f"indexer_state.{column} is {shape}, not {expected}"
+            )
+
+        checks = indexer_state_checks(url)
+        assert len(checks) == 1, f"expected exactly one CHECK, found {checks}"
+        definition, validated, comment = checks[0]
+        assert definition == CANONICAL_STATE_CHECK, definition
+        assert validated is True, (
+            "a NOT VALID CHECK enforces new rows having never checked the "
+            "existing ones"
+        )
+        assert comment == INDEXER_STATE_CHECK_MARKER
+
+        # --- the column ---
+        shape = column_shape(url, "notes_metadata", "chunks_truncated")
+        assert shape is not None, "notes_metadata.chunks_truncated is missing"
+        attnotnull, coltype, coldefault = shape
+        assert attnotnull is True, (
+            "the marker must be NOT NULL — a nullable column would let the "
+            "vector tools read NULL as 'not truncated' for a note whose "
+            "embedding IS capped, presenting a match against the head of a "
+            "2 MB note as a match against the note"
+        )
+        assert coltype == "boolean"
+        assert coldefault == "false", (
+            "the server default is what makes the ADD COLUMN metadata-only on "
+            "a table carrying a tsvector and two GIN indexes, and what gives "
+            "every pre-existing row the one correct value"
+        )
+        assert chunks_truncated_comment(url) == CHUNKS_TRUNCATED_MARKER
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+        assert "No new upgrade operations detected" in check.stdout
+
+
+def test_023_rejects_a_key_outside_the_closed_set():
+    """The CHECK is not tidiness. A key this table does not hold reads as
+    *absent*, and absent is the state that makes the startup fingerprint check
+    adopt the current configuration rather than refuse it — so one mistyped key
+    would disable, permanently and silently, the guard that exists to stop a
+    same-dimension model swap from mixing two vector spaces in one column."""
+    with throwaway_db("schema_is_key") as url:
+        sql(
+            url,
+            "INSERT INTO indexer_state (key, value) "
+            "VALUES ('embedding_fingerprint', '{\"v\":1}')",
+        )
+        with pytest.raises(asyncpg.exceptions.CheckViolationError):
+            sql(
+                url,
+                "INSERT INTO indexer_state (key, value) "
+                "VALUES ('embeding_fingerprint', '{\"v\":1}')",
+            )
+        with pytest.raises(asyncpg.exceptions.CheckViolationError):
+            sql(
+                url,
+                "UPDATE indexer_state SET key = 'something_else' "
+                "WHERE key = 'embedding_fingerprint'",
+            )
+        assert fetchval(url, "SELECT count(*) FROM indexer_state") == 1
+
+
+def test_023_writes_no_state_row_and_backfills_nothing():
+    """Deriving a fingerprint at migration time would assert that the stored
+    vectors were produced by the configuration the `.env` carries *now* —
+    exactly the claim the fingerprint exists to test, and 016's
+    reassignment-lag mistake in a new place. An absent fingerprint means
+    "unknown", which is the only true statement available here.
+
+    And every row that exists when 023 runs was embedded by a chunker with no
+    cap, which could not truncate, so `false` is the fact rather than a
+    placeholder. Neither `content_hash` (the move-detection key) nor
+    `embedded_content_hash` (the embed backlog's predicate) is disturbed."""
+    with throwaway_db("schema_is_backfill", revision="022") as url:
+        seed_pre_023_notes(url)
+        assert column_shape(url, "notes_metadata", "chunks_truncated") is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert fetchval(url, "SELECT count(*) FROM indexer_state") == 0
+        rows = fetch(
+            url,
+            "SELECT id, content_hash, embedded_content_hash, links_truncated, "
+            "       chunks_truncated "
+            "FROM notes_metadata ORDER BY id",
+        )
+        assert [tuple(r) for r in rows] == [
+            (1, "hash-a", "hash-a", False, False),
+            (2, "hash-b", None, False, False),
+        ]
+
+
+def test_rerunning_023_preserves_recorded_state():
+    """Stamp-back idempotence, the shape the gate itself performs: the
+    migration body genuinely re-executes. A fingerprint the application has
+    since adopted must survive it — an erased fingerprint reads as absent, and
+    absent means *adopt*, which would silently bless whatever is configured at
+    that moment — and so must a truncation the embed pass has recorded."""
+    with throwaway_db("schema_is_rerun", revision="022") as url:
+        seed_pre_023_notes(url)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        sql(
+            url,
+            "INSERT INTO indexer_state (key, value) VALUES "
+            "('embedding_fingerprint', '{\"model\":\"bge-m3\",\"v\":1}'), "
+            "('embed_rotation_cursor', '7')",
+        )
+        sql(url, "UPDATE notes_metadata SET chunks_truncated = true WHERE id = 1")
+
+        _harness.run_alembic(url, "stamp", "022", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        # Sorted in Python, not by the database: `ORDER BY key` is
+        # collation-dependent, and the container's default collation sorts
+        # `embedding_fingerprint` before `embed_rotation_cursor` because it
+        # ignores the underscore at the primary level. What this case is about
+        # is the rows surviving, not their order.
+        assert sorted(
+            tuple(r) for r in fetch(url, "SELECT key, value FROM indexer_state")
+        ) == [
+            ("embed_rotation_cursor", "7"),
+            ("embedding_fingerprint", '{"model":"bge-m3","v":1}'),
+        ]
+        assert fetchval(
+            url, "SELECT chunks_truncated FROM notes_metadata WHERE id = 1"
+        ) is True
+        assert fetchval(
+            url, "SELECT chunks_truncated FROM notes_metadata WHERE id = 2"
+        ) is False
+        assert indexer_state_table_comment(url) == INDEXER_STATE_TABLE_MARKER
+        assert chunks_truncated_comment(url) == CHUNKS_TRUNCATED_MARKER
+
+
+def test_023_refuses_a_table_of_unknown_provenance():
+    """013's philosophy: reconcile a database that demonstrably has our shape,
+    refuse to guess for one that does not. A same-named table somebody else
+    created is not the one startup reads its fingerprints out of."""
+    with throwaway_db("schema_is_foreign_table", revision="022") as url:
+        sql(
+            url,
+            "CREATE TABLE indexer_state (key varchar(64) PRIMARY KEY, "
+            "value text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now())",
+        )
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0, "023 should have refused"
+        combined = result.stdout + result.stderr
+        assert "023's table comment marker" in combined, combined
+        assert alembic_version(url) == "022", "nothing should have been recorded"
+        assert column_shape(url, "notes_metadata", "chunks_truncated") is None
+
+
+def test_023_refuses_an_impostor_constraint_under_the_right_name():
+    """The case `alembic check` is blind to and a name lookup cannot see: a
+    `CHECK (true)` carrying the expected name, on a table carrying the expected
+    marker. It satisfies every name-level test while enforcing nothing, and
+    what it stops enforcing is the closed key set."""
+    with throwaway_db("schema_is_impostor_check", revision="022") as url:
+        sql(
+            url,
+            "CREATE TABLE indexer_state (key varchar(64) PRIMARY KEY, "
+            "value text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(), "
+            f"CONSTRAINT {STATE_CHECK_NAME} CHECK (true))",
+        )
+        sql(
+            url,
+            "COMMENT ON TABLE indexer_state IS "
+            f"'{INDEXER_STATE_TABLE_MARKER}'",
+        )
+        sql(
+            url,
+            f"COMMENT ON CONSTRAINT {STATE_CHECK_NAME} ON indexer_state IS "
+            f"'{INDEXER_STATE_CHECK_MARKER}'",
+        )
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0, "023 should have refused"
+        combined = result.stdout + result.stderr
+        assert "its CHECK is" in combined, combined
+        assert alembic_version(url) == "022"
+        # And the impostor is untouched — nothing was adopted or repaired.
+        assert indexer_state_checks(url) == [
+            ("CHECK (true)", True, INDEXER_STATE_CHECK_MARKER)
+        ]
+
+
+def test_023_refuses_an_unmarked_constraint_on_an_otherwise_correct_table():
+    with throwaway_db("schema_is_unmarked_check", revision="022") as url:
+        sql(
+            url,
+            "CREATE TABLE indexer_state (key varchar(64) PRIMARY KEY, "
+            "value text NOT NULL, updated_at timestamptz NOT NULL DEFAULT now(), "
+            f"CONSTRAINT {STATE_CHECK_NAME} CHECK (key IN "
+            "('embedding_fingerprint', 'fts_fingerprint', "
+            "'embed_rotation_cursor')))",
+        )
+        sql(
+            url,
+            "COMMENT ON TABLE indexer_state IS "
+            f"'{INDEXER_STATE_TABLE_MARKER}'",
+        )
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0, "023 should have refused"
+        combined = result.stdout + result.stderr
+        assert "023's constraint marker" in combined, combined
+        assert alembic_version(url) == "022"
+
+
+def test_023_refuses_a_column_of_unknown_provenance():
+    """A nullable `chunks_truncated` somebody else created is not adoptable:
+    the vector tools read this column as whether that note's embedding covers
+    the whole note, and NULL read as `false` hides a capped note from an
+    agent."""
+    with throwaway_db("schema_is_foreign_column", revision="022") as url:
+        sql(
+            url,
+            "ALTER TABLE notes_metadata ADD COLUMN chunks_truncated BOOLEAN",
+        )
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0, "023 should have refused"
+        combined = result.stdout + result.stderr
+        assert "it is nullable" in combined, combined
+        assert "023's comment marker" in combined, combined
+        assert alembic_version(url) == "022", "nothing should have been recorded"
+        # The refusal is atomic across both units: the table 023 would have
+        # created is rolled back with it.
+        assert fetchval(url, "SELECT to_regclass('indexer_state')") is None
+
+
+def test_downgrade_023_drops_the_marked_units_and_upgrade_rebuilds_them():
+    with throwaway_db("schema_is_downgrade") as url:
+        _harness.run_alembic(url, "downgrade", "022", dimensions=DIM)
+        assert alembic_version(url) == "022"
+        assert fetchval(url, "SELECT to_regclass('indexer_state')") is None
+        assert column_shape(url, "notes_metadata", "chunks_truncated") is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert indexer_state_table_comment(url) == INDEXER_STATE_TABLE_MARKER
+        assert chunks_truncated_comment(url) == CHUNKS_TRUNCATED_MARKER
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_023_refuses_a_table_it_did_not_create():
+    """013's rule on the way back down: undo *this* migration, not delete
+    somebody else's table of the same name."""
+    with throwaway_db("schema_is_downgrade_foreign_table") as url:
+        sql(
+            url,
+            "COMMENT ON TABLE indexer_state IS 'somebody else made this'",
+        )
+        result = _harness.run_alembic(
+            url, "downgrade", "022", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "023's comment marker" in result.stdout + result.stderr
+        assert fetchval(url, "SELECT to_regclass('indexer_state')") is not None
+        # Per-unit all-or-nothing: the refusal rolls the whole downgrade back,
+        # so the column 023 *did* create is still there too.
+        assert column_shape(url, "notes_metadata", "chunks_truncated") is not None
+
+
+def test_downgrade_023_refuses_a_column_it_did_not_create():
+    with throwaway_db("schema_is_downgrade_foreign_column") as url:
+        sql(
+            url,
+            "COMMENT ON COLUMN notes_metadata.chunks_truncated IS "
+            "'somebody else made this'",
+        )
+        result = _harness.run_alembic(
+            url, "downgrade", "022", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "023's comment marker" in result.stdout + result.stderr
+        assert column_shape(url, "notes_metadata", "chunks_truncated") is not None
+        assert fetchval(url, "SELECT to_regclass('indexer_state')") is not None

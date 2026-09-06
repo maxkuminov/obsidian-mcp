@@ -48,6 +48,43 @@ MAX_NOTE_BYTES = 10 * 1024 * 1024  # 10 MB
 # real note, including a generated MOC.
 MAX_LINKS_PER_NOTE = 10_000
 
+# Chunks embedded and stored for a single note. Unbounded, the arithmetic is
+# `MAX_NOTE_BYTES` (10 MiB) ÷ `CHUNK_SIZE` (512 tokens, ~4 characters each) ≈
+# 5,120 chunks for one legal note, each of them one sequential, 30 s-bounded
+# provider call — and the embed backlog has no LIMIT, so re-editing one such
+# note keeps every later tenant's notes out of the index indefinitely.
+#
+# 1,000 chunks is ~2 MB of cleaned text, far beyond any real note. The cap is
+# applied in DOCUMENT order (see `chunk_text_bounded`) so a note keeps its head
+# rather than an arbitrary window, and a capped note is a *declared*
+# degradation: the first N chunks are embedded, the note **is** certified (an
+# uncertified note is re-selected by the backlog for ever, which is #127's
+# permanent burn), `notes_metadata.chunks_truncated` is set, one ERROR line is
+# logged after the certifying commit, and both vector paths say
+# `embedding_truncated: true`.
+#
+# **Accepted worst case, written down rather than discovered:** this cap times
+# the provider's per-call bound is one note's embedding time — 1,000 × 30 s ≈
+# 8.3 hours on a provider answering every call at the very edge of its timeout
+# — and that is the delay one tenant's last note can add to the next tenant,
+# because the per-user budget is evaluated only *between* notes and never
+# preempts one that has started. It is a pathological-provider figure, not a
+# steady-state one, and the alternative is an aggregate deadline, which is
+# exactly the construct #127 removed because it produced a note the pass could
+# never finish. Lowering the cap trades that bound against how much of a large
+# note is semantically searchable at all.
+#
+# In the embedding fingerprint (`src/services/index_state.py`): changing it
+# changes what a note's stored vector set *is*, so a change is a declared reset
+# rather than a silent under-embedding.
+MAX_CHUNKS_PER_NOTE = 1_000
+
+# Characters of a provider exception's message carried on an `EmbedNoteFailure`.
+# Truncated at capture, not at the run row: `MAX_RUN_ERROR_CHARS` (4,000) bounds
+# the *whole* `indexer_runs.error` text, and a single provider traceback can
+# exceed it on its own and evict the stage labels beside it.
+MAX_EMBED_FAILURE_MESSAGE_CHARS = 200
+
 # Longest `pattern` `list_files` will accept. `fnmatch.translate` +
 # `re.compile` is linear at ~10 µs/char and runs on the event loop, so a
 # 500 KB pattern was a 5.4 s stall for every other tenant; the transport body
@@ -188,10 +225,39 @@ class Settings(BaseSettings):
     index_interval_seconds: int = Field(300, ge=1)
     embedding_model: str = "bge-m3"
     embedding_dimensions: int = Field(1024, ge=1, le=16000)
-    chunk_size: int = Field(512, ge=1)  # bge-m3 design point
+    # bge-m3 design point. Must stay strictly greater than `chunk_overlap`:
+    # the chunker steps by `max(char_size - char_overlap, 1)`, so at equality
+    # the step collapses to one character and `MAX_CHUNKS_PER_NOTE` stops
+    # bounding a *note* and starts bounding ~3 KB of prose. Enforced by
+    # `_reject_overlap_at_or_above_chunk_size` below.
+    chunk_size: int = Field(512, ge=1)
     # Overlap disabled: 2025 chunking benchmarks show no measurable retrieval
-    # benefit; some research finds zero overlap optimal.
+    # benefit; some research finds zero overlap optimal. Must stay strictly
+    # below `chunk_size` — see the note there and the validator below; the #10
+    # infinite-loop guard turns the equal case from a hang into a quiet
+    # catastrophe, which is not the same as making it sane.
     chunk_overlap: int = Field(0, ge=0)
+    # Per-user bounds on one pass's *embed stage*, so one tenant's backlog
+    # cannot hold every later tenant's new and edited notes out of the index.
+    # `0` disables either. Both are checked only at a note boundary, after at
+    # least one note, and **only when the pass serves more than one active user
+    # scope** — in single-user mode, and in a multi-user deployment with one
+    # active user, there is no other tenant to be fair to and a budget would
+    # turn a first index of a few thousand notes into several passes separated
+    # by five-minute sleeps for no benefit.
+    #
+    # The chunk budget debits chunks *submitted* to the provider, never chunks
+    # stored: a budget debited by stored chunks is not debited at all when the
+    # provider fails, so a tenant whose notes all fail would consume the whole
+    # pass, every pass, without ever reaching its bound — the starvation the
+    # budget exists to stop, surviving inside it.
+    #
+    # A budget stop is not a failure: it writes nothing to `indexer_runs.error`
+    # and logs once per user per pass. The operator-visible signal for a tenant
+    # permanently over budget is the dashboard's pending count.
+    embed_chunk_budget_per_user: int = Field(5000, ge=0)
+    # 300 s matches one `INDEX_INTERVAL_SECONDS`.
+    embed_time_budget_seconds_per_user: int = Field(300, ge=0)
     # Path globs (fnmatch) skipped by the embedder — files remain
     # keyword-searchable but produce no vectors. Default skips Excalidraw
     # plugin files (drawings + downloaded scripts) which contain serialized
@@ -576,6 +642,31 @@ class Settings(BaseSettings):
         if self.embedding_provider == "openai" and not (self.openai_api_key or "").strip():
             raise ValueError(
                 "OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _reject_overlap_at_or_above_chunk_size(self) -> "Settings":
+        """`CHUNK_OVERLAP` must be strictly less than `CHUNK_SIZE`.
+
+        The chunker steps by `max(char_size - char_overlap, 1)` — the #10
+        infinite-loop guard. At `CHUNK_OVERLAP == CHUNK_SIZE` that step
+        collapses to **one character**, so ~3 KB of prose produces ~3,000
+        chunks and every ordinary note in the vault hits
+        `MAX_CHUNKS_PER_NOTE`: a configuration typo silently truncating the
+        embedding of the whole vault, with the cap's ERROR line firing
+        thousands of times. Above it the step is the same floor with the
+        arithmetic already nonsensical. The guard turned a hang into a quiet
+        catastrophe; it did not make the configuration sane, so the
+        configuration is refused here instead.
+        """
+        if self.chunk_overlap >= self.chunk_size:
+            raise ValueError(
+                f"CHUNK_OVERLAP ({self.chunk_overlap}) must be strictly less "
+                f"than CHUNK_SIZE ({self.chunk_size}). At or above it the "
+                "chunker's step collapses to one character, so a few kilobytes "
+                "of prose becomes thousands of chunks and every note hits "
+                f"MAX_CHUNKS_PER_NOTE ({MAX_CHUNKS_PER_NOTE})."
             )
         return self
 
