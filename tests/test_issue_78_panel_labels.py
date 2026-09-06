@@ -444,9 +444,12 @@ def test_keyword_search_is_logged_under_its_registered_name():
     registered = server.keyword_search.__name__
     assert registered == "keyword_search"
 
+    # The decorator is multi-line since the query cap joined it (#194), so the
+    # pin is on the *name argument* rather than on the call's first line.
     src = inspect.getsource(tools)
-    assert '@_tracked("keyword_search"' in src
+    assert '"keyword_search",' in src
     assert '@_tracked("search_notes"' not in src
+    assert '"search_notes",' not in src
 
 
 def test_usage_detail_still_renders_historical_search_notes_rows():

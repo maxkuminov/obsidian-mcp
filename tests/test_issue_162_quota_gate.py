@@ -176,11 +176,16 @@ def test_an_over_quota_call_is_refused_before_the_body():
     )
     day_after = _dt.datetime.now(_dt.timezone.utc).date()
 
+    # The prose is unchanged and the sentinel line is **appended** (#194), so
+    # the refusal still *starts* with exactly what #162 wrote — which is the
+    # additive property the rate-limit change promised for all three
+    # pre-existing pre-body refusals.
     expected = {
         quotas.quota_refusal_message(5, quotas.reset_instant(d))
         for d in {day_before, day_after}
     }
-    assert result in expected
+    assert any(result.startswith(prose) for prose in expected)
+    assert result.splitlines()[-1].startswith("MCP-REFUSAL ")
     assert "ran:" not in result, "the tool body ran anyway"
     assert len(_admissions(spy)) == 1
 

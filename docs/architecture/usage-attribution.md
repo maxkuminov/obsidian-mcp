@@ -173,15 +173,43 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   string; a new value costs nothing and a shared one mis-measures in a
   direction nobody can see from the page.
 
-  **The register, as of #199.** Pre-body: `no_vault_assigned`,
+  **The register, as of #194.** Pre-body: `no_vault_assigned`,
   `argument_not_encodable`, the three vault-root quarantine markers
   `vault_root_overlap`, `vault_root_unexaminable` and `vault_root_not_ready`
-  (#199), and the boolean `over_quota` (#162). Post-body:
+  (#199), the boolean `over_quota` (#162), and the rate controls' two —
+  `rate_limited` (either per-principal token bucket, with `rate_limit_scope`
+  saying which) and `argument_too_long` (the declarative argument length cap),
+  both written by gates that run *above* the tool body and neither of which
+  did any work at all (#188, #194). Post-body:
   `vault_assignment_changed`, `vault_confirmation_unavailable`,
   `vault_anchor_lost_at_publish`, `find_related`'s two operational
   failures, `related_source_not_found` and `related_source_not_embedded`, and
   the two the security-event change added — `permission_denied` (#192) and
-  `tool_exception` (#193).
+  `tool_exception` (#193) — and `provider_input_rejected` (#194), which is
+  post-body **although its caller-facing code is `argument_too_long`**: the
+  body ran, resolved a vault and made a network round trip before the
+  provider could reject the input, so enumerating it as a refusal would drop a
+  real provider call out of the percentiles. That the operator-facing marker
+  and the caller-facing code differ here is the classification rule applied,
+  not an oversight: they answer different questions.
+
+  Two `params` keys travel with `rate_limited`: `rate_limit_scope`, a
+  **string** no reader casts (`principal` or `principal_write`, so a
+  write-bucket refusal is never attributed to the general bucket), and
+  `suppressed`, an **integer** read with a *guarded* cast. `suppressed` exists
+  because `rate_limited` rows are **coalesced**: at most one row is written per
+  `(principal, tool, marker, scope)` per `MCP_REFUSAL_LOG_INTERVAL_SECONDS`,
+  and every reader must take a row to stand for `1 + suppressed` refusals
+  rather than for one. The count is exact only after a flush — the indexer tick
+  and the lifespan shutdown both drive one — and an abrupt kill loses at most
+  one interval per key, which is the deliberate trade against a durable write
+  per refusal, the amplification the coalescer exists to stop. A deferred flush
+  writes from a **template captured when the window opened**, so it reads no
+  ContextVar and needs no live credential; a row whose foreign key no longer
+  resolves lands through the same 23503 recovery below. `argument_too_long` is
+  deliberately **not** coalesced: it is refused below the general bucket, so
+  its rate is already bounded by that bucket and a second mechanism would buy
+  nothing.
   `related_source_not_found` and `related_source_not_embedded` were classified
   by the rule above and land on the post-body side: the body ran, resolved the vault and queried the database before
   either branch could be reached, so enumerating them as refusals would drop a

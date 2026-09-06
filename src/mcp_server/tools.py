@@ -5,6 +5,7 @@ import copy
 import errno
 import inspect
 import logging
+import math
 import mimetypes
 import os
 import posixpath
@@ -28,6 +29,7 @@ from src.auth.session import (
     ACTOR_LABEL_MAX as _ACTOR_LABEL_MAX,
     ACTOR_REF_MAX as _ACTOR_REF_MAX,
     actor_columns,
+    current_principal,
     current_user_id,
 )
 from src.config import (
@@ -35,6 +37,7 @@ from src.config import (
     MAX_LINKS_PER_NOTE,
     MAX_MOVE_REWRITE_BYTES,
     MAX_NOTE_BYTES,
+    MAX_SEARCH_QUERY_CHARS,
     max_move_rewrite_sources,
     settings,
 )
@@ -53,7 +56,7 @@ from src.mcp_server.read_result import (
     screen_unrenderable,
 )
 from src.models.db import UsageLog
-from src.services import security_events, timing
+from src.services import rate_limits, refusals, security_events, timing
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
@@ -249,7 +252,31 @@ async def _insert_usage(values: dict) -> None:
 async def _log_usage(
     tool: str, params: dict, duration_ms: int, response_size: int
 ) -> bool:
-    """Write one `usage_logs` row, and do not lose it to a dangling credential.
+    """Write one `usage_logs` row for the request in flight.
+
+    The values are read from the request-scoped context variables here and
+    nowhere else; `write_usage_row` below owns the insert and its recovery, so
+    a caller that already *holds* the attribution — the refusal coalescer's
+    deferred flush, which by definition has no request context left — can land
+    a row through exactly the same path.
+    """
+    return await write_usage_row(
+        dict(
+            key_id=current_api_key_id.get(),
+            oauth_token_id=current_oauth_token_id.get(),
+            user_id=current_user_id.get(),
+            tool=tool,
+            params=params,
+            duration_ms=duration_ms,
+            response_size=response_size,
+            **_actor_columns(),
+        )
+    )
+
+
+async def write_usage_row(values: dict) -> bool:
+    """Insert one prepared `usage_logs` row, and do not lose it to a dangling
+    credential.
 
     A tool call can outlive its own credential: an operator revokes and deletes
     a key, or deletes an OAuth client, while a slow call is still running. The
@@ -278,16 +305,8 @@ async def _log_usage(
     and the row is missing". Every existing caller ignores the value and is
     unchanged.
     """
-    values = dict(
-        key_id=current_api_key_id.get(),
-        oauth_token_id=current_oauth_token_id.get(),
-        user_id=current_user_id.get(),
-        tool=tool,
-        params=params,
-        duration_ms=duration_ms,
-        response_size=response_size,
-        **_actor_columns(),
-    )
+    tool = values.get("tool")
+    subject = security_events.subject_for(user_id=values.get("user_id"))
     try:
         await _insert_usage(values)
         return True
@@ -300,7 +319,7 @@ async def _log_usage(
             # traceback would have carried the lot (design D2, D18).
             security_events.emit(
                 "usage_log_failed",
-                subject=_security_subject(),
+                subject=subject,
                 tool=tool,
                 reason="initial",
                 error_type=type(e).__name__,
@@ -311,7 +330,7 @@ async def _log_usage(
             retry["user_id"] = None
         security_events.emit(
             "usage_log_credential_gone",
-            subject=_security_subject(),
+            subject=subject,
             tool=tool,
             cleared_user_id=retry["user_id"] is None,
         )
@@ -322,7 +341,7 @@ async def _log_usage(
     except Exception as e:
         security_events.emit(
             "usage_log_failed",
-            subject=_security_subject(),
+            subject=subject,
             tool=tool,
             reason="after_clearing_fks",
             error_type=type(e).__name__,
@@ -347,10 +366,21 @@ def _truncate_params(params: dict) -> dict:
     }
 
 
-_NO_VAULT_MESSAGE = (
+#: The prose, unchanged since #66. Every `in` / `startswith` assertion written
+#: against it still holds, because the sentinel line below is **appended**.
+_NO_VAULT_PROSE = (
     "Error: no vault is assigned to this account, so no vault tool can run. "
     "Ask an administrator to assign a vault path to your user in the control "
     "panel."
+)
+
+#: What the caller actually receives: the prose plus the one machine-readable
+#: line every refusal raised inside `_tracked` now ends with. **No
+#: `retry_after_seconds`** — an unassigned vault is a fact about the account
+#: that no amount of waiting changes, and a number there would invite a loop
+#: that cannot end.
+_NO_VAULT_MESSAGE = refusals.render(
+    _NO_VAULT_PROSE, refusals.Refusal(code=refusals.NO_VAULT_ASSIGNED)
 )
 
 # Marker written into `usage_logs.params` for a call refused by the gate. It
@@ -610,6 +640,55 @@ _TOOL_EXCEPTION_MARKER = "tool_exception"
 # (see docs/architecture/usage-attribution.md, "the casts are unguarded").
 _OVER_QUOTA_MARKER = OVER_QUOTA_PARAM
 
+# ── The rate controls' three markers (#188, #194) ───────────────────────────
+#
+# Split by what an operator asks, which is the classification rule applied
+# rather than three names for one event: "is one agent too fast?", "did a
+# caller send something too big?" and "did the provider refuse what we sent?"
+# are answerable from the marker alone, without parsing a scope string.
+
+# **Pre-body.** Either token bucket; `rate_limit_scope` says which. The buckets
+# are the *first* gates in the decorator, so a row carrying this marker did
+# nothing at all — no vault resolution, no argument walk, no quota statement,
+# no body — and it belongs out of the latency percentiles, which is what the
+# pre-body predicate in `src/services/usage_stats.py` is for.
+_RATE_LIMITED_MARKER = "rate_limited"
+
+# **Pre-body.** The declarative argument length cap, refused beside the
+# unencodable-argument screen and therefore before the embedding call, the
+# `tsquery` parse and the quota statement.
+_ARGUMENT_TOO_LONG_MARKER = "argument_too_long"
+
+# **Post-body, and deliberately not in the pre-body predicate.** The embedding
+# provider rejected the input against *its own* token limit, which can only be
+# learned by asking it: the body ran, resolved a vault and made a network round
+# trip before this branch could be reached. Enumerating it as a refusal would
+# drop the slowest kind of call there is out of the percentiles — the same
+# classification error `vault_anchor_lost_at_publish` exists to record.
+#
+# The caller-facing *code* for this branch is `argument_too_long`, so the agent
+# sees one actionable failure mode for "the query was too large" whichever
+# limit applied. The marker and the code answering different questions is
+# permitted, and here it is deliberate.
+_PROVIDER_INPUT_REJECTED_MARKER = "provider_input_rejected"
+
+# `params` keys the rate controls add. Neither is one of the three reserved
+# keys the unguarded casts on `/admin/performance` read (`embed_ms`, `db_ms`,
+# `over_quota`).
+#
+# `rate_limit_scope` is a **string** and no reader casts it — it exists so a
+# write-bucket refusal is never attributed to the general one.
+_RATE_LIMIT_SCOPE_PARAM = "rate_limit_scope"
+# `suppressed` is an **integer** and is read with a *guarded* cast: a row
+# stands for `1 + suppressed` refusals, so a reader that summed rows would
+# undercount every coalesced window.
+_SUPPRESSED_PARAM = "suppressed"
+
+#: Which setting an over-long argument names in its refusal. Keyed by argument
+#: name rather than by the cap's value, because two caps may one day share a
+#: number and an operator needs the name of the thing they would change.
+_CHAR_CAP_SETTING_NAMES = {"query": "MAX_SEARCH_QUERY_CHARS"}
+
 
 class _TrashUnusable(Exception):
     """The trash probe failed for a reason that is not `UnsupportedFilesystem`.
@@ -688,19 +767,36 @@ async def _confirmed_publication(uid: int | None, publish):
 #: wording from a fixed table makes "the refusal names no other user, no other
 #: vault path and no note path" a property of this module rather than a
 #: property of every future `raise` site.
+#: **The prose is unchanged and the sentinel line is appended**, like every
+#: other pre-body refusal. Each carries its own `code` rather than folding onto
+#: `no_vault_assigned`, for the reason the markers are three and not one: an
+#: agent that can tell "this account has no vault" from "the server will not
+#: serve the vault it has" can say something useful to its operator. None
+#: carries a `retry_after_seconds` — no interval this module could name is
+#: honest for a misconfigured mount or an unpublished snapshot, and a wrong one
+#: would be a retry loop nobody scheduled.
 _QUARANTINE_REFUSALS: dict[type, tuple[str, str, str]] = {
     VaultRootOverlap: (
-        VAULT_ROOT_OVERLAP_ERROR,
+        refusals.render(
+            VAULT_ROOT_OVERLAP_ERROR,
+            refusals.Refusal(code=refusals.VAULT_ROOT_OVERLAP),
+        ),
         _VAULT_ROOT_OVERLAP_MARKER,
         "overlap",
     ),
     VaultRootUnexaminable: (
-        VAULT_ROOT_UNEXAMINABLE_ERROR,
+        refusals.render(
+            VAULT_ROOT_UNEXAMINABLE_ERROR,
+            refusals.Refusal(code=refusals.VAULT_ROOT_UNEXAMINABLE),
+        ),
         _VAULT_ROOT_UNEXAMINABLE_MARKER,
         "root_unexaminable",
     ),
     VaultRootNotReady: (
-        VAULT_ROOT_NOT_READY_ERROR,
+        refusals.render(
+            VAULT_ROOT_NOT_READY_ERROR,
+            refusals.Refusal(code=refusals.VAULT_ROOT_NOT_READY),
+        ),
         _VAULT_ROOT_NOT_READY_MARKER,
         "snapshot_not_ready",
     ),
@@ -851,7 +947,30 @@ async def _quota_admission_error() -> str | None:
     # midnight and tell an obedient agent to back off for nearly two days when
     # its quota was about to reset in milliseconds — a self-inflicted outage
     # produced entirely by reading the clock twice.
-    return quota_refusal_message(limit, decision.reset_at)
+    #
+    # `refusals.render` is idempotent, so this is the *fallback* rendering: the
+    # sentinel line belongs on the message either way, and the moment
+    # `quota_refusal_message` renders it from the admission's own recorded
+    # decision instant this call sees a message that already carries one and
+    # returns it untouched. Until then the interval is derived here, and the
+    # `max(1, …)` is what keeps the UTC-midnight case honest — a decision whose
+    # reset has already passed quotes one second, never a negative number and
+    # never the day-after-next's midnight.
+    prose = quota_refusal_message(limit, decision.reset_at)
+    decided_at = getattr(decision, "decided_at", None) or datetime.now(timezone.utc)
+    retry_after = max(
+        1, math.ceil((decision.reset_at - decided_at).total_seconds())
+    )
+    return refusals.render(
+        prose,
+        refusals.Refusal(
+            code=refusals.OVER_QUOTA,
+            scope="api_key",
+            limit=limit,
+            limit_unit=refusals.CALLS_PER_DAY,
+            retry_after_seconds=retry_after,
+        ),
+    )
 
 
 def _response_size(result) -> int:
@@ -949,9 +1068,12 @@ def _unencodable_argument_error(name: str) -> str:
     Quoting it back is the whole problem: the argument is precisely the one
     that cannot be encoded into the response carrying the complaint.
     """
-    return (
+    return refusals.render(
         f"Argument '{name}' is not valid UTF-8: it contains an unpaired "
-        "surrogate code point. Re-send it as UTF-8 text."
+        "surrogate code point. Re-send it as UTF-8 text.",
+        # No retry interval: the argument's bytes are the problem, and they do
+        # not improve while the caller waits.
+        refusals.Refusal(code=refusals.ARGUMENT_NOT_ENCODABLE),
     )
 
 
@@ -1026,11 +1148,142 @@ async def _record_tool_failure(
         )
 
 
+def _bucket_admission(write_class: bool) -> tuple[str, int] | None:
+    """`(scope, retry_after_seconds)` for the bucket that refused, or `None`.
+
+    Two buckets, because velocity and destruction are different questions. The
+    general one bounds the rate at which *any* work is created; the write one
+    halves that for the eight tools that change vault bytes. Neither bounds
+    totality — 120 deletes a minute empties this vault in about twenty minutes
+    — which is what the daily quota is for, and only for the credentials it
+    reaches.
+
+    The general bucket is charged first and its token is **spent** even when
+    the write bucket then refuses: a token refills, and the refusal itself is
+    work the server performed.
+
+    A caller with no principal — sandbox mode, or a direct in-process caller —
+    reads `None` and is exempt from both, the same shape as the quota gate's
+    "a limit with no key is exempt rather than a crash".
+    """
+    principal = current_principal.get()
+    admitted, retry_after = rate_limits.take(principal, refusals.SCOPE_PRINCIPAL)
+    if not admitted:
+        return refusals.SCOPE_PRINCIPAL, retry_after
+    if write_class:
+        admitted, retry_after = rate_limits.take(
+            principal, refusals.SCOPE_PRINCIPAL_WRITE
+        )
+        if not admitted:
+            return refusals.SCOPE_PRINCIPAL_WRITE, retry_after
+    return None
+
+
+def _rate_limited_message(scope: str, retry_after: int) -> str:
+    """The refusal a rate-limited caller receives, prose plus sentinel line.
+
+    It says what was *not* consumed, because the reader is an agent deciding
+    what to do next: a refused call ran no body and spent no daily quota slot,
+    so retrying after the quoted interval is exactly as good as the original
+    call would have been.
+    """
+    limit = rate_limits.bucket_limit(scope)
+    which = "write" if scope == refusals.SCOPE_PRINCIPAL_WRITE else "general"
+    prose = (
+        f"Error: this credential exceeded its {which} rate limit of {limit} "
+        f"calls per minute, so the call was refused before it ran. Nothing "
+        f"was read, written, or counted against the daily quota. Retry in "
+        f"{retry_after} seconds, or slow the calling loop down."
+    )
+    return refusals.render(
+        prose,
+        refusals.Refusal(
+            code=refusals.RATE_LIMITED,
+            scope=scope,
+            limit=limit,
+            limit_unit=refusals.CALLS_PER_MINUTE,
+            retry_after_seconds=retry_after,
+        ),
+    )
+
+
+def _rate_refusal_template(tool_name: str, params: dict, scope: str) -> dict:
+    """The complete row a coalescing window will write, captured when it opens.
+
+    Everything the row needs, resolved **now**: the owner, both credential ids,
+    the denormalised actor triple, the tool, the marker, the scope and the
+    bounded arguments. That is what lets a deferred flush read no
+    request-scoped context variable and depend on no live credential — by the
+    time the tick or the shutdown flush runs, the request is long gone and the
+    key may have been deleted, and `write_usage_row`'s existing 23503 recovery
+    (clear the foreign keys, keep the `actor_*` columns) is what lands the row
+    anyway.
+
+    `duration_ms` and `response_size` are zero because they are meaningless for
+    a call that never ran; the pre-body predicate keeps such rows out of the
+    latency aggregates regardless.
+    """
+    return dict(
+        key_id=current_api_key_id.get(),
+        oauth_token_id=current_oauth_token_id.get(),
+        user_id=current_user_id.get(),
+        tool=tool_name,
+        params={
+            **params,
+            "error": _RATE_LIMITED_MARKER,
+            _RATE_LIMIT_SCOPE_PARAM: scope,
+        },
+        duration_ms=0,
+        response_size=0,
+        **_actor_columns(),
+    )
+
+
+def _argument_too_long_error(name: str, length: int, cap: int) -> str:
+    """The over-long-argument refusal. **Never echoes the argument.**
+
+    Quoting it back would be the #149 discipline broken by the very screen that
+    exists to enforce it — and an 8 KB argument quoted into a tool result is 8
+    KB of the caller's context spent on repeating what it just sent. The
+    setting is named so an operator reading the agent's transcript knows what
+    they would change.
+    """
+    setting = _CHAR_CAP_SETTING_NAMES.get(name)
+    named = f" ({setting})" if setting else ""
+    prose = (
+        f"Error: argument '{name}' is {length} characters, above the limit of "
+        f"{cap}{named}. The call was refused before it ran and the argument is "
+        "not echoed back. Send a shorter one."
+    )
+    return refusals.render(
+        prose,
+        # No retry interval: re-sending the same argument fails identically,
+        # however long the caller waits. What fixes it is a shorter argument.
+        refusals.Refusal(
+            code=refusals.ARGUMENT_TOO_LONG,
+            scope="argument",
+            limit=cap,
+            limit_unit=refusals.CHARACTERS,
+        ),
+    )
+
+
+def _first_over_long_argument(bound, caps: dict[str, int]) -> tuple[str, int] | None:
+    """`(name, length)` of the first argument over its declared cap, or None."""
+    for name, cap in caps.items():
+        value = bound.arguments.get(name)
+        if isinstance(value, str) and len(value) > cap:
+            return name, len(value)
+    return None
+
+
 def _tracked(
     tool_name: str,
     param_keys: list[str],
     transforms: dict | None = None,
     refusal_result=None,
+    write_class: bool = False,
+    arg_char_caps: dict[str, int] | None = None,
 ):
     """Decorator that times the call and logs it to usage_logs.
 
@@ -1050,8 +1303,32 @@ def _tracked(
     screen and the quota gate (#162) reach the same branch, so a structured
     tool refuses over quota in its own shape rather than by breaking the wire
     format.
+
+    `write_class` marks a tool that changes vault bytes, so it must pass the
+    per-principal **write** bucket in addition to the general one. Eight tools
+    carry it — the five note tools, `write_file`, `delete_file` and
+    `import_from_url` — because those are the calls that amplify into the next
+    indexer pass. `PUT /transfer/upload` writes vault bytes without being a
+    tool call at all and consumes the same bucket at redemption, in
+    `src/transfer/routes.py`; bounding only the tools would leave the write
+    rate escapable by minting capabilities and redeeming them.
+
+    `arg_char_caps` maps an argument name to the longest string this tool will
+    accept for it, refused **pre-body** — before the embedding call, the
+    `tsquery` parse, any search statement and the quota gate. Declarative and
+    beside the unencodable-argument screen on purpose: a generic argument
+    screen already lives there, and auditing each interpolation one at a time
+    is how the #149 class stayed open for two audit rounds.
+
+    **The gate order is L2 → L3 → L4 → L5 → L6 → body** — general bucket,
+    write bucket, vault admission, the two argument screens, daily quota, and
+    only then the tool. The buckets are first because they are the only gate
+    that is pure arithmetic; the quota stays **last** because it is the only
+    gate that consumes something durable, and nothing durable may be spent by a
+    call that does not run.
     """
     transforms = transforms or {}
+    arg_char_caps = arg_char_caps or {}
 
     def decorator(fn):
         sig = inspect.signature(fn)
@@ -1095,29 +1372,108 @@ def _tracked(
                     params = {}
                 return _truncate_params(params)
 
+            # Whether this call writes its own `usage_logs` row. False for
+            # exactly one case: a rate refusal folded into an already-open
+            # coalescing window, where the whole point is that it issues no
+            # statement of any kind. Its count lands on the next row that key
+            # writes, or on the tick / shutdown flush.
+            log_row = True
             try:
-                # Admission gate: a caller with no resolvable vault root never
-                # reaches the tool body, including the DB-only ones. The
-                # refusal is still logged, like any other tool error.
-                refusal = _vault_admission_error()
-                # **The refusal names its own marker.** The gate has four
-                # reasons now — no assignment, and the three vault-root
-                # quarantine reasons (#199) — and each is a different fact an
-                # operator acts on differently, so each gets its own value in
-                # `usage_logs.params["error"]`. A plain `str` is the
-                # no-assignment refusal, which keeps the historical default
-                # and keeps a monkeypatched gate returning a bare message
-                # working.
-                extra = (
-                    {"error": getattr(refusal, "marker", _NO_VAULT_MARKER)}
-                    if refusal is not None
-                    else {}
-                )
+                refusal = None
+                extra: dict = {}
+
+                # ── L2 and L3: the two per-principal token buckets, the first
+                # gates in the decorator (design D3).
+                #
+                # First because they are the only gate that is pure arithmetic
+                # — one dictionary lookup and some floats, no statement, no
+                # session checkout, no lock and no `await` between the read and
+                # the write — so the flood we most want to shed is shed before
+                # anything touches a cache, an argument tree or the database.
+                #
+                # Above the vault gate, deliberately: a rate-refused call never
+                # resolves a vault root, and it reveals nothing about the vault
+                # by not doing so, because its content depends only on the
+                # caller's own request rate.
+                #
+                # A token is not a quota slot. A token refills, so spending one
+                # on a call a later gate refuses is correct — the refusal is
+                # itself work. The daily quota keeps its #162 position as the
+                # last pre-body gate, so a call refused here consumes no daily
+                # slot.
+                bucket = _bucket_admission(write_class)
+                if bucket is not None:
+                    scope, retry_after = bucket
+                    refusal = _rate_limited_message(scope, retry_after)
+                    security_events.emit(
+                        "tool_refused_rate_limited",
+                        subject=_security_subject(),
+                        tool=tool_name,
+                        reason=scope,
+                        limit=rate_limits.bucket_limit(scope),
+                        user_id=current_user_id.get(),
+                        key_id=current_api_key_id.get(),
+                        oauth_token_id=current_oauth_token_id.get(),
+                    )
+                    # Recorded through the coalescer, because a rate refusal
+                    # arrives at the caller's *arrival* rate — precisely the
+                    # rate nothing else bounds — so an uncoalesced row would
+                    # make "generate database writes" the cheapest thing an
+                    # agent could do. The template is built only when a window
+                    # opens or rolls over.
+                    def refusal_template():
+                        # Guarded for the telemetry tail's reason: a
+                        # `transforms` entry that raises on the value it was
+                        # given must not turn a *refusal* into an exception.
+                        # A row with no arguments is a worse row; a refusal
+                        # that became a traceback is a worse bug.
+                        try:
+                            params = named_params()
+                        except Exception:  # noqa: BLE001 - never fail a refusal
+                            params = {}
+                        return _rate_refusal_template(tool_name, params, scope)
+
+                    suppressed = rate_limits.record_rate_refusal(
+                        current_principal.get(),
+                        tool_name,
+                        _RATE_LIMITED_MARKER,
+                        scope,
+                        refusal_template,
+                    )
+                    if suppressed is None:
+                        log_row = False
+                    else:
+                        extra = {
+                            "error": _RATE_LIMITED_MARKER,
+                            _RATE_LIMIT_SCOPE_PARAM: scope,
+                            _SUPPRESSED_PARAM: suppressed,
+                        }
+
                 if refusal is None:
-                    # Second admission gate, same altitude: an argument that
-                    # cannot be encoded as UTF-8 never reaches a tool body,
-                    # where quoting it back into an error message would make
-                    # the MCP layer's serialization raise.
+                    # L4 — admission gate: a caller with no resolvable vault
+                    # root never reaches the tool body, including the DB-only
+                    # ones. The refusal is still logged, like any other tool
+                    # error.
+                    refusal = _vault_admission_error()
+                    # **The refusal names its own marker.** The gate has four
+                    # reasons now — no assignment, and the three vault-root
+                    # quarantine reasons (#199) — and each is a different fact
+                    # an operator acts on differently, so each gets its own
+                    # value in `usage_logs.params["error"]`. A plain `str` is
+                    # the no-assignment refusal, which keeps the historical
+                    # default and keeps a monkeypatched gate returning a bare
+                    # message working.
+                    extra = (
+                        {"error": getattr(refusal, "marker", _NO_VAULT_MARKER)}
+                        if refusal is not None
+                        else {}
+                    )
+                screened = None
+                if refusal is None:
+                    # L5a — second admission gate, same altitude: an argument
+                    # that cannot be encoded as UTF-8 never reaches a tool
+                    # body, where quoting it back into an error message would
+                    # make the MCP layer's serialization raise.
                     try:
                         screened = sig.bind(*args, **kwargs)
                         screened.apply_defaults()
@@ -1130,9 +1486,29 @@ def _tracked(
                     if offender is not None:
                         refusal = _unencodable_argument_error(offender)
                         extra = {"error": _UNENCODABLE_ARG_MARKER}
+                if refusal is None and arg_char_caps and screened is not None:
+                    # L5b — the declarative argument length cap, beside the
+                    # screen above and for the same reason: before the tool
+                    # body, so before the embedding-provider call, before the
+                    # `tsquery` parse, before any search or quota statement,
+                    # and before the value is interpolated into a
+                    # server-authored string.
+                    #
+                    # **Not coalesced**, unlike the rate refusals: this gate
+                    # sits *below* the general bucket, so a principal can
+                    # produce at most `MCP_RATE_LIMIT_PER_MINUTE` of these a
+                    # minute — the same bound an admitted call's row already
+                    # has. A second mechanism would buy nothing.
+                    over_long = _first_over_long_argument(screened, arg_char_caps)
+                    if over_long is not None:
+                        name, length = over_long
+                        refusal = _argument_too_long_error(
+                            name, length, arg_char_caps[name]
+                        )
+                        extra = {"error": _ARGUMENT_TOO_LONG_MARKER}
                 if refusal is None:
-                    # Third and last admission gate (#162), deliberately after
-                    # the other two: a call refused for having no vault or for
+                    # L6 — the last admission gate (#162), deliberately after
+                    # every other one: a call refused for having no vault or for
                     # an unencodable argument must consume no quota, because
                     # its body was never going to run. This one *does* consume
                     # — the increment commits before the body starts, so an
@@ -1219,9 +1595,10 @@ def _tracked(
                     # Whatever the service measured. Absent for tools that
                     # measure nothing, so `params` keeps its current shape.
                     logged.update(timing.current() or {})
-                    await _log_usage(
-                        tool_name, logged, duration_ms, _response_size(result)
-                    )
+                    if log_row:
+                        await _log_usage(
+                            tool_name, logged, duration_ms, _response_size(result)
+                        )
                 except Exception as tail_exc:  # noqa: BLE001 - see above
                     # Class only, and structurally distinct from
                     # `tool_exception`: an operator filtering for failed tool
@@ -1253,7 +1630,11 @@ def _tracked(
 # the function name), so that is what `usage_logs.tool` must record — the old
 # "search_notes" named a tool no client was ever offered, which made the audit
 # trail unsearchable in both directions (#78).
-@_tracked("keyword_search", ["query", "folder", "limit", "tags", "frontmatter"])
+@_tracked(
+    "keyword_search",
+    ["query", "folder", "limit", "tags", "frontmatter"],
+    arg_char_caps={"query": MAX_SEARCH_QUERY_CHARS},
+)
 async def search_notes_impl(
     query: str,
     folder: str | None = None,
@@ -1665,7 +2046,11 @@ async def get_recent_impl(
     return "\n".join(lines)
 
 
-@_tracked("semantic_search", ["query", "limit", "folder", "tags", "frontmatter"])
+@_tracked(
+    "semantic_search",
+    ["query", "limit", "folder", "tags", "frontmatter"],
+    arg_char_caps={"query": MAX_SEARCH_QUERY_CHARS},
+)
 async def semantic_search_impl(
     query: str,
     limit: int = 15,
@@ -1684,15 +2069,45 @@ async def semantic_search_impl(
     """
     limit = _clamp_limit(limit, _MAX_SEMANTIC_RESULTS)
     uid = current_user_id.get()
-    async with async_session() as session:
-        results = await semantic_search(
-            session,
-            query,
-            limit=limit,
-            folder=folder,
-            tags=tags,
-            frontmatter=frontmatter,
-            user_id=uid,
+    try:
+        async with async_session() as session:
+            results = await semantic_search(
+                session,
+                query,
+                limit=limit,
+                folder=folder,
+                tags=tags,
+                frontmatter=frontmatter,
+                user_id=uid,
+            )
+    except refusals.ProviderInputTooLarge as exc:
+        # The provider refused the input against **its own** token limit,
+        # which `MAX_SEARCH_QUERY_CHARS` cannot promise: 8,192 characters of a
+        # densely-tokenizing script still exceed it. The caller sees the same
+        # `argument_too_long` code it would have seen from the character cap,
+        # carrying the provider's stated reason, so there is one actionable
+        # failure mode for "the query was too large" rather than a raw
+        # provider error.
+        #
+        # **The marker is different, and post-body.** This branch is reached
+        # only after the body ran, resolved a vault and made a network round
+        # trip, so `provider_input_rejected` stays out of the pre-body refusal
+        # predicate: enumerating it would drop a real provider round trip out
+        # of the latency percentiles. The caller-facing code and the
+        # operator-facing marker answer different questions and are permitted
+        # to differ — here they do.
+        timing.record("error", _PROVIDER_INPUT_REJECTED_MARKER)
+        return refusals.render(
+            "Error: the embedding provider refused this query as too large "
+            f"for its own input limit: {exc.reason} The query is under "
+            f"{MAX_SEARCH_QUERY_CHARS} characters, but a character cap cannot "
+            "promise a token limit. Send a shorter query.",
+            refusals.Refusal(
+                code=refusals.ARGUMENT_TOO_LONG,
+                scope="provider",
+                limit=MAX_SEARCH_QUERY_CHARS,
+                limit_unit=refusals.CHARACTERS,
+            ),
         )
     if not results:
         return f"No semantic results for '{query}' (embeddings may still be building)"
@@ -2055,7 +2470,7 @@ def _unmatched_fence_error(path: str, scan_text: str, diagnosis=None) -> str | N
     )
 
 
-@_tracked("create_note", ["path"])
+@_tracked("create_note", ["path"], write_class=True)
 async def create_note_impl(path: str, content: str) -> str:
     """Create a new note in the vault.
 
@@ -2753,6 +3168,7 @@ async def find_orphans_impl(folder: str | None = None, limit: int = 50) -> str:
         "path", "append", "operation", "find", "section", "replace_all",
         "dry_run", "replace_frontmatter",
     ],
+    write_class=True,
 )
 async def edit_note_impl(
     path: str,
@@ -3450,7 +3866,9 @@ def _ensure_move_source_in_index(index: dict, from_rel: str) -> None:
     index["stems"].setdefault(stem, []).append((from_rel, synthetic_id))
 
 
-@_tracked("move_note", ["from_path", "to_path", "rewrite_links"])
+@_tracked(
+    "move_note", ["from_path", "to_path", "rewrite_links"], write_class=True
+)
 async def move_note_impl(
     from_path: str,
     to_path: str,
@@ -4179,7 +4597,7 @@ async def _move_note_locked(
 # ────────────────────────────────────────────────────────────────────────────
 
 
-@_tracked("delete_note", ["path", "permanent"])
+@_tracked("delete_note", ["path", "permanent"], write_class=True)
 async def delete_note_impl(path: str, permanent: bool = False) -> str:
     """Soft-delete a note to `.trash/`, or unlink it when `permanent=True`.
 
@@ -4333,7 +4751,7 @@ def _same_frontmatter_value(current, proposed, _seen: set | None = None) -> bool
     return current == proposed
 
 
-@_tracked("set_frontmatter", ["path"])
+@_tracked("set_frontmatter", ["path"], write_class=True)
 async def set_frontmatter_impl(
     path: str,
     updates: dict | None = None,
@@ -4624,7 +5042,7 @@ def _write_cap_for(path: str) -> tuple[int, str]:
     return settings.max_file_write_bytes, "MAX_FILE_WRITE_BYTES"
 
 
-@_tracked("write_file", ["path", "encoding", "overwrite"])
+@_tracked("write_file", ["path", "encoding", "overwrite"], write_class=True)
 async def write_file_impl(
     path: str,
     content: str,
@@ -5227,7 +5645,10 @@ def _url_host(url) -> str:
 
 
 @_tracked(
-    "import_from_url", ["url", "path", "overwrite"], transforms={"url": _url_host}
+    "import_from_url",
+    ["url", "path", "overwrite"],
+    transforms={"url": _url_host},
+    write_class=True,
 )
 async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> str:
     """Fetch a public URL straight into the vault, under the outbound policy."""
@@ -5343,7 +5764,7 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
     )
 
 
-@_tracked("delete_file", ["path", "permanent"])
+@_tracked("delete_file", ["path", "permanent"], write_class=True)
 async def delete_file_impl(path: str, permanent: bool = False) -> str:
     """Delete a non-markdown vault file, soft by default.
 

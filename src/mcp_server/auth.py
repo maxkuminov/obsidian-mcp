@@ -12,6 +12,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from src.auth.session import (
     UNSET_VAULT_ROOT,
     current_actor,
+    current_principal,
     current_user_id,
     current_vault_root,
 )
@@ -19,7 +20,7 @@ from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthClient, OAuthToken, User
 from src.oauth.scope import has_vault_scope, token_has_write
-from src.services import security_events
+from src.services import rate_limits, security_events
 from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
@@ -72,7 +73,15 @@ def _emit_auth_failure(
     oauth_token_id: int | None = None,
     user_id: int | None = None,
 ) -> None:
-    """One `auth_failure` record, through the suppressor.
+    """One `auth_failure` record, through the suppressor — and the one place
+    the failed-authentication budget is charged.
+
+    **Every** 401 branch in this middleware goes through here, which is why the
+    increment lives here rather than at each `return`: a prober picks the
+    cheapest branch, so a budget covering six of seven bounds nothing, and a
+    list of call sites somebody has to remember to extend is how the seventh
+    gets missed. `tests/test_mcp_auth_failure_budget.py` pins that every 401 in
+    this module is preceded by a call to this function.
 
     These are the highest-volume caller-triggerable refusals in the server — a
     credential-stuffing burst is N of them a second — so they go through
@@ -87,6 +96,7 @@ def _emit_auth_failure(
     trusted client address otherwise; never the token tag, or every rotated
     bogus token would mint itself a fresh allowance.
     """
+    rate_limits.record_auth_failure(security_events.client_ip(request))
     security_events.emit(
         "auth_failure",
         subject=security_events.subject_for(user_id=user_id, request=request),
@@ -133,9 +143,64 @@ class APIKeyMiddleware:
             return
 
         request = Request(scope)
+
+        # L1 — the failed-authentication budget, **before everything**: before
+        # the credential lookup, and before the bearer check that is the
+        # cheapest 401 of all. A refused probe therefore costs no database
+        # session and no query, which is exactly what this control bounds — the
+        # database work an unauthenticated caller can force. It is *not* a
+        # defence against credential guessing (256-bit keys need none).
+        #
+        # The address comes from `security_events.client_ip`, which reads
+        # `scope["client"]` — already rewritten from `X-Forwarded-For` by
+        # `ProxyHeadersMiddleware`, and **only** for peers inside the trusted
+        # private ranges. A budget keyed on a header any client could forge
+        # would be worse than none.
+        #
+        # A **transport** refusal, deliberately outside the in-band refusal
+        # contract every gate inside `_tracked` obeys: there is no tool call to
+        # answer, no principal and no `usage_logs` row, so it carries
+        # `Retry-After` and `WWW-Authenticate` instead of a sentinel line.
+        # Fabricating a tool result for a request that never authenticated
+        # would be a worse answer than an honest HTTP error.
+        over_budget = rate_limits.check_auth_failures(
+            security_events.client_ip(request)
+        )
+        if over_budget is not None:
+            if over_budget.first:
+                # One record per slot per window. Every later refusal in the
+                # same window is the same fact, and would be the unbounded
+                # channel this control exists to close.
+                security_events.emit(
+                    "auth_failure_rate_limited",
+                    subject=security_events.subject_for(request=request),
+                    client_ip=security_events.client_ip(request),
+                    route=request.url.path,
+                    limit_count=over_budget.limit,
+                    window_seconds=over_budget.window_seconds,
+                )
+            response = JSONResponse(
+                {"error": "Too many failed authentication attempts"},
+                status_code=429,
+                headers={
+                    "Retry-After": str(over_budget.retry_after_seconds),
+                    "WWW-Authenticate": _www_authenticate(),
+                },
+            )
+            await response(scope, receive, send)
+            return
+
         auth_header = request.headers.get("authorization", "")
 
         if not auth_header.startswith("Bearer "):
+            # Charged like every other 401 — this is the *cheapest* probe there
+            # is, so a budget that skipped it would bound nothing: a prober
+            # would simply stop sending a token. Charged directly rather than
+            # through `_emit_auth_failure` because no credential was presented,
+            # so there is no `auth_failure` record to make: that event's
+            # `reason` is a closed vocabulary about a credential that was read,
+            # and this branch read none.
+            rate_limits.record_auth_failure(security_events.client_ip(request))
             response = JSONResponse(
                 {"error": "Missing Bearer token"},
                 status_code=401,
@@ -166,6 +231,12 @@ class APIKeyMiddleware:
         # from the credential row this request authenticated with, and reset
         # with the rest so it can never label another request's log line.
         token_actor = current_actor.set(None)
+        # The identity every per-principal rate control is keyed on, bound
+        # below from the same row: `("api_key", api_keys.id)` or
+        # `("oauth", oauth_tokens.grant_id)`. Default `None` — no principal —
+        # which every per-principal control reads as *exempt*, so sandbox mode
+        # and a direct in-process caller behave exactly as they did.
+        token_principal = current_principal.set(None)
 
         try:
             if token.startswith("omcp_"):
@@ -278,6 +349,10 @@ class APIKeyMiddleware:
                     # means unlimited, and `_tracked` then issues no quota
                     # statement at all.
                     current_daily_request_limit.set(api_key.daily_request_limit)
+                    # The row is in hand, so the principal costs no query
+                    # either — the same house rule the actor label and the
+                    # quota ceiling follow.
+                    current_principal.set(("api_key", api_key.id))
                     # In single-user mode `api_key.user_id` is None so this
                     # is skipped entirely. In multi-user mode, read the user's
                     # `vault_path` now and bind the answer to this request:
@@ -451,6 +526,12 @@ class APIKeyMiddleware:
                     current_oauth_token_id.set(oauth_token.id)
                     current_user_id.set(oauth_token.user_id)
                     current_actor.set(("oauth", client_name, oauth_token.client_id))
+                    # The **grant**, not the access token: `grant_id` is NOT
+                    # NULL and shared by every rotation of one `/authorize`
+                    # approval (migration 014, #64), so refreshing an access
+                    # token continues an allowance rather than resetting it,
+                    # and two independently revocable grants never share one.
+                    current_principal.set(("oauth", oauth_token.grant_id))
                     if oauth_token.user_id is not None:
                         current_vault_root.set((
                             oauth_token.user_id,
@@ -466,3 +547,4 @@ class APIKeyMiddleware:
             current_vault_root.reset(token_vault)
             current_actor.reset(token_actor)
             current_daily_request_limit.reset(token_limit)
+            current_principal.reset(token_principal)

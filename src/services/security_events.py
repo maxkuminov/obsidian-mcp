@@ -233,6 +233,16 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "auth_failure": frozenset(
         {"reason", "token_tag", "key_id", "oauth_token_id", "client_ip", "route"}
     ),
+    # An address over its failed-authentication budget (#194). **One record per
+    # slot per window** — the first refusal — because every later refusal in
+    # the same window is the same fact and would be an unbounded channel beside
+    # the bounded one. No `token_tag` and no `reason`: nothing was looked up,
+    # and the presented credential (if any) was never read. `limit_count` and
+    # `window_seconds` are the two numbers an operator needs to decide whether
+    # the budget is too tight for a shared egress address.
+    "auth_failure_rate_limited": frozenset(
+        {"client_ip", "route", "limit_count", "window_seconds"}
+    ),
     # ── The tool surface (Slice C) ──
     # No `client_ip`: `_tracked` and `_require_write` run below
     # `ProxyHeadersMiddleware` and nothing binds the request address into a
@@ -270,6 +280,20 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     # accounts, reasons and roots are named on the operator surfaces.
     "tool_refused_vault_quarantined": frozenset({"user_id", "tool", "reason"}),
     "tool_refused_over_quota": frozenset({"key_id", "limit", "day", "user_id", "tool"}),
+    # A call refused by one of the two per-principal token buckets (#188,
+    # #194). `reason` is the bucket — `principal` or `principal_write` — a
+    # closed vocabulary and the same string the caller's refusal carries as its
+    # `scope`, so an operator reading the log and an agent reading its result
+    # are talking about the same control. No `client_ip`, for the reason every
+    # other tool-surface event has none (residual R8): `_tracked` runs below
+    # `ProxyHeadersMiddleware`, so these records identify the *credential*.
+    #
+    # The record is bounded by the suppressor like every other one — which is
+    # the point, because the `usage_logs` half is bounded by a coalescer and
+    # the two bounds are independent.
+    "tool_refused_rate_limited": frozenset(
+        {"tool", "reason", "limit", "user_id", "key_id", "oauth_token_id"}
+    ),
     "usage_log_credential_gone": frozenset({"tool", "cleared_user_id"}),
     "usage_log_failed": frozenset({"tool", "error_type", "reason"}),
     "tool_result_measure_failed": frozenset({"tool", "error_type"}),
