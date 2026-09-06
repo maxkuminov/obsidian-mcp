@@ -79,7 +79,9 @@ from src.services.vault import (
     _vault_root,
     classify_bytes,
     confirmed_publication,
+    content_hash_for_bytes,
     extract_section_parts,
+    is_canonical_content_hash,
     is_encodable,
     is_hidden_path,
     list_dir,
@@ -1834,6 +1836,14 @@ async def read_note_impl(
       round-tripping the view.
     - `metadata_omissions` — every metadata field this response dropped, and
       why. Nothing is signalled inside a note-controlled field.
+    - `content_hash` — the **whole file's** digest,
+      `sha256:<64 lowercase hex>`, from the same read that built this response
+      (never a second one, which could describe different bytes). It is the
+      whole file's for a section read and a truncated read alike, so the token
+      means one thing wherever it came from, and it is **not** a hash of
+      `content`: a note with frontmatter or CRLF terminators has a digest the
+      returned text cannot reproduce. Hand it to a write tool as
+      `expected_hash` to bind the write to the bytes this read saw.
 
     Byte-identity on a round trip holds for LF-bodied notes; terminators inside
     the selected body come back as LF because this path normalises and the
@@ -1910,6 +1920,13 @@ async def read_note_impl(
     view, view_omission = frontmatter_view(note["frontmatter"])
     result = ReadNoteResult(
         path=note["path"],
+        # From `read_file`'s single read of the note's bytes — the same bytes
+        # every field beside it was derived from. A second open here could
+        # hash a different file than the one this response describes, which is
+        # worse than no hash at all (#149's D3, #205's D6). Set for every
+        # successful read: whole-note, section, windowed and truncated alike,
+        # and always the whole file's.
+        content_hash=note["content_hash"],
         title=note["title"],
         tags=list(note["tags"]) or None,
         frontmatter_yaml=note["frontmatter_yaml"],
@@ -2154,6 +2171,324 @@ async def get_vault_guide_impl() -> str:
     except ValueError as e:
         vault_section = f"# Vault-Specific Conventions\n\n{e}"
     return f"{_VAULT_GUIDE_PRIMER}\n\n---\n\n{vault_section}"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The write precondition (#205)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# **Two windows, and they are a pair.** `_atomic_write_at(expected=…)` re-reads
+# the destination through the same parent descriptor immediately before the
+# publishing rename, so it closes *this call's read → this call's rename*. It
+# structurally cannot see a change that landed between the caller's own
+# `read_note` and its `edit_note`, because the bytes it compares are the ones
+# this call read. `expected_hash` closes that other window — *the caller's read
+# → this call's read* — and neither subsumes the other. Both stay. What is left
+# after both is the rename syscall itself, against a writer who can already
+# write the destination directory: the residual `vault-tools.md` has declared
+# since #59, narrowed here rather than widened.
+#
+# **Two helpers, not one, and the split is the design.** The syntax check is a
+# pure function of the argument, so it runs at a tool's *entry* — before path
+# resolution, before the leaf check, before any read — which is what makes a
+# malformed hash outrank "not found", a symlinked leaf and the size cap. A
+# caller told "not found" for a call whose argument was never valid fixes the
+# wrong thing. The rest of the ladder needs the file, so it lives in the
+# second helper and runs where the tool has read the incumbent.
+#
+# The ladder, in order, first match wins:
+#
+#   1. syntax          — not `sha256:<64 lowercase hex>`  → malformed_precondition
+#   2. no incumbent    — nothing at this path to bind      → no_incumbent
+#   3. unavailable     — incumbent over the tool's cap     → precondition_unavailable
+#   4. required        — no hash while the deployment      → precondition_required
+#                        requires one
+#   5. comparison      — digest differs                    → stale_precondition
+#   6. publication     — the in-call compare (elsewhere)   → concurrent_write
+#
+# Ordering is observable and therefore normative: the comparison runs *before*
+# mode dispatch, before the result size cap, before a `dry_run` diff and before
+# any no-op or defect determination, because a diff or a "no changes" answer
+# computed against a base the caller does not hold is a wrong answer, not a
+# cheap one.
+
+#: The one sentence that says where a usable hash comes from — carried by
+#: every refusal a read can resolve, and by `malformed_precondition`, which
+#: must name where a *valid* hash comes from as well as the form it takes.
+#: `no_incumbent` and `precondition_unavailable` deliberately omit it: no
+#: re-read resolves either, and pointing at one would send a caller after a
+#: hash that changes nothing.
+_PRECONDITION_READ_HINT = (
+    "`read_note` returns a note's hash as `content_hash`; "
+    "`read_file(hash_only=true)` returns a raw file's."
+)
+
+#: What a caller may send. Stated in one place so every refusal spells it the
+#: same way.
+_PRECONDITION_CANONICAL_FORM = "sha256:<64 lowercase hex>"
+
+
+def _precondition_path(path: str | None) -> str | None:
+    """`path` if it can be quoted into a refusal, else `None`.
+
+    The same bound every other path-bearing message obeys: `MAX_PATH_CHARS`
+    and UTF-8-encodability. A path that fails either is refused at admission
+    long before a write tool runs, so this is the belt to that braces — an
+    unencodable path in a sentinel line would be a serialization failure in the
+    one message whose job is to be parseable.
+    """
+    if path is None:
+        return None
+    if len(path) <= MAX_PATH_CHARS and is_encodable(path):
+        return path
+    return None
+
+
+def _precondition_refusal(
+    prose: str,
+    code: str,
+    *,
+    path: str | None = None,
+    current_hash: str | None = None,
+    cap_name: str | None = None,
+    cap_bytes: int | None = None,
+    nothing_written: bool | None = True,
+) -> str:
+    """`prose` with the typed sentinel line appended.
+
+    Prose an agent has to pattern-match is not a contract, which is the whole
+    reason these refusals are typed; the prose half stays because a human reads
+    it too. No refusal here carries note content — no excerpt, no diff, no
+    length — and none carries a retry delay: no interval makes a stale hash
+    match, a malformed one canonical, or a file smaller than a cap.
+    """
+    return refusals.render(
+        prose,
+        refusals.Refusal(
+            code=code,
+            path=_precondition_path(path),
+            current_hash=current_hash,
+            cap_name=cap_name,
+            cap_bytes=cap_bytes,
+            nothing_written=nothing_written,
+        ),
+    )
+
+
+def _precondition_syntax_error(
+    tool: str, expected_hash: str | None, *, path: str | None = None
+) -> str | None:
+    """`malformed_precondition` when `expected_hash` is not canonical.
+
+    **A pure function of the argument.** It needs no path, no descriptor and no
+    filesystem, and every guarded tool calls it at its entry — ahead of
+    `open_mutable`, `_leaf_state_error` and every read — so that a caller who
+    sent the wrong *kind* of value learns that, rather than learning something
+    about a file its argument never validly named. `path` is quoted into the
+    prose when the tool has one to quote; it is not needed to decide.
+
+    The caller's value is deliberately **not** echoed: it is unbounded input,
+    and the refusal names the accepted form instead, which is the actionable
+    half.
+    """
+    if expected_hash is None or is_canonical_content_hash(expected_hash):
+        return None
+    where = f" for {path}" if _precondition_path(path) else ""
+    return _precondition_refusal(
+        f"{tool}: expected_hash{where} is not a content hash this server can "
+        f"compare. The one accepted form is `{_PRECONDITION_CANONICAL_FORM}` — "
+        "the exact value a read returns, prefix included. It was not compared "
+        "against the file and nothing was written. "
+        f"{_PRECONDITION_READ_HINT} (Note: `notes_metadata`'s own content hash "
+        "is a different digest of different bytes and is not accepted here.)",
+        refusals.MALFORMED_PRECONDITION,
+        path=path,
+    )
+
+
+def _precondition_error(
+    tool: str,
+    path: str,
+    incumbent: bytes | None,
+    expected_hash: str | None,
+    *,
+    cap_name: str | None = None,
+    cap_bytes: int | None = None,
+    no_incumbent: bool = False,
+    over_cap: bool = False,
+    enforceable: bool = True,
+) -> str | None:
+    """The rest of the ladder. `None` means "the write may proceed".
+
+    Arguments:
+        tool: the tool's name, for the prose.
+        path: the vault-relative path the refusal is about.
+        incumbent: the bytes this call read for the file, or `None` when it
+            read none (which must be explained by `no_incumbent` or
+            `over_cap`).
+        expected_hash: exactly what the caller supplied, `None` when it
+            supplied nothing.
+        cap_name / cap_bytes: the cap that governs this tool's reads. Required
+            when `over_cap` is set — a cap without its name is a number no
+            operator can act on.
+        no_incumbent: this tool or mode can never bind incumbent bytes
+            (`create_note`, `write_file(overwrite=False)`) or the path holds no
+            file. Such calls are also **exempt from required mode**: requiring
+            a hash where none can exist would make creation impossible.
+        over_cap: the incumbent exists but is larger than `cap_bytes`, so no
+            comparison is possible.
+        enforceable: whether `WRITE_PRECONDITION_REQUIRED` applies to this
+            call at all.
+    """
+    syntax = _precondition_syntax_error(tool, expected_hash, path=path)
+    if syntax is not None:
+        return syntax
+
+    if no_incumbent:
+        if expected_hash is None:
+            # Exempt from required mode by construction: there is nothing here
+            # a precondition could bind.
+            return None
+        return _precondition_refusal(
+            f"{tool}: there are no existing bytes at {path} for expected_hash "
+            "to bind — nothing was overwritten, so there was nothing to "
+            "guard. Nothing was written. Call again without expected_hash if "
+            "you meant to create this file.",
+            refusals.NO_INCUMBENT,
+            path=path,
+        )
+
+    required = enforceable and settings.write_precondition_required
+
+    if over_cap:
+        # "I could not check" is not "I checked and it differs", and it is not
+        # "you forgot to send one" either. Under required mode this outranks
+        # `precondition_required`, because telling such a caller to supply a
+        # hash sends it after one it can never obtain.
+        if expected_hash is None and not required:
+            # The compatibility rule: an unguarded call on an over-cap file
+            # behaves exactly as it does today and simply reports no hash.
+            # Nothing that works now may stop working because a file is too
+            # large to hash.
+            return None
+        return _precondition_refusal(
+            f"{tool}: {path} is larger than {cap_name} ({cap_bytes:,} bytes), "
+            "the most this tool may read, so its current bytes cannot be "
+            "hashed and no precondition can be checked. Nothing was written. "
+            f"Raising {cap_name} is an operator action; to fetch this file's "
+            "bytes, use the transfer download route (`request_download`).",
+            refusals.PRECONDITION_UNAVAILABLE,
+            path=path,
+            cap_name=cap_name,
+            cap_bytes=cap_bytes,
+        )
+
+    if incumbent is None:
+        # A wiring error, not a caller error: a tool that read nothing must say
+        # why with `no_incumbent` or `over_cap`. Failing loudly here is the
+        # only way a green-but-unwired guard is caught before it silently
+        # admits every write.
+        raise ValueError(
+            f"{tool}: _precondition_error was given no incumbent bytes and "
+            "neither no_incumbent nor over_cap — the guard would admit every "
+            "write."
+        )
+
+    current_hash = content_hash_for_bytes(incumbent)
+
+    if expected_hash is None:
+        if not required:
+            return None
+        return _precondition_refusal(
+            f"{tool}: this deployment requires every write to name the bytes "
+            "it is replacing (WRITE_PRECONDITION_REQUIRED). Resend with "
+            f"expected_hash. Nothing was written. {path} currently hashes to "
+            f"{current_hash}, which you may send as expected_hash if nothing "
+            "changes in between.",
+            refusals.PRECONDITION_REQUIRED,
+            path=path,
+            current_hash=current_hash,
+        )
+
+    if expected_hash == current_hash:
+        return None
+
+    return _precondition_refusal(
+        f"{tool}: {path} has changed since the hash you supplied was taken, so "
+        "this write was refused rather than applied to bytes you have not "
+        f"seen. Nothing was written. Its current content_hash is {current_hash}"
+        " — re-read the file, recompute the write from its current bytes, and "
+        "resend; the hash named here may be sent as expected_hash if nothing "
+        f"else changes in between. {_PRECONDITION_READ_HINT}",
+        refusals.STALE_PRECONDITION,
+        path=path,
+        current_hash=current_hash,
+    )
+
+
+def _concurrent_write_refusal(
+    prose: str, path: str | None = None, *, nothing_written: bool | None = True
+) -> str:
+    """The **in-call** conflict, typed, with its prose untouched.
+
+    `_atomic_write_at` refuses with `File changed while editing: <name>` and
+    that wording stays exactly as it is — every existing `in` / `startswith`
+    assertion still holds — with the sentinel appended, which is the same
+    additive rule the pre-body refusals follow. The two windows then differ by
+    **code** rather than by prose shape: `stale_precondition` means "the file
+    moved before you called, and here is the new hash"; `concurrent_write`
+    means "the file moved during my call, so no hash from before it can be
+    valid — re-read and retry".
+
+    `nothing_written` is a parameter because a post-rename failure is a
+    *partial success*: `move_note`'s rename has committed, and a caller told
+    "nothing was written" would go looking for a note that has already
+    relocated.
+    """
+    return _precondition_refusal(
+        prose, refusals.CONCURRENT_WRITE, path=path, nothing_written=nothing_written
+    )
+
+
+def _note_precondition_cap() -> tuple[str, int]:
+    """The cap a *note* tool may read, by name and value."""
+    return "MAX_NOTE_BYTES", MAX_NOTE_BYTES
+
+
+def _file_precondition_cap() -> tuple[str, int]:
+    """The cap a *raw-file* tool may read, by name and value."""
+    return "MAX_FILE_READ_BYTES", settings.max_file_read_bytes
+
+
+def _read_incumbent(target, path: str, cap_bytes: int) -> tuple[bytes | None, bool]:
+    """The incumbent bytes at `target`, bounded. Returns `(bytes, over_cap)`.
+
+    `(None, False)` means there is no file there; `(None, True)` means there is
+    one and it is over `cap_bytes`.
+
+    **The size is established from the descriptor the tool already holds and
+    the read runs through that same descriptor** — `read_bytes_at` opens the
+    leaf `O_NOFOLLOW` under the pinned parent, `fstat`s it and then reads it —
+    so the bytes measured are the bytes hashed and no second pathname is
+    resolved. The bound is the one that already governs that tool's content
+    (`MAX_NOTE_BYTES` for a note tool, `MAX_FILE_READ_BYTES` for a raw-file
+    tool): this capability adds no unbounded read anywhere.
+
+    A tool whose path guard is not `open_mutable` — `delete_file` walks
+    `vault_fs`'s beneath-root lookup — performs its own equally anchored
+    bounded read and passes the result to `_precondition_error` directly.
+    """
+    try:
+        return read_bytes_at(target, max_bytes=cap_bytes, label=path), False
+    except FileNotFoundError:
+        return None, False
+    except ValueError:
+        # `read_bytes_at` raises `ValueError` for an over-cap file and for a
+        # non-regular one. The latter is already refused by `_leaf_state_error`
+        # ahead of every guarded write, so what reaches here is the size — and
+        # reporting "I could not hash it" for a leaf that changed shape under
+        # us is the honest answer either way, since no comparison happened.
+        return None, True
 
 
 def _require_write() -> str | None:

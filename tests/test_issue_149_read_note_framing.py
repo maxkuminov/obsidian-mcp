@@ -1138,9 +1138,17 @@ async def test_the_whole_mcp_response_meets_the_documented_combined_bound(vault)
     loaded with characters that JSON escapes six-fold (`\\u0001`):
 
     * `content` — a full cap window of control characters;
-    * `title` — a cap-sized control-character title that SURVIVES, because the
-      three fields ahead of it in the drop order are dropped first;
+    * the metadata budget — control-character **tags** loaded to it, which
+      SURVIVE because the two fields ahead of them in the drop order (the
+      frontmatter view, then the raw block) are dropped first, beside a title
+      loaded to its own bound;
     * `outline` — control-character headings, filled to the outline budget.
+
+    The metadata budget used to be loaded by the title alone. It cannot be any
+    more: since #205 adopted the indexer's title rule (`vault.note_title`),
+    every surface bounds a title at `TITLE_MAX_CHARS` — so the field that can
+    still fill this budget with six-fold-escaping text is `tags`, and it is
+    what fills it here.
 
     Measured over the MCP text block PLUS the serialized structuredContent,
     because the result carries both and the caller pays for both — that
@@ -1155,10 +1163,15 @@ async def test_the_whole_mcp_response_meets_the_documented_combined_bound(vault)
     sections = "".join(
         f"## {'\\u0001' * 90}\n" + "\x01" * 400 + "\n" for i in range(400)
     )
+    # 950 distinct tags of 38 control characters each: ~39k of metadata cost
+    # (`_tag_cost` counts each tag's characters plus three), which loads the
+    # 40,000-character metadata budget without overflowing it once the two
+    # fields ahead of tags in the drop order are gone.
+    tag_entries = ", ".join(f'"{"\\u0001" * 34}{i:04d}"' for i in range(950))
     write(
         vault, "n.md",
         '---\ntitle: "' + "\\u0001" * cap + '"'
-        + "\ntags: [" + ", ".join("t" * 40 for _ in range(200)) + "]"
+        + "\ntags: [" + tag_entries + "]"
         + "\nfiller: " + "f" * 50_000
         + "\n---\n" + sections,
     )
@@ -1170,8 +1183,15 @@ async def test_the_whole_mcp_response_meets_the_documented_combined_bound(vault)
     # Every budgeted component is loaded to its limit, or the bound is vacuous.
     assert len(structured["content"]) == cap
     assert structured["truncated"] is True
-    assert len(structured["title"]) == cap, "the title did not survive the drops"
+    assert len(structured["title"]) == vault_service.TITLE_MAX_CHARS, (
+        "the title did not survive the drops, or is not at its own bound"
+    )
     assert set(structured["title"]) == {"\x01"}, "the title is not escape-heavy"
+    tag_chars = sum(len(t) for t in structured["tags"])
+    assert tag_chars > cap - 5_000, (
+        f"tags only filled {tag_chars} of a {cap} metadata budget — not a worst case"
+    )
+    assert set("".join(structured["tags"])) >= {"\x01"}, "the tags are not escape-heavy"
     # Compact separators, matching how `build_outline` measures its own budget
     # and how the JSON-RPC layer puts `structuredContent` on the wire.
     compact = {"ensure_ascii": False, "separators": (",", ":")}
@@ -1181,7 +1201,7 @@ async def test_the_whole_mcp_response_meets_the_documented_combined_bound(vault)
         f"outline only filled {outline_chars} of a {cap} budget — not a worst case"
     )
     assert {o["field"] for o in structured["metadata_omissions"]} >= {
-        "frontmatter", "frontmatter_yaml", "tags",
+        "frontmatter", "frontmatter_yaml",
     }
     assert text.count("\\u0001") > cap, "escaping is not dominating the response"
 
