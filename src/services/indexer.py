@@ -42,7 +42,6 @@ from src.services.embeddings import (
     NoteEmbedOutcome,
     StaleCertification,
     certify_embedded,
-    chunk_text,
     chunk_text_bounded,
     clean_at_version,
     clean_for_embedding,

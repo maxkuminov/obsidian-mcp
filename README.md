@@ -959,6 +959,16 @@ correctness — a database-level generation lock makes an
 old-configuration container's certifications refuse rather than land —
 but the ordering above is the one that never has to rely on it.
 
+**Maintenance waits for an in-flight index pass.** That same generation
+lock is taken at the head of the index pass's transaction and held until
+it commits, so `make reset-embeddings` and `make rebuild-tsvectors` block
+until the pass finishes — up to a few minutes on a large vault — rather
+than interleaving with it. That wait is the required behaviour, not a
+stall to work around: a reset that landed mid-pass is precisely the
+interleaving that stores vectors from one configuration under a
+fingerprint naming another. Neither command sets a short lock timeout,
+and neither should be given one.
+
 You can also use Settings → Danger zone → Reset embeddings in the
 control panel, which performs the same SQL — including the fingerprint
 record — while the server is running (pauses the indexer, runs the SQL,

@@ -423,6 +423,14 @@ is pennies a month.
   `*` in `ALLOWED_ORIGINS` is refused outright, sandbox or not: CORS
   runs with credentials enabled, so a wildcard origin would make the
   server reflect any Origin.
+- `make reset-embeddings` or `make rebuild-tsvectors` appears to hang.
+  Both take the index generation lock, and the periodic index pass holds
+  that lock for the whole of its transaction — minutes on a large vault.
+  They are waiting for the pass to commit, which is the required
+  behaviour: a reset that lands mid-pass is what stores vectors from one
+  configuration under a fingerprint naming another. Wait it out, or pause
+  the indexer from the panel first. Do not give either command a short
+  lock timeout.
 - Transfer links 404 in the browser. The reverse proxy is not forwarding
   `/transfer/*` — see Step 2 for the bundled Caddy config and the
   external-proxy notes above. If the tools themselves refuse to mint,
