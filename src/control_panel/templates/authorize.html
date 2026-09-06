@@ -102,6 +102,93 @@
 
         .card-body { padding: 24px 28px; }
 
+        /* ── Client identity (#183) ──
+           Who registered, and where the authorization code would be
+           delivered. Every value here is either server-generated
+           (`client_id`, `created_at`) or derived from the registered
+           redirect URI by `src/oauth/trust.py`; the one piece of
+           client-chosen text, the name, sits in its own labelled row and is
+           escaped like any other Jinja value. No token is added — the
+           `--consent-*` group already carries everything this block needs. */
+        .identity {
+            border: 1px solid var(--consent-surface-border);
+            border-radius: 7px;
+            padding: 12px 16px;
+            margin-bottom: 12px;
+        }
+
+        .identity-row {
+            display: flex;
+            gap: 12px;
+            align-items: baseline;
+            padding: 3px 0;
+        }
+
+        .identity-label {
+            flex: 0 0 76px;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            color: var(--consent-label);
+        }
+
+        .identity-value {
+            flex: 1;
+            min-width: 0;
+            font-size: 12.5px;
+            color: var(--consent-text);
+            word-break: break-all;
+        }
+
+        /* The destination is the value the whole disclosure turns on, so it
+           is set in the mono face: a host is a string to be read character by
+           character, not prose. */
+        .identity-value.host {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 12.5px;
+        }
+
+        .identity-value.mono {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 11px;
+            color: var(--consent-text-2);
+        }
+
+        .identity-value.undetermined {
+            font-family: 'DM Sans', sans-serif;
+            color: var(--consent-warn);
+        }
+
+        .self-registered {
+            font-size: 11.5px;
+            color: var(--consent-text-3);
+            line-height: 1.45;
+            margin-bottom: 12px;
+        }
+
+        .trust {
+            border-radius: 7px;
+            padding: 10px 14px;
+            margin-bottom: 20px;
+            font-size: 11.5px;
+            line-height: 1.5;
+        }
+
+        .trust strong { font-weight: 600; }
+
+        .trust.known {
+            background: var(--consent-surface);
+            border: 1px solid var(--consent-surface-border);
+            color: var(--consent-text-2);
+        }
+
+        .trust.unverified {
+            background: var(--consent-neutral-surface);
+            border: 1px solid var(--consent-warn);
+            color: var(--consent-warn);
+        }
+
         .request-box {
             background: var(--consent-surface);
             border: 1px solid var(--consent-surface-border);
@@ -247,6 +334,75 @@
         </div>
 
         <div class="card-body">
+            {# Identity block (#183). `/register` is unauthenticated, so the
+               application name is attacker-chosen text and, on its own, tells
+               the user nothing. The destination host — derived by
+               `src/oauth/trust.py` from the registered redirect URI's
+               `hostname`, never its `netloc`, and never Unicode-decoded — is
+               the value that cannot be dressed up, so it gets its own
+               labelled row well away from the name. Nothing here is `|safe`. #}
+            <div class="identity">
+                <div class="identity-row">
+                    <div class="identity-label">Application</div>
+                    <div class="identity-value">{{ client_name }}</div>
+                </div>
+                <div class="identity-row">
+                    <div class="identity-label">Destination</div>
+                    {% if redirect_host %}
+                    <div class="identity-value host">{{ redirect_host }}</div>
+                    {% else %}
+                    <div class="identity-value undetermined">Destination could not be determined</div>
+                    {% endif %}
+                </div>
+                <div class="identity-row">
+                    <div class="identity-label">Client ID</div>
+                    <div class="identity-value mono">{{ client_id }}</div>
+                </div>
+                <div class="identity-row">
+                    <div class="identity-label">Registered</div>
+                    <div class="identity-value mono">{% if client_registered_at %}{{ client_registered_at }}{% else %}unknown{% endif %}</div>
+                </div>
+            </div>
+
+            {# Unconditional, on every render, allow-listed or not (D17).
+               Nothing on this server verifies an application; suppressing the
+               notice for a recognised destination would restore exactly the
+               page #183 was filed about. #}
+            <div class="self-registered">
+                This application registered itself with this server. Registration is open to
+                anyone, and the name shown above was chosen by the application — it is not
+                verified by this server.
+            </div>
+
+            {# The badge is a statement about the *destination*, never about
+               the application: the only thing behind it is the operator's
+               `OAUTH_KNOWN_REDIRECT_HOSTS` list, matched by exact host
+               equality. An undetermined host has `client_trust` of
+               "unverified" and lands here in the warning branch. #}
+            {% if client_trust == "known" %}
+            <div class="trust known">
+                <strong>Known destination.</strong>
+                This server's operator lists <strong>{{ redirect_host }}</strong> as a known
+                connector destination. That says the destination is expected here; it does not
+                verify the application, its name, or what it intends to do with your vault.
+            </div>
+            {% else %}
+            <div class="trust unverified">
+                {% if redirect_host %}
+                <strong>Unrecognised destination.</strong>
+                <strong>{{ redirect_host }}</strong> is not on this server's list of known
+                connector destinations. If you approve, the authorization code for your vault
+                is sent to {{ redirect_host }}. Deny unless you started this yourself from
+                that application.
+                {% else %}
+                <strong>Unrecognised destination.</strong>
+                The destination for this authorization could not be determined from the
+                registered redirect, so there is no host to show you. Deny unless you started
+                this yourself from an application you trust.
+                {% endif %}
+            </div>
+            {% endif %}
+
             <div class="request-box">
                 <strong>{{ client_name }}</strong> is requesting
                 <strong>{% if requested_write %}Read + Write{% else %}Read only{% endif %}</strong>
