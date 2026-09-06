@@ -187,6 +187,89 @@
   assertion against a concurrent request is a flake generator on a shared
   runner.
 
+## Every pass entry point publishes a vault-root snapshot first (#199)
+
+Two active users whose `vault_path` values overlap make the indexer file one
+tenant's notes under the other's `user_id`, which is a silently wrong search
+result for as long as the rows survive. The checks themselves, the snapshot's
+lifecycle and the limitations live in
+[vault-roots-and-tenancy.md](vault-roots-and-tenancy.md); what belongs here is
+where the pass calls them and what it records.
+
+- **One `detect_and_publish()`, called from every entry point that can begin a
+  pass — and the loop alone was not enough.** `run_indexer_loop` is two of the
+  five: the startup block (`detect_root_overlaps("startup")`) and each periodic
+  tick (`detect_root_overlaps("periodic")`). The other three reach
+  `index_vault` / `embed_vault` / `rebuild_tsvectors` without going through it
+  at all — `src/main.py::lifespan` (`_publish_first_root_snapshot`, run
+  **synchronously before the app serves**), the panel's `_reindex_background`
+  (Reindex Now, re-embed and reset embeddings, which mirrors the loop and
+  shares `index_pass_lock` and *nothing else*), and
+  `scripts/rebuild_tsvectors.py`, which is a **separate process**
+  (`docker compose run --rm`) with its own `_active_user_ids()` loop, no
+  lifespan and no indexer loop. A detection installed in the loop would have
+  been bypassed by the last two, one of them from outside this process
+  entirely.
+- **Detection runs before `index_pass_lock`, at every one of them.** The check
+  must not queue behind the pass it exists to gate. That the entry points
+  therefore overlap is expected, not a race: `detect_and_publish` serializes
+  observation, the checks and the publication under one process-global lock and
+  its publication is monotonic in a sequence taken under that lock, so an older
+  detection cannot overwrite a newer quarantine with its own empty result.
+- **On the periodic tick it runs *before* `_is_paused()`.** A pause suppresses
+  index and embed work; it must not suppress detection, because a pause is
+  entered precisely when an operator is doing something destructive and
+  watching the panel, which is the worst moment for a quarantine to become
+  invisible.
+- **A paused iteration still records.** It publishes, and then
+  `record_quarantined_runs("scheduled")` logs at ERROR and writes one
+  `indexer_runs` row per quarantined user before returning. Only the work is
+  suppressed. The row cadence is unchanged — a running deployment already
+  writes one row per user per tick.
+- **The skip lives in the shared pass helpers, not in each loop.**
+  `index_vault`, `link_backfill_pass`, `embed_vault` and `rebuild_tsvectors`
+  each call `_refuse_quarantined_pass(user_id, stage)` **ahead of resolving the
+  root**, so every caller inherits it and a sixth entry point added later gets
+  it by routing through the same helper. A skip re-implemented per loop is a
+  skip one loop will be missing. It also refuses when *nothing* has been
+  published — no pass may begin over a root nothing has checked — and it never
+  applies to `user_id is None`, so single-user mode is untouched.
+- **Nothing is deleted, pruned or provenance-stamped for a skipped user.** The
+  refusal precedes `_vault_root` and the pinned root, so the pass never reaches
+  the prune or `classify_provenance`. Preserving the rows is what makes a
+  corrected assignment cheap; they are unreachable meanwhile, because the
+  admission gate refuses every tool for the same user.
+- **Both records, and the ring buffer's lifetime is the reason for both.**
+  `VaultRootQuarantined` is a `RuntimeError` carrying the **operator**-facing
+  wording — both accounts, both roots, the relation or the cause — so the
+  existing per-stage handlers write it into `indexer_runs.error` and log at
+  ERROR, and `_index_pass_once` returns False: a skipped user's pass is not
+  recorded as a clean run. The log line alone would not do. It reaches the
+  in-process error ring buffer, which is 100 entries and process-lifetime,
+  while the misconfiguration survives restarts — the same argument that made
+  `notes_metadata.links_truncated` a column rather than a log line (#203). The
+  run row is what an operator reads *after* a restart, and a pass that quietly
+  did no work for a user is otherwise indistinguishable from a pass that found
+  nothing to do.
+- **Unrelated tenants are indexed exactly as before**, in the same pass — the
+  same isolation `_index_pass_once` already gives a user with a broken vault.
+- **A detection failure does not abort the caller.** `detect_root_overlaps`
+  logs and swallows: it is not a per-root failure (an unopenable root is a
+  per-user verdict), so the only way it raises is that the user enumeration
+  failed, which means the database is unavailable and the pass would fail
+  anyway. Swallowing it opens nothing — either a previous snapshot still stands
+  (retained, never cleared) or nothing has been published and
+  `_refuse_quarantined_pass` refuses every multi-user stage until a later entry
+  point publishes one.
+- **The standalone rebuild is the one exception, deliberately: a detection
+  failure there is fatal.** `scripts/rebuild_tsvectors.py` calls
+  `detect_and_publish()` directly rather than through `detect_root_overlaps`,
+  and lets it propagate to the script's `sys.exit(1)`. The caller is an
+  operator at a terminal who can read the error and re-run, and rewriting every
+  keyword vector in the vault against roots nothing has checked is exactly the
+  pass this guard exists to stop — where the long-running server's answer is to
+  keep the panel up and retry at the next entry point.
+
 ## The pass record (#160, migration 019)
 
 The heartbeat above and `indexer_runs` answer different questions and neither

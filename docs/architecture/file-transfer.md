@@ -176,6 +176,54 @@ The 503 refusals — mount boundary, unsupported filesystem — keep their own
 bodies and their own records; they are not part of the uniform 404 and never
 were.
 
+### A quarantined owner's capability is refused at redemption (#199)
+
+A capability is a **delayed** write — or a delayed read — into a vault root:
+authorised at mint and redeemed later on the public `/transfer/*` routes, which
+carry no OAuth chain and never call `vault._vault_root`. So when the vault-root
+overlap guard quarantines a tenant, every MCP tool refuses and an outstanding
+capability would still redeem: the token pins a `vault_root` that is *still,
+byte for byte*, the owner's current assignment, so every existing predicate
+here agrees. Refusing the tools while leaving the capability redeemable would
+leave the cross-tenant write reachable through the one path designed to outlive
+the session that created it.
+
+- **The test goes where the owner is already re-read**, all three of them:
+  `resolve_root_ok` (the unlocked entry check — upload *and* download),
+  `locked_rows_ok` (the locked publish path, evaluated **before** the link or
+  the rename, so nothing is published), and `_identity_publish_ok` (the
+  `import_from_url` gate). Same place and same manner as an inactive owner or a
+  changed root.
+- **`owner_quarantined` is refuse-only and costs one attribute read plus a dict
+  lookup** — no session, no statement, no syscall — so it may be called from a
+  diagnosis path that must not take a connection. Both quarantine reasons
+  refuse, and so does the **never-published** state, for the same reason
+  `_vault_root` refuses in it: a redemption served before the first detection
+  is served against roots nothing has checked. Single-user mode is untouched;
+  in multi-user mode an ownerless row is nobody and stays
+  `_ownerless_in_multi_user`'s refusal.
+- **The response does not change.** `_not_found()` stays byte-identical for
+  every cause — the uniform 404 above is the anti-oracle the whole surface
+  rests on — and only the server-side reason differs: `root_unverified` (no
+  snapshot published in this process) or `owner_quarantined`, carried on the
+  bounded `transfer_refused` event by `root_refusal`.
+- **Nothing is logged from inside the predicate.** It used to emit two
+  `logger.warning` lines from a service helper on the redemption path, which is
+  exactly the unbounded flood channel the permit exists to close — an
+  unauthenticated caller replaying one dead capability drives that branch as
+  fast as it can open connections. Worse, the bounded record beside it called
+  the condition `root_reassigned`, which sends an operator to look at an
+  assignment nobody changed. The reason now travels to the one permitted
+  emission, and the operator detail that names the overlapping roots lives on
+  the surfaces built for it: the panel's quarantine block, the affected user's
+  `indexer_runs` row, and the ERROR line the detection writes once per pass.
+- **Precedence is the predicate's own order, written down.** Quarantine is
+  evaluated before the stored root is compared to the owner's assignment, and
+  `root_unverified` precedes `owner_quarantined` — with no snapshot there is no
+  entry to have found. A quarantined owner whose assignment *also* changed is
+  still a quarantine: the root is shared or unverifiable, and reporting the
+  reassignment would tell an operator to check a column that is doing its job.
+
 ### Fingerprint binding — and its two honest limits
 An overwrite upload and every download record `{dev, inode, size, mtime_ns, ctime_ns, sha256}` of the target at mint. At publish (or before a download's first byte) the incumbent is `fstat`ed and, when the mint recorded a hash, re-hashed **from the descriptor**. Mismatch → 409 / 404.
 - **Optimistic, not linearizable.** `stat` → `replace` is check-then-act; a writer landing in that window is still overwritten. Same guarantee level as `edit_note(expected=…)`, declared rather than implied. The no-clobber path (`overwrite=False`) *is* kernel-linearizable — it is `link()`.

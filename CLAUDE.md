@@ -119,6 +119,16 @@ update it in the same change.** What stays here is the short list:
   40,000) independently of the byte caps on disk I/O — see "Three kinds of size cap"
   in [vault tools](docs/architecture/vault-tools.md). Tool output is model
   input; the server must bound it.
+- Two active users' vault roots may not overlap. `src/services/vault_overlap.py`
+  compares each pair by inode identity `(st_dev, st_ino)` and by a
+  **component-wise** canonical-containment test, at assignment time and before
+  every pass (five entry points, `detect_and_publish`); an affected pair is
+  refused by every MCP tool, pass stage and transfer redemption, and nothing is
+  deleted. **Until a snapshot is published, `_vault_root` refuses every
+  multi-user caller** — the lifespan publishes synchronously before serving.
+  A bind-mount *graft* is still undetected (L1/L2, owner decision pending) and
+  the consequence is cross-tenant read/overwrite/delete — see
+  [vault roots and tenancy](docs/architecture/vault-roots-and-tenancy.md).
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
@@ -166,7 +176,7 @@ summaries.
 | --- | --- |
 | [schema-and-migrations.md](docs/architecture/schema-and-migrations.md) | any alembic migration; `alembic check` is the cheap gate, not the whole gate |
 | [oauth-and-grants.md](docs/architecture/oauth-and-grants.md) | `src/oauth/`, the consent page, anything minting/rotating/revoking a token |
-| [vault-roots-and-tenancy.md](docs/architecture/vault-roots-and-tenancy.md) | `APIKeyMiddleware`, `_vault_root`, owner predicates, publication confirmation |
+| [vault-roots-and-tenancy.md](docs/architecture/vault-roots-and-tenancy.md) | `APIKeyMiddleware`, `_vault_root`, owner predicates, publication confirmation, the vault-root overlap guard (`src/services/vault_overlap.py`, the snapshot, the five pass entry points) |
 | [vault-tools.md](docs/architecture/vault-tools.md) | any note or file tool: frontmatter, symlinks, anchored writes, section addressing, size caps |
 | [file-transfer.md](docs/architecture/file-transfer.md) | `src/transfer/`, `src/services/vault_fs.py`, the publish gate, SSRF policy |
 | [search.md](docs/architecture/search.md) | `semantic_search` / `keyword_search` / `find_related` and every `SET LOCAL` they issue |

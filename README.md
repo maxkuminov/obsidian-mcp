@@ -880,6 +880,33 @@ to multi-user later resumes where you left off without re-bootstrapping
 - The `vault_path` validator does not resolve symlinks, so an admin
   can technically point a user at host files via a symlinked
   `/vaults/<name>`. Treat `/vaults/` as an admin-trust boundary.
+  **What *is* checked, since the vault-root overlap guard:** two active
+  users' roots may not name overlapping directories. Each root is
+  opened once and compared by inode identity — `(st_dev, st_ino)`,
+  which catches a symlink alias or a bind mount naming one directory
+  twice — and by a component-wise containment test over the two
+  canonical real paths in both directions, which catches an
+  ancestor/descendant pair like `/vaults/team` and
+  `/vaults/team/private`. A conflicting assignment is refused in the
+  panel naming the other user, and the same checks re-run before every
+  index pass, so an alias created *after* the assignment quarantines
+  both accounts: their MCP tools, index passes and transfer
+  redemptions are refused until an administrator corrects it, and no
+  index rows are deleted. A root that cannot be opened at all
+  quarantines only its own account.
+  **What is still not detected, and the consequence:** a bind mount
+  that grafts one user's vault — or any mount nested inside it — to a
+  path *inside* another user's root. `mount --bind /vaults/b
+  /vaults/a/inner` leaves both root inodes distinct and both canonical
+  paths outside each other, so neither check sees it, and user A can
+  then **read, overwrite and delete every note in user B's vault**
+  through the ordinary write tools, while A's index pass files B's
+  notes under A's account so A's searches return B's content. The same
+  gap covers an accessible alias of a root that could not be examined:
+  that peer keeps serving. Neither condition is reported anywhere.
+  Both require an administrator to write a bind mount into the deploy
+  configuration — which is why `/vaults/` **and the compose file's
+  mounts** are the admin-trust boundary, not just the path strings.
 
 ## Configuration
 
@@ -890,6 +917,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
 | `MULTI_USER_MODE` | `false` | In-app login, per-user vaults. See [Multi-user mode](#multi-user-mode). |
+| `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS` | `10` | How long the vault-root overlap check waits on one root before giving up on it. Expiry quarantines that one account (`root unexaminable`) and the check carries on, so a hung mount cannot hold up startup. Multi-user mode only. |
 | `MCP_HOSTNAME` | — | Public hostname. Derives `BASE_URL`, `ALLOWED_ORIGINS` and `ALLOWED_HOSTS` as `https://<host>`. Required (or `BASE_URL`) for the transfer tools. |
 | `BASE_URL` | derived | Explicit public origin. HTTPS except on loopback. |
 | `ALLOWED_ORIGINS` | derived | CORS origins, JSON list |
