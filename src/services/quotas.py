@@ -78,6 +78,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import math
 from dataclasses import dataclass
 
 from sqlalchemy import text
@@ -85,7 +86,7 @@ from sqlalchemy import text
 from src.auth.session import current_user_id
 from src.database import async_session
 from src.models.db import DAILY_REQUEST_LIMIT_MAX, DAILY_REQUEST_LIMIT_MIN
-from src.services import security_events
+from src.services import refusals, security_events
 from src.services.usage_stats import OVER_QUOTA_PARAM
 
 logger = logging.getLogger(__name__)
@@ -96,9 +97,11 @@ __all__ = [
     "DAILY_REQUEST_LIMIT_MIN",
     "OVER_QUOTA_PARAM",
     "PRUNE_AFTER_DAYS",
+    "QUOTA_REFUSAL_SCOPE",
     "Admission",
     "admit",
     "apply_daily_request_limit",
+    "as_utc",
     "consumed_today",
     "limit_value_error",
     "parse_limit_form_value",
@@ -145,6 +148,12 @@ ADMISSION_SQL = text(
 #: this server does not otherwise need.
 PRUNE_SQL = text("DELETE FROM quota_counters WHERE day < :cutoff")
 
+#: The `scope` an over-quota refusal reports: the ceiling belongs to one API
+#: key, not to a user and not to an OAuth grant (which this quota does not
+#: reach at all). Named here so this module's renderer and the decorator's own
+#: fallback rendering cannot drift into two different words for one fact.
+QUOTA_REFUSAL_SCOPE = "api_key"
+
 
 def utc_day(now: _dt.datetime | None = None) -> _dt.date:
     """The UTC date a call falls in. The counter's `day`, always."""
@@ -152,6 +161,19 @@ def utc_day(now: _dt.datetime | None = None) -> _dt.date:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=_dt.timezone.utc)
     return moment.astimezone(_dt.timezone.utc).date()
+
+
+def as_utc(moment: _dt.datetime) -> _dt.datetime:
+    """One clock reading, normalised to UTC. Naive input is assumed UTC.
+
+    The same normalisation `utc_day` applies before taking a date, factored out
+    so the instant stored on an `Admission` and the day bound into the
+    statement are demonstrably the *same* reading rather than two readings that
+    usually agree.
+    """
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=_dt.timezone.utc)
+    return moment.astimezone(_dt.timezone.utc)
 
 
 def reset_instant(day: _dt.date) -> _dt.datetime:
@@ -191,6 +213,14 @@ class Admission:
     day: _dt.date
     #: The day's admission count including this call, or None when refused.
     count: int | None
+    #: The instant `admit()` read the clock to pick `day` — the *same*
+    #: reading, not a second one taken alongside it. Everything a refusal
+    #: quotes about time is derived from this pair (`day`, `decided_at`) and
+    #: from nothing else, which is what makes the refusal reproducible: the
+    #: message is a pure function of the decision, so however long the caller
+    #: takes to render it, it cannot describe a different decision than the
+    #: one the statement made.
+    decided_at: _dt.datetime
 
     @property
     def admitted(self) -> bool:
@@ -202,8 +232,32 @@ class Admission:
         clock, so it is correct however long the caller takes to read it."""
         return reset_instant(self.day)
 
+    @property
+    def retry_after_seconds(self) -> int:
+        """Whole seconds from the decision to the reset, never below one.
 
-def quota_refusal_message(limit: int, reset_at: _dt.datetime) -> str:
+        The interval a refused caller is told to wait, derived here so that
+        **no** downstream renderer has to read the clock a second time (D10).
+        Both halves of the arithmetic are the decision's own: `reset_at` comes
+        from the day the statement was bound to, `decided_at` from the reading
+        that picked it.
+
+        `max(1, …)` is what keeps the UTC-midnight case honest. A decision made
+        a hundred milliseconds before midnight quotes one second — not zero,
+        which invites a retry that arrives before the counter has rolled, and
+        not a negative number, which `Refusal` rejects outright. A decision
+        whose reset has already passed by the time the message is built (the
+        caller was slow, not the clock wrong) quotes one second for the same
+        reason.
+        """
+        return max(1, math.ceil((self.reset_at - self.decided_at).total_seconds()))
+
+
+def quota_refusal_message(
+    limit: int,
+    reset_at: _dt.datetime,
+    retry_after_seconds: int | None = None,
+) -> str:
     """The refusal an over-quota caller receives, in place of its tool result.
 
     It names the limit and the reset instant because the reader is an agent:
@@ -213,13 +267,42 @@ def quota_refusal_message(limit: int, reset_at: _dt.datetime) -> str:
     `reset_at` is **passed in**, from `Admission.reset_at`, and is never
     recomputed here. A message that re-read the clock could name the wrong
     midnight for a call that crossed one between the statement and the string.
+    The prose is unchanged from #162 — the machine-readable line is *appended*
+    (#194), so every `in` / `startswith` assertion written against the wording
+    still holds.
+
+    `retry_after_seconds` is `Admission.retry_after_seconds` — the interval the
+    decision itself derived, never one measured here. Given it, this function
+    appends the sentinel line through `refusals.render`; without it the caller
+    holds only a reset instant and cannot honestly quote an interval, so the
+    prose is returned bare for that caller to render with the interval it does
+    hold. The over-quota code is **not** one of the futile ones: a refusal that
+    omitted the retry field would tell an agent that waiting cannot help, which
+    is exactly wrong for a ceiling that resets at midnight. So the sentinel is
+    appended only where the number is known, never with the field dropped.
+
+    `refusals.render` is idempotent, so a caller that renders again over this
+    message gets it back untouched — the two altitudes cannot stack two
+    sentinel lines on one refusal.
     """
-    return (
+    prose = (
         f"Error: this API key has used its daily request limit of {limit} "
         f"tool calls for the current UTC day. No further calls will run until "
         f"the limit resets at {reset_at.strftime('%Y-%m-%dT%H:%M:%SZ')} (the "
         "next UTC midnight). Wait for the reset, or ask an administrator to "
         "raise this key's daily request limit in the control panel."
+    )
+    if retry_after_seconds is None:
+        return prose
+    return refusals.render(
+        prose,
+        refusals.Refusal(
+            code=refusals.OVER_QUOTA,
+            scope=QUOTA_REFUSAL_SCOPE,
+            limit=limit,
+            limit_unit=refusals.CALLS_PER_DAY,
+            retry_after_seconds=retry_after_seconds,
+        ),
     )
 
 
@@ -232,8 +315,11 @@ async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> Adm
     waits on it.
 
     **The clock is read exactly once**, here, to pick `day`; the returned
-    `Admission` carries it so the refusal's reset instant cannot drift from the
-    decision that produced it.
+    `Admission` carries both the day and that very instant (`decided_at`), so
+    neither the refusal's reset instant nor the interval it quotes can drift
+    from the decision that produced them. Nothing downstream reads the clock
+    again — the retry interval is arithmetic on the two values recorded here
+    (D10, #194).
 
     A failure of the admission statement itself is logged and re-raised: the
     call does not run (fail closed, deliberately — see the module docstring),
@@ -246,7 +332,11 @@ async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> Adm
     at least 1 — and its failure is swallowed: a call that has already been
     admitted must not be turned into an error by housekeeping.
     """
-    day = utc_day(now)
+    # The one reading. `day` is taken *from it* rather than beside it, so the
+    # statement's day and the instant the refusal measures against are the same
+    # observation by construction and not by two calls happening to agree.
+    decided_at = as_utc(now or _dt.datetime.now(_dt.timezone.utc))
+    day = utc_day(decided_at)
     async with async_session() as session:
         try:
             count = (
@@ -283,7 +373,7 @@ async def admit(key_id: int, limit: int, now: _dt.datetime | None = None) -> Adm
                     subject=security_events.subject_for(user_id=current_user_id.get()),
                     error_type=type(exc).__name__,
                 )
-        return Admission(day=day, count=count)
+        return Admission(day=day, count=count, decided_at=decided_at)
 
 
 #: Deletes the current day's counter for one key. Issued only on the

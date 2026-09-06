@@ -33,7 +33,16 @@ TODAY = _dt.datetime.now(_dt.timezone.utc).date()
 import src.mcp_server.tools as tools  # noqa: E402
 import src.services.quotas as quotas  # noqa: E402
 from src.models.db import APIKey  # noqa: E402
-from src.services import usage_stats  # noqa: E402
+from src.services import refusals, usage_stats  # noqa: E402
+
+
+def _sentinel_payload(message: str) -> dict:
+    """The JSON object on a refusal's machine-readable final line."""
+    import json
+
+    line = message.splitlines()[-1]
+    assert line.startswith(f"{refusals.SENTINEL} "), message
+    return json.loads(line.split(" ", 1)[1])
 
 
 # --------------------------------------------------------------------------
@@ -800,13 +809,75 @@ def test_reset_instant_takes_a_day_not_a_clock_reading():
 
 
 def test_an_admission_carries_the_day_it_decided_for():
-    refused = quotas.Admission(day=_dt.date(2026, 8, 29), count=None)
+    decided_at = _dt.datetime(2026, 8, 29, 12, 0, tzinfo=_dt.timezone.utc)
+    refused = quotas.Admission(
+        day=_dt.date(2026, 8, 29), count=None, decided_at=decided_at
+    )
     assert refused.admitted is False
     assert refused.reset_at == _dt.datetime(
         2026, 8, 30, 0, 0, tzinfo=_dt.timezone.utc
     )
-    admitted = quotas.Admission(day=_dt.date(2026, 8, 29), count=7)
+    admitted = quotas.Admission(
+        day=_dt.date(2026, 8, 29), count=7, decided_at=decided_at
+    )
     assert admitted.admitted is True
+
+
+def test_an_admission_carries_the_instant_it_decided_at(monkeypatch):
+    """`decided_at` is **required**, and it is the reading `day` came from.
+
+    A default would let an `Admission` exist without the instant the whole
+    retry interval is measured from, and the fallback such a decision took
+    would be a second clock read — the exact defect (#194, D10). So the
+    dataclass refuses to be built without it.
+    """
+    import inspect
+
+    field = inspect.signature(quotas.Admission).parameters["decided_at"]
+    assert field.default is inspect.Parameter.empty, (
+        "decided_at acquired a default, so an Admission can exist without the "
+        "instant its retry interval is measured from"
+    )
+
+    frozen = _dt.datetime(2026, 8, 29, 12, 0, tzinfo=_dt.timezone.utc)
+    spy = _QuotaSpySession(admitted=None)
+    monkeypatch.setattr(quotas, "async_session", spy)
+
+    decision = asyncio.run(quotas.admit(7, 5, now=frozen))
+
+    assert decision.decided_at == frozen
+    assert decision.day == frozen.date(), "the day did not come from that reading"
+
+
+def test_the_retry_interval_is_arithmetic_on_the_decision_alone():
+    """No clock, no `now`: the interval is a pure function of the pair the
+    decision recorded, so reading it twice cannot give two answers."""
+    day = _dt.date(2026, 8, 29)
+    decision = quotas.Admission(
+        day=day,
+        count=None,
+        decided_at=_dt.datetime(2026, 8, 29, 23, 0, tzinfo=_dt.timezone.utc),
+    )
+    assert decision.retry_after_seconds == 3600
+    assert decision.retry_after_seconds == decision.retry_after_seconds
+
+    # Sub-second, and already-past, both floor at one second: zero invites a
+    # retry that arrives before the counter has rolled, and a negative number
+    # is not a refusal shape `Refusal` will accept at all.
+    late = quotas.Admission(
+        day=day,
+        count=None,
+        decided_at=_dt.datetime(
+            2026, 8, 29, 23, 59, 59, 900000, tzinfo=_dt.timezone.utc
+        ),
+    )
+    assert late.retry_after_seconds == 1
+    overdue = quotas.Admission(
+        day=day,
+        count=None,
+        decided_at=_dt.datetime(2026, 8, 31, 12, 0, tzinfo=_dt.timezone.utc),
+    )
+    assert overdue.retry_after_seconds == 1
 
 
 def test_a_refusal_straddling_utc_midnight_names_the_right_midnight(monkeypatch):
@@ -861,7 +932,11 @@ def test_the_gate_hands_the_decisions_reset_to_the_message(monkeypatch):
     assert fixed_day != TODAY, "the fixture must not coincide with today"
 
     async def fake_admit(key_id, limit, now=None):
-        return quotas.Admission(day=fixed_day, count=None)
+        return quotas.Admission(
+            day=fixed_day,
+            count=None,
+            decided_at=_dt.datetime(2019, 3, 7, 9, 0, tzinfo=_dt.timezone.utc),
+        )
 
     monkeypatch.setattr(tools, "_admit_quota", fake_admit)
     result, params, _ = _run_tracked(_probe, limit=5)
@@ -874,3 +949,126 @@ def test_the_gate_hands_the_decisions_reset_to_the_message(monkeypatch):
     assert today_reset not in result, (
         "the gate re-read the clock instead of using the admission's day"
     )
+
+
+def test_the_retry_interval_survives_a_decision_taken_at_utc_midnight(monkeypatch):
+    """D10, end to end: the decision lands 100 ms before midnight and the
+    refusal is built after the clock has crossed it.
+
+    Two failures are pinned at once, and the second is the one that is easy to
+    reintroduce because it looks like ordinary code:
+
+    * the reset must be **2026-08-30T00:00:00Z** — the boundary the statement
+      was actually bound to — and never 2026-08-31's;
+    * the interval must be the **small** one. A second clock read after
+      midnight, subtracted from a reset recomputed for the new day, quotes
+      ~86,400 seconds — nearly forty-eight hours from the decision — and an
+      obedient agent then sleeps through quota it was entitled to spend. That
+      is a self-inflicted outage produced entirely by reading the clock twice.
+
+    The clock inside `quotas` counts its readings, and the decorator's own
+    clock **raises** if it is read at all: between the admission statement and
+    the rendered refusal there must be no reading, not merely a harmless one.
+    """
+    before = _dt.datetime(2026, 8, 29, 23, 59, 59, 900000, tzinfo=_dt.timezone.utc)
+    after = _dt.datetime(2026, 8, 30, 0, 0, 0, 100000, tzinfo=_dt.timezone.utc)
+    reads = []
+
+    class _CountingClock(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            reads.append(len(reads))
+            # Only the first reading falls before midnight: anything that read
+            # the clock again would be told it is already the next day.
+            return before if len(reads) == 1 else after
+
+    class _ForbiddenClock(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):  # pragma: no cover - the assertion is the test
+            raise AssertionError(
+                "the quota gate read the clock after the admission decided"
+            )
+
+    monkeypatch.setattr(quotas._dt, "datetime", _CountingClock)
+    monkeypatch.setattr(tools, "datetime", _ForbiddenClock)
+
+    result, params, spy = _run_tracked(
+        _probe, limit=5, spy=_QuotaSpySession(admitted=None)
+    )
+
+    assert params["over_quota"] is True
+    assert spy.statements[0][1]["day"] == _dt.date(2026, 8, 29)
+    assert len(reads) == 1, (
+        f"the clock was read {len(reads)} times; the decision is one reading "
+        "and everything downstream is arithmetic on it"
+    )
+
+    assert "2026-08-30T00:00:00Z" in result, result
+    assert "2026-08-31" not in result
+
+    payload = _sentinel_payload(result)
+    assert payload["code"] == refusals.OVER_QUOTA
+    assert payload["limit"] == 5
+    assert payload["limit_unit"] == refusals.CALLS_PER_DAY
+    assert payload["retry_after_seconds"] == 1, (
+        "the refusal quoted an interval measured from a second clock read"
+    )
+
+
+def test_the_message_carries_the_sentinel_when_given_the_decisions_interval():
+    """`quota_refusal_message` renders the machine-readable line itself when it
+    is handed the interval the decision derived — and the prose in front of it
+    is byte-for-byte what #162 wrote, because the line is *appended*."""
+    decision = quotas.Admission(
+        day=_dt.date(2026, 8, 29),
+        count=None,
+        decided_at=_dt.datetime(2026, 8, 29, 23, 0, tzinfo=_dt.timezone.utc),
+    )
+
+    prose = quotas.quota_refusal_message(5, decision.reset_at)
+    message = quotas.quota_refusal_message(
+        5, decision.reset_at, decision.retry_after_seconds
+    )
+
+    assert refusals.SENTINEL not in prose, (
+        "the bare two-argument call must stay prose-only: it holds a reset "
+        "instant but no interval, and an over-quota refusal that omitted "
+        "retry_after_seconds would tell an agent that waiting cannot help"
+    )
+    assert message.startswith(prose + "\n")
+    assert _sentinel_payload(message) == {
+        "code": refusals.OVER_QUOTA,
+        "scope": quotas.QUOTA_REFUSAL_SCOPE,
+        "limit": 5,
+        "limit_unit": refusals.CALLS_PER_DAY,
+        "retry_after_seconds": 3600,
+    }
+
+
+def test_rendering_the_message_again_does_not_stack_a_second_line():
+    """The two altitudes — this module composing the refusal, the decorator
+    rendering it — must not be able to put two sentinel lines on one message
+    by both doing their job. `refusals.render` is idempotent."""
+    decision = quotas.Admission(
+        day=_dt.date(2026, 8, 29),
+        count=None,
+        decided_at=_dt.datetime(2026, 8, 29, 23, 0, tzinfo=_dt.timezone.utc),
+    )
+    message = quotas.quota_refusal_message(
+        5, decision.reset_at, decision.retry_after_seconds
+    )
+
+    again = refusals.render(
+        message,
+        refusals.Refusal(
+            code=refusals.OVER_QUOTA,
+            scope=quotas.QUOTA_REFUSAL_SCOPE,
+            limit=5,
+            limit_unit=refusals.CALLS_PER_DAY,
+            retry_after_seconds=1,
+        ),
+    )
+
+    assert again == message
+    assert message.count(refusals.SENTINEL) == 1
+

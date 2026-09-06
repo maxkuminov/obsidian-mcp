@@ -116,10 +116,18 @@ def test_a_limit_sent_to_the_json_api_is_actually_persisted():
     )
 
 
-def test_an_omitted_limit_still_means_unlimited():
+def test_an_omitted_limit_now_receives_the_configured_default():
+    """Changed by #194, deliberately: an omitted field means "apply
+    `DEFAULT_DAILY_REQUEST_LIMIT`". Explicit null is still the only way to ask
+    for an unlimited key, and the next test is what pins that. The full
+    omitted / null / explicit matrix, the panel's half of it, and the
+    grandfathering of existing keys live in `tests/test_default_daily_limit.py`.
+    """
+    from src.config import settings
+
     response, key = _create()
-    assert key.daily_request_limit is None
-    assert response.daily_request_limit is None
+    assert key.daily_request_limit == settings.default_daily_request_limit
+    assert response.daily_request_limit == settings.default_daily_request_limit
 
 
 def test_an_explicit_null_means_unlimited():
