@@ -582,7 +582,8 @@ async def test_the_refusal_writes_the_distinct_error_marker(multi_user_vault):
     assert ctx.logged["tool"] == "edit_note"
     assert params["error"] == tools._VAULT_REASSIGNED_MARKER
     assert params["error"] != tools._NO_VAULT_MARKER
-    # The usual allow-listed params, plus `error`, and nothing else: a refusal
+    assert params["body_outcome"] == "refused"
+    # The usual allow-listed params plus closed outcome fields: a refusal
     # must not become a new disclosure channel.
     assert set(params) == {
         "path",
@@ -601,6 +602,7 @@ async def test_the_refusal_writes_the_distinct_error_marker(multi_user_vault):
         # which writes were guarded and against which base.
         "expected_hash",
         "error",
+        "body_outcome",
     }
     assert params["path"] == "note.md"
 
