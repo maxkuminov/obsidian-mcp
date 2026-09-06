@@ -102,6 +102,34 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
         {"actor_user_id", "user_id", "username", "client_ip", "route"}
     ),
     "password_hash_malformed": frozenset({"user_id"}),
+    # ── The panel session registry (#198) ──
+    #
+    # **No credential material, ever** — not the cookie's session identifier,
+    # and **not its stored SHA-256**. That digest is `user_sessions.id`, so a
+    # record carrying it names one specific live session; it is as much a
+    # secret as the identifier for the purpose of a log. Where a record must
+    # identify a session it uses `token_tag`, which is `sha:` plus eight hex
+    # characters — four short of the twelve-character fragment the canary test
+    # forbids.
+    "panel_session_replay_refused": frozenset(
+        {"reason", "user_id", "token_tag", "route", "client_ip"}
+    ),
+    # `user_id_session` is the logout path's provenance: there the id is copied
+    # from the session cookie and no row was read. The account-event callers
+    # (an administrative reset, a deactivation, a delete, a password change)
+    # revoke against a row they hold and pass `user_id`.
+    "panel_sessions_revoked": frozenset(
+        {"reason", "user_id", "user_id_session", "count"}
+    ),
+    # The logout whose revocation write — or whose rollback — failed. The
+    # cookie is still cleared and the redirect still happens: failing closed
+    # would leave the user signed in *and* the cookie alive. No `exc_info` and
+    # no `str(exc)`, for `oauth_refresh_reuse_revocation_failed`'s reason: a
+    # SQLAlchemy error renders the failing statement *and its bound
+    # parameters*, one of which here is the stored session hash.
+    "panel_session_revocation_failed": frozenset(
+        {"reason", "user_id_session", "error_type", "route", "client_ip"}
+    ),
     # ── OAuth (Slice B) ──
     "oauth_token_issued": frozenset(
         {"client_id", "user_id", "grant_id", "scope", "client_ip", "reason"}

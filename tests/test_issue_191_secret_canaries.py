@@ -208,6 +208,54 @@ async def test_a_submitted_session_cookie_never_reaches_a_record(sink):
     sink.assert_absent(cookie)
 
 
+async def test_a_session_identifier_and_its_stored_hash_never_reach_a_record(sink):
+    """#198: the registry's key is as much a secret as the identifier.
+
+    The cookie carries `sid`; `user_sessions.id` is `sha256(sid)`. A record
+    carrying *either* names one specific live session, so both are canaries —
+    the hash deliberately, because it is the value the refusal path actually
+    has in its hands, the value SQLAlchemy would render into a failing
+    statement's bound parameters, and therefore the one an "it's only a hash"
+    argument would let through.
+
+    The session is minted by the production `start_session`, and every refusal
+    branch that can name a session is driven: the replay of a revoked cookie,
+    an unknown row, and a logout whose revocation write failed with the stored
+    hash *inside the exception message*.
+    """
+    import session_helpers as sh
+    from src.auth.session import get_active_session_user, hash_session_id
+
+    user = sh.fake_user(7)
+    sid, request, registry = await sh.sign_in(user)
+    stored = hash_session_id(sid)
+    cookie = dict(request.session)
+
+    await auth_routes.logout(
+        sh.browser_request(method="POST", session=dict(cookie)), registry
+    )
+    await get_active_session_user(sh.browser_request(session=dict(cookie)), registry)
+    await get_active_session_user(
+        sh.browser_request(session=sh.cookie_for(user, "never-minted")), registry
+    )
+
+    failing, _r, failing_registry = await sh.sign_in(user)
+    failing_registry.fail_on = "UPDATE user_sessions SET revoked_at"
+    failing_registry.fail_with = RuntimeError(
+        f"(psycopg) could not write [parameters: (id={hash_session_id(failing)})]"
+    )
+    await auth_routes.logout(
+        sh.browser_request(method="POST", session=dict(_r.session)), failing_registry
+    )
+
+    assert sink.records, "the refusals must have produced records to search"
+    sink.assert_absent(sid, stored, failing, hash_session_id(failing))
+    # The permitted form is present, so the search above is demonstrably live:
+    # `sha:` plus eight hex characters — four short of the fragment length the
+    # rule forbids.
+    assert "sha:" + hashlib.sha256(sid.encode()).hexdigest()[:8] in sink.rendered()
+
+
 async def test_a_submitted_csrf_token_never_reaches_a_record(sink):
     token = canary()
     request = _request(

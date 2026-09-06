@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import session_helpers
 from src.auth.session import get_current_user
 from src.control_panel import users as panel_users
 from src.control_panel.flash import FLASH_SESSION_KEY
@@ -61,17 +62,21 @@ class _Request:
         self.session = session
 
 
+# Since #198 a browser session is a server-side row, not a cookie: both tests
+# below therefore mint one through `session_helpers.sign_in`, which drives the
+# production `start_session`. Hand-building the cookie here is exactly the
+# drift that helper exists to remove — and without a `sid` and a live row every
+# assertion below would be answered by the pre-registry refusal rather than by
+# the `session_version` check it was written for.
+
+
 @pytest.mark.asyncio
 async def test_current_user_accepts_matching_session_version(monkeypatch):
     monkeypatch.setattr("src.auth.session.settings.multi_user_mode", True)
-    user = SimpleNamespace(id=7, session_version=3, is_active=True)
-    result = MagicMock()
-    result.scalar_one_or_none.return_value = user
-    db = AsyncMock()
-    db.execute.return_value = result
-    request = _Request({"user_id": 7, "session_version": 3})
+    user = session_helpers.fake_user(7, session_version=3)
+    _sid, request, registry = await session_helpers.sign_in(user)
 
-    assert await get_current_user(request, db) is user
+    assert await get_current_user(request, registry) is user
     assert request.session["user_id"] == 7
 
 
@@ -79,17 +84,15 @@ async def test_current_user_accepts_matching_session_version(monkeypatch):
 @pytest.mark.parametrize("cookie_version", [None, 2])
 async def test_current_user_rejects_and_clears_stale_session(monkeypatch, cookie_version):
     monkeypatch.setattr("src.auth.session.settings.multi_user_mode", True)
-    user = SimpleNamespace(id=7, session_version=3, is_active=True)
-    result = MagicMock()
-    result.scalar_one_or_none.return_value = user
-    db = AsyncMock()
-    db.execute.return_value = result
-    session = {"user_id": 7}
-    if cookie_version is not None:
-        session["session_version"] = cookie_version
-    request = _Request(session)
+    user = session_helpers.fake_user(7, session_version=3)
+    _sid, request, registry = await session_helpers.sign_in(user)
+    # A live row, so the refusal below is the version check and nothing else.
+    if cookie_version is None:
+        request.session.pop("session_version")
+    else:
+        request.session["session_version"] = cookie_version
 
-    assert await get_current_user(request, db) is None
+    assert await get_current_user(request, registry) is None
     assert request.session == {}
 
 
