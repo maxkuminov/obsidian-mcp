@@ -616,6 +616,72 @@ async def complete_upload(
     return result.rowcount == 1
 
 
+@dataclass(frozen=True)
+class TransferRefusal:
+    """Why a bearer-protected transfer endpoint said no, plus the row if any.
+
+    The *response* never carries this: `_not_found()` is byte-identical for
+    every cause and that is the anti-oracle the whole surface rests on. The
+    reason exists only so the server-side record can say what the response
+    deliberately withholds.
+    """
+
+    reason: str
+    row: TransferToken | None = None
+
+
+async def classify_token_refusal(
+    session, token: str, *, direction: str
+) -> TransferRefusal:
+    """Diagnose an already-refused token. **Read-only, and never an admission.**
+
+    `lookup_token` and `claim_upload` are each *one filtered query* — hash,
+    direction, `state = pending`, `expires_at > now` — and that is the
+    linearizability argument for single-use redemption. Splitting either of
+    them into a sequence of probes so the route could name the reason would
+    rewrite that argument, so nothing here touches them: the decision has
+    already been taken by the time this runs, this helper takes no decision of
+    its own, and its answer changes no outcome.
+
+    Because the four collapsed conditions overlap — a row can be expired *and*
+    consumed, expired *and* of the wrong direction — the precedence is
+    **total**, so a row matching several always yields the same reason:
+
+    1. `unknown_token` — no row for the hash at all;
+    2. `wrong_direction` — the row exists but belongs to the other endpoint;
+    3. the row's state — `already_claimed` / `already_completed` /
+       `already_consumed`;
+    4. `expired` — still `pending`, but past `expires_at`;
+    5. `claim_lost` — pending, unexpired, right direction: the conditional
+       `UPDATE` lost a race to a concurrent redemption.
+
+    State precedes expiry deliberately: a consumed token that has since aged
+    out was *used*, and reporting it as "expired" would tell an operator the
+    least interesting of the two true facts.
+
+    It may raise — it issues a database read on a path whose whole contract is
+    a fixed 404 — so the caller wraps it and answers `diagnosis_failed` rather
+    than letting a dead connection turn a refusal into a 500.
+    """
+    result = await session.execute(
+        select(TransferToken).where(TransferToken.token_hash == hash_token(token))
+    )
+    row = result.scalars().first()
+    if row is None:
+        return TransferRefusal("unknown_token")
+    if row.direction != direction:
+        return TransferRefusal("wrong_direction", row)
+    if row.state == STATE_CLAIMED:
+        return TransferRefusal("already_claimed", row)
+    if row.state == STATE_COMPLETED:
+        return TransferRefusal("already_completed", row)
+    if row.state == STATE_CONSUMED:
+        return TransferRefusal("already_consumed", row)
+    if _as_aware(row.expires_at) <= _now():
+        return TransferRefusal("expired", row)
+    return TransferRefusal("claim_lost", row)
+
+
 async def lookup_token(session, token: str, *, direction: str) -> TransferToken | None:
     """A usable (`pending`, unexpired) token of the given direction, or `None`.
 

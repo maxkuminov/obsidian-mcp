@@ -23,6 +23,7 @@ When admin mutates a user's `vault_path`, we call
 authenticated API/MCP request picks up the new value without a process
 restart.
 """
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -38,10 +39,17 @@ from src.auth.passwords import hash_password
 from src.auth.session import _SingleUserSentinel
 from src.config import settings
 from src.control_panel.flash import ERR, flash
-from src.control_panel.routes import _panel_context, require_admin_panel
+from src.control_panel.routes import (
+    _actor,
+    _log_panel_forbidden,
+    _panel_context,
+    _request_route,
+    require_admin_panel,
+)
 from src.csrf import verify_csrf
 from src.database import get_session
 from src.models.db import APIKey, NoteMetadata, UsageLog, User
+from src.services import security_events
 from src.services.vault import clear_user_vault_cache, validate_vault_root_path
 
 router = APIRouter(prefix="/admin/users", tags=["users"])
@@ -166,6 +174,22 @@ _ACTOR_REVOKED_MSG = (
     "Your account's admin access changed while that request was in flight — "
     "nothing was saved. Sign in again."
 )
+
+
+def _log_actor_revoked(request: Request, user) -> None:
+    """The `actor_revoked` record for a lost race inside the admin guard.
+
+    `require_admin_panel` authorised this request before the advisory lock was
+    even requested; the wait for that lock is the window in which another
+    admin's demotion of *this* actor commits. Nothing else in the server tells
+    an operator that happened — the caller sees only a flash message — so the
+    refusal is the record.
+
+    `user_id` is deliberately absent: the resource is not what was refused,
+    the actor's own standing was. `create_user` takes neither this lock nor
+    this re-check and therefore has no such refusal to log (residual R7).
+    """
+    _log_panel_forbidden(request, "actor_revoked", user, None)
 
 
 # --- Routes ---------------------------------------------------------------
@@ -341,6 +365,7 @@ async def edit_user_submit(
     await _lock_admin_guard(session)
     if not await _actor_still_privileged(session, user):
         await session.rollback()
+        _log_actor_revoked(request, user)
         return _back_to_list_with_error(request, _ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
@@ -493,6 +518,7 @@ async def delete_user(
     await _lock_admin_guard(session)
     if not await _actor_still_privileged(session, user):
         await session.rollback()
+        _log_actor_revoked(request, user)
         return _back_to_list_with_error(request, _ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
@@ -600,6 +626,7 @@ async def reset_password(
     await _lock_admin_guard(session)
     if not await _actor_still_privileged(session, user):
         await session.rollback()
+        _log_actor_revoked(request, user)
         return _back_to_list_with_error(request, _ACTOR_REVOKED_MSG)
     result = await session.execute(select(User).where(User.id == user_id))
     target = result.scalar_one_or_none()
@@ -610,6 +637,25 @@ async def reset_password(
     target.session_version += 1
     await session.commit()
 
+    # **After the commit** (D17). Emitted before the commit, a rollback would
+    # leave a log line asserting a password was reset that was not — and this
+    # is the one panel action that is a full account takeover of the target,
+    # so it is exactly the record an operator must be able to trust.
+    #
+    # D19's pair, both halves: `actor_user_id` is the administrator who did it,
+    # `user_id`/`username` the account it was done to. The new password is not
+    # a field and has no field to ride in.
+    actor_user_id, _actor_username = _actor(user)
+    security_events.emit(
+        "panel_password_reset",
+        level=logging.INFO,
+        subject=security_events.subject_for(user_id=actor_user_id, request=request),
+        actor_user_id=actor_user_id,
+        user_id=target.id,
+        username=target.username,
+        client_ip=security_events.client_ip(request),
+        route=_request_route(request),
+    )
     return _back_to_list(request, f"Password reset for '{target.username}'.")
 
 

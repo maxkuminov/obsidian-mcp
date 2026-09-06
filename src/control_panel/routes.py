@@ -44,6 +44,7 @@ from src.oauth.scope import (
     has_vault_scope,
     token_has_write,
 )
+from src.services import security_events
 from src.services.indexer import invalidate_hnsw_index_cache
 from src.services.quotas import (
     apply_daily_request_limit,
@@ -95,6 +96,45 @@ from src.services.usage_stats import (
 from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
+
+
+def _request_route(request) -> str | None:
+    """`request.url.path`, defensively. A logging call may not raise.
+
+    Not paranoia about Starlette: these emitters are reached from plain
+    helpers that a test — or a future non-HTTP caller — can drive with
+    something that is not a full `Request`. `security_events.emit` swallows its
+    own failures, but the field expressions are evaluated *before* it is
+    called, so an attribute error here would escape into a request path and
+    turn a 403 into a 500. The record is allowed to be poorer; the response is
+    not allowed to change.
+    """
+    try:
+        return request.url.path
+    except (AttributeError, TypeError):
+        return None
+
+
+def _request_method(request) -> str | None:
+    """`request.method`, defensively. Same reason as `_request_route`."""
+    try:
+        return request.method
+    except (AttributeError, TypeError):
+        return None
+
+
+def _actor(user) -> tuple[int | None, str | None]:
+    """`(actor_user_id, actor_username)` — who *acted*, for a refusal record.
+
+    D19's pair: `actor_user_id` is the principal that caused the record,
+    `user_id` is the account the record is *about*. On the panel's ownership
+    guards the two differ exactly when one person touches another's resource,
+    which is the case the log has to be able to answer.
+
+    The single-user sentinel has `id=None`, so a record from that deployment
+    carries the name and no id rather than inventing one.
+    """
+    return getattr(user, "id", None), getattr(user, "username", None)
 
 
 def _reembed_serializer() -> URLSafeTimedSerializer:
@@ -223,14 +263,34 @@ async def require_user_panel(
 
 
 async def require_admin_panel(
+    request: Request,
     user: User | _SingleUserSentinel = Depends(require_user_panel),
 ):
     """Gate dangerous handlers (settings, user management) on `is_admin`.
 
     In single-user mode the sentinel reports `is_admin=True` so these
     handlers work exactly as today.
+
+    `request` is here only so the 403 can be *recorded* with the route, the
+    method and who was refused (D12); it takes no part in the decision. FastAPI
+    injects it, so no call site changes.
     """
     if not user.is_admin:
+        actor_user_id, actor_username = _actor(user)
+        # No `user_id`: nothing here names a resource with an owner. Absence is
+        # the honest rendering — inventing the actor's own id in that field
+        # would make "whose resource was this about" unanswerable.
+        security_events.emit(
+            "panel_forbidden",
+            subject=security_events.subject_for(
+                user_id=actor_user_id, request=request
+            ),
+            reason="admin_required",
+            actor_user_id=actor_user_id,
+            actor_username=actor_username,
+            route=_request_route(request),
+            method=_request_method(request),
+        )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin required")
     return user
 
@@ -241,6 +301,34 @@ async def require_admin_panel(
 # fires first if there's no session.
 router.dependencies.append(Depends(require_user_panel))
 router.dependencies.append(Depends(verify_csrf))
+
+
+def _log_panel_forbidden(
+    request: Request | None,
+    reason: str,
+    user,
+    owner_user_id: int | None,
+) -> None:
+    """One `panel_forbidden` record for an ownership refusal.
+
+    `actor_*` is who was refused; `user_id` is the owner of the resource they
+    named (D19). The pair is what makes "who tried to touch whose key" a query
+    rather than an inference, and it is emitted even when the two are equal so
+    that a search for one administrator's actions is complete.
+
+    The response is decided by the caller and is never affected by this.
+    """
+    actor_user_id, actor_username = _actor(user)
+    security_events.emit(
+        "panel_forbidden",
+        subject=security_events.subject_for(user_id=actor_user_id, request=request),
+        reason=reason,
+        actor_user_id=actor_user_id,
+        actor_username=actor_username,
+        user_id=owner_user_id,
+        route=_request_route(request),
+        method=_request_method(request),
+    )
 
 
 def _panel_context(
@@ -705,11 +793,24 @@ async def delete_all_revoked(
     return RedirectResponse("/admin/keys", status_code=303)
 
 
-def _assert_key_owner(key: APIKey | None, user: User | _SingleUserSentinel) -> APIKey:
+def _assert_key_owner(
+    key: APIKey | None,
+    user: User | _SingleUserSentinel,
+    *,
+    request: Request | None = None,
+) -> APIKey:
+    """The shared key-ownership predicate. `request` is for the record only.
+
+    Keyword-only and defaulted so the predicate keeps its meaning if a future
+    caller has no request in hand: a refusal with no route recorded is worse
+    than no refusal recorded, but neither may change who is allowed through.
+    `src/api/routes.py` calls this too — see D12.
+    """
     if key is None:
         raise HTTPException(404, "Key not found")
     # Admin can mutate any key. Regular user can only mutate their own.
     if not _is_admin(user) and key.user_id != user.id:
+        _log_panel_forbidden(request, "not_your_key", user, key.user_id)
         raise HTTPException(403, "Not your key")
     return key
 
@@ -717,12 +818,13 @@ def _assert_key_owner(key: APIKey | None, user: User | _SingleUserSentinel) -> A
 @router.post("/keys/{key_id}/revoke")
 async def revoke_key_form(
     key_id: int,
+    request: Request,
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
     result = await session.execute(select(APIKey).where(APIKey.id == key_id))
     api_key = result.scalar_one_or_none()
-    _assert_key_owner(api_key, user)
+    _assert_key_owner(api_key, user, request=request)
     api_key.is_active = False
     await session.commit()
     return RedirectResponse("/admin/keys", status_code=303)
@@ -747,7 +849,7 @@ async def set_key_limit_form(
     """
     result = await session.execute(select(APIKey).where(APIKey.id == key_id))
     api_key = result.scalar_one_or_none()
-    _assert_key_owner(api_key, user)
+    _assert_key_owner(api_key, user, request=request)
 
     limit, limit_error = parse_limit_form_value(daily_request_limit)
     if limit_error is not None:
@@ -760,6 +862,7 @@ async def set_key_limit_form(
 
 @router.post("/keys/{key_id}/delete")
 async def delete_key_form(
+    request: Request,
     key_id: int,
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
@@ -769,7 +872,7 @@ async def delete_key_form(
         select(APIKey).where(APIKey.id == key_id, APIKey.is_active == False)
     )
     api_key = result.scalar_one_or_none()
-    _assert_key_owner(api_key, user)
+    _assert_key_owner(api_key, user, request=request)
     await session.execute(
         sa_update(UsageLog).where(UsageLog.key_id == key_id).values(key_id=None)
     )
@@ -1045,25 +1148,35 @@ async def oauth_page(
 
 
 async def _assert_oauth_client_owner(
-    session: AsyncSession, client_id: str, user: User | _SingleUserSentinel
+    session: AsyncSession,
+    client_id: str,
+    user: User | _SingleUserSentinel,
+    *,
+    request: Request | None = None,
 ) -> OAuthClient:
     result = await session.execute(select(OAuthClient).where(OAuthClient.client_id == client_id))
     client = result.scalar_one_or_none()
     if client is None:
         raise HTTPException(404, "Client not found")
     if not _is_admin(user) and client.user_id != user.id:
+        _log_panel_forbidden(request, "not_your_client", user, client.user_id)
         raise HTTPException(403, "Not your client")
     return client
 
 
 async def _assert_oauth_token_owner(
-    session: AsyncSession, token_id: int, user: User | _SingleUserSentinel
+    session: AsyncSession,
+    token_id: int,
+    user: User | _SingleUserSentinel,
+    *,
+    request: Request | None = None,
 ) -> OAuthToken:
     result = await session.execute(select(OAuthToken).where(OAuthToken.id == token_id))
     token = result.scalar_one_or_none()
     if token is None:
         raise HTTPException(404, "Token not found")
     if not _is_admin(user) and token.user_id != user.id:
+        _log_panel_forbidden(request, "not_your_token", user, token.user_id)
         raise HTTPException(403, "Not your token")
     return token
 
@@ -1071,6 +1184,7 @@ async def _assert_oauth_token_owner(
 @router.post("/oauth/{client_id}/delete")
 async def delete_oauth_client(
     client_id: str,
+    request: Request = None,
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
@@ -1097,7 +1211,7 @@ async def delete_oauth_client(
     at all and the confirm text can honestly promise the history stays. Do not
     "fix" this by swapping the delete for a revoke — see #64 and #77.
     """
-    client = await _assert_oauth_client_owner(session, client_id, user)
+    client = await _assert_oauth_client_owner(session, client_id, user, request=request)
     await session.delete(client)
     await session.commit()
     return RedirectResponse("/admin/oauth", status_code=303)
@@ -1106,6 +1220,7 @@ async def delete_oauth_client(
 @router.post("/oauth/token/{token_id}/revoke")
 async def revoke_oauth_token(
     token_id: int,
+    request: Request = None,
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
@@ -1121,9 +1236,31 @@ async def revoke_oauth_token(
     still asserted on the row the operator named; the family cannot span users
     (see `src/oauth/grants.py`), so that check covers everything this touches.
     """
-    token = await _assert_oauth_token_owner(session, token_id, user)
-    await revoke_grant_family(session, token.grant_id)
+    token = await _assert_oauth_token_owner(session, token_id, user, request=request)
+    revoked = await revoke_grant_family(session, token.grant_id)
     await session.commit()
+    # **After the commit** (D17): a record asserting tokens were revoked must
+    # not outlive a transaction that then rolled back. And emitted *here*
+    # rather than inside `revoke_grant_family` (D10), which has no request, no
+    # client address and no session user, and does not commit — the rowcount it
+    # returns and every caller discarded is what `count` carries.
+    #
+    # Both halves of D19's pair: `actor_user_id` is the administrator who
+    # clicked, `user_id` is the grant's owner. An admin revoking someone else's
+    # grant used to produce one ambiguous id.
+    actor_user_id, _actor_username = _actor(user)
+    security_events.emit(
+        "oauth_grant_revoked",
+        level=logging.INFO,
+        subject=security_events.subject_for(user_id=actor_user_id, request=request),
+        client_id=token.client_id,
+        user_id=token.user_id,
+        actor_user_id=actor_user_id,
+        grant_id=token.grant_id,
+        count=revoked,
+        client_ip=security_events.client_ip(request),
+        route=_request_route(request),
+    )
     return RedirectResponse("/admin/oauth", status_code=303)
 
 
@@ -1169,7 +1306,7 @@ async def update_oauth_token_scope(
     """
     if scope not in ("read", "readwrite"):
         return RedirectResponse("/admin/oauth", status_code=303)
-    token = await _assert_oauth_token_owner(session, token_id, user)
+    token = await _assert_oauth_token_owner(session, token_id, user, request=request)
     if token.revoked:
         return RedirectResponse("/admin/oauth", status_code=303)
 
@@ -1272,6 +1409,53 @@ def _usage_actor(row) -> tuple[str | None, str | None]:
     return (None, None)
 
 
+#: The marker a raising tool body writes (`src/mcp_server/tools.py`). It is the
+#: one value that renders as a *failure* rather than a refusal, so it is named
+#: here rather than spelled inline in the mapping below.
+_TOOL_EXCEPTION_MARKER = "tool_exception"
+
+
+def _usage_outcome(row) -> dict | None:
+    """The displayed outcome for one request-log row, or `None` for a plain call.
+
+    The precedence is declared (design D9) and total, because the three raw
+    values can co-occur — a body that recorded `over_quota` and then raised
+    carries both — and a page that decided by whichever branch it tested first
+    would rank them differently as the code moved:
+
+    1. `tool_exception` — the body ran and raised. Rendered as a **failure**
+       carrying the exception class, because "it broke" and "it was refused"
+       are different answers to "why did this call not do anything".
+    2. any other `error` marker — a refusal, showing the marker as its reason.
+    3. `over_quota` equal to the string `"true"` — a refusal for quota.
+    4. any other non-empty `over_quota` value — a refusal showing the **raw
+       value**. This is the malformed case, and showing it beats hiding it: the
+       row is not an ordinary successful call, and the operator is the one who
+       can tell whether a `"True"`, a `"1"` or a hand-edited `"false"` in there
+       is a bug or a repair. `_tracked` writes the key only when it refuses,
+       and only as the JSON boolean `true`, so nothing the server produces
+       reaches this branch. Nothing is cast, so nothing here can raise — which
+       is the whole reason the value arrives as text.
+    5. none of the above — no outcome; the row rendered exactly as it always
+       has.
+    """
+    error = getattr(row, "error_marker", None)
+    if error:
+        if error == _TOOL_EXCEPTION_MARKER:
+            return {
+                "kind": "failed",
+                "label": "failed",
+                "detail": getattr(row, "error_type", None),
+            }
+        return {"kind": "refused", "label": "refused", "detail": error}
+    over_quota = getattr(row, "over_quota", None)
+    if over_quota:
+        if over_quota == "true":
+            return {"kind": "refused", "label": "refused", "detail": "over_quota"}
+        return {"kind": "refused", "label": "refused", "detail": over_quota}
+    return None
+
+
 @router.get("/usage", response_class=HTMLResponse)
 async def usage_page(
     request: Request,
@@ -1316,6 +1500,7 @@ async def usage_page(
             "created_at": r.created_at.isoformat(),
             "actor_name": actor_name,
             "actor_detail": actor_detail,
+            "outcome": _usage_outcome(r),
         })
 
     totals = []
@@ -1585,15 +1770,27 @@ async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
     """
     try:
         return await _health_strip(session, user)
-    except Exception:  # noqa: BLE001 - the strip must never take the page down
+    except Exception as exc:  # noqa: BLE001 - the strip must never take the page down
         try:
             await session.rollback()
-        except Exception:  # noqa: BLE001 - best effort; the render is what matters
-            logger.exception("could not roll back after a failed health strip read")
-        logger.error(
-            "Dashboard health strip unavailable: its reads failed. The rest of "
-            "the dashboard is unaffected; see /admin/health.",
+        except Exception as rollback_exc:  # noqa: BLE001 - best effort; the render is what matters
+            # Same event as the read failure below (D18's table names both):
+            # they are two ways for the same feature to be unavailable, and an
+            # operator filtering on one name wants to see either. The class in
+            # `error_type` says which.
+            security_events.emit(
+                "panel_health_strip_failed",
+                level=logging.ERROR,
+                subject=security_events.subject_for(user_id=getattr(user, "id", None)),
+                exc_info=True,
+                error_type=type(rollback_exc).__name__,
+            )
+        security_events.emit(
+            "panel_health_strip_failed",
+            level=logging.ERROR,
+            subject=security_events.subject_for(user_id=getattr(user, "id", None)),
             exc_info=True,
+            error_type=type(exc).__name__,
         )
         return {"unavailable": True, "show_ops": _is_admin(user)}
 
@@ -2132,12 +2329,24 @@ async def _reindex_background():
                         stats.record_index(await index_vault(user_id=uid))
                     except Exception as e:
                         stats.record_error("index", e)
-                        logger.error(f"On-demand index failed (user_id={uid}): {e}")
+                        security_events.emit(
+                            "panel_ondemand_index_failed",
+                            level=logging.ERROR,
+                            subject=security_events.subject_for(user_id=uid),
+                            user_id=uid,
+                            error_type=type(e).__name__,
+                        )
                     try:
                         stats.record_embedded(await embed_vault(user_id=uid))
                     except Exception as e:
                         stats.record_error("embed", e)
-                        logger.error(f"On-demand embedding failed (user_id={uid}): {e}")
+                        security_events.emit(
+                            "panel_ondemand_embed_failed",
+                            level=logging.ERROR,
+                            subject=security_events.subject_for(user_id=uid),
+                            user_id=uid,
+                            error_type=type(e).__name__,
+                        )
         else:
             async with record_indexer_run("manual", None) as stats:
                 stats.record_index(await index_vault())
