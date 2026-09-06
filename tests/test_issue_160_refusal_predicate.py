@@ -28,12 +28,25 @@ def test_the_marker_values_match_the_writer():
 
     assert usage_stats.NO_VAULT_MARKER == tools._NO_VAULT_MARKER
     assert usage_stats.UNENCODABLE_ARG_MARKER == tools._UNENCODABLE_ARG_MARKER
+    # The three vault-root quarantine markers (#199) are mirrored the same way
+    # and pinned by the same rule.
+    assert usage_stats.VAULT_ROOT_OVERLAP_MARKER == tools._VAULT_ROOT_OVERLAP_MARKER
+    assert (
+        usage_stats.VAULT_ROOT_UNEXAMINABLE_MARKER
+        == tools._VAULT_ROOT_UNEXAMINABLE_MARKER
+    )
+    assert (
+        usage_stats.VAULT_ROOT_NOT_READY_MARKER == tools._VAULT_ROOT_NOT_READY_MARKER
+    )
 
 
 def test_exactly_the_pre_body_markers_are_enumerated():
     assert usage_stats.PRE_BODY_REFUSAL_ERROR_MARKERS == (
         "no_vault_assigned",
         "argument_not_encodable",
+        "vault_root_overlap",
+        "vault_root_unexaminable",
+        "vault_root_not_ready",
     )
     assert usage_stats.OVER_QUOTA_PARAM == "over_quota"
 

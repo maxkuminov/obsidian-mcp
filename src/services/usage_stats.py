@@ -54,12 +54,24 @@ The enumerated set:
   resolvable vault root, so no tool body runs.
 * `error = 'argument_not_encodable'` — the unpaired-surrogate screen, which
   refuses at the same altitude for the same reason.
+* `error = 'vault_root_overlap'`, `error = 'vault_root_unexaminable'` and
+  `error = 'vault_root_not_ready'` — the vault-root quarantine (#199), written
+  by the *same* admission gate for the three reasons `_vault_root` can refuse
+  a caller whose account is otherwise assigned and active: its root collides
+  with another account's, its root could not be examined, or no quarantine
+  snapshot has been published in this process yet. Three values rather than
+  one because an operator acts differently on each — an assignment corrected,
+  a mount restored, a detection that is failing — and the register in
+  `docs/architecture/usage-attribution.md` says so. All three are pre-body by
+  construction: the gate runs before the body, which is the same position
+  `no_vault_assigned` holds.
 
-The two string values are mirrored from `_NO_VAULT_MARKER` and
-`_UNENCODABLE_ARG_MARKER` in `src/mcp_server/tools.py`. They are *mirrored*
+The five string values are mirrored from `_NO_VAULT_MARKER`,
+`_UNENCODABLE_ARG_MARKER` and the three `_VAULT_ROOT_*_MARKER` constants in
+`src/mcp_server/tools.py`. They are *mirrored*
 rather than imported because #162's quota gate will import this module from
 `tools.py`, and an import in the other direction closes the cycle.
-`tests/test_issue_160_refusal_predicate.py` asserts the two copies are equal,
+`tests/test_issue_160_refusal_predicate.py` asserts the copies are equal,
 so the mirror cannot drift silently.
 """
 from __future__ import annotations
@@ -71,6 +83,14 @@ from sqlalchemy import text
 # this is a mirror and not an import.
 NO_VAULT_MARKER = "no_vault_assigned"
 UNENCODABLE_ARG_MARKER = "argument_not_encodable"
+
+# The three vault-root quarantine markers (#199), mirrored the same way and
+# pinned by the same test. They are written by the admission gate — the same
+# `_tracked` branch that writes `NO_VAULT_MARKER` — so they sit on the same
+# side of the body/no-body line by construction, not by judgement.
+VAULT_ROOT_OVERLAP_MARKER = "vault_root_overlap"
+VAULT_ROOT_UNEXAMINABLE_MARKER = "vault_root_unexaminable"
+VAULT_ROOT_NOT_READY_MARKER = "vault_root_not_ready"
 
 #: The `params.error` values `_tracked` writes *before* a tool body runs.
 #:
@@ -98,6 +118,9 @@ UNENCODABLE_ARG_MARKER = "argument_not_encodable"
 PRE_BODY_REFUSAL_ERROR_MARKERS: tuple[str, ...] = (
     NO_VAULT_MARKER,
     UNENCODABLE_ARG_MARKER,
+    VAULT_ROOT_OVERLAP_MARKER,
+    VAULT_ROOT_UNEXAMINABLE_MARKER,
+    VAULT_ROOT_NOT_READY_MARKER,
 )
 
 #: The boolean `params` key the quota gate (#162) sets on a refusal.

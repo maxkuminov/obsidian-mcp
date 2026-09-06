@@ -98,6 +98,7 @@ Round 3 found the hole this leaves: a record emitted straight through `logger.*`
 | --- | --- | --- | --- |
 | `src/mcp_server/auth.py` × 10 | `auth_failure` (unchanged name) | WARNING | A |
 | `src/mcp_server/tools.py:477` | `tool_refused_no_vault` | WARNING | C |
+| `src/mcp_server/tools.py` (the same gate) | `tool_refused_vault_quarantined` | WARNING | C — added by #199; `reason` in {`overlap`, `root_unexaminable`, `snapshot_not_ready`} |
 | `src/mcp_server/tools.py:522` | `tool_refused_over_quota` | WARNING | C |
 | `src/mcp_server/tools.py:252` | `usage_log_credential_gone` | WARNING | C |
 | `src/mcp_server/tools.py` — `f"Failed to log usage for {tool}: {e}"` × 2 | `usage_log_failed` (`tool`, `error_type`, `reason` = `initial` \| `after_clearing_fks`) | WARNING | C |
