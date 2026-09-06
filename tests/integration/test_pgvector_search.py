@@ -202,6 +202,11 @@ async def seeded(sessionmaker, monkeypatch):
                 tags=["fixture"],
                 frontmatter={},
                 content_hash=name,
+                # Equal to `content_hash`, so these fixtures are **fresh**: a
+                # NULL here is `IS DISTINCT FROM` and would make every seeded
+                # row stale, withholding its chunk preview (#200). Staleness
+                # itself is exercised in `tests/test_issue_200_stale_service.py`.
+                embedded_content_hash=name,
             )
             session.add(note)
             await session.flush()
@@ -245,6 +250,16 @@ async def test_semantic_search_orders_dedupes_and_scores(sessionmaker, seeded, m
     assert paths == ["near.md", "middle.md", "far.md"], paths
     # One row per note even though near.md contributed two chunks.
     assert len(paths) == len(set(paths))
+    # The result shape, against a real database: every row carries the two
+    # annotations (#200 / #202), and these fixtures are fresh and uncapped, so
+    # they read false and the chunk preview is present.
+    assert set(results[0]) == {
+        "path", "title", "tags", "chunk", "chunk_index", "similarity",
+        "stale", "embedding_truncated",
+    }
+    assert all(r["stale"] is False for r in results)
+    assert all(r["embedding_truncated"] is False for r in results)
+    assert all(r["chunk"] for r in results)
     # The similarity is computed in Python from the returned vector, which is a
     # plain list on pgvector 0.5 — the value must still be right.
     by_path = {r["path"]: r["similarity"] for r in results}

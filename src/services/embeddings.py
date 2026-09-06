@@ -1,7 +1,9 @@
 import asyncio
+import enum
 import logging
 import re
 import time
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Protocol
 
@@ -10,10 +12,22 @@ import numpy as np
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.config import settings
+from src.config import (
+    MAX_CHUNKS_PER_NOTE,
+    MAX_EMBED_FAILURE_MESSAGE_CHARS,
+    settings,
+)
 from src.models.db import NoteEmbedding, NoteMetadata
 from src.services import timing
 from src.services.filters import apply_note_filters
+from src.services.index_state import (
+    KEY_EMBEDDING_FINGERPRINT,
+    FingerprintStatus,
+    acquire_generation_lock,
+    compare_fingerprint,
+    embedding_fingerprint,
+    get_state,
+)
 from src.services.links import BODY, scan_fences
 
 logger = logging.getLogger(__name__)
@@ -219,9 +233,41 @@ def clean_at_version(version: int, body: str) -> str | None:
     return cleaner(body) if cleaner is not None else None
 
 
-def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[str]:
-    """Split text into chunks of ~chunk_size tokens with overlap.
-    Approximation: 1 token ~ 4 chars.
+def chunk_text_bounded(
+    content: str,
+    *,
+    chunk_size: int = 512,
+    overlap: int = 0,
+    max_chunks: int = MAX_CHUNKS_PER_NOTE,
+) -> tuple[list[str], bool]:
+    """The first `max_chunks` chunks in DOCUMENT order, and whether it capped.
+
+    The bounded sibling `chunk_text` delegates to, in the shape #203 gave
+    `extract_links_bounded`. `MAX_NOTE_BYTES` is 10 MiB and `CHUNK_SIZE` is 512
+    tokens (~4 characters each), so one *legal* note is ~5,120 chunks — each of
+    them one sequential, 30 s-bounded provider call, under `index_pass_lock`,
+    with no LIMIT on the backlog behind it. Re-editing one such note kept every
+    later tenant's notes out of the index indefinitely (#202).
+
+    **Document order, and the head rather than an arbitrary window**, so a
+    capped note keeps the part a reader would call the note. A capped note is a
+    *declared degradation*, never a skip: the caller certifies it through the
+    ordinary conditional stamp (an uncertified note is re-selected by the
+    backlog on every tick for ever — #127's permanent burn arriving by a new
+    route), sets `notes_metadata.chunks_truncated`, and both vector paths
+    report `embedding_truncated`.
+
+    The second element is `True` only when a chunk was actually *dropped*: a
+    note that lands on exactly `max_chunks` is complete and is not marked. That
+    is settled by generating one chunk past the cap and discarding it — one
+    extra window, never the unbounded chunking the cap exists to prevent, which
+    is also why nothing here can ever report the note's true chunk count.
+
+    `step = max(char_size - char_overlap, 1)` is #10's infinite-loop guard and
+    stays. It is a floor, not a sane configuration: `Settings` refuses
+    `CHUNK_OVERLAP >= CHUNK_SIZE` at startup, because at the floor ~3 KB of
+    prose becomes ~3,000 chunks and every ordinary note in the vault would be
+    silently truncated here (D3b).
     """
     char_size = chunk_size * 4
     char_overlap = overlap * 4
@@ -230,19 +276,48 @@ def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[st
     step = max(char_size - char_overlap, 1)
 
     if len(content) <= char_size:
-        return [content] if content.strip() else []
+        # Deliberately unstripped, which is this branch's long-standing
+        # behaviour: the emptiness test is `strip()`, the stored chunk is the
+        # content. One chunk can never exceed a cap of at least one.
+        return ([content] if content.strip() else []), False
 
-    chunks = []
+    # One past the cap: if that chunk materialises, something was dropped.
+    ceiling = max_chunks + 1 if max_chunks > 0 else None
+
+    chunks: list[str] = []
     start = 0
     while start < len(content):
         end = start + char_size
         chunk = content[start:end]
         if chunk.strip():
             chunks.append(chunk.strip())
+            if ceiling is not None and len(chunks) >= ceiling:
+                break
         if end >= len(content):
             break
         start += step
 
+    if ceiling is not None and len(chunks) >= ceiling:
+        return chunks[:max_chunks], True
+    return chunks, False
+
+
+def chunk_text(content: str, chunk_size: int = 512, overlap: int = 0) -> list[str]:
+    """Split text into chunks of ~chunk_size tokens with overlap.
+    Approximation: 1 token ~ 4 chars.
+
+    Bounded by `MAX_CHUNKS_PER_NOTE` through `chunk_text_bounded`, so "this
+    note produces no chunks" and "this note's chunks" mean the same thing
+    everywhere they are asked — `embed_note` and the exclusion sweep's
+    zero-chunk probe alike. Callers that need to know whether the cap bit call
+    `chunk_text_bounded` directly.
+    """
+    chunks, _truncated = chunk_text_bounded(
+        content,
+        chunk_size=chunk_size,
+        overlap=overlap,
+        max_chunks=MAX_CHUNKS_PER_NOTE,
+    )
     return chunks
 
 
@@ -473,6 +548,193 @@ async def certify_embedded(
         session.expire(expire_on, ["embedded_content_hash"])
 
 
+class NoteEmbedOutcome(enum.Enum):
+    """What `embed_note` did, as five distinct things instead of one `0`.
+
+    The return used to be a chunk count, and `0` meant three unrelated things:
+    a note that cleaned to zero chunks *and was certified*, a provider
+    exception the function swallowed, and a vector/chunk cardinality mismatch.
+    `_embed_vault_pinned` then ran `outcome.embedded += 1` after all three, so a
+    total Ollama or OpenAI outage wrote an `indexer_runs` row reading
+    `notes_embedded = N, error = NULL` — byte for byte the record a healthy
+    pass writes, with a *positive* count (#201).
+    """
+
+    #: Chunks were embedded and the note was certified.
+    EMBEDDED = "embedded"
+    #: Cleaning and chunking produced nothing. The note is certified with zero
+    #: vectors, which is the correct representation of it, and **no provider
+    #: call was made** — so it is not an attempt.
+    CERTIFIED_EMPTY = "certified_empty"
+    #: The provider raised. Nothing certified, nothing written, previous
+    #: vectors intact (#11). A failure of the pass.
+    PROVIDER_FAILED = "provider_failed"
+    #: The provider returned a number of vectors that is not the number of
+    #: chunks requested. Same disposition, a distinct diagnosis.
+    PROVIDER_CARDINALITY_MISMATCH = "provider_cardinality_mismatch"
+    #: The embedding configuration moved under the provider call (D7c): the
+    #: fingerprint re-read under the generation lock no longer matches this
+    #: process's. Nothing certified, inserted or deleted. **Not** a failure —
+    #: nothing went wrong with the provider — but an attempt, because a call
+    #: was issued.
+    GENERATION_MISMATCH = "generation_mismatch"
+
+
+@dataclass(frozen=True)
+class EmbedNoteFailure:
+    """Bounded, structured detail for the two failing outcomes.
+
+    The pass's own record of a failed embed is built from this and from nothing
+    else: `embed_note` swallows the provider exception, so by the time
+    `_embed_vault_pinned` sees a failure there is no exception left to inspect
+    and `EpassResult.first_error` would otherwise read `"... first: None"`.
+
+    `message` is truncated **at capture**, not where the run row is written:
+    `MAX_RUN_ERROR_CHARS` (4,000) bounds the whole `indexer_runs.error` text,
+    and one untruncated provider traceback can exceed that on its own and evict
+    the stage labels beside it.
+    """
+
+    #: `type(exc).__name__`, or the literal `"CardinalityMismatch"`.
+    exc_type: str
+    #: Truncated to `MAX_EMBED_FAILURE_MESSAGE_CHARS` by `capture`.
+    message: str
+    #: Chunks sent to the provider. Set for both failing outcomes.
+    requested: int | None = None
+    #: Vectors the provider returned. Set for the cardinality mismatch only.
+    received: int | None = None
+
+    @classmethod
+    def capture(cls, exc: BaseException, *, requested: int) -> "EmbedNoteFailure":
+        """From a provider exception, with the message bounded here."""
+        return cls(
+            exc_type=type(exc).__name__,
+            message=str(exc)[:MAX_EMBED_FAILURE_MESSAGE_CHARS],
+            requested=requested,
+        )
+
+    @classmethod
+    def cardinality(cls, *, requested: int, received: int) -> "EmbedNoteFailure":
+        """For a batch whose size is not the requested chunk count."""
+        return cls(
+            exc_type="CardinalityMismatch",
+            message=f"{received} vectors for {requested} chunks",
+            requested=requested,
+            received=received,
+        )
+
+
+#: The outcomes that carry an `EmbedNoteFailure`, and the only ones that may.
+_FAILING_OUTCOMES = frozenset(
+    {
+        NoteEmbedOutcome.PROVIDER_FAILED,
+        NoteEmbedOutcome.PROVIDER_CARDINALITY_MISMATCH,
+    }
+)
+
+
+@dataclass(frozen=True)
+class EmbedNoteResult:
+    """What one `embed_note` call did, read by field and never as a number.
+
+    **Two chunk counts, deliberately.** `chunks_submitted` is what went to the
+    provider and is what the per-tenant budget debits; `chunks_embedded` is
+    what was stored and is what feeds a pass's `total_chunks`. A budget debited
+    by *stored* chunks is not debited at all when the provider fails, so a
+    tenant whose every note fails would burn unbounded provider time and never
+    reach its own bound — the starvation #202 is about, surviving inside the
+    fix for it.
+
+    **There is deliberately no `__int__` and no `__radd__`.** A first draft of
+    this design claimed `total_chunks += result` would keep working through an
+    `__int__`; it does not — `int.__iadd__` falls back to `int.__add__(result)`,
+    which returns `NotImplemented`, and with no `__radd__` the statement raises
+    `TypeError`. Explicit is also the outcome we want: a caller that must name
+    the field it means cannot silently go on treating five outcomes as one
+    number.
+    """
+
+    outcome: NoteEmbedOutcome
+    #: Chunks handed to the provider. Zero exactly when no call was issued.
+    chunks_submitted: int
+    #: Chunks stored as `note_embeddings` rows by this call.
+    chunks_embedded: int
+    #: Whether the chunker dropped chunks at `MAX_CHUNKS_PER_NOTE`. Reported
+    #: for every outcome because it is a fact about the note's text; only a
+    #: certifying outcome licenses writing `notes_metadata.chunks_truncated`
+    #: from it, and only after that transaction commits.
+    truncated: bool
+    #: Non-null exactly for `PROVIDER_FAILED` and
+    #: `PROVIDER_CARDINALITY_MISMATCH`.
+    failure: EmbedNoteFailure | None = None
+
+    def __post_init__(self) -> None:
+        # An invariant rather than a convention: `record_failure_detail` is
+        # driven off `failure`, so a failing outcome without one would report a
+        # provider outage as `"first: None"` — the exact hole #201 is.
+        if (self.outcome in _FAILING_OUTCOMES) != (self.failure is not None):
+            raise ValueError(
+                f"{self.outcome.value} must carry a failure "
+                f"{'' if self.outcome in _FAILING_OUTCOMES else 'no failure '}"
+                "and does not"
+            )
+
+
+async def _generation_matches(session: AsyncSession, note: NoteMetadata) -> bool:
+    """Take the generation lock and re-read the embedding fingerprint under it.
+
+    **This is the whole enforcement of D7c**, and it lives here because this is
+    the only place the window exists: `get_embeddings_batch` and
+    `certify_embedded` are twenty lines apart inside `embed_note`, so no caller
+    can interpose between them. `_embed_vault_pinned`'s per-stage read is an
+    early exit, not the guarantee — a check at the head of a stage is separated
+    from the act by a provider round trip:
+
+        old process: read fingerprint A == A, proceed
+        old process: get_embeddings_batch(note)     <- seconds to minutes
+        reset:       wipe column, write fingerprint B, commit
+        old process: certify + insert              <- old-model vectors under B
+
+    `make reset-embeddings` runs as a one-off container on purpose (#142), so
+    it can and does run while a previous container is still serving; the
+    vectors that interleaving stores are permanently wrong and every later
+    startup is silent, because the stored fingerprint already matches.
+
+    Called **after** the provider call and **before** the certification, which
+    is the window `index-integrity` already reserves — so no lock of any kind
+    is held across a network request. It is also before the first row lock this
+    transaction takes (the certification is that lock), so the
+    advisory-before-any-row-lock ordering and the after-the-provider-call rule
+    agree here rather than conflict.
+
+    An **absent** fingerprint is not a mismatch: nothing has been claimed about
+    the stored rows, so there is nothing to contradict, and this path never
+    writes one — only the maintenance workflows and the startup adoption do,
+    which is what stops a refusal from clearing itself. `DIFFERS` and
+    `UNREADABLE` both refuse; an unreadable stored value is one this build
+    cannot compare, so it cannot certify against it (the rule
+    `clean_at_version` already follows for an unknown stamped version).
+    """
+    await acquire_generation_lock(session)
+    current = embedding_fingerprint()
+    verdict = compare_fingerprint(
+        await get_state(session, KEY_EMBEDDING_FINGERPRINT), current
+    )
+    if verdict.status in (FingerprintStatus.MATCH, FingerprintStatus.ABSENT):
+        return True
+    logger.error(
+        "Refusing to certify %s: the embedding configuration changed under "
+        "this pass. Stored fingerprint %s, this process's %s (%s). Nothing was "
+        "certified, inserted or deleted; a pass running the stored "
+        "configuration will embed it.",
+        note.file_path,
+        verdict.stored,
+        current,
+        ", ".join(verdict.fields) if verdict.fields else verdict.reason,
+    )
+    return False
+
+
 async def embed_note(
     session: AsyncSession,
     note: NoteMetadata,
@@ -480,8 +742,12 @@ async def embed_note(
     *,
     certified_hash: str | None = None,
     certified_path: str | None = None,
-):
+) -> EmbedNoteResult:
     """Chunk a note's content, embed, and store in note_embeddings.
+
+    Returns an `EmbedNoteResult`, **never an integer**: the five things this
+    function can do are five outcomes, and the caller reads the field it means.
+    See `NoteEmbedOutcome` for why one number was wrong.
 
     `certified_hash` / `certified_path` are what the caller **verified the
     bytes against** — `embed_vault` passes the hash and path from its own
@@ -491,6 +757,14 @@ async def embed_note(
     replaced. When they are absent the legacy behaviour stands (copy the
     in-memory row's `content_hash`), which is what the unit tests that drive
     this function with a stub session exercise.
+
+    The chunking is bounded (`MAX_CHUNKS_PER_NOTE`) and a capped note is still
+    certified — on full coverage of the *requested* list, which is what the
+    cap redefines. The truncation ERROR line is emitted by the caller **after
+    the certifying transaction commits**, not here: logging it before the
+    commit would leave a permanent ERROR in a bounded, process-lifetime buffer
+    for a write that then rolled back on a `StaleCertification`, sending an
+    operator after a note that was never stored that way.
     """
     if (certified_hash is None) != (certified_path is None):
         # Half a certification is worse than none: `file_path == None` renders
@@ -501,11 +775,21 @@ async def embed_note(
             "neither"
         )
     cleaned = clean_for_embedding(content)
-    chunks = chunk_text(cleaned, chunk_size=settings.chunk_size, overlap=settings.chunk_overlap)
+    chunks, truncated = chunk_text_bounded(
+        cleaned,
+        chunk_size=settings.chunk_size,
+        overlap=settings.chunk_overlap,
+        max_chunks=MAX_CHUNKS_PER_NOTE,
+    )
     if not chunks:
         # Empty/fully-filtered notes are successfully represented by zero
         # vectors. Remove stale vectors and stamp the hash so they do not get
         # selected on every embedding pass forever.
+        #
+        # No generation lock and no fingerprint re-read: no provider call was
+        # made, and "the correct vector set for this note is the empty one" is
+        # true under every embedding configuration — the same argument that
+        # exempts the exclusion branch (D7c).
         if certified_hash is not None:
             await certify_embedded(
                 session, note.id, certified_hash, certified_path, expire_on=note
@@ -516,20 +800,64 @@ async def embed_note(
         if certified_hash is None:
             note.embedded_content_hash = note.content_hash
         await session.flush()
-        return 0
+        # `truncated` is False by construction here: a note the cap bit has at
+        # least `MAX_CHUNKS_PER_NOTE` chunks.
+        return EmbedNoteResult(
+            outcome=NoteEmbedOutcome.CERTIFIED_EMPTY,
+            chunks_submitted=0,
+            chunks_embedded=0,
+            truncated=False,
+        )
 
     try:
         embeddings = await get_embeddings_batch(chunks)
     except Exception as e:
+        # Swallowed here rather than raised, deliberately: `_reconcile_exclusions`
+        # calls this function too and its declared convergence exception is that
+        # a row whose provider call fails is left unstamped and retried, so a
+        # raise would have to be re-caught there anyway — and a raise makes a
+        # provider blip indistinguishable from a database error at the call
+        # site, which is the conflation the typed outcome exists to remove.
+        # Nothing is written, so the note's previous vectors survive (#11).
         logger.warning(f"Failed to embed {note.file_path}: {e}")
-        return 0
+        return EmbedNoteResult(
+            outcome=NoteEmbedOutcome.PROVIDER_FAILED,
+            chunks_submitted=len(chunks),
+            chunks_embedded=0,
+            truncated=truncated,
+            failure=EmbedNoteFailure.capture(e, requested=len(chunks)),
+        )
 
     if len(embeddings) != len(chunks):
+        # Cardinality is exact over the *requested* list, which the cap has
+        # already bounded: one vector short of the capped list is still a
+        # refusal.
         logger.warning(
             "Embedding provider returned %d vectors for %d chunks in %s",
             len(embeddings), len(chunks), note.file_path,
         )
-        return 0
+        return EmbedNoteResult(
+            outcome=NoteEmbedOutcome.PROVIDER_CARDINALITY_MISMATCH,
+            chunks_submitted=len(chunks),
+            chunks_embedded=0,
+            truncated=truncated,
+            failure=EmbedNoteFailure.cardinality(
+                requested=len(chunks), received=len(embeddings)
+            ),
+        )
+
+    # ── The generation interlock (D7c) ───────────────────────────────────
+    # After the provider call, before the certification, before this
+    # transaction's first row lock. A mismatch certifies nothing, inserts
+    # nothing and deletes nothing — the disposition `StaleCertification`
+    # already has — and is neither an embedded note nor a failure.
+    if not await _generation_matches(session, note):
+        return EmbedNoteResult(
+            outcome=NoteEmbedOutcome.GENERATION_MISMATCH,
+            chunks_submitted=len(chunks),
+            chunks_embedded=0,
+            truncated=truncated,
+        )
 
     # Certify first, then replace. The stamp is the conditional write that
     # proves the row still records the hash these vectors were built from, and
@@ -560,7 +888,12 @@ async def embed_note(
     await session.flush()
     if certified_hash is None:
         note.embedded_content_hash = note.content_hash
-    return len(chunks)
+    return EmbedNoteResult(
+        outcome=NoteEmbedOutcome.EMBEDDED,
+        chunks_submitted=len(chunks),
+        chunks_embedded=len(chunks),
+        truncated=truncated,
+    )
 
 
 async def semantic_search(
@@ -666,18 +999,64 @@ async def semantic_search(
         if len(deduped) >= limit:
             break
 
+    # ── Staleness and truncation, annotated from the already-hydrated row ──
+    #
+    # `stale` is `embedded_content_hash IS DISTINCT FROM content_hash`,
+    # computed in Python: the statement above already hydrates the whole
+    # `NoteMetadata` entity, so both hashes are in hand and **no predicate, no
+    # `SET LOCAL`, no overfetch and no exact-fallback eligibility changes** —
+    # which is the point. Filtering on the hashes was rejected outright: it
+    # would remove every note edited since the last completed embed pass (the
+    # whole vault during a provider outage), and because the owner mapping
+    # makes every query here a filtered one whose zero-row result re-runs
+    # exactly, it would turn an outage into an O(n) scan of the embedding table
+    # on every search.
+    #
+    # `IS DISTINCT FROM`, never `!=`: a note that was never embedded, or whose
+    # certification a move cleared, holds `NULL` and must read stale rather
+    # than NULL-propagating into "fresh". Python's `!=` against `None` **is**
+    # that operator, which is why this reads as it does — do not "fix" it into
+    # an `is not None` guard.
+    #
+    # **A stale row's `chunk` is `None`, not a clip of superseded text.** Of
+    # the fields on a result, `path`, `title` and `tags` come from
+    # `notes_metadata`, which the *scan* refreshed — a row is stale precisely
+    # because the scan already committed the new `content_hash` — and
+    # `similarity` is a retrieval score, not a claim about content. The chunk
+    # is the only field that is a verbatim quotation of the note's text, the
+    # only one that is out of date, and the one an agent pastes into an answer.
+    # Withholding it turns a silently wrong answer into a visibly degraded one
+    # whose remedy (`read_note`) is one call away. The note is still found,
+    # still ranked, still named: nothing leaves the result set and nothing
+    # moves in it.
+    #
+    # The bound this signal has, stated here so it is not later read as a
+    # stronger claim: staleness is derived from `notes_metadata`, so it reports
+    # what the *index knows*. Between an edit landing on disk and the next pass
+    # committing the new hash, the row reads fresh while the chunk is already
+    # superseded. Closing that would put a filesystem read on the hot path of
+    # every search and would still race the writer.
     results = [
         {
             "path": nm.file_path,
             "title": nm.title,
             "tags": nm.tags,
-            "chunk": ne.chunk_text[:500],
+            "chunk": None if stale else ne.chunk_text[:500],
             "chunk_index": ne.chunk_index,
             "similarity": float(np.dot(ne.embedding, query_embedding) / (
                 np.linalg.norm(ne.embedding) * np.linalg.norm(query_embedding)
             )),
+            "stale": stale,
+            # Read from the durable column, never inferred from the number of
+            # chunk rows: a capped note holds exactly the cap and is
+            # indistinguishable by count from a note that legitimately produces
+            # that many.
+            "embedding_truncated": bool(nm.chunks_truncated),
         }
-        for ne, nm in deduped
+        for ne, nm, stale in (
+            (ne, nm, nm.embedded_content_hash != nm.content_hash)
+            for ne, nm in deduped
+        )
     ]
     # Result telemetry, recorded after the dedupe so the count and the paths
     # are what the tool actually returns (#161) — an overfetched, not-yet-

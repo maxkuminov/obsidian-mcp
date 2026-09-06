@@ -97,11 +97,29 @@ class _Chunk:
 
 
 class _Note:
-    def __init__(self, note_id, path):
+    """A `notes_metadata` row as `semantic_search` hydrates it.
+
+    The two hashes are **equal** and `chunks_truncated` is False, so every row
+    these tests build is fresh and uncapped and the annotations (#200, #202)
+    change nothing they assert. Staleness itself is exercised in
+    `tests/test_issue_200_stale_service.py`.
+    """
+
+    def __init__(
+        self,
+        note_id,
+        path,
+        content_hash="h",
+        embedded_content_hash="h",
+        chunks_truncated=False,
+    ):
         self.id = note_id
         self.file_path = path
         self.title = path.removesuffix(".md")
         self.tags = []
+        self.content_hash = content_hash
+        self.embedded_content_hash = embedded_content_hash
+        self.chunks_truncated = chunks_truncated
 
 
 def _semantic_row(note_id, path, embedding, distance):
@@ -263,6 +281,10 @@ async def test_semantic_search_returns_a_plain_list(holder):
     assert isinstance(results, list)
     assert set(results[0]) == {
         "path", "title", "tags", "chunk", "chunk_index", "similarity",
+        # #200 / #202: annotations, never predicates. Every row carries them,
+        # so a caller cannot mistake "this build does not report staleness"
+        # for "nothing here is stale".
+        "stale", "embedding_truncated",
     }
 
 
@@ -276,15 +298,34 @@ class _RelatedRow:
     the distance the database computed, so a service that reached for the raw
     vector to recompute one would fail here rather than silently disagree with
     its own ORDER BY.
+
+    It carries `content_hash`, `embedded_content_hash` and `chunks_truncated`
+    ahead of the tool change that reads them (#200 / #202): the hashes are
+    equal and the marker is False, so every row here is fresh and uncapped and
+    nothing in this file's assertions moves. Pre-added deliberately, so the
+    slice that widens `find_related_stmt`'s projection lands against a fake
+    that already has them and neither slice edits the other's file.
     """
 
-    def __init__(self, note_id, path, distance, chunk="chunk"):
+    def __init__(
+        self,
+        note_id,
+        path,
+        distance,
+        chunk="chunk",
+        content_hash="h",
+        embedded_content_hash="h",
+        chunks_truncated=False,
+    ):
         self.note_id = note_id
         self.file_path = path
         self.title = path.removesuffix(".md")
         self.tags = []
         self.chunk_text = f"{path} {chunk}"
         self.distance = distance
+        self.content_hash = content_hash
+        self.embedded_content_hash = embedded_content_hash
+        self.chunks_truncated = chunks_truncated
 
 
 class _FindRelatedSession(_RecordingSession):
