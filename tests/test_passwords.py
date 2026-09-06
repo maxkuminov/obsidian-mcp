@@ -148,21 +148,32 @@ def test_malformed_stored_hash_fails_closed(stored):
 
 
 def test_malformed_stored_hash_logs_a_warning(caplog):
-    """Failing closed silently would hide a corrupted column indefinitely."""
-    with caplog.at_level(logging.WARNING, logger="src.auth.passwords"):
-        assert verify_password("anything", "not-a-hash") is False
+    """Failing closed silently would hide a corrupted column indefinitely.
+
+    The record moved onto `security_events.emit` with #191: a caller drives
+    this branch through the login form, so it has to pass the same allowance
+    check as every other caller-triggerable refusal. The event name *is* the
+    message now, and the row it names rides in an allow-listed field.
+    """
+    with caplog.at_level(logging.WARNING, logger="security_events"):
+        assert verify_password("anything", "not-a-hash", user_id=42) is False
 
     warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 1
-    assert "not a well-formed bcrypt hash" in warnings[0].message
+    assert warnings[0].getMessage() == "password_hash_malformed"
+    assert warnings[0].user_id == 42
 
 
 def test_malformed_hash_warning_leaks_no_secrets(caplog):
     """The log line is read by whoever tails production; keep it identifier-free."""
-    with caplog.at_level(logging.WARNING, logger="src.auth.passwords"):
+    with caplog.at_level(logging.WARNING, logger="security_events"):
         verify_password("s3cret-plaintext", "$2b$12$corrupted-column-value")
 
-    logged = caplog.text
+    logged = caplog.text + " ".join(
+        str(value)
+        for record in caplog.records
+        for value in record.__dict__.values()
+    )
     assert "s3cret-plaintext" not in logged
     assert "corrupted-column-value" not in logged
 

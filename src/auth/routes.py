@@ -12,6 +12,7 @@ race-free in practice — only an already-SSO'd admin can reach
 guard with a PostgreSQL transaction-scoped advisory lock for defense in
 depth.
 """
+import logging
 import os
 import re
 from datetime import datetime, timezone
@@ -29,6 +30,7 @@ from src.database import get_session
 from src.limiter import limiter
 from src.models.db import APIKey, NoteMetadata, OAuthClient, OAuthCode, OAuthToken, UsageLog, User
 from src.oauth.grants import USER_BOOTSTRAP_LOCK_KEY
+from src.services import security_events
 from src.services.vault import validate_vault_root_path, warm_user_vault_cache
 
 router = APIRouter(tags=["auth"], dependencies=[Depends(verify_csrf)])
@@ -85,6 +87,21 @@ def _safe_next(next_url: str | None) -> str:
     if next_url[1:2] in ("/", "\\"):
         return "/admin/"
     return next_url
+
+
+def _bootstrap_refused(request: Request, reason: str) -> None:
+    """One `panel_bootstrap_refused` record. The rendered form is unchanged.
+
+    Bootstrap is reachable by anyone Traefik's OAuth chain lets through, and
+    every branch below is a form field away, so the record is bounded on the
+    client address like every other unauthenticated refusal.
+    """
+    security_events.emit(
+        "panel_bootstrap_refused",
+        subject=security_events.subject_for(request=request),
+        reason=reason,
+        client_ip=security_events.client_ip(request),
+    )
 
 
 async def _users_table_empty(session: AsyncSession) -> bool:
@@ -170,7 +187,35 @@ async def login_submit(
     result = await session.execute(select(User).where(User.username == normalized))
     user = result.scalar_one_or_none()
 
-    if user is None or not user.is_active or not verify_password(password, user.password_hash):
+    # The merged condition is split **for the reason code only**. All three
+    # branches fall into one `_render_login(..., status_code=401)`, so the
+    # response is byte-identical across them and the log is the only place the
+    # cause exists (#191). The order also preserves the original
+    # short-circuit: `verify_password` still runs only for an active row.
+    reason: str | None = None
+    if user is None:
+        reason = "unknown_user"
+    elif not user.is_active:
+        reason = "inactive_user"
+    elif not verify_password(password, user.password_hash, user_id=user.id):
+        reason = "bad_password"
+
+    if reason is not None:
+        # The suppression subject is the client address, never the resolved
+        # row: a failed login resolved no credential, and keying on the user
+        # would hand an attacker one fresh allowance per valid username they
+        # guess.
+        security_events.emit(
+            "panel_login_failed",
+            subject=security_events.subject_for(request=request),
+            reason=reason,
+            username_submitted=normalized,
+            # Present only where a row actually resolved; `unknown_user` has
+            # none, and the unsuffixed name may hold nothing else (D15).
+            user_id=None if user is None else user.id,
+            client_ip=security_events.client_ip(request),
+            route=request.url.path,
+        )
         return _render_login(
             request,
             error=invalid_msg,
@@ -184,6 +229,18 @@ async def login_submit(
         update(User).where(User.id == user.id).values(last_login_at=datetime.now(timezone.utc))
     )
     await session.commit()
+
+    # After the commit, never before it (D17): a commit that then fails would
+    # otherwise leave a record asserting a sign-in that did not happen.
+    security_events.emit(
+        "panel_login_succeeded",
+        level=logging.INFO,
+        subject=security_events.subject_for(user_id=user.id, request=request),
+        user_id=user.id,
+        username=user.username,
+        client_ip=security_events.client_ip(request),
+        route=request.url.path,
+    )
 
     # Warm the per-user vault-path cache so any subsequent panel route /
     # vault tool call in this process can resolve `_vault_root(user.id)`
@@ -202,6 +259,27 @@ async def login_submit(
 
 @router.post("/admin/auth/logout")
 async def logout(request: Request):
+    # Read the session **before** it is cleared, and read nothing else: the
+    # `_session` suffix is the provenance (D15). Both values are copied from
+    # the session cookie without a database lookup, so they may name an account
+    # that has since been renamed or deleted — which is exactly what a logout
+    # can honestly say, and a logout must not pay for a query to say it.
+    try:
+        user_id_session = request.session.get("user_id")
+        username_session = request.session.get("username")
+    except (AssertionError, AttributeError):
+        user_id_session = None
+        username_session = None
+
+    security_events.emit(
+        "panel_logout",
+        level=logging.INFO,
+        subject=security_events.subject_for(user_id=user_id_session, request=request),
+        user_id_session=user_id_session,
+        username_session=username_session,
+        client_ip=security_events.client_ip(request),
+    )
+
     request.session.clear()
     return RedirectResponse("/admin/auth/login", status_code=status.HTTP_302_FOUND)
 
@@ -232,6 +310,7 @@ async def register_submit(
     # Early UX-friendly validation (no DB roundtrip).
     normalized = (username or "").strip().lower()
     if not _USERNAME_RE.match(normalized):
+        _bootstrap_refused(request, "invalid_username")
         return _render_register(
             request,
             error="Username must be 1–64 chars, lowercase letters / digits / underscores only.",
@@ -240,6 +319,7 @@ async def register_submit(
             status_code=status.HTTP_400_BAD_REQUEST,
         )
     if len(password) < 8:
+        _bootstrap_refused(request, "weak_password")
         return _render_register(
             request,
             error="Password must be at least 8 characters.",
@@ -248,6 +328,7 @@ async def register_submit(
             status_code=status.HTTP_400_BAD_REQUEST,
         )
     if password != password_confirm:
+        _bootstrap_refused(request, "password_mismatch")
         return _render_register(
             request,
             error="Passwords do not match.",
@@ -257,6 +338,7 @@ async def register_submit(
         )
     vault_path = (vault_path or "").strip()
     if not vault_path:
+        _bootstrap_refused(request, "vault_path_missing")
         return _render_register(
             request,
             error="Vault path is required.",
@@ -266,6 +348,7 @@ async def register_submit(
         )
     normalized_vp, vp_err = validate_vault_root_path(vault_path)
     if vp_err:
+        _bootstrap_refused(request, "vault_path_invalid")
         return _render_register(
             request,
             error=vp_err,
@@ -286,6 +369,7 @@ async def register_submit(
             # Someone else won the race. Don't reveal that to the form
             # (just send them to login).
             await session.rollback()
+            _bootstrap_refused(request, "already_bootstrapped")
             return RedirectResponse(
                 "/admin/auth/login", status_code=status.HTTP_302_FOUND
             )
@@ -329,6 +413,19 @@ async def register_submit(
     except Exception:
         await session.rollback()
         raise
+
+    # After the commit, never after the insert (D17): a commit that then raises
+    # would otherwise leave a record asserting an administrator exists who does
+    # not — which is the one claim an operator reading this line must be able
+    # to trust.
+    security_events.emit(
+        "panel_bootstrap_admin_created",
+        level=logging.INFO,
+        subject=security_events.subject_for(user_id=uid, request=request),
+        user_id=uid,
+        username=normalized,
+        client_ip=security_events.client_ip(request),
+    )
 
     # Warm the freshly-created admin's vault-path cache before any vault
     # tool call. The bootstrap flow flips us straight into /admin/ which

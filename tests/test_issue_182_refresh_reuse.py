@@ -28,8 +28,11 @@ import pytest
 from src.models.db import OAuthToken
 from src.oauth import routes as oauth
 from src.oauth.grants import grant_lock_key
+from src.services import security_events
 
 from sqlalchemy.sql.dml import Update
+
+from src.logging_setup import StructuredFormatter
 
 from _oauth_grant_fakes import (
     ADVISORY_LOCK_SQL,
@@ -95,7 +98,31 @@ class TracingSession(FakeSession):
 
 REFRESH_SECRET = "r" * 64
 UNKNOWN_SECRET = "z" * 64
-LOGGER_NAME = "src.oauth.routes"
+
+# The alarm moved onto `security_events.emit` with #191, so it is emitted on the
+# security stream rather than this module's own logger, and the identifiers are
+# allow-listed *fields* rather than message text. The old code interpolated them
+# into the message because the process formatter was `%(message)s` and anything
+# left in `extra` never reached the operator; #190 replaced that formatter, so
+# the fields are now what an operator actually queries.
+LOGGER_NAME = "security_events"
+REUSE_EVENT = "oauth_refresh_reuse_detected"
+FAILURE_EVENT = "oauth_refresh_reuse_revocation_failed"
+
+
+@pytest.fixture(autouse=True)
+def _one_record_per_outcome():
+    """One emission attempt means one record, for every test in this file.
+
+    The suppressor bounds a `(event, subject)` pair at ten records a minute and
+    every replay here shares one subject, so without this the later cases in a
+    full-suite run would assert on records the flood bound had (correctly)
+    withheld.
+    """
+    security_events.reset_state()
+    with security_events.suppression_disabled():
+        yield
+    security_events.reset_state()
 
 
 def refresh(session, monkeypatch, token=REFRESH_SECRET, client_id=None):
@@ -176,10 +203,8 @@ def rotate_once(session, monkeypatch):
 def records_named(caplog, event: str) -> list[logging.LogRecord]:
     """Records for one event, matched on the message the operator sees.
 
-    The process formatter is `%(message)s` (`src/main.py`), so an identifier
-    that lives only in `extra` never reaches an operator. Matching on the
-    rendered message is therefore also an assertion that the message carries
-    the event name at all.
+    `security_events.emit` renders the event name as the message, so matching
+    on it is also an assertion that the record says which event it is.
     """
     return [
         record
@@ -189,11 +214,11 @@ def records_named(caplog, event: str) -> list[logging.LogRecord]:
 
 
 def reuse_records(caplog) -> list[logging.LogRecord]:
-    return records_named(caplog, "oauth.refresh_reuse_detected")
+    return records_named(caplog, REUSE_EVENT)
 
 
 def failure_records(caplog) -> list[logging.LogRecord]:
-    return records_named(caplog, "oauth.refresh_reuse_revocation_failed")
+    return records_named(caplog, FAILURE_EVENT)
 
 
 # --- the replay kills the family ----------------------------------------
@@ -368,7 +393,7 @@ def test_a_failed_revocation_keeps_the_response_and_logs_no_token_material(
 
     (record,) = failure_records(caplog)
     assert record.exc_info is None, "a traceback would carry the statement"
-    assert record.error == "RuntimeError"
+    assert record.error_type == "RuntimeError"
     assert reuse_records(caplog) == [], "nothing was revoked, so nothing fired"
     rendered = record.getMessage() + " ".join(
         str(value) for value in record.__dict__.values()
@@ -520,24 +545,27 @@ def test_the_reuse_record_names_the_grant_and_carries_no_token_material(
     (record,) = reuse_records(caplog)
     assert record.levelno == logging.WARNING
     assert record.name == LOGGER_NAME
-    assert record.event == "oauth.refresh_reuse_detected"
+    assert record.getMessage() == REUSE_EVENT
     assert record.client_id == "client123"
     assert record.grant_id == "g1"
     assert record.user_id == 7
     assert record.revoked_tokens >= 1
 
-    # The identifiers must survive the process formatter, which is
-    # `%(message)s` (`src/main.py`): anything left in `extra` alone is invisible
-    # to the operator who has to act on the alarm.
-    message = record.getMessage()
-    assert "client_id=client123" in message
-    assert "grant_id=g1" in message
-    assert "user_id=7" in message
-    assert f"revoked_tokens={record.revoked_tokens}" in message
+    # The identifiers must survive the *formatter*, which is what actually
+    # reaches the operator. #190 replaced `%(message)s` with a structured
+    # renderer, so this is now the assertion the old "put them in the message"
+    # workaround stood in for.
+    rendered_line = StructuredFormatter().format(record)
+    emitted = json.loads(rendered_line)
+    assert emitted["msg"] == REUSE_EVENT
+    assert emitted["client_id"] == "client123"
+    assert emitted["grant_id"] == "g1"
+    assert emitted["user_id"] == 7
+    assert emitted["revoked_tokens"] == record.revoked_tokens
 
     rendered = " ".join(
         str(value) for value in record.__dict__.values()
-    ) + message
+    ) + rendered_line
     for secret in (REFRESH_SECRET, current_refresh, oauth._hash(REFRESH_SECRET)):
         assert secret not in rendered
 

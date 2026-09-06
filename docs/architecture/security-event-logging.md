@@ -190,6 +190,8 @@ nothing binds the request address into a ContextVar (residual R8).
 | `oauth_token_refreshed` | INFO | `client_id`, `client_ip`, `grant_id`, `scope`, `user_id` | `src/oauth/routes.py` `/token`, after the rotation's commit |
 | `oauth_token_refused` | WARNING | `client_id`, `client_id_submitted`, `client_ip`, `grant_id`, `reason`, `user_id` | every `/token` refusal; `reason` is `<rfc_code>.<sub_reason>` |
 | `oauth_token_rotation_failed` | ERROR | `client_id`, `client_ip`, `error_type`, `grant_id` | the `except Exception` whose traceback is discarded behind a 500 |
+| `oauth_refresh_reuse_detected` | WARNING | `client_id`, `client_ip`, `grant_id`, `revoked_tokens`, `user_id` | `src/oauth/routes.py` `/token`, when a replayed refresh token killed its whole family (#182) |
+| `oauth_refresh_reuse_revocation_failed` | ERROR | `client_id`, `client_ip`, `error_type`, `grant_id`, `user_id` | the same branch when the revocation write failed. **No `exc_info`**: a SQLAlchemy error renders the failing statement and its bound parameters, one of which is the token hash |
 | `oauth_consent_granted` | INFO | `client_id`, `client_ip`, `scope`, `user_id` | `/authorize`, after the code row commits |
 | `oauth_consent_denied` | INFO | `client_id`, `client_id_submitted`, `client_ip`, `user_id` | `/authorize` deny |
 | `oauth_authorize_refused` | WARNING | `client_id`, `client_id_submitted`, `client_ip`, `reason`, `user_id` | every `/authorize` refusal |

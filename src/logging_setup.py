@@ -148,6 +148,10 @@ ALLOWED_FIELDS: dict[str, _FieldSpec] = {
     "limit": _S(int),
     "limit_count": _S(int),
     "count": _S(int),
+    # How many live tokens a refresh-reuse replay killed (#182). Distinct from
+    # `count` so the two can be queried apart: `count` on `oauth_grant_revoked`
+    # is a deliberate revocation, this one is a family destroyed by an alarm.
+    "revoked_tokens": _S(int),
     "day": _S(str, 10),
     "window_seconds": _S(int),
     "duration_ms": _S(int),

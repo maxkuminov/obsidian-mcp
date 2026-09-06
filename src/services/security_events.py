@@ -122,6 +122,18 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "oauth_token_rotation_failed": frozenset(
         {"client_id", "grant_id", "client_ip", "error_type"}
     ),
+    # The #182 refresh-reuse alarm, migrated onto the suppressor by Slice B: a
+    # replayed refresh token is caller-driven and repeatable, so a bare
+    # `logger.warning` was an unbounded flood channel beside the bounded one.
+    "oauth_refresh_reuse_detected": frozenset(
+        {"client_id", "grant_id", "user_id", "revoked_tokens", "client_ip"}
+    ),
+    # No `exc_info` and no `stack` on this one, deliberately: a SQLAlchemy
+    # error renders the failing statement *and its bound parameters*, one of
+    # which is the token hash. Only the exception's class name is recorded.
+    "oauth_refresh_reuse_revocation_failed": frozenset(
+        {"client_id", "grant_id", "user_id", "client_ip", "error_type"}
+    ),
     "oauth_consent_granted": frozenset({"client_id", "user_id", "scope", "client_ip"}),
     "oauth_consent_denied": frozenset(
         {"client_id", "client_id_submitted", "user_id", "client_ip"}
