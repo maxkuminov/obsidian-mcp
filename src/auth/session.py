@@ -11,9 +11,11 @@ is what revocation acts on and what validation consults.
 Four functions, and the asymmetry between two of them is the contract:
 
 * `start_session` — the **single** mint. It takes the account guard, re-reads
-  the account under it, and **commits**, because `get_session` neither commits
-  nor rolls back: an insert left to a caller's discretion is an insert that may
-  never happen, and the cookie handed out beside it would authenticate nothing.
+  the account under it, refuses unless the row is active **and still on the
+  `expected_session_version` its caller authorized against**, and **commits**,
+  because `get_session` neither commits nor rolls back: an insert left to a
+  caller's discretion is an insert that may never happen, and the cookie handed
+  out beside it would authenticate nothing.
 * `revoke_session` / `revoke_user_sessions` — **never** commit. They ride the
   caller's transaction, because every caller holds the account guard and
   nothing may commit between taking that lock and writing the flags it
