@@ -1917,7 +1917,7 @@ async def read_note_impl(
         )
 
     truncated = offset > 0 or next_offset is not None
-    view, view_omission = frontmatter_view(note["frontmatter"])
+    view, view_omission, view_coercions = frontmatter_view(note["frontmatter"])
     result = ReadNoteResult(
         path=note["path"],
         # From `read_file`'s single read of the note's bytes — the same bytes
@@ -1956,7 +1956,11 @@ async def read_note_impl(
     # room on a field that is about to be dropped anyway.
     carried = [] if view_omission is None else [view_omission]
     carried += screen_unrenderable(result, note["lossy_metadata"])
-    apply_metadata_budget(result, carried, metadata_budget)
+    # Coercions go in beside the omissions and are filtered against what
+    # survives the budget: a retained-but-altered value is a different fact
+    # from a dropped one, and the two lists never carry each other's entries
+    # (#154, design D10).
+    apply_metadata_budget(result, carried, metadata_budget, view_coercions)
     return result
 
 

@@ -34,12 +34,11 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
-import math
 from typing import Any
 
 from pydantic import BaseModel, model_serializer
 
-from src.services.vault import is_encodable, outline_sections
+from src.services.vault import is_encodable, non_finite_token, outline_sections
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +68,13 @@ class _OmitNone(BaseModel):
 OMITTED_BUDGET = "metadata_budget"
 OMITTED_NOT_REPRESENTABLE = "not_json_representable"
 OMITTED_DUPLICATE_KEY = "duplicate_json_key"
+#: The same loss, but *caused by* this server's own non-finite coercion
+#: (`.nan: 1` beside `".nan": 2`) rather than by two keys YAML itself renders
+#: alike (`1:` beside `"1":`). A caller can act on the difference — the first
+#: is a property of the note, the second is a property of the note *plus* this
+#: rendering rule — so it is a distinct code rather than the same one (#154,
+#: design D10, L14).
+OMITTED_COERCED_DUPLICATE_KEY = "duplicate_json_key_after_coercion"
 OMITTED_UNPAIRED_SURROGATE = "unpaired_surrogate"
 OMITTED_TOO_DEEP = "excessive_depth"
 
@@ -213,7 +219,17 @@ class _ViewUnrepresentable(Exception):
 
 
 class _ViewKeyCollision(Exception):
-    """Two YAML keys would land on one JSON key."""
+    """Two YAML keys would land on one JSON key.
+
+    `coerced` says whether this server's non-finite coercion is what made them
+    collide, which is a different fact from `1:` beside `"1":` and gets its own
+    reason code.
+    """
+
+    def __init__(self, key: str, coerced: bool = False) -> None:
+        super().__init__(key)
+        self.key = key
+        self.coerced = coerced
 
 
 class _ViewNotEncodable(Exception):
@@ -221,6 +237,16 @@ class _ViewNotEncodable(Exception):
 
 
 def _view_key(key: Any) -> str:
+    """A mapping key as one JSON string. Non-finite floats take YAML's token.
+
+    A YAML mapping may be *keyed* by a number, non-finite ones included
+    (`.nan: 1`), and today's `str(key)` renders Python's `nan` in a place the
+    note spells `.nan`. Same helper as the leaf below and as the indexer, so
+    the view, the index and the block cannot disagree (#154).
+    """
+    token = non_finite_token(key)
+    if token is not None:
+        return token
     if isinstance(key, str):
         return key
     if isinstance(key, (_dt.datetime, _dt.date, _dt.time)):
@@ -234,7 +260,17 @@ def _view_leaf(value: Any, budget: dict) -> Any:
     if isinstance(value, int):
         return value if -_VIEW_INT_BOUND < value < _VIEW_INT_BOUND else _view_str(str(value), budget)
     if isinstance(value, float):
-        return value if math.isfinite(value) else _view_str(str(value), budget)
+        # `NaN` / `Infinity` / `-Infinity` are not JSON. This branch has always
+        # coerced them; what changes with #154 is *what it coerces to* and that
+        # it says so: YAML's own `.nan` / `.inf` / `-.inf` rather than Python's
+        # `nan` / `inf`, which is a spelling no note contains, and a
+        # `metadata_coercions` entry so the caller can tell this from a note
+        # whose value really is the string `"nan"`.
+        token = non_finite_token(value)
+        if token is None:
+            return value
+        budget["coerced"] = True
+        return _view_str(token, budget)
     if isinstance(value, str):
         return _view_str(value, budget)
     if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
@@ -269,10 +305,20 @@ def _view_walk(node: Any, depth: int, path: frozenset[int], budget: dict) -> Any
             raise _ViewUnrepresentable("frontmatter contains a recursive alias")
         inner = path | {id(node)}
         out: dict[str, Any] = {}
+        # Which rendered keys exist only because a non-finite float was
+        # coerced. A collision involving one of them is caused by this
+        # rendering rule, not by the note alone, and is reported as such.
+        coerced_keys: set[str] = set()
         for key, value in node.items():
+            key_token = non_finite_token(key)
             rendered = _view_key(key)
             if rendered in out:
-                raise _ViewKeyCollision(rendered)
+                raise _ViewKeyCollision(
+                    rendered, coerced=key_token is not None or rendered in coerced_keys
+                )
+            if key_token is not None:
+                coerced_keys.add(rendered)
+                budget["coerced"] = True
             _view_str(rendered, budget)
             out[rendered] = _view_walk(value, depth + 1, inner, budget)
         return out
@@ -286,36 +332,53 @@ def _view_walk(node: Any, depth: int, path: frozenset[int], budget: dict) -> Any
     return _view_leaf(node, budget)
 
 
-def frontmatter_view(frontmatter: dict) -> tuple[dict | None, MetadataOmission | None]:
+def frontmatter_view(
+    frontmatter: dict,
+) -> tuple[dict | None, MetadataOmission | None, list[MetadataCoercion]]:
     """Best-effort JSON view of a parsed frontmatter mapping.
 
-    Returns `(view, omission)`. `view` is None when the block has nothing to
-    show (no block, or an empty mapping) — that is not an omission — and also
-    when construction failed, in which case `omission` says why. Never raises:
-    a note must not be able to make a read fail.
+    Returns `(view, omission, coercions)`. `view` is None when the block has
+    nothing to show (no block, or an empty mapping) — that is not an omission —
+    and also when construction failed, in which case `omission` says why.
+    `coercions` names values the view rendered in a canonical form the note
+    does not literally contain; it is empty for the overwhelming majority of
+    notes and non-empty only alongside a `view` that was actually built, since
+    a coercion is a statement about a field the caller *received*. Never
+    raises: a note must not be able to make a read fail.
     """
     if not frontmatter:
-        return None, None
-    budget = {"nodes": _VIEW_MAX_NODES, "chars": _VIEW_MAX_CHARS}
+        return None, None, []
+    budget = {"nodes": _VIEW_MAX_NODES, "chars": _VIEW_MAX_CHARS, "coerced": False}
     try:
-        return _view_walk(frontmatter, 0, frozenset(), budget), None
+        view = _view_walk(frontmatter, 0, frozenset(), budget)
     except _ViewNotEncodable:
-        return None, unrenderable_omission("frontmatter", OMITTED_UNPAIRED_SURROGATE)
+        return None, unrenderable_omission("frontmatter", OMITTED_UNPAIRED_SURROGATE), []
     except _ViewKeyCollision as exc:
+        # A coercion-induced collision keeps #149's omit-whole-view rule rather
+        # than the index's first-key-wins: first-wins here would emit a partial
+        # view, and a caller cannot tell a pruned mapping from a complete one.
+        # The reason code says which of the two collisions this was (D10, L14).
         return None, _omission(
             "frontmatter",
-            OMITTED_DUPLICATE_KEY,
-            f"Two frontmatter keys both render as the JSON key {str(exc)!r}, so the "
-            "JSON view would silently lose one of them; frontmatter_yaml carries "
-            "both.",
-        )
+            OMITTED_COERCED_DUPLICATE_KEY if exc.coerced else OMITTED_DUPLICATE_KEY,
+            (
+                f"Two frontmatter keys both render as the JSON key {exc.key!r} once a "
+                "non-finite number is written as its canonical YAML token, so the "
+                "JSON view would silently lose one of them; frontmatter_yaml carries "
+                "both, with the spellings the note uses."
+                if exc.coerced
+                else f"Two frontmatter keys both render as the JSON key {exc.key!r}, so "
+                "the JSON view would silently lose one of them; frontmatter_yaml "
+                "carries both."
+            ),
+        ), []
     except _ViewUnrepresentable as exc:
         return None, _omission(
             "frontmatter",
             OMITTED_NOT_REPRESENTABLE,
             f"The frontmatter has no bounded JSON form ({exc}); frontmatter_yaml "
             "carries it verbatim.",
-        )
+        ), []
     except Exception:
         # Reached, not hypothetical: `str()` on a hex integer past CPython's
         # digit limit raises from inside the walk. `debug`, not `exception` —
@@ -327,7 +390,8 @@ def frontmatter_view(frontmatter: dict) -> tuple[dict | None, MetadataOmission |
             OMITTED_NOT_REPRESENTABLE,
             "The frontmatter could not be rendered as JSON; frontmatter_yaml "
             "carries it verbatim.",
-        )
+        ), []
+    return view, None, ([non_finite_coercion("frontmatter")] if budget["coerced"] else [])
 
 
 def _view_cost(view: dict) -> int:
@@ -638,6 +702,7 @@ def apply_metadata_budget(
     result: ReadNoteResult,
     carried: list[MetadataOmission],
     budget: int,
+    coercions: list[MetadataCoercion] | None = None,
 ) -> None:
     """Bring `result`'s metadata fields inside `budget`, recording every drop.
 
@@ -663,6 +728,12 @@ def apply_metadata_budget(
     `carried` holds omissions decided before the budget ran — the JSON view's
     own construction failures, and the unencodable-value screen — so the list
     the caller sees is in decision order.
+
+    `coercions` holds values rendered in a canonical form (#154). They are
+    filtered here rather than set by the caller because the budget decides
+    which fields survive, and a coercion is a statement about a field the
+    response **still carries**: an entry naming a field this function has just
+    dropped whole would contradict the omission beside it.
 
     **`path` and `content_hash` are not in the drop order and not in the
     cost.** Both are server-controlled and of fixed width, and both are
@@ -730,3 +801,7 @@ def apply_metadata_budget(
 
     if omissions:
         result.metadata_omissions = omissions
+
+    kept = [c for c in (coercions or []) if getattr(result, c.field, None) is not None]
+    if kept:
+        result.metadata_coercions = kept
