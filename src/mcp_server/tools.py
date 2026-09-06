@@ -57,7 +57,7 @@ from src.mcp_server.read_result import (
     screen_unrenderable,
 )
 from src.models.db import UsageLog
-from src.services import rate_limits, refusals, security_events, timing
+from src.services import concurrency, rate_limits, refusals, security_events, timing
 from src.services.tool_outcomes import BodyOutcome, body_refusal as _body_refusal
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
@@ -279,6 +279,42 @@ async def _log_usage(
 
 
 async def write_usage_row(values: dict) -> bool:
+    """Bound every usage write, including initial insert and dangling-FK retry.
+
+    Acquire before opening any session; refusal is a failed audit, never a
+    failed completed tool. Coalesced callers requeue their unconfirmed weight.
+    """
+    controller = concurrency.get_controller()
+    admission = await controller.writer()
+    if not admission.admitted:
+        try:
+            security_events.emit(
+                "usage_log_failed",
+                subject=security_events.subject_for(user_id=values.get("user_id")),
+                tool=values.get("tool"),
+                reason="concurrency_capacity",
+            )
+        except Exception:
+            pass
+        return False
+    try:
+        if admission.shadow is not None:
+            # The writer observation rides on this same actual row. Do not
+            # emit another row to observe logging, or replace an actual error.
+            params = dict(values.get("params") or {})
+            previous = params.get("concurrency_shadow", {}).get("observations", ())
+            observations = [concurrency.Pressure(p["stage"], p["scope"], p["limit"])
+                            for p in previous]
+            params["concurrency_shadow"] = concurrency.shadow_metadata(
+                (*observations, admission.pressure)
+            )
+            values = dict(values, params=params)
+        return await _write_usage_row_admitted(values)
+    finally:
+        admission.lease.release()
+
+
+async def _write_usage_row_admitted(values: dict) -> bool:
     """Insert one prepared `usage_logs` row, and do not lose it to a dangling
     credential.
 
@@ -1209,6 +1245,20 @@ def _rate_limited_message(scope: str, retry_after: int) -> str:
     )
 
 
+def _slot_timeout_message(pressure: concurrency.Pressure, queue_ms: float) -> str:
+    waited = f" after waiting {queue_ms / 1000:.3f} seconds" if queue_ms > 0 else " now"
+    return refusals.render(
+        f"Error: no concurrency capacity is available{waited} "
+        f"(scope {pressure.scope}, limit {pressure.limit}). The call was refused "
+        "before its body ran and spent no daily quota. Retry later or reduce "
+        "parallel calls; no release time is guaranteed.",
+        refusals.Refusal(
+            code=refusals.SLOT_TIMEOUT, scope=pressure.scope,
+            limit=pressure.limit, limit_unit=refusals.CONCURRENT_CALLS,
+        ),
+    )
+
+
 def _rate_refusal_template(tool_name: str, params: dict, scope: str) -> dict:
     """The complete row a coalescing window will write, captured when it opens.
 
@@ -1225,6 +1275,11 @@ def _rate_refusal_template(tool_name: str, params: dict, scope: str) -> dict:
     a call that never ran; the pre-body predicate keeps such rows out of the
     latency aggregates regardless.
     """
+    # Auth/request pressure belongs to the actual refusal row too, without
+    # replacing its real error or creating a synthetic observed request.
+    shadow = (timing.current() or {}).get("concurrency_shadow")
+    if shadow is not None:
+        params = {**params, "concurrency_shadow": shadow}
     return dict(
         key_id=current_api_key_id.get(),
         oauth_token_id=current_oauth_token_id.get(),
@@ -1286,6 +1341,7 @@ def _tracked(
     refusal_result=None,
     write_class: bool = False,
     arg_char_caps: dict[str, int] | None = None,
+    resource_class: str | None = None,
 ):
     """Decorator that times the call and logs it to usage_logs.
 
@@ -1322,12 +1378,15 @@ def _tracked(
     screen already lives there, and auditing each interpolation one at a time
     is how the #149 class stayed open for two audit rounds.
 
-    **The gate order is L2 → L3 → L4 → L5 → L6 → body** — general bucket,
-    write bucket, vault admission, the two argument screens, daily quota, and
+    **The gate order is L2 → L3 → L4 → L5 → slots → L6 → body** — general bucket,
+    write bucket, vault admission, the two argument screens, concurrency, daily quota, and
     only then the tool. The buckets are first because they are the only gate
     that is pure arithmetic; the quota stays **last** because it is the only
     gate that consumes something durable, and nothing durable may be spent by a
     call that does not run.
+
+    `resource_class` declares a class for internal test tools; registered tools
+    use concurrency.TOOL_CLASSES and cannot override that closed mapping.
     """
     transforms = transforms or {}
     arg_char_caps = arg_char_caps or {}
@@ -1380,9 +1439,17 @@ def _tracked(
             # statement of any kind. Its count lands on the next row that key
             # writes, or on the tick / shutdown flush.
             log_row = True
+            slot_lease = None
             try:
                 refusal = None
                 extra: dict = {}
+                controller = concurrency.get_controller()
+                transport_observations = (
+                    concurrency.request_observations.get()
+                    if controller.mode == "shadow" else ()
+                )
+                if shadow := concurrency.shadow_metadata(transport_observations):
+                    timing.record("concurrency_shadow", shadow)
 
                 # ── L2 and L3: the two per-principal token buckets, the first
                 # gates in the decorator (design D3).
@@ -1514,6 +1581,47 @@ def _tracked(
                             name, length, arg_char_caps[name]
                         )
                         extra = {"error": _ARGUMENT_TOO_LONG_MARKER}
+                if refusal is None:
+                    # All tool dimensions are admitted together before quota,
+                    # with one bounded wait and no held database connection.
+                    principal = current_principal.get()
+                    if principal is not None:
+                        admission = await controller.tool(
+                            tool_name, current_user_id.get(), principal,
+                            resource_class=resource_class,
+                        )
+                        slot_lease = admission.lease
+                        if controller.mode != "off":
+                            timing.record("queue_ms", admission.queue_ms)
+                        if controller.mode == "shadow":
+                            shadow = concurrency.shadow_metadata(
+                                (*transport_observations, admission.pressure)
+                            )
+                            if shadow is not None:
+                                timing.record("concurrency_shadow", shadow)
+                        if not admission.admitted:
+                            pressure = admission.pressure
+                            refusal = _slot_timeout_message(pressure, admission.queue_ms)
+                            def slot_template():
+                                try:
+                                    params = named_params()
+                                except Exception:
+                                    params = {}
+                                row = _rate_refusal_template(tool_name, params, pressure.scope)
+                                row["params"].pop(_RATE_LIMIT_SCOPE_PARAM, None)
+                                row["params"].update(
+                                    error=refusals.SLOT_TIMEOUT,
+                                    concurrency_scope=pressure.scope,
+                                    queue_ms=admission.queue_ms,
+                                )
+                                return row
+                            planned = rate_limits.record_rate_refusal(
+                                principal, tool_name, refusals.SLOT_TIMEOUT,
+                                pressure.scope, slot_template,
+                            )
+                            log_row = False
+                            if planned is not None:
+                                await rate_limits.write_planned_row(planned)
                 if refusal is None:
                     # L6 — the last admission gate (#162), deliberately after
                     # every other one: a call refused for having no vault or for
@@ -1650,6 +1758,8 @@ def _tracked(
                         pass
                 return result
             finally:
+                if slot_lease is not None:
+                    slot_lease.release()
                 timing.clear(token)
                 _current_tool_name.reset(name_token)
 
@@ -1658,6 +1768,7 @@ def _tracked(
         # "the admission gate is inherited by construction" is checked rather
         # than asserted.
         wrapper.__tracked_tool__ = tool_name
+        wrapper.__concurrency_class__ = resource_class or concurrency.TOOL_CLASSES.get(tool_name)
         return wrapper
     return decorator
 

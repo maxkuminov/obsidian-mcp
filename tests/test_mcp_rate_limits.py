@@ -78,18 +78,18 @@ class _QuotaSpySession:
         pass
 
 
-@tools._tracked("rate_probe", ["value"])
+@tools._tracked("rate_probe", ["value"], resource_class="other")
 async def _probe(value: str = "x") -> str:
     return f"ran:{value}"
 
 
-@tools._tracked("rate_probe_write", ["value"], write_class=True)
+@tools._tracked("rate_probe_write", ["value"], write_class=True, resource_class="other")
 async def _write_probe(value: str = "x") -> str:
     return f"wrote:{value}"
 
 
 @tools._tracked(
-    "rate_probe_structured", ["path"], refusal_result=tools._read_note_refusal
+    "rate_probe_structured", ["path"], refusal_result=tools._read_note_refusal, resource_class="other"
 )
 async def _structured_probe(path: str = "n.md") -> ReadNoteResult:  # pragma: no cover
     return ReadNoteResult(content="body")
@@ -354,7 +354,7 @@ def test_two_grants_of_one_client_and_user_are_distinct_principals():
 
 
 def test_the_middleware_binds_the_grant_id_in_the_oauth_branch():
-    source = inspect.getsource(mcp_auth.APIKeyMiddleware.__call__)
+    source = inspect.getsource(mcp_auth.APIKeyMiddleware)
     assert 'current_principal.set(("oauth", oauth_token.grant_id))' in source
     assert 'current_principal.set(("api_key", api_key.id))' in source
     assert "current_principal.reset(token_principal)" in source
@@ -791,7 +791,7 @@ def _windows():
         yield from entry.windows.values()
 
 
-@tools._tracked("rate_probe_hostile", ["value"], transforms={"value": lambda v: 1 / 0})
+@tools._tracked("rate_probe_hostile", ["value"], transforms={"value": lambda v: 1 / 0}, resource_class="other")
 async def _hostile_probe(value: str = "x") -> str:  # pragma: no cover
     return "ran"
 

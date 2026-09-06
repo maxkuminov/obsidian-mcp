@@ -230,7 +230,7 @@ def test_single_user_mode_passes_the_gate(cold_cache):
     multi-user cache is completely empty."""
     ran = {}
 
-    @tools._tracked("fake_tool", ["q"])
+    @tools._tracked("fake_tool", ["q"], resource_class="other")
     async def fake_tool(q: str) -> str:
         ran["yes"] = True
         return "served"
@@ -260,7 +260,7 @@ def test_warm_cache_makes_an_assigned_user_pass(as_unassigned_user, tmp_path):
     cache the body runs. Guards against a gate that refuses everyone."""
     ran = {}
 
-    @tools._tracked("fake_tool", [])
+    @tools._tracked("fake_tool", [], resource_class="other")
     async def fake_tool() -> str:
         ran["yes"] = True
         return "served"
@@ -880,7 +880,7 @@ def test_admission_gate_issues_no_database_statements(cold_cache, tmp_path):
 
     ran = {}
 
-    @tools._tracked("fake_tool", [])
+    @tools._tracked("fake_tool", [], resource_class="other")
     async def fake_tool() -> str:
         ran["yes"] = True
         return "served"
@@ -1149,7 +1149,7 @@ def test_successful_call_persists_no_error_marker(as_unassigned_user, tmp_path):
     shape *without* the marker, so the marker means what it says."""
     from src.models.db import UsageLog
 
-    @tools._tracked("fake_tool", ["q"])
+    @tools._tracked("fake_tool", ["q"], resource_class="other")
     async def fake_tool(q: str) -> str:
         return "served"
 

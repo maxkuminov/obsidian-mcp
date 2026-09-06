@@ -55,7 +55,7 @@ def test_invalid_metadata_and_partial_nothing_written_are_rejected():
 @pytest.mark.asyncio
 async def test_only_terminal_value_is_classified_and_calls_are_isolated(capture):
     rows, events, _ = capture
-    @tools._tracked("probe", [])
+    @tools._tracked("probe", [], resource_class="other")
     async def probe(refused):
         discarded = body_refusal("discarded", "not_found")
         await asyncio.sleep(0)
@@ -148,7 +148,7 @@ async def test_completed_outcome_survives_event_and_usage_failures(capture, monk
 
 @pytest.mark.asyncio
 async def test_body_exception_wins_and_cancelled_body_has_no_completion(capture):
-    @tools._tracked("probe", [])
+    @tools._tracked("probe", [], resource_class="other")
     async def probe(cancel=False):
         body_refusal("discarded", "not_found")
         if cancel:
@@ -202,7 +202,7 @@ async def test_precondition_helper_records_terminal_marker_without_side_effects(
     kwargs = {"cap_name": "MAX_NOTE_BYTES", "cap_bytes": 10} if code == "precondition_unavailable" else {}
     outcome = tools._precondition_refusal("refused", code, path="a.md", **kwargs)
     assert capture[0] == []
-    @tools._tracked("precondition_probe", [])
+    @tools._tracked("precondition_probe", [], resource_class="other")
     async def probe():
         return outcome
     assert await probe() is outcome

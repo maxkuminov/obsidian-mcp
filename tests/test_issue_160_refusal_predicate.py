@@ -57,6 +57,7 @@ def test_exactly_the_pre_body_markers_are_enumerated():
         "vault_root_not_ready",
         "rate_limited",
         "argument_too_long",
+        "slot_timeout",
     )
     assert usage_stats.OVER_QUOTA_PARAM == "over_quota"
 

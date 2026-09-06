@@ -61,6 +61,7 @@ SENTINEL = "MCP-REFUSAL"
 # call, so the row belongs inside the latency percentiles).
 
 RATE_LIMITED = "rate_limited"
+SLOT_TIMEOUT = "slot_timeout"
 ARGUMENT_TOO_LONG = "argument_too_long"
 OVER_QUOTA = "over_quota"
 NO_VAULT_ASSIGNED = "no_vault_assigned"
@@ -126,6 +127,7 @@ BODY_CODES = frozenset({
 CODES = frozenset(
     {
         RATE_LIMITED,
+        SLOT_TIMEOUT,
         ARGUMENT_TOO_LONG,
         OVER_QUOTA,
         NO_VAULT_ASSIGNED,
@@ -160,6 +162,7 @@ SCOPE_PRINCIPAL_WRITE = "principal_write"
 CALLS_PER_MINUTE = "calls_per_minute"
 CALLS_PER_DAY = "calls_per_day"
 CHARACTERS = "characters"
+CONCURRENT_CALLS = "concurrent_calls"
 
 
 class RefusalShapeError(ValueError):

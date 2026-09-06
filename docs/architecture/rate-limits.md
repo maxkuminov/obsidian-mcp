@@ -28,11 +28,14 @@ nothing to slow it and nothing to tell it to stop.
 | L | Control | Where | Scope key | Default (setting) | Refusal | Marker |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Failed-auth budget | `APIKeyMiddleware`, before the credential lookup | address slot (salted fixed table) | 60 / 300 s (`MCP_AUTH_FAILURE_LIMIT`, `MCP_AUTH_FAILURE_WINDOW_SECONDS`; null ⇒ off) | HTTP **429** + `Retry-After` — **transport, not a tool result** | none; one WARNING per slot per window |
+| 1a | Request occupancy (#261) | `APIKeyMiddleware`, before auth session through ASGI completion | global / presented-bearer fingerprint | 32 / 4; default **shadow** | Enforcement: transport 429; shadow: observation only | bounded transport event; authenticated observations can accompany tool rows |
+| 1b | Auth-session occupancy (#261) | around the middleware's own DB session only | global | 2; default **shadow** | Enforcement: transport 429 before opening a session | same transport observation channel |
 | 2 | General velocity bucket | `_tracked`, first gate | principal | 120/min, burst 30 (`MCP_RATE_LIMIT_PER_MINUTE`, `MCP_RATE_LIMIT_BURST`) | in-band, sentinel line | `rate_limited`, scope `principal` — **coalesced** |
 | 3 | Write velocity bucket | `_tracked` (write tools) **and** `PUT /transfer/upload` | principal | 60/min, burst 15 (`MCP_WRITE_RATE_LIMIT_PER_MINUTE`, `MCP_WRITE_RATE_LIMIT_BURST`) | in-band on a tool; **429** on the transfer route | `rate_limited`, scope `principal_write` — **coalesced** |
 | 4 | Vault admission (#66) | `_tracked` | user | — | in-band | `no_vault_assigned` (and the three vault-root quarantine markers, #199) |
 | 5a | Unencodable-argument screen (#149) | `_tracked` | argument | — | in-band | `argument_not_encodable` |
 | 5b | Query length cap | `_tracked`, beside 5a | argument | 8,192 (`MAX_SEARCH_QUERY_CHARS`) | in-band | `argument_too_long` — **own row** |
+| 5c | Atomic tool slots (#261) | `_tracked`, after argument screens and before quota | class / principal / tenant / global | one per class; principal 2 / tenant 3 / global 4; default **shadow** | Enforcement: in-band sentinel; shadow: call runs | `slot_timeout`, coalesced only for actual enforcement refusals |
 | 6 | Daily quota (#162) | `_tracked`, last pre-body gate | api key | 5,000 for **new** keys (`DEFAULT_DAILY_REQUEST_LIMIT`) | in-band | `over_quota` |
 | 7 | Provider input rejection | inside the body, on the provider's answer | argument | the provider's own limit | in-band, `argument_too_long` **code** | `provider_input_rejected` — **post-body** |
 
@@ -72,7 +75,7 @@ middleware, which binds a principal or answers 401/429. The failed-auth budget
 
 ## Gate order, and the invariant it preserves
 
-L2 → L3 → L4 → L5 → L6 (quota) → body.
+L2 → L3 → L4 → L5a/b → L5c (slots) → L6 (quota) → body → telemetry.
 
 - **A token is not a quota slot.** A rate token refills, so consuming one on a
   call a later gate refuses is correct — the refusal itself costs work. The
@@ -85,8 +88,10 @@ L2 → L3 → L4 → L5 → L6 (quota) → body.
   keeps its #162 position as the **last** pre-body gate, so a call refused for
   having no vault, for an unencodable argument, for an over-long query — or now
   for exceeding its rate — consumes no daily slot. Its `quota_counters` row is
-  untouched. Removing the once-proposed concurrency slots restored this to
-  exactly the shape #162 designed, with one more gate above it.
+  untouched. The atomic slot gate (#261) also precedes quota, and an admitted
+  lease stays held through the response-neutral telemetry tail, releasing in
+  `finally` on success, quota refusal, exception or cancellation. Waiting holds
+  neither partial permits nor a DB connection.
 
 Because L2/L3 sit *above* the vault gate, a call can be refused before its
 vault root is resolved, which the `mcp-request-routing` requirement did not
@@ -598,9 +603,10 @@ allocated in full and is therefore a direct memory bound.
 so the boot failure names `ck_api_keys_daily_request_limit`'s 1..1,000,000
 rather than a bare field bound — the domain is what an operator has to satisfy.
 
-With the concurrency lattice deferred there is no pool equation and no
-class-sum rule left to check, and `src/database.py` is untouched. Settings
-validation enforces only:
+The original rate settings validate the following rules. #261 adds separate
+class hierarchy/sum and pool-budget validation, described under concurrency
+below; pool sizes remain 5 + 10, now shared constants consumed by the engine
+and validation.
 
 - each bucket's rate and burst are **both set or both null** — a rate with no
   burst is not "a bucket with a default burst", it is a control an operator

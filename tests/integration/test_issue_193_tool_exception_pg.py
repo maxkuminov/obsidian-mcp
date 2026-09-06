@@ -54,12 +54,12 @@ class Boom(RuntimeError):
     """The tool body's own failure."""
 
 
-@tools._tracked("probe_raises_pg", ["path"])
+@tools._tracked("probe_raises_pg", ["path"], resource_class="other")
 async def probe_raises_pg(path: str = "a.md") -> str:
     raise Boom("the body failed after doing real work")
 
 
-@tools._tracked("probe_ok_pg", ["path"])
+@tools._tracked("probe_ok_pg", ["path"], resource_class="other")
 async def probe_ok_pg(path: str = "a.md") -> str:
     return "ran"
 

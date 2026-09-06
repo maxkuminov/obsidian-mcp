@@ -28,7 +28,7 @@ async def sessionmaker(migrated_url):
 async def test_real_refusal_partial_success_and_shadow_are_counted_once(sessionmaker, monkeypatch):
     monkeypatch.setattr(tools, "async_session", sessionmaker)
     monkeypatch.setattr(tools, "_vault_admission_error", lambda: None)
-    @tools._tracked("outcome_probe", [])
+    @tools._tracked("outcome_probe", [], resource_class="other")
     async def probe(disposition=None):
         timing.record("concurrency_shadow", {"shadow": True, "code": "slot_timeout"})
         if disposition:

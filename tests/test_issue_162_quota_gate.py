@@ -131,14 +131,14 @@ def _run_tracked(fn, *args, limit=None, key_id=7, spy=None, **kwargs):
     return result, captured.get("params"), spy
 
 
-@tools._tracked("quota_probe", ["value"])
+@tools._tracked("quota_probe", ["value"], resource_class="other")
 async def _probe(value: str = "x") -> str:
     """A minimal tracked tool. The decorator is what is under test, so a real
     tool would only add a vault and a database to the surface."""
     return f"ran:{value}"
 
 
-@tools._tracked("quota_probe_raises", [])
+@tools._tracked("quota_probe_raises", [], resource_class="other")
 async def _probe_raises() -> str:
     raise RuntimeError("the body failed after being admitted")
 

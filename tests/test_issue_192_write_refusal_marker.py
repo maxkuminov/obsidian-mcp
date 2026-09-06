@@ -210,7 +210,7 @@ async def test_request_download_has_no_permission_refusal(sink, read_only):
     assert _events(sink.records, "tool_write_refused") == []
 
 
-@tools._tracked("probe_write", [])
+@tools._tracked("probe_write", [], resource_class="other")
 async def probe_write() -> str:
     """A gated tool's first statement, and nothing else.
 

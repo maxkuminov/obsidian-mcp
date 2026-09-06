@@ -263,7 +263,7 @@ async def test_no_leakage_into_a_later_call_in_the_same_task(monkeypatch, captur
 
 @pytest.mark.asyncio
 async def test_holder_is_cleared_even_when_the_tool_raises(monkeypatch, captured):
-    @tools._tracked("boom", [])
+    @tools._tracked("boom", [], resource_class="other")
     async def _boom():
         timing.record("db_ms", 5)
         raise RuntimeError("boom")
