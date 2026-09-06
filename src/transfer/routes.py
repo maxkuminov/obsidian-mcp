@@ -59,7 +59,7 @@ from src.config import MAX_NOTE_BYTES, settings
 from src.database import async_session
 from src.limiter import limiter
 from src.models.db import UsageLog
-from src.services import security_events, transfer, vault_fs
+from src.services import rate_limits, refusals, security_events, transfer, vault_fs
 from src.services.vault import classify_bytes, is_hidden_path
 
 logger = logging.getLogger(__name__)
@@ -107,6 +107,25 @@ MOUNT_BOUNDARY_BODY = {
         "directory, or is itself a mount point, so this transfer cannot be "
         "published there. The filesystem is fine; the mount layout is what "
         "refuses."
+    )
+}
+
+
+# The write bucket's refusal. Deliberately **not** the uniform 404: this says
+# nothing about whether the token is usable — it is, and it stays claimable —
+# only that the minter's write rate is spent right now. Collapsing it into the
+# 404 would tell a legitimate redeemer their link had died and make them mint
+# another, which is the one behaviour a rate control must not provoke.
+#
+# It also carries **no in-band sentinel line** (design D5). That contract is
+# for a tool *result*, where an agent has nowhere else to read a refusal from;
+# here there is no tool call to answer and the status code plus `Retry-After`
+# is the transport's own vocabulary for exactly this.
+RATE_LIMITED_BODY = {
+    "error": (
+        "The write rate limit for the credential that issued this transfer "
+        "link is exhausted. The link is still valid: retry after the number "
+        "of seconds in the Retry-After header."
     )
 }
 
@@ -282,6 +301,45 @@ async def _refuse(
         error_type=error_type,
     )
     return _not_found()
+
+
+def _rate_limited(request: Request, row, retry_after: int) -> JSONResponse:
+    """Record the write-bucket refusal, then answer 429 with `Retry-After`.
+
+    The record is a `security_events` event and not a bare `logger.warning`
+    for the reason the guard test enforces: this is a refusal a caller can
+    drive at whatever rate it likes, so the record has to pass the suppressor's
+    allowance or the control that bounds writes would open an unbounded log
+    channel of its own.
+
+    Attribution comes off the **token row**, as everywhere else on this route:
+    the request carried a capability and no credential of its own, so `key_id`
+    / `oauth_token_id` name the minter and the suppression subject is the
+    minter's owner. `reason` is the bucket's scope — the same closed vocabulary
+    string `tool_refused_rate_limited` carries, so an operator reading the log
+    sees one control and not two.
+
+    No `usage_logs` row: this route writes one on a *completed* upload, and the
+    coalescer in `rate_limits` is fed by `_tracked`, which this path does not
+    pass through. The security event is the whole record.
+    """
+    security_events.emit(
+        "transfer_refused_rate_limited",
+        level=logging.WARNING,
+        subject=security_events.subject_for(user_id=row.user_id, request=request),
+        reason=refusals.SCOPE_PRINCIPAL_WRITE,
+        limit=rate_limits.bucket_limit(refusals.SCOPE_PRINCIPAL_WRITE),
+        route=request.url.path,
+        method=request.method,
+        user_id=row.user_id,
+        key_id=row.key_id,
+        oauth_token_id=row.oauth_token_id,
+    )
+    return JSONResponse(
+        dict(RATE_LIMITED_BODY),
+        status_code=429,
+        headers={"Retry-After": str(retry_after)},
+    )
 
 
 def _log_row(row, tool: str, params: dict, response_size: int | None = None) -> UsageLog:
@@ -540,7 +598,14 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
         # still runs only if its predecessors passed — and the response is the
         # same 404 for all three. Only the record got more specific.
         revalidation = None
-        if not await transfer.resolve_identity_ok(session, row, need_write=True):
+        # `resolve_identity`, not `resolve_identity_ok`: the credential it
+        # already loaded is where the minting principal's OAuth grant comes
+        # from, and the write bucket below must not pay for a second lookup of
+        # a row this line is holding.
+        identity_ok, minting_credential = await transfer.resolve_identity(
+            session, row, need_write=True
+        )
+        if not identity_ok:
             revalidation = "credential_invalid"
         elif not await transfer.resolve_root_ok(session, row):
             revalidation = transfer.root_refusal(row).reason
@@ -551,6 +616,32 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
             return await _refuse(
                 request, reason=revalidation, token=token, row=row
             )
+
+        # (3) The write rate, **before a single body byte is read and before
+        # anything is staged**. This route publishes vault bytes without ever
+        # passing through `_tracked`, so bounding only the write tools would
+        # leave the write rate escapable by minting capabilities and redeeming
+        # them without limit (design D5a). The tokens come from the principal
+        # that *minted* this capability, so presenting one cannot spend another
+        # principal's allowance.
+        #
+        # It sits here on purpose: after the re-validation, because a token
+        # that is no longer usable is a 404 and must not also cost its minter a
+        # token; and before `check_publication_support`, because that is a
+        # filesystem probe and a rate control that admits work has to precede
+        # the work — the same order `_tracked` uses.
+        admitted, retry_after = rate_limits.take(
+            transfer.minting_principal(row, minting_credential),
+            refusals.SCOPE_PRINCIPAL_WRITE,
+        )
+        if not admitted:
+            # Released, never consumed — the mirror of the `QueueTimeout` 503
+            # below, and for the same reason: a capability the server declined
+            # to serve *right now* is a promise still outstanding, so the same
+            # link must be redeemable once the bucket refills. Nothing has been
+            # read, staged or published at this point.
+            await _release_quietly(session, row, request)
+            return _rate_limited(request, row, retry_after)
 
         try:
             # Publication only: the trash probe belongs to `delete_file`, and

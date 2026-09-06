@@ -362,6 +362,13 @@ def harness(vault, monkeypatch):
     async def resolve_identity_ok(session, row, *, need_write):
         return h.identity_ok
 
+    async def resolve_identity(session, row, *, need_write):
+        # The upload route reads the verdict *and* the credential from one
+        # call (#194): the credential is where an OAuth-minted capability's
+        # grant — the write bucket's principal — comes from. These rows name a
+        # key, so the credential is never read and `None` is honest.
+        return h.identity_ok, None
+
     async def resolve_root_ok(session, row):
         return h.root_ok
 
@@ -408,6 +415,7 @@ def harness(vault, monkeypatch):
 
     monkeypatch.setattr(transfer, "lookup_token", lookup_token)
     monkeypatch.setattr(transfer, "resolve_identity_ok", resolve_identity_ok)
+    monkeypatch.setattr(transfer, "resolve_identity", resolve_identity)
     monkeypatch.setattr(transfer, "resolve_root_ok", resolve_root_ok)
     monkeypatch.setattr(transfer, "claim_upload", claim_upload)
     monkeypatch.setattr(transfer, "release_claim", release_claim)

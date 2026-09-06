@@ -116,6 +116,7 @@ Round 3 found the hole this leaves: a record emitted straight through `logger.*`
 | `src/services/vault.py:1018` | `publication_refused_vault_assignment_changed` | WARNING | A |
 | `src/auth/passwords.py` — malformed bcrypt hash | `password_hash_malformed` (`user_id`) | WARNING | B |
 | `src/oauth/routes.py` — the #182 reuse alarm × 2 | `oauth_refresh_reuse_detected` / `oauth_refresh_reuse_revocation_failed` | WARNING / ERROR | B |
+| `src/transfer/routes.py` — the write-bucket 429 (#194) | `transfer_refused_rate_limited` (`reason` = the bucket scope, `limit`, `route`, `method`, `user_id`, `key_id`, `oauth_token_id`) | WARNING | mcp-rate-limits |
 | `src/transfer/routes.py` — mount boundary × 2 | `transfer_refused_mount_boundary` (`error_type`) | ERROR | D |
 | `src/transfer/routes.py` — unsupported filesystem | `transfer_refused_unsupported_fs` (`error_type`) | ERROR | D |
 | `src/transfer/routes.py` — vault root unusable | `transfer_root_unusable` (`error_type`) | ERROR | D |

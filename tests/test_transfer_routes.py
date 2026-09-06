@@ -12,14 +12,18 @@ assertions read it back.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import datetime
 import errno
 import hashlib
+import inspect
 import logging
 import os
+import pathlib
 import re
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -27,7 +31,7 @@ import pytest_asyncio
 
 from src.config import settings
 from src.limiter import limiter
-from src.services import transfer, vault_fs
+from src.services import rate_limits, refusals, transfer, vault_fs
 from src.transfer import routes as transfer_routes
 
 pytestmark = pytest.mark.asyncio
@@ -128,6 +132,10 @@ class Harness:
         self.row = row
         self.token = token
         self.identity_ok = True
+        #: What `resolve_identity` hands back beside its verdict — the minting
+        #: credential row. Only the OAuth branch of `minting_principal` reads
+        #: it (for `grant_id`), so it stays `None` for the API-key default.
+        self.credential = None
         self.root_ok = True
         self.lock_ok = True
         self.locked_ok = True
@@ -178,6 +186,17 @@ def harness(vault, monkeypatch):
     async def resolve_identity_ok(session, row, *, need_write):
         return h.identity_ok
 
+    async def resolve_identity(session, row, *, need_write):
+        """The pair the upload route reads: the verdict and the credential.
+
+        `upload()` takes the credential off this call rather than looking it up
+        again, because the OAuth branch's `grant_id` is what the write bucket
+        is keyed on. The harness hands back whatever `h.credential` is set to —
+        `None` for the API-key rows every other test uses, since that branch
+        reads `key_id` off the token and never touches the credential.
+        """
+        return h.identity_ok, (h.credential if h.identity_ok else None)
+
     async def resolve_root_ok(session, row):
         return h.root_ok
 
@@ -217,6 +236,7 @@ def harness(vault, monkeypatch):
 
     monkeypatch.setattr(transfer, "lookup_token", lookup_token)
     monkeypatch.setattr(transfer, "resolve_identity_ok", resolve_identity_ok)
+    monkeypatch.setattr(transfer, "resolve_identity", resolve_identity)
     monkeypatch.setattr(transfer, "resolve_root_ok", resolve_root_ok)
     monkeypatch.setattr(transfer, "claim_upload", claim_upload)
     monkeypatch.setattr(transfer, "release_claim", release_claim)
@@ -1317,6 +1337,442 @@ async def test_only_plain_loaded_columns_are_read_after_phase_one(
     assert {"path", "vault_root"} <= reads, reads
     columns = set(sa.inspect(TransferToken).columns.keys())
     assert reads <= columns, reads - columns
+
+
+# ── 4b the write bucket at redemption (#194) ────────────────────────────────
+#
+# `PUT /transfer/upload` publishes vault bytes without ever passing through
+# `_tracked`, so bounding only the eight write tools would leave the write rate
+# escapable: mint capabilities at the general rate, then redeem them without
+# limit. The redemption therefore spends the write bucket of the principal that
+# **minted** the capability (design D5a), and these tests are about the four
+# properties that makes load-bearing — where the charge sits, whose allowance
+# it comes from, what a refusal does to the claim, and what it costs to derive.
+
+
+class _Events(logging.Handler):
+    """Every `security_events` record, so a refusal can be read back by name."""
+
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+    def named(self, event: str) -> list[logging.LogRecord]:
+        return [r for r in self.records if r.getMessage() == event]
+
+
+@pytest.fixture
+def events():
+    handler = _Events()
+    logger = logging.getLogger("security_events")
+    logger.addHandler(handler)
+    try:
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+
+
+def _fields(record) -> dict:
+    """The allow-listed extras a record carries, by name."""
+    standard = set(logging.LogRecord("", 0, "", 0, "", (), None).__dict__)
+    standard |= {"message", "asctime", "taskName"}
+    return {k: v for k, v in record.__dict__.items() if k not in standard}
+
+
+@pytest.fixture
+def write_bucket(monkeypatch):
+    """A narrow write bucket on a clock the test drives.
+
+    Narrow because the per-IP `BYTES_LIMIT` on this route is 10/minute while
+    the shipped write burst is 15: a burst driven over HTTP at the configured
+    numbers would be refused by slowapi first and prove nothing about *this*
+    control. Two tokens refilling at one a second makes the third redemption
+    the interesting one and the refill observable without sleeping.
+
+    Returns the clock, so a test can advance it and watch the bucket refill.
+    """
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(settings, "mcp_write_rate_limit_per_minute", 60)
+    monkeypatch.setattr(settings, "mcp_write_rate_limit_burst", 2)
+    monkeypatch.setattr(
+        rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    rate_limits.reset_state_for_tests()
+    return clock
+
+
+@pytest.fixture
+def charges(monkeypatch):
+    """Every `(principal, scope)` the route charges, in order.
+
+    Wraps rather than replaces `take`, so the bucket still decides — a spy that
+    always admitted would make the refusal tests pass for the wrong reason.
+    """
+    seen: list[tuple] = []
+    real = rate_limits.take
+
+    def spy(principal, scope):
+        seen.append((principal, scope))
+        return real(principal, scope)
+
+    monkeypatch.setattr(transfer_routes.rate_limits, "take", spy)
+    return seen
+
+
+def _rearm(harness, name: str) -> None:
+    """Put the harness's single row back to a fresh, pending capability.
+
+    One `FakeRow` stands in for the whole table here, so redeeming twice means
+    resetting the state a completed upload left behind and pointing the next
+    redemption at a path that does not exist yet — otherwise the second PUT
+    would be answered by the no-clobber publish rather than by the bucket.
+    """
+    harness.row.state = "pending"
+    harness.row.claimed_at = None
+    harness.row.completed_at = None
+    harness.row.size = harness.row.sha256 = harness.row.mime = None
+    harness.row.path = f"Attachments/{name}.png"
+
+
+async def test_redemptions_above_the_write_rate_are_refused(
+    client, harness, vault, write_bucket, charges, events
+):
+    """The third redemption inside the burst is a 429, and nothing else moves.
+
+    Every assertion here is one clause of the requirement: the status and the
+    `Retry-After`, the claim **released** rather than consumed, no bytes staged
+    and none published, and no completion or usage row for a redemption that
+    did not happen.
+    """
+    for name in ("first", "second"):
+        _rearm(harness, name)
+        ok = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+        assert ok.status_code == 200, ok.text
+
+    _rearm(harness, "third")
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+
+    assert response.status_code == 429
+    assert int(response.headers["retry-after"]) >= 1
+    # Not the uniform 404: the token is fine and stays redeemable. Telling a
+    # legitimate redeemer their link had died would make them mint another,
+    # which is the one behaviour a rate control must not provoke.
+    assert response.json() != {"error": "not found"}
+    assert "Retry-After" in response.text or "retry" in response.text.lower()
+
+    assert harness.released == 1
+    assert harness.consumed == 0
+    assert harness.row.state == "pending"
+    assert not (vault / "Attachments" / "third.png").exists()
+    assert temp_files(vault / "Attachments") == []
+    # Two uploads happened, so two completions and two usage rows — the refused
+    # third contributed neither.
+    assert len(harness.completed) == 2
+    assert [log.tool for log in harness.logs] == ["upload_file", "upload_file"]
+
+    # Three redemptions, three charges, all against the write bucket.
+    assert charges == [(("api_key", 7), refusals.SCOPE_PRINCIPAL_WRITE)] * 3
+
+    record = events.named("transfer_refused_rate_limited")
+    assert len(record) == 1
+    carried = _fields(record[0])
+    assert carried["reason"] == refusals.SCOPE_PRINCIPAL_WRITE
+    assert carried["route"] == "/transfer/upload"
+    assert carried["method"] == "PUT"
+    assert carried["key_id"] == 7
+    assert harness.token not in str(carried)
+
+
+async def test_the_charge_happens_before_a_single_body_byte_is_read(
+    client, harness, vault, write_bucket
+):
+    """A refused redemption costs a header parse, not a spooled body.
+
+    The same property `test_body_is_not_read_before_the_claim` pins for the
+    claim: a control that only refused *after* the bytes arrived would have let
+    the write it is bounding consume the bandwidth and the staging directory
+    anyway.
+    """
+    rate_limits.take(("api_key", 7), refusals.SCOPE_PRINCIPAL_WRITE)
+    rate_limits.take(("api_key", 7), refusals.SCOPE_PRINCIPAL_WRITE)
+    chunks = 0
+
+    async def body():
+        nonlocal chunks
+        for _ in range(64):
+            chunks += 1
+            yield b"x" * 65536
+
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=body()
+    )
+
+    assert response.status_code == 429
+    assert chunks == 0
+    assert temp_files(vault / "Attachments") == []
+    assert not (vault / "Attachments" / "shot.png").exists()
+
+
+async def test_the_same_capability_is_redeemable_once_the_bucket_refills(
+    client, harness, vault, write_bucket
+):
+    """A refusal is a deferral, not a revocation.
+
+    This is why the refusal releases the claim instead of consuming it — the
+    same reason the `QueueTimeout` 503 does. The capability the server declined
+    to serve *right now* is a promise still outstanding, and the identical link
+    has to work once the tokens are back.
+    """
+    for name in ("first", "second"):
+        _rearm(harness, name)
+        assert (
+            await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+        ).status_code == 200
+
+    _rearm(harness, "third")
+    refused = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+    assert refused.status_code == 429
+
+    # The claim went back to `pending`, so nothing is re-armed here: this is
+    # the very same capability, redeemed again after the bucket refilled.
+    write_bucket.now += 5.0
+    accepted = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+
+    assert accepted.status_code == 200, accepted.text
+    assert (vault / "Attachments" / "third.png").read_bytes() == PNG
+    assert harness.row.state == "completed"
+
+
+async def test_the_bucket_belongs_to_the_minter_not_the_presenter(
+    client, harness, vault, write_bucket, charges
+):
+    """A capability cannot be used to spend another principal's allowance.
+
+    The request carries no credential of its own — that is what a capability
+    *is* — so the only identity available is the token's, and it is the minting
+    one. Draining the minter's bucket refuses its own links while a capability
+    minted by a different key redeems unaffected.
+    """
+    _rearm(harness, "drained")
+    while rate_limits.take(("api_key", 7), refusals.SCOPE_PRINCIPAL_WRITE)[0]:
+        pass
+    charges.clear()  # the drain went through the same spy; only the route counts
+
+    refused = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+    assert refused.status_code == 429
+    assert charges == [(("api_key", 7), refusals.SCOPE_PRINCIPAL_WRITE)]
+
+    # A capability minted by another key, presented by the same client over the
+    # same connection: a different bucket, still full.
+    harness.row.key_id = 9
+    _rearm(harness, "other-minter")
+    accepted = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+    assert accepted.status_code == 200, accepted.text
+    assert charges[-1] == (("api_key", 9), refusals.SCOPE_PRINCIPAL_WRITE)
+    assert (vault / "Attachments" / "other-minter.png").read_bytes() == PNG
+
+
+async def test_an_oauth_minted_capability_is_charged_to_its_grant(
+    client, harness, vault, write_bucket, charges
+):
+    """The OAuth key is the **grant**, not the access token (issue #64, D1).
+
+    Refreshing an access token mints a new `oauth_tokens` row for the same
+    grant; keying on the row would hand out a fresh allowance for the price of
+    a refresh, on the one surface that writes vault bytes without a tool call.
+    """
+    harness.row.key_id = None
+    harness.row.oauth_token_id = 41
+    harness.credential = SimpleNamespace(grant_id="grant-abc")
+    _rearm(harness, "oauth")
+
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+
+    assert response.status_code == 200, response.text
+    assert charges == [(("oauth", "grant-abc"), refusals.SCOPE_PRINCIPAL_WRITE)]
+
+    # The same grant, a *different* access token row: one bucket, not two.
+    harness.row.oauth_token_id = 42
+    _rearm(harness, "oauth-refreshed")
+    assert (
+        await client.put("/transfer/upload", headers=auth(harness), content=PNG)
+    ).status_code == 200
+    assert charges[-1] == (("oauth", "grant-abc"), refusals.SCOPE_PRINCIPAL_WRITE)
+
+
+async def test_deriving_the_principal_issues_no_query_of_its_own():
+    """`minting_principal` has no session, so it cannot have a round trip.
+
+    The requirement is "no additional query", and the cheapest way to keep it
+    true forever is a signature that makes the alternative impossible: a plain
+    synchronous function over the row and the credential `resolve_identity` has
+    already loaded. If a later edit needed a lookup it would have to change
+    this signature, and this assertion is what would notice.
+    """
+    assert not inspect.iscoroutinefunction(transfer.minting_principal)
+    parameters = list(inspect.signature(transfer.minting_principal).parameters)
+    assert parameters == ["row", "credential"]
+    assert "session" not in parameters
+
+
+async def test_the_oauth_principal_costs_exactly_the_identity_check(monkeypatch):
+    """Statement-counting on the real `resolve_identity`: two, as before.
+
+    The credential row and the owner row — precisely what `resolve_identity_ok`
+    read before this change. Loading the `OAuthToken` a second time to reach
+    `grant_id` would have added a third to the phase-one window that #208 exists
+    to keep short, which is why the verdict and the row travel together.
+    """
+    from src.models.db import OAuthToken, User
+
+    cred = OAuthToken(
+        id=41,
+        grant_id="grant-abc",
+        user_id=3,
+        scope="offline_access readwrite",
+        revoked=False,
+        expires_at=_now() + datetime.timedelta(hours=1),
+    )
+    owner = User(id=3, is_active=True)
+
+    class _Scalar:
+        def __init__(self, value):
+            self._value = value
+
+        def scalar_one_or_none(self):
+            return self._value
+
+    class _CountingSession:
+        def __init__(self):
+            self.statements = 0
+            self.answers = [cred, owner]
+
+        async def execute(self, _statement):
+            self.statements += 1
+            return _Scalar(self.answers.pop(0))
+
+    row = SimpleNamespace(key_id=None, oauth_token_id=41, user_id=3)
+    session = _CountingSession()
+
+    ok, credential = await transfer.resolve_identity(session, row, need_write=True)
+
+    assert ok is True
+    assert session.statements == 2
+    assert transfer.minting_principal(row, credential) == ("oauth", "grant-abc")
+    # And nothing was read to say it.
+    assert session.statements == 2
+
+
+async def test_a_token_naming_neither_credential_is_exempt_rather_than_refused():
+    """No principal means *exempt*, the same rule `_tracked` applies.
+
+    The single-user / sandbox shape. There is no allowance to charge such a row
+    to, and inventing one — or refusing outright — would turn a bookkeeping gap
+    into an outage. The row is unusable for an unrelated reason anyway
+    (`_load_credential` cannot resolve it), which is what keeps this from being
+    a way to mint an unbounded capability.
+    """
+    row = SimpleNamespace(key_id=None, oauth_token_id=None, user_id=None)
+    assert transfer.minting_principal(row, None) is None
+    assert rate_limits.take(None, refusals.SCOPE_PRINCIPAL_WRITE) == (True, 0)
+
+
+async def test_a_capability_with_no_credential_still_redeems(
+    client, harness, vault, write_bucket, charges
+):
+    """The exemption, end to end: charged to nobody, refused by nothing."""
+    harness.row.key_id = None
+    harness.row.oauth_token_id = None
+
+    for index in range(4):  # past the burst of two, and still admitted
+        _rearm(harness, f"ownerless-{index}")
+        response = await client.put(
+            "/transfer/upload", headers=auth(harness), content=PNG
+        )
+        assert response.status_code == 200, response.text
+
+    assert charges == [(None, refusals.SCOPE_PRINCIPAL_WRITE)] * 4
+
+
+async def test_the_upload_metadata_read_consumes_nothing(
+    client, harness, write_bucket, charges
+):
+    """Only the redemption is charged; nothing else on the upload side is.
+
+    `/transfer/upload/info` is the route half of `check_upload`. Billing both
+    the mint and the redemption would count one write twice, and charging a
+    metadata read would let a capability be exhausted without a byte ever being
+    written.
+    """
+    assert (await client.get("/transfer/upload")).status_code == 200
+    assert (
+        await client.get("/transfer/upload/info", headers=auth(harness))
+    ).status_code == 200
+
+    assert charges == []
+
+
+async def test_a_download_redemption_consumes_nothing(
+    client, harness, download, write_bucket, charges
+):
+    """The *write* bucket bounds writes. A download moves no vault bytes."""
+    assert (
+        await client.get("/transfer/download/info", headers=auth(harness))
+    ).status_code == 200
+    assert (
+        await client.get("/transfer/download/file", headers=auth(harness))
+    ).status_code == 200
+
+    assert charges == []
+
+
+async def test_the_mint_tools_are_not_write_class_and_import_still_is():
+    """The other half of "no double charge", read off `_tracked` itself.
+
+    `request_upload` / `request_download` / `check_upload` create or read
+    capability rows and write no vault bytes, so they stay unclassed and the
+    redemption is the single charge for the transfer. `import_from_url` is the
+    opposite case and must keep its own: it writes bytes *at the tool call*,
+    with no redemption to charge later, so its token comes from Slice A's gate
+    and this route never sees it.
+    """
+    # Anchored on this file, not the working directory: a sibling test that
+    # chdirs would otherwise turn this into a spurious failure.
+    source = pathlib.Path(__file__).resolve().parents[1] / "src" / "mcp_server" / "tools.py"
+    tree = ast.parse(source.read_text())
+    classes: dict[str, bool] = {}
+    for node in ast.walk(tree):
+        for decorator in getattr(node, "decorator_list", []):
+            if not isinstance(decorator, ast.Call):
+                continue
+            func = decorator.func
+            if not isinstance(func, ast.Name) or func.id != "_tracked":
+                continue
+            name = decorator.args[0].value
+            classes[name] = any(
+                keyword.arg == "write_class" and keyword.value.value
+                for keyword in decorator.keywords
+            )
+
+    assert classes["request_upload"] is False
+    assert classes["request_download"] is False
+    assert classes["check_upload"] is False
+    assert classes["import_from_url"] is True
 
 
 # ── 4.5 download ────────────────────────────────────────────────────────────
