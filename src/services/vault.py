@@ -104,7 +104,7 @@ from sqlalchemy import select
 
 from src.auth.session import _UnsetVaultRoot, current_vault_root
 from src.config import MAX_LIST_PATTERN_CHARS, settings
-from src.services import security_events, vault_fs
+from src.services import security_events, vault_fs, vault_overlap
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +205,93 @@ def vault_unassigned_error(user_id: int) -> str:
     )
 
 
+class VaultRootOverlap(RuntimeError):
+    """This user's vault root collides with another active user's.
+
+    A `RuntimeError` on purpose, like every other refusal `_vault_root` raises:
+    every existing `except RuntimeError` around the admission gate keeps failing
+    closed unchanged, and a tool added later inherits the refusal by being
+    registered rather than by remembering to catch a new type.
+    """
+
+
+class VaultRootUnexaminable(RuntimeError):
+    """This user's vault root could not be examined, so it is not served.
+
+    Distinct from `VaultRootOverlap` because the two need different fixes — a
+    mount restored versus an assignment corrected — and an operator reading one
+    marker in the usage log must not be sent looking for a second account that
+    does not exist.
+    """
+
+
+class VaultRootNotReady(RuntimeError):
+    """No overlap snapshot has been published in this process yet.
+
+    The startup path publishes synchronously before the app serves, so this is
+    normally never observed. It stays reachable — a detection that raised at
+    startup, or a worker that somehow serves before it — and in that state the
+    correct answer is to refuse: a call served in that window is served against
+    roots nothing has checked, which is the whole window the guard exists to
+    close.
+    """
+
+
+# The three agent-facing wordings. **They name no other user, no other vault
+# path and no note path, for any reason.** The caller is a tenant's agent; the
+# panel, the log line and the `indexer_runs` row are where the affected
+# accounts, reasons and roots are named.
+VAULT_ROOT_OVERLAP_ERROR = (
+    "Vault access is suspended for this account: its configured vault root "
+    "conflicts with another account's configuration. No tool can be served "
+    "until an administrator corrects it. The index is retained."
+)
+
+VAULT_ROOT_UNEXAMINABLE_ERROR = (
+    "Vault access is suspended for this account: its configured vault root "
+    "could not be examined, so the server cannot establish that it is safe to "
+    "serve. An administrator must check the mount. The index is retained."
+)
+
+VAULT_ROOT_NOT_READY_ERROR = (
+    "Vault access is not available yet: the server has not completed its "
+    "vault-root check. Retry shortly."
+)
+
+
+def _refuse_quarantined_root(user_id: int) -> None:
+    """The gate's refuse-only consultation of the published overlap snapshot.
+
+    **This is the one exception to "`_vault_root` is a pure cache lookup", and
+    it is not licence to add a query.** It is a single attribute read followed
+    by a dict lookup: no session, no statement, no syscall, no mount table. All
+    of the work — every other user's assignment, an `open`/`fstat`/`realpath`
+    per root, dispatched to a worker thread under a deadline — happens in
+    `vault_overlap.detect_and_publish`, once per pass, and this reads only what
+    it published.
+
+    **Refuse-only, which is why it may run first.** It can make the gate
+    stricter and can never admit a caller the rest of the gate would refuse.
+    That is what makes it safe ahead of the request's immutable vault-root
+    snapshot: unlike an assignment — where a stale read must never re-admit a
+    revoked caller, which is why the snapshot outranks the process-global
+    cache — a quarantine has no direction in which staleness admits anyone.
+
+    Never consulted for `user_id is None`: single-user mode has one root and no
+    second assignment, so there is nothing to detect and nothing to be ready
+    for.
+    """
+    snapshot = vault_overlap.published_snapshot()
+    if snapshot is None:
+        raise VaultRootNotReady(VAULT_ROOT_NOT_READY_ERROR)
+    reason = snapshot.reason_for(user_id)
+    if reason is None:
+        return
+    if isinstance(reason, vault_overlap.Overlap):
+        raise VaultRootOverlap(VAULT_ROOT_OVERLAP_ERROR)
+    raise VaultRootUnexaminable(VAULT_ROOT_UNEXAMINABLE_ERROR)
+
+
 def _vault_root(user_id: int | None = None) -> Path:
     """Return the vault root for the given user.
 
@@ -235,6 +322,14 @@ def _vault_root(user_id: int | None = None) -> Path:
     user id: a snapshot for a different user (nested contexts, a panel route
     resolving somebody else's root) falls through to the dict rather than
     answering for the wrong vault.
+
+    **The overlap snapshot is consulted first, and only to refuse.** Two active
+    users whose roots name overlapping directories are one tenant in both
+    directions — every write tool resolves beneath a root that physically
+    contains the other tenant's files, and `RESOLVE_BENEATH` agrees they are
+    contained — so a quarantined caller is refused here, before the request's
+    own snapshot is read. See `_refuse_quarantined_root` for why reading it
+    first is safe and why it is not a licence to add a query.
     """
     if user_id is None:
         if settings.multi_user_mode:
@@ -246,6 +341,7 @@ def _vault_root(user_id: int | None = None) -> Path:
             # and is exactly the write nobody authorised. Fail closed.
             raise RuntimeError(UNOWNED_IN_MULTI_USER_ERROR)
         return Path(settings.vault_path)
+    _refuse_quarantined_root(user_id)
     snapshot = current_vault_root.get()
     if not isinstance(snapshot, _UnsetVaultRoot) and snapshot[0] == user_id:
         root = snapshot[1]

@@ -258,6 +258,28 @@ class Settings(BaseSettings):
     embed_chunk_budget_per_user: int = Field(5000, ge=0)
     # 300 s matches one `INDEX_INTERVAL_SECONDS`.
     embed_time_budget_seconds_per_user: int = Field(300, ge=0)
+    # Wall-clock bound on observing ONE vault root during overlap detection —
+    # the `os.open` + `os.fstat` + `os.path.realpath` in
+    # `src/services/vault_overlap.py`. Vault roots are bind mounts, and a
+    # network- or FUSE-backed one blocks in the kernel for as long as it likes.
+    # Two things break together without this bound. The startup detection is
+    # deliberately *synchronous* — that is what makes the process closed rather
+    # than permissive before it serves — so an unbounded observation would hold
+    # the application before its first request, taking the control panel down at
+    # exactly the moment an operator opens it to find out why; and the detection
+    # critical section would be held for the whole stall, queuing every other
+    # entry point behind one hung mount.
+    #
+    # Expiry is a **per-user verdict** (`root_unexaminable(timeout)`), never a
+    # failure of the detection: the remaining roots are still observed and the
+    # snapshot is still published. Treating it as a detection failure would
+    # retain the previous snapshot on every iteration a slow mount was slow, so
+    # a genuine overlap appearing later would never be published.
+    #
+    # It bounds the *wait*, not the syscall — a thread blocked in `open(2)`
+    # cannot be cancelled and stays parked until the filesystem answers
+    # (limitation L4).
+    vault_root_observe_timeout_seconds: float = Field(10.0, gt=0)
     # Path globs (fnmatch) skipped by the embedder — files remain
     # keyword-searchable but produce no vectors. Default skips Excalidraw
     # plugin files (drawings + downloaded scripts) which contain serialized
