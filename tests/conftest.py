@@ -33,6 +33,7 @@ SETTINGS_ENV_KEYS = (
     "CHUNK_OVERLAP",
     "EMBED_CHUNK_BUDGET_PER_USER",
     "EMBED_TIME_BUDGET_SECONDS_PER_USER",
+    "VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS",
     "EMBEDDING_EXCLUDE_PATTERNS",
     "MCP_HOSTNAME",
     "BASE_URL",
@@ -152,6 +153,47 @@ else:
             import src.config  # noqa: F401,E402
         finally:
             pydantic_settings.BaseSettings.__init__ = _orig_settings_init
+
+
+@pytest.fixture(autouse=True)
+def published_vault_root_snapshot():
+    """Publish an **empty** vault-root overlap snapshot around every test.
+
+    `vault._vault_root` refuses every multi-user caller until a snapshot has
+    been published in the process — that readiness state is what keeps the
+    server closed rather than permissive between accepting connections and the
+    first detection. Without this fixture it would also turn every existing
+    multi-user test into a vault-unavailable failure, for a reason that has
+    nothing to do with what those tests assert.
+
+    Empty, not synthetic: the default is "everything was checked and nothing
+    overlaps", which is the state the production deployment is expected to be
+    in. Tests that need a quarantined caller publish their own entries with
+    `vault_overlap.publish_synthetic_snapshot`, and the handful that exercise
+    the *detector entry points* opt in to the never-published state with the
+    `unpublished_vault_root_snapshot` fixture below rather than relying on
+    import or collection order.
+    """
+    from src.services import vault_overlap
+
+    vault_overlap.reset_snapshot_state()
+    vault_overlap.publish_synthetic_snapshot()
+    yield
+    vault_overlap.reset_snapshot_state()
+
+
+@pytest.fixture
+def unpublished_vault_root_snapshot():
+    """Opt in to the never-published state for one test.
+
+    Requested by name, so a test that depends on the readiness refusal says so.
+    It runs after the autouse fixture above and undoes it for the duration.
+    """
+    from src.services import vault_overlap
+
+    vault_overlap.reset_snapshot_state()
+    yield
+    vault_overlap.reset_snapshot_state()
 
 
 @pytest.fixture(autouse=True)
