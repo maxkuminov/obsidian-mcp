@@ -42,9 +42,12 @@
                 id="password"
                 name="password"
                 autocomplete="new-password"
-                minlength="8"
+                {# `minlength` and the hint below mirror the server's
+                   `MIN_PASSWORD_LENGTH`, passed in by `_render_register`, so
+                   the browser and the validator cannot disagree. #}
+                minlength="{{ min_password_length }}"
                 required>
-            <div class="field-hint">Minimum 8 characters.</div>
+            <div class="field-hint">Minimum {{ min_password_length }} characters.</div>
         </div>
 
         <div class="field">
@@ -55,7 +58,7 @@
                 id="password_confirm"
                 name="password_confirm"
                 autocomplete="new-password"
-                minlength="8"
+                minlength="{{ min_password_length }}"
                 required>
         </div>
 

@@ -142,8 +142,10 @@
             </div>
             <div class="field">
                 <label class="field-label">Initial Password</label>
-                <input type="password" name="initial_password" required minlength="8"
-                       class="field-input" placeholder="≥ 8 characters" autocomplete="new-password">
+                {# `minlength` and the placeholder read `MIN_PASSWORD_LENGTH`, so
+                   the browser stops what `create_user` would refuse anyway. #}
+                <input type="password" name="initial_password" required minlength="{{ min_password_length }}"
+                       class="field-input" placeholder="≥ {{ min_password_length }} characters" autocomplete="new-password">
                 <div style="font-size:11px;color:var(--text-3);margin-top:6px;">
                     Share with the user out-of-band. They can change it after first login.
                 </div>

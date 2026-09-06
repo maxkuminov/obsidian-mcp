@@ -43,7 +43,7 @@ from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.passwords import hash_password, validate_new_password
+from src.auth.passwords import MIN_PASSWORD_LENGTH, hash_password, validate_new_password
 from src.auth.session import _SingleUserSentinel, revoke_user_sessions
 from src.config import settings
 from src.control_panel.flash import ERR, flash
@@ -408,6 +408,11 @@ async def list_users(
     return templates.TemplateResponse(request, "users.html", _panel_context(request, user, {
         "active": "users",
         "users": users,
+        # The create form's `minlength` and hint read the server's constant
+        # (#197). Written into the markup they said eight while `create_user`
+        # refused anything under twelve — a form that let an administrator
+        # submit a password guaranteed to bounce.
+        "min_password_length": MIN_PASSWORD_LENGTH,
     }))
 
 
@@ -495,6 +500,8 @@ async def edit_user_form(
         },
         "available_vaults": available_vaults,
         "is_self": (isinstance(user, User) and user.id == target.id),
+        # As on the list page: the reset form's minimum is the server's.
+        "min_password_length": MIN_PASSWORD_LENGTH,
     }))
 
 

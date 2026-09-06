@@ -514,6 +514,7 @@ how the panel says so.
   per-pass budget, which is deliberately *not* written into the pass record's
   `error` because it is a decision rather than a fault.
 
+
 ## The last-admin guard
 
 - **Every panel handler that can change `users.is_admin` / `users.is_active`
@@ -590,7 +591,7 @@ The lifecycle, in one table — one implementation per phase:
 | Phase | Trigger | What happens | Where |
 | --- | --- | --- | --- |
 | **Mint** | login; bootstrap registration; the re-issue after a password change | **under the account guard**: re-read the user `FOR UPDATE` with `populate_existing=True`, require it to exist and be active, insert a row keyed on `sha256(sid)` with `expires_at = now + session_max_age` and `user_agent_hash`, **commit**, and only then write `sid` into the signed cookie | `start_session()`, three callers |
-| **Validate** | every request that resolves a browser identity | the cookie must carry **both** `user_id` and `sid`; refused when the row is absent, revoked, expired, or `row.user_id` disagrees with the cookie's; then the existing user-exists / `is_active` / `session_version` checks. Every refusal clears the cookie | `get_active_session_user()`, reached from `require_user_panel`, `login_form`, `authorize_get`, `authorize_post` — the only four entry points |
+| **Validate** | every request that resolves a browser identity | the cookie must carry **both** `user_id` and `sid`; refused when the row is absent, revoked, expired, or `row.user_id` disagrees with the cookie's; then the existing user-exists / `is_active` / `session_version` checks. Every refusal clears the cookie **and records `panel_session_replay_refused`** with one of eight reasons | `get_active_session_user()`, reached from `require_user_panel`, `login_form`, `authorize_get`, `authorize_post` — the only four entry points |
 | **Touch** | a `GET`/`HEAD` whose row is more than `SESSION_TOUCH_INTERVAL_SECONDS` stale | `last_seen_at = now()` on the **request's own** session, committed in the dependency before the handler runs; skipped on every other method and on any failure | `touch_session()` |
 | **Revoke — one** | logout | `revoked_at` for that row, commit, cookie cleared | `logout` in `src/auth/routes.py` |
 | **Revoke — all** | self-service password change; admin password reset; deactivation through the user edit form; soft delete | `revoked_at` for every unrevoked row of that user, **in the caller's transaction**, under the account guard | `change_password`; `reset_password`, `edit_user_submit`, `delete_user` |
@@ -629,6 +630,30 @@ The lifecycle, in one table — one implementation per phase:
   session-fixation hygiene and means **a caller must flash after the mint,
   never before**, or the message is thrown away with the old cookie.
 
+- **A mint is bound to the credential generation that authorized it, not just
+  to `is_active`.** `start_session` takes a required `expected_session_version`
+  and refuses when the locked re-read disagrees. Checking the active flag alone
+  left the hole the guard was supposed to close: an administrator's reset
+  writes a new hash, **bumps `session_version`** and revokes every row it can
+  see, and it can commit in the window between a caller verifying a credential
+  and the mint taking the lock. The account is active throughout, so a mint
+  that only asked that question would insert a live row *after* the reset's
+  sweep and copy the new version into the cookie — handing the **superseded**
+  password a fully valid session and defeating both invalidators at once. The
+  three call sites each pass the generation they hold: `login_submit` the
+  version `verify_password` ran against, `register_submit` the row it just
+  created, `change_password` the bumped version it just committed. The same
+  window is why the post-change re-issue, which runs in a *second* transaction,
+  needs it too.
+
+- **`panel_login_succeeded` is emitted after the mint, not after the
+  `last_login_at` commit.** That commit was never what made somebody signed in
+  — the session row is — so a mint refused by the race above would otherwise
+  have left a record asserting a sign-in that did not happen. A refused mint
+  records `panel_login_failed` with reason `session_mint_refused` instead: a
+  correct credential that did not sign in must not be silently absent from the
+  log.
+
 - **The touch never opens a second `AsyncSession`, and only ever runs on a safe
   method.** A request holding two connection-pool leases halves a pool that
   tops out at `pool_size + max_overflow` = fifteen; the sixteenth caller
@@ -652,6 +677,20 @@ The lifecycle, in one table — one implementation per phase:
   signs real users out on every browser auto-update — training them to
   re-authenticate after an unexplained logout, which is the habit phishing
   depends on. The same argument rules out IP binding.
+
+- **Every refusal records its reason, all eight of them.** Clearing the cookie
+  signs a browser out mid-session, so an operator asked "why was this user
+  logged out?" must be able to answer it from the log for every branch, not
+  five of them. `REPLAY_REFUSAL_REASONS` is the closed vocabulary —
+  `no_session_id`, `unknown_session`, `revoked_session`, `expired_session`,
+  `user_mismatch`, `user_missing`, `user_inactive`, `version_mismatch` — and
+  the last three were the ones that used to clear silently. `version_mismatch`
+  in particular is the account-wide invalidator working as designed after a
+  password reset, and it was the refusal with no record at all. The one case
+  that records nothing is a cookie with no `user_id`: that is an anonymous
+  request, not a refusal. A test closes the vocabulary in both directions and
+  asserts `cookie.clear()` and `_replay_refused(` occur the same number of
+  times in the validator.
 
 - **`login_form` must resolve through `get_active_session_user`, never read
   `request.session["user_id"]` raw.** That raw read was a fifth validation
@@ -799,3 +838,14 @@ The lifecycle, in one table — one implementation per phase:
   **The 72-byte truncation and the NUL rejection themselves are untouched** —
   every stored hash depends on them; read the module docstring before
   "fixing" either.
+
+- **The four forms render `MIN_PASSWORD_LENGTH`; none of them writes a
+  number.** `register.html`, `account.html`, `users.html` and `user_edit.html`
+  take `min_password_length` from their handler's context and put it in both
+  `minlength` and the hint. That is not tidiness either: the server moved to
+  twelve while three of those templates went on promising eight, so the browser
+  accepted precisely what the handler would then refuse. A literal that happens
+  to equal today's constant is still a literal, and the test asserts the
+  absence of any numeric `minlength` on these forms **and** that each handler
+  actually passes the key — a template reading it off a context that has none
+  renders `minlength=""`, which is silently no minimum at all.

@@ -18,6 +18,8 @@ Three things are pinned here, all of them foundations the rest of
    the code that reads them, and the redirect-host allow-list refuses a
    pattern rather than accepting an entry that would match nothing.
 """
+import pathlib
+
 import pytest
 from pydantic import ValidationError
 
@@ -249,3 +251,49 @@ def test_a_pattern_inside_an_otherwise_valid_list_is_refused():
 def test_a_non_list_value_is_refused():
     with pytest.raises(ValidationError):
         _settings(oauth_known_redirect_hosts=17)
+
+
+# --------------------------------------------------------------------------
+# every setter's form reads the constant too
+# --------------------------------------------------------------------------
+
+#: The four password-setting forms and the handler whose context feeds each.
+#: A `minlength` written into the markup is how the number drifted in the first
+#: place: the server moved to twelve and three of these went on promising
+#: eight, so the browser accepted exactly what the handler then refused.
+PASSWORD_FORMS = {
+    "src/control_panel/templates/register.html": ("src.auth.routes", "_render_register"),
+    "src/control_panel/templates/account.html": ("src.control_panel.routes", "account_page"),
+    "src/control_panel/templates/users.html": ("src.control_panel.users", "list_users"),
+    "src/control_panel/templates/user_edit.html": ("src.control_panel.users", "edit_user_form"),
+}
+
+
+#: Resolved from this file, not from the working directory — another module in
+#: the suite `chdir`s, and a relative path here would read whatever happened to
+#: sit at that name (or nothing) depending on collection order.
+REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("template", sorted(PASSWORD_FORMS))
+def test_no_password_form_hard_codes_a_minimum(template):
+    markup = (REPO_ROOT / template).read_text()
+    assert 'minlength="{{ min_password_length }}"' in markup
+    # No numeric `minlength` on these forms at any value: a literal that
+    # happens to equal today's constant is still a literal.
+    assert 'minlength="8"' not in markup
+    assert f'minlength="{MIN_PASSWORD_LENGTH}"' not in markup
+
+
+@pytest.mark.parametrize("template", sorted(PASSWORD_FORMS))
+def test_every_password_form_is_handed_the_constant(template):
+    """A template reading `min_password_length` off a context that has none
+    renders `minlength=""` — silently no minimum at all — so the binding is
+    asserted at the handler, not only in the markup."""
+    import importlib
+    import inspect
+
+    module_name, function_name = PASSWORD_FORMS[template]
+    module = importlib.import_module(module_name)
+    source = inspect.getsource(getattr(module, function_name))
+    assert '"min_password_length": MIN_PASSWORD_LENGTH' in source

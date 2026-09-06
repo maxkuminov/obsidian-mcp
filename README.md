@@ -922,7 +922,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `BASE_URL` | derived | Explicit public origin. HTTPS except on loopback. |
 | `ALLOWED_ORIGINS` | derived | CORS origins, JSON list |
 | `ALLOWED_HOSTS` | derived | Accepted `Host` headers, JSON list. `localhost` is always added. |
-| `SESSION_MAX_AGE` | `604800` | Panel session cookie lifetime, seconds (multi-user mode) |
+| `SESSION_MAX_AGE` | `604800` | Panel session lifetime, seconds (multi-user mode). Absolute — the server-side row is never extended, so a session used daily still expires |
 | `SESSION_COOKIE_NAME` | `omcp_session` | Panel session cookie name |
 | `SESSION_TOUCH_INTERVAL_SECONDS` | `60` | How stale a session's `last_seen_at` may get before a validated `GET`/`HEAD` rewrites it. Telemetry only — nothing authorizes on it. Must be ≥ 1. |
 | `SESSION_PURGE_RETAIN_DAYS` | `7` | How long a dead panel session row is kept, measured from the *later* of its expiry and its revocation, so a revocation stays visible for the full window. Must be ≥ 1. |
@@ -1189,7 +1189,7 @@ clients genuinely want larger reads, raise `MAX_READ_RESPONSE_CHARS` —
 that is an operator decision, made once, by someone who knows the
 deployment.
 
-> **Upgrading:** two visible contract changes, in two releases.
+> **Upgrading:** three visible contract changes.
 >
 > `read_note` on a large note used to return the whole thing; it now
 > truncates. The response is self-describing, so an agent needs no prior
@@ -1205,6 +1205,13 @@ deployment.
 > parsed the old envelope must read `content` (and, for section reads,
 > `heading`) instead; clients that ignore `structuredContent` still get
 > an unambiguous JSON text block.
+>
+> **Panel sessions are now server-side rows, so everyone is signed out
+> once at that upgrade.** A cookie issued before it carries no session
+> identifier, and such a cookie is refused rather than grandfathered —
+> accepting it would keep the old replay window open for another seven
+> days after the fix shipped. Sign in again; there is nothing to
+> migrate.
 
 ## Architecture
 

@@ -147,11 +147,20 @@ class FakeRegistry:
     correct-looking behaviour.
     """
 
-    def __init__(self, *, users=(), sessions=()):
+    def __init__(self, *, users=(), sessions=(), restore_on_rollback: bool = False):
         self.users = list(users)
         self.sessions = list(sessions)
         self.committed = 0
         self.rolled_back = 0
+        #: Discard a handler's **uncommitted** attribute writes on rollback,
+        #: the way a real `AsyncSession` does. Off by default, and the default
+        #: is not laziness: these rows are also how a test models *another*
+        #: transaction's committed write (an administrator deactivating an
+        #: account through `on_lock`, say), and a rollback must not undo one of
+        #: those. Only a test that injects a failure *inside* the handler's own
+        #: transaction — and then asks what survived it — wants this on.
+        self.restore_on_rollback = restore_on_rollback
+        self._user_snapshot: dict[int, dict] = {}
         self.added: list = []
         #: Every advisory lock taken, in order. The order is itself under test:
         #: the mint must take the guard *before* it re-reads the account.
@@ -170,13 +179,22 @@ class FakeRegistry:
         self.fail_on: str | None = None
         self.fail_with: Exception | None = None
         self.fail_rollback: Exception | None = None
+        # The state a rollback before the first commit returns to.
+        self._snapshot_users()
 
     # -- async session surface --------------------------------------------
 
     async def __aenter__(self):
         return self
 
-    async def __aexit__(self, *_exc):
+    async def __aexit__(self, exc_type, *_rest):
+        # `AsyncSession.__aexit__` closes, and closing an open transaction
+        # rolls it back. That is how a handler which raises mid-transaction
+        # gets undone in production — the dependency's context manager, not the
+        # handler — so the fake has to do it too or a test would have to fake
+        # the undo itself and prove nothing.
+        if exc_type is not None:
+            await self.rollback()
         return False
 
     def add(self, obj):
@@ -184,13 +202,25 @@ class FakeRegistry:
         if isinstance(obj, UserSession):
             self.sessions.append(obj)
 
+    def _snapshot_users(self):
+        if self.restore_on_rollback:
+            self._user_snapshot = {id(u): dict(vars(u)) for u in self.users}
+
     async def commit(self):
         self.committed += 1
         self.events.append(("commit",))
+        # What survives a later rollback is what was committed.
+        self._snapshot_users()
 
     async def rollback(self):
         self.rolled_back += 1
         self.events.append(("rollback",))
+        if self.restore_on_rollback:
+            for user in self.users:
+                snapshot = self._user_snapshot.get(id(user))
+                if snapshot is not None:
+                    vars(user).clear()
+                    vars(user).update(snapshot)
         if self.fail_rollback is not None:
             raise self.fail_rollback
 
@@ -320,6 +350,7 @@ def browser_request(
     query: str = "",
     user_agent: str = "pytest",
     client: tuple[str, int] = ("203.0.113.9", 44444),
+    cookies: dict[str, str] | None = None,
 ):
     """A **real** `starlette.requests.Request` carrying a session dict.
 
@@ -328,6 +359,9 @@ def browser_request(
     one under `clear()`; `request.url.path` parses the way it does in
     production; and slowapi's decorator on `login_submit` refuses anything that
     is not a `Request` at all.
+
+    `cookies` is rendered into a real `Cookie` header, so `request.cookies` is
+    whatever Starlette parses rather than a dict a test asserted into place.
     """
     from starlette.requests import Request
 
@@ -345,7 +379,20 @@ def browser_request(
             "headers": [
                 (b"host", b"testserver"),
                 (b"user-agent", user_agent.encode()),
-            ],
+            ]
+            + (
+                # Real `Cookie` header rather than a `cookies` attribute, so
+                # Starlette's own parser produces `request.cookies` — the
+                # OAuth consent POST reads its signed state from there.
+                [
+                    (
+                        b"cookie",
+                        "; ".join(f"{k}={v}" for k, v in cookies.items()).encode(),
+                    )
+                ]
+                if cookies
+                else []
+            ),
             "client": client,
             "server": ("testserver", 80),
             "session": {} if session is None else session,
@@ -396,8 +443,18 @@ async def sign_in(user, *, registry: FakeRegistry | None = None, request=None):
         registry.users.append(user)
     if request is None:
         request = browser_request()
-    sid = await start_session(request, registry, user.id)
-    assert sid is not None, "the mint refused; is the fake user active?"
+    sid = await start_session(
+        request,
+        registry,
+        user.id,
+        # The generation the fake user is on. The production callers each pass
+        # the version they authorized against; a helper that signs a user in
+        # passes the one that user currently holds.
+        expected_session_version=user.session_version,
+    )
+    assert sid is not None, (
+        "the mint refused; is the fake user active and on this session_version?"
+    )
     return sid, request, registry
 
 

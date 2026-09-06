@@ -181,6 +181,11 @@ db-check:
 # directly. Nothing it touches outlives the target: the container is removed
 # even when the tests fail, and it never reads the deploy .env or the live DB.
 #
+# It also runs the session pool-capacity case, which is here for the same
+# reason: it needs a real engine and a real database, and this is the only
+# job in CI that has one. A fake cannot show that twenty-five concurrent
+# validations complete against fifteen leases.
+#
 # Start, run and teardown are **one shell** with a `trap` armed the instant the
 # container exists, so the removal also happens on the paths a trailing `docker
 # rm` line cannot cover: a Ctrl-C at the prompt, a SIGTERM, or a `make` that
@@ -204,7 +209,8 @@ test-schema:
 	if [ "$$ready" -eq 1 ]; then \
 		OMCP_REQUIRE_SCHEMA_INTEGRATION=1 \
 		PGVECTOR_TEST_ADMIN_URL=postgresql+asyncpg://postgres:test@127.0.0.1:$(SCHEMA_TEST_PORT)/postgres \
-		$(PYTHON) -m pytest -q tests/integration/test_schema_check.py; \
+		$(PYTHON) -m pytest -q tests/integration/test_schema_check.py \
+			tests/integration/test_issue_198_session_pool_capacity.py; \
 		status=$$?; \
 	else \
 		echo "$(RED)$(SCHEMA_TEST_CONTAINER) never became ready$(NC)"; status=1; \

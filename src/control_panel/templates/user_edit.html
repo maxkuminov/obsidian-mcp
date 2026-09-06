@@ -94,8 +94,9 @@
                     {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                     <div class="field">
                         <label class="field-label">New password</label>
-                        <input type="password" name="new_password" required minlength="8"
-                               class="field-input" placeholder="≥ 8 characters" autocomplete="new-password">
+                        {# As on the users list: the server's constant, not a literal. #}
+                        <input type="password" name="new_password" required minlength="{{ min_password_length }}"
+                               class="field-input" placeholder="≥ {{ min_password_length }} characters" autocomplete="new-password">
                         <div style="font-size:11px;color:var(--text-3);margin-top:6px;">
                             Replaces the user's current password. Communicate the new one
                             to them out-of-band.

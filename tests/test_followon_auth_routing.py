@@ -5,9 +5,11 @@ import pytest
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from src.auth.session import get_active_session_user
+from src.auth.session import SESSION_ID_KEY, get_active_session_user
 from src.main import RootMCPProxyMiddleware
 from src.oauth import routes as oauth_routes
+
+import session_helpers as sh
 
 
 class _Request:
@@ -19,15 +21,26 @@ class _Request:
 
 @pytest.mark.asyncio
 async def test_active_session_resolver_clears_deactivated_user():
-    user = SimpleNamespace(id=7, session_version=3, is_active=False)
-    result = MagicMock()
-    result.scalar_one_or_none.return_value = user
-    db = AsyncMock()
-    db.execute.return_value = result
-    request = _Request({"user_id": 7, "session_version": 3})
+    """A deactivated account's *live* session is refused and its cookie cleared.
 
-    assert await get_active_session_user(request, db) is None
+    The cookie is minted through `session_helpers.sign_in`, not hand-built.
+    Written by hand it carried no `sid`, and once #198 landed the resolver
+    refused it at the `no_session_id` branch before ever reading the `users`
+    row — so the assertion below passed without the deactivation being what
+    caused it. The registry row and the `sid` are what make this test reach the
+    branch it is named for.
+    """
+    user = sh.fake_user(user_id=7, session_version=3)
+    sid, request, registry = await sh.sign_in(user)
+    assert request.session[SESSION_ID_KEY] == sid
+
+    user.is_active = False
+
+    assert await get_active_session_user(request, registry) is None
     assert request.session == {}
+    # The proof that the refusal came from the account and not from the cookie
+    # shape: the resolver got past the `sid` check and looked the row up.
+    assert any("user_sessions" in statement for statement in registry.statements)
 
 
 @pytest.mark.asyncio

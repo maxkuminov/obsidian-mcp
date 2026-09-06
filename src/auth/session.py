@@ -11,9 +11,11 @@ is what revocation acts on and what validation consults.
 Four functions, and the asymmetry between two of them is the contract:
 
 * `start_session` — the **single** mint. It takes the account guard, re-reads
-  the account under it, and **commits**, because `get_session` neither commits
-  nor rolls back: an insert left to a caller's discretion is an insert that may
-  never happen, and the cookie handed out beside it would authenticate nothing.
+  the account under it, refuses unless the row is active **and still on the
+  `expected_session_version` its caller authorized against**, and **commits**,
+  because `get_session` neither commits nor rolls back: an insert left to a
+  caller's discretion is an insert that may never happen, and the cookie handed
+  out beside it would authenticate nothing.
 * `revoke_session` / `revoke_user_sessions` — **never** commit. They ride the
   caller's transaction, because every caller holds the account guard and
   nothing may commit between taking that lock and writing the flags it
@@ -179,6 +181,16 @@ REPLAY_REFUSAL_REASONS = frozenset(
         "revoked_session",
         "expired_session",
         "user_mismatch",
+        # The three account-level refusals. They are here rather than silent
+        # because **every** validation refusal clears the cookie, and a cleared
+        # cookie is a user signed out mid-session: an operator asking "why was
+        # this browser logged out?" must be able to answer it from the log for
+        # all eight branches, not five of them. `version_mismatch` in
+        # particular is the account-wide invalidator doing its job after a
+        # password reset, and it was the one refusal with no record at all.
+        "user_missing",
+        "user_inactive",
+        "version_mismatch",
     }
 )
 
@@ -233,12 +245,28 @@ async def start_session(
     request: Request,
     session: AsyncSession,
     user_id: int,
+    *,
+    expected_session_version: int,
 ) -> str | None:
     """Mint one browser session, inside the account guard, and commit it.
 
     Returns the identifier written into the cookie, or `None` when the account
-    is gone or inactive — a refusal the caller does not recover from: the user
+    is gone, inactive, or **no longer on the credential generation the caller
+    authorized against** — a refusal the caller does not recover from: the user
     is simply not signed in.
+
+    **`expected_session_version` is the credential generation that authorized
+    this mint, and it is not optional.** Checking `is_active` alone is not
+    enough: an administrator's password reset bumps `session_version` and
+    revokes every row, and it can commit in the window between the caller
+    verifying a credential and this function taking the guard. Adopting
+    whatever version the locked re-read happens to see would then hand the
+    *old* password a brand-new, fully valid session — the account-wide
+    invalidator defeated by the very race the guard exists to close, and the
+    reset's own revocation sweep already behind it. The three callers each pass
+    the generation they hold: `login_submit` the version it verified the
+    password against, `register_submit` the freshly inserted row's, and the
+    self-service change the bumped version it has just committed.
 
     **One guarded critical section.** Take the account guard, re-read the user
     `FOR UPDATE` with `populate_existing=True`, require the row to exist and be
@@ -293,6 +321,15 @@ async def start_session(
         # Nothing was written, but this transaction holds the guard and the
         # caller goes on to render a page: release it rather than leave an
         # advisory lock held for the rest of the request.
+        await session.rollback()
+        return None
+    if user.session_version != expected_session_version:
+        # A reset (or another change that bumps the account-wide version)
+        # committed between the caller's credential check and this lock. The
+        # credential that authorized this mint is the *previous* generation, so
+        # minting here would resurrect it: the reset revoked every row it could
+        # see, and this insert lands after that sweep. Refuse, for the same
+        # reason and on the same terms as the deactivation branch above.
         await session.rollback()
         return None
 
@@ -503,7 +540,11 @@ async def get_active_session_user(
 
     **Every refusal clears the cookie**, so a rejected cookie cannot be
     replayed against a different route — notably OAuth consent — after a
-    password reset, a deactivation or a logout.
+    password reset, a deactivation or a logout. **And every refusal is
+    recorded**, under one of `REPLAY_REFUSAL_REASONS`: clearing the cookie
+    signs a browser out mid-session, and an operator asked why must be able to
+    answer it from the log for all eight branches. The lone anonymous
+    request — no `user_id` at all — is not a refusal and records nothing.
     """
     cookie = _session_cookie(request)
     if cookie is None:
@@ -547,6 +588,12 @@ async def get_active_session_user(
     result = await session.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if user is None or not user.is_active:
+        _replay_refused(
+            request,
+            "user_missing" if user is None else "user_inactive",
+            user_id=user_id,
+            sid=sid,
+        )
         cookie.clear()
         return None
     # Starlette sessions are signed client-side cookies. Binding the cookie to
@@ -555,6 +602,7 @@ async def get_active_session_user(
     # if a registry write is lost — which is why it stays beside the registry
     # rather than being replaced by it.
     if cookie.get("session_version") != user.session_version:
+        _replay_refused(request, "version_mismatch", user_id=user_id, sid=sid)
         cookie.clear()
         return None
 

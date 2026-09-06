@@ -632,6 +632,10 @@ async def change_password(
 
     changed_user_id = fresh.id
     changed_username = fresh.username
+    # The generation this handler has just committed. The re-issue below is
+    # bound to it, so a reset that lands between these two transactions refuses
+    # the mint rather than minting against a version this user no longer holds.
+    changed_session_version = fresh.session_version
 
     security_events.emit(
         "panel_sessions_revoked",
@@ -650,7 +654,12 @@ async def change_password(
     )
 
     try:
-        sid = await start_session(request, session, changed_user_id)
+        sid = await start_session(
+            request,
+            session,
+            changed_user_id,
+            expected_session_version=changed_session_version,
+        )
     except Exception as exc:  # noqa: BLE001 - the change is already durable
         # Through the catalogue rather than a bare `logger.error`: a caller
         # drives this path, so the record passes the same allowance check every

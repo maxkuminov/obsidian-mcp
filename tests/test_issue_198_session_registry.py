@@ -212,7 +212,15 @@ async def test_a_mint_for_an_inactive_account_writes_nothing():
     registry = sh.FakeRegistry(users=[user])
     request = sh.browser_request()
 
-    assert await start_session(request, registry, user.id) is None
+    assert (
+        await start_session(
+            request,
+            registry,
+            user.id,
+            expected_session_version=user.session_version,
+        )
+        is None
+    )
     assert registry.sessions == []
     assert registry.committed == 0
     assert registry.rolled_back == 1, "the guard must not be held on"
@@ -271,12 +279,123 @@ async def test_a_deactivation_racing_a_re_issue_leaves_the_browser_signed_out():
 
     # The re-issue, overtaken by a deactivation.
     user.is_active = False
-    assert await start_session(request, registry, user.id) is None
+    assert (
+        await start_session(
+            request,
+            registry,
+            user.id,
+            expected_session_version=user.session_version,
+        )
+        is None
+    )
     assert [row for row in registry.sessions if row.revoked_at is None] == []
 
     signed_out = sh.browser_request(path="/admin/", session=dict(request.session))
     assert await get_active_session_user(signed_out, registry) is None
     assert hash_session_id(sid) == registry.sessions[0].id
+
+
+async def test_a_reset_racing_a_login_mints_nothing_for_the_old_password(monkeypatch):
+    """The mint is bound to the generation that authorized it.
+
+    `is_active` alone does not close this window. An administrator's reset
+    writes a new hash, **bumps `session_version`** and revokes every row it can
+    see — all while a login that has already verified the *old* password waits
+    for the account guard. The account stays active throughout, so a mint that
+    checked only `is_active` would insert a live row *after* the reset's sweep
+    and copy the new version into the cookie: the superseded password would
+    come away with a fully valid session, and both invalidators — the registry
+    and `session_version` — would have been defeated by the same race they
+    exist to close.
+    """
+    monkeypatch.setattr(auth_routes, "verify_password", lambda *_a, **_k: True)
+    user = sh.fake_user(7, session_version=3)
+    registry = sh.FakeRegistry(users=[user])
+
+    def reset(_key):
+        # What `reset_password` does, in the window: new hash, new generation.
+        user.password_hash = "$2b$12$" + "z" * 53
+        user.session_version = 4
+
+    registry.on_lock = reset
+    request = sh.browser_request(
+        method="POST", path="/admin/auth/login", client=("10.0.0.197", 5555)
+    )
+
+    response = await auth_routes.login_submit(
+        request=request,
+        username=user.username,
+        password="the old password",
+        next="/admin/",
+        session=registry,
+    )
+
+    assert response.status_code == 401
+    assert user.is_active is True, "the account was never disabled — only reset"
+    assert registry.sessions == [], "no row for a superseded credential"
+    # The one commit is `last_login_at`, which precedes the mint. The mint's
+    # own transaction rolled back rather than committing a row, and released
+    # the guard doing it.
+    assert registry.rolled_back == 1, "the guard must not be held on"
+    assert "user_id" not in request.session
+    assert SESSION_ID_KEY not in request.session
+
+
+async def test_a_reset_racing_a_re_issue_leaves_the_browser_signed_out():
+    """The same window on the password-change re-issue (D13).
+
+    The re-issue runs in a *second* guarded transaction, so an administrator's
+    reset can commit in the gap. The user is still active and the browser still
+    holds a cookie, but the generation the handler committed is no longer the
+    one on the row — so the mint refuses and this browser is signed out rather
+    than re-issued against a version it does not hold.
+    """
+    user = sh.fake_user(7, session_version=1)
+    sid, request, registry = await sh.sign_in(user)
+
+    # The change's own transaction: bump, revoke, commit.
+    user.session_version = 2
+    assert await revoke_user_sessions(registry, user.id) == 1
+    await registry.commit()
+    committed_version = user.session_version
+
+    # ...and an administrator's reset lands before the re-issue takes the guard.
+    user.session_version = 3
+
+    assert (
+        await start_session(
+            request,
+            registry,
+            user.id,
+            expected_session_version=committed_version,
+        )
+        is None
+    )
+    assert [row for row in registry.sessions if row.revoked_at is None] == []
+
+    signed_out = sh.browser_request(path="/admin/", session=dict(request.session))
+    assert await get_active_session_user(signed_out, registry) is None
+    assert hash_session_id(sid) == registry.sessions[0].id
+
+
+def test_the_locked_re_read_repopulates_the_identity_map():
+    """`populate_existing=True` on the mint's `SELECT … FOR UPDATE`.
+
+    Asserted against the source because the effect is invisible to a fake: a
+    locking re-read whose row is already in the session's identity map hands
+    back the **pre-lock** attribute values, and `is_active` and
+    `session_version` are both read in Python here. Every caller arrives with
+    that row already loaded, so without this option the two checks above prove
+    nothing at all.
+    """
+    import inspect
+
+    source = inspect.getsource(auth_session.start_session)
+    assert "with_for_update()" in source
+    assert "execution_options(populate_existing=True)" in source
+    # And the two checks that depend on it.
+    assert "user.is_active is not True" in source
+    assert "user.session_version != expected_session_version" in source
 
 
 async def test_bootstrap_mints_outside_the_bootstrap_transaction(tmp_path, monkeypatch):
@@ -389,7 +508,7 @@ async def test_a_row_owned_by_another_user_is_refused_and_cleared(records):
     ]
 
 
-async def test_an_inactive_user_is_refused_even_with_a_live_row():
+async def test_an_inactive_user_is_refused_even_with_a_live_row(records):
     user = sh.fake_user(7)
     sid, request, registry = await sh.sign_in(user)
     user.is_active = False
@@ -398,6 +517,70 @@ async def test_an_inactive_user_is_refused_even_with_a_live_row():
     assert await get_active_session_user(replay, registry) is None
     assert replay.session == {}
     assert registry.sessions[0].revoked_at is None, "validation revokes nothing"
+    assert [r.reason for r in _events(records, "panel_session_replay_refused")] == [
+        "user_inactive"
+    ]
+
+
+async def test_a_deleted_user_is_refused_and_recorded(records):
+    user = sh.fake_user(7)
+    _sid, request, registry = await sh.sign_in(user)
+    registry.users.clear()  # the account was hard-deleted under the cookie
+
+    replay = sh.browser_request(path="/admin/", session=dict(request.session))
+    assert await get_active_session_user(replay, registry) is None
+    assert replay.session == {}
+    assert [r.reason for r in _events(records, "panel_session_replay_refused")] == [
+        "user_missing"
+    ]
+
+
+async def test_a_stale_session_version_is_refused_and_recorded(records):
+    """The account-wide invalidator, and the branch that had no record at all.
+
+    A cookie whose row is still live but whose `session_version` is behind is
+    exactly what an administrator's password reset leaves behind on a browser
+    the registry write somehow missed — the second gate doing its job. It signs
+    that browser out, so it has to say so.
+    """
+    user = sh.fake_user(7, session_version=3)
+    _sid, request, registry = await sh.sign_in(user)
+    user.session_version = 4  # the reset bumps it
+
+    replay = sh.browser_request(path="/admin/", session=dict(request.session))
+    assert await get_active_session_user(replay, registry) is None
+    assert replay.session == {}
+    assert [r.reason for r in _events(records, "panel_session_replay_refused")] == [
+        "version_mismatch"
+    ]
+
+
+def test_every_refusal_branch_has_a_reason_and_every_reason_is_declared():
+    """The vocabulary is closed, and the closure is checked both ways.
+
+    A branch that clears the cookie without a record is a user signed out with
+    nothing in the log to explain it; a reason declared but never emitted is a
+    catalogue that has drifted from the code.
+    """
+    import inspect
+    import re
+
+    source = inspect.getsource(auth_session.get_active_session_user)
+    emitted = set(re.findall(r'_replay_refused\(\s*request,\s*"([a-z_]+)"', source))
+    emitted |= set(re.findall(r'_replay_refused\(\n?\s*request,\n?\s*"([a-z_]+)"', source))
+    # The four resolved by the `reason = "..."` ladder above the shared call.
+    emitted |= set(re.findall(r'reason = "([a-z_]+)"', source))
+    # `user_missing` / `user_inactive` arrive through a conditional expression.
+    emitted |= set(re.findall(r'"([a-z_]+)" if user is None else "([a-z_]+)"', source)[0]
+                   if re.findall(r'"([a-z_]+)" if user is None else "([a-z_]+)"', source)
+                   else [])
+    assert emitted == auth_session.REPLAY_REFUSAL_REASONS, (
+        f"declared but never emitted: "
+        f"{sorted(auth_session.REPLAY_REFUSAL_REASONS - emitted)}; "
+        f"emitted but not declared: {sorted(emitted - auth_session.REPLAY_REFUSAL_REASONS)}"
+    )
+    # And every `cookie.clear()` in the validator is preceded by a record.
+    assert source.count("cookie.clear()") == source.count("_replay_refused(")
 
 
 async def test_a_live_session_authenticates():
