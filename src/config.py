@@ -414,6 +414,53 @@ class Settings(BaseSettings):
     session_max_age: int = 60 * 60 * 24 * 7
     session_cookie_name: str = "omcp_session"
 
+    # ── Panel session registry (#198, migration 024) ───────────────────────
+    #
+    # How stale `user_sessions.last_seen_at` may get before a validated request
+    # rewrites it. The touch is telemetry — nothing authorizes on it — and it
+    # runs on `GET`/`HEAD` only, on the request's own database session.
+    #
+    # **`ge=1` is enforced, not assumed.** A zero or negative interval turns a
+    # throttled hint into an `UPDATE` plus a commit on *every* panel request,
+    # so the bound fails at settings construction and stops the container
+    # rather than degrading it silently. Env: SESSION_TOUCH_INTERVAL_SECONDS.
+    session_touch_interval_seconds: int = Field(60, ge=1)
+
+    # How long a dead session row is kept after it dies. The purge deletes a
+    # row only once *both* its expiry and, if set, its revocation are further
+    # in the past than this — the later of the two, never `expires_at` alone.
+    #
+    # **`ge=1` is enforced for a specific failure.** An administrative password
+    # reset revokes every unrevoked row of a user, already-expired rows
+    # included; with a zero window such a row is deleted on the next indexer
+    # tick, erasing the record of a revocation minutes after an operator
+    # performed it. That is the #64 blank space this retention exists to
+    # prevent. Env: SESSION_PURGE_RETAIN_DAYS.
+    session_purge_retain_days: int = Field(7, ge=1)
+
+    # Redirect **hosts** an operator recognises as belonging to a real
+    # connector. The OAuth consent screen shows a badge when a client's
+    # redirect host equals one of these and a warning naming the host when it
+    # does not; an empty list means nothing is recognised, which is safe (every
+    # client warns) rather than permissive.
+    #
+    # Matching is case-insensitive **equality** and nothing else — a suffix
+    # test is the bug it looks like a convenience: `endswith("claude.ai")`
+    # matches `evilclaude.ai`, `"claude.ai" in host` matches
+    # `claude.ai.evil.example`, and even `endswith(".claude.ai")` hands the
+    # badge to any subdomain an attacker can obtain. Neither real connector
+    # needs one.
+    #
+    # `NoDecode` for `fts_configs`' reason: **a bare `list[str]` is
+    # JSON-decoded by pydantic-settings**, so the comma-separated form an
+    # operator naturally writes would abort startup. Env
+    # `OAUTH_KNOWN_REDIRECT_HOSTS` accepts JSON (`["claude.ai"]`) or CSV
+    # (`claude.ai,chatgpt.com`).
+    oauth_known_redirect_hosts: Annotated[list[str], NoDecode] = [
+        "claude.ai",
+        "chatgpt.com",
+    ]
+
     # Registry-eval only: when true, lifespan skips the DB dim check,
     # indexer, and embedding provider, and the /mcp auth middleware
     # short-circuits. Lets Glama's sandbox build the image and validate
@@ -523,6 +570,80 @@ class Settings(BaseSettings):
             out.append(name)
         if not out:
             raise ValueError("FTS_CONFIGS must contain at least one config name")
+        return out
+
+    @field_validator("oauth_known_redirect_hosts", mode="before")
+    @classmethod
+    def _parse_known_redirect_hosts(cls, v):
+        """Accept a JSON list, a comma-separated string, or a list of hosts.
+
+        Mirrors `_parse_fts_configs` — strip each entry's outer whitespace
+        (`claude.ai, chatgpt.com` means two hosts, not one host and one with a
+        leading space that would then equal nothing), lower-case, drop empties,
+        dedupe order-preservingly — and adds one rule of its own.
+
+        **A pattern is rejected, loudly, at configuration time.** An entry
+        containing `*`, `/`, `@` or internal whitespace is somebody reaching
+        for a wildcard, a path, a userinfo form or a mistyped separator; since
+        matching is exact-host equality, such an entry would match nothing at
+        all and every client would silently take the warning branch while the
+        operator believed they had allow-listed one. Refusing at startup makes
+        that a container that will not start rather than a badge that never
+        appears.
+
+        An **empty** list is accepted and means "nothing is recognised" — every
+        consent screen warns, which is the safe direction and a legitimate
+        thing for an operator to configure.
+        """
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith("["):
+                import json
+
+                try:
+                    parsed = json.loads(s)
+                except ValueError as e:
+                    # Looks like JSON (leading "[") but isn't — fail loudly
+                    # rather than CSV-splitting into junk host names.
+                    raise ValueError(
+                        "OAUTH_KNOWN_REDIRECT_HOSTS looks like JSON but failed "
+                        f"to parse: {e}. Use a JSON list "
+                        '(["claude.ai","chatgpt.com"]) or a comma-separated '
+                        "string (claude.ai,chatgpt.com)."
+                    ) from e
+                if not isinstance(parsed, list):
+                    raise ValueError(
+                        "OAUTH_KNOWN_REDIRECT_HOSTS JSON must be a list of hosts"
+                    )
+                v = parsed
+            else:
+                v = s.split(",")
+        if not isinstance(v, (list, tuple)):
+            raise ValueError(
+                "OAUTH_KNOWN_REDIRECT_HOSTS must be a list of bare hostnames "
+                "(JSON or comma-separated)"
+            )
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in v:
+            host = str(item).strip().lower()
+            if not host:
+                continue
+            bad = [c for c in ("*", "/", "@") if c in host]
+            if any(c.isspace() for c in host):
+                bad.append("whitespace")
+            if bad:
+                raise ValueError(
+                    f"OAUTH_KNOWN_REDIRECT_HOSTS entry {host!r} contains "
+                    f"{', '.join(repr(c) for c in bad)}; patterns are not "
+                    "supported. Each entry is one bare hostname matched by "
+                    "exact, case-insensitive equality — no wildcards, no "
+                    "paths, no userinfo, no suffix matching."
+                )
+            if host in seen:
+                continue
+            seen.add(host)
+            out.append(host)
         return out
 
     # Set by `_record_public_origin`, which must run *before*
