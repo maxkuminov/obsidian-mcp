@@ -22,6 +22,7 @@ os.environ.setdefault("VAULT_PATH", "/tmp/test-vault")
 os.chdir(tempfile.gettempdir())
 
 from src.services import embeddings  # noqa: E402
+from src.services.embeddings import NoteEmbedOutcome  # noqa: E402
 
 
 def test_embed_batch_takes_no_timeout_argument():
@@ -131,6 +132,12 @@ async def test_partial_coverage_is_not_certified_on_the_certified_path(monkeypat
         certified_hash="hash-1", certified_path="A.md",
     )
 
-    assert result == 0
+    # Its own outcome, carrying both cardinalities, and **no statement at
+    # all** — not the generation lock either, which is taken only on the path
+    # that is about to write.
+    assert result.outcome is NoteEmbedOutcome.PROVIDER_CARDINALITY_MISMATCH
+    assert result.chunks_embedded == 0
+    assert result.failure.requested == result.chunks_submitted
+    assert result.failure.received == result.chunks_submitted - 1
     assert session.executed == [] and session.added == []
     assert note.embedded_content_hash == "old"

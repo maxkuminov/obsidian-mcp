@@ -89,11 +89,30 @@ class _FindRelatedSession(_Session):
 
 
 class _Note:
-    def __init__(self, note_id=1, path="a.md"):
+    """A `notes_metadata` row, fresh and uncapped.
+
+    Equal hashes and `chunks_truncated=False`, so the staleness and truncation
+    annotations (#200, #202) are inert: this file asserts *which paths* the
+    telemetry names, and every row it builds must read as an ordinary fresh
+    hit. Carrying the attributes here is also what lets the tool-surface slice
+    land without editing this file.
+    """
+
+    def __init__(
+        self,
+        note_id=1,
+        path="a.md",
+        content_hash="h",
+        embedded_content_hash="h",
+        chunks_truncated=False,
+    ):
         self.id = note_id
         self.file_path = path
         self.title = "a"
         self.tags = []
+        self.content_hash = content_hash
+        self.embedded_content_hash = embedded_content_hash
+        self.chunks_truncated = chunks_truncated
 
 
 def _keyword_row(path):
@@ -109,9 +128,14 @@ def _semantic_row(note_id, path):
 
 
 def _related_row(note_id, path, distance=0.1):
+    # The last three are `find_related_stmt`'s widened projection (#200 /
+    # #202), pre-added so the tool slice lands against a fake that already
+    # carries them. Equal hashes, no truncation: a fresh, uncapped neighbour.
     return type("R", (), {
         "note_id": note_id, "file_path": path, "title": path, "tags": [],
         "chunk_text": "x", "distance": distance,
+        "content_hash": "h", "embedded_content_hash": "h",
+        "chunks_truncated": False,
     })()
 
 
