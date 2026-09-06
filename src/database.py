@@ -1,12 +1,13 @@
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from src.config import settings
+from src.services.pool_budget import POOL_SIZE, POOL_OVERFLOW
 
 engine = create_async_engine(
     settings.database_url,
     echo=False,
-    pool_size=5,
-    max_overflow=10,
+    pool_size=POOL_SIZE,
+    max_overflow=POOL_OVERFLOW,
     # 30s — SQLAlchemy's own default, written down rather than inherited. This
     # is the bound a pool-exhaustion failure is measured against: once all
     # 5 + 10 connections are checked out, every other caller (MCP tools, OAuth

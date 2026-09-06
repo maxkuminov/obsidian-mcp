@@ -892,3 +892,30 @@ highest — and never toward discarding, which costs a full re-embed.
   it would give the move path a dependency on embedding configuration it has no
   other reason to know.
 
+
+
+## Concurrency identities and authentication lifetimes (#261)
+
+The MCP concurrency controller keys tenant capacity by the authenticated user ID,
+not by bearer text, OAuth access-token ID, vault pathname or a caller argument.
+Single-user NULL-owner calls share one stable identity; OAuth principal capacity
+uses the existing grant ID. Refresh preserves that allowance. Before authentication
+there is no tenant reservation: a global request ceiling and transient hashed-bearer
+ceiling bound full request lifetimes, while a separate permit bounds DB auth work.
+GET/SSE holds request capacity through stream completion, not auth capacity.
+
+Authentication still checks key/token state, owner activity, cross-user grants,
+expiry and scope in the existing order. `_authenticate` returns a refusal response
+from inside its session; context-manager exit completes before `__call__` sends
+that response or invokes downstream tools. A slow client cannot occupy an auth
+connection or auth permit while receiving an error. All principal/vault ContextVars
+retain their existing final reset. Request leases release on response cancellation,
+downstream exceptions and disconnects. Registry sandbox bypass remains explicit.
+
+Keyed occupancy registries are bounded. When dedicated entries fill, new identities
+share a sticky overflow entry through active and pending ownership. Freeing a
+separate dedicated entry cannot split an overflow tenant's/principal's allowance;
+only a fully drained overflow epoch permits new dedicated assignments. This can
+be stricter under registry pressure; it cannot become a tenancy exemption. Shadow
+mode records this hypothetical admission pressure but preserves existing tool
+outcomes and performs no concurrency refusal or additional wait.

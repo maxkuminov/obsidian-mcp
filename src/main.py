@@ -38,6 +38,7 @@ from src.services.index_state import (
 )
 from src.services.indexer import run_indexer_loop
 from src.services.rate_limits import flush_all
+from src.services import concurrency
 from src.services import vault_fs
 from src.logging_setup import configure_logging
 from src.transfer.routes import router as transfer_router
@@ -443,6 +444,7 @@ async def lifespan(app: FastAPI):
     # ERROR, so it sees every module's errors without any of them opting in;
     # process-lifetime only, no schema — see `src/services/error_log.py`.
     error_log.attach()
+    concurrency_controller = concurrency.reset_controller(settings)
     # Wrapped so the suppressor's outstanding counts are flushed on **every**
     # exit path, the sandbox-mode early return included. A window still holding
     # a withheld count when the process stops takes the count with it, and the
@@ -513,6 +515,7 @@ async def lifespan(app: FastAPI):
             # Best-effort, like every other shutdown step: a database already
             # going away must not turn a clean shutdown into a traceback.
             try:
+                concurrency_controller.shutdown()
                 await flush_all()
             except Exception as e:  # noqa: BLE001 - shutdown, never fatal
                 logging.getLogger(__name__).error(
@@ -520,8 +523,10 @@ async def lifespan(app: FastAPI):
                 )
             # Explicitly close pooled database connections during application
             # shutdown (important for reloads and test/application lifecycles).
+            concurrency_controller.shutdown(close_writers=True)
             await engine.dispose()
     finally:
+        concurrency_controller.shutdown(close_writers=True)
         security_events.flush_suppression_summaries()
 
 

@@ -645,47 +645,74 @@ the page to see. The full reading rules are in
 Every nullable one accepts an **empty value**, `null` or `none` as "off". Zero
 is refused at boot.
 
-## What is deliberately absent: concurrency
+## Concurrency: shadow first (#261)
 
-**Nothing here bounds concurrency.** Every concurrency control — the
-pre-authentication in-flight ceilings (identity-blind, per-credential
-fingerprint, and the authentication-concurrency semaphore), the per-class /
-per-tenant / per-principal / global tool slots, the `slot_timeout` refusal, and
-the boot validator that checked those numbers against the connection pool — was
-removed from this change and deferred to a follow-up, `mcp-concurrency-slots`.
+`src/services/concurrency.py` owns one process controller. `off` bypasses only
+concurrency controls; `shadow` is the default and observes real concurrent work
+without adding waits, refusals or dropped usage rows. `enforce` is an explicit
+operator configuration change, never an automatic promotion. Keep one worker.
+The earlier rate-limit change deferred these controls because authentication,
+rotating credentials and refusal logging each exposed holes in partial designs.
 
-**Why.** Three successive cross-family review rounds each produced a *new
-class* of finding in exactly that area — first the pool being exhaustible on
-the authentication path itself, then tenant-level admission reachable through
-rotated tokens, then the refusal rows' own pool usage. Each round's fix was
-locally correct and each opened a fresh interaction between admission ceilings,
-the 5 + 10 pool and the slot lattice. That pattern is the engineering
-workflow's non-convergence signal: it means the design is a heuristic being
-tuned, not a rule being stated, and the right response is to stop adding rounds
-and narrow the change. **Rate limiting needs no arithmetic against the pool and
-no lattice; concurrency limiting needs both**, and it deserves its own change
-with its own review budget.
+Shadow requires `MCP_CONCURRENCY_WAIT_SECONDS=0`. Its namespaced
+`concurrency_shadow` metadata reports the zero-wait predicate against **observed
+occupancy**, not a counterfactual replay: earlier calls which enforcement might
+have rejected actually ran and influence later observations. Existing errors,
+body outcomes, quota flags and request counts remain actual outcomes. Pressure
+before a tool exists emits a bounded transport event, not an ownerless usage row.
 
-**How it will ship.** `mcp-concurrency-slots` ships in **shadow mode first**:
-the slots are computed and the would-be refusal is recorded in `usage_logs` —
-the same markers, a `shadow: true` flag — while every call still runs. Only
-after a period of real traffic shows what the ceilings would actually have
-refused does enforcement turn on. That is the correct order for a control whose
-failure mode is refusing a legitimate agent, and it is only possible because
-the observability half of this change landed first.
+The request envelope admits global+bearer-fingerprint dimensions together before
+DB lookup. Its lease lasts until the whole downstream ASGI request finishes,
+including GET/SSE streams, initialization and notifications. SHA-256 fingerprints
+stay in bounded memory only and are erased when their final references drain.
+The separate authentication permit encloses only the middleware session, including
+cache warming and teardown. Even invalid-auth responses are sent **after** that
+session and permit have closed. Auth/request enforcement misses return transport
+429 with a backoff hint; they neither query credentials nor INSERT usage rows.
 
-**What holds meanwhile.** The one *proven* pool-exhaustion path —
-`PUT /transfer/upload` re-checking out a connection and holding it across a
-semaphore wait and the whole body stream — was closed by **#208**. Concurrency
-on the tool surface remains unbounded until the follow-up ships; a bounded
-arrival rate bounds how fast concurrency can build, which is a mitigation and
-not a bound.
+Every tool has one explicit class: embedding (`semantic_search`), vector
+(`find_related`), write (the existing eight write-class tools), or other (the
+remaining fifteen). Unknown registrations cannot silently become other. Tenant
+ceilings share authenticated user IDs, including one stable NULL-owner identity;
+principals use key IDs or OAuth grant IDs, so refresh cannot reset them. A tool
+acquires class, tenant, principal and global counters in one non-awaiting
+transition. A queued call holds none of those active permits. Eligible FIFO wakes
+the oldest call that can acquire **all** dimensions, so a saturated class cannot
+park global capacity. There is no per-tenant embedding reservation or starvation
+SLA: one embedding slot cannot reserve work for N tenants.
 
-Two findings were carried forward to that change rather than answered here: a
-per-tenant *reservation* for the embedding class (with two slots and N tenants
-there is nothing to reserve), and "acquire the global slot first, then narrow
-inward" (global-first makes a task hold the global slot while waiting for a
-class slot, so one saturated class parks tasks that block every tenant).
+Positive enforcement waiting has one monotonic deadline (maximum five seconds)
+and bounded global/tenant/principal waiter counts. Zero wait means immediate
+admission or refusal, not disabled control. Grants transfer ownership before
+waking a waiter; cancellation before or after grant returns every captured lease.
+Registry overflow is sticky while any overflow lease **or waiter** exists, even
+if a dedicated entry becomes free. Unknown identities share that overflow entry
+until it drains, preventing an active identity from obtaining fresh capacity.
+Dedicated entries have a bounded reverse index, so arbitrary release order does
+not cause quadratic registry scans. No active entry is evicted or migrated.
+
+Default ceilings: requests 32/fingerprint 4, auth 2, tools 4/tenant 3/principal 2,
+one per class; pending tools 32/tenant 4/principal 2; keyed registry 1024; writers
+1 with 64 waiters and a maximum .25-second enforcement wait. Writer admission is
+independent of authenticated principal so background/coalesced refusal flushes
+cannot bypass it. Shadow writers neither wait nor drop rows because of this
+control. Writer leases encompass the entire usage write including FK retry; the
+logging integration releases its initial DB session before opening a retry.
+
+`src/services/pool_budget.py` is the single source for pool size 5, overflow 10,
+conservative maximum two simultaneous connections per tool and four headroom
+connections. Settings validate `auth + 2*tools + writers + 4 <= 15`, the class sum
+and hierarchy. This bounds the **configured MCP contribution in enforce mode**,
+not universal pool availability: indexer/panel/OAuth/transfer consumers share the
+pool and can consume that headroom. It is not reserved capacity. Future tool paths
+with more than two overlapping connections require budget/review updates.
+
+Lifespan explicitly installs a controller; requests never replace live state.
+Shutdown refuses/wakes pending tool work, allows the final coalescer writer flush,
+then closes writers before engine disposal. Captured leases release their own
+controller even across explicit lifecycle/test resets. No asyncio primitives are
+created at module import. Production saturation tests are prohibited; calibrate
+shadow observations first and test enforcement only in isolated environments.
 
 ## Alternatives rejected
 
@@ -709,7 +736,8 @@ class slot, so one saturated class parks tasks that block every tenant).
 
 ## Standing residuals
 
-- Concurrency is not bounded by this change (`mcp-concurrency-slots`).
+- Default shadow mode does not enforce concurrency ceilings. Explicit enforcement
+  bounds MCP contributions only, not every shared pool consumer.
 - OAuth grants and grandfathered NULL-limit keys have **velocity bounds only**.
 - The transport 429s — L1 and the transfer redemption — sit outside the in-band
   refusal contract.

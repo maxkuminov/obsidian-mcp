@@ -593,6 +593,52 @@ class Settings(BaseSettings):
     # day.
     default_daily_request_limit: NullableDailyLimit = 5000
 
+    # Process-local concurrency. Shadow observes arrivals without delaying them.
+    mcp_concurrency_mode: Literal["off", "shadow", "enforce"] = "shadow"
+    mcp_concurrency_wait_seconds: float = Field(0, ge=0, le=5, allow_inf_nan=False)
+    mcp_concurrency_requests: int = Field(32, ge=1, le=10000)
+    mcp_concurrency_fingerprint: int = Field(4, ge=1, le=10000)
+    mcp_concurrency_auth: int = Field(2, ge=1, le=15)
+    mcp_concurrency_tools: int = Field(4, ge=1, le=15)
+    mcp_concurrency_tenant: int = Field(3, ge=1, le=15)
+    mcp_concurrency_principal: int = Field(2, ge=1, le=15)
+    mcp_concurrency_embedding: int = Field(1, ge=1, le=15)
+    mcp_concurrency_vector: int = Field(1, ge=1, le=15)
+    mcp_concurrency_write: int = Field(1, ge=1, le=15)
+    mcp_concurrency_other: int = Field(1, ge=1, le=15)
+    mcp_concurrency_waiters: int = Field(32, ge=1, le=10000)
+    mcp_concurrency_tenant_waiters: int = Field(4, ge=1, le=10000)
+    mcp_concurrency_principal_waiters: int = Field(2, ge=1, le=10000)
+    mcp_concurrency_registry_size: int = Field(1024, ge=1, le=100000)
+    mcp_concurrency_writers: int = Field(1, ge=1, le=15)
+    mcp_concurrency_writer_waiters: int = Field(64, ge=1, le=10000)
+    mcp_concurrency_writer_wait_seconds: float = Field(.25, ge=0, le=.25, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _validate_concurrency(self) -> "Settings":
+        from src.services.pool_budget import (
+            MCP_POOL_HEADROOM, POOL_CAPACITY, TOOL_CONNECTION_MULTIPLIER,
+        )
+        if self.mcp_concurrency_mode == "shadow" and self.mcp_concurrency_wait_seconds != 0:
+            raise ValueError("MCP_CONCURRENCY_MODE=shadow requires MCP_CONCURRENCY_WAIT_SECONDS=0")
+        pairs = (
+            ("fingerprint", "requests"), ("principal", "tenant"),
+            ("tenant", "tools"), ("principal_waiters", "tenant_waiters"),
+            ("tenant_waiters", "waiters"),
+        )
+        for child, parent in pairs:
+            if getattr(self, "mcp_concurrency_" + child) > getattr(self, "mcp_concurrency_" + parent):
+                raise ValueError(f"MCP_CONCURRENCY_{child.upper()} exceeds {parent.upper()}")
+        total_classes = sum(getattr(self, "mcp_concurrency_" + name)
+                            for name in ("embedding", "vector", "write", "other"))
+        if total_classes > self.mcp_concurrency_tools:
+            raise ValueError("MCP_CONCURRENCY class sum exceeds global TOOLS ceiling")
+        demand = (self.mcp_concurrency_auth + TOOL_CONNECTION_MULTIPLIER *
+                  self.mcp_concurrency_tools + self.mcp_concurrency_writers + MCP_POOL_HEADROOM)
+        if demand > POOL_CAPACITY:
+            raise ValueError(f"MCP_CONCURRENCY pool budget: auth + 2*tools + writers + headroom = {demand} > {POOL_CAPACITY}")
+        return self
+
     multi_user_mode: bool = False
     session_max_age: int = 60 * 60 * 24 * 7
     session_cookie_name: str = "omcp_session"
