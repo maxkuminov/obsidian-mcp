@@ -24,7 +24,7 @@ from src.limiter import limiter
 from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
 from src.oauth.routes import router as oauth_router
-from src.services import error_log, security_events, vault
+from src.services import error_log, security_events, vault, vault_overlap
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
     KEY_FTS_FINGERPRINT,
@@ -407,6 +407,33 @@ def _on_indexer_done(task: asyncio.Task) -> None:
         logging.getLogger(__name__).warning("Indexer task exited without exception (should run forever)")
 
 
+async def _publish_first_root_snapshot() -> None:
+    """Run the vault-root overlap detection once, before this process serves.
+
+    **It does not exit on failure, and it does not open the gate.** A detection
+    failure is not a per-root failure — a root that cannot be opened is a
+    per-user verdict the snapshot carries — so the only way this raises is that
+    the user enumeration failed, which means the database is unavailable and the
+    tools cannot serve regardless. The right posture is the one
+    `_check_mount_identity_support` takes: log at ERROR, keep serving the panel
+    so the operator can see what happened, and retry at the next entry point.
+
+    What keeps that safe is the readiness state on the other side: until a
+    snapshot is published, `vault._vault_root` refuses every multi-user caller
+    with `VaultRootNotReady`. A failed first detection therefore leaves the
+    process **closed**, not permissive.
+    """
+    try:
+        await vault_overlap.detect_and_publish()
+    except Exception as e:  # noqa: BLE001 - a failed detection must not exit
+        logging.getLogger(__name__).error(
+            "Vault-root overlap detection failed at startup; every multi-user "
+            "tool call is refused until a later entry point publishes a "
+            "snapshot: %s",
+            e,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # First, before any guard can fail: the panel's health page reads this
@@ -425,6 +452,12 @@ async def lifespan(app: FastAPI):
                 "MCP_SANDBOX_MODE active — skipping DB check and indexer. "
                 "Tools are registered but cannot run. Registry-eval only."
             )
+            # Sandbox mode still has to be *ready*: the admission gate refuses
+            # every multi-user caller until a snapshot is published, and a
+            # sandbox that never publishes one would refuse every registered
+            # tool for a reason the sandbox cannot fix. `detect_and_publish`
+            # short-circuits here — it opens no root and no session.
+            await _publish_first_root_snapshot()
             async with mcp.session_manager.run():
                 yield
             return
@@ -440,6 +473,14 @@ async def lifespan(app: FastAPI):
         # database to read a fingerprint from and nothing it could verify.
         await _check_embedding_fingerprint()
         await _check_fts_fingerprint()
+        # E1 — **synchronously, before the app serves, and before the indexer
+        # task exists.** An asynchronously-published snapshot is not startup
+        # enforcement: a tool call between the first accepted connection and the
+        # first published snapshot would be served against roots nothing had
+        # checked, which is the whole window this guard exists to close,
+        # reopened once per restart. Placed after the fingerprint guards so a
+        # misconfigured deployment still fails with their own messages.
+        await _publish_first_root_snapshot()
         # Fire-and-forget so a ~15s cold load doesn't block the app from serving.
         # The lifespan frame stays suspended at `yield`, keeping this referenced.
         warmup_task = asyncio.create_task(_warm_embedding_model())

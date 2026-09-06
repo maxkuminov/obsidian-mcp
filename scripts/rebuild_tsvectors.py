@@ -16,18 +16,39 @@ import sys
 from src.config import settings
 from src.database import async_session, engine
 from src.services.fts import validate_fts_configs
-from src.services.indexer import _active_user_ids, rebuild_tsvectors
+from src.services.indexer import (
+    VaultRootQuarantined,
+    _active_user_ids,
+    rebuild_tsvectors,
+)
+from src.services.vault_overlap import detect_and_publish
 
 
 async def main() -> None:
     print(f"Rebuilding tsvectors for FTS_CONFIGS={settings.fts_configs}...")
+    # E5 — this is a **separate process**: no lifespan, no indexer loop, and its
+    # own `_active_user_ids()` loop that reaches a pass without touching either.
+    # A detection installed in the indexer loop would not be installed here, so
+    # it publishes its own snapshot and consumes only what it published. A
+    # detection that raises here is fatal by design: the caller is an operator
+    # at a terminal who can read the error and re-run, and rewriting every
+    # keyword vector in the vault against roots nothing has checked is exactly
+    # the pass this guard exists to stop.
+    await detect_and_publish()
     async with async_session() as session:
         # Fail fast on an unknown config name before touching any rows.
         await validate_fts_configs(session)
         if settings.multi_user_mode:
             total = 0
             for uid in await _active_user_ids():
-                total += await rebuild_tsvectors(session, user_id=uid)
+                try:
+                    total += await rebuild_tsvectors(session, user_id=uid)
+                except VaultRootQuarantined as e:
+                    # One quarantined tenant must not stop the rebuild for the
+                    # rest: the condition is a property of specific roots and
+                    # says nothing about a third tenant's vault. Nothing was
+                    # read or written for this user.
+                    print(f"Skipped: {e}", file=sys.stderr)
         else:
             total = await rebuild_tsvectors(session, user_id=None)
     await engine.dispose()
