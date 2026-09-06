@@ -44,7 +44,7 @@ from src.oauth.scope import (
     has_vault_scope,
     token_has_write,
 )
-from src.services import security_events
+from src.services import security_events, vault_overlap
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
     acquire_generation_lock,
@@ -1753,6 +1753,70 @@ async def _backup_view(session: AsyncSession) -> dict | None:
     return {**backup, "age_rel": _humanize_delta(backup["created_at"])}
 
 
+def _quarantine_view(is_admin: bool) -> dict | None:
+    """The published vault-root quarantine, as the operator surfaces render it.
+
+    **A read of the published snapshot and nothing else.** One attribute read
+    and a mapping walk: no session, no statement, and — the part that matters —
+    no `open`, no `stat` and no `realpath`. The panel must not touch a vault
+    root on a page render, and two independent computations of "do these roots
+    overlap" is how the panel and the enforcement come to disagree.
+
+    **It re-reads no `users` row either.** Every name, path and relation here is
+    a fact the detection recorded at the moment it looked, and the surfaces
+    label them "as at last check". An operator's first move on reading "vault
+    root overlaps <peer>" is to edit or delete one of the two accounts; a
+    render-time resolution would show a changed path — or a blank where the
+    deleted peer was — beside a condition that is still in force.
+
+    Administrators only, the same split the backup and error cells already
+    take: the condition names another account and another account's vault path,
+    which is exactly what the tool-facing refusal withholds because its reader
+    is a tenant's agent. `None` for everyone else, so the templates render
+    nothing rather than an empty operator section.
+
+    The tri-state comes through intact:
+
+    * never published → `checked: False`, and the surfaces say the roots have
+      not been checked yet rather than rendering an all-clear;
+    * published and empty → `accounts: []`, and nothing renders — an empty
+      snapshot is the healthy state, not an error state;
+    * published with reasons → one entry per named account.
+    """
+    if not is_admin:
+        return None
+    snapshot = vault_overlap.published_snapshot()
+    if snapshot is None:
+        return {"checked": False, "detected_at_iso": None, "accounts": []}
+    return {
+        "checked": True,
+        "detected_at_iso": snapshot.detected_at.isoformat(),
+        "accounts": [
+            {
+                "user_id": entry.user_id,
+                "username": entry.username,
+                "assignment": entry.assignment,
+                # Which of the two reasons this is. They are worded apart
+                # because they need different fixes and the wrong wording sends
+                # the operator to the wrong place: an overlap is corrected by
+                # changing an assignment or a mount, an unexaminable root by
+                # restoring one — and describing the latter as an overlap sends
+                # an administrator hunting for a second account that does not
+                # exist.
+                "overlap": isinstance(entry.reason, vault_overlap.Overlap),
+                # The one operator wording, shared with the log line and the
+                # `indexer_runs` row. Composing a second one here is how the
+                # panel and the run row come to describe the same condition
+                # differently.
+                "text": vault_overlap.operator_text(entry),
+            }
+            for entry in sorted(
+                snapshot.entries.values(), key=lambda e: (e.username, e.user_id)
+            )
+        ],
+    }
+
+
 @router.get("/health", response_class=HTMLResponse)
 async def health_page(
     request: Request,
@@ -1787,6 +1851,11 @@ async def health_page(
             "show_ops": is_admin,
             "backup": backup,
             "stale_after_days": STALE_AFTER_DAYS,
+            # The same condition the dashboard's strip carries, from the same
+            # published snapshot — read once here, not recomputed, and never
+            # resolved against `users`. The page is where an operator reads the
+            # detail after the strip has told them there is some.
+            "quarantine": _quarantine_view(is_admin),
             **(errors or {}),
         }),
     )
@@ -1821,6 +1890,15 @@ async def _health_strip(session: AsyncSession, user) -> dict:
         # The count and the window, not the hundred records — the strip links
         # to the page, which is where they are read.
         strip.update(_error_window())
+    # The vault-root quarantine, read from the published snapshot. It belongs
+    # above the fold for the reason the strip exists: the condition has
+    # silently disabled a tenant's tools, it persists until an operator acts,
+    # and every other record of it decays — the container log rotates and the
+    # error ring buffer is a hundred entries for the life of *this* process, so
+    # the line naming it is gone after a restart while the two roots are still
+    # overlapping. It is not a flash: nothing is dismissed, and it disappears
+    # on its own once a later snapshot stops naming the account.
+    strip["quarantine"] = _quarantine_view(is_admin)
     return strip
 
 
@@ -1867,6 +1945,11 @@ async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
             exc_info=True,
             error_type=type(exc).__name__,
         )
+        # No `quarantine` key here, and the dashboard template treats its
+        # absence as "nothing to show". A degraded strip is the one case where
+        # the condition is not on the dashboard; it is still on the health page
+        # this cell links to, which reads the snapshot on its own and shares
+        # none of the three queries that failed here.
         return {"unavailable": True, "show_ops": _is_admin(user)}
 
 
@@ -1993,7 +2076,11 @@ async def vault_page(
     folder = request.query_params.get("folder", "")
     selected_note = request.query_params.get("note")
 
-    from src.services.vault import _vault_root, vault_unassigned_error
+    from src.services.vault import (
+        _refuse_quarantined_root,
+        _vault_root,
+        vault_unassigned_error,
+    )
 
     # Resolve the per-user vault root. In single-user mode `user.id` is None
     # and `_vault_root(None)` returns `settings.vault_path` — the legacy
@@ -2017,6 +2104,25 @@ async def vault_page(
         vault = await warm_user_vault_cache(session, user.id)
         if vault is None:
             vault_error = vault_unassigned_error(user.id)
+        else:
+            # The vault browser is the panel's third consuming surface, beside
+            # every MCP tool and transfer redemption, and it has to refuse for
+            # the same reasons: listing a directory tree beneath a root that
+            # overlaps another tenant's shows this user another tenant's notes,
+            # which is the leak the quarantine exists to stop. The gate's own
+            # refusal is reused rather than re-derived — one implementation of
+            # "is this caller quarantined", and the wording that names no other
+            # account or path, which is right here too because this page is not
+            # admin-only.
+            #
+            # After the warm, not before: an account whose assignment was
+            # cleared while a stale snapshot still names it should be told it
+            # has no vault, which is the thing the operator just did to it.
+            try:
+                _refuse_quarantined_root(user.id)
+            except RuntimeError as e:
+                vault = None
+                vault_error = str(e)
 
     if vault_error is not None:
         return templates.TemplateResponse(request, "vault.html", _panel_context(request, user, {
@@ -2511,9 +2617,20 @@ async def _reindex_background():
     # from a five-minute tick — which is the first thing anyone asks when a
     # pass in the history took ten times as long as its neighbours.
     from src.services.indexer import (
-        index_vault, embed_vault, _active_user_ids, index_pass_lock,
-        record_indexer_run,
+        index_vault, embed_vault, _active_user_ids, detect_root_overlaps,
+        index_pass_lock, record_indexer_run,
     )
+    # E4 — **before `index_pass_lock` is taken.** Reindex Now, re-embed and
+    # reset embeddings all land in this function, and it is a separate entry
+    # point from the indexer loop: it mirrors `run_indexer_loop` and shares only
+    # the pass lock with it, so a detection installed there is not installed
+    # here. The call is ahead of the lock deliberately — the check that gates
+    # the pass must not queue behind the pass it gates — which is also why
+    # `detect_and_publish` serializes itself and publishes monotonically, so a
+    # tick and a panel reindex overlapping here is ordinary rather than a race.
+    # The per-user skip is in the shared pass helpers, so the loops below
+    # inherit it without knowing about it.
+    await detect_root_overlaps("panel on-demand")
     async with index_pass_lock:
         if settings.multi_user_mode:
             for uid in await _active_user_ids():

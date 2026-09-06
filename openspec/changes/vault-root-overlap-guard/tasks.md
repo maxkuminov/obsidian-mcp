@@ -90,13 +90,13 @@ slice-1 fixture and some need their expectations re-read:
 
 ## 6. Operator surface and the `_reindex_background` entry point — `src/control_panel/routes.py`, `src/control_panel/templates/dashboard.html`, `src/control_panel/templates/health.html`, `tests/test_panel_overlap_surface.py`
 
-- [ ] 6.1 `_health_strip` reads the published snapshot (never recomputes it, never opens a directory) and resolves the usernames and roots it names; the strip and the health page render the condition for administrators only.
-- [ ] 6.2 The two reasons are worded separately: an overlap names the peer account and the relation; an unexaminable root names the root and the errno and states that no peer was observed.
-- [ ] 6.3 The condition clears on its own when a later snapshot no longer names the account; it is not a flash message and needs no dismissal. An empty snapshot renders nothing, and the never-published state renders its own "not yet checked" note rather than an all-clear.
-- [ ] 6.4 `vault_page` renders the existing `vault_error` empty state for a named user.
-- [ ] 6.5 Templates use theme tokens only — no color literals — so `colorscan` / the literal sweep stays clean.
-- [ ] 6.6 **E4:** `_reindex_background` calls `detect_and_publish()` at its top, before `index_pass_lock` is taken, so Reindex Now, re-embed and reset-embeddings cannot start a pass against an unchecked snapshot. This file is owned here, so the call site lands in this slice; the helper it calls comes from slice 1 and the stage skip from slice 3.
-- [ ] 6.7 Tests: the strip names every affected account, its reason and its root for an admin; **the pair is still named from the snapshot's recorded facts after the peer's assignment is corrected and after the peer row is deleted, before the next detection publishes**; a non-admin sees no other account's name or path; an empty snapshot renders nothing; the never-published state renders the not-yet-checked note; the handler opens no directory; `vault_page` empty state; `_reindex_background` publishes before taking the pass lock.
+- [x] 6.1 `_health_strip` reads the published snapshot (never recomputes it, never opens a directory) and resolves the usernames and roots it names; the strip and the health page render the condition for administrators only.
+- [x] 6.2 The two reasons are worded separately: an overlap names the peer account and the relation; an unexaminable root names the root and the errno and states that no peer was observed.
+- [x] 6.3 The condition clears on its own when a later snapshot no longer names the account; it is not a flash message and needs no dismissal. An empty snapshot renders nothing, and the never-published state renders its own "not yet checked" note rather than an all-clear.
+- [x] 6.4 `vault_page` renders the existing `vault_error` empty state for a named user.
+- [x] 6.5 Templates use theme tokens only — no color literals — so `colorscan` / the literal sweep stays clean.
+- [x] 6.6 **E4:** `_reindex_background` calls `detect_and_publish()` at its top, before `index_pass_lock` is taken, so Reindex Now, re-embed and reset-embeddings cannot start a pass against an unchecked snapshot. This file is owned here, so the call site lands in this slice; the helper it calls comes from slice 1 and the stage skip from slice 3.
+- [x] 6.7 Tests: the strip names every affected account, its reason and its root for an admin; **the pair is still named from the snapshot's recorded facts after the peer's assignment is corrected and after the peer row is deleted, before the next detection publishes**; a non-admin sees no other account's name or path; an empty snapshot renders nothing; the never-published state renders the not-yet-checked note; the handler opens no directory; `vault_page` empty state; `_reindex_background` publishes before taking the pass lock.
 
 ## 7. Documentation — `docs/architecture/*.md`, `README.md`, `CLAUDE.md`
 

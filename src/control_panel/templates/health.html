@@ -27,6 +27,80 @@
 
 <div class="page-body">
 
+    {#
+      Vault-root quarantine, first: it is the one condition on this page that
+      means a tenant is being served nothing at all, and it persists until an
+      operator acts. `quarantine` is None for a non-administrator — the block is
+      absent rather than empty — because it names another account and another
+      account's vault path, the detail the tool-facing refusal deliberately
+      withholds from a tenant's agent.
+
+      Read from the published snapshot: this page opens no directory, stats no
+      root and re-reads no `users` row. The names, paths and relation below are
+      the facts the detection recorded when it looked, which is what keeps the
+      pair nameable after an operator edits or deletes one of them — and why
+      they are labelled as at the last check rather than presented as the state
+      of those accounts now.
+    #}
+    {% if quarantine and (not quarantine.checked or quarantine.accounts) %}
+    <div class="card anim-1" style="margin-bottom:20px;">
+        <div class="card-header">
+            <span class="card-title">Vault-root quarantine</span>
+            {% if quarantine.checked %}
+            <span class="badge badge-red">{{ quarantine.accounts | length }} account(s) not served</span>
+            {% else %}
+            <span class="badge badge-yellow">not yet checked</span>
+            {% endif %}
+        </div>
+        <div class="card-body">
+            {% if not quarantine.checked %}
+            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+                The vault roots have not been checked in this process yet, so no
+                account has been cleared and none has been quarantined — this is
+                not an all-clear.
+            </p>
+            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:10px 0 0;">
+                Startup runs the check before the server accepts its first
+                request, so this state is normally never seen. While it stands,
+                every multi-user tool call is refused rather than served against
+                roots nothing has checked. A detection that failed is logged at
+                ERROR and appears in Recent errors below; the next index pass
+                retries it.
+            </p>
+            {% else %}
+            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0 0 14px;">
+                Facts as at the last check{% if quarantine.detected_at_iso %},
+                <time datetime="{{ quarantine.detected_at_iso }}" data-localize>{{ quarantine.detected_at_iso }}</time>{% endif %}
+                — recorded when the roots were observed, not re-read now, so an
+                account or a path named here may already have been changed.
+            </p>
+            {% for a in quarantine.accounts %}
+            <div class="kv" style="align-items:flex-start;">
+                <span class="kv-k" style="white-space:nowrap;">
+                    {% if a.overlap %}
+                    <span class="badge badge-red">overlap</span>
+                    {% else %}
+                    <span class="badge badge-yellow">root unexaminable</span>
+                    {% endif %}
+                </span>
+                <span class="kv-v" style="text-align:left;font-size:13px;line-height:1.6;">{{ a.text }}</span>
+            </div>
+            {% endfor %}
+            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:14px 0 0;">
+                These accounts are served by nothing — every tool call is refused
+                before its body runs and no pass indexes them — and nothing was
+                deleted: a corrected assignment or a restored mount resumes both.
+                An overlap is fixed by changing an assignment on the users page
+                or the mount behind it; a root that could not be examined is
+                fixed by restoring that mount, and names no conflicting account
+                because none was observed. The condition clears itself at the
+                next check; there is nothing to dismiss.
+            </p>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
+
     {% if show_ops %}
 
     <!-- Backups -->
