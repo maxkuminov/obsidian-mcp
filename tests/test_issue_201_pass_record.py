@@ -444,6 +444,141 @@ def test_a_paused_pass_records_neither_a_failure_nor_an_attempt(
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# The chunk-cap marker (#202, D3) — set, cleared, and logged after the commit
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _truncated(chunks: int = 3) -> EmbedNoteResult:
+    return EmbedNoteResult(
+        outcome=NoteEmbedOutcome.EMBEDDED,
+        chunks_submitted=chunks,
+        chunks_embedded=chunks,
+        truncated=True,
+    )
+
+
+def test_a_capped_note_is_marked_certified_and_logged_after_the_commit(
+    monkeypatch, tmp_path, caplog
+):
+    """A declared degradation, never a skip and never a refusal.
+
+    A capped note held uncertified would be re-selected by the backlog on every
+    tick for ever and would re-perform every provider call it already made —
+    #127's permanent burn arriving by a new route. So it certifies, counts as
+    embedded, and says so on the row.
+
+    And the ERROR line comes **after** the certifying transaction commits.
+    Logging it first would leave a permanent entry in a bounded,
+    process-lifetime buffer for a write that then rolled back on a
+    `StaleCertification`, sending an operator after a note that was never
+    stored that way.
+    """
+    _vault, session, backlog, _ = _fixture(monkeypatch, tmp_path, {
+        "Huge.md": "a very long note\n",
+    })
+    _no_sweep(monkeypatch)
+
+    order: list[str] = []
+    real_commit = session.commit
+
+    async def _watch_commit():
+        order.append("commit")
+        return await real_commit()
+
+    session.commit = _watch_commit
+
+    class _Handler(indexer.logging.Handler):
+        def emit(self, record):
+            if "MAX_CHUNKS_PER_NOTE" in record.getMessage():
+                order.append("error line")
+
+    handler = _Handler()
+    indexer.logger.addHandler(handler)
+
+    async def _capped(*_a, **_k):
+        return _truncated()
+
+    monkeypatch.setattr(indexer, "embed_note", _capped)
+    try:
+        result = asyncio.run(indexer.embed_vault(user_id=7))
+    finally:
+        indexer.logger.removeHandler(handler)
+
+    assert result.embedded == 1, "a capped note was not certified"
+    assert result.failures == 0, "a capped note was reported as a failure"
+    assert order == ["commit", "error line"], (
+        "the truncation was logged before the transaction that carries it "
+        "committed"
+    )
+    # The marker is written in the certifying transaction, from the result.
+    note = backlog[0]
+    assert note.chunks_truncated is True
+
+
+def test_the_marker_is_cleared_when_the_note_fits(monkeypatch, tmp_path):
+    """`links_truncated`'s lifecycle exactly: set when it bites, cleared when
+    a later embed of that note fits under the cap."""
+    _vault, _session, backlog, _ = _fixture(monkeypatch, tmp_path, {
+        "Shrunk.md": "now a short note\n",
+    })
+    _no_sweep(monkeypatch)
+    backlog[0].chunks_truncated = True
+
+    async def _fits(*_a, **_k):
+        return embedded(2)
+
+    monkeypatch.setattr(indexer, "embed_note", _fits)
+
+    result = asyncio.run(indexer.embed_vault(user_id=7))
+    assert result.embedded == 1
+    assert backlog[0].chunks_truncated is False
+
+
+def test_a_zero_chunk_certification_clears_the_marker(monkeypatch, tmp_path):
+    """`CERTIFIED_EMPTY` leaves the note with no vectors at all, so a marker
+    claiming a truncated set describes something that no longer exists."""
+    _vault, _session, backlog, _ = _fixture(monkeypatch, tmp_path, {
+        "Empty.md": "```\nonly a fence\n```\n",
+    })
+    _no_sweep(monkeypatch)
+    backlog[0].chunks_truncated = True
+
+    async def _empty(*_a, **_k):
+        return certified_empty()
+
+    monkeypatch.setattr(indexer, "embed_note", _empty)
+
+    asyncio.run(indexer.embed_vault(user_id=7))
+    assert backlog[0].chunks_truncated is False
+
+
+def test_a_failing_outcome_does_not_touch_the_marker(monkeypatch, tmp_path):
+    """`truncated` is a fact about the note's text and is reported for every
+    outcome, but only a *certifying* one licenses writing it: nothing was
+    stored, so nothing on the row may claim a truncated set."""
+    _vault, _session, backlog, _ = _fixture(monkeypatch, tmp_path, {
+        "Huge.md": "a very long note\n",
+    })
+    _no_sweep(monkeypatch)
+
+    async def _failed(*_a, **_k):
+        return EmbedNoteResult(
+            outcome=NoteEmbedOutcome.PROVIDER_FAILED,
+            chunks_submitted=3,
+            chunks_embedded=0,
+            truncated=True,
+            failure=EmbedNoteFailure(
+                exc_type="ConnectionError", message="down", requested=3
+            ),
+        )
+
+    monkeypatch.setattr(indexer, "embed_note", _failed)
+
+    asyncio.run(indexer.embed_vault(user_id=7))
+    assert backlog[0].chunks_truncated is False
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # The reconciliation sweep reports into the same accumulator
 # ══════════════════════════════════════════════════════════════════════════
 
