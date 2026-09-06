@@ -4887,6 +4887,126 @@ def test_024_refuses_a_partial_index_of_its_name():
         refuse_024(url, must_mention=["partial-or-expression=True"])
 
 
+def test_024_refuses_an_extra_unique_constraint():
+    """The adversarial case a *subset* check adopts, and the reason the shape
+    check has to be complete.
+
+    Everything 024 makes is present and correct: the marker, every column, the
+    primary key, the cascading foreign key, both named indexes, the default.
+    All that has been added is `UNIQUE (user_id)` — which is invisible to every
+    check that only looks for what 024 creates, and which breaks the **second**
+    session a user opens and every re-issue that follows their own password
+    change, on a constraint no handler has a branch for.
+    """
+    with throwaway_db("schema_sessions_extra_unique") as url:
+        sql(url, "ALTER TABLE user_sessions ADD CONSTRAINT one_per_user UNIQUE (user_id)")
+        combined = refuse_024(
+            url, must_mention=["unexpected UNIQUE constraint", "one_per_user"]
+        )
+        # The definition is named too: an operator has to be able to find it.
+        assert "UNIQUE (user_id)" in combined, combined
+
+        # Nothing was modified in the course of refusing — not the rows, not
+        # the constraint. A migration that "repaired" this would be dropping a
+        # constraint somebody added on purpose.
+        assert (
+            fetchval(
+                url,
+                "SELECT count(*) FROM pg_constraint "
+                "WHERE conrelid = 'public.user_sessions'::regclass "
+                "AND conname = 'one_per_user'",
+            )
+            == 1
+        ), "the constraint must be left exactly as it was found"
+        assert user_sessions_comment(url) == USER_SESSIONS_MARKER
+        assert user_sessions_columns(url) == list(USER_SESSIONS_COLUMNS)
+
+
+def test_024_refuses_an_extra_unique_constraint_with_rows_present():
+    """The same, on a table that is actually in use.
+
+    A stamp-back re-run must preserve existing rows — that is the property
+    `test_024_preserves_rows_across_a_stamp_back` pins — and a refusal must not
+    become the exception. Signing every live session out because a constraint
+    was added by hand would be a worse outcome than the constraint.
+    """
+    with throwaway_db("schema_sessions_extra_unique_rows") as url:
+        insert_user(url, 1, "alice")
+        sql(
+            url,
+            "INSERT INTO user_sessions "
+            "(id, user_id, created_at, last_seen_at, expires_at) VALUES "
+            "('a' || repeat('0', 63), 1, now(), now(), now() + interval '7 days')",
+        )
+        sql(url, "ALTER TABLE user_sessions ADD CONSTRAINT one_per_user UNIQUE (user_id)")
+
+        refuse_024(url, must_mention=["unexpected UNIQUE constraint"])
+
+        assert fetchval(url, "SELECT count(*) FROM user_sessions") == 1, (
+            "a refusal writes nothing and deletes nothing"
+        )
+        assert fetchval(
+            url, "SELECT revoked_at FROM user_sessions"
+        ) is None, "and revokes nothing"
+
+
+def test_024_refuses_an_extra_check_constraint():
+    """One layer down from UNIQUE and just as quiet. `revoked_at IS NULL` reads
+    like a tidy invariant and makes revocation itself raise — so logout, the
+    administrative reset and the password change all fail on a table that
+    otherwise looks exactly like 024's."""
+    with throwaway_db("schema_sessions_extra_check") as url:
+        sql(
+            url,
+            "ALTER TABLE user_sessions ADD CONSTRAINT never_revoked "
+            "CHECK (revoked_at IS NULL)",
+        )
+        refuse_024(
+            url, must_mention=["unexpected CHECK constraint", "never_revoked"]
+        )
+
+
+def test_024_refuses_an_extra_unique_index_carrying_no_constraint():
+    """`CREATE UNIQUE INDEX` creates no `pg_constraint` row at all.
+
+    So the constraint enumeration cannot see it, and without the index set
+    being checked as a *set* nothing in this migration could. The effect on the
+    application is identical to the UNIQUE constraint above.
+    """
+    with throwaway_db("schema_sessions_extra_index") as url:
+        sql(url, "CREATE UNIQUE INDEX one_session_per_user ON user_sessions (user_id)")
+        refuse_024(
+            url,
+            must_mention=["unexpected index", "one_session_per_user", "unique=True"],
+        )
+
+
+def test_024_accepts_its_own_shape_on_a_stamp_back():
+    """The other side of the same coin: complete does not mean brittle.
+
+    The primary key's own backing index is read from the catalogue rather than
+    assumed, so it is not counted as an extra — a table 024 itself created must
+    still reconcile, or every re-run of the migration would refuse.
+    """
+    with throwaway_db("schema_sessions_reconcile_clean") as url:
+        insert_user(url, 1, "alice")
+        sql(
+            url,
+            "INSERT INTO user_sessions "
+            "(id, user_id, created_at, last_seen_at, expires_at) VALUES "
+            "('b' || repeat('0', 63), 1, now(), now(), now() + interval '7 days')",
+        )
+        _harness.run_alembic(url, "stamp", "023", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT count(*) FROM user_sessions") == 1
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
 def test_024_refuses_a_missing_column():
     """A partial shape carrying 024's marker: everything else agrees, and the
     column the forensic record lives in is simply gone."""

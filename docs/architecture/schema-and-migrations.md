@@ -211,7 +211,24 @@ the same transaction as the create and mirrored in `src/models/db.py` as
 attribute. Where the table already exists, 024 **verifies the complete shape it
 would have created** — every column's type and nullability, the primary key,
 the `created_at` server default, the FK's delete action, each index — and
-**refuses**, naming what disagreed, rather than patching it. `IF NOT EXISTS`
+**refuses**, naming what disagreed, rather than patching it.
+
+**Complete, not minimal, and that distinction is the whole check.** The
+constraint set and the index set are compared as *sets*: a table that has
+everything 024 makes **plus** something it does not is not 024's table, so any
+`UNIQUE`, `CHECK` or `EXCLUSION` constraint and any index beyond the two named
+ones (and the primary key's own, read from the catalogue rather than assumed by
+name) is refused and named. A subset check looked sufficient and was not — the
+damaging addition is precisely the one every other check passes. `UNIQUE
+(user_id)` added by hand leaves the marker, the columns, the primary key, the
+cascading foreign key and both indexes exactly as 024 created them, and then
+the **second** session a user opens, and every re-issue that follows their own
+password change, fails on a constraint no handler has a branch for. `CHECK
+(revoked_at IS NULL)` is the same trap one layer down: it makes revocation
+itself raise, so logout, the administrative reset and the password change all
+fail. And a bare `CREATE UNIQUE INDEX` creates no `pg_constraint` row at all,
+which is why the index set is checked as well as the constraint set rather than
+either one standing in for the other. `IF NOT EXISTS`
 would be worse than raising: it adopts *any* table of that name, and the
 session validator would then be authorizing browsers against a schema nothing
 verified. The primary key and the server default are read for a reason

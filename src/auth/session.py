@@ -28,6 +28,7 @@ Four functions, and the asymmetry between two of them is the contract:
   fifth entry point reading `request.session["user_id"]` raw is the defect this
   change removed from the login page.
 """
+import contextlib
 import hashlib
 import logging
 import secrets
@@ -428,6 +429,8 @@ async def touch_session(
     request: Request,
     session: AsyncSession,
     row: UserSession,
+    *,
+    protect: "tuple[object, ...]" = (),
 ) -> bool:
     """Refresh `last_seen_at` on the request's **own** session. Never raises.
 
@@ -451,8 +454,15 @@ async def touch_session(
     * **Throttled to `session_touch_interval_seconds`.** Nothing authorizes on
       `last_seen_at`; a write per request buys nothing and costs a commit.
 
-    Any failure is swallowed: the transaction is returned to a clean state, a
-    `panel_session_touch_failed` record is emitted, and the request is served.
+    Any failure is swallowed: a `panel_session_touch_failed` record is emitted
+    and the request is served. **The `UPDATE` runs inside a savepoint**, so the
+    ordinary failure — the write refused while the reads succeed — rolls back
+    that savepoint alone and leaves the enclosing transaction, and every object
+    loaded in it, **attached and writable**. That last word is the point: a
+    plain rollback here detached the authenticated user, and a write through a
+    detached instance commits nothing and says nothing. `protect` names the
+    instances whose loaded state must survive the rarer case where the *commit*
+    fails and a real rollback is unavoidable.
     The exception's **class name only** reaches the log — SQLAlchemy renders
     bound parameters into an error's text, and one of them here is the stored
     session hash (the engine also sets `hide_parameters=True`; this is the
@@ -475,16 +485,59 @@ async def touch_session(
         seconds=settings.session_touch_interval_seconds
     ):
         return False
+    # **The `UPDATE` runs inside a SAVEPOINT, and only the savepoint is rolled
+    # back when it fails.** `Session.rollback()` restores the identity map to
+    # the transaction's start, which **expunges every object that became
+    # persistent inside it** — and the object loaded inside *this* one is the
+    # authenticated `User` this function's caller is about to return. Rolling
+    # the request's own transaction back to recover from a failed *telemetry*
+    # write therefore handed the panel a **detached** user.
+    #
+    # Detached is the dangerous kind of broken, because it is silent. Every
+    # column already loaded still reads, so nothing raises and the page renders
+    # exactly as expected. What breaks is writing: a mutation through a
+    # detached instance is not in the session's unit of work, so a later
+    # `commit()` reports success and persists **nothing**. A refused
+    # `last_seen_at` update turned any subsequent write through the request's
+    # own user object into a lost update that announced itself nowhere. (An
+    # *expired* instance would instead raise `MissingGreenlet` on the next read
+    # — loud, and not what actually happens here. Measured, not assumed:
+    # `tests/integration/test_issue_198_touch_failure_isolation.py`.)
+    #
+    # The reachable trigger is narrow and entirely plausible: the `UPDATE` is
+    # refused while the `SELECT`s succeed — a revoked `UPDATE` grant on
+    # `user_sessions`, a trigger rejecting the write, a check constraint added
+    # by hand. A savepoint rollback restores the connection and leaves the
+    # enclosing transaction, and everything loaded in it, exactly as it was.
     try:
-        await session.execute(
-            update(UserSession)
-            .where(UserSession.id == row.id, UserSession.revoked_at.is_(None))
-            .values(last_seen_at=now)
-        )
+        async with session.begin_nested():
+            await session.execute(
+                update(UserSession)
+                .where(UserSession.id == row.id, UserSession.revoked_at.is_(None))
+                .values(last_seen_at=now)
+            )
+    except Exception as exc:  # noqa: BLE001 - telemetry may not fail a request
+        # The savepoint is gone; the outer transaction is untouched and there
+        # is deliberately nothing else to undo.
+        _touch_failed(request, row, "touch", exc)
+        return False
+
+    try:
         await session.commit()
         return True
-    except Exception as exc:  # noqa: BLE001 - telemetry may not fail a request
+    except Exception as exc:  # noqa: BLE001 - nor may the commit
         _touch_failed(request, row, "touch", exc)
+        # A failed commit leaves the session unusable, and its rollback will
+        # evict what is loaded whether or not a savepoint was used. `protect`
+        # names the instances whose already-loaded state the caller still
+        # needs; expunging them deliberately, before the rollback does it by
+        # accident, is what makes the outcome a *stated* one — a detached
+        # object whose columns read — rather than a side effect nobody chose.
+        # It cannot make the write survive: nothing can, once the transaction
+        # carrying it is gone.
+        for instance in protect:
+            with contextlib.suppress(Exception):
+                session.expunge(instance)
         try:
             await session.rollback()
         except Exception as rollback_exc:  # noqa: BLE001 - nor may the recovery
@@ -632,7 +685,9 @@ async def get_active_session_user(
         cookie.clear()
         return None
 
-    await touch_session(request, session, row)
+    # `protect=(user,)`: the touch is optional, and its failure must not cost
+    # this request the identity it just resolved.
+    await touch_session(request, session, row, protect=(user,))
     return user
 
 
