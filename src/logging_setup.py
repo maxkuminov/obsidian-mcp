@@ -134,12 +134,26 @@ ALLOWED_FIELDS: dict[str, _FieldSpec] = {
     "user_id_session": _S(int),
     "actor_username": _S(str, 64),
     "actor_kind": _S(str, 20),
-    "actor_ref": _S(str, 64),
+    # **No `actor_ref`.** It was here for `tool_write_refused` and
+    # `tool_exception`, and for an API-key caller it holds
+    # `api_keys.key_prefix` — the first twelve characters of the live key. A
+    # security record goes to a shared log sink, so it names the credential by
+    # row id (`key_id` / `oauth_token_id`) and never by any part of the secret.
+    # `usage_logs.actor_ref` is unchanged: that is the #77 attribution design,
+    # and those rows are read behind the panel's own authentication.
     "key_id": _S(int),
     "oauth_token_id": _S(int),
     "client_id": _S(str, 64),
     "client_id_submitted": _S(str, 64),
-    "client_name_submitted": _S(str, 120),
+    # 64, like the other two `_submitted` names. These three are the only
+    # caller-authored text in the whole allow-list, and the bound is the
+    # accepted limitation written down: a caller who pastes a live credential
+    # into a username, a client id or a client name has that much of it
+    # logged. Operators need to see what was *tried* — a refusal record that
+    # withheld the attempted username would not answer the one question a
+    # credential-stuffing burst raises — so the field stays and the bound is
+    # the mitigation, not the removal.
+    "client_name_submitted": _S(str, 64),
     "grant_id": _S(str, 64),
     "scope": _S(str, 64),
     "token_tag": _S(str, 16),

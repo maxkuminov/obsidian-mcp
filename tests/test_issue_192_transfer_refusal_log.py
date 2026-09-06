@@ -827,3 +827,73 @@ async def test_a_valid_token_still_redeems_with_the_logging_in_place(
     assert response.status_code == 200
     assert response.json()["path"] == harness.row.path
     assert captured.records == []
+
+
+# ── the claim cleanup may not change a decided response ────────────────────
+
+
+async def test_a_failed_release_keeps_the_404_and_keeps_the_record(
+    client, harness, monkeypatch, captured
+):
+    """Cleanup is bookkeeping; the answer was already chosen.
+
+    `release_claim` is one conditional UPDATE, but it takes a pooled
+    connection — and the pool is 5 + 10 on one worker, so it is exactly the
+    thing that fails under the load a refusal burst arrives with. When it did,
+    the decided 404 became a 500 and the `transfer_refused` record went with
+    it: the caller learned *more* from the failure than from the refusal, which
+    is the one thing the uniform 404 exists to prevent (design D22).
+    """
+
+    async def exploding_release(session, row):
+        raise RuntimeError("QueuePool limit of size 5 overflow 10 reached")
+
+    monkeypatch.setattr(transfer, "release_claim", exploding_release)
+    harness.identity_ok = False
+
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+
+    assert response.status_code == 404, "a cleanup failure moved the answer"
+    assert response.json() == {"error": "not found"}
+    assert reason_of(captured) == "credential_invalid", (
+        "the refusal record must survive the cleanup that follows the decision"
+    )
+    failures = captured.named("transfer_claim_release_failed")
+    assert len(failures) == 1
+    assert failures[0].levelno == logging.ERROR
+    carried = fields(failures[0])
+    assert carried["error_type"] == "RuntimeError"
+    assert carried["route"] == "/transfer/upload"
+    assert carried["method"] == "PUT"
+    # Class only — a SQLAlchemy error's text quotes the statement, and the
+    # engine hides its parameters; neither belongs in a field.
+    assert "QueuePool" not in repr(carried)
+
+
+async def test_a_failed_release_after_the_gate_refuses_still_answers_404(
+    client, harness, monkeypatch, captured
+):
+    """The site Codex named: `PrePublishAborted` releases and *then* refuses.
+
+    Ordering makes this the worst of the release sites — a raise here loses the
+    refusal record that has not been emitted yet, not just the cleanup.
+    """
+
+    async def stream_to_vault(*args, **kwargs):
+        raise transfer.PrePublishAborted("gate said no")
+
+    async def exploding_release(session, row):
+        raise RuntimeError("the pool is gone")
+
+    monkeypatch.setattr(transfer, "stream_to_vault", stream_to_vault)
+    monkeypatch.setattr(transfer, "release_claim", exploding_release)
+
+    response = await client.put(
+        "/transfer/upload", headers=auth(harness), content=PNG
+    )
+
+    assert response.status_code == 404
+    assert reason_of(captured) == "prepublish_revalidation_failed"
+    assert len(captured.named("transfer_claim_release_failed")) == 1

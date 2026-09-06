@@ -117,6 +117,16 @@ A record's message SHALL be a developer-authored constant or format string, and 
 - **WHEN** an existing warning interpolates a vault-relative path into its message
 - **THEN** the record SHALL be emitted unchanged and the check SHALL NOT fail on it
 
+#### Scenario: No structured field carries part of a credential
+
+- **WHEN** a read-only API key created through the key-creation endpoint is used to drive a write tool to its permission refusal, and the credential is bound into the request the way the authentication middleware binds one
+- **THEN** the refusal record SHALL identify the credential by its row identifier only, and SHALL NOT contain the key, its stored prefix, or any substring of the key twelve characters or longer
+
+#### Scenario: A failing database statement does not render its bound credential
+
+- **WHEN** a statement that binds a credential hash — the API key lookup, an OAuth token lookup, the authorization-code exchange, dynamic client registration or the transfer admission — fails, and the resulting exception is carried into a record as a traceback
+- **THEN** the record SHALL NOT contain the bound hash nor any substring of it twelve characters or longer, and a catalogue event emitted on a credential-bound write SHALL record the exception's class without a traceback
+
 ### Requirement: Every authentication outcome SHALL cause exactly one emission, with a reason code
 
 The server SHALL attempt exactly one emission — never zero, never twice for one decision — for each of: panel login success, panel login failure, panel logout, first-administrator bootstrap and its refusals, an administrator's password reset of another account, OAuth authorization-code issuance, OAuth refresh-token rotation, every token-endpoint refusal, every `/authorize` refusal, consent granted, consent denied, dynamic client registration and its refusals, token revocation together with the number of tokens revoked, each revocation no-op the RFC requires the response to conceal, and every rate-limit rejection. A failure record SHALL carry a reason code distinguishing the cause. Whether a given attempt reaches the log sink is governed by the suppression requirement below, which applies to every level and accounts for what it withholds. **A record asserting that something succeeded SHALL be emitted only after the transaction that made it true has committed**, so that a failed commit leaves no record claiming otherwise; a revocation record SHALL further be emitted by the request handler itself, never by the shared helper that performs the revocation, so that every record carries the acting identity and request context. The externally visible response SHALL be unchanged by the presence of logging — in particular the panel login failure SHALL remain a single indistinguishable response across all of its causes, and the revocation endpoint SHALL remain non-disclosing.
@@ -180,6 +190,11 @@ The server SHALL emit one record for each authorization refusal: a write tool re
 - **WHEN** a transfer redemption succeeds, and separately when a refusal's permit is denied because the source is already at its allowance
 - **THEN** no diagnosis read SHALL be issued in either case, and the refused request SHALL still return its uniform response
 
+#### Scenario: A failed claim cleanup changes neither the response nor the record
+
+- **WHEN** a transfer upload is refused after its token has been claimed, and returning that claim to its pending state then fails
+- **THEN** the response SHALL be the same uniform not-found the refusal already decided, the refusal record SHALL still be emitted, and the cleanup failure SHALL be recorded separately by exception class
+
 #### Scenario: An unresolved token invents no identity
 
 - **WHEN** a transfer refusal occurs on a branch where no token row resolved
@@ -196,8 +211,13 @@ The tool tracking decorator SHALL guard **only the invocation of the tool body**
 
 #### Scenario: A completed body is never reported as failed
 
-- **WHEN** a tool body returns normally and the parameter-building or usage-logging work that follows it then raises
-- **THEN** no `tool_exception` record SHALL be emitted and no row SHALL carry the `tool_exception` marker
+- **WHEN** a tool body returns normally and the parameter-building, result-measuring or usage-logging work that follows it then raises
+- **THEN** no `tool_exception` record SHALL be emitted, no row SHALL carry the `tool_exception` marker, **the caller SHALL receive the completed body's result**, and one warning record naming the failed telemetry work and its exception class SHALL be emitted instead
+
+#### Scenario: Cancellation after the body still unwinds
+
+- **WHEN** the enclosing task is cancelled while the post-body telemetry work runs
+- **THEN** the cancellation SHALL propagate to the caller rather than be absorbed into a returned result, and no telemetry-failure record SHALL be emitted
 
 #### Scenario: A pre-body failure is not a tool exception
 

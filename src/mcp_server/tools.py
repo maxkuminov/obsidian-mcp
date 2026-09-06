@@ -773,7 +773,16 @@ async def _record_tool_failure(
         error_type=type(exc).__name__,
         user_id=current_user_id.get(),
         actor_kind=actor.get("actor_kind"),
-        actor_ref=actor.get("actor_ref"),
+        # **Never `actor_ref`.** For an API-key caller that column holds
+        # `api_keys.key_prefix`, which is the first twelve characters of the
+        # live key — a credential substring, in a record that also carries a
+        # traceback. `usage_logs` keeps it (that is the #77 attribution design,
+        # and those rows are read behind the panel's own auth); a security
+        # event, which goes to a shared log sink, identifies the credential by
+        # its row id instead. The ids answer the same operator question — which
+        # credential did this — without being any part of the secret.
+        key_id=current_api_key_id.get(),
+        oauth_token_id=current_oauth_token_id.get(),
         duration_ms=duration_ms,
     )
     try:
@@ -956,14 +965,45 @@ def _tracked(
                         # the audit above swallowed a cancellation of its own.
                         raise
                 # From here the body has COMPLETED. Nothing below may write
-                # `_TOOL_EXCEPTION_MARKER`.
-                duration_ms = int((time.monotonic() - start) * 1000)
-                logged = named_params()
-                logged.update(extra)
-                # Whatever the service measured. Absent for tools that measure
-                # nothing, so `params` keeps its current shape for them.
-                logged.update(timing.current() or {})
-                await _log_usage(tool_name, logged, duration_ms, _response_size(result))
+                # `_TOOL_EXCEPTION_MARKER` — and nothing below may fail the
+                # call either. Keeping the tail outside the exception
+                # classifier stops a failed audit being *reported* as a tool
+                # failure (design D5); it did not stop a failed audit
+                # **being** one. `named_params()` runs the tools' `transforms`,
+                # `_response_size` serialises the result, and `_log_usage`
+                # takes a pooled connection: any of the three can raise after
+                # `edit_note` has already written the bytes, and the caller
+                # then sees an error for a write that stood. So the tail is
+                # best-effort and response-neutral — the completed result is
+                # returned either way, and the bookkeeping failure is recorded
+                # as itself.
+                #
+                # `Exception`, not `BaseException`: a cancellation here is a
+                # client that went away or a shutdown, and it must keep
+                # unwinding rather than be swallowed into a returned result.
+                try:
+                    duration_ms = int((time.monotonic() - start) * 1000)
+                    logged = named_params()
+                    logged.update(extra)
+                    # Whatever the service measured. Absent for tools that
+                    # measure nothing, so `params` keeps its current shape.
+                    logged.update(timing.current() or {})
+                    await _log_usage(
+                        tool_name, logged, duration_ms, _response_size(result)
+                    )
+                except Exception as tail_exc:  # noqa: BLE001 - see above
+                    # Class only, and structurally distinct from
+                    # `tool_exception`: an operator filtering for failed tool
+                    # calls must not find a call that succeeded. The exception's
+                    # own text is withheld because a `transforms` or
+                    # serialisation failure quotes the arguments or the result,
+                    # which are note content and vault paths (design D2).
+                    security_events.emit(
+                        "tool_telemetry_failed",
+                        subject=_security_subject(),
+                        tool=tool_name,
+                        error_type=type(tail_exc).__name__,
+                    )
                 return result
             finally:
                 timing.clear(token)
@@ -1481,7 +1521,8 @@ def _require_write() -> str | None:
         tool=_current_tool_name.get(),
         user_id=uid,
         actor_kind=actor.get("actor_kind"),
-        actor_ref=actor.get("actor_ref"),
+        # Never `actor_ref` — see `_record_tool_failure`. `key_id` and
+        # `oauth_token_id` were already here; the prefix added nothing but risk.
         key_id=current_api_key_id.get(),
         oauth_token_id=current_oauth_token_id.get(),
     )
@@ -3429,7 +3470,25 @@ async def _move_note_locked(
                     # either replacement destroys the other's span. Refused
                     # here, before phase 2, rather than published as two
                     # "successful" rewrites over mangled bytes (#211).
-                    logger.warning("Overlapping link rewrites: %s", e)
+                    # Migrated off the bare logger for the reason the
+                    # three siblings above it were (design D18): a caller
+                    # drives this branch on demand, by moving a note some
+                    # other note links to twice over, so a direct
+                    # `logger.warning` is an unbounded flood channel beside
+                    # the bounded one. Its own event rather than
+                    # `move_rewrite_failed`, because the dispositions differ:
+                    # this one *aborts the whole move* before any mutation,
+                    # while `move_rewrite_failed` skips one source and carries
+                    # on. The path has no allow-listed field to ride in and is
+                    # named where both the caller and the operator still see
+                    # it — in the aborting reply below, and in the move's own
+                    # `params` on `/admin/usage`.
+                    security_events.emit(
+                        "move_rewrite_overlap_refused",
+                        subject=_security_subject(),
+                        tool=_current_tool_name.get(),
+                        error_type=type(e).__name__,
+                    )
                     drop(read_target)
                     return (
                         f"Move aborted: {original_src_path} holds a link to "
@@ -3602,10 +3661,18 @@ async def _move_note_locked(
             # row's stored sanitized frontmatter instead — possibly stale, and
             # self-healing at the note's next content change. Never a reason to
             # fail a move that has already stood.
-            logger.warning(
-                "Could not read the moved note to derive its title (%s → %s): "
-                "%s; falling back to the indexed frontmatter",
-                from_rel, to_rel, exc,
+            # Post-rename, so `reason` separates it from the other
+            # best-effort failure below: both happen after the move has stood
+            # and neither fails the call, and an operator reading a burst of
+            # them needs to know whether the *file* or the *database* is the
+            # one misbehaving. The two paths are already in the reply and in
+            # the move's `params`; no structured field carries one (D16).
+            security_events.emit(
+                "move_post_rename_failed",
+                subject=_security_subject(),
+                tool=_current_tool_name.get(),
+                reason="title_read_failed",
+                error_type=type(exc).__name__,
             )
 
         db_failed = False
@@ -3677,8 +3744,12 @@ async def _move_note_locked(
                 await session.execute(link_update)
                 await session.commit()
         except Exception as e:
-            logger.warning(
-                "DB update failed after FS move %s → %s: %s", from_rel, to_rel, e
+            security_events.emit(
+                "move_post_rename_failed",
+                subject=_security_subject(),
+                tool=_current_tool_name.get(),
+                reason="db_update_failed",
+                error_type=type(e).__name__,
             )
             db_failed = True
 
@@ -3712,9 +3783,17 @@ async def _move_note_locked(
                 # partial outcome, naming the outage *as an outage*: reporting
                 # it as a reassignment would put a claim in the audit trail
                 # about something no administrator did.
-                logger.warning(
-                    "Vault confirmation unavailable during the link rewrites "
-                    "after %s → %s: %s", from_rel, to_rel, exc
+                # `move_rewrite_failed`, reused: this is the same loop and
+                # the same disposition as the `except Exception` below — one
+                # rewrite that did not happen — and `error_type` already tells
+                # the two apart (`VaultConfirmationUnavailable` against
+                # whatever the write raised). A separate event would split one
+                # operator question across two names.
+                security_events.emit(
+                    "move_rewrite_failed",
+                    subject=_security_subject(),
+                    tool=_current_tool_name.get(),
+                    error_type=type(exc).__name__,
                 )
                 timing.record("error", _CONFIRMATION_UNAVAILABLE_MARKER)
                 outcome = "unavailable"

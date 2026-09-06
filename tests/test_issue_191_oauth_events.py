@@ -21,6 +21,7 @@ What is asserted, in the order the design argues it:
   empty body; every refusal keeps its status and error code.
 """
 import asyncio
+import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from starlette.requests import Request
 
+from src.logging_setup import build_payload
 from src.models.db import OAuthCode, OAuthToken
 from src.oauth import routes as oauth
 from src.services import security_events
@@ -322,8 +324,20 @@ def test_a_rotation_is_recorded_after_its_commit(monkeypatch, events):
         assert token.token_hash not in rendered
 
 
-def test_a_rotation_failure_is_recorded_with_its_traceback(monkeypatch, events):
-    """The traceback used to be discarded behind the 500 and nothing replaced it."""
+def test_a_rotation_failure_is_recorded_by_class_and_never_by_traceback(
+    monkeypatch, events
+):
+    """The 500 used to discard everything; the fix must not over-correct.
+
+    A traceback here would be the most dangerous one in the catalogue. This
+    transaction binds `_hash(new_access)`, `_hash(new_refresh)` and the
+    presented token's hash, and SQLAlchemy renders a failing statement's bound
+    parameters into `StatementError.__str__` — so `exc_info` on *this* branch
+    puts credential hashes into a shared log sink and into the health page's
+    ring buffer. The engine sets `hide_parameters=True`; this event carries the
+    exception's **class only**, which is the second layer. Same rule, and the
+    same wording, as `oauth_refresh_reuse_revocation_failed` two branches away.
+    """
     session = FakeSession(clients=[FakeClient()], tokens=_live_family())
 
     async def failing_commit():
@@ -336,12 +350,57 @@ def test_a_rotation_failure_is_recorded_with_its_traceback(monkeypatch, events):
     assert events.attempted == ["oauth_token_rotation_failed"]
     record = events.one("oauth_token_rotation_failed")
     assert record.levelno == logging.ERROR
-    assert record.exc_info is not None
+    assert record.exc_info is None, "no traceback on a credential-bound write"
+    assert record.error_type == "RuntimeError"
+    assert "rotation exploded" not in build_payload(record).get("stack", "")
     # Only the identifiers that came off rows.
     assert record.client_id == "client123"
     assert record.grant_id == "g1"
     assert record.client_ip == "203.0.113.7"
     assert events.named("oauth_token_refreshed") == []
+
+
+def test_a_rotation_failure_carrying_bound_hashes_leaks_none_of_them(
+    monkeypatch, events
+):
+    """The failure Codex named, injected: a `StatementError` on the rotation.
+
+    The exception is built the way the engine builds one — with
+    `src.database.engine.hide_parameters`, not with a hard-coded `True` — so
+    turning that setting off fails this test rather than quietly re-opening the
+    hole. The bound value is a realistic token hash, and no twelve-character
+    run of it may appear anywhere in the record.
+    """
+    from sqlalchemy.exc import StatementError
+
+    from src.database import engine
+
+    hashed = hashlib.sha256(b"a-brand-new-refresh-token").hexdigest()
+    session = FakeSession(clients=[FakeClient()], tokens=_live_family())
+
+    async def failing_commit():
+        raise StatementError(
+            "could not commit",
+            "INSERT INTO oauth_tokens (token_hash, token_type) VALUES (?, ?)",
+            {"token_hash": hashed, "token_type": "refresh"},
+            RuntimeError("connection reset"),
+            hide_parameters=engine.hide_parameters,
+        )
+
+    session.commit = failing_commit
+    response = _refresh(monkeypatch, session)
+
+    assert response.status_code == 500
+    record = events.one("oauth_token_rotation_failed")
+    haystack = "\n".join(
+        [json.dumps(build_payload(record)), record.getMessage()]
+        + [str(value) for value in record.__dict__.values()]
+    )
+    for start in range(len(hashed) - 12 + 1):
+        assert hashed[start : start + 12] not in haystack, (
+            "a bound credential hash reached the record — check "
+            "`hide_parameters=True` in src/database.py"
+        )
 
 
 def test_an_unknown_refresh_token_resolves_nothing_and_says_so(monkeypatch, events):

@@ -221,13 +221,54 @@ def test_an_entry_holding_a_count_emits_its_summary_before_eviction(clock, sink)
         security_events.emit("auth_failure", subject=victim, reason="invalid_key")
     assert _summaries(sink) == []
 
-    # Push the victim, the oldest entry, out of a full map.
+    # Push the victim — now the least recently used entry — out of a full map.
     for i in range(security_events.MAX_TRACKED_KEYS + 1):
         security_events.acquire("csrf_refused", f"ip:203.0.113.{i}")
 
     summary = _summaries(sink)[0]
     assert summary.reason == "auth_failure"
     assert summary.count == 3
+
+
+def test_eviction_is_least_recently_used_and_not_oldest_window_first(clock, sink):
+    """Which entry goes when the map is full — pinned, because the note says so.
+
+    The two policies disagree exactly where it matters. `_event_windows` is an
+    `OrderedDict`; every `acquire` calls `move_to_end`, and eviction pops from
+    the *front*, so what goes is the key nobody has touched for longest.
+    "Oldest window first" would evict by `window.started` instead — and a key
+    acquired steadily inside one 60-second window keeps its original start
+    time, so under that policy the **busiest** key would be the first one
+    thrown away, taking its withheld count with it.
+
+    The scenario separates them: `first` opens its window before all the
+    others and is therefore the oldest by window, but is touched again just
+    before the map overflows, so it is the *most* recent by use. LRU keeps it;
+    oldest-window-first would not.
+    """
+    first = ("auth_failure", "ip:198.51.100.1")
+    security_events.acquire(*first)
+
+    # Fill the map to its bound with distinct, older-by-use keys.
+    for i in range(security_events.MAX_TRACKED_KEYS - 1):
+        security_events.acquire("csrf_refused", f"ip:203.0.113.{i}")
+
+    # Touch the first key again, inside its own window, so its *window* is
+    # still the oldest while its *use* is now the newest.
+    security_events.acquire(*first)
+    assert first in security_events._event_windows
+
+    # One more key overflows the bound and forces exactly one eviction.
+    security_events.acquire("csrf_refused", "ip:198.51.100.254")
+
+    assert first in security_events._event_windows, (
+        "the oldest *window* was evicted — eviction is least-recently-used, "
+        "and the busiest key is the one that must survive"
+    )
+    assert ("csrf_refused", "ip:203.0.113.0") not in security_events._event_windows, (
+        "the least recently used key should have been the one to go"
+    )
+    assert len(security_events._event_windows) == security_events.MAX_TRACKED_KEYS
 
 
 # ── Failing open ────────────────────────────────────────────────────────────

@@ -174,9 +174,14 @@ async def test_every_gated_tool_marks_its_row_and_records_one_refusal(
     # The *credential*, not the peer: `_require_write` runs below
     # `ProxyHeadersMiddleware` and nothing binds the address there (residual R8).
     assert payload["actor_kind"] == ACTOR[0]
-    assert payload["actor_ref"] == ACTOR[2]
     assert payload["key_id"] == KEY_ID
     assert "client_ip" not in payload
+    # **Never `actor_ref`** (design D20). For an API-key caller that value is
+    # `api_keys.key_prefix` — the first twelve characters of the live key — and
+    # this record goes to a shared log sink. The credential is named by row id;
+    # `usage_logs` keeps the prefix, and is read behind the panel's own auth.
+    assert "actor_ref" not in payload
+    assert ACTOR[2] not in repr(payload)
 
 
 async def test_the_refusal_message_is_unchanged(sink, read_only):

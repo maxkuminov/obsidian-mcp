@@ -24,14 +24,17 @@ The match is deliberately not equality. A record containing any **12-character
 substring** of a canary fails, which catches a truncation ("the first 8
 characters are harmless") as well as a whole value.
 
-Two positions are exercised at the boundary rather than through their route.
-`/transfer/*` and the panel's key administration belong to Slices D and C of
-this change and emit nothing yet, so a route-level canary there would pass
-vacuously today and say nothing. Instead their bearers go through
-`redacted_token_tag` — the single function in the codebase that turns a
-presented credential into something loggable, and therefore the only way one
-could ever reach a record — and through `auth_failure`, which is what actually
-carries a presented bearer into the log.
+Two of the positions are covered twice over. `redacted_token_tag` — the
+single function in the codebase that turns a presented credential into
+something loggable, and therefore the only way one could reach a record — is
+pinned at the boundary; and now that Slices C and D have landed and those
+surfaces actually emit, the same secrets are also driven through their **real**
+paths: a transfer token is minted by `request_upload` and redeemed against
+`/transfer/*` until it is refused, an `omcp_` key is created through
+`POST /api/keys` and presented to the middleware, and a read-only key drives
+`create_note` to a `tool_write_refused`. A canary that is only planted proves
+the plumbing; one that is captured from the server and driven through the route
+proves the record.
 """
 import asyncio
 import hashlib
@@ -49,6 +52,7 @@ from src.limiter import limiter
 from src.logging_setup import StructuredFormatter
 from src.mcp_server import auth as mcp_auth
 from src.models.db import OAuthCode, OAuthToken
+from src.api import routes as api_routes
 from src.oauth import routes as oauth
 from src.services import security_events
 
@@ -690,13 +694,287 @@ def test_the_rotated_token_pair_never_reaches_a_record(monkeypatch, sink):
     sink.assert_absent(rotated["access_token"], rotated["refresh_token"])
 
 
+class _KeyUser:
+    id = 1
+    is_admin = True
+    is_active = True
+    username = "max"
+
+
+class _KeyCreateSession:
+    """Enough session for `create_key`: it adds one row and refreshes its id."""
+
+    def __init__(self):
+        self.added = []
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def commit(self):
+        return None
+
+    async def refresh(self, obj):
+        if getattr(obj, "id", None) is None:
+            obj.id = 99
+
+
+def _create_real_key(permission: str = "readwrite"):
+    """Create a key through the real handler and return `(raw_key, row)`.
+
+    Captured, never synthesised. A test that builds `omcp_` + 64 hex characters
+    itself proves that *that shape* does not leak; it proves nothing about the
+    value `create_key` actually hands a caller, which is the one an operator
+    would have to rotate. `key_prefix` — the first twelve characters, and the
+    thing that used to ride into `tool_write_refused` as `actor_ref` — is
+    derived by the handler, so it comes back with the row.
+    """
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/keys",
+            "headers": [],
+            "query_string": b"",
+            "client": ("203.0.113.7", 1234),
+            "state": {},
+            "app": None,
+        }
+    )
+    session = _KeyCreateSession()
+    response = asyncio.run(
+        api_routes.create_key(
+            request=request,
+            req=api_routes.CreateKeyRequest(name="canary", permission=permission),
+            session=session,
+            user=_KeyUser(),
+        )
+    )
+    return response.key, session.added[0]
+
+
 def test_a_generated_omcp_key_never_reaches_a_record(monkeypatch, sink):
-    """The shape `src/api/routes.py` mints, driven through the one middleware
+    """The key the server actually returned, driven through the one middleware
     that ever sees a presented key."""
-    raw_key = f"omcp_{secrets.token_hex(32)}"
+    raw_key, row = _create_real_key()
+    assert raw_key.startswith("omcp_") and len(raw_key) == 69
+    assert row.key_prefix == raw_key[:12], "the row's prefix is part of the key"
 
     status = _drive_middleware(monkeypatch, raw_key)
 
     assert status == 401
     assert sink.records
+    # The whole value, and the prefix the row carries — which is a twelve
+    # character substring of it, i.e. exactly the length this file refuses.
     sink.assert_absent(raw_key.removeprefix("omcp_"))
+    assert row.key_prefix not in sink.rendered()
+
+
+# --- generated: the credential-attributed tool events ---------------------
+
+
+def test_a_read_only_key_refused_at_create_note_leaks_no_part_of_itself(
+    monkeypatch, sink, tmp_path
+):
+    """`tool_write_refused`, with a *live* credential bound the way the
+    middleware binds one.
+
+    This is the record that shipped carrying `actor_ref` — which for an
+    API-key caller is `api_keys.key_prefix`, the first twelve characters of the
+    key the caller is still using. The credential is now named by row id
+    (`key_id`), and the assertion is the general rule: no security record
+    carries a substring of a credential.
+    """
+    from src.auth.session import current_actor
+    from src.mcp_server import tools
+    from src.mcp_server.auth import current_api_key_id, current_permission
+
+    raw_key, row = _create_real_key(permission="read")
+    row.id = 4242
+
+    async def _no_usage_row(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(tools, "_log_usage", _no_usage_row)
+    monkeypatch.setattr(tools.settings, "vault_path", str(tmp_path))
+
+    permission = current_permission.set("read")
+    key_id = current_api_key_id.set(row.id)
+    # Exactly what `APIKeyMiddleware` binds out of the key row it just loaded.
+    actor = current_actor.set(("api_key", row.name, row.key_prefix))
+    try:
+        refusal = asyncio.run(tools.create_note_impl("Notes/canary.md", "body"))
+    finally:
+        current_actor.reset(actor)
+        current_api_key_id.reset(key_id)
+        current_permission.reset(permission)
+
+    assert refusal.startswith("Permission denied")
+    refused = [r for r in sink.records if r.getMessage() == "tool_write_refused"]
+    assert len(refused) == 1, "the refusal must have produced the record to search"
+    assert getattr(refused[0], "key_id") == 4242, (
+        "the credential is named by row id — that is what replaced the prefix"
+    )
+    assert not hasattr(refused[0], "actor_ref")
+    sink.assert_absent(raw_key.removeprefix("omcp_"))
+    assert row.key_prefix not in sink.rendered()
+
+
+# --- generated: a minted transfer capability -----------------------------
+
+
+class _MintResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar_one_or_none(self):
+        return self._value
+
+    def scalars(self):
+        return self
+
+    def first(self):
+        return self._value
+
+
+class _MintSession:
+    """The session `mint_token` writes through: one credential read, one add."""
+
+    def __init__(self, credential):
+        self.credential = credential
+        self.added = []
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def add(self, obj):
+        self.added.append(obj)
+
+    async def execute(self, *args, **kwargs):
+        return _MintResult(self.credential)
+
+    async def commit(self):
+        return None
+
+    async def refresh(self, obj):
+        return None
+
+
+class _RefusalSession:
+    """The redemption side, which must reach no database in this test."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def add(self, obj):
+        pass
+
+    async def commit(self):
+        return None
+
+    async def rollback(self):
+        return None
+
+
+def test_a_minted_transfer_token_never_reaches_a_record(monkeypatch, sink, tmp_path):
+    """D16's captured-secret case for the transfer capability.
+
+    The token is **minted by the real `request_upload` path** and read out of
+    the URL fragment the tool hands the agent — the exact string a human is told
+    to treat as a secret — then presented to `/transfer/*` until the routes
+    refuse it. Both refusals emit `transfer_refused`, which is the one event
+    that carries a *presented* transfer bearer into the log.
+
+    The hash is swept as well as the token. `transfer_tokens` stores only
+    `hash_token(token)`, so a record that leaked the hash would leak the thing
+    the admission query compares against — and `token_tag`, which is `sha:` plus
+    **eight** hex characters, is deliberately shorter than the twelve this file
+    refuses, so the tag survives the sweep and a longer prefix would not.
+    """
+    from src.mcp_server import tools
+    from src.mcp_server.auth import current_api_key_id, current_permission
+    from src.models.db import APIKey
+    from src.services import transfer, vault_fs
+    from src.transfer import routes as transfer_routes
+
+    credential = APIKey(
+        id=11,
+        name="k",
+        key_hash="k" * 64,
+        key_prefix="omcp_test",
+        permission="readwrite",
+        is_active=True,
+        expires_at=None,
+    )
+
+    async def _no_usage_row(*_args, **_kwargs):
+        return True
+
+    (tmp_path / "Attachments").mkdir()
+    vault_fs.reset_filesystem_probe_cache()
+    monkeypatch.setattr(tools, "_log_usage", _no_usage_row)
+    monkeypatch.setattr(tools, "async_session", lambda: _MintSession(credential))
+    monkeypatch.setattr(tools.settings, "vault_path", str(tmp_path))
+    monkeypatch.setattr(tools.settings, "mcp_hostname", "vault.example.com")
+    monkeypatch.setattr(tools.settings, "base_url", "https://vault.example.com")
+    monkeypatch.setattr(tools.settings, "_public_origin_explicit", True)
+
+    permission = current_permission.set("readwrite")
+    key_id = current_api_key_id.set(11)
+    try:
+        minted = asyncio.run(tools.request_upload_impl("Attachments/shot.png"))
+    finally:
+        current_api_key_id.reset(key_id)
+        current_permission.reset(permission)
+        vault_fs.reset_filesystem_probe_cache()
+
+    line = next(
+        l for l in minted.splitlines() if "https://" in l and "/transfer/upload#" in l
+    )
+    token = line.split("#", 1)[1].strip()
+    assert len(token) >= 32, "the fragment did not carry a capability"
+    digest = hashlib.sha256(token.encode()).hexdigest()
+
+    # ── redeem it until it is refused ──────────────────────────────────────
+    # The row is not in any database this test can reach, so both admission
+    # queries answer `None` — which is the *most* interesting case for a
+    # canary: it is the branch that runs the diagnosis, builds a `token_tag`
+    # out of the presented value, and emits the record.
+    async def _no_row(*_args, **_kwargs):
+        return None
+
+    async def _unknown(_session, _token, *, direction):
+        return transfer.TransferRefusal("unknown_token")
+
+    monkeypatch.setattr(transfer, "lookup_token", _no_row)
+    monkeypatch.setattr(transfer, "claim_upload", _no_row)
+    monkeypatch.setattr(transfer, "classify_token_refusal", _unknown)
+    monkeypatch.setattr(transfer_routes, "async_session", _RefusalSession)
+
+    async def _drive() -> list[int]:
+        import httpx
+
+        from src.main import app
+
+        headers = {"Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, client=("203.0.113.7", 4242)),
+            base_url="http://localhost:8000",
+        ) as client:
+            info = await client.get("/transfer/upload/info", headers=headers)
+            put = await client.put("/transfer/upload", headers=headers, content=b"x")
+        return [info.status_code, put.status_code]
+
+    assert asyncio.run(_drive()) == [404, 404], "the uniform 404 moved"
+
+    refusals = [r for r in sink.records if r.getMessage() == "transfer_refused"]
+    assert len(refusals) == 2, "both redemptions must have produced a record"
+    tags = {getattr(r, "token_tag", None) for r in refusals}
+    assert tags == {"sha:" + digest[:8]}, "the tag is the only permitted form"
+
+    sink.assert_absent(token, digest)
