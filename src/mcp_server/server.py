@@ -342,7 +342,9 @@ async def semantic_search(
 
 
 @mcp.tool()
-async def create_note(path: str, content: str) -> str:
+async def create_note(
+    path: str, content: str, expected_hash: str | None = None
+) -> str:
     """Create a new markdown note in the Obsidian vault. Requires write permission — a `readwrite` API key, or an OAuth token
     carrying the `readwrite` scope.
 
@@ -360,11 +362,32 @@ async def create_note(path: str, content: str) -> str:
     `VAULT_ALLOW_NAMED_STAGING_FALLBACK` rather than staging under a visible
     name.
 
+    **`expected_hash` — binding a write to the bytes you read.** Optional; omit
+    it and nothing changes. Pass the `content_hash` a read returned, verbatim
+    and canonical (`sha256:<64 lowercase hex>`), and the call is refused with
+    nothing written if the file changed in between. It is always the **whole
+    file's** hash, never a hash of the text you received. Two windows, both
+    live: `expected_hash` covers your read → this call's read, the server's own
+    pre-publication compare covers this call's read → its publication, and a
+    match on the first does not exempt the second. Every refusal ends with one
+    machine-readable `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with
+    the file's current hash, ready to resend), `concurrent_write`,
+    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
+    `precondition_required` — and each states what resolves it.
+
+    Here there are no incumbent bytes to bind: a supplied hash is answered
+    `no_incumbent` before any filesystem work, nothing is created, and the
+    remedy is to call again without it. A malformed hash is still reported as
+    malformed first. Success reports the `content_hash` of the note this call
+    published.
+
     Args:
         path: Vault-relative path for the new note (e.g. "Cards/New Topic.md"). The .md extension is added if missing.
         content: Full markdown content for the note, including any frontmatter.
+        expected_hash: Accepted and always refused as `no_incumbent`, so the
+            refusal is a normal result rather than a protocol error.
     """
-    return await create_note_impl(path, content)
+    return await create_note_impl(path, content, expected_hash=expected_hash)
 
 
 @mcp.tool()
@@ -378,6 +401,7 @@ async def edit_note(
     replace_all: bool = False,
     dry_run: bool = False,
     replace_frontmatter: bool = False,
+    expected_hash: str | None = None,
 ) -> str:
     """Edit an existing note in the Obsidian vault. Requires write permission — a `readwrite` API key, or an OAuth token
     carrying the `readwrite` scope.
@@ -489,18 +513,41 @@ async def edit_note(
     but only against a change landing inside **this call**: the file is read
     here and re-compared immediately before the rename, so a writer racing this
     tool's own read-modify-write fails with `File changed while editing:
-    <name>` and nothing is written. **That is not a guard on your read.** No
-    write tool takes an expected hash or version, so `content` computed from an
-    earlier `read_note` silently overwrites whatever changed the note in
-    between — the whole note under full replacement and
-    `replace_frontmatter=True`, only the touched region under
-    `append`/`find`/`section`. Re-read immediately before editing when a
-    concurrent writer is possible. Structured frontmatter mutation is better
-    done via `set_frontmatter` — PyYAML serialization there discards YAML
-    comments. A
+    <name>` and nothing is written. **That is not a guard on your read** — it
+    is the second of the two windows below, and `expected_hash` is the first.
+    Structured frontmatter mutation is better done via `set_frontmatter` —
+    PyYAML serialization there discards YAML comments. A
     path whose final component is a symlink is refused in every mode
     (`dry_run` included), naming the link's target; symlinked folders inside
     the vault work normally.
+
+    **`expected_hash` — binding a write to the bytes you read.** Optional; omit
+    it and nothing changes, including today's silent overwrite of whatever
+    landed since your `read_note`. Pass the `content_hash` a read returned,
+    verbatim and canonical (`sha256:<64 lowercase hex>`), and the call is
+    refused with nothing written if the file changed in between. It is always
+    the **whole file's** hash, never a hash of the text you received. Two
+    windows, both live: `expected_hash` covers your read → this call's read,
+    the server's own pre-publication compare covers this call's read → its
+    publication, and a match on the first does not exempt the second. Every
+    refusal ends with one machine-readable `MCP-REFUSAL {"code":…}` line —
+    `stale_precondition` (with the file's current hash, ready to resend),
+    `concurrent_write`, `no_incumbent`, `malformed_precondition`,
+    `precondition_unavailable`, `precondition_required` — and each states what
+    resolves it.
+
+    It applies in **all four modes**, `dry_run` included, and is checked before
+    mode dispatch, the size cap, the diff and every no-op branch, so a stale
+    base never yields a diff or a "no changes" answer. A `section=` write binds
+    the **whole file** as well: `#N` ordinals are positional, so a body-only
+    digest could certify an unchanged body while an insertion above it changed
+    which section the selector names. That makes the narrowest mode the most
+    conflict-prone — an unrelated edit elsewhere refuses it — which is exactly
+    why the argument is optional: bind when you reasoned about what you read,
+    omit when you are appending to a log. Every mode that publishes reports the
+    `content_hash` of the bytes **this call wrote** (not of whatever is on disk
+    when you read the message), so an edit→edit chain needs no intervening
+    read; `dry_run` publishes nothing and reports none.
 
     Args:
         path: Vault-relative path to the note.
@@ -517,6 +564,8 @@ async def edit_note(
         replace_frontmatter: Full-replace only. If True, `content` replaces the
             entire file including any frontmatter block. Default False
             preserves an existing valid block.
+        expected_hash: The note's `content_hash` as you last read it. Refuses
+            the write, changing nothing, if the file has changed since.
     """
     return await edit_note_impl(
         path,
@@ -528,6 +577,7 @@ async def edit_note(
         replace_all=replace_all,
         dry_run=dry_run,
         replace_frontmatter=replace_frontmatter,
+        expected_hash=expected_hash,
     )
 
 
@@ -656,7 +706,10 @@ async def find_orphans(folder: str | None = None, limit: int = 50) -> str:
 
 @mcp.tool()
 async def move_note(
-    from_path: str, to_path: str, rewrite_links: bool = False
+    from_path: str,
+    to_path: str,
+    rewrite_links: bool = False,
+    expected_hash: str | None = None,
 ) -> str:
     """Move or rename a note inside the vault. Requires write permission — a `readwrite` API key, or an OAuth token
     carrying the `readwrite` scope.
@@ -706,6 +759,31 @@ async def move_note(
     normally and the recorded paths are the real ones behind them. See
     `get_vault_guide` for vault folder conventions.
 
+    **`expected_hash` — binding a write to the bytes you read.** Optional; omit
+    it and nothing changes. Pass the `content_hash` a read returned, verbatim
+    and canonical (`sha256:<64 lowercase hex>`), and the call is refused with
+    nothing written if the file changed in between. It is always the **whole
+    file's** hash, never a hash of the text you received. Two windows, both
+    live: `expected_hash` covers your read → this call's read, the server's own
+    pre-publication compare covers this call's read → its publication, and a
+    match on the first does not exempt the second. Every refusal ends with one
+    machine-readable `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with
+    the file's current hash, ready to resend), `concurrent_write`,
+    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
+    `precondition_required` — and each states what resolves it.
+
+    Here it binds **`from_path`'s own bytes and nothing else**, compared before
+    the rename and before any rewrite; the backlink sources a
+    `rewrite_links=True` move would rewrite are *not* bound, because you never
+    read them. Success reports the `content_hash` of the bytes actually
+    published at `to_path` — the moved bytes for a plain move, the post-rewrite
+    bytes when the moved note's own body was rewritten — and that value binds a
+    following `edit_note(to_path, …, expected_hash=…)`. A rewrite that fails
+    after the rename stays a **partial success** and never claims nothing was
+    written; if it failed because another writer changed `to_path` in between,
+    **no hash is reported at all** and the result says to re-read `to_path`
+    before writing to it.
+
     Args:
         from_path: Vault-relative path of the existing note.
         to_path: Vault-relative path of the destination. Must not exist. Parent
@@ -713,14 +791,21 @@ async def move_note(
         rewrite_links: If True, also rewrite incoming wikilinks and embeds in
             source notes. Off by default — opting in is destructive (it modifies
             other notes' bodies).
+        expected_hash: `from_path`'s `content_hash` as you last read it.
+            Refuses the move, changing nothing, if that note has changed since.
     """
     return await move_note_impl(
-        from_path, to_path, rewrite_links=rewrite_links
+        from_path,
+        to_path,
+        rewrite_links=rewrite_links,
+        expected_hash=expected_hash,
     )
 
 
 @mcp.tool()
-async def delete_note(path: str, permanent: bool = False) -> str:
+async def delete_note(
+    path: str, permanent: bool = False, expected_hash: str | None = None
+) -> str:
     """Delete a note from the vault. Requires write permission — a `readwrite` API key, or an OAuth token
     carrying the `readwrite` scope.
 
@@ -748,11 +833,33 @@ async def delete_note(path: str, permanent: bool = False) -> str:
     Dangling backlinks left behind by a delete are surfaced via
     `get_backlinks` and `find_orphans`. See `get_vault_guide` for context.
 
+    **`expected_hash` — binding a write to the bytes you read.** Optional; omit
+    it and nothing changes. Pass the `content_hash` a read returned, verbatim
+    and canonical (`sha256:<64 lowercase hex>`), and the call is refused with
+    nothing written if the file changed in between. It is always the **whole
+    file's** hash, never a hash of the text you received. Two windows, both
+    live: `expected_hash` covers your read → this call's read, the server's own
+    pre-publication compare covers this call's read → its publication, and a
+    match on the first does not exempt the second. Every refusal ends with one
+    machine-readable `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with
+    the file's current hash, ready to resend), `concurrent_write`,
+    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
+    `precondition_required` — and each states what resolves it.
+
+    It applies in **both modes**, and the comparison runs before the `.trash`
+    rename and before the unlink, so a refused delete leaves the note where it
+    was and creates no trash entry. A successful delete reports **no**
+    `content_hash`: nothing remains to hash.
+
     Args:
         path: Vault-relative path to the note.
         permanent: If True, unlink instead of soft-deleting.
+        expected_hash: The note's `content_hash` as you last read it. Refuses
+            the delete, changing nothing, if the note has changed since.
     """
-    return await delete_note_impl(path, permanent=permanent)
+    return await delete_note_impl(
+        path, permanent=permanent, expected_hash=expected_hash
+    )
 
 
 @mcp.tool()
@@ -760,6 +867,7 @@ async def set_frontmatter(
     path: str,
     updates: dict | None = None,
     remove: list[str] | None = None,
+    expected_hash: str | None = None,
 ) -> str:
     """Mutate a note's YAML frontmatter without touching its body. Requires write permission — a `readwrite` API key, or an OAuth token
     carrying the `readwrite` scope.
@@ -797,14 +905,36 @@ async def set_frontmatter(
 
     See `get_vault_guide` for vault frontmatter conventions.
 
+    **`expected_hash` — binding a write to the bytes you read.** Optional; omit
+    it and nothing changes. Pass the `content_hash` a read returned, verbatim
+    and canonical (`sha256:<64 lowercase hex>`), and the call is refused with
+    nothing written if the file changed in between. It is always the **whole
+    file's** hash, never a hash of the text you received. Two windows, both
+    live: `expected_hash` covers your read → this call's read, the server's own
+    pre-publication compare covers this call's read → its publication, and a
+    match on the first does not exempt the second. Every refusal ends with one
+    machine-readable `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with
+    the file's current hash, ready to resend), `concurrent_write`,
+    `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
+    `precondition_required` — and each states what resolves it.
+
+    The comparison runs ahead of the malformed-block diagnosis and ahead of the
+    no-op check, so a stale base never yields "no changes" or a defect report
+    about bytes you have not seen. A write reports the `content_hash` of the
+    bytes **this call published**; a no-op publishes nothing and reports none.
+
     Args:
         path: Vault-relative path to the note.
         updates: Mapping of keys to set. Use the empty dict (or omit) to skip.
         remove: List of keys to delete from the frontmatter. Missing keys are
             ignored (and, on their own, make the call a no-op rather than a
             write).
+        expected_hash: The note's `content_hash` as you last read it. Refuses
+            the write, changing nothing, if the note has changed since.
     """
-    return await set_frontmatter_impl(path, updates=updates, remove=remove)
+    return await set_frontmatter_impl(
+        path, updates=updates, remove=remove, expected_hash=expected_hash
+    )
 
 
 @mcp.tool()
