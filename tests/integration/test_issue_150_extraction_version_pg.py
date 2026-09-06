@@ -156,6 +156,55 @@ CORPUS = [
 ]
 
 
+async def test_version_two_mask_decided_rows_are_repaired_without_reembedding(
+    sessionmaker, vault, monkeypatch
+):
+    """Unchanged version-2 bytes repair their graph and keep certified vectors."""
+    body = "[[`x`Old]] ![[`x`Old]] [t](<`x`Old.md>) [[Keep|`alias`]] #real\n"
+    ids = await seed_pre_150(sessionmaker, vault, [("Source.md", body, ["real"])])
+    note_id = ids["Source.md"]
+    async with sessionmaker() as session:
+        await session.execute(text("UPDATE notes_metadata SET extraction_version = 2"))
+        # Version 2 emitted phantom Old rows after trimming the masked prefix.
+        for kind in ("link", "embed", "markdown"):
+            session.add(NoteLink(source_note_id=note_id, target_path="Old", kind=kind))
+        session.add(NoteLink(source_note_id=note_id, target_path="Keep", kind="link"))
+        await session.commit()
+        before_vector = (await session.execute(
+            select(NoteEmbedding.id, NoteEmbedding.chunk_text, NoteEmbedding.embedding)
+            .where(NoteEmbedding.note_id == note_id)
+        )).one()
+    before = (await rows(sessionmaker))["Source.md"]
+
+    async def unexpected_provider_call(chunks):
+        pytest.fail("A link-only version bump must not call the embedding provider")
+
+    monkeypatch.setattr(embeddings_service, "get_embeddings_batch", unexpected_provider_call)
+    await indexer.index_vault(user_id=None)
+    await indexer.embed_vault(user_id=None)
+
+    after = (await rows(sessionmaker))["Source.md"]
+    assert after.id == note_id
+    assert after.extraction_version == 3
+    assert after.content_hash == before.content_hash == content_hash(body)
+    assert after.embedded_content_hash == before.embedded_content_hash == after.content_hash
+    assert after.tags == ["real"]
+    assert await link_targets(sessionmaker, note_id) == ["Keep"]
+    async with sessionmaker() as session:
+        after_vector = (await session.execute(
+            select(NoteEmbedding.id, NoteEmbedding.chunk_text, NoteEmbedding.embedding)
+            .where(NoteEmbedding.note_id == note_id)
+        )).one()
+    assert after_vector.id == before_vector.id
+    assert after_vector.chunk_text == before_vector.chunk_text
+    assert list(after_vector.embedding) == list(before_vector.embedding)
+    assert (vault / "Source.md").read_text(encoding="utf-8") == body
+
+    await indexer.index_vault(user_id=None)
+    assert (await rows(sessionmaker))["Source.md"] == after
+    assert await link_targets(sessionmaker, note_id) == ["Keep"]
+
+
 async def test_a_stale_marker_re_derives_links_and_tags_for_every_note(
     sessionmaker, vault
 ):

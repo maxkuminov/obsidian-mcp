@@ -1440,6 +1440,26 @@ user until the pass completes, per the existing requirement — which is the
 correct disposition for a grammar change, since the rewrite planner and the
 extractor must agree about what a link is.
 
+### Version 3 rejects targets invented by code masking (#218)
+
+Masking inline code can manufacture a target: `` [[`x`Old]] `` used to become a
+link to `Old` after its masked prefix was stripped. Extraction now compares
+each raw wikilink target capture or markdown href span against the same
+code-point offsets in the original body, before stripping, decoding or cap
+accounting. A changed deciding span is omitted. Code confined to a label,
+alias or anchor does not change the target and remains extractable; the
+existing `link_text` representation and scanner grammar are unchanged.
+
+Rejected candidates neither consume `MAX_LINKS_PER_NOTE` nor set truncation.
+Version 3 shares version 2's embedding cleaner, so the existing atomic stale
+version pass repairs unchanged notes' links and stamps version 3 while
+preserving their content hashes and embedding certification. No migration or
+embedding reset is needed. Deployment costs one re-derivation pass; the
+existing owner-scoped `move_note(rewrite_links=True)` refusal lasts until that
+scope's markers are current. The version-2 row repair and unchanged vectors
+are pinned against PostgreSQL in
+`tests/integration/test_issue_150_extraction_version_pg.py`.
+
 ### The frozen v0 cleaner is a line scanner with the regexes as its oracle
 
 `_v0_clean` must keep producing byte-identical output forever — the
@@ -1474,7 +1494,7 @@ The rollback procedure is:
 
 1. revert the grammar commits on a branch;
 2. **bump `CURRENT_EXTRACTION_VERSION`** in that build (to the next unused
-   number — 2 is taken by the link-grammar bump above) and
+   number — 2 and 3 are taken by the link-grammar bumps above) and
    keep the versioned mechanism and the frozen per-version registry — the
    registry is what lets the pass compare each row's stamped grammar against
    the restored one;

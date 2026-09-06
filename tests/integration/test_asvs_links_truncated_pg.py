@@ -232,7 +232,7 @@ async def test_the_pass_stamps_the_current_extraction_version(sessionmaker, vaul
     await indexer.index_vault(user_id=None)
 
     row = await note_row(sessionmaker, "Stamped.md")
-    assert row.extraction_version == indexer.CURRENT_EXTRACTION_VERSION == 2
+    assert row.extraction_version == indexer.CURRENT_EXTRACTION_VERSION == 3
 
 
 # ── get_links is bounded, and says what it is bounding ────────────────────
