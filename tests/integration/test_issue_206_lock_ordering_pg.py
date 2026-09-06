@@ -268,3 +268,190 @@ async def test_the_lock_is_one_key_so_the_ordering_is_total(world):
     assert free is False, (
         "an embed certification and a keyword write did not serialise"
     )
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The wait is not capped by `statement_timeout`
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `lock_timeout` was never the only way to defeat the wait. `src/database.py`
+# sets `statement_timeout` to 60 s in the engine's `server_settings`, and
+# `pg_advisory_xact_lock` is a statement like any other — so a wait longer than
+# a minute was *cancelled*, and since the pass holds the lock for its whole
+# transaction (L5b, minutes on a large vault) the maintenance commands did not
+# wait for a pass at all. The specified behaviour ("a maintenance operation
+# waits for an in-flight pass") was contradicted by the engine, silently, at
+# every site the docs asserted it.
+#
+# The timeout is lowered to 1 s here rather than the pass being made to run for
+# a minute: the cap is a parameter and every branch is on the same side of it
+# either way, so waiting out the real 60 s would prove the same thing and cost
+# a minute per case.
+
+#: One second, so a hold of `HOLD_SECONDS` is unambiguously past it.
+IMPATIENT = {"server_settings": {"statement_timeout": "1000"}}
+
+HOLD_SECONDS = 2.5
+
+
+@pytest_asyncio.fixture(loop_scope="module")
+async def impatient(migrated_url):
+    """An engine whose connections cancel any statement after one second."""
+    engine = create_async_engine(
+        migrated_url, poolclass=None, connect_args=IMPATIENT
+    )
+    maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    yield engine, maker
+    await engine.dispose()
+
+
+async def _hold_the_lock(maker, seconds: float, started: asyncio.Event):
+    """Stand in for an in-flight pass: take the lock, hold it, commit."""
+    async with maker() as session:
+        await index_state.acquire_generation_lock(session)
+        started.set()
+        await asyncio.sleep(seconds)
+        await session.commit()
+
+
+async def test_the_plain_acquisition_is_capped_and_the_unbounded_one_is_not(
+    world, impatient
+):
+    """The regression and the fix, on one connection.
+
+    Two assertions in one test on purpose. The first proves the fixture
+    actually bites — without it the second could pass on a build that never
+    raised the timeout at all, which is exactly the state this test exists to
+    detect. The second proves the raise covers the wait and nothing after it.
+    """
+    _engine, maker = impatient
+    started = asyncio.Event()
+    holder = asyncio.create_task(
+        _hold_the_lock(world["maker_a"], HOLD_SECONDS, started)
+    )
+    try:
+        await started.wait()
+
+        with pytest.raises(Exception) as capped:
+            async with maker() as session:
+                await index_state.acquire_generation_lock(session)
+        assert "statement timeout" in str(capped.value), (
+            "the impatient engine did not cancel the wait, so this test could "
+            f"not tell a raised timeout from an absent one: {capped.value}"
+        )
+
+        async with maker() as session:
+            await index_state.acquire_generation_lock_unbounded(session)
+            # The exemption covers the wait and nothing else: the connection's
+            # own bound is back in force for everything after it.
+            restored = (
+                await session.execute(text("SHOW statement_timeout"))
+            ).scalar_one()
+            await session.rollback()
+        assert restored == "1s", (
+            "the timeout was left lifted for the rest of the transaction: "
+            f"{restored!r}"
+        )
+    finally:
+        await asyncio.wait_for(holder, timeout=30)
+
+
+async def test_the_rebuild_waits_past_the_statement_timeout(world, impatient):
+    """`make rebuild-tsvectors` against a live service, in miniature.
+
+    The driver is the production entry point `scripts/rebuild_tsvectors.py`
+    calls, so this asserts the raise where an operator meets it rather than on
+    a hand-rolled acquisition.
+    """
+    _engine, maker = impatient
+    started = asyncio.Event()
+    holder = asyncio.create_task(
+        _hold_the_lock(world["maker_a"], HOLD_SECONDS, started)
+    )
+    await started.wait()
+    async with maker() as session:
+        outcomes = await asyncio.wait_for(
+            indexer.rebuild_tsvectors_all_scopes(session), timeout=30
+        )
+        await session.commit()
+    await asyncio.wait_for(holder, timeout=30)
+    assert outcomes[None].completed, (
+        "the rebuild was cancelled instead of waiting for the in-flight pass"
+    )
+
+
+async def test_the_pass_waits_past_the_statement_timeout(
+    world, impatient, monkeypatch
+):
+    """The symmetric case: the pass is the *waiting* side of this lock too.
+
+    Its failure direction was safe — a cancelled acquisition aborts the pass,
+    which commits nothing and retries next tick — but "waits" is the documented
+    contract on both sides, and a pass that abandons every tick for the
+    duration of a long rebuild writes an `indexer_runs` error row per tick
+    about a database that is merely busy.
+    """
+    _engine, maker = impatient
+    monkeypatch.setattr(indexer, "async_session", maker)
+    monkeypatch.setattr(src.database, "async_session", maker)
+
+    started = asyncio.Event()
+    holder = asyncio.create_task(
+        _hold_the_lock(world["maker_a"], HOLD_SECONDS, started)
+    )
+    await started.wait()
+    await asyncio.wait_for(indexer.index_vault(user_id=None), timeout=30)
+    await asyncio.wait_for(holder, timeout=30)
+
+    async with world["maker_a"]() as session:
+        assert (await session.execute(text(
+            "SELECT count(*) FROM notes_metadata WHERE file_path = 'Note.md'"
+        ))).scalar() == 1, "the pass was cancelled and committed nothing"
+
+
+async def test_the_reset_script_waits_past_the_statement_timeout(
+    world, impatient, monkeypatch
+):
+    """`scripts/reset_embeddings.py` itself, not a re-implementation of it.
+
+    The script's ordering comment used to argue that the raise had to come
+    *after* the acquisition, because a `SET LOCAL` ahead of it "would put a
+    statement before the lock". That reading of the ordering rule was wrong —
+    the rule is about row and table locks and a `SET LOCAL` takes neither — and
+    it left the documented wait capped at 60 s. Running the real `reset()`
+    against a held lock is the only thing that proves the correction landed in
+    the script an operator actually runs.
+
+    Kept last in the module: it wipes `note_embeddings` and re-types the
+    column.
+    """
+    import importlib.util
+
+    engine, maker = impatient
+    started = asyncio.Event()
+    holder = asyncio.create_task(
+        _hold_the_lock(world["maker_a"], HOLD_SECONDS, started)
+    )
+
+    spec = importlib.util.spec_from_file_location(
+        "_reset_embeddings_script",
+        _harness.ROOT / "scripts" / "reset_embeddings.py",
+    )
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    monkeypatch.setattr(script, "async_session", maker)
+    monkeypatch.setattr(script, "engine", engine)
+    monkeypatch.setattr(settings, "embedding_dimensions", DIM, raising=False)
+
+    await started.wait()
+    await asyncio.wait_for(script.reset(), timeout=30)
+    await asyncio.wait_for(holder, timeout=30)
+
+    async with world["maker_a"]() as session:
+        assert (await session.execute(text(
+            "SELECT value FROM indexer_state "
+            "WHERE key = 'embedding_fingerprint'"
+        ))).scalar() is not None, (
+            "the reset was cancelled instead of waiting for the in-flight pass"
+        )

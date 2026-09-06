@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Migration 023 owns the indexer state table and the chunk-truncation column as two marked units
-Migration 023 SHALL create the `indexer_state` table — `key` as the primary key, a non-null `value`, and a non-null `updated_at` defaulting to the transaction timestamp — stamped with 023's ownership marker as its table comment, and SHALL add `notes_metadata.chunks_truncated` as `BOOLEAN NOT NULL DEFAULT FALSE` stamped with 023's column marker as its column comment. It SHALL write no row into `indexer_state` and SHALL backfill no value into the column. `downgrade()` SHALL drop each unit only if it carries the marker, all-or-nothing per unit. After migrating to head, `alembic check` SHALL report no pending operations, and the same marker strings SHALL be declared on the ORM table and column so the check compares them.
+Migration 023 SHALL create the `indexer_state` table — `key` as the primary key, a non-null `value`, and a non-null `updated_at` defaulting to the transaction timestamp — stamped with 023's ownership marker as its table comment, and SHALL add `notes_metadata.chunks_truncated` as `BOOLEAN NOT NULL DEFAULT FALSE` stamped with 023's column marker as its column comment. It SHALL write no row into `indexer_state` and SHALL backfill no value into the column. `downgrade()` SHALL drop each unit only if it carries the marker, all-or-nothing **per unit**: an unmarked unit SHALL be left in place and named on the operator's output, and SHALL NOT prevent the other unit's removal — a refusal that rolled both back would make one unit's provenance a veto over the other's, and the two share a revision rather than a lifecycle. `upgrade()` refuses as a whole, which is the opposite disposition and the right one there: an unrecognised object of either name means the database is not what 023 assumes, so nothing may be created against it. After migrating to head, `alembic check` SHALL report no pending operations, and the same marker strings SHALL be declared on the ORM table and column so the check compares them.
 
 **`indexer_state` SHALL carry a CHECK constraint restricting `key` to the closed set of keys the application uses**, resolved through the catalogue rather than by name — a same-named `CHECK (true)` satisfies a lookup by name while enforcing nothing — with its definition compared against the server's own rendering of the canonical predicate, required to be validated, and required to carry 023's marker as its constraint comment.
 
@@ -65,6 +65,12 @@ The deploy migrates before the container is recreated, so the previous build ser
 - **AND** an object of either name that lacks the marker SHALL be left in place instead
 - **AND** no other table, column or constraint SHALL be altered
 
+#### Scenario: An unmarked unit does not veto the other unit's removal
+
+- **WHEN** exactly one of the two units lacks 023's marker and the database is downgraded to 022
+- **THEN** the downgrade SHALL complete, dropping the marked unit and leaving the unmarked one exactly as it was found
+- **AND** it SHALL name the unit it left and why, on the operator's output rather than only in a log record
+
 ### Requirement: 023's units are exercised by the schema gate before deploy
 The schema gate SHALL exercise migration 023 on a throwaway pgvector container before the deploy that carries it, asserting the catalogue **directly** for both units — the table's columns, its primary key, its CHECK definition, validation and marker, the table comment, and the column's type, nullability, default and comment — across the fresh, stamp-back, impostor-object, impostor-constraint and downgrade paths, and asserting that a disallowed key is actually rejected on insert.
 
@@ -84,18 +90,21 @@ Asserting the catalogue directly is required because `alembic check` does not co
 ## MODIFIED Requirements
 
 ### Requirement: The schema gate covers both migrations of this wave before deploy
-The schema gate SHALL exercise every migration whose behaviour it asserts on a throwaway database, in the same run, and SHALL assert `alembic check` clean at the resulting head. **The head revision the gate asserts SHALL be raised from `017` to `023`** — the literal `017` in the gate module is replaced by the literal `023` — so a later migration added without updating the gate fails loudly rather than silently widening what "head" means.
+The schema gate SHALL exercise every migration whose behaviour it asserts on a throwaway database, in the same run, and SHALL assert `alembic check` clean at the resulting head. **The gate SHALL carry a single literal naming the current head revision and SHALL assert that a migrated database reads exactly that**, and it SHALL assert that **`023` is present in the applied chain** — so a later migration added without updating the gate fails loudly rather than silently widening what "head" means.
 
-Raising the asserted head is a required part of adding a migration, not a chore that accompanies it. The assertion is the only thing that makes "head" a value somebody chose; left at `017` it would pass on a database migrated to `023`, and the gate's guarantee — that the revisions it exercises are the revisions that will run — would quietly become a guarantee about a prefix of them.
+The head literal is named as "whatever the chain's last revision is at the time", not as `023`. `023` is this change's migration and is not the head for long: the sibling `panel-sessions-and-consent` change chains `024` (`user_sessions`) from it, so a requirement pinning the gate's literal to `023` would be false the moment either change merged after the other, and would put two changes in conflict over one line for no behavioural reason. What must hold is the property, and it does not name a number: the gate asserts a head somebody chose, and this change's revision is in the chain that leads to it.
+
+Raising the asserted head is a required part of adding a migration, not a chore that accompanies it. The assertion is the only thing that makes "head" a value somebody chose; left at an earlier revision it would pass on a database migrated past it, and the gate's guarantee — that the revisions it exercises are the revisions that will run — would quietly become a guarantee about a prefix of them.
 
 The historical checks SHALL be kept, not replaced. 016's and 017's cases assert facts about those migrations' bodies that no later revision restates, and 013's and 014's before them; a gate rewritten around only the newest wave stops testing the reconciliations the earlier ones exist to perform.
 
 Idempotence SHALL be exercised by stamping the revision back and upgrading again, not by a second `upgrade head` — the latter is a no-op at the alembic level and proves nothing about the migration body.
 
-#### Scenario: Head at 023
+#### Scenario: The gate asserts the current head and 023 is in the chain
 
 - **WHEN** a throwaway database is migrated to head
-- **THEN** `alembic_version` SHALL read `023`
+- **THEN** `alembic_version` SHALL read the single head revision the gate module names
+- **AND** `023` SHALL be one of the revisions that ran to reach it
 - **AND** `alembic check` SHALL report no new upgrade operations
 
 #### Scenario: The earlier waves' cases still run

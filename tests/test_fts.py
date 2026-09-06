@@ -180,12 +180,12 @@ def test_default_config_reproduces_single_english_behavior(monkeypatch):
     assert "||" not in sql
 
 
-# ── rebuild_tsvectors (offline: fake session, real file IO) ───────────────
+# ── _rebuild_tsvectors_single_scope_for_tests (offline: fake session, real file IO) ───────────────
 
 
 @pytest.mark.asyncio
 async def test_rebuild_tsvectors_updates_every_note(monkeypatch, tmp_path):
-    """`rebuild_tsvectors` re-reads each indexed note and issues an UPDATE that
+    """`_rebuild_tsvectors_single_scope_for_tests` re-reads each indexed note and issues an UPDATE that
     sets `content_tsvector` under the configured config(s), carrying the FTS
     config bind params. Fully offline — no DB, no network, no embeddings."""
     import hashlib
@@ -257,7 +257,7 @@ async def test_rebuild_tsvectors_updates_every_note(monkeypatch, tmp_path):
             return None
 
     session = _FakeSession()
-    n = await indexer.rebuild_tsvectors(session, user_id=None)
+    n = await indexer._rebuild_tsvectors_single_scope_for_tests(session, user_id=None)
 
     assert n == 2
     assert len(session.updates) == 2

@@ -408,7 +408,7 @@ async def test_the_tsvector_rebuild_helper_refuses_a_quarantined_user(monkeypatc
 
     monkeypatch.setattr(indexer, "_vault_root", _never)
     with pytest.raises(indexer.VaultRootQuarantined):
-        await indexer.rebuild_tsvectors(object(), user_id=1)
+        await indexer._rebuild_tsvectors_single_scope_for_tests(object(), user_id=1)
 
 
 @pytest.mark.parametrize(
@@ -532,7 +532,12 @@ def test_e4_the_panel_reindex_calls_the_guarded_helpers():
     source = inspect.getsource(routes._reindex_background)
     assert "index_vault" in source
     assert "embed_vault" in source
-    for name in ("index_vault", "link_backfill_pass", "embed_vault", "rebuild_tsvectors"):
+    for name in (
+        "index_vault",
+        "link_backfill_pass",
+        "embed_vault",
+        "_rebuild_tsvectors_single_scope_for_tests",
+    ):
         assert "_refuse_quarantined_pass" in inspect.getsource(
             getattr(indexer, name)
         ), f"{name} must carry the shared skip"
@@ -962,7 +967,12 @@ async def test_the_scope_survey_runs_before_the_generation_lock(monkeypatch, tmp
 
     monkeypatch.setattr(indexer, "_rebuild_root_participants", _participants)
     monkeypatch.setattr(indexer, "survey_rebuild_roots", _survey)
-    monkeypatch.setattr(indexer, "acquire_generation_lock", _lock)
+    # The *unbounded* acquisition: the driver lifts the engine's 60 s
+    # `statement_timeout` off the wait and restores it, because the pass holds
+    # this lock for its whole transaction and a capped wait was cancelled
+    # rather than served. Where it sits is what this test is about, and that is
+    # unchanged.
+    monkeypatch.setattr(indexer, "acquire_generation_lock_unbounded", _lock)
     monkeypatch.setattr(indexer, "pinned_root", _never)
 
     with pytest.raises(indexer.RebuildCoverageAborted) as excinfo:

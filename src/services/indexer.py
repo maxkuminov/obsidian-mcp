@@ -55,7 +55,7 @@ from src.services.index_state import (
     KEY_FTS_FINGERPRINT,
     KEY_ROTATION_CURSOR,
     FingerprintStatus,
-    acquire_generation_lock,
+    acquire_generation_lock_unbounded,
     compare_fingerprint,
     embedding_fingerprint,
     fts_fingerprint,
@@ -479,7 +479,7 @@ def _refuse_quarantined_pass(user_id: int | None, stage: str) -> None:
     """Refuse `stage` for a user the published snapshot names. **The one skip.**
 
     It lives in the shared pass helpers — `index_vault`, `link_backfill_pass`,
-    `embed_vault`, `rebuild_tsvectors` — rather than in each loop, so that every
+    `embed_vault`, `_rebuild_tsvectors_single_scope_for_tests` — rather than in each loop, so that every
     caller inherits it: the periodic tick, the startup block, the panel's
     on-demand reindex and the standalone tsvector rebuild are four entry points
     today and a fifth added later must not have to remember this. A skip
@@ -692,11 +692,11 @@ async def write_tsvector_bounded(
 
     The two call sites carry different, individually stated guarantees: the
     incremental pass commits nothing on a floor failure, so the note is retried
-    next tick; `rebuild_tsvectors` is atomic, so a floor failure rolls the whole
+    next tick; `_rebuild_tsvectors_single_scope_for_tests` is atomic, so a floor failure rolls the whole
     rebuild back and surfaces to the operator who invoked it.
 
     Returns `(prefix_length, rowcount)`. **The rowcount is not something this
-    helper acts on, deliberately.** `rebuild_tsvectors` addresses its UPDATE by
+    helper acts on, deliberately.** `_rebuild_tsvectors_single_scope_for_tests` addresses its UPDATE by
     a certified predicate (id + owner + path + hash), so a zero-row result
     means the row moved or its content advanced under the rebuild — staleness,
     which halving the prefix cannot fix and must never be retried here. It is
@@ -1701,7 +1701,20 @@ async def _index_vault_pinned(
         # in-flight pass instead of interleaving with it. That is the required
         # behaviour, and those paths deliberately do not defeat it with a short
         # `lock_timeout`.
-        await acquire_generation_lock(session)
+        #
+        # The *unbounded* form, and it is the same argument in the other
+        # direction: this pass is on the waiting side whenever a rebuild or a
+        # reset already holds the lock, and under the engine's 60s
+        # `statement_timeout` the wait was cancelled rather than served. That
+        # failure direction was safe — the pass aborts, commits nothing and
+        # retries next tick — but "waits" is the documented contract on both
+        # sides of this lock, and a pass that abandons every tick for the
+        # duration of a long rebuild writes an `indexer_runs` error row per
+        # tick for a database that is merely busy. The raise is a `SET LOCAL`,
+        # which takes no row or table lock, so it sits ahead of the acquisition
+        # without touching the ordering rule; the timeout is restored before
+        # the first mutation below.
+        await acquire_generation_lock_unbounded(session)
         await _assert_fts_generation_current(session)
 
         # Get existing hashes (scoped to this user when set)
@@ -2867,6 +2880,60 @@ class EmbedBudget:
         )
 
 
+class _ProviderCallAccounting:
+    """One provider call, counted once, from whichever side reports it first.
+
+    The two embed loops used to reconstruct the attempt and the chunk debit
+    from the returned `EmbedNoteResult.chunks_submitted`. That is correct for
+    every path that *returns* and silently wrong for every path that **raises
+    after the provider call** — `certify_embedded` raising `StaleCertification`
+    on a row that moved is the ordinary one, and a database error anywhere
+    below it is the rest. The call had been made and the provider's time spent,
+    but nothing counted it as an attempt and nothing debited the tenant's chunk
+    budget. A tenant losing that race on every note could therefore issue
+    provider calls indefinitely without ever becoming budget-exhaustible: the
+    starvation #202 exists to bound, surviving inside the fix for it.
+
+    So the authoritative signal is `issued()`, handed to `embed_note` as
+    `on_provider_call` and invoked by it **at the moment of issuance**, before
+    the await — which is the only point that is on every subsequent path,
+    including the ones that never produce a result.
+
+    `reconcile()` is the backstop for the opposite risk: a return that reports
+    a call nothing announced. It exists because "the caller reads
+    `chunks_submitted`" was the contract for a while, and a future
+    provider-calling path that forgets to pass the callback should
+    under-report nothing rather than silently stop debiting. `_counted` makes
+    the pair idempotent per note, so the ordinary path — announce, then
+    return, then reconcile — counts exactly once.
+
+    `begin()` starts a note. The backlog loop and the reconciliation sweep each
+    build one over the *same* `outcome` and `budget`, so the rule they must not
+    drift on lives here once rather than in two hand-written copies.
+    """
+
+    def __init__(self, outcome: "EmbedPassResult", budget: "EmbedBudget"):
+        self._outcome = outcome
+        self._budget = budget
+        self._counted = False
+
+    def begin(self) -> None:
+        """A new note; nothing has been counted for it yet."""
+        self._counted = False
+
+    def issued(self, chunks_submitted: int) -> None:
+        """`embed_note`'s `on_provider_call`: a provider call went out."""
+        if self._counted or not chunks_submitted:
+            return
+        self._counted = True
+        self._outcome.record_attempt()
+        self._budget.debit(chunks_submitted)
+
+    def reconcile(self, result) -> None:
+        """A result came back; count it if its call was never announced."""
+        self.issued(result.chunks_submitted)
+
+
 async def _active_scope_count(session) -> int:
     """How many scopes this pass is serving — the budget's on/off switch.
 
@@ -3030,7 +3097,14 @@ async def _embed_vault_pinned(
         # as embedded. `attempted` starts at zero and rises with each provider
         # call — never from `len(unembedded)`, which counts work contemplated.
         outcome = EmbedPassResult()
+        # One accountant for this user's whole embed stage — the backlog loop
+        # below and the reconciliation sweep after it — so the attempt and the
+        # chunk debit are recorded where the provider call is *issued* rather
+        # than where its result is read.
+        accounting = _ProviderCallAccounting(outcome, budget)
         for i, row in enumerate(unembedded):
+            entered_embed = False
+            accounting.begin()
             # Re-check the pause flag every iteration so a panel-driven pause
             # (e.g. reset-embeddings) stops an in-flight embed pass promptly
             # instead of grinding through the whole backlog first (issue #19).
@@ -3146,13 +3220,23 @@ async def _embed_vault_pinned(
                 # single vector, and raises `StaleCertification` if the row has
                 # moved.
                 was_truncated = bool(getattr(note, "chunks_truncated", False))
+                # Past this line the note has reached the provider path, so it
+                # has reached a note *boundary* whatever happens next — that is
+                # what the `finally` below keys on.
+                entered_embed = True
                 result = await embed_note(
                     session,
                     note,
                     content,
                     certified_hash=row.content_hash,
                     certified_path=row.file_path,
+                    # The attempt and the budget debit are recorded by
+                    # `embed_note` at the moment it issues the provider call,
+                    # not reconstructed here from a result this `try` may never
+                    # receive. See `_ProviderCallAccounting`.
+                    on_provider_call=accounting.issued,
                 )
+                accounting.reconcile(result)
 
                 # ── Read the result by field, never as a number ────────────
                 # `embed_note` used to return an int and `0` meant three
@@ -3162,15 +3246,6 @@ async def _embed_vault_pinned(
                 # provider outage therefore wrote `notes_embedded = N,
                 # error = NULL`: the row a healthy pass writes, with a
                 # *positive* count (#201).
-                if result.chunks_submitted:
-                    # The one increment point for `attempted`: a provider call
-                    # was issued. Everything that does not reach here — a
-                    # zero-chunk certification, an exclusion, a hash mismatch,
-                    # a pause, a budget stop — is a consequence of that rule
-                    # rather than an exception to it.
-                    outcome.record_attempt()
-                    budget.debit(result.chunks_submitted)
-
                 if result.outcome in (
                     NoteEmbedOutcome.EMBEDDED,
                     NoteEmbedOutcome.CERTIFIED_EMPTY,
@@ -3229,7 +3304,6 @@ async def _embed_vault_pinned(
                     outcome.record_failure_detail(result.failure)
                     await session.rollback()
 
-                budget.note_finished()
                 if (i + 1) % 50 == 0:
                     logger.info(f"Embedded {i + 1}/{len(unembedded)} notes ({total_chunks} chunks)")
             except StaleCertification as e:
@@ -3250,6 +3324,16 @@ async def _embed_vault_pinned(
                 outcome.record_failure(e)
                 logger.warning(f"Failed to embed {row.file_path}: {e}")
                 await session.rollback()
+            finally:
+                # A note that reached `embed_note` reached a note boundary,
+                # including the ones that got there and then raised. Leaving
+                # this at the end of the success path meant a note whose
+                # certification lost its race never advanced the budget's
+                # note counter, so `exhausted()`'s "at least one note
+                # completed" guard could never be satisfied by exactly the
+                # notes that were burning the provider time.
+                if entered_embed:
+                    budget.note_finished()
 
         if outcome.failures:
             logger.error(
@@ -3355,7 +3439,12 @@ async def _reconcile_exclusions(
 
     removed = 0
     restored = 0
+    # The same accounting rule as the backlog's, over the same `outcome` and
+    # the same `budget`.
+    accounting = _ProviderCallAccounting(outcome, budget)
     for row in rows:
+        entered_embed = False
+        accounting.begin()
         # Between notes only, exactly as the backlog checks it: a partially
         # applied *note* is what the certified predicate exists to prevent.
         if _is_paused():
@@ -3440,17 +3529,18 @@ async def _reconcile_exclusions(
                 select(NoteMetadata).where(NoteMetadata.id == row.id)
             )).scalar_one()
             was_truncated = bool(getattr(note, "chunks_truncated", False))
+            # Past this line the note has reached the provider path, so it has
+            # reached a note boundary whatever happens next.
+            entered_embed = True
             result = await embed_note(
                 session,
                 note,
                 content,
                 certified_hash=row.content_hash,
                 certified_path=row.file_path,
+                on_provider_call=accounting.issued,
             )
-            if result.chunks_submitted:
-                outcome.record_attempt()
-                budget.debit(result.chunks_submitted)
-            budget.note_finished()
+            accounting.reconcile(result)
 
             if result.outcome in (
                 NoteEmbedOutcome.EMBEDDED,
@@ -3469,6 +3559,15 @@ async def _reconcile_exclusions(
                         row.file_path,
                         MAX_CHUNKS_PER_NOTE,
                     )
+                # **Counted as embedded, like the backlog's** (adversarial
+                # review). This sweep commits vectors through the same
+                # `certify_embedded` predicate, and on a fully indexed vault it
+                # is the *only* stage making provider calls — so leaving
+                # `embedded` alone here made `indexer_runs.notes_embedded`
+                # under-report exactly the pass whose whole output was the
+                # sweep's. Incremented after the commit, so a certification
+                # that rolled back is not reported as embedded.
+                outcome.embedded += 1
                 if result.chunks_embedded:
                     restored += 1
             elif result.outcome is NoteEmbedOutcome.GENERATION_MISMATCH:
@@ -3496,6 +3595,12 @@ async def _reconcile_exclusions(
                 "Reconciliation failed for %s: %s", row.file_path, e
             )
             await session.rollback()
+        finally:
+            # Same rule as the backlog's: a note that reached `embed_note`
+            # reached a note boundary, including one that got there and then
+            # raised.
+            if entered_embed:
+                budget.note_finished()
 
     if removed or restored:
         logger.info(
@@ -3696,7 +3801,7 @@ async def survey_rebuild_roots(
 
     **The moment.** The observation is bounded and off the event loop
     (`vault_overlap.observe_root`, `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`) and it
-    happens **before `acquire_generation_lock`**. Opening a root synchronously
+    happens **before the generation lock is acquired**. Opening a root synchronously
     after the lock — which is what `pinned_root` did, and still does, only now
     against a root already proved openable — means one hung NFS or FUSE mount
     holds the index generation lock for as long as the kernel likes, and every
@@ -3845,7 +3950,7 @@ async def _rebuild_scope(
     """
     log_suffix = f" (user_id={owner})" if owner is not None else ""
     try:
-        # The same guard `rebuild_tsvectors` applies, applied here because the
+        # The same guard `_rebuild_tsvectors_single_scope_for_tests` applies, applied here because the
         # driver calls the pinned rebuild directly. A quarantined root is a
         # skip like the others, not an exception the driver may step over: the
         # scope keeps its previous-configuration vectors, and the fingerprint
@@ -3967,7 +4072,7 @@ async def rebuild_tsvectors_all_scopes(session) -> dict:
     # serving snapshot publishes. Reading it would file that tenant's notes'
     # keyword vectors under the inactive owner's scope, under a fingerprint
     # certifying the result. So the same two checks run over *this command's*
-    # read set — and they run before `acquire_generation_lock`, because a
+    # read set — and they run before the generation lock is taken, because a
     # bounded observation that happens after the lock has already let one hung
     # mount hold the index generation lock for as long as the kernel likes.
     #
@@ -3992,8 +4097,15 @@ async def rebuild_tsvectors_all_scopes(session) -> dict:
 
     # Before the first row is read, so nothing can commit a keyword vector
     # between this snapshot and the record. A wait here is a wait for an
-    # in-flight index pass to commit, which is the intended behaviour.
-    await acquire_generation_lock(session)
+    # in-flight index pass to commit, which is the intended behaviour — and
+    # the *unbounded* form, because the engine caps a statement at 60s and the
+    # pass holds this lock for its whole transaction (L5b). Capped, this
+    # command did not wait for a pass at all: it was cancelled after a minute
+    # with a query-cancelled error that reads as a broken command rather than
+    # as a busy index. The raise is a `SET LOCAL`, which takes no row or table
+    # lock, so it precedes the acquisition without disturbing the ordering
+    # rule, and it is restored the moment the lock is ours.
+    await acquire_generation_lock_unbounded(session)
 
     # Re-enumerated under the lock, and deliberately not assumed equal to the
     # surveyed set: the survey ran before the lock, so a scope could have
@@ -4060,14 +4172,39 @@ async def rebuild_tsvectors_all_scopes(session) -> dict:
     return outcomes
 
 
-async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
-    """Recompute `content_tsvector` for every indexed note under the currently
+async def _rebuild_tsvectors_single_scope_for_tests(
+    session, user_id: int | None = None
+) -> int:
+    """Recompute `content_tsvector` for one owner scope under the currently
     configured `FTS_CONFIGS` (see `src/services/fts.py`). Returns the count of
     notes updated.
 
-    **The single-scope entry point, and it records no fingerprint.** A
-    per-owner rebuild cannot establish the global claim a fingerprint makes, so
-    that is `rebuild_tsvectors_all_scopes`'s job and only its job.
+    **Private, and the name says who it is for** (adversarial review). This
+    was `rebuild_tsvectors`, a public export — and it commits keyword vectors
+    **without taking the generation lock and without re-reading the keyword
+    fingerprint under it**, which is precisely the interlock every other
+    `content_tsvector` writer has. It had no production caller, so nothing was
+    wrong in the tree; but "no caller today" is a fact about today, and a
+    plausible-looking public function that quietly writes outside the interlock
+    is an invitation. A keyword vector is only ever rewritten when a note's
+    content hash changes, so one row written here under a superseded
+    `FTS_CONFIGS` keeps that vector indefinitely behind a fingerprint claiming
+    otherwise — a keyword search that matches a note not containing the word,
+    handed to an agent that acts on it unseen.
+
+    So the operational entry point is `rebuild_tsvectors_all_scopes`, which
+    takes the lock before its first read and writes the fingerprint for every
+    retained scope in one transaction. This one survives because the tests hold
+    its `int` contract over a single scope — atomicity, the certified UPDATE
+    predicate, the provenance gate — facts about `_rebuild_tsvectors_pinned`
+    that the driver's dict-of-outcomes return would obscure. Anything that
+    gives it a production caller must take the generation lock at the head of
+    that transaction first, and should almost certainly call the driver
+    instead.
+
+    **It records no fingerprint.** A per-owner rebuild cannot establish the
+    global claim a fingerprint makes, so that is
+    `rebuild_tsvectors_all_scopes`'s job and only its job.
 
     Run this after changing `FTS_CONFIGS`, since `notes_metadata` stores no raw
     body column — the tsvector must be rebuilt by re-reading each note's file.
@@ -4104,7 +4241,7 @@ async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
 
 
 class TsvectorRebuildAborted(RuntimeError):
-    """`rebuild_tsvectors` met a row it could not certify, and rolled back.
+    """`_rebuild_tsvectors_single_scope_for_tests` met a row it could not certify, and rolled back.
 
     Deliberately fatal rather than a skip. A rebuild exists to move every row
     onto the *current* `FTS_CONFIGS`, and a row it silently steps over keeps its
@@ -4298,7 +4435,7 @@ async def _rebuild_tsvectors_pinned(
     # **No commit here.** It used to commit at the end of each scope, which
     # made one user's index the unit of atomicity; the coverage driver needs a
     # wider one — every retained scope and the fingerprint that describes them,
-    # or nothing. The single-scope entry point (`rebuild_tsvectors`) commits on
+    # or nothing. The single-scope entry point (`_rebuild_tsvectors_single_scope_for_tests`) commits on
     # this function's behalf. The every-500 intermediate commits are still
     # gone, for #127's reason: a floor failure must roll the whole rebuild back
     # rather than leave a keyword index half-migrated between two

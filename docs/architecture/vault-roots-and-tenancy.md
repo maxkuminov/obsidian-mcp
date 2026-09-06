@@ -243,7 +243,7 @@ bypassed by two of the five, one of which is a different process entirely.
 path may begin a pass over a vault root without a snapshot published in this
 process by this orchestration*. That is why the per-user skip lives in the
 shared pass helpers rather than in each loop: `index_vault`,
-`link_backfill_pass`, `embed_vault` and `rebuild_tsvectors` each call
+`link_backfill_pass`, `embed_vault` and `_rebuild_tsvectors_single_scope_for_tests` each call
 `_refuse_quarantined_pass` **ahead of resolving the root**, so a sixth entry
 point added later inherits the guard by routing through the same helper. A skip
 re-implemented per loop is a skip one loop will be missing.

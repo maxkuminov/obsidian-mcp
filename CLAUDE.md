@@ -84,7 +84,17 @@ specific to this MCP server.
 | Migrations | `make db-migrate` (alembic) |
 | Schema drift | `make db-check` (`docker exec obsidian-mcp alembic check`) |
 | Schema gate (any change carrying a migration) | `make test-schema` |
+| Integration suite (real Postgres) | `make test-integration` |
 | Deploy | `make deploy` (build, backup, migrate, deploy) |
+
+**`tests/integration/` skips itself without a database.** Those modules are
+guarded on `PGVECTOR_TEST_ADMIN_URL`, so a local `pytest tests` reports green
+having executed none of them. CI's `tests` job sets it against a
+`pgvector/pgvector:pg16` service, so they do run on every push — but any local
+claim that "the suite passes" is a claim about the offline subset unless
+`make test-integration` ran, which stands up the throwaway container and sets
+the URL. It shares `SCHEMA_TEST_CONTAINER` / `SCHEMA_TEST_PORT` with
+`test-schema`, so do not run the two concurrently.
 
 **`alembic check` must be clean** — "No new upgrade operations detected." Run
 it after any migration and after any deploy that ran one (`make db-check`, or

@@ -149,6 +149,21 @@ A pre-existing object of either name is refused, not adopted, for the reason
 covers the whole note, and a wrong value either hides a capped note from an
 agent or invents a cap that never happened.
 
+**On the way *down*, the two units are decided independently.** `upgrade()`
+refuses as a whole — an unrecognised object of either name means the database
+is not what 023 assumes and nothing should be created against it. `downgrade()`
+does not: it drops each unit only if that unit carries 023's marker, prints
+which unmarked object it is leaving and why, and completes. The first
+implementation raised there too, which rolled the whole downgrade back — so a
+foreign `chunks_truncated` also preserved the `indexer_state` table 023 *did*
+create, and the downgrade could not run at all until an operator deleted
+somebody else's column by hand. One unit's provenance is not a veto over the
+other's; the two share a revision, not a lifecycle. The skip is `print`ed
+rather than logged because `alembic/env.py` never calls `fileConfig`, so
+`alembic.ini`'s logger configuration is not applied and a `logger.warning` from
+a migration body reaches nothing — and a silent skip is indistinguishable from
+a completed drop.
+
 **023 pins `SET LOCAL search_path TO public`** and asserts afterwards that the
 unqualified name really resolves to `public.indexer_state`. 021 introduced the
 pin and `RESET`s its own at the end of `upgrade()`, so a later revision in the
@@ -158,15 +173,21 @@ Pinning rather than passing `schema="public"` to each `op.*` call is
 deliberate: a schema-qualified table in alembic's eyes does not match a model
 that declares no schema, and `alembic check` would report drift for ever after.
 
-**The gate's asserted head moves from `022` to `023`.** Raising it is a
-required part of adding a migration, not a chore beside it: the assertion is
-the only thing that makes "head" a value somebody chose. Left at `022` the
-module would pass on a database migrated to `023`, and its guarantee — that the
-revisions it exercises are the revisions that will run — would quietly become a
-guarantee about a *prefix* of them. **The earlier waves' cases stay.** 013's,
-014's, 016's, 017's and 022's cases assert facts about those migrations' bodies
-that no later revision restates; a gate rewritten around only the newest wave
-stops testing the reconciliations the earlier ones exist to perform.
+**The gate's asserted head moves with the chain, and `023` was the head for
+about a day.** `HEAD_REVISION` in `tests/integration/test_schema_check.py`
+reads `024` at the time of writing — 023 landed with
+`index-integrity-hardening` and 024 (`user_sessions`) chained from it out of
+the sibling `panel-sessions-and-consent` change — and 023 is asserted as a
+revision *in the chain*, through its own fresh, stamp-back, impostor and
+downgrade cases, rather than as the head. Raising the literal is a required
+part of adding a migration, not a chore beside it: the assertion is the only
+thing that makes "head" a value somebody chose. Left behind, the module would
+pass on a database migrated past it, and its guarantee — that the revisions it
+exercises are the revisions that will run — would quietly become a guarantee
+about a *prefix* of them. **The earlier waves' cases stay.** 013's, 014's,
+016's, 017's and 022's cases assert facts about those migrations' bodies that
+no later revision restates; a gate rewritten around only the newest wave stops
+testing the reconciliations the earlier ones exist to perform.
 
 ## 024: `user_sessions`, and why no cookie was grandfathered
 

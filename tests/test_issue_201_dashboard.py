@@ -554,16 +554,27 @@ def test_reset_takes_the_generation_lock_as_its_first_statement(danger):
             request=_Req("application/json"), session=_FreshSession(), user=object()
         )
     )
-    assert "pg_advisory_xact_lock" in danger.executed[0], (
-        "advisory before any row or table lock — one direction everywhere; "
-        f"got {danger.executed[0]!r}"
+    lock_at = _index(danger.executed, "pg_advisory_xact_lock")
+    # The ordering rule is "advisory before any row or **table** lock", and the
+    # only statements ahead of it are the `SET LOCAL`s that lift the engine's
+    # 60 s `statement_timeout` off the wait. A `SET LOCAL` takes neither kind
+    # of lock — it is a session-variable assignment the lock graph cannot see —
+    # so it does not violate the rule, and without it the wait for an in-flight
+    # pass is cancelled after a minute instead of served.
+    assert all(
+        "statement_timeout" in sql for sql in danger.executed[:lock_at]
+    ), (
+        "something other than the timeout raise ran before the generation "
+        f"lock: {danger.executed[:lock_at]!r}"
     )
-    assert _index(danger.executed, "pg_advisory_xact_lock") < _index(
-        danger.executed, "statement_timeout"
-    ), "a 5-minute statement timeout must not abort a legitimate lock wait"
-    assert _index(danger.executed, "pg_advisory_xact_lock") < _index(
-        danger.executed, "DROP INDEX"
+    assert danger.executed[lock_at - 1].endswith("statement_timeout = 0"), (
+        "the timeout raise must be the statement immediately before the "
+        f"acquisition; got {danger.executed[lock_at - 1]!r}"
     )
+    assert lock_at < _index(danger.executed, "statement_timeout = '5min'"), (
+        "a 5-minute statement timeout must not abort a legitimate lock wait"
+    )
+    assert lock_at < _index(danger.executed, "DROP INDEX")
 
 
 def test_reset_records_the_fingerprint_in_the_same_transaction_as_the_wipe(danger):
@@ -633,10 +644,12 @@ def test_legacy_reembed_takes_the_lock_and_records_the_fingerprint(danger):
             token=token, request=_Req(), session=_FreshSession(), user=object()
         )
     )
-    assert "pg_advisory_xact_lock" in danger.executed[0]
-    assert _index(danger.executed, "pg_advisory_xact_lock") < _index(
-        danger.executed, "DELETE FROM note_embeddings"
-    )
+    lock_at = _index(danger.executed, "pg_advisory_xact_lock")
+    # Only the `statement_timeout` raise precedes it; see the reset test above.
+    assert all(
+        "statement_timeout" in sql for sql in danger.executed[:lock_at]
+    ), danger.executed[:lock_at]
+    assert lock_at < _index(danger.executed, "DELETE FROM note_embeddings")
     at = _index(danger.executed, "INSERT INTO indexer_state")
     assert danger.calls[at][1]["value"] == embedding_fingerprint()
     assert danger.committed

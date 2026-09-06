@@ -152,11 +152,57 @@ async def acquire_generation_lock(session: AsyncSession) -> None:
     A caller that waits here is waiting for an in-flight pass to commit, which
     is the intended behaviour — a reset must not land mid-pass — so the
     maintenance paths deliberately do not set a short `lock_timeout`.
+
+    **This form waits under whatever `statement_timeout` the connection
+    carries**, which for the application engine is 60 s
+    (`src/database.py`). That is the right bound for the embed path, whose
+    per-note transaction must not sit on a lock for minutes. Every path whose
+    documented contract is "it *waits* for an in-flight pass" — the two
+    maintenance commands, the panel's Danger-zone resets, and the incremental
+    pass itself — calls `acquire_generation_lock_unbounded` instead.
     """
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:key)"),
         {"key": INDEX_GENERATION_LOCK_KEY},
     )
+
+
+async def acquire_generation_lock_unbounded(session: AsyncSession) -> None:
+    """`acquire_generation_lock`, with **the wait alone** exempted from
+    `statement_timeout`, then the timeout restored for the rest of the
+    transaction.
+
+    The engine sets `statement_timeout` to 60 s in `server_settings`
+    (`src/database.py`), and `pg_advisory_xact_lock` is a statement like any
+    other: a wait longer than that is cancelled with a `QueryCanceledError`.
+    The pass holds this lock for the duration of its transaction — minutes on
+    a large vault (L5b) — so under the plain form a reset or a rebuild started
+    against a live service does not *wait* for the pass at all. It aborts after
+    a minute. That contradicts the specified behaviour ("a maintenance
+    operation waits for an in-flight pass"), and it contradicts it in the one
+    place the operator is least able to interpret: a maintenance command
+    failing with a query-cancelled error reads as a broken command, not as a
+    busy index.
+
+    **`SET LOCAL` takes no row or table lock**, so raising the timeout ahead of
+    the acquisition does not put a *lock* before the advisory lock and the
+    ordering rule (advisory before any row or table lock) is intact. It is a
+    session-variable assignment, invisible to the lock graph. An earlier
+    comment in `scripts/reset_embeddings.py` claimed otherwise and is corrected.
+
+    The timeout is put back the moment the lock is held, so the exemption
+    covers the wait and nothing else: the statements that follow keep whatever
+    bound their caller intends (the reset raises its own `5min` over the DDL
+    afterwards, and the index pass runs its mutations under the connection's
+    ordinary 60 s). `DEFAULT` rather than a value read back and re-issued —
+    `SET LOCAL x = DEFAULT` restores the *session* default, which for a
+    parameter delivered in the connection's startup packet (`server_settings`)
+    is exactly the engine's configured value. Nothing has to know what that
+    value is, so nothing can restore the wrong one.
+    """
+    await session.execute(text("SET LOCAL statement_timeout = 0"))
+    await acquire_generation_lock(session)
+    await session.execute(text("SET LOCAL statement_timeout = DEFAULT"))
 
 
 # --------------------------------------------------------------------------
