@@ -45,17 +45,39 @@ Single-user mode SHALL neither create nor validate session rows, because identit
 - **THEN** the session rows SHALL be removed by the database's cascade
 - **AND** the ORM SHALL NOT issue individual deletes or null the owning reference
 
-### Requirement: A minted session row SHALL be durable before its cookie is handed to the browser
+### Requirement: A session SHALL be minted under the account guard, against a freshly read active account, and committed there
 
-The mint implementation SHALL commit the session row itself and SHALL return only once that row is durable, so that no response can carry a cookie whose row was never committed. The request-scoped database session neither commits nor rolls back on its own, so an insert left to a caller's discretion is an insert that may never happen, and the resulting cookie would authenticate nothing.
+The mint implementation SHALL take the same account-guard advisory lock the administrative user-management handlers and the self-service password change take, SHALL re-read the owning user `FOR UPDATE` with the loaded object's attributes forced to the values read under the lock, and SHALL refuse to insert unless that row exists and its active flag is exactly true. The insert and its commit SHALL happen inside that same critical section, and the session identifier SHALL be written to the cookie only after that commit.
 
-Each of the three mint sites SHALL call it at a point where committing is safe: after the login handler's own commit, **after** the bootstrap transaction has committed rather than inside it — that transaction holds the bootstrap advisory lock and MUST NOT be lengthened — and in a second transaction after a password change has committed.
+Minting outside the guard is not sufficient, even where the caller checked the account moments earlier. A login that pauses between its own commit and its mint, or a password change whose re-issue follows the transaction that released the guard, can be overtaken by an administrator's deactivation — and the mint would then create a **live row for an account that has just been disabled**. Validation refuses such a row while the account is inactive, which conceals it; the row persists, and a later reactivation turns it into a working credential the administrator never granted. Serializing the mint against the handlers that deactivate is what removes that window: the insert either precedes the deactivation, and is revoked by it, or does not happen.
+
+The mint SHALL commit the row itself and SHALL return only once it is durable, so that no response can carry a cookie whose row was never committed. The request-scoped database session neither commits nor rolls back on its own, so an insert left to a caller's discretion is an insert that may never happen, and the resulting cookie would authenticate nothing.
+
+Each of the three mint sites SHALL call it where taking the guard and committing is safe: after the login handler's own commit; **after** the bootstrap transaction has committed rather than inside it — that transaction holds the bootstrap advisory lock and MUST NOT be lengthened, and the two keys are therefore taken sequentially and never nested; and in a second guarded transaction after a password change has committed.
 
 #### Scenario: The cookie works on the very next request
 
 - **WHEN** a user signs in and immediately makes another request with the cookie the login response set
 - **THEN** that request SHALL be authenticated
 - **AND** the session row SHALL be present in a separately opened database session
+
+#### Scenario: A deactivation racing a login mints nothing
+
+- **WHEN** an administrator's deactivation of an account commits after that account's login has verified its password but before the mint takes the guard
+- **THEN** no session row SHALL be created for that account
+- **AND** the response SHALL NOT present a cookie that authenticates a subsequent request
+
+#### Scenario: A deactivation racing a post-change re-issue mints nothing
+
+- **WHEN** an administrator's deactivation commits between a password change's commit and its session re-issue
+- **THEN** no session row SHALL be created
+- **AND** the acting browser SHALL be signed out
+
+#### Scenario: Reactivation does not revive a session that was never minted
+
+- **WHEN** an account deactivated during a mint window is later reactivated
+- **THEN** no session row from that window SHALL exist
+- **AND** no cookie issued in that window SHALL authenticate a request
 
 #### Scenario: Bootstrap mints outside the bootstrap transaction
 

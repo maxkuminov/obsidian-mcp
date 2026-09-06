@@ -6,7 +6,7 @@ The control panel SHALL expose an account page and a password-change handler ava
 
 The administrator-driven password reset SHALL remain available as the recovery path for a user who cannot sign in.
 
-In single-user mode there is no account row and no local password, so the handler SHALL answer as if the route did not exist.
+In single-user mode there is no account row and no local password, so **both** the account page and the password-change handler SHALL answer as if the route did not exist. A page whose only content is a form that cannot exist there is not a page, and the sidebar entry is already gated on multi-user mode; one rule for both methods is also one thing to verify.
 
 #### Scenario: A user changes their own password
 
@@ -19,9 +19,9 @@ In single-user mode there is no account row and no local password, so the handle
 - **WHEN** a signed-in user without the administrator role opens the account page
 - **THEN** the page SHALL render with the password-change form
 
-#### Scenario: Single-user mode has no account to change
+#### Scenario: Single-user mode has no account page and no account to change
 
-- **WHEN** the password-change handler is reached with multi-user mode disabled
+- **WHEN** either the account page or the password-change handler is reached with multi-user mode disabled
 - **THEN** it SHALL answer not-found and change nothing
 
 #### Scenario: The existing hashing semantics are unchanged
@@ -157,6 +157,14 @@ If the re-issue fails after the change has committed, the user SHALL be signed o
 The handler SHALL require a valid CSRF token like every other panel POST, and SHALL report both success and refusal through the panel's session-carried flash mechanism followed by a redirect, never through a query-string parameter. A message a link can carry is a message an attacker chooses.
 
 Refusal messages SHALL NOT distinguish which of the credential checks failed in a way that discloses anything about the stored password beyond the fact that the submitted current password did not match.
+
+A request rejected by either rate limit is **exempt** from this rule: it never reaches the handler, and the application-wide rate-limit error handler's JSON response SHALL stand unchanged. Producing a flash for it would require either a second counter inside the handler — which would diverge from the limiter that already decided — or replacing a process-wide error handler for one route. A rate-limit rejection also carries no message any caller chose.
+
+#### Scenario: A rate-limited attempt answers with the limiter's own response
+
+- **WHEN** a sixth attempt within the window is rejected by either limit
+- **THEN** the response SHALL be the application's rate-limit response rather than a flash and a redirect
+- **AND** nothing SHALL be written
 
 #### Scenario: A POST without a CSRF token is rejected
 

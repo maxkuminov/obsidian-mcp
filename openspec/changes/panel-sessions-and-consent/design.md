@@ -66,21 +66,30 @@ The registry is the per-session control; `users.session_version` remains in the 
 
 `WHERE revoked_at IS NULL` means a second revocation does not rewrite a historical revocation time.
 
-### D7a — The mint helper *does* commit, and that asymmetry is the contract
+### D7a — The mint runs inside the account guard, against a freshly read active account, and commits there
 
-**Added after review.** `start_session(request, session, user)` inserts the row **and commits it**, then writes `sid` into the cookie. It returns only once the row is durable.
+**Added after review round 1, tightened after round 2.** `start_session(request, session, user_id)` is one critical section:
 
-*Why the asymmetry with D7:* an insert nobody is required to commit is an insert that silently does not happen. `get_session` neither commits nor rolls back, so a cookie handed to the browser beside an uncommitted row is a cookie that authenticates nothing — a hard logout loop on the very next request, and one that only shows up under a handler whose own commit path changes later. Making the helper own the commit makes "the row exists before the cookie leaves" a property of one function rather than of three call sites' discipline.
+1. take the **account guard** — the same advisory key the administrative handlers and the password change take (D12);
+2. re-read the user `SELECT … FOR UPDATE` with **`execution_options(populate_existing=True)`**;
+3. refuse unless the row exists and `is_active` is exactly true;
+4. insert the session row;
+5. **commit**, which releases the guard;
+6. only then write `sid` into the cookie.
 
-The three callers are placed so that committing is always safe:
+*Why it commits (round 1):* an insert nobody is required to commit is an insert that silently does not happen. `get_session` neither commits nor rolls back, so a cookie handed to the browser beside an uncommitted row authenticates nothing — a hard logout loop on the very next request. Making the helper own the commit makes "the row exists before the cookie leaves" a property of one function rather than of three call sites' discipline. This is the deliberate asymmetry with D7: the mint owns a transaction, the revoke helpers ride someone else's.
+
+*Why it must be **inside** the guard (round 2):* every mint in the first draft happened after its guard-holding transaction had already committed and released — the login mint held no guard at all, and the post-change mint ran in a second transaction with no re-check. So an administrator's deactivation committing during a paused login, or between a password change's commit and its re-issue, would be followed by an insert creating a **live row for an account that had just been disabled**. Validation refuses that row while `is_active` is false, which hides the defect; the row is still there, and the day the account is **reactivated** it becomes a working credential the administrator never granted and never saw. Taking the guard and re-reading under it makes the mint serialize with the very handlers that deactivate, so the insert either precedes the deactivation (and is revoked by it) or never happens.
+
+The three callers, each placed so that taking the guard and committing is safe:
 
 | Caller | Placement |
 | --- | --- |
-| `login_submit` | after the existing `last_login_at` commit; the mint is its own transaction |
-| `register_submit` | **after** the bootstrap transaction commits — never inside it, because that transaction holds `USER_BOOTSTRAP_LOCK_KEY` and must not be lengthened |
-| the password-change handler | in a second transaction after the change has committed (D12) |
+| `login_submit` | after the existing `last_login_at` commit; the mint's guarded transaction is its own |
+| `register_submit` | **after** the bootstrap transaction commits — never inside it, because that transaction holds `USER_BOOTSTRAP_LOCK_KEY` and must not be lengthened. The two keys are taken sequentially, never nested, so no cycle is introduced |
+| the password-change handler | in a second guarded transaction after the change has committed (D13) |
 
-The regression is stated as a requirement: the cookie a mint hands back authenticates the **very next** request.
+Two regressions are stated as requirements: the cookie a mint hands back authenticates the **very next** request, and a deactivation racing a mint leaves **no row at all** — checked again after a subsequent reactivation, which is where a row created in that window would otherwise come to life.
 
 ### D8 — Logout that cannot revoke still logs you out, and records only a class name
 
@@ -139,7 +148,7 @@ The handler therefore:
 
 ### D13 — A password change revokes every session and re-mints the current one
 
-In the transaction of D12: new hash, `session_version += 1`, `revoke_user_sessions(session, user.id)` — **all** rows, this one included — then commit. Then, in a second transaction, `start_session(...)` mints a fresh identifier and row, and `SessionMiddleware` writes the new cookie on the redirect.
+In the transaction of D12: new hash, `session_version += 1`, `revoke_user_sessions(session, user.id)` — **all** rows, this one included — then commit. Then, in a second **guarded** transaction (D7a), `start_session(...)` re-takes the account guard, re-reads the account, requires it to still be active, mints a fresh identifier and row and commits; `SessionMiddleware` writes the new cookie on the redirect. The guard is released between the two transactions, so the re-check in the second is not redundant: an administrator can deactivate the account in exactly that gap.
 
 *Why revoke-all-then-remint:* the cookie that was live while the old password was live should not survive the change. Rotating the identifier alongside the password is standard fixation hygiene. The user-visible behaviour is the one asked for — other devices signed out, this browser still signed in.
 
@@ -207,7 +216,7 @@ If the integration slice finds `security_events` absent at merge time, the same 
 
 | Phase | Trigger | What happens | Where |
 | --- | --- | --- | --- |
-| **Mint** | successful login; bootstrap admin registration; re-issue after a password change | `sid = secrets.token_urlsafe(32)`; row inserted with `id = sha256(sid)`, `user_id`, `created_at`, `last_seen_at`, `expires_at = now + session_max_age`, `revoked_at = NULL`, `user_agent_hash`; **the helper commits the row**, then writes `sid` into the signed cookie beside `user_id` / `session_version` / `is_admin` / `username` | `start_session()` in `src/auth/session.py`; three callers, one implementation, each placed where committing is safe (D7a) |
+| **Mint** | successful login; bootstrap admin registration; re-issue after a password change | **under the account guard**: re-read the user `FOR UPDATE` with `populate_existing=True`, require it to exist and be active, then `sid = secrets.token_urlsafe(32)` and a row with `id = sha256(sid)`, `user_id`, `created_at`, `last_seen_at`, `expires_at = now + session_max_age`, `revoked_at = NULL`, `user_agent_hash`; **the helper commits**, releasing the guard, and only then writes `sid` into the signed cookie beside `user_id` / `session_version` / `is_admin` / `username` | `start_session()` in `src/auth/session.py`; three callers, one implementation, each placed where taking the guard and committing is safe (D7a) |
 | **Validate** | every request that resolves a browser identity | cookie must carry **both** `user_id` and `sid`; row read by `sha256(sid)`; refused when the row is absent, `revoked_at` is set, `expires_at <= now`, **`row.user_id != cookie user_id`** (D14), the user is missing or inactive, or `session_version` disagrees. Every refusal clears the cookie and records `panel_session_replay_refused` | `get_active_session_user()`; reached from `require_user_panel` (panel, `/api`, `/admin/users`), `login_form`, `authorize_get`, `authorize_post` — the only four entry points |
 | **Touch** | a `GET`/`HEAD` request whose row is more than `session_touch_interval_seconds` (60) stale | `UPDATE … SET last_seen_at = now() WHERE id = :h AND revoked_at IS NULL` on the **request's own** session, committed in the dependency before the handler runs; skipped on every other method and on any failure (D6) | `touch_session()`, called from `get_active_session_user` |
 | **Revoke — one** | logout | `revoked_at = now()` for this row, commit, cookie cleared, `panel_logout` + `panel_sessions_revoked(reason=logout)`; a failure still clears and redirects, logging the exception class only (D8) | `logout` in `src/auth/routes.py` |
@@ -237,11 +246,16 @@ POST /admin/account/password   (panel router: require_user_panel + verify_csrf)
   │    revoke_user_sessions(session, user.id)     ← all, including this one  [D13]
   │    commit                                     ← releases the lock
   ├─ panel_password_changed  (after the commit)
-  └─ SECOND TRANSACTION: start_session(...) → new sid, committed row, new cookie
+  └─ SECOND GUARDED TRANSACTION: start_session(...)                          [D7a]
+       lock_account_guard  →  re-read FOR UPDATE  →  still active?
+       no  → no row is minted; the user is simply signed out
+       yes → insert + commit → new sid, durable row, new cookie
      303 → /admin/account  with a flash
 ```
 
 Every refusal returns the same shape — flash on the session, 303 back to `/admin/account`, never a query string (`#138`) — and the credential refusal carries one constant message. Refusals count against the same limits as successes.
+
+**One exception, deliberately.** A request rejected by either rate limit never reaches the handler: slowapi's `RateLimitExceeded` is answered by the application-wide `_rate_limit_exceeded_handler` (`src/main.py:299`) with its own JSON 429. That response is **exempt** from the flash-and-303 rule and stays as it is. Wrapping it would mean either duplicating the limiter's decision inside the handler — where it is no longer a limit but a second, divergent counter — or replacing a process-wide error handler for one route. A 429 is also the one refusal a caller should be able to read programmatically, and it carries no message an attacker chose. The user-visible cost is that the sixth attempt in a minute renders as JSON rather than as the account page with a flash; the account page is one back-navigation away, and the limit is five attempts per minute.
 
 ## The consent card
 
@@ -298,7 +312,8 @@ Colours come from existing `--consent-*` tokens. If a token is added it goes int
 | The known-client badge attests the redirect **host**, not the application | Nothing on this server verifies an application. (D17) |
 | An allow-listed client still shows the self-registration notice | The notice is the finding; suppressing it restores the page #183 describes. |
 | A stolen cookie still works until logout, expiry, or an account event | This change makes those three effective; it does not detect theft. |
-| The account guard serializes self-service password changes against admin user-management writes | One shared key is what makes the check-then-act atomic; two keys do not exclude each other. Contention is two users deep. |
+| The account guard serializes self-service password changes, **every session mint**, and admin user-management writes against each other | One shared key is what makes the check-then-act atomic; two keys do not exclude each other. Every login now waits on it, so the contention set grew — but it is two users deep, the section is one indexed read and one insert, and the alternative is the deactivation race of D7a. |
+| The sixth password-change attempt in a minute renders as slowapi's JSON 429 rather than as the account page with a flash | Duplicating the limiter's decision inside the handler makes it a second, divergent counter; replacing the process-wide handler for one route is worse. (D25) |
 
 ## Owner decisions
 
@@ -309,7 +324,7 @@ Colours come from existing `--consent-*` tokens. If a token is added it goes int
 5. `user_agent_hash` is forensic only. (D5)
 6. **The touch runs in the request's own transaction, on `GET`/`HEAD` only, committed in the dependency, and is skipped otherwise** — never a second pool lease. (D6)
 7. Revocation helpers never commit. (D7)
-8. **The mint helper does commit**, and each of its three callers is placed where committing is safe. (D7a)
+8. **The mint runs inside the account guard against a freshly re-read, still-active account, and commits there** — a mint after the guard is released can create a live row for an account an administrator has just disabled, which comes to life on reactivation. (D7a)
 9. A failing logout still clears the cookie and redirects; the rollback is guarded and only the exception class is recorded. (D8)
 10. **Purge retains until seven days past the later of `expires_at` and `revoked_at`.** (D9)
 11. Password minimum is 12, in one constant, applied by **four** setters including `create_user`; no composition rules; no forced rotation. (D10)
@@ -324,7 +339,8 @@ Colours come from existing `--consent-*` tokens. If a token is added it goes int
 20. Events are **declared in `security_events`' catalogue** by one integration slice; no identifier, stored hash, password or hash — nor any ≥12-character substring — reaches a record. (D19)
 21. Config ranges are enforced (`ge=1` on both). (D20)
 22. `User.sessions` is `passive_deletes=True` with `cascade="all, delete"`, and the cascade is tested through the real handler. (D21)
-23. New panel page is `/admin/account`, `require_user_panel` (not admin), 404 in single-user mode, linked from the sidebar's Access section.
+23. New panel page is `/admin/account`, `require_user_panel` (not admin), linked from the sidebar's Access section — and **both** the `GET` and the `POST` answer 404 in single-user mode. The first draft rendered the page without its password card there; a page whose only content is a form that cannot exist is not a page, and the sidebar entry is already gated on `multi_user_mode`. One rule for both methods is also one thing to test.
+25. **Rate-limit rejections are exempt from the flash-and-303 rule**: slowapi's JSON 429 from the application-wide handler stands, because the alternative is a second, divergent counter inside the handler or a process-wide error handler replaced for one route.
 24. 024 chains from **023** (`index-integrity-hardening`) and must not merge ahead of it; the schema gate's head requirement is **modified**, not duplicated, to move `017 → 024`.
 
 ## Review round 1 (Codex, pre-code) — findings and where they went
@@ -350,3 +366,14 @@ FAIL: 3 BLOCKER, 11 MAJOR, 3 MINOR. All folded; none rejected.
 | MINOR — config ranges unenforced | D20 |
 | MINOR — "single-user mode never reads `user_sessions`" contradicts the purge | Context section and the spec now exempt maintenance cleanup |
 | MINOR — allow-list whitespace | D16 |
+
+## Review round 2 (Codex, pre-code) — findings and where they went
+
+FAIL: 1 BLOCKER, 1 MAJOR, 2 MINOR, with round 1's items accepted as resolved. All folded; none rejected. This was the final spec round.
+
+| Finding | Disposition |
+| --- | --- |
+| BLOCKER — the mint runs after the guard is released and with no fresh active-account check, so a paused login or a post-change re-issue can create a live row for an account an administrator just deactivated, which authenticates once the account is reactivated | D7a rewritten: every mint takes the account guard, re-reads `FOR UPDATE` with `populate_existing=True`, requires the account to exist and be active, and inserts and commits inside that critical section. Both race regressions specified, including the reactivation check |
+| MAJOR — slice 7 misses the two test modules the guard-key move and the row-counted `revoke_user_sessions` break, and does not name the shared mint helper | `tests/test_issue_69_self_edit_role_lock.py` and `tests/test_issue_90_self_delete_refused.py` added to slice 7's inventory; the helper is `tests/session_helpers.py`, owned by that slice |
+| MINOR — `GET /admin/account` in single-user mode | Owner decision 23: **404 for both methods**; the page has no purpose there. Decision, task and scenario aligned |
+| MINOR — rate-limit responses versus the flash-and-303 rule | D25 and a spec exemption: slowapi's JSON 429 stands, with the reasons and a sixth-request test |
