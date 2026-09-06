@@ -154,14 +154,25 @@ update it in the same change.** What stays here is the short list:
   inside `_tracked` ends with one parseable line,
   `MCP-REFUSAL {"code":…,"retry_after_seconds":…}`, carried identically into a
   structured tool's error field; the transport 429s (failed-auth budget,
-  transfer redemption) are deliberately outside that contract. `rate_limited`
+  transfer redemption) are deliberately outside that contract. `rate_limited` and enforced `slot_timeout`
   rows are coalesced — a row stands for `1 + suppressed` refusals.
 - **New API keys get `DEFAULT_DAILY_REQUEST_LIMIT` (5,000); existing keys are
   grandfathered** — applied in application code, never as a column default, and
   an explicit `null` (or a blank panel field) still means unlimited. OAuth
   grants and pre-existing NULL-limit keys therefore have **velocity bounds
-  only**, owner-accepted. **Concurrency is not bounded at all** — deferred to
-  `mcp-concurrency-slots`, which ships in shadow mode first.
+  only**, owner-accepted. **Concurrency admission defaults to shadow mode**:
+  observe pressure without delaying or refusing calls. `enforce` bounds full
+  MCP requests, authentication sessions, tool classes/tenants/principals, and
+  usage writers. Tool admission follows argument checks and precedes quota;
+  leases remain held through telemetry. Its pool budget leaves four shared
+  connections of headroom, not a reservation against other consumers. See
+  [rate limits](docs/architecture/rate-limits.md) before changing settings.
+- **Tool-body outcomes are typed internally.** Only the terminal `BodyOutcome`
+  (or `ReadNoteResult` private outcome) drives usage classification; never
+  infer failure from prose or a note's forged `MCP-REFUSAL` text. Partial writes
+  retain publication uncertainty and cannot claim `nothing_written`. Body
+  refusals remain executed work; shadow pressure cannot replace their actual
+  outcome. See [usage attribution](docs/architecture/usage-attribution.md).
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
@@ -215,7 +226,7 @@ summaries.
 | [search.md](docs/architecture/search.md) | `semantic_search` / `keyword_search` / `find_related` and every `SET LOCAL` they issue |
 | [indexing-and-embeddings.md](docs/architecture/indexing-and-embeddings.md) | the indexer loop, the embed pass, tsvector writers, provider abstraction |
 | [security-event-logging.md](docs/architecture/security-event-logging.md) | `src/logging_setup.py`, `src/services/security_events.py`, and any call site that logs a refusal: the field allow-list, the event catalogue, the suppressor |
-| [rate-limits.md](docs/architecture/rate-limits.md) | `src/services/rate_limits.py`, `src/services/refusals.py`, the failed-auth budget in `APIKeyMiddleware`, the gate order in `_tracked`, the worker count, and every `MCP_RATE_LIMIT_*` / `MCP_AUTH_FAILURE_*` / `DEFAULT_DAILY_REQUEST_LIMIT` setting |
+| [rate-limits.md](docs/architecture/rate-limits.md) | `src/services/rate_limits.py`, `src/services/concurrency.py`, `src/services/pool_budget.py`, `src/services/refusals.py`, the failed-auth budget in `APIKeyMiddleware`, the gate order in `_tracked`, the worker count, and every `MCP_RATE_LIMIT_*` / `MCP_AUTH_FAILURE_*` / `MCP_CONCURRENCY_*` / `DEFAULT_DAILY_REQUEST_LIMIT` setting |
 | [usage-attribution.md](docs/architecture/usage-attribution.md) | `usage_logs`, `_log_usage`, actor columns |
 | [control-panel.md](docs/architecture/control-panel.md) | panel templates, flash messages, admin guards, the Danger zone |
 

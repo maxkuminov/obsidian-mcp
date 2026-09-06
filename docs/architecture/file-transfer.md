@@ -4,6 +4,15 @@
 
 ## File transfer
 
+The transfer tools return typed body refusals (#263) without moving credential
+checks, stream deadlines or publication boundaries. A returned
+`PostPublishFailure` from `import_from_url` is `partial_completion` with a
+partial disposition: bytes landed and the caller must inspect them before
+retrying. Existing `check_upload` statuses, including expired, revoked and
+unknown, remain successful status queries; only a malformed or inaccessible
+handle is a body refusal. Outcome telemetry records closed markers, never a
+capability or exception prose. Transport routes keep their HTTP contracts.
+
 No MCP client can hand a tool the bytes of a file the user is looking at, and
 the server cannot reach the user's disk. Five tools plus a public route family
 close that gap. The whole design is one idea: **a capability pins everything it
@@ -405,4 +414,3 @@ The host is folded to canonical ASCII **first** (NFKC, the alternative full stop
 
 ### Declared filesystem semantics
 Case-sensitive, non-normalising filesystems (ext4/xfs — the production bind mount) on Linux. Hard links must work within the root, and `.trash` must accept a same-device `renameat2(RENAME_NOREPLACE)`; the probes refuse otherwise rather than degrading to an overwriting move. Since #59 this covers the **note** tools too — `create_note`/`write_file` no-clobber publication needs the hard link, and `move_note`/`delete_note` need `renameat2` — so a mount without them loses those tools with a named error, not silently. Case-insensitive or normalising mounts are out of scope, as is any platform without `renameat2` — the non-replacing move has no portable fallback.
-

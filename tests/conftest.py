@@ -59,6 +59,25 @@ SETTINGS_ENV_KEYS = (
     "SESSION_TOUCH_INTERVAL_SECONDS",
     "SESSION_PURGE_RETAIN_DAYS",
     "OAUTH_KNOWN_REDIRECT_HOSTS",
+    "MCP_CONCURRENCY_MODE",
+    "MCP_CONCURRENCY_WAIT_SECONDS",
+    "MCP_CONCURRENCY_REQUESTS",
+    "MCP_CONCURRENCY_FINGERPRINT",
+    "MCP_CONCURRENCY_AUTH",
+    "MCP_CONCURRENCY_TOOLS",
+    "MCP_CONCURRENCY_TENANT",
+    "MCP_CONCURRENCY_PRINCIPAL",
+    "MCP_CONCURRENCY_EMBEDDING",
+    "MCP_CONCURRENCY_VECTOR",
+    "MCP_CONCURRENCY_WRITE",
+    "MCP_CONCURRENCY_OTHER",
+    "MCP_CONCURRENCY_WAITERS",
+    "MCP_CONCURRENCY_TENANT_WAITERS",
+    "MCP_CONCURRENCY_PRINCIPAL_WAITERS",
+    "MCP_CONCURRENCY_REGISTRY_SIZE",
+    "MCP_CONCURRENCY_WRITERS",
+    "MCP_CONCURRENCY_WRITER_WAITERS",
+    "MCP_CONCURRENCY_WRITER_WAIT_SECONDS",
     "MCP_SANDBOX_MODE",
     # The /mcp rate controls (#188, #194). Every one is a `Settings` field, so
     # a developer with any of them exported would otherwise change what the
@@ -223,6 +242,23 @@ def _reset_provider_cache():
     embeddings.get_provider.cache_clear()
     yield
     embeddings.get_provider.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_concurrency_controller():
+    """Give each test its own explicit process-controller boundary (#261).
+
+    Lifespan tests intentionally close admissions and writers. That shutdown
+    must persist for the rest of that test, but must not turn unrelated later
+    middleware calls into 429s or suppress their usage inserts. Production
+    requests never reset the controller; tests and lifespan own that boundary.
+    Captured leases still release their original controller after replacement.
+    """
+    from src.services import concurrency
+
+    concurrency.reset_controller()
+    yield
+    concurrency.get_controller().shutdown(close_writers=True)
 
 
 @pytest.fixture(autouse=True)

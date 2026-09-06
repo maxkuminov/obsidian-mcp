@@ -69,7 +69,7 @@ class _QuotaSpySession:
     "cap_probe_structured",
     ["query"],
     refusal_result=tools._read_note_refusal,
-    arg_char_caps={"query": MAX_SEARCH_QUERY_CHARS},
+    arg_char_caps={"query": MAX_SEARCH_QUERY_CHARS}, resource_class="other",
 )
 async def _structured_probe(query: str) -> ReadNoteResult:  # pragma: no cover
     return ReadNoteResult(content="body")

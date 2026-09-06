@@ -1385,7 +1385,7 @@ def _no_db(monkeypatch) -> list:
 
 @pytest.mark.parametrize("kind", ["directory", "symlink"])
 async def test_a_source_replaced_by_a_non_file_is_moved_back(
-    vault, monkeypatch, kind
+    vault, monkeypatch, outcome_rows, kind
 ):
     """`renameat2` relocates whatever inode is at the source when it runs.
 
@@ -1414,6 +1414,7 @@ async def test_a_source_replaced_by_a_non_file_is_moved_back(
     monkeypatch.setattr(tools, "_pin_source_inode", swap_before_capture)
 
     result = await tools.move_note_impl("source.md", "moved.md")
+    _assert_terminal_outcome(result, outcome_rows, "concurrent_write", "refused")
 
     assert fired
     assert "Move refused" in result, result
@@ -1429,7 +1430,7 @@ async def test_a_source_replaced_by_a_non_file_is_moved_back(
     assert executed == []
 
 
-async def test_a_failed_rollback_names_the_recovery_location(vault, monkeypatch):
+async def test_a_failed_rollback_names_the_recovery_location(vault, monkeypatch, outcome_rows):
     source = vault / "source.md"
     source.write_text("note\n", encoding="utf-8")
     executed = _no_db(monkeypatch)
@@ -1453,6 +1454,7 @@ async def test_a_failed_rollback_names_the_recovery_location(vault, monkeypatch)
     monkeypatch.setattr(vault_fs, "rename_noreplace", fail_rollback)
 
     result = await tools.move_note_impl("source.md", "moved.md")
+    _assert_terminal_outcome(result, outcome_rows, "partial_completion", "partial")
 
     assert "Move refused" in result, result
     assert "could not be moved back" in result, result
@@ -1465,7 +1467,7 @@ async def test_a_failed_rollback_names_the_recovery_location(vault, monkeypatch)
 
 
 async def test_a_destination_taken_over_after_the_move_is_not_rolled_back(
-    vault, monkeypatch
+    vault, monkeypatch, outcome_rows
 ):
     """Only our own inode is ever moved back.
 
@@ -1494,6 +1496,7 @@ async def test_a_destination_taken_over_after_the_move_is_not_rolled_back(
     # The retained source witness prevents reuse without a fake identity.
 
     result = await tools.move_note_impl("source.md", "moved.md")
+    _assert_terminal_outcome(result, outcome_rows, "publication_uncertain", "partial")
 
     assert fired
     assert "not the file that was moved" in result, result
@@ -1504,7 +1507,7 @@ async def test_a_destination_taken_over_after_the_move_is_not_rolled_back(
 
 
 async def test_an_unverifiable_destination_is_reported_not_raised(
-    vault, monkeypatch
+    vault, monkeypatch, outcome_rows
 ):
     """Every post-rename failure becomes an explicit result: by then the file
     has been published somewhere, and a traceback leaves the caller with no
@@ -1534,6 +1537,7 @@ async def test_an_unverifiable_destination_is_reported_not_raised(
     )
 
     result = await tools.move_note_impl("source.md", "moved.md")
+    _assert_terminal_outcome(result, outcome_rows, "publication_uncertain", "partial")
 
     assert "unverifiable" in result, result
     assert "moved.md" in result, result
@@ -1541,13 +1545,14 @@ async def test_an_unverifiable_destination_is_reported_not_raised(
 
 
 async def test_an_unpinnable_source_is_reported_rather_than_assumed(
-    vault, monkeypatch
+    vault, monkeypatch, outcome_rows
 ):
     (vault / "source.md").write_text("note\n", encoding="utf-8")
     executed = _no_db(monkeypatch)
     monkeypatch.setattr(tools, "_pin_source_inode", lambda target: nullcontext(None))
 
     result = await tools.move_note_impl("source.md", "moved.md")
+    _assert_terminal_outcome(result, outcome_rows, "publication_uncertain", "partial")
 
     assert "could not be identified" in result, result
     assert executed == []
@@ -1999,3 +2004,23 @@ def test_witness_stat_failure_yields_none_and_closes_descriptor(vault, monkeypat
         with pytest.raises(OSError) as closed:
             os.fstat(witnesses[0])
         assert closed.value.errno == errno.EBADF
+
+
+@pytest.fixture
+def outcome_rows(vault, monkeypatch):
+    rows = []
+    async def record(tool, params, *args):
+        rows.append(params)
+    monkeypatch.setattr(tools, "_log_usage", record)
+    return rows
+
+
+def _assert_terminal_outcome(result, rows, code, disposition):
+    from src.services.tool_outcomes import BodyOutcome
+    assert isinstance(result, BodyOutcome)
+    assert result.refusal.code == result.marker == code
+    assert result.disposition == disposition
+    assert result.refusal.nothing_written is None
+    assert len(rows) == 1
+    assert rows[0]["error"] == code
+    assert rows[0]["body_outcome"] == disposition

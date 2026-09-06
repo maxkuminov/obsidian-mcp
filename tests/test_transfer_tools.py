@@ -590,7 +590,9 @@ async def test_a_pasted_url_or_token_never_reaches_usage_logs(
     """The mistake an agent actually makes must not write a capability to a log."""
     await tools.check_upload_impl(bad)
     entry = next(e for e in usage_log if e["tool"] == "check_upload")
-    assert entry["params"] == {"upload_id": "<invalid>"}
+    assert entry["params"] == {
+        "upload_id": "<invalid>", "error": "invalid_argument", "body_outcome": "refused"
+    }
     logged = str(usage_log)
     assert "s" * 43 not in logged
     assert "transfer/upload#" not in logged
@@ -858,7 +860,7 @@ async def test_import_survives_a_failing_close_after_publication(
 
 
 async def test_import_reports_a_post_publish_failure_as_written(
-    vault, readwrite, canned_fetch, publish_gate, monkeypatch
+    vault, readwrite, canned_fetch, publish_gate, monkeypatch, usage_log
 ):
     """When the bookkeeping genuinely fails, the message still says "in place".
 
@@ -879,6 +881,14 @@ async def test_import_reports_a_post_publish_failure_as_written(
     )
     monkeypatch.undo()
 
+    from src.services.tool_outcomes import BodyOutcome
+    assert isinstance(result, BodyOutcome)
+    assert result.refusal.code == result.marker == "partial_completion"
+    assert result.disposition == "partial"
+    assert result.refusal.nothing_written is None
+    assert len(usage_log) == 1
+    assert usage_log[0]["params"]["error"] == "partial_completion"
+    assert usage_log[0]["params"]["body_outcome"] == "partial"
     assert "IS in place" in result
     assert "Nothing was written" not in result
     assert (vault / "Attachments" / "a.png").read_bytes() == PNG

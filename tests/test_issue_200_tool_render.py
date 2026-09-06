@@ -495,7 +495,7 @@ async def test_the_not_embedded_branch_is_unchanged(monkeypatch, captured):
 
     out = await tools.find_related_impl("Source.md", limit=5)
 
-    assert out == (
+    assert out.prose == (
         "`Source.md` has not been embedded yet — "
         "the indexer is still catching up. Try again in a few minutes."
     )
@@ -512,7 +512,7 @@ async def test_the_not_found_branch_is_unchanged(monkeypatch, captured):
 
     out = await tools.find_related_impl("Nope.md", limit=5)
 
-    assert out == "Note not found: Nope.md"
+    assert out.prose == "Note not found: Nope.md"
     assert captured.params_for("find_related")["error"] == (
         tools._RELATED_SOURCE_NOT_FOUND_MARKER
     )

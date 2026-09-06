@@ -20,7 +20,7 @@ from src.config import settings
 from src.database import async_session
 from src.models.db import APIKey, OAuthClient, OAuthToken, User
 from src.oauth.scope import has_vault_scope, token_has_write
-from src.services import rate_limits, security_events
+from src.services import concurrency, rate_limits, security_events
 from src.services.vault import warm_user_vault_cache
 
 logger = logging.getLogger(__name__)
@@ -125,6 +125,34 @@ def _www_authenticate(error: str | None = None) -> str:
         parts.append(f'error="{error}"')
     parts.append(f'resource_metadata="{resource_metadata}"')
     return "Bearer " + ", ".join(parts)
+
+
+
+def _concurrency_response(admission):
+    pressure = admission.pressure
+    return JSONResponse(
+        {"error": "MCP concurrency capacity is unavailable", "code": pressure.code,
+         "scope": pressure.scope, "limit": pressure.limit},
+        status_code=429, headers={"Retry-After": "1"},
+    )
+
+
+def _emit_concurrency_pressure(request, admission):
+    pressure = admission.pressure
+    try:
+        security_events.emit(
+            "mcp_concurrency_pressure",
+            subject=security_events.subject_for(request=request),
+            reason=f"{pressure.stage}:{pressure.scope}",
+            outcome="shadow" if admission.shadow is not None else "refused",
+            limit_count=pressure.limit, method=request.method,
+            route=request.url.path, client_ip=security_events.client_ip(request),
+        )
+    except Exception:
+        # Telemetry is response-neutral, including catalogue/configuration
+        # faults. No failed emission may strand a request/auth lease.
+        pass
+
 
 
 class APIKeyMiddleware:
@@ -245,308 +273,41 @@ class APIKeyMiddleware:
         # and a direct in-process caller behave exactly as they did.
         token_principal = current_principal.set(None)
 
+        controller = concurrency.get_controller()
+        request_admission = controller.request(hash_key(token))
+        if request_admission.pressure is not None:
+            _emit_concurrency_pressure(request, request_admission)
+        if not request_admission.admitted:
+            # No session was opened; the full-request envelope is already full.
+            response = _concurrency_response(request_admission)
+            # Context restoration below still runs on this early refusal.
+        else:
+            response = None
+        observed = tuple(p for p in (request_admission.pressure,)
+                         if p is not None and controller.mode == "shadow")
+        observation_token = concurrency.request_observations.set(observed)
         try:
-            if token.startswith("omcp_"):
-                # Legacy API key auth
-                key_hash = hash_key(token)
-
-                async with async_session() as session:
-                    result = await session.execute(
-                        select(APIKey).where(
-                            APIKey.key_hash == key_hash,
-                            APIKey.is_active == True,
-                        )
-                    )
-                    api_key = result.scalar_one_or_none()
-
-                    if api_key is None:
-                        _emit_auth_failure(request, "invalid_key", token=token)
-                        response = JSONResponse(
-                            {"error": "Invalid or revoked key"},
-                            status_code=401,
-                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
-                        )
-                        await response(scope, receive, send)
-                        return
-
-                    if api_key.user_id is None and settings.multi_user_mode:
-                        # An ownerless key in multi-user mode. These exist: a
-                        # key minted while multi-user was off keeps
-                        # `user_id = NULL`, and the bootstrap backfill in
-                        # `src/auth/routes.py` only claims those rows when
-                        # `users` is *empty* — flip the flag after users
-                        # exist and the NULLs are never adopted. Such a key
-                        # used to be treated as single-user by every layer:
-                        # the warm was skipped and `_vault_root(None)`
-                        # returned the global `settings.vault_path`, so an
-                        # ownerless readwrite key could edit the whole vault.
-                        # Refuse it here, with the same body as any other
-                        # rejected key.
-                        _emit_auth_failure(
-                            request, "ownerless_credential", key_id=api_key.id
-                        )
-                        response = JSONResponse(
-                            {"error": "Invalid or revoked key"},
-                            status_code=401,
-                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
-                        )
-                        await response(scope, receive, send)
-                        return
-
-                    if api_key.user_id is not None:
-                        result = await session.execute(
-                            select(User.is_active).where(User.id == api_key.user_id)
-                        )
-                        if result.scalar_one_or_none() is not True:
-                            _emit_auth_failure(
-                                request,
-                                "inactive_user",
-                                key_id=api_key.id,
-                                user_id=api_key.user_id,
-                            )
-                            response = JSONResponse(
-                                {"error": "Invalid or revoked key"},
-                                status_code=401,
-                                headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
-                            )
-                            await response(scope, receive, send)
-                            return
-
-                    # Check expiry
-                    if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
-                        _emit_auth_failure(
-                            request,
-                            "key_expired",
-                            key_id=api_key.id,
-                            user_id=api_key.user_id,
-                        )
-                        response = JSONResponse(
-                            {"error": "Key expired"},
-                            status_code=401,
-                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
-                        )
-                        await response(scope, receive, send)
-                        return
-
-                    # Update last_used_at
-                    await session.execute(
-                        update(APIKey).where(APIKey.id == api_key.id).values(
-                            last_used_at=datetime.now(timezone.utc)
-                        )
-                    )
-                    await session.commit()
-
-                    # Store key info in scope for tools to access
-                    scope["state"] = scope.get("state", {})
-                    scope["state"]["api_key_id"] = api_key.id
-                    scope["state"]["api_key_permission"] = api_key.permission
-                    scope["state"]["request_start"] = time.time()
-
-                    # Set context variables so tools can check permission and log usage
-                    current_permission.set(api_key.permission)
-                    current_api_key_id.set(api_key.id)
-                    current_user_id.set(api_key.user_id)
-                    # The key row is already loaded, so the actor label costs
-                    # no extra query -- and once written to `usage_logs` it
-                    # survives the row's deletion, which the panel performs
-                    # after NULLing `usage_logs.key_id` (issue #77).
-                    current_actor.set(("api_key", api_key.name, api_key.key_prefix))
-                    # The key row is loaded, so the quota ceiling is free here
-                    # too (#162). NULL — every key until an operator sets one —
-                    # means unlimited, and `_tracked` then issues no quota
-                    # statement at all.
-                    current_daily_request_limit.set(api_key.daily_request_limit)
-                    # The row is in hand, so the principal costs no query
-                    # either — the same house rule the actor label and the
-                    # quota ceiling follow.
-                    current_principal.set(("api_key", api_key.id))
-                    # In single-user mode `api_key.user_id` is None so this
-                    # is skipped entirely. In multi-user mode, read the user's
-                    # `vault_path` now and bind the answer to this request:
-                    # it both warms the shared cache (so sync
-                    # `_vault_root(user_id)` calls don't hit a cold one) and
-                    # gives `_vault_root` a snapshot no other task can
-                    # overwrite. A None here means "unassigned", and every
-                    # tool call in this request is refused (issue #66).
-                    if api_key.user_id is not None:
-                        current_vault_root.set((
-                            api_key.user_id,
-                            await warm_user_vault_cache(session, api_key.user_id),
-                        ))
+            if response is None:
+                auth_admission = controller.auth()
+                if auth_admission.pressure is not None:
+                    _emit_concurrency_pressure(request, auth_admission)
+                    if controller.mode == "shadow":
+                        concurrency.request_observations.set(observed + (auth_admission.pressure,))
+                if auth_admission.admitted:
+                    try:
+                        response = await self._authenticate(request, scope, token)
+                    finally:
+                        auth_admission.lease.release()
+                else:
+                    response = _concurrency_response(auth_admission)
+            if response is not None:
+                await response(scope, receive, send)
             else:
-                # OAuth token auth
-                token_hash = hash_key(token)
-
-                async with async_session() as session:
-                    # One statement, three consumers: the token itself, the
-                    # client's owner for the cross-user check below, and the
-                    # client's name for the denormalised `usage_logs` actor
-                    # label (issue #77). Reading the name in a *second* query
-                    # would add a round trip to every OAuth request, including
-                    # the single-user path that previously issued none -- and
-                    # the join is over the FK `oauth_tokens.client_id` already
-                    # is. `outerjoin`, not `join`: the FK makes a token without
-                    # a client row impossible, and if that ever stopped holding
-                    # an inner join would silently turn the token into a 401,
-                    # which is a different decision than the one made here.
-                    result = await session.execute(
-                        select(
-                            OAuthToken,
-                            OAuthClient.user_id.label("client_owner"),
-                            OAuthClient.client_name,
-                        )
-                        .outerjoin(
-                            OAuthClient,
-                            OAuthClient.client_id == OAuthToken.client_id,
-                        )
-                        .where(
-                            OAuthToken.token_hash == token_hash,
-                            OAuthToken.token_type == "access",
-                            OAuthToken.revoked == False,
-                        )
-                    )
-                    row = result.first()
-                    oauth_token, client_owner, client_name = (
-                        row if row is not None else (None, None, None)
-                    )
-
-                    if oauth_token is None:
-                        _emit_auth_failure(request, "invalid_key", token=token)
-                        response = JSONResponse(
-                            {"error": "Invalid or revoked token"},
-                            status_code=401,
-                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
-                        )
-                        await response(scope, receive, send)
-                        return
-
-
-                    if oauth_token.user_id is None and settings.multi_user_mode:
-                        # Same as the API-key branch above: an ownerless token
-                        # in multi-user mode would resolve the global vault.
-                        _emit_auth_failure(
-                            request,
-                            "ownerless_credential",
-                            oauth_token_id=oauth_token.id,
-                        )
-                        response = JSONResponse(
-                            {"error": "Invalid or revoked token"},
-                            status_code=401,
-                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
-                        )
-                        await response(scope, receive, send)
-                        return
-
-                    if oauth_token.user_id is not None:
-                        result = await session.execute(
-                            select(User.is_active).where(User.id == oauth_token.user_id)
-                        )
-                        if result.scalar_one_or_none() is not True:
-                            _emit_auth_failure(
-                                request,
-                                "inactive_user",
-                                oauth_token_id=oauth_token.id,
-                                user_id=oauth_token.user_id,
-                            )
-                            response = JSONResponse(
-                                {"error": "Invalid or revoked token"},
-                                status_code=401,
-                                headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
-                            )
-                            await response(scope, receive, send)
-                            return
-
-                    # The grant's owner must still be the client's owner. A
-                    # cross-user grant can no longer be created, but one made
-                    # before the consent and rotation paths refused it stays
-                    # live for the access token's full hour and is invisible in
-                    # either user's panel. An unbound client (NULL owner) is
-                    # not a conflict — it has simply never been claimed.
-                    if oauth_token.user_id is not None:
-                        if client_owner is not None and client_owner != oauth_token.user_id:
-                            _emit_auth_failure(
-                                request,
-                                "cross_user_grant",
-                                oauth_token_id=oauth_token.id,
-                                user_id=oauth_token.user_id,
-                            )
-                            response = JSONResponse(
-                                {"error": "Invalid or revoked token"},
-                                status_code=401,
-                                headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
-                            )
-                            await response(scope, receive, send)
-                            return
-
-                    if oauth_token.expires_at < datetime.now(timezone.utc):
-                        _emit_auth_failure(
-                            request,
-                            "key_expired",
-                            oauth_token_id=oauth_token.id,
-                            user_id=oauth_token.user_id,
-                        )
-                        response = JSONResponse(
-                            {"error": "Token expired"},
-                            status_code=401,
-                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
-                        )
-                        await response(scope, receive, send)
-                        return
-
-                    # A token that names no vault scope grants nothing. Falling
-                    # through to `read` here is the same conflation
-                    # `clamp_scope` used to make: `offline_access` says the
-                    # grant may carry a refresh token, not that it may read a
-                    # note. No path can mint such a token any more, but a
-                    # client registered `scope="offline_access"` before this
-                    # could already hold one, and this is the boundary that
-                    # decides what it may do.
-                    if not has_vault_scope(oauth_token.scope):
-                        _emit_auth_failure(
-                            request,
-                            "no_vault_scope",
-                            oauth_token_id=oauth_token.id,
-                            user_id=oauth_token.user_id,
-                        )
-                        response = JSONResponse(
-                            {"error": "Invalid or revoked token"},
-                            status_code=401,
-                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
-                        )
-                        await response(scope, receive, send)
-                        return
-
-                    # Map OAuth scope to permission. Scopes are space-separated
-                    # sets (OAuth 2.0 convention), so this is a membership test
-                    # -- and it is the *same* helper the control panel uses to
-                    # decide what to display, so the badge and the enforcement
-                    # cannot disagree (issue #65).
-                    permission = "readwrite" if token_has_write(oauth_token.scope) else "read"
-
-                    scope["state"] = scope.get("state", {})
-                    scope["state"]["api_key_id"] = None
-                    scope["state"]["api_key_permission"] = permission
-                    scope["state"]["request_start"] = time.time()
-
-                    current_permission.set(permission)
-                    current_api_key_id.set(None)
-                    current_oauth_token_id.set(oauth_token.id)
-                    current_user_id.set(oauth_token.user_id)
-                    current_actor.set(("oauth", client_name, oauth_token.client_id))
-                    # The **grant**, not the access token: `grant_id` is NOT
-                    # NULL and shared by every rotation of one `/authorize`
-                    # approval (migration 014, #64), so refreshing an access
-                    # token continues an allowance rather than resetting it,
-                    # and two independently revocable grants never share one.
-                    current_principal.set(("oauth", oauth_token.grant_id))
-                    if oauth_token.user_id is not None:
-                        current_vault_root.set((
-                            oauth_token.user_id,
-                            await warm_user_vault_cache(session, oauth_token.user_id),
-                        ))
-
-            await self.app(scope, receive, send)
+                await self.app(scope, receive, send)
         finally:
+            if request_admission.lease is not None:
+                request_admission.lease.release()
+            concurrency.request_observations.reset(observation_token)
             current_permission.reset(token_perm)
             current_api_key_id.reset(token_key)
             current_oauth_token_id.reset(token_oauth)
@@ -555,3 +316,296 @@ class APIKeyMiddleware:
             current_actor.reset(token_actor)
             current_daily_request_limit.reset(token_limit)
             current_principal.reset(token_principal)
+
+    async def _authenticate(self, request, scope, token):
+        """Return an auth refusal only AFTER its DB session has exited."""
+        if token.startswith("omcp_"):
+            # Legacy API key auth
+            key_hash = hash_key(token)
+
+            async with async_session() as session:
+                result = await session.execute(
+                    select(APIKey).where(
+                        APIKey.key_hash == key_hash,
+                        APIKey.is_active == True,
+                    )
+                )
+                api_key = result.scalar_one_or_none()
+
+                if api_key is None:
+                    _emit_auth_failure(request, "invalid_key", token=token)
+                    response = JSONResponse(
+                        {"error": "Invalid or revoked key"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                    )
+                    return response
+
+                if api_key.user_id is None and settings.multi_user_mode:
+                    # An ownerless key in multi-user mode. These exist: a
+                    # key minted while multi-user was off keeps
+                    # `user_id = NULL`, and the bootstrap backfill in
+                    # `src/auth/routes.py` only claims those rows when
+                    # `users` is *empty* — flip the flag after users
+                    # exist and the NULLs are never adopted. Such a key
+                    # used to be treated as single-user by every layer:
+                    # the warm was skipped and `_vault_root(None)`
+                    # returned the global `settings.vault_path`, so an
+                    # ownerless readwrite key could edit the whole vault.
+                    # Refuse it here, with the same body as any other
+                    # rejected key.
+                    _emit_auth_failure(
+                        request, "ownerless_credential", key_id=api_key.id
+                    )
+                    response = JSONResponse(
+                        {"error": "Invalid or revoked key"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                    )
+                    return response
+
+                if api_key.user_id is not None:
+                    result = await session.execute(
+                        select(User.is_active).where(User.id == api_key.user_id)
+                    )
+                    if result.scalar_one_or_none() is not True:
+                        _emit_auth_failure(
+                            request,
+                            "inactive_user",
+                            key_id=api_key.id,
+                            user_id=api_key.user_id,
+                        )
+                        response = JSONResponse(
+                            {"error": "Invalid or revoked key"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
+                        return response
+
+                # Check expiry
+                if api_key.expires_at and api_key.expires_at < datetime.now(timezone.utc):
+                    _emit_auth_failure(
+                        request,
+                        "key_expired",
+                        key_id=api_key.id,
+                        user_id=api_key.user_id,
+                    )
+                    response = JSONResponse(
+                        {"error": "Key expired"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                    )
+                    return response
+
+                # Update last_used_at
+                await session.execute(
+                    update(APIKey).where(APIKey.id == api_key.id).values(
+                        last_used_at=datetime.now(timezone.utc)
+                    )
+                )
+                await session.commit()
+
+                # Store key info in scope for tools to access
+                scope["state"] = scope.get("state", {})
+                scope["state"]["api_key_id"] = api_key.id
+                scope["state"]["api_key_permission"] = api_key.permission
+                scope["state"]["request_start"] = time.time()
+
+                # Set context variables so tools can check permission and log usage
+                current_permission.set(api_key.permission)
+                current_api_key_id.set(api_key.id)
+                current_user_id.set(api_key.user_id)
+                # The key row is already loaded, so the actor label costs
+                # no extra query -- and once written to `usage_logs` it
+                # survives the row's deletion, which the panel performs
+                # after NULLing `usage_logs.key_id` (issue #77).
+                current_actor.set(("api_key", api_key.name, api_key.key_prefix))
+                # The key row is loaded, so the quota ceiling is free here
+                # too (#162). NULL — every key until an operator sets one —
+                # means unlimited, and `_tracked` then issues no quota
+                # statement at all.
+                current_daily_request_limit.set(api_key.daily_request_limit)
+                # The row is in hand, so the principal costs no query
+                # either — the same house rule the actor label and the
+                # quota ceiling follow.
+                current_principal.set(("api_key", api_key.id))
+                # In single-user mode `api_key.user_id` is None so this
+                # is skipped entirely. In multi-user mode, read the user's
+                # `vault_path` now and bind the answer to this request:
+                # it both warms the shared cache (so sync
+                # `_vault_root(user_id)` calls don't hit a cold one) and
+                # gives `_vault_root` a snapshot no other task can
+                # overwrite. A None here means "unassigned", and every
+                # tool call in this request is refused (issue #66).
+                if api_key.user_id is not None:
+                    current_vault_root.set((
+                        api_key.user_id,
+                        await warm_user_vault_cache(session, api_key.user_id),
+                    ))
+        else:
+            # OAuth token auth
+            token_hash = hash_key(token)
+
+            async with async_session() as session:
+                # One statement, three consumers: the token itself, the
+                # client's owner for the cross-user check below, and the
+                # client's name for the denormalised `usage_logs` actor
+                # label (issue #77). Reading the name in a *second* query
+                # would add a round trip to every OAuth request, including
+                # the single-user path that previously issued none -- and
+                # the join is over the FK `oauth_tokens.client_id` already
+                # is. `outerjoin`, not `join`: the FK makes a token without
+                # a client row impossible, and if that ever stopped holding
+                # an inner join would silently turn the token into a 401,
+                # which is a different decision than the one made here.
+                result = await session.execute(
+                    select(
+                        OAuthToken,
+                        OAuthClient.user_id.label("client_owner"),
+                        OAuthClient.client_name,
+                    )
+                    .outerjoin(
+                        OAuthClient,
+                        OAuthClient.client_id == OAuthToken.client_id,
+                    )
+                    .where(
+                        OAuthToken.token_hash == token_hash,
+                        OAuthToken.token_type == "access",
+                        OAuthToken.revoked == False,
+                    )
+                )
+                row = result.first()
+                oauth_token, client_owner, client_name = (
+                    row if row is not None else (None, None, None)
+                )
+
+                if oauth_token is None:
+                    _emit_auth_failure(request, "invalid_key", token=token)
+                    response = JSONResponse(
+                        {"error": "Invalid or revoked token"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                    )
+                    return response
+
+
+                if oauth_token.user_id is None and settings.multi_user_mode:
+                    # Same as the API-key branch above: an ownerless token
+                    # in multi-user mode would resolve the global vault.
+                    _emit_auth_failure(
+                        request,
+                        "ownerless_credential",
+                        oauth_token_id=oauth_token.id,
+                    )
+                    response = JSONResponse(
+                        {"error": "Invalid or revoked token"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                    )
+                    return response
+
+                if oauth_token.user_id is not None:
+                    result = await session.execute(
+                        select(User.is_active).where(User.id == oauth_token.user_id)
+                    )
+                    if result.scalar_one_or_none() is not True:
+                        _emit_auth_failure(
+                            request,
+                            "inactive_user",
+                            oauth_token_id=oauth_token.id,
+                            user_id=oauth_token.user_id,
+                        )
+                        response = JSONResponse(
+                            {"error": "Invalid or revoked token"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
+                        return response
+
+                # The grant's owner must still be the client's owner. A
+                # cross-user grant can no longer be created, but one made
+                # before the consent and rotation paths refused it stays
+                # live for the access token's full hour and is invisible in
+                # either user's panel. An unbound client (NULL owner) is
+                # not a conflict — it has simply never been claimed.
+                if oauth_token.user_id is not None:
+                    if client_owner is not None and client_owner != oauth_token.user_id:
+                        _emit_auth_failure(
+                            request,
+                            "cross_user_grant",
+                            oauth_token_id=oauth_token.id,
+                            user_id=oauth_token.user_id,
+                        )
+                        response = JSONResponse(
+                            {"error": "Invalid or revoked token"},
+                            status_code=401,
+                            headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                        )
+                        return response
+
+                if oauth_token.expires_at < datetime.now(timezone.utc):
+                    _emit_auth_failure(
+                        request,
+                        "key_expired",
+                        oauth_token_id=oauth_token.id,
+                        user_id=oauth_token.user_id,
+                    )
+                    response = JSONResponse(
+                        {"error": "Token expired"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                    )
+                    return response
+
+                # A token that names no vault scope grants nothing. Falling
+                # through to `read` here is the same conflation
+                # `clamp_scope` used to make: `offline_access` says the
+                # grant may carry a refresh token, not that it may read a
+                # note. No path can mint such a token any more, but a
+                # client registered `scope="offline_access"` before this
+                # could already hold one, and this is the boundary that
+                # decides what it may do.
+                if not has_vault_scope(oauth_token.scope):
+                    _emit_auth_failure(
+                        request,
+                        "no_vault_scope",
+                        oauth_token_id=oauth_token.id,
+                        user_id=oauth_token.user_id,
+                    )
+                    response = JSONResponse(
+                        {"error": "Invalid or revoked token"},
+                        status_code=401,
+                        headers={"WWW-Authenticate": _www_authenticate("invalid_token")},
+                    )
+                    return response
+
+                # Map OAuth scope to permission. Scopes are space-separated
+                # sets (OAuth 2.0 convention), so this is a membership test
+                # -- and it is the *same* helper the control panel uses to
+                # decide what to display, so the badge and the enforcement
+                # cannot disagree (issue #65).
+                permission = "readwrite" if token_has_write(oauth_token.scope) else "read"
+
+                scope["state"] = scope.get("state", {})
+                scope["state"]["api_key_id"] = None
+                scope["state"]["api_key_permission"] = permission
+                scope["state"]["request_start"] = time.time()
+
+                current_permission.set(permission)
+                current_api_key_id.set(None)
+                current_oauth_token_id.set(oauth_token.id)
+                current_user_id.set(oauth_token.user_id)
+                current_actor.set(("oauth", client_name, oauth_token.client_id))
+                # The **grant**, not the access token: `grant_id` is NOT
+                # NULL and shared by every rotation of one `/authorize`
+                # approval (migration 014, #64), so refreshing an access
+                # token continues an allowance rather than resetting it,
+                # and two independently revocable grants never share one.
+                current_principal.set(("oauth", oauth_token.grant_id))
+                if oauth_token.user_id is not None:
+                    current_vault_root.set((
+                        oauth_token.user_id,
+                        await warm_user_vault_cache(session, oauth_token.user_id),
+                    ))
+
+        return None

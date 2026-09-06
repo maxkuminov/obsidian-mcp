@@ -180,6 +180,7 @@ PRE_BODY_REFUSAL_ERROR_MARKERS: tuple[str, ...] = (
     VAULT_ROOT_NOT_READY_MARKER,
     RATE_LIMITED_MARKER,
     ARGUMENT_TOO_LONG_MARKER,
+    "slot_timeout",
 )
 
 #: The boolean `params` key the quota gate (#162) sets on a refusal.

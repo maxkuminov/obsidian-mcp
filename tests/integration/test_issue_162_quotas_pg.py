@@ -220,7 +220,7 @@ async def test_exactly_n_tool_bodies_run_under_more_than_n_concurrent_calls(
 
     monkeypatch.setattr(tools, "_log_usage", fake_log_usage)
 
-    @tools._tracked("swarm_probe", [])
+    @tools._tracked("swarm_probe", [], resource_class="other")
     async def probe() -> str:
         nonlocal bodies
         bodies += 1
@@ -336,7 +336,7 @@ async def test_a_pre_body_refusal_consumes_nothing_and_an_admitted_failure_consu
     key_id = await make_key(quota_db, name="order", prefix="omcp_000008", limit=10)
     monkeypatch.setattr(tools, "_log_usage", _noop_log)
 
-    @tools._tracked("order_probe", [])
+    @tools._tracked("order_probe", [], resource_class="other")
     async def probe() -> str:
         raise RuntimeError("the body failed after being admitted")
 
@@ -792,7 +792,7 @@ async def test_a_limit_created_through_the_api_is_enforced_by_the_gate(
     bodies = 0
     seen_limits = []
 
-    @tools._tracked("api_created_probe", [])
+    @tools._tracked("api_created_probe", [], resource_class="other")
     async def probe() -> str:
         nonlocal bodies
         bodies += 1

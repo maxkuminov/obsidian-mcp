@@ -253,6 +253,14 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "tool_write_refused": frozenset(
         {"tool", "user_id", "actor_kind", "key_id", "oauth_token_id"}
     ),
+    "tool_body_outcome": frozenset(
+        {"tool", "reason", "outcome", "user_id", "key_id", "oauth_token_id"}
+    ),
+    # #261 transport observer integration; no credential fingerprints.
+    "mcp_concurrency_pressure": frozenset(
+        {"reason", "outcome", "limit_count", "method", "route", "client_ip",
+         "user_id", "key_id", "oauth_token_id"}
+    ),
     "tool_exception": frozenset(
         {
             "tool",

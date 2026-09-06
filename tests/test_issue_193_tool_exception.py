@@ -101,17 +101,17 @@ def _events(records, name):
     return [r for r in records if r.getMessage() == name]
 
 
-@tools._tracked("probe_raises", ["value"])
+@tools._tracked("probe_raises", ["value"], resource_class="other")
 async def probe_raises(value: str = "x", exc: BaseException | None = None) -> str:
     raise exc if exc is not None else Boom("the body failed")
 
 
-@tools._tracked("probe_ok", ["value"])
+@tools._tracked("probe_ok", ["value"], resource_class="other")
 async def probe_ok(value: str = "x") -> str:
     return f"ran:{value}"
 
 
-@tools._tracked("probe_marks_then_raises", [])
+@tools._tracked("probe_marks_then_raises", [], resource_class="other")
 async def probe_marks_then_raises() -> str:
     timing.record("error", tools._RELATED_SOURCE_NOT_FOUND_MARKER)
     raise Boom("recorded a marker, then failed")

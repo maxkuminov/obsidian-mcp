@@ -979,7 +979,13 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `60` | Sustained vault-mutating calls per minute per principal — the eight write tools, plus `PUT /transfer/upload` charged to the principal that minted the capability. |
 | `MCP_WRITE_RATE_LIMIT_BURST` | `15` | Capacity of the write bucket. |
 | `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` | `10000` | Principals holding their own limiter entry before further ones share one overflow entry. |
-| `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one rate-refusal coalescing window stays open. Inside it a refusal writes nothing; the row that lands stands for `1 + suppressed` refusals. |
+| `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one rate/slot-refusal coalescing window stays open. Inside it a refusal writes nothing; the row that lands stands for `1 + suppressed` refusals. |
+| `MCP_CONCURRENCY_MODE` | `shadow` | `off`, `shadow`, or `enforce`. Shadow observes pressure without rejecting or waiting. See [Concurrency admission](#concurrency-admission). |
+| `MCP_CONCURRENCY_WAIT_SECONDS` | `0` | Tool admission wait in enforce mode, 0–5 seconds. Shadow requires zero. |
+| `MCP_CONCURRENCY_TOOLS` | `4` | Global tool ceiling in enforce mode, also subject to class, tenant (3), and principal (2) ceilings. |
+| `MCP_CONCURRENCY_REQUESTS` | `32` | Full MCP request ceiling, including open streams; per bearer fingerprint ceiling defaults to 4. |
+| `MCP_CONCURRENCY_AUTH` | `2` | Authentication database-session ceiling. Released before response delivery or downstream work. |
+| `MCP_CONCURRENCY_WRITERS` | `1` | Usage-log writer ceiling; includes fallback inserts. Defaults: 64 pending writers and a 0.25-second enforce-mode wait. |
 | `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** API key receives when the caller does not say otherwise. Existing keys are untouched; an explicit null (or a blank panel field) still means unlimited. |
 | `MCP_SANDBOX_MODE` | `false` | Registry-eval only. Skips DB, indexer, embedding provider, and `/mcp` auth so introspection works without external deps. Do not enable in production. |
 
@@ -1288,11 +1294,15 @@ identical text in its declared error field. `retry_after_seconds` is
 present only where waiting can actually help — a refusal for an
 unassigned vault or an unencodable argument omits it rather than invite a
 loop that cannot end. The same shape covers the daily quota
-(`over_quota`) and the query length cap (`argument_too_long`).
+(`over_quota`), the query length cap (`argument_too_long`), and tool-body
+refusals such as `not_found`, `already_exists`, and `invalid_path`. A partial
+write also carries a typed outcome: read its explanation before retrying,
+because some bytes may already have changed. Empty search results and
+successful no-op calls remain successes.
 
-The two **transport** refusals are outside that contract, because there
-is no tool call to answer: an over-budget unauthenticated request gets an
-HTTP 429 with `Retry-After`, and so does an over-rate `PUT
+The **transport** refusals are outside that contract, because there
+is no tool call to answer: an over-budget unauthenticated request or an enforced MCP request/authentication
+concurrency refusal gets an HTTP 429 with `Retry-After`, and so does an over-rate `PUT
 /transfer/upload` — which **releases** its claim rather than consuming
 it, so the same link is still redeemable once the bucket refills.
 
@@ -1303,11 +1313,11 @@ it, so the same link is still redeemable once the bucket refills.
   `--workers 1`; raising the worker count multiplies every rate above by
   the worker count.
 - Refusals appear on `/admin/performance` as refusal counts, not in the
-  latency percentiles. Repeated rate refusals are **coalesced** — one row
+  latency percentiles. Repeated rate and enforced slot refusals are **coalesced** — one row
   per credential/tool/scope per `MCP_REFUSAL_LOG_INTERVAL_SECONDS`, each
   standing for `1 + suppressed` refusals — so that a refusal loop cannot
   make writing the log the load.
-- Every one of the defaults is a guess against a small sample. Read
+- The velocity defaults are estimates against a small sample. Read
   `/admin/performance` for a week before treating any as settled, and
   disable one by setting it empty, `null` or `none` (zero is refused at
   startup).
@@ -1318,6 +1328,40 @@ it, so the same link is still redeemable once the bucket refills.
 
 The rationale lives in
 [`docs/architecture/rate-limits.md`](docs/architecture/rate-limits.md).
+
+### Concurrency admission
+
+Concurrency admission ships with `MCP_CONCURRENCY_MODE=shadow`. It records
+pressure under `concurrency_shadow` on existing usage rows and emits bounded
+security events for request/authentication pressure. Calls keep their actual
+outcome, quota accounting and duration. Shadow mode observes current occupancy
+with zero wait; it does not predict how traffic would behave under enforcement.
+
+In `enforce` mode, the server limits full MCP requests (including open SSE
+streams), authentication database sessions, tools, and usage-log writers.
+Tools pass velocity, vault and argument checks before acquiring slots; daily
+quota is checked afterward. A rejected tool receives `slot_timeout` without
+spending daily quota. Zero wait means immediate admission or refusal; a positive
+wait uses a bounded queue and one deadline. A retry hint is not a promise that
+a running call will finish by that time.
+
+The four tool classes each default to one concurrent call: `semantic_search`
+uses embedding, `find_related` uses vector, the eight vault-mutating tools use
+write, and the remaining tools use other. Global, tenant and principal ceilings
+default to 4, 3 and 2. OAuth refresh keeps the same principal. Full request and
+per-bearer ceilings default to 32 and 4, authentication to 2, and usage writers
+to 1. All settings and queue limits are listed in `.env.example`.
+
+Startup validates the pool budget as `auth + 2 × tools + writers + 4 ≤ 15`.
+The four connections of headroom are shared with panel, OAuth, indexing and
+transfer work; this arithmetic cannot guarantee availability when those other
+consumers exhaust it. Shadow mode does not enforce that budget. The controller
+is in-process and requires the existing single-worker deployment.
+
+Review pressure observations and long-lived stream occupancy before enabling
+`enforce`. Choose `off` to disable concurrency admission; the existing velocity
+limits and daily quotas still apply. Shadow requires a zero tool wait and never
+adds a writer wait or drops a usage row because of its observed pressure.
 
 ## Architecture
 

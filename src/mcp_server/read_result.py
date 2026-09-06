@@ -36,7 +36,8 @@ import json
 import logging
 from typing import Any
 
-from pydantic import BaseModel, model_serializer
+from pydantic import BaseModel, PrivateAttr, model_serializer
+from src.services.tool_outcomes import BodyOutcome
 
 from src.services.vault import is_encodable, non_finite_token, outline_sections
 
@@ -568,6 +569,8 @@ class ReadNoteResult(_OmitNone):
     On an error result the content-bearing fields are absent: `error` is the
     answer, and a caller must never find a half-response beside it.
     """
+
+    _body_outcome: BodyOutcome | None = PrivateAttr(default=None)
 
     # Always exact, never elided, never marked: two paths that differ only by a
     # character a lossy rendering would collapse must stay distinguishable.
