@@ -487,7 +487,9 @@ async def test_an_unchanged_assignment_publishes_with_exactly_one_re_read(
 
     result = await tools.create_note_impl("fresh.md", "new body\n")
 
-    assert result == "Created note: fresh.md"
+    # The success line now ends with the hash of the bytes this call
+    # published (#205 D9); the prose ahead of it is unchanged.
+    assert result.startswith("Created note: fresh.md — content_hash: sha256:")
     assert (ctx.vault / "fresh.md").read_text(encoding="utf-8") == "new body\n"
     assert ctx.assignment["reads"] == 1
 
@@ -561,7 +563,7 @@ async def test_single_user_mode_issues_no_re_read(monkeypatch, tmp_path):
     finally:
         current_permission.reset(perm)
 
-    assert result == "Created note: solo.md"
+    assert result.startswith("Created note: solo.md — content_hash: sha256:")
     assert (tmp_path / "solo.md").read_text(encoding="utf-8") == "body\n"
     assert reads["n"] == 0
 
@@ -594,6 +596,10 @@ async def test_the_refusal_writes_the_distinct_error_marker(multi_user_vault):
         # operator reading this row after a frontmatter block went missing
         # needs to see whether wholesale replacement was asked for.
         "replace_frontmatter",
+        # #205: the write precondition, for the same reason — a digest, not a
+        # secret, and an operator investigating a lost update needs to see
+        # which writes were guarded and against which base.
+        "expected_hash",
         "error",
     }
     assert params["path"] == "note.md"
