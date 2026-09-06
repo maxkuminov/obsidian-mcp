@@ -132,7 +132,22 @@ async def acquire_generation_lock(session: AsyncSession) -> None:
     statement that needs the fingerprint: this lock is acquired before any row
     or table lock the transaction takes.** One direction everywhere, so the
     lock cannot close a cycle with the row locks the pass and the panel already
-    contend for. For a transaction that mutates rows before it reaches the
+    contend for.
+
+    **And it is acquired *after* the account-administration guard, never
+    before** — including through `acquire_generation_lock_unbounded`, which is
+    this function with the wait exempted and inherits every rule here. Exactly
+    one path holds both: `indexer.rebuild_tsvectors_all_scopes` takes
+    `grants.ACCOUNT_GUARD_LOCK_KEY` first, so that assignment edits cannot land
+    between its vault-root survey and its reads (#199), and its locked half
+    then takes this one. That makes the total order **account guard → this
+    lock → row locks**. Every other holder (the index pass, the embed
+    certification, the panel's Danger-zone resets,
+    `scripts/reset_embeddings.py`) takes this lock alone and touches no account
+    guard, and no path anywhere takes them in the opposite order. If you add
+    one that needs both, take the account guard first.
+
+    For a transaction that mutates rows before it reaches the
     write that depends on the configuration — the incremental index pass, whose
     upserts, move updates, prunes, link rows and certification invalidation all
     precede its tsvector write — that means the head of the transaction, and

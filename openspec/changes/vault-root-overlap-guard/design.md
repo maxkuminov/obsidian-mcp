@@ -263,15 +263,51 @@ users the admission gate refuses. Two populations, two questions — "whom does
 this server serve" and "whose bytes will this command read" — and collapsing
 them would be wrong in both directions at once.
 
-**And it runs before the generation lock.** The observation is the same
-bounded, off-loop one (`observe_root`, `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`),
-completed before `acquire_generation_lock`, and the descriptor-bound verdict is
-carried into the locked section: under the lock the driver re-checks that the
-assignment is still the one surveyed and that `os.fstat(root_fd)` reports the
-inode that was observed, and refuses otherwise. Opening a root synchronously
-*after* the lock — which is what `pinned_root` alone did — lets one hung NFS or
-FUSE mount hold the index generation lock for as long as the kernel likes, with
-every pass in the process queued behind it.
+**And it runs before the generation lock, keeping the descriptors.** The
+observation is the same bounded, off-loop one under
+`VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`, completed before
+the generation lock — but it uses
+`observe_root_blocking_retaining`, which hands back the open directory instead
+of closing it, and `_rebuild_scope` reads through *that descriptor*. Under the
+lock this command resolves **no pathname at all**; its only filesystem call on
+a root is `fstat` of the fd it already holds.
+
+Reopening was wrong twice. `pinned_root` calls `os.open` synchronously, so an
+unexamined root opened after the lock lets one hung NFS or FUSE mount hold the
+index generation lock for as long as the kernel likes with every pass in every
+process queued behind it; and it is a *second lookup*, so it can land on an
+inode nobody examined. The assignment is still compared, because a scope
+reassigned in the interval holds a descriptor that is the wrong directory to
+rebuild — right in identity, wrong in tenancy. Peer descriptors are closed at
+once (nothing reads a peer's directory), `RebuildRootSurvey.close()` runs from
+a `finally` on every path, and a timed-out observation whose thread answers
+later is closed by a done-callback — L4's descriptor half.
+
+**The account guard, and the lock order.** The survey is still check-then-act
+*across processes* on its own: it accepts a nested pair whenever the
+conflicting user is **inactive** — correctly, since nothing serves an inactive
+user — and an administrator can reactivate or reassign that user in the panel
+while the command runs, turning the accepted layout into the cross-tenant read
+the survey exists to prevent. No re-check inside the driver's transaction sees
+that coming, because the edit is another connection committing between the
+check and the read. So `rebuild_tsvectors_all_scopes` takes
+`ACCOUNT_GUARD_LOCK_KEY` — the key `users._lock_admin_guard`, the password
+change and every session mint take — as its **first statement**, before the
+enumeration, and holds it to the commit.
+
+| # | Lock | Taken alone by | Taken in sequence by |
+| --- | --- | --- | --- |
+| 1 | `ACCOUNT_GUARD_LOCK_KEY` | `users._lock_admin_guard`, `routes.change_password`, `session.start_session` | `indexer.rebuild_tsvectors_all_scopes` |
+| 2 | `INDEX_GENERATION_LOCK_KEY` (`acquire_generation_lock_unbounded` on the waiting paths) | `indexer._index_vault_pinned`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` | `indexer._rebuild_all_scopes_locked` (reached only from 1's holder) |
+| 3 | row locks | every pass | the per-scope rebuild |
+
+One direction everywhere; the maintenance rebuild is the only holder of the
+pair and nothing takes them the other way round. The accepted cost is that a
+running `make rebuild-tsvectors` blocks account edits and session mints until
+it commits — including its wait for the generation lock, which is a wait for an
+in-flight pass. It is an operator-run one-off, the alternative is the
+cross-tenant read, and both locks are transaction-scoped so a crash releases
+them.
 
 ### Fail closed until the first snapshot
 
@@ -681,6 +717,24 @@ check again.**
 | MAJOR — a slow filesystem stalls the synchronous startup detection | Observation runs in `asyncio.to_thread` under `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS` (default 10); expiry is `root_unexaminable(timeout)`; the uncancellable-thread residual is L4; owner decisions 8a and 17; `index-integrity` requirement + scenarios; `src/config.py` added to slice 1 |
 | MAJOR — the owned-file map omits existing tests | Every existing test that resolves a vault root is assigned to a slice in a second ownership table, and `tests/conftest.py` goes to slice 1 with an autouse published-empty-snapshot fixture that detector-entry tests opt out of |
 | MINOR — mountinfo parser hardening | Moot: the parser, its availability state, its health-page statement and its tasks and tests are all removed |
+
+Round 4 (Codex, post-implementation): FAIL — 1 BLOCKER, 2 MAJOR. All three
+folded in; none rejected.
+
+| Finding | Where it landed |
+| --- | --- |
+| BLOCKER — E5 reads a population the serving snapshot never observes | `survey_rebuild_roots` runs the two checks over the **maintenance** read set (every retained scope, active or inactive, plus active assigned roots as peers) before the generation lock; `RebuildSkip.ROOT_OVERLAPS` / `ROOT_UNEXAMINABLE`; `index-integrity` requirement + five scenarios; the population split written out in the tenancy note |
+| MAJOR — the driver opened a root synchronously under the generation lock | The bounded observation moved ahead of `acquire_generation_lock` and its verdict carried into the locked section |
+| MAJOR — `validate_vault_root_path` ran an unbounded `Path.is_dir()` on the event loop, holding the account guard | Split into `validate_vault_root_lexical` (pure) and an `async validate_vault_root_path` that observes off-loop under the deadline; the `/vaults/*` dropdown probed the same way |
+
+Round 5 (Codex, post-implementation): FAIL — 1 BLOCKER, 1 MAJOR, 1 MINOR. All
+three folded in; none rejected.
+
+| Finding | Where it landed |
+| --- | --- |
+| BLOCKER — the survey is still check-then-act *across processes*: an administrator may reactivate or reassign the inactive peer it accepted, between the survey and the reads | `rebuild_tsvectors_all_scopes` takes `ACCOUNT_GUARD_LOCK_KEY` before the enumeration and holds it to the commit; lock order **account guard → generation lock → row locks** recorded at both lock definitions and in the tenancy note, and audited across every caller of either; `index-integrity` requirement + four scenarios |
+| MAJOR — the survey closed its descriptors and `_rebuild_scope` reopened the pathname under the lock | `observe_root_blocking_retaining` hands the open directory back, `_observe_root_retaining` bounds it off-loop, `_rebuild_scope` reads through the retained fd and resolves no pathname under the lock; `RebuildRootSurvey.close()` from a `finally`, peer descriptors released at once, and a late-completing timed-out observation closed by a done-callback |
+| MINOR — `detect_and_publish` queried and observed before its single-user short-circuit | `_detect` returns an empty snapshot on `not multi_user_mode` **before** the enumeration and before any `open`; asserted with a populated fake session that must go unread |
 
 ## Open Questions
 

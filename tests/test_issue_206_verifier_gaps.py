@@ -291,9 +291,15 @@ def test_the_rebuild_drivers_abort_is_not_reachable_from_the_backfill():
         "about every retained row; the backfill claims nothing global and "
         "must keep skipping the scope and completing for the rest."
     )
-    assert "RebuildCoverageAborted" in _function_source(
-        indexer.rebuild_tsvectors_all_scopes
-    ), "the driver stopped raising it — this test lost its contrast"
+    # The driver is two functions since #199 round 2 — a guarded half that
+    # takes the account guard and surveys the roots, and a locked half that
+    # takes the generation lock and reads — so the contrast is read off both.
+    driver = _function_source(indexer.rebuild_tsvectors_all_scopes) + (
+        _function_source(indexer._rebuild_all_scopes_locked)
+    )
+    assert "RebuildCoverageAborted" in driver, (
+        "the driver stopped raising it — this test lost its contrast"
+    )
 
 
 # --------------------------------------------------------------------------- #

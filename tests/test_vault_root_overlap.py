@@ -255,7 +255,7 @@ def test_the_detector_normalises_every_spelling_of_one_pathname(
 
 @pytest.mark.parametrize("spelling", ["{base}/", "{base}//sub", "{base}/."])
 async def test_detection_names_both_users_however_the_root_is_spelled(
-    spelling, tmp_path
+    detecting, spelling, tmp_path
 ):
     """The same three spellings, through `detect_and_publish` rather than the
     predicate — the assignment reaches the detector as a `users.vault_path`
@@ -354,7 +354,7 @@ async def test_observation_deadline_is_a_timeout_verdict(monkeypatch, tmp_path):
     assert not observation.examinable
 
 
-async def test_a_timed_out_root_is_one_users_verdict(monkeypatch, tmp_path):
+async def test_a_timed_out_root_is_one_users_verdict(detecting, monkeypatch, tmp_path):
     """The detection still publishes, and every other root is still observed."""
     slow = tmp_path / "slow"
     slow.mkdir()
@@ -404,7 +404,22 @@ async def test_an_unstable_realpath_is_unexaminable_not_an_overlap(
 # ── Detection and the snapshot ──────────────────────────────────────────────
 
 
-async def test_detection_publishes_the_overlapping_pair(tmp_path):
+@pytest.fixture
+def detecting(monkeypatch):
+    """Multi-user mode, which is the only mode a detection runs in at all.
+
+    `_detect` answers an empty snapshot **before** it touches the database or
+    the filesystem when `multi_user_mode` is off, so every case below that
+    hands it a non-empty user list has to say which mode it is describing.
+    The single-user behaviour is asserted on its own, further down, with a
+    populated fake session that must go unread.
+    """
+    monkeypatch.setattr(vault_overlap.settings, "multi_user_mode", True)
+
+
+
+
+async def test_detection_publishes_the_overlapping_pair(detecting, tmp_path):
     outer = tmp_path / "team"
     outer.mkdir()
     inner = outer / "private"
@@ -426,7 +441,7 @@ async def test_detection_publishes_the_overlapping_pair(tmp_path):
     assert not snapshot.names(3)
 
 
-async def test_detection_records_the_facts_as_observed(tmp_path):
+async def test_detection_records_the_facts_as_observed(detecting, tmp_path):
     """The entry stays nameable after the peer row changes — nothing is re-read."""
     outer = tmp_path / "team"
     outer.mkdir()
@@ -450,11 +465,55 @@ async def test_detection_records_the_facts_as_observed(tmp_path):
     assert "alice" in text and "bob" in text
 
 
-async def test_no_active_assignment_publishes_an_empty_snapshot():
-    """Single-user mode: `_active_user_ids` is empty, so nothing is quarantined."""
+async def test_no_active_assignment_publishes_an_empty_snapshot(detecting):
+    """No active user holds an assignment: nothing to compare, nothing named."""
     snapshot = await vault_overlap.detect_and_publish(_FakeSessionFactory([]))
     assert snapshot.entries == {}
     assert vault_overlap.is_published()
+
+
+async def test_single_user_mode_answers_before_it_touches_anything(
+    monkeypatch, tmp_path
+):
+    """`multi_user_mode` off short-circuits **before** the query and the opens.
+
+    The check used to sit after `_active_assignments`, so a single-user
+    deployment whose `users` table still held rows — a flag flipped back, or a
+    configuration that was multi-user once — issued that query and then opened
+    every root in it, once per pass entry point, to build a snapshot nothing in
+    that mode reads: `_vault_root(None)` never consults it and
+    `_refuse_quarantined_pass` returns immediately for a null user.
+
+    The fake session is deliberately **not empty**, so a detection that reached
+    the enumeration would find two overlapping roots and publish them. It must
+    find nothing, because it must not look.
+    """
+    outer = tmp_path / "team"
+    outer.mkdir()
+    inner = outer / "private"
+    inner.mkdir()
+
+    monkeypatch.setattr(vault_overlap.settings, "multi_user_mode", False)
+
+    def _boom(*_a, **_k):
+        raise AssertionError("single-user detection touched the filesystem")
+
+    monkeypatch.setattr(vault_overlap, "observe_root_blocking", _boom)
+    monkeypatch.setattr(vault_overlap, "observe_root_blocking_retaining", _boom)
+
+    factory = _FakeSessionFactory(
+        [(1, "alice", str(outer)), (2, "bob", str(inner))]
+    )
+    snapshot = await vault_overlap.detect_and_publish(factory)
+
+    assert snapshot.entries == {}, (
+        "single-user mode enumerated the users table and observed its roots"
+    )
+    assert factory.calls == 0, "the enumeration query was issued"
+    assert vault_overlap.is_published(), (
+        "the snapshot must still be published — the readiness state is a "
+        "refusal, and single-user mode must never sit in it"
+    )
 
 
 async def test_sandbox_mode_publishes_without_touching_the_filesystem(monkeypatch):
@@ -471,7 +530,7 @@ async def test_sandbox_mode_publishes_without_touching_the_filesystem(monkeypatc
     assert factory.calls == 0
 
 
-async def test_unexaminable_root_quarantines_only_its_own_user(tmp_path):
+async def test_unexaminable_root_quarantines_only_its_own_user(detecting, tmp_path):
     a = tmp_path / "alice"
     a.mkdir()
     b = tmp_path / "bob"
@@ -489,7 +548,7 @@ async def test_unexaminable_root_quarantines_only_its_own_user(tmp_path):
     assert snapshot.entries[1].reason == RootUnexaminable(errno.ENOENT)
 
 
-async def test_a_corrected_condition_clears_at_the_next_detection(tmp_path):
+async def test_a_corrected_condition_clears_at_the_next_detection(detecting, tmp_path):
     outer = tmp_path / "team"
     outer.mkdir()
     inner = outer / "private"
@@ -507,7 +566,7 @@ async def test_a_corrected_condition_clears_at_the_next_detection(tmp_path):
     assert vault_overlap.published_snapshot() is second
 
 
-async def test_an_alias_created_after_assignment_is_detected(tmp_path):
+async def test_an_alias_created_after_assignment_is_detected(detecting, tmp_path):
     """Both assignments are unchanged strings; one becomes a link to the other."""
     a = tmp_path / "alice"
     a.mkdir()
@@ -523,7 +582,7 @@ async def test_an_alias_created_after_assignment_is_detected(tmp_path):
     assert second.entries[1].reason.relation == RELATION_IDENTICAL
 
 
-async def test_a_failed_redetection_retains_the_previous_snapshot(tmp_path, caplog):
+async def test_a_failed_redetection_retains_the_previous_snapshot(detecting, tmp_path, caplog):
     outer = tmp_path / "team"
     outer.mkdir()
     inner = outer / "private"
@@ -542,7 +601,7 @@ async def test_a_failed_redetection_retains_the_previous_snapshot(tmp_path, capl
 
 
 async def test_a_failed_first_detection_stays_never_published(
-    unpublished_vault_root_snapshot, caplog
+    detecting, unpublished_vault_root_snapshot, caplog
 ):
     broken = _FakeSessionFactory([], raises=RuntimeError("database is away"))
     with caplog.at_level("ERROR"):
@@ -554,7 +613,7 @@ async def test_a_failed_first_detection_stays_never_published(
     assert any(record.levelname == "ERROR" for record in caplog.records)
 
 
-async def test_the_snapshot_mapping_is_immutable(tmp_path):
+async def test_the_snapshot_mapping_is_immutable(detecting, tmp_path):
     root = tmp_path / "solo"
     root.mkdir()
     snapshot = await vault_overlap.detect_and_publish(
@@ -567,7 +626,7 @@ async def test_the_snapshot_mapping_is_immutable(tmp_path):
 # ── Serialization and monotonic publication ─────────────────────────────────
 
 
-async def test_detections_do_not_interleave(tmp_path):
+async def test_detections_do_not_interleave(detecting, tmp_path):
     """The second detection does not begin observing until the first published."""
     root = tmp_path / "solo"
     root.mkdir()
@@ -605,7 +664,7 @@ async def test_detections_do_not_interleave(tmp_path):
 
 
 async def test_a_stalled_older_detection_does_not_overwrite_a_newer_quarantine(
-    tmp_path,
+    detecting, tmp_path,
 ):
     """The lock, end to end: the older result must not re-admit both tenants.
 
@@ -653,7 +712,7 @@ async def test_a_stalled_older_detection_does_not_overwrite_a_newer_quarantine(
     assert set(published.entries) == {1, 2}
 
 
-async def test_an_out_of_order_publication_is_discarded(tmp_path):
+async def test_an_out_of_order_publication_is_discarded(detecting, tmp_path):
     """The sequence guard, asserted without the lock.
 
     A future caller — a test, a fixture, an entry point added later — that

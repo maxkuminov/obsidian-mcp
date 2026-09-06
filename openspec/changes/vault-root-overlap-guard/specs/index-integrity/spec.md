@@ -40,6 +40,12 @@ The startup entry point SHALL run the detection **synchronously before the appli
 - **WHEN** the server runs in single-user mode, where the root comes from settings and no `users` row carries an assignment
 - **THEN** the published snapshot SHALL be empty and every pass SHALL behave exactly as it does today
 
+#### Scenario: Single-user mode publishes without reading anything
+
+- **WHEN** the server runs in single-user mode and the `users` table nevertheless holds active rows carrying overlapping assignments — a flag flipped back, or a deployment that was multi-user before
+- **THEN** the detection SHALL publish an empty snapshot **without** enumerating those rows and **without** opening any root
+- **AND** the snapshot SHALL still be published, because the never-published state is a refusal and single-user mode must never sit in it
+
 ### Requirement: Each root's observation SHALL be bounded by a finite deadline
 Observing a root — opening it, stating the descriptor and resolving its canonical real path — SHALL be dispatched off the event loop and bounded by a finite, configurable deadline. Expiry SHALL be a per-user verdict of **root unexaminable with a timeout cause**, distinguishable from an error number, and the detection SHALL continue to the remaining roots and publish. Expiry MUST NOT be treated as a failure of the detection as a whole.
 
@@ -165,7 +171,54 @@ An unexaminable root SHALL quarantine **only that user**. The peers it could not
 - **AND** the other two SHALL be indexed normally
 
 ### Requirement: The all-scopes keyword rebuild SHALL check every root it will open, before it takes the generation lock
-The maintenance rebuild that enumerates scopes from the rows that exist — rather than from the active users the server serves — SHALL evaluate the identity and containment conditions across **every root it would open**, including the retained root of an inactive owner, together with the roots of all active users holding an assignment. Any relation involving a root it would open SHALL abort the whole operation, naming both sides and the relation; a root it would open that cannot be observed SHALL be a non-completed outcome and SHALL abort the operation in the same way. The observation SHALL be complete before the index generation lock is taken, and no root the observation did not examine SHALL be opened while that lock is held.
+The maintenance rebuild that enumerates scopes from the rows that exist — rather than from the active users the server serves — SHALL evaluate the identity and containment conditions across **every root it would open**, including the retained root of an inactive owner, together with the roots of all active users holding an assignment. Any relation involving a root it would open SHALL abort the whole operation, naming both sides and the relation; a root it would open that cannot be observed SHALL be a non-completed outcome and SHALL abort the operation in the same way. The observation SHALL be complete before the index generation lock is taken, and **no pathname SHALL be resolved while that lock is held**: the observation SHALL retain the directory descriptor it opened for each scope, the rebuild SHALL read through that descriptor, and the only filesystem call made on a root inside the locked section SHALL be a status check of the descriptor already held.
+
+Retaining the descriptor answers two failures that reopening the pathname does not. The reopen is an unbounded synchronous call, so a network- or FUSE-backed mount that stops answering holds the index generation lock for as long as the kernel takes and every pass in every process queues behind it. And it is a second lookup, so it may resolve to a directory the observation never examined; a descriptor is the only reference that still names the same directory across the wait for the lock. The assignment SHALL nevertheless still be compared, because a scope reassigned in that interval holds a descriptor that is the wrong directory to rebuild — correct in identity, wrong in tenancy.
+
+Every retained descriptor SHALL be closed on completion, on abort, and on an unexpected failure, and a descriptor opened by an observation that had already exceeded its deadline SHALL be closed when that observation completes. Descriptors for roots the command would not open SHALL be released as soon as the checks are done.
+
+#### Scenario: No pathname is resolved after the lock
+
+- **WHEN** the survey has succeeded and the rebuild runs
+- **THEN** no vault-root pathname SHALL be opened after the generation lock is acquired
+- **AND** each scope SHALL be rebuilt through the descriptor the survey retained for it
+
+#### Scenario: A root renamed after the survey does not redirect the read
+
+- **WHEN** a scope's assigned pathname is repointed to a different directory between the survey and the rebuild
+- **THEN** the rebuild SHALL still read the directory the survey examined
+
+#### Scenario: Every retained descriptor is released
+
+- **WHEN** the rebuild completes, aborts, or raises
+- **THEN** every descriptor the survey retained SHALL be closed
+
+### Requirement: The all-scopes keyword rebuild SHALL hold the account-administration guard across its survey and its reads
+The maintenance rebuild SHALL acquire the same cross-process advisory guard that the account-administration handlers take — the one held by the administrative user-management handlers, the self-service password change and every session mint — **before** it enumerates the roots it will open, and SHALL hold it until its transaction commits or rolls back. The lock order SHALL be **account guard, then index generation lock, then row locks**, in that direction on every path that takes more than one, and the ordering rule SHALL be recorded at each lock's definition.
+
+Without it the survey is check-then-act across processes. The survey accepts a layout in which two roots nest whenever the conflicting user is inactive — which is correct, because nothing serves or indexes an inactive user — and an administrator may reactivate or reassign that user while the command is still running. The reads that follow are then the cross-tenant read the survey exists to prevent, and no re-check inside the command's own transaction can prevent it, because the edit is a separate connection committing between the check and the read. Serializing against the handlers that make those edits is the only mechanism that closes it, and that guard already exists for exactly this class of check-then-act.
+
+The cost SHALL be accepted rather than mitigated: while the rebuild runs, account edits and session mints wait. It is an operator-initiated one-off command, the alternative is a cross-tenant read, and the guard is transaction-scoped so a crashed rebuild releases it with no operator action.
+
+#### Scenario: An assignment edit cannot land between the survey and the reads
+
+- **WHEN** the rebuild has completed its survey and has not yet read a row
+- **THEN** another connection SHALL NOT be able to acquire the account-administration guard
+
+#### Scenario: The guard precedes the enumeration
+
+- **WHEN** the rebuild runs
+- **THEN** the account guard SHALL be acquired before the roots it will open are enumerated
+
+#### Scenario: The guard is released by the transaction
+
+- **WHEN** the rebuild commits or rolls back
+- **THEN** the account-administration guard SHALL be released without operator action
+
+#### Scenario: The rebuild reads only scopes the surveyed population examined
+
+- **WHEN** the rebuild reads any scope
+- **THEN** that scope SHALL have been examined by the survey in force
 
 The published quarantine snapshot cannot answer for this command, and this is a population difference rather than an oversight. The snapshot observes active users holding an assignment because that is exactly whom the server serves and indexes; this command opens the scope of an **inactive** owner too, because an inactive user's retained rows are as returnable by keyword search as anyone's and the coverage proof is about rows that exist. An inactive owner retaining a root that is an ancestor or an alias of an active tenant's is therefore named by nothing the snapshot publishes, and the rebuild would read that tenant's notes under the inactive owner's scope and record a fingerprint asserting that every retained row was rebuilt correctly.
 

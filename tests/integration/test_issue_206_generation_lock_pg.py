@@ -349,19 +349,26 @@ async def test_an_old_config_keyword_write_is_refused_after_a_rebuild(
 async def test_the_rebuild_takes_the_lock_before_it_reads(engines, world):
     """Asserted structurally, because the ordering is the property.
 
-    The driver must hold the lock before the first row it intends to rebuild is
-    read — not merely before its fingerprint write — so that no keyword-vector
-    write by any process can commit between the snapshot and the record.
+    The driver must hold the generation lock before the first row it intends to
+    rebuild is read — not merely before its fingerprint write — so that no
+    keyword-vector write by any process can commit between the snapshot and the
+    record.
 
-    **One thing runs before the lock, and it is not a row read of the rows the
-    fingerprint certifies (#199).** The vault-root survey observes every root
-    this command would open — including the retained root of an *inactive*
-    owner, whom the serving overlap snapshot never observes because nothing
-    serves them — and that observation is a bounded `open`/`fstat`/`realpath`
-    against a bind mount. Doing it *after* the lock would let one hung NFS or
-    FUSE mount hold the index generation lock for as long as the kernel likes,
-    with every pass in the process queued behind it. So it happens first, and
-    the ordering below pins both halves at once.
+    Two things now run before it, and neither is a row read of the rows the
+    fingerprint certifies (#199):
+
+    * **The account-administration guard.** It is the head of the lock order
+      (account guard → generation lock → row locks) and it is taken first
+      because the survey below accepts a layout on the strength of a peer being
+      *inactive* — an administrator reactivating that peer mid-run would turn
+      the accepted layout into a cross-tenant read, and only serializing
+      against the handlers that make such edits closes it.
+    * **The vault-root survey.** A bounded `open`/`fstat`/`realpath` per root
+      against a bind mount. Under the lock, one hung NFS or FUSE mount would
+      hold the index generation lock for as long as the kernel likes with every
+      pass in the process queued behind it — so it happens before, and it keeps
+      the descriptors it opened so the locked half reads through them rather
+      than reopening a name.
 
     The survey does enumerate scopes to know which roots to look at, and that
     enumeration is deliberately **not** the one the coverage claim rests on:
@@ -369,14 +376,34 @@ async def test_the_rebuild_takes_the_lock_before_it_reads(engines, world):
     `_rebuild_scope` refuses any scope the survey did not examine rather than
     opening it. So every row the fingerprint speaks for is still read inside
     the locked section — which is the property this test has always been about.
+
+    The driver is split in two so the retained descriptors have exactly one
+    closing path, so the order is read off both halves and the split itself is
+    pinned: the locked half is reached only from the guarded half.
     """
-    # The docstring names the same statements, so it is stripped before the
-    # ordering is read off the body.
-    body = inspect.getsource(indexer.rebuild_tsvectors_all_scopes).split(
-        '"""'
-    )[2]
-    participants_at = body.index("_rebuild_root_participants(session)")
-    survey_at = body.index("survey_rebuild_roots(participants)")
+    # The docstrings name the same statements, so they are stripped before the
+    # ordering is read off the bodies.
+    head = inspect.getsource(indexer.rebuild_tsvectors_all_scopes).split('"""')[2]
+    body = inspect.getsource(indexer._rebuild_all_scopes_locked).split('"""')[2]
+
+    # ── the guarded half, in order
+    guard_at = head.index("lock_account_guard(session)")
+    participants_at = head.index("_rebuild_root_participants(session)")
+    survey_at = head.index("survey_rebuild_roots(participants)")
+    locked_at = head.index("_rebuild_all_scopes_locked(session, survey)")
+    assert guard_at < participants_at < survey_at < locked_at
+
+    # Nothing in the guarded half reads a row of its own, and nothing in it
+    # takes the generation lock: the survey's observation must not be under it.
+    assert "acquire_generation_lock" not in head.replace(
+        "acquire_generation_lock`", ""
+    )
+    assert "session.execute(" not in head
+    assert "notes_metadata" not in head
+    # And the descriptors it now owns are released on every path.
+    assert "finally:" in head and "survey.close()" in head
+
+    # ── the locked half, in order
     # `acquire_generation_lock_unbounded` — the same acquisition with the
     # engine's 60 s `statement_timeout` lifted off the wait, since the pass
     # holds this lock for its whole transaction and a capped wait was cancelled
@@ -386,30 +413,66 @@ async def test_the_rebuild_takes_the_lock_before_it_reads(engines, world):
     read_at = body.index("_retained_scopes(session)")
     rebuild_at = body.index("_rebuild_scope(session, owner, survey)")
     write_at = body.index("set_state(session, KEY_FTS_FINGERPRINT")
+    assert lock_at < read_at < rebuild_at < write_at
 
-    assert participants_at < survey_at < lock_at < read_at < rebuild_at < write_at
-
-    # The driver itself issues no statement of its own before the lock: the
-    # `notes_metadata` reads it performs — the ownerless count and every
-    # per-scope row — are all inside the locked section.
+    # Every `notes_metadata` read this command makes is inside the lock.
     assert body.index("session.execute(") > lock_at
     assert body.index("notes_metadata") > lock_at
 
-    # The part that must not run under the lock is the filesystem observation,
-    # and it is structurally incapable of reading a row: `survey_rebuild_roots`
-    # takes participants rather than a session and issues no statement.
+    # The observation is structurally incapable of reading a row:
+    # `survey_rebuild_roots` takes participants rather than a session.
     survey_body = inspect.getsource(indexer.survey_rebuild_roots).split('"""')[2]
     assert "session" not in survey_body
     assert "execute" not in survey_body
 
-    # And the pre-lock enumeration is not trusted: the same helper runs again
-    # under the lock, and a scope the survey did not examine is refused rather
-    # than opened on the strength of a survey that predates it.
+    # The pre-lock enumeration is not trusted: the same helper runs again under
+    # the lock, and a scope the survey did not examine is refused rather than
+    # opened on the strength of a survey that predates it.
     assert "_retained_scopes(session)" in inspect.getsource(
         indexer._rebuild_root_participants
     )
-    assert "not in the pre-lock root survey" in inspect.getsource(
-        indexer._rebuild_scope
+    scope_source = inspect.getsource(indexer._rebuild_scope)
+    assert "not in the pre-lock root survey" in scope_source
+    # And it reads through the retained descriptor **and nothing else**: the
+    # `survey` parameter is required and there is no `pinned_root` fallback.
+    # An optional survey would be a bypass parameter on a guarantee, which is
+    # a guarantee until the next caller.
+    assert "no retained descriptor" in scope_source
+    assert "with pinned_root(" not in scope_source
+    assert "survey: RebuildRootSurvey," in scope_source
+    assert "survey: RebuildRootSurvey | None = None" not in scope_source
+
+
+async def test_the_locked_half_is_reached_only_through_the_guarded_half(
+    engines, world
+):
+    """The split must not become a second entry point.
+
+    `_rebuild_all_scopes_locked` takes the generation lock and reads rows, and
+    it assumes a survey taken under the account guard. A caller that reached it
+    directly would get the coverage proof with neither protection, which is the
+    whole of what this change added.
+    """
+    import pathlib
+
+    root = pathlib.Path(inspect.getfile(indexer)).parent.parent.parent
+    callers = []
+    for source in list((root / "src").rglob("*.py")) + list(
+        (root / "scripts").rglob("*.py")
+    ):
+        text_ = source.read_text()
+        if "_rebuild_all_scopes_locked" in text_:
+            callers.append(source.relative_to(root).as_posix())
+
+    assert callers == ["src/services/indexer.py"], callers
+    defined_at = inspect.getsource(indexer).index(
+        "async def _rebuild_all_scopes_locked"
+    )
+    called_at = inspect.getsource(indexer).index(
+        "await _rebuild_all_scopes_locked(session, survey)"
+    )
+    assert called_at < defined_at, (
+        "the only call site should be the guarded driver above the definition"
     )
 
 

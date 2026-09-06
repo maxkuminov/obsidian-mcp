@@ -19,6 +19,7 @@ import datetime
 import errno
 import importlib.util
 import inspect
+import os
 from pathlib import Path
 
 import pytest
@@ -614,7 +615,10 @@ async def test_e5_a_quarantined_scope_blocks_the_fingerprint(
     provenance or an unpinnable root.
     """
     _quarantine(_entry(4))
-    outcome = await indexer._rebuild_scope(object(), 4)
+    empty = indexer.RebuildRootSurvey(
+        observations={}, assignments={}, failures={}, descriptors={}
+    )
+    outcome = await indexer._rebuild_scope(object(), 4, empty)
     assert not outcome.completed
     assert outcome.skip is indexer.RebuildSkip.ROOT_QUARANTINED
     assert "4" in outcome.describe()
@@ -713,6 +717,7 @@ async def test_an_alias_created_after_assignment_is_caught_at_the_next_entry_poi
     factory = _RowSessionFactory([(1, "alice", str(a)), (2, "bob", str(b))])
     monkeypatch.setattr("src.database.async_session", factory, raising=False)
     monkeypatch.setattr(vault_overlap.settings, "mcp_sandbox_mode", False)
+    monkeypatch.setattr(vault_overlap.settings, "multi_user_mode", True)
 
     await indexer.detect_root_overlaps("periodic")
     assert vault_overlap.published_snapshot().entries == {}
@@ -743,6 +748,7 @@ async def test_a_nested_symlink_is_found_through_the_canonical_paths(
     factory = _RowSessionFactory([(1, "alice", str(outer)), (2, "bob", str(alias))])
     monkeypatch.setattr("src.database.async_session", factory, raising=False)
     monkeypatch.setattr(vault_overlap.settings, "mcp_sandbox_mode", False)
+    monkeypatch.setattr(vault_overlap.settings, "multi_user_mode", True)
 
     await indexer.detect_root_overlaps("periodic")
     entries = vault_overlap.published_snapshot().entries
@@ -921,23 +927,40 @@ async def test_the_survey_observes_off_the_loop_under_the_deadline(
     generation lock for as long as the kernel likes."""
     import threading
 
+    # Released after the assertions, so the parked thread finishes inside the
+    # test rather than outliving the event loop. The *production* residual is
+    # unchanged — a thread blocked in `open(2)` cannot be cancelled (L4) — but
+    # a suite that leaves one pending prints an asyncio "Task was destroyed"
+    # for every run, which trains a reader to ignore that message.
     release = threading.Event()
+    entered = threading.Event()
 
     def _blocking(assignment, **kwargs):
-        release.set()
-        threading.Event().wait(30)
+        entered.set()
+        release.wait(30)
         raise AssertionError("the deadline did not abandon the wait")
 
-    monkeypatch.setattr(vault_overlap, "observe_root_blocking", _blocking)
+    monkeypatch.setattr(
+        vault_overlap, "observe_root_blocking_retaining", _blocking
+    )
     monkeypatch.setattr(
         vault_overlap.settings, "vault_root_observe_timeout_seconds", 0.05
     )
 
-    survey = await asyncio.wait_for(
-        indexer.survey_rebuild_roots([_scope(1, tmp_path / "team")]), 5
-    )
-    assert survey.failures[1].skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
-    assert "not answering" in survey.failures[1].describe()
+    try:
+        survey = await asyncio.wait_for(
+            indexer.survey_rebuild_roots([_scope(1, tmp_path / "team")]), 5
+        )
+        assert survey.failures[1].skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
+        assert "not answering" in survey.failures[1].describe()
+        assert entered.is_set(), "the observation never reached the thread"
+    finally:
+        release.set()
+        # Let the abandoned task finish and its done-callback run.
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            if not [t for t in asyncio.all_tasks() if t is not asyncio.current_task()]:
+                break
 
 
 async def test_the_scope_survey_runs_before_the_generation_lock(monkeypatch, tmp_path):
@@ -965,6 +988,10 @@ async def test_the_scope_survey_runs_before_the_generation_lock(monkeypatch, tmp
     def _never(*_a, **_k):
         raise AssertionError("a root was opened despite the survey's verdict")
 
+    async def _guard(_session):
+        order.append("account guard")
+
+    monkeypatch.setattr(indexer, "lock_account_guard", _guard)
     monkeypatch.setattr(indexer, "_rebuild_root_participants", _participants)
     monkeypatch.setattr(indexer, "survey_rebuild_roots", _survey)
     # The *unbounded* acquisition: the driver lifts the engine's 60 s
@@ -978,7 +1005,8 @@ async def test_the_scope_survey_runs_before_the_generation_lock(monkeypatch, tmp
     with pytest.raises(indexer.RebuildCoverageAborted) as excinfo:
         await indexer.rebuild_tsvectors_all_scopes(object())
 
-    assert order == ["participants", "survey"], order
+    # The account guard is first of all: the survey it protects has not run yet.
+    assert order == ["account guard", "participants", "survey"], order
     assert "before the generation lock" in str(excinfo.value)
     assert str(outer) in str(excinfo.value) and str(inner) in str(excinfo.value)
 
@@ -993,11 +1021,21 @@ async def test_the_scope_survey_runs_before_the_generation_lock(monkeypatch, tmp
 # lands on must still be the inode that was observed.
 
 
-def _survey_of(owner, assignment, observation):
+def _survey_of(owner, assignment, observation, fd=None):
+    """A survey as the driver would hand it over, descriptor included.
+
+    `fd` defaults to a real descriptor for `assignment`, because that is what
+    the locked rebuild reads through — a survey without one refuses before it
+    reaches any of the checks below, which would make those checks untested.
+    The caller closes it via `survey.close()`.
+    """
+    if fd is None:
+        fd = os.open(str(assignment), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     return indexer.RebuildRootSurvey(
         observations={owner: observation},
         assignments={owner: str(assignment)},
         failures={},
+        descriptors={str(assignment): fd},
     )
 
 
@@ -1044,21 +1082,77 @@ async def test_a_reassignment_between_the_survey_and_the_lock_refuses(
     monkeypatch.setattr(indexer, "pinned_root", _never)
 
     survey = _survey_of(7, surveyed, vault_overlap.observe_root_blocking(str(surveyed)))
-    outcome = await indexer._rebuild_scope(object(), 7, survey)
+    try:
+        outcome = await indexer._rebuild_scope(object(), 7, survey)
+    finally:
+        survey.close()
 
     assert outcome.skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
     assert str(surveyed) in outcome.describe()
     assert str(moved) in outcome.describe()
 
 
-async def test_a_pathname_retargeted_after_the_survey_refuses_at_the_pin(
+async def test_a_pathname_retargeted_after_the_survey_cannot_reach_the_rebuild(
     monkeypatch, tmp_path
 ):
-    """The assignment is unchanged and the *directory it names* is not.
+    """Retargeting the pathname is now a no-op against this command.
 
-    This is the check-then-act interval `pinned_root` closes for the rest of
-    the pass, applied to the survey's own verdict: the pin lands on an inode
-    nobody examined, and `(st_dev, st_ino)` is what notices.
+    The rebuild reads through the **descriptor the survey opened**, not through
+    the name: a symlink repointed between the survey and the lock renames
+    nothing the driver is holding. This asserts the mechanism directly — the
+    scope root is replaced by a symlink to somewhere else entirely, and the
+    rebuild still receives the original directory's descriptor.
+    """
+    root = tmp_path / "team"
+    root.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+
+    async def _path(_session, _owner):
+        return root
+
+    monkeypatch.setattr(indexer, "_scope_vault_path", _path)
+
+    observed = vault_overlap.observe_root_blocking(str(root))
+    survey = _survey_of(7, root, observed)
+
+    handed = {}
+
+    async def _rebuilt(session, user_id, vault, root_fd, log_suffix):
+        handed["st"] = os.fstat(root_fd)
+        return indexer.RebuildOutcome(rows=1)
+
+    monkeypatch.setattr(indexer, "_rebuild_tsvectors_pinned", _rebuilt)
+
+    # The name now points somewhere else. A reopen would land on `elsewhere`.
+    root.rmdir()
+    root.symlink_to(elsewhere)
+
+    def _no_open(*_a, **_k):
+        raise AssertionError("the rebuild resolved a pathname after the survey")
+
+    monkeypatch.setattr(indexer, "pinned_root", _no_open)
+
+    try:
+        outcome = await indexer._rebuild_scope(object(), 7, survey)
+    finally:
+        survey.close()
+
+    assert outcome.completed
+    assert (handed["st"].st_dev, handed["st"].st_ino) == (
+        observed.st_dev, observed.st_ino
+    ), "the rebuild read the retargeted directory rather than the examined one"
+
+
+async def test_a_descriptor_that_does_not_match_its_recorded_facts_refuses(
+    monkeypatch, tmp_path
+):
+    """The bookkeeping check on the handover.
+
+    The descriptor cannot drift from the directory it names, so this cannot be
+    a filesystem race — it is the assertion that the fd handed to the rebuild
+    is the fd whose facts the survey recorded, which is what makes the
+    survey's verdict a statement about what is read.
     """
     root = tmp_path / "team"
     root.mkdir()
@@ -1069,8 +1163,6 @@ async def test_a_pathname_retargeted_after_the_survey_refuses_at_the_pin(
     monkeypatch.setattr(indexer, "_scope_vault_path", _path)
 
     observed = vault_overlap.observe_root_blocking(str(root))
-    # The same assignment, observed as a *different* inode — exactly what a
-    # symlink retargeted between the survey and the lock produces.
     stale = vault_overlap.RootObservation(
         assignment=observed.assignment,
         st_dev=observed.st_dev,
@@ -1083,10 +1175,42 @@ async def test_a_pathname_retargeted_after_the_survey_refuses_at_the_pin(
 
     monkeypatch.setattr(indexer, "_rebuild_tsvectors_pinned", _never_rebuilt)
 
-    outcome = await indexer._rebuild_scope(object(), 7, _survey_of(7, root, stale))
+    survey = _survey_of(7, root, stale)
+    try:
+        outcome = await indexer._rebuild_scope(object(), 7, survey)
+    finally:
+        survey.close()
 
     assert outcome.skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
-    assert "changed between the root survey and the rebuild" in outcome.describe()
+    assert "does not report the facts the survey recorded" in outcome.describe()
+
+
+async def test_a_scope_with_no_retained_descriptor_is_never_reopened(
+    monkeypatch, tmp_path
+):
+    """No descriptor, no rebuild — and emphatically no second `open`."""
+    root = tmp_path / "team"
+    root.mkdir()
+
+    async def _path(_session, _owner):
+        return root
+
+    def _no_open(*_a, **_k):
+        raise AssertionError("the rebuild reopened a pathname under the lock")
+
+    monkeypatch.setattr(indexer, "_scope_vault_path", _path)
+    monkeypatch.setattr(indexer, "pinned_root", _no_open)
+
+    survey = indexer.RebuildRootSurvey(
+        observations={7: vault_overlap.observe_root_blocking(str(root))},
+        assignments={7: str(root)},
+        failures={},
+        descriptors={},
+    )
+    outcome = await indexer._rebuild_scope(object(), 7, survey)
+
+    assert outcome.skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
+    assert "no retained descriptor" in outcome.describe()
 
 
 async def test_a_matching_verdict_proceeds_to_the_rebuild(monkeypatch, tmp_path):
@@ -1108,7 +1232,211 @@ async def test_a_matching_verdict_proceeds_to_the_rebuild(monkeypatch, tmp_path)
     monkeypatch.setattr(indexer, "_rebuild_tsvectors_pinned", _rebuilt)
 
     survey = _survey_of(7, root, vault_overlap.observe_root_blocking(str(root)))
-    outcome = await indexer._rebuild_scope(object(), 7, survey)
+    try:
+        outcome = await indexer._rebuild_scope(object(), 7, survey)
+    finally:
+        survey.close()
 
     assert outcome.completed and outcome.rows == 3
     assert seen["user_id"] == 7
+
+
+# ── Nothing resolves a pathname after the generation lock ────────────────────
+
+
+async def test_no_root_is_opened_by_name_after_the_generation_lock(
+    monkeypatch, tmp_path
+):
+    """The MAJOR, asserted where it bites: `os.open` on a vault root is banned
+    from the locked section entirely.
+
+    `pinned_root` opened the scope's pathname *after* `acquire_generation_lock`.
+    Two things follow and both are bad. The `open` is unbounded, so a hung NFS
+    or FUSE mount holds the index generation lock for as long as the kernel
+    takes — every pass in the process, in every container, queues behind one
+    stalled mount. And it is a second lookup, so the inode it lands on need not
+    be the inode the survey checked.
+
+    The survey therefore retains the descriptor and the rebuild reads through
+    it. The stub below fails **only** for the scope roots and only after the
+    lock, so pytest's own machinery (which opens source files to format a
+    failure) is untouched.
+    """
+    roots = {}
+    for owner in (1, 2):
+        root = tmp_path / f"vault{owner}"
+        root.mkdir()
+        roots[owner] = root
+
+    participants = [_scope(owner, root) for owner, root in roots.items()]
+    survey = await indexer.survey_rebuild_roots(participants)
+    assert survey.failures == {}
+    assert len(survey.descriptors) == 2, "the survey retained no descriptors"
+
+    locked = {"yes": False}
+    banned = {str(root) for root in roots.values()}
+    real_open = os.open
+
+    def _guarded_open(path, *args, **kwargs):
+        if locked["yes"] and str(path) in banned:
+            raise AssertionError(
+                f"a vault root pathname was opened after the generation lock: {path}"
+            )
+        return real_open(path, *args, **kwargs)
+
+    async def _path(_session, owner):
+        return roots[owner]
+
+    async def _rebuilt(session, user_id, vault, root_fd, log_suffix):
+        # It really did get a usable directory, not merely "not an open".
+        os.fstat(root_fd)
+        return indexer.RebuildOutcome(rows=1)
+
+    monkeypatch.setattr(indexer, "_scope_vault_path", _path)
+    monkeypatch.setattr(indexer, "_rebuild_tsvectors_pinned", _rebuilt)
+    monkeypatch.setattr(os, "open", _guarded_open)
+
+    try:
+        locked["yes"] = True
+        outcomes = [
+            await indexer._rebuild_scope(object(), owner, survey)
+            for owner in roots
+        ]
+    finally:
+        locked["yes"] = False
+        monkeypatch.undo()
+        survey.close()
+
+    assert all(o.completed for o in outcomes)
+
+
+async def test_the_survey_closes_a_peer_descriptor_it_will_never_read(tmp_path):
+    """A peer is present so a scope can be found to overlap it. Nothing reads
+    its directory, so holding it open would be a plain leak."""
+    scope_root = tmp_path / "scope"
+    scope_root.mkdir()
+    peer_root = tmp_path / "peer"
+    peer_root.mkdir()
+
+    survey = await indexer.survey_rebuild_roots(
+        [_scope(1, scope_root), _peer(2, peer_root, "bob")]
+    )
+    try:
+        assert set(survey.descriptors) == {str(scope_root)}
+        assert survey.descriptor_for(2) is None
+    finally:
+        survey.close()
+
+
+async def test_close_is_idempotent_and_releases_every_descriptor(tmp_path):
+    """It runs from a `finally` that also runs on the abort paths, so a second
+    call must be a no-op rather than an `EBADF` replacing the real failure."""
+    roots = []
+    for name in ("a", "b"):
+        root = tmp_path / name
+        root.mkdir()
+        roots.append(root)
+
+    survey = await indexer.survey_rebuild_roots(
+        [_scope(i, root) for i, root in enumerate(roots)]
+    )
+    held = list(survey.descriptors.values())
+    assert len(held) == 2
+
+    survey.close()
+    assert survey.descriptors == {}
+    survey.close()  # must not raise
+
+    for fd in held:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+async def test_an_abort_after_the_survey_still_closes_every_descriptor(
+    monkeypatch, tmp_path
+):
+    """The driver's `finally`, through the real entry point."""
+    root = tmp_path / "team"
+    root.mkdir()
+
+    surveys = []
+    real_survey = indexer.survey_rebuild_roots
+
+    async def _survey(participants):
+        result = await real_survey(participants)
+        surveys.append(result)
+        return result
+
+    async def _participants(_session):
+        return [_scope(1, root)]
+
+    async def _guard(_session):
+        return None
+
+    async def _lock(_session):
+        raise RuntimeError("the lock wait was interrupted")
+
+    monkeypatch.setattr(indexer, "lock_account_guard", _guard)
+    monkeypatch.setattr(indexer, "_rebuild_root_participants", _participants)
+    monkeypatch.setattr(indexer, "survey_rebuild_roots", _survey)
+    monkeypatch.setattr(indexer, "acquire_generation_lock_unbounded", _lock)
+
+    with pytest.raises(RuntimeError, match="lock wait"):
+        await indexer.rebuild_tsvectors_all_scopes(object())
+
+    assert len(surveys) == 1
+    assert surveys[0].descriptors == {}, (
+        "an abort after the survey leaked its retained descriptors"
+    )
+
+
+async def test_an_abandoned_observation_closes_the_descriptor_it_opened_late(
+    monkeypatch, tmp_path
+):
+    """L4's descriptor half.
+
+    The deadline abandons the wait, not the syscall: the thread stays parked in
+    `open(2)` and comes back holding an open directory nobody is waiting for.
+    Without the late-completion callback that descriptor lives as long as the
+    process — one per stalled root per run, on exactly the pathological mount
+    the deadline exists to survive.
+    """
+    import threading
+
+    root = tmp_path / "team"
+    root.mkdir()
+    release = threading.Event()
+    opened = {}
+
+    real = vault_overlap.observe_root_blocking_retaining
+
+    def _slow(assignment, **kwargs):
+        release.wait(10)
+        observation, fd = real(assignment, **kwargs)
+        opened["fd"] = fd
+        return observation, fd
+
+    monkeypatch.setattr(vault_overlap, "observe_root_blocking_retaining", _slow)
+    monkeypatch.setattr(
+        vault_overlap.settings, "vault_root_observe_timeout_seconds", 0.05
+    )
+
+    observation, fd = await indexer._observe_root_retaining(str(root))
+    assert observation.cause == vault_overlap.CAUSE_TIMEOUT
+    assert fd is None
+
+    # Let the thread finish; the done-callback closes what it opened.
+    release.set()
+    for _ in range(200):
+        if "fd" in opened:
+            break
+        await asyncio.sleep(0.01)
+    assert "fd" in opened, "the abandoned observation never completed"
+    for _ in range(200):
+        try:
+            os.fstat(opened["fd"])
+        except OSError:
+            break
+        await asyncio.sleep(0.01)
+    else:  # pragma: no cover - the callback did not run
+        raise AssertionError("the late descriptor was never closed")

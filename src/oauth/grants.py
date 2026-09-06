@@ -144,12 +144,28 @@ async def lock_account_guard(session) -> None:
     credential nobody granted and nobody saw. Serializing the mint against the
     deactivating handlers is what removes the window.
 
-    **Lock order.** This lock is taken alone: the password change takes it and
-    nothing else, the admin handlers take it and nothing else, the mint takes
-    it and nothing else. `register_submit` takes `USER_BOOTSTRAP_LOCK_KEY` for
-    its bootstrap transaction and this one for its mint **sequentially, never
-    nested**, so no path holds one while asking for the other and there is no
-    cycle.
+    **Lock order.** On the request paths this lock is taken alone: the password
+    change takes it and nothing else, the admin handlers take it and nothing
+    else, the mint takes it and nothing else. `register_submit` takes
+    `USER_BOOTSTRAP_LOCK_KEY` for its bootstrap transaction and this one for
+    its mint **sequentially, never nested**, so no path holds one while asking
+    for the other and there is no cycle.
+
+    **One path holds this together with another lock, and it is the head of the
+    order:** `indexer.rebuild_tsvectors_all_scopes` (`make rebuild-tsvectors`)
+    takes this first and `index_state.acquire_generation_lock` second, then row
+    locks. It has to hold this one because its vault-root survey accepts a
+    layout on the strength of a peer being *inactive*, and an administrator
+    reactivating or reassigning that peer mid-run would turn the accepted
+    layout into a cross-tenant read — a check-then-act across processes that
+    only serializing against these very handlers can close (#199). Nothing
+    takes the two in the opposite order, so there is still no cycle; if you add
+    a path that needs both, take **this one first**.
+
+    The visible cost is that a running `make rebuild-tsvectors` blocks account
+    edits and session mints until it commits. Accepted: it is an operator-run
+    one-off, the alternative is the cross-tenant read, and this lock is
+    transaction-scoped so a crashed rebuild releases it.
 
     Transaction-scoped (`pg_advisory_xact_lock`), so it is released by the
     commit or the rollback — there is no unlock path to forget and a crashed
