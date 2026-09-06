@@ -70,6 +70,12 @@ TEMPLATES_DIR = os.path.join(os.path.dirname(users_mod.__file__), "templates")
 
 
 class _Result:
+    """`rowcount` answers `revoke_user_sessions`, which `edit_user_submit`
+    calls on a deactivating transition (#198). Zero: this fake models the
+    vault-root peer query, not the session registry."""
+
+    rowcount = 0
+
     def __init__(self, value=None, rows=None):
         self._value = value
         self._rows = rows or []

@@ -39,12 +39,12 @@ from typing import Any
 from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from sqlalchemy import func, select, text, update as sa_update
+from sqlalchemy import func, select, update as sa_update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.passwords import hash_password
-from src.auth.session import _SingleUserSentinel
+from src.auth.passwords import hash_password, validate_new_password
+from src.auth.session import _SingleUserSentinel, revoke_user_sessions
 from src.config import settings
 from src.control_panel.flash import ERR, flash
 from src.control_panel.routes import (
@@ -57,7 +57,7 @@ from src.control_panel.routes import (
 from src.csrf import verify_csrf
 from src.database import get_session
 from src.models.db import APIKey, NoteMetadata, UsageLog, User
-from src.oauth.grants import ACCOUNT_GUARD_LOCK_KEY
+from src.oauth.grants import ACCOUNT_GUARD_LOCK_KEY, lock_account_guard
 from src.services import security_events, vault_overlap
 from src.services.vault import clear_user_vault_cache, validate_vault_root_path
 
@@ -228,16 +228,24 @@ _ADMIN_GUARD_LOCK_KEY = ACCOUNT_GUARD_LOCK_KEY
 
 
 async def _lock_admin_guard(session: AsyncSession) -> None:
-    """Enter the "who may be an admin" critical section.
+    """Enter the "who may be an admin, and what may happen to an account"
+    critical section.
 
     Must be taken *before* reading the admin count and released only by the
     same transaction that writes the flags — i.e. never commit between this
-    and the write.
+    and the write. That rule now also covers the session revocations these
+    handlers issue: their `UPDATE user_sessions` rides this same transaction,
+    which is exactly why `revoke_user_sessions` does not commit.
+
+    **A delegation, not a second implementation.** `lock_account_guard` in
+    `src/oauth/grants.py` holds the one definition, and the self-service
+    password change (#197) and every session mint (#198) take it too. They
+    have to take *the same key as this one*: an administrator deactivating an
+    account and that account changing its own password must exclude each
+    other, and two keys do not exclude each other. The value is unchanged —
+    only where it is written down moved.
     """
-    await session.execute(
-        text("SELECT pg_advisory_xact_lock(:key)"),
-        {"key": _ADMIN_GUARD_LOCK_KEY},
-    )
+    await lock_account_guard(session)
 
 
 async def _actor_still_privileged(
@@ -271,6 +279,40 @@ _ACTOR_REVOKED_MSG = (
     "Your account's admin access changed while that request was in flight — "
     "nothing was saved. Sign in again."
 )
+
+
+def _log_sessions_revoked(
+    request: Request,
+    user: User | _SingleUserSentinel,
+    target_id: int,
+    reason: str,
+    count: int,
+) -> None:
+    """The `panel_sessions_revoked` record for an administrative account event.
+
+    **Emitted after the commit that makes it true**, for the same reason
+    `panel_password_reset` is: a record asserting that a user's sessions were
+    ended is one an operator acts on, and a record written before the commit
+    would survive a rollback that ended nothing.
+
+    `user_id` — the *unsuffixed* name — is the account whose sessions went,
+    because these callers hold the row they revoked against. (The logout path
+    uses `user_id_session`: there the id is copied from the cookie and no row
+    was read. The catalogue declares both so the provenance stays legible.)
+
+    `count` is what `revoke_user_sessions` returned, so an operator reading the
+    line knows whether anything was live. Nothing else rides along: not the
+    identifier, not its stored hash, not the new password.
+    """
+    actor_user_id, _actor_username = _actor(user)
+    security_events.emit(
+        "panel_sessions_revoked",
+        level=logging.INFO,
+        subject=security_events.subject_for(user_id=actor_user_id, request=request),
+        reason=reason,
+        user_id=target_id,
+        count=count,
+    )
 
 
 def _log_actor_revoked(request: Request, user) -> None:
@@ -383,10 +425,18 @@ async def create_user(
             request,
             "Username must be 1–64 chars, lowercase letters / digits / underscores only.",
         )
-    if len(initial_password) < 8:
-        return _back_to_list_with_error(
-            request, "Initial password must be at least 8 characters."
-        )
+    # One policy, four setters (#197). `create_user` accepted eight characters
+    # and handed its input straight to `hash_password`, which **raises** on an
+    # embedded NUL — so a NUL in the initial-password field was an unhandled
+    # `ValueError` and a 500 on an admin-only route. The validator turns that
+    # into a form error and applies the same minimum the account's owner will
+    # be held to when they set it themselves; leaving this one at eight would
+    # let an administrator set a password its owner is then forbidden to reuse.
+    #
+    # No `confirm`: this form has one password field.
+    password_error = validate_new_password(initial_password)
+    if password_error:
+        return _back_to_list_with_error(request, password_error)
 
     existing = (await session.execute(select(User.id).where(User.username == normalized))).scalar_one_or_none()
     if existing is not None:
@@ -575,15 +625,35 @@ async def edit_user_submit(
             return _back_with_error(request, user_id, conflict)
 
     old_vault = target.vault_path
+    # Read *before* the write below, because the transition is what decides the
+    # revocation: an account that was active and no longer will be. A vault-path
+    # edit, a promotion, a demotion or a save that leaves `is_active` alone all
+    # revoke nothing — a live session of an account that is still active is a
+    # session nobody ended.
+    was_active = target.is_active
     target.vault_path = normalized
     target.is_admin = new_admin
     target.is_active = new_active
+
+    # Deactivation is the moment the account stops being able to sign in, so it
+    # is the moment its live sessions stop being credentials (#198). Before the
+    # commit and with no commit of its own: the account guard above is
+    # transaction-scoped and the flag write and the revocation must land or
+    # roll back together, or an `IntegrityError` below would leave a user
+    # signed out of an account that is still active.
+    revoked = 0
+    deactivating = was_active and not new_active
+    if deactivating:
+        revoked = await revoke_user_sessions(session, target.id)
 
     try:
         await session.commit()
     except IntegrityError:
         await session.rollback()
         return _back_with_error(request, user_id, "Database integrity error (vault path may not be unique).")
+
+    if deactivating:
+        _log_sessions_revoked(request, user, target.id, "user_deactivated", revoked)
 
     # Invalidate the in-process vault cache so the next indexer pass and
     # any authenticated request resolves the new path.
@@ -719,9 +789,18 @@ async def delete_user(
             request, f"User '{target.username}' permanently deleted."
         )
 
+    # A soft delete is a deactivation by another name and its live sessions go
+    # the same way (#198) — inside the guard, before the commit, with no commit
+    # of its own. The permanent branch above adds **nothing**: `user_sessions`
+    # carries `ON DELETE CASCADE` and `User.sessions` declares
+    # `passive_deletes=True`, so the database removes those rows and the ORM
+    # does not load and delete them one at a time. Adding a revocation there
+    # would hide whether the cascade is the thing that actually fires.
     target.is_active = False
+    revoked = await revoke_user_sessions(session, target.id)
     await session.commit()
     clear_user_vault_cache(target.id)
+    _log_sessions_revoked(request, user, target.id, "user_deleted", revoked)
     return _back_to_list(request, f"User '{target.username}' deactivated.")
 
 
@@ -733,8 +812,14 @@ async def reset_password(
     session: AsyncSession = Depends(get_session),
     user: User | _SingleUserSentinel = Depends(require_admin_panel),
 ):
-    if len(new_password) < 8:
-        return _back_with_error(request, user_id, "New password must be at least 8 characters.")
+    # The shared policy (#197). Same constant, same message, same NUL rule as
+    # the account owner's own change and as `create_user` — and the NUL check
+    # is what stops `hash_password`'s `ValueError` from reaching the client as
+    # a 500. Refused before the lock is taken: a refusal that never writes has
+    # no business holding the critical section.
+    password_error = validate_new_password(new_password)
+    if password_error:
+        return _back_with_error(request, user_id, password_error)
 
     # Same critical section as `edit_user_submit` and `delete_user`. A password
     # reset is a full account takeover of the target — it rewrites the hash and
@@ -758,6 +843,19 @@ async def reset_password(
 
     target.password_hash = hash_password(new_password)
     target.session_version += 1
+    # The rows, not just the account-wide counter (#198). `session_version`
+    # was the only invalidator this handler had, and it is a second switch
+    # rather than a substitute: the registry is what a *specific* live session
+    # is refused by, and it is what survives if a cookie ever escapes the
+    # version check.
+    #
+    # **No commit here and none before it.** `revoke_user_sessions` writes on
+    # this session and deliberately does not commit, because the account guard
+    # taken above is transaction-scoped and its check-then-act atomicity
+    # depends on nothing committing between the lock and the write. The one
+    # commit below carries the hash, the version bump and the revocation
+    # together — a failure rolls back all three, and nothing is revoked.
+    revoked = await revoke_user_sessions(session, target.id)
     await session.commit()
 
     # **After the commit** (D17). Emitted before the commit, a rollback would
@@ -778,6 +876,12 @@ async def reset_password(
         username=target.username,
         client_ip=security_events.client_ip(request),
         route=_request_route(request),
+    )
+    # Keyed on `target.id` alone, so the acting administrator's own session
+    # survives resetting somebody else's password — they stay on the page they
+    # did it from.
+    _log_sessions_revoked(
+        request, user, target.id, "admin_password_reset", revoked
     )
     return _back_to_list(request, f"Password reset for '{target.username}'.")
 

@@ -153,8 +153,13 @@ async def test_password_reset_takes_the_admin_guard_lock(monkeypatch):
     )
     target_row = MagicMock()
     target_row.scalar_one_or_none.return_value = target
+    # The fourth statement is the session revocation (#198): the reset now
+    # revokes every live session of the target inside this same critical
+    # section, and `revoke_user_sessions` reads `rowcount` off its result.
+    revocation = MagicMock()
+    revocation.rowcount = 2
     db = AsyncMock()
-    db.execute.side_effect = [lock, actor_row, target_row]
+    db.execute.side_effect = [lock, actor_row, target_row, revocation]
     monkeypatch.setattr(panel_users, "hash_password", lambda _password: "new-hash")
 
     request = _PanelRequest()
@@ -170,6 +175,9 @@ async def test_password_reset_takes_the_admin_guard_lock(monkeypatch):
     # The advisory lock is the *first* statement, before the actor is re-read
     # and before the target row is loaded.
     assert "pg_advisory_xact_lock" in str(db.execute.await_args_list[0].args[0])
+    # And the revocation rides the same transaction: it is issued after the
+    # lock and before the single commit, with nothing committed in between.
+    assert "UPDATE user_sessions" in str(db.execute.await_args_list[3].args[0])
     assert target.password_hash == "new-hash"
     db.commit.assert_awaited_once()
     db.rollback.assert_not_awaited()

@@ -377,6 +377,13 @@ class _ActorRow:
 
 
 class _Result:
+    """`rowcount` is read by the session revocation these handlers now issue
+    (#198): `revoke_user_sessions` takes it off the `UPDATE user_sessions`
+    result. Zero — this fake holds no session rows, and these tests are about
+    what gets *recorded*, not about the registry."""
+
+    rowcount = 0
+
     def __init__(self, value):
         self._value = value
 
