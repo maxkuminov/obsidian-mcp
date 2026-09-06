@@ -340,3 +340,151 @@ async def test_a_skip_and_an_empty_scope_are_not_the_same_value(
         assert skipped.skip is indexer.RebuildSkip.PROVENANCE_UNSETTLED
         assert skipped.rows == 0
     world["verdicts"][2] = indexer.PROVENANCE_KEEP
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The maintenance root survey (#199, adversarial round 1 BLOCKER)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+async def test_an_inactive_scope_containing_an_active_root_aborts_before_any_read(
+    sessionmaker, world, monkeypatch
+):
+    """The population gap between the serving snapshot and this driver.
+
+    `detect_and_publish` observes **active** users holding an assignment,
+    because that is whom the server serves. This driver opens every scope that
+    holds rows, and since #206 that deliberately includes an **inactive**
+    owner's retained root. So user 2 — inactive, retaining `/vaults/team` — is
+    named by nothing the serving snapshot publishes, while active user 1 sits
+    at `/vaults/team/private` underneath it. Without the pre-lock survey the
+    rebuild opens user 2's root, walks user 1's notes through it, and writes
+    their keyword vectors under user 2's scope, under a fingerprint asserting
+    that every retained row was rebuilt correctly.
+
+    Asserted as "nothing was read": `pinned_root` raises if it is reached at
+    all, so the abort cannot be a late one that has already opened a root.
+    """
+    roots = world["roots"]
+    nested = roots[2] / "private"
+    nested.mkdir(exist_ok=True)
+    (nested / "Note.md").write_text(BODY_A, encoding="utf-8")
+
+    await _seed_rows(sessionmaker, [1, 2])
+    async with sessionmaker() as session:
+        # user 1 is ACTIVE and nested inside inactive user 2's retained root.
+        await session.execute(
+            text("UPDATE users SET vault_path = :p WHERE id = 1"),
+            {"p": str(nested)},
+        )
+        await session.commit()
+
+    def _never(*_a, **_k):
+        raise AssertionError("a vault root was opened despite the survey")
+
+    monkeypatch.setattr(indexer, "pinned_root", _never)
+
+    try:
+        async with sessionmaker() as session:
+            with pytest.raises(indexer.RebuildCoverageAborted) as excinfo:
+                await indexer.rebuild_tsvectors_all_scopes(session)
+
+        message = str(excinfo.value)
+        assert "before the generation lock" in message
+        assert "root overlaps another scope" in message
+        # The pair is named, both roots and the relation.
+        assert str(roots[2]) in message and str(nested) in message
+        assert await _stored_fingerprint(sessionmaker) is None
+        assert await _tsvectors(sessionmaker) == {1: False, 2: False}
+    finally:
+        async with sessionmaker() as session:
+            await session.execute(
+                text("UPDATE users SET vault_path = :p WHERE id = 1"),
+                {"p": str(roots[1])},
+            )
+            await session.commit()
+
+
+async def test_the_survey_leaves_the_serving_snapshot_alone(
+    sessionmaker, world, monkeypatch
+):
+    """Maintenance-only, asserted. The survey publishes nothing, so the users
+    the server serves and refuses are exactly the users they were before."""
+    from src.services import vault_overlap
+
+    vault_overlap.publish_synthetic_snapshot()
+    before = vault_overlap.published_snapshot()
+
+    roots = world["roots"]
+    nested = roots[2] / "private"
+    nested.mkdir(exist_ok=True)
+    await _seed_rows(sessionmaker, [1, 2])
+    async with sessionmaker() as session:
+        await session.execute(
+            text("UPDATE users SET vault_path = :p WHERE id = 1"),
+            {"p": str(nested)},
+        )
+        await session.commit()
+
+    try:
+        async with sessionmaker() as session:
+            with pytest.raises(indexer.RebuildCoverageAborted):
+                await indexer.rebuild_tsvectors_all_scopes(session)
+
+        after = vault_overlap.published_snapshot()
+        assert after is before, "the maintenance survey republished the snapshot"
+        assert after.entries == {}
+    finally:
+        async with sessionmaker() as session:
+            await session.execute(
+                text("UPDATE users SET vault_path = :p WHERE id = 1"),
+                {"p": str(roots[1])},
+            )
+            await session.commit()
+
+
+async def test_an_unexaminable_scope_root_aborts_before_the_lock(
+    sessionmaker, world, monkeypatch
+):
+    """"We could not look" is not a completed rebuild, and it is decided before
+    the generation lock rather than by an `open` that blocks while holding it.
+    """
+    roots = world["roots"]
+    await _seed_rows(sessionmaker, [1, 2])
+    async with sessionmaker() as session:
+        await session.execute(
+            text("UPDATE users SET vault_path = :p WHERE id = 2"),
+            {"p": str(roots[2] / "not-there")},
+        )
+        await session.commit()
+
+    def _never(*_a, **_k):
+        raise AssertionError("a vault root was opened despite the survey")
+
+    monkeypatch.setattr(indexer, "pinned_root", _never)
+
+    try:
+        async with sessionmaker() as session:
+            with pytest.raises(indexer.RebuildCoverageAborted) as excinfo:
+                await indexer.rebuild_tsvectors_all_scopes(session)
+        message = str(excinfo.value)
+        assert "root unexaminable" in message
+        assert "before the generation lock" in message
+        assert await _stored_fingerprint(sessionmaker) is None
+    finally:
+        async with sessionmaker() as session:
+            await session.execute(
+                text("UPDATE users SET vault_path = :p WHERE id = 2"),
+                {"p": str(roots[2])},
+            )
+            await session.commit()
+
+
+async def test_sibling_roots_still_rebuild_normally(sessionmaker, world):
+    """The survey must not abort a healthy layout — production's two roots are
+    siblings under `/vaults/`, so the expected live result is silence."""
+    await _seed_rows(sessionmaker, [1, 2])
+    async with sessionmaker() as session:
+        outcomes = await indexer.rebuild_tsvectors_all_scopes(session)
+    assert all(o.completed for o in outcomes.values())
+    assert await _tsvectors(sessionmaker) == {1: True, 2: True}

@@ -223,6 +223,56 @@ The standalone rebuild process (E5) has its own event loop and its own lock, and
 that is correct: it is a different process with a different snapshot, and it
 consumes only what it published itself.
 
+### The maintenance rebuild checks a different population, and must
+
+`detect_and_publish` enumerates **active users holding an assignment**. That is
+the right population for the *serving* snapshot, and it is deliberately not
+widened: quarantining an inactive account refuses nothing (nothing serves it,
+nothing indexes it) while making an active peer look implicated on the panel.
+
+E5's driver, `rebuild_tsvectors_all_scopes`, enumerates something else. Since
+#206 it takes its scopes from the rows that exist — `SELECT DISTINCT user_id
+FROM notes_metadata` — because the keyword fingerprint asserts something about
+*every retained row*, and an inactive owner's rows are as retained, and as
+returnable by `keyword_search`, as anyone's. So it opens an inactive owner's
+retained root, and the serving snapshot has never observed it.
+
+The gap is exactly one configuration, and it is a cross-tenant read:
+
+> User B is **inactive**, retaining rows under `/vaults/team`. User A is active
+> at `/vaults/team/private`. Nothing quarantines B — the detection does not
+> observe inactive users, correctly — so the driver pins `/vaults/team`, walks
+> A's notes through it, writes their keyword vectors under B's `user_id`, and
+> records a fingerprint certifying that every retained row was rebuilt.
+
+So the driver runs the **same two checks over its own read set**: every
+retained scope's root, active or inactive, plus every active assigned root as a
+peer it could collide with, deduplicated by user so a scope is never paired
+against itself. A relation involving a root it would open aborts the whole
+operation, naming the pair. A root it would open that cannot be observed is
+`RebuildSkip.ROOT_UNEXAMINABLE`, a non-completed outcome that aborts exactly as
+an unsettled provenance or an unpinnable root does — "we could not look" is not
+a completed rebuild. A root it would **not** open and cannot observe does not
+abort it: nothing was observed to relate it to anything, which is L2's class,
+and failing maintenance because one unrelated tenant's mount is down is the
+false-positive direction.
+
+**It publishes nothing.** The verdict is computed inside the command and
+discarded with it; the serving snapshot is untouched, and so is the set of
+users the admission gate refuses. Two populations, two questions — "whom does
+this server serve" and "whose bytes will this command read" — and collapsing
+them would be wrong in both directions at once.
+
+**And it runs before the generation lock.** The observation is the same
+bounded, off-loop one (`observe_root`, `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`),
+completed before `acquire_generation_lock`, and the descriptor-bound verdict is
+carried into the locked section: under the lock the driver re-checks that the
+assignment is still the one surveyed and that `os.fstat(root_fd)` reports the
+inode that was observed, and refuses otherwise. Opening a root synchronously
+*after* the lock — which is what `pinned_root` alone did — lets one hung NFS or
+FUSE mount hold the index generation lock for as long as the kernel likes, with
+every pass in the process queued behind it.
+
 ### Fail closed until the first snapshot
 
 An asynchronously-published snapshot is not startup enforcement. Between the app
@@ -289,7 +339,20 @@ the current state.
 | Reason | Meaning | Wording |
 | --- | --- | --- |
 | `overlap(peer_user_id, peer_username, peer_assignment, relation)` | This root and that user's root are the same directory or nested. `relation` is one of `identical`, `contains`, `contained_by`. | Panel: "vault root overlaps <peer>'s (<relation>), as at last check". Run row and log: names both users and both roots, from the recorded facts. |
-| `root_unexaminable(errno)` | The root could not be opened, so no overlap could be ruled out. **Not an overlap** — no peer is named, because none was observed. | Panel: "vault root could not be examined (<errno>) — not served". Run row and log: names the one user, the recorded assignment and the errno. |
+| `root_unexaminable(cause)` | The root could not be *established*, so no overlap could be ruled out. **Not an overlap** — no peer is named, because none was observed. `cause` is one of **three**: an `errno`, `timeout` (the observation exceeded its deadline), or `unstable` — the root opened and its canonical real path then named a *different* inode, so nothing observed describes one directory. | Panel: "vault root could not be examined (<cause>) — not served". Run row and log: names the one user, the recorded assignment and the cause. |
+
+**Three causes, for the reason there are two reasons.** A missing directory is
+a mount that was not applied; a timeout is a mount that is not answering; an
+unstable pathname is a root being *retargeted while the check runs* — the only
+one of the three that says something is moving underneath the server rather
+than absent from it, and the one an operator investigates as a live change
+rather than as a configuration error. It is also the only one with no `errno`
+to report: folding it in would mean naming an error number no syscall returned.
+`observe_root_blocking` produces it by binding the real path to the descriptor
+the way `indexer.observe_root_facts` does — `os.stat(os.path.realpath(...))`
+must report the same `(st_dev, st_ino)` as `os.fstat(fd)` — and a disagreement
+is not a mismatch to report but a statement that neither fact describes one
+directory.
 
 Calling an unopenable root an "overlap" would send an operator looking for a
 second account that does not exist. The two reasons are separately worded in the

@@ -3519,6 +3519,18 @@ class RebuildSkip(enum.Enum):
     #: keeps its previous-configuration vectors, so the coverage claim cannot
     #: be made.
     ROOT_QUARANTINED = "root quarantined"
+    #: The pre-lock survey found this scope's root identical to, inside, or
+    #: containing another root in the **maintenance** population — which
+    #: includes the retained scopes of *inactive* users, whom the serving
+    #: snapshot never observes because nothing serves them. Distinct from
+    #: `ROOT_QUARANTINED`, which is the serving snapshot's verdict about an
+    #: active tenant.
+    ROOT_OVERLAPS = "root overlaps another scope"
+    #: The pre-lock survey could not observe this scope's root within the
+    #: bounded deadline, or could not open it at all. "We could not look" is
+    #: not evidence of safety, and it is emphatically not a completed rebuild:
+    #: it aborts the coverage claim exactly as the other skips do.
+    ROOT_UNEXAMINABLE = "root unexaminable"
 
 
 @dataclass(frozen=True)
@@ -3601,8 +3613,235 @@ async def _scope_vault_path(session, owner: int | None) -> Path | None:
     return Path(row.vault_path)
 
 
-async def _rebuild_scope(session, owner: int | None) -> RebuildOutcome:
-    """Rebuild one retained owner scope. Does **not** commit."""
+async def _retained_scopes(session) -> list[int | None]:
+    """Every owner scope holding `notes_metadata` rows. **One statement, two
+    readers** — the pre-lock survey and the locked driver both enumerate
+    through this, so "the roots that were surveyed" and "the roots that are
+    opened" are the same question asked twice rather than two questions."""
+    return [
+        row[0]
+        for row in (await session.execute(text(
+            "SELECT DISTINCT user_id FROM notes_metadata ORDER BY user_id"
+        ))).all()
+    ]
+
+
+@dataclass(frozen=True)
+class _RootParticipant:
+    """One root the all-scopes rebuild must reason about before it opens any.
+
+    `is_scope` is the half that matters. A **scope** is a root this driver
+    would open and read; a **peer** is an active tenant's root it would not,
+    present only so that a scope can be found to overlap it.
+    """
+
+    owner: int | None
+    label: str
+    assignment: str
+    is_scope: bool
+
+
+@dataclass(frozen=True)
+class RebuildRootSurvey:
+    """What one bounded look at every root the rebuild would open established.
+
+    `observations` is the **descriptor-bound verdict** — `(st_dev, st_ino)` and
+    the canonical real path taken from an opened directory descriptor — carried
+    into the locked section so that nothing under the generation lock has to
+    open a root nobody has examined.
+    """
+
+    #: Per participant owner, the observation taken before the lock.
+    observations: dict[int | None, vault_overlap.RootObservation]
+    #: Per participant owner, the canonical assignment that was observed.
+    assignments: dict[int | None, str]
+    #: Per **scope**, why it may not be rebuilt. Empty means the survey found
+    #: nothing; any entry aborts the whole operation.
+    failures: dict[int | None, RebuildOutcome]
+
+
+def _survey_overlap_detail(
+    subject: _RootParticipant, peer: _RootParticipant, relation: str
+) -> str:
+    """The abort text for one surveyed pair. Names both sides and the relation."""
+    return (
+        f"{subject.label} at '{subject.assignment}' "
+        f"{vault_overlap.relation_text(relation)} {peer.label} at "
+        f"'{peer.assignment}'"
+    )
+
+
+async def survey_rebuild_roots(
+    participants: list[_RootParticipant],
+) -> RebuildRootSurvey:
+    """Observe every root the rebuild would open, **before** the lock is taken.
+
+    Two defects this closes, and they are the same defect seen from two sides.
+
+    **The population.** `vault_overlap.detect_and_publish` observes *active*
+    users holding an assignment, because that is exactly whom the server serves
+    and indexes — and the all-scopes rebuild does not serve, it enumerates the
+    scopes that hold **rows** (`SELECT DISTINCT user_id FROM notes_metadata`)
+    and opens an *inactive* owner's retained root along with everyone else's
+    (D7b: an inactive user's rows are as retained, and as returnable by
+    `keyword_search`, as anyone's). So the serving snapshot cannot speak for
+    this driver: an inactive user retaining `/vaults/team` beside an active
+    tenant at `/vaults/team/private` is named by nothing, and the rebuild would
+    read that tenant's notes under the inactive owner's scope and write their
+    keyword vectors there — under a fingerprint certifying the result. The
+    survey therefore runs the same two checks over the population **this
+    command** will open: every retained scope, active or not, plus every active
+    assigned root as a peer it could collide with.
+
+    **The moment.** The observation is bounded and off the event loop
+    (`vault_overlap.observe_root`, `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`) and it
+    happens **before `acquire_generation_lock`**. Opening a root synchronously
+    after the lock — which is what `pinned_root` did, and still does, only now
+    against a root already proved openable — means one hung NFS or FUSE mount
+    holds the index generation lock for as long as the kernel likes, and every
+    index pass in the process queues behind it.
+
+    **This changes the serving snapshot not at all.** It publishes nothing,
+    quarantines nobody, and no tool call consults it: it is a maintenance
+    verdict about one command's read set, computed and discarded within it. The
+    serving population must stay "active users holding an assignment", because
+    quarantining an inactive account would refuse nothing (nothing serves it)
+    while making an active peer look implicated.
+
+    A verdict per scope, never a global one:
+
+    * a **scope** whose root cannot be observed is `ROOT_UNEXAMINABLE` — "we
+      could not look" is not a completed rebuild, and it aborts like any other
+      non-completed outcome;
+    * a **scope** in any relation (identical, contains, contained by) with any
+      other participant is `ROOT_OVERLAPS`, naming the pair;
+    * a **peer** that cannot be observed is *not* an abort. Nothing was
+      observed to relate it to anything, which is limitation **L2**'s class
+      exactly — and failing the whole maintenance command because one unrelated
+      tenant's mount is down is the false-positive direction this codebase
+      treats as the expensive error.
+    """
+    distinct = sorted({p.assignment for p in participants})
+    observed = await asyncio.gather(
+        *(vault_overlap.observe_root(assignment) for assignment in distinct)
+    )
+    by_assignment = dict(zip(distinct, observed))
+
+    observations = {p.owner: by_assignment[p.assignment] for p in participants}
+    assignments = {p.owner: p.assignment for p in participants}
+    failures: dict[int | None, RebuildOutcome] = {}
+
+    for participant in participants:
+        if not participant.is_scope:
+            continue
+        observation = by_assignment[participant.assignment]
+        if observation.examinable:
+            continue
+        failures[participant.owner] = RebuildOutcome(
+            skip=RebuildSkip.ROOT_UNEXAMINABLE,
+            detail=(
+                f"{participant.label} at '{participant.assignment}' could not "
+                f"be examined: {vault_overlap.cause_text(observation.cause)}"
+            ),
+        )
+
+    for i, a in enumerate(participants):
+        for b in participants[i + 1 :]:
+            if not (a.is_scope or b.is_scope):
+                continue
+            relation = vault_overlap.relation_between(
+                by_assignment[a.assignment], by_assignment[b.assignment]
+            )
+            if relation is None:
+                continue
+            inverse = vault_overlap.inverse_relation(relation)
+            for subject, peer, rel in ((a, b, relation), (b, a, inverse)):
+                if subject.is_scope and subject.owner not in failures:
+                    failures[subject.owner] = RebuildOutcome(
+                        skip=RebuildSkip.ROOT_OVERLAPS,
+                        detail=_survey_overlap_detail(subject, peer, rel),
+                    )
+
+    return RebuildRootSurvey(
+        observations=observations, assignments=assignments, failures=failures
+    )
+
+
+async def _rebuild_root_participants(session) -> list[_RootParticipant]:
+    """Every root the all-scopes rebuild would open, plus the active roots it
+    could collide with.
+
+    Scopes come from the rows that exist, which is the driver's own population
+    and includes inactive owners. Peers are added **only in multi-user mode**
+    and only for a user who is not already a scope: in single-user mode
+    `users.vault_path` is not the tenancy source at all, and the one root is
+    already in the list as the ownerless scope — pairing it against the same
+    directory read out of a `users` row would abort a healthy rebuild against
+    itself.
+
+    A scope with no assignment contributes nothing to observe. It is left to
+    `_rebuild_scope`, which reports it as `ROOT_UNPINNABLE` with the wording an
+    operator already knows.
+    """
+    participants: list[_RootParticipant] = []
+    scope_owners: set[int | None] = set()
+
+    for owner in await _retained_scopes(session):
+        if owner is None and settings.multi_user_mode:
+            # The ownerless coverage abort below owns this case, and it must
+            # keep owning it: there is no root to pin for an unowned scope, and
+            # substituting `settings.vault_path` here would observe one
+            # tenant's directory on behalf of nobody.
+            continue
+        try:
+            vault = await _scope_vault_path(session, owner)
+        except Exception:  # noqa: BLE001 - reported by `_rebuild_scope`
+            continue
+        if vault is None:
+            continue
+        scope_owners.add(owner)
+        participants.append(_RootParticipant(
+            owner=owner,
+            label=(
+                "the single-user scope" if owner is None
+                else f"retained scope user_id={owner}"
+            ),
+            assignment=vault_overlap.canonical_assignment(vault),
+            is_scope=True,
+        ))
+
+    if settings.multi_user_mode:
+        peers = (await session.execute(text(
+            "SELECT id, username, vault_path FROM users "
+            "WHERE is_active AND vault_path IS NOT NULL ORDER BY id"
+        ))).all()
+        for peer in peers:
+            if peer.id in scope_owners:
+                continue
+            participants.append(_RootParticipant(
+                owner=peer.id,
+                label=f"active user '{peer.username}' (user_id={peer.id})",
+                assignment=vault_overlap.canonical_assignment(peer.vault_path),
+                is_scope=False,
+            ))
+
+    return participants
+
+
+async def _rebuild_scope(
+    session,
+    owner: int | None,
+    survey: RebuildRootSurvey | None = None,
+) -> RebuildOutcome:
+    """Rebuild one retained owner scope. Does **not** commit.
+
+    `survey` carries the descriptor-bound verdict taken **before** the
+    generation lock. When it is present this function opens no root the survey
+    did not examine: the assignment must still be the one that was observed,
+    and the directory the pin lands on must still be the inode that was
+    observed. Either disagreement means the pathname moved between the survey
+    and the lock, so the verdict does not describe what is about to be read.
+    """
     log_suffix = f" (user_id={owner})" if owner is not None else ""
     try:
         # The same guard `rebuild_tsvectors` applies, applied here because the
@@ -3630,8 +3869,52 @@ async def _rebuild_scope(session, owner: int | None) -> RebuildOutcome:
                 "assigned vault_path"
             ),
         )
+    observed = None
+    if survey is not None:
+        observed = survey.observations.get(owner)
+        surveyed_assignment = survey.assignments.get(owner)
+        canonical = vault_overlap.canonical_assignment(vault)
+        if observed is None or surveyed_assignment is None:
+            return RebuildOutcome(
+                skip=RebuildSkip.ROOT_UNEXAMINABLE,
+                detail=(
+                    f"user_id={owner} was not in the pre-lock root survey, so "
+                    "its root has not been examined; nothing may be opened "
+                    "under the generation lock on that basis. Re-run."
+                ),
+            )
+        if canonical != surveyed_assignment:
+            return RebuildOutcome(
+                skip=RebuildSkip.ROOT_UNEXAMINABLE,
+                detail=(
+                    f"user_id={owner} was assigned '{surveyed_assignment}' "
+                    f"when the roots were surveyed and '{canonical}' now, so "
+                    "the verdict does not describe the root about to be read. "
+                    "Re-run."
+                ),
+            )
     try:
         with pinned_root(vault) as root_fd:
+            if observed is not None:
+                # The survey's verdict is bound to `(st_dev, st_ino)`, not to
+                # the pathname — which is the only way it can still be a
+                # statement about *this* directory after the lock. A pathname
+                # retargeted in between lands the pin on an inode nobody
+                # examined, and that is precisely the check-then-act interval
+                # `pinned_root` exists to close for the rest of the pass.
+                pinned = os.fstat(root_fd)
+                if (pinned.st_dev, pinned.st_ino) != (
+                    observed.st_dev, observed.st_ino
+                ):
+                    return RebuildOutcome(
+                        skip=RebuildSkip.ROOT_UNEXAMINABLE,
+                        detail=(
+                            f"{vault}: the directory this pathname names "
+                            "changed between the root survey and the rebuild, "
+                            "so the examined root is not the one that would be "
+                            "read. Re-run."
+                        ),
+                    )
             return await _rebuild_tsvectors_pinned(
                 session, owner, vault, root_fd, log_suffix
             )
@@ -3658,28 +3941,66 @@ async def rebuild_tsvectors_all_scopes(session) -> dict:
     previous configuration, and the startup guard that now fails closed on it
     would pass while keyword search was exactly as wrong as before.
 
-    So: take the generation lock **before reading the first row**, enumerate
-    the scopes from the rows that exist (`SELECT DISTINCT user_id FROM
+    So: survey every root this command would open **before** taking the
+    generation lock, take the lock before reading the first row, enumerate the
+    scopes from the rows that exist (`SELECT DISTINCT user_id FROM
     notes_metadata` — not `_active_user_ids()`), rebuild each, and write the
     fingerprint in the same transaction as all of them. Any retained scope
     whose outcome is not completed aborts the whole thing.
+
+    **The survey is this command's own overlap check, and it must be.** The
+    published quarantine snapshot answers for the users the server *serves*;
+    the scope list here is the users whose rows *exist*, which is a strictly
+    larger set. `survey_rebuild_roots` has the reasoning and the population.
 
     The cost is that a multi-tenant rebuild is all-or-nothing rather than per
     tenant (L5). That is the price of the fingerprint meaning what it says, and
     this is the cheap maintenance path — keyword index only, no provider calls,
     seconds for a few thousand notes.
     """
+    # **Every root this command would open is observed here, before the lock.**
+    # `detect_and_publish` speaks only for *active* assigned users, because
+    # that is whom the server serves; this driver opens the retained scope of
+    # an **inactive** owner too, and an inactive owner retaining `/vaults/team`
+    # beside an active tenant at `/vaults/team/private` is named by nothing the
+    # serving snapshot publishes. Reading it would file that tenant's notes'
+    # keyword vectors under the inactive owner's scope, under a fingerprint
+    # certifying the result. So the same two checks run over *this command's*
+    # read set — and they run before `acquire_generation_lock`, because a
+    # bounded observation that happens after the lock has already let one hung
+    # mount hold the index generation lock for as long as the kernel likes.
+    #
+    # Nothing about the serving snapshot changes: this publishes nothing and
+    # quarantines nobody. See `survey_rebuild_roots`.
+    participants = await _rebuild_root_participants(session)
+    survey = await survey_rebuild_roots(participants)
+    if survey.failures:
+        owner, outcome = next(iter(sorted(
+            survey.failures.items(), key=lambda item: (item[0] is not None, item[0])
+        )))
+        raise RebuildCoverageAborted(
+            f"keyword rebuild aborted before the generation lock at scope "
+            f"user_id={owner!r}: {outcome.describe()}. This command opens "
+            "every scope that holds rows — including the retained root of an "
+            "inactive user, whom the serving overlap snapshot never observes "
+            "because nothing serves them — so the roots it will read are "
+            "checked against each other here. Nothing has been read, nothing "
+            "has been rebuilt and no fingerprint was recorded. Correct the "
+            "overlapping assignment or restore the root, then re-run."
+        )
+
     # Before the first row is read, so nothing can commit a keyword vector
     # between this snapshot and the record. A wait here is a wait for an
     # in-flight index pass to commit, which is the intended behaviour.
     await acquire_generation_lock(session)
 
-    scopes = [
-        row[0]
-        for row in (await session.execute(text(
-            "SELECT DISTINCT user_id FROM notes_metadata ORDER BY user_id"
-        ))).all()
-    ]
+    # Re-enumerated under the lock, and deliberately not assumed equal to the
+    # surveyed set: the survey ran before the lock, so a scope could have
+    # appeared in between. Such a scope is a root **nobody examined**, and
+    # `_rebuild_scope` refuses it (`ROOT_UNEXAMINABLE`) rather than opening it
+    # on the strength of a survey that did not include it. Re-running is cheap;
+    # guessing is not.
+    scopes = await _retained_scopes(session)
 
     if settings.multi_user_mode and None in scopes:
         # **Aborts by decision** (L6). `_vault_root(None)` refuses in this mode
@@ -3704,7 +4025,7 @@ async def rebuild_tsvectors_all_scopes(session) -> dict:
 
     outcomes: dict = {}
     for owner in scopes:
-        outcome = await _rebuild_scope(session, owner)
+        outcome = await _rebuild_scope(session, owner, survey)
         outcomes[owner] = outcome
         if not outcome.completed:
             raise RebuildCoverageAborted(

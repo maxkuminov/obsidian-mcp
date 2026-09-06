@@ -107,9 +107,13 @@
 
           It is a block of its own rather than a cell in the row above because
           it is several lines of prose naming two accounts and two paths, not a
-          badge. A degraded strip carries no `quarantine` key at all and this
-          renders nothing; the condition is still on the health page, which
-          reads the snapshot itself and shares none of the strip's queries.
+          badge — and because it therefore survives the degraded strip above.
+          `_health_strip_or_degraded` carries the key through when its own
+          queries fail: the quarantine is the one cell here that needs no
+          session, and the strip degrades exactly when the database is unhappy,
+          which is not the moment to stop reporting that a tenant's tools are
+          disabled. The key is absent only when there is nothing to say, and
+          this renders nothing then.
 
           Not a flash. Nothing is dismissed and nothing has to be: it stands
           while the condition stands and disappears on its own once a later

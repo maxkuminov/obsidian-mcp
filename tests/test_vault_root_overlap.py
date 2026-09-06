@@ -8,9 +8,11 @@ premise unproved.
 """
 
 import asyncio
+import contextlib
 import datetime
 import errno
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -207,6 +209,82 @@ def test_string_prefix_sibling_is_accepted(tmp_path):
 )
 def test_contains_path_is_component_wise(ancestor, descendant, expected):
     assert vault_overlap.contains_path(ancestor, descendant) is expected
+
+
+@pytest.mark.parametrize("spelling", ["{base}/", "{base}//sub", "{base}/."])
+def test_the_detector_normalises_every_spelling_of_one_pathname(
+    spelling, tmp_path
+):
+    """`/vaults/team/`, `/vaults//team` and `/vaults/team/.` name one directory.
+
+    Asserted in **both ancestor directions**: the spelling is applied to the
+    outer root and then to the inner one, so a normalisation that only worked
+    on the left-hand operand of the containment test would still fail here.
+    """
+    outer = tmp_path / "team"
+    outer.mkdir()
+    inner = outer / "private"
+    inner.mkdir()
+
+    # The repeated-separator form is spelled against the *parent* so the doubled
+    # separator lands mid-path, which is where a naive string compare breaks.
+    def _spell(path):
+        if spelling == "{base}/":
+            return f"{path}/"
+        if spelling == "{base}//sub":
+            return f"{path.parent}//{path.name}"
+        return f"{path}/."
+
+    # Direction 1: the ancestor is the oddly spelled one.
+    a, b = _observe(_spell(outer)), _observe(inner)
+    assert a.assignment == str(outer), "the assignment is stored normalised"
+    assert relation_between(a, b) == RELATION_CONTAINS
+    assert relation_between(b, a) == RELATION_CONTAINED_BY
+
+    # Direction 2: the descendant is.
+    a, b = _observe(outer), _observe(_spell(inner))
+    assert b.assignment == str(inner)
+    assert relation_between(a, b) == RELATION_CONTAINS
+    assert relation_between(b, a) == RELATION_CONTAINED_BY
+
+    # And one directory spelled two ways is `identical`, not a containment.
+    assert relation_between(_observe(outer), _observe(_spell(outer))) == (
+        RELATION_IDENTICAL
+    )
+
+
+@pytest.mark.parametrize("spelling", ["{base}/", "{base}//sub", "{base}/."])
+async def test_detection_names_both_users_however_the_root_is_spelled(
+    spelling, tmp_path
+):
+    """The same three spellings, through `detect_and_publish` rather than the
+    predicate — the assignment reaches the detector as a `users.vault_path`
+    string, and that is the string an administrator typed."""
+    outer = tmp_path / "team"
+    outer.mkdir()
+    inner = outer / "private"
+    inner.mkdir()
+
+    def _spell(path):
+        if spelling == "{base}/":
+            return f"{path}/"
+        if spelling == "{base}//sub":
+            return f"{path.parent}//{path.name}"
+        return f"{path}/."
+
+    for rows in (
+        [(1, "alice", _spell(outer)), (2, "bob", str(inner))],
+        [(1, "alice", str(outer)), (2, "bob", _spell(inner))],
+    ):
+        vault_overlap.reset_snapshot_state()
+        snapshot = await vault_overlap.detect_and_publish(_FakeSessionFactory(rows))
+        assert set(snapshot.entries) == {1, 2}, rows
+        # The recorded facts are the normalised forms, so the operator surfaces
+        # never render a doubled separator back at the person who typed it.
+        assert snapshot.entries[1].assignment == str(outer)
+        assert snapshot.entries[2].assignment == str(inner)
+        assert snapshot.entries[1].reason.relation == RELATION_CONTAINS
+        assert snapshot.entries[2].reason.relation == RELATION_CONTAINED_BY
 
 
 def test_a_path_does_not_contain_itself(tmp_path):
@@ -765,3 +843,127 @@ def test_cause_text_distinguishes_a_timeout_from_an_errno():
     assert vault_overlap.cause_text(CAUSE_TIMEOUT) != vault_overlap.cause_text(
         errno.ENOENT
     )
+
+
+# ── The assignment validator's filesystem check is bounded and off-loop ──────
+
+
+async def test_the_validator_does_not_block_the_event_loop_on_a_hung_root(
+    monkeypatch, tmp_path
+):
+    """`validate_vault_root_path`'s existence check runs off the loop, under
+    the observation deadline (#199, adversarial round 1).
+
+    It used to be `Path(normalized).is_dir()` called inline from
+    `edit_user_submit` — a synchronous `stat` against a bind mount, on the event
+    loop, **after** the handler had taken the transaction-scoped account guard.
+    A network- or FUSE-backed root that stops answering therefore stalled every
+    request the process was serving, from inside the one page an operator would
+    use to reassign the vault away from that mount, and held the guard while it
+    did.
+
+    The stub blocks for far longer than the deadline. What is asserted is that
+    the call returns inside it, that the loop kept running while it did, and
+    that the verdict is a refusal naming the cause rather than "does not exist"
+    — an administrator sent to look for a directory that is present would lose
+    the incident to the wrong hypothesis.
+    """
+    root = tmp_path / "team"
+    root.mkdir()
+
+    started = asyncio.Event()
+    release = threading.Event()
+
+    def _blocking_observe(assignment, **kwargs):
+        started.set()
+        release.wait(30)
+        raise AssertionError("the deadline did not abandon the wait")
+
+    monkeypatch.setattr(vault_overlap, "observe_root_blocking", _blocking_observe)
+    monkeypatch.setattr(
+        vault_overlap.settings, "vault_root_observe_timeout_seconds", 0.05
+    )
+    monkeypatch.setattr(vault.settings, "vault_path", str(root))
+
+    ticks = 0
+
+    async def _tick():
+        nonlocal ticks
+        while True:
+            await asyncio.sleep(0.005)
+            ticks += 1
+
+    ticker = asyncio.create_task(_tick())
+    try:
+        normalized, error = await asyncio.wait_for(
+            vault.validate_vault_root_path(str(root)), 5
+        )
+    finally:
+        ticker.cancel()
+        release.set()
+        with contextlib.suppress(asyncio.CancelledError):
+            await ticker
+
+    assert normalized is None
+    assert "could not be examined" in error
+    assert "does not exist" not in error
+    assert ticks > 0, "the event loop was blocked for the whole observation"
+
+
+async def test_the_validator_still_refuses_a_missing_root_with_the_known_wording(
+    monkeypatch, tmp_path
+):
+    """The message operators know is unchanged. It names the likeliest cause,
+    and a mount configured but not applied is exactly that cause."""
+    missing = tmp_path / "not-there"
+    # Admitted lexically (it is the configured legacy mount) so the case under
+    # test is the *filesystem* verdict and not the `/vaults/` rule.
+    monkeypatch.setattr(vault.settings, "vault_path", str(missing))
+    normalized, error = await vault.validate_vault_root_path(str(missing))
+    assert normalized is None
+    assert "does not exist as a directory" in error
+    assert "docker-compose volume mount" in error
+
+
+async def test_the_validator_admits_a_real_directory(monkeypatch, tmp_path):
+    root = tmp_path / "team"
+    root.mkdir()
+    monkeypatch.setattr(vault.settings, "vault_path", str(root))
+    assert await vault.validate_vault_root_path(str(root)) == (str(root), None)
+
+
+async def test_a_file_is_refused_by_the_kernel_not_by_a_stat_race(
+    monkeypatch, tmp_path
+):
+    """`O_DIRECTORY` is what refuses it, so there is no window between the
+    check and the open in which the path could become a directory."""
+    target = tmp_path / "team"
+    target.write_text("not a directory")
+    monkeypatch.setattr(vault.settings, "vault_path", str(target))
+    normalized, error = await vault.validate_vault_root_path(str(target))
+    assert normalized is None
+    assert "does not exist as a directory" in error
+
+
+def test_the_lexical_half_touches_no_filesystem(monkeypatch):
+    """Split apart so the shape of a string is decided without a syscall.
+
+    Every way of reaching the filesystem raises; the lexical validator must
+    still answer, because the rules it enforces are about the string.
+    """
+    def _boom(*_a, **_k):
+        raise AssertionError("the lexical validator touched the filesystem")
+
+    for target in ("open", "stat", "scandir", "listdir"):
+        monkeypatch.setattr(os, target, _boom)
+    monkeypatch.setattr(os.path, "realpath", _boom)
+
+    assert vault.validate_vault_root_lexical("") == (None, None)
+    assert vault.validate_vault_root_lexical("/vaults/team") == (
+        "/vaults/team", None
+    )
+    assert vault.validate_vault_root_lexical("/vaults/team/") == (
+        "/vaults/team", None
+    )
+    assert vault.validate_vault_root_lexical("/etc")[1] is not None
+    assert "traversal" in vault.validate_vault_root_lexical("/vaults/../etc")[1]

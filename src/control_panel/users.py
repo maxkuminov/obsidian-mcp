@@ -14,7 +14,10 @@ Validation rules for `vault_path` (panel-side, before the DB sees it):
   against an admin pointing a user at `/etc`, the host's home dir, etc.
 - Must exist as a directory inside the container fs. Catches the
   docker-compose mount-not-yet-applied case loudly instead of silently
-  later when the indexer fails.
+  later when the indexer fails. That check is a syscall against a bind
+  mount, so it runs **off the event loop under a deadline** — see
+  `vault.validate_vault_root_path`, which is `async` for exactly that
+  reason; the `/vaults/*` dropdown is probed the same way.
 - Must not overlap another active user's assigned root. Not merely
   "unique": an equal string is only the degenerate case. `/vaults/team`
   beside `/vaults/team/private` is two different strings and one root
@@ -31,6 +34,7 @@ When admin mutates a user's `vault_path`, we call
 authenticated API/MCP request picks up the new value without a process
 restart.
 """
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -60,6 +64,8 @@ from src.models.db import APIKey, NoteMetadata, UsageLog, User
 from src.oauth.grants import ACCOUNT_GUARD_LOCK_KEY, lock_account_guard
 from src.services import security_events, vault_overlap
 from src.services.vault import clear_user_vault_cache, validate_vault_root_path
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/admin/users", tags=["users"])
 
@@ -135,12 +141,12 @@ async def _check_vault_root_conflict(
                 peer_root.assignment, peer_root.cause
             )
         if not candidate.examinable:
-            # The candidate passed `validate_vault_root_path`'s `is_dir()` and
-            # then could not be opened — a permission wall, a mount that went
-            # away between the two calls, or one that stopped answering. With a
-            # peer present and nothing observed about the candidate, identity
-            # cannot be ruled out, so this refuses for the same reason a
-            # peer that cannot be opened does.
+            # The candidate passed `validate_vault_root_path`'s bounded
+            # observation and then could not be opened — a permission wall, a
+            # mount that went away between the two looks, or one that stopped
+            # answering. With a peer present and nothing observed about the
+            # candidate, identity cannot be ruled out, so this refuses for the
+            # same reason a peer that cannot be opened does.
             return (
                 f"Vault path '{candidate.assignment}' could not be examined: "
                 f"{vault_overlap.cause_text(candidate.cause)}. The assignment "
@@ -182,12 +188,54 @@ def _quarantine_display(entry) -> dict[str, str]:
     }
 
 
-def _list_available_vaults() -> list[str]:
+async def _list_available_vaults() -> list[str]:
+    """The `/vaults/*` dropdown, probed **off the event loop and bounded**.
+
+    `_list_available_vaults_blocking` is a directory listing plus one `is_dir`
+    per entry, and every one of those entries is a bind mount that may be
+    network- or FUSE-backed. Run inline it was an unbounded blocking scan on
+    the loop, on a page render — so a single hung mount took the whole panel
+    down at exactly the moment an operator opened it to reassign a vault away
+    from that mount.
+
+    The deadline is `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`, the same bound the
+    root observation uses, and **expiry degrades the dropdown rather than the
+    page**: an empty list still renders the form, and the custom-path field
+    beside it is the way through. Offering nothing is legible; hanging is not.
+    (As with every deadline over a filesystem call, it abandons the wait and
+    not the syscall — limitation L4.)
+    """
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(_list_available_vaults_blocking),
+            float(settings.vault_root_observe_timeout_seconds),
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        # INFO, not WARNING, and deliberately not a `security_events` emission
+        # (D18/D23): this is a *cosmetic* degradation of one admin form, it is
+        # driven by a page render an authenticated admin can repeat, and the
+        # condition itself is already reported where it belongs — the hung root
+        # is quarantined by the next detection under `root_unexaminable`, with
+        # an ERROR line, a panel strip entry and an `indexer_runs` row naming
+        # the account and the cause. A second, unbounded WARNING channel here
+        # would add nothing but the flood.
+        logger.info(
+            "listing /vaults for the assignment dropdown exceeded %ss; "
+            "offering no candidates rather than holding the page",
+            settings.vault_root_observe_timeout_seconds,
+        )
+        return []
+
+
+def _list_available_vaults_blocking() -> list[str]:
     """Scan `/vaults/*` for directories. Used to populate the edit dropdown.
 
     The legacy `settings.vault_path` is also offered. Result is a sorted
     list of absolute paths; the caller adds a "leave unassigned" option.
     Silent on errors (missing /vaults dir → empty list).
+
+    **Blocking on purpose** — call it through `_list_available_vaults`, which
+    dispatches it off the loop under a deadline.
     """
     out: list[str] = []
     legacy = settings.vault_path.rstrip("/")
@@ -477,7 +525,7 @@ async def edit_user_form(
     if target is None:
         raise HTTPException(404, "User not found")
 
-    available_vaults = _list_available_vaults()
+    available_vaults = await _list_available_vaults()
     # Prepend the current value so it's selectable even if not under /vaults
     # (e.g. legacy /obsidian for max).
     if target.vault_path and target.vault_path not in available_vaults:
@@ -599,7 +647,11 @@ async def edit_user_submit(
                 "Refusing to demote or deactivate the last active admin.",
             )
 
-    normalized, err = _validate_vault_path(vault_path)
+    # Awaited: the existence-and-type check is a syscall against a bind mount
+    # and runs off the event loop under `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`.
+    # It is inside the `_lock_admin_guard` transaction, so a blocking form here
+    # would hold the account guard for the whole of a hung mount's stall.
+    normalized, err = await _validate_vault_path(vault_path)
     if err:
         return _back_with_error(request, user_id, err)
     # Only when the edit's **resulting** state is active and assigned. An edit
