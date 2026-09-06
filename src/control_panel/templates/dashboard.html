@@ -122,6 +122,26 @@
                 <div style="height:4px;background:var(--border);border-radius:99px;overflow:hidden;">
                     <div style="height:100%;width:0%;background:linear-gradient(90deg,var(--primary-dim),var(--primary));border-radius:99px;transition:width 1.1s cubic-bezier(0.22,1,0.36,1);" data-progress="{{ stats.embedding_pct | default(0) }}"></div>
                 </div>
+                {# Currency, beside coverage. The bar answers "is this note
+                   represented at all"; these two answer "is that
+                   representation current" and "is it complete". They disagree
+                   with the bar during every embed backlog, which is exactly
+                   why all three are shown and the bar is not redefined.
+
+                   Both are rendered unconditionally, zero included. An absent
+                   count is not evidence of absence: an operator cannot
+                   distinguish "no backlog" from "this build does not report
+                   one", which is the reason the vector tools carry their stale
+                   count even when it is nought. Zero is stated in the muted
+                   token and a non-zero truncation count in the warning one, so
+                   the page changes colour rather than changing shape.
+
+                   "not current" and not "pending", because the number beside
+                   it is coverage: same rows, different question. #}
+                <div style="display:flex;justify-content:space-between;margin-top:6px;">
+                    <span style="font-size:12px;color:var(--text-3);" title="Notes never embedded, or edited since they were last embedded. The indexer works through these; a figure that does not shrink across passes is the signal.">{{ stats.notes_pending | default(0) }} not current</span>
+                    <span style="font-size:12px;color:{% if stats.notes_chunks_truncated %}var(--warning){% else %}var(--text-3){% endif %};" title="Notes whose embedding stopped at the per-note chunk cap; the tail of such a note is not semantically searchable.">{{ stats.notes_chunks_truncated | default(0) }} truncated</span>
+                </div>
             </div>
         </div>
 
