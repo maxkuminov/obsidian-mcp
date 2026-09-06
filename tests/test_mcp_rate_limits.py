@@ -596,6 +596,27 @@ def _windows():
         yield from entry.windows.values()
 
 
+@tools._tracked("rate_probe_hostile", ["value"], transforms={"value": lambda v: 1 / 0})
+async def _hostile_probe(value: str = "x") -> str:  # pragma: no cover
+    return "ran"
+
+
+def test_a_raising_transform_cannot_turn_a_refusal_into_an_exception():
+    """The coalescer's template runs the tool's own `transforms`. One that
+    raises on the value it was given must not escape the gate: a row with no
+    arguments is a worse row, a refusal that became a traceback is a worse
+    bug — the same trade the telemetry tail already makes."""
+    rows = []
+    _drain()
+    result = _run(_hostile_probe, rows=rows)
+    # The caller still receives the refusal it asked about, in the shape the
+    # contract promises. (The row is separately lost here, because the
+    # telemetry tail runs the same `transforms` and makes the same trade — it
+    # records `tool_telemetry_failed` rather than failing a call that already
+    # had its answer.)
+    assert _sentinel(result)["code"] == refusals.RATE_LIMITED
+
+
 def test_argument_too_long_is_not_coalesced():
     """It sits *below* the general bucket, so its rate is already bounded by
     that bucket. A second mechanism would buy nothing and cost a code path."""

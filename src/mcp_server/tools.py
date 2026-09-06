@@ -1421,14 +1421,24 @@ def _tracked(
                     # make "generate database writes" the cheapest thing an
                     # agent could do. The template is built only when a window
                     # opens or rolls over.
+                    def refusal_template():
+                        # Guarded for the telemetry tail's reason: a
+                        # `transforms` entry that raises on the value it was
+                        # given must not turn a *refusal* into an exception.
+                        # A row with no arguments is a worse row; a refusal
+                        # that became a traceback is a worse bug.
+                        try:
+                            params = named_params()
+                        except Exception:  # noqa: BLE001 - never fail a refusal
+                            params = {}
+                        return _rate_refusal_template(tool_name, params, scope)
+
                     suppressed = rate_limits.record_rate_refusal(
                         current_principal.get(),
                         tool_name,
                         _RATE_LIMITED_MARKER,
                         scope,
-                        lambda: _rate_refusal_template(
-                            tool_name, named_params(), scope
-                        ),
+                        refusal_template,
                     )
                     if suppressed is None:
                         log_row = False
