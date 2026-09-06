@@ -90,6 +90,10 @@ def _install_fakes(monkeypatch, session_manager):
     monkeypatch.setattr(main, "_check_embedding_dim", _noop_check)
     monkeypatch.setattr(main, "_check_pgvector_version", _noop_check)
     monkeypatch.setattr(main, "_validate_fts_configs", _noop_check)
+    # Same reason: the two fingerprint guards (#206) open a session of their
+    # own before the lifecycle behaviour under test is reached.
+    monkeypatch.setattr(main, "_check_embedding_fingerprint", _noop_check)
+    monkeypatch.setattr(main, "_check_fts_fingerprint", _noop_check)
     # Replace the indexer loop with a forever-sleeping coroutine so it never
     # touches a DB/network and is observably cancellable.
     monkeypatch.setattr(main, "run_indexer_loop", _never_returns)
