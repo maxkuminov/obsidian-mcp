@@ -9,7 +9,27 @@ Two surfaces, and no third:
 - a **base64** result SHALL carry `content_hash` in the labelled header it already emits ahead of its opaque body;
 - `read_file(path, hash_only=true)` SHALL return a metadata-only result — the path, the size in bytes, the MIME type and the `content_hash` — and **no file content at all**.
 
-Argument precedence SHALL be fixed and documented, because two validations now compete: `encoding` is validated **first**, so an invalid `encoding` is refused whatever `hash_only` says; then `hash_only` against `offset` and `limit` — supplying either alongside `hash_only=true` SHALL be refused rather than silently ignored; then the existing `offset`/`limit` range checks. With `hash_only=true` a *valid* `encoding` SHALL have no effect, because the digest is over raw bytes in every case, and the docstring SHALL say so rather than leaving it to be inferred.
+Argument precedence SHALL be fixed and documented, because two validations now compete: `encoding` is validated **first**, so an invalid `encoding` is refused whatever `hash_only` says; then `hash_only` against `offset` and `limit` — a window alongside `hash_only=true` SHALL be refused rather than silently ignored; then the existing `offset`/`limit` range checks. With `hash_only=true` a *valid* `encoding` SHALL have no effect, because the digest is over raw bytes in every case, and the docstring SHALL say so rather than leaving it to be inferred.
+
+The window conflict SHALL be decided **by value** — `offset != 0` or `limit is not None` — and not by whether the caller passed the argument: MCP arguments arrive with defaults applied, so "was it supplied" is not reliably knowable, and an explicit `offset=0` means exactly what an omitted one means.
+
+**Every path this tool renders into a server-controlled metadata region SHALL be encoded so that no filename can produce a line of its own.** The path SHALL be written as a JSON string — quoted and escaped — in both the base64 header and the `hash_only` result, uniformly for every path rather than only for paths that would otherwise break the region. A vault path may contain a line terminator, a colon, or leading and trailing whitespace, and this capability now asks callers to trust a hash read out of that header; an unescaped path could forge that line. Uniform encoding also means a reader never has to determine which form it is looking at. This changes the rendered header line for ordinary paths too, which is accepted.
+
+#### Scenario: A path cannot forge a header line
+
+- **WHEN** `read_file` returns a base64 result, or a `hash_only` result, for a file whose vault-relative path contains a newline, a carriage return, a colon, or a blank line
+- **THEN** every metadata field SHALL remain on its own line with its own value, the path SHALL appear as a single quoted JSON string, and no line the file's name contains SHALL be readable as a metadata field
+
+#### Scenario: The encoding is uniform
+
+- **WHEN** the same two result kinds are produced for an ordinary path with no special characters
+- **THEN** the path SHALL still be rendered as a quoted JSON string, in the same form as for a path that needed escaping
+
+#### Scenario: The window conflict is decided by value
+
+- **WHEN** `read_file(path, hash_only=true, offset=0)` is invoked
+- **THEN** the call SHALL succeed, because `offset=0` is not a window
+- **AND** `read_file(path, hash_only=true, limit=1)` SHALL be refused
 
 A text result SHALL remain exactly what it is today: the file's decoded text with nothing added. An envelope around note-controlled bytes is the forgery class the structured-read work removed, and it SHALL NOT be reintroduced here under any flag. `read_file` is also the byte-exact route for a note's frontmatter block, which `read_note` returns only LF-normalized.
 
@@ -75,3 +95,29 @@ For the guarded call to reach the pre-publication comparison at all, the shared 
 
 - **WHEN** an existing caller publishes raw bytes through the shared helper without an expectation
 - **THEN** the publication SHALL behave exactly as it does today
+
+### Requirement: delete_file honours an optional expected_hash before it destroys anything
+
+`delete_file` SHALL accept an optional `expected_hash` in **both** of its modes and SHALL evaluate it, through the same shared comparison and the same precedence the `vault-write` capability defines, **before** it creates a `.trash` entry and before it unlinks anything.
+
+A raw file is not exempt from the lost-update class merely because it is byte transport: `permanent=true` destroys bytes irreversibly, and `permanent=false` puts them under a generated `.trash` name that only an agent which knows to look will recover. The read of the incumbent SHALL go through the same anchored, beneath-root lookup this tool already validates with, so the bytes hashed are the bytes at the entry it is about to remove, and SHALL happen only when a hash is supplied or the deployment requires one. Required mode applies to this tool. A successful delete reports no `content_hash`, because nothing remains to hash.
+
+#### Scenario: A stale hash prevents a soft delete
+
+- **WHEN** `delete_file(path, expected_hash=…)` is invoked with `permanent=false` and the file's bytes have changed since the hash was obtained
+- **THEN** the tool SHALL refuse with `stale_precondition` naming the current hash, no `.trash` entry SHALL be created, and the file SHALL remain at its path
+
+#### Scenario: A stale hash prevents a permanent delete
+
+- **WHEN** the same call is made with `permanent=true`
+- **THEN** the tool SHALL refuse and the file SHALL still exist
+
+#### Scenario: A matching hash deletes
+
+- **WHEN** `delete_file(path, expected_hash=…)` is invoked with a hash matching the file's current bytes
+- **THEN** the delete SHALL proceed exactly as an unguarded one does, and the result SHALL report no `content_hash`
+
+#### Scenario: Required mode covers the raw delete
+
+- **WHEN** the deployment requires preconditions and `delete_file` is invoked without `expected_hash`
+- **THEN** the tool SHALL refuse with `precondition_required` and SHALL NOT delete

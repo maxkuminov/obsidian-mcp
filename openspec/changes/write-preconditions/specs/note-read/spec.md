@@ -39,7 +39,9 @@ A response that carries an `error` need not carry a hash.
 
 ### Requirement: The frontmatter JSON view renders non-finite numbers as canonical YAML tokens and discloses the coercion
 
-The `frontmatter` JSON view SHALL render a non-finite YAML float as the canonical YAML token — `.nan`, `.inf`, or `-.inf` — and SHALL record that coercion in the server-controlled `metadata_coercions` list, naming the `frontmatter` field, a stable reason code, and where to read the value as the note spells it.
+The `frontmatter` JSON view SHALL render a non-finite YAML float as the canonical YAML token — `.nan`, `.inf`, or `-.inf` — and SHALL record that coercion in the server-controlled `metadata_coercions` list, naming the `frontmatter` field, the reason code **`non_finite_float`**, and where to read the value as the note spells it. That literal is the code: the spec, the implementation and the tests SHALL use the same string.
+
+The rule applies to mapping **keys** as well as values: a mapping keyed by a non-finite number is rendered with the same canonical token, not with Python's spelling. When the coercion makes two distinct YAML keys land on one JSON key, the existing key-collision handling applies unchanged — the view is omitted whole and reported in `metadata_omissions` — with a reason code that distinguishes a collision caused by this coercion from a native one (`1:` beside `"1":`). First-key-wins is deliberately **not** used here: keeping one of two keys silently would emit a partial view, which the framing requirement forbids because a caller cannot tell a pruned mapping from a complete one.
 
 `NaN`, `Infinity` and `-Infinity` are not JSON, and Python's `nan` / `inf` spelling is not a form any note contains. Rendering the canonical YAML token keeps the read view, the indexed value and the note's own frontmatter in agreement.
 
@@ -69,6 +71,17 @@ The parsed frontmatter mapping SHALL keep the float itself; this coercion is a p
 
 - **WHEN** a note's frontmatter contains `x: .NaN`, `y: .INF` and `z: +.inf`
 - **THEN** the view SHALL render `.nan`, `.inf` and `.inf`, and `frontmatter_yaml` SHALL still carry the note's own spellings
+
+#### Scenario: A non-finite mapping key is coerced too
+
+- **WHEN** a note's frontmatter maps a non-finite number as a key, as in `.nan: 1`
+- **THEN** the view SHALL render the key as `.nan`, and `metadata_coercions` SHALL record `non_finite_float`
+
+#### Scenario: A coercion-induced key collision omits the view
+
+- **WHEN** a note's frontmatter carries both `.nan: 1` and `".nan": 2`, which the coercion renders as one JSON key
+- **THEN** the `frontmatter` view SHALL be omitted whole and reported in `metadata_omissions` with a reason distinguishing a coercion-induced collision from a native one
+- **AND** no key SHALL be silently kept in preference to the other, and `frontmatter_yaml` SHALL still carry both
 
 ## MODIFIED Requirements
 

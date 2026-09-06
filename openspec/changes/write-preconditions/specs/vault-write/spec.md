@@ -30,14 +30,18 @@ The digest SHALL NOT be conflated with `notes_metadata.content_hash`, which hash
 
 Every refusal this capability introduces SHALL be delivered through the shared caller-visible refusal shape — a final, line-initial, single-line `MCP-REFUSAL {…}` sentinel appended to the tool's prose, carried into a structured tool's declared error field unchanged — and SHALL carry a `code` drawn from a closed set, together with `path` and `nothing_written: true`.
 
-The four codes this capability contributes:
+The six codes this capability contributes:
 
 - `stale_precondition` — the supplied hash does not match the incumbent bytes. It SHALL additionally carry `current_hash`, the file's `content_hash` as the tool just read it.
+- `concurrent_write` — the **in-call** comparison observed a change between this call's own read and its publication. Its existing prose (`File changed while editing: <name>`) SHALL be unchanged and the sentinel appended to it, so existing assertions keep holding while the two windows become distinguishable by code.
 - `no_incumbent` — `expected_hash` was supplied where there are no incumbent bytes to bind.
 - `malformed_precondition` — `expected_hash` is not in the canonical form.
-- `precondition_required` — an unguarded call to a guarded tool while the deployment requires preconditions. It SHALL carry `current_hash` when the tool had already read the incumbent bytes, and SHALL omit it otherwise rather than performing a read solely to populate it.
+- `precondition_unavailable` — an incumbent exists but is larger than the cap this tool may read, so no comparison is possible. It SHALL carry the cap's name and its value.
+- `precondition_required` — an unguarded call to an enforceable tool while the deployment requires preconditions. It SHALL carry `current_hash` when the tool had already read the incumbent bytes, and SHALL omit it otherwise rather than performing a read solely to populate it.
 
-No code SHALL carry a retry delay: no amount of waiting makes a stale or missing hash valid, and a delay would invite a retry loop that cannot terminate. The remedy — re-read, recompute, resend — SHALL be stated in the prose half.
+"I could not check" and "I checked and it differs" SHALL NOT share a code: answering an over-cap file with a mismatch sends the caller to fetch a hash it can never obtain.
+
+No code SHALL carry a retry delay: no amount of waiting makes a stale or missing hash valid, and none shrinks a file below a cap. The remedy — re-read (`read_note`, or `read_file(hash_only=true)`), recompute, resend — SHALL be stated in the prose half.
 
 The refusal SHALL carry no note content: no excerpt, no diff, no length. `path` SHALL be bounded as every other path-bearing message is.
 
@@ -53,14 +57,27 @@ If the shared refusal module does not yet exist when this capability is implemen
 - **WHEN** a caller receives, in turn, a stale precondition, a precondition on a path with no incumbent, and a malformed hash
 - **THEN** the three results SHALL carry three different `code` values, and a client SHALL be able to distinguish them without parsing prose
 
+#### Scenario: The two conflict windows are distinguishable by code
+
+- **WHEN** a caller receives a refusal for a hash that was stale on arrival, and separately a refusal for a file that changed between this call's read and its publication
+- **THEN** the first SHALL carry `stale_precondition` with `current_hash` and the second SHALL carry `concurrent_write`
+- **AND** the second's existing prose SHALL be unchanged, with the sentinel appended to it
+
+#### Scenario: An unhashable incumbent has its own code
+
+- **WHEN** a guarded write names a file larger than the cap the tool may read
+- **THEN** the refusal SHALL carry `precondition_unavailable` with the cap's name and value, and SHALL NOT be reported as a mismatch
+
 #### Scenario: No refusal invites a blind retry
 
-- **WHEN** any of the four refusals is returned
+- **WHEN** any of the six refusals is returned
 - **THEN** it SHALL NOT carry a retry delay, and the prose SHALL name the read that produces a usable hash
 
 ### Requirement: Every overwrite path accepts an optional caller-supplied precondition
 
-`edit_note` (in all four modes, `dry_run` included, and with `replace_frontmatter` set or unset), `set_frontmatter`, `write_file`, `move_note`, `delete_note` and `create_note` SHALL each accept an optional `expected_hash` argument, and SHALL behave exactly as they do today when it is omitted and the deployment does not require it.
+`edit_note` (in all four modes, `dry_run` included, and with `replace_frontmatter` set or unset), `set_frontmatter`, `write_file`, `move_note`, `delete_note`, `delete_file` and `create_note` SHALL each accept an optional `expected_hash` argument, and SHALL behave exactly as they do today when it is omitted and the deployment does not require it.
+
+The list SHALL cover **every tool that can destroy content the caller may have read**, which includes both delete tools in both of their modes: a permanent delete is irreversible, and a soft delete puts the bytes under a `.trash` name only an agent that knows to look will find. For `delete_file` the comparison SHALL run before the trash rename or the unlink, through the same anchored lookup that tool already validates with.
 
 The argument SHALL NOT be required by default. A call that omits it keeps today's behaviour in full, including the absence of any conflict detection on `write_file(overwrite=true)`, so no deployed client is broken by this capability. Backward compatibility is claimed for **mutation and conflict semantics**; success result text changes, because every publishing write now reports the hash of what it published.
 
@@ -113,6 +130,12 @@ The value of `expected_hash` SHALL be recorded in the tool's usage-log parameter
 - **WHEN** `delete_note` is invoked with an `expected_hash` that no longer matches, with `permanent` either true or false
 - **THEN** the note SHALL remain at its path, nothing SHALL be moved to `.trash` or unlinked, and the refusal SHALL name the current hash
 
+#### Scenario: A guarded raw-file delete
+
+- **WHEN** `delete_file` is invoked with an `expected_hash` that no longer matches, with `permanent` either true or false
+- **THEN** the file SHALL remain at its path, no `.trash` entry SHALL be created and nothing SHALL be unlinked, and the refusal SHALL carry `stale_precondition` with the current hash
+- **AND** with a matching hash the delete SHALL proceed exactly as an unguarded one does
+
 #### Scenario: A guarded move binds the source only
 
 - **WHEN** `move_note(from_path, to_path, expected_hash=…)` is invoked and `from_path`'s bytes no longer match
@@ -141,11 +164,20 @@ With the setting false — the default — the deploy SHALL be a no-op for every
 - **WHEN** the setting is left at its default
 - **THEN** every tool SHALL accept unguarded calls exactly as it does today
 
-### Requirement: The precondition is checked immediately after the in-call read and before any other decision
+### Requirement: The precondition checks run in one fixed precedence
 
-A tool that receives `expected_hash` SHALL evaluate it immediately after the read of the incumbent bytes inside that call, and SHALL do so before mode dispatch, before the result size cap, before `dry_run` diff generation, and before any no-op or defect determination.
+A tool that receives `expected_hash` SHALL evaluate the precondition in this order, and SHALL report the **first** condition that applies:
 
-Ordering is observable and therefore normative: a unified diff, a "no changes" answer, or a frontmatter-defect report computed against a base the caller does not hold is a wrong answer, not a cheap one. A tool that reads nothing today when unguarded (`write_file`, `move_note`, `delete_note`) SHALL perform the read **only** when `expected_hash` is supplied. A tool with no incumbent bytes at all (`create_note`) SHALL refuse before any filesystem work.
+1. **syntax** — a hash that is not in the canonical form is `malformed_precondition`, decided **before any filesystem work**, in every tool and every mode;
+2. **no incumbent** — a tool or mode that can never bind incumbent bytes (`create_note`, `write_file` with `overwrite=false`), and an overwrite naming a path with no file at it, is `no_incumbent`;
+3. **unavailable** — an incumbent larger than the cap the tool may read is `precondition_unavailable`, naming the cap;
+4. **required** — an enforceable call supplying no hash while the deployment requires one is `precondition_required`;
+5. **comparison** — a digest that differs from the incumbent's is `stale_precondition`;
+6. **publication** — the existing in-call comparison, reported as `concurrent_write`.
+
+Malformed always wins, because a caller who sent the wrong *kind* of value must learn that rather than learning something about a file its argument never validly named. A call that is both unguarded and over-cap under required mode SHALL be `precondition_unavailable`, not `precondition_required`: telling such a caller to supply a hash sends it after one it cannot obtain.
+
+The comparison SHALL run immediately after the read of the incumbent bytes and **before** mode dispatch, before the result size cap, before `dry_run` diff generation, and before any no-op or defect determination. Ordering is observable and therefore normative: a unified diff, a "no changes" answer, or a frontmatter-defect report computed against a base the caller does not hold is a wrong answer, not a cheap one. A tool that reads nothing today when unguarded (`write_file`, `move_note`, `delete_note`, `delete_file`) SHALL perform the read **only** when a hash is supplied or required mode demands one.
 
 #### Scenario: A dry run against a stale base refuses instead of diffing
 
@@ -161,6 +193,31 @@ Ordering is observable and therefore normative: a unified diff, a "no changes" a
 
 - **WHEN** `write_file(overwrite=true)` is invoked without `expected_hash` and the deployment does not require one
 - **THEN** the tool SHALL NOT read the incumbent file
+
+#### Scenario: Malformed beats no-incumbent on a creation
+
+- **WHEN** `create_note` is invoked with an `expected_hash` that is not in the canonical form
+- **THEN** the refusal SHALL be `malformed_precondition`, not `no_incumbent`, and nothing SHALL be created
+
+#### Scenario: Malformed beats no-incumbent on a no-clobber write
+
+- **WHEN** `write_file(overwrite=false, expected_hash=<bare hex>)` is invoked
+- **THEN** the refusal SHALL be `malformed_precondition`
+
+#### Scenario: Malformed beats no-incumbent on a missing path
+
+- **WHEN** `write_file(overwrite=true, expected_hash=<uppercase hex>)` names a path with no file at it
+- **THEN** the refusal SHALL be `malformed_precondition`, and the tool SHALL NOT have needed to look at the filesystem to decide it
+
+#### Scenario: Malformed beats unavailable on an over-cap file
+
+- **WHEN** a guarded write names a file larger than the tool's read cap and supplies a hash that is not in the canonical form
+- **THEN** the refusal SHALL be `malformed_precondition`, not `precondition_unavailable`
+
+#### Scenario: Required mode on an unhashable file names the real cause
+
+- **WHEN** the deployment requires preconditions and a guarded write names a file larger than the tool's read cap with no `expected_hash`
+- **THEN** the refusal SHALL be `precondition_unavailable`, not `precondition_required`
 
 ### Requirement: A section write's precondition is the whole file's hash
 
@@ -184,10 +241,16 @@ A hash over a section body is unsound as a precondition because section selector
 
 The value describes what this call wrote, not what is on disk at the moment the caller reads the message; the docstrings SHALL state that distinction. Reporting it makes a write→write chain guardable without an intervening read.
 
-Two specific cases, because a wrong answer here hands the caller a token that binds nothing:
+The reported value SHALL always be the hash of the bytes the call **actually published**, never of bytes it intended to publish. Reporting an intended-but-unpublished result would hand the caller a token that binds nothing and would make its next guarded write fail against bytes that were never written.
 
-- `move_note` SHALL report the **destination's** hash. With `rewrite_links=true` the moved note's own body is rewritten, so the bytes at the destination are not the bytes that were at the source; the reported hash SHALL be the moved note's alone, and the rewritten backlink sources' hashes SHALL NOT be reported.
-- A result that publishes nothing SHALL report no hash: `edit_note(dry_run=true)`, a `set_frontmatter` no-op, and every refusal.
+`move_note` therefore reports by this matrix:
+
+- a plain move (`rewrite_links=false`) SHALL report the moved bytes, unchanged from the source;
+- a `rewrite_links=true` move whose **moved note's own rewrite published** SHALL report the post-rewrite bytes at the destination;
+- a `rewrite_links=true` move whose **moved note's own rewrite failed** after the rename — the existing partial-success report — SHALL report the hash of the bytes the rename published, that is, the unrewritten bytes now at the destination;
+- a **backlink source's** rewrite failing SHALL NOT change what is reported: the value is always the moved note's, and the rewritten sources' hashes SHALL NOT be reported at all.
+
+A result that publishes nothing SHALL report no hash: `edit_note(dry_run=true)`, a `set_frontmatter` no-op, both delete tools, and every refusal.
 
 #### Scenario: A write reports a hash the next write can bind to
 
@@ -198,6 +261,16 @@ Two specific cases, because a wrong answer here hands the caller a token that bi
 
 - **WHEN** `move_note(from_path, to_path, rewrite_links=true)` succeeds and the moved note's own body contained a self-link that was rewritten
 - **THEN** the reported `content_hash` SHALL be that of the file now at `to_path`, and passing it to `edit_note(to_path, …, expected_hash=…)` SHALL proceed
+
+#### Scenario: A move whose own rewrite failed reports what is on disk
+
+- **WHEN** `move_note(rewrite_links=true)` completes its rename but the **moved note's own** body rewrite fails, producing the partial-success report
+- **THEN** the reported `content_hash` SHALL be that of the unrewritten bytes now at the destination — the bytes the rename published — and passing it to a following guarded write SHALL proceed
+
+#### Scenario: A backlink source's failure does not change the reported hash
+
+- **WHEN** `move_note(rewrite_links=true)` completes and one **backlink source's** rewrite fails
+- **THEN** the reported `content_hash` SHALL still be the moved note's, and no source's hash SHALL be reported
 
 #### Scenario: A dry run reports no hash
 
@@ -210,6 +283,8 @@ Two specific cases, because a wrong answer here hands the caller a token that bi
 `edit_note`, `set_frontmatter`, and backlink body rewrites SHALL compare the current on-disk content with the content on which the new result was computed immediately before atomic publication. They SHALL reject a mutation when that comparison observes a difference. This is optimistic conflict detection and does not claim coordination with a non-cooperating writer in the interval after comparison.
 
 This comparison covers **one window: this call's own read through to this call's publishing rename.** It structurally cannot see a change that landed between a caller's earlier read and this call, because the bytes it compares are the ones this call read. The caller-visible `expected_hash` precondition covers that other window — the caller's read through to this call's read — and the two SHALL be documented as a pair, with neither described as subsuming the other and neither removed in favour of the other. A supplied `expected_hash` that matched therefore does not exempt a call from this comparison: a writer landing between the precondition check and the publication SHALL still be detected here.
+
+A refusal from this comparison SHALL be typed as `concurrent_write` through the shared refusal contract: its existing prose SHALL be unchanged and the sentinel appended, so that existing callers and assertions are unaffected while an agent can tell this window from the caller-visible one **by code** rather than by prose shape. The guidance it carries is to re-read and retry, and it SHALL carry no retry delay. `move_note`'s per-source rewrite failures keep their existing partial-success report and are not this refusal.
 
 The raw-byte publish helpers SHALL accept the same `expected` parameter the text helpers accept, defaulting to no comparison, so that a caller which reads before it writes can reach the comparison at all; existing callers that pass nothing SHALL be unaffected.
 
@@ -230,9 +305,10 @@ The raw-byte publish helpers SHALL accept the same `expected` parameter the text
 - **THEN** the in-call comparison SHALL observe the difference and refuse with its own distinct conflict message
 - **AND** nothing SHALL be written
 
-#### Scenario: The two refusals are distinguishable
+#### Scenario: The two refusals are distinguishable by code
 - **WHEN** a caller compares a stale-precondition refusal with an in-call conflict refusal
-- **THEN** the two SHALL differ, and only the precondition refusal SHALL carry the `stale_precondition` code and the file's current `content_hash`
+- **THEN** the first SHALL carry `stale_precondition` with the file's current `content_hash` and the second SHALL carry `concurrent_write`
+- **AND** the in-call refusal's prose SHALL be unchanged from today's
 
 #### Scenario: The raw-byte helper can carry an expectation
 - **WHEN** a raw-byte write is published through the shared helper with an expectation that no longer matches the file
