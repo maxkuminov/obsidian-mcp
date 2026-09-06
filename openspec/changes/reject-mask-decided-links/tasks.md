@@ -3,5 +3,5 @@
 - [x] 3. Reject mask-decided targets before cap accounting; bump extraction version with equivalent cleaner.
 - [x] 4. Add regressions for rejection, valid labels/aliases/anchors, caps and unchanged-note re-derivation; update architecture notes.
 - [x] 5. Independent defensive implementation/spec review — PASS, no findings; offline 4,685 passed / 557 skipped; real-PG 554 passed; OpenSpec 33 passed; audit clean.
-- [ ] 6. Record triage and validation; publish reviewable branch/PR.
+- [x] 6. Record triage and validation; published branch and draft PR #270.
 - [ ] 7. Release follow-up: deploy, confirm version-3 re-derivation and exercise affected live MCP graph tools, then archive the change.

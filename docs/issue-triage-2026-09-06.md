@@ -61,6 +61,7 @@ runs were stopped and are not counted as validation.
 `make test-integration` passed **554 tests**, including the new version-2 graph
 repair regression, with one existing warning. It used a dedicated disposable
 container; production was untouched. The feature branch is
-`codex-fix-mask-decided-links`; publication is the final implementation step. No production
+`codex-fix-mask-decided-links`, published as
+[draft PR #270](https://github.com/maxkuminov/obsidian-mcp/pull/270). No production
 deployment or live MCP exercise has run for this change; the OpenSpec change
 remains active for release checks.
