@@ -73,6 +73,28 @@ NO_VAULT_MARKER = "no_vault_assigned"
 UNENCODABLE_ARG_MARKER = "argument_not_encodable"
 
 #: The `params.error` values `_tracked` writes *before* a tool body runs.
+#:
+#: **`permission_denied` and `tool_exception` are deliberately absent** (#192,
+#: #193). Both are post-body by the classification rule above, and both were
+#: classified before they were written rather than after somebody noticed the
+#: page reporting the wrong numbers:
+#:
+#: * `permission_denied` is recorded by `_require_write`, which is called from
+#:   *inside* a tool body that has already passed the vault gate, the argument
+#:   screen and the quota gate whose marker this module owns — and has already
+#:   spent its quota slot. The cost of leaving it out is that a read-only
+#:   credential probing `create_note` dilutes that tool's percentiles with
+#:   near-zero rows;
+#:   the refusal is made visible on `/admin/usage` instead. Moving the write
+#:   gate up into `_tracked` would make it a genuine pre-body refusal and would
+#:   change quota accounting and refusal ordering for nine tools, which is a
+#:   change of its own.
+#: * `tool_exception` is by definition a body that ran, and a tool that raises
+#:   after eight seconds of I/O is the slowest path there is. Enumerating it
+#:   here would hide precisely the calls this page exists to surface.
+#:
+#: Adding either to this tuple is not a tuning knob: it silently drops those
+#: rows out of every percentile and moves them into the refusal count.
 PRE_BODY_REFUSAL_ERROR_MARKERS: tuple[str, ...] = (
     NO_VAULT_MARKER,
     UNENCODABLE_ARG_MARKER,

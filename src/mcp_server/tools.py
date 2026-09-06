@@ -12,6 +12,7 @@ import re
 import stat
 import time
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path, PurePosixPath
@@ -51,7 +52,7 @@ from src.mcp_server.read_result import (
     screen_unrenderable,
 )
 from src.models.db import UsageLog
-from src.services import timing
+from src.services import security_events, timing
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
 from src.services.quotas import admit as _admit_quota, quota_refusal_message
@@ -86,6 +87,37 @@ from src.services.vault import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The tool whose call is in flight on this task, or `None` outside one.
+#:
+#: `_tracked` owns the lifecycle — set at the top of the wrapper, reset in the
+#: same `finally` that clears the timing holder — so a helper reached from deep
+#: inside a tool body can name the tool without every caller growing a
+#: parameter. That is what lets `_require_write` record its refusal at the one
+#: definition all nine gated call sites reach (#192): a per-caller `tool=` is
+#: eight chances to forget one and a tenth tool that silently has none.
+#:
+#: Deliberately *not* the timing holder: `_tracked` merges that holder into
+#: `usage_logs.params` verbatim, so a tool name parked there would become a
+#: `params` key, and the reserved-key rule in
+#: `docs/architecture/usage-attribution.md` exists to keep that surface
+#: enumerated. A `ContextVar` is per-task, and each MCP tool call runs in its
+#: own task, so concurrent calls cannot see each other's name.
+_current_tool_name: ContextVar[str | None] = ContextVar(
+    "_current_tool_name", default=None
+)
+
+
+def _security_subject() -> str:
+    """The suppression subject for a tool-surface record.
+
+    The resolved user when the credential named one, otherwise `-`. Never the
+    client address: `_tracked` runs below `ProxyHeadersMiddleware` and nothing
+    binds the request there (residual R8), so these records identify the
+    *credential*, not the peer.
+    """
+    return security_events.subject_for(user_id=current_user_id.get())
+
 
 _VAULT_GUIDE_PRIMER = (Path(__file__).parent / "vault_guide_primer.md").read_text(
     encoding="utf-8"
@@ -207,7 +239,9 @@ async def _insert_usage(values: dict) -> None:
             raise
 
 
-async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: int):
+async def _log_usage(
+    tool: str, params: dict, duration_ms: int, response_size: int
+) -> bool:
     """Write one `usage_logs` row, and do not lose it to a dangling credential.
 
     A tool call can outlive its own credential: an operator revokes and deletes
@@ -227,6 +261,15 @@ async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: i
 
     The broad `except` stays as the last resort: usage logging must never fail
     a tool call that has already done its work.
+
+    **It returns whether the row landed** (#193). Swallowing every failure is
+    right for the success path — a call that has already written to disk must
+    not be failed by its own bookkeeping — but it left the one caller that has
+    to *report* the audit unable to know: `_tracked`'s exception handler says
+    `tool_usage_log_failed` when this answers `False`, so an operator reading
+    the log can tell "the tool failed and here is the row" from "the tool failed
+    and the row is missing". Every existing caller ignores the value and is
+    unchanged.
     """
     values = dict(
         key_id=current_api_key_id.get(),
@@ -240,23 +283,44 @@ async def _log_usage(tool: str, params: dict, duration_ms: int, response_size: i
     )
     try:
         await _insert_usage(values)
-        return
+        return True
     except Exception as e:
         if not _is_fk_violation(e):
-            logger.warning(f"Failed to log usage for {tool}: {e}")
-            return
+            # `error_type` and not the exception's text: a failed insert's
+            # message quotes the statement *and its bound parameters*, which
+            # here are `usage_logs.params` — truncated note content and vault
+            # paths. The allow-list has no field one could ride in, and a
+            # traceback would have carried the lot (design D2, D18).
+            security_events.emit(
+                "usage_log_failed",
+                subject=_security_subject(),
+                tool=tool,
+                reason="initial",
+                error_type=type(e).__name__,
+            )
+            return False
         retry = dict(values, key_id=None, oauth_token_id=None)
         if _violated_user_fk(e):
             retry["user_id"] = None
-        logger.warning(
+        security_events.emit(
             "usage_log_credential_gone",
-            extra={"tool": tool, "cleared_user_id": retry["user_id"] is None},
+            subject=_security_subject(),
+            tool=tool,
+            cleared_user_id=retry["user_id"] is None,
         )
 
     try:
         await _insert_usage(retry)
+        return True
     except Exception as e:
-        logger.warning(f"Failed to log usage for {tool} after clearing FKs: {e}")
+        security_events.emit(
+            "usage_log_failed",
+            subject=_security_subject(),
+            tool=tool,
+            reason="after_clearing_fks",
+            error_type=type(e).__name__,
+        )
+        return False
 
 
 _MAX_PARAM_LEN = 200  # truncate long string params (e.g. note content)
@@ -349,6 +413,39 @@ _ANCHOR_LOST_AT_PUBLISH_MARKER = "vault_anchor_lost_at_publish"
 # not reached it, which resolves itself and is a fact about the indexer.
 _RELATED_SOURCE_NOT_FOUND_MARKER = "related_source_not_found"
 _RELATED_SOURCE_NOT_EMBEDDED_MARKER = "related_source_not_embedded"
+
+# The write gate's marker (#192). `_require_write` records it at its single
+# definition, so all nine gated call sites inherit it without being touched —
+# `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`,
+# `write_file`, `delete_file`, and `request_upload` / `import_from_url` through
+# `_mint_preflight(need_write=True)`. `request_download` asks for
+# `need_write=False` and is deliberately unmarked.
+#
+# **Post-body**, by the classification rule above, and deliberately so (design
+# D6): `_require_write` is called from *inside* a tool body that has already
+# passed the vault gate, the argument screen and the quota gate — and has
+# already spent its quota slot. So it must never be added to
+# `src/services/usage_stats.py`'s pre-body refusal predicate. The accepted cost
+# is stated where it can be seen: a read-only credential probing `create_note`
+# contributes near-zero rows to that tool's percentiles (residual R5). Moving
+# the gate up into `_tracked` would fix that and change quota accounting and
+# refusal ordering for nine tools, which is a different change.
+#
+# Before this marker existed the row was shaped *exactly* like a successful
+# write, so `/admin/usage` showed a read-only credential apparently writing.
+_PERMISSION_DENIED_MARKER = "permission_denied"
+
+# The marker for a tool body that raised (#193). Also **post-body** by
+# definition — the body is what raised — so it too stays out of the pre-body
+# predicate: a tool that fails after eight seconds of I/O is the slowest path
+# there is, and the one view built to find slow paths must see it.
+#
+# It wins over any post-body marker the body recorded before it raised: a
+# `find_related` that recorded `related_source_not_found` and *then* raised is
+# logged as `tool_exception`, because the exception is the outcome. It travels
+# with the reserved `params` key `error_type` (the exception's class name),
+# which no reader casts — see docs/architecture/usage-attribution.md.
+_TOOL_EXCEPTION_MARKER = "tool_exception"
 
 # The quota gate's marker (#162), and the one marker on this list that is not a
 # `params.error` string: it is the JSON **boolean** `over_quota: true`.
@@ -473,8 +570,11 @@ def _vault_admission_error() -> str | None:
         # Unassigned, deactivated, or a cold cache. All three mean the same
         # thing to the caller and all three must refuse: a cold cache is not
         # permission to serve stale rows.
-        logger.warning(
-            "tool_refused_no_vault", extra={"user_id": uid}
+        security_events.emit(
+            "tool_refused_no_vault",
+            subject=_security_subject(),
+            user_id=uid,
+            tool=_current_tool_name.get(),
         )
         return _NO_VAULT_MESSAGE
     return None
@@ -518,9 +618,14 @@ async def _quota_admission_error() -> str | None:
     decision = await _admit_quota(key_id, limit)
     if decision.admitted:
         return None
-    logger.warning(
+    security_events.emit(
         "tool_refused_over_quota",
-        extra={"key_id": key_id, "limit": limit, "day": decision.day.isoformat()},
+        subject=_security_subject(),
+        key_id=key_id,
+        limit=limit,
+        day=decision.day.isoformat(),
+        user_id=current_user_id.get(),
+        tool=_current_tool_name.get(),
     )
     # The reset comes from the decision, not from a fresh clock read. A refusal
     # that straddles UTC midnight would otherwise name the day-after-next's
@@ -544,8 +649,16 @@ def _response_size(result) -> int:
     if isinstance(result, BaseModel):
         try:
             return len(pydantic_core.to_json(result, fallback=str, indent=2).decode())
-        except Exception:  # pragma: no cover — accounting must never fail a call
-            logger.exception("could not measure a structured tool result")
+        except Exception as exc:  # pragma: no cover — accounting never fails a call
+            # `error_type` and no traceback: the failure is a serialisation of
+            # the *result*, so its message and frames quote note content. The
+            # allow-list has no field that could carry it (design D2).
+            security_events.emit(
+                "tool_result_measure_failed",
+                subject=_security_subject(),
+                tool=_current_tool_name.get(),
+                error_type=type(exc).__name__,
+            )
     return len(str(result))
 
 
@@ -623,6 +736,68 @@ def _unencodable_argument_error(name: str) -> str:
     )
 
 
+async def _record_tool_failure(
+    tool_name: str, exc: Exception, duration_ms: int, logged: dict
+) -> None:
+    """Record a tool body that raised, then let `_tracked` re-raise it (#193).
+
+    `_tracked`'s wrapper used to have a `try`/`finally` and no `except`, so an
+    exception from a tool body skipped `_log_usage` entirely — zero usage rows,
+    no logger call, and nothing for the health page's ERROR ring buffer. A
+    write tool that failed halfway left no trace at all.
+
+    The order is deliberate. The record goes first because it is the cheapest
+    step and the one the health page depends on; the row second, because it is
+    the one that can fail; the re-raise last, and by the caller, so the SDK
+    still produces its error result and the traceback is unchanged.
+
+    **The audit write is best-effort, and this is the one place in the codebase
+    that catches `BaseException`** — scoped to a single bookkeeping `await`. If
+    the task is cancelled while the row is being written, the `CancelledError`
+    is recorded as `tool_usage_log_failed` and **superseded**: the caller
+    re-raises the tool's original exception instead. The coroutine still unwinds
+    immediately, so cancellation achieves its purpose; what changes is only the
+    exception type the awaiter observes on a call that had *already* failed. The
+    accepted consequence, written down rather than glossed: a `wait_for` around
+    such a call reports the tool's failure rather than the timeout. The
+    alternative — letting the cancellation win — loses the tool exception
+    entirely, which is the record this whole change exists to produce (D11).
+    """
+    actor = _actor_columns()
+    security_events.emit(
+        "tool_exception",
+        level=logging.ERROR,
+        subject=_security_subject(),
+        exc_info=exc,
+        tool=tool_name,
+        error_type=type(exc).__name__,
+        user_id=current_user_id.get(),
+        actor_kind=actor.get("actor_kind"),
+        actor_ref=actor.get("actor_ref"),
+        duration_ms=duration_ms,
+    )
+    try:
+        written = await _log_usage(tool_name, logged, duration_ms, 0)
+    except BaseException as audit_exc:
+        security_events.emit(
+            "tool_usage_log_failed",
+            subject=_security_subject(),
+            tool=tool_name,
+            error_type=type(audit_exc).__name__,
+        )
+        return
+    if not written:
+        # No `error_type`: `_log_usage` swallowed the failure by design and
+        # already emitted `usage_log_failed` carrying the class. What is worth
+        # saying here is the thing only this caller knows — that the tool
+        # exception's own audit row is missing.
+        security_events.emit(
+            "tool_usage_log_failed",
+            subject=_security_subject(),
+            tool=tool_name,
+        )
+
+
 def _tracked(
     tool_name: str,
     param_keys: list[str],
@@ -662,6 +837,36 @@ def _tracked(
             # measured phases at their measured value, and the *next* call in
             # the same task starts from empty rather than inheriting them.
             token = timing.begin()
+            # The tool's name, for the helpers reached from inside its body
+            # that must name it without growing a parameter — `_require_write`
+            # above all (#192). Same lifecycle as the timing holder, reset in
+            # the same `finally`.
+            name_token = _current_tool_name.set(tool_name)
+
+            def named_params() -> dict:
+                """The row's named arguments, truncated. No outcome markers.
+
+                Resolved by NAME via the wrapped signature so that a non-logged
+                positional argument between logged ones cannot shift the
+                mapping (positional zipping silently mislabelled params once).
+                `transforms` reduces a value before it is logged (e.g. an
+                import URL to its host) so no capability leaks.
+
+                Both outcome paths build the row from this, so the failed call
+                and the successful one carry the same arguments.
+                """
+                try:
+                    bound = sig.bind(*args, **kwargs)
+                    bound.apply_defaults()
+                    params = {
+                        key: transforms.get(key, lambda v: v)(bound.arguments[key])
+                        for key in param_keys
+                        if key in bound.arguments
+                    }
+                except TypeError:
+                    params = {}
+                return _truncate_params(params)
+
             try:
                 # Admission gate: a caller with no resolvable vault root never
                 # reaches the tool body, including the DB-only ones. The
@@ -708,25 +913,52 @@ def _tracked(
                 if refusal is not None:
                     result = refusal if refusal_result is None else refusal_result(refusal)
                 else:
-                    result = await fn(*args, **kwargs)
+                    # **The only guarded expression** (design D5). The handler
+                    # wraps the body call and nothing else: not the three
+                    # admission gates above it — a database fault inside the
+                    # quota gate is not a tool failure, and `quotas.admit`
+                    # already logs and re-raises it deliberately — and not the
+                    # telemetry below it, because reporting a completed
+                    # `edit_note` as `tool_exception` because `_log_usage`
+                    # failed *after* the bytes landed is precisely the silently
+                    # wrong record this change exists to prevent.
+                    #
+                    # `Exception`, never `BaseException`: `asyncio.CancelledError`
+                    # is a `BaseException` in 3.8+, and a client disconnect or a
+                    # shutdown must not be recorded as a tool failure or write a
+                    # row.
+                    try:
+                        result = await fn(*args, **kwargs)
+                    except Exception as exc:
+                        # Guarded: a `transforms` entry that raises on a value
+                        # the body already choked on must not become the
+                        # exception the caller sees. A row with no arguments is
+                        # a worse row; a masked failure is a worse bug.
+                        try:
+                            failed = named_params()
+                            failed.update(timing.current() or {})
+                        except Exception:  # noqa: BLE001 - never mask `exc`
+                            failed = {}
+                        # Merged over the top: a body that recorded
+                        # `related_source_not_found` and *then* raised is
+                        # logged as `tool_exception`, because the exception is
+                        # the outcome.
+                        failed["error"] = _TOOL_EXCEPTION_MARKER
+                        failed["error_type"] = type(exc).__name__
+                        await _record_tool_failure(
+                            tool_name,
+                            exc,
+                            int((time.monotonic() - start) * 1000),
+                            failed,
+                        )
+                        # Bare, so the SDK still produces its error result over
+                        # the *original* traceback. It re-raises `exc` even when
+                        # the audit above swallowed a cancellation of its own.
+                        raise
+                # From here the body has COMPLETED. Nothing below may write
+                # `_TOOL_EXCEPTION_MARKER`.
                 duration_ms = int((time.monotonic() - start) * 1000)
-                params = {}
-                # Resolve logged params by NAME via the wrapped signature so
-                # that a non-logged positional arg between logged ones can't
-                # shift the mapping (positional zipping silently mislabelled
-                # params before). `transforms` reduces a value before it is
-                # logged (e.g. import URL -> host) so no capability leaks.
-                try:
-                    bound = sig.bind(*args, **kwargs)
-                    bound.apply_defaults()
-                    params = {
-                        key: transforms.get(key, lambda v: v)(bound.arguments[key])
-                        for key in param_keys
-                        if key in bound.arguments
-                    }
-                except TypeError:
-                    params = {}
-                logged = _truncate_params(params)
+                logged = named_params()
                 logged.update(extra)
                 # Whatever the service measured. Absent for tools that measure
                 # nothing, so `params` keeps its current shape for them.
@@ -735,6 +967,7 @@ def _tracked(
                 return result
             finally:
                 timing.clear(token)
+                _current_tool_name.reset(name_token)
 
         # Structural marker. `tests/test_issue_66_*` asserts that every tool
         # registered on the MCP server delegates to something carrying it, so
@@ -1217,14 +1450,46 @@ def _require_write() -> str | None:
     key's `permission` *or* from an OAuth token's scope (`src/mcp_server/auth.py`),
     so naming "a readwrite API key" told an OAuth caller to go get a kind of
     credential it does not use and cannot mint.
+
+    **The refusal is recorded here and only here** (#192, design D4). Both the
+    `usage_logs` marker and the log record are written at this single
+    definition, so all nine gated call sites inherit them without being
+    touched; a per-caller marker would be eight chances to forget one and a
+    tenth tool that silently has none. `request_download` asks
+    `_mint_preflight` for `need_write=False`, never reaches this function, and
+    is deliberately unaffected.
+
+    Until this existed, the row written for a refused write was shaped
+    *exactly* like a successful one, so `/admin/usage` showed a read-only
+    credential apparently writing.
+
+    `timing.record` is a no-op outside a tracked call
+    (`src/services/timing.py`), so a call from a test or a future non-tool path
+    records nothing and cannot raise; `_tracked` merges the holder into
+    `params`. The tool name comes from the tracked context for the same reason
+    the marker does — no caller signature changes — and is simply absent when
+    there is no tracked call to name.
     """
-    if current_permission.get() != "readwrite":
-        return (
-            "Permission denied: this credential has read-only access. Write "
-            "permission is required — a 'readwrite' API key, or an OAuth token "
-            "carrying the 'readwrite' scope."
-        )
-    return None
+    if current_permission.get() == "readwrite":
+        return None
+    timing.record("error", _PERMISSION_DENIED_MARKER)
+    uid = current_user_id.get()
+    actor = _actor_columns()
+    security_events.emit(
+        "tool_write_refused",
+        subject=_security_subject(),
+        tool=_current_tool_name.get(),
+        user_id=uid,
+        actor_kind=actor.get("actor_kind"),
+        actor_ref=actor.get("actor_ref"),
+        key_id=current_api_key_id.get(),
+        oauth_token_id=current_oauth_token_id.get(),
+    )
+    return (
+        "Permission denied: this credential has read-only access. Write "
+        "permission is required — a 'readwrite' API key, or an OAuth token "
+        "carrying the 'readwrite' scope."
+    )
 
 
 def _leaf_state_error(target, path: str, *, missing: str | None = None) -> str | None:
@@ -3112,8 +3377,20 @@ async def _move_note_locked(
                             "rewrite_links and update links in batches, or "
                             "raise the process's RLIMIT_NOFILE."
                         )
-                    logger.warning(
-                        "Failed to rewrite links in %s: %s", original_src_path, e
+                    # `move_rewrite_failed` rather than a bare
+                    # `logger.warning`: a caller can drive this branch on
+                    # demand, and a direct logger call is an unbounded flood
+                    # channel beside the bounded one (design D18). The path it
+                    # used to interpolate has no allow-listed field to ride in
+                    # and `emit`'s message is the event name, so the note is
+                    # named where the caller and the operator both still see
+                    # it: in `failed_rewrite_sources` on the tool's own reply,
+                    # and in the move's `params` on `/admin/usage`.
+                    security_events.emit(
+                        "move_rewrite_failed",
+                        subject=_security_subject(),
+                        tool=_current_tool_name.get(),
+                        error_type=type(e).__name__,
                     )
                     failed_rewrite_sources.append(original_src_path)
                     drop(read_target)
@@ -3163,8 +3440,11 @@ async def _move_note_locked(
                         "hand first."
                     )
                 except Exception as e:
-                    logger.warning(
-                        "Failed to rewrite links in %s: %s", original_src_path, e
+                    security_events.emit(
+                        "move_rewrite_failed",
+                        subject=_security_subject(),
+                        tool=_current_tool_name.get(),
+                        error_type=type(e).__name__,
                     )
                     failed_rewrite_sources.append(original_src_path)
                     drop(read_target)
@@ -3444,7 +3724,12 @@ async def _move_note_locked(
                 # it be logged as one.
                 raise
             except Exception as e:
-                logger.warning("Failed to rewrite links in %s: %s", write_path, e)
+                security_events.emit(
+                    "move_rewrite_failed",
+                    subject=_security_subject(),
+                    tool=_current_tool_name.get(),
+                    error_type=type(e).__name__,
+                )
                 outcome = "failed"
 
             if outcome in ("reassigned", "unavailable"):
