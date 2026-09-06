@@ -304,9 +304,42 @@ deliberately, because the traceback saying *why* the fingerprint write failed
 is the whole value of the record, and a bound that withheld it would leave an
 administrator with a flash message and nothing else.
 
+The second shape is **background and post-publication work**:
+`src/services/vault_overlap.py`'s detection pass, and the flush, close and
+staging-cleanup helpers in `src/services/vault_fs.py`, `src/services/vault.py`
+and `src/services/transfer.py`. The detection pass is background or
+admin-guarded; the flush and close helpers are reached by a foreground tool
+call, and are exempted on an owner decision recorded below as **R10**.
+
+**R10 — post-publication filesystem failures.** `flush_dir_quietly` and
+`flush_publication_ancestors_quietly` fire when a directory `fsync` returns
+`EIO`/`EINVAL` after a create, edit, move or delete has *already published*;
+`_close_quietly` fires up to three times per transfer publication when `close`
+returns `EIO`; `_unlink_quietly` and `discard_staged_name` clean up staging
+after a write has landed or aborted. Every one of them runs when the vault's
+own filesystem is failing and the operation has already stood, so the tool
+result is **success** and the record is a durability note, not a refusal.
+They stay on the bare logger, with the decision quoted verbatim at each site:
+
+> post-publication filesystem failure on a successful write; class-only,
+> bounded by the write bucket; not routed through the suppressor to keep the
+> destructive publication path unchanged
+
+**The consequence, stated rather than glossed:** an agent writing into a vault
+whose filesystem is returning `EIO` produces one warning per successful write —
+three per publication on the transfer path — with nothing but
+`mcp-rate-limits`' write bucket (#188/#194) to bound it. The trade is
+deliberate. The alternative is threading an emission through the destructive
+publication path, which is the one path in this codebase that has clobbered a
+note, to bound records that tell the caller nothing it can act on. If the
+volume matters before that bucket lands, the answer is a counter at the flush
+helpers rather than an event inside the publish.
+
 Each entry carries its justification in the test, and the list itself is
 asserted — a new exemption is a decision somebody has to write down, not a
-line somebody can add.
+line somebody can add. So is the *scope*: round 2's three findings and round
+3's two were all "a sibling change added a call to a module the list did not
+name", so the guarded-module list is asserted too.
 
 ## The suppressor: one allowance check, on a subject a caller cannot mint
 
@@ -400,3 +433,8 @@ point of logging them at that level.
   ability to redeem, and the summary states the withheld count. The alternative
   — per-token subjects — is the unbounded-allowance hole.
 * **MCP tool events carry no `client_ip`** (R8, above).
+* **Post-publication filesystem failures are unbounded** (R10, above). On a
+  failing filesystem an agent produces one WARNING per successful write, and
+  up to three per transfer publication, until `mcp-rate-limits`' write bucket
+  refuses. They are durability notes on operations that succeeded, and keeping
+  them off the destructive publication path is the reason.
