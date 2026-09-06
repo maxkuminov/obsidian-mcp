@@ -287,6 +287,31 @@ async def semantic_search(
     Each result is one note (deduped) with its best-matching chunk as a ~200-character preview.
     Call `read_note` on a result's path to get the full note content.
 
+    The header line carries a stale count and a truncated count, always —
+    including when both are zero, so "nothing here is degraded" is
+    distinguishable from a build that does not report it.
+
+    `stale: true` on a row means the note changed after it was embedded: it was
+    matched and ranked against its **previous** content, and its preview is
+    **withheld** rather than shown, because that excerpt is text the note no
+    longer has. Its path, title and tags are current — the indexer refreshed
+    them, which is how the staleness is known at all — so `read_note` on that
+    path returns the true content and is the remedy. Stale notes are never
+    filtered out: during an embedding outage that would empty the result set
+    rather than degrade it.
+
+    `embedding_truncated: true` means the note is longer than the indexer's
+    per-note chunk cap and only its head was embedded. A match against such a
+    note is a match against its head; its tail is not reachable by semantic
+    search at all, though `keyword_search` still covers the whole note.
+
+    **The bound on the staleness signal, stated so it is not over-read:** it
+    reports what the index has *committed*. An edit that the indexer has not
+    yet scanned is not marked, so a note edited in the last few minutes may
+    come back unmarked with a superseded preview. The guarantee is "no result
+    presents text the index knows to be superseded", not "no result is ever
+    out of date".
+
     Args:
         query: Natural language description of what you're looking for.
         limit: Maximum number of distinct notes to return (default 15).
@@ -573,6 +598,26 @@ async def find_related(path: str, limit: int = 10) -> str:
     Independent of the link graph — useful when the source is sparsely linked
     or when looking for thematic neighbors. For link-based exploration use
     `get_neighborhood`. For arbitrary topic queries use `semantic_search`.
+
+    Carries `semantic_search`'s per-row markers and its header counts:
+    `stale: true` means that neighbour changed after it was embedded, so it was
+    ranked against its previous content and its preview is **withheld** —
+    `read_note` returns the current text. `embedding_truncated: true` means
+    only that note's head was embedded, so a match against it says nothing
+    about its tail.
+
+    **One marker is about the source rather than a neighbour.** If the note you
+    asked about has itself changed since it was embedded, the result says so
+    once, at the top — and it says so on the empty result too. The query vector
+    is the average of the *source's stored* chunk vectors, so a stale source
+    means every neighbour answers a question about content that note no longer
+    has, and "no related notes" from a stale source means "nothing is near what
+    this note used to say", not "this note has no neighbours". The next embed
+    pass repairs it. A source with no vectors at all is a different message
+    ("has not been embedded yet") with a different fix.
+
+    **The bound on the staleness signal:** it reports what the index has
+    committed, so an edit the indexer has not yet scanned is not marked.
 
     Args:
         path: Vault-relative path to the source note.
