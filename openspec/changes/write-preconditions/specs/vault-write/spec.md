@@ -41,7 +41,16 @@ The six codes this capability contributes:
 
 "I could not check" and "I checked and it differs" SHALL NOT share a code: answering an over-cap file with a mismatch sends the caller to fetch a hash it can never obtain.
 
-No code SHALL carry a retry delay: no amount of waiting makes a stale or missing hash valid, and none shrinks a file below a cap. The remedy — re-read (`read_note`, or `read_file(hash_only=true)`), recompute, resend — SHALL be stated in the prose half.
+No code SHALL carry a retry delay: no amount of waiting makes a stale or missing hash valid, and none shrinks a file below a cap. **Each code's prose half SHALL state the action that resolves it**, and the actions differ, so one generic "re-read and retry" sentence is not sufficient:
+
+- `stale_precondition` — re-read the file and recompute the write from its current bytes; the returned `current_hash` may be resent as `expected_hash` if nothing else changes in between;
+- `concurrent_write` — the file changed during this call; re-read it and retry, since no hash from before this call can be valid;
+- `precondition_required` — this deployment requires a precondition; re-read the file and resend with `expected_hash` (using the `current_hash` returned here when one is present);
+- `no_incumbent` — there is nothing to guard at this path; **call again without `expected_hash`**;
+- `malformed_precondition` — state the canonical form, `sha256:<64 lowercase hex>`, and where a valid one comes from;
+- `precondition_unavailable` — name the cap that applied and its value, and state that only an operator can raise it, so a caller that must inspect the file's bytes should use the transfer download route instead.
+
+The prose SHALL name the read that produces a usable hash (`read_note`, or `read_file(hash_only=true)` for a raw file) wherever re-reading is the remedy.
 
 The refusal SHALL carry no note content: no excerpt, no diff, no length. `path` SHALL be bounded as every other path-bearing message is.
 
@@ -71,7 +80,13 @@ If the shared refusal module does not yet exist when this capability is implemen
 #### Scenario: No refusal invites a blind retry
 
 - **WHEN** any of the six refusals is returned
-- **THEN** it SHALL NOT carry a retry delay, and the prose SHALL name the read that produces a usable hash
+- **THEN** it SHALL NOT carry a retry delay, and the prose SHALL name the read that produces a usable hash wherever re-reading is the remedy
+
+#### Scenario: Each code states its own remedy
+
+- **WHEN** a caller receives `no_incumbent`, `malformed_precondition` and `precondition_unavailable` in turn
+- **THEN** the first SHALL tell it to call again **without** `expected_hash`, the second SHALL state the canonical form `sha256:<64 lowercase hex>`, and the third SHALL name the cap and its value and say that raising it is an operator action
+- **AND** none of the three SHALL tell the caller to re-read and retry, which would not resolve any of them
 
 ### Requirement: Every overwrite path accepts an optional caller-supplied precondition
 
@@ -168,7 +183,7 @@ With the setting false — the default — the deploy SHALL be a no-op for every
 
 A tool that receives `expected_hash` SHALL evaluate the precondition in this order, and SHALL report the **first** condition that applies:
 
-1. **syntax** — a hash that is not in the canonical form is `malformed_precondition`, decided **before any filesystem work**, in every tool and every mode;
+1. **syntax** — a hash that is not in the canonical form is `malformed_precondition`, decided **at the tool's entry, before path resolution, before any leaf check and before any read**, in every tool and every mode. It is a pure function of the argument and SHALL live apart from the comparison, so that a malformed hash wins over "not found", over a symlinked leaf, and over the size cap — a caller told "not found" for a call whose argument was never valid fixes the wrong thing;
 2. **no incumbent** — a tool or mode that can never bind incumbent bytes (`create_note`, `write_file` with `overwrite=false`), and an overwrite naming a path with no file at it, is `no_incumbent`;
 3. **unavailable** — an incumbent larger than the cap the tool may read is `precondition_unavailable`, naming the cap;
 4. **required** — an enforceable call supplying no hash while the deployment requires one is `precondition_required`;
@@ -178,6 +193,10 @@ A tool that receives `expected_hash` SHALL evaluate the precondition in this ord
 Malformed always wins, because a caller who sent the wrong *kind* of value must learn that rather than learning something about a file its argument never validly named. A call that is both unguarded and over-cap under required mode SHALL be `precondition_unavailable`, not `precondition_required`: telling such a caller to supply a hash sends it after one it cannot obtain.
 
 The comparison SHALL run immediately after the read of the incumbent bytes and **before** mode dispatch, before the result size cap, before `dry_run` diff generation, and before any no-op or defect determination. Ordering is observable and therefore normative: a unified diff, a "no changes" answer, or a frontmatter-defect report computed against a base the caller does not hold is a wrong answer, not a cheap one. A tool that reads nothing today when unguarded (`write_file`, `move_note`, `delete_note`, `delete_file`) SHALL perform the read **only** when a hash is supplied or required mode demands one.
+
+**Every read this capability adds is bounded, and the bound is the one that already governs that tool's content**: `MAX_NOTE_BYTES` for a note tool, `MAX_FILE_READ_BYTES` for a raw-file tool. The size SHALL be established from the descriptor the tool has already opened — `fstat` first, then a bounded read through that same descriptor, never a second pathname resolution — so the bytes measured are the bytes hashed. A file over the bound is `precondition_unavailable`.
+
+**The compatibility rule for an over-cap file:** when no `expected_hash` was supplied and required mode is off, the tool SHALL proceed exactly as it does today and simply report no `content_hash`. This capability SHALL NOT make a call fail that succeeds today merely because the file is too large to hash.
 
 #### Scenario: A dry run against a stale base refuses instead of diffing
 
@@ -219,6 +238,16 @@ The comparison SHALL run immediately after the read of the incumbent bytes and *
 - **WHEN** the deployment requires preconditions and a guarded write names a file larger than the tool's read cap with no `expected_hash`
 - **THEN** the refusal SHALL be `precondition_unavailable`, not `precondition_required`
 
+#### Scenario: Malformed beats a missing file and a symlinked leaf
+
+- **WHEN** any guarded tool is invoked with a non-canonical `expected_hash` against a path that does not exist, and again against a path whose final component is a symlink
+- **THEN** both SHALL refuse with `malformed_precondition`, not with the not-found or symlink error, because the syntax check runs at the tool's entry before any path work
+
+#### Scenario: An over-cap file is unchanged for an unguarded caller
+
+- **WHEN** a file larger than the tool's read cap is written by a call that supplies no `expected_hash`, with required mode off
+- **THEN** the call SHALL behave exactly as it does today and SHALL succeed, reporting no `content_hash`
+
 ### Requirement: A section write's precondition is the whole file's hash
 
 `edit_note(section=…)` SHALL accept the file's whole-file `content_hash` as its precondition and SHALL NOT define or accept any section-scoped digest.
@@ -247,10 +276,19 @@ The reported value SHALL always be the hash of the bytes the call **actually pub
 
 - a plain move (`rewrite_links=false`) SHALL report the moved bytes, unchanged from the source;
 - a `rewrite_links=true` move whose **moved note's own rewrite published** SHALL report the post-rewrite bytes at the destination;
-- a `rewrite_links=true` move whose **moved note's own rewrite failed** after the rename — the existing partial-success report — SHALL report the hash of the bytes the rename published, that is, the unrewritten bytes now at the destination;
+- a `rewrite_links=true` move whose **moved note's own rewrite failed after the rename** SHALL report by the *observed cause*, per the post-rename contract below;
 - a **backlink source's** rewrite failing SHALL NOT change what is reported: the value is always the moved note's, and the rewritten sources' hashes SHALL NOT be reported at all.
 
+**The post-rename partial-success contract.** Once the rename has committed, the call has changed the vault, and what the server may claim about the destination depends on why the follow-up rewrite failed:
+
+- the rewrite failed **without observing a change** — an I/O error, a cap, a refusal computed before it read — so the destination still holds exactly the bytes the rename published: report **that** hash, and say the move completed while the rewrite did not;
+- the rewrite failed with the in-call conflict (`concurrent_write`) — something changed the destination between the rename and the rewrite's publication, so the destination holds **that writer's** bytes, which this call never read: the result SHALL **omit** the `content_hash` entirely and SHALL state that the move completed, the link rewrite did not, and the destination must be re-read before it is written to. Reporting the rename's hash there would name bytes that are no longer on disk, which is precisely the token-that-binds-nothing failure this requirement exists to prevent.
+
+A post-rename failure SHALL NOT be reported as a whole-call refusal and SHALL NOT carry `nothing_written: true` in any form: something *was* written — the rename — and a caller told otherwise would look for a note that has moved. The existing partial-success report remains the shape, extended with the statements above.
+
 A result that publishes nothing SHALL report no hash: `edit_note(dry_run=true)`, a `set_frontmatter` no-op, both delete tools, and every refusal.
+
+**A hash is reported only when the bytes can be bounded.** Where a tool would have to read a file back to report its hash and that file exceeds the cap the tool may read, the result SHALL omit the `content_hash` and say so, rather than failing a call that has already succeeded.
 
 #### Scenario: A write reports a hash the next write can bind to
 
@@ -262,10 +300,21 @@ A result that publishes nothing SHALL report no hash: `edit_note(dry_run=true)`,
 - **WHEN** `move_note(from_path, to_path, rewrite_links=true)` succeeds and the moved note's own body contained a self-link that was rewritten
 - **THEN** the reported `content_hash` SHALL be that of the file now at `to_path`, and passing it to `edit_note(to_path, …, expected_hash=…)` SHALL proceed
 
-#### Scenario: A move whose own rewrite failed reports what is on disk
+#### Scenario: A move whose own rewrite failed without a conflict reports what is on disk
 
-- **WHEN** `move_note(rewrite_links=true)` completes its rename but the **moved note's own** body rewrite fails, producing the partial-success report
+- **WHEN** `move_note(rewrite_links=true)` completes its rename but the **moved note's own** body rewrite fails for a reason that observed no change to the destination, producing the partial-success report
 - **THEN** the reported `content_hash` SHALL be that of the unrewritten bytes now at the destination — the bytes the rename published — and passing it to a following guarded write SHALL proceed
+
+#### Scenario: A move whose own rewrite lost the in-call conflict reports no hash
+
+- **WHEN** `move_note(rewrite_links=true)` completes its rename and the **moved note's own** body rewrite is then refused as `concurrent_write`, because another writer changed the destination in between
+- **THEN** the result SHALL omit `content_hash` entirely, SHALL state that the move completed and the link rewrite did not, and SHALL direct the caller to re-read the destination before writing to it
+- **AND** the result SHALL NOT claim that nothing was written, because the rename committed
+
+#### Scenario: A destination too large to hash still reports success
+
+- **WHEN** a call succeeds but the file whose hash it would report exceeds the cap that tool may read
+- **THEN** the result SHALL report the success without a `content_hash`, naming the reason, and SHALL NOT fail
 
 #### Scenario: A backlink source's failure does not change the reported hash
 
