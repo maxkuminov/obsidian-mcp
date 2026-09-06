@@ -6,6 +6,7 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.session import _SingleUserSentinel
+from src.config import settings
 from src.control_panel.routes import (
     _assert_key_owner,
     _log_panel_forbidden,
@@ -42,16 +43,27 @@ class CreateKeyRequest(BaseModel):
     watching. Forbidding extras makes every future control that this model does
     not implement a loud 422 instead of a quiet no-op — including the next one
     somebody adds to the form and forgets here.
+
+    **Omitted and explicit-null are different requests** (#194). An omitted
+    `daily_request_limit` means "whatever the server considers sensible" and
+    the handler applies `DEFAULT_DAILY_REQUEST_LIMIT`; an explicit
+    `{"daily_request_limit": null}` still means *unlimited*, as it always has,
+    and is the only way to ask for one. The two are told apart by
+    `model_fields_set` — whether the field was present in the request — never
+    by the value's truthiness, because a `None` default cannot distinguish
+    them and a sentinel default would leak into the schema. Any explicit value
+    wins over the default outright.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     name: str = Field(..., min_length=1, max_length=255, pattern=r"^[\w\-. ]+$")
     permission: str = Field("read", pattern="^(read|readwrite)$")
-    # Null (or absent) is unlimited, matching the column and the form's empty
-    # box. The bounds are the same ones `ck_api_keys_daily_request_limit`
-    # enforces, restated here so a bad value is a 422 naming the field rather
-    # than a 500 out of the database.
+    # Null is unlimited, matching the column and the form's empty box; absent
+    # is "apply the configured default", resolved in the handler (see
+    # `_created_key_limit`). The bounds are the same ones
+    # `ck_api_keys_daily_request_limit` enforces, restated here so a bad value
+    # is a 422 naming the field rather than a 500 out of the database.
     daily_request_limit: int | None = Field(
         None, ge=DAILY_REQUEST_LIMIT_MIN, le=DAILY_REQUEST_LIMIT_MAX
     )
@@ -112,6 +124,37 @@ class KeyInfo(BaseModel):
     daily_request_limit: int | None
 
 
+def _created_key_limit(req: CreateKeyRequest) -> int | None:
+    """The `daily_request_limit` a newly created key receives.
+
+    Three inputs, three answers, and the middle one is the whole reason this is
+    a function rather than an `or`:
+
+    * the field was **omitted** — apply `DEFAULT_DAILY_REQUEST_LIMIT`;
+    * the field was sent as **null** — unlimited, exactly as before #194;
+    * the field carries a **value** — that value, whatever the default is.
+
+    `model_fields_set` is what separates the first two: it holds the names the
+    request actually carried, so an absent field and a null field are
+    distinguishable even though both read as `None`. An `or` against the
+    default would silently turn the documented "unlimited" request into a
+    limited key — the same silent substitution the panel's create handler
+    deliberately refuses to perform (D9).
+
+    **Applied here, in application code, never as a column default** (D9). A
+    `server_default` would reach every future insert path, would be a schema
+    change, and — the point — could not express "grandfather the rows that
+    already exist": keys created before this setting existed keep whatever they
+    carry, including NULL, with no migration and no backfill.
+
+    The setting is read per request rather than captured at import, so this
+    module never holds a stale copy of it.
+    """
+    if "daily_request_limit" in req.model_fields_set:
+        return req.daily_request_limit
+    return settings.default_daily_request_limit
+
+
 @router.post("/keys", response_model=CreateKeyResponse)
 @limiter.limit("5/minute")
 async def create_key(
@@ -134,8 +177,9 @@ async def create_key(
         user_id=user.id,
         # Persisted, not dropped (#162). A create that accepted this field and
         # then ignored it handed the caller an unlimited key while reporting
-        # success.
-        daily_request_limit=req.daily_request_limit,
+        # success. Omitted now means the configured default (#194); explicit
+        # null still means unlimited.
+        daily_request_limit=_created_key_limit(req),
     )
     session.add(api_key)
     await session.commit()

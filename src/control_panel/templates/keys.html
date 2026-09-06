@@ -157,12 +157,20 @@
             <div class="field">
                 <label class="field-label">Daily request limit</label>
                 <input type="number" name="daily_request_limit" class="field-input"
-                       min="1" max="{{ quota_limit_max }}" step="1" placeholder="Leave empty for unlimited">
+                       min="1" max="{{ quota_limit_max }}" step="1" placeholder="Leave empty for unlimited"
+                       value="{{ quota_limit_default|default(none) if quota_limit_default|default(none) is not none else '' }}">
                 <div style="font-size:11px;color:var(--text-3);margin-top:6px;line-height:1.5;">
                     Tool calls this key may make per UTC day. Empty means unlimited.
                     Calls over the limit are refused before they run and do not
                     count toward it; the counter resets at UTC midnight. To stop a
                     key entirely, revoke it — a limit of 0 is not accepted.
+                    {% if quota_limit_default|default(none) is not none %}
+                    This box is pre-filled with the server's default for new keys
+                    ({{ quota_limit_default }}); change it or clear it — whatever
+                    is in the box when you submit is what the key gets, and an
+                    empty box creates an unlimited key. Keys that already exist
+                    are unaffected.
+                    {% endif %}
                 </div>
             </div>
             <div class="modal-footer">

@@ -1061,6 +1061,14 @@ async def keys_page(
         "active": "keys", "keys": keys, "new_key": new_key, "key_error": key_error,
         "quota_day": quota_day,
         "quota_limit_max": DAILY_REQUEST_LIMIT_MAX,
+        # The configured default for *new* keys (#194), and the **only** place
+        # the panel applies it: the create form is pre-filled with it, and
+        # `create_key_form` substitutes nothing. So the operator's last view of
+        # that field is what the key receives — clearing the box creates an
+        # unlimited key, exactly as it always did. None leaves the box empty,
+        # which is the same page this was before the setting existed. Existing
+        # keys are untouched by it in either direction.
+        "quota_limit_default": settings.default_daily_request_limit,
     }))
 
 
@@ -1124,6 +1132,17 @@ async def create_key_form(
     # Server-side, above the DB CHECK (#162). Both layers: the constraint is
     # what makes the invariant true of the data, and this is what makes it
     # fixable — a violated CHECK is a 500 with no key and no explanation.
+    #
+    # **No default substitution here, deliberately** (#194, D9). A blank field
+    # is an explicit unlimited: `DEFAULT_DAILY_REQUEST_LIMIT` reaches the panel
+    # only as `keys_page`'s pre-filled value, so what the operator saw in the
+    # box is what the key gets. Substituting it on this side would mean an
+    # operator who deliberately cleared the field got a limited key anyway —
+    # the surprise that gets a quota feature turned off — and would give the
+    # default two places to be overridden instead of one. The JSON API
+    # distinguishes omitted from null and applies the default there
+    # (`_created_key_limit`); a form has no such distinction to make, because
+    # every submission carries the field.
     limit, limit_error = parse_limit_form_value(daily_request_limit)
     if limit_error is not None:
         _flash_key_error(request, limit_error)
