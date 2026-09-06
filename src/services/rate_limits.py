@@ -157,8 +157,12 @@ class _Entry:
     write: TokenBucket | None
     last_seen: float
     windows: dict[tuple[str, str, str], _Window] = field(default_factory=dict)
+    # Planned rows still belong to this registered entry until acknowledged.
+    in_flight: int = 0
 
     def idle_and_full(self, now: float) -> bool:
+        if self.in_flight:
+            return False
         if now - self.last_seen < ENTRY_TTL_SECONDS:
             return False
         if any(window.pending for window in self.windows.values()):
@@ -481,6 +485,7 @@ def _planned(
     params = dict(values.get("params") or {})
     params[SUPPRESSED_PARAM] = suppressed
     values["params"] = params
+    entry.in_flight += 1
     return PlannedRow(
         values=values,
         weight=1 + suppressed,
@@ -508,6 +513,7 @@ def requeue(planned: PlannedRow) -> None:
       the captured template and its **original** start, so the row is due again
       on the very next tick rather than after another whole interval.
     """
+    planned.entry.in_flight -= 1
     window = planned.entry.windows.get(planned.key)
     if window is None:
         planned.entry.windows[planned.key] = _Window(
@@ -539,8 +545,14 @@ async def write_planned_row(planned: PlannedRow) -> bool:
         landed = await write_usage_row(planned.values)
     except Exception:  # noqa: BLE001 - a failed row must not fail its caller
         landed = False
+    except BaseException:
+        # Cancellation must propagate, but the unconfirmed weight survives.
+        requeue(planned)
+        raise
     if not landed:
         requeue(planned)
+    else:
+        planned.entry.in_flight -= 1
     return landed
 
 
@@ -599,9 +611,16 @@ async def _write_all(planned: list[PlannedRow]) -> int:
     """Write each planned row, acknowledging or requeueing it. Returns the
     number that landed."""
     written = 0
-    for row in planned:
-        if await write_planned_row(row):
-            written += 1
+    for index, row in enumerate(planned):
+        try:
+            if await write_planned_row(row):
+                written += 1
+        except BaseException:
+            # The active writer restores its own row. Every later row was
+            # also retired by _due_rows and has not reached a writer yet.
+            for unattempted in planned[index + 1:]:
+                requeue(unattempted)
+            raise
     return written
 
 

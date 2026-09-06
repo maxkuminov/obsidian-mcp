@@ -301,8 +301,11 @@ answer 404 for the next several minutes, so an obedient agent retries on
 schedule, is refused, and has no way to tell the refusal it was given from the
 one it now gets. When the claim cannot be restored the route falls back to this
 route's ordinary non-retryable answer — which is what a retry would in fact
-receive — and `transfer_claim_release_failed` records the cause class-only. A
-retryable refusal is a promise, and only a confirmed release can support it.
+receive — and an exception emits `transfer_claim_release_failed` with its
+class only. A
+retryable refusal is a promise, and only a confirmed release can support it. The helper
+returns the conditional UPDATE's actual boolean: zero affected rows is an
+unconfirmed release too, even when the database raised no exception.
 
 The answer is **429 with `Retry-After`**, with its own body rather than the
 uniform 404 — the token is fine and stays claimable, and telling a legitimate

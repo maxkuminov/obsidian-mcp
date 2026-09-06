@@ -84,3 +84,10 @@ Everything on the request path lives in one slice: the failed-auth budget, the p
 - [ ] 6.8 Operator follow-up (not a code task): set a daily limit on the five existing production keys — D4's accepted limitation means they have velocity bounds only until one is set.
 - [ ] 6.9 **File the `mcp-concurrency-slots` issue** before archiving, carrying forward: the pre-authentication in-flight ceilings (identity-blind, per-credential fingerprint, authentication-concurrency semaphore) with the pool arithmetic; the per-class / per-tenant / per-principal / global slot lattice with the "every tool has a class" reservation invariant; the `slot_timeout` refusal; the boot validator for the pool and class-sum relationships; the two carried-forward rejected findings (global-first acquisition, per-tenant reservation); and the requirement that it **ship in shadow mode first** — slots computed and would-be refusals recorded with a `shadow` flag before anything is enforced. Reference the three review rounds and #208.
 - [ ] 6.10 `/openspec-archive-change`; PR with `Closes #194`, `Closes #188`; record on #194 the accepted residuals — **concurrency is not bounded by this change** (see the new issue); **expiring unused dynamically registered OAuth clients is not closed here**; **OAuth grants and grandfathered NULL-limit keys have velocity bounds only**; the transport 429 sits outside the in-band refusal contract; a hard kill loses at most one coalescing interval of refusal counts; past 10,000 principals the shared overflow entries lose per-principal attribution. Note #202 (indexer fairness) as the sibling still open.
+
+## 7. Takeover review recovery (#194 / #188)
+
+- [x] 7.1 Retain current and unattempted planned rows on cancellation; pin registered entries until acknowledgement or requeue without increasing the registry cap.
+- [x] 7.2 Respect a false conditional claim-release result before returning upload 429.
+- [x] 7.3 Add deterministic regressions for cancellation, sweep during persistence, and zero-row claim release.
+- [ ] 7.4 Independent review and completion of the remaining verification/deploy gates above.

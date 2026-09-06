@@ -305,7 +305,7 @@ before mutating would let one refusal be counted on both sides.
 Advancing the window when a row is *planned* is the only workable order — the
 alternative is holding a lock across a database write on the hottest path in
 the server — but it means the count that row carries is in flight, owned by
-nobody, until the write is confirmed. So every row the coalescer decides to
+the registered entry, until the write is confirmed. So every row the coalescer decides to
 write is a **`PlannedRow`** carrying its own `weight` (`1 + suppressed`), and
 `write_planned_row` either sees `write_usage_row` return `True` or **requeues
 the whole weight** into the window's `pending`.
@@ -320,6 +320,20 @@ window with its **original start**, so the row is due again on the very next
 tick rather than after another whole interval; a requeue after an *immediate*
 failure adds to whatever has accumulated since. Exceptions count as failures:
 an exception is not evidence the row landed.
+
+**In-flight rows pin their entry.** Planning increments an entry-local count;
+acknowledgement or requeue releases it. The idle sweep refuses an entry while
+that count is nonzero, even after a flush retired all its windows. Otherwise a
+new principal could evict it during the database await and a failed write would
+restore counts into an object no future flush can reach. Pinned entries still
+count against the registry cap; new principals use the existing shared overflow
+entry, so retaining ownership does not expand that cap.
+
+**Cancellation retains counts and still propagates.** The active writer puts
+its unconfirmed weight back before re-raising cancellation; the batch puts back
+every later row it retired but has not attempted. The lifespan cancels the
+periodic indexer before its final flush, so losing these rows on cancellation
+would lose refusals on a graceful restart, not just on a hard kill.
 
 The immediate row is written from the captured template too, through the same
 `write_planned_row`. One code path builds every `rate_limited` row, so the

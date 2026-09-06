@@ -399,8 +399,7 @@ async def _release_quietly(session, row, request: Request) -> bool:
     statement, and the engine hides its parameters — belt and braces).
     """
     try:
-        await transfer.release_claim(session, row)
-        return True
+        return await transfer.release_claim(session, row)
     except Exception as exc:  # noqa: BLE001 - the response is already decided
         security_events.emit(
             "transfer_claim_release_failed",
@@ -659,8 +658,9 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
             # refusal it was given was not the refusal it now gets. When the
             # claim cannot be restored we fall back to this route's
             # non-retryable answer, which is what a retry would in fact
-            # receive. `_release_quietly` has already recorded the failure
-            # class-only as `transfer_claim_release_failed`.
+            # receive. When release raised, `_release_quietly` recorded its
+            # class as `transfer_claim_release_failed`; a zero-row UPDATE
+            # also fails this gate without inventing an exception.
             if not await _release_quietly(session, row, request):
                 return _not_found()
             return _rate_limited(request, row, retry_after)

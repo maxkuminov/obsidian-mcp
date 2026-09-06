@@ -1233,3 +1233,96 @@ def test_the_daily_limit_domain_is_mirrored_from_the_model():
 
     assert config._DAILY_REQUEST_LIMIT_MIN == DAILY_REQUEST_LIMIT_MIN
     assert config._DAILY_REQUEST_LIMIT_MAX == DAILY_REQUEST_LIMIT_MAX
+
+
+@pytest.mark.parametrize("flush", [False, True])
+async def test_cancelled_writer_preserves_current_and_unattempted_counts(monkeypatch, flush):
+    """A cancelled periodic flush must leave shutdown enough state to recover."""
+    rate_limits.reset_state_for_tests()
+    rows = []
+
+    async def persist(values):
+        rows.append(values)
+        return True
+
+    monkeypatch.setattr(tools, "write_usage_row", persist)
+
+    def refuse(principal):
+        return rate_limits.record_rate_refusal(
+            principal, "read_note", "rate_limited", "principal", lambda: {"params": {}}
+        )
+
+    principals = [("api_key", 1), ("api_key", 2)]
+    if flush:
+        for principal in principals:
+            await rate_limits.write_planned_row(refuse(principal))
+            assert refuse(principal) is None
+        operation = rate_limits.flush_all()
+        expected = 4
+    else:
+        operation = rate_limits.write_planned_row(refuse(principals[0]))
+        expected = 1
+
+    entered = asyncio.Event()
+
+    async def blocked(values):
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(tools, "write_usage_row", blocked)
+    task = asyncio.create_task(operation)
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert all(entry.in_flight == 0 for entry in rate_limits._entries.values())
+    monkeypatch.setattr(tools, "write_usage_row", persist)
+    await rate_limits.flush_all()
+    assert sum(_weight(row) for row in rows) == expected
+    assert await rate_limits.flush_all() == 0
+
+
+@pytest.mark.parametrize("landed", [False, True])
+async def test_in_flight_flush_pins_idle_entry_without_exceeding_cap(monkeypatch, landed):
+    rate_limits.reset_state_for_tests()
+    monkeypatch.setattr(rate_limits.settings, "mcp_limiter_max_tracked_principals", 1)
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(rate_limits, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    rows = []
+
+    async def persist(values):
+        rows.append(values)
+        return True
+
+    monkeypatch.setattr(tools, "write_usage_row", persist)
+    principal = ("api_key", 1)
+
+    def refuse():
+        return rate_limits.record_rate_refusal(
+            principal, "read_note", "rate_limited", "principal", lambda: {"params": {}}
+        )
+
+    await rate_limits.write_planned_row(refuse())
+    assert refuse() is None
+    entry = rate_limits._entries[principal]
+    clock.now += rate_limits.ENTRY_TTL_SECONDS + 1
+
+    async def write_during_admission(values):
+        assert not entry.windows  # retired, but still owns this row
+        assert entry.in_flight == 1
+        rate_limits.take(("api_key", 2), refusals.SCOPE_PRINCIPAL)
+        assert rate_limits._entries[principal] is entry
+        assert rate_limits.tracked_principals() == 1
+        assert rate_limits._overflow is not None
+        if landed:
+            rows.append(values)
+        return landed
+
+    monkeypatch.setattr(tools, "write_usage_row", write_during_admission)
+    await rate_limits.flush_expired()
+    assert entry.in_flight == 0
+    monkeypatch.setattr(tools, "write_usage_row", persist)
+    await rate_limits.flush_all()
+    assert sum(_weight(row) for row in rows) == 2
+    rate_limits._sweep(clock.now)
+    assert principal not in rate_limits._entries

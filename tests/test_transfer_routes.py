@@ -1488,8 +1488,9 @@ async def test_redemptions_above_the_write_rate_are_refused(
     assert harness.token not in str(carried)
 
 
+@pytest.mark.parametrize("release_raises", [True, False])
 async def test_a_rate_refusal_whose_release_fails_is_not_a_retryable_429(
-    client, harness, vault, write_bucket, events, monkeypatch
+    harness, vault, write_bucket, events, monkeypatch, release_raises
 ):
     """A 429 with `Retry-After` promises the link still works. Only a confirmed
     release can support that promise.
@@ -1503,24 +1504,35 @@ async def test_a_rate_refusal_whose_release_fails_is_not_a_retryable_429(
     non-retryable answer, which is what a retry would in fact receive, and
     `transfer_claim_release_failed` records the cause class-only.
     """
-    for name in ("first", "second"):
-        _rearm(harness, name)
-        ok = await client.put("/transfer/upload", headers=auth(harness), content=PNG)
-        assert ok.status_code == 200, ok.text
+    # The release branch runs before any upload I/O; spend its allowance
+    # directly so this regression exercises only the refused request.
+    for _ in range(2):
+        assert rate_limits.take(("api_key", 7), refusals.SCOPE_PRINCIPAL_WRITE)[0]
 
     async def failing_release(_session, _row):
         harness.released += 1
-        raise RuntimeError("the pool is gone")
+        if release_raises:
+            raise RuntimeError("the pool is gone")
+        return False
 
     monkeypatch.setattr(transfer, "release_claim", failing_release)
 
     _rearm(harness, "third")
-    response = await client.put(
-        "/transfer/upload", headers=auth(harness), content=PNG
+    from starlette.requests import Request
+
+    async def unexpected_body():
+        pytest.fail("a refused upload must not read its body")
+
+    request = Request(
+        {"type": "http", "method": "PUT", "path": "/transfer/upload",
+         "headers": [], "client": ("203.0.113.7", 4242), "scheme": "http",
+         "server": ("localhost", 8000)},
+        receive=unexpected_body,
     )
+    response = await transfer_routes.upload.__wrapped__(request, token=harness.token)
 
     assert response.status_code == 404
-    assert response.json() == {"error": "not found"}
+    assert response.body == b'{"error":"not found"}'
     assert "retry-after" not in {k.lower() for k in response.headers}
 
     # The claim really is still held — which is exactly why the 429 would have
@@ -1533,8 +1545,9 @@ async def test_a_rate_refusal_whose_release_fails_is_not_a_retryable_429(
     # The cause is recorded, class-only, and no rate-limit record claims a
     # refusal the caller was never told about in those terms.
     failures = events.named("transfer_claim_release_failed")
-    assert len(failures) == 1
-    assert _fields(failures[0])["error_type"] == "RuntimeError"
+    assert len(failures) == (1 if release_raises else 0)
+    if release_raises:
+        assert _fields(failures[0])["error_type"] == "RuntimeError"
     assert events.named("transfer_refused_rate_limited") == []
 
 
