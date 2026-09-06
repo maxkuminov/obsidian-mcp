@@ -38,7 +38,7 @@ os.environ.setdefault("VAULT_PATH", "/tmp/test-vault")
 os.chdir(tempfile.gettempdir())
 
 from src.control_panel import routes  # noqa: E402
-from src.services import error_log, ops_health  # noqa: E402
+from src.services import error_log, ops_health, vault_overlap  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATES_DIR = os.path.join(HERE, "..", "src", "control_panel", "templates")
@@ -811,14 +811,53 @@ def _dashboard_context(monkeypatch, session):
 
 def test_a_failing_strip_query_does_not_take_the_dashboard_down(monkeypatch):
     """The dashboard is the page an operator opens *because* something is
-    wrong. Losing three cells beats losing the page."""
+    wrong. Losing three cells beats losing the page.
+
+    The vault-root quarantine is **not** one of the three. It needs no session
+    — an attribute read and a mapping walk over the published snapshot — so it
+    shares none of the queries that just failed, and it reports that a tenant's
+    tools are disabled. Dropping it here hid that condition exactly when the
+    database was unhappy (#199).
+    """
     session = _ExplodingStripSession()
     ctx, response = _dashboard_context(monkeypatch, session)
 
     assert response == "rendered", "the page still renders"
-    assert ctx["health"] == {"unavailable": True, "show_ops": True}
+    assert set(ctx["health"]) == {"unavailable", "show_ops", "quarantine"}
+    assert ctx["health"]["unavailable"] is True
+    assert ctx["health"]["show_ops"] is True
+    # The suite's autouse fixture publishes an empty snapshot, so the cell is
+    # present and says "checked, nothing to report" rather than being absent.
+    assert ctx["health"]["quarantine"]["checked"] is True
+    assert ctx["health"]["quarantine"]["accounts"] == []
     # And the dashboard's own data is untouched.
     assert "stats" in ctx and "graph" in ctx
+
+
+def test_a_degraded_strip_still_carries_the_vault_root_quarantine(monkeypatch):
+    """The condition survives the strip's own failure and names the account.
+
+    A quarantine persists until an operator acts and every other record of it
+    decays; the strip degrading is not a reason for the dashboard to stop
+    showing it.
+    """
+    entry = vault_overlap.QuarantineEntry(
+        user_id=11,
+        username="alice",
+        assignment="/vaults/team",
+        reason=vault_overlap.Overlap(
+            12, "bob", "/vaults/team/private", vault_overlap.RELATION_CONTAINS
+        ),
+        detected_at=datetime.datetime.now(datetime.timezone.utc),
+    )
+    vault_overlap.publish_synthetic_snapshot([entry])
+
+    session = _ExplodingStripSession()
+    ctx, _response = _dashboard_context(monkeypatch, session)
+
+    accounts = ctx["health"]["quarantine"]["accounts"]
+    assert [a["username"] for a in accounts] == ["alice"]
+    assert "/vaults/team/private" in accounts[0]["text"]
 
 
 def test_the_failed_strip_transaction_is_rolled_back(monkeypatch):

@@ -487,7 +487,9 @@ async def register_submit(
             vault_path=vault_path,
             status_code=status.HTTP_400_BAD_REQUEST,
         )
-    normalized_vp, vp_err = validate_vault_root_path(vault_path)
+    # Awaited: the existence check is a syscall against a bind mount, and
+    # `validate_vault_root_path` runs it off the loop under a deadline.
+    normalized_vp, vp_err = await validate_vault_root_path(vault_path)
     if vp_err:
         _bootstrap_refused(request, "vault_path_invalid")
         return _render_register(

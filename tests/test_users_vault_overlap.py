@@ -200,8 +200,12 @@ def _accept_any_absolute_path(monkeypatch):
     the *normalised* value that validator returns, and what is under test is
     what the check does with two real directories — so the validator is stubbed
     to normalise and admit, and its own rules are exercised by its own tests.
+
+    The stub is a **coroutine function**, because the real validator is one: its
+    existence check is a syscall against a bind mount and runs off the event
+    loop under a deadline, inside a handler holding the account guard.
     """
-    def _accept(p):
+    async def _accept(p):
         raw = (p or "").strip()
         if not raw:
             return None, None
@@ -894,3 +898,118 @@ def test_rendering_the_page_deletes_no_index_row(monkeypatch):
     sql = " ".join(str(s) for s in session.statements).lower()
     assert "delete" not in sql
     assert "update" not in sql
+
+
+# --- Normalisation: one directory, several spellings ------------------------
+
+
+@pytest.mark.parametrize("form", ["trailing-slash", "double-separator", "dot"])
+@pytest.mark.parametrize("direction", ["candidate-outer", "candidate-inner"])
+def test_the_assignment_check_normalises_every_spelling(form, direction, tmp_path):
+    """`/vaults/team/`, `/vaults//team` and `/vaults/team/.` are one root.
+
+    The assignment refusal has to see through all three, in **both ancestor
+    directions**: an administrator types the path by hand, and a check that
+    compared the raw strings would admit `/vaults/team/` beside the peer's
+    `/vaults/team` — the exact-duplicate case, which is the one the panel has
+    claimed to catch since before this change existed.
+    """
+    outer = tmp_path / "team"
+    inner = outer / "private"
+    inner.mkdir(parents=True)
+
+    def _spell(path):
+        if form == "trailing-slash":
+            return f"{path}/"
+        if form == "double-separator":
+            return f"{path.parent}//{path.name}"
+        return f"{path}/."
+
+    if direction == "candidate-outer":
+        candidate, peer, expected = _spell(outer), str(inner), "contains"
+    else:
+        candidate, peer, expected = _spell(inner), str(outer), "is inside"
+
+    target = _user()
+    response, session = _submit(
+        target, [_PeerRow(3, "carol", peer)], vault_path=candidate
+    )
+    message = _refusal(response)
+    assert message is not None, f"{candidate} beside {peer} was accepted"
+    assert "carol" in message
+    assert expected in message
+    assert session.committed is False
+    assert target.vault_path is None
+
+
+@pytest.mark.parametrize("form", ["trailing-slash", "double-separator", "dot"])
+def test_a_respelled_duplicate_keeps_the_exact_duplicate_wording(form, tmp_path):
+    """One directory under two spellings is `identical`, not a containment —
+    so it gets the message operators already know rather than one that would
+    send them looking for a nesting that is not there."""
+    shared = tmp_path / "team"
+    shared.mkdir()
+
+    if form == "trailing-slash":
+        candidate = f"{shared}/"
+    elif form == "double-separator":
+        candidate = f"{shared.parent}//{shared.name}"
+    else:
+        candidate = f"{shared}/."
+
+    target = _user()
+    response, _ = _submit(
+        target, [_PeerRow(3, "carol", str(shared))], vault_path=candidate
+    )
+    message = _refusal(response)
+    assert message == (
+        f"Vault path '{shared}' is already assigned to user 'carol'."
+    ), message
+
+
+# --- The `/vaults/*` dropdown does not block the loop ------------------------
+
+
+def test_the_vaults_dropdown_is_probed_off_the_loop_and_bounded(monkeypatch):
+    """`_list_available_vaults` is a directory listing plus one `is_dir` per
+    entry, and every entry is a bind mount (#199, adversarial round 1).
+
+    Run inline it was an unbounded blocking scan on the event loop, on a page
+    render — so one hung mount took the whole panel down at exactly the moment
+    an operator opened it to reassign a vault *away* from that mount. Expiry
+    degrades the dropdown, never the page: an empty list still renders the
+    form, and the custom-path field beside it is the way through.
+    """
+    import threading
+
+    release = threading.Event()
+
+    def _blocking_scan():
+        release.wait(30)
+        raise AssertionError("the deadline did not abandon the wait")
+
+    monkeypatch.setattr(users_mod, "_list_available_vaults_blocking", _blocking_scan)
+    monkeypatch.setattr(
+        users_mod.settings, "vault_root_observe_timeout_seconds", 0.05
+    )
+
+    async def _drive():
+        ticks = 0
+
+        async def _tick():
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.005)
+                ticks += 1
+
+        ticker = asyncio.create_task(_tick())
+        try:
+            listed = await asyncio.wait_for(users_mod._list_available_vaults(), 5)
+        finally:
+            ticker.cancel()
+            release.set()
+        return listed, ticks
+
+    listed, ticks = asyncio.run(_drive())
+    assert listed == [], "a hung scan offers no candidates rather than hanging"
+    assert ticks > 0, "the event loop was blocked for the whole scan"

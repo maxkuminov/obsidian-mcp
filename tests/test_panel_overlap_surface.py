@@ -373,13 +373,64 @@ def test_a_non_admin_strip_names_no_account_and_no_path():
     assert "vault-root quarantine" not in html
 
 
-def test_a_degraded_strip_still_renders_and_shows_no_condition():
-    """`_health_strip_or_degraded` returns no `quarantine` key when its own
-    queries fail; the template must treat the absence as nothing to show rather
-    than raising in the middle of the page it exists to save."""
+class _ExplodingSession:
+    """Every read the strip issues fails; the render must survive it.
+
+    The realistic fault is `indexer_runs` or `backups_log` unreadable while the
+    rest of the page is fine — which is exactly when an operator is looking.
+    """
+
+    async def execute(self, *_a, **_k):
+        raise RuntimeError('relation "indexer_runs" does not exist')
+
+    async def rollback(self):
+        return None
+
+
+def test_a_degraded_strip_renders_and_shows_no_condition_when_there_is_none():
+    """The template treats a missing or empty `quarantine` as nothing to show
+    rather than raising in the middle of the page it exists to save."""
     html = _render_strip(unavailable=True)
     assert "Health summary unavailable" in html
     assert "vault-root quarantine" not in html
+
+
+def test_a_degraded_strip_still_carries_the_condition():
+    """`_health_strip_or_degraded` keeps the `quarantine` key when its own
+    queries fail (#199 verifier).
+
+    The three cells it loses are the ones that read `indexer_runs` and
+    `backups_log`. The quarantine reads neither — no session, no statement, no
+    syscall — so dropping it hid a tenancy fault behind an unrelated database
+    fault, in the one place an operator would have seen it.
+    """
+    alice, bob = _overlap_pair()
+    vault_overlap.publish_synthetic_snapshot([alice, bob], detected_at=DETECTED_AT)
+    degraded = asyncio.run(
+        routes._health_strip_or_degraded(_ExplodingSession(), _User())
+    )
+    assert degraded["unavailable"] is True
+    assert [a["username"] for a in degraded["quarantine"]["accounts"]] == [
+        "alice", "bob"
+    ]
+
+    html = _render_strip(**degraded)
+    assert "Health summary unavailable" in html
+    assert "vault-root quarantine" in html
+    assert "alice" in html and "bob" in html
+
+
+def test_a_degraded_strip_names_nothing_for_a_non_admin():
+    """The same admin split as the healthy strip: the condition names another
+    account and another account's vault path."""
+    alice, bob = _overlap_pair()
+    vault_overlap.publish_synthetic_snapshot([alice, bob], detected_at=DETECTED_AT)
+    degraded = asyncio.run(
+        routes._health_strip_or_degraded(_ExplodingSession(), _User(is_admin=False))
+    )
+    assert degraded["quarantine"] is None
+    html = _render_strip(**degraded)
+    assert "alice" not in html and "bob" not in html
 
 
 # --------------------------------------------------------------------------

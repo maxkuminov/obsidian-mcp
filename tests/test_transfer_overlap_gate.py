@@ -374,3 +374,181 @@ def test_load_valid_still_accepts_an_unaffected_owner(monkeypatch, direction):
         )
     )
     assert outcome is row
+
+
+# --- The endpoints themselves: byte-for-byte with an unknown token -----------
+#
+# `_load_valid` refusing is the mechanism; what a caller can *observe* is the
+# response, and the anti-oracle the whole public surface rests on is that every
+# refusal is indistinguishable. A quarantine is a new reason to refuse, so it is
+# a new way for the surface to leak one: a caller replaying a capability they
+# hold could otherwise learn, from a changed status, a changed header set or a
+# changed body, that this owner's vault root has just been quarantined — which
+# is a fact about another tenant's configuration.
+#
+# So these compare the real endpoint's answer for a quarantined token against
+# its answer for a token that does not exist, on GET and on HEAD, over status,
+# headers and raw bytes.
+
+
+#: Set per response by the server and by definition not comparable.
+_VOLATILE_HEADERS = {"date", "server"}
+
+
+def _comparable(response):
+    headers = {
+        k.lower(): v
+        for k, v in response.headers.items()
+        if k.lower() not in _VOLATILE_HEADERS
+    }
+    return response.status_code, headers, response.content
+
+
+@pytest.fixture
+def download_world(tmp_path, monkeypatch):
+    """A real file, a real download row, and the routes' own session."""
+    from src.limiter import limiter
+
+    root = tmp_path / "bob"
+    (root / "Attachments").mkdir(parents=True)
+    target = root / "Attachments" / "spec.pdf"
+    target.write_bytes(b"%PDF-1.4\n" + b"payload " * 64)
+
+    row = _TokenRow(direction="download")
+    row.vault_root = str(root)
+    row.path = "Attachments/spec.pdf"
+    st = target.stat()
+    row.expected_fingerprint = {
+        "dev": st.st_dev,
+        "inode": st.st_ino,
+        "size": st.st_size,
+        "mtime_ns": st.st_mtime_ns,
+        "ctime_ns": st.st_ctime_ns,
+    }
+    row.public_id = "pub-1"
+    row.overwrite = False
+    row.claimed_at = None
+    row.completed_at = None
+    row.expires_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+        minutes=10
+    )
+    row.size = row.sha256 = row.mime = None
+    row.actor_kind = row.actor_label = row.actor_ref = None
+
+    known = "tok-known"
+
+    async def _lookup(session, token, *, direction):
+        return row if token == known and direction == "download" else None
+
+    async def _identity_ok(session, r, *, need_write):
+        return True
+
+    class _LoggingOwnerSession(_OwnerSession):
+        """`_OwnerSession` plus the two calls a *served* download makes.
+
+        The refusal path never reaches them, which is the asymmetry the pair of
+        tests below is built on: the byte-identity case must refuse before any
+        row is written, and the control case must get all the way to the log
+        row and the commit.
+        """
+
+        def __init__(self):
+            super().__init__(_OwnerRow(vault_path=str(root), is_active=True))
+            self.logged = []
+            self.commits = 0
+
+        def add(self, obj):
+            self.logged.append(obj)
+
+        async def commit(self):
+            self.commits += 1
+
+    class _Session:
+        async def __aenter__(self):
+            return _LoggingOwnerSession()
+
+        async def __aexit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(transfer, "lookup_token", _lookup)
+    monkeypatch.setattr(transfer, "resolve_identity_ok", _identity_ok)
+    monkeypatch.setattr(transfer_routes, "async_session", _Session)
+    monkeypatch.setattr(settings, "vault_path", str(root))
+    limiter.reset()
+    yield {"token": known, "root": root, "file": target}
+    limiter.reset()
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+async def test_a_quarantined_download_is_byte_identical_to_an_unknown_token(
+    method, download_world
+):
+    """The refusal must be unobservable, on both methods the route serves."""
+    import httpx
+
+    from src.limiter import limiter
+    from src.main import app
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, client=("203.0.113.7", 4242)),
+        base_url="http://localhost:8000",
+    ) as client:
+        # Baseline: a token that was never minted.
+        vault_overlap.publish_synthetic_snapshot()
+        limiter.reset()
+        unknown = await client.request(
+            method,
+            "/transfer/download/file",
+            headers={"Authorization": "Bearer tok-does-not-exist"},
+        )
+
+        # The same request with a live token whose owner is quarantined.
+        _quarantine()
+        limiter.reset()
+        quarantined = await client.request(
+            method,
+            "/transfer/download/file",
+            headers={"Authorization": f"Bearer {download_world['token']}"},
+        )
+
+    assert unknown.status_code == 404
+    assert _comparable(quarantined) == _comparable(unknown), (
+        "a quarantined owner's refusal is distinguishable from an unknown "
+        "token — the response is the oracle"
+    )
+
+
+@pytest.mark.parametrize("method", ["GET", "HEAD"])
+async def test_the_same_token_is_served_once_the_quarantine_clears(
+    method, download_world
+):
+    """The control is the quarantine and nothing else about the capability.
+
+    Without this the byte-identity above would also pass if the token were
+    simply broken, and the test would be proving nothing.
+    """
+    import httpx
+
+    from src.limiter import limiter
+    from src.main import app
+
+    vault_overlap.publish_synthetic_snapshot()
+    limiter.reset()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, client=("203.0.113.7", 4242)),
+        base_url="http://localhost:8000",
+    ) as client:
+        served = await client.request(
+            method,
+            "/transfer/download/file",
+            headers={"Authorization": f"Bearer {download_world['token']}"},
+        )
+
+    assert served.status_code == 200
+    if method == "GET":
+        assert served.content == download_world["file"].read_bytes()
+    else:
+        assert served.content == b""
+        assert served.headers["content-length"] == str(
+            download_world["file"].stat().st_size
+        )

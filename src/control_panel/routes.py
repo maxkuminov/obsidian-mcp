@@ -2272,12 +2272,19 @@ async def _health_strip_or_degraded(session: AsyncSession, user) -> dict:
             exc_info=True,
             error_type=type(exc).__name__,
         )
-        # No `quarantine` key here, and the dashboard template treats its
-        # absence as "nothing to show". A degraded strip is the one case where
-        # the condition is not on the dashboard; it is still on the health page
-        # this cell links to, which reads the snapshot on its own and shares
-        # none of the three queries that failed here.
-        return {"unavailable": True, "show_ops": _is_admin(user)}
+        # **The quarantine still renders.** It is the one cell here that needs
+        # no session: `_quarantine_view` is an attribute read and a mapping
+        # walk over the published snapshot, and it shares none of the three
+        # queries that just failed. Dropping the key made the degraded strip
+        # hide a condition that has silently disabled a tenant's tools — and
+        # the strip degrades precisely when the database is unhappy, which is
+        # not the moment to stop reporting a tenancy fault. The rest of the
+        # strip is gone; this is not.
+        return {
+            "unavailable": True,
+            "show_ops": _is_admin(user),
+            "quarantine": _quarantine_view(_is_admin(user)),
+        }
 
 
 # --- Search analytics -----------------------------------------------------

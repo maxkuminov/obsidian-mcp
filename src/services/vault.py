@@ -359,8 +359,8 @@ def _vault_root(user_id: int | None = None) -> Path:
     return cached
 
 
-def validate_vault_root_path(p: str) -> tuple[str | None, str | None]:
-    """Validate an absolute container path as an acceptable vault root.
+def validate_vault_root_lexical(p: str) -> tuple[str | None, str | None]:
+    """The half of the validation that is **decided without a filesystem**.
 
     Returns ``(normalized_path, error)`` — at most one of the two is set.
     Empty / None input → ``(None, None)``: callers that allow clearing a
@@ -372,8 +372,17 @@ def validate_vault_root_path(p: str) -> tuple[str | None, str | None]:
 
     The ``/vaults/`` restriction prevents an admin from accidentally (or
     deliberately) pointing a user at ``/etc``, the host home dir, or another
-    container path that happens to be visible.  The directory-existence check
-    catches a docker-compose mount that was configured but not yet applied.
+    container path that happens to be visible.
+
+    **Split out from the existence check on purpose.** Deciding the shape of a
+    string is pure and instant; deciding whether a *bind mount* is there and is
+    a directory is a syscall against a filesystem that may be network- or
+    FUSE-backed and may not answer for minutes. Fusing the two put an unbounded
+    blocking `stat` on the event loop, inside an administrative handler that
+    had already taken a transaction-scoped advisory lock — so one hung mount
+    stalled every request the process was serving *and* held the account guard
+    while it did. `validate_vault_root_path` is the composed form and is where
+    the observation is bounded.
     """
     raw = (p or "").strip()
     if not raw:
@@ -387,12 +396,53 @@ def validate_vault_root_path(p: str) -> tuple[str | None, str | None]:
             f"Vault path must be either '{legacy}' (legacy mount) or a "
             "subpath of '/vaults/'."
         )
-    if not Path(normalized).is_dir():
+    return normalized, None
+
+
+async def validate_vault_root_path(p: str) -> tuple[str | None, str | None]:
+    """Validate an absolute container path as an acceptable vault root.
+
+    Lexical validation (`validate_vault_root_lexical`) and then the
+    existence-and-type check, **off the event loop and under a deadline** —
+    `vault_overlap.observe_root`, the same bounded observer the detection uses,
+    bounded by `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`. It opens the path with
+    `O_DIRECTORY`, so a file is refused by the kernel rather than by a `stat`
+    race, and the descriptor is closed before it returns.
+
+    **Async on purpose, and not merely for tidiness.** Every caller is an
+    `async def` handler, and the check it is replacing was a synchronous
+    `Path.is_dir()` on a bind mount: a hung NFS or FUSE root blocked the whole
+    event loop — the panel, the MCP surface, the transfer routes — from inside
+    the one handler an operator would be using to *fix* it, and it did so
+    holding `_ADMIN_GUARD_LOCK_KEY`. Making the signature `async` is what stops
+    a future caller from reintroducing the blocking form by accident: a sync
+    call site now gets a coroutine it cannot use, loudly, instead of a stall
+    nobody attributes to this line.
+
+    The missing-mount wording is unchanged — it is the message operators know,
+    and it names the likeliest cause. A root that exists but could not be
+    observed (a permission wall, a hung mount, a pathname moving underneath the
+    check) is reported as what it is rather than as "does not exist": sending
+    an administrator to look for a directory that is there would cost them the
+    incident.
+    """
+    normalized, error = validate_vault_root_lexical(p)
+    if error is not None or normalized is None:
+        return normalized, error
+    observation = await vault_overlap.observe_root(normalized)
+    if observation.examinable:
+        return normalized, None
+    cause = observation.cause
+    if cause in (errno.ENOENT, errno.ENOTDIR):
         return None, (
             f"Vault path '{normalized}' does not exist as a directory "
             "inside the container. Check the docker-compose volume mount."
         )
-    return normalized, None
+    return None, (
+        f"Vault path '{normalized}' could not be examined: "
+        f"{vault_overlap.cause_text(cause)}. The assignment is refused "
+        "because the root could not be confirmed to be a directory."
+    )
 
 
 # The one bound on how long a vault-relative path may be. It matches

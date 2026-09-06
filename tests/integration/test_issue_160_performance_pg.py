@@ -143,6 +143,92 @@ async def test_the_predicate_excludes_exactly_the_enumerated_markers(clean):
     assert row["mean_size"] == 25  # (10 + 20 + 30 + 40) / 4
 
 
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "vault_root_overlap",
+        "vault_root_unexaminable",
+        "vault_root_not_ready",
+    ],
+)
+async def test_each_vault_root_marker_is_a_refusal_and_not_a_latency_sample(
+    clean, marker
+):
+    """The three quarantine markers, one row each, against real JSONB (#199).
+
+    A marker the predicate does not enumerate is wrong in **both** directions
+    at once, and both are silent. Its `duration_ms` lands in the tool's
+    percentiles — and a pre-body refusal is near-zero, so a burst of them drags
+    p50 down and the page reports a tool getting faster while it is refusing
+    every call. And the refusal is never counted, so the one number that would
+    have explained the drop is absent from the same row.
+
+    `usage_stats` asserts the constants are in the tuple; only PostgreSQL can
+    say whether `params->>'error' IN (...)` actually matches the value the
+    refusal writes.
+    """
+    async with clean() as session:
+        session.add_all([
+            # Executed: the only rows the percentiles may see.
+            _log("semantic_search", duration=100, size=10),
+            _log("semantic_search", duration=300, size=30),
+            # Refused before the body ran, carrying this marker.
+            _log("semantic_search", duration=0, size=1, params={"error": marker}),
+            _log("semantic_search", duration=0, size=1, params={"error": marker}),
+        ])
+        await session.commit()
+
+        rows = await tool_aggregates(session, "24h", None)
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["executed"] == 2, f"{marker} was counted as an executed call"
+    assert row["refusals"] == 2, f"{marker} was not counted as a refusal"
+    # 100 and 300 only: the two zero-duration refusals would have moved this.
+    assert row["p50"] == pytest.approx(200.0), (
+        f"{marker} polluted the latency percentiles"
+    )
+    assert row["mean_size"] == 20
+
+
+async def test_the_three_vault_root_markers_stay_distinct_from_no_vault_assigned(
+    clean,
+):
+    """Four different conditions, four different fixes: an unassigned account,
+    two overlapping roots, a mount that is gone, and a process that has not
+    finished checking. Collapsing them tells an operator to look at the wrong
+    thing — and `vault_root_not_ready` in particular is the signal that a
+    *detection* is failing, which nothing else in the log says."""
+    markers = [
+        "no_vault_assigned",
+        "vault_root_overlap",
+        "vault_root_unexaminable",
+        "vault_root_not_ready",
+    ]
+    async with clean() as session:
+        session.add_all(
+            [_log("read_note", duration=500, size=50)]
+            + [
+                _log("read_note", duration=0, size=1, params={"error": m})
+                for m in markers
+            ]
+        )
+        await session.commit()
+
+        rows = await tool_aggregates(session, "24h", None)
+        stored = (await session.execute(text(
+            "SELECT DISTINCT params->>'error' AS marker FROM usage_logs "
+            "WHERE params ? 'error' ORDER BY 1"
+        ))).all()
+
+    assert sorted(r.marker for r in stored) == sorted(markers), (
+        "the four markers must remain four distinct values in the column"
+    )
+    assert rows[0]["refusals"] == 4
+    assert rows[0]["executed"] == 1
+    assert rows[0]["p50"] == pytest.approx(500.0)
+
 async def test_a_publish_time_anchor_loss_stays_in_the_percentiles(clean):
     """`vault_anchor_lost_at_publish` is a post-body marker and must aggregate.
 

@@ -352,16 +352,61 @@ async def test_the_rebuild_takes_the_lock_before_it_reads(engines, world):
     The driver must hold the lock before the first row it intends to rebuild is
     read — not merely before its fingerprint write — so that no keyword-vector
     write by any process can commit between the snapshot and the record.
+
+    **One thing runs before the lock, and it is not a row read of the rows the
+    fingerprint certifies (#199).** The vault-root survey observes every root
+    this command would open — including the retained root of an *inactive*
+    owner, whom the serving overlap snapshot never observes because nothing
+    serves them — and that observation is a bounded `open`/`fstat`/`realpath`
+    against a bind mount. Doing it *after* the lock would let one hung NFS or
+    FUSE mount hold the index generation lock for as long as the kernel likes,
+    with every pass in the process queued behind it. So it happens first, and
+    the ordering below pins both halves at once.
+
+    The survey does enumerate scopes to know which roots to look at, and that
+    enumeration is deliberately **not** the one the coverage claim rests on:
+    `_retained_scopes` is called a second time *under* the lock, and
+    `_rebuild_scope` refuses any scope the survey did not examine rather than
+    opening it. So every row the fingerprint speaks for is still read inside
+    the locked section — which is the property this test has always been about.
     """
     # The docstring names the same statements, so it is stripped before the
     # ordering is read off the body.
     body = inspect.getsource(indexer.rebuild_tsvectors_all_scopes).split(
         '"""'
     )[2]
+    participants_at = body.index("_rebuild_root_participants(session)")
+    survey_at = body.index("survey_rebuild_roots(participants)")
     lock_at = body.index("acquire_generation_lock(session)")
-    read_at = body.index("SELECT DISTINCT user_id")
+    # The locked section's first statement, and the authoritative scope list.
+    read_at = body.index("_retained_scopes(session)")
+    rebuild_at = body.index("_rebuild_scope(session, owner, survey)")
     write_at = body.index("set_state(session, KEY_FTS_FINGERPRINT")
-    assert lock_at < read_at < write_at
+
+    assert participants_at < survey_at < lock_at < read_at < rebuild_at < write_at
+
+    # The driver itself issues no statement of its own before the lock: the
+    # `notes_metadata` reads it performs — the ownerless count and every
+    # per-scope row — are all inside the locked section.
+    assert body.index("session.execute(") > lock_at
+    assert body.index("notes_metadata") > lock_at
+
+    # The part that must not run under the lock is the filesystem observation,
+    # and it is structurally incapable of reading a row: `survey_rebuild_roots`
+    # takes participants rather than a session and issues no statement.
+    survey_body = inspect.getsource(indexer.survey_rebuild_roots).split('"""')[2]
+    assert "session" not in survey_body
+    assert "execute" not in survey_body
+
+    # And the pre-lock enumeration is not trusted: the same helper runs again
+    # under the lock, and a scope the survey did not examine is refused rather
+    # than opened on the strength of a survey that predates it.
+    assert "_retained_scopes(session)" in inspect.getsource(
+        indexer._rebuild_root_participants
+    )
+    assert "not in the pre-lock root survey" in inspect.getsource(
+        indexer._rebuild_scope
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════

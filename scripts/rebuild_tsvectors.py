@@ -22,17 +22,30 @@ search was exactly as wrong as before. So a skipped scope aborts the whole
 operation, names itself and its reason, rolls every rebuilt scope back and
 records nothing.
 
+**It checks every root it will open, before it takes the lock.** The published
+quarantine snapshot speaks for *active* users holding an assignment, because
+that is whom the server serves — and this command opens an **inactive** owner's
+retained root too. An inactive owner retaining `/vaults/team` beside an active
+tenant at `/vaults/team/private` is therefore named by nothing the snapshot
+publishes, and reading it would file that tenant's notes' keyword vectors under
+the inactive owner's scope, under a fingerprint certifying the result. So the
+driver runs the same two checks over its own read set first
+(`indexer.survey_rebuild_roots`) and aborts naming the pair. The survey is
+bounded and off the loop and happens **before** the generation lock, so a hung
+mount cannot hold that lock while an `open` waits on it.
+
 **It waits for an in-flight index pass.** The rebuild takes the index
 generation lock before it reads its first row, and the periodic pass holds that
 lock for the duration of its transaction — so this command blocks until the
 pass commits rather than interleaving with it. That is the required behaviour,
 and it is why nothing here sets a short `lock_timeout`.
 
-Four ways forward when it refuses, in order of preference: settle the scope
-(assign or delete that user, or let an in-progress re-derive finish), resolve
-the root overlap that quarantined it, delete or reassign ownerless rows, or put
-`FTS_CONFIGS` back to the value the stored fingerprint names — which clears the
-startup refusal immediately with no rebuild at all.
+Five ways forward when it refuses, in order of preference: settle the scope
+(assign or delete that user, or let an in-progress re-derive finish), correct
+the overlapping assignment the survey named, restore a root it could not
+examine, delete or reassign ownerless rows, or put `FTS_CONFIGS` back to the
+value the stored fingerprint names — which clears the startup refusal
+immediately with no rebuild at all.
 """
 import asyncio
 import sys

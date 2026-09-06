@@ -185,6 +185,32 @@ row and both writes land.
   message operators already know; `contains` and `contained_by` name the
   relation, because "already assigned" would be false for them and would send
   an operator looking for a duplicate string.
+- **Every filesystem call on this path is off the loop and bounded**, and that
+  is not tidiness. `validate_vault_root_path` is split in two:
+  `validate_vault_root_lexical` decides the shape of the string (the `..`
+  guard, the `/vaults/`-or-legacy rule) with no syscall, and the `async`
+  `validate_vault_root_path` then observes the root through
+  `vault_overlap.observe_root` — `O_DIRECTORY`, off the event loop, under
+  `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS`. It used to be one function ending in a
+  synchronous `Path(normalized).is_dir()`, called inline from
+  `edit_user_submit` **after** the account guard was taken: a bind mount that
+  stopped answering stalled every request the process was serving, from inside
+  the one page an operator would use to move a vault *off* that mount, and held
+  `_ADMIN_GUARD_LOCK_KEY` while it did. The signature is `async` on purpose —
+  it is what stops a future caller reintroducing the blocking form by accident,
+  because a sync call site now gets an unusable coroutine loudly instead of a
+  stall nobody attributes to that line. The missing-mount wording is unchanged;
+  a root that exists but could not be observed reports the cause instead, since
+  sending an administrator to look for a directory that is present costs them
+  the incident.
+- **The `/vaults/*` dropdown is probed the same way.**
+  `_list_available_vaults` runs `_list_available_vaults_blocking` through
+  `asyncio.to_thread` under the same deadline, and expiry degrades the
+  *dropdown*, not the page: it offers no candidates and the custom-path field
+  beside it is the way through. The dropdown itself is otherwise unchanged and
+  still does not pre-filter conflicting directories (limitation **L9**) — the
+  refusal on submit is the enforcement, and a filtered dropdown that silently
+  omits a directory is less legible than a refusal naming the conflicting user.
 - **`create_user` and the bootstrap are untouched.** `create_user` always
   writes `vault_path=None`. `src/auth/routes.py::register_submit` runs only
   while `_users_table_empty` holds — zero rows — so the peer set is empty by
@@ -251,6 +277,63 @@ That is limitation **L4**: the bound that matters is on detection *latency*,
 the blocked thread holds no lock and no pooled connection, the condition is
 loud (the user is quarantined and named on the panel), and the alternative is a
 server that will not start.
+
+### The detection population is *active assigned users* — and E5 checks a wider one
+
+`detect_and_publish` observes **active users holding an assignment**, and that
+is deliberate in both directions. It is who the server serves: `_vault_root`
+admits them, the periodic pass indexes them, and a quarantine is a refusal
+aimed at exactly that. Widening it would be a mistake, not a hardening — an
+inactive account is served by nothing and indexed by nothing, so quarantining
+it refuses nothing while putting its name on the panel beside an active peer
+that now looks implicated. **Do not widen the serving snapshot to inactive
+users.**
+
+The **all-scopes keyword rebuild** (`rebuild_tsvectors_all_scopes`, E5) opens a
+strictly larger set, and that is equally deliberate. Since #206 it enumerates
+scopes from the rows that exist (`SELECT DISTINCT user_id FROM notes_metadata`,
+not `_active_user_ids()`), because the fingerprint it records asserts something
+about *every retained row* — and an inactive owner's rows are as retained, and
+as returnable by `keyword_search`, as anyone's. `_scope_vault_path` reads that
+owner's `users.vault_path` directly for the purpose.
+
+Those two facts are each correct and together they were a cross-tenant read:
+
+> User B is **inactive**, retaining rows under `/vaults/team`. User A is active
+> at `/vaults/team/private`. The snapshot names nobody — B is not observed, A
+> overlaps no *active* peer — so the driver pins `/vaults/team`, walks A's
+> notes through it, writes their keyword vectors under B's `user_id`, and
+> records a fingerprint certifying that every retained row was rebuilt.
+
+So the driver runs the same two checks over **its own read set**:
+`survey_rebuild_roots` observes every retained scope's root, active or not,
+together with every active assigned root as a peer it could collide with
+(deduplicated by user, so a scope is never paired against itself, and skipped
+entirely in single-user mode where `users.vault_path` is not the tenancy
+source). A relation involving a root the driver would open aborts the whole
+operation and names the pair. A root it would open that cannot be observed is
+`RebuildSkip.ROOT_UNEXAMINABLE` — a non-completed outcome that aborts exactly
+as an unsettled provenance does, because "we could not look" is not a completed
+rebuild. A root it would **not** open and cannot observe does not abort it:
+nothing was observed to relate that root to anything, which is L2's class, and
+failing maintenance because one unrelated tenant's mount is down is the
+false-positive direction this codebase treats as expensive.
+
+**The survey is maintenance-only. It publishes nothing.** The verdict is
+computed inside the command and discarded with it, the serving snapshot is
+untouched, and the set of users the admission gate refuses is unchanged. Two
+populations answering two questions — *whom does this server serve* and *whose
+bytes will this command read* — and a single answer would be wrong for one of
+them.
+
+**It also runs before `acquire_generation_lock`.** The observation is the same
+bounded, off-loop one, and the descriptor-bound verdict is carried into the
+locked section: under the lock, `_rebuild_scope` re-checks that the assignment
+is still the one that was surveyed and that `os.fstat(root_fd)` reports the
+inode that was observed, and refuses otherwise. `pinned_root` on its own opens
+synchronously, so an unexamined root opened under the lock lets one hung mount
+hold the index generation lock for as long as the kernel takes to answer, with
+every pass in the process queued behind it.
 
 ### One detection at a time, and a publication that cannot go backwards
 

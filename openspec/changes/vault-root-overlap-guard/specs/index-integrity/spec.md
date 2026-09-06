@@ -124,9 +124,11 @@ A detection failure is not a per-root failure: a root that cannot be opened is a
 - **THEN** an empty snapshot SHALL be published without opening any root
 
 ### Requirement: The snapshot SHALL record why each user is quarantined, and an unexaminable root SHALL NOT be reported as an overlap
-The snapshot SHALL map each quarantined user to a structured reason: an **overlap** carrying the peer user and the relation found (identical, contains, or contained by), or a **root unexaminable** carrying its cause — an error number, or a timeout — and naming no peer. Each entry SHALL additionally carry, as immutable facts observed at detection time, the subject's username and canonical assignment, the peer's username and canonical assignment for an overlap, and the moment the detection ran. Each reason SHALL be worded separately wherever it is surfaced — the control panel, the log line, the `indexer_runs` row and the usage-log marker.
+The snapshot SHALL map each quarantined user to a structured reason: an **overlap** carrying the peer user and the relation found (identical, contains, or contained by), or a **root unexaminable** carrying its cause and naming no peer. The cause SHALL be one of three, kept distinguishable wherever it is surfaced: an **error number**, a **timeout** (the observation exceeded its deadline), or an **unstable pathname** — the root opened but its canonical real path did not name the inode that was opened, so nothing observed describes one directory. Each entry SHALL additionally carry, as immutable facts observed at detection time, the subject's username and canonical assignment, the peer's username and canonical assignment for an overlap, and the moment the detection ran. Each reason SHALL be worded separately wherever it is surfaced — the control panel, the log line, the `indexer_runs` row and the usage-log marker.
 
-A root that could not be opened is not an overlap. Reporting it as one sends an operator looking for a second account that does not exist, and reporting it under the overlap marker makes the two indistinguishable in the usage log. The user is quarantined because their status could not be established, which is a different fact requiring a different fix.
+Three causes and not two, for the same reason there are two reasons and not one: they are different incidents an operator acts on differently. A missing directory is a mount that was not applied; a timeout is a mount that is not answering; an unstable pathname is a root being retargeted *while the check runs*, which is the only one of the three that says something is moving underneath the server rather than absent from it. Folding the third into an error number would name an `errno` no syscall returned.
+
+A root that could not be opened is not an overlap, whichever of the three causes it carries. Reporting it as one sends an operator looking for a second account that does not exist, and reporting it under the overlap marker makes the two indistinguishable in the usage log. The user is quarantined because their status could not be established, which is a different fact requiring a different fix.
 
 Recording the facts rather than the ids alone is what keeps the condition legible while the operator acts on it. The first response to "this root overlaps that account's" is to edit or delete one of the two accounts, and between that edit and the next detection a surface that resolved names at render time would show a changed path — or a blank, where a deleted peer was — beside a condition still in force. The recorded facts also make the staleness honest, because a surface can label them as of the last check rather than presenting them as the present state.
 
@@ -143,6 +145,13 @@ An unexaminable root SHALL quarantine **only that user**. The peers it could not
 - **THEN** that user's reason SHALL record that the root could not be examined, with the error number
 - **AND** SHALL NOT name any peer user or claim an overlap was observed
 
+#### Scenario: A pathname moving under the check is its own cause
+
+- **WHEN** a user's root opens but its canonical real path does not name the inode that was opened
+- **THEN** that user SHALL be quarantined as root unexaminable with the unstable-pathname cause
+- **AND** that cause SHALL be distinguishable from both an error number and a timeout wherever it is surfaced
+- **AND** it SHALL NOT be reported as an overlap
+
 #### Scenario: The pair stays nameable after the peer is changed
 
 - **WHEN** an overlap is published and an administrator then corrects or deletes one of the two accounts, before a later detection publishes
@@ -154,6 +163,47 @@ An unexaminable root SHALL quarantine **only that user**. The peers it could not
 - **WHEN** one active user's root cannot be opened and two other users hold unrelated, examinable roots
 - **THEN** only the first user SHALL be quarantined
 - **AND** the other two SHALL be indexed normally
+
+### Requirement: The all-scopes keyword rebuild SHALL check every root it will open, before it takes the generation lock
+The maintenance rebuild that enumerates scopes from the rows that exist — rather than from the active users the server serves — SHALL evaluate the identity and containment conditions across **every root it would open**, including the retained root of an inactive owner, together with the roots of all active users holding an assignment. Any relation involving a root it would open SHALL abort the whole operation, naming both sides and the relation; a root it would open that cannot be observed SHALL be a non-completed outcome and SHALL abort the operation in the same way. The observation SHALL be complete before the index generation lock is taken, and no root the observation did not examine SHALL be opened while that lock is held.
+
+The published quarantine snapshot cannot answer for this command, and this is a population difference rather than an oversight. The snapshot observes active users holding an assignment because that is exactly whom the server serves and indexes; this command opens the scope of an **inactive** owner too, because an inactive user's retained rows are as returnable by keyword search as anyone's and the coverage proof is about rows that exist. An inactive owner retaining a root that is an ancestor or an alias of an active tenant's is therefore named by nothing the snapshot publishes, and the rebuild would read that tenant's notes under the inactive owner's scope and record a fingerprint asserting that every retained row was rebuilt correctly.
+
+This check SHALL be maintenance-only: it SHALL publish nothing and SHALL NOT change which users the serving snapshot names. The serving population MUST stay "active users holding an assignment" — quarantining an inactive account refuses nothing, because nothing serves it, while making an active peer appear implicated.
+
+Completing the observation before the lock is a separate requirement from the check itself and neither substitutes for the other. Opening a root synchronously after the lock lets one hung mount hold the index generation lock for as long as the kernel takes to answer, and every pass in the process queues behind it — so the verdict is taken through the same bounded, off-loop observation the detection uses, and carried into the locked section.
+
+A root that this command would **not** open and that cannot be observed SHALL NOT abort it. Nothing was observed to relate that root to anything, which is the same residual already recorded for an inaccessible peer, and failing a maintenance command because one unrelated tenant's mount is down is the false-positive direction this system treats as the expensive error.
+
+#### Scenario: An inactive owner's retained root containing an active tenant's aborts the rebuild
+
+- **WHEN** an inactive user retains rows under a root that contains an active user's assigned root, and the all-scopes rebuild is run
+- **THEN** the rebuild SHALL abort, naming both roots and the relation
+- **AND** no vault root SHALL have been opened
+- **AND** no keyword vector and no fingerprint SHALL have been written
+
+#### Scenario: The check happens before the generation lock
+
+- **WHEN** the all-scopes rebuild runs
+- **THEN** every root it will open SHALL have been observed before the generation lock is acquired
+- **AND** no root that was not observed SHALL be opened while the lock is held
+
+#### Scenario: A scope whose root cannot be observed aborts like any other skip
+
+- **WHEN** a root the rebuild would open cannot be observed within the deadline, or cannot be opened at all
+- **THEN** that scope's outcome SHALL be a non-completed one naming the cause
+- **AND** the rebuild SHALL abort and record no fingerprint
+
+#### Scenario: The maintenance check does not move the serving snapshot
+
+- **WHEN** the all-scopes rebuild runs its check and aborts
+- **THEN** the published quarantine snapshot SHALL be unchanged
+- **AND** the users the admission gate refuses SHALL be exactly the users it refused before
+
+#### Scenario: Sibling roots rebuild normally
+
+- **WHEN** every scope's root is unrelated to every other
+- **THEN** the rebuild SHALL proceed and record the fingerprint exactly as before
 
 ### Requirement: A quarantined user SHALL NOT be indexed, and unrelated users SHALL be
 A pass SHALL skip the index, link-backfill, embed and tsvector-rebuild stages for every user the published snapshot names, and SHALL run all of them normally for every active user it does not name. The skip SHALL NOT delete, prune or otherwise mutate any `notes_metadata`, `note_embeddings` or `note_links` row belonging to a skipped user, and SHALL NOT write that user's provenance record.

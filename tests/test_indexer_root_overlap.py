@@ -753,3 +753,352 @@ async def test_single_user_mode_publishes_an_empty_snapshot(monkeypatch):
     await indexer.detect_root_overlaps("startup")
     assert vault_overlap.published_snapshot().entries == {}
     indexer._refuse_quarantined_pass(None, "index")
+
+
+# ── E5's own root survey: the population the serving snapshot does not cover ──
+#
+# `detect_and_publish` observes **active** users holding an assignment, because
+# that is exactly whom the server serves and indexes. The all-scopes keyword
+# rebuild opens a different set: every scope that holds `notes_metadata` rows,
+# which since #206 deliberately includes an **inactive** owner's retained root.
+# So an inactive user retaining `/vaults/team` beside an active tenant at
+# `/vaults/team/private` is named by nothing the serving snapshot publishes,
+# and the rebuild would read that tenant's notes under the inactive owner's
+# scope — under a fingerprint certifying the result.
+#
+# The survey is that command's own check over its own read set. It publishes
+# nothing and quarantines nobody: the serving population is unchanged.
+
+
+def _scope(owner, assignment, label=None):
+    return indexer._RootParticipant(
+        owner=owner,
+        label=label or f"retained scope user_id={owner}",
+        assignment=str(assignment),
+        is_scope=True,
+    )
+
+
+def _peer(owner, assignment, username="alice"):
+    return indexer._RootParticipant(
+        owner=owner,
+        label=f"active user '{username}' (user_id={owner})",
+        assignment=str(assignment),
+        is_scope=False,
+    )
+
+
+async def test_the_survey_catches_an_inactive_scope_containing_an_active_root(
+    tmp_path,
+):
+    """The blocker, at the unit. Nothing about this pair is in the snapshot."""
+    outer = tmp_path / "team"
+    inner = outer / "private"
+    inner.mkdir(parents=True)
+
+    survey = await indexer.survey_rebuild_roots(
+        [_scope(2, outer), _scope(1, inner)]
+    )
+
+    assert set(survey.failures) == {1, 2}
+    assert survey.failures[2].skip is indexer.RebuildSkip.ROOT_OVERLAPS
+    detail = survey.failures[2].describe()
+    assert str(outer) in detail and str(inner) in detail
+    assert "contains" in detail
+    assert "is inside" in survey.failures[1].describe()
+
+
+async def test_the_survey_relates_a_scope_to_an_active_peer_holding_no_rows(
+    tmp_path,
+):
+    """The active tenant need not be a scope: a fresh tenant with no rows yet
+    is still a tenant whose notes the rebuild would read through the ancestor.
+    """
+    outer = tmp_path / "team"
+    inner = outer / "private"
+    inner.mkdir(parents=True)
+
+    survey = await indexer.survey_rebuild_roots(
+        [_scope(2, outer), _peer(1, inner, "alice")]
+    )
+
+    assert set(survey.failures) == {2}, "only a scope this driver reads aborts"
+    assert "alice" in survey.failures[2].describe()
+
+
+async def test_two_peers_alone_are_not_this_commands_business(tmp_path):
+    """Two active tenants overlapping is the serving snapshot's finding and it
+    quarantines them there. This command aborts on what *it* would open."""
+    outer = tmp_path / "team"
+    inner = outer / "private"
+    inner.mkdir(parents=True)
+
+    survey = await indexer.survey_rebuild_roots(
+        [_peer(1, outer, "alice"), _peer(2, inner, "bob")]
+    )
+    assert survey.failures == {}
+
+
+async def test_the_survey_accepts_siblings_and_a_string_prefix_sibling(tmp_path):
+    """The false-positive direction. `/vaults/team` is not an ancestor of
+    `/vaults/team-2`, and aborting maintenance on a healthy layout is the
+    expensive error here."""
+    for name in ("team", "team-2", "other"):
+        (tmp_path / name).mkdir()
+
+    survey = await indexer.survey_rebuild_roots([
+        _scope(1, tmp_path / "team"),
+        _scope(2, tmp_path / "team-2"),
+        _scope(3, tmp_path / "other"),
+    ])
+    assert survey.failures == {}
+    assert set(survey.observations) == {1, 2, 3}
+    assert all(o.examinable for o in survey.observations.values())
+
+
+async def test_a_scope_whose_root_cannot_be_examined_is_a_non_completed_outcome(
+    tmp_path,
+):
+    """"We could not look" is not a completed rebuild, and it aborts like the
+    others rather than being stepped over."""
+    survey = await indexer.survey_rebuild_roots(
+        [_scope(1, tmp_path / "gone")]
+    )
+    assert survey.failures[1].skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
+    assert "could not be examined" in survey.failures[1].describe()
+
+
+async def test_an_unexaminable_peer_does_not_abort_the_command(tmp_path):
+    """L2's class, and the decision that goes with it: one unrelated tenant's
+    broken mount must not fail a maintenance command that would not read it."""
+    root = tmp_path / "team"
+    root.mkdir()
+
+    survey = await indexer.survey_rebuild_roots(
+        [_scope(1, root), _peer(2, tmp_path / "gone", "bob")]
+    )
+    assert survey.failures == {}
+
+
+async def test_the_survey_sees_through_a_symlink_alias(tmp_path):
+    """Two spellings, one inode — which is exactly what a string comparison of
+    two `vault_path` values cannot see."""
+    real = tmp_path / "team"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real)
+
+    survey = await indexer.survey_rebuild_roots(
+        [_scope(1, real), _scope(2, alias)]
+    )
+    assert set(survey.failures) == {1, 2}
+    assert "is the same directory as" in survey.failures[1].describe()
+
+
+async def test_the_survey_publishes_nothing(tmp_path, unpublished_vault_root_snapshot):
+    """Maintenance-only. It is a verdict about one command's read set, computed
+    and discarded inside it — quarantining an inactive account would refuse
+    nothing (nothing serves it) while making an active peer look implicated."""
+    outer = tmp_path / "team"
+    inner = outer / "private"
+    inner.mkdir(parents=True)
+
+    await indexer.survey_rebuild_roots([_scope(2, outer), _scope(1, inner)])
+
+    assert vault_overlap.published_snapshot() is None
+
+
+async def test_the_survey_observes_off_the_loop_under_the_deadline(
+    monkeypatch, tmp_path
+):
+    """It runs before `acquire_generation_lock`, and it is bounded — a root
+    opened synchronously *after* the lock lets one hung mount hold the index
+    generation lock for as long as the kernel likes."""
+    import threading
+
+    release = threading.Event()
+
+    def _blocking(assignment, **kwargs):
+        release.set()
+        threading.Event().wait(30)
+        raise AssertionError("the deadline did not abandon the wait")
+
+    monkeypatch.setattr(vault_overlap, "observe_root_blocking", _blocking)
+    monkeypatch.setattr(
+        vault_overlap.settings, "vault_root_observe_timeout_seconds", 0.05
+    )
+
+    survey = await asyncio.wait_for(
+        indexer.survey_rebuild_roots([_scope(1, tmp_path / "team")]), 5
+    )
+    assert survey.failures[1].skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
+    assert "not answering" in survey.failures[1].describe()
+
+
+async def test_the_scope_survey_runs_before_the_generation_lock(monkeypatch, tmp_path):
+    """Ordering, asserted directly: the observation is complete before the lock
+    is taken, and the lock is never held across an unexamined open."""
+    outer = tmp_path / "team"
+    inner = outer / "private"
+    inner.mkdir(parents=True)
+
+    order: list[str] = []
+
+    async def _participants(_session):
+        order.append("participants")
+        return [_scope(2, outer), _scope(1, inner)]
+
+    real_survey = indexer.survey_rebuild_roots
+
+    async def _survey(participants):
+        order.append("survey")
+        return await real_survey(participants)
+
+    async def _lock(_session):
+        order.append("lock")
+
+    def _never(*_a, **_k):
+        raise AssertionError("a root was opened despite the survey's verdict")
+
+    monkeypatch.setattr(indexer, "_rebuild_root_participants", _participants)
+    monkeypatch.setattr(indexer, "survey_rebuild_roots", _survey)
+    monkeypatch.setattr(indexer, "acquire_generation_lock", _lock)
+    monkeypatch.setattr(indexer, "pinned_root", _never)
+
+    with pytest.raises(indexer.RebuildCoverageAborted) as excinfo:
+        await indexer.rebuild_tsvectors_all_scopes(object())
+
+    assert order == ["participants", "survey"], order
+    assert "before the generation lock" in str(excinfo.value)
+    assert str(outer) in str(excinfo.value) and str(inner) in str(excinfo.value)
+
+
+# ── The verdict carried into the locked section ──────────────────────────────
+#
+# The survey happens before `acquire_generation_lock`; the read happens after.
+# In between, a pathname can be retargeted and a scope can be reassigned — and
+# a verdict that no longer describes what is about to be opened is not a
+# verdict. So `_rebuild_scope` opens nothing the survey did not examine: the
+# assignment must still be the one that was observed, and the directory the pin
+# lands on must still be the inode that was observed.
+
+
+def _survey_of(owner, assignment, observation):
+    return indexer.RebuildRootSurvey(
+        observations={owner: observation},
+        assignments={owner: str(assignment)},
+        failures={},
+    )
+
+
+async def test_a_scope_missing_from_the_survey_is_never_opened(monkeypatch, tmp_path):
+    """A scope that appeared between the survey and the lock is a root nobody
+    examined. Re-running is cheap; opening it on a survey that did not include
+    it is the hole the survey exists to close."""
+    root = tmp_path / "team"
+    root.mkdir()
+
+    async def _path(_session, _owner):
+        return root
+
+    def _never(*_a, **_k):
+        raise AssertionError("an unexamined root was opened under the lock")
+
+    monkeypatch.setattr(indexer, "_scope_vault_path", _path)
+    monkeypatch.setattr(indexer, "pinned_root", _never)
+
+    empty = indexer.RebuildRootSurvey(observations={}, assignments={}, failures={})
+    outcome = await indexer._rebuild_scope(object(), 7, empty)
+
+    assert outcome.skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
+    assert "not in the pre-lock root survey" in outcome.describe()
+
+
+async def test_a_reassignment_between_the_survey_and_the_lock_refuses(
+    monkeypatch, tmp_path
+):
+    """The scope's `users.vault_path` changed after it was observed, so the
+    verdict describes a directory this rebuild is no longer going to read."""
+    surveyed = tmp_path / "team"
+    surveyed.mkdir()
+    moved = tmp_path / "elsewhere"
+    moved.mkdir()
+
+    async def _path(_session, _owner):
+        return moved
+
+    def _never(*_a, **_k):
+        raise AssertionError("an unexamined root was opened under the lock")
+
+    monkeypatch.setattr(indexer, "_scope_vault_path", _path)
+    monkeypatch.setattr(indexer, "pinned_root", _never)
+
+    survey = _survey_of(7, surveyed, vault_overlap.observe_root_blocking(str(surveyed)))
+    outcome = await indexer._rebuild_scope(object(), 7, survey)
+
+    assert outcome.skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
+    assert str(surveyed) in outcome.describe()
+    assert str(moved) in outcome.describe()
+
+
+async def test_a_pathname_retargeted_after_the_survey_refuses_at_the_pin(
+    monkeypatch, tmp_path
+):
+    """The assignment is unchanged and the *directory it names* is not.
+
+    This is the check-then-act interval `pinned_root` closes for the rest of
+    the pass, applied to the survey's own verdict: the pin lands on an inode
+    nobody examined, and `(st_dev, st_ino)` is what notices.
+    """
+    root = tmp_path / "team"
+    root.mkdir()
+
+    async def _path(_session, _owner):
+        return root
+
+    monkeypatch.setattr(indexer, "_scope_vault_path", _path)
+
+    observed = vault_overlap.observe_root_blocking(str(root))
+    # The same assignment, observed as a *different* inode — exactly what a
+    # symlink retargeted between the survey and the lock produces.
+    stale = vault_overlap.RootObservation(
+        assignment=observed.assignment,
+        st_dev=observed.st_dev,
+        st_ino=observed.st_ino + 1,
+        realpath=observed.realpath,
+    )
+
+    async def _never_rebuilt(*_a, **_k):
+        raise AssertionError("the scope was rebuilt through an unexamined inode")
+
+    monkeypatch.setattr(indexer, "_rebuild_tsvectors_pinned", _never_rebuilt)
+
+    outcome = await indexer._rebuild_scope(object(), 7, _survey_of(7, root, stale))
+
+    assert outcome.skip is indexer.RebuildSkip.ROOT_UNEXAMINABLE
+    assert "changed between the root survey and the rebuild" in outcome.describe()
+
+
+async def test_a_matching_verdict_proceeds_to_the_rebuild(monkeypatch, tmp_path):
+    """The negative control: same assignment, same inode, and the scope is
+    rebuilt exactly as it was before the survey existed."""
+    root = tmp_path / "team"
+    root.mkdir()
+
+    async def _path(_session, _owner):
+        return root
+
+    seen = {}
+
+    async def _rebuilt(session, user_id, vault, root_fd, log_suffix):
+        seen["user_id"] = user_id
+        return indexer.RebuildOutcome(rows=3)
+
+    monkeypatch.setattr(indexer, "_scope_vault_path", _path)
+    monkeypatch.setattr(indexer, "_rebuild_tsvectors_pinned", _rebuilt)
+
+    survey = _survey_of(7, root, vault_overlap.observe_root_blocking(str(root)))
+    outcome = await indexer._rebuild_scope(object(), 7, survey)
+
+    assert outcome.completed and outcome.rows == 3
+    assert seen["user_id"] == 7
