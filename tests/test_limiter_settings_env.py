@@ -18,6 +18,7 @@ refused everywhere and null is the only disable.
 """
 import pytest
 
+import src.config as config
 from src.config import Settings
 
 
@@ -110,6 +111,69 @@ def test_zero_is_refused_from_the_file(tmp_path, setting):
     with pytest.raises(Exception) as exc:
         _load(tmp_path, {setting: "0"})
     assert setting.lower() in str(exc.value).lower()
+
+
+# ── the ceilings ───────────────────────────────────────────────────────────
+#
+# "No upper bound" is not the same as "no limit". pydantic accepts an
+# arbitrarily long integer literal from the environment, so a limiter setting
+# with only a floor booted cleanly on a 401-digit number and then handed one
+# principal a bucket no real traffic could exhaust — a control that is
+# *configured* and does nothing, which is the failure an operator cannot see
+# from any surface. The ceiling turns that into a refused boot.
+
+CEILINGS = {
+    "MCP_AUTH_FAILURE_LIMIT": config.LIMITER_COUNT_MAX,
+    "MCP_RATE_LIMIT_PER_MINUTE": config.LIMITER_COUNT_MAX,
+    "MCP_RATE_LIMIT_BURST": config.LIMITER_COUNT_MAX,
+    "MCP_WRITE_RATE_LIMIT_PER_MINUTE": config.LIMITER_COUNT_MAX,
+    "MCP_WRITE_RATE_LIMIT_BURST": config.LIMITER_COUNT_MAX,
+    "MCP_LIMITER_MAX_TRACKED_PRINCIPALS": config.LIMITER_COUNT_MAX,
+    "MCP_AUTH_FAILURE_WINDOW_SECONDS": config.LIMITER_WINDOW_SECONDS_MAX,
+    "MCP_REFUSAL_LOG_INTERVAL_SECONDS": config.REFUSAL_INTERVAL_SECONDS_MAX,
+    "MCP_AUTH_FAILURE_TABLE_SIZE": config.AUTH_FAILURE_TABLE_SIZE_MAX,
+    # `DEFAULT_DAILY_REQUEST_LIMIT`'s ceiling is the column constraint's, and
+    # the model validator owns the message, so it is asserted separately below.
+}
+
+
+@pytest.mark.parametrize("setting", sorted(CEILINGS))
+def test_the_ceiling_itself_loads(tmp_path, setting):
+    loaded = _load(tmp_path, {setting: str(CEILINGS[setting])})
+    assert getattr(loaded, setting.lower()) == CEILINGS[setting]
+
+
+@pytest.mark.parametrize("setting", sorted(CEILINGS))
+def test_one_past_the_ceiling_refuses_the_boot(tmp_path, setting):
+    with pytest.raises(Exception) as exc:
+        _load(tmp_path, {setting: str(CEILINGS[setting] + 1)})
+    assert setting.lower() in str(exc.value).lower()
+
+
+@pytest.mark.parametrize(
+    "setting", sorted(CEILINGS) + ["DEFAULT_DAILY_REQUEST_LIMIT"]
+)
+def test_a_401_digit_integer_is_refused_at_boot(tmp_path, setting):
+    """The shape the finding named: an operator (or a broken deployment
+    template) writes a number with no plausible upper bound and the boot has to
+    refuse it rather than accept a control that cannot fire."""
+    absurd = "9" * 401
+    assert len(absurd) == 401
+    with pytest.raises(Exception) as exc:
+        _load(tmp_path, {setting: absurd})
+    assert setting.lower() in str(exc.value).lower() or "1..1000000" in str(exc.value)
+
+
+def test_the_daily_default_keeps_the_column_constraints_domain(tmp_path):
+    """Its ceiling is `ck_api_keys_daily_request_limit`'s, stated once where
+    the operator-facing message is — a field-level bound would name the field
+    and not the domain, and the domain is what an operator has to satisfy."""
+    assert _load(
+        tmp_path, {"DEFAULT_DAILY_REQUEST_LIMIT": "1000000"}
+    ).default_daily_request_limit == 1_000_000
+    with pytest.raises(Exception) as exc:
+        _load(tmp_path, {"DEFAULT_DAILY_REQUEST_LIMIT": "1000001"})
+    assert "1..1000000" in str(exc.value)
 
 
 def test_a_half_configured_bucket_refuses_the_boot_with_both_names(tmp_path):

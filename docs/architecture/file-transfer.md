@@ -293,6 +293,17 @@ retry mints afresh): there the capability's own window is gone, so there is
 nothing left to hand back. Getting these two backwards tells a caller whose
 link is perfectly good that it expired.
 
+**The 429 is conditional on the release actually landing.** `claim_upload`
+commits before this gate, so a `release_claim` that fails leaves the token
+**claimed until its TTL** — and `Retry-After` would then be a lie the caller
+acts on: it says "this link works again in N seconds" about a link that will
+answer 404 for the next several minutes, so an obedient agent retries on
+schedule, is refused, and has no way to tell the refusal it was given from the
+one it now gets. When the claim cannot be restored the route falls back to this
+route's ordinary non-retryable answer — which is what a retry would in fact
+receive — and `transfer_claim_release_failed` records the cause class-only. A
+retryable refusal is a promise, and only a confirmed release can support it.
+
 The answer is **429 with `Retry-After`**, with its own body rather than the
 uniform 404 — the token is fine and stays claimable, and telling a legitimate
 redeemer their link had died would make them mint another, which is more load,

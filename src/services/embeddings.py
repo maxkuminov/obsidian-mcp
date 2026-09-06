@@ -411,6 +411,17 @@ _OLLAMA_INPUT_LIMIT_CODES: frozenset[str] = frozenset()
 #: primary rule — a code is preferred wherever one is sent — and it is applied
 #: only on the statuses above, so a generic 400 (an unknown model, a malformed
 #: body) still propagates as the provider error it is.
+#:
+#: **Every alternative names what was too large.** A bare size complaint —
+#: `maximum length`, which this list used to carry on its own — matches
+#: sentences that have nothing to do with the input: OpenAI answers an unknown
+#: deployment with `invalid_model` and the message "identifier exceeds maximum
+#: length", which was translated into `argument_too_long` and told an agent to
+#: shorten a query that was never the problem. A caller acting on that refusal
+#: trims its query, retries, and is refused identically forever, while the real
+#: fault — a misconfigured model name, an operator's problem — never surfaces.
+#: So a phrase must pair the complaint with an input-shaped word (input,
+#: prompt, query, message, string, context, token) within one sentence.
 _INPUT_LIMIT_PHRASES = re.compile(
     r"maximum context length"
     r"|context length"
@@ -418,10 +429,12 @@ _INPUT_LIMIT_PHRASES = re.compile(
     r"|maximum (?:input )?(?:number of )?tokens"
     r"|tokens per request"
     r"|too many tokens"
-    r"|reduce your (?:prompt|input|message)"
-    r"|input (?:length |size )?(?:is )?too (?:long|large)"
-    r"|string too long"
-    r"|maximum length",
+    r"|token limit"
+    r"|reduce your (?:prompt|input|message|query)"
+    r"|(?:input|prompt|query|message|string)\b[^.]{0,40}?\b"
+    r"(?:too (?:long|large|big)|exceeds? the maximum|above the maximum)"
+    r"|(?:too (?:long|large|big)|exceeds? the maximum)[^.]{0,40}?\b"
+    r"(?:input|prompt|query|message|context|token)",
     re.IGNORECASE,
 )
 
@@ -441,14 +454,25 @@ def _bounded_reason(message: str) -> str:
     return text
 
 
-def _error_message_and_code(response: httpx.Response) -> tuple[str, str]:
-    """`(message, code)` from an error body in either provider's shape.
+def _error_message_and_code(response: httpx.Response) -> tuple[str, str, str]:
+    """`(message, code, kind)` from an error body in either provider's shape.
 
     OpenAI answers `{"error": {"message": …, "type": …, "code": …}}`; Ollama
     answers `{"error": "…"}`. Anything else — HTML from a proxy, an empty body,
-    a truncated stream — yields the raw text and no code, so the phrase test
-    still gets its chance and **nothing on this path may raise**: a detection
-    helper that threw would convert a provider error into an internal one.
+    a truncated stream — yields the raw text and neither field, so the phrase
+    test still gets its chance and **nothing on this path may raise**: a
+    detection helper that threw would convert a provider error into an internal
+    one.
+
+    `code` and `kind` (`error.type`) are returned **separately**, and the
+    difference decides whether the prose fallback may run at all. `code` is the
+    provider's specific machine name for this fault — `context_length_exceeded`,
+    `invalid_model` — so an unrecognised one is a positive statement that the
+    fault is something else. `type` is a coarse bucket (`invalid_request_error`)
+    that accompanies input-limit rejections and unknown models alike, so it
+    says nothing either way. Collapsing the two, as this used to, meant either
+    trusting prose the provider had already contradicted or refusing to read
+    the prose of every gateway that sends only a type.
     """
     try:
         payload = response.json()
@@ -458,19 +482,21 @@ def _error_message_and_code(response: httpx.Response) -> tuple[str, str]:
         err = payload.get("error")
         if isinstance(err, dict):
             message = err.get("message")
-            code = err.get("code") or err.get("type") or ""
+            code = err.get("code")
+            kind = err.get("type")
             return (
                 message if isinstance(message, str) else "",
                 code if isinstance(code, str) else "",
+                kind if isinstance(kind, str) else "",
             )
         if isinstance(err, str):
-            return err, ""
+            return err, "", ""
         if isinstance(payload.get("message"), str):
-            return payload["message"], ""
+            return payload["message"], "", ""
     try:
-        return response.text or "", ""
+        return response.text or "", "", ""
     except Exception:
-        return "", ""
+        return "", "", ""
 
 
 def _input_limit_reason(
@@ -484,9 +510,19 @@ def _input_limit_reason(
     """
     if response.status_code not in _INPUT_LIMIT_STATUSES:
         return None
-    message, code = _error_message_and_code(response)
-    if code and code in codes:
-        return _bounded_reason(message or code)
+    message, code, kind = _error_message_and_code(response)
+    if code:
+        # The provider named the fault. If it is one of ours this *is* an
+        # input-limit rejection; if it is not, the provider has already said
+        # what went wrong and the prose fallback must not overrule it. That
+        # ordering is the whole fix for `invalid_model` + "identifier exceeds
+        # maximum length": a specific code we do not recognise is evidence
+        # **against** this branch, not the absence of evidence.
+        return _bounded_reason(message or code) if code in codes else None
+    if kind and kind in codes:
+        return _bounded_reason(message or kind)
+    # No specific code — an Ollama-shaped body, a gateway that sends only a
+    # coarse `type`, or no JSON at all. Prose is all there is.
     if message and _INPUT_LIMIT_PHRASES.search(message):
         return _bounded_reason(message)
     return None
