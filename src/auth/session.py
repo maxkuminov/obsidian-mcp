@@ -1,14 +1,49 @@
+"""Panel identity: the session registry and the one validation every entry uses.
+
+Before the registry (#198), a browser session *was* the signed cookie: logout
+called `request.session.clear()`, Starlette answered with an expiring
+`Set-Cookie`, and the copy already taken stayed a correctly-signed credential
+until its itsdangerous timestamp aged out — seven days of panel access, on a
+panel that mints `readwrite` API keys and approves OAuth grants. A signed
+cookie cannot be un-signed. Only a server-side row can be revoked, so the row
+is what revocation acts on and what validation consults.
+
+Four functions, and the asymmetry between two of them is the contract:
+
+* `start_session` — the **single** mint. It takes the account guard, re-reads
+  the account under it, and **commits**, because `get_session` neither commits
+  nor rolls back: an insert left to a caller's discretion is an insert that may
+  never happen, and the cookie handed out beside it would authenticate nothing.
+* `revoke_session` / `revoke_user_sessions` — **never** commit. They ride the
+  caller's transaction, because every caller holds the account guard and
+  nothing may commit between taking that lock and writing the flags it
+  protects, or the last-admin check-then-act stops being atomic.
+* `touch_session` — telemetry, on the request's **own** session, on safe
+  methods only. A second `AsyncSession` would hold two connection-pool leases
+  for the life of the request against a pool that tops out at fifteen.
+* `get_active_session_user` — the one validation, reached from
+  `require_user_panel`, `login_form`, `authorize_get` and `authorize_post`. A
+  fifth entry point reading `request.session["user_id"]` raw is the defect this
+  change removed from the login page.
+"""
+import hashlib
+import logging
+import secrets
 from contextvars import ContextVar
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import Depends, HTTPException, Request, status
-from sqlalchemy import select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.config import settings
 from src.database import get_session
-from src.models.db import User
+from src.models.db import User, UserSession
+from src.services import security_events
+
+logger = logging.getLogger(__name__)
 
 current_user_id: ContextVar[int | None] = ContextVar("current_user_id", default=None)
 
@@ -122,35 +157,375 @@ async def get_current_user(
     return await get_active_session_user(request, session)
 
 
+# ── The session registry ─────────────────────────────────────────────
+
+#: Bytes of CSPRNG entropy behind the cookie's identifier. 32 bytes is 256
+#: bits, which is what makes the unkeyed digest below safe: there is nothing to
+#: brute-force, so the table can store the digest and never the identifier.
+SESSION_ID_BYTES = 32
+
+#: The cookie key the identifier travels under, beside `user_id`,
+#: `session_version`, `is_admin` and `username`. A cookie carrying `user_id`
+#: and **no** `sid` is a pre-registry cookie and is refused, not grandfathered:
+#: accepting it would keep #198's replay window open for another seven days.
+SESSION_ID_KEY = "sid"
+
+#: The refusal reasons `panel_session_replay_refused` may carry — a closed
+#: vocabulary, mirrored in the event catalogue.
+REPLAY_REFUSAL_REASONS = frozenset(
+    {
+        "no_session_id",
+        "unknown_session",
+        "revoked_session",
+        "expired_session",
+        "user_mismatch",
+    }
+)
+
+
+def hash_session_id(sid: str) -> str:
+    """`user_sessions.id` for a cookie identifier: its SHA-256 hex digest.
+
+    The one definition. The identifier itself is a bearer credential for seven
+    days, and a `pg_dump` of this database is taken before every migration and
+    kept for thirty days; storing the identifier verbatim would turn every
+    retained dump into a file full of live panel sessions. Unkeyed on purpose
+    — 256 bits of CSPRNG output has nothing to brute-force, and keying it with
+    `SECRET_KEY` would make the whole table unreadable after a rotation an
+    operator may need to perform.
+    """
+    return hashlib.sha256(sid.encode()).hexdigest()
+
+
+def _user_agent_hash(request: Request) -> str | None:
+    """Forensic only, and never an authorization input (D5).
+
+    Whoever stole the cookie also has the header, so as a *binding* it stops
+    nobody; enforcing it would sign real users out on every browser
+    auto-update, training them to re-authenticate after an unexplained logout
+    — the habit phishing depends on.
+    """
+    try:
+        agent = request.headers.get("user-agent") or ""
+    except (AttributeError, KeyError):  # pragma: no cover - defensive
+        return None
+    return hashlib.sha256(agent.encode("utf-8", "replace")).hexdigest()
+
+
+def _session_cookie(request: Request):
+    """`request.session`, or `None` when no `SessionMiddleware` is mounted."""
+    try:
+        return request.session
+    except (AssertionError, AttributeError):
+        return None
+
+
+def _aware(moment: datetime | None) -> datetime | None:
+    """A naive timestamp read back from a column is UTC; say so explicitly."""
+    if moment is None:
+        return None
+    if moment.tzinfo is None:
+        return moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+async def start_session(
+    request: Request,
+    session: AsyncSession,
+    user_id: int,
+) -> str | None:
+    """Mint one browser session, inside the account guard, and commit it.
+
+    Returns the identifier written into the cookie, or `None` when the account
+    is gone or inactive — a refusal the caller does not recover from: the user
+    is simply not signed in.
+
+    **One guarded critical section.** Take the account guard, re-read the user
+    `FOR UPDATE` with `populate_existing=True`, require the row to exist and be
+    active, insert, commit — and only then write the identifier into the
+    cookie.
+
+    *Why it commits, when the revoke helpers deliberately do not.*
+    `get_session` neither commits nor rolls back, so an insert left to a
+    caller's discretion is an insert that may never happen; the cookie handed
+    to the browser beside it would authenticate nothing, which is a hard logout
+    loop on the very next request. Making the helper own the transaction makes
+    "the row exists before the cookie leaves" a property of one function rather
+    than of three call sites' discipline.
+
+    *Why the guard and the re-read are not belt-and-braces.* A mint that runs
+    after its caller's guard has been released can be overtaken by an
+    administrator's deactivation, and will then insert a **live row for a
+    just-disabled account**. Validation refuses that row while `is_active` is
+    false, which hides it — and the day the account is reactivated it becomes a
+    working credential nobody granted and nobody saw. Serializing the mint
+    against the handlers that deactivate is what removes the window: the insert
+    either precedes the deactivation, and is revoked by it, or never happens.
+
+    `populate_existing` is load-bearing for the same reason it is on the OAuth
+    rotation re-read: a `SELECT … FOR UPDATE` whose row is already in the
+    session's identity map hands back the *loaded* object with its pre-lock
+    attribute values, and `is_active` is read here in Python. Every caller
+    arrives with that row already loaded.
+
+    The cookie is rewritten from scratch (`clear()` first), so a mint is also
+    session-fixation hygiene: nothing a previous session left behind survives
+    it. A caller that wants to flash a message must therefore flash **after**
+    the mint, never before.
+    """
+    # Imported here rather than at module scope because `src/oauth/__init__.py`
+    # imports `src/oauth/routes.py`, which imports this module: a top-level
+    # `from src.oauth.grants import …` makes that cycle a hard ImportError at
+    # startup. The lock primitive lives in `grants.py` because the panel's two
+    # routers cannot import each other, and `grants.py` is dependency-light on
+    # purpose — the cycle is the package `__init__`, not the module.
+    from src.oauth.grants import lock_account_guard
+
+    await lock_account_guard(session)
+    locked = await session.execute(
+        select(User)
+        .where(User.id == user_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    user = locked.scalar_one_or_none()
+    if user is None or user.is_active is not True:
+        # Nothing was written, but this transaction holds the guard and the
+        # caller goes on to render a page: release it rather than leave an
+        # advisory lock held for the rest of the request.
+        await session.rollback()
+        return None
+
+    sid = secrets.token_urlsafe(SESSION_ID_BYTES)
+    now = datetime.now(timezone.utc)
+    session.add(
+        UserSession(
+            id=hash_session_id(sid),
+            user_id=user.id,
+            created_at=now,
+            last_seen_at=now,
+            # Absolute, never extended (D3). Starlette re-signs the cookie on
+            # any response that modifies the session, so the cookie's own age
+            # slides; the row must be the tighter bound, or a session used
+            # daily never expires at all — which is precisely the durable
+            # access #198 is about.
+            expires_at=now + timedelta(seconds=settings.session_max_age),
+            user_agent_hash=_user_agent_hash(request),
+        )
+    )
+    await session.commit()
+
+    cookie = _session_cookie(request)
+    if cookie is not None:
+        cookie.clear()
+        cookie["user_id"] = user.id
+        cookie["session_version"] = user.session_version
+        cookie["is_admin"] = bool(user.is_admin)
+        cookie["username"] = user.username
+        cookie[SESSION_ID_KEY] = sid
+    return sid
+
+
+async def revoke_session(session: AsyncSession, sid_hash: str) -> int:
+    """Revoke one session row. **Does not commit** — the caller does.
+
+    `AND revoked_at IS NULL`, so a second revocation does not rewrite a
+    historical revocation time. Returns the number of rows actually flipped.
+    """
+    result = await session.execute(
+        update(UserSession)
+        .where(UserSession.id == sid_hash, UserSession.revoked_at.is_(None))
+        .values(revoked_at=func.now())
+    )
+    return result.rowcount or 0
+
+
+async def revoke_user_sessions(session: AsyncSession, user_id: int) -> int:
+    """Revoke every live session of one user. **Does not commit** — the caller does.
+
+    The asymmetry with `start_session` is the contract. Every caller here —
+    the self-service password change, the administrative reset, the
+    deactivation, the soft delete — holds the account guard, and the
+    documented rule for that critical section is that **nothing may commit
+    between taking the lock and writing the flags it protects**. A helper that
+    committed would silently break the last-admin guard from inside.
+
+    Returns the number of rows flipped, so a caller can record a count without
+    a second query.
+    """
+    result = await session.execute(
+        update(UserSession)
+        .where(UserSession.user_id == user_id, UserSession.revoked_at.is_(None))
+        .values(revoked_at=func.now())
+    )
+    return result.rowcount or 0
+
+
+async def touch_session(
+    request: Request,
+    session: AsyncSession,
+    row: UserSession,
+) -> bool:
+    """Refresh `last_seen_at` on the request's **own** session. Never raises.
+
+    Returns whether the update was issued and committed.
+
+    Three restrictions, each answering a specific failure:
+
+    * **The request's own `AsyncSession`, never a second one.** A request
+      holding two connection-pool leases halves a pool that tops out at
+      `pool_size + max_overflow` = fifteen; the sixteenth caller anywhere in
+      the process — an MCP tool call, `/token`, the indexer — waits
+      `pool_timeout` and then 500s. A telemetry field must not be able to take
+      the server down.
+    * **`GET`/`HEAD` only, committed here and now.** Committing inside the
+      dependency is safe precisely because no handler work is pending on a safe
+      request. It also releases the row lock this `UPDATE` takes *before* any
+      handler can ask for the account-guard advisory lock — otherwise a
+      mutating panel request would hold this row lock while waiting on a lock
+      an administrator holds while revoking that same user's sessions, which is
+      a deadlock between the two.
+    * **Throttled to `session_touch_interval_seconds`.** Nothing authorizes on
+      `last_seen_at`; a write per request buys nothing and costs a commit.
+
+    Any failure is swallowed: the transaction is returned to a clean state, a
+    WARNING is logged, and the request is served. The exception's **class name
+    only** reaches the log — SQLAlchemy renders bound parameters into an
+    error's text, and one of them here is the stored session hash.
+    """
+    method = (getattr(request, "method", "") or "").upper()
+    if method not in ("GET", "HEAD"):
+        return False
+    last_seen = _aware(getattr(row, "last_seen_at", None))
+    now = datetime.now(timezone.utc)
+    if last_seen is not None and now - last_seen < timedelta(
+        seconds=settings.session_touch_interval_seconds
+    ):
+        return False
+    try:
+        await session.execute(
+            update(UserSession)
+            .where(UserSession.id == row.id, UserSession.revoked_at.is_(None))
+            .values(last_seen_at=now)
+        )
+        await session.commit()
+        return True
+    except Exception as exc:  # noqa: BLE001 - telemetry may not fail a request
+        logger.warning("session last-seen update failed: %s", type(exc).__name__)
+        try:
+            await session.rollback()
+        except Exception as rollback_exc:  # noqa: BLE001 - nor may the recovery
+            logger.warning(
+                "session last-seen rollback failed: %s", type(rollback_exc).__name__
+            )
+        return False
+
+
+def _replay_refused(
+    request: Request,
+    reason: str,
+    *,
+    user_id: int | None,
+    sid: str | None,
+) -> None:
+    """One `panel_session_replay_refused`. The caller clears the cookie.
+
+    **No credential material, ever.** Not the identifier, and not its stored
+    SHA-256 — that digest is the registry's key, so a record carrying it names
+    a specific live session. Where a session must be identified it is by
+    `token_tag`, the catalogue's `sha:` plus eight hex characters, which is
+    shorter than the twelve-character fragment the canary test forbids.
+    """
+    security_events.emit(
+        "panel_session_replay_refused",
+        subject=security_events.subject_for(user_id=user_id, request=request),
+        reason=reason,
+        user_id=user_id if isinstance(user_id, int) and not isinstance(user_id, bool) else None,
+        token_tag=security_events.redacted_token_tag(sid),
+        route=getattr(getattr(request, "url", None), "path", None),
+        client_ip=security_events.client_ip(request),
+    )
+
+
 async def get_active_session_user(
     request: Request,
     session: AsyncSession,
 ) -> User | None:
-    """Resolve and validate a multi-user browser session.
+    """Resolve and validate a multi-user browser session. One implementation.
 
-    Keep every browser entry point on the same database-backed checks: the
-    user must still exist, be active, and have the session version encoded in
-    the signed cookie. Invalid cookies are cleared so they cannot be reused by
-    another route (notably OAuth consent) after a password reset or account
-    deactivation.
+    Every browser entry point — `require_user_panel`, the login page's
+    already-signed-in short-circuit, `authorize_get` and `authorize_post` —
+    comes through here, so the checks cannot diverge. A fifth entry point
+    reading `request.session["user_id"]` directly is the shape of this
+    function's regression, and was the defect removed from `login_form`.
+
+    The cookie must carry **both** `user_id` and `sid`; the row is resolved by
+    `sha256(sid)` and refused when it is absent, revoked, expired, or owned by
+    a different user than the cookie names (D14 — the two are written together
+    at mint and can only disagree through tampering or a bug, so a
+    disagreement is an error rather than a preference for one of them). Then
+    the existing user-exists / `is_active` / `session_version` checks run as
+    before: the registry is the per-session control and `session_version` the
+    account-wide one, and both have to pass.
+
+    **Every refusal clears the cookie**, so a rejected cookie cannot be
+    replayed against a different route — notably OAuth consent — after a
+    password reset, a deactivation or a logout.
     """
-    try:
-        user_id = request.session.get("user_id")
-    except (AssertionError, AttributeError):
+    cookie = _session_cookie(request)
+    if cookie is None:
         return None
+    user_id = cookie.get("user_id")
+    sid = cookie.get(SESSION_ID_KEY)
     if user_id is None:
+        # An anonymous request, not a refusal: nothing to clear, nothing to
+        # record.
         return None
+    if not sid:
+        # A correctly-signed cookie from before the registry existed. Refused
+        # rather than grandfathered: accepting it would keep the #198 replay
+        # window open for a further seven days after the fix shipped.
+        _replay_refused(request, "no_session_id", user_id=user_id, sid=None)
+        cookie.clear()
+        return None
+
+    row = (
+        await session.execute(
+            select(UserSession).where(UserSession.id == hash_session_id(sid))
+        )
+    ).scalar_one_or_none()
+
+    now = datetime.now(timezone.utc)
+    reason: str | None = None
+    if row is None:
+        reason = "unknown_session"
+    elif row.revoked_at is not None:
+        reason = "revoked_session"
+    elif (_aware(row.expires_at) or now) <= now:
+        reason = "expired_session"
+    elif row.user_id != user_id:
+        reason = "user_mismatch"
+
+    if reason is not None:
+        _replay_refused(request, reason, user_id=user_id, sid=sid)
+        cookie.clear()
+        return None
+
     result = await session.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
     if user is None or not user.is_active:
-        request.session.clear()
+        cookie.clear()
         return None
-    # Starlette sessions are signed client-side cookies. Binding the cookie
-    # to a database-backed version lets password resets invalidate every
-    # previously issued session without introducing a server-side store.
-    if request.session.get("session_version") != user.session_version:
-        request.session.clear()
+    # Starlette sessions are signed client-side cookies. Binding the cookie to
+    # a database-backed version lets password resets invalidate every
+    # previously issued session, and it is the one invalidator that still works
+    # if a registry write is lost — which is why it stays beside the registry
+    # rather than being replaced by it.
+    if cookie.get("session_version") != user.session_version:
+        cookie.clear()
         return None
+
+    await touch_session(request, session, row)
     return user
 
 

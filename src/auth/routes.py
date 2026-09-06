@@ -24,6 +24,13 @@ from sqlalchemy import func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.passwords import hash_password, verify_password
+from src.auth.session import (
+    SESSION_ID_KEY,
+    get_active_session_user,
+    hash_session_id,
+    revoke_session,
+    start_session,
+)
 from src.config import settings
 from src.csrf import generate_csrf_token, verify_csrf
 from src.database import get_session
@@ -162,9 +169,18 @@ def _render_register(
 
 
 @router.get("/admin/auth/login", response_class=HTMLResponse)
-async def login_form(request: Request, next: str = "/admin/"):
-    # If already logged in, redirect straight through.
-    if request.session.get("user_id") is not None:
+async def login_form(
+    request: Request,
+    next: str = "/admin/",
+    session: AsyncSession = Depends(get_session),
+):
+    # The already-signed-in short-circuit resolves through the **same**
+    # validation every other entry point uses. Reading `request.session["user_id"]`
+    # raw here is what made a revoked cookie bounce forever between this page
+    # (which saw a user id and redirected to the panel) and `require_user_panel`
+    # (which refused the session and redirected back) — a login page nobody
+    # holding a dead cookie could reach.
+    if await get_active_session_user(request, session) is not None:
         return RedirectResponse(_safe_next(next), status_code=status.HTTP_302_FOUND)
     return _render_login(request, next_url=_safe_next(next))
 
@@ -248,17 +264,38 @@ async def login_submit(
     # (warm_user_vault_cache filters them out).
     await warm_user_vault_cache(session, user.id)
 
-    request.session.clear()
-    request.session["user_id"] = user.id
-    request.session["session_version"] = user.session_version
-    request.session["is_admin"] = bool(user.is_admin)
-    request.session["username"] = user.username
+    # The mint, **after** the `last_login_at` commit above: `start_session`
+    # owns its own guarded transaction, and it commits the row before the
+    # cookie carrying its identifier leaves. A refusal here means an
+    # administrator's deactivation committed in the window between the password
+    # check and the guard — the account is disabled, so nobody is signed in and
+    # no row exists to come back to life if it is re-enabled.
+    if await start_session(request, session, user.id) is None:
+        request.session.clear()
+        return _render_login(
+            request,
+            error=invalid_msg,
+            next_url=target,
+            username=normalized,
+            status_code=status.HTTP_401_UNAUTHORIZED,
+        )
 
     return RedirectResponse(target, status_code=status.HTTP_302_FOUND)
 
 
 @router.post("/admin/auth/logout")
-async def logout(request: Request):
+async def logout(request: Request, session: AsyncSession = Depends(get_session)):
+    """Revoke this session server-side, then clear the cookie. Always redirects.
+
+    Clearing the cookie was the whole of logout before #198, and it logs
+    nobody out: Starlette answers `request.session.clear()` with an expiring
+    `Set-Cookie`, while the copy an attacker already holds stays correctly
+    signed until its itsdangerous timestamp ages out. The row is what makes
+    "signed out" true for every other holder of that cookie.
+
+    Only the presenting session is revoked — a logout on one device is not an
+    account event.
+    """
     # Read the session **before** it is cleared, and read nothing else: the
     # `_session` suffix is the provenance (D15). Both values are copied from
     # the session cookie without a database lookup, so they may name an account
@@ -267,9 +304,32 @@ async def logout(request: Request):
     try:
         user_id_session = request.session.get("user_id")
         username_session = request.session.get("username")
+        sid = request.session.get(SESSION_ID_KEY)
     except (AssertionError, AttributeError):
         user_id_session = None
         username_session = None
+        sid = None
+
+    revoked = 0
+    failure: str | None = None
+    if sid:
+        try:
+            revoked = await revoke_session(session, hash_session_id(sid))
+            await session.commit()
+        except Exception as exc:  # noqa: BLE001 - a logout may not 500
+            # Failing closed here would leave the user signed in *and* the
+            # cookie alive, which is worse than the state we are leaving:
+            # clearing it removes this browser's copy — the common case, a
+            # person walking away from a shared machine. The replay window
+            # survives only for a copy already taken, which is what this
+            # record is for.
+            failure = type(exc).__name__
+            try:
+                await session.rollback()
+            except Exception as rollback_exc:  # noqa: BLE001 - nor may this
+                # A failing rollback must not escape either, or the sign-out
+                # becomes the 500 the branch above exists to avoid.
+                failure = f"{failure}/{type(rollback_exc).__name__}"
 
     security_events.emit(
         "panel_logout",
@@ -279,6 +339,36 @@ async def logout(request: Request):
         username_session=username_session,
         client_ip=security_events.client_ip(request),
     )
+    if failure is not None:
+        # The exception's **class name only** — never `str(exc)`, never
+        # `exc_info`. SQLAlchemy renders the failing statement *and its bound
+        # parameters* into the message, and one of those parameters here is
+        # the stored session hash, i.e. the name of a specific live session.
+        security_events.emit(
+            "panel_session_revocation_failed",
+            level=logging.ERROR,
+            subject=security_events.subject_for(
+                user_id=user_id_session, request=request
+            ),
+            reason="logout",
+            # `_session`, not the unsuffixed name: the id was copied from the
+            # cookie and no row was read (the provenance rule).
+            user_id_session=user_id_session,
+            error_type=failure,
+            route=request.url.path,
+            client_ip=security_events.client_ip(request),
+        )
+    elif sid:
+        security_events.emit(
+            "panel_sessions_revoked",
+            level=logging.INFO,
+            subject=security_events.subject_for(
+                user_id=user_id_session, request=request
+            ),
+            reason="logout",
+            user_id_session=user_id_session,
+            count=revoked,
+        )
 
     request.session.clear()
     return RedirectResponse("/admin/auth/login", status_code=status.HTTP_302_FOUND)
@@ -443,10 +533,18 @@ async def register_submit(
     # in phase 4 will load the dashboard for `uid`.
     await warm_user_vault_cache(session, uid)
 
-    request.session.clear()
-    request.session["user_id"] = uid
-    request.session["session_version"] = new_user.session_version
-    request.session["is_admin"] = True
-    request.session["username"] = normalized
+    # The mint runs **after** the bootstrap transaction has committed, never
+    # inside it: that transaction holds `USER_BOOTSTRAP_LOCK_KEY` and must not
+    # be lengthened, and `start_session` takes the account guard for its own
+    # transaction. The two keys are therefore taken **sequentially, never
+    # nested**, so no path holds one while asking for the other and no cycle is
+    # introduced.
+    if await start_session(request, session, uid) is None:
+        # The account it just created is gone or disabled — only reachable if
+        # another administrator acted in that window. Nobody is signed in.
+        request.session.clear()
+        return RedirectResponse(
+            "/admin/auth/login", status_code=status.HTTP_302_FOUND
+        )
 
     return RedirectResponse("/admin/", status_code=status.HTTP_302_FOUND)
