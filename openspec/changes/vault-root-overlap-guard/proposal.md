@@ -43,13 +43,11 @@ produces the same overlap with no administrator action to intercept.
 - **At assignment (`edit_user_submit`), inside the existing `_lock_admin_guard`
   transaction and only when the edit's *resulting* state is active and
   assigned** — deactivating or unassigning an account is the operator's remedy
-  for a quarantine and must not be refused by the guard — **three checks against
-  every *other* active assignment — the
-  `(st_dev, st_ino)` identity of an opened directory descriptor (aliases), a
-  component-wise realpath prefix test in both directions (ancestor/descendant),
-  and a best-effort `/proc/self/mountinfo` scan for a mount of one tenant's
-  filesystem-relative root grafted inside another's tree.** A conflict is
-  refused, naming the conflicting user; an equal pair keeps today's wording.
+  for a quarantine and must not be refused by the guard — **two checks against
+  every *other* active assignment: the `(st_dev, st_ino)` identity of an opened
+  directory descriptor (aliases) and a component-wise realpath prefix test in
+  both directions (ancestor/descendant).** A conflict is refused, naming the
+  conflicting user; an equal pair keeps today's wording.
 - **One `detect_and_publish()`, called from every entry point that can begin a
   pass** — the lifespan, the indexer's startup block, each periodic tick, the
   panel's `_reindex_background` (Reindex Now, re-embed, reset embeddings) and
@@ -69,6 +67,13 @@ produces the same overlap with no administrator action to intercept.
   inside **one process-global `asyncio.Lock`**, and each snapshot carries a
   **monotonic sequence** taken under that lock, so an older result is dropped
   rather than published.
+- **Root observation is bounded.** `os.open`, `os.fstat` and `os.path.realpath`
+  on a bind-mounted root can block for minutes on a network or FUSE filesystem,
+  which would hold the synchronous startup detection and the detection lock with
+  it. Each root is observed in `asyncio.to_thread` under
+  `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS` (default 10); expiry is a
+  `root_unexaminable(timeout)` verdict for that user and the detection carries
+  on, so startup completes in bounded time and the panel stays available.
 - **Structured quarantine reasons that preserve what was observed.** The
   snapshot maps a user id to `overlap(peer, relation)` or
   `root_unexaminable(errno)` — an unopenable root is not an overlap and must not
@@ -127,23 +132,29 @@ with the directory it describes.
 
 ## Impact
 
-- `src/services/vault_overlap.py` (new — the three checks, the snapshot, the
+- `src/services/vault_overlap.py` (new — the two checks, the snapshot, the
   orchestration), `src/services/vault.py` (the exception types, the gate's
   refuse-only lookup), `src/control_panel/users.py` + `users.html` (assignment
   check, quarantined state), `src/auth/routes.py` (a comment at the bootstrap
-  path), `src/services/indexer.py` + `scripts/rebuild_tsvectors.py` +
+  path), `src/config.py` (the observation deadline),
+  `src/services/indexer.py` + `scripts/rebuild_tsvectors.py` +
   `src/main.py` (detection at every entry point, pass skip, run-row recording),
   `src/mcp_server/tools.py` + `src/services/usage_stats.py` (markers and the
   pre-body predicate), `src/services/transfer.py` (redemption gate),
   `src/control_panel/routes.py` + `dashboard.html` / `health.html` (surface,
   `vault_page`, the `_reindex_background` entry point).
-- Mountinfo availability is tracked as **its own state** in the new module and
-  is deliberately *not* folded into `src/services/vault_fs.py`'s
-  `mount_identity_available()`: `STATX_MNT_ID` is Linux 5.8 while reading
-  `/proc/self/mountinfo` needs neither that extension nor that kernel, so
-  reusing the flag would disable the graft check on kernels that can perform it
-  and would make its failure masquerade as a transfer-write outage on
-  `/health`. `transfer_mount_check_available`'s semantics are untouched.
+- **Deliberately out of scope:** detecting a bind mount that grafts a peer's
+  vault, or a mount nested inside it, to a path *inside* another tenant's root.
+  A `/proc/self/mountinfo` check was specified and then removed — each of three
+  review rounds produced a new mount configuration it failed to cover, which is
+  the signal that it is a heuristic rather than a rule, and it would have sat on
+  the admission gate for two live tenants. The condition and its destructive
+  consequence are written out as accepted limitation **L1** (with **L2**, an
+  accessible alias of an unexaminable root, as the same class), the owner
+  decision is recorded as **pending**, and a follow-up issue
+  `vault-root-mount-graft-detection` is filed at archive time. Nothing in
+  `src/services/vault_fs.py` is touched, so `transfer_mount_check_available`
+  keeps its meaning.
 - Docs: `docs/architecture/vault-roots-and-tenancy.md`,
   `docs/architecture/vault-tools.md`,
   `docs/architecture/indexing-and-embeddings.md`,

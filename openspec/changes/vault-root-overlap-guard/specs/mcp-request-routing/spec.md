@@ -81,9 +81,9 @@ Failing closed is cheap here precisely because a detection failure is not a per-
 ## MODIFIED Requirements
 
 ### Requirement: The admission gate performs no database work
-Resolving the caller's vault root for admission SHALL NOT issue a database statement, SHALL NOT perform filesystem I/O and SHALL NOT read the process's mount table, so the check costs nothing on the hot path. The quarantine and readiness tests the gate performs SHALL be lookups into a snapshot already published by the shared detection, and they SHALL be able only to refuse — they MUST NOT be capable of admitting a caller the rest of the gate would refuse.
+Resolving the caller's vault root for admission SHALL NOT issue a database statement and SHALL NOT perform filesystem I/O, so the check costs nothing on the hot path. The quarantine and readiness tests the gate performs SHALL be lookups into a snapshot already published by the shared detection, and they SHALL be able only to refuse — they MUST NOT be capable of admitting a caller the rest of the gate would refuse.
 
-The gate runs on every tool call and the per-request cache warm is what makes a cache read correct there; a query would be a query per call, and detection needs a query for every other user's assignment, an `open`, `fstat` and `realpath` per root, **and** a mount-table parse. All of it belongs in the detection, which already does it once per pass. Because the tests can only refuse, it is safe to consult them ahead of the request's immutable vault-root snapshot: unlike an assignment — where a stale read must never re-admit a revoked caller, which is why the snapshot outranks the process-global cache — a quarantine has no direction in which staleness admits anyone.
+The gate runs on every tool call and the per-request cache warm is what makes a cache read correct there; a query would be a query per call, and detection needs a query for every other user's assignment plus an `open`, `fstat` and `realpath` per root — the latter dispatched to a worker thread under a deadline, which is not something a per-call gate can do. All of it belongs in the detection, which already does it once per pass. Because the tests can only refuse, it is safe to consult them ahead of the request's immutable vault-root snapshot: unlike an assignment — where a stale read must never re-admit a revoked caller, which is why the snapshot outranks the process-global cache — a quarantine has no direction in which staleness admits anyone.
 
 #### Scenario: Assigned caller invokes a tool
 
@@ -93,7 +93,7 @@ The gate runs on every tool call and the per-request cache warm is what makes a 
 #### Scenario: The quarantine test opens nothing
 
 - **WHEN** a tool call is refused for a quarantine or for readiness
-- **THEN** the gate SHALL have opened no database session, made no filesystem call and read no mount table
+- **THEN** the gate SHALL have opened no database session and made no filesystem call
 
 #### Scenario: The quarantine test cannot admit
 

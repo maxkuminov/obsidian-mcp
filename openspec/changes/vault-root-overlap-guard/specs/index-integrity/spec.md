@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: No pass over a vault root SHALL begin without a quarantine snapshot published by the shared detection
-Every code path that can begin an index, link-backfill, embed or tsvector-rebuild pass over a vault root SHALL first call one shared detection routine, and that routine SHALL be the only thing in the process that computes and publishes a quarantine snapshot. The routine SHALL evaluate the identity, containment and mount-grafting conditions across the roots of all active users holding an assignment, taking each root's device, inode and canonical real path from **one opened directory descriptor** rather than from the assignment string, and SHALL issue no database write.
+Every code path that can begin an index, link-backfill, embed or tsvector-rebuild pass over a vault root SHALL first call one shared detection routine, and that routine SHALL be the only thing in the process that computes and publishes a quarantine snapshot. The routine SHALL evaluate the identity and containment conditions across the roots of all active users holding an assignment, taking each root's device, inode and canonical real path from **one opened directory descriptor** rather than from the assignment string, and SHALL issue no database write.
 
 Installing detection in the periodic loop alone leaves it installed in one of five places. The panel's on-demand reindex — reached by **Reindex Now**, by *re-embed* and by *reset embeddings* — mirrors the loop and shares only `index_pass_lock` with it, and the standalone tsvector rebuild (`make rebuild-tsvectors`) is a **separate process** with its own user enumeration, no loop and no lifespan. Both reach a pass, and neither would consult a check placed in the loop. The requirement is therefore stated over the property — no pass begins unchecked — and the per-user stage skip SHALL live in the shared pass helpers rather than in each caller's loop, so a sixth entry point added later inherits the guard by routing through the same helper instead of by remembering to add a call.
 
@@ -39,6 +39,37 @@ The startup entry point SHALL run the detection **synchronously before the appli
 
 - **WHEN** the server runs in single-user mode, where the root comes from settings and no `users` row carries an assignment
 - **THEN** the published snapshot SHALL be empty and every pass SHALL behave exactly as it does today
+
+### Requirement: Each root's observation SHALL be bounded by a finite deadline
+Observing a root — opening it, stating the descriptor and resolving its canonical real path — SHALL be dispatched off the event loop and bounded by a finite, configurable deadline. Expiry SHALL be a per-user verdict of **root unexaminable with a timeout cause**, distinguishable from an error number, and the detection SHALL continue to the remaining roots and publish. Expiry MUST NOT be treated as a failure of the detection as a whole.
+
+Vault roots are bind mounts, and a network- or FUSE-backed one blocks in the kernel for as long as it likes. Two things break together without a deadline. The startup detection is deliberately synchronous — it is what makes the process closed rather than permissive before it serves — so an unbounded observation would hold the application before its first request, taking the control panel down at exactly the moment an operator opens it to find out why. And the detection critical section would be held for the whole stall, queuing every other entry point behind one hung mount.
+
+Treating expiry as a detection failure would be the other error: the previous snapshot would be retained on every iteration a slow mount was slow, so a genuine overlap appearing later would never be published. A timed-out root is one user's verdict, and the users beside it are still observable.
+
+The cause is recorded as a timeout rather than folded into the error numbers because the two need different responses — a hung filesystem and a deleted directory are different incidents — and the operator surfaces word them apart.
+
+#### Scenario: A hung root does not stall startup
+
+- **WHEN** one active user's root blocks indefinitely on being opened and the application starts
+- **THEN** the startup detection SHALL complete within the deadline for that root
+- **AND** the application SHALL begin serving, with the control panel available
+
+#### Scenario: A timed-out root is one user's verdict
+
+- **WHEN** one root's observation exceeds the deadline and two other roots are observable
+- **THEN** that user SHALL be quarantined with a timeout cause
+- **AND** the other two SHALL be observed and the snapshot SHALL be published
+
+#### Scenario: A timeout is not a detection failure
+
+- **WHEN** an iteration times out observing a root
+- **THEN** the resulting snapshot SHALL be published rather than the previous one retained
+
+#### Scenario: The timeout cause is distinguishable
+
+- **WHEN** one user is quarantined for a timeout and another for a root that could not be opened
+- **THEN** the two reasons SHALL be distinguishable wherever they are surfaced
 
 ### Requirement: Detection SHALL be serialized, and a publication SHALL NOT replace a newer one
 The whole detect-and-publish operation — observing the roots, evaluating the conditions and publishing the result — SHALL run inside one process-global critical section, so that a second detection cannot begin until the first has published. Each snapshot SHALL carry a sequence number assigned when its detection begins, taken inside that critical section, and publication SHALL discard a snapshot whose sequence is not greater than the sequence of the snapshot already published.
@@ -93,7 +124,7 @@ A detection failure is not a per-root failure: a root that cannot be opened is a
 - **THEN** an empty snapshot SHALL be published without opening any root
 
 ### Requirement: The snapshot SHALL record why each user is quarantined, and an unexaminable root SHALL NOT be reported as an overlap
-The snapshot SHALL map each quarantined user to a structured reason: an **overlap** carrying the peer user and the relation found (identical, contains, contained by, or mount graft), or a **root unexaminable** carrying the error number and naming no peer. Each entry SHALL additionally carry, as immutable facts observed at detection time, the subject's username and canonical assignment, the peer's username and canonical assignment for an overlap, and the moment the detection ran. Each reason SHALL be worded separately wherever it is surfaced — the control panel, the log line, the `indexer_runs` row and the usage-log marker.
+The snapshot SHALL map each quarantined user to a structured reason: an **overlap** carrying the peer user and the relation found (identical, contains, or contained by), or a **root unexaminable** carrying its cause — an error number, or a timeout — and naming no peer. Each entry SHALL additionally carry, as immutable facts observed at detection time, the subject's username and canonical assignment, the peer's username and canonical assignment for an overlap, and the moment the detection ran. Each reason SHALL be worded separately wherever it is surfaced — the control panel, the log line, the `indexer_runs` row and the usage-log marker.
 
 A root that could not be opened is not an overlap. Reporting it as one sends an operator looking for a second account that does not exist, and reporting it under the overlap marker makes the two indistinguishable in the usage log. The user is quarantined because their status could not be established, which is a different fact requiring a different fix.
 
@@ -153,13 +184,6 @@ Nothing is deleted for the same reason unassignment deletes nothing: preserving 
 
 - **WHEN** one user's assigned path is subsequently replaced by a symbolic link resolving to a directory inside another active user's root
 - **THEN** the next detection SHALL find it through the canonical real paths, not through the unchanged assignment strings
-
-#### Scenario: A vault grafted into another by a bind mount is detected
-
-- **WHEN** one user's vault directory is bind-mounted to a path inside another active user's root, leaving both root inodes distinct and both canonical real paths outside each other
-- **THEN** the mount-grafting condition SHALL name both users
-- **AND** where the mount table cannot be read the condition SHALL be skipped and logged once rather than reported as an overlap
-- **AND** its availability SHALL be tracked independently of whether this kernel can report a descriptor's mount identity, which is a different capability on a different kernel version
 
 #### Scenario: A corrected condition resumes indexing
 
