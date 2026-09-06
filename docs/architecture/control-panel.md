@@ -268,6 +268,82 @@
   `is_admin` rather than filtered, and a non-admin gets a page of their own run
   history with a line saying why.
 
+## The vault-root quarantine on the operator surfaces (#199)
+
+When two active users' vault roots overlap — or one cannot be examined — the
+affected accounts are refused by every MCP tool, every pass stage and the
+transfer redemption gate. The checks and the snapshot are in
+[vault-roots-and-tenancy.md](vault-roots-and-tenancy.md); what belongs here is
+how the panel says so.
+
+- **The panel reads the published snapshot and never recomputes it.**
+  `_quarantine_view(is_admin)` is one attribute read and a mapping walk: no
+  session, no statement, and — the part that matters — **no `open`, no `stat`
+  and no `realpath`**. A page render must not touch a vault root, and two
+  independent computations of "do these roots overlap" is how the panel and the
+  enforcement come to disagree about a live tenant.
+- **It re-reads no `users` row either.** Every name, path, relation and cause
+  rendered is a fact the detection recorded at the moment it looked, and the
+  surfaces label it **"as at last check"**. The operator's first move on
+  reading "vault root overlaps bob" is to edit or delete one of the two
+  accounts; a render-time resolution would show a changed path — or a blank
+  where the deleted peer was — beside a condition that is still in force. **Do
+  not "improve" these into a join.**
+- **The tri-state comes through intact, and the empty state is not an
+  all-clear.** Never published → `checked: False`, and the strip and page say
+  the roots have not been checked in this process yet *and* that every
+  multi-user tool call is refused while that holds. Published and empty →
+  `accounts: []`, and nothing renders at all: an empty snapshot is the healthy
+  state, and a green badge for it would be one more thing to read on a page
+  that exists to show what is wrong. Published with reasons → one entry per
+  named account.
+- **The two reasons are worded apart, from the one shared wording.** An overlap
+  names the peer account, the peer's root and the relation; an unexaminable
+  root names the root and the cause and states that **no peer was observed**.
+  Both come from `vault_overlap.operator_text`, which is also what the ERROR
+  log line and the `indexer_runs.error` row carry — composing a second wording
+  in a template is how the panel and the run row come to describe the same
+  condition differently. Calling an unexaminable root an overlap sends an
+  administrator hunting for a second account that does not exist.
+- **Administrators only, and that asymmetry is the point.** The condition names
+  another account and another account's vault path, which is exactly what the
+  tool-facing refusal withholds because *its* reader is a tenant's agent.
+  `_quarantine_view` returns `None` for everyone else, so the block is absent
+  rather than empty — the same split the backup and error cells already take.
+  The operator surfaces name everything; the agent-facing wording names no
+  other user, no other path and no note path.
+- **It is not a flash message.** There is nothing to dismiss and no
+  acknowledgement: the condition clears on its own when a later snapshot stops
+  naming the account. A dismissible banner for a state that is still in force
+  is a banner an operator dismisses once and never sees again.
+- **A degraded health strip carries no `quarantine` key** and renders nothing
+  there; the condition is still on `/admin/health`, which reads the snapshot
+  itself and shares none of the strip's three queries. This keeps
+  `_health_strip_or_degraded`'s failure return byte-identical, which an
+  existing test asserts exactly.
+- **`vault_page` refuses a named user through the gate's own
+  `_refuse_quarantined_root`** and renders the existing `vault_error` empty
+  state — placed *after* the warm, so an account whose assignment was just
+  cleared is told it has no vault rather than that it is quarantined for a root
+  it no longer holds. The wording there is the agent-facing one that names no
+  other account, which is right because this page is not admin-only.
+- **The users list shows the quarantined state instead of the note count.** The
+  page already refuses to render a number beside an *unassigned* account, for
+  precisely this reason: a count reads as capacity the account has, when every
+  tool call from it is refused before its body runs. A quarantined account is
+  in the same position — assigned, indexed, and served by nothing — so it gets
+  the same treatment with its own wording (`(quarantined — not served)`), its
+  own reason from `_quarantine_display`, the "as at" timestamp, and the
+  statement that **the index is retained**. The count is not deleted to make
+  the display true.
+- **The panel's on-demand reindex is a detection entry point (E4).**
+  `_reindex_background` awaits `detect_root_overlaps("panel on-demand")` at its
+  top, **before** `index_pass_lock` is taken, so Reindex Now, re-embed and
+  reset embeddings cannot start a pass against an unchecked snapshot. It routes
+  through the indexer's shared helper rather than calling `detect_and_publish`
+  directly, so the "a detection failure must not abort the caller" handling is
+  not re-implemented in a second place.
+
 ## The usage page's outcome column
 
 - **A refused write must not look like a successful one.** A read-only

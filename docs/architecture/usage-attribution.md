@@ -216,7 +216,10 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   and **names no other user, no other vault path and no note path**. The
   marker is the operator's half of that split: `usage_logs` says which reason
   refused the call, and the panel, the log line and the `indexer_runs` row are
-  where the affected accounts and roots are named.
+  where the affected accounts and roots are named. The guard behind them — the
+  two root checks, the snapshot's tri-state and the five pass entry points that
+  publish it — is in
+  [vault-roots-and-tenancy.md](vault-roots-and-tenancy.md).
 
   **`permission_denied` and `tool_exception` are post-body, and that is a
   decision, not an oversight.** Both are written by `_tracked`'s own code

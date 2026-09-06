@@ -100,13 +100,13 @@ slice-1 fixture and some need their expectations re-read:
 
 ## 7. Documentation — `docs/architecture/*.md`, `README.md`, `CLAUDE.md`
 
-- [ ] 7.1 `docs/architecture/vault-roots-and-tenancy.md`: the two checks and what each does and does not prove, **including L1 and L2 written out as residuals with their destructive consequence** and a pointer to the follow-up issue; the two enforcement points and the five pass entry points; the readiness state and why the lifespan detection is synchronous; the refuse-only exception to "`_vault_root` is a pure cache lookup", written so a future reader cannot take it as licence to add a query; the disposition and why index refusal alone is not it.
-- [ ] 7.2 `docs/architecture/vault-tools.md`: correct the `RESOLVE_NO_XDEV` paragraph — the omission is a containment non-issue for one tenant and is exactly what makes a nested second tenant reachable; say plainly that a *grafted* second tenant (L1) is still reachable and is tracked in the follow-up.
-- [ ] 7.3 `docs/architecture/indexing-and-embeddings.md`: one detection called from every entry point (and why the loop alone was not enough), its position before the pause check, the paused-iteration recording rule, and the skip's two records with the ring buffer's lifetime as the reason for both.
-- [ ] 7.4 `docs/architecture/control-panel.md`: the condition on the strip and the health page, the two reasons' separate wording, the quarantined state on the users list, and why the operator surfaces name everything while the tool refusal names nothing.
-- [ ] 7.5 `docs/architecture/usage-attribution.md`: the new markers and their membership in the pre-body-refusal predicate.
-- [ ] 7.6 `README.md`: extend the existing "the `vault_path` validator does not resolve symlinks" paragraph with what is now caught — and, in the same paragraph, with L1 and L2: a bind mount grafting a peer's vault inside another tenant's root is **not** detected, and the consequence is full cross-tenant read, overwrite and delete.
-- [ ] 7.7 `CLAUDE.md`: one line under Key decisions.
+- [x] 7.1 `docs/architecture/vault-roots-and-tenancy.md`: the two checks and what each does and does not prove, **including L1 and L2 written out as residuals with their destructive consequence** and a pointer to the follow-up issue; the two enforcement points and the five pass entry points; the readiness state and why the lifespan detection is synchronous; the refuse-only exception to "`_vault_root` is a pure cache lookup", written so a future reader cannot take it as licence to add a query; the disposition and why index refusal alone is not it.
+- [x] 7.2 `docs/architecture/vault-tools.md`: correct the `RESOLVE_NO_XDEV` paragraph — the omission is a containment non-issue for one tenant and is exactly what makes a nested second tenant reachable; say plainly that a *grafted* second tenant (L1) is still reachable and is tracked in the follow-up.
+- [x] 7.3 `docs/architecture/indexing-and-embeddings.md`: one detection called from every entry point (and why the loop alone was not enough), its position before the pause check, the paused-iteration recording rule, and the skip's two records with the ring buffer's lifetime as the reason for both.
+- [x] 7.4 `docs/architecture/control-panel.md`: the condition on the strip and the health page, the two reasons' separate wording, the quarantined state on the users list, and why the operator surfaces name everything while the tool refusal names nothing.
+- [x] 7.5 `docs/architecture/usage-attribution.md`: the new markers and their membership in the pre-body-refusal predicate.
+- [x] 7.6 `README.md`: extend the existing "the `vault_path` validator does not resolve symlinks" paragraph with what is now caught — and, in the same paragraph, with L1 and L2: a bind mount grafting a peer's vault inside another tenant's root is **not** detected, and the consequence is full cross-tenant read, overwrite and delete.
+- [x] 7.7 `CLAUDE.md`: one line under Key decisions.
 
 ## 8. Verification
 
