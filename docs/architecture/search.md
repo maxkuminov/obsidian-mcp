@@ -72,6 +72,129 @@ Consequences that are easy to undo by accident:
   `hnsw.scan_mem_multiplier` (1). At ~16.7k chunks the vault is under the cap;
   those are the next knobs, not `ef_search`.
 
+## Stale vectors are annotated, never filtered (#200)
+
+Both vector paths returned the **stored** `chunk_text[:500]` with no predicate
+on `embedded_content_hash`. During the window a provider outage opens — the one
+#201 used to hide entirely — an agent was handed superseded note text as a
+current result with nothing marking it. Every other field on that row was
+refreshed by the scan; only the chunk text is stale, and only the chunk text is
+quotable as the note's content.
+
+**The predicate is `embedded_content_hash IS DISTINCT FROM content_hash`, not
+`!=`.** A note that was never embedded, or whose certification a move cleared,
+holds `NULL`, and under `!=` that yields `NULL`, which a `WHERE` reads as false
+— every never-embedded note would count as *fresh*, the exact inversion of what
+the flag is for. `semantic_search` already hydrates the whole `NoteMetadata`
+entity, so both hashes are in hand and the comparison is done in Python, where
+`!= None` **is** that operator; do not "fix" it into an `is not None` guard.
+`find_related_stmt` gained `content_hash`, `embedded_content_hash` and
+`chunks_truncated` as projected columns of a table it already joins — scalar
+columns, no predicate, so no plan moves, and the recall benchmark's EXPLAIN case
+now asserts that they are projected and **not filtered on**, so a predicate
+smuggled in later changes what the benchmark measures and the benchmark says so.
+
+**Nothing about the query changes.** No predicate, no fourth `SET LOCAL`, no
+change to the overfetch, the re-sort, the dedupe or exact-fallback eligibility.
+The annotation is post-processing over rows the query already returned, which is
+what keeps every claim in the section above true — and keeps the recall SLO's
+baseline meaningful, since no note leaves any result set.
+
+### Why filtering was refused
+
+Removing stale rows was rejected in the issue and again here. It fails in three
+ways at once:
+
+- **The edit window.** A note edited a minute ago is stale by construction until
+  the next pass commits its new hash, so a filter would hide every note edited in
+  the last five minutes from every search.
+- **The outage.** During a provider outage the whole vault is stale, so the
+  filter empties the result set entirely — turning a degraded answer into no
+  answer, at exactly the moment an operator has not yet noticed.
+- **The exact fallback.** The owner predicate makes every vector query a
+  *filtered* query, and both paths re-run the identical statement as an O(n)
+  exact sequential scan on **any** zero-row result. A staleness filter would
+  therefore convert an outage into a full scan of the embedding table on every
+  single query.
+
+### The preview is withheld; everything else is kept
+
+Of the fields a vector result carries, `path`, `title` and `tags` come from
+`notes_metadata`, which the **scan** refreshed — a row is stale precisely
+because the scan already committed the new `content_hash` — so those fields
+describe the note as it stands now. `similarity` is a retrieval score, not a
+claim about content. `chunk` is the only field that is a verbatim quotation of
+the note's text, the only one that is out of date, and the one an agent pastes
+into an answer.
+
+So a stale row's `chunk` is set to `None` in the service, not clipped in the
+renderer: a caller cannot obtain the superseded text at all. The row keeps its
+rank, its path and its title — the note is still found, still ranked, still
+named — and the preview line becomes an explicit notice naming `read_note`,
+which reads the file and is always correct. That notice contains **no text read
+from the note**: not the stored chunk, and not the note's current leading text
+either, which would be a different span from the one that matched presented
+where the matching span goes — a fabricated excerpt, worse than none.
+
+Two alternatives were considered and rejected for the same reason. *Flag it and
+keep the preview*: the flag is metadata and the preview is content, and an agent
+summarising three results into a paragraph quotes the previews and drops the
+metadata. *Return the note's current first 500 characters*: see the fabricated
+excerpt above.
+
+Rendering follows `get_links`'s rules (`_degradation_suffix`,
+`_degradation_footer` in `src/mcp_server/tools.py`). The header carries the stale
+and truncated counts **always, including zero**, because an absent token is not
+evidence of absence and an agent cannot otherwise distinguish "no stale rows"
+from a build that does not report staleness. Per row, only a *true* marker is
+rendered — `stale: false` on fifteen of fifteen rows is noise, not information.
+A capped note (see the chunk cap in
+[indexing and embeddings](indexing-and-embeddings.md)) carries
+`embedding_truncated: true` on the same line, because a match against its head
+reads as a match against the whole note.
+
+### `find_related` states a stale source on every return path
+
+The query vector is the mean of the **source's stored** chunk vectors, so a
+stale source means every neighbour answers a question about content the note no
+longer has — a fact no per-row flag can express. `source_stale` is therefore
+computed from the source row every path below it has in hand, and the line
+(`_stale_source_line`) is emitted on the ranked path **and on the true
+zero-result path**.
+
+The empty case is where it matters most, and a first draft put the line only
+above a non-empty list, losing it exactly where it explains the most: a bare
+`No related notes for 'X'` from a stale source is the reading an agent acts on —
+*this note has no neighbours* — when the truth is that the vector searched with
+describes content the note no longer has.
+
+The two operational-failure branches keep their own messages and their own
+markers: `related_source_not_found` never loaded a row at all, and
+`related_source_not_embedded` is a source with *no* vectors, which is a
+different fact with a different fix.
+
+### The declared bound: this reports what the index has committed
+
+`stale` is derived from `notes_metadata`, so it reports a note as stale only
+once the scan has committed the note's new `content_hash`. Between an edit
+landing on disk and the next scan reaching that note — up to
+`INDEX_INTERVAL_SECONDS` plus the pass in flight — the row reads
+`embedded_content_hash == content_hash` while the stored chunk is already
+superseded, and the result is presented as fresh.
+
+This is not closable from the read path: detecting it would mean hashing the
+file on disk for every returned row, which puts a per-result filesystem read on
+the hot path of every search and still races the writer. It is therefore
+**declared** rather than quietly narrowed. The guarantee this signal makes is:
+
+> No result presents text the index **knows** to be superseded.
+
+Not "no result is ever out of date". The bound is stated in both tools'
+docstrings, and the post-deploy exercise sets the state up explicitly — edit a
+note, search *before* the pass and observe the row is **not** marked, then search
+after the pass and observe that it is. Writing the test that way is what keeps
+the residual from being re-described as a guarantee later.
+
 ## Search benchmarks (opt-in integration)
 
 `tests/integration/test_search_recall.py` and `test_keyword_plan.py` run only
