@@ -96,20 +96,27 @@ vanished from the page, so the operator saw a blank space that read as success.
     that is already fully revoked is a harmless no-op: `revoke_grant_family`
     flips zero rows, nothing is committed.
   - **One WARNING, on the path that killed something.**
-    `oauth.refresh_reuse_detected` with `client_id`, `grant_id`, `user_id` and
-    the number of rows revoked. Those identifiers go in the **message text**,
-    not only in `extra`: the process formatter is `%(message)s`
-    (`src/main.py`), so an identifier left in `extra` alone never reaches the
-    operator who has to act on the alarm. None of them is a secret and no
-    token value or hash is ever among them. It is emitted only when live
-    tokens were actually revoked: the not-found refusals are not reuse, and a
-    second replay against an already-dead family has nothing new to report, so
-    neither may drown the real alarm.
+    `oauth_refresh_reuse_detected` with `client_id`, `grant_id`, `user_id` and
+    `revoked_tokens`, emitted through `security_events.emit` (#191). Two things
+    changed with #190/#191 and neither is cosmetic. The identifiers are
+    **structured fields** now rather than message text: the old code
+    interpolated them into the message because the process formatter was
+    `%(message)s` and anything left in `extra` never reached the operator —
+    that formatter is gone, and the allow-listed fields are what an operator
+    queries. And the record passes the **suppressor**, because a replayed
+    refresh token is caller-driven and repeatable, so a bare `logger.warning`
+    was an unbounded flood channel beside the bounded one. None of the fields
+    is a secret and no token value or hash is ever among them. It is emitted
+    only when live tokens were actually revoked: the not-found refusals are not
+    reuse, and a second replay against an already-dead family has nothing new
+    to report (it records the ordinary `oauth_token_refused`), so neither may
+    drown the real alarm.
   - **A failed revocation logs the exception's class name and nothing else.**
-    Not `logger.exception`, not `str(exc)`: SQLAlchemy renders the failing
-    statement *and its bound parameters* into the error text, the engine does
-    not set `hide_parameters`, and one of those parameters is the token hash.
-    A log line is not a safe place for it.
+    `oauth_refresh_reuse_revocation_failed` carries `error_type` and **no
+    `exc_info`**. Not `logger.exception`, not `str(exc)`: SQLAlchemy renders the
+    failing statement *and its bound parameters* into the error text, the engine
+    does not set `hide_parameters`, and one of those parameters is the token
+    hash. A log line is not a safe place for it.
   - **Residual: the record is written after the commit.** A crash in between
     keeps the revocation and loses the alarm. That is the right half to lose —
     the tokens are dead either way — and an outbox for one WARNING would add a

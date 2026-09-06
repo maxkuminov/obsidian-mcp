@@ -308,16 +308,15 @@ def test_every_catalogue_row_in_the_architecture_note_has_an_entry():
 _SWEEP_EXEMPT = {SRC / "services" / "security_events.py"}
 _LOG_METHODS = {"debug", "info", "warning", "error", "exception", "critical", "log"}
 
-# One dated, per-name gap. The refresh-reuse alarm (#182, archived after this
-# change was proposed) logs `event`, `error` and `revoked_tokens` through
-# `extra=` from `src/oauth/routes.py`; none of the three is allow-listed —
-# `event` duplicates `msg`, and `error` is the bare-string field the allow-list
-# deliberately does not have. `src/oauth/routes.py` belongs to Slice B (#191),
-# which is where those two call sites move onto `security_events.emit`; this
-# entry is what makes the gap visible instead of silent, and Slice B deletes it.
-_KNOWN_GAPS: dict[str, set[str]] = {
-    "src/oauth/routes.py": {"event", "error", "revoked_tokens"},
-}
+# Empty, and meant to stay that way. It held one dated entry: the #182
+# refresh-reuse alarm logged `event`, `error` and `revoked_tokens` through
+# `extra=` from `src/oauth/routes.py`, none of them allow-listed — `event`
+# duplicated `msg` and `error` was the bare-string field the allow-list
+# deliberately does not have. Slice B (#191) moved both call sites onto
+# `security_events.emit` as `oauth_refresh_reuse_detected` and
+# `oauth_refresh_reuse_revocation_failed`, so the gap is closed and the entry
+# is gone. A new one is a debt, not a fix: add the field to `ALLOWED_FIELDS`.
+_KNOWN_GAPS: dict[str, set[str]] = {}
 
 
 def _is_logger_call(node: ast.Call) -> bool:

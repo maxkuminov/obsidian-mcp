@@ -29,8 +29,14 @@ from src.oauth.scope import VALID_SCOPES, clamp_scope, has_vault_scope
 # `client_can_write` (the consent template reads that key) without shadowing
 # the helper.
 from src.oauth.scope import client_can_write as _client_can_write
+from src.services import security_events
 
-logger = logging.getLogger(__name__)
+# No module logger, deliberately. Everything this module records is an
+# authentication outcome a caller can drive on demand, so it goes through
+# `security_events.emit` and its allowance check; a bare logger sitting here
+# would be an unbounded flood channel beside the bounded one, and the next
+# person to add a refusal would reach for it. `logging` stays imported for the
+# level constants the emitter takes.
 
 router = APIRouter(tags=["oauth"])
 templates = Jinja2Templates(
@@ -51,6 +57,125 @@ _PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 def _hash(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+# --- Security-event helpers ------------------------------------------------
+#
+# This module is the primary authentication surface for third-party AI clients,
+# and until #191 it contained no logger at all: an issuance, a refusal and a
+# revocation left the same trace, which is none. Every outcome below now emits
+# exactly one record through `src/services/security_events.py` — one allowance
+# check, an allow-listed field set, and never a secret.
+#
+# Three rules the helpers exist to keep in one place rather than at forty call
+# sites:
+#
+# * **Provenance is in the name.** `client_id` may hold only a value read from
+#   an `oauth_clients` row; the caller's form field goes in
+#   `client_id_submitted` and nowhere else (D15). Each helper takes both and
+#   drops the submitted one the moment a row has resolved.
+# * **The subject is the trusted client address** for every refusal, because a
+#   refusal resolved no credential. Only the records about an authenticated
+#   principal (an issuance, a consent, a revocation) key on `user_id`.
+# * **Nothing secret has a field to ride in.** No `code`, no `code_verifier`,
+#   no `client_secret`, no `access_token`, no `refresh_token`, no token hash —
+#   not in a field, not in a message. `client_id` is a public identifier and is
+#   logged deliberately.
+#
+# `request` is optional throughout: `_handle_auth_code` and `_handle_refresh`
+# are called directly by a large body of tests with the form alone, and a
+# missing request means an absent `client_ip`, never a raise.
+
+
+def _route(request) -> str | None:
+    """`request.url.path`, or `None` when there is no request to ask.
+
+    Defensive for the same reason the helpers take an optional request: these
+    handlers are called directly, with a form and a stand-in, by a large body of
+    tests, and a logging helper may never be the thing that raises.
+    """
+    try:
+        return request.url.path
+    except Exception:  # noqa: BLE001 - a logging helper may not raise
+        return None
+
+
+def _token_refused(
+    request,
+    reason: str,
+    *,
+    client_id: str | None = None,
+    submitted_client_id=None,
+    user_id: int | None = None,
+    grant_id: str | None = None,
+) -> None:
+    """One `oauth_token_refused`, reason `<rfc_code>.<sub_reason>`.
+
+    `user_id` and `grant_id` are absent on the early failures that have
+    resolved neither — a missing field means the path did not have it, which is
+    the honest answer.
+    """
+    security_events.emit(
+        "oauth_token_refused",
+        subject=security_events.subject_for(request=request),
+        reason=reason,
+        client_id=client_id,
+        client_id_submitted=None if client_id else submitted_client_id,
+        user_id=user_id,
+        grant_id=grant_id,
+        client_ip=security_events.client_ip(request),
+    )
+
+
+def _authorize_refused(
+    request,
+    reason: str,
+    *,
+    client_id: str | None = None,
+    submitted_client_id=None,
+    user_id: int | None = None,
+) -> None:
+    """One `oauth_authorize_refused`. The rendered refusal is unchanged."""
+    security_events.emit(
+        "oauth_authorize_refused",
+        subject=security_events.subject_for(request=request),
+        reason=reason,
+        client_id=client_id,
+        client_id_submitted=None if client_id else submitted_client_id,
+        user_id=user_id,
+        client_ip=security_events.client_ip(request),
+    )
+
+
+def _registration_refused(request, reason: str) -> None:
+    """One `oauth_client_registration_refused`.
+
+    `/register` is unauthenticated (RFC 7591), so the record carries no
+    identity at all and is bounded on the address.
+    """
+    security_events.emit(
+        "oauth_client_registration_refused",
+        subject=security_events.subject_for(request=request),
+        reason=reason,
+        client_ip=security_events.client_ip(request),
+    )
+
+
+def _revoke_noop(request, reason: str, submitted_client_id=None) -> None:
+    """One `oauth_revoke_noop`. RFC 7009 §2.2 forbids the *response* saying it.
+
+    The endpoint answers 200 with an empty body whether the token was unknown,
+    foreign or already dead, so the log is the only place the distinction
+    exists.
+    """
+    security_events.emit(
+        "oauth_revoke_noop",
+        level=logging.INFO,
+        subject=security_events.subject_for(request=request),
+        reason=reason,
+        client_id_submitted=submitted_client_id,
+        client_ip=security_events.client_ip(request),
+    )
 
 
 def _base64url_sha256(verifier: str) -> str:
@@ -127,8 +252,30 @@ def _client_authenticated(client, client_secret) -> bool:
     return auth_method == "none"
 
 
-def _cross_user_client_error() -> JSONResponse:
-    """The refusal both consent paths give for someone else's client."""
+def _cross_user_client_error(
+    request=None,
+    *,
+    client_id: str | None = None,
+    actor_user_id: int | None = None,
+    owner_user_id: int | None = None,
+) -> JSONResponse:
+    """The refusal both consent paths give for someone else's client.
+
+    The record is emitted **here**, at the one helper both `:approve` sites
+    return, so neither can grow a refusal that logs nothing. It is the clearest
+    case for D19's pair: `actor_user_id` is the session user who asked, and
+    `user_id` is the account that owns the client they asked about — one
+    `user_id` would have left an operator unable to tell which was which.
+    """
+    security_events.emit(
+        "oauth_cross_user_client_refused",
+        subject=security_events.subject_for(user_id=actor_user_id, request=request),
+        client_id=client_id,
+        actor_user_id=actor_user_id,
+        user_id=owner_user_id,
+        route=_route(request),
+        client_ip=security_events.client_ip(request),
+    )
     return JSONResponse(
         {
             "error": "access_denied",
@@ -212,13 +359,16 @@ async def register_client(request: Request):
     try:
         body = await request.json()
     except Exception:
+        _registration_refused(request, "invalid_client_metadata")
         return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
     if not isinstance(body, dict):
+        _registration_refused(request, "invalid_client_metadata")
         return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
     client_name = body.get("client_name", "Unknown Client")
     redirect_uris = body.get("redirect_uris", [])
 
     if not isinstance(client_name, str) or not client_name.strip() or len(client_name) > 255:
+        _registration_refused(request, "invalid_client_metadata")
         return JSONResponse({"error": "invalid_client_metadata"}, status_code=400)
     if (
         not isinstance(redirect_uris, list)
@@ -226,13 +376,16 @@ async def register_client(request: Request):
         or len(redirect_uris) > 10
         or any(not isinstance(uri, str) or len(uri) > 2048 for uri in redirect_uris)
     ):
+        _registration_refused(request, "invalid_redirect_uri")
         return JSONResponse({"error": "redirect_uris required"}, status_code=400)
     if len(set(redirect_uris)) != len(redirect_uris):
+        _registration_refused(request, "invalid_redirect_uri")
         return JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
 
     # Validate all redirect URIs
     for uri in redirect_uris:
         if not _valid_redirect_uri(uri):
+            _registration_refused(request, "invalid_redirect_uri")
             return JSONResponse(
                 {"error": "invalid_redirect_uri", "error_description": f"Redirect URI must use https and contain no fragment: {uri}"},
                 status_code=400,
@@ -244,10 +397,12 @@ async def register_client(request: Request):
     # actual grant on the consent screen.
     raw_scope = body.get("scope", DEFAULT_CLIENT_SCOPE)
     if not isinstance(raw_scope, str):
+        _registration_refused(request, "invalid_scope")
         return JSONResponse({"error": "invalid_scope"}, status_code=400)
     try:
         scope = _validate_scope(raw_scope)
     except ValueError as exc:
+        _registration_refused(request, "invalid_scope")
         return JSONResponse({"error": "invalid_scope", "error_description": str(exc)}, status_code=400)
 
     # A registration naming neither `read` nor `readwrite` grants nothing --
@@ -258,6 +413,7 @@ async def register_client(request: Request):
     # endpoint. Refusing here says so at the only point where the developer
     # registering the client is still in the loop.
     if not has_vault_scope(scope):
+        _registration_refused(request, "invalid_scope")
         return JSONResponse(
             {
                 "error": "invalid_scope",
@@ -273,6 +429,7 @@ async def register_client(request: Request):
         "token_endpoint_auth_method", "client_secret_post"
     )
     if token_endpoint_auth_method not in TOKEN_ENDPOINT_AUTH_METHODS:
+        _registration_refused(request, "unsupported_auth_method")
         return JSONResponse(
             {
                 "error": "invalid_client_metadata",
@@ -299,6 +456,22 @@ async def register_client(request: Request):
         )
         session.add(client)
         await session.commit()
+
+    # After the commit (D17). `client_id` is server-generated and public; the
+    # name is the client's own text and is marked as such. The `client_secret`
+    # this route just minted appears in **no** field and in no message — the
+    # canary test captures the value the response carries and asserts its
+    # absence from every record.
+    security_events.emit(
+        "oauth_client_registered",
+        level=logging.INFO,
+        subject=security_events.subject_for(request=request),
+        client_id=client_id,
+        client_name_submitted=client_name,
+        scope=scope,
+        count=len(redirect_uris),
+        client_ip=security_events.client_ip(request),
+    )
 
     registration = {
         "client_id": client_id,
@@ -348,15 +521,22 @@ async def authorize_get(
             )
 
     if response_type != "code":
+        _authorize_refused(
+            request, "unsupported_response_type", submitted_client_id=client_id
+        )
         return JSONResponse({"error": "unsupported_response_type"}, status_code=400)
 
     if not _valid_pkce_challenge(code_challenge, code_challenge_method):
+        # The challenge is a public value, but the record carries neither it nor
+        # the verifier that will answer it — only that the check refused.
+        _authorize_refused(request, "pkce_invalid", submitted_client_id=client_id)
         return JSONResponse({"error": "invalid_request", "error_description": "A valid S256 PKCE challenge is required"}, status_code=400)
 
     # Validate scope
     try:
         scope = _validate_scope(scope)
     except ValueError as exc:
+        _authorize_refused(request, "invalid_scope", submitted_client_id=client_id)
         return JSONResponse({"error": "invalid_scope", "error_description": str(exc)}, status_code=400)
 
     async with async_session() as session:
@@ -366,9 +546,15 @@ async def authorize_get(
         client = result.scalar_one_or_none()
 
     if client is None:
+        # No row resolved, so the caller's value may appear only under the
+        # `_submitted` name (D15).
+        _authorize_refused(request, "unknown_client", submitted_client_id=client_id)
         return JSONResponse({"error": "invalid_client"}, status_code=400)
 
     if redirect_uri not in client.redirect_uris:
+        _authorize_refused(
+            request, "invalid_redirect_uri", client_id=client.client_id
+        )
         return JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
 
     # Generate server-side CSRF state and bind it to a signed cookie
@@ -446,15 +632,18 @@ async def authorize_post(
             state_valid = False
 
     if not state_valid:
+        _authorize_refused(request, "state_mismatch", submitted_client_id=client_id)
         return JSONResponse({"error": "invalid_state", "error_description": "CSRF state mismatch or missing"}, status_code=400)
 
     if not _valid_pkce_challenge(code_challenge, code_challenge_method):
+        _authorize_refused(request, "pkce_invalid", submitted_client_id=client_id)
         return JSONResponse({"error": "invalid_request", "error_description": "A valid S256 PKCE challenge is required"}, status_code=400)
 
     # Validate scope
     try:
         scope = _validate_scope(scope)
     except ValueError as exc:
+        _authorize_refused(request, "invalid_scope", submitted_client_id=client_id)
         return JSONResponse({"error": "invalid_scope", "error_description": str(exc)}, status_code=400)
 
     async with async_session() as session:
@@ -464,6 +653,9 @@ async def authorize_post(
         if action == "approve" and settings.multi_user_mode:
             current_user = await get_active_session_user(request, session)
             if current_user is None:
+                _authorize_refused(
+                    request, "session_required", submitted_client_id=client_id
+                )
                 return JSONResponse(
                     {"error": "login_required", "error_description": "Session required"},
                     status_code=401,
@@ -482,10 +674,27 @@ async def authorize_post(
         client_row = result.scalar_one_or_none()
 
         if client_row is None:
+            _authorize_refused(
+                request,
+                "unknown_client",
+                submitted_client_id=client_id,
+                user_id=session_user_id,
+            )
             return JSONResponse({"error": "invalid_client"}, status_code=400)
 
         if redirect_uri not in client_row.redirect_uris:
+            _authorize_refused(
+                request,
+                "invalid_redirect_uri",
+                client_id=client_row.client_id,
+                user_id=session_user_id,
+            )
             return JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
+
+        # The lookup above filtered on `client_id`, so this value is now a
+        # value read from a row rather than the caller's form field — the
+        # unsuffixed `client_id` field may hold nothing else (D15).
+        resolved_client_id = client_row.client_id
 
         # Clamp the consent-form scope to what the client registered for.
         # `scope` arrives as an attacker-controllable form field (the radio
@@ -494,6 +703,27 @@ async def authorize_post(
         scope = _clamp_scope(scope, client_row.scope)
 
         if action != "approve":
+            # A deny carried no identity at all before #191, so the session user
+            # is resolved *for the record* — best-effort and guarded, because a
+            # logging read must never turn a deny into a 500 and must never
+            # change where the browser is sent.
+            denied_user_id: int | None = None
+            if settings.multi_user_mode:
+                try:
+                    denying_user = await get_active_session_user(request, session)
+                    denied_user_id = None if denying_user is None else denying_user.id
+                except Exception:  # noqa: BLE001 - the deny is decided already
+                    denied_user_id = None
+            security_events.emit(
+                "oauth_consent_denied",
+                level=logging.INFO,
+                subject=security_events.subject_for(
+                    user_id=denied_user_id, request=request
+                ),
+                client_id=resolved_client_id,
+                user_id=denied_user_id,
+                client_ip=security_events.client_ip(request),
+            )
             # Denied — redirect with error (redirect_uri now verified)
             url = _append_query(redirect_uri, error="access_denied", state=client_state)
             return RedirectResponse(url, status_code=302)
@@ -517,6 +747,12 @@ async def authorize_post(
         # whole vault read-only — a permission its registration never named.
         # Refuse instead of minting a code for a grant that means nothing.
         if not scope:
+            _authorize_refused(
+                request,
+                "scope_clamped_empty",
+                client_id=client_row.client_id,
+                user_id=session_user_id,
+            )
             return JSONResponse(
                 {
                     "error": "invalid_scope",
@@ -529,7 +765,12 @@ async def authorize_post(
             )
 
         if _client_belongs_to_another_user(client_row, session_user_id):
-            return _cross_user_client_error()
+            return _cross_user_client_error(
+                request,
+                client_id=client_row.client_id,
+                actor_user_id=session_user_id,
+                owner_user_id=client_row.user_id,
+            )
 
         code = secrets.token_hex(32)
 
@@ -570,7 +811,12 @@ async def authorize_post(
                     )
                 ).scalar_one_or_none()
                 if owner != session_user_id:
-                    return _cross_user_client_error()
+                    return _cross_user_client_error(
+                        request,
+                        client_id=client_row.client_id,
+                        actor_user_id=session_user_id,
+                        owner_user_id=owner,
+                    )
 
         oauth_code = OAuthCode(
             code_hash=_hash(code),
@@ -584,6 +830,20 @@ async def authorize_post(
         )
         session.add(oauth_code)
         await session.commit()
+
+    # After the code row commits (D17), and before the redirect is built. The
+    # `code` this consent just minted is a bearer credential and appears in no
+    # field and no message; the canary test captures it out of the `Location`
+    # header and asserts its absence.
+    security_events.emit(
+        "oauth_consent_granted",
+        level=logging.INFO,
+        subject=security_events.subject_for(user_id=session_user_id, request=request),
+        client_id=resolved_client_id,
+        user_id=session_user_id,
+        scope=scope,
+        client_ip=security_events.client_ip(request),
+    )
 
     url = _append_query(redirect_uri, code=code, state=client_state)
     return RedirectResponse(url, status_code=302)
@@ -599,21 +859,35 @@ async def token_endpoint(request: Request):
     grant_type = form.get("grant_type")
 
     if grant_type == "authorization_code":
-        return await _handle_auth_code(form)
+        return await _handle_auth_code(form, request)
     elif grant_type == "refresh_token":
-        return await _handle_refresh(form)
+        return await _handle_refresh(form, request)
     else:
+        _token_refused(
+            request,
+            "unsupported_grant_type.grant_type_not_supported",
+            submitted_client_id=form.get("client_id"),
+        )
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
 
-async def _handle_auth_code(form):
+async def _handle_auth_code(form, request=None):
     code = form.get("code")
     client_id = form.get("client_id")
     client_secret = form.get("client_secret")
     code_verifier = form.get("code_verifier")
     redirect_uri = form.get("redirect_uri")
 
+    # The caller's `client_id` until a row resolves. Every refusal below that
+    # has not yet read `oauth_clients` reports it as `client_id_submitted`.
+    submitted_client_id = client_id
+
     if not all([code, code_verifier]):
+        _token_refused(
+            request,
+            "invalid_request.missing_parameter",
+            submitted_client_id=submitted_client_id,
+        )
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     async with async_session() as session:
@@ -641,6 +915,14 @@ async def _handle_auth_code(form):
         oauth_code = result.scalar_one_or_none()
 
         if not oauth_code:
+            # No code row, so no client and no owner resolved: only the
+            # submitted identifier may appear, and `user_id`/`grant_id` are
+            # absent because this path has neither.
+            _token_refused(
+                request,
+                "invalid_grant.unknown_code",
+                submitted_client_id=submitted_client_id,
+            )
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
         result = await session.execute(
@@ -648,24 +930,66 @@ async def _handle_auth_code(form):
         )
         client = result.scalar_one_or_none()
         if not client:
+            _token_refused(
+                request,
+                "invalid_client.unknown_client",
+                submitted_client_id=submitted_client_id,
+                user_id=oauth_code.user_id,
+            )
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
         if not _client_authenticated(client, client_secret):
+            # The presented `client_secret` is never recorded, in any form.
+            _token_refused(
+                request,
+                "invalid_client.authentication_failed",
+                client_id=client.client_id,
+                user_id=oauth_code.user_id,
+            )
             return JSONResponse({"error": "invalid_client"}, status_code=401)
 
         client_id = oauth_code.client_id
 
         if oauth_code.expires_at < datetime.now(timezone.utc):
+            _token_refused(
+                request,
+                "invalid_grant.code_expired",
+                client_id=client_id,
+                user_id=oauth_code.user_id,
+            )
             return JSONResponse({"error": "invalid_grant", "error_description": "code expired"}, status_code=400)
 
         if not redirect_uri or oauth_code.redirect_uri != redirect_uri:
+            # The URI itself is not recorded: the reason says which check
+            # refused, and the allow-list has no field a URL could ride in.
+            _token_refused(
+                request,
+                "invalid_grant.redirect_uri_mismatch",
+                client_id=client_id,
+                user_id=oauth_code.user_id,
+            )
             return JSONResponse({"error": "invalid_grant", "error_description": "redirect_uri mismatch"}, status_code=400)
 
         # Verify PKCE
         if not isinstance(code_verifier, str) or not _PKCE_RE.fullmatch(code_verifier):
+            _token_refused(
+                request,
+                "invalid_grant.pkce_verifier_invalid",
+                client_id=client_id,
+                user_id=oauth_code.user_id,
+            )
             return JSONResponse({"error": "invalid_grant", "error_description": "Invalid PKCE verifier"}, status_code=400)
         expected_challenge = _base64url_sha256(code_verifier)
         if not secrets.compare_digest(expected_challenge, oauth_code.code_challenge):
+            # Neither the verifier nor the challenge is recorded — the verifier
+            # is a bearer secret, and a failed exchange is exactly when one
+            # would be most tempting to log.
+            _token_refused(
+                request,
+                "invalid_grant.pkce_verification_failed",
+                client_id=client_id,
+                user_id=oauth_code.user_id,
+            )
             return JSONResponse({"error": "invalid_grant", "error_description": "PKCE verification failed"}, status_code=400)
 
         # In multi-user mode every token must have an owner. A code stamped
@@ -675,6 +999,9 @@ async def _handle_auth_code(form):
         # the panel's per-user filters and the vault-root lookup all key off
         # `user_id`. Refuse rather than create one.
         if settings.multi_user_mode and oauth_code.user_id is None:
+            _token_refused(
+                request, "invalid_grant.code_ownerless", client_id=client_id
+            )
             return JSONResponse(
                 {
                     "error": "invalid_grant",
@@ -693,6 +1020,12 @@ async def _handle_auth_code(form):
         # unaffected, including on a database whose clients were later claimed
         # by the multi-user bootstrap.
         if _client_belongs_to_another_user(client, oauth_code.user_id):
+            _token_refused(
+                request,
+                "invalid_grant.cross_user_client",
+                client_id=client_id,
+                user_id=oauth_code.user_id,
+            )
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
         # Last clamp before anything is persisted (issue #67). `authorize_post`
@@ -709,6 +1042,12 @@ async def _handle_auth_code(form):
         # handed a read token over the entire vault.
         granted_scope = _clamp_scope(oauth_code.scope, client.scope)
         if not granted_scope:
+            _token_refused(
+                request,
+                "invalid_scope.no_vault_scope",
+                client_id=client_id,
+                user_id=oauth_code.user_id,
+            )
             return JSONResponse(
                 {
                     "error": "invalid_scope",
@@ -756,6 +1095,22 @@ async def _handle_auth_code(form):
             user_id=oauth_code.user_id,
         ))
         await session.commit()
+        issued_user_id = oauth_code.user_id
+
+    # After the mint's commit (D17), so a commit that fails leaves no record
+    # claiming a live token exists. Neither token value appears — only the
+    # public `client_id`, the owner, the grant family and the granted scope.
+    security_events.emit(
+        "oauth_token_issued",
+        level=logging.INFO,
+        subject=security_events.subject_for(user_id=issued_user_id, request=request),
+        reason="authorization_code",
+        client_id=client_id,
+        user_id=issued_user_id,
+        grant_id=grant_id,
+        scope=granted_scope,
+        client_ip=security_events.client_ip(request),
+    )
 
     return _oauth_json({
         "access_token": access_token,
@@ -766,12 +1121,28 @@ async def _handle_auth_code(form):
     })
 
 
-async def _handle_refresh(form):
+async def _handle_refresh(form, request=None):
     refresh_token = form.get("refresh_token")
     client_id = form.get("client_id")
     client_secret = form.get("client_secret")
 
+    # Two provenances, kept apart deliberately (D15). `submitted_client_id` is
+    # whatever the caller typed and may appear only under the `_submitted`
+    # name; `resolved_client_id` and `resolved_grant_id` are set from rows and
+    # are the only values the unsuffixed fields may carry — which matters most
+    # in the rotation-failure handler below, where `client_id` may still hold
+    # the caller's form value.
+    submitted_client_id = client_id
+    resolved_client_id: str | None = None
+    resolved_grant_id: str | None = None
+    resolved_user_id: int | None = None
+
     if not refresh_token:
+        _token_refused(
+            request,
+            "invalid_request.missing_parameter",
+            submitted_client_id=submitted_client_id,
+        )
         return JSONResponse({"error": "invalid_request"}, status_code=400)
 
     async with async_session() as session:
@@ -817,8 +1188,17 @@ async def _handle_refresh(form):
             )
             grant_ids = (await session.execute(grant_query)).scalars().all()
             if not grant_ids:
+                # Nothing resolved at all: no client row, no grant, no owner.
+                # The record says so by carrying none of them (D15) — the
+                # presented token never appears in any form.
+                _token_refused(
+                    request,
+                    "invalid_grant.unknown_token",
+                    submitted_client_id=submitted_client_id,
+                )
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
             grant_id = grant_ids[0]
+            resolved_grant_id = grant_id
             await lock_grant(session, grant_id)
 
             # Re-read under the lock. The statement takes a fresh snapshot, so
@@ -851,6 +1231,12 @@ async def _handle_refresh(form):
                 # The row was deleted while we waited (`cleanup_expired_tokens`
                 # retires long-dead rows). Nothing left says it was ever
                 # rotated, so this is a not-found refusal, not reuse.
+                _token_refused(
+                    request,
+                    "invalid_grant.token_vanished",
+                    submitted_client_id=submitted_client_id,
+                    grant_id=grant_id,
+                )
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
             if old_token.revoked:
@@ -918,25 +1304,31 @@ async def _handle_refresh(form):
                     except Exception as rollback_exc:
                         failure = f"{failure}+{type(rollback_exc).__name__}"
 
-                # The identifiers go in the message text, not only in `extra`:
-                # the process formatter is `%(message)s`, so anything left in
-                # `extra` alone never reaches the operator. None of them is a
-                # secret; no token value or hash is ever among them.
+                # Through `security_events.emit` since #191, not a bare
+                # `logger.warning`: a replayed refresh token is caller-driven
+                # and repeatable, so the alarm has to pass the same allowance
+                # check as every other caller-triggerable record. The
+                # identifiers are structured fields now rather than message
+                # text — #190 made `extra` actually reach the sink, which is
+                # exactly what the old "put them in the message" workaround
+                # existed to route around. None of them is a secret; no token
+                # value or hash is ever among them.
                 if failure is not None:
-                    logger.warning(
-                        "oauth.refresh_reuse_revocation_failed "
-                        "client_id=%s grant_id=%s user_id=%s error=%s",
-                        reused_client_id,
-                        grant_id,
-                        reused_user_id,
-                        failure,
-                        extra={
-                            "event": "oauth.refresh_reuse_revocation_failed",
-                            "client_id": reused_client_id,
-                            "grant_id": grant_id,
-                            "user_id": reused_user_id,
-                            "error": failure,
-                        },
+                    security_events.emit(
+                        "oauth_refresh_reuse_revocation_failed",
+                        level=logging.ERROR,
+                        subject=security_events.subject_for(
+                            user_id=reused_user_id, request=request
+                        ),
+                        client_id=reused_client_id,
+                        grant_id=grant_id,
+                        user_id=reused_user_id,
+                        client_ip=security_events.client_ip(request),
+                        # The class name only, never `str(exc)`: a SQLAlchemy
+                        # error renders the failing statement *and its bound
+                        # parameters*, one of which is the token hash. For the
+                        # same reason there is no `exc_info` here.
+                        error_type=failure,
                     )
                 elif revoked_count:
                     # One record, on the path that actually killed live tokens.
@@ -950,20 +1342,29 @@ async def _handle_refresh(form):
                     # between loses the alarm while keeping the revocation.
                     # Accepted: the safe half is the one that persists, and an
                     # outbox for one WARNING is not worth its own failure mode.
-                    logger.warning(
-                        "oauth.refresh_reuse_detected "
-                        "client_id=%s grant_id=%s user_id=%s revoked_tokens=%s",
-                        reused_client_id,
-                        grant_id,
-                        reused_user_id,
-                        revoked_count,
-                        extra={
-                            "event": "oauth.refresh_reuse_detected",
-                            "client_id": reused_client_id,
-                            "grant_id": grant_id,
-                            "user_id": reused_user_id,
-                            "revoked_tokens": revoked_count,
-                        },
+                    security_events.emit(
+                        "oauth_refresh_reuse_detected",
+                        subject=security_events.subject_for(
+                            user_id=reused_user_id, request=request
+                        ),
+                        client_id=reused_client_id,
+                        grant_id=grant_id,
+                        user_id=reused_user_id,
+                        revoked_tokens=revoked_count,
+                        client_ip=security_events.client_ip(request),
+                    )
+                else:
+                    # Revoked, but nothing live was left to kill: an operator
+                    # revocation the client has not noticed, or a second replay
+                    # after the first one closed the family. Not the reuse
+                    # alarm — that one means *this* request killed something —
+                    # but still exactly one record for exactly one outcome.
+                    _token_refused(
+                        request,
+                        "invalid_grant.refresh_token_revoked",
+                        client_id=reused_client_id,
+                        user_id=reused_user_id,
+                        grant_id=grant_id,
                     )
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
@@ -973,6 +1374,15 @@ async def _handle_refresh(form):
             # token presented with the wrong `client_id` is a misconfigured or
             # confused client, not evidence that the token leaked.
             if client_id and old_token.client_id != client_id:
+                # The row's own identity resolved, so it is the one that may
+                # appear; what the caller claimed does not.
+                _token_refused(
+                    request,
+                    "invalid_grant.client_id_mismatch",
+                    client_id=old_token.client_id,
+                    user_id=old_token.user_id,
+                    grant_id=grant_id,
+                )
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
             result = await session.execute(
@@ -980,14 +1390,37 @@ async def _handle_refresh(form):
             )
             client = result.scalar_one_or_none()
             if not client:
+                _token_refused(
+                    request,
+                    "invalid_client.unknown_client",
+                    submitted_client_id=submitted_client_id,
+                    user_id=old_token.user_id,
+                    grant_id=grant_id,
+                )
                 return JSONResponse({"error": "invalid_client"}, status_code=401)
 
             if not _client_authenticated(client, client_secret):
+                _token_refused(
+                    request,
+                    "invalid_client.authentication_failed",
+                    client_id=client.client_id,
+                    user_id=old_token.user_id,
+                    grant_id=grant_id,
+                )
                 return JSONResponse({"error": "invalid_client"}, status_code=401)
 
             client_id = old_token.client_id
+            resolved_client_id = old_token.client_id
+            resolved_user_id = old_token.user_id
 
             if old_token.expires_at < datetime.now(timezone.utc):
+                _token_refused(
+                    request,
+                    "invalid_grant.refresh_token_expired",
+                    client_id=client_id,
+                    user_id=old_token.user_id,
+                    grant_id=grant_id,
+                )
                 return JSONResponse({"error": "invalid_grant", "error_description": "refresh token expired"}, status_code=400)
 
             # In multi-user mode a token with no owner cannot be rotated: the
@@ -995,6 +1428,12 @@ async def _handle_refresh(form):
             # ownership check. Such a row can only be a pre-flag-flip leftover
             # the bootstrap did not claim.
             if settings.multi_user_mode and old_token.user_id is None:
+                _token_refused(
+                    request,
+                    "invalid_grant.token_ownerless",
+                    client_id=client_id,
+                    grant_id=grant_id,
+                )
                 return JSONResponse(
                     {
                         "error": "invalid_grant",
@@ -1010,6 +1449,13 @@ async def _handle_refresh(form):
             # forever, keeping a live cross-user grant alive indefinitely and
             # invisible in either user's panel.
             if _client_belongs_to_another_user(client, old_token.user_id):
+                _token_refused(
+                    request,
+                    "invalid_grant.cross_user_client",
+                    client_id=client_id,
+                    user_id=old_token.user_id,
+                    grant_id=grant_id,
+                )
                 return JSONResponse({"error": "invalid_grant"}, status_code=400)
 
             # Re-clamp against the client's *current* registration (issue #67).
@@ -1021,6 +1467,13 @@ async def _handle_refresh(form):
             # takes effect on the next refresh instead of never.
             granted_scope = _clamp_scope(old_token.scope, client.scope)
             if not granted_scope:
+                _token_refused(
+                    request,
+                    "invalid_scope.no_vault_scope",
+                    client_id=client_id,
+                    user_id=old_token.user_id,
+                    grant_id=grant_id,
+                )
                 # The registration grants no vault access any more, so there is
                 # nothing to rotate into. Nothing is committed, so the old
                 # refresh token is left exactly as it was — the thing to fix is
@@ -1065,9 +1518,41 @@ async def _handle_refresh(form):
             old_token.revoked = True
 
             await session.commit()
-        except Exception:
+            rotated_user_id = old_token.user_id
+            rotated_grant_id = old_token.grant_id
+        except Exception as exc:
+            # The traceback used to be discarded behind the 500, so a rotation
+            # failing in production left an operator with a status code and
+            # nothing else. Emitted **before** the rollback, which is the
+            # cheapest step and the one that may not be skipped if the rollback
+            # itself fails; only the identifiers that resolved from rows appear.
+            security_events.emit(
+                "oauth_token_rotation_failed",
+                level=logging.ERROR,
+                exc_info=exc,
+                subject=security_events.subject_for(
+                    user_id=resolved_user_id, request=request
+                ),
+                client_id=resolved_client_id,
+                grant_id=resolved_grant_id,
+                client_ip=security_events.client_ip(request),
+            )
             await session.rollback()
             return JSONResponse({"error": "server_error", "error_description": "Token rotation failed"}, status_code=500)
+
+    # After the rotation's commit (D17) and outside the guarded block, so a
+    # record can never claim a rotation the transaction did not keep. The new
+    # pair is in hand here and appears nowhere in the record.
+    security_events.emit(
+        "oauth_token_refreshed",
+        level=logging.INFO,
+        subject=security_events.subject_for(user_id=rotated_user_id, request=request),
+        client_id=client_id,
+        user_id=rotated_user_id,
+        grant_id=rotated_grant_id,
+        scope=granted_scope,
+        client_ip=security_events.client_ip(request),
+    )
 
     return _oauth_json({
         "access_token": new_access,
@@ -1093,6 +1578,9 @@ async def revoke_token(request: Request):
     client_id = form.get("client_id")
     client_secret = form.get("client_secret")
 
+    if not token:
+        _revoke_noop(request, "missing_token", client_id)
+
     if token:
         token_hash = _hash(token)
         async with async_session() as session:
@@ -1100,6 +1588,8 @@ async def revoke_token(request: Request):
                 select(OAuthToken).where(OAuthToken.token_hash == token_hash)
             )
             oauth_token = result.scalar_one_or_none()
+            if oauth_token is None:
+                _revoke_noop(request, "unknown_token", client_id)
             if oauth_token:
                 # RFC 7009 §2.1: the client authenticates. This endpoint used
                 # to do neither authentication nor an ownership check, so any
@@ -1133,12 +1623,24 @@ async def revoke_token(request: Request):
                 # cost either: revocation is optional for a client, and RFC
                 # 7009 §2.1 requires it to authenticate when it does revoke.
                 if client is None:
+                    _revoke_noop(request, "unknown_client", client_id)
                     return JSONResponse({})
                 if not client_id or client_id != oauth_token.client_id:
+                    # Deliberately does **not** name the token's real owner or
+                    # client: §2.2 hides that from the response, and a log an
+                    # operator shares is not a reason to hand it back.
+                    _revoke_noop(request, "client_mismatch", client_id)
                     return JSONResponse({})
                 if not _client_authenticated(client, client_secret):
                     # The one case that is a real error rather than a no-op:
                     # the right client was named and failed to authenticate.
+                    security_events.emit(
+                        "oauth_revoke_refused",
+                        subject=security_events.subject_for(request=request),
+                        reason="client_auth_failed",
+                        client_id=oauth_token.client_id,
+                        client_ip=security_events.client_ip(request),
+                    )
                     return JSONResponse({"error": "invalid_client"}, status_code=401)
 
                 # Revoke the whole grant family, not just the row presented.
@@ -1154,8 +1656,33 @@ async def revoke_token(request: Request):
                 # The family cannot span clients or users (see
                 # `src/oauth/grants.py`), so an authenticated client revoking
                 # its own token reaches nothing that is not its own.
-                await revoke_grant_family(session, oauth_token.grant_id)
+                revoked_count = await revoke_grant_family(
+                    session, oauth_token.grant_id
+                )
                 await session.commit()
+
+                # Emitted **here**, by the HTTP caller, after its own commit —
+                # never inside `revoke_grant_family`, which has no request, no
+                # client address and no session user, and does not commit, so a
+                # record written there would be a claim about a transaction
+                # that may still roll back (D10).
+                #
+                # No `actor_user_id`: `/revoke` authenticates as the *client*,
+                # not as a person, so there is no acting human to name. The
+                # panel's revoke handler emits the same event *with* one.
+                security_events.emit(
+                    "oauth_grant_revoked",
+                    level=logging.INFO,
+                    subject=security_events.subject_for(
+                        user_id=oauth_token.user_id, request=request
+                    ),
+                    client_id=oauth_token.client_id,
+                    user_id=oauth_token.user_id,
+                    grant_id=oauth_token.grant_id,
+                    count=revoked_count,
+                    client_ip=security_events.client_ip(request),
+                    route=_route(request),
+                )
 
     # RFC 7009: always return 200
     return JSONResponse({})

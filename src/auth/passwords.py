@@ -37,15 +37,19 @@ is ever called. This is the same policy the previous implementation had, so no
 stored hash can have been produced from a NUL-containing password.
 
 **A malformed stored hash fails closed.** A `password_hash` column that is not
-a well-formed bcrypt hash makes `checkpw` raise; we log one warning (no user
-identifier, no hash bytes) and return False. It can never match anything, and a
-failed login is a better answer than a 500 on the login route.
-"""
-import logging
+a well-formed bcrypt hash makes `checkpw` raise; we record one
+`password_hash_malformed` event (no password, no hash bytes — only the row's
+own id, when the caller knows it) and return False. It can never match
+anything, and a failed login is a better answer than a 500 on the login route.
 
+The record goes through `src/services/security_events.py` rather than straight
+to a logger because **a caller drives it through the login form**: one corrupted
+column plus a scripted login loop is an unbounded flood channel, and every
+caller-triggerable refusal in this server is bounded by the same suppressor.
+"""
 import bcrypt
 
-logger = logging.getLogger(__name__)
+from src.services import security_events
 
 # bcrypt's own default is also 12; stated explicitly so the cost factor is a
 # decision recorded here rather than whatever a future release picks.
@@ -71,12 +75,17 @@ def hash_password(plain: str) -> str:
     return bcrypt.hashpw(_prepare(plain), bcrypt.gensalt(rounds=_BCRYPT_ROUNDS)).decode("ascii")
 
 
-def verify_password(plain: str, hashed: str) -> bool:
+def verify_password(plain: str, hashed: str, *, user_id: int | None = None) -> bool:
     """Check `plain` against a stored bcrypt hash.
 
     `checkpw` accepts the `$2a$` / `$2b$` / `$2y$` prefixes, so hashes from any
     era of this application verify. Missing, non-string, or malformed stored
     values and NUL-containing candidates all return False rather than raising.
+
+    `user_id` is optional and names the row whose column is corrupt, so an
+    operator can fix the one account rather than search for it. It is the only
+    thing the record carries: never the candidate password, never the stored
+    bytes.
     """
     if hashed is None or not isinstance(hashed, str):
         return False
@@ -86,5 +95,9 @@ def verify_password(plain: str, hashed: str) -> bool:
     try:
         return bcrypt.checkpw(_prepare(plain), hashed.encode("utf-8"))
     except (ValueError, TypeError):
-        logger.warning("password_hash for a user is not a well-formed bcrypt hash; failing closed")
+        security_events.emit(
+            "password_hash_malformed",
+            subject=security_events.subject_for(user_id=user_id),
+            user_id=user_id,
+        )
         return False
