@@ -18,7 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.auth.session import _SingleUserSentinel, get_current_user
 from src.config import settings
-from src.control_panel.flash import pop_flash
+from src.control_panel.flash import ERR, flash, pop_flash
 from src.csrf import generate_csrf_token, verify_csrf
 from src.database import async_session, get_session
 from src.mcp_server.auth import hash_key
@@ -45,6 +45,12 @@ from src.oauth.scope import (
     token_has_write,
 )
 from src.services import security_events
+from src.services.index_state import (
+    KEY_EMBEDDING_FINGERPRINT,
+    acquire_generation_lock,
+    embedding_fingerprint,
+    set_state,
+)
 from src.services.indexer import invalidate_hnsw_index_cache
 from src.services.quotas import (
     apply_daily_request_limit,
@@ -385,6 +391,42 @@ def _scope_user_id(user: User | _SingleUserSentinel) -> int | None:
 # --- Dashboard ------------------------------------------------------------
 
 
+def _vectors_not_current():
+    """The one expression for "this note's stored vectors are not current".
+
+    ``embedded_content_hash IS NULL OR embedded_content_hash IS DISTINCT FROM
+    content_hash`` — a note never embedded, a note whose certification was
+    invalidated (a move, a grammar bump), or a note edited since it was last
+    embedded.
+
+    **`IS DISTINCT FROM`, not `!=`.** A NULL `embedded_content_hash` under `!=`
+    yields NULL, which a `WHERE` reads as false, so every never-embedded note
+    would silently count as current — the exact inversion of what the count is
+    for. The explicit `IS NULL` arm is kept beside it because it is the arm a
+    reader checks first, and the two together say the predicate out loud.
+
+    It lives in one place because two call sites consume it and they answer to
+    different audiences:
+
+    * `dashboard()` — **scoped** by `_scope_user_id(user)`, exactly as the
+      coverage numbers beside it are, so a non-admin never reads another
+      tenant's backlog as their own;
+    * `reset_progress()` — **unscoped and admin-only**, because it is the
+      poller behind a whole-database reset.
+
+    Those two scopes are deliberate and different; the *definition of pending*
+    must not be. A second copy of this predicate is how the page and the poller
+    come to disagree about what "pending" means, which is the failure this
+    helper exists to make impossible (design D8).
+    """
+    return or_(
+        NoteMetadata.embedded_content_hash.is_(None),
+        NoteMetadata.embedded_content_hash.is_distinct_from(
+            NoteMetadata.content_hash
+        ),
+    )
+
+
 async def _graph_stats(session: AsyncSession, user_id: int | None) -> dict:
     """Return totals + top hub notes for the dashboard's Graph widget.
 
@@ -494,6 +536,37 @@ async def dashboard(
         emb_q = select(func.count(func.distinct(NoteEmbedding.note_id)))
     notes_with_embeddings = (await session.execute(emb_q)).scalar() or 0
 
+    # Currency, beside coverage — two different questions about the same rows.
+    #
+    # `notes_with_embeddings` (and so `embedding_pct`) counts notes holding *at
+    # least one vector row*: "is this note represented at all". `notes_pending`
+    # counts notes whose vectors are not current: "is that representation the
+    # note as it stands now". They disagree during every embed backlog, and the
+    # bar is deliberately NOT redefined to the stricter question — every
+    # coverage figure an operator has ever read on this page meant the looser
+    # one, and silently changing what it means would rewrite that history.
+    #
+    # Scoped by `uid` exactly as the two numbers above are. An unscoped copy —
+    # which is what the progress poller legitimately runs, being admin-only —
+    # would show a regular user the *whole database's* backlog beside their own
+    # note count, i.e. another tenant's index state read as their own.
+    #
+    # A non-zero pending count on an otherwise-idle vault is the operator-facing
+    # shape of a provider outage (the pass record now carries the error, but
+    # coverage still reads whatever it read yesterday) and of a tenant whose
+    # embedding is repeatedly stopped at its per-pass budget, which is
+    # deliberately not recorded as a pass failure. A backlog that does not
+    # shrink across passes is the signal.
+    pending_q = select(func.count(NoteMetadata.id)).where(_vectors_not_current())
+    truncated_q = select(func.count(NoteMetadata.id)).where(
+        NoteMetadata.chunks_truncated.is_(True)
+    )
+    if uid is not None:
+        pending_q = pending_q.where(NoteMetadata.user_id == uid)
+        truncated_q = truncated_q.where(NoteMetadata.user_id == uid)
+    notes_pending = (await session.execute(pending_q)).scalar() or 0
+    notes_chunks_truncated = (await session.execute(truncated_q)).scalar() or 0
+
     keys_count = (await session.execute(keys_q)).scalar() or 0
 
     if uid is not None:
@@ -573,6 +646,8 @@ async def dashboard(
             "notes_indexed": notes_count,
             "notes_with_embeddings": notes_with_embeddings,
             "embedding_pct": embedding_pct,
+            "notes_pending": notes_pending,
+            "notes_chunks_truncated": notes_chunks_truncated,
             "active_keys": keys_count,
             "requests_today": requests_today,
         },
@@ -2157,6 +2232,51 @@ async def _pass_lock_without_a_connection(session: AsyncSession):
         yield
 
 
+async def _record_embedding_fingerprint(
+    fresh: AsyncSession, request: Request | None
+) -> bool:
+    """Record the current embedding fingerprint in `fresh`'s transaction.
+
+    Returns True when it was recorded, False when it was not — in which case
+    the transaction has been rolled back, the operator has a flash error, and
+    the caller must abandon the reset rather than commit half of it.
+
+    **This one write is not instrumentation and is not swallowed** (design
+    D7d). The "recording never fails the operation" rule covers the run history
+    and the rotation cursor, where a lost write costs an operator a view. A
+    fingerprint is the claim a later startup *refuses* on: a reset that wiped
+    the column and then swallowed a failed record would leave the stored value
+    naming the **previous** configuration over rows about to be built under the
+    new one, and every later startup would be silent about it. So the failure
+    rolls the wipe back too — the vault keeps the vectors it had, which is a
+    recoverable state, instead of losing them under a lying fingerprint, which
+    is not.
+
+    The caller has already taken `acquire_generation_lock(fresh)` as the first
+    statement of this transaction, so the value written here cannot be
+    interleaved with another process's.
+    """
+    try:
+        await set_state(fresh, KEY_EMBEDDING_FINGERPRINT, embedding_fingerprint())
+    except Exception:
+        logger.exception(
+            "Embedding reset aborted: the fingerprint could not be recorded. "
+            "Nothing was wiped; the stored fingerprint is unchanged."
+        )
+        try:
+            await fresh.rollback()
+        except Exception:
+            logger.exception("Rollback after the failed fingerprint record failed")
+        flash(
+            request,
+            "Reset aborted: the embedding fingerprint could not be recorded, "
+            "so nothing was changed. Check the server logs and retry.",
+            ERR,
+        )
+        return False
+    return True
+
+
 @router.post("/settings/reindex")
 async def trigger_reindex(
     request: Request,
@@ -2184,6 +2304,7 @@ async def reembed_confirm_page(
 @router.post("/settings/reembed")
 async def trigger_reembed(
     token: str = Form(...),
+    request: Request = None,
     session: AsyncSession = Depends(get_session),
     user=Depends(require_admin_panel),
 ):
@@ -2199,6 +2320,15 @@ async def trigger_reembed(
     with _pause_indexer():
         async with _pass_lock_without_a_connection(session):
             async with async_session() as fresh:
+                # The generation lock, first — before the DELETE takes a single
+                # row or table lock. Two different locks are held here and both
+                # are needed: `index_pass_lock` (taken above) is **process-
+                # local** and stops *this* container's pass; the advisory lock
+                # is **cross-process** and stops another container's. The reset
+                # workflow deliberately runs as a one-off `docker compose run`
+                # against a live service (#142), so the process-local lock
+                # excludes nobody that matters.
+                await acquire_generation_lock(fresh)
                 await fresh.execute(delete(NoteEmbedding))
                 # Deleting the vectors is not enough: `embed_vault` selects
                 # notes whose `embedded_content_hash` differs from
@@ -2209,6 +2339,13 @@ async def trigger_reembed(
                 await fresh.execute(
                     update(NoteMetadata).values(embedded_content_hash=None)
                 )
+                # And the fingerprint, in that same locked transaction. This
+                # path wipes every vector, so the rows the next startup will
+                # verify are the rows the *current* configuration is about to
+                # produce — recording it anywhere else, or in a transaction of
+                # its own, reintroduces the window the lock exists to close.
+                if not await _record_embedding_fingerprint(fresh, request):
+                    return RedirectResponse("/admin/settings", status_code=303)
                 await fresh.commit()
 
     _spawn(_reindex_background())
@@ -2236,9 +2373,32 @@ async def reset_embeddings(
     # completes; semantic_search falls back to a sequential scan. See issue #6.
     hnsw = dim <= 2000
 
+    recorded = True
     with _pause_indexer():
         async with _pass_lock_without_a_connection(session):
             async with async_session() as fresh:
+                # The generation lock is the **first** statement of this
+                # transaction — before `SET LOCAL statement_timeout`, and long
+                # before the DROP INDEX takes a table lock. Two reasons, and
+                # both are load-bearing:
+                #
+                #  * "advisory before any row or table lock" is one direction
+                #    everywhere (design D7c), so the new lock cannot close a
+                #    cycle with the row locks the index pass already holds;
+                #  * the wait here is *meant* to be long. It is a wait for an
+                #    in-flight pass in another container to commit, and the
+                #    maintenance paths must not defeat it with a short timeout.
+                #    `statement_timeout` would apply to this statement too, so
+                #    it is set only afterwards, over the destructive DDL it was
+                #    written for.
+                #
+                # This is a different lock from the `index_pass_lock` taken
+                # above and both are needed: that one is process-local and
+                # stops *this* process's pass; this one is cross-process and
+                # stops another container's, which is the whole hole — the
+                # reset is designed to run as a one-off container while the
+                # service is still up (#142).
+                await acquire_generation_lock(fresh)
                 await fresh.execute(text("SET LOCAL statement_timeout = '5min'"))
                 await fresh.execute(
                     text("DROP INDEX IF EXISTS ix_note_embeddings_embedding_hnsw")
@@ -2262,16 +2422,37 @@ async def reset_embeddings(
                         )
                     )
                 else:
+                    # Already conditional on the configured dimension, and it
+                    # stays that way: pgvector refuses an HNSW index above 2000
+                    # dims, so an unconditional CREATE would abort the whole
+                    # reset on a deployment configured above the limit (#6).
                     logger.warning(
                         "Skipping HNSW index: embedding_dimensions=%d exceeds "
                         "pgvector's 2000-dim HNSW limit; semantic_search will "
                         "use a sequential scan.",
                         dim,
                     )
-                await fresh.commit()
+                # The fingerprint, in the same locked transaction as the wipe:
+                # the configuration this reset commits to is the configuration
+                # the next startup verifies against. A failure here rolls the
+                # wipe back rather than being swallowed.
+                recorded = await _record_embedding_fingerprint(fresh, request)
+                if recorded:
+                    await fresh.commit()
         # The pre-warm caches whether an HNSW index exists; this route is the
-        # one place that changes the answer.
+        # one place that changes the answer. Invalidated on the abandoned path
+        # too: the DDL above is transactional and the rollback undid it, so the
+        # cached answer is right again — re-probing costs one query and being
+        # wrong here costs a dropped index nobody notices.
         invalidate_hnsw_index_cache()
+
+    if not recorded:
+        if "application/json" in request.headers.get("accept", ""):
+            return JSONResponse(
+                {"status": "error", "detail": "fingerprint not recorded"},
+                status_code=500,
+            )
+        return RedirectResponse("/admin/settings", status_code=303)
 
     _spawn(_reindex_background())
 
@@ -2285,16 +2466,28 @@ async def reset_progress(
     session: AsyncSession = Depends(get_session),
     user=Depends(require_admin_panel),
 ):
-    """Return re-embedding progress (notes still pending) for dashboard polling."""
+    """Return re-embedding progress (notes still pending) for dashboard polling.
+
+    **Admin-only and unscoped, deliberately.** It is the poller behind a
+    whole-database reset, so "how much is left" is a question about the whole
+    table; the dashboard's counterpart is scoped to the viewer instead. The two
+    scopes differ on purpose — the *definition* of pending must not, so the
+    predicate comes from `_vectors_not_current()` and is written down once.
+
+    The response keys and their values are unchanged. `pending` is now counted
+    directly rather than derived, and `embedded` derived from it rather than
+    counted; the two queries are exact complements over this table
+    (`content_hash` is NOT NULL, and `IS DISTINCT FROM` is total where `=` was
+    three-valued), so every previously reported figure is the figure still
+    reported. Counting `pending` is what lets the shared predicate be the one
+    that runs here, which is the whole point of writing it down once.
+    """
     total = (await session.execute(select(func.count(NoteMetadata.id)))).scalar() or 0
-    embedded = (await session.execute(
-        text(
-            "SELECT count(*) FROM notes_metadata "
-            "WHERE embedded_content_hash IS NOT NULL "
-            "AND embedded_content_hash = content_hash"
-        )
+    pending = (await session.execute(
+        select(func.count(NoteMetadata.id)).where(_vectors_not_current())
     )).scalar() or 0
-    pending = max(0, total - embedded)
+    pending = max(0, min(int(total), int(pending)))
+    embedded = max(0, int(total) - pending)
     return JSONResponse({
         "paused": indexer_paused,
         "total": int(total),
