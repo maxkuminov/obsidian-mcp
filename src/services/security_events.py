@@ -130,6 +130,32 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "panel_session_revocation_failed": frozenset(
         {"reason", "user_id_session", "error_type", "route", "client_ip"}
     ),
+    # ── The self-service password change (#197) ──
+    #
+    # Emitted **after** the commit that made it true, and never carrying a
+    # password, a hash or a session identifier in any field — the account these
+    # records name is the one whose credential just moved, so a record that
+    # leaked any part of it would be the worst line in the file.
+    "panel_password_changed": frozenset({"user_id", "username", "client_ip", "route"}),
+    # `reason` says which rule refused, never anything about the stored
+    # password: the two credential branches (`wrong_current_password` and
+    # `same_as_current`) are distinguished *here* for the operator while the
+    # caller is told one constant message, which is the whole point of
+    # separating the record from the response.
+    "panel_password_change_refused": frozenset(
+        {"reason", "user_id", "client_ip", "route"}
+    ),
+    # The mint that follows a committed password change and did not happen. The
+    # change is **not** rolled back — it is the durable half — so this records
+    # a user who is signed out holding a new password, which is a recoverable
+    # state an operator should still see. Modelled on
+    # `panel_session_revocation_failed`, including its rule: **no `exc_info`
+    # and no `str(exc)`**, only the class name, because a SQLAlchemy error
+    # renders the failing statement *and its bound parameters*, one of which on
+    # this path is a stored session hash.
+    "panel_session_reissue_failed": frozenset(
+        {"reason", "user_id", "error_type", "route", "client_ip"}
+    ),
     # ── OAuth (Slice B) ──
     "oauth_token_issued": frozenset(
         {"client_id", "user_id", "grant_id", "scope", "client_ip", "reason"}

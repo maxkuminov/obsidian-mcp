@@ -885,6 +885,19 @@
                 </svg>
                 OAuth
             </a>
+            {# The signed-in user's own account (#197) — every panel user, not
+               just admins. Gated on `multi_user_mode` like the Users link:
+               in single-user mode there is no account row and no local
+               password, and both the page and its handler answer 404 there. #}
+            {% if multi_user_mode %}
+            <a href="/admin/account" class="nav-item {% if active == 'account' %}active{% endif %}">
+                <svg class="nav-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                    <circle cx="8" cy="5.5" r="2.8"/>
+                    <path d="M2.5 14c0-2.8 2.4-4.8 5.5-4.8s5.5 2 5.5 4.8"/>
+                </svg>
+                Account
+            </a>
+            {% endif %}
 
             <div class="nav-section">Content</div>
             <a href="/admin/vault" class="nav-item {% if active == 'vault' %}active{% endif %}">
