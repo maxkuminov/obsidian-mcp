@@ -49,6 +49,7 @@ from src.control_panel.routes import (
 from src.csrf import verify_csrf
 from src.database import get_session
 from src.models.db import APIKey, NoteMetadata, UsageLog, User
+from src.oauth.grants import ACCOUNT_GUARD_LOCK_KEY
 from src.services import security_events
 from src.services.vault import clear_user_vault_cache, validate_vault_root_path
 
@@ -126,8 +127,12 @@ _USERNAME_RE = __import__("re").compile(r"^[a-z0-9_]{1,64}$")
 #
 # The value is arbitrary but must never change: it is the *name* of the
 # critical section, and two builds using different constants would not
-# exclude each other during a rolling restart.
-_ADMIN_GUARD_LOCK_KEY = 7_842_119_530_461_007
+# exclude each other during a rolling restart. It now lives in
+# `src/oauth/grants.py` — beside this codebase's other advisory-lock
+# primitives, and importable from `src/control_panel/routes.py` and
+# `src/auth/session.py`, which need the same key and cannot import this
+# module. **The value is unchanged**; only where it is written down moved.
+_ADMIN_GUARD_LOCK_KEY = ACCOUNT_GUARD_LOCK_KEY
 
 
 async def _lock_admin_guard(session: AsyncSession) -> None:

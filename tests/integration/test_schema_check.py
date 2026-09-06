@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "023"
+HEAD_REVISION = "024"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -4468,3 +4468,451 @@ def test_downgrade_023_refuses_a_column_it_did_not_create():
         assert "023's comment marker" in result.stdout + result.stderr
         assert column_shape(url, "notes_metadata", "chunks_truncated") is not None
         assert fetchval(url, "SELECT to_regclass('indexer_state')") is not None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 024 — user_sessions, the panel session registry (#198)
+# ══════════════════════════════════════════════════════════════════════════
+
+USER_SESSIONS_MARKER = "one row per panel browser session (024_user_sessions)"
+
+SESSIONS_USER_INDEX = "ix_user_sessions_user_id"
+SESSIONS_EXPIRES_INDEX = "ix_user_sessions_expires_at"
+
+# The whole shape, in creation order, as PostgreSQL 16 prints it. Mirrored from
+# the migration's `EXPECTED_COLUMNS` and asserted independently here so a
+# reviewer reading the gate sees the table the registry actually runs against
+# rather than being told the migration agrees with itself.
+USER_SESSIONS_COLUMNS = (
+    ("id", "character varying(64)", True),
+    ("user_id", "integer", True),
+    ("created_at", "timestamp with time zone", True),
+    ("last_seen_at", "timestamp with time zone", True),
+    ("expires_at", "timestamp with time zone", True),
+    ("revoked_at", "timestamp with time zone", False),
+    ("user_agent_hash", "character varying(64)", False),
+)
+
+# 024's DDL, written out so the refusal cases can stand a *foreign* table of
+# this name up and mutate exactly one thing about it. Deliberately not derived
+# from the migration: a case that built its impostor by importing the
+# migration's own definition would move with the migration and stop being
+# adversarial.
+USER_SESSIONS_DDL = (
+    "CREATE TABLE user_sessions ("
+    " id varchar(64) PRIMARY KEY,"
+    " user_id integer NOT NULL REFERENCES users(id) ON DELETE CASCADE,"
+    " created_at timestamptz NOT NULL DEFAULT now(),"
+    " last_seen_at timestamptz NOT NULL,"
+    " expires_at timestamptz NOT NULL,"
+    " revoked_at timestamptz,"
+    " user_agent_hash varchar(64))"
+)
+
+
+def user_sessions_comment(url):
+    return fetchval(
+        url,
+        "SELECT obj_description(c.oid, 'pg_class') FROM pg_class c "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "WHERE c.relname = 'user_sessions' AND c.relkind = 'r' "
+        "  AND n.nspname = ANY (current_schemas(false))",
+    )
+
+
+def user_sessions_columns(url):
+    rows = fetch(
+        url,
+        "SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS coltype, "
+        "       a.attnotnull "
+        "FROM pg_attribute a "
+        "WHERE a.attrelid = 'public.user_sessions'::regclass "
+        "  AND a.attnum > 0 AND NOT a.attisdropped "
+        "ORDER BY a.attnum",
+    )
+    return [(r["attname"], r["coltype"], r["attnotnull"]) for r in rows]
+
+
+def user_sessions_fk(url):
+    """`(local, referenced_table, referenced_columns, delete, update, valid)`.
+
+    The delete action is read from `pg_constraint.confdeltype`, never by
+    constraint name, and the *referent* is read with it: an FK of the right
+    name and the right delete action pointing at another table would bind
+    browser sessions to somebody else's rows while satisfying every name-level
+    check.
+    """
+    rows = fetch(
+        url,
+        "SELECT (SELECT array_agg(a.attname ORDER BY k.ord) "
+        "          FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          JOIN pg_attribute a ON a.attrelid = c.conrelid "
+        "                             AND a.attnum = k.attnum) AS local_columns, "
+        "       c.confrelid::regclass::text AS referenced_table, "
+        "       (SELECT array_agg(a.attname ORDER BY k.ord) "
+        "          FROM unnest(c.confkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          JOIN pg_attribute a ON a.attrelid = c.confrelid "
+        "                             AND a.attnum = k.attnum) AS referenced_columns, "
+        "       c.confdeltype::text, c.confupdtype::text, c.convalidated "
+        "FROM pg_constraint c "
+        "WHERE c.conrelid = 'public.user_sessions'::regclass AND c.contype = 'f'",
+    )
+    return [tuple(r) for r in rows]
+
+
+def user_sessions_index_columns(url, name):
+    return fetchval(
+        url,
+        "SELECT array_agg(a.attname ORDER BY k.ord) "
+        "FROM pg_index i JOIN pg_class ic ON ic.oid = i.indexrelid "
+        "     CROSS JOIN unnest(string_to_array(i.indkey::text, ' ')) "
+        "                WITH ORDINALITY AS k(attnum, ord) "
+        "     JOIN pg_attribute a ON a.attrelid = i.indrelid "
+        "                        AND a.attnum = k.attnum::smallint "
+        "WHERE i.indrelid = 'public.user_sessions'::regclass AND ic.relname = $1 "
+        "GROUP BY ic.relname",
+        name,
+    )
+
+
+def user_sessions_pk_columns(url):
+    return fetchval(
+        url,
+        "SELECT (SELECT array_agg(a.attname ORDER BY k.ord) "
+        "          FROM unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+        "          JOIN pg_attribute a ON a.attrelid = c.conrelid "
+        "                             AND a.attnum = k.attnum) "
+        "FROM pg_constraint c "
+        "WHERE c.conrelid = 'public.user_sessions'::regclass AND c.contype = 'p'",
+    )
+
+
+def insert_session(url, session_id, user_id, *, expires=None, revoked=None):
+    """One `user_sessions` row, shaped the way `start_session` writes it."""
+    sql(
+        url,
+        "INSERT INTO user_sessions "
+        "(id, user_id, last_seen_at, expires_at, revoked_at, user_agent_hash) "
+        "VALUES ($1, $2, now(), $3, $4, $5)",
+        session_id,
+        user_id,
+        expires or FUTURE,
+        revoked,
+        "u" * 64,
+    )
+
+
+def refuse_024(url, *, must_mention):
+    """Stamp back to 023, re-run 024, require a refusal, return the message.
+
+    Stamping back is what makes this adversarial rather than theatrical: it is
+    the same path `make test-schema` exercises for idempotence, so a shape
+    waved through here would be waved through on a real database somebody had
+    altered.
+    """
+    _harness.run_alembic(url, "stamp", "023", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "024 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "023", "nothing should have been recorded"
+    return combined
+
+
+def test_024_creates_the_registry_it_promises():
+    with throwaway_db("schema_sessions_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+
+        assert fetchval(url, "SELECT to_regclass('public.user_sessions')") is not None
+        assert user_sessions_comment(url) == USER_SESSIONS_MARKER
+        assert user_sessions_columns(url) == list(USER_SESSIONS_COLUMNS)
+        assert list(user_sessions_pk_columns(url) or []) == ["id"], (
+            "the primary key must be on `id`: two rows claiming one session "
+            "identifier hash would leave validation authorizing against an "
+            "arbitrary one of them"
+        )
+
+        # `'c'` is CASCADE. Read from the catalog with the referent, never by
+        # constraint name — the cascade is the entire mechanism by which a
+        # permanent user delete removes that user's sessions, because
+        # `User.sessions` declares `passive_deletes=True` and no handler code
+        # does it instead.
+        assert user_sessions_fk(url) == [
+            (["user_id"], "users", ["id"], "c", "a", True)
+        ]
+
+        assert user_sessions_index_columns(url, SESSIONS_USER_INDEX) == ["user_id"]
+        assert user_sessions_index_columns(url, SESSIONS_EXPIRES_INDEX) == ["expires_at"]
+
+        # The created_at default is asserted here or nowhere: `alembic check`
+        # does not compare server defaults at all.
+        assert column_shape(url, "user_sessions", "created_at") == (
+            True,
+            "timestamp with time zone",
+            "now()",
+        )
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+        assert "No new upgrade operations detected" in check.stdout
+
+
+def test_024_chains_from_023_and_023_is_applied_first():
+    """The stated merge precondition, asserted rather than assumed: 024 must
+    not migrate ahead of the sibling `index-integrity-hardening` migration."""
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+
+    assert script.get_current_head() == HEAD_REVISION
+    assert script.get_revision("024").down_revision == "023"
+
+    ordered = [rev.revision for rev in script.walk_revisions("base", "024")]
+    assert ordered.index("023") > ordered.index("024"), (
+        "walk_revisions yields newest-first, so 023 must appear after 024 — "
+        "i.e. 023 is applied before it"
+    )
+
+
+def test_024_writes_no_rows():
+    """There is nothing to backfill *from*: a session that predates the table
+    has no identifier the registry could resolve, and inventing rows for the
+    cookies currently in flight would grandfather exactly the credentials this
+    change exists to invalidate."""
+    with throwaway_db("schema_sessions_backfill", revision="023") as url:
+        insert_user(url, 1, "alice")
+        insert_user(url, 2, "bob")
+        assert fetchval(url, "SELECT to_regclass('public.user_sessions')") is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT count(*) FROM user_sessions") == 0
+        # And the users it could have invented rows for are untouched.
+        assert fetchval(url, "SELECT count(*) FROM users") == 2
+
+
+def test_deleting_a_user_cascades_their_sessions():
+    """The cascade is the mechanism, not a safety net: `User.sessions` declares
+    `passive_deletes=True`, so nothing in the handler deletes these rows and a
+    missing cascade would leave live sessions bound to a user that no longer
+    exists — or block the delete outright."""
+    with throwaway_db("schema_sessions_cascade") as url:
+        insert_user(url, 1, "alice")
+        insert_user(url, 2, "bob")
+        insert_session(url, "a" * 64, 1)
+        insert_session(url, "b" * 64, 1, revoked=FUTURE)
+        insert_session(url, "c" * 64, 2)
+
+        sql(url, "DELETE FROM users WHERE id = 1")
+
+        assert [
+            r["id"] for r in fetch(url, "SELECT id FROM user_sessions ORDER BY id")
+        ] == ["c" * 64]
+
+
+def test_rerunning_024_preserves_live_sessions():
+    """Stamp-back idempotence, the shape the gate itself performs: the
+    migration body genuinely re-executes. Its reconciliation path writes and
+    deletes nothing, so a gate exercise — or a re-run on a real database —
+    cannot silently sign every logged-in user out."""
+    with throwaway_db("schema_sessions_rerun", revision="023") as url:
+        insert_user(url, 1, "alice")
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        insert_session(url, "a" * 64, 1)
+        insert_session(url, "b" * 64, 1, revoked=FUTURE)
+
+        _harness.run_alembic(url, "stamp", "023", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        rows = fetch(
+            url,
+            "SELECT id, user_id, revoked_at IS NULL AS live "
+            "FROM user_sessions ORDER BY id",
+        )
+        assert [(r["id"], r["user_id"], r["live"]) for r in rows] == [
+            ("a" * 64, 1, True),
+            ("b" * 64, 1, False),
+        ]
+        assert user_sessions_comment(url) == USER_SESSIONS_MARKER
+
+
+def test_024_refuses_a_foreign_table_of_its_name():
+    """013's philosophy: reconcile a database that demonstrably has our shape,
+    refuse to guess for one that does not. A same-named table somebody else
+    created is not the table every panel request resolves its session out of.
+    """
+    with throwaway_db("schema_sessions_foreign", revision="023") as url:
+        sql(url, USER_SESSIONS_DDL)
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0, "024 should have refused"
+        combined = result.stdout + result.stderr
+        assert "024's comment marker" in combined, combined
+        assert alembic_version(url) == "023", "nothing should have been recorded"
+        # And the impostor is untouched — nothing was adopted or repaired.
+        assert user_sessions_comment(url) is None
+        assert user_sessions_index_columns(url, SESSIONS_USER_INDEX) is None
+
+
+def test_024_refuses_a_foreign_key_that_does_not_cascade():
+    """The adversarial case a marker-and-name check adopts. Everything else is
+    024's: its marker, its columns, its indexes. Only the delete action moved —
+    and with it the promise that a permanent user delete removes that user's
+    sessions. `SET NULL` against a NOT NULL column would fail the delete
+    outright; `NO ACTION` would leave the rows behind."""
+    with throwaway_db("schema_sessions_fk_action") as url:
+        constraint = fetchval(
+            url,
+            "SELECT conname FROM pg_constraint "
+            "WHERE conrelid = 'public.user_sessions'::regclass AND contype = 'f'",
+        )
+        sql(url, f"ALTER TABLE user_sessions DROP CONSTRAINT {constraint}")
+        sql(
+            url,
+            f"ALTER TABLE user_sessions ADD CONSTRAINT {constraint} "
+            "FOREIGN KEY (user_id) REFERENCES users(id)",
+        )
+        combined = refuse_024(url, must_mention=["deletes with", "CASCADE"])
+        assert "user_id foreign key" in combined
+
+
+def test_024_refuses_a_foreign_key_pointing_at_another_table():
+    """Only the *referent* moved, and with it the meaning of every session the
+    registry holds."""
+    with throwaway_db("schema_sessions_fk_target") as url:
+        constraint = fetchval(
+            url,
+            "SELECT conname FROM pg_constraint "
+            "WHERE conrelid = 'public.user_sessions'::regclass AND contype = 'f'",
+        )
+        sql(url, f"ALTER TABLE user_sessions DROP CONSTRAINT {constraint}")
+        sql(
+            url,
+            f"ALTER TABLE user_sessions ADD CONSTRAINT {constraint} "
+            "FOREIGN KEY (user_id) REFERENCES api_keys(id) ON DELETE CASCADE",
+        )
+        refuse_024(url, must_mention=["references", "api_keys"])
+
+
+def test_024_refuses_a_missing_index():
+    with throwaway_db("schema_sessions_missing_index") as url:
+        sql(url, f"DROP INDEX {SESSIONS_EXPIRES_INDEX}")
+        refuse_024(url, must_mention=[f"missing index {SESSIONS_EXPIRES_INDEX}"])
+
+
+def test_024_refuses_an_index_of_its_name_on_another_column():
+    """A name is not a definition. Recreated on `revoked_at`, the index keeps
+    the name an existence check looks for while the purge's range scan over
+    `expires_at` has nothing to lean on."""
+    with throwaway_db("schema_sessions_wrong_index") as url:
+        sql(url, f"DROP INDEX {SESSIONS_EXPIRES_INDEX}")
+        sql(url, f"CREATE INDEX {SESSIONS_EXPIRES_INDEX} ON user_sessions (revoked_at)")
+        refuse_024(url, must_mention=[SESSIONS_EXPIRES_INDEX, "revoked_at"])
+
+
+def test_024_refuses_a_partial_index_of_its_name():
+    """`WHERE revoked_at IS NULL` reads as an optimisation and silently
+    excludes exactly the rows the purge exists to remove."""
+    with throwaway_db("schema_sessions_partial_index") as url:
+        sql(url, f"DROP INDEX {SESSIONS_EXPIRES_INDEX}")
+        sql(
+            url,
+            f"CREATE INDEX {SESSIONS_EXPIRES_INDEX} ON user_sessions (expires_at) "
+            "WHERE revoked_at IS NULL",
+        )
+        refuse_024(url, must_mention=["partial-or-expression=True"])
+
+
+def test_024_refuses_a_missing_column():
+    """A partial shape carrying 024's marker: everything else agrees, and the
+    column the forensic record lives in is simply gone."""
+    with throwaway_db("schema_sessions_missing_column") as url:
+        sql(url, "ALTER TABLE user_sessions DROP COLUMN user_agent_hash")
+        refuse_024(url, must_mention=["its columns are"])
+
+
+def test_024_refuses_a_nullable_expiry():
+    """A nullable `expires_at` is a session with no expiry at all — the
+    absolute seven-day bound is the tighter half of the pair the cookie's own
+    sliding age cannot be trusted for."""
+    with throwaway_db("schema_sessions_nullable_expiry") as url:
+        sql(url, "ALTER TABLE user_sessions ALTER COLUMN expires_at DROP NOT NULL")
+        refuse_024(url, must_mention=["its columns are"])
+
+
+def test_024_refuses_a_missing_primary_key():
+    """`alembic check` does not compare primary keys, so a table of the right
+    columns with none reports as being in perfect agreement with the model —
+    while two rows could claim one session-identifier hash and validation reads
+    exactly one row per hash."""
+    with throwaway_db("schema_sessions_no_pk") as url:
+        constraint = fetchval(
+            url,
+            "SELECT conname FROM pg_constraint "
+            "WHERE conrelid = 'public.user_sessions'::regclass AND contype = 'p'",
+        )
+        sql(url, f"ALTER TABLE user_sessions DROP CONSTRAINT {constraint}")
+        refuse_024(url, must_mention=["no primary key at all"])
+
+
+def test_024_refuses_a_tampered_created_at_default():
+    """The quietest drift this table has, and the one `alembic check` is blind
+    to: every column, type, constraint and index stays exactly as 024 made
+    them while the recorded age of every session minted afterwards is wrong."""
+    with throwaway_db("schema_sessions_default") as url:
+        sql(
+            url,
+            "ALTER TABLE user_sessions ALTER COLUMN created_at "
+            "SET DEFAULT now() - interval '100 years'",
+        )
+        refuse_024(url, must_mention=["created_at default"])
+
+
+def test_a_refusal_leaves_a_seeded_registry_intact():
+    """The refusal is atomic and writes nothing: an operator who hits it still
+    has every row, and every logged-in user is still logged in."""
+    with throwaway_db("schema_sessions_refusal_rows") as url:
+        insert_user(url, 1, "alice")
+        insert_session(url, "a" * 64, 1)
+        sql(url, f"DROP INDEX {SESSIONS_USER_INDEX}")
+        refuse_024(url, must_mention=[f"missing index {SESSIONS_USER_INDEX}"])
+        assert fetchval(url, "SELECT count(*) FROM user_sessions") == 1
+
+
+def test_downgrade_024_drops_the_marked_table_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_sessions_downgrade") as url:
+        _harness.run_alembic(url, "downgrade", "023", dimensions=DIM)
+        assert alembic_version(url) == "023"
+        assert fetchval(url, "SELECT to_regclass('public.user_sessions')") is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert user_sessions_comment(url) == USER_SESSIONS_MARKER
+        assert user_sessions_index_columns(url, SESSIONS_USER_INDEX) == ["user_id"]
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_024_refuses_a_table_it_did_not_create():
+    """013's rule on the way back down: undo *this* migration, not delete
+    somebody else's table of the same name."""
+    with throwaway_db("schema_sessions_downgrade_foreign") as url:
+        sql(url, "COMMENT ON TABLE user_sessions IS 'somebody else made this'")
+        result = _harness.run_alembic(
+            url, "downgrade", "023", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "024's comment marker" in result.stdout + result.stderr
+        assert fetchval(url, "SELECT to_regclass('public.user_sessions')") is not None
+        assert alembic_version(url) == HEAD_REVISION

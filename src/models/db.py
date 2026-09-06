@@ -194,6 +194,19 @@ class User(Base):
     notes: Mapped[list["NoteMetadata"]] = relationship(
         back_populates="user", cascade="all, delete-orphan", passive_deletes=True
     )
+    # `passive_deletes=True` for the same reason as the four above, and here it
+    # is the *only* thing that makes migration 024's `ON DELETE CASCADE` the
+    # mechanism that fires. Without it SQLAlchemy would SELECT every session
+    # row of the user being deleted and emit a DELETE per row — or, worse, try
+    # `UPDATE user_sessions SET user_id = NULL`, which a NOT NULL column
+    # rejects outright. The ORM would then be doing the cascade the schema
+    # declares, so a divergence between the two would go unnoticed until the
+    # ORM path was removed. `tests/test_issue_198_session_revocation.py`
+    # exercises the permanent delete through the real handler for exactly that
+    # reason.
+    sessions: Mapped[list["UserSession"]] = relationship(
+        back_populates="user", cascade="all, delete", passive_deletes=True
+    )
 
 
 # Migration 020's ownership marker for `api_keys.daily_request_limit` (#162).
@@ -1056,4 +1069,113 @@ class BackupLog(Base):
         # reads the same one on every render.
         Index("ix_backups_log_created_at", "created_at"),
         {"comment": _BACKUPS_LOG_TABLE_MARKER},
+    )
+
+
+# Migration 024's ownership marker for `user_sessions`, mirrored here for the
+# reason 019's, 020's and 021's are: `alembic check` compares a table comment,
+# so a marker that drifted from the migration keying on it is a dirty check
+# rather than a `downgrade()` that has quietly stopped recognising its own
+# work. Keep byte identical to `MARKER` in
+# `alembic/versions/024_user_sessions.py`.
+_USER_SESSIONS_TABLE_MARKER = "one row per panel browser session (024_user_sessions)"
+
+
+class UserSession(Base):
+    """One row per panel browser session (migration 024, #198).
+
+    **Why the registry exists at all.** Before it, `logout()` called
+    `request.session.clear()` and nothing else. Starlette answers that with an
+    expiring `Set-Cookie`, but the cookie already in an attacker's hands stays
+    a correctly-signed credential until its itsdangerous timestamp passes
+    `session_max_age` — seven days of durable panel access after the user
+    believed they had signed out, and the panel mints `readwrite` API keys and
+    approves OAuth grants. A signed cookie cannot be un-signed; only a
+    server-side row can be revoked, so the row is the thing revocation acts on.
+
+    **`id` is the SHA-256 hex of the cookie's identifier, never the identifier
+    itself.** The identifier (`secrets.token_urlsafe(32)`, written into the
+    signed cookie under `sid`) *is* a bearer credential for seven days. A
+    `pg_dump` of this database is taken before every migration and kept for
+    thirty days, and the invariant `docs/architecture/schema-and-migrations.md`
+    records is that a dump holds hashes and no plaintext credential. Storing
+    the identifier verbatim would make every retained dump a file full of live
+    panel sessions. The column is therefore byte for byte the shape
+    `api_keys.key_hash` and `transfer_tokens` already use, and the digest is
+    unkeyed on purpose: 256 bits of CSPRNG output has nothing to brute-force,
+    while keying it with `SECRET_KEY` would make the whole table unreadable
+    after a rotation an operator may need to perform.
+
+    **`expires_at` is absolute and never extended.** Starlette re-signs the
+    cookie on any response that modifies the session, so the cookie's own age
+    effectively slides; making the row the *tighter* bound means the pair can
+    never disagree in the dangerous direction. A session used daily and
+    therefore never expiring is precisely the durable access #198 is about.
+
+    **`last_seen_at` is telemetry and nothing authorizes on it.** It is written
+    at most once per `SESSION_TOUCH_INTERVAL_SECONDS` and only on safe methods,
+    on the request's own database session — never a second one, because a
+    second `AsyncSession` holds two pool leases for the life of the request and
+    the pool tops out at fifteen.
+
+    **`user_agent_hash` is recorded and never enforced.** It is useful when
+    reconstructing an incident and worthless as a binding: whoever stole the
+    cookie also has the header, and enforcing it signs users out on every
+    browser auto-update — training them to re-authenticate after an
+    unexplained logout, which is the habit phishing depends on.
+
+    `revoked_at` is set rather than the row deleted, so an operator can still
+    see *that* a session was ended and when. The purge in
+    `cleanup_expired_tokens` keeps a row until the retention window past the
+    **later** of its expiry and its revocation: an administrative reset revokes
+    every unrevoked row of a user including already-expired ones, and an
+    `expires_at`-only predicate would delete the record of that revocation on
+    the next tick, minutes after the operator performed it.
+    """
+
+    __tablename__ = "user_sessions"
+
+    # 024's ownership marker, reachable from the class so a caller checking
+    # model/migration agreement names the table it is checking. `ClassVar` is
+    # what keeps the declarative mapper from reading it as a column.
+    _TABLE_MARKER: ClassVar[str] = _USER_SESSIONS_TABLE_MARKER
+
+    # `sha256(sid).hexdigest()` — 64 hex characters, fixed width, and never the
+    # identifier the cookie carries. See the class docstring.
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # `ON DELETE CASCADE` is load-bearing rather than tidy: a permanent user
+    # delete removes that user's sessions with no handler code at all, and
+    # `User.sessions` declares `passive_deletes=True` so the database cascade is
+    # what actually fires. Indexed because every revocation is
+    # `WHERE user_id = :u AND revoked_at IS NULL`.
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Written at mint alongside `created_at`, then touched at most once per
+    # interval. NOT NULL: a NULL here would read as "never seen", which is not
+    # a state a minted session can be in.
+    last_seen_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    expires_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    # NULL means live. Set once — every revocation carries
+    # `AND revoked_at IS NULL`, so a second revocation does not rewrite a
+    # historical revocation time.
+    revoked_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    user_agent_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    user: Mapped["User"] = relationship(back_populates="sessions")
+
+    __table_args__ = (
+        # The purge scans `WHERE expires_at < cutoff AND (revoked_at IS NULL OR
+        # revoked_at < cutoff)` on every indexer tick.
+        Index("ix_user_sessions_expires_at", "expires_at"),
+        {"comment": _USER_SESSIONS_TABLE_MARKER},
     )
