@@ -68,11 +68,30 @@ class _Session:
 
 
 class _Note:
-    def __init__(self, note_id=1, path="a.md"):
+    """A `notes_metadata` row, fresh and uncapped.
+
+    The two hashes are equal and `chunks_truncated` is False, so the staleness
+    and truncation annotations (#200, #202) are inert here — this file measures
+    phase timing, and every row it builds must read as an ordinary fresh hit.
+    Carrying the three attributes is also what lets the tool-surface slice land
+    without editing this file.
+    """
+
+    def __init__(
+        self,
+        note_id=1,
+        path="a.md",
+        content_hash="h",
+        embedded_content_hash="h",
+        chunks_truncated=False,
+    ):
         self.id = note_id
         self.file_path = path
         self.title = "a"
         self.tags = []
+        self.content_hash = content_hash
+        self.embedded_content_hash = embedded_content_hash
+        self.chunks_truncated = chunks_truncated
 
 
 class _Captured:
@@ -150,7 +169,7 @@ async def test_exact_fallback_is_recorded_when_it_fires(monkeypatch, captured):
                        "chunk_text": "x"})(),
         _Note(1, "B/a.md"),
         0.1,
-    )]
+    )]  # `_Note` is fresh and uncapped, so the annotations are inert here.
     monkeypatch.setattr(tools, "async_session", lambda: _Session([[], rows]))
 
     await tools.semantic_search_impl("needle", limit=5, folder="B/")
@@ -176,9 +195,15 @@ class _FindRelatedSession(_Session):
 
 @pytest.mark.asyncio
 async def test_find_related_logs_db_ms_only(monkeypatch, captured):
+    # The three trailing attributes are `find_related_stmt`'s widened
+    # projection (#200 / #202), pre-added so the tool slice lands against a
+    # fake that already carries them: equal hashes and no truncation, so this
+    # row is a fresh, uncapped neighbour and nothing here changes.
     row = type("R", (), {
         "note_id": 2, "file_path": "b.md", "title": "b", "tags": [],
         "chunk_text": "x", "embedding": [1.0, 0.0, 0.0], "distance": 0.1,
+        "content_hash": "h", "embedded_content_hash": "h",
+        "chunks_truncated": False,
     })()
     monkeypatch.setattr(
         tools,
