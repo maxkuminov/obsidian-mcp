@@ -4,6 +4,6 @@
 - [x] 4. Integrate request/auth lifetimes and bounded writer/tool admission with #263.
 - [x] 5. Update docs/settings and add real-PostgreSQL occupancy/outcome regressions.
 - [x] 6. Independent spec/defensive implementation reviews; resolve blocking findings.
-- [ ] 7. Combined offline/PostgreSQL/OpenSpec/audit/build/scan validation.
-- [ ] 8. Deploy default shadow mode, db-check, live owned-fixture MCP exercise and cleanup.
+- [x] 7. Combined offline/PostgreSQL/OpenSpec/audit/build/scan validation.
+- [x] 8. Deploy default shadow mode, db-check, live owned-fixture MCP exercise and cleanup.
 - [ ] 9. Archive completed changes and publish tested PR to main for #263/#261.

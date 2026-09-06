@@ -51,3 +51,31 @@ Every index/embed pass SHALL persist one `indexer_runs` row — start, finish, t
 - **WHEN** passes ran for two different users
 - **THEN** their run rows carry the respective user_id and displays distinguish them
 
+### Requirement: Body outcomes retain executed-work attribution
+The usage record SHALL retain body refusals and partial completions as executed
+work in latency and request accounting, distinct from pre-body refusals.
+
+#### Scenario: Refused body performed work
+- **WHEN** a body completes with a closed refusal marker
+- **THEN** the record SHALL remain eligible for existing latency statistics
+- **AND** the new body marker SHALL not enter the pre-body refusal predicate
+
+#### Scenario: Shadow concurrency and real failure coexist
+- **WHEN** an executed call has both a concurrency shadow observation and a real body refusal
+- **THEN** its real error marker and disposition SHALL be retained
+- **AND** shadow data SHALL not turn it into a pre-body refusal or a second actual request
+
+### Requirement: Actual slot refusals and shadow observations remain distinct
+Usage statistics SHALL classify enforced slot_timeout as pre-body and SHALL keep
+shadow observations separate from real outcomes and executed-work statistics.
+
+#### Scenario: Enforced refusal is coalesced
+- **WHEN** slot_timeout refusals are coalesced
+- **THEN** existing weighted refusal counts SHALL read their full represented count
+- **AND** their rows SHALL not enter body latency percentiles
+
+#### Scenario: Shadow pressure accompanies a body error
+- **WHEN** a call executes under shadow pressure and returns a typed #263 body refusal
+- **THEN** the row SHALL preserve that post-body error and remain one executed request
+- **AND** the shadow object SHALL not be interpreted as an actual slot refusal
+

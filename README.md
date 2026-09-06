@@ -979,7 +979,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `60` | Sustained vault-mutating calls per minute per principal — the eight write tools, plus `PUT /transfer/upload` charged to the principal that minted the capability. |
 | `MCP_WRITE_RATE_LIMIT_BURST` | `15` | Capacity of the write bucket. |
 | `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` | `10000` | Principals holding their own limiter entry before further ones share one overflow entry. |
-| `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one rate-refusal coalescing window stays open. Inside it a refusal writes nothing; the row that lands stands for `1 + suppressed` refusals. |
+| `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one rate/slot-refusal coalescing window stays open. Inside it a refusal writes nothing; the row that lands stands for `1 + suppressed` refusals. |
 | `MCP_CONCURRENCY_MODE` | `shadow` | `off`, `shadow`, or `enforce`. Shadow observes pressure without rejecting or waiting. See [Concurrency admission](#concurrency-admission). |
 | `MCP_CONCURRENCY_WAIT_SECONDS` | `0` | Tool admission wait in enforce mode, 0–5 seconds. Shadow requires zero. |
 | `MCP_CONCURRENCY_TOOLS` | `4` | Global tool ceiling in enforce mode, also subject to class, tenant (3), and principal (2) ceilings. |

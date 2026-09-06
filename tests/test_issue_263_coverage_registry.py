@@ -43,7 +43,7 @@ def test_every_registered_tool_has_inventory_and_live_behavioral_references():
     assert set(COVERAGE) == registered
     assert len(registered) == 25
     root = Path(__file__).resolve().parents[1]
-    inventory = (root / 'openspec/changes/typed-tool-outcomes/inventory.md').read_text()
+    inventory = (root / 'openspec/changes/archive/2026-09-06-typed-tool-outcomes/inventory.md').read_text()
     for tool, references in COVERAGE.items():
         implementation = 'search_notes_impl' if tool == 'keyword_search' else tool + '_impl'
         assert '### ' + implementation + ' ' in inventory
