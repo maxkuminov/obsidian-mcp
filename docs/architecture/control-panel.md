@@ -116,6 +116,11 @@
   is that everything inline is nonced. Their security headers must stay
   byte-identical once each response's per-request nonce is canonicalized.
 
+- The archived ops-health and usage-slicing sweep wrappers locate their
+  shared `colorscan` module by walking ancestors, then use its `repo_root()`
+  helper (#220). They must not assume a fixed `parents[N]` depth; archiving
+  changes that depth and previously broke the import before any scan ran.
+
 - **The sweep discovers its own templates now, and refuses to report a
   vacuous pass.** `checks/literal_sweep.py` in the light-mode change (under
   `openspec/changes/archive/`) is what proves "no color literal outside a

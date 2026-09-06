@@ -13,7 +13,7 @@ import posixpath
 import re
 import stat
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from functools import wraps
@@ -2592,7 +2592,8 @@ def _leaf_state_error(target, path: str, *, missing: str | None = None) -> str |
     return None
 
 
-def _pin_source_inode(target) -> tuple[int, int] | None:
+@contextmanager
+def _pin_source_inode(target):
     """`(dev, ino)` of the source, pinned through an `O_PATH|O_NOFOLLOW` fd.
 
     Taken *before* the rename. `O_PATH` opens the directory entry without
@@ -2607,19 +2608,25 @@ def _pin_source_inode(target) -> tuple[int, int] | None:
     """
     parent_fd = target.parent_fd
     if parent_fd is None:
-        return None
+        yield None
+        return
     flags = os.O_PATH | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
     try:
         fd = os.open(target.name, flags, dir_fd=parent_fd)
     except OSError:
-        return None
+        yield None
+        return
     try:
-        info = os.stat(fd)
-        return (info.st_dev, info.st_ino)
-    except OSError:
-        return None
+        try:
+            info = os.stat(fd)
+            identity = (info.st_dev, info.st_ino)
+        except OSError:
+            identity = None
+        # Keep the inode allocated until verification and any rollback end.
+        # A sampled number alone can be reused immediately after unlink.
+        yield identity
     finally:
-        os.close(fd)
+        vault_fs.close_quietly(fd, f"move source witness for {target.rel}")
 
 
 def _verify_the_moved_inode(
@@ -4955,17 +4962,17 @@ async def _move_note_locked(
             # Identify the source *before* the rename: `renameat2` moves
             # whichever inode is there when it runs, so this is the only chance
             # to know what we actually moved.
-            moved_inode = _pin_source_inode(src_target)
-            permit = move_file_no_clobber(
-                src_target, dst_target, confirmation=confirmation
-            )
-            # What actually arrived at the destination: our inode, and a
-            # regular file? Anything else is refused, and only our own inode is
-            # ever moved back — see `_verify_the_moved_inode`.
-            return _verify_the_moved_inode(
-                src_target, dst_target, moved_inode, from_path, to_rel,
-                permit=permit,
-            )
+            with _pin_source_inode(src_target) as moved_inode:
+                permit = move_file_no_clobber(
+                    src_target, dst_target, confirmation=confirmation
+                )
+                # What actually arrived at the destination: our inode, and a
+                # regular file? Anything else is refused, and only our own inode is
+                # ever moved back — see `_verify_the_moved_inode`.
+                return _verify_the_moved_inode(
+                    src_target, dst_target, moved_inode, from_path, to_rel,
+                    permit=permit,
+                )
 
         try:
             err, verify_error = await _confirmed_publication(uid, _commit_the_move)
@@ -6679,11 +6686,7 @@ async def delete_file_impl(
                     # Keep the validated parent pinned through the destructive
                     # step. No second pathname walk may redirect the delete.
                     if permanent:
-                        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                        if not stat.S_ISREG(info.st_mode):
-                            raise vault_fs.UnsafePath(f"Not a regular file: {rel}")
-                        os.unlink(name, dir_fd=parent_fd)
-                        vault_fs.flush_dir_quietly(parent_fd, f"parent directory of {rel}")
+                        vault_fs.remove_at(parent_fd, name, label=rel)
                         return None
                     return vault_fs.soft_delete_at(parent_fd, name, root_fd, label=rel)
                 finally:

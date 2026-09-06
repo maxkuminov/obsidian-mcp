@@ -4,35 +4,27 @@
 here, so the panel-theming requirement they already satisfy — "no color literal
 outside a custom-property definition" — has to be re-proved rather than assumed.
 
-    python3 openspec/changes/panel-ops-health/checks/literal_sweep.py
+    python3 openspec/changes/archive/2026-08-29-panel-ops-health/checks/literal_sweep.py
 
-The scanner itself is `panel-light-mode`'s, reused rather than reimplemented: a
-second copy of the parser is a second set of blind spots. It is imported from
-the archive with **one** correction, which is why this wrapper exists at all —
-`colorscan.TEMPLATE_DIR` is derived as `parents[4]` of its own path, and
-archiving the change moved it one directory deeper, so it now resolves to
-`openspec/src/control_panel/templates`, which does not exist. A scan of a
-directory that does not exist reports zero declarations and exits 0, which is a
-gate that passes by finding nothing (issue #170). So the directory is repointed
-here and the declaration count is asserted non-zero: a sweep that scanned
-nothing must fail, not pass.
-
-`health.html` is not in `colorscan.PANEL_TEMPLATES` either — that list is the
-set of templates that existed when the sweep was written — so it is named
-explicitly below, exactly as #161's and #162's wrappers name theirs.
+The shared archived scanner resolves its own repository root (#170). Locate
+its module by walking ancestors instead of assuming an archive depth (#220),
+then use its root helper. The nonzero declaration check prevents an empty
+scan from passing.
 """
 import sys
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[4]
-ARCHIVED = REPO / "openspec/changes/archive/2026-08-29-panel-light-mode/checks"
+SCANNER_REL = Path("2026-08-29-panel-light-mode/checks/colorscan.py")
+ARCHIVED = next(
+    parent / SCANNER_REL.parent
+    for parent in Path(__file__).resolve().parents
+    if (parent / SCANNER_REL).is_file()
+)
 sys.path.insert(0, str(ARCHIVED))
 
 import colorscan  # noqa: E402
 
-# The correction. See the module docstring — and issue #170, which tracks
-# fixing it at the source.
-colorscan.TEMPLATE_DIR = REPO / "src" / "control_panel" / "templates"
+REPO = colorscan.repo_root()
 
 #: The templates this change adds or edits, scanned alongside the shared token
 #: partial, which is where their tokens are defined.

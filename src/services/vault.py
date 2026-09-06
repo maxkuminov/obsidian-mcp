@@ -2416,8 +2416,11 @@ def _atomic_write_at(
 
         if expected is not None:
             try:
-                current = _read_fd_bytes(dir_fd, name)
-            except FileNotFoundError:
+                # A larger file cannot equal expected. Bound the comparison
+                # too: a concurrent writer may have grown this leaf since the
+                # tool's bounded preflight read.
+                current = _read_fd_bytes(dir_fd, name, max_bytes=len(expected))
+            except (FileNotFoundError, _ReadLimitExceeded):
                 raise RuntimeError(f"File changed while editing: {name}") from None
             if current != expected:
                 raise RuntimeError(f"File changed while editing: {name}")
@@ -2524,20 +2527,24 @@ def _discard_temp(
     vault_fs.discard_staged_name(dir_fd, tmp, staged, published=published)
 
 
+class _ReadLimitExceeded(ValueError):
+    """A regular file exceeded a bounded read, distinct from a changed type."""
+
+
 def _bound_read(fd: int, label: str, max_bytes: int | None) -> bytes:
     """Read and bound an already-open regular file. Closes nothing."""
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
         raise ValueError(f"Not a regular file: {label}")
     if max_bytes is not None and info.st_size > max_bytes:
-        raise ValueError(
+        raise _ReadLimitExceeded(
             f"File too large: {label} is {info.st_size:,} bytes "
             f"(max {max_bytes:,})"
         )
     with os.fdopen(fd, "rb", closefd=False) as stream:
         payload = stream.read(None if max_bytes is None else max_bytes + 1)
     if max_bytes is not None and len(payload) > max_bytes:
-        raise ValueError(f"File too large: {label} exceeds {max_bytes:,} bytes")
+        raise _ReadLimitExceeded(f"File too large: {label} exceeds {max_bytes:,} bytes")
     return payload
 
 

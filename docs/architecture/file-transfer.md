@@ -389,6 +389,14 @@ The `lstat` symlink/directory refusal still runs first. A **symlink** swapped in
 
 **Follow-up:** `usage_logs.key_id` still has no `ON DELETE` — a usage-log row written by an upload blocks its key's delete. Pre-existing, not regressed here.
 
+**Permanent raw-file deletion shares one anchored primitive.**
+`vault_fs.remove_at` performs the regular-file check, unlink and quiet parent
+flush; `remove` resolves a parent and delegates to it. A guarded `delete_file`
+passes the parent it held while checking the incumbent hash, inside the step
+that already consumed its root confirmation. It never re-resolves that parent
+and never issues a bare mutating syscall from the tool layer. This preserves
+both the descriptor guarantee and the shared-publication structural gate.
+
 ### Path canonicalisation — do not "simplify" this
 `validate_visible_path` runs (it is the shared traversal and dot-dir guard, and it is what refuses a link pointing out of the vault) but its **return value is the resolved path, and resolving follows symlinks**. The vault-relative path a transfer acts on is normalised *lexically* in `tools._vault_context`. Taking it from the resolved result silently retargets the operation: `delete_file("Attachments/alias.png")` where `alias.png` links to `secret.png` resolved to `secret.png` and deleted **that**, reporting success for a path nobody named. Keeping the caller's own components means the anchored walk is what meets the symlink — and refuses it.
 

@@ -3170,6 +3170,10 @@ async def _embed_vault_pinned(
         result = await session.execute(text(sql), params)
         unembedded = result.fetchall()
         budget = await _budget_for_pass(session, log_suffix)
+        # Discovery is a read-only transaction. Its table locks must end before
+        # filesystem/provider work or a later generation-lock acquisition.
+        # SQL result rows retain the hash/path snapshot after the commit.
+        await session.commit()
 
         exclude_patterns = settings.embedding_exclude_patterns or []
         if not unembedded:
@@ -3292,6 +3296,10 @@ async def _embed_vault_pinned(
                     select(NoteMetadata).where(NoteMetadata.id == row.id)
                 )
                 note = note_result.scalar_one()
+                # The session uses expire_on_commit=False: keep the loaded note
+                # writable, but release this SELECT's AccessShareLock before
+                # provider I/O and the advisory lock taken by embed_note.
+                await session.commit()
 
                 # ── Certify against what was verified, not what was re-read ──
                 # The `select` above is a *second* database read, in a later
@@ -3520,6 +3528,12 @@ async def _reconcile_exclusions(
           AND nm.embedded_content_hash IS NOT DISTINCT FROM nm.content_hash
         ORDER BY nm.modified_at DESC
     """), params)).fetchall()
+    # EXISTS read note_embeddings and holds AccessShareLock until transaction
+    # end. Reset takes the generation advisory lock then DROP INDEX requests
+    # AccessExclusiveLock on that table. Carrying this discovery transaction
+    # into embed_note's advisory wait closes a real deadlock cycle. Retain the
+    # immutable result-row snapshots, and release their discovery locks now.
+    await session.commit()
 
     if not rows:
         return
@@ -3615,6 +3629,10 @@ async def _reconcile_exclusions(
             note = (await session.execute(
                 select(NoteMetadata).where(NoteMetadata.id == row.id)
             )).scalar_one()
+            # End the per-note read transaction too. The verified hash/path
+            # remain row's snapshots; embed_note rechecks generation and uses
+            # the certified predicate in a fresh transaction after provider I/O.
+            await session.commit()
             was_truncated = bool(getattr(note, "chunks_truncated", False))
             # Past this line the note has reached the provider path, so it has
             # reached a note boundary whatever happens next.

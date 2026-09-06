@@ -482,8 +482,9 @@ def test_a_capped_note_is_marked_certified_and_logged_after_the_commit(
     real_commit = session.commit
 
     async def _watch_commit():
+        result = await real_commit()
         order.append("commit")
-        return await real_commit()
+        return result
 
     session.commit = _watch_commit
 
@@ -496,6 +497,7 @@ def test_a_capped_note_is_marked_certified_and_logged_after_the_commit(
     indexer.logger.addHandler(handler)
 
     async def _capped(*_a, **_k):
+        order.append("embed returned")
         return _truncated()
 
     monkeypatch.setattr(indexer, "embed_note", _capped)
@@ -506,7 +508,13 @@ def test_a_capped_note_is_marked_certified_and_logged_after_the_commit(
 
     assert result.embedded == 1, "a capped note was not certified"
     assert result.failures == 0, "a capped note was reported as a failure"
-    assert order == ["commit", "error line"], (
+    # Discovery commits precede the provider and certify nothing. Anchor the
+    # assertion to the embed result so only its publishing commit can satisfy
+    # the ordering; the watch records completion, not merely commit entry.
+    assert order.count("embed returned") == 1
+    assert order[order.index("embed returned"):] == [
+        "embed returned", "commit", "error line"
+    ], (
         "the truncation was logged before the transaction that carries it "
         "committed"
     )

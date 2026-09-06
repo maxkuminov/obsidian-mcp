@@ -1152,6 +1152,27 @@ provider), logged at ERROR. It is an *attempt*, because a provider call was
 issued — the `attempted` rule applying unchanged rather than gaining an
 exception.
 
+**Discovery SELECTs end their transaction before provider work.** A plain
+SELECT takes a table lock even though it takes no row lock. The reconciliation
+query's `EXISTS` reads `note_embeddings` and holds `AccessShareLock`; a reset
+then takes the generation advisory lock and waits for `AccessExclusiveLock`
+while dropping the HNSW index. If the provider returns while that discovery
+transaction remains open, certification waits for the reset's advisory lock,
+closing a cycle that PostgreSQL breaks by aborting one operation.
+
+The backlog enumeration, reconciliation enumeration, and both per-note ORM
+lookups therefore commit their read-only transactions before provider I/O.
+The immutable SQL rows retain the verified hash/path snapshots; the session's
+`expire_on_commit=False` keeps the loaded note attached and writable for the
+later chunk-truncation update. These commits certify nothing. After the
+provider returns, `embed_note` opens the certification transaction by taking
+the generation lock and re-reading the fingerprint, then uses the same
+conditional hash/path certification. A reset can complete during provider
+work, and old output is refused without deadlocking or overwriting that reset.
+The regression runs the actual reset driver's DROP INDEX, ALTER TABLE and index
+recreation, rather than substituting a fingerprint UPDATE that takes no
+conflicting table lock.
+
 **An absent `indexer_state` table is checked separately from an absent row.**
 `_generation_matches` probes with `state_table_exists` (`to_regclass`) before
 reading the fingerprint, so a missing-relation SELECT cannot abort the
