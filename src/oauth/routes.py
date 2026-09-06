@@ -29,6 +29,11 @@ from src.oauth.scope import VALID_SCOPES, clamp_scope, has_vault_scope
 # `client_can_write` (the consent template reads that key) without shadowing
 # the helper.
 from src.oauth.scope import client_can_write as _client_can_write
+from src.oauth.trust import (
+    known_redirect_host,
+    normalize_redirect_uri,
+    redirect_display_host,
+)
 from src.services import security_events
 
 # No module logger, deliberately. Everything this module records is an
@@ -186,12 +191,35 @@ def _base64url_sha256(verifier: str) -> str:
     return base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
 
 
-def _valid_redirect_uri(uri: str) -> bool:
+def _normalized_redirect_uri(uri: str) -> str | None:
+    """The form registration stores, or `None` if the URI is unacceptable.
+
+    HTTPS, no fragment — and, since #183, a **non-empty host that converts to
+    an ASCII A-label**, stored in that converted form.
+
+    The host requirement is not decoration. The old check was
+    `p.scheme == "https" and bool(p.netloc) and not p.fragment`, and
+    `urlparse("https://@/cb").netloc` is `"@"` — truthy, while its `hostname`
+    is empty. Such a row registered happily and would then render a consent
+    card with **no destination at all**, defeating the identification the
+    screen exists for at registration time rather than at display time.
+
+    Normalising here rather than at display time is the other half: a host
+    stored once as Unicode and once as its A-label renders alike and compares
+    differently, so only one of the two spellings could ever match the
+    operator's allow-list while both look identical to the user reading them.
+    """
     try:
         p = urlparse(uri)
-        return p.scheme == "https" and bool(p.netloc) and not p.fragment
-    except Exception:
-        return False
+    except Exception:  # noqa: BLE001 - any parse failure is a refusal
+        return None
+    if p.scheme != "https" or not p.netloc or p.fragment:
+        return None
+    return normalize_redirect_uri(uri)
+
+
+def _valid_redirect_uri(uri: str) -> bool:
+    return _normalized_redirect_uri(uri) is not None
 
 
 def _append_query(uri: str, **params: str) -> str:
@@ -382,14 +410,38 @@ async def register_client(request: Request):
         _registration_refused(request, "invalid_redirect_uri")
         return JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
 
-    # Validate all redirect URIs
+    # Validate all redirect URIs, and register the **normalised** form of each
+    # (#183). Everything downstream — the stored row, the event's count, the
+    # RFC 7591 response echo — reads the normalised list, so the URI the
+    # client is told it registered is the URI `authorize_post` will compare
+    # against and the one the consent screen derives its destination from.
+    normalized_uris = []
     for uri in redirect_uris:
-        if not _valid_redirect_uri(uri):
+        normalized = _normalized_redirect_uri(uri)
+        if normalized is None:
             _registration_refused(request, "invalid_redirect_uri")
             return JSONResponse(
-                {"error": "invalid_redirect_uri", "error_description": f"Redirect URI must use https and contain no fragment: {uri}"},
+                {
+                    "error": "invalid_redirect_uri",
+                    "error_description": (
+                        "Redirect URI must use https, contain no fragment, and "
+                        f"carry a host that converts to ASCII: {uri}"
+                    ),
+                },
                 status_code=400,
             )
+        normalized_uris.append(normalized)
+
+    # Two spellings that normalise to one URI are a duplicate registration the
+    # earlier literal check could not see. Refused rather than deduped, for
+    # the same reason the literal duplicate is: the client asked for something
+    # incoherent and should be told so while its developer is still in the
+    # loop.
+    if len(set(normalized_uris)) != len(normalized_uris):
+        _registration_refused(request, "invalid_redirect_uri")
+        return JSONResponse({"error": "invalid_redirect_uri"}, status_code=400)
+
+    redirect_uris = normalized_uris
 
     # DCR clients commonly omit ``scope`` and ask for the desired subset at
     # /authorize. Register the full supported set in that case so consent can
@@ -582,8 +634,32 @@ async def authorize_get(
     requested_write = "readwrite" in scope_parts
     write_unavailable = requested_write and not client_can_write
 
+    # --- Who is asking, and where the code would go (#183) -----------------
+    #
+    # `redirect_uri` has already been checked against `client.redirect_uris`
+    # above, and `authorize_post` re-validates the *submitted* value against
+    # that same list before minting anything, so the destination shown here is
+    # the destination the authorization code is delivered to.
+    #
+    # The host comes from `src/oauth/trust.py` and nowhere else: it is the URI's
+    # `hostname`, lower-cased and in its ASCII form, so userinfo cannot
+    # disguise it and a homograph cannot be rendered decoded. `None` — a row
+    # registered before `_valid_redirect_uri` required a host — is passed
+    # through as `None` and the template says so, taking the warning branch.
+    redirect_host = redirect_display_host(redirect_uri)
+    client_trust = "known" if known_redirect_host(redirect_uri) else "unverified"
+    # Date only. `getattr` because `created_at` is server-defaulted and a row
+    # constructed but not yet flushed carries `None` there.
+    registered_at = getattr(client, "created_at", None)
+    client_registered_at = (
+        registered_at.date().isoformat() if registered_at is not None else None
+    )
+
     response = templates.TemplateResponse(request, "authorize.html", {
         "client_name": client.client_name,
+        "redirect_host": redirect_host,
+        "client_trust": client_trust,
+        "client_registered_at": client_registered_at,
         "scope": scope,
         "client_can_write": client_can_write,
         "requested_write": requested_write,
