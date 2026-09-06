@@ -104,7 +104,7 @@ from sqlalchemy import select
 
 from src.auth.session import _UnsetVaultRoot, current_vault_root
 from src.config import MAX_LIST_PATTERN_CHARS, settings
-from src.services import vault_fs
+from src.services import security_events, vault_fs
 
 logger = logging.getLogger(__name__)
 
@@ -995,9 +995,11 @@ async def _confirm_vault_assignment(user_id: int | None = None) -> RootConfirmat
     except Exception as exc:
         # The read failed; the assignment is unknown, which is not the same
         # fact as "the assignment changed" and must not be reported as one.
-        logger.warning(
+        security_events.emit(
             "publication_refused_confirmation_unavailable",
-            extra={"user_id": user_id, "error": str(exc)},
+            subject=security_events.subject_for(user_id=user_id),
+            user_id=user_id,
+            error_type=type(exc).__name__,
         )
         raise VaultConfirmationUnavailable(
             f"{CONFIRMATION_UNAVAILABLE_ERROR} ({exc})"
@@ -1014,9 +1016,11 @@ async def _confirm_vault_assignment(user_id: int | None = None) -> RootConfirmat
     else:
         return RootConfirmation(user_id, bound, queried=True)
 
-    logger.warning(
+    security_events.emit(
         "publication_refused_vault_assignment_changed",
-        extra={"user_id": user_id, "reason": reason},
+        subject=security_events.subject_for(user_id=user_id),
+        user_id=user_id,
+        reason=reason,
     )
     raise VaultAssignmentChanged(
         _assignment_changed_error(user_id, bound, reason),

@@ -279,7 +279,10 @@ def test_middleware_checks_the_owner_before_expiry():
     from src.mcp_server import auth
 
     src = inspect.getsource(auth)
-    owner_at = src.index('"reason": "inactive_user"')
+    # The reason code is a positional argument to `_emit_auth_failure` since
+    # the `auth_failure` sites moved onto `security_events.emit` (#190); the
+    # ordering this asserts is unchanged.
+    owner_at = src.index('"inactive_user"')
     expiry_at = src.index("api_key.expires_at < datetime.now(timezone.utc)")
     assert owner_at < expiry_at
 

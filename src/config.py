@@ -1,4 +1,5 @@
 import ipaddress
+import logging
 import resource
 import sys
 from typing import Annotated, Any, Literal
@@ -332,6 +333,18 @@ class Settings(BaseSettings):
     # production — tools register but cannot run.
     mcp_sandbox_mode: bool = False
 
+    # ── Logging (see docs/architecture/security-event-logging.md) ───────────
+    # The root level `src/logging_setup.configure_logging()` applies. Accepts
+    # any standard level name, case-insensitively; an unknown name is refused
+    # at startup rather than silently degrading to WARNING.
+    log_level: str = "INFO"
+    # `json` is the production rendering — one line per record, parsed natively
+    # by Alloy/Loki. `text` renders the *same* allow-listed object as
+    # `ts level logger msg k=v …` for reading `make logs` locally; it is a
+    # second rendering, never a second field policy. `Literal` refuses anything
+    # else when `Settings()` is constructed, i.e. at startup.
+    log_format: Literal["json", "text"] = "json"
+
     # `extra` stays at pydantic-settings' default ("forbid") so a misspelled
     # constructor kwarg or an unknown init value is still a hard error; only the
     # dotenv source is filtered (see `settings_customise_sources` below).
@@ -360,6 +373,27 @@ class Settings(BaseSettings):
             _FieldFilteredSource(dotenv_settings),
             file_secret_settings,
         )
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _normalise_log_level(cls, v):
+        """Upper-case the level name and refuse one `logging` does not know.
+
+        `logging.getLevelName("LOUD")` answers the string `"Level LOUD"` rather
+        than raising, and `setLevel` on that value throws at the first record —
+        i.e. long after startup, from inside a logging call. Refusing here makes
+        a typo a start-up failure like every other bad setting.
+        """
+        if isinstance(v, int):
+            return logging.getLevelName(v)
+        if isinstance(v, str):
+            name = v.strip().upper()
+            if name not in logging.getLevelNamesMapping():
+                raise ValueError(
+                    f"LOG_LEVEL must be a standard logging level name, got {v!r}"
+                )
+            return name
+        return v
 
     @field_validator("fts_configs", mode="before")
     @classmethod

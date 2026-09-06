@@ -1,0 +1,559 @@
+"""The security-event emitter: one catalogue, one allowance check, one tag.
+
+Every authentication, authorization and credential-outcome record in this server
+is emitted from here, so that three properties hold in one place instead of at
+forty call sites.
+
+**One catalogue.** `EVENT_FIELDS` mirrors the table in
+`docs/architecture/security-event-logging.md`: one entry per event, naming the
+fields that event may carry. `emit` drops a field the event does not declare —
+and raises under the test suite's strict flag — so the catalogue and the code
+cannot drift apart. The declared set is *permitted*, never required: every field
+is optional, and a record missing one means the emitting path did not have it.
+Absence is meaningful.
+
+**One allowance check.** A record is bounded by `acquire(event, subject)`, which
+charges the subject's allowance **once** and returns a `Permit` or `None`;
+`emit(permit, …)` consumes it and performs *no* second check. An earlier design
+had a `should_emit` predicate followed by an `emit` that also checked, which
+charged the flood bound twice for the one call site that has to do work to build
+its fields (the transfer refusal diagnosis). There is no `should_emit`. A caller
+that acquires a permit and then does not spend it has **spent** its slot anyway:
+the failure direction is a quieter log, never a louder one.
+
+The subject is `user_id` when the request already resolved a credential to one,
+otherwise the **trusted** client address, otherwise `-`. It is never a token
+tag, a submitted username or a submitted client id — a caller that could mint
+subjects could mint allowances, which is exactly what rotating a bogus bearer
+token on every request would do.
+
+Every level is bounded, INFO included. Bounded volume beats audit completeness
+because a summary carrying an exact count still answers "how many logins
+succeeded", while a quiet log answers nothing. Nothing is dropped silently:
+every withheld record is counted and an `events_suppressed` summary names the
+event and the count.
+
+**One redaction.** `redacted_token_tag` is the only function in the codebase
+that turns a presented credential into something loggable, and `sha:` plus eight
+hex characters is the only form in which one may appear. It answers `None` when
+nothing was presented, so the field is *absent* rather than `sha:` of the empty
+string — a constant that reads like a tag.
+
+What this does **not** do: it bounds what reaches the log sink and nothing else.
+It never suppresses a `usage_logs` row, and nothing here bounds how many events
+a caller can *cause* — that is the sibling change `mcp-rate-limits` (#188/#194).
+Background work (the indexer, the embed pass, filesystem housekeeping, startup)
+stays on the bare logger, so suppression can never hide the operational errors
+the health page exists to show.
+"""
+from __future__ import annotations
+
+import collections
+import contextlib
+import hashlib
+import logging
+import os
+import threading
+import time
+from dataclasses import dataclass
+
+from src.logging_setup import ALLOWED_FIELDS, EMITTER_CONTROL, FORMATTER_OWNED
+
+#: Records are emitted on their own logger so an operator can select the whole
+#: security stream with one label, and so the module that owns the policy owns
+#: the name. It propagates to the root, which is where both sinks live (the
+#: stream handler and, for ERROR, the health page's ring buffer).
+logger = logging.getLogger("security_events")
+
+
+class SecurityEventFieldError(AssertionError):
+    """A field the catalogue does not permit, raised only under strict mode.
+
+    Subclasses `AssertionError` because it means the same thing a failed
+    assertion does: the tree is inconsistent with its own registry. In
+    production the field is dropped instead and the record is still emitted —
+    losing a field is bad, losing the record is worse.
+    """
+
+
+# ── The catalogue ───────────────────────────────────────────────────────────
+#
+# One entry per row of the table in docs/architecture/security-event-logging.md.
+# `ts`, `level`, `logger` and `msg` are formatter-owned and appear on every
+# record without being declared here; `stack` likewise, and it arrives through
+# `exc_info=` rather than as a field.
+#
+# Provenance is carried by the field name and is a property of the (event,
+# field) pair: an unsuffixed identifier holds only a value read from a database
+# row, a `_submitted` name is the only place a caller-supplied identifier that
+# did not resolve may appear, and a `_session` name is the only place a value
+# copied from the session cookie without a database read may appear.
+
+EVENT_FIELDS: dict[str, frozenset[str]] = {
+    # ── Panel authentication (Slice B) ──
+    "panel_login_succeeded": frozenset({"user_id", "username", "client_ip", "route"}),
+    "panel_login_failed": frozenset(
+        {"reason", "username_submitted", "user_id", "client_ip", "route"}
+    ),
+    "panel_logout": frozenset({"user_id_session", "username_session", "client_ip"}),
+    "panel_bootstrap_admin_created": frozenset({"user_id", "username", "client_ip"}),
+    "panel_bootstrap_refused": frozenset({"reason", "client_ip"}),
+    "panel_password_reset": frozenset(
+        {"actor_user_id", "user_id", "username", "client_ip", "route"}
+    ),
+    "password_hash_malformed": frozenset({"user_id"}),
+    # ── OAuth (Slice B) ──
+    "oauth_token_issued": frozenset(
+        {"client_id", "user_id", "grant_id", "scope", "client_ip", "reason"}
+    ),
+    "oauth_token_refreshed": frozenset(
+        {"client_id", "user_id", "grant_id", "scope", "client_ip"}
+    ),
+    "oauth_token_refused": frozenset(
+        {
+            "reason",
+            "client_id",
+            "client_id_submitted",
+            "user_id",
+            "grant_id",
+            "client_ip",
+        }
+    ),
+    "oauth_token_rotation_failed": frozenset(
+        {"client_id", "grant_id", "client_ip", "error_type"}
+    ),
+    "oauth_consent_granted": frozenset({"client_id", "user_id", "scope", "client_ip"}),
+    "oauth_consent_denied": frozenset(
+        {"client_id", "client_id_submitted", "user_id", "client_ip"}
+    ),
+    "oauth_authorize_refused": frozenset(
+        {"reason", "client_id", "client_id_submitted", "user_id", "client_ip"}
+    ),
+    "oauth_cross_user_client_refused": frozenset(
+        {"client_id", "actor_user_id", "user_id", "route", "client_ip"}
+    ),
+    "oauth_client_registered": frozenset(
+        {"client_id", "client_name_submitted", "scope", "count", "client_ip"}
+    ),
+    "oauth_client_registration_refused": frozenset({"reason", "client_ip"}),
+    "oauth_grant_revoked": frozenset(
+        {
+            "client_id",
+            "user_id",
+            "actor_user_id",
+            "grant_id",
+            "count",
+            "client_ip",
+            "route",
+        }
+    ),
+    "oauth_revoke_noop": frozenset({"reason", "client_id_submitted", "client_ip"}),
+    "oauth_revoke_refused": frozenset({"reason", "client_id", "client_ip"}),
+    # ── The request boundary (Slice A) ──
+    "rate_limit_exceeded": frozenset(
+        {"route", "method", "client_ip", "limit_count", "window_seconds"}
+    ),
+    "auth_failure": frozenset(
+        {"reason", "token_tag", "key_id", "oauth_token_id", "client_ip", "route"}
+    ),
+    # ── The tool surface (Slice C) ──
+    # No `client_ip`: `_tracked` and `_require_write` run below
+    # `ProxyHeadersMiddleware` and nothing binds the request address into a
+    # ContextVar, so these records identify the *credential*, not the address
+    # (residual R8).
+    "tool_write_refused": frozenset(
+        {"tool", "user_id", "actor_kind", "actor_ref", "key_id", "oauth_token_id"}
+    ),
+    "tool_exception": frozenset(
+        {"tool", "error_type", "user_id", "actor_kind", "actor_ref", "duration_ms"}
+    ),
+    "tool_usage_log_failed": frozenset({"tool", "error_type"}),
+    "tool_refused_no_vault": frozenset({"user_id", "tool"}),
+    "tool_refused_over_quota": frozenset({"key_id", "limit", "day", "user_id", "tool"}),
+    "usage_log_credential_gone": frozenset({"tool", "cleared_user_id"}),
+    "usage_log_failed": frozenset({"tool", "error_type", "reason"}),
+    "tool_result_measure_failed": frozenset({"tool", "error_type"}),
+    "move_rewrite_failed": frozenset({"tool", "error_type"}),
+    # ── Vault and quota admission (Slice A) ──
+    "quota_admission_failed": frozenset({"key_id", "day", "error_type"}),
+    "quota_counter_prune_failed": frozenset({"error_type"}),
+    "publication_refused_confirmation_unavailable": frozenset(
+        {"user_id", "error_type"}
+    ),
+    "publication_refused_vault_assignment_changed": frozenset({"user_id", "reason"}),
+    # ── Transfer (Slice D) ──
+    "transfer_refused": frozenset(
+        {
+            "reason",
+            "token_tag",
+            "route",
+            "method",
+            "client_ip",
+            "user_id",
+            "key_id",
+            "oauth_token_id",
+            "error_type",
+        }
+    ),
+    "transfer_refused_mount_boundary": frozenset({"error_type", "route", "method"}),
+    "transfer_refused_unsupported_fs": frozenset({"error_type", "route", "method"}),
+    "transfer_root_unusable": frozenset({"error_type", "user_id", "route", "method"}),
+    "transfer_post_publish_failure": frozenset({"error_type", "user_id", "route"}),
+    "transfer_prepublish_failure": frozenset({"error_type", "user_id", "route"}),
+    # ── Panel authorization and operations (Slice D) ──
+    "panel_forbidden": frozenset(
+        {"reason", "actor_user_id", "actor_username", "user_id", "route", "method"}
+    ),
+    "csrf_refused": frozenset({"route", "method", "user_id", "client_ip"}),
+    "panel_ondemand_index_failed": frozenset({"user_id", "error_type"}),
+    "panel_ondemand_embed_failed": frozenset({"user_id", "error_type"}),
+    "panel_health_strip_failed": frozenset({"error_type"}),
+    # ── The suppressor's own record (this module) ──
+    "events_suppressed": frozenset({"reason", "count", "window_seconds"}),
+}
+
+#: The suppressor's summary. Never itself suppressed, never counted.
+SUMMARY_EVENT = "events_suppressed"
+
+
+# ── Redaction and request context ───────────────────────────────────────────
+
+
+def redacted_token_tag(value: str | None) -> str | None:
+    """`sha:` plus eight hex characters, or `None` when nothing was presented.
+
+    The single definition in the codebase (`src/mcp_server/auth.py` delegates to
+    it), and the only form in which a presented credential may reach a log. A
+    SHA-256 prefix keeps failures correlatable — the same token yields the same
+    tag — without writing credential material anywhere; the `token[:8]` this
+    replaced leaked the first eight characters of an attacker-supplied, or in
+    the worst case a valid, token.
+
+    `None` rather than `sha:` of the empty string: a constant that looks like a
+    tag on every credential-less request is worse than an absent field, because
+    an operator would correlate on it.
+    """
+    if not value:
+        return None
+    return "sha:" + hashlib.sha256(value.encode()).hexdigest()[:8]
+
+
+def client_ip(request) -> str | None:
+    """The peer address ASGI reports, never a header.
+
+    `ProxyHeadersMiddleware` (`src/main.py`) has already rewritten
+    `scope["client"]` from `X-Forwarded-For` — but **only** for peers inside the
+    RFC 1918 ranges the deployment trusts. Reading the header here instead would
+    accept a forged one from any client on the internet, which is the precise
+    thing that middleware exists to prevent, so this helper never touches
+    headers.
+    """
+    try:
+        client = getattr(request, "client", None)
+        host = getattr(client, "host", None)
+        return host or None
+    except Exception:  # noqa: BLE001 - a logging helper may not raise
+        return None
+
+
+def subject_for(user_id=None, request=None, ip: str | None = None) -> str:
+    """The suppression subject: resolved user, else trusted address, else `-`.
+
+    Prefixed (`user:` / `ip:`) so that user 5 and the address "5" cannot share a
+    bucket. Must be computable **before** any work the permit gates — that is
+    why the transfer refusal always keys on the address even on the branches
+    where a row later resolves: the owner is knowable only after the diagnosis
+    the permit is supposed to gate.
+    """
+    if isinstance(user_id, int) and not isinstance(user_id, bool):
+        return f"user:{user_id}"
+    address = ip if ip is not None else client_ip(request)
+    if address:
+        return f"ip:{address}"
+    return "-"
+
+
+# ── The suppressor ──────────────────────────────────────────────────────────
+
+#: Records of one event, for one subject, per window.
+MAX_EVENTS_PER_WINDOW = 10
+#: Records of *all* events for one subject per window, so a source cycling
+#: through twenty refusal events cannot multiply its allowance by twenty.
+MAX_EVENTS_PER_SUBJECT_PER_WINDOW = 50
+WINDOW_SECONDS = 60
+#: Bound on each map. Unbounded state is a memory leak whose trigger is a flood,
+#: i.e. the one shape of leak an attacker can ask for.
+MAX_TRACKED_KEYS = 512
+
+
+@dataclass
+class _Window:
+    started: float
+    count: int = 0
+    suppressed: int = 0
+    level: int = logging.WARNING
+
+
+@dataclass(frozen=True)
+class Permit:
+    """A charged allowance for one record. Spend it with `emit(permit, …)`.
+
+    Carries the level so a summary for the window can be emitted at the level of
+    the records it withheld — an operator filtering at WARNING still sees that
+    warnings were withheld.
+    """
+
+    event: str
+    subject: str
+    level: int = logging.WARNING
+
+
+_lock = threading.Lock()
+_event_windows: "collections.OrderedDict[tuple[str, str], _Window]" = (
+    collections.OrderedDict()
+)
+_subject_windows: "collections.OrderedDict[str, _Window]" = collections.OrderedDict()
+
+#: Strict mode turns a catalogue violation into a raise. On in the test suite
+#: (via the environment variable or the `strict_fields()` context manager),
+#: never in production, where dropping the field and keeping the record is the
+#: right failure.
+STRICT_ENV_VAR = "OMCP_SECURITY_EVENTS_STRICT"
+_strict = os.environ.get(STRICT_ENV_VAR) == "1"
+
+#: Tests that count emission attempts need the suppressor out of the way.
+_suppression_enabled = True
+
+
+@contextlib.contextmanager
+def strict_fields(enabled: bool = True):
+    """Raise on a catalogue violation for the duration. Tests only."""
+    global _strict
+    previous = _strict
+    _strict = enabled
+    try:
+        yield
+    finally:
+        _strict = previous
+
+
+@contextlib.contextmanager
+def suppression_disabled():
+    """Force every `acquire` to return a permit. Tests only.
+
+    The suppressor's own tests exercise the caps directly; every *other* test
+    that counts emission attempts wants one attempt to mean one record.
+    """
+    global _suppression_enabled
+    previous = _suppression_enabled
+    _suppression_enabled = False
+    try:
+        yield
+    finally:
+        _suppression_enabled = previous
+
+
+def reset_state() -> None:
+    """Forget every window without emitting summaries. Tests only."""
+    with _lock:
+        _event_windows.clear()
+        _subject_windows.clear()
+
+
+def _roll(window: _Window | None, now: float) -> tuple[_Window, tuple | None]:
+    """Return the live window for `now`, plus any summary the closed one owes."""
+    if window is not None and now - window.started < WINDOW_SECONDS:
+        return window, None
+    owed = None
+    if window is not None and window.suppressed:
+        owed = (window.suppressed, window.level)
+    return _Window(started=now), owed
+
+
+def _evict_locked() -> list[tuple]:
+    """Trim both maps to their bound, oldest first, keeping every count.
+
+    An entry holding a nonzero withheld count emits its summary **before** it
+    goes: otherwise the count vanishes and the log silently under-reports, which
+    is worse than the flood it was bounding.
+    """
+    pending = []
+    while len(_event_windows) > MAX_TRACKED_KEYS:
+        (event, subject), window = _event_windows.popitem(last=False)
+        if window.suppressed:
+            pending.append((event, subject, window.suppressed, window.level))
+    while len(_subject_windows) > MAX_TRACKED_KEYS:
+        _subject_windows.popitem(last=False)
+    return pending
+
+
+def acquire(event: str, subject: str | None = None, *, level: int = logging.WARNING):
+    """Charge one unit of `subject`'s allowance for `event`. Fails open.
+
+    Returns a `Permit` when the record may be emitted and `None` when it is
+    withheld (and counted). The allowance is charged **here and only here**;
+    `emit(permit, …)` performs no second check.
+
+    `level` is recorded so the window's summary can carry the level of what it
+    withheld; pass `emit` the same level.
+
+    Any internal error returns a permit — a suppressor that has broken must not
+    also silence the log, and it may never raise into a request path.
+    """
+    try:
+        key_subject = subject or "-"
+        now = time.monotonic()
+        pending: list[tuple] = []
+        with _lock:
+            key = (event, key_subject)
+            event_window, owed = _roll(_event_windows.get(key), now)
+            if owed is not None:
+                pending.append((event, key_subject, owed[0], owed[1]))
+            _event_windows[key] = event_window
+            _event_windows.move_to_end(key)
+
+            subject_window, _ = _roll(_subject_windows.get(key_subject), now)
+            _subject_windows[key_subject] = subject_window
+            _subject_windows.move_to_end(key_subject)
+
+            allowed = _suppression_enabled is False or (
+                event_window.count < MAX_EVENTS_PER_WINDOW
+                and subject_window.count < MAX_EVENTS_PER_SUBJECT_PER_WINDOW
+            )
+            if allowed:
+                event_window.count += 1
+                subject_window.count += 1
+            else:
+                # Charged against the *event's* entry whichever cap refused, so
+                # the summary can name the event that was withheld.
+                event_window.suppressed += 1
+                event_window.level = level
+            pending.extend(_evict_locked())
+
+        for summary in pending:
+            _emit_summary(*summary)
+        return Permit(event=event, subject=key_subject, level=level) if allowed else None
+    except Exception:  # noqa: BLE001 - fail open, never raise into a request
+        return Permit(event=event, subject=subject or "-", level=level)
+
+
+def flush_suppression_summaries() -> None:
+    """Emit every outstanding withheld count. Called at shutdown.
+
+    Registered in the FastAPI lifespan and, for the stdio entry point, via
+    `atexit`. Without it, a window holding a count when the process stops takes
+    the count with it and the log under-reports for good.
+    """
+    try:
+        with _lock:
+            pending = [
+                (event, subject, window.suppressed, window.level)
+                for (event, subject), window in _event_windows.items()
+                if window.suppressed
+            ]
+            for (event, subject), window in _event_windows.items():
+                window.suppressed = 0
+        for summary in pending:
+            _emit_summary(*summary)
+    except Exception:  # noqa: BLE001 - shutdown may not fail on bookkeeping
+        pass
+
+
+def _emit_summary(event: str, subject: str, count: int, level: int) -> None:
+    """One `events_suppressed` record. Bypasses suppression; never counted."""
+    _log(
+        SUMMARY_EVENT,
+        level,
+        None,
+        {"reason": event, "count": count, "window_seconds": WINDOW_SECONDS},
+    )
+
+
+# ── Emission ────────────────────────────────────────────────────────────────
+
+
+def _clean_fields(event: str, fields: dict) -> dict:
+    """The subset of `fields` this event may carry. Strict mode raises instead.
+
+    Three rejections, for three different reasons:
+    * a **formatter-owned** name (`ts`, `level`, `logger`, `msg`, `stack`) —
+      a call site may not forge a timestamp, a level or a traceback;
+    * a name outside `ALLOWED_FIELDS` — the allow-list is the whole point;
+    * a name outside this event's declared set — so a call site cannot quietly
+      widen an event past its catalogue row.
+    """
+    allowed = EVENT_FIELDS.get(event)
+    if allowed is None and _strict:
+        raise SecurityEventFieldError(
+            f"{event!r} is not in EVENT_FIELDS; add its catalogue row first"
+        )
+    clean: dict[str, object] = {}
+    for name, value in fields.items():
+        if value is None:
+            # Every field is optional; absence is the honest rendering of "the
+            # emitting path did not have this".
+            continue
+        if name in FORMATTER_OWNED:
+            if _strict:
+                raise SecurityEventFieldError(
+                    f"{event!r} passed formatter-owned field {name!r}"
+                )
+            continue
+        if name not in ALLOWED_FIELDS:
+            if _strict:
+                raise SecurityEventFieldError(
+                    f"{event!r} passed field {name!r}, which is not allow-listed"
+                )
+            continue
+        if allowed is not None and name not in allowed:
+            if _strict:
+                raise SecurityEventFieldError(
+                    f"{event!r} does not declare field {name!r}"
+                )
+            continue
+        clean[name] = value
+    return clean
+
+
+def _log(event: str, level: int, exc_info, fields: dict) -> None:
+    logger.log(level, event, extra=fields, exc_info=exc_info)
+
+
+def emit(
+    permit_or_event,
+    *,
+    level: int = logging.WARNING,
+    exc_info=None,
+    subject: str | None = None,
+    **fields,
+) -> None:
+    """Emit one security event. Never raises (except under strict mode).
+
+    Two shapes:
+
+    * `emit("auth_failure", subject=…, reason=…)` — acquire and consume in one
+      step. What almost every call site wants.
+    * `emit(permit, reason=…)` — consume a permit obtained from `acquire`,
+      **without a second allowance check**. For the one call site that must do
+      work to build its fields and therefore has to know it will be emitting
+      before it does that work (the transfer refusal diagnosis). Pass the same
+      `level` the permit was acquired with; the permit's own level is used only
+      for the window's summary.
+    """
+    try:
+        if permit_or_event is None:
+            # A caller that passed a denied permit straight through. The record
+            # was already withheld and counted at `acquire`; emitting it here
+            # would be the second check this design exists to remove.
+            return
+        if isinstance(permit_or_event, Permit):
+            event = permit_or_event.event
+        else:
+            event = permit_or_event
+            if acquire(event, subject, level=level) is None:
+                return
+        _log(event, level, exc_info, _clean_fields(event, fields))
+    except SecurityEventFieldError:
+        raise
+    except Exception:  # noqa: BLE001 - logging may not fail a request path
+        pass

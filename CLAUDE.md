@@ -171,6 +171,7 @@ summaries.
 | [file-transfer.md](docs/architecture/file-transfer.md) | `src/transfer/`, `src/services/vault_fs.py`, the publish gate, SSRF policy |
 | [search.md](docs/architecture/search.md) | `semantic_search` / `keyword_search` / `find_related` and every `SET LOCAL` they issue |
 | [indexing-and-embeddings.md](docs/architecture/indexing-and-embeddings.md) | the indexer loop, the embed pass, tsvector writers, provider abstraction |
+| [security-event-logging.md](docs/architecture/security-event-logging.md) | `src/logging_setup.py`, `src/services/security_events.py`, and any call site that logs a refusal: the field allow-list, the event catalogue, the suppressor |
 | [usage-attribution.md](docs/architecture/usage-attribution.md) | `usage_logs`, `_log_usage`, actor columns |
 | [control-panel.md](docs/architecture/control-panel.md) | panel templates, flash messages, admin guards, the Danger zone |
 
