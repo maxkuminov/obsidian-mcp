@@ -22,7 +22,9 @@ hashing the full string instead.
 
 The consequence, inherited from bcrypt itself and unchanged by this rewrite:
 **two passwords whose first 72 UTF-8 bytes are identical are the same password
-here.** Password policy is unaffected (minimum 8 characters, no maximum).
+here.** Password policy is unaffected by that: `MIN_PASSWORD_LENGTH` (12
+characters, no maximum) is a separate rule expressed by `validate_new_password`
+below, and it is measured in characters rather than bytes.
 
 Truncation is deliberately on bytes, not characters: slicing the encoding can
 split a multi-byte character and yield invalid UTF-8, which is fine because
@@ -57,6 +59,52 @@ _BCRYPT_ROUNDS = 12
 
 # bcrypt ignores everything past this many bytes of the password.
 _MAX_PASSWORD_BYTES = 72
+
+# The minimum length **every** path that sets a password applies (#197): the
+# self-service change, bootstrap registration, the administrator reset, and
+# administrative user creation. One constant, four setters.
+#
+# Twelve rather than the eight three of those carried before. Leaving them at
+# eight meant an administrator could set a password its owner was then
+# forbidden from setting again, and it left the bootstrap admin — the most
+# privileged account on the server — under the weakest rule.
+#
+# **No composition rules**, deliberately: they push people to `Password1!`,
+# and length is the control that works. **No forced rotation**: nothing
+# re-checks policy at login, so raising this cannot lock an existing account
+# out, and existing stored passwords keep working.
+MIN_PASSWORD_LENGTH = 12
+
+
+def validate_new_password(new: str, confirm: str | None = None) -> str | None:
+    """Return a user-facing refusal message, or `None` when `new` is settable.
+
+    The one place the password policy is expressed, so the four setters cannot
+    drift apart. Length is measured in **characters**, which is what the form
+    copy promises; the 72-*byte* truncation below is a separate, older fact
+    about bcrypt and is not a policy this function restates.
+
+    **The NUL check lives here because `hash_password` raises `ValueError` on
+    an embedded NUL** — passlib's policy, preserved deliberately (see the
+    module docstring; do not "fix" it). Four handlers pass form input straight
+    into the hasher, so without this a NUL in a password field is an unhandled
+    exception and a 500. Routing every setter through the validator turns four
+    latent 500s into form errors.
+
+    `confirm` is optional: a caller with no confirmation field passes nothing
+    and only the intrinsic rules apply.
+
+    **No message ever echoes the submitted password** — a refusal is rendered
+    back into a page and, on the admin paths, may be seen by somebody other
+    than the person who typed it.
+    """
+    if confirm is not None and new != confirm:
+        return "The new password and its confirmation do not match."
+    if "\x00" in new:
+        return "The new password must not contain NUL bytes."
+    if len(new) < MIN_PASSWORD_LENGTH:
+        return f"The new password must be at least {MIN_PASSWORD_LENGTH} characters."
+    return None
 
 
 def _prepare(plain: str) -> bytes:

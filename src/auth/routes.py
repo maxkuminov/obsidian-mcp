@@ -358,6 +358,17 @@ async def register_submit(
         )
     vault_path = normalized_vp or vault_path
 
+    # **No vault-root overlap check here, deliberately (#199).** The panel's
+    # user-edit handler refuses an assignment that is identical to, contains,
+    # or is contained by another active user's root; this path does not, and a
+    # future reader should not read that as an omission. Bootstrap runs only
+    # while `_users_table_empty` holds — zero rows — and the check's peer set is
+    # "every *other* active user holding an assignment", which is empty by that
+    # same invariant. A check that can never fire would invite the belief that
+    # this path is covered by code, when what covers it is the invariant.
+    # Anything assigned here is checked at the next detection entry point
+    # anyway, like any root that changes underneath an assignment.
+
     # Critical section: take a transaction-scoped advisory lock so two
     # concurrent first-visits serialize. Inside the lock we re-check that
     # `users` is empty before inserting. The lock auto-releases on commit

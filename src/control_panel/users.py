@@ -15,8 +15,16 @@ Validation rules for `vault_path` (panel-side, before the DB sees it):
 - Must exist as a directory inside the container fs. Catches the
   docker-compose mount-not-yet-applied case loudly instead of silently
   later when the indexer fails.
-- Must be unique among active users. Two users sharing a vault would
-  produce silently overlapping `notes_metadata` rows and confused links.
+- Must not overlap another active user's assigned root. Not merely
+  "unique": an equal string is only the degenerate case. `/vaults/team`
+  beside `/vaults/team/private` is two different strings and one root
+  beneath the other, and a symlink or bind mount makes two different
+  strings name one directory — in every one of those shapes each tenant's
+  tools reach the other's files and the indexer files both under one
+  `user_id`. `_check_vault_root_conflict` runs the shared
+  `vault_overlap.relation_between` predicate against every other active
+  assigned root, and a peer root that cannot be opened refuses the
+  assignment rather than admitting on "we could not look".
 
 When admin mutates a user's `vault_path`, we call
 `clear_user_vault_cache(user_id)` so the indexer's next pass and any
@@ -49,7 +57,8 @@ from src.control_panel.routes import (
 from src.csrf import verify_csrf
 from src.database import get_session
 from src.models.db import APIKey, NoteMetadata, UsageLog, User
-from src.services import security_events
+from src.oauth.grants import ACCOUNT_GUARD_LOCK_KEY
+from src.services import security_events, vault_overlap
 from src.services.vault import clear_user_vault_cache, validate_vault_root_path
 
 router = APIRouter(prefix="/admin/users", tags=["users"])
@@ -73,20 +82,104 @@ router.dependencies.append(Depends(verify_csrf))
 _validate_vault_path = validate_vault_root_path
 
 
-async def _check_vault_path_unique(
+async def _check_vault_root_conflict(
     session: AsyncSession, normalized: str, exclude_user_id: int | None
 ) -> str | None:
-    """Reject reuse of the same vault_path among active users."""
-    q = select(User.username).where(
-        User.vault_path == normalized,
+    """Refuse an assignment whose root collides with another active user's.
+
+    **This subsumes the old `_check_vault_path_unique`.** That function compared
+    two `vault_path` *strings* and rejected only an exact duplicate, which let
+    three shapes through: `/vaults/team` beside `/vaults/team/private`
+    (different strings, one root beneath the other, so every tool and the
+    indexer reach across both accounts), a symlink or bind-mount alias of one
+    directory under two pathnames, and the same pair reached through a
+    symlinked component. Two functions answering "do these roots collide" is
+    how the two answers drift apart, so there is now one predicate —
+    `vault_overlap.relation_between` — and this is its only caller here.
+
+    Exact duplication is not lost: it is the degenerate case of both checks, it
+    is reported as `identical`, and `assignment_conflict_message` keeps the
+    wording operators already know for it. The other two relations name the
+    relation, because "already assigned" would be false for them and would send
+    an operator looking for a duplicate string that does not exist.
+
+    **A root that cannot be opened refuses the assignment**, naming that root
+    and saying the overlap could not be ruled out — never reporting an overlap
+    that was not observed. Identity is precisely the check that catches what
+    string equality already misses, so admitting on "we could not look" is the
+    expensive direction; `validate_vault_root_path` sets the precedent by
+    refusing the *candidate* for the same missing-mount case.
+
+    Only active users **holding an assignment** are peers: an inactive or
+    unassigned account is served by nothing and indexed by nothing, so it can
+    create no overlap. That is the same population `vault_overlap` and
+    `indexer._active_user_ids` scope to.
+    """
+    q = select(User.id, User.username, User.vault_path).where(
         User.is_active.is_(True),
+        User.vault_path.isnot(None),
     )
     if exclude_user_id is not None:
         q = q.where(User.id != exclude_user_id)
-    other = (await session.execute(q)).scalar_one_or_none()
-    if other is not None:
-        return f"Vault path '{normalized}' is already assigned to user '{other}'."
+    peers = (await session.execute(q.order_by(User.id))).all()
+    if not peers:
+        return None
+
+    candidate = await vault_overlap.observe_root(normalized)
+    for peer in peers:
+        peer_root = await vault_overlap.observe_root(
+            peer.vault_path, user_id=peer.id, username=peer.username
+        )
+        if not peer_root.examinable:
+            return vault_overlap.peer_unexaminable_message(
+                peer_root.assignment, peer_root.cause
+            )
+        if not candidate.examinable:
+            # The candidate passed `validate_vault_root_path`'s `is_dir()` and
+            # then could not be opened — a permission wall, a mount that went
+            # away between the two calls, or one that stopped answering. With a
+            # peer present and nothing observed about the candidate, identity
+            # cannot be ruled out, so this refuses for the same reason a
+            # peer that cannot be opened does.
+            return (
+                f"Vault path '{candidate.assignment}' could not be examined: "
+                f"{vault_overlap.cause_text(candidate.cause)}. The assignment "
+                "is refused because an overlap with another active user's "
+                "vault could not be ruled out."
+            )
+        relation = vault_overlap.relation_between(candidate, peer_root)
+        if relation is not None:
+            return vault_overlap.assignment_conflict_message(
+                normalized, relation, peer.username
+            )
     return None
+
+
+def _quarantine_display(entry) -> dict[str, str]:
+    """The users list's rendering of one recorded quarantine.
+
+    Built from the snapshot's **recorded** facts and nothing else — no `users`
+    row is re-read to resolve the peer. The operator's first move on reading
+    "overlaps bob" is to edit or delete one of the two accounts, and a display
+    that resolved the name at render time would show a changed path, or a blank
+    where a deleted peer was, beside a condition that is still in force. The
+    cell says "as at" so the staleness is legible as a fact about the past.
+    """
+    reason = entry.reason
+    if isinstance(reason, vault_overlap.Overlap):
+        detail = (
+            f"vault root {vault_overlap.relation_text(reason.relation)} the "
+            f"vault root of user '{reason.peer_username}'"
+        )
+    else:
+        detail = (
+            "vault root could not be examined — "
+            f"{vault_overlap.cause_text(reason.cause)}"
+        )
+    return {
+        "detail": detail,
+        "detected_at": entry.detected_at.isoformat(),
+    }
 
 
 def _list_available_vaults() -> list[str]:
@@ -126,8 +219,12 @@ _USERNAME_RE = __import__("re").compile(r"^[a-z0-9_]{1,64}$")
 #
 # The value is arbitrary but must never change: it is the *name* of the
 # critical section, and two builds using different constants would not
-# exclude each other during a rolling restart.
-_ADMIN_GUARD_LOCK_KEY = 7_842_119_530_461_007
+# exclude each other during a rolling restart. It now lives in
+# `src/oauth/grants.py` — beside this codebase's other advisory-lock
+# primitives, and importable from `src/control_panel/routes.py` and
+# `src/auth/session.py`, which need the same key and cannot import this
+# module. **The value is unchanged**; only where it is written down moved.
+_ADMIN_GUARD_LOCK_KEY = ACCOUNT_GUARD_LOCK_KEY
 
 
 async def _lock_admin_guard(session: AsyncSession) -> None:
@@ -235,9 +332,19 @@ async def list_users(
         ).all()
     )
 
+    # The quarantine comes from the **published snapshot** and nowhere else:
+    # one attribute read, no query, no syscall. An account the snapshot names is
+    # refused by the admission gate before any tool body runs, so rendering its
+    # note count unqualified beside a healthy-looking assignment is the most
+    # misleading of the three states — the row count is real, and nothing will
+    # serve it. Nothing is deleted to make the display true; the display was
+    # what was wrong (#91, and the same argument again).
+    snapshot = vault_overlap.published_snapshot()
+
     result = await session.execute(select(User).order_by(User.created_at.asc()))
     users = []
     for u in result.scalars().all():
+        entry = snapshot.entry_for(u.id) if snapshot is not None else None
         users.append({
             "id": u.id,
             "username": u.username,
@@ -249,6 +356,7 @@ async def list_users(
             "api_keys_active": key_counts.get(u.id, (0, 0))[0],
             "api_keys_total": key_counts.get(u.id, (0, 0))[1],
             "notes": note_counts.get(u.id, 0),
+            "quarantine": _quarantine_display(entry) if entry is not None else None,
         })
 
     # `flash` / `flash_kind` come from the session, through `_panel_context`
@@ -444,12 +552,27 @@ async def edit_user_submit(
     normalized, err = _validate_vault_path(vault_path)
     if err:
         return _back_with_error(request, user_id, err)
-    if normalized:
-        uniq_err = await _check_vault_path_unique(
+    # Only when the edit's **resulting** state is active and assigned. An edit
+    # whose result is an inactive account, or one with no assignment, can
+    # create no overlap — the peer query and the detector both scope to active
+    # users holding an assignment — and refusing it would trap the operator in
+    # the one state they most need to leave: deactivating or unassigning is the
+    # panel's own remedy for a quarantined account, and a guard that refuses
+    # *that* because the account still overlaps is a guard with no exit.
+    # Reactivating or reassigning is an edit whose result is active and
+    # assigned, and runs the full check.
+    #
+    # It runs here on purpose: after `_lock_admin_guard` took the *existing*
+    # `_ADMIN_GUARD_LOCK_KEY` (no second key — outside a lock this is
+    # check-then-act, and two admins assigning `/vaults/team` and
+    # `/vaults/team/private` at the same moment would each read the other's
+    # previous row and both writes would land) and before the commit below.
+    if normalized and new_active:
+        conflict = await _check_vault_root_conflict(
             session, normalized, exclude_user_id=target.id
         )
-        if uniq_err:
-            return _back_with_error(request, user_id, uniq_err)
+        if conflict:
+            return _back_with_error(request, user_id, conflict)
 
     old_vault = target.vault_path
     target.vault_path = normalized

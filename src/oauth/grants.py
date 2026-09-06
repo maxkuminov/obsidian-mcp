@@ -56,6 +56,32 @@ _ADVISORY_NAMESPACE = 0x0A17  # "oauth grant"
 # window this exists to close.
 USER_BOOTSTRAP_LOCK_KEY = 7283910429
 
+# The "who may be an admin, and what may happen to an account" critical
+# section. Every handler that can change a `users.is_admin` / `users.is_active`
+# flag takes it before it counts the remaining active admins: the count and the
+# write are otherwise two statements with nothing between them, so two admins
+# demoting each other at the same moment both read "1 other active admin
+# remains", both pass the guard, and the panel ends up with zero admins and no
+# way back in through the UI.
+#
+# **It lives here rather than in `src/control_panel/users.py`, where it began,
+# because three unrelated callers now need it and two of them cannot import
+# each other.** `users.py` already imports `src/control_panel/routes.py`, so
+# `routes.py` — which owns the self-service password change (#197) — cannot
+# import back; and `src/auth/session.py`'s session mint needs it too. This
+# module is already the codebase's home for advisory-lock primitives
+# (`USER_BOOTSTRAP_LOCK_KEY`, `lock_user_bootstrap`, `lock_grant`) and is
+# dependency-light on purpose, so both sides can reach it.
+#
+# **The value is unchanged from the literal `users.py` carried.** It is a wire
+# constant, not an implementation detail: during a rolling deploy an old
+# process holds it under the old literal while a new one imports it from here,
+# and two different constants would not exclude each other — which is to say
+# the guard would silently stop guarding for exactly the window it exists to
+# cover. Two keys do not exclude each other; that is the whole reason the
+# password change takes *this* key rather than one of its own.
+ACCOUNT_GUARD_LOCK_KEY = 7_842_119_530_461_007
+
 
 def new_grant_id() -> str:
     """A fresh grant identifier for one consent event."""
@@ -95,6 +121,43 @@ async def lock_user_bootstrap(session) -> None:
     await session.execute(
         text("SELECT pg_advisory_xact_lock(:key)"),
         {"key": USER_BOOTSTRAP_LOCK_KEY},
+    )
+
+
+async def lock_account_guard(session) -> None:
+    """Enter the account critical section for this transaction.
+
+    Taken by the administrative user-management handlers (`_lock_admin_guard`
+    delegates here with the value unchanged), by the self-service password
+    change, and by every session mint. Must be taken *before* reading anything
+    the guard decides on — the admin count, the acting user's own flags, the
+    target's `is_active` — and released only by the transaction that writes
+    them: **nothing may commit between this and the protected write**, or the
+    check-then-act stops being atomic and the guard serializes the writes
+    correctly while letting the wrong one through.
+
+    The mint takes it for a reason that is not belt-and-braces. A mint running
+    after its caller's guard has been released can be overtaken by an
+    administrator's deactivation and will then insert a **live row for a
+    just-disabled account**. Validation refuses that row while the account is
+    inactive, which hides it — and on reactivation it becomes a working
+    credential nobody granted and nobody saw. Serializing the mint against the
+    deactivating handlers is what removes the window.
+
+    **Lock order.** This lock is taken alone: the password change takes it and
+    nothing else, the admin handlers take it and nothing else, the mint takes
+    it and nothing else. `register_submit` takes `USER_BOOTSTRAP_LOCK_KEY` for
+    its bootstrap transaction and this one for its mint **sequentially, never
+    nested**, so no path holds one while asking for the other and there is no
+    cycle.
+
+    Transaction-scoped (`pg_advisory_xact_lock`), so it is released by the
+    commit or the rollback — there is no unlock path to forget and a crashed
+    backend cannot strand it.
+    """
+    await session.execute(
+        text("SELECT pg_advisory_xact_lock(:key)"),
+        {"key": ACCOUNT_GUARD_LOCK_KEY},
     )
 
 

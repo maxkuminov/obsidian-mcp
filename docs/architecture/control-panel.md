@@ -343,6 +343,101 @@
   the `DELETE`: `embed_vault` selects on hash mismatch, so deleting vectors
   alone meant the reindex it spawns re-embedded nothing.
 
+- **They also take the generation lock, and it is a different lock doing a
+  different job** (#206). `acquire_generation_lock(fresh)` is the **first
+  statement of the destructive transaction** in both `reset_embeddings` and
+  `trigger_reembed` — before `SET LOCAL statement_timeout`, before the
+  `DROP INDEX`, before the `DELETE`. `index_pass_lock` is **process-local**: it
+  stops *this* container's pass and nobody else's. The reset workflow is
+  deliberately a one-off `docker compose run` that reads the edited `.env` and
+  works whether or not the service is up (#142), so the process it must exclude
+  is usually a *different* one — and only a database-level lock can. Without
+  it: the reset wipes the column and records the new fingerprint while the old
+  container, mid-provider-call, comes back and stamps `embedded_content_hash`
+  with old-model vectors under a fingerprint claiming the new model, silently
+  and for ever. Both locks, in that order — advisory before any row or table
+  lock, one direction everywhere, so the new lock cannot close a cycle with the
+  row locks the pass already holds.
+
+- **The wait is meant to be long, so no timeout is set over it.** Waiting here
+  means an index pass in another container is in flight, and waiting for it to
+  commit is the required behaviour rather than a stall. `SET LOCAL
+  statement_timeout = '5min'` therefore comes *after* the acquisition, over the
+  destructive DDL it was written for; putting the lock inside its scope would
+  abort a legitimate wait and turn a correct interlock into an intermittent
+  failure.
+
+- **The fingerprint is recorded in that same locked transaction, and a failed
+  record rolls the wipe back** (`_record_embedding_fingerprint`). This is the
+  one write on these paths that is *not* instrumentation: it is the claim a
+  later startup refuses on. Swallowing a failed record — the rule that rightly
+  governs `_write_indexer_run` and the rotation cursor — would leave the stored
+  value naming the **previous** configuration over rows about to be built under
+  the new one, and every later startup silent about it. So the failure aborts
+  the whole operation: the operator gets a flash error (a 500 with
+  `{"status": "error"}` on the JSON branch), no reindex is spawned, and the
+  vault keeps the vectors it had. Losing a reset is recoverable; keeping one
+  under a lying fingerprint is not. `reset_embeddings` still invalidates the
+  HNSW cache on that path — the DDL was transactional and the rollback undid
+  it, so a re-probe costs one query and is never wrong.
+
+- **HNSW creation on both reset paths is conditional on the configured
+  dimension** and must stay so: pgvector refuses the index above 2000 dims, so
+  an unconditional `CREATE INDEX` aborts the entire reset on such a deployment
+  and leaves the operator with a wiped column and no index (#6).
+  `trigger_reembed` creates no index at all, so the condition is vacuous there.
+
+## Two coverage questions, and the dashboard answers both
+
+- **The bar and the pending count are different questions and the bar was not
+  redefined** (#201). `stats.embedding_pct` counts notes holding *at least one
+  vector row* — "is this note represented at all". The pending count beside it
+  counts notes whose vectors are **not current** — "is that representation the
+  note as it stands now". They disagree during every embed backlog, and
+  collapsing them into the stricter one would silently rewrite what every
+  coverage figure an operator has ever read on this page meant. So the page
+  shows both, and `embedding_pct` / `notes_with_embeddings` are untouched.
+
+- **`_vectors_not_current()` is written once and called twice.** The predicate
+  is `embedded_content_hash IS NULL OR embedded_content_hash IS DISTINCT FROM
+  content_hash`. `IS DISTINCT FROM`, not `!=`: under `!=` a NULL
+  `embedded_content_hash` yields NULL, a `WHERE` reads that as false, and every
+  never-embedded note would count as *current* — the exact inversion of what
+  the count is for. Its two callers are `dashboard()` and
+  `/settings/reset-embeddings/progress`, and a second copy of the expression is
+  precisely how the page and the poller come to disagree about what "pending"
+  means.
+
+- **The two callers differ in scope, deliberately, and only in scope.**
+  `dashboard()` scopes both new counts by `_scope_user_id(user)` exactly as the
+  coverage numbers directly above them are scoped. The progress endpoint is
+  admin-only and **unscoped** — it is the poller behind a whole-database reset,
+  so "how much is left" is a question about the whole table. Copying the
+  poller's unscoped query onto the dashboard would show a regular user the
+  entire database's backlog beside their own note count: another tenant's index
+  state read as their own, on the one panel surface a non-admin can reach.
+
+- **The progress endpoint's JSON is unchanged.** `pending` is now counted with
+  the shared predicate and `embedded` derived as `total - pending`, rather than
+  the reverse. The two queries are exact complements over this table
+  (`content_hash` is `NOT NULL`, and `IS DISTINCT FROM` is total where `=` was
+  three-valued), so every previously reported figure is the figure still
+  reported under the same four keys.
+
+- **Both counts render at zero.** An absent count is not evidence of absence:
+  an operator cannot distinguish "no backlog" from "this build does not report
+  one", which is the same reason the vector tools carry their stale count even
+  when it is nought. Zero renders in the muted token and a non-zero truncation
+  count in the warning one, so the row changes colour rather than changing
+  shape — no new CSS values, `checks/token_coverage.py` stays green.
+
+- **A pending count that does not shrink across passes is the operator-visible
+  shape of two failures nothing else on this page surfaces**: a provider
+  outage, which now marks the pass record but leaves coverage reading whatever
+  it read yesterday, and a tenant whose embedding is repeatedly stopped at its
+  per-pass budget, which is deliberately *not* written into the pass record's
+  `error` because it is a decision rather than a fault.
+
 ## The last-admin guard
 
 - **Every panel handler that can change `users.is_admin` / `users.is_active`
