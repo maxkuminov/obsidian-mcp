@@ -488,3 +488,141 @@ async def test_sibling_roots_still_rebuild_normally(sessionmaker, world):
         outcomes = await indexer.rebuild_tsvectors_all_scopes(session)
     assert all(o.completed for o in outcomes.values())
     assert await _tsvectors(sessionmaker) == {1: True, 2: True}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The account guard: the survey is check-then-act without it (#199 round 2)
+# ══════════════════════════════════════════════════════════════════════════
+
+
+async def test_the_rebuild_holds_the_account_guard_for_its_whole_run(
+    sessionmaker, world, monkeypatch
+):
+    """An assignment edit cannot land between the survey and the reads.
+
+    The survey accepts a nested pair when the conflicting user is **inactive**
+    — correctly, since nothing serves an inactive user — and an administrator
+    reactivating or reassigning that user while this command runs turns the
+    accepted layout into the cross-tenant read the survey exists to prevent.
+    That is check-then-act across *processes*: the edit is a different
+    connection committing between the check and the read, and no amount of
+    re-checking inside this transaction can see it coming.
+
+    So the driver takes `ACCOUNT_GUARD_LOCK_KEY` — the same key the panel's
+    `_lock_admin_guard`, the password change and every session mint take —
+    before it enumerates anything, and holds it to the commit. This asserts
+    that directly: while the rebuild is between its survey and its reads, a
+    second connection asking for the guard **cannot get it**.
+    """
+    from src.oauth.grants import ACCOUNT_GUARD_LOCK_KEY
+
+    await _seed_rows(sessionmaker, [1, 2])
+
+    observed = {}
+    real_survey = indexer.survey_rebuild_roots
+
+    async def _survey(participants):
+        result = await real_survey(participants)
+        # Mid-run: the survey has happened, the reads have not. This is exactly
+        # the window an administrator's edit would have to land in.
+        async with sessionmaker() as other:
+            observed["held"] = (await other.execute(
+                text("SELECT pg_try_advisory_xact_lock(:k)"),
+                {"k": ACCOUNT_GUARD_LOCK_KEY},
+            )).scalar()
+            await other.rollback()
+        return result
+
+    monkeypatch.setattr(indexer, "survey_rebuild_roots", _survey)
+
+    async with sessionmaker() as session:
+        outcomes = await indexer.rebuild_tsvectors_all_scopes(session)
+
+    assert observed["held"] is False, (
+        "an administrator could have edited an assignment between the survey "
+        "and the rebuild's reads"
+    )
+    assert all(o.completed for o in outcomes.values())
+
+    # And it is transaction-scoped: the commit released it.
+    async with sessionmaker() as after:
+        free = (await after.execute(
+            text("SELECT pg_try_advisory_xact_lock(:k)"),
+            {"k": ACCOUNT_GUARD_LOCK_KEY},
+        )).scalar()
+        await after.rollback()
+    assert free is True, "the rebuild stranded the account guard"
+
+
+async def test_the_account_guard_is_taken_before_the_survey_enumerates(
+    sessionmaker, world, monkeypatch
+):
+    """Order, not merely presence. A guard taken *after* the enumeration
+    leaves the window it exists to close wide open."""
+    from src.oauth.grants import ACCOUNT_GUARD_LOCK_KEY
+
+    await _seed_rows(sessionmaker, [1, 2])
+
+    order = []
+    real_guard = indexer.lock_account_guard
+    real_participants = indexer._rebuild_root_participants
+
+    async def _guard(session):
+        order.append("account guard")
+        return await real_guard(session)
+
+    async def _participants(session):
+        order.append("participants")
+        return await real_participants(session)
+
+    monkeypatch.setattr(indexer, "lock_account_guard", _guard)
+    monkeypatch.setattr(indexer, "_rebuild_root_participants", _participants)
+
+    async with sessionmaker() as session:
+        await indexer.rebuild_tsvectors_all_scopes(session)
+
+    assert order[:2] == ["account guard", "participants"], order
+
+
+async def test_a_scope_the_final_population_did_not_examine_is_never_read(
+    sessionmaker, world, monkeypatch
+):
+    """The guard's purpose, stated as the property it buys.
+
+    An assignment applied *before* the survey is seen by it; one attempted
+    after waits for the rebuild. Either way the rebuild reads only scopes the
+    survey examined — which this asserts by failing if any scope reaches
+    `_rebuild_tsvectors_pinned` without a retained descriptor from the survey
+    that is in force.
+    """
+    await _seed_rows(sessionmaker, [1, 2])
+
+    surveys = []
+    real_survey = indexer.survey_rebuild_roots
+
+    async def _survey(participants):
+        result = await real_survey(participants)
+        surveys.append(result)
+        return result
+
+    read = []
+    real_pinned = indexer._rebuild_tsvectors_pinned
+
+    async def _pinned(session, user_id, vault, root_fd, log_suffix):
+        assert surveys, "a scope was read before any survey ran"
+        survey = surveys[-1]
+        assert survey.descriptor_for(user_id) == root_fd, (
+            f"user_id={user_id} was read through a descriptor the survey did "
+            "not retain"
+        )
+        read.append(user_id)
+        return await real_pinned(session, user_id, vault, root_fd, log_suffix)
+
+    monkeypatch.setattr(indexer, "survey_rebuild_roots", _survey)
+    monkeypatch.setattr(indexer, "_rebuild_tsvectors_pinned", _pinned)
+
+    async with sessionmaker() as session:
+        outcomes = await indexer.rebuild_tsvectors_all_scopes(session)
+
+    assert sorted(read) == [1, 2]
+    assert all(o.completed for o in outcomes.values())

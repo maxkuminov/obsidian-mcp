@@ -119,6 +119,88 @@ class RootObservation:
         return self.cause is None
 
 
+def close_root_descriptor(fd: int | None) -> None:
+    """Close a retained root descriptor, tolerating a double close.
+
+    One helper because a descriptor retained past the function that opened it
+    has more than one closing path — the caller's success path, its abort path,
+    and the late-completion callback for an observation whose deadline expired
+    after the thread had already opened the directory. A `close` that raises in
+    any of them would replace the real failure with an `OSError` about
+    bookkeeping.
+    """
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:  # pragma: no cover - close of a valid fd
+        logger.warning("failed to close vault-root descriptor", exc_info=True)
+
+
+def observe_root_blocking_retaining(
+    assignment: str,
+    *,
+    user_id: int | None = None,
+    username: str | None = None,
+) -> tuple[RootObservation, int | None]:
+    """`observe_root_blocking`, **returning the open descriptor** on success.
+
+    The one place the facts are taken, and the only difference from
+    `observe_root_blocking` is who owns the descriptor afterwards. The caller
+    that asks for it owns it and **must** close it — see `close_root_descriptor`
+    — on the success path and on every abort path.
+
+    Only the *maintenance* rebuild asks for it, and for a reason no serving
+    path shares. That command's read of a root must be a read of the directory
+    the survey examined, and the only object that guarantees that across a wait
+    for the index generation lock is the descriptor itself: a pathname reopened
+    afterwards is a second `open`, unbounded, under a lock, on a directory that
+    may no longer be the one that was checked. The detection publishes a
+    verdict and reads nothing, so it retains nothing — holding one descriptor
+    per tenant across the awaited pairwise phase would be a leak proportional
+    to the tenant count for no gain.
+
+    `fd` is `None` exactly when the observation produced a `cause`.
+    """
+    canonical = canonical_assignment(assignment)
+    fd: int | None = None
+    keep = False
+    try:
+        try:
+            fd = os.open(canonical, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            pinned = os.fstat(fd)
+            realpath = os.path.realpath(canonical)
+            named = os.stat(realpath)
+        except OSError as exc:
+            return RootObservation(
+                assignment=canonical,
+                user_id=user_id,
+                username=username,
+                cause=exc.errno if exc.errno is not None else errno_module.EIO,
+            ), None
+        if (named.st_dev, named.st_ino) != (pinned.st_dev, pinned.st_ino):
+            return RootObservation(
+                assignment=canonical,
+                user_id=user_id,
+                username=username,
+                cause=CAUSE_UNSTABLE,
+            ), None
+        keep = True
+        return RootObservation(
+            assignment=canonical,
+            user_id=user_id,
+            username=username,
+            st_dev=pinned.st_dev,
+            st_ino=pinned.st_ino,
+            realpath=realpath,
+        ), fd
+    finally:
+        # Every path that does not hand the descriptor to the caller closes it
+        # here, including an exception nobody expected.
+        if not keep:
+            close_root_descriptor(fd)
+
+
 def observe_root_blocking(
     assignment: str,
     *,
@@ -132,6 +214,8 @@ def observe_root_blocking(
     `exec`. **The descriptor is the source of every fact and is closed on every
     exit path** — nothing downstream needs it open, and holding one across the
     awaited pairwise phase would be a leak proportional to the tenant count.
+    (The maintenance rebuild is the one caller that does need it open, and it
+    calls `observe_root_blocking_retaining` and owns the close.)
 
     The real path is bound to the descriptor the way
     `indexer.observe_root_facts` binds it: `os.stat(os.path.realpath(...))` must
@@ -147,41 +231,11 @@ def observe_root_blocking(
     it through `observe_root`, which dispatches it off the event loop under a
     deadline.
     """
-    canonical = canonical_assignment(assignment)
-    fd: int | None = None
-    try:
-        fd = os.open(canonical, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-        pinned = os.fstat(fd)
-        realpath = os.path.realpath(canonical)
-        named = os.stat(realpath)
-    except OSError as exc:
-        return RootObservation(
-            assignment=canonical,
-            user_id=user_id,
-            username=username,
-            cause=exc.errno if exc.errno is not None else errno_module.EIO,
-        )
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:  # pragma: no cover - close of a valid fd
-                logger.warning("failed to close vault-root descriptor", exc_info=True)
-    if (named.st_dev, named.st_ino) != (pinned.st_dev, pinned.st_ino):
-        return RootObservation(
-            assignment=canonical,
-            user_id=user_id,
-            username=username,
-            cause=CAUSE_UNSTABLE,
-        )
-    return RootObservation(
-        assignment=canonical,
-        user_id=user_id,
-        username=username,
-        st_dev=pinned.st_dev,
-        st_ino=pinned.st_ino,
-        realpath=realpath,
+    observation, fd = observe_root_blocking_retaining(
+        assignment, user_id=user_id, username=username
     )
+    close_root_descriptor(fd)
+    return observation
 
 
 async def observe_root(
@@ -564,10 +618,26 @@ async def _detect(sequence: int, session_factory) -> QuarantineSnapshot:
         # the sandbox cannot fix. No filesystem is touched.
         return _snapshot(sequence, detected_at, ())
 
+    if not settings.multi_user_mode:
+        # **Before the enumeration, not after it.** Single-user mode has one
+        # root, from `settings.vault_path`, and `users.vault_path` is not the
+        # tenancy source there at all: `_vault_root(None)` never consults the
+        # snapshot, `_refuse_quarantined_pass` returns immediately for a null
+        # user, and there is no second assignment for anything to overlap. The
+        # check used to sit *after* `_active_assignments`, which meant a
+        # single-user deployment whose `users` table still held rows from a
+        # previous multi-user configuration — or from a flag flipped back —
+        # issued the query and then observed every one of those roots, opening
+        # directories that mode does not serve, once per pass entry point, to
+        # build a snapshot nothing reads. Neither a database nor a filesystem
+        # call is correct here, and skipping only the *observation* would still
+        # leave the query.
+        return _snapshot(sequence, detected_at, ())
+
     rows = await _active_assignments(session_factory)
     if not rows:
-        # Single-user mode reaches here too: `_active_user_ids` is empty there,
-        # so the snapshot is empty and every pass behaves exactly as today.
+        # No active user holds an assignment. Nothing to compare, and nothing
+        # to quarantine.
         return _snapshot(sequence, detected_at, ())
 
     observations = await asyncio.gather(

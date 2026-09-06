@@ -69,6 +69,7 @@ from src.services.links import (
     extract_links_bounded,
     resolve_target,
 )
+from src.oauth.grants import lock_account_guard
 from src.services import vault_overlap
 from src.services.transfer import canonical_vault_root
 from src.services.vault import (
@@ -3642,14 +3643,27 @@ class _RootParticipant:
     is_scope: bool
 
 
-@dataclass(frozen=True)
+@dataclass
 class RebuildRootSurvey:
     """What one bounded look at every root the rebuild would open established.
 
     `observations` is the **descriptor-bound verdict** — `(st_dev, st_ino)` and
-    the canonical real path taken from an opened directory descriptor — carried
-    into the locked section so that nothing under the generation lock has to
-    open a root nobody has examined.
+    the canonical real path taken from an opened directory descriptor — and
+    `descriptors` holds **that descriptor, still open**, so the locked rebuild
+    reads through the object the survey examined rather than through a pathname
+    it reopens.
+
+    Reopening was the defect. `pinned_root` calls `os.open` synchronously, and
+    doing that after `acquire_generation_lock` means one hung NFS or FUSE mount
+    holds the index generation lock for as long as the kernel likes with every
+    pass in the process queued behind it — and it is a *second* lookup, so the
+    inode it lands on need not be the inode that was checked. Carrying the
+    descriptor answers both: no pathname resolution happens under the lock at
+    all, and the identity check is a plain `fstat` of the thing about to be
+    read.
+
+    **The owner of this object owns the descriptors** and must call `close()`
+    on every path — success, abort, and exception. `close()` is idempotent.
     """
 
     #: Per participant owner, the observation taken before the lock.
@@ -3659,6 +3673,80 @@ class RebuildRootSurvey:
     #: Per **scope**, why it may not be rebuilt. Empty means the survey found
     #: nothing; any entry aborts the whole operation.
     failures: dict[int | None, RebuildOutcome]
+    #: Canonical assignment → the still-open directory descriptor. Keyed by
+    #: **assignment and not by owner** so that two scopes naming one directory
+    #: share one descriptor and it is closed exactly once. (That pair is an
+    #: `identical` overlap and aborts, but the bookkeeping must not depend on
+    #: the check that makes it unreachable.)
+    descriptors: dict[str, int] = field(default_factory=dict)
+
+    def descriptor_for(self, owner: int | None) -> int | None:
+        """The retained descriptor for this scope's root, or None."""
+        assignment = self.assignments.get(owner)
+        if assignment is None:
+            return None
+        return self.descriptors.get(assignment)
+
+    def close(self) -> None:
+        """Close every retained descriptor. Idempotent, and it never raises."""
+        while self.descriptors:
+            _assignment, fd = self.descriptors.popitem()
+            vault_overlap.close_root_descriptor(fd)
+
+
+def _close_late_root_descriptor(task) -> None:
+    """Close a descriptor an abandoned observation opened after we gave up.
+
+    The deadline abandons the *wait*, not the syscall (L4): the thread stays
+    parked in `open(2)` until the filesystem answers, and when it does it comes
+    back holding an open directory nobody is waiting for any more. Without this
+    callback that descriptor lives as long as the process — one per stalled
+    root per detection, which is a slow leak on exactly the pathological mount
+    the deadline exists to survive.
+    """
+    if task.cancelled():
+        return
+    if task.exception() is not None:
+        return
+    _observation, fd = task.result()
+    vault_overlap.close_root_descriptor(fd)
+
+
+async def _observe_root_retaining(
+    assignment: str, *, timeout: float | None = None
+) -> tuple[vault_overlap.RootObservation, int | None]:
+    """One root observed off the loop under the deadline, descriptor retained.
+
+    The maintenance twin of `vault_overlap.observe_root`: same bound, same
+    per-root verdict, and it hands back the open directory instead of closing
+    it. The caller owns the descriptor.
+
+    Expiry returns `(RootUnexaminable(timeout), None)` exactly as the serving
+    observation does, and arms `_close_late_root_descriptor` so a thread that
+    answers afterwards does not leave the directory open. The same arming
+    covers an outer cancellation, which is the other way this coroutine can
+    stop caring about a task that is still running.
+    """
+    if timeout is None:
+        timeout = float(settings.vault_root_observe_timeout_seconds)
+    task = asyncio.ensure_future(
+        asyncio.to_thread(
+            vault_overlap.observe_root_blocking_retaining, assignment
+        )
+    )
+    handed_off = False
+    try:
+        observation, fd = await asyncio.wait_for(asyncio.shield(task), timeout)
+        handed_off = True
+        return observation, fd
+    except (asyncio.TimeoutError, TimeoutError):
+        return vault_overlap.RootObservation(
+            assignment=vault_overlap.canonical_assignment(assignment),
+            cause=vault_overlap.CAUSE_TIMEOUT,
+        ), None
+    finally:
+        if not handed_off:
+            task.add_done_callback(_close_late_root_descriptor)
 
 
 def _survey_overlap_detail(
@@ -3724,9 +3812,22 @@ async def survey_rebuild_roots(
     """
     distinct = sorted({p.assignment for p in participants})
     observed = await asyncio.gather(
-        *(vault_overlap.observe_root(assignment) for assignment in distinct)
+        *(_observe_root_retaining(assignment) for assignment in distinct)
     )
-    by_assignment = dict(zip(distinct, observed))
+    by_assignment = {a: o for a, (o, _fd) in zip(distinct, observed)}
+
+    # **Only a scope's descriptor is retained.** A peer is present so that a
+    # scope can be found to overlap it; nothing reads a peer's directory, so
+    # holding its descriptor open across the rebuild would be a plain leak.
+    scope_assignments = {p.assignment for p in participants if p.is_scope}
+    descriptors: dict[str, int] = {}
+    for assignment, (_observation, fd) in zip(distinct, observed):
+        if fd is None:
+            continue
+        if assignment in scope_assignments:
+            descriptors[assignment] = fd
+        else:
+            vault_overlap.close_root_descriptor(fd)
 
     observations = {p.owner: by_assignment[p.assignment] for p in participants}
     assignments = {p.owner: p.assignment for p in participants}
@@ -3764,7 +3865,10 @@ async def survey_rebuild_roots(
                     )
 
     return RebuildRootSurvey(
-        observations=observations, assignments=assignments, failures=failures
+        observations=observations,
+        assignments=assignments,
+        failures=failures,
+        descriptors=descriptors,
     )
 
 
@@ -3837,11 +3941,24 @@ async def _rebuild_scope(
     """Rebuild one retained owner scope. Does **not** commit.
 
     `survey` carries the descriptor-bound verdict taken **before** the
-    generation lock. When it is present this function opens no root the survey
-    did not examine: the assignment must still be the one that was observed,
-    and the directory the pin lands on must still be the inode that was
-    observed. Either disagreement means the pathname moved between the survey
-    and the lock, so the verdict does not describe what is about to be read.
+    generation lock, and it carries the descriptors themselves. When it is
+    present this function performs **no pathname lookup at all**: it reads
+    through the directory the survey opened, and the only filesystem call it
+    makes on the root is `fstat` of that descriptor.
+
+    That is stronger than re-checking the assignment, and it has to be. A
+    pathname reopened after the lock is a second lookup — unbounded, so a hung
+    mount holds the index generation lock while it waits, and *racy*, so it can
+    land on an inode nobody examined. The descriptor is the only object that
+    survives the wait still naming the same directory.
+
+    The assignment is still compared, because a scope reassigned between the
+    survey and the lock is a scope whose retained descriptor is now the *wrong*
+    directory to rebuild — correct in identity, wrong in tenancy — and the
+    coverage claim is about the root the user holds now.
+
+    With no `survey` (the single-scope callers) it falls back to `pinned_root`,
+    which opens the pathname itself.
     """
     log_suffix = f" (user_id={owner})" if owner is not None else ""
     try:
@@ -3870,10 +3987,10 @@ async def _rebuild_scope(
                 "assigned vault_path"
             ),
         )
-    observed = None
     if survey is not None:
         observed = survey.observations.get(owner)
         surveyed_assignment = survey.assignments.get(owner)
+        retained = survey.descriptor_for(owner)
         canonical = vault_overlap.canonical_assignment(vault)
         if observed is None or surveyed_assignment is None:
             return RebuildOutcome(
@@ -3894,28 +4011,45 @@ async def _rebuild_scope(
                     "Re-run."
                 ),
             )
+        if retained is None:
+            # The survey examined this scope but is not holding its directory
+            # open — a timed-out or unopenable root, which is already a
+            # failure, or a survey that was closed. Reopening the pathname is
+            # exactly what must not happen here.
+            return RebuildOutcome(
+                skip=RebuildSkip.ROOT_UNEXAMINABLE,
+                detail=(
+                    f"user_id={owner} has no retained descriptor from the "
+                    "pre-lock survey, and this command does not reopen a "
+                    "pathname under the generation lock. Re-run."
+                ),
+            )
+        try:
+            # The only filesystem call this makes on the root, and it is on the
+            # descriptor rather than the name. It cannot fail the way a second
+            # `open` can — there is no lookup — so what it actually guards is
+            # the bookkeeping: that the fd handed over is the fd whose facts
+            # the survey recorded.
+            pinned = os.fstat(retained)
+        except OSError as exc:
+            return RebuildOutcome(
+                skip=RebuildSkip.ROOT_UNEXAMINABLE,
+                detail=f"{vault}: the retained root descriptor is unusable: {exc}",
+            )
+        if (pinned.st_dev, pinned.st_ino) != (observed.st_dev, observed.st_ino):
+            return RebuildOutcome(
+                skip=RebuildSkip.ROOT_UNEXAMINABLE,
+                detail=(
+                    f"{vault}: the retained descriptor does not report the "
+                    "facts the survey recorded for it, so the examined root is "
+                    "not the one about to be read. Re-run."
+                ),
+            )
+        return await _rebuild_tsvectors_pinned(
+            session, owner, vault, retained, log_suffix
+        )
     try:
         with pinned_root(vault) as root_fd:
-            if observed is not None:
-                # The survey's verdict is bound to `(st_dev, st_ino)`, not to
-                # the pathname — which is the only way it can still be a
-                # statement about *this* directory after the lock. A pathname
-                # retargeted in between lands the pin on an inode nobody
-                # examined, and that is precisely the check-then-act interval
-                # `pinned_root` exists to close for the rest of the pass.
-                pinned = os.fstat(root_fd)
-                if (pinned.st_dev, pinned.st_ino) != (
-                    observed.st_dev, observed.st_ino
-                ):
-                    return RebuildOutcome(
-                        skip=RebuildSkip.ROOT_UNEXAMINABLE,
-                        detail=(
-                            f"{vault}: the directory this pathname names "
-                            "changed between the root survey and the rebuild, "
-                            "so the examined root is not the one that would be "
-                            "read. Re-run."
-                        ),
-                    )
             return await _rebuild_tsvectors_pinned(
                 session, owner, vault, root_fd, log_suffix
             )
@@ -3942,12 +4076,47 @@ async def rebuild_tsvectors_all_scopes(session) -> dict:
     previous configuration, and the startup guard that now fails closed on it
     would pass while keyword search was exactly as wrong as before.
 
-    So: survey every root this command would open **before** taking the
-    generation lock, take the lock before reading the first row, enumerate the
-    scopes from the rows that exist (`SELECT DISTINCT user_id FROM
-    notes_metadata` — not `_active_user_ids()`), rebuild each, and write the
-    fingerprint in the same transaction as all of them. Any retained scope
+    So: take the **account-administration guard** first, survey every root this
+    command would open, take the generation lock before reading the first row,
+    enumerate the scopes from the rows that exist (`SELECT DISTINCT user_id
+    FROM notes_metadata` — not `_active_user_ids()`), rebuild each, and write
+    the fingerprint in the same transaction as all of them. Any retained scope
     whose outcome is not completed aborts the whole thing.
+
+    ## Lock order, and why the account guard is here at all
+
+    | # | Lock | Taken |
+    | --- | --- | --- |
+    | 1 | `ACCOUNT_GUARD_LOCK_KEY` (`lock_account_guard`) | first statement, before the participant enumeration |
+    | 2 | `INDEX_GENERATION_LOCK_KEY` (`acquire_generation_lock`) | after the survey, before the first row read |
+    | 3 | row locks | inside the per-scope rebuild |
+
+    **One direction, everywhere.** No other path in this codebase takes both:
+    the account guard is taken alone by the admin handlers
+    (`users._lock_admin_guard`), the self-service password change and every
+    session mint; the generation lock is taken alone by the index pass, the
+    embed certification, the panel's Danger-zone resets and
+    `scripts/reset_embeddings.py`. This driver is the only holder of the pair
+    and it takes them in the order above, so no cycle exists.
+
+    Without the guard the survey is check-then-act **across processes**. The
+    survey accepts a nested pair because the conflicting user is *inactive*
+    — inactive users are not peers, correctly, since nothing serves them — and
+    an administrator may then reactivate or reassign that user in the panel
+    while this command is still running. The reads that follow are exactly the
+    cross-tenant read the survey exists to prevent, and no amount of
+    re-checking inside this transaction closes it: the edit is a different
+    connection committing between the check and the read. The guard is the
+    mechanism the panel already uses to serialize precisely those edits, so
+    holding it across the whole rebuild makes an edit wait for the rebuild, or
+    land before the survey and be seen by it.
+
+    **The cost, stated:** an operator running `make rebuild-tsvectors` blocks
+    panel account edits and session mints for the duration — including the wait
+    for the generation lock, which is a wait for an in-flight index pass to
+    commit. That is accepted. This is a one-off maintenance command an operator
+    runs deliberately, the alternative is a cross-tenant read, and the guard
+    is transaction-scoped so a crash releases it with no operator action.
 
     **The survey is this command's own overlap check, and it must be.** The
     published quarantine snapshot answers for the users the server *serves*;
@@ -3959,6 +4128,24 @@ async def rebuild_tsvectors_all_scopes(session) -> dict:
     this is the cheap maintenance path — keyword index only, no provider calls,
     seconds for a few thousand notes.
     """
+    # ── Lock 1 of 3: the account-administration guard, before anything is
+    # enumerated. See the docstring's lock-order table.
+    #
+    # The survey below is check-then-act across processes without it. It
+    # accepts a nested pair whose conflicting user is *inactive* — correctly,
+    # since nothing serves an inactive user — and an administrator may then
+    # reactivate or reassign that user in the panel while this command runs,
+    # turning the accepted layout into the cross-tenant read the survey exists
+    # to prevent. No re-check inside this transaction closes that: the edit is
+    # another connection committing between the check and the read. This is
+    # the same key `users._lock_admin_guard` takes, so those edits serialize
+    # behind this command — they either wait for it, or land before the survey
+    # and are seen by it.
+    #
+    # It is `pg_advisory_xact_lock`, so this transaction's commit or rollback
+    # releases it and there is no unlock path to forget.
+    await lock_account_guard(session)
+
     # **Every root this command would open is observed here, before the lock.**
     # `detect_and_publish` speaks only for *active* assigned users, because
     # that is whom the server serves; this driver opens the retained scope of
@@ -3971,10 +4158,31 @@ async def rebuild_tsvectors_all_scopes(session) -> dict:
     # bounded observation that happens after the lock has already let one hung
     # mount hold the index generation lock for as long as the kernel likes.
     #
+    # The survey **retains** each scope's directory descriptor, and this
+    # function owns them from here: every path below closes them, which is what
+    # the `try`/`finally` is for. They are what the locked rebuild reads
+    # through, so no pathname is resolved after the generation lock at all.
+    #
     # Nothing about the serving snapshot changes: this publishes nothing and
     # quarantines nobody. See `survey_rebuild_roots`.
     participants = await _rebuild_root_participants(session)
     survey = await survey_rebuild_roots(participants)
+    try:
+        return await _rebuild_all_scopes_locked(session, survey)
+    finally:
+        # Success, abort and exception alike. A descriptor per tenant leaked
+        # once per run of a command an operator may run in a loop is a slow
+        # exhaustion of the process's file-descriptor budget.
+        survey.close()
+
+
+async def _rebuild_all_scopes_locked(session, survey: RebuildRootSurvey) -> dict:
+    """The body of `rebuild_tsvectors_all_scopes`, with the survey in hand.
+
+    Split out so that the descriptors the survey retains have exactly one
+    owner and exactly one closing path — the caller's `finally` — rather than
+    a `close()` repeated down every `raise` in here.
+    """
     if survey.failures:
         owner, outcome = next(iter(sorted(
             survey.failures.items(), key=lambda item: (item[0] is not None, item[0])

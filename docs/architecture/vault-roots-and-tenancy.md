@@ -326,14 +326,66 @@ populations answering two questions — *whom does this server serve* and *whose
 bytes will this command read* — and a single answer would be wrong for one of
 them.
 
-**It also runs before `acquire_generation_lock`.** The observation is the same
-bounded, off-loop one, and the descriptor-bound verdict is carried into the
-locked section: under the lock, `_rebuild_scope` re-checks that the assignment
-is still the one that was surveyed and that `os.fstat(root_fd)` reports the
-inode that was observed, and refuses otherwise. `pinned_root` on its own opens
-synchronously, so an unexamined root opened under the lock lets one hung mount
-hold the index generation lock for as long as the kernel takes to answer, with
-every pass in the process queued behind it.
+**It also runs before `acquire_generation_lock`, and it keeps the
+descriptors.** `survey_rebuild_roots` calls
+`vault_overlap.observe_root_blocking_retaining` through
+`indexer._observe_root_retaining` — same bound, same per-root verdict, but the
+open directory is handed back rather than closed — and `_rebuild_scope` reads
+through *that descriptor*. Under the generation lock this command performs **no
+pathname lookup at all**; its only filesystem call on a root is `fstat` of the
+fd it is already holding.
+
+Reopening the pathname was wrong twice over. `pinned_root` calls `os.open`
+synchronously, so an unexamined root opened under the lock lets one hung NFS or
+FUSE mount hold the index generation lock for as long as the kernel takes to
+answer, with every pass in the process — in every container — queued behind it.
+And it is a *second* lookup, so it can land on an inode nobody examined; a
+descriptor is the only object that still names the same directory after a wait.
+
+The assignment is still compared, because a scope reassigned between the survey
+and the lock has a retained descriptor that is the *wrong directory to rebuild*
+— right in identity, wrong in tenancy. Peer descriptors are closed immediately:
+nothing reads a peer's directory. `RebuildRootSurvey.close()` is idempotent and
+`rebuild_tsvectors_all_scopes` calls it from a `finally`, so success, abort and
+exception all release them; a timed-out observation whose thread answers later
+is closed by `_close_late_root_descriptor`, which is L4's descriptor half.
+
+### Lock order: account guard → generation lock → row locks
+
+The survey is check-then-act **across processes** on its own. It accepts a
+nested pair when the conflicting user is *inactive* — correctly, since nothing
+serves an inactive user — and an administrator may reactivate or reassign that
+user in the panel while `make rebuild-tsvectors` is still running. The reads
+that follow are then exactly the cross-tenant read the survey exists to
+prevent, and nothing inside the driver's transaction can see it coming: the
+edit is a different connection committing between the check and the read.
+
+So `rebuild_tsvectors_all_scopes` takes **`ACCOUNT_GUARD_LOCK_KEY`**
+(`oauth.grants.lock_account_guard`) as its first statement, before it
+enumerates anything, and holds it to the commit. That is the same key
+`users._lock_admin_guard`, the self-service password change and every session
+mint take, so an assignment edit either waits for the rebuild or lands before
+the survey and is seen by it.
+
+| # | Lock | Who takes it |
+| --- | --- | --- |
+| 1 | `ACCOUNT_GUARD_LOCK_KEY` | `users._lock_admin_guard` (admin handlers), `routes.change_password`, `session.start_session` (mint) — each **alone**; and `indexer.rebuild_tsvectors_all_scopes`, which then takes 2. |
+| 2 | `INDEX_GENERATION_LOCK_KEY` | `indexer._index_vault_pinned`, `embeddings._generation_matches`, `routes.reset_embeddings`, `routes.trigger_reembed`, `scripts/reset_embeddings.py` — each **alone**; and `indexer._rebuild_all_scopes_locked`, reached only from 1's holder. |
+| 3 | row locks | inside each per-scope rebuild. |
+
+**One direction everywhere.** The maintenance rebuild is the only holder of the
+pair, and it takes them in that order; no path anywhere takes them in the
+opposite one. If you add a path that needs both, **take the account guard
+first**. The rule is written at both lock definitions
+(`oauth/grants.py::lock_account_guard`, `index_state.py::acquire_generation_lock`)
+as well as here.
+
+**The cost, stated rather than discovered:** a running `make rebuild-tsvectors`
+blocks panel account edits and session mints until it commits — including its
+wait for the generation lock, which is a wait for an in-flight index pass. That
+is accepted. It is an operator-run one-off, the alternative is a cross-tenant
+read, and both locks are `pg_advisory_xact_lock`, so a crashed rebuild releases
+them with no operator action.
 
 ### One detection at a time, and a publication that cannot go backwards
 
@@ -473,7 +525,14 @@ query.**
 - It is **never consulted for `user_id is None`**. Single-user mode has one
   root and no second assignment, so there is nothing to detect and nothing to
   be ready for; a pass and a tool call there behave exactly as they did before
-  this guard existed.
+  this guard existed. And `_detect` short-circuits to an empty snapshot on
+  `not settings.multi_user_mode` **before the enumeration query and before any
+  `open`** — not after, which is where the check used to sit. A single-user
+  deployment whose `users` table still holds rows (a flag flipped back, a
+  deployment that was multi-user once) would otherwise issue that query and
+  then observe every root in it, once per pass entry point, to build a snapshot
+  nothing in that mode reads. It still *publishes*: the never-published state
+  is a refusal, and single-user mode must never sit in it.
 - `VaultRootOverlap`, `VaultRootUnexaminable` and `VaultRootNotReady` all
   subclass **`RuntimeError`**, which is load-bearing: every existing
   `except RuntimeError` around `_vault_root` keeps failing closed unchanged,
