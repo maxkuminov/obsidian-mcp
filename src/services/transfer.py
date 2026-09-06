@@ -883,26 +883,79 @@ def owner_quarantined(user_id: int | None) -> bool:
     byte-identical for every cause, which is the anti-oracle the whole surface
     rests on — so only the server-side record says which condition refused.
     """
+    return quarantine_refusal(user_id) is not None
+
+
+#: The two quarantine conditions, as reason codes on `transfer_refused`.
+#: They are **not** the same fact and must not share a name: one says a tenant's
+#: root is shared or unverifiable, the other says *this process* has not
+#: finished looking yet.
+REASON_OWNER_QUARANTINED = "owner_quarantined"
+REASON_ROOT_UNVERIFIED = "root_unverified"
+
+
+def quarantine_refusal(user_id: int | None) -> str | None:
+    """Which quarantine condition refuses this owner's root, or `None`.
+
+    The predicate half of `owner_quarantined`, split out so the refusal can be
+    **named** rather than collapsed. It used to log its own two `logger.warning`
+    lines from inside a service helper on the redemption path — which is
+    exactly the unbounded flood channel D18 exists to close, since an
+    unauthenticated caller replaying one dead capability drives this branch as
+    fast as it can open connections. Worse, the bounded record it sat beside
+    then called the condition `root_reassigned`, because that is what the
+    route's `resolve_root_ok` predicate collapses to: a *wrong* reason, which
+    sends an operator to look at an assignment nobody changed.
+
+    So nothing is logged here at all. The reason travels to the one permitted
+    emission — `transfer_refused`, behind the permit — and the operator detail
+    that used to be interpolated into the message (`operator_text(entry)`,
+    which names the overlapping roots) is on the surfaces built for it: the
+    panel's quarantine strip, the affected user's `indexer_runs` row, and the
+    ERROR line `vault_overlap._log_snapshot` writes once per detection pass.
+    A structured field for it would be free text on a shared sink, which the
+    allow-list has no room for (design D2).
+
+    Refuse-only, and one attribute read plus a dict lookup: no session, no
+    statement, no syscall — it may be called from a diagnosis path that must
+    not take a connection.
+    """
     if not settings.multi_user_mode:
-        return False
+        return None
     snapshot = vault_overlap.published_snapshot()
     if snapshot is None:
-        logger.warning(
-            "transfer redemption refused: no vault-root overlap snapshot has "
-            "been published in this process, so the owner's root has not been "
-            "checked"
-        )
-        return True
+        return REASON_ROOT_UNVERIFIED
     if user_id is None:
-        return False
-    entry = snapshot.entry_for(user_id)
-    if entry is None:
-        return False
-    logger.warning(
-        "transfer redemption refused: owner is quarantined — %s",
-        vault_overlap.operator_text(entry),
+        return None
+    if snapshot.entry_for(user_id) is None:
+        return None
+    return REASON_OWNER_QUARANTINED
+
+
+def root_refusal(row) -> TransferRefusal:
+    """The typed reason for a root check that has **already** said no.
+
+    Diagnosis after the decision, the same shape as `classify_token_refusal`
+    (design D8): `resolve_root_ok` remains the one admission predicate and its
+    answer is unchanged, so the accepted-token set does not move and the 404
+    stays byte-identical. This only names which of the conditions inside it
+    refused.
+
+    **The precedence is the predicate's own order, written down.** Quarantine
+    first, because `resolve_root_ok` evaluates `owner_quarantined` before it
+    compares the stored root to the owner's assignment and returns on it — and
+    because the two answers mean opposite things when both are true. A
+    quarantined owner whose assignment *also* changed is still a quarantine: the
+    root is shared or unverifiable, and reporting the reassignment would tell an
+    operator to check a column that is doing its job. Within quarantine,
+    `root_unverified` (no snapshot published in this process) precedes
+    `owner_quarantined` for the same reason it does in `quarantine_refusal` —
+    with no snapshot there is no entry to have found.
+    """
+    return TransferRefusal(
+        quarantine_refusal(getattr(row, "user_id", None)) or "root_reassigned",
+        row,
     )
-    return True
 
 
 def _credential_ok(cred, *, need_write: bool, row: TransferToken) -> bool:

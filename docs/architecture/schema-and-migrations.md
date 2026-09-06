@@ -168,6 +168,85 @@ guarantee about a *prefix* of them. **The earlier waves' cases stay.** 013's,
 that no later revision restates; a gate rewritten around only the newest wave
 stops testing the reconciliations the earlier ones exist to perform.
 
+## 024: `user_sessions`, and why no cookie was grandfathered
+
+Migration 024 creates one table, `user_sessions`, and **writes no row on any
+path**. It chains from **023** (`down_revision = "023"`, the
+`index-integrity-hardening` migration) and must not be merged or migrated ahead
+of it; the `schema-integrity` spec delta names that ordering, and the gate's
+asserted `HEAD_REVISION` moves `017 → 024` as a *modification* of the existing
+head requirement rather than a second requirement beside it.
+
+**`id` is `sha256(sid)`, and that is a schema decision, not an application
+one.** The signed panel cookie carries a `secrets.token_urlsafe(32)`
+identifier; the column stores its hex digest, `varchar(64)` — byte for byte the
+shape `api_keys.key_hash` and `transfer_tokens` already use. The reason lives
+in this note: **a `pg_dump` of this database is protected data**, taken before
+every migration and retained thirty days, and the invariant is that it holds
+password, API-key, OAuth and transfer-token *hashes* and deliberately no
+plaintext credential. Storing the identifier verbatim would make every retained
+dump a file full of live panel sessions — the invariant inverted, by one
+column. The digest is unkeyed on purpose: 256 bits of CSPRNG output has nothing
+to brute-force, and an HMAC under `SECRET_KEY` would make the table unreadable
+after a rotation an operator may need to perform.
+
+**The `ON DELETE CASCADE` is verified through `pg_constraint.confdeltype`,
+never by constraint name.** A permanent user delete removes that user's
+sessions with no handler code at all, and `User.sessions` declares
+`passive_deletes=True` so the *database* cascade is what fires rather than a
+per-row ORM delete that would leave the schema's cascade untested. A same-named
+FK pointing at another table, or one that deletes with `SET NULL` against a NOT
+NULL column, satisfies every name-level lookup while being a different
+constraint. Both indexes — `ix_user_sessions_user_id` for the revocation
+predicate and `ix_user_sessions_expires_at` for the purge — are resolved
+through `pg_index` as column lists plus uniqueness, validity and whether they
+are partial or over an expression, which is 019's and 021's rule: a name
+recreated on another column keeps the name an existence check looks for while
+the scan has nothing to lean on.
+
+**Marker-owned, in 016/017/022/023's shape — a bare `create_table` is not the
+house shape.** A module-level `MARKER` is stamped as a `COMMENT ON TABLE` in
+the same transaction as the create and mirrored in `src/models/db.py` as
+`_USER_SESSIONS_TABLE_MARKER`, so `alembic check` compares it like any other
+attribute. Where the table already exists, 024 **verifies the complete shape it
+would have created** — every column's type and nullability, the primary key,
+the `created_at` server default, the FK's delete action, each index — and
+**refuses**, naming what disagreed, rather than patching it. `IF NOT EXISTS`
+would be worse than raising: it adopts *any* table of that name, and the
+session validator would then be authorizing browsers against a schema nothing
+verified. The primary key and the server default are read for a reason
+autogenerate makes necessary — it compares neither. A table whose PK has been
+dropped reports as being in perfect agreement with the model while two rows
+could claim one session-identifier hash, and validation reads exactly one row
+per hash; a wrong `created_at` default is quieter still, leaving every column,
+constraint and index exactly as 024 made them while the recorded age of every
+session is wrong. `downgrade()` drops the table **only if it carries 024's
+marker**.
+
+**Nothing is backfilled, and a stamp-back re-run cannot sign anyone out.**
+There is nothing to backfill *from*: a session that predates the table has no
+identifier the registry could resolve, and inventing rows for the cookies
+currently in flight would grandfather exactly the credentials the change exists
+to invalidate. Because the reconciliation path writes and deletes nothing, the
+gate's `alembic stamp 023` then `upgrade head` preserves existing rows — a gate
+exercise must not log a live user out.
+
+**Why grandfathering was rejected, in one line:** `get_active_session_user`
+requires the cookie to carry both `user_id` and `sid`, so a correctly-signed
+pre-deploy cookie is refused rather than accepted. Accepting it would keep
+#198's replay window open for a further seven days after the fix shipped. The
+cost is that the first deploy of this migration signs every live panel session
+out exactly once — two production users, two logins.
+
+024 pins `SET LOCAL search_path TO public` and asserts afterwards that the
+unqualified name really resolves to `public.user_sessions`, for 021's reason
+and 023's repetition of it: 021 and 023 both `RESET` the path at the end of
+their own `upgrade()`, so a later revision in the same transaction inherits
+nothing and **024 needs its own pin**. Creating the registry in a decoy schema
+would leave the validator finding no row for any cookie, i.e. every user locked
+out of the panel. `lock_timeout` / `statement_timeout` are set and `RESET` for
+013's reason.
+
 ## Backups are protected data, not just a rollback tool
 
 A `pg_dump` of this database is the complete text of every tenant's notes

@@ -143,10 +143,13 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   hand-written predicates agree until somebody adds a third marker to one of
   them.
 
-  It matches exactly three things and nothing else: `over_quota: true` (the
+  It matches exactly six things and nothing else: `over_quota: true` (the
   quota gate, #162, declared here ahead of the gate that writes it so the two
-  land as one contract), `error = 'no_vault_assigned'`, and
-  `error = 'argument_not_encodable'`. A broad match — `params ? 'error'`, or
+  land as one contract), `error = 'no_vault_assigned'`,
+  `error = 'argument_not_encodable'`, and the three vault-root quarantine
+  markers the same admission gate writes (#199) —
+  `error = 'vault_root_overlap'`, `error = 'vault_root_unexaminable'` and
+  `error = 'vault_root_not_ready'`. A broad match — `params ? 'error'`, or
   `params->>'error' IS NOT NULL` — is wrong in a way that is invisible on the
   page: `_VAULT_REASSIGNED_MARKER`, `_CONFIRMATION_UNAVAILABLE_MARKER` and
   `_ANCHOR_LOST_AT_PUBLISH_MARKER` are written by tools whose bodies *ran*,
@@ -170,8 +173,10 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   string; a new value costs nothing and a shared one mis-measures in a
   direction nobody can see from the page.
 
-  **The register, as of #192/#193.** Pre-body: `no_vault_assigned`,
-  `argument_not_encodable`, and the boolean `over_quota` (#162). Post-body:
+  **The register, as of #199.** Pre-body: `no_vault_assigned`,
+  `argument_not_encodable`, the three vault-root quarantine markers
+  `vault_root_overlap`, `vault_root_unexaminable` and `vault_root_not_ready`
+  (#199), and the boolean `over_quota` (#162). Post-body:
   `vault_assignment_changed`, `vault_confirmation_unavailable`,
   `vault_anchor_lost_at_publish`, `find_related`'s two operational
   failures, `related_source_not_found` and `related_source_not_embedded`, and
@@ -188,6 +193,33 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   indistinguishable in the log from one that looked and found nothing, and
   `/admin/search-analytics` reads the second as the signature fact about what
   a vault does not hold. The marker is what keeps the first out of that count.
+
+  **The three quarantine markers are three and not one**, and they are not
+  `no_vault_assigned`. They are all written by the admission gate, so they are
+  all unambiguously pre-body — the classification rule above decides that for
+  them rather than leaving it to judgement — but each names a different fact
+  an operator acts on differently. `vault_root_overlap`: this account's root
+  collides with another active account's, and the fix is an assignment or a
+  mount corrected, with a second account involved. `vault_root_unexaminable`:
+  the root could not be opened, so no overlap could be *ruled out*; the fix is
+  a mount restored and there is no second account — recording it as an overlap
+  would send an operator looking for a peer that was never observed.
+  `vault_root_not_ready`: no snapshot has been published in this process yet,
+  so nothing about the account is wrong at all. The lifespan publishes
+  synchronously before the app serves, which makes a burst of that third value
+  in the usage log the signal that detection is failing — a fact neither of
+  the other two can carry. Reusing `no_vault_assigned` for any of them would
+  tell an operator that an administrator unassigned a user whose users page
+  plainly shows an assignment.
+
+  The caller-facing wording for all three comes from `src/services/vault.py`
+  and **names no other user, no other vault path and no note path**. The
+  marker is the operator's half of that split: `usage_logs` says which reason
+  refused the call, and the panel, the log line and the `indexer_runs` row are
+  where the affected accounts and roots are named. The guard behind them — the
+  two root checks, the snapshot's tri-state and the five pass entry points that
+  publish it — is in
+  [vault-roots-and-tenancy.md](vault-roots-and-tenancy.md).
 
   **`permission_denied` and `tool_exception` are post-body, and that is a
   decision, not an oversight.** Both are written by `_tracked`'s own code

@@ -126,13 +126,9 @@ contain the string `The last-admin guard`, and `alembic/versions/` must contain
 ## 6. Documentation
 
 - [x] 6.1 `docs/architecture/control-panel.md`: a session section — why the cookie alone was not enough; why the identifier is stored hashed; the mint/validate/touch/revoke/purge table; **why the mint helper commits and the revoke helpers do not**; why the touch never opens a second session and is safe-method-only (pool capacity, and the deadlock against the account guard); why `login_form` must not read the cookie directly; why a failing logout still signs the browser out and logs a class name only; why the user-agent hash is forensic; the account page and its locked re-read.
-- [ ] 6.2 `docs/architecture/oauth-and-grants.md`: the consent card — what it discloses, why `hostname` beats `netloc`, why the host is never Unicode-decoded, why registration now requires a resolvable ASCII host, why the notice is unconditional, and why the allow-list is exact equality with pattern entries rejected at configuration time.
-- [ ] 6.3 `docs/architecture/schema-and-migrations.md`: 024 — marker-owned, reconcile-or-refuse, marker-guarded downgrade, no backfill, the cascade, rows preserved across a stamp-back, and why grandfathering existing cookies was rejected.
+- [x] 6.2 `docs/architecture/oauth-and-grants.md`: the consent card — what it discloses, why `hostname` beats `netloc`, why the host is never Unicode-decoded, why registration now requires a resolvable ASCII host, why the notice is unconditional, and why the allow-list is exact equality with pattern entries rejected at configuration time.
+- [x] 6.3 `docs/architecture/schema-and-migrations.md`: 024 — marker-owned, reconcile-or-refuse, marker-guarded downgrade, no backfill, the cascade, rows preserved across a stamp-back, and why grandfathering existing cookies was rejected.
 - [x] 6.4 `README.md`: replace the "Password reset is admin-driven only" limitation with the self-service flow and the retained admin recovery path; correct the adjacent "No rate limiting on `/admin/auth/login`" bullet, false since `login_submit` gained `@limiter.limit("5/minute")`. Document `OAUTH_KNOWN_REDIRECT_HOSTS`, `SESSION_TOUCH_INTERVAL_SECONDS` and `SESSION_PURGE_RETAIN_DAYS`, and the one-time logout at deploy.
-  - Done in the verifier/adversarial-review pass, which found 6.1–6.4 all
-    open on the merged tree. **6.2 and 6.3 remain open** — the consent card in
-    `oauth-and-grants.md` and 024 in `schema-and-migrations.md` — and are the
-    two documentation items still outstanding before archive.
 
 ## 7. Integration — the event catalogue and the existing tests
 
@@ -275,8 +271,12 @@ sessions, which several slices would otherwise all have to touch.
       both directions and asserts `cookie.clear()` and `_replay_refused(` occur
       the same number of times. Catalogue tables updated.
     - *NIT f* — 024's redirected-`search_path` decoy case, mirroring 021's.
-    - *NIT g* — the docs were **not** merged: 6.1–6.4 were all open on this
-      tree. 6.1 and 6.4 are done here; **6.2 and 6.3 remain**.
+    - *NIT g* — correct: 6.1–6.4 landed in #246, which merged to `main` after
+      this branch was cut. The branch's own edits to `control-panel.md` and
+      `README.md` were reconciled against that merge rather than kept, and only
+      the facts #246 could not have known are carried forward: the mint's
+      `expected_session_version`, the three added replay-refusal reasons, and
+      the four-setter `minlength`.
 - [ ] 8.9 `make deploy`, then `make db-check` (`alembic check` must read "No new upgrade operations detected").
 - [ ] 8.10 Browser pass on the live panel: sign in; open a second browser and confirm both work; log out of the first and **replay its cookie** — expect a redirect to login; change the password from the second and confirm the first is signed out while the second is not; sign in with the new password; open an `/authorize` URL for a self-registered test client with a non-allow-listed redirect host and confirm the warning and the host; confirm an allow-listed client shows the badge **and still shows the self-registration notice**. There is no `user-representative` gate on this project — record which flows were actually exercised.
 - [ ] 8.11 Confirm the deploy's one-time logout happened as designed and both production users can sign in.

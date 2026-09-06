@@ -856,19 +856,57 @@ to multi-user later resumes where you left off without re-bootstrapping
 
 - The indexer iterates active users sequentially each cycle. Fine for
   tens of users; hundreds would need parallelization.
-- There's no email-based password recovery. A signed-in user changes
-  their own password from **Account** (multi-user mode only), and an
-  administrator can reset any user's from the user-edit page — so a
-  forgotten password is recovered by an administrator, not by email. Both
-  paths apply the same minimum, and both sign every other device out.
-- `/admin/auth/login` and the password-change route are rate-limited at
-  five attempts a minute — the login by address, the password change by
-  **both** the account and the address, since neither key bounds the other
-  on its own. The Traefik OAuth gate in front of the panel is still the
-  outer brute-force defense.
+- Password recovery is admin-driven — there's no email-based reset. A
+  signed-in user *can* rotate their own password at `/admin/account`
+  (current password, new password, confirmation; minimum 12
+  characters), which signs their other browsers out and keeps the one
+  they changed it from signed in. The admin reset stays the recovery
+  path for somebody who cannot sign in at all, and it also ends every
+  live session of the account it resets.
+- `/admin/auth/login` and `/admin/account/password` are rate-limited
+  at 5 requests per minute; the login limit is keyed on the client
+  address, and the password change carries two independent limits —
+  one per account, one per address. The limiter's storage is in-memory
+  and per-process, so counters reset on restart. The Traefik OAuth
+  gate in front of the panel is still the main brute-force defense; if
+  you expose `/admin/auth/login` to the open internet, put a rate-limit
+  middleware in front of it as well.
+- Panel sessions are server-side rows (`user_sessions`), so logging
+  out, changing a password, a deactivation or a delete really ends
+  them. The trade-off: **the first deploy of the build that introduced
+  the registry signs every live panel session out once**, because a
+  cookie issued before it carries no session id and is refused rather
+  than grandfathered. Everyone signs in again; nothing else changes.
 - The `vault_path` validator does not resolve symlinks, so an admin
   can technically point a user at host files via a symlinked
   `/vaults/<name>`. Treat `/vaults/` as an admin-trust boundary.
+  **What *is* checked, since the vault-root overlap guard:** two active
+  users' roots may not name overlapping directories. Each root is
+  opened once and compared by inode identity — `(st_dev, st_ino)`,
+  which catches a symlink alias or a bind mount naming one directory
+  twice — and by a component-wise containment test over the two
+  canonical real paths in both directions, which catches an
+  ancestor/descendant pair like `/vaults/team` and
+  `/vaults/team/private`. A conflicting assignment is refused in the
+  panel naming the other user, and the same checks re-run before every
+  index pass, so an alias created *after* the assignment quarantines
+  both accounts: their MCP tools, index passes and transfer
+  redemptions are refused until an administrator corrects it, and no
+  index rows are deleted. A root that cannot be opened at all
+  quarantines only its own account.
+  **What is still not detected, and the consequence:** a bind mount
+  that grafts one user's vault — or any mount nested inside it — to a
+  path *inside* another user's root. `mount --bind /vaults/b
+  /vaults/a/inner` leaves both root inodes distinct and both canonical
+  paths outside each other, so neither check sees it, and user A can
+  then **read, overwrite and delete every note in user B's vault**
+  through the ordinary write tools, while A's index pass files B's
+  notes under A's account so A's searches return B's content. The same
+  gap covers an accessible alias of a root that could not be examined:
+  that peer keeps serving. Neither condition is reported anywhere.
+  Both require an administrator to write a bind mount into the deploy
+  configuration — which is why `/vaults/` **and the compose file's
+  mounts** are the admin-trust boundary, not just the path strings.
 
 ## Configuration
 
@@ -879,15 +917,16 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
 | `MULTI_USER_MODE` | `false` | In-app login, per-user vaults. See [Multi-user mode](#multi-user-mode). |
+| `VAULT_ROOT_OBSERVE_TIMEOUT_SECONDS` | `10` | How long the vault-root overlap check waits on one root before giving up on it. Expiry quarantines that one account (`root unexaminable`) and the check carries on, so a hung mount cannot hold up startup. Multi-user mode only. |
 | `MCP_HOSTNAME` | — | Public hostname. Derives `BASE_URL`, `ALLOWED_ORIGINS` and `ALLOWED_HOSTS` as `https://<host>`. Required (or `BASE_URL`) for the transfer tools. |
 | `BASE_URL` | derived | Explicit public origin. HTTPS except on loopback. |
 | `ALLOWED_ORIGINS` | derived | CORS origins, JSON list |
 | `ALLOWED_HOSTS` | derived | Accepted `Host` headers, JSON list. `localhost` is always added. |
 | `SESSION_MAX_AGE` | `604800` | Panel session lifetime, seconds (multi-user mode). Absolute — the server-side row is never extended, so a session used daily still expires |
 | `SESSION_COOKIE_NAME` | `omcp_session` | Panel session cookie name |
-| `SESSION_TOUCH_INTERVAL_SECONDS` | `60` | How stale a session's `last_seen_at` may be before a read request refreshes it. Must be ≥ 1: zero turns a throttled hint into a write on every request |
-| `SESSION_PURGE_RETAIN_DAYS` | `7` | How long dead session rows are kept before the maintenance tick deletes them. Must be ≥ 1: zero deletes a revocation the moment it is made |
-| `OAUTH_KNOWN_REDIRECT_HOSTS` | `claude.ai,chatgpt.com` | Hosts whose OAuth clients show a "recognised" badge on the consent screen. Exact-host equality, JSON list or comma-separated; wildcards and paths are refused at startup, and an empty list means nothing is recognised. Every client still carries the self-registration notice |
+| `SESSION_TOUCH_INTERVAL_SECONDS` | `60` | How stale a session's `last_seen_at` may get before a validated `GET`/`HEAD` rewrites it. Telemetry only — nothing authorizes on it. Must be ≥ 1. |
+| `SESSION_PURGE_RETAIN_DAYS` | `7` | How long a dead panel session row is kept, measured from the *later* of its expiry and its revocation, so a revocation stays visible for the full window. Must be ≥ 1. |
+| `OAUTH_KNOWN_REDIRECT_HOSTS` | `claude.ai,chatgpt.com` | Redirect **hosts** the consent screen badges as known connector destinations. JSON or CSV. Matched by exact host equality — no wildcards, no suffixes; entries containing `*`, `/`, `@` or internal whitespace are refused at startup. An empty list means every client is shown as unverified. |
 | `MAX_FILE_READ_BYTES` | `10485760` | `read_file` cap (10 MB); bounds what the server reads from disk |
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
 | `MAX_READ_RESPONSE_CHARS` | `40000` | `read_note` / `read_file` cap on what is returned to the caller (≈10K tokens). See [Response size limits](#response-size-limits). |
@@ -1150,7 +1189,7 @@ clients genuinely want larger reads, raise `MAX_READ_RESPONSE_CHARS` —
 that is an operator decision, made once, by someone who knows the
 deployment.
 
-> **Upgrading:** two visible contract changes, in two releases.
+> **Upgrading:** three visible contract changes.
 >
 > `read_note` on a large note used to return the whole thing; it now
 > truncates. The response is self-describing, so an agent needs no prior
@@ -1244,6 +1283,7 @@ ignores mtime jitter. Stale embeddings are caught by the
 | `oauth_clients`, `oauth_codes`, `oauth_tokens` | OAuth 2.0 PKCE state, including the grant id that ties a consent's tokens together |
 | `transfer_tokens` | Capability rows behind the `/transfer/*` links: direction, destination path, state, fingerprint, expiry |
 | `users` | Multi-user mode: login, role, per-user `vault_path`, and the vault the index was last built under |
+| `user_sessions` | One revocable row per live panel browser session, keyed on the SHA-256 of the cookie's session id. Cascades with the user. |
 
 GIN indexes on `content_tsvector` and `tags[]`. B-tree indexes on the
 hot foreign keys. pgvector HNSW index on the embedding column
@@ -1328,6 +1368,18 @@ backup, `alembic upgrade head`, then recreate the container. Run
 - The control panel is intended to sit behind an external auth
   gateway. The included `docker-compose.yml` uses Traefik with an
   OAuth chain. Don't expose `/admin` directly to the internet.
+- Panel sessions are server-side rows. The signed cookie carries a
+  256-bit random id; the database stores only its SHA-256, so a
+  database dump contains no usable session. Logging out revokes that
+  row, and a password change, an admin reset, a deactivation or a
+  delete revokes every session of the account.
+- The OAuth consent screen identifies the client it is asking about:
+  the redirect **host** the authorization code would be sent to (taken
+  from the URI's hostname, never its `netloc`, and shown in punycode
+  rather than decoded), the server-generated client id, and the
+  registration date. Every render says the application registered
+  itself and is not verified by this server; a host outside
+  `OAUTH_KNOWN_REDIRECT_HOSTS` is called out as unrecognised.
 - The OpenAI key is rendered on the settings page as
   `key[:8] + "..." + key[-4:]` and never appears in full in HTML or
   JS sources.

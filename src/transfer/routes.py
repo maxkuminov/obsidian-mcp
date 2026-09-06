@@ -189,7 +189,10 @@ async def _load_valid(session, token: str, *, direction: str):
     if not await transfer.resolve_identity_ok(session, row, need_write=need_write):
         return transfer.TransferRefusal("credential_invalid", row)
     if not await transfer.resolve_root_ok(session, row):
-        return transfer.TransferRefusal("root_reassigned", row)
+        # The predicate is unchanged; only the *name* of its "no" got specific.
+        # A quarantined owner used to be reported as a reassignment, which is a
+        # different fault with a different fix.
+        return transfer.root_refusal(row)
     if not _path_ok(row.vault_root, row.path):
         return transfer.TransferRefusal("path_invalid", row)
     return row
@@ -540,7 +543,7 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
         if not await transfer.resolve_identity_ok(session, row, need_write=True):
             revalidation = "credential_invalid"
         elif not await transfer.resolve_root_ok(session, row):
-            revalidation = "root_reassigned"
+            revalidation = transfer.root_refusal(row).reason
         elif not _path_ok(row.vault_root, row.path):
             revalidation = "path_invalid"
         if revalidation is not None:
@@ -772,7 +775,24 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
         )
         await release()
         return JSONResponse(dict(MOUNT_BOUNDARY_BODY), status_code=503)
-    except vault_fs.UnsupportedFilesystem:
+    except vault_fs.UnsupportedFilesystem as exc:
+        # The **post-admission** half, and it was silent. Phase one's probe
+        # emits this event; `stream_to_vault` re-probes the root before it
+        # publishes, so a filesystem whose identity changed *after* admission —
+        # a remount, a bind swapped under the vault mid-upload — took the same
+        # 503 out of this branch with nothing in the log at all. That is the
+        # more interesting of the two occurrences: the first says a deployment
+        # is misconfigured, this one says it changed **while a write was in
+        # flight**. Same event and same fields as phase one, deliberately, so
+        # an operator queries one name; `route` and the timing separate them.
+        security_events.emit(
+            "transfer_refused_unsupported_fs",
+            level=logging.ERROR,
+            subject=security_events.subject_for(user_id=row.user_id, request=request),
+            error_type=type(exc).__name__,
+            route=request.url.path,
+            method=request.method,
+        )
         await release()
         return JSONResponse(dict(UNSUPPORTED_FS_BODY), status_code=503)
     except ClientDisconnect:

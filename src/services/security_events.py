@@ -102,6 +102,17 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
         {"actor_user_id", "user_id", "username", "client_ip", "route"}
     ),
     "password_hash_malformed": frozenset({"user_id"}),
+    # The session registry's `last_seen_at` write, which is telemetry and may
+    # never fail a request. Bounded because the touch interval gates the
+    # *write*: a failing update records no new `last_seen_at`, so the interval
+    # check passes on every retry and a stale browser drives one record per
+    # `GET`. `reason` is the stage — `touch` or `rollback` — because a failing
+    # update with a working rollback is a database refusing one statement,
+    # while a failing rollback is a connection that is gone. Class only: the
+    # statement binds `user_sessions.session_hash`.
+    "panel_session_touch_failed": frozenset(
+        {"reason", "user_id", "error_type", "route"}
+    ),
     # ── The panel session registry (#198) ──
     #
     # **No credential material, ever** — not the cookie's session identifier,
@@ -249,6 +260,15 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "tool_telemetry_failed": frozenset({"tool", "error_type"}),
     "tool_usage_log_failed": frozenset({"tool", "error_type"}),
     "tool_refused_no_vault": frozenset({"user_id", "tool"}),
+    # The vault-root quarantine (#199), refused by the *same* admission gate.
+    # Its own event rather than a fourth reason on `tool_refused_no_vault`:
+    # that one means "this credential has no vault", and this one means "it has
+    # one and the server will not serve it". `reason` tells the three apart —
+    # `overlap`, `root_unexaminable`, `snapshot_not_ready` — and is a closed
+    # vocabulary, never a peer's name or a path: the caller-facing refusal
+    # names no other tenant and neither does the field that classifies it. The
+    # accounts, reasons and roots are named on the operator surfaces.
+    "tool_refused_vault_quarantined": frozenset({"user_id", "tool", "reason"}),
     "tool_refused_over_quota": frozenset({"key_id", "limit", "day", "user_id", "tool"}),
     "usage_log_credential_gone": frozenset({"tool", "cleared_user_id"}),
     "usage_log_failed": frozenset({"tool", "error_type", "reason"}),

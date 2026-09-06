@@ -187,6 +187,89 @@
   assertion against a concurrent request is a flake generator on a shared
   runner.
 
+## Every pass entry point publishes a vault-root snapshot first (#199)
+
+Two active users whose `vault_path` values overlap make the indexer file one
+tenant's notes under the other's `user_id`, which is a silently wrong search
+result for as long as the rows survive. The checks themselves, the snapshot's
+lifecycle and the limitations live in
+[vault-roots-and-tenancy.md](vault-roots-and-tenancy.md); what belongs here is
+where the pass calls them and what it records.
+
+- **One `detect_and_publish()`, called from every entry point that can begin a
+  pass — and the loop alone was not enough.** `run_indexer_loop` is two of the
+  five: the startup block (`detect_root_overlaps("startup")`) and each periodic
+  tick (`detect_root_overlaps("periodic")`). The other three reach
+  `index_vault` / `embed_vault` / `rebuild_tsvectors` without going through it
+  at all — `src/main.py::lifespan` (`_publish_first_root_snapshot`, run
+  **synchronously before the app serves**), the panel's `_reindex_background`
+  (Reindex Now, re-embed and reset embeddings, which mirrors the loop and
+  shares `index_pass_lock` and *nothing else*), and
+  `scripts/rebuild_tsvectors.py`, which is a **separate process**
+  (`docker compose run --rm`) with its own `_active_user_ids()` loop, no
+  lifespan and no indexer loop. A detection installed in the loop would have
+  been bypassed by the last two, one of them from outside this process
+  entirely.
+- **Detection runs before `index_pass_lock`, at every one of them.** The check
+  must not queue behind the pass it exists to gate. That the entry points
+  therefore overlap is expected, not a race: `detect_and_publish` serializes
+  observation, the checks and the publication under one process-global lock and
+  its publication is monotonic in a sequence taken under that lock, so an older
+  detection cannot overwrite a newer quarantine with its own empty result.
+- **On the periodic tick it runs *before* `_is_paused()`.** A pause suppresses
+  index and embed work; it must not suppress detection, because a pause is
+  entered precisely when an operator is doing something destructive and
+  watching the panel, which is the worst moment for a quarantine to become
+  invisible.
+- **A paused iteration still records.** It publishes, and then
+  `record_quarantined_runs("scheduled")` logs at ERROR and writes one
+  `indexer_runs` row per quarantined user before returning. Only the work is
+  suppressed. The row cadence is unchanged — a running deployment already
+  writes one row per user per tick.
+- **The skip lives in the shared pass helpers, not in each loop.**
+  `index_vault`, `link_backfill_pass`, `embed_vault` and `rebuild_tsvectors`
+  each call `_refuse_quarantined_pass(user_id, stage)` **ahead of resolving the
+  root**, so every caller inherits it and a sixth entry point added later gets
+  it by routing through the same helper. A skip re-implemented per loop is a
+  skip one loop will be missing. It also refuses when *nothing* has been
+  published — no pass may begin over a root nothing has checked — and it never
+  applies to `user_id is None`, so single-user mode is untouched.
+- **Nothing is deleted, pruned or provenance-stamped for a skipped user.** The
+  refusal precedes `_vault_root` and the pinned root, so the pass never reaches
+  the prune or `classify_provenance`. Preserving the rows is what makes a
+  corrected assignment cheap; they are unreachable meanwhile, because the
+  admission gate refuses every tool for the same user.
+- **Both records, and the ring buffer's lifetime is the reason for both.**
+  `VaultRootQuarantined` is a `RuntimeError` carrying the **operator**-facing
+  wording — both accounts, both roots, the relation or the cause — so the
+  existing per-stage handlers write it into `indexer_runs.error` and log at
+  ERROR, and `_index_pass_once` returns False: a skipped user's pass is not
+  recorded as a clean run. The log line alone would not do. It reaches the
+  in-process error ring buffer, which is 100 entries and process-lifetime,
+  while the misconfiguration survives restarts — the same argument that made
+  `notes_metadata.links_truncated` a column rather than a log line (#203). The
+  run row is what an operator reads *after* a restart, and a pass that quietly
+  did no work for a user is otherwise indistinguishable from a pass that found
+  nothing to do.
+- **Unrelated tenants are indexed exactly as before**, in the same pass — the
+  same isolation `_index_pass_once` already gives a user with a broken vault.
+- **A detection failure does not abort the caller.** `detect_root_overlaps`
+  logs and swallows: it is not a per-root failure (an unopenable root is a
+  per-user verdict), so the only way it raises is that the user enumeration
+  failed, which means the database is unavailable and the pass would fail
+  anyway. Swallowing it opens nothing — either a previous snapshot still stands
+  (retained, never cleared) or nothing has been published and
+  `_refuse_quarantined_pass` refuses every multi-user stage until a later entry
+  point publishes one.
+- **The standalone rebuild is the one exception, deliberately: a detection
+  failure there is fatal.** `scripts/rebuild_tsvectors.py` calls
+  `detect_and_publish()` directly rather than through `detect_root_overlaps`,
+  and lets it propagate to the script's `sys.exit(1)`. The caller is an
+  operator at a terminal who can read the error and re-run, and rewriting every
+  keyword vector in the vault against roots nothing has checked is exactly the
+  pass this guard exists to stop — where the long-running server's answer is to
+  keep the panel up and retry at the next entry point.
+
 ## The pass record (#160, migration 019)
 
 The heartbeat above and `indexer_runs` answer different questions and neither
@@ -295,6 +378,718 @@ dropping it in `downgrade()` costs an operator a view and nothing else. The
 panel surface that reads it is
 [usage attribution](usage-attribution.md#the-read-only-consumer-160) and
 `/admin/performance`.
+
+## The embed pass reports what it did (#201, #202)
+
+The section above ends at the point #160 could reach: a provider outage folds
+a summary into `indexer_runs.error`. It could not reach further, because the
+thing it was summarising still lied. `embed_note` returned an **int**, and `0`
+meant three unrelated things — a note that cleaned to zero chunks *and was
+certified*, a provider exception the function swallowed, and a vector/chunk
+cardinality mismatch — while `_embed_vault_pinned` ran `outcome.embedded += 1`
+after all three. A total Ollama or OpenAI outage therefore wrote
+`notes_embedded = N, error = NULL`: byte for byte the row a healthy pass
+writes, with a **positive** count, which is more misleading than the zero #160
+was designed against (#201).
+
+### The outcome is typed, and the failure detail rides on it
+
+`embed_note` returns a frozen `EmbedNoteResult` over a five-member
+`NoteEmbedOutcome` (`src/services/embeddings.py`). Each outcome answers every
+question the pass asks about a note, so no caller has to infer one from a
+number:
+
+| outcome | certifies | counts into `notes_embedded` | a failure | an attempt |
+| --- | --- | --- | --- | --- |
+| `EMBEDDED` | yes | yes | no | yes |
+| `CERTIFIED_EMPTY` — cleaned to zero chunks | yes | yes | no | **no** — no provider call |
+| `PROVIDER_FAILED` — the swallowed exception | no | **no** | yes | yes |
+| `PROVIDER_CARDINALITY_MISMATCH` | no | **no** | yes | yes |
+| `GENERATION_MISMATCH` — the configuration moved under the call | no | **no** | **no** | yes |
+
+- **Two chunk counts, not one.** `chunks_submitted` is what went to the
+  provider; `chunks_embedded` is what was stored. A single field would have to
+  mean one or the other, and the two consumers want different ones: the pass's
+  `total_chunks` metric wants what was stored, and the per-tenant budget below
+  must debit what was *sent*. A budget debited by stored chunks is not debited
+  at all by a failing provider, so a tenant whose every note fails would burn
+  the whole pass, every pass, and never reach its own bound — the starvation
+  #202 is about, surviving inside the fix for it.
+- **The failure detail is on the result, because the caller has nothing left
+  to build it from.** `embed_note` swallows the provider exception, so by the
+  time `_embed_vault_pinned` sees a failure there is no exception to inspect
+  and `EmbedPassResult.first_error` would have read `embed failures: 412 of
+  412 — first: None` — an operator's only view of a total outage, saying
+  nothing. `EmbedNoteFailure` carries the exception class, the message, and
+  the requested/received chunk counts, and
+  `EmbedPassResult.record_failure_detail` builds the summary from it.
+  `record_failure(exc)` stays for the exceptions that genuinely escape *around*
+  the call (a database error, a failed rollback), so the two entry points
+  converge on one counter and one `failure_summary`.
+- **The message is truncated at capture** (`MAX_EMBED_FAILURE_MESSAGE_CHARS`,
+  200), not where the run row is written. `MAX_RUN_ERROR_CHARS` (4,000) bounds
+  the *whole* `error` text, and one untruncated provider traceback can exceed
+  that on its own and evict the stage labels beside it.
+- **A failing outcome without a failure raises**, in `__post_init__`. It is an
+  invariant rather than a convention precisely because `record_failure_detail`
+  is driven entirely off that field.
+
+**Why a return value and not a raise.** Re-raising from `embed_note` and
+letting the caller's existing `except Exception` fire is smaller, and it is
+wrong in two places. `_reconcile_exclusions` also calls `embed_note`, and its
+declared convergence exception is that a row whose provider call fails is left
+unstamped and retried on a later pass — a raise there would have to be
+re-caught to preserve that, so nothing is saved. And a raise makes the *type*
+of a provider blip indistinguishable from a database error at the call site,
+which is the conflation the typed outcome exists to remove.
+
+**There is deliberately no `__int__` and no `__radd__` on `EmbedNoteResult`.**
+A first draft of the design claimed an `__int__` would keep
+`total_chunks += result` working. It does not: `int.__iadd__` falls back to
+`int.__add__(result)`, which returns `NotImplemented`, and with no `__radd__`
+the statement raises `TypeError`. The shim was dropped rather than completed,
+and explicit is the outcome we want — a caller that must name the field it
+means cannot silently go on treating five outcomes as one number.
+(`EmbedPassResult.__int__` is a different thing and stays: it is the *pass*'s
+embedded count, which the recorder still reads as a number.)
+
+### `attempted` is one sentence, and its exceptions are consequences
+
+> **`attempted` is incremented exactly once per note for which an embedding
+> provider call is issued** — at the `embed_note` call sites, and nowhere else.
+
+`EmbedPassResult.record_attempt()` is the only writer, called for a note whose
+`chunks_submitted` is non-zero. Three things follow, and they are stated
+because they change what the run row used to say:
+
+- **It is no longer initialised from the backlog's size.** `attempted` counted
+  work *contemplated*; it now counts work done.
+- **A zero-chunk note is not an attempt.** It certifies and counts into
+  `notes_embedded`, and it makes no provider call, so a pass over 400 notes of
+  which 50 clean to nothing reports `… of 350`.
+- **A sweep row decided without a provider call is not an attempt.** The
+  exclusion sweep scans every certification-current row in the scope (~16,700
+  on the production vault) and decides about almost all of them without calling
+  anything; counting those would render three failures out of three calls as
+  `3 of 16,700`.
+
+Everything else follows from the same rule rather than needing its own clause:
+an excluded note, a hash-mismatched note, a note left behind by a pause or a
+budget stop, and a certification that matched no row all issue no provider
+call, so none of them moves the denominator. One sentence with derived
+consequences is what lets the design, the requirement, the tasks and the tests
+agree.
+
+**The reconciliation sweep feeds the same accumulator.** It re-embeds
+re-included notes and used to swallow their failures into its own
+`except Exception` with nothing riding back to the pass — so a provider outage
+during a pass whose *backlog was empty*, which is the steady state of a
+fully-indexed vault where the sweep is the only thing making provider calls,
+still wrote a clean run row. That is #201 surviving in the one code path a
+narrower fix would not have touched. The sweep now takes the same
+`EmbedPassResult` and calls the same `record_attempt` /
+`record_failure_detail`.
+
+The **#160 asymmetry is unchanged**: none of this flips the in-process
+`_record_index_run` heartbeat. "Is the loop alive" and "did the work succeed"
+are still different questions.
+
+### The chunk cap is a declared degradation, and a capped note certifies
+
+`chunk_text` had no bound. `MAX_NOTE_BYTES` is 10 MiB and `CHUNK_SIZE` is 512
+tokens (~4 characters each), so one *legal* note is ~5,120 chunks — each of
+them one sequential, 30 s-bounded provider call under `index_pass_lock`, with
+no `LIMIT` on the backlog behind it. Re-editing one such note kept every later
+tenant's new and edited notes out of `notes_metadata`, out of the tsvector
+index and out of the embeddings indefinitely, visible only as missing
+`indexer_runs` rows (#202).
+
+`MAX_CHUNKS_PER_NOTE` (1,000, a module constant in `src/config.py` beside
+`MAX_LINKS_PER_NOTE` — the same call the link cap made) bounds it, through
+`chunk_text_bounded(content, *, chunk_size, overlap, max_chunks)` in the shape
+#203 gave `extract_links_bounded`. `chunk_text` delegates to it, so "this note
+produces no chunks" means the same thing at the embed path and at the exclusion
+sweep's zero-chunk probe — and the probe now stops at the first chunk instead
+of chunking a 10 MiB note to find out it is non-empty.
+
+The cap is **declared in the same four places** #203 established for links:
+
+- **first N in document order** — the head, so a capped note keeps the part a
+  reader would call the note;
+- **`notes_metadata.chunks_truncated`** (migration 023), written in the
+  certifying transaction so the marker and the vectors it describes land or
+  roll back together, and cleared by a later embed that fits under the cap, by
+  the exclusion branch, and by a `CERTIFIED_EMPTY` — the last two because both
+  leave the note with no vectors at all;
+- **one ERROR line naming the path and the cap**;
+- **`embedding_truncated: true` on every vector-search row for that note**,
+  because the tail of the note is not semantically searchable at all and a
+  result from its head reads as a result from the whole note.
+
+Three clauses are load-bearing and a future reader will otherwise undo them:
+
+- **A capped note is CERTIFIED, never held.** An uncertified note is
+  re-selected by the backlog on every tick for ever — #127's permanent burn
+  arriving by a new route. This narrows what "full coverage" means (it is now
+  full coverage of the *bounded requested set*) and the requirement was
+  modified to say so rather than quietly contradicted. Like a link-capped note,
+  a chunk-capped note is **not a skip**: A.7a's claim is structural, and a
+  deterministic truncation whose rows are exactly the rows derived does not
+  falsify it.
+- **The ERROR follows the commit.** Logging before it would leave a permanent
+  ERROR in a bounded, process-lifetime buffer for a truncation that then rolled
+  back on a `StaleCertification`, sending an operator after a note that was
+  never stored that way.
+- **The line can never name the note's true chunk count.** Obtaining it means
+  the unbounded chunking the cap exists to prevent. `chunk_text_bounded`
+  settles *whether* it capped by generating exactly one window past the cap and
+  discarding it — which is also why a note landing on exactly `max_chunks` is
+  complete and is not marked.
+
+**Why a cap at all, given #127 removed the aggregate deadline.** #127 removed a
+*time* budget that fired on healthy chunks; this is a *count* bound that
+changes what is embedded, deterministically, and says so. A note the deadline
+killed never certified and burned the same 300 s every tick for ever; a capped
+note certifies once and is never re-selected while it is unchanged.
+
+**`CHUNK_OVERLAP` must stay strictly below `CHUNK_SIZE`, and `Settings`
+refuses otherwise.** The chunker steps by `max(char_size - char_overlap, 1)` —
+#10's infinite-loop guard. At `CHUNK_OVERLAP == CHUNK_SIZE` that step collapses
+to **one character**, so ~3 KB of prose produces ~3,000 chunks and every
+ordinary note in the vault hits the cap: a configuration typo silently
+truncating the embedding of the whole vault, with the cap's ERROR line firing
+thousands of times. The guard turned a hang into a quiet catastrophe; it did
+not make the configuration sane, so the model validator in `src/config.py`
+rejects it at startup naming both values. The cap is a bound on a *note*, and
+it only behaves like one while the step is a meaningful fraction of the chunk.
+
+### The rotation cursor is persisted, and it fails open
+
+`_active_user_ids()` had no `ORDER BY`, so its order was the planner's opinion
+— stable enough in practice that the same tenant went first every cycle, and
+unspecified enough that nothing could be asserted about it. It now orders by
+`users.id`, which alone makes the order a fact; a rotation over an unspecified
+order is not a rotation.
+
+`_rotated_user_ids()` rotates that list to begin at the smallest id **strictly
+greater** than the value stored under `indexer_state['embed_rotation_cursor']`,
+wrapping. `_advance_rotation_cursor(uid)` writes it after each user's per-user
+sequence finishes, success or failure, in its own short session opened by the
+holder of `index_pass_lock` after the wrapped body's session has closed —
+`_write_indexer_run`'s discipline, so one task never holds two pooled
+connections.
+
+- **It is used by `run_indexer_loop` only** — the startup pass and the periodic
+  tick. `_reindex_background` and the keyword rebuild keep the unrotated list:
+  an operator-triggered reindex is not the starvation vector, and letting a
+  panel click move the periodic pass's rotation would make the schedule a
+  function of who clicked what.
+- **The cursor stores a user id, never a positional offset.** The active list
+  changes when a user is added, deactivated or deleted, so an offset points
+  somewhere else on the next cycle. "Resume after id 7" is well defined whether
+  or not user 7 still exists, because "the smallest id strictly greater than 7"
+  does not require it to — and an out-of-range value needs no special case
+  either: it selects nothing and wraps to the first, which is the same outcome
+  by the ordinary rule.
+- **In-memory would have been a no-op.** In-process state resets on every
+  restart and every deploy, and a deploy recreates the container — so the
+  tenants at the tail of the order are exactly the ones a restart-truncated
+  pass never reaches, and an in-memory cursor would reset precisely when it was
+  about to pay off. It is persisted, and it is persisted beside the
+  fingerprints because all three are single facts about the index as a whole.
+- **A cursor the pass cannot use is logged once at WARNING and ignored, never
+  fatal**, and this is the **opposite disposition** from the fingerprints'
+  below. The value is text in a key/value table, so drift, a hand-edited row or
+  a downgrade can make it non-numeric, negative or wider than the column it is
+  compared against; `parse_rotation_cursor` returns `None` for every unusable
+  spelling and never raises, and the pass starts at the first tenant in id
+  order — a complete, correct pass, and precisely today's behaviour. A cursor
+  is scheduling state whose worst consequence is an *order*; a fingerprint is a
+  claim about what the stored rows **are**, and its worst consequence is a
+  permanently wrong answer. Fail-closed belongs to the second and would be
+  absurd on the first: a stray character in a bookkeeping row must not stop
+  every tenant's indexing to protect nothing.
+
+### The per-tenant budget is checked at a note boundary and nowhere else
+
+`EmbedBudget` gives each tenant's **embed stage** a chunk allowance
+(`EMBED_CHUNK_BUDGET_PER_USER` / `settings.embed_chunk_budget_per_user`, 5,000)
+and a wall-clock allowance (`EMBED_TIME_BUDGET_SECONDS_PER_USER` /
+`settings.embed_time_budget_seconds_per_user`, 300 — one
+`INDEX_INTERVAL_SECONDS`); `0` disables either, and both at `0` disables the
+machinery entirely. It is
+consumed by the backlog loop and by the reconciliation sweep, since both call
+the provider, and it is checked at exactly the two places `_is_paused()`
+already sits.
+
+- **It debits chunks *submitted*.** Every provider call debits what it sent,
+  whatever it returned: a raise and a cardinality mismatch debit exactly as a
+  success does. This is the same argument as the two chunk counts above, and
+  the wall clock does not rescue the other choice, because an operator may set
+  the time budget to `0` and keep only the chunk budget.
+- **Never mid-note.** `embed_note` refuses partial certification, so a note
+  abandoned between chunks is uncertified, re-selected next tick, and
+  re-performs every provider call it already made — #127, exactly. Checking at
+  the boundary means the overrun is at most one note, which the chunk cap has
+  already bounded.
+- **At least one note, always.** The check runs only after a note of that
+  user's pass has completed, so a tenant whose very first note exceeds the
+  whole budget still advances by one note per pass instead of zero for ever.
+  Without this clause a small budget is a livelock.
+- **Only when the pass serves more than one scope** (`_active_scope_count`, and
+  `enforced` is `scopes > 1`). In single-user mode, and in a multi-user
+  deployment with one active user, there is no other tenant to be fair to; a
+  budget there would spread a first index of 2,577 notes over several
+  five-minute-spaced passes for no benefit and would look like a stall. This
+  clause is what keeps the default deployment's behaviour identical to today's.
+  A *failed* scope count returns 1 and leaves the pass unbudgeted, which is the
+  safe direction: a bookkeeping query that fails must not start stopping
+  tenants short.
+- **A stop is not a failure and writes nothing to `error`.** It is a deliberate
+  decision, the same class of event as a pause, and writing it into
+  `indexer_runs.error` would fire #201's own outage signal on a healthy server.
+  It logs once at WARNING per user per pass, whichever stage reached it. The
+  operator-visible signal for a tenant that is permanently over budget is the
+  **dashboard's pending count**, which stays high across passes — a persistent
+  backlog is a property of the index rather than of one pass, which is exactly
+  what an operator needs to see.
+- **The bound this buys, stated exactly.** Because the budget is evaluated only
+  between notes, the delay one tenant can impose on the next is *the budget
+  plus one note's embedding time*, and one note's embedding time is bounded by
+  `MAX_CHUNKS_PER_NOTE` × the provider's per-call bound — 1,000 × 30 s ≈ **8.3
+  hours** on a provider answering every call at the very edge of its timeout.
+  That is a pathological-provider figure, not a steady-state one, and it is
+  accepted (L4) rather than closed by an aggregate deadline, which is precisely
+  the construct #127 removed and which would recreate the never-finishing note
+  one size class up.
+- **The fairness claim covers the embed stage only.** `index_vault` and
+  `link_backfill_pass` run before `embed_vault` in each user's sequence and
+  stay unbudgeted (L3). Each is a single transaction over a walk of the vault
+  whose cost is bounded by the vault's size and the write-side caps rather than
+  by an external provider's latency, and stopping one part-way means either
+  committing a partial derive — which A.7a exists to forbid — or discarding the
+  whole pass's work. The starvation #202 measured was the embed stage's; the
+  scoping is recorded rather than implied.
+
+## The settings fingerprints (#206, migration 023)
+
+`note_embeddings` recorded nothing about the provider, model, chunk size or
+overlap that produced it, and `content_tsvector` recorded nothing about
+`FTS_CONFIGS`. The dimension guard reads the live column width from
+`pg_attribute` — a **physical** fact about the table — so it catches a dump
+restored into a differently configured deployment and cannot catch a
+**same-dimension model swap**. bge-m3 for another 1024-dim model mixes two
+vector spaces in one column permanently, makes cosine distance meaningless, and
+every startup after it is clean. Both guards stay: they answer different
+questions, and the fingerprint is the logical one.
+
+`indexer_state` (migration 023) is a three-key `key`/`value` table holding
+`embedding_fingerprint`, `fts_fingerprint` and `embed_rotation_cursor`, with a
+`CHECK` closing the key set. **The CHECK is not tidiness**: a key that does not
+exist reads as *absent*, and absent is the state that makes the startup guard
+adopt rather than refuse — so one mistyped key would silently disable the guard
+whose entire purpose is to prevent a permanent, undetectable corruption. Adding
+a key is therefore a migration, which is correct, because every key here has a
+startup or a scheduling consequence. **023 backfills nothing**: a fingerprint
+derived at migration time would assert that the stored rows were produced by
+the configuration the `.env` carries *now*, which is exactly the claim the
+fingerprint exists to test.
+
+Both values are canonical JSON — `json.dumps(obj, sort_keys=True,
+separators=(",", ":"))` — built in `src/services/index_state.py`, a separate
+module so `embeddings.py` and `indexer.py` can both import it without a cycle:
+
+```
+embedding_fingerprint() -> {"chunk_overlap":0,"chunk_size":512,"dimensions":1024,
+                            "max_chunks_per_note":1000,"model":"bge-m3",
+                            "provider":"ollama","v":1}
+fts_fingerprint()       -> {"configs":["english"],"v":1}
+```
+
+- **`model` is the ACTIVE provider's**, resolved by `active_embedding_model()`
+  through the same branch `get_provider()` takes. Reading the inactive
+  provider's model while the provider is chosen somewhere else is the exact
+  defect this guard exists to catch, so the selection lives in one function.
+- **`max_chunks_per_note` is in it.** It changes what a note's stored vector
+  set *is*: at cap N a long note holds N chunks and its tail is absent, and the
+  same note at cap 2N would hold a different set. Lowering the cap leaves rows
+  beyond the new bound; raising it leaves rows silently incomplete against the
+  new policy that **nothing will ever re-select**, because their
+  `embedded_content_hash` still matches. Including it makes a cap change a
+  declared reset instead of a permanent, invisible under-embedding (L7).
+- **`configs` is sorted**, so membership is compared and order is not.
+  Index-time tsvectors are `||`-concatenated and query-time tsqueries are OR'd,
+  and both operators are order-insensitive over lexeme sets, so
+  `["english","norwegian"]` and `["norwegian","english"]` produce identical
+  stored vectors; comparing them as ordered lists would refuse startup over a
+  reordering that changed nothing.
+- **Canonical JSON rather than a delimited string.** A model name may contain
+  any character, so a delimiter would need an escaping rule that would then
+  have to be specified, versioned and tested. JSON has one already, it parses
+  on both sides so a mismatch can name **which field changed** rather than
+  printing two opaque strings, and `sort_keys` with compact separators admits
+  exactly one spelling per configuration — the property byte equality needs.
+- **`v` (`FINGERPRINT_VERSION`) makes adding a field a deliberate act.** It
+  changes every fingerprint, so the change that adds one must ship either a
+  rewrite of the stored value or an instruction to reset.
+
+### Comparison at startup: both fail closed
+
+`_check_embedding_fingerprint()` and `_check_fts_fingerprint()` in
+`src/main.py` share one body (`_check_settings_fingerprint`), which is what
+makes "identical disposition" structural rather than a coincidence two
+functions happen to preserve. They run immediately after
+`_validate_fts_configs()` — deliberately, so a *misspelled* config name still
+fails with that check's own message listing the configurations the database
+has, rather than as an opaque fingerprint diff — and inside the sandbox-mode
+short-circuit, so `MCP_SANDBOX_MODE` skips them like every other guard.
+
+| stored | disposition |
+| --- | --- |
+| table absent | return, deferring to alembic — `state_table_exists` asks with `to_regclass`, because a `SELECT` against a missing relation aborts the transaction and the guard could then not go on to defer |
+| `ABSENT` | **adopt**: write the current fingerprint, commit, WARNING that it was *assumed, not verified* |
+| `MATCH` | proceed silently |
+| `DIFFERS` | CRITICAL naming both fingerprints and the differing fields, pointing at `make reset-embeddings` / `make rebuild-tsvectors`, then `sys.exit(1)` |
+| `UNREADABLE` — not JSON, JSON that is not an object, or a `v` this build does not know | the same refusal, saying the stored value could not be interpreted, and **writing nothing** |
+
+- **Absence is adopted, not refused.** Refusing there would take every existing
+  deployment down on upgrade over a configuration nobody changed. The cost is
+  L8: the first startup after this change blesses whatever it finds, which is
+  why the change had to be deployed with the embedding and FTS configuration
+  unchanged.
+- **Keyword vectors fail closed exactly as embeddings do.** A first draft let
+  an FTS mismatch warn and serve, on the reasoning that a stale stemmer is
+  *incomplete* rather than wrong. That reasoning does not survive contact with
+  the failure: under `["english"]` the token `running` is stored as the lexeme
+  `run`, and a query under `["simple"]` for `run` then **matches a note that
+  does not contain the word `run`** — a false positive, indistinguishable from
+  a real hit, handed to an agent that acts on it without a human ever seeing
+  the query. That is this product's second-named expensive failure, not a
+  recall shortfall. (Symmetrically, a query for `running` under `simple` misses
+  the note entirely.) Changing `FTS_CONFIGS` is a rare operator action, the
+  refusal names the one command that repairs it, and there is always a second
+  exit — putting `FTS_CONFIGS` back clears the refusal immediately with no
+  rebuild at all. That second exit is what distinguishes this from an outage.
+- **An unreadable value refuses and is never rewritten.** A value this build
+  cannot compare is one it cannot certify the rows against, and overwriting it
+  with the current fingerprint would convert an unreadable claim into a
+  confident false one. It is `clean_at_version`'s rule — an unknown stamped
+  version counts as *differs* — in a new place.
+- **Startup never rewrites a fingerprint it has just refused on.** Only the
+  maintenance workflows write one after the initial adoption; a guard that can
+  clear its own refusal is not a guard.
+- **Endpoint URLs are excluded, deliberately, and that is L1.** `OLLAMA_URL`
+  and `OPENAI_BASE_URL` are infrastructure: moving between `api.openai.com`, an
+  Azure deployment and a compatible proxy usually serves the identical
+  artifact, and including them would demand a full vault re-embed for a move
+  that changed nothing about the vectors. The consequence is that the
+  fingerprint records the **configuration, not the artifact**: `bge-m3` is a
+  mutable Ollama tag, so `ollama pull` can replace the weights behind it and a
+  second host can serve different weights under the same name. No value
+  available to this process distinguishes those cases, and a probe would have
+  to trust the endpoint it is checking. **The operator rule that stands in its
+  place**, documented beside the model keys in `.env.example` and `README.md`:
+  *a change of model artifact — re-pulling a tag, or repointing at a host
+  serving different weights — requires `make reset-embeddings`, and nothing
+  will detect it if you skip that.*
+
+### A fingerprint write is not instrumentation
+
+"Recording never fails a pass" governs the run history and the rotation cursor,
+where a lost write costs an operator a view. A fingerprint is the claim a later
+startup **refuses** on, so `set_state` has no internal `try`/`except` and every
+fingerprint write lives inside its maintenance operation's own transaction. A
+reset that wiped the column and then swallowed a failed record would leave the
+stored value naming the **previous** configuration over rows about to be built
+under the new one; a rebuild that rebuilt everything and lost its write would
+refuse at every subsequent startup over a database that is actually correct.
+Swallow-on-failure stays exactly where it was — `_write_indexer_run` and
+`_advance_rotation_cursor`.
+
+### The keyword fingerprint is written by a rebuild that proved coverage
+
+`_rebuild_tsvectors_pinned` is **per owner**. Writing the global fingerprint
+inside it would claim something a per-owner rebuild cannot establish — that
+*every retained row* in `notes_metadata` was rebuilt. Two ordinary shapes
+falsify it: user B's rebuild raising after user A's already wrote the
+fingerprint, and a scope holding rows the driver never visits at all. Either
+way the stored value certifies rows still on the previous configuration, and a
+startup that now fails closed would pass while keyword search was exactly as
+wrong as before.
+
+So `rebuild_tsvectors_all_scopes(session)` — what `make rebuild-tsvectors`
+runs, and beside startup's adoption the **only** writer of `fts_fingerprint`:
+
+1. takes the generation lock **before it reads its first row**, so nothing can
+   commit a keyword vector between its snapshot and its record;
+2. enumerates the scopes as `SELECT DISTINCT user_id FROM notes_metadata` —
+   every scope that **retains rows**, not `_active_user_ids()`;
+3. rebuilds each scope through the existing per-owner rebuild, which already
+   certifies every row it writes against owner, path and hash;
+4. writes the fingerprint in **one transaction with all of them**.
+
+**The per-owner rebuild returns a typed outcome, because `0` already meant two
+things.** `RebuildOutcome` is `completed` with a row count, or carries a
+`RebuildSkip` — `PROVENANCE_UNSETTLED`, `ROOT_UNPINNABLE`, `ROOT_QUARANTINED`.
+A row count of `0` is both "this scope had nothing to do" and "this scope was
+**skipped**", and a driver reading `0` as success would record a fingerprint
+certifying a scope the rebuild deliberately declined to touch — the exact class
+of false claim the coverage proof exists to remove, and invisible from the
+outside. **Any retained scope whose outcome is not completed aborts the
+driver** (`RebuildCoverageAborted`), names the scope and its reason, rolls every
+scope rebuilt so far back, and records nothing.
+
+- **An inactive owner with an assigned vault is rebuilt, not skipped.**
+  `_active_user_ids()` and the vault-path cache are keyed to *active* users
+  because that is whom the periodic pass serves; the coverage proof asks a
+  different question — which rows **exist** — and an inactive user's rows are
+  as retained, and as returnable by `keyword_search`, as anyone's.
+  `_scope_vault_path` therefore reads `users.vault_path` directly, read-only,
+  inside the driver, and pins it the way every other file-reading pass pins a
+  root. Nothing about the active-user machinery is widened to do it. Only a
+  scope with **no** assigned path, or one whose path cannot be pinned, is
+  `ROOT_UNPINNABLE`.
+- **NULL-owned retained rows abort under `MULTI_USER_MODE`** (L6). They cannot
+  be rebuilt — `_vault_root(None)` refuses in that mode by design, and
+  substituting `settings.vault_path` would read one tenant's notes under an
+  unowned scope, a tenancy violation performed to satisfy a bookkeeping row.
+  Nor may they be silently excluded from the coverage proof: they are retained
+  rows `keyword_search` can still return. So the driver names them and their
+  count and stops. In single-user mode the ownerless scope is the *only* scope
+  and rebuilds normally.
+- **All-or-nothing across scopes is a narrow, deliberate carve-out.** The
+  standing rule is that the ancillary passes' provenance skip is *per user*, so
+  one tenant's unsettled provenance does not block another's indexing. That
+  rule is **modified**, not overridden: the carve-out applies only to the
+  operator-invoked rebuild that records the fingerprint, it does not weaken the
+  per-user gate (a skipped user still gets nothing written), and its reason is
+  structural — a fingerprint is one row asserting something about *every*
+  retained row, so "all scopes rebuilt" is not a fact that can be established
+  one user at a time. The rule's purpose, one tenant not blocking another's
+  **ongoing** indexing, is untouched, because this is a one-shot an operator
+  ran rather than the loop that keeps the index fresh. The cost is L5, and the
+  rebuild is already the cheap path — keyword index only, no provider calls,
+  seconds for a few thousand notes.
+- `rebuild_tsvectors(session, user_id)` stays as the single-scope entry point
+  and records **no** fingerprint, for the reason this whole subsection exists.
+
+## The index generation lock (#206)
+
+A startup check is not enough, and the interleaving that defeats it is ordinary
+rather than exotic. `make reset-embeddings` runs `docker compose run --rm` on
+purpose (#142) so that it reads the edited `.env` and works whether the service
+is up or down — and that last property is the hole:
+
+```
+old process: read fingerprint A == A, proceed
+old process: get_embeddings_batch(note)          <- seconds to minutes
+reset:       wipe the column, write fingerprint B, commit
+old process: certify_embedded + insert vectors   <- old-model vectors, under B
+```
+
+The check and the act are separated by a network call, so the vectors that
+interleaving stores are permanently wrong and every later startup is silent,
+because the stored fingerprint already matches. The enforcement is therefore a
+**transaction-scoped PostgreSQL advisory lock** on one fixed key,
+`INDEX_GENERATION_LOCK_KEY` — `8029183045093649969`, the ASCII bytes
+`omcpgen1`, **written out literally** in `src/services/index_state.py` and
+deliberately never derived at runtime from a hash of a string, a version or a
+table name. A key computed at runtime can differ between builds, and two
+processes holding different keys are two processes holding no lock at all, with
+a failure mode that is silent and permanent.
+
+- **`pg_advisory_xact_lock`, never a session lock.** It releases at commit or
+  rollback, so a crashed pass cannot strand it; a session lock leaked into a
+  pooled connection would be held by whatever ran next.
+- **Every maintenance operation that mutates the generation takes it first** —
+  before its wipe, its rebuild or its fingerprint write:
+  `scripts/reset_embeddings.py`, the panel's Danger-zone reset paths, and the
+  rebuild driver.
+- **Every transaction that writes a configuration-dependent derived row takes
+  it too**, re-reads the relevant fingerprint under it, and refuses to write on
+  a mismatch — certifying nothing, inserting nothing, deleting nothing, and
+  leaving the row for a later pass, which is `StaleCertification`'s existing
+  disposition. **Acquiring the lock without re-reading buys nothing**: the
+  value may have changed while the caller waited for it.
+- **`ABSENT` is not a mismatch** on any of these paths, and none of them writes
+  a fingerprint. Nothing has been claimed about the stored rows, so there is
+  nothing to contradict — and only the maintenance workflows and the startup
+  adoption write, which is what stops a refusal from clearing itself.
+
+### The ordering rule is a property of the transaction
+
+> **A transaction that will write any configuration-dependent derived row
+> acquires the generation lock and re-validates the fingerprint before its
+> first row-locking mutation.**
+
+Stated that way, not as "before the statement that needs the fingerprint",
+because the second spelling produces a real deadlock. The incremental index
+pass is **one transaction**, and it mutates `notes_metadata` long before it
+reaches its tsvector write: the upsert of each changed note, the id-preserving
+move UPDATE, the prune DELETE, the `note_links` delete-and-insert, and the
+grammar-invalidation `UPDATE … SET embedded_content_hash = NULL` all take row
+locks first. Taking the advisory lock at the tsvector write would give:
+
+```
+pass:    upsert notes_metadata rows          (holds row locks)
+rebuild: pg_advisory_xact_lock               (holds advisory)
+rebuild: rebuild those rows                  -> waits on the pass's row locks
+pass:    pg_advisory_xact_lock at the write  -> waits on the rebuild's advisory
+```
+
+— a cycle the database resolves by killing one side. So the pass calls
+`acquire_generation_lock(session)` and `_assert_fts_generation_current(session)`
+as the **first two statements of `_index_vault_pinned`'s transaction**, and
+anyone adding a mutation to that function must keep it below that line: the
+requirement is to audit what the transaction touches, not to reason backwards
+from the write that consumes the fingerprint. A mismatch raises
+`GenerationMismatch` and the pass commits nothing, exactly as a tsvector floor
+failure already does, and retries next tick under whichever configuration is
+then current. The abort is deliberately fatal to the pass rather than a skip: a
+keyword vector is only ever rewritten when a note's `content_hash` changes, so
+a row written under the previous `FTS_CONFIGS` would keep that vector for ever
+behind a fingerprint claiming otherwise.
+
+**Lock ordering is one direction everywhere** — the advisory lock before any
+row or table lock, in every transaction that takes it — so it cannot close a
+cycle with the row locks the pass and the panel already contend for. **Every
+writer of `content_tsvector` takes it**, because the same check-then-act gap
+exists one step removed on the keyword side: a rebuild can rebuild every
+retained row under the new `FTS_CONFIGS` and record the fingerprint while an
+old container's *incremental* pass writes `content_tsvector` for a changed note
+under the previous one — and a keyword vector is only ever rewritten when a
+note's `content_hash` changes, so that row would stay on the old configuration
+for ever behind a fingerprint claiming otherwise. In the tree that is the
+incremental pass (at the head of its transaction) and the per-owner rebuild
+(through its driver, which takes the lock before its first read);
+`rebuild_tsvectors(session, user_id)` survives as a single-scope entry point
+with **no production caller** — it keeps its `int` contract for the tests that
+hold it — so anything that gives it one must take the lock first.
+
+### On the embed path the window exists only inside `embed_note`
+
+`get_embeddings_batch` and `certify_embedded` are twenty lines apart in the
+*same* function, and the caller in `indexer.py` sees only the result: there is
+no point between them the indexer can reach. So the acquisition and the
+re-read live in `embed_note` itself (`_generation_matches`), **after the
+provider call and before the certification** — which is precisely the window
+the spec already reserves, so no lock of any kind is ever held across a network
+round trip. It is also before the first row lock that per-note transaction
+takes (the certification *is* that lock), so here the head-of-transaction rule
+and the after-the-provider-call rule agree rather than conflict. Both callers —
+the backlog loop and the reconciliation sweep — inherit it, and a mismatch
+returns `GENERATION_MISMATCH`: nothing certified, nothing written, not counted
+as embedded and **not counted as a failure** (nothing went wrong with the
+provider), logged at ERROR. It is an *attempt*, because a provider call was
+issued — the `attempted` rule applying unchanged rather than gaining an
+exception.
+
+**The exclusion branch is exempt, and the exemption is argued rather than
+assumed.** It makes no provider call, writes no vector, and stamps a row to
+record that an *excluded* note has been dealt with — a claim that is true under
+any model, because the correct vector set for an excluded note is the empty
+one. It has nothing a generation change can invalidate, so it keeps its
+existing `certify_embedded` predicate and its existing per-note commit. Both
+branches carry a comment saying so.
+
+**The per-stage fingerprint re-read is a cheap early exit, not the guarantee.**
+`_embed_vault_pinned` reads the embedding fingerprint once per user stage
+(`_embedding_generation_current`) and, on a mismatch, returns an empty
+`EmbedPassResult` — nothing attempted, nothing recorded, no failure — so an old
+container abandons the stage within one tick instead of grinding through a
+backlog whose every certification the lock will refuse. `ABSENT` proceeds here
+too, since a database with no recorded fingerprint makes no claim the stage
+could contradict. The lock is what makes the guarantee; the re-read is what
+makes it cheap.
+
+### Maintenance waits for an in-flight pass, and that is correct (L5b)
+
+The pass holds the generation lock for the duration of its transaction —
+minutes on a large vault — so `make reset-embeddings` and
+`make rebuild-tsvectors` **wait** for an in-flight pass instead of interleaving
+with it. That is the behaviour we want: a reset must not land mid-pass. The
+maintenance paths therefore deliberately do **not** set a short `lock_timeout`
+to defeat it. (`scripts/reset_embeddings.py` takes the lock as the first
+statement of its transaction and only then raises `statement_timeout` to
+`5min`, because a `SET LOCAL` ahead of the acquisition would put a statement
+before the lock and break the ordering rule; the wait therefore runs under the
+engine's 60 s statement timeout, and an operator who resets against a live
+service may have to retry — time, not correctness.)
+
+**The runbook, and why it inverts the old advice.** For any change to the
+embedding provider, model, dimensions, chunk size, chunk overlap or the chunk
+cap: edit `.env` → `make deploy` (the new image refuses at the fingerprint or
+dimension guard and stays down, embedding nothing) → `make reset-embeddings`
+while it is down → restart. The pre-fingerprint advice told operators to reset
+*before* recreating; that ordering was safe only because nothing then depended
+on a stored claim. For `FTS_CONFIGS`: edit `.env` → `make deploy` → the new
+container refuses at the keyword fingerprint guard → `make rebuild-tsvectors`,
+which rebuilds every scope holding rows and writes the fingerprint only if
+every one of them completed → restart. **The lock is what makes an operator who
+ignores the runbook lose time rather than correctness.**
+
+*One key, not two.* The two subsystems guard one fact — which configuration the
+derived rows were built under — and a single key makes the ordering rule
+trivially total. The cost is that an embed certification and a tsvector write
+serialise against each other across processes; within a process
+`index_pass_lock` already did, and across processes serialising them is the
+point.
+
+*Rejected — have the rebuild refuse while an old writer could run.* There is no
+way to ask that question: "an old writer" is another container the database
+cannot enumerate, and a heuristic over `pg_stat_activity` would be a guess
+whose failure direction is silent, permanent staleness.
+
+## What this change does not do (#200, #201, #202, #206)
+
+Every residual is listed here, so none of them is discovered later as a defect.
+
+- **L1 — a model artifact can change under an unchanged name.** Endpoint
+  identity is excluded from the fingerprint, so re-pulling a mutable tag or
+  repointing at a host serving different weights mixes vector spaces
+  undetected. **This is the one an operator can trip with no warning of any
+  kind**, because nothing available to the process can see it: the recourse is
+  the documented operator rule at the model keys — a change of model artifact
+  requires `make reset-embeddings`.
+- **L2 — an edit the scan has not yet committed is served as fresh.** The
+  staleness signal is derived from `notes_metadata`, so it reports what the
+  index knows. Bounded by `INDEX_INTERVAL_SECONDS` plus the pass in flight; see
+  [search.md](search.md).
+- **L3 — the scan and the one-shot link backfill are unbudgeted.** A tenant
+  with an enormous vault still delays the next tenant through those stages.
+  Each is a single transaction over a vault walk, so budgeting one means
+  committing a partial derive (A.7a forbids it) or discarding the pass's work.
+- **L4 — the cross-tenant delay is the budget plus one note's embedding time**,
+  ~8.3 h arithmetic worst case on a provider answering at its timeout. The only
+  tighter bound is an aggregate deadline, which is what #127 removed.
+- **L5 — a multi-tenant keyword rebuild is all-or-nothing**, and a scope that
+  cannot be rebuilt blocks the fingerprint and therefore, with FTS failing
+  closed, blocks startup after an `FTS_CONFIGS` change. Reachable by an
+  *unassigned* user's leftover rows, a tenant still in re-derive mode, a
+  quarantined root, or ownerless rows under multi-user mode — **not** by an
+  inactive-but-assigned user, whose scope the driver resolves and rebuilds.
+  Recourses: settle the scope, delete or reassign the rows, or revert
+  `FTS_CONFIGS`.
+- **L5b — the incremental pass holds the generation lock for its whole
+  transaction**, so the maintenance commands wait minutes on a large vault.
+  Waiting is the correct behaviour and the maintenance paths do not defeat it.
+- **L6 — NULL-owned `notes_metadata` rows abort the rebuild** while
+  `MULTI_USER_MODE` is on. Delete or reassign them.
+- **L7 — raising `MAX_CHUNKS_PER_NOTE` forces a full re-embed**, although it
+  only widens coverage. A comparison rule that knew which direction was safe
+  would have to reason about every field jointly: a larger cap with a smaller
+  chunk size is not a widening.
+- **L8 — the first startup after this change adopts whatever is configured.**
+  There is no prior evidence to compare against, and refusing would take every
+  existing deployment down on upgrade. It shipped with the embedding and FTS
+  configuration unchanged, for that reason.
+- **L9 — a capped note's tail is not semantically searchable at all.** That is
+  what the cap is; the note stays fully keyword-searchable, and the truncation
+  is marked on the row, in every vector result and on the dashboard.
+- **L10 — `semantic_search` still hydrates every candidate's full vector** to
+  recompute a similarity the query already returned as `distance`. Pre-existing
+  and unrelated to these four findings; filed as a follow-up rather than
+  widened into a change that already touches both read paths.
 
 ## Re-deriving after a grammar change (#150)
 
