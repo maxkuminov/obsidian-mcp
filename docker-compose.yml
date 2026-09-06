@@ -72,6 +72,21 @@ services:
       - "traefik.http.routers.obsidian-mcp-panel-rtr.middlewares=chain-oauth@file"
       - "traefik.http.routers.obsidian-mcp-panel-rtr.service=obsidian-mcp-svc"
       # API/MCP/OAuth public router (no OAuth — app-level auth)
+      #
+      # NO `ratelimit` middleware here, deliberately (#194). A Traefik
+      # ratelimit was considered and rejected for three reasons. (1) A proxy
+      # cannot condition on the RESPONSE STATUS, so bounding unauthenticated
+      # probing at this layer would mean throttling authenticated agents too;
+      # the failed-authentication budget lives in `APIKeyMiddleware` instead,
+      # where it can count only the 401s. (2) This one router also serves
+      # /transfer, /health and /.well-known, so any label here would throttle
+      # all four surfaces together. (3) The host's Traefik STATIC config lives
+      # outside this repo (see CLAUDE.md, "Public repo — host paths live
+      # outside the tree"), so a control expressed there would not be
+      # reproducible from the tree. The per-principal token buckets and the
+      # per-address auth budget are in-process — see
+      # docs/architecture/rate-limits.md, and note that `--workers 1` in the
+      # Dockerfile is load-bearing for them.
       - "traefik.http.routers.obsidian-mcp-api-rtr.entrypoints=https"
       - "traefik.http.routers.obsidian-mcp-api-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && (PathPrefix(`/mcp`) || PathPrefix(`/transfer`) || Path(`/health`) || PathPrefix(`/.well-known`) || Path(`/register`) || Path(`/token`) || Path(`/revoke`))"
       - "traefik.http.routers.obsidian-mcp-api-rtr.tls=true"
