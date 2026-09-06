@@ -488,6 +488,8 @@ _GUARDED_MODULES = (
     "src/csrf.py",
     "src/services/transfer.py",
     "src/services/vault_overlap.py",
+    "src/services/vault_fs.py",
+    "src/services/vault.py",
 )
 
 _GUARDED_METHODS = {"warning", "error", "exception", "critical"}
@@ -506,6 +508,33 @@ _GUARDED_METHODS = {"warning", "error", "exception", "critical"}
 #: operation rather than bound a flood. Anything a *credential* can drive
 #: belongs in the catalogue instead; an entry here is a claim that no such
 #: caller exists, and it has to say why.
+#: The owner decision of round 3, recorded as accepted limitation **R10** and
+#: used verbatim by every site it covers. These fire only when the vault's own
+#: filesystem is failing *after* the bytes have landed: the tool call
+#: succeeded, the record adds nothing the caller can act on, and threading an
+#: event through the destructive publication path — the one path in this
+#: codebase that has clobbered a note before — buys a bound that
+#: `mcp-rate-limits`' write bucket already provides.
+_POST_PUBLICATION = (
+    "post-publication filesystem failure on a successful write; class-only, "
+    "bounded by the write bucket; not routed through the suppressor to keep "
+    "the destructive publication path unchanged"
+)
+
+#: The staging half of the same story: cleanup and substitution guards that run
+#: after a write has finished or aborted. Same class as `_POST_PUBLICATION` and
+#: the same R10 decision, but the write they follow did not necessarily
+#: succeed, so the reason says what it actually is rather than borrowing text
+#: that would be a claim about the wrong thing.
+_STAGING_CLEANUP = (
+    "staging cleanup and substitution guard, reached only after a write has "
+    "already landed or already aborted; it changes no result, and detecting a "
+    "substituted staging name is precisely the operational fact suppression "
+    "must not withhold. Same R10 decision as the post-publication flush: "
+    "bounded by the write bucket, not routed through the suppressor, because "
+    "the destructive publication path stays unchanged"
+)
+
 _BARE_LOGGER_EXEMPTIONS: dict[str, dict[str, str]] = {
     "src/control_panel/routes.py": {
         "Skipping HNSW index": (
@@ -539,13 +568,56 @@ _BARE_LOGGER_EXEMPTIONS: dict[str, dict[str, str]] = {
         ),
     },
     "src/services/transfer.py": {
-        "Could not close the": (
-            "The descriptor-close warning design D18 names by hand as staying "
-            "on the bare logger. It is `close_quietly` housekeeping in a "
-            "`finally`, it reports a leaked file descriptor — an operational "
-            "fact with no caller and no refusal attached — and it fires at "
-            "most once per descriptor the process has already finished with."
-        )
+        # Round 2 exempted this as "an operational fact with no caller". That
+        # was **wrong**, and round 3 said so: `_close_quietly` runs on the
+        # publish path of `PUT /transfer/upload` and `import_from_url`, up to
+        # three times per publication, so a caller reaches it directly. The
+        # exemption stands — on the accurate reason.
+        "Could not close the %s descriptor": _POST_PUBLICATION,
+    },
+    # R10 — the post-publication flush and the staging cleanup. Every entry
+    # here is reachable from a foreground tool call (create/edit/move/delete a
+    # note, write/delete a file, redeem an upload), and every one of them runs
+    # when the operation has *already* landed.
+    "src/services/vault_fs.py": {
+        # `flush_dir_quietly` — every rename publication: move_note's
+        # renameat2, the soft delete's rename into .trash, the permanent
+        # unlink.
+        "Could not flush the %s to durable storage": _POST_PUBLICATION,
+        # `flush_publication_ancestors_quietly` — every note publish, through
+        # `vault._flush_target_dirs`.
+        "Completed %s but could not flush the directories above": _POST_PUBLICATION,
+        # `_unlink_quietly` after a publish consumed the name.
+        "Published upload but could not remove temp file": _POST_PUBLICATION,
+        # The same cleanup when the write did not publish.
+        "Could not remove temp file %s": _STAGING_CLEANUP,
+        # `discard_staged_name`'s four guards. Each one refuses to unlink a
+        # name it cannot prove is ours — the destructive write that guard
+        # exists to prevent — and says so.
+        "Cannot confirm what was staged under %s": _STAGING_CLEANUP,
+        "Staging name": _STAGING_CLEANUP,
+        "Could not confirm that staging name": _STAGING_CLEANUP,
+        # Once per process, by construction: a lock-guarded flag makes this
+        # announcement fire on the first exercise and never again, so no
+        # caller can drive it at all.
+        "VAULT_ALLOW_NAMED_STAGING_FALLBACK is set": (
+            "Announced once per process — `_named_staging_exercised` is set "
+            "under a lock before the call — so it is a startup-class notice "
+            "about how this vault's filesystem stages writes, not a "
+            "per-request record. No caller can drive it a second time."
+        ),
+        # The staging prune, from the maintenance driver.
+        "Could not list %s for pruning": (
+            "The staging prune's directory listing, run by the maintenance "
+            "driver rather than by a request. Background and once per pass — "
+            "the class D18 keeps on the bare logger."
+        ),
+    },
+    "src/services/vault.py": {
+        # `_flush_target_dirs`, reached when `move_note`'s link rewrites have
+        # already released the root descriptor. Design D18 already named this
+        # site as staying on the bare logger; R10 is why.
+        "Published %s but could not flush the directories above it": _POST_PUBLICATION,
     },
     "src/services/vault_overlap.py": {
         # The detection pass. Its entry points are startup, the indexer tick,
@@ -644,6 +716,8 @@ def test_the_exemption_list_is_exactly_what_the_design_says_it_is():
         "src/control_panel/routes.py",
         "src/services/transfer.py",
         "src/services/vault_overlap.py",
+        "src/services/vault_fs.py",
+        "src/services/vault.py",
     }
     assert set(_BARE_LOGGER_EXEMPTIONS["src/control_panel/routes.py"]) == {
         "Skipping HNSW index",
@@ -651,9 +725,52 @@ def test_the_exemption_list_is_exactly_what_the_design_says_it_is():
         "Rollback after the failed fingerprint record failed",
     }
     assert set(_BARE_LOGGER_EXEMPTIONS["src/services/transfer.py"]) == {
-        "Could not close the"
+        "Could not close the %s descriptor"
     }
     assert len(_BARE_LOGGER_EXEMPTIONS["src/services/vault_overlap.py"]) == 5
+    assert len(_BARE_LOGGER_EXEMPTIONS["src/services/vault_fs.py"]) == 9
+    assert set(_BARE_LOGGER_EXEMPTIONS["src/services/vault.py"]) == {
+        "Published %s but could not flush the directories above it"
+    }
+
+
+def test_the_r10_reason_is_recorded_verbatim_everywhere_it_applies():
+    """R10 is an owner decision, so its wording is the record of it.
+
+    Every post-publication site quotes the same sentence — one string, used by
+    reference — so a reader who greps one of them finds the decision rather
+    than a paraphrase of it, and the architecture note and design.md can be
+    checked against it.
+    """
+    assert _POST_PUBLICATION == (
+        "post-publication filesystem failure on a successful write; "
+        "class-only, bounded by the write bucket; not routed through the "
+        "suppressor to keep the destructive publication path unchanged"
+    )
+    quoting = {
+        rel: sorted(k for k, v in entries.items() if v is _POST_PUBLICATION)
+        for rel, entries in _BARE_LOGGER_EXEMPTIONS.items()
+        if any(v is _POST_PUBLICATION for v in entries.values())
+    }
+    assert quoting == {
+        "src/services/transfer.py": ["Could not close the %s descriptor"],
+        "src/services/vault.py": [
+            "Published %s but could not flush the directories above it"
+        ],
+        "src/services/vault_fs.py": [
+            "Completed %s but could not flush the directories above",
+            "Could not flush the %s to durable storage",
+            "Published upload but could not remove temp file",
+        ],
+    }
+    for source in (
+        ROOT / "docs" / "architecture" / "security-event-logging.md",
+        ROOT / "openspec" / "changes" / "security-event-logging" / "design.md",
+    ):
+        assert "R10" in source.read_text(), (
+            f"{source.name} must record the accepted limitation, not just the "
+            "test that enforces it"
+        )
 
 
 def test_every_exemption_names_a_call_that_still_exists_and_says_why():
