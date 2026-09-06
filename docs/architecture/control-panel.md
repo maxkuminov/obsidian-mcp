@@ -243,9 +243,21 @@
   succeeds — on the page an operator opens *because* something is wrong. So
   `_health_strip_or_degraded` rolls the failed transaction back (without it the
   render's own queries raise `InFailedSQLTransaction` instead of the real
-  error), logs at ERROR so the ring buffer catches it, and renders a "health
-  summary unavailable" strip. Saying so beats rendering "ok" from a query that
-  never returned.
+  error), records `panel_health_strip_failed` at ERROR so the ring buffer
+  catches it, and renders a "health summary unavailable" strip. Saying so beats
+  rendering "ok" from a query that never returned. It goes through
+  `security_events.emit` rather than the bare logger because a caller can drive
+  it on demand by reloading the dashboard — see
+  [security event logging](security-event-logging.md); the panel's on-demand
+  index and embed failures migrated with it for the same reason.
+
+- **Reconfiguring logging must not take the buffer with it.** `configure_logging`
+  removes and closes every root handler *except* the one `error_log` owns, in
+  either call order, and `attach()` stays idempotent across it. The rule and
+  the reason it is not `basicConfig(force=True)` live in
+  [security event logging](security-event-logging.md); what matters here is
+  that the health page keeps working because the code says so, not because an
+  import happens to run first.
 
 - **Errors and backup age are admin-only; the pass history is scoped.** The run
   list follows the performance page's rule (an admin sees every pass, a regular
@@ -255,6 +267,45 @@
   included, and a backup covers the whole database — so they are gated on
   `is_admin` rather than filtered, and a non-admin gets a page of their own run
   history with a line saying why.
+
+## The usage page's outcome column
+
+- **A refused write must not look like a successful one.** A read-only
+  credential calling `create_note` writes a `usage_logs` row shaped exactly
+  like a successful write, so `/admin/usage` showed a read-only key apparently
+  writing (#192). The request log now carries an **Outcome** column derived
+  from the row's own markers.
+
+- **The values are read as text and cast nowhere.** `recent_logs` selects
+  `params->>'error'`, `params->>'error_type'` and `params->>'over_quota'`, all
+  three as `text`. `params` is `JSONB` and `->>` always yields text; a
+  `::boolean` on `over_quota` would 500 the whole page — for every user, until
+  the offending row aged out of the window — the moment one row carried
+  anything that is not `true`/`false`. `/admin/performance`'s unguarded casts
+  are the standing example of that hazard and this query deliberately does not
+  join it.
+
+- **The mapping lives in the route, with a declared precedence** (`_usage_outcome`),
+  because the three values can co-occur and a page that decided by whichever
+  branch it happened to test first would rank them differently as the code
+  moved:
+  1. `tool_exception` → **failed**, showing the exception class. "It broke" and
+     "it was refused" are different answers to "why did this call do nothing",
+     and the colour tells them apart before the reason is read.
+  2. any other `error` marker → **refused**, showing that marker
+     (`permission_denied` is the one this change added).
+  3. `over_quota == "true"` → **refused / over_quota**.
+  4. any other non-empty `over_quota` value → **refused**, showing the value
+     **raw**. `_tracked` writes that key only when it refuses and only as the
+     JSON boolean `true`, so nothing the server produces reaches this branch —
+     but a hand-edited or future-shaped row renders instead of taking the page
+     down, and the operator is the one who can tell whether it is a bug.
+  5. none of the above → no outcome; the row renders exactly as it always did.
+
+- **Nothing is discarded between the query and the template.** All three
+  selected values survive to the mapping, and the mapping shows what it does
+  not recognise rather than dropping it — which is the difference between a row
+  that looks ordinary and a row that says it is not.
 
 ## Flash messages
 

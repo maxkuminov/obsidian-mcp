@@ -134,6 +134,7 @@
                     <th>Time</th>
                     <th>Key</th>
                     <th>Tool</th>
+                    <th>Outcome</th>
                     <th>Duration</th>
                 </tr>
             </thead>
@@ -159,6 +160,23 @@
                         {% endif %}
                     </td>
                     <td style="color:var(--primary-text);font-size:13px;font-weight:500;">{{ log.tool }}</td>
+                    {# The outcome the route derived (design D9). A row with no
+                       marker shows an em dash, exactly as it did before this
+                       column existed; a *failure* is red and a *refusal*
+                       yellow, so the two are told apart at a glance rather
+                       than by reading the reason. The reason is whatever was
+                       recorded — including a value the mapping did not
+                       recognise, which is shown raw rather than dropped. #}
+                    <td style="font-size:12px;line-height:1.3;">
+                        {% if log.outcome %}
+                            <span class="badge {% if log.outcome.kind == 'failed' %}badge-red{% else %}badge-yellow{% endif %}">{{ log.outcome.label }}</span>
+                            {% if log.outcome.detail %}
+                                <div class="mono" style="font-size:10px;color:var(--text-3);margin-top:3px;">{{ log.outcome.detail }}</div>
+                            {% endif %}
+                        {% else %}
+                            <span style="color:var(--text-3);">—</span>
+                        {% endif %}
+                    </td>
                     <td class="mono" style="font-size:11px;color:var(--text-2);">
                         {% if log.duration_ms %}{{ log.duration_ms }} ms{% else %}—{% endif %}
                     </td>
@@ -166,7 +184,7 @@
                 {% endfor %}
                 {% if not logs %}
                 <tr>
-                    <td colspan="4" style="text-align:center;padding:32px;color:var(--text-3);">{% if filters_active %}No requests match these filters.{% else %}No usage data yet.{% endif %}</td>
+                    <td colspan="5" style="text-align:center;padding:32px;color:var(--text-3);">{% if filters_active %}No requests match these filters.{% else %}No usage data yet.{% endif %}</td>
                 </tr>
                 {% endif %}
             </tbody>

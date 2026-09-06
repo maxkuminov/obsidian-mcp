@@ -59,7 +59,7 @@ from src.config import MAX_NOTE_BYTES, settings
 from src.database import async_session
 from src.limiter import limiter
 from src.models.db import UsageLog
-from src.services import transfer, vault_fs
+from src.services import security_events, transfer, vault_fs
 from src.services.vault import classify_bytes, is_hidden_path
 
 logger = logging.getLogger(__name__)
@@ -161,23 +161,124 @@ def _path_ok(vault_root: str, rel_path: str) -> bool:
 
 
 async def _load_valid(session, token: str, *, direction: str):
-    """A usable token row for `direction`, or `None` — the whole 404 matrix.
+    """A usable token row for `direction`, or why not — the whole 404 matrix.
 
     Identity, root and path are re-derived from the database on every call.
     A token is a snapshot of a permission; this is where we check the snapshot
     still describes reality.
+
+    Three return shapes, and the distinction is only about what the *log* can
+    say — every caller answers all three with the same `_not_found()`:
+
+    * a row — the token is usable;
+    * a `TransferRefusal` — one of the three predicates *this function*
+      evaluates said no, so the reason is already known and no diagnosis read
+      is needed;
+    * `None` — `lookup_token` returned nothing, and that one query collapses
+      unknown, expired, wrong-direction, claimed, completed and consumed into
+      a single answer by design. The caller diagnoses that case afterwards,
+      behind a permit (`transfer.classify_token_refusal`).
+
+    The predicates, their order and their outcomes are unchanged; only the
+    value carrying "no" got more specific.
     """
     need_write = direction == "upload"
     row = await transfer.lookup_token(session, token, direction=direction)
     if row is None:
         return None
     if not await transfer.resolve_identity_ok(session, row, need_write=need_write):
-        return None
+        return transfer.TransferRefusal("credential_invalid", row)
     if not await transfer.resolve_root_ok(session, row):
-        return None
+        return transfer.TransferRefusal("root_reassigned", row)
     if not _path_ok(row.vault_root, row.path):
-        return None
+        return transfer.TransferRefusal("path_invalid", row)
     return row
+
+
+def _refused(outcome) -> bool:
+    """Did `_load_valid` refuse? True for both refusal shapes, never for a row.
+
+    Deliberately **not** `isinstance(outcome, TransferToken)`: the route tests
+    stand in a plain object for the ORM row, and a type check here would make
+    the routes untestable without a database for no gain.
+    """
+    return outcome is None or isinstance(outcome, transfer.TransferRefusal)
+
+
+async def _refuse(
+    request: Request,
+    *,
+    reason: str | None = None,
+    refusal=None,
+    token: str | None = None,
+    session=None,
+    direction: str | None = None,
+    row=None,
+) -> JSONResponse:
+    """Record why, then return the one refusal. The response is never affected.
+
+    The order is the whole point, and it is the order of design D8:
+
+    1. The admission decision has **already been taken** by the caller. Nothing
+       below can change it, and every path through here returns the same
+       `_not_found()`.
+    2. Acquire the suppression permit **first**, keyed on the trusted client
+       address — the only subject computable before the diagnosis, and the one
+       a caller cannot mint by rotating bogus bearer tokens. An accepted
+       request never reaches this function at all, and a refusal whose source
+       is already at its allowance stops here, so neither pays for a read.
+    3. Only with a permit in hand, and only when the reason is not already
+       known, run the read-only diagnosis. It issues a database read on a path
+       whose entire contract is a fixed 404, so it is wrapped in its own
+       `try/except`: a dead connection or an exhausted pool answers
+       `diagnosis_failed` and the 404 goes out unchanged. A diagnosis must
+       never turn a refusal into a 500.
+
+    Identity is carried only where a row actually resolved; `token_tag` only
+    where a token was actually presented. Nothing is invented for a record.
+    """
+    permit = security_events.acquire(
+        "transfer_refused",
+        subject=security_events.subject_for(request=request),
+        level=logging.WARNING,
+    )
+    if permit is None:
+        return _not_found()
+
+    if refusal is not None:
+        reason = refusal.reason
+        if row is None:
+            row = refusal.row
+
+    error_type = None
+    if reason is None:
+        # The collapsed case: `lookup_token`/`claim_upload` said no and cannot
+        # say why. Diagnose it now, outside the decision, behind the permit.
+        try:
+            diagnosed = await transfer.classify_token_refusal(
+                session, token, direction=direction
+            )
+            reason = diagnosed.reason
+            if row is None:
+                row = diagnosed.row
+        except Exception as exc:  # noqa: BLE001 - a read here may not 500 the route
+            reason = "diagnosis_failed"
+            error_type = type(exc).__name__
+
+    security_events.emit(
+        permit,
+        level=logging.WARNING,
+        reason=reason,
+        token_tag=security_events.redacted_token_tag(token),
+        route=request.url.path,
+        method=request.method,
+        client_ip=security_events.client_ip(request),
+        user_id=getattr(row, "user_id", None),
+        key_id=getattr(row, "key_id", None),
+        oauth_token_id=getattr(row, "oauth_token_id", None),
+        error_type=error_type,
+    )
+    return _not_found()
 
 
 def _log_row(row, tool: str, params: dict, response_size: int | None = None) -> UsageLog:
@@ -258,11 +359,17 @@ async def download_page(request: Request) -> Response:
 @limiter.limit(PAGE_LIMIT)
 async def upload_info(request: Request, token: str | None = Depends(_bearer)) -> Response:
     if token is None:
-        return _not_found()
+        return await _refuse(request, reason="missing_token")
     async with async_session() as session:
         row = await _load_valid(session, token, direction="upload")
-        if row is None:
-            return _not_found()
+        if _refused(row):
+            return await _refuse(
+                request,
+                refusal=row,
+                token=token,
+                session=session,
+                direction="upload",
+            )
         payload = {
             "path": row.path,
             "max_bytes": _upload_max_bytes(row),
@@ -277,11 +384,17 @@ async def upload_info(request: Request, token: str | None = Depends(_bearer)) ->
 @limiter.limit(PAGE_LIMIT)
 async def download_info(request: Request, token: str | None = Depends(_bearer)) -> Response:
     if token is None:
-        return _not_found()
+        return await _refuse(request, reason="missing_token")
     async with async_session() as session:
         row = await _load_valid(session, token, direction="download")
-        if row is None:
-            return _not_found()
+        if _refused(row):
+            return await _refuse(
+                request,
+                refusal=row,
+                token=token,
+                session=session,
+                direction="download",
+            )
         fingerprint = row.expected_fingerprint or {}
         payload = {
             "path": row.path,
@@ -371,7 +484,7 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
     session closed.
     """
     if token is None:
-        return _not_found()
+        return await _refuse(request, reason="missing_token")
 
     # ── phase 1: claim + re-validate, then hand the connection back ─────────
     async with async_session() as session:
@@ -379,16 +492,30 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
         # a single body byte is read.
         row = await transfer.claim_upload(session, token)
         if row is None:
-            return _not_found()
+            return await _refuse(
+                request,
+                token=token,
+                session=session,
+                direction="upload",
+            )
 
         # (2) Re-validate everything the token asserts, from the database.
-        if (
-            not await transfer.resolve_identity_ok(session, row, need_write=True)
-            or not await transfer.resolve_root_ok(session, row)
-            or not _path_ok(row.vault_root, row.path)
-        ):
+        # The `or` chain is split into an `elif` ladder so the *log* can name
+        # which of the three said no. Evaluation is identical — each predicate
+        # still runs only if its predecessors passed — and the response is the
+        # same 404 for all three. Only the record got more specific.
+        revalidation = None
+        if not await transfer.resolve_identity_ok(session, row, need_write=True):
+            revalidation = "credential_invalid"
+        elif not await transfer.resolve_root_ok(session, row):
+            revalidation = "root_reassigned"
+        elif not _path_ok(row.vault_root, row.path):
+            revalidation = "path_invalid"
+        if revalidation is not None:
             await transfer.release_claim(session, row)
-            return _not_found()
+            return await _refuse(
+                request, reason=revalidation, token=token, row=row
+            )
 
         try:
             # Publication only: the trash probe belongs to `delete_file`, and
@@ -399,17 +526,47 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
             # `UnsupportedFilesystem` so every existing surface keeps answering
             # it, which makes the ordering here load-bearing rather than
             # cosmetic.
-            logger.error("Transfer refused at a mount boundary: %s", exc)
+            security_events.emit(
+                "transfer_refused_mount_boundary",
+                level=logging.ERROR,
+                subject=security_events.subject_for(
+                    user_id=row.user_id, request=request
+                ),
+                error_type=type(exc).__name__,
+                route=request.url.path,
+                method=request.method,
+            )
             await transfer.release_claim(session, row)
             return JSONResponse(dict(MOUNT_BOUNDARY_BODY), status_code=503)
         except vault_fs.UnsupportedFilesystem as exc:
-            logger.error("Transfer refused: %s", exc)
+            security_events.emit(
+                "transfer_refused_unsupported_fs",
+                level=logging.ERROR,
+                subject=security_events.subject_for(
+                    user_id=row.user_id, request=request
+                ),
+                error_type=type(exc).__name__,
+                route=request.url.path,
+                method=request.method,
+            )
             await transfer.release_claim(session, row)
             return JSONResponse(dict(UNSUPPORTED_FS_BODY), status_code=503)
         except (OSError, vault_fs.VaultFSError) as exc:
-            logger.error("Vault root unusable for transfer: %s", exc)
+            security_events.emit(
+                "transfer_root_unusable",
+                level=logging.ERROR,
+                subject=security_events.subject_for(
+                    user_id=row.user_id, request=request
+                ),
+                error_type=type(exc).__name__,
+                user_id=row.user_id,
+                route=request.url.path,
+                method=request.method,
+            )
             await transfer.release_claim(session, row)
-            return _not_found()
+            return await _refuse(
+                request, reason="publication_unsupported", token=token, row=row
+            )
 
         # **Commit before the session closes.** `claim_upload` commits, but the
         # `resolve_identity_ok` / `resolve_root_ok` / `lock_for_publish`-free
@@ -523,13 +680,26 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
         await consume()
         return JSONResponse({"error": str(exc)}, status_code=408)
     except transfer.PrePublishAborted:
+        # The locked gate refused. `GateHandle` exposes only `ok`, so this one
+        # reason covers a revocation, a permission downgrade, a root
+        # reassignment and a cascade delete alike — an accepted limitation
+        # (design D8, residual R9), not an oversight.
         await release()
-        return _not_found()
+        return await _refuse(
+            request, reason="prepublish_revalidation_failed", token=token, row=row
+        )
     except transfer.PostPublishFailure:
         # The bytes landed; only the bookkeeping failed. Releasing here
         # would hand back a replayable token over a path that is already
         # written, so the claim stands until the TTL expires.
-        logger.exception("Upload published but not recorded (token left claimed)")
+        security_events.emit(
+            "transfer_post_publish_failure",
+            level=logging.ERROR,
+            subject=security_events.subject_for(user_id=row.user_id, request=request),
+            exc_info=True,
+            user_id=row.user_id,
+            route=request.url.path,
+        )
         raise
     except vault_fs.Conflict as exc:
         await release()
@@ -543,7 +713,14 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
         # released and the same link may be retried once the mount is gone.
         # **Must stay above the `UnsupportedFilesystem` branch** — it is a
         # subclass, and Python takes the first match.
-        logger.error("Transfer refused at a mount boundary: %s", exc)
+        security_events.emit(
+            "transfer_refused_mount_boundary",
+            level=logging.ERROR,
+            subject=security_events.subject_for(user_id=row.user_id, request=request),
+            error_type=type(exc).__name__,
+            route=request.url.path,
+            method=request.method,
+        )
         await release()
         return JSONResponse(dict(MOUNT_BOUNDARY_BODY), status_code=503)
     except vault_fs.UnsupportedFilesystem:
@@ -562,7 +739,14 @@ async def upload(request: Request, token: str | None = Depends(_bearer)) -> Resp
         # correct answer: the human gets to retry the same link instead of
         # holding a capability that is stuck until its TTL for a transfer
         # that never touched the vault.
-        logger.exception("Upload failed before publication (claim released)")
+        security_events.emit(
+            "transfer_prepublish_failure",
+            level=logging.ERROR,
+            subject=security_events.subject_for(user_id=row.user_id, request=request),
+            exc_info=True,
+            user_id=row.user_id,
+            route=request.url.path,
+        )
         await release()
         raise
 
@@ -665,19 +849,27 @@ async def _stream_fd(fd: int, size: int):
 @limiter.limit(BYTES_LIMIT)
 async def download_file(request: Request, token: str | None = Depends(_bearer)) -> Response:
     if token is None:
-        return _not_found()
+        return await _refuse(request, reason="missing_token")
 
     async with async_session() as session:
         row = await _load_valid(session, token, direction="download")
-        if row is None:
-            return _not_found()
+        if _refused(row):
+            return await _refuse(
+                request,
+                refusal=row,
+                token=token,
+                session=session,
+                direction="download",
+            )
 
         try:
             fd, st = _open_bound_file(row)
         except (FileNotFoundError, vault_fs.VaultFSError, OSError):
             # Deleted, replaced by a symlink, turned into a directory — all the
             # same uniform 404. Nothing here tells the caller which.
-            return _not_found()
+            return await _refuse(
+                request, reason="file_unreadable", token=token, row=row
+            )
 
         # The descriptor is closed on every exit but one: the streaming
         # response, which takes ownership of it and closes it when the body is
@@ -688,13 +880,17 @@ async def download_file(request: Request, token: str | None = Depends(_bearer)) 
         try:
             want = row.expected_fingerprint or {}
             if not _fingerprint_matches(want, st):
-                return _not_found()
+                return await _refuse(
+                    request, reason="fingerprint_mismatch", token=token, row=row
+                )
             if want.get("sha256") is not None and _sha256_fd(fd) != want["sha256"]:
                 # An in-place edit that preserved length and restored mtime is
                 # invisible to the metadata compare; the re-hash is what closes
                 # it. Above `MAX_FILE_WRITE_BYTES` the mint recorded no hash and
                 # the binding really is metadata-only (documented limitation).
-                return _not_found()
+                return await _refuse(
+                    request, reason="content_changed", token=token, row=row
+                )
 
             head = os.read(fd, _MIME_SNIFF_BYTES)
             os.lseek(fd, 0, os.SEEK_SET)
