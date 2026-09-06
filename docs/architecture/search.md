@@ -195,6 +195,49 @@ note, search *before* the pass and observe the row is **not** marked, then searc
 after the pass and observe that it is. Writing the test that way is what keeps
 the residual from being re-described as a guarantee later.
 
+## The query length cap (`MAX_SEARCH_QUERY_CHARS`, #194)
+
+`keyword_search` and `semantic_search` refuse a `query` longer than
+`MAX_SEARCH_QUERY_CHARS` (8,192 — a module constant in `src/config.py` beside
+`MAX_LIST_PATTERN_CHARS`, not an operator setting).
+
+**It is enforced on the decorator, not in the search bodies.** `_tracked`
+carries `arg_char_caps={"query": MAX_SEARCH_QUERY_CHARS}` on both tools, beside
+the existing unencodable-argument screen (#149) — a generic argument screen
+already lived there, so the mechanism generalises to any future argument. Being
+a **pre-body** gate is the whole point: the refusal happens before the
+embedding-provider call, before the `tsquery` parse, before any search or quota
+statement, and before the value is interpolated into a server-authored string.
+Enforcing it inside the bodies would have made it a post-body marker polluting
+the latency percentiles. The refusal names the argument, its length, the limit
+and the setting, and **never echoes the argument**.
+
+**Provider cost is not the reason.** #194's own verification withdrew the
+cost-amplification claim: Ollama truncates to the model context and OpenAI
+rejects input over its token limit, so an over-long query was never a way to
+spend the operator's money. The three real reasons are an unbounded argument
+interpolated into a server-authored result string (the #149 discipline),
+`tsquery` parsing on the single event loop (the #204 class), and an OpenAI
+deployment turning an over-long query into a raw provider error where the
+contract promises a typed refusal.
+
+**A character cap cannot promise a token limit, so the provider's own limit is
+handled separately, in the body.** 8,192 characters of a densely-tokenizing
+script can still exceed what a provider accepts. When one rejects the input for
+its own limit, `src/services/embeddings.py` raises
+`refusals.ProviderInputTooLarge` (declared in `src/services/refusals.py`, which
+imports nothing from the app, so the raiser and the handler share a
+dependency-free contract) and `semantic_search_impl` translates it into the
+**same caller-facing `argument_too_long` code** carrying the provider's stated
+reason — one actionable failure mode for "the query was too large", whichever
+limit applied. Its usage marker is deliberately different:
+`provider_input_rejected`, classified **post-body** and *not* in
+`pre_body_refusal_sql()`, because the body ran, resolved a vault and paid for a
+network round trip, and enumerating it would drop the most expensive class of
+call in the server out of the percentiles. The caller-facing code and the
+operator-facing marker answer different questions and are permitted to differ;
+see [rate limits](rate-limits.md) and [usage attribution](usage-attribution.md).
+
 ## Search benchmarks (opt-in integration)
 
 `tests/integration/test_search_recall.py` and `test_keyword_plan.py` run only

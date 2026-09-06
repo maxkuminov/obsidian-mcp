@@ -243,9 +243,78 @@ An overwrite upload and every download record `{dev, inode, size, mtime_ns, ctim
 
 `download_file` already had the right shape — it commits, closes its session, and only then returns the `StreamingResponse` — so upload was the outlier rather than a considered exception. The rule, for everything under `src/transfer/`:
 
-- **Phase 1 holds a connection; nothing after it does.** Phase 1 is the claim, `resolve_identity_ok`, `resolve_root_ok`, `_path_ok` and `check_publication_support` — including their refusal branches, which release the claim on that same session. It commits and exits before the route waits for a slot or reads a body byte.
+- **Phase 1 holds a connection; nothing after it does.** Phase 1 is the claim, `resolve_identity` (`resolve_identity_ok`'s verdict half, called directly here because the credential it returns is where the write bucket's minting principal comes from — see below), `resolve_root_ok`, `_path_ok`, the write-bucket take, and `check_publication_support` — including their refusal branches, which release the claim on that same session. It commits and exits before the route waits for a slot or reads a body byte.
 - **Every later database action opens its own short-lived session.** `release_claim`, `consume` and the publish gate each take one and give it straight back. The gate always did; what changed is that it is no longer *nested inside* a longer-lived one.
 - **The claimed row is used detached.** Safe, and not by luck: `TransferToken` has no relationships and no deferred columns, `claim_upload` commits under `expire_on_commit=False`, and `close()` expunges without expiring — so every attribute the route reads afterwards (`id`, `path`, `vault_root`, `overwrite`, `expected_fingerprint`, `claimed_at`, `expires_at`) is a plain column already populated. Two tests hold that premise up: one asserts the *model* carries nothing lazy, the other records every attribute the route reads after the session closes and checks it against the mapper's columns. Add a relationship to `TransferToken` and the first one fails, which is much better than a `DetachedInstanceError` 500 on the write path.
+
+### Redemption spends the *minting* principal's write bucket (#194)
+
+`PUT /transfer/upload` publishes into the vault and **never passes through
+`_tracked`**, so bounding only the eight write tools left the write rate
+escapable in the obvious way: mint capabilities at the general rate, then
+redeem them without limit. Redemption therefore takes one token of the write
+bucket (`MCP_WRITE_RATE_LIMIT_PER_MINUTE`, scope `principal_write`) — the same
+bucket the write tools spend, not a second control. The general bucket is
+**not** charged here: this is not a tool call, and the write bucket is the one
+that follows the bytes. See [rate limits](rate-limits.md).
+
+**The principal is the one that *minted* the capability, not the one presenting
+it.** Otherwise a capability would be a way to spend somebody else's allowance,
+and a drained principal could keep writing by handing its links to a fresh
+credential. It costs no extra query: `resolve_identity` was split out of
+`resolve_identity_ok` so it returns `(verdict, credential)`, and
+`minting_principal(row, credential)` reads `("api_key", row.key_id)` or
+`("oauth", grant_id)` off the `OAuthToken` row the identity check **already
+loaded**. `ck_transfer_tokens_one_credential` makes the two branches exclusive;
+a row naming neither credential (single-user, sandbox) resolves to no principal
+and is **exempt**, matching `_tracked`'s "a control with no key is exempt
+rather than a crash" rule.
+
+**Where it sits is load-bearing, and it is inside phase 1.** The take happens
+on the phase-one session, *after* the re-validation ladder and *before*
+`check_publication_support` — so before any request body byte is read and
+before anything is staged, and still inside the window that holds a connection,
+which the rule above requires:
+
+- **After the re-validation**, because a token that is no longer usable is a
+  404 and must not *also* cost its minter a token. A capability the server was
+  never going to honour cannot be charged for.
+- **Before `check_publication_support`**, because that is a filesystem probe:
+  a rate control that admits work has to precede the work. Same order
+  `_tracked` uses.
+
+**A refusal releases the claim; it never consumes it.** This mirrors the
+`QueueTimeout` → 503 path exactly, and for the same reason — *a capability the
+server declined to serve right now is a promise still outstanding*. The token
+is **fine**: it has not expired, nothing was read, staged or published, and the
+same link must be redeemable once the bucket refills. That is precisely what
+distinguishes it from a **deadline overrun**, which consumes (`Timeout` → 408,
+retry mints afresh): there the capability's own window is gone, so there is
+nothing left to hand back. Getting these two backwards tells a caller whose
+link is perfectly good that it expired.
+
+The answer is **429 with `Retry-After`**, with its own body rather than the
+uniform 404 — the token is fine and stays claimable, and telling a legitimate
+redeemer their link had died would make them mint another, which is more load,
+not less. Like the failed-authentication budget's 429 it is a **transport**
+refusal, outside the in-band `MCP-REFUSAL` sentinel contract every gate inside
+`_tracked` obeys: there is no tool call to answer.
+
+The record is a `security_events` event (`transfer_refused_rate_limited`,
+`reason` = the bucket scope, so an operator sees one control and not two) and
+deliberately **not** a bare `logger.warning`: this is a refusal a caller can
+drive at whatever rate it likes, so it has to pass the suppressor's allowance
+or the control that bounds writes would open an unbounded log channel of its
+own. Attribution comes off the **token row** (`key_id` / `oauth_token_id` name
+the minter), as everywhere else on this route. There is no `usage_logs` row —
+this route writes one only on a *completed* upload, and the refusal coalescer
+lives in `_tracked`, which this path does not pass through.
+
+**No double charge.** `request_upload`, `request_download` and `check_upload`
+touch capability rows only and are not write-class — billing both the mint and
+the redemption would count one write twice. `import_from_url` keeps consuming
+the write bucket at its own tool call, as an ordinary write tool, and is not
+charged again at redemption.
 
 ### The slot wait is bounded, sliced, and 408 beats 503
 
