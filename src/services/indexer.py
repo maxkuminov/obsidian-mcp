@@ -208,8 +208,34 @@ class EmbedPassResult:
 
     @property
     def failure_summary(self) -> str | None:
+        """The one line an operator reads for a failed pass.
+
+        **"N of M" is only meaningful while every failure came from a note that
+        issued a provider call**, and not every one does. `record_failure` also
+        catches what escapes *around* the call — a database error opening the
+        note's row, a rollback that itself failed, a byte read that raised
+        after the backlog selected the row — and those move `failures` without
+        moving `attempted`. Rendered as a ratio, one such error on a pass whose
+        provider was never reached reads `1 of 0`, which is not a small
+        infelicity: `of 0` says the pass made no calls, so the natural reading
+        of `1 of 0` is that the counter is broken, and an operator who
+        concludes that stops trusting the number that would have told them
+        about a real outage.
+
+        So when the failures outnumber the calls, the count and the call count
+        are stated as two separate facts instead of as a ratio. The ordinary
+        case — every failure from a note that called the provider — keeps the
+        ratio it always had, because that is the shape an outage produces and
+        the one the existing history is full of.
+        """
         if not self.failures:
             return None
+        if self.failures > self.attempted:
+            return (
+                f"embed failures: {self.failures} "
+                f"({self.attempted} provider call(s) issued) — "
+                f"first: {self.first_error}"
+            )
         return (
             f"embed failures: {self.failures} of {self.attempted} — "
             f"first: {self.first_error}"
@@ -3397,12 +3423,12 @@ async def _embed_vault_pinned(
                     budget.note_finished()
 
         if outcome.failures:
+            # The same rendering as the run row's, from the same property, so
+            # the log line and the `error` column cannot disagree about what a
+            # pass did — and so neither can print "1 of 0" when the one thing
+            # that failed never reached the provider.
             logger.error(
-                "Embedding pass%s swallowed %s of %s notes: %s",
-                log_suffix,
-                outcome.failures,
-                outcome.attempted,
-                outcome.first_error,
+                "Embedding pass%s: %s", log_suffix, outcome.failure_summary
             )
 
         if unembedded:

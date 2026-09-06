@@ -763,10 +763,11 @@ async def move_note(
     it and nothing changes. Pass the `content_hash` a read returned, verbatim
     and canonical (`sha256:<64 lowercase hex>`), and the call is refused with
     nothing written if the file changed in between. It is always the **whole
-    file's** hash, never a hash of the text you received. Two windows, both
-    live: `expected_hash` covers your read → this call's read, the server's own
-    pre-publication compare covers this call's read → its publication, and a
-    match on the first does not exempt the second. Every refusal ends with one
+    file's** hash, never a hash of the text you received. `expected_hash`
+    covers your read through this call's preflight read. The rename pins inode
+    identity but does not compare the bytes again: an in-place edit after that
+    comparison can still be moved. Each optional link rewrite retains its own
+    pre-publication byte comparison. Precondition refusals end with one
     machine-readable `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with
     the file's current hash, ready to resend), `concurrent_write`,
     `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
@@ -837,10 +838,10 @@ async def delete_note(
     it and nothing changes. Pass the `content_hash` a read returned, verbatim
     and canonical (`sha256:<64 lowercase hex>`), and the call is refused with
     nothing written if the file changed in between. It is always the **whole
-    file's** hash, never a hash of the text you received. Two windows, both
-    live: `expected_hash` covers your read → this call's read, the server's own
-    pre-publication compare covers this call's read → its publication, and a
-    match on the first does not exempt the second. Every refusal ends with one
+    file's** hash, never a hash of the text you received. `expected_hash`
+    covers your read through this call's preflight read. The delete acts through the
+    pinned parent directory but does not compare the bytes again: an in-place edit after that
+    comparison can still be deleted. Precondition refusals end with one
     machine-readable `MCP-REFUSAL {"code":…}` line — `stale_precondition` (with
     the file's current hash, ready to resend), `concurrent_write`,
     `no_incumbent`, `malformed_precondition`, `precondition_unavailable`,
@@ -943,6 +944,7 @@ async def read_file(
     encoding: str = "auto",
     offset: int = 0,
     limit: int | None = None,
+    hash_only: bool = False,
 ):
     """Read any file in the vault — including non-markdown (PDFs, images,
     skill HTML/JS, data files). Peer to `read_note`, which stays markdown-only.
@@ -971,15 +973,28 @@ async def read_file(
     the returned window, and a truncated read appends a short notice carrying
     the `offset` to continue from. Base64 and image results are not windowed.
 
+    The base64 header and `hash_only=True` return the whole raw file's
+    `content_hash` (`sha256:<64 lowercase hex>`), which write/delete tools
+    accept as `expected_hash`. Their path is a quoted JSON string. Text stays
+    deliberately unenveloped. Use base64 for byte-exact frontmatter bytes;
+    `read_note.frontmatter_yaml` has normalized line endings.
+
+    Encoding is validated first, then hash_only/window compatibility, then
+    ranges. `hash_only` refuses `offset != 0` or any non-None `limit`; explicitly
+    passing `offset=0` is fine. A valid encoding has no effect in this mode.
+
     Args:
         path: Vault-relative path to the file (e.g. "Reference Docs/spec.pdf").
+        hash_only: Return only path, byte count, MIME and hash, with no content.
         encoding: One of "auto" (default), "text", or "base64".
         offset: Character offset to start a text read from (default 0). Use the
             value the truncation notice reports to continue.
         limit: Maximum characters to return for a text read. Only lowers the
             server cap; it cannot raise it.
     """
-    return await read_file_impl(path, encoding=encoding, offset=offset, limit=limit)
+    return await read_file_impl(
+        path, encoding=encoding, offset=offset, limit=limit, hash_only=hash_only
+    )
 
 
 @mcp.tool()
@@ -988,6 +1003,7 @@ async def write_file(
     content: str,
     encoding: str = "base64",
     overwrite: bool = False,
+    expected_hash: str | None = None,
 ) -> str:
     """Write a file into the vault — including non-markdown (e.g. save a
     generated PDF or image). Requires write permission — a `readwrite` API key, or an OAuth token
@@ -1019,14 +1035,29 @@ async def write_file(
     bound is rejected by the transport with a bare HTTP 413 before this tool
     runs — send such content as base64 instead.
 
+    Optional `expected_hash` binds an existing whole file on `overwrite=True`.
+    Obtain its canonical `sha256:<64 lowercase hex>` value from `read_file`'s
+    base64 header, `read_file(hash_only=True)`, or a prior write's success.
+    Syntax is checked before path work; a hash with no-clobber or a missing
+    destination is `no_incumbent`. An over-cap incumbent cannot be guarded.
+    A stale hash refuses before publication; matching also enables the in-call
+    comparison, which refuses an edit arriving during this call as
+    `concurrent_write`. Without a hash, overwrite remains unconditional unless
+    the deployment requires preconditions. Creation is exempt.
+
+    Success reports the hash of the bytes this call published, not necessarily
+    what remains when the response arrives. Over-cap incumbents or results omit
+    the hash without failing an otherwise permitted unguarded write.
+
     Args:
         path: Vault-relative destination path (e.g. "Outputs/report.pdf").
         content: File contents — base64 string (default) or UTF-8 text.
         encoding: "base64" (default) or "text".
         overwrite: If True, replace an existing file. Off by default.
+        expected_hash: Optional whole-file raw-byte digest of the incumbent.
     """
     return await write_file_impl(
-        path, content, encoding=encoding, overwrite=overwrite
+        path, content, encoding=encoding, overwrite=overwrite, expected_hash=expected_hash
     )
 
 
@@ -1214,7 +1245,9 @@ async def import_from_url(url: str, path: str, overwrite: bool = False) -> str:
 
 
 @mcp.tool()
-async def delete_file(path: str, permanent: bool = False) -> str:
+async def delete_file(
+    path: str, permanent: bool = False, expected_hash: str | None = None
+) -> str:
     """Delete a non-markdown file from the vault. Requires write permission — a `readwrite` API key, or an OAuth token
     carrying the `readwrite` scope.
     Peer to `delete_note`, which stays markdown-only.
@@ -1231,8 +1264,18 @@ async def delete_file(path: str, permanent: bool = False) -> str:
     backlinks), directories, and symlinks. Non-markdown files are not indexed,
     so search and embeddings are unaffected either way.
 
+    Optional `expected_hash` binds the whole raw file in either mode. Use the
+    canonical `sha256:<64 lowercase hex>` from `read_file`'s base64 header,
+    `read_file(hash_only=True)`, or a write success. Malformed hashes refuse
+    before path checks; unavailable, required and stale preconditions refuse
+    before any trash entry or unlink. The deployment may require a hash.
+    This checks the caller-read-to-call window; a later concurrent replacement
+    remains possible, so it is not an atomic filesystem compare-and-delete.
+    A successful delete reports no content hash.
+
     Args:
         path: Vault-relative path to the file.
         permanent: If True, unlink instead of moving to `.trash/`.
+        expected_hash: Optional whole-file raw-byte digest of the incumbent.
     """
-    return await delete_file_impl(path, permanent=permanent)
+    return await delete_file_impl(path, permanent=permanent, expected_hash=expected_hash)

@@ -4,6 +4,7 @@ import binascii
 import copy
 import errno
 import inspect
+import json
 import logging
 import math
 import mimetypes
@@ -4562,9 +4563,12 @@ async def _move_note_locked(
         # order.)
         if expected_hash is not None or settings.write_precondition_required:
             _, note_cap_bytes = _note_precondition_cap()
-            incumbent, over_cap = _read_incumbent(
-                src_target, from_path, note_cap_bytes
-            )
+            try:
+                incumbent, over_cap = _read_incumbent(
+                    src_target, from_path, note_cap_bytes
+                )
+            except OSError as e:
+                return f"Failed to read {from_path}: {e}"
             if incumbent is None and not over_cap:
                 return f"Source note not found: {from_path}"
             if err := _move_precondition_error(
@@ -5309,7 +5313,10 @@ async def delete_note_impl(
             # hash sends it after one it can never obtain. Having read, the
             # refusal carries the hash, which saves the compliant caller a call.
             cap_name, cap_bytes = _note_precondition_cap()
-            incumbent, over_cap = _read_incumbent(target, path, cap_bytes)
+            try:
+                incumbent, over_cap = _read_incumbent(target, path, cap_bytes)
+            except OSError as e:
+                return f"Failed to read {path}: {e}"
             if incumbent is None and not over_cap:
                 # It was there for `_leaf_state_error` and is gone now. Today's
                 # answer for a delete of a note that does not exist, not a
@@ -5687,7 +5694,8 @@ def _base64_payload(path: str, data: bytes, mime: str) -> str:
         "encoding: base64\n"
         f"mime: {mime}\n"
         f"bytes: {len(data)}\n"
-        f"path: {path}\n"
+        f"path: {json.dumps(path)}\n"
+        f"content_hash: {content_hash_for_bytes(data)}\n"
         "(opaque bytes — not human-readable; pass to a skill/client to decode)\n\n"
         f"{b64}"
     )
@@ -5721,16 +5729,24 @@ def _capped_text(text: str, path: str, offset: int, cap: int) -> str:
     return chunk + notice
 
 
-@_tracked("read_file", ["path", "encoding", "offset", "limit"])
+@_tracked("read_file", ["path", "encoding", "offset", "limit", "hash_only"])
 async def read_file_impl(
     path: str,
     encoding: str = "auto",
     offset: int = 0,
     limit: int | None = None,
+    hash_only: bool = False,
 ):
-    """Read any vault file: text, inline image block, or base64 bytes."""
+    """Read text, inline images, base64 bytes, or metadata with `hash_only`.
+
+    Encoding is validated first, then hash_only/window compatibility, then
+    ranges. A valid encoding has no effect under hash_only. Text is bare; use
+    base64 for a byte-exact frontmatter block, or hash_only for its file hash.
+    """
     if encoding not in ("auto", "text", "base64"):
         return f"Invalid encoding '{encoding}'. Use 'auto', 'text', or 'base64'."
+    if hash_only and (offset != 0 or limit is not None):
+        return "read_file: hash_only cannot be combined with offset or limit windows."
     if offset < 0:
         return f"read_file: offset must be >= 0 (got {offset})."
     cap = settings.max_read_response_chars
@@ -5746,6 +5762,15 @@ async def read_file_impl(
         return f"File not found: {path}"
     except ValueError as e:
         return str(e)
+
+    if hash_only:
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        return (
+            f"path: {json.dumps(path)}\n"
+            f"bytes: {len(data)}\n"
+            f"mime: {mime}\n"
+            f"content_hash: {content_hash_for_bytes(data)}"
+        )
 
     if encoding == "text":
         try:
@@ -5794,12 +5819,13 @@ def _write_cap_for(path: str) -> tuple[int, str]:
     return settings.max_file_write_bytes, "MAX_FILE_WRITE_BYTES"
 
 
-@_tracked("write_file", ["path", "encoding", "overwrite"], write_class=True)
+@_tracked("write_file", ["path", "encoding", "overwrite", "expected_hash"], write_class=True)
 async def write_file_impl(
     path: str,
     content: str,
     encoding: str = "base64",
     overwrite: bool = False,
+    expected_hash: str | None = None,
 ) -> str:
     """Write a file into the vault from base64 or text content.
 
@@ -5809,6 +5835,12 @@ async def write_file_impl(
     publishing call — it does not close it, the same optimistic guarantee
     the system declares for `edit_note(expected=…)`.
     """
+    if err := _precondition_syntax_error("write_file", expected_hash, path=path):
+        return err
+    if not overwrite and expected_hash is not None:
+        return _precondition_error(
+            "write_file", path, None, expected_hash, no_incumbent=True
+        )
     if err := _require_write():
         return err
     if encoding not in ("base64", "text"):
@@ -5836,6 +5868,26 @@ async def write_file_impl(
         # that was never why the write is refused.
         if err := _leaf_state_error(target, path):
             return err
+
+        incumbent = None
+        over_cap = False
+        read_cap_name, read_cap = _file_precondition_cap()
+        if overwrite and (expected_hash is not None or settings.write_precondition_required):
+            try:
+                incumbent, over_cap = _read_incumbent(target, path, read_cap)
+            except OSError as exc:
+                return _leaf_state_error(target, path) or f"Failed to read {path}: {exc}"
+            if err := _precondition_error(
+                "write_file", path, incumbent, expected_hash,
+                no_incumbent=incumbent is None and not over_cap,
+                over_cap=over_cap, cap_name=read_cap_name, cap_bytes=read_cap,
+            ):
+                return err
+        elif overwrite:
+            # Preserve unconditional writes: stat is enough to suppress a result
+            # hash for an over-cap incumbent; never read its content here.
+            info = target.lstat()
+            over_cap = info is not None and info.st_size > read_cap
 
         if encoding == "base64":
             try:
@@ -5866,7 +5918,7 @@ async def write_file_impl(
             err, _ = await _confirmed_publication(  # #88
                 uid,
                 lambda c: write_bytes_at(
-                    target, data, overwrite=overwrite, confirmation=c
+                    target, data, overwrite=overwrite, expected=incumbent, confirmation=c
                 ),
             )
             if err:
@@ -5875,11 +5927,19 @@ async def write_file_impl(
             return _leaf_state_error(target, path) or (
                 f"File already exists: {path}. Pass overwrite=True to replace it."
             )
-        except (ValueError, vault_fs.VaultFSError) as e:
+        except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
+            if _is_in_call_conflict(e):
+                return _concurrent_write_refusal(str(e), path)
             return str(e)
         except OSError as e:
             return f"Failed to write {path}: {e}"
-        return f"Wrote {len(data):,} bytes to {path}"
+        result = f"Wrote {len(data):,} bytes to {path}"
+        if over_cap or len(data) > read_cap:
+            return result + (
+                f" — hash not reported: incumbent or published file exceeds "
+                f"{read_cap_name} ({read_cap:,} bytes)"
+            )
+        return result + _published_hash_clause(data)
 
 
 @_tracked("list_files", ["folder", "pattern", "recursive", "limit"])
@@ -6516,8 +6576,10 @@ async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> 
     )
 
 
-@_tracked("delete_file", ["path", "permanent"], write_class=True)
-async def delete_file_impl(path: str, permanent: bool = False) -> str:
+@_tracked("delete_file", ["path", "permanent", "expected_hash"], write_class=True)
+async def delete_file_impl(
+    path: str, permanent: bool = False, expected_hash: str | None = None
+) -> str:
     """Delete a non-markdown vault file, soft by default.
 
     Confirms the caller's vault assignment immediately before deleting (#88).
@@ -6531,6 +6593,8 @@ async def delete_file_impl(path: str, permanent: bool = False) -> str:
     one. As everywhere else, the check narrows the window to the deleting call
     and does not close it.
     """
+    if err := _precondition_syntax_error("delete_file", expected_hash, path=path):
+        return err
     if err := _require_write():
         return err
     uid = current_user_id.get()
@@ -6557,8 +6621,9 @@ async def delete_file_impl(path: str, permanent: bool = False) -> str:
     # checked against the vault context it resolved for itself — and the whole
     # delete runs inside the confirmed step, which is what stops an `await`
     # ever being introduced between the two.
-    def _delete(confirmation):
-        confirmation.consume(uid, root, f"delete {rel}")
+    precondition_refusal = None
+
+    def _check_trash():
         if not permanent:
             # Only the soft delete needs the trash to be usable; `permanent=True`
             # is a plain unlink, and probing for it would create `.trash` for a
@@ -6569,6 +6634,47 @@ async def delete_file_impl(path: str, permanent: bool = False) -> str:
                 raise
             except (OSError, vault_fs.VaultFSError) as exc:
                 raise _TrashUnusable(f"Vault root is not usable: {exc}") from exc
+
+    def _delete(confirmation):
+        nonlocal precondition_refusal
+        confirmation.consume(uid, root, f"delete {rel}")
+        if expected_hash is not None or settings.write_precondition_required:
+            # Use this tool's beneath-root walk, never open_mutable's different
+            # path policy. The shared reader fstats and bounds one leaf fd.
+            root_fd = vault_fs.open_root(root)
+            try:
+                parent_fd, name = vault_fs.open_parent(root_fd, rel)
+                try:
+                    target = SimpleNamespace(parent_fd=parent_fd, name=name, rel=rel)
+                    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                    if not stat.S_ISREG(info.st_mode):
+                        raise vault_fs.UnsafePath(f"Not a regular file (symlink or directory): {rel}")
+                    cap_name, cap_bytes = _file_precondition_cap()
+                    incumbent, over_cap = _read_incumbent(target, rel, cap_bytes)
+                    if incumbent is None and not over_cap:
+                        raise FileNotFoundError(rel)
+                    precondition_refusal = _precondition_error(
+                        "delete_file", rel, incumbent, expected_hash,
+                        over_cap=over_cap, cap_name=cap_name, cap_bytes=cap_bytes,
+                    )
+                    if precondition_refusal is not None:
+                        return None
+                    _check_trash()
+                    # Keep the validated parent pinned through the destructive
+                    # step. No second pathname walk may redirect the delete.
+                    if permanent:
+                        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                        if not stat.S_ISREG(info.st_mode):
+                            raise vault_fs.UnsafePath(f"Not a regular file: {rel}")
+                        os.unlink(name, dir_fd=parent_fd)
+                        vault_fs.flush_dir_quietly(parent_fd, f"parent directory of {rel}")
+                        return None
+                    return vault_fs.soft_delete_at(parent_fd, name, root_fd, label=rel)
+                finally:
+                    vault_fs.close_quietly(parent_fd, f"source directory for {rel}")
+            finally:
+                vault_fs.close_quietly(root_fd, f"vault root for {rel}")
+        _check_trash()
 
         root_fd = vault_fs.open_root(root)
         try:
@@ -6599,6 +6705,10 @@ async def delete_file_impl(path: str, permanent: bool = False) -> str:
         return f"{e}. Nothing was deleted."
     except vault_fs.VaultFSError as e:
         return str(e)
+    except OSError as e:
+        return f"Failed to delete {rel}: {e}"
+    if precondition_refusal is not None:
+        return precondition_refusal
     if permanent:
         return f"Permanently deleted {rel}"
     return (

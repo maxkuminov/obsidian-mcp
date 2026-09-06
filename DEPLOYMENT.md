@@ -446,6 +446,12 @@ is pennies a month.
   `/health` reports `transfer_mount_check_available: false`. A nested
   mount underneath the vault root is refused too: publication cannot
   cross a mount boundary.
+- Writes refuse with `precondition_required`. `WRITE_PRECONDITION_REQUIRED`
+  defaults to `false`; enable it only after clients send the `content_hash`
+  from `read_note` or `read_file(hash_only=True)` as `expected_hash`.
+  Creation remains exempt. A `stale_precondition` requires a fresh read and
+  reconsideration of the edit; `precondition_unavailable` means the file
+  exceeds the tool's read cap and an operator must resolve that limit.
 - `/admin` exposed without auth. Don't skip Step 6. The MCP endpoint
   itself is API-key gated, but the panel can mint new keys and reset
   embeddings.

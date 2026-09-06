@@ -95,6 +95,31 @@ def digest(vault, name: str) -> str:
     return "sha256:" + hashlib.sha256((vault / name).read_bytes()).hexdigest()
 
 
+@pytest.mark.parametrize("operation", ["move", "soft_delete", "permanent_delete"])
+@pytest.mark.parametrize("read_error", [PermissionError(13, "Permission denied"), OSError(40, "Too many symbolic links")])
+async def test_guarded_move_and_delete_return_read_errors_without_mutation(
+    vault, monkeypatch, operation, read_error
+):
+    name = seed(vault, "source.md")
+    expected = digest(vault, name)
+    original = (vault / name).read_bytes()
+
+    def fail_read(*args, **kwargs):
+        raise read_error
+
+    monkeypatch.setattr(tools, "_read_incumbent", fail_read)
+    if operation == "move":
+        result = await tools.move_note_impl(name, "destination.md", expected_hash=expected)
+    else:
+        result = await tools.delete_note_impl(
+            name, permanent=operation == "permanent_delete", expected_hash=expected
+        )
+    assert result.startswith("Failed to read source.md:")
+    assert (vault / name).read_bytes() == original
+    assert not (vault / "destination.md").exists()
+    assert not (vault / ".trash").exists()
+
+
 def sentinel(text: str) -> dict:
     """The refusal's machine-readable final line, parsed."""
     last = text.rsplit("\n", 1)[-1]

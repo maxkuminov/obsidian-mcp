@@ -259,6 +259,13 @@ Neither subsumes the other and neither was removed. A matching `expected_hash` d
 
 **Bounded incumbent reads.** Every read this capability adds is bounded by the cap that already governs that tool's content — `MAX_NOTE_BYTES` for a note tool, `MAX_FILE_READ_BYTES` for a raw-file tool — with the size taken from an `fstat` on the descriptor the tool **already holds** and the read performed through that same descriptor (`_read_incumbent`), so the bytes measured are the bytes hashed and no second pathname is resolved. A tool that reads nothing today when unguarded (`move_note`, `delete_note`, `write_file`, `delete_file`) performs the read **only** when a hash is supplied or required mode demands one. `edit_note` and `set_frontmatter` already read the incumbent, so they feed their existing bounded read into the ladder rather than performing a second one; an over-cap file there is `precondition_unavailable` when guarded and today's `Failed to read` when not.
 
+Guarded move/delete incumbent-read failures return an in-band read error
+before any rename, trash entry or unlink. An unreadable leaf or a leaf
+replaced with a symlink must not escape as an SDK exception. Moves pin the
+source inode; deletes act through the pinned parent directory. Neither does
+a second byte comparison after the preflight check, so an in-place edit in
+that interval remains an accepted race.
+
 ### Per tool: what it accepts, what it binds, what it reports
 
 | tool / mode | `expected_hash` | binds | success reports `content_hash` |
@@ -328,11 +335,24 @@ Every refusal is the shared shape from `src/services/refusals.py`: the tool's pr
 
 ## File-access tools (non-markdown)
 Raw read/write/browse of arbitrary vault files, distinct peers to the note tools (note tools stay markdown-only). Pure byte transport — no server-side PDF/text extraction, no embedding or indexing of non-markdown files.
-- `read_file(path, encoding="auto", offset=0, limit=None)` — `auto` resolves text-like MIME → text, image → inline MCP image content block (renders in-client), everything else → base64 string. `text` forces UTF-8 decode (errors on non-UTF-8); `base64` forces raw-bytes base64. Capped by `MAX_FILE_READ_BYTES` (default 10 MB), checked against on-disk size before reading. Text results are additionally bounded by `MAX_READ_RESPONSE_CHARS` and page via `offset`; base64 and image results are not windowed. Base64 reads are token-heavy — check size with `list_files` first.
-- `write_file(path, content, encoding="base64", overwrite=False)` — `base64` decodes `content` to raw bytes; `text` writes UTF-8. No-clobber by default (`overwrite=True` to replace), auto-creates parent dirs, atomic via `vault.write_file`. Capped by `MAX_FILE_WRITE_BYTES` (default 25 MB) on decoded length — **except for a `.md` destination**, which is capped at `min(MAX_NOTE_BYTES, MAX_FILE_WRITE_BYTES)`; see "The `.md` cap follows the extension, not the tool" below.
+- `read_file(path, encoding="auto", offset=0, limit=None, hash_only=False)` — `auto` resolves text-like MIME → text, image → inline MCP image content block (renders in-client), everything else → base64 string. `text` forces UTF-8 decode (errors on non-UTF-8); `base64` forces raw-bytes base64. Capped by `MAX_FILE_READ_BYTES` (default 10 MB), checked against on-disk size before reading. Text results are additionally bounded by `MAX_READ_RESPONSE_CHARS` and page via `offset`; base64 and image results are not windowed. Base64 reads are token-heavy — check size with `list_files` first.
+- `write_file(path, content, encoding="base64", overwrite=False, expected_hash=None)` — `base64` decodes `content` to raw bytes; `text` writes UTF-8. No-clobber by default (`overwrite=True` to replace), auto-creates parent dirs, atomic via `vault.write_file`. Capped by `MAX_FILE_WRITE_BYTES` (default 25 MB) on decoded length — **except for a `.md` destination**, which is capped at `min(MAX_NOTE_BYTES, MAX_FILE_WRITE_BYTES)`; see "The `.md` cap follows the extension, not the tool" below.
 - `list_files(folder=".", pattern="*", recursive=False, limit=200)` — `ls`-style: immediate children (subdirs + files) by default, each file with size + mtime; glob-filterable; capped at `limit` with a truncation note. `pattern` is refused over `MAX_LIST_PATTERN_CHARS` (1,024) — see "The `list_files` pattern cap" below.
 
-- `delete_file(path, permanent=False)` — soft-deletes to `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` through the anchored helper; `permanent=True` unlinks. Refuses `.md` (pointing at `delete_note`), directories and symlinks. The `.md` refusal runs on the **canonical** final component, so `note.md/.`, `a//note.md` and `NOTE.MD` are refused too — the caller's string is not the path.
+- `delete_file(path, permanent=False, expected_hash=None)` — soft-deletes to `.trash/<YYYYMMDD-HHMMSS>-<basename>-<8 hex>` through the anchored helper; `permanent=True` unlinks. Refuses `.md` (pointing at `delete_note`), directories and symlinks. The `.md` refusal runs on the **canonical** final component, so `note.md/.`, `a//note.md` and `NOTE.MD` are refused too — the caller's string is not the path.
+
+The base64 header and `hash_only=True` result carry the complete raw-byte
+`content_hash`, with `path` encoded as a quoted JSON string so newlines and
+colons in filenames cannot inject metadata fields. `hash_only` returns no
+file content, follows encoding validation, and refuses any nonzero `offset`
+or supplied `limit`; a valid encoding is otherwise irrelevant in this mode.
+Text output stays unenveloped and image output stays an image.
+
+Guarded raw overwrites pass the compared incumbent bytes as `expected=` to
+`write_bytes_at`, preserving the separate in-call comparison. Unguarded
+writes perform no incumbent read. Guarded raw deletes retain the beneath-root
+parent descriptor from the bounded read through deletion, so a parent renamed
+between those steps cannot redirect the deletion into its replacement.
 
 `write_file` additionally goes through `validate_mutable_path`, so it refuses a symlinked final component the way the note tools do (see "Mutations act on the path as named" above) — `overwrite=True` cannot clobber a file through an alias. `read_file` and `list_files` still follow links.
 
@@ -1026,9 +1046,9 @@ on.
 
 **Depth is bounded too, and it is a bound on the predicate, not on the walk.**
 `_SCRUB_MAX_DEPTH` (64) exists because the consumers this boundary protects are
-recursive and always will be: `indexer._sanitize_value`, `_note_title`,
-`copy.deepcopy` and `yaml.safe_dump` all descend a frontmatter value frame by
-frame. A structure deeper than they can descend is a structure *nothing can
+recursive and always will be: `indexer._jsonb_value`, `indexer._note_title`
+(which delegates the rule to `vault.note_title`), `copy.deepcopy` and
+`yaml.safe_dump` all descend a frontmatter value frame by frame. A structure deeper than they can descend is a structure *nothing can
 render*, which is precisely what this scrub removes — reached structurally
 instead of scalar by scalar, and reported as `excessive_depth`.
 
@@ -1037,8 +1057,10 @@ nothing about depth**, and the two are independent axes. A 550 KB alias chain
 (`a0: &a0 {k: 1}` / `a1: &a1 {n: *a0}` / …) parses cleanly — PyYAML composes
 every `a<i>` at depth one, so its own composer never recurses even though the
 constructed graph is thousands deep — passed the budget with a 1,045-deep
-subtree intact, and came back `valid=True, lossy={}`. `_sanitize_value` then
-raised `RecursionError` on every index pass, forever, because nothing commits
+subtree intact, and came back `valid=True, lossy={}`. The indexer's JSONB
+sanitiser (`_sanitize_value` then, `_jsonb_value` since #154 split the JSONB
+question from the title question) raised `RecursionError` on every index pass,
+forever, because nothing commits
 and the content hash never advances: #126's failure mode, reached by a new
 route. The empty loss record also walked straight through `set_frontmatter`'s
 refusal, where `deepcopy` and `safe_dump` raised in turn.

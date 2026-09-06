@@ -671,6 +671,12 @@ The lifecycle, in one table — one implementation per phase:
   `last_seen_at` is telemetry throttled to once a minute and nothing authorizes
   on it.
 
+  Failure reporting captures the actor's `user_id` and route as primitives
+  before database work. A failed commit followed by a failed rollback can
+  expire the ORM row; reading its attributes to log that failure would attempt
+  another database refresh and fail the request. Both failure records use the
+  captured values and carry no session identifier, including its stored hash.
+
 - **`user_agent_hash` is forensic and is never an authorization input.** It is
   useful when reconstructing an incident. As a *binding* it is bad: whoever
   stole the cookie also has the header, so it stops nobody, and enforcing it

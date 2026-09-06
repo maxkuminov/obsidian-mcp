@@ -2621,15 +2621,17 @@ def write_bytes_at(
     data: bytes,
     overwrite: bool = False,
     *,
+    expected: bytes | None = None,
     confirmation: RootConfirmation | None = None,
 ) -> Path:
     """Atomically write raw bytes to an already-validated `MutableTarget`.
 
     Same contract as `write_file_at`. Raises `FileExistsError` when the target
-    exists and `overwrite` is False.
+    exists and `overwrite` is False. `expected` compares the incumbent bytes
+    immediately before publication; None preserves unconditional overwrite.
     """
     return _atomic_write_at(
-        target, data=data, overwrite=overwrite, confirmation=confirmation
+        target, data=data, overwrite=overwrite, expected=expected, confirmation=confirmation
     )
 
 
@@ -2939,6 +2941,7 @@ def write_bytes(
     data: bytes,
     overwrite: bool = False,
     user_id: int | None = None,
+    expected: bytes | None = None,
 ) -> Path:
     """Write raw bytes to an arbitrary vault file atomically (dot-dirs rejected).
 
@@ -2958,7 +2961,7 @@ def write_bytes(
         try:
             with _leased(_single_shot_confirmation(user_id)) as confirmation:
                 return write_bytes_at(
-                    target, data, overwrite=overwrite, confirmation=confirmation
+                    target, data, overwrite=overwrite, expected=expected, confirmation=confirmation
                 )
         except FileExistsError:
             raise FileExistsError(

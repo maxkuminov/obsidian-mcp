@@ -49,6 +49,13 @@ class _StateResult:
     def scalar_one_or_none(self):
         return self._value
 
+    def scalar(self):
+        # `state_table_exists`'s `to_regclass('indexer_state')`. The fakes
+        # answer it separately from the fingerprint read, because the two are
+        # different questions with different dispositions: "has 023 run" and
+        # "what does it say".
+        return self._value
+
 
 class _RowcountResult:
     def __init__(self, rowcount):
@@ -64,6 +71,10 @@ class _Session:
 
     async def execute(self, clause, params=None):
         if isinstance(clause, TextClause):
+            # `to_regclass` first: both statements name `indexer_state`, and
+            # only this one answers when the table is absent.
+            if "to_regclass" in clause.text:
+                return _StateResult("indexer_state")
             if "indexer_state" in clause.text:
                 return _StateResult(self.fingerprint)
             return None

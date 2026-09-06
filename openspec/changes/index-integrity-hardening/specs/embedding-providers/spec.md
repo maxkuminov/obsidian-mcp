@@ -184,6 +184,7 @@ The lock's rules:
 - **That ordering is a property of the transaction, not of the statement that needs the fingerprint.** A transaction that will write any configuration-dependent derived row SHALL acquire the lock and re-validate the fingerprint **before its first row-locking mutation**, and the implementation SHALL audit every mutation earlier in that transaction rather than reason backwards from the write that consumes the fingerprint. The index pass is one transaction that mutates note metadata — upserts, move updates, prunes, link rows, certification invalidation — long before it reaches its keyword-vector write; acquiring the lock at that write would leave the pass holding row locks while it waits for the lock, and the rebuild holding the lock while it waits for those rows, which is a deadlock and a direct violation of the ordering rule. The acquisition therefore belongs at the head of that transaction.
 
 Holding the lock for the duration of a long pass is accepted: the maintenance operations then **wait** for an in-flight pass rather than interleaving with it, which is the required behaviour, and those operations SHALL NOT defeat it with a short lock timeout — **nor with any other timeout that applies to the acquisition**. The connection carries a statement timeout and the advisory-lock acquisition is a statement, so every path whose contract is "it waits" SHALL lift that timeout for the acquisition alone and restore the previous value once the lock is held. Lifting it beforehand SHALL NOT be treated as a violation of the ordering rule: a session-variable assignment takes no row or table lock and is invisible to the lock graph. The waiting side includes the incremental index pass whenever a maintenance operation holds the lock first; only the per-note embedding acquisition keeps the connection's timeout, because that transaction must not sit on a lock for minutes and its mismatch disposition is already to leave the note for a later pass.
+- **An absent state table has the same disposition as an absent fingerprint.** A transaction that would re-read a fingerprint SHALL first establish that the state table exists without raising when it does not, and SHALL proceed past this guard when it is absent. Other required schema objects remain prerequisites; this does not guarantee operation on an otherwise unmigrated schema.
 - **The key SHALL be a single declared constant**, defined in one place and not derived at runtime from a value that could differ between builds.
 - **Any keyword-vector writer retained outside the interlock SHALL be private and SHALL have no production caller**, and that SHALL be enforced by a test rather than by a comment. The single-scope keyword rebuild kept for the tests that hold its per-scope contract writes `content_tsvector` without taking the lock or re-reading the fingerprint; exported under a plausible public name beside the operational driver, it reads like the per-user version of it, and one row written through it under a superseded configuration keeps that vector indefinitely behind a fingerprint claiming otherwise.
 
@@ -252,6 +253,12 @@ The documented ordering for any change to the embedding configuration SHALL stil
 - **WHEN** the reset is performed by the running process itself
 - **THEN** it SHALL acquire the generation lock and complete
 - **AND** the following embed stage SHALL proceed normally against the fingerprint that reset recorded
+
+#### Scenario: An absent state table does not abort certification
+
+- **WHEN** a note is embedded with every required schema object present except the indexer state table
+- **THEN** the note SHALL be embedded and certified normally
+- **AND** no read of the state table's contents SHALL be issued, and the pass SHALL NOT fail
 
 #### Scenario: A crashed holder does not strand the lock
 

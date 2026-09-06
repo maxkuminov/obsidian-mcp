@@ -27,6 +27,7 @@ from src.services.index_state import (
     compare_fingerprint,
     embedding_fingerprint,
     get_state,
+    state_table_exists,
 )
 from src.services.links import BODY, scan_fences
 
@@ -891,7 +892,19 @@ async def _generation_matches(session: AsyncSession, note: NoteMetadata) -> bool
     `UNREADABLE` both refuse; an unreadable stored value is one this build
     cannot compare, so it cannot certify against it (the rule
     `clean_at_version` already follows for an unknown stamped version).
+
+    An absent `indexer_state` table has the same disposition as an absent
+    fingerprint. Probe with `to_regclass` before querying its contents, because
+    a missing-relation SELECT aborts the transaction after the provider call.
+    This matches the startup guard's ABSENT disposition. It does not make an
+    otherwise unmigrated schema supported: the other required columns and
+    tables must still exist.
     """
+    if not await state_table_exists(session):
+        # Before the lock, deliberately: nothing to compare means nothing to
+        # serialise against, and `to_regclass` takes no row or table lock, so
+        # the ordering rule is untouched either way.
+        return True
     await acquire_generation_lock(session)
     current = embedding_fingerprint()
     verdict = compare_fingerprint(

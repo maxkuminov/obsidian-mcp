@@ -613,6 +613,20 @@ A certification that matched no row is therefore an **attempt** (its call was
 made) and still not a failure and not embedded — the same disposition it always
 had, now with a truthful denominator.
 
+**And the denominator is only rendered as a ratio when it is one.**
+`record_failure` also catches what escapes *around* the call — a database error
+loading the row, a rollback that itself failed, a byte read that raised after
+the backlog selected the note — and those move `failures` without moving
+`attempted`. Rendered as `N of M`, one such error on a pass that never reached
+the provider reads `1 of 0`, and `of 0` says the pass made no calls: the
+natural reading is that the counter is broken, and an operator who concludes
+that stops trusting the number that would have told them about a real outage.
+So `failure_summary` states the two as separate facts when the failures
+outnumber the calls — `embed failures: 1 (0 provider call(s) issued)` — and
+keeps the ratio otherwise, because that is the shape an outage produces and the
+one the existing history is full of. The pass's own ERROR line is built from
+the same property, so the log and the `error` column cannot disagree.
+
 **The reconciliation sweep feeds the same accumulator.** It re-embeds
 re-included notes and used to swallow their failures into its own
 `except Exception` with nothing riding back to the pass — so a provider outage
@@ -1137,6 +1151,16 @@ as embedded and **not counted as a failure** (nothing went wrong with the
 provider), logged at ERROR. It is an *attempt*, because a provider call was
 issued — the `attempted` rule applying unchanged rather than gaining an
 exception.
+
+**An absent `indexer_state` table is checked separately from an absent row.**
+`_generation_matches` probes with `state_table_exists` (`to_regclass`) before
+reading the fingerprint, so a missing-relation SELECT cannot abort the
+transaction after the provider call. Absence proceeds, matching the startup
+guard's `ABSENT` disposition. This only handles the missing state table;
+it does not certify an unmigrated schema as operational. For example, a
+complete revision-022 schema lacks `notes_metadata.chunks_truncated`, which
+the backlog query still requires. The tests use an otherwise usable session
+double with the state table absent.
 
 **The exclusion branch is exempt, and the exemption is argued rather than
 assumed.** It makes no provider call, writes no vector, and stamps a row to
