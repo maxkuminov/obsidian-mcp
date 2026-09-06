@@ -2805,9 +2805,122 @@ def _unmatched_fence_error(path: str, scan_text: str, diagnosis=None) -> str | N
     )
 
 
-@_tracked("create_note", ["path"], write_class=True)
-async def create_note_impl(path: str, content: str) -> str:
+# ────────────────────────────────────────────────────────────────────────────
+# Note-write preconditions (#205)
+#
+# The caller-visible half of the pair `vault-tools.md` documents: `expected=`
+# closes *this call's* read→rename window, `expected_hash` closes the caller's
+# read→this call's read window. Neither subsumes the other, so both run.
+# ────────────────────────────────────────────────────────────────────────────
+
+
+#: `_atomic_write_at`'s in-call conflict, by its opening words. The prose is
+#: unchanged by this change (#205 D3) — every existing `in`/`startswith`
+#: assertion still holds — so recognising it is a prefix test, and the typed
+#: `concurrent_write` sentinel is appended to whatever it said.
+_IN_CALL_CONFLICT_PREFIX = "File changed while editing:"
+
+
+def _is_in_call_conflict(exc: BaseException) -> bool:
+    """Is `exc` the publish-time comparison refusing, rather than an I/O error?
+
+    The two are told apart because they mean different things to an agent:
+    a conflict says "re-read and retry", an `OSError` says "this write did not
+    happen for a reason retrying will not fix". `_atomic_write_at` raises the
+    conflict as a `RuntimeError` carrying `File changed while editing: <name>`.
+    """
+    return isinstance(exc, RuntimeError) and str(exc).startswith(
+        _IN_CALL_CONFLICT_PREFIX
+    )
+
+
+def _published_hash_clause(data: bytes) -> str:
+    """The `content_hash` a successful note write ends its result with (D9).
+
+    The value describes **the bytes this call published**, not whatever is on
+    disk by the time the caller reads the message; the docstrings say so. It is
+    appended rather than interpolated so the existing result prose — which
+    plenty of callers and tests match with `in` / `startswith` — is unchanged
+    ahead of it.
+    """
+    return f" — content_hash: {content_hash_for_bytes(data)}"
+
+
+def _hash_unavailable_clause(path: str) -> str:
+    """Why a successful write reported no hash: the file is over the note cap.
+
+    A call that has already succeeded must not be failed merely because its
+    result is too large to hash (design D4, L16), so the hash is omitted and
+    the reason named.
+    """
+    cap_name, cap_bytes = _note_precondition_cap()
+    return (
+        f"content_hash not reported: {path} is larger than {cap_name} "
+        f"({cap_bytes:,} bytes), the most this tool may read back"
+    )
+
+
+def _move_precondition_error(
+    from_path: str,
+    incumbent: bytes | None,
+    expected_hash: str | None,
+    *,
+    over_cap: bool = False,
+) -> str | None:
+    """`_precondition_error` for `move_note`, with the binding scope spelled out.
+
+    A `move_note` precondition binds **`from_path`'s own bytes and nothing
+    else** (design D8, L3). The backlink sources a `rewrite_links=True` move
+    rewrites are unbound because the caller never read them, and a precondition
+    that covered one of N files while implying all of them would be worse than
+    none — so the refusal says it, rather than leaving an agent to infer the
+    scope from a tool name.
+
+    The sentence goes into the **prose** half: the sentinel is a final,
+    line-initial single line by contract, so it stays last.
+    """
+    cap_name, cap_bytes = _note_precondition_cap()
+    err = _precondition_error(
+        "move_note",
+        from_path,
+        incumbent,
+        expected_hash,
+        cap_name=cap_name,
+        cap_bytes=cap_bytes,
+        over_cap=over_cap,
+    )
+    if err is None:
+        return None
+    scope = (
+        " (A move_note precondition binds this note's own bytes only: the "
+        "backlink sources a rewrite_links=True move would rewrite are not "
+        "bound, because you never read them.)"
+    )
+    prose, newline, line = err.rpartition("\n")
+    if not newline or not refusals.has_sentinel(err):
+        # Defensive: the renderer always appends the sentinel on its own final
+        # line, and if that ever stops being true the scope sentence still gets
+        # said rather than being silently dropped into the machine-readable
+        # half.
+        return f"{err}{scope}"
+    return f"{prose}{scope}\n{line}"
+
+
+@_tracked("create_note", ["path", "expected_hash"], write_class=True)
+async def create_note_impl(
+    path: str, content: str, expected_hash: str | None = None
+) -> str:
     """Create a new note in the vault.
+
+    Accepts `expected_hash` and can never honour it: there are no incumbent
+    bytes at a path this tool is willing to write, so a supplied hash is
+    `no_incumbent`, answered **before any filesystem work**. The argument is in
+    the signature deliberately — a signature that rejected it would answer with
+    a protocol-level argument error instead of the typed refusal #205 promises
+    — and a malformed hash still outranks it, so a caller that sent the wrong
+    *kind* of value learns that first. Exempt from `WRITE_PRECONDITION_REQUIRED`
+    for the same reason: requiring a hash where none can exist would make
+    creation impossible.
 
     Confirms the caller's vault assignment immediately before it
     publishes (#88). That narrows the window in which an administrator's
@@ -2819,6 +2932,24 @@ async def create_note_impl(path: str, content: str) -> str:
         return err
     if not path.endswith(".md"):
         path += ".md"
+    # The tool's entry, ahead of `open_mutable` and every read: a malformed
+    # hash is a pure function of the argument and must win over "not found"
+    # and over a symlinked leaf. `.md` is appended first because it is a
+    # string normalisation, not a resolution, and both refusals should name
+    # the same path.
+    if err := _precondition_syntax_error("create_note", expected_hash, path=path):
+        return err
+    # Still before any filesystem work. `enforceable=False` states the required
+    # -mode exemption at the call site rather than leaving it to be inferred.
+    if err := _precondition_error(
+        "create_note",
+        path,
+        None,
+        expected_hash,
+        no_incumbent=True,
+        enforceable=False,
+    ):
+        return err
     uid = current_user_id.get()
     # Validate before the size check: a caller naming an alias should learn
     # that the path is a symlink, not that its content is too big — the second
@@ -2845,7 +2976,11 @@ async def create_note_impl(path: str, content: str) -> str:
             )
             if err:
                 return err
-            return f"Created note: {path}"
+            # D9: the bytes this call published, which `_atomic_write_at`
+            # encoded exactly this way.
+            return f"Created note: {path}" + _published_hash_clause(
+                content.encode("utf-8")
+            )
         except FileExistsError:
             # No-clobber `link` refuses a plain file, a directory *and* a
             # symlink identically, so the bare "already exists" would hide a
@@ -3499,9 +3634,13 @@ async def find_orphans_impl(folder: str | None = None, limit: int = 50) -> str:
     # note's frontmatter and one that replaced it wholesale, and an operator
     # reading `usage_logs` after a block went missing needs to see which was
     # asked for. `content` stays out, as it always has.
+    # `expected_hash` is logged for every tool that accepts it (design D11):
+    # it is a digest, not a secret, and an operator reading `usage_logs` after
+    # a lost update needs to see which writes were guarded and against which
+    # base.
     [
         "path", "append", "operation", "find", "section", "replace_all",
-        "dry_run", "replace_frontmatter",
+        "dry_run", "replace_frontmatter", "expected_hash",
     ],
     write_class=True,
 )
@@ -3515,6 +3654,7 @@ async def edit_note_impl(
     replace_all: bool = False,
     dry_run: bool = False,
     replace_frontmatter: bool = False,
+    expected_hash: str | None = None,
 ) -> str:
     """Edit an existing note in the vault.
 
@@ -3585,8 +3725,28 @@ async def edit_note_impl(
     confirmation narrows the window to staging, the durability flush and one
     publishing call; it does not close it, at the same optimistic level as this
     tool's own `expected=` conflict check.
+
+    **`expected_hash` binds the whole file, in every mode.** It is the
+    caller-visible half of the pair: `expected=` below closes this call's
+    read→rename window, `expected_hash` closes the caller's read→this call's
+    read window (#205 D2). It is compared **immediately after the in-call read
+    and before mode dispatch, the size cap, the `dry_run` diff and every no-op
+    branch** — a diff or a "no changes" answer computed against a base the
+    caller does not hold is a wrong answer, not a cheap one. A section write is
+    bound to the *whole file's* hash because `#N` ordinals are positional, so a
+    body-only digest could certify an unchanged body while an insertion above
+    it changed which section the selector names (D5); the price is that an
+    unrelated edit elsewhere refuses the safest mode, which is why the argument
+    is optional.
     """
     if err := _require_write():
+        return err
+
+    # The tool's entry: ahead of `open_mutable`, `_leaf_state_error` and every
+    # read, so a malformed hash outranks not-found, a symlinked leaf and the
+    # size cap. A caller told "not found" for a call whose argument was never
+    # valid fixes the wrong thing.
+    if err := _precondition_syntax_error("edit_note", expected_hash, path=path):
         return err
 
     if operation is not None:
@@ -3648,14 +3808,52 @@ async def edit_note_impl(
         ):
             return err
 
+        cap_name, cap_bytes = _note_precondition_cap()
         try:
-            existing_bytes = read_bytes_at(
-                target, max_bytes=MAX_NOTE_BYTES, label=path
-            )
-            existing = existing_bytes.decode("utf-8")
+            # The bounded incumbent read this tool has always performed: one
+            # `fstat` and one read through the descriptor already open above,
+            # bounded by this tool's own content cap, so the bytes measured are
+            # the bytes hashed and no second pathname is resolved.
+            existing_bytes = read_bytes_at(target, max_bytes=cap_bytes, label=path)
+        except ValueError as e:
+            # `read_bytes_at` raises `ValueError` only for an over-cap file
+            # here — a non-regular leaf was refused by `_leaf_state_error`
+            # above. A guarded call learns *why the guard could not run*
+            # (`precondition_unavailable`, naming the cap) rather than being
+            # told the file differs; an unguarded call with required mode off
+            # keeps today's message, which is the compatibility rule.
+            if err := _precondition_error(
+                "edit_note",
+                path,
+                None,
+                expected_hash,
+                cap_name=cap_name,
+                cap_bytes=cap_bytes,
+                over_cap=True,
+            ):
+                return err
+            return f"Failed to read {path}: {e}"
         except Exception as e:
             # Includes OSError: an ELOOP from the `O_NOFOLLOW` read means the leaf
             # became a symlink after validation. That is a refusal, not a crash.
+            return f"Failed to read {path}: {e}"
+
+        # Immediately after the read and before everything else this tool does:
+        # mode dispatch, the size cap, the `dry_run` diff and every no-op or
+        # defect branch. Ordering here is observable and therefore normative.
+        if err := _precondition_error(
+            "edit_note",
+            path,
+            existing_bytes,
+            expected_hash,
+            cap_name=cap_name,
+            cap_bytes=cap_bytes,
+        ):
+            return err
+
+        try:
+            existing = existing_bytes.decode("utf-8")
+        except Exception as e:
             return f"Failed to read {path}: {e}"
 
         new_content: str | None = None
@@ -3785,10 +3983,19 @@ async def edit_note_impl(
             if err:
                 return err
         except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
+            if _is_in_call_conflict(e):
+                # The *other* window, typed. Prose byte-unchanged, sentinel
+                # appended, so an agent tells this from `stale_precondition`
+                # by code: that one means "the file moved before you called,
+                # and here is the new hash", this one means "the file moved
+                # during my call, so no hash from before it can be valid".
+                return _concurrent_write_refusal(str(e), path)
             return str(e)
         except OSError as e:
             return f"Failed to write {path}: {e}"
-        return success_message
+        return success_message + _published_hash_clause(
+            new_content.encode("utf-8")
+        )
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -4202,12 +4409,15 @@ def _ensure_move_source_in_index(index: dict, from_rel: str) -> None:
 
 
 @_tracked(
-    "move_note", ["from_path", "to_path", "rewrite_links"], write_class=True
+    "move_note",
+    ["from_path", "to_path", "rewrite_links", "expected_hash"],
+    write_class=True,
 )
 async def move_note_impl(
     from_path: str,
     to_path: str,
     rewrite_links: bool = False,
+    expected_hash: str | None = None,
 ) -> str:
     """Move (rename or relocate) a note inside the vault.
 
@@ -4232,8 +4442,21 @@ async def move_note_impl(
     therefore carries its own narrowed window rather than one for the whole
     call; the tool has several such windows and can be refused part way
     through.
+
+    **`expected_hash` binds `from_path`'s own bytes and nothing else** (design
+    D8): it is compared in the preflight, before the rename and before any
+    rewrite, and the backlink sources a `rewrite_links=True` move would rewrite
+    are unbound because the caller never read them. Success reports the hash of
+    the bytes **actually published at the destination** — see the matrix in
+    `_move_note_locked`.
     """
     if err := _require_write():
+        return err
+
+    # The tool's entry: ahead of the descriptor gate, `open_mutable` and every
+    # read, so a malformed hash outranks a missing source and a symlinked leaf
+    # at either endpoint.
+    if err := _precondition_syntax_error("move_note", expected_hash, path=from_path):
         return err
 
     uid = current_user_id.get()
@@ -4244,7 +4467,9 @@ async def move_note_impl(
     # not per call. Moves without rewrites pin two descriptors and are not
     # serialised.
     async with _move_rewrite_gate(rewrite_links):
-        return await _move_note_locked(from_path, to_path, rewrite_links, uid)
+        return await _move_note_locked(
+            from_path, to_path, rewrite_links, uid, expected_hash
+        )
 
 
 # Process-wide, so the descriptor budget is a bound on the *process* and not
@@ -4265,9 +4490,36 @@ async def _move_rewrite_gate(rewrite_links: bool):
 
 
 async def _move_note_locked(
-    from_path: str, to_path: str, rewrite_links: bool, uid: int | None
+    from_path: str,
+    to_path: str,
+    rewrite_links: bool,
+    uid: int | None,
+    expected_hash: str | None = None,
 ) -> str:
-    """`move_note`'s body, under the descriptor gate. See `move_note_impl`."""
+    """`move_note`'s body, under the descriptor gate. See `move_note_impl`.
+
+    **What the success result's `content_hash` is** (design D4). A
+    `rewrite_links=True` move publishes twice — the `renameat2`, then the moved
+    note's own body rewrite — and the second can fail after the first has
+    committed, so the reported value is always the hash of the bytes *actually
+    published*, never of bytes this call intended to publish:
+
+    - plain move (`rewrite_links=False`) → the moved bytes, read back through
+      the destination's own verified descriptor;
+    - the moved note's own rewrite published → the post-rewrite bytes;
+    - that rewrite failed **without observing a change** (I/O, a stopped loop
+      under a reassignment or a confirmation outage) → the rename's bytes,
+      which are what is on disk;
+    - that rewrite lost the in-call conflict (`concurrent_write`) → **no hash
+      at all**: the destination holds a third writer's bytes this call never
+      read, and naming the rename's hash would hand back a token that binds
+      nothing;
+    - a **backlink source's** rewrite failing changes none of the above.
+
+    A post-rename failure is a **partial success**, never a whole-call refusal,
+    and never carries `nothing_written: true`: the move happened, and a caller
+    told otherwise goes looking for a note that has already relocated.
+    """
     from sqlalchemy import select, update
     from src.models.db import NoteLink, NoteMetadata
     from src.services.links import build_vault_index
@@ -4295,6 +4547,27 @@ async def _move_note_locked(
             missing=f"Source note not found: {from_path}",
         ):
             return err
+
+        # The precondition, before the rename and before any rewrite — and
+        # before the index queries and the preflight too, so a refused move
+        # costs the database nothing. It binds `from_path`'s own bytes only,
+        # and the refusal says so. Read only when a hash was supplied or the
+        # deployment requires one: an unguarded move reads nothing here that it
+        # does not read today. (Under required mode the read is what tells an
+        # over-cap source from a missing hash, which the ladder ranks in that
+        # order.)
+        if expected_hash is not None or settings.write_precondition_required:
+            _, note_cap_bytes = _note_precondition_cap()
+            incumbent, over_cap = _read_incumbent(
+                src_target, from_path, note_cap_bytes
+            )
+            if incumbent is None and not over_cap:
+                return f"Source note not found: {from_path}"
+            if err := _move_precondition_error(
+                from_path, incumbent, expected_hash, over_cap=over_cap
+            ):
+                return err
+
         # Both targets carry `resolved_parent / name`, so `rel` is the path the
         # indexer stores for a note reached through a symlinked folder — the DB
         # rows below, and the backlink lookup keyed on `from_rel`, line up with it.
@@ -4715,12 +4988,17 @@ async def _move_note_locked(
 
         dest_name = PurePosixPath(to_rel).name
         moved_title: str | None = None
+        # The bytes the **rename** published, captured from the same read the
+        # title derivation already performs (D9: one read, and the hash it
+        # yields describes exactly the bytes that read saw). `None` when the
+        # destination could not be read back within `MAX_NOTE_BYTES` — the
+        # move still stands and the result then says why it names no hash.
+        renamed_bytes: bytes | None = None
         try:
-            moved_frontmatter, _ = parse_frontmatter(
-                read_bytes_at(
-                    dst_target, max_bytes=MAX_NOTE_BYTES, label=to_rel
-                ).decode("utf-8")
+            renamed_bytes = read_bytes_at(
+                dst_target, max_bytes=MAX_NOTE_BYTES, label=to_rel
             )
+            moved_frontmatter, _ = parse_frontmatter(renamed_bytes.decode("utf-8"))
             moved_title = _note_title(moved_frontmatter, dest_name)
         except Exception as exc:
             # Best-effort fallback, declared: the file vanished, is no longer
@@ -4823,8 +5101,18 @@ async def _move_note_locked(
         rewrites_done = 0
         files_modified = 0
         stopped: str | None = None
+        # The moved note's own rewrite, tracked apart from the backlink
+        # sources: only it can change what is at the destination, so only it
+        # can change which hash this call may honestly report.
+        moved_rewrite_bytes: bytes | None = None
+        moved_rewrite_conflicted = False
         for position, planned in enumerate(planned_rewrites):
             write_path, write_target, original_bytes, new_content, n = planned
+            # The moved note is the one source written through the destination
+            # target itself (`read_target, write_target = src_target,
+            # dst_target` in the preflight), so identity is exact and needs no
+            # path comparison against a name that may repeat.
+            is_moved_note = write_target is dst_target
             # #88, one confirmation per publication. The confirmation taken
             # before the move covers none of this: the metadata transaction
             # above is an `await` of unbounded duration, and so is every
@@ -4877,6 +5165,12 @@ async def _move_note_locked(
                     error_type=type(e).__name__,
                 )
                 outcome = "failed"
+                if is_moved_note and _is_in_call_conflict(e):
+                    # The one case where the *rename's* hash is wrong too:
+                    # somebody changed the destination between the rename and
+                    # this rewrite's publication, so the bytes there are
+                    # theirs and this call never read them.
+                    moved_rewrite_conflicted = True
 
             if outcome in ("reassigned", "unavailable"):
                 # Stop. Under a reassignment every remaining rewrite would
@@ -4899,6 +5193,10 @@ async def _move_note_locked(
             else:
                 rewrites_done += n
                 files_modified += 1
+                if is_moved_note:
+                    # Published, so these are the bytes at the destination —
+                    # exactly what `write_file_at` encoded.
+                    moved_rewrite_bytes = new_content.encode("utf-8")
             # Its descriptor has done both jobs now. Closing here — rather than
             # in the outer `finally` — keeps the peak at the number of
             # *planned* rewrites still awaiting their write, not the number of
@@ -4917,6 +5215,33 @@ async def _move_note_locked(
             )
             if warning is not None:
                 parts.append(f"(warning: {warning})")
+
+        if moved_rewrite_conflicted:
+            # A post-rename partial success, and the one case that reports no
+            # hash at all. The two statements are said in full — the move
+            # completed, the rewrite did not — and the refusal is typed with
+            # `nothing_written` **absent**: something was written (the
+            # rename), and claiming otherwise would send the caller looking
+            # for a note that has already relocated.
+            parts.append(
+                f"(the move completed, but the moved note's own link rewrite "
+                f"did not: {to_rel} was changed by another writer between the "
+                "rename and the rewrite's publication, so the destination "
+                "holds bytes this call never read. No content_hash is "
+                "reported, because none this server could name would describe "
+                f"what is on disk. Re-read {to_rel} before writing to it.)"
+            )
+            return _concurrent_write_refusal(
+                " — ".join(parts), to_rel, nothing_written=None
+            )
+
+        published = (
+            moved_rewrite_bytes if moved_rewrite_bytes is not None else renamed_bytes
+        )
+        if published is not None:
+            parts.append(f"content_hash: {content_hash_for_bytes(published)}")
+        else:
+            parts.append(_hash_unavailable_clause(to_rel))
         return " — ".join(parts) if len(parts) > 1 else parts[0]
     finally:
         for opened in targets:
@@ -4932,8 +5257,10 @@ async def _move_note_locked(
 # ────────────────────────────────────────────────────────────────────────────
 
 
-@_tracked("delete_note", ["path", "permanent"], write_class=True)
-async def delete_note_impl(path: str, permanent: bool = False) -> str:
+@_tracked("delete_note", ["path", "permanent", "expected_hash"], write_class=True)
+async def delete_note_impl(
+    path: str, permanent: bool = False, expected_hash: str | None = None
+) -> str:
     """Soft-delete a note to `.trash/`, or unlink it when `permanent=True`.
 
     Both forms confirm the caller's vault assignment immediately before they
@@ -4942,8 +5269,21 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
     it does not close it — a reassignment committing inside that call still
     takes effect in the former root, at the same optimistic level as
     `edit_note(expected=…)`.
+
+    **`expected_hash` applies in both modes** (design O3). A permanent delete
+    is irreversible and a soft delete puts the bytes under a `.trash` name only
+    an agent that knows to look will find, so both destroy content the caller
+    may have read; the comparison runs **before** the pin, the `.trash` rename
+    and the unlink. Success reports no `content_hash` — nothing remains to
+    hash. The incumbent is read **only** when a hash was supplied or the
+    deployment requires one, so an unguarded delete reads nothing it does not
+    read today.
     """
     if err := _require_write():
+        return err
+
+    # The tool's entry, before `open_mutable` and `_leaf_state_error`.
+    if err := _precondition_syntax_error("delete_note", expected_hash, path=path):
         return err
 
     uid = current_user_id.get()
@@ -4956,6 +5296,31 @@ async def delete_note_impl(path: str, permanent: bool = False) -> str:
             target, path, missing=f"Note not found: {path}"
         ):
             return err
+
+        if expected_hash is not None or settings.write_precondition_required:
+            # The read is not "solely to populate `current_hash`": under
+            # required mode it is the only way to learn whether the incumbent
+            # is over the cap, and `precondition_unavailable` must outrank
+            # `precondition_required` there — telling such a caller to supply a
+            # hash sends it after one it can never obtain. Having read, the
+            # refusal carries the hash, which saves the compliant caller a call.
+            cap_name, cap_bytes = _note_precondition_cap()
+            incumbent, over_cap = _read_incumbent(target, path, cap_bytes)
+            if incumbent is None and not over_cap:
+                # It was there for `_leaf_state_error` and is gone now. Today's
+                # answer for a delete of a note that does not exist, not a
+                # precondition refusal about bytes that no longer exist either.
+                return f"Note not found: {path}"
+            if err := _precondition_error(
+                "delete_note",
+                path,
+                incumbent,
+                expected_hash,
+                cap_name=cap_name,
+                cap_bytes=cap_bytes,
+                over_cap=over_cap,
+            ):
+                return err
 
         if permanent:
             # #88. The unlink itself lives in `vault.unlink_at`, which takes
@@ -5086,11 +5451,12 @@ def _same_frontmatter_value(current, proposed, _seen: set | None = None) -> bool
     return current == proposed
 
 
-@_tracked("set_frontmatter", ["path"], write_class=True)
+@_tracked("set_frontmatter", ["path", "expected_hash"], write_class=True)
 async def set_frontmatter_impl(
     path: str,
     updates: dict | None = None,
     remove: list[str] | None = None,
+    expected_hash: str | None = None,
 ) -> str:
     """Merge `updates` into a note's YAML frontmatter and drop keys in `remove`.
 
@@ -5121,8 +5487,18 @@ async def set_frontmatter_impl(
     reassignment can be missed to staging, the durability flush and one
     publishing call — it does not close it, the same optimistic guarantee
     the system declares for `edit_note(expected=…)`.
+
+    **`expected_hash` binds the whole file** and is compared immediately after
+    the incumbent read — ahead of the defect diagnosis, the lossy refusal and
+    the empty-`updates` no-op (#205 D2). A "no changes" answer computed against
+    a base the caller does not hold is a wrong answer, and a defect report on
+    bytes it has not seen sends it to repair something it cannot see.
     """
     if err := _require_write():
+        return err
+
+    # The tool's entry, before `open_mutable` and before any read (#205 D2).
+    if err := _precondition_syntax_error("set_frontmatter", expected_hash, path=path):
         return err
 
     updates = dict(updates or {})
@@ -5146,12 +5522,44 @@ async def set_frontmatter_impl(
         ):
             return err
 
+        cap_name, cap_bytes = _note_precondition_cap()
         try:
-            raw_bytes = read_bytes_at(target, max_bytes=MAX_NOTE_BYTES, label=path)
-            raw = raw_bytes.decode("utf-8")
+            raw_bytes = read_bytes_at(target, max_bytes=cap_bytes, label=path)
+        except ValueError as e:
+            # Over cap: the guard cannot run, which is its own answer and not a
+            # mismatch (see the twin branch in `edit_note_impl`). Unguarded and
+            # not required, today's message stands.
+            if err := _precondition_error(
+                "set_frontmatter",
+                path,
+                None,
+                expected_hash,
+                cap_name=cap_name,
+                cap_bytes=cap_bytes,
+                over_cap=True,
+            ):
+                return err
+            return f"Failed to read {path}: {e}"
         except Exception as e:
             # OSError included — an ELOOP here means the leaf was swapped for a
             # link after validation; report it rather than raising.
+            return f"Failed to read {path}: {e}"
+
+        # Immediately after the read: ahead of the defect diagnosis, the lossy
+        # refusal and the empty-`updates` no-op.
+        if err := _precondition_error(
+            "set_frontmatter",
+            path,
+            raw_bytes,
+            expected_hash,
+            cap_name=cap_name,
+            cap_bytes=cap_bytes,
+        ):
+            return err
+
+        try:
+            raw = raw_bytes.decode("utf-8")
+        except Exception as e:
             return f"Failed to read {path}: {e}"
 
         fm, body, diagnosis = parse_frontmatter_diagnose(raw)
@@ -5239,6 +5647,8 @@ async def set_frontmatter_impl(
             if err:
                 return err
         except (ValueError, RuntimeError, vault_fs.VaultFSError) as e:
+            if _is_in_call_conflict(e):
+                return _concurrent_write_refusal(str(e), path)
             return str(e)
         except OSError as e:
             return f"Failed to write {path}: {e}"
@@ -5250,7 +5660,10 @@ async def set_frontmatter_impl(
             summary.append(f"removed: {', '.join(removed_keys)}")
         if not fm and removed_keys:
             summary.append("frontmatter block removed (last key)")
-        return f"Updated frontmatter in {path} ({'; '.join(summary)})"
+        return (
+            f"Updated frontmatter in {path} ({'; '.join(summary)})"
+            + _published_hash_clause(new_raw.encode("utf-8"))
+        )
 
 
 # ────────────────────────────────────────────────────────────────────────────
