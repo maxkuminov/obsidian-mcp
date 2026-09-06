@@ -109,6 +109,20 @@ PRECONDITION_CODES = frozenset(
     }
 )
 
+# Body-only codes omit unrelated bucket fields. Existing gate codes retain
+# their historical wire shape, including argument_too_long at the provider.
+BODY_CODES = frozenset({
+    "permission_denied", "related_source_not_found", "related_source_not_embedded",
+    "vault_assignment_changed", "vault_anchor_lost_at_publish",
+    "vault_confirmation_unavailable", "invalid_argument", "validation_failed",
+    "invalid_path", "unsafe_path", "not_found", "already_exists",
+    "read_window_unavailable", "selector_unresolved", "match_not_found",
+    "match_ambiguous", "content_unsafe", "size_limit", "resource_limit",
+    "unsupported_filesystem", "io_failure", "index_not_ready",
+    "transfer_unavailable", "credential_unusable", "fetch_refused",
+    "transfer_busy", "transfer_timeout", "partial_completion", "publication_uncertain",
+})
+
 CODES = frozenset(
     {
         RATE_LIMITED,
@@ -120,7 +134,7 @@ CODES = frozenset(
         VAULT_ROOT_UNEXAMINABLE,
         VAULT_ROOT_NOT_READY,
     }
-    | PRECONDITION_CODES
+    | PRECONDITION_CODES | BODY_CODES
 )
 
 #: The codes for which a retry interval is **forbidden**, not merely omitted.
@@ -250,7 +264,7 @@ class Refusal:
         bucket scope.
         """
         payload: dict = {"code": self.code}
-        if self.code not in PRECONDITION_CODES:
+        if self.code not in PRECONDITION_CODES | BODY_CODES:
             payload["scope"] = self.scope
             payload["limit"] = self.limit
             payload["limit_unit"] = self.limit_unit
@@ -282,7 +296,7 @@ def has_sentinel(text: str) -> bool:
     return text.rsplit("\n", 1)[-1].startswith(f"{SENTINEL} ")
 
 
-def render(prose: str, refusal: Refusal) -> str:
+def render(prose: str, refusal: Refusal, *, authoritative: bool = False) -> str:
     """`prose`, unchanged, with the sentinel line appended.
 
     **Idempotent.** A refusal message is built at one altitude and rendered at
@@ -291,7 +305,9 @@ def render(prose: str, refusal: Refusal) -> str:
     stack two sentinel lines on one message by both doing their job. A message
     that already ends in a rendered line is returned untouched.
     """
-    if has_sentinel(prose):
+    # BodyOutcome passes original prose and owns the final line. A quoted
+    # caller-controlled sentinel must never suppress that authoritative line.
+    if not authoritative and has_sentinel(prose):
         return prose
     return f"{prose}\n{sentinel_line(refusal)}"
 

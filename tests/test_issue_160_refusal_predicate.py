@@ -184,12 +184,12 @@ def test_a_publish_time_anchor_loss_is_an_executed_row_not_a_refusal():
         tools._ANCHOR_LOST_AT_PUBLISH_MARKER
         not in usage_stats.PRE_BODY_REFUSAL_ERROR_MARKERS
     )
-    # And the source of the branch really writes the new value: a test that only
-    # compared constants would pass with the branch still logging the old one.
+    # The branch carries the marker to the terminal classifier (#263); a test
+    # comparing constants alone would miss a helper carrying the old value.
     import inspect
 
     recorded = re.findall(
-        r'timing\.record\(\s*"error",\s*(\w+)\s*\)',
+        r'_body_refusal\(str\(exc\),\s*(\w+)\)',
         inspect.getsource(tools._confirmed_publication),
     )
     assert recorded == ["_VAULT_REASSIGNED_MARKER", "_ANCHOR_LOST_AT_PUBLISH_MARKER"], (

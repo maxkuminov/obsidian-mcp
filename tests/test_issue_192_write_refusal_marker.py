@@ -156,7 +156,9 @@ async def test_every_gated_tool_marks_its_row_and_records_one_refusal(
     with security_events.suppression_disabled():
         result = await call()
 
-    assert result == REFUSAL, "the in-band message is the caller's contract"
+    assert result.prose == REFUSAL, "the in-band message is the caller's contract"
+    assert result.refusal.code == "permission_denied"
+    assert result.disposition == "refused"
 
     assert len(read_only) == 1
     row = read_only[0]
@@ -185,26 +187,26 @@ async def test_every_gated_tool_marks_its_row_and_records_one_refusal(
 
 
 async def test_the_refusal_message_is_unchanged(sink, read_only):
-    """The reader is an agent that has to act on this string. Recording the
-    refusal must not change a byte of what the caller is told."""
+    """#263 appends a typed line while keeping the original explanation."""
     with security_events.suppression_disabled():
         result = await tools.create_note_impl("a.md", "body")
-    assert result == REFUSAL
+    assert result.prose == REFUSAL
     assert result.startswith("Permission denied: ")
 
 
-async def test_request_download_is_neither_marked_nor_recorded(sink, read_only):
+async def test_request_download_has_no_permission_refusal(sink, read_only):
     """`_mint_preflight(need_write=False)` never reaches the gate. A read-only
     credential minting a download link is doing exactly what it may do, and a
-    refusal record for it would be a false positive in the one channel an
-    operator is meant to trust."""
+    permission refusal would be a false positive. Its own mint preflight may
+    still return a different typed refusal (#263)."""
     with security_events.suppression_disabled():
         result = await tools.request_download_impl("missing.bin")
 
     assert result != REFUSAL
     assert len(read_only) == 1
     assert read_only[0]["tool"] == "request_download"
-    assert "error" not in read_only[0]["params"]
+    assert read_only[0]["params"]["error"] == result.marker
+    assert result.marker != "permission_denied"
     assert _events(sink.records, "tool_write_refused") == []
 
 
@@ -241,7 +243,7 @@ async def test_the_probe_refuses_like_the_nine(sink, read_only):
     """And the control's own control: the probe is only evidence that the gate
     passes for a readwrite credential if it refuses for a read-only one."""
     with security_events.suppression_disabled():
-        assert await probe_write() == REFUSAL
+        assert (await probe_write()).prose == REFUSAL
     assert read_only[0]["params"]["error"] == tools._PERMISSION_DENIED_MARKER
     assert len(_events(sink.records, "tool_write_refused")) == 1
 
@@ -306,7 +308,8 @@ async def test_every_refusal_writes_its_row_even_when_records_are_withheld(
 
     # Nothing is dropped silently: the withheld count is stated exactly.
     security_events.flush_suppression_summaries()
-    summaries = _events(sink.records, "events_suppressed")
+    summaries = [r for r in _events(sink.records, "events_suppressed")
+                 if build_payload(r)["reason"] == "tool_write_refused"]
     assert len(summaries) == 1
     payload = build_payload(summaries[0])
     assert payload["reason"] == "tool_write_refused"

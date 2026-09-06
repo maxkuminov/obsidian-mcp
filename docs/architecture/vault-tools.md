@@ -3,6 +3,18 @@
 > Deep rationale extracted from `CLAUDE.md`. Read before touching any note or file tool — this is the destructive-write surface.
 
 ## Write tools
+Returned body refusals carry a pure `BodyOutcome` and an authoritative final
+`MCP-REFUSAL` line (#263). `_tracked` classifies only the terminal typed value;
+a note containing the same text is still content. `read_note` carries its
+outcome privately, outside the public schema, reserving the complete sentinel
+within the error budget before truncating sanitized prose. Helpers composing
+an explanation use the outcome's original prose to preserve one generated
+sentinel and its metadata. Successful empty reads and no-op writes stay
+unchanged. Partial moves retain published-path/hash rules and omit
+`nothing_written`; a compound failure can retain `concurrent_write` for the
+caller while a later publication refusal keeps usage-marker precedence.
+See [usage attribution](usage-attribution.md) for the post-body register.
+
 - `create_note(path, content, expected_hash=None)` — create a new note (atomic write). `expected_hash` is accepted and always refused as `no_incumbent` — see "Write preconditions" below.
 - `edit_note(path, content, append=False, operation=None, find=None, section=None, replace_all=False, dry_run=False, replace_frontmatter=False, expected_hash=None)` — four mutually exclusive modes (full-replace, append, find/replace, section). `dry_run` returns a unified diff without writing; `replace_all` lifts the single-match guard for `find`. Section mode matches ATX headings only and supports `Parent/Child` path-style and `#N` ordinal disambiguation (see "Section addressing" below). Full-replace **preserves an existing valid frontmatter block** and section mode never touches one — see "Frontmatter is preserved unless the caller says otherwise" below.
 - `move_note(from_path, to_path, rewrite_links=False, expected_hash=None)` — rename or relocate a note. Updates `notes_metadata.file_path` and `note_links.target_path` rows for the moved note. With `rewrite_links=True`, also rewrites `[[Old]]` / `[[Old|alias]]` / `[[Old#anchor]]` / `![[Old]]` / `[[folder/Old]]` **and markdown `[text](Old.md)`** forms (the markdown href is regenerated relative to the *linking* note's folder), in every backlink source **and in the moved note's own body** — `rewrite_sources` starts as `[from_rel]`. The rewrites run *after* the `renameat2` commits, so one that fails leaves a **partial success** naming the unrewritten sources (`_rewrite_failure_warning`); the move is not rolled back. The docstring must say so — "the link graph never disagrees with the vault bytes" is only true of the preflight refusal, not of the whole call.

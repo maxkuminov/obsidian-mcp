@@ -311,12 +311,23 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   the marker is a closed vocabulary this register enumerates, and the class
   name is not.
 
-  **In-band refusals outside this register stay unmarked** (residual R1).
-  `create_note` on an existing path, a path-validation refusal, a size refusal
-  and a write conflict each return a message and write an ordinary row, exactly
-  as they did before #192. That is deliberate: a typed outcome for every tool
-  return is a change of its own, and half-marking the set would leave the
-  register looking complete when it is not.
+  **Returned body outcomes are typed and post-body** (#263, closing R1).
+  `tool_outcomes.BodyOutcome` carries a closed marker, caller Refusal and
+  `refused`/`partial` disposition. Only the terminal result reaches the existing
+  usage row as `error` and `body_outcome`; constructing a discarded helper
+  outcome records nothing. The register is `BODY_MARKERS` in that module,
+  including the six write-precondition codes and broad `validation_failed`
+  where an existing ValueError catch cannot honestly name a narrower cause.
+  These markers do **not** join the pre-body predicate: the body ran and quota
+  admission already happened. Empty results, no-op edits, status lookups and
+  ordinary note text containing a forged sentinel stay successful. Structured
+  reads carry their outcome privately, outside their wire schema. A move that
+  committed its rename but lost rewrites or metadata repair is `partial`;
+  a later publication failure retains its existing usage-marker precedence
+  even when the caller needs the moved note's `concurrent_write` code.
+  Concurrency shadow metadata is namespaced separately and cannot replace an
+  actual error or create a second request. Body exceptions still take
+  `tool_exception` precedence; cancellation does not invent completion.
 
   Both halves are `COALESCE(..., false)`: `params` is nullable and `->>` on a
   missing key yields NULL, so without them the negation used by the executed

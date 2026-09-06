@@ -131,7 +131,7 @@ def reported_hash(result: str) -> str:
     """The `content_hash` a successful write ends its result with."""
     marker = "content_hash: "
     assert marker in result, result
-    return result.rsplit(marker, 1)[1].strip()
+    return result.rsplit(marker, 1)[1].splitlines()[0].strip()
 
 
 STALE = "sha256:" + "0" * 64
@@ -742,7 +742,8 @@ async def test_a_moved_note_rewrite_failing_without_a_conflict_reports_the_renam
     assert "partial success" in out
     assert (vault / "New.md").read_bytes() == SELF_LINKING
     assert reported_hash(out) == digest(vault, "New.md")
-    assert not refusals.has_sentinel(out), out
+    assert sentinel(out)["code"] == "partial_completion"
+    assert out.disposition == "partial"
 
 
 async def test_a_moved_note_rewrite_losing_the_conflict_reports_no_hash(
@@ -914,7 +915,7 @@ async def test_an_unguarded_over_cap_edit_keeps_todays_read_error(vault, tiny_ca
     out = await tools.edit_note_impl("n.md", "x", replace_frontmatter=True)
 
     assert out.startswith("Failed to read n.md:")
-    assert not refusals.has_sentinel(out), out
+    assert sentinel(out)["code"] == "size_limit"
 
 
 async def test_required_mode_on_an_over_cap_file_names_the_real_cause(
