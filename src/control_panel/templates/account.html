@@ -1,0 +1,104 @@
+{% extends "base.html" %}
+{% block title %}Account — Obsidian MCP{% endblock %}
+{% block content %}
+
+{#
+  The signed-in user's own account (#197). Reached by every panel user, admin
+  or not — the finding this page closes is that a non-administrator had no way
+  to rotate their own password and had to ask somebody who would then know the
+  replacement.
+
+  Rendered only in multi-user mode: the route 404s otherwise, because in
+  single-user mode there is no account row and no local password, and the
+  sidebar entry is gated the same way.
+
+  Colours come from the panel's tokens only — no literal anywhere on this page,
+  or `colorscan` fails the sweep.
+#}
+
+<div class="page-top">
+    <h1 class="page-title">Account</h1>
+</div>
+
+<div class="page-body">
+
+    {# One session-backed flash (#138), never a query parameter. Both values
+       come from `_panel_context`, which pops them, so a message is shown once
+       and is gone on reload. #}
+    {% if flash %}
+    <div class="alert {% if flash_kind == 'err' %}alert-warning{% else %}alert-success{% endif %} anim-1">{{ flash }}</div>
+    {% endif %}
+
+    <div class="split-2">
+
+        <!-- Who you are -->
+        <div class="card anim-1">
+            <div class="card-header">
+                <span class="card-title">Signed in as</span>
+            </div>
+            <div class="card-body">
+                <div class="kv">
+                    <div class="kv-k">Username</div>
+                    <div class="kv-v mono">{{ username }}</div>
+                </div>
+                <div class="kv">
+                    <div class="kv-k">Role</div>
+                    <div class="kv-v">{% if is_admin %}Admin{% else %}User{% endif %}</div>
+                </div>
+                <div style="color:var(--text-3);font-size:12px;margin-top:12px;">
+                    Your username and role are set by an administrator. If you cannot
+                    sign in at all, an administrator can reset your password for you.
+                </div>
+            </div>
+        </div>
+
+        <!-- Change password -->
+        <div class="card anim-2">
+            <div class="card-header">
+                <span class="card-title">Change password</span>
+            </div>
+            <div class="card-body">
+                <form method="POST" action="/admin/account/password">
+                    {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
+                    <div class="field">
+                        <label class="field-label" for="current_password">Current password</label>
+                        <input type="password" name="current_password" id="current_password" required
+                               class="field-input" autocomplete="current-password">
+                    </div>
+                    <div class="field">
+                        <label class="field-label" for="new_password">New password</label>
+                        {# `minlength` mirrors the server's `MIN_PASSWORD_LENGTH`, passed
+                           into the context so the two cannot drift. The browser's check
+                           is a convenience; the server refuses regardless. #}
+                        <input type="password" name="new_password" id="new_password" required
+                               minlength="{{ min_password_length }}"
+                               class="field-input"
+                               placeholder="≥ {{ min_password_length }} characters"
+                               autocomplete="new-password">
+                    </div>
+                    <div class="field">
+                        <label class="field-label" for="new_password_confirm">Confirm new password</label>
+                        <input type="password" name="new_password_confirm" id="new_password_confirm" required
+                               minlength="{{ min_password_length }}"
+                               class="field-input" autocomplete="new-password">
+                    </div>
+                    <div style="font-size:11px;color:var(--text-3);margin-top:6px;">
+                        At least {{ min_password_length }} characters. There are no
+                        composition rules — length is the control that works.
+                    </div>
+                    <div class="alert alert-warning" style="margin-top:14px;font-size:12px;">
+                        Changing your password signs you out of every other browser and
+                        device. This one stays signed in, under a new session.
+                    </div>
+                    <div style="display:flex;gap:10px;margin-top:18px;">
+                        <button type="submit" class="btn btn-primary">Change password</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+    </div>
+
+</div>
+
+{% endblock %}

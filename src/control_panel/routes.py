@@ -16,11 +16,23 @@ from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.auth.session import _SingleUserSentinel, get_current_user
+from src.auth.passwords import (
+    MIN_PASSWORD_LENGTH,
+    hash_password,
+    validate_new_password,
+    verify_password,
+)
+from src.auth.session import (
+    _SingleUserSentinel,
+    get_current_user,
+    revoke_user_sessions,
+    start_session,
+)
 from src.config import settings
 from src.control_panel.flash import ERR, flash, pop_flash
 from src.csrf import generate_csrf_token, verify_csrf
 from src.database import async_session, get_session
+from src.limiter import get_remote_address, limiter, session_user_key
 from src.mcp_server.auth import hash_key
 from src.models.db import (
     DAILY_REQUEST_LIMIT_MAX,
@@ -35,6 +47,7 @@ from src.models.db import (
 )
 from src.oauth.grants import (
     live_family_scopes,
+    lock_account_guard,
     revoke_grant_family,
     set_grant_family_scope,
 )
@@ -386,6 +399,292 @@ def _scope_user_id(user: User | _SingleUserSentinel) -> int | None:
     if _is_admin(user):
         return None
     return user.id
+
+
+# --- Account: self-service password change (#197) -------------------------
+#
+# The whole surface a signed-in user has over their own credential. It is
+# deliberately **not** admin-gated (the router-wide `require_user_panel` is the
+# only gate), because the finding is that a non-admin who suspects their
+# password is compromised has to ask an administrator — who then knows the
+# replacement. The administrative reset stays as the recovery path for somebody
+# who cannot sign in at all.
+
+#: Where every outcome of this page's POST lands. One redirect target, and the
+#: message rides the session rather than the URL (#138).
+ACCOUNT_PATH = "/admin/account"
+
+#: The **one** message every credential refusal carries — a wrong current
+#: password and a new password that is already the current one alike. One
+#: constant, because a message that says *which* of the two checks failed says
+#: something about the stored password, and the spec forbids that. It names
+#: both possibilities rather than only the first so that the honest case is not
+#: told something untrue: a user who reused their password would otherwise read
+#: "the current password is not correct" about a password that was.
+CREDENTIAL_REFUSAL = (
+    "The current password is not correct, or the new password is the same as "
+    "the current one."
+)
+
+#: Shown when the row read under the lock is gone or inactive. The acting
+#: session is ended in that branch, so this is the last thing that browser is
+#: told.
+INACTIVE_REFUSAL = "Your account is no longer active. Sign in again."
+
+SUCCESS_MESSAGE = (
+    "Your password has been changed. Your other browsers have been signed out."
+)
+
+
+def _require_account_route() -> None:
+    """404 both methods in single-user mode (D23).
+
+    There is no `users` row and no local password there — the panel's identity
+    is the sentinel and the credential is Traefik's OAuth chain — so the page's
+    only content would be a form that cannot exist, and the sidebar entry is
+    already gated on `multi_user_mode`. One rule for both methods is also one
+    thing to test. Not a 403: a route that cannot do anything here should not
+    advertise that it exists elsewhere.
+    """
+    if not settings.multi_user_mode:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+
+
+def _password_refusal_reason(new: str, confirm: str) -> str:
+    """The catalogue `reason` for a `validate_new_password` message (D19).
+
+    Called **only** when the validator has already refused, and it mirrors that
+    function's order of checks — mismatch, then NUL, then length — so the two
+    cannot disagree about which rule fired. The reason is for the log; the
+    message the user sees is the validator's own, always.
+    """
+    if new != confirm:
+        return "mismatch"
+    if "\x00" in new:
+        return "nul_byte"
+    return "too_short"
+
+
+def _end_acting_session(request: Request) -> None:
+    """Drop the session cookie's contents, best effort.
+
+    Used on the two paths where this browser must not stay signed in: the row
+    read under the lock is gone or inactive, and the post-change re-issue that
+    did not produce a session. The row behind the cookie is already revoked (or
+    was never valid), so the validator would refuse the next request anyway —
+    clearing is what makes the sign-out immediate rather than one request late.
+
+    Swallows the absent-`SessionMiddleware` case for `flash`'s reason: a
+    completed decision must never become a 500 over its own bookkeeping.
+    """
+    try:
+        request.session.clear()
+    except (AssertionError, AttributeError):  # pragma: no cover - defensive
+        pass
+
+
+def _refuse_password_change(
+    request: Request,
+    message: str,
+    *,
+    reason: str,
+    user_id: int | None,
+) -> RedirectResponse:
+    """Record the refusal, flash it, and 303 back to the account page.
+
+    Every refusal that reaches the handler has this one shape (#138): the text
+    travels in the session, the redirect target is bare, and nothing is
+    written. The exception is the rate-limited request, which never arrives
+    here at all — slowapi answers it with the application-wide handler's JSON
+    429, deliberately (D25).
+    """
+    security_events.emit(
+        "panel_password_change_refused",
+        subject=security_events.subject_for(user_id=user_id, request=request),
+        reason=reason,
+        user_id=user_id,
+        client_ip=security_events.client_ip(request),
+        route=_request_route(request),
+    )
+    flash(request, message, ERR)
+    return RedirectResponse(ACCOUNT_PATH, status_code=303)
+
+
+@router.get("/account", response_class=HTMLResponse)
+async def account_page(
+    request: Request,
+    user=Depends(require_user_panel),
+):
+    """The signed-in user's own account page: who they are, and the form."""
+    _require_account_route()
+    return templates.TemplateResponse(request, "account.html", _panel_context(request, user, {
+        "active": "account",
+        "min_password_length": MIN_PASSWORD_LENGTH,
+    }))
+
+
+@router.post("/account/password")
+@limiter.limit("5/minute", key_func=session_user_key)
+@limiter.limit("5/minute", key_func=get_remote_address)
+async def change_password(
+    request: Request,
+    current_password: str = Form(...),
+    new_password: str = Form(...),
+    new_password_confirm: str = Form(...),
+    session: AsyncSession = Depends(get_session),
+    user=Depends(require_user_panel),
+):
+    """Change the acting user's own password (#197).
+
+    **Two independent throttles, not one composite key (D11).** An
+    account-keyed limit bounds guessing against one account no matter how many
+    addresses the attacker rotates through; an address-keyed limit bounds one
+    address walking many accounts. A single `(ip, user)` key does neither: it
+    hands out a fresh allowance per address. Successes count too, so the
+    allowance cannot be drained by guessing. A request either limit rejects
+    never reaches this function.
+
+    **One transaction, under the account guard, against a re-read row (D12).**
+    The `User` a dependency loaded is not evidence: between that read and this
+    write an administrator's reset or deactivation can commit, and verifying
+    the submitted current password against the stale hash would overwrite the
+    administrator's new one — restoring access they had just removed. So the
+    handler takes the *same* advisory key the administrative handlers take (two
+    different keys do not exclude each other), re-reads `FOR UPDATE` with
+    `populate_existing=True` — without which SQLAlchemy hands back the loaded
+    object's pre-lock attribute values and the re-read proves nothing — and
+    re-checks `is_active` before it verifies anything.
+
+    **Then revoke everything and re-mint (D13).** The new hash, `session_version
+    + 1` and a revocation of *every* session row of that user go in that same
+    transaction; the commit releases the lock. Only then does `start_session`
+    run, in its own guarded transaction, and re-check the account — the guard
+    is released between the two and an administrator can deactivate in exactly
+    that gap. Net effect for the user: other devices signed out, this one not,
+    under a new session identifier. The password change is the durable half; a
+    re-issue that fails leaves the new password in force and signs this browser
+    out rather than rolling anything back.
+    """
+    _require_account_route()
+
+    actor_id = getattr(user, "id", None)
+
+    message = validate_new_password(new_password, new_password_confirm)
+    if message is not None:
+        return _refuse_password_change(
+            request,
+            message,
+            reason=_password_refusal_reason(new_password, new_password_confirm),
+            user_id=actor_id,
+        )
+
+    # ── The critical section. Nothing commits between the lock and the write.
+    await lock_account_guard(session)
+    locked = await session.execute(
+        select(User)
+        .where(User.id == actor_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    fresh = locked.scalar_one_or_none()
+
+    if fresh is None or fresh.is_active is not True:
+        # Deactivated or deleted while this request queued for the guard —
+        # which is precisely the window the guard creates. Release it, write
+        # nothing, and end the session this browser is holding.
+        await session.rollback()
+        _end_acting_session(request)
+        return _refuse_password_change(
+            request,
+            INACTIVE_REFUSAL,
+            reason="account_inactive",
+            user_id=actor_id,
+        )
+
+    if not verify_password(current_password, fresh.password_hash, user_id=fresh.id):
+        await session.rollback()
+        return _refuse_password_change(
+            request,
+            CREDENTIAL_REFUSAL,
+            reason="wrong_current_password",
+            user_id=fresh.id,
+        )
+
+    if verify_password(new_password, fresh.password_hash, user_id=fresh.id):
+        # Re-setting the current password would revoke every session and rotate
+        # the identifier for no change at all, and the constant message is what
+        # keeps the refusal from confirming a guess.
+        await session.rollback()
+        return _refuse_password_change(
+            request,
+            CREDENTIAL_REFUSAL,
+            reason="same_as_current",
+            user_id=fresh.id,
+        )
+
+    fresh.password_hash = hash_password(new_password)
+    # The account-wide switch moves too (D2/D13): a cookie that somehow escapes
+    # the registry check still fails the version check.
+    fresh.session_version = (fresh.session_version or 0) + 1
+    revoked = await revoke_user_sessions(session, fresh.id)
+    await session.commit()
+    # ── Lock released. Everything below is after the fact.
+
+    changed_user_id = fresh.id
+    changed_username = fresh.username
+
+    security_events.emit(
+        "panel_sessions_revoked",
+        subject=security_events.subject_for(user_id=changed_user_id, request=request),
+        reason="password_change",
+        user_id=changed_user_id,
+        count=revoked,
+    )
+    security_events.emit(
+        "panel_password_changed",
+        subject=security_events.subject_for(user_id=changed_user_id, request=request),
+        user_id=changed_user_id,
+        username=changed_username,
+        client_ip=security_events.client_ip(request),
+        route=_request_route(request),
+    )
+
+    try:
+        sid = await start_session(request, session, changed_user_id)
+    except Exception as exc:  # noqa: BLE001 - the change is already durable
+        # Through the catalogue rather than a bare `logger.error`: a caller
+        # drives this path, so the record passes the same allowance check every
+        # other caller-triggerable refusal does. Only the class name, never the
+        # exception's text — a SQLAlchemy error renders the failing statement
+        # *and* its bound parameters, one of which here is a stored session
+        # hash (D8's reasoning).
+        security_events.emit(
+            "panel_session_reissue_failed",
+            level=logging.ERROR,
+            subject=security_events.subject_for(
+                user_id=changed_user_id, request=request
+            ),
+            reason="password_change",
+            user_id=changed_user_id,
+            error_type=type(exc).__name__,
+            route=_request_route(request),
+            client_ip=security_events.client_ip(request),
+        )
+        sid = None
+
+    if sid is None:
+        # Refused (the account was deactivated in the gap between the two
+        # transactions) or raised. The change stands — it is the durable half —
+        # and this browser is signed out rather than left holding a cookie
+        # whose row is revoked. No flash: nothing will render it.
+        _end_acting_session(request)
+        return RedirectResponse(ACCOUNT_PATH, status_code=303)
+
+    # **After** the mint, never before: `start_session` clears the cookie
+    # before writing the new session into it, so a message flashed earlier
+    # would be thrown away with it.
+    flash(request, SUCCESS_MESSAGE)
+    return RedirectResponse(ACCOUNT_PATH, status_code=303)
 
 
 # --- Dashboard ------------------------------------------------------------
