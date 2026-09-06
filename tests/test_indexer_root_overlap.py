@@ -550,9 +550,22 @@ def _load_rebuild_script():
     return module
 
 
-async def test_e5_the_script_publishes_before_its_loop_and_skips_the_quarantined(
-    monkeypatch, capsys, unpublished_vault_root_snapshot
+async def test_e5_the_script_publishes_before_it_reads_a_root(
+    monkeypatch, unpublished_vault_root_snapshot
 ):
+    """Detection first, and a quarantined scope stops the whole rebuild.
+
+    The publish-before-any-read half is E5's and unchanged. The *disposition*
+    of a quarantined scope is not a per-user skip any more (#206): this command
+    records a keyword fingerprint asserting that **every retained row** was
+    rebuilt under the current `FTS_CONFIGS`, and that is not a claim that can
+    be made one tenant at a time. A quarantined owner's rows keep their
+    previous-configuration vectors, so continuing past them and recording the
+    fingerprint would certify exactly the rows that were not rebuilt — and the
+    startup guard, which now fails closed on that fingerprint, would pass while
+    keyword search stayed as wrong as before. So the scope aborts the operation,
+    names itself, and nothing is committed.
+    """
     script = _load_rebuild_script()
     order: list[str] = []
 
@@ -563,31 +576,43 @@ async def test_e5_the_script_publishes_before_its_loop_and_skips_the_quarantined
     async def _noop_validate(_session):
         order.append("validate")
 
-    async def _users():
-        return [1, 2]
-
-    async def _rebuild(session, user_id=None):
-        indexer._refuse_quarantined_pass(user_id, "tsvector rebuild")
-        order.append(f"rebuild:{user_id}")
-        return 7
+    async def _driver(session):
+        order.append("driver")
+        # The driver's own per-scope guard, reached before any row is read for
+        # that scope; the real one turns it into a non-completed outcome.
+        indexer._refuse_quarantined_pass(1, "tsvector rebuild")
+        raise AssertionError("the driver read a quarantined scope")
 
     async def _dispose():
         return None
 
     monkeypatch.setattr(script, "detect_and_publish", _detect)
     monkeypatch.setattr(script, "validate_fts_configs", _noop_validate)
-    monkeypatch.setattr(script, "_active_user_ids", _users)
-    monkeypatch.setattr(script, "rebuild_tsvectors", _rebuild)
+    monkeypatch.setattr(script, "rebuild_tsvectors_all_scopes", _driver)
     monkeypatch.setattr(script, "async_session", lambda: _FakeSession([]))
     monkeypatch.setattr(script, "engine", type("E", (), {"dispose": staticmethod(_dispose)}))
     monkeypatch.setattr(script.settings, "multi_user_mode", True, raising=False)
 
-    await script.main()
+    with pytest.raises(indexer.VaultRootQuarantined):
+        await script.main()
 
     assert order[0] == "detect", "the script publishes before it reads any root"
-    assert "rebuild:1" not in order, "a quarantined user's vectors are not rebuilt"
-    assert "rebuild:2" in order, "an unrelated tenant is rebuilt as before"
-    assert "Skipped" in capsys.readouterr().err
+
+
+async def test_e5_a_quarantined_scope_blocks_the_fingerprint(
+    monkeypatch, unpublished_vault_root_snapshot
+):
+    """The driver's own disposition, at the unit the coverage proof is made in.
+
+    A quarantined scope is a **skip**, so it is not a completed rebuild, so the
+    driver aborts and records nothing — the same shape as an unsettled
+    provenance or an unpinnable root.
+    """
+    _quarantine(_entry(4))
+    outcome = await indexer._rebuild_scope(object(), 4)
+    assert not outcome.completed
+    assert outcome.skip is indexer.RebuildSkip.ROOT_QUARANTINED
+    assert "4" in outcome.describe()
 
 
 async def test_e5_a_failed_detection_aborts_the_script(

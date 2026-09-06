@@ -35,15 +35,35 @@ os.chdir(tempfile.gettempdir())
 from sqlalchemy.sql.elements import TextClause  # noqa: E402
 
 import src.services.indexer as indexer  # noqa: E402
+from src.services.embeddings import (  # noqa: E402
+    EmbedNoteResult,
+    NoteEmbedOutcome,
+)
+
+
+def _embedded(chunks: int = 1) -> EmbedNoteResult:
+    """What a healthy `embed_note` now returns.
+
+    It used to return a bare chunk count, and `0` meant three unrelated things
+    at once (#201). The fakes here return the typed result so this module keeps
+    asserting about the pause flag rather than about the return shape.
+    """
+    return EmbedNoteResult(
+        outcome=NoteEmbedOutcome.EMBEDDED,
+        chunks_submitted=chunks,
+        chunks_embedded=chunks,
+        truncated=False,
+    )
 
 
 class _Row:
     """Mimics one row from the unembedded SELECT."""
 
-    def __init__(self, id, file_path, content_hash):
+    def __init__(self, id, file_path, content_hash, chunks_truncated=False):
         self.id = id
         self.file_path = file_path
         self.content_hash = content_hash
+        self.chunks_truncated = chunks_truncated
 
 
 class _FakeResult:
@@ -58,7 +78,15 @@ class _FakeResult:
         return self._rows
 
     def scalar(self):
+        # Also answers the pass's `to_regclass('indexer_state')` probe. `0` is
+        # not `None`, so the fingerprint read below is reached and answers
+        # *absent*, which proceeds.
         return 0
+
+    def scalar_one_or_none(self):
+        # `get_state`: no stored embedding fingerprint, which is the state
+        # startup adopts and this stage proceeds through.
+        return None
 
     def scalar_one(self):
         # Returned for the per-note `select(NoteMetadata)` lookup. Any object
@@ -133,7 +161,7 @@ async def test_embed_vault_breaks_when_paused_before_loop(monkeypatch, tmp_path)
 
     async def _fake_embed_note(session, note, content, **kwargs):
         embedded.append(note)
-        return 1
+        return _embedded()
 
     monkeypatch.setattr(indexer, "embed_note", _fake_embed_note)
     # Paused for the entire pass.
@@ -165,7 +193,7 @@ async def test_embed_vault_stops_early_when_pause_flips_mid_pass(monkeypatch, tm
         embedded.append(note)
         # After the first note is embedded, simulate a panel-driven pause.
         paused["value"] = True
-        return 1
+        return _embedded()
 
     monkeypatch.setattr(indexer, "embed_note", _fake_embed_note)
     monkeypatch.setattr(indexer, "_is_paused", lambda: paused["value"])

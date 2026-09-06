@@ -31,6 +31,7 @@ from src.auth.session import (
     current_user_id,
 )
 from src.config import (
+    MAX_CHUNKS_PER_NOTE,
     MAX_LINKS_PER_NOTE,
     MAX_MOVE_REWRITE_BYTES,
     MAX_NOTE_BYTES,
@@ -413,6 +414,108 @@ _ANCHOR_LOST_AT_PUBLISH_MARKER = "vault_anchor_lost_at_publish"
 # not reached it, which resolves itself and is a fact about the indexer.
 _RELATED_SOURCE_NOT_FOUND_MARKER = "related_source_not_found"
 _RELATED_SOURCE_NOT_EMBEDDED_MARKER = "related_source_not_embedded"
+
+
+# ── The vector tools' declared degradations (#200, #202) ────────────────────
+#
+# Both vector paths used to render the stored `chunk_text` with no
+# `embedded_content_hash` predicate, so during a provider outage an agent was
+# handed **superseded note text** as a current result with nothing marking it.
+# Every other field on that row — path, title, tags — had been refreshed by the
+# scan; only the chunk text was out of date, and only the chunk text is
+# quotable as the note's content.
+#
+# The render is `get_links_impl`'s idiom, and the three properties are the same
+# three: the count is on the header **always, including zero** (an absent token
+# is not evidence of absence — a caller cannot otherwise tell "nothing here is
+# stale" from a build that does not report staleness); the per-row marker is
+# rendered only when it is *true* (`stale: false` on fifteen of fifteen rows is
+# noise, not information, and the header count is the always-present signal);
+# and a trailing bold block states the consequence in words rather than leaving
+# the caller to infer it from a flag.
+_STALE_PREVIEW_NOTICE = (
+    "(preview withheld — this note changed after it was embedded, so the "
+    "stored excerpt is superseded text. Call `read_note` for the current "
+    "content.)"
+)
+
+
+def _degradation_suffix(stale: bool, truncated: bool) -> str:
+    """The per-row markers, in `get_links`'s `— key: true` shape.
+
+    Only the true ones are rendered. A row can carry both: a capped note whose
+    head was embedded before its last edit is stale *and* truncated, and those
+    are independent facts with different remedies — `read_note` repairs the
+    first for this call, and nothing repairs the second short of the note
+    getting shorter.
+    """
+    parts = []
+    if stale:
+        parts.append(" — stale: true")
+    if truncated:
+        parts.append(" — embedding_truncated: true")
+    return "".join(parts)
+
+
+def _stale_source_line(path: str) -> str:
+    """`find_related`'s one extra fact, which no per-row marker can express.
+
+    The query vector is the mean of the *source's* stored chunk vectors, so a
+    stale source means every neighbour answers a question about content that
+    note no longer has. Distinct from `related_source_not_embedded`, which
+    keeps its own message: a source with no vectors at all is a different fact
+    with a different fix, and collapsing them would send a caller to the wrong
+    remedy.
+    """
+    # Worded so it reads correctly on **both** return paths, because it is
+    # emitted on both: "these neighbours were computed from…" is nonsense above
+    # an empty list, and the empty list is where this line does the most work.
+    return (
+        f"**`{path}` changed after it was embedded**, so this search ran "
+        "against the vector of its previous content and answers a superseded "
+        "question. The next embed pass repairs this on its own."
+    )
+
+
+def _degradation_footer(stale_count: int, truncated_count: int) -> list[str]:
+    """The trailing block, one paragraph per degradation that occurred.
+
+    Says what was withheld and what is still trustworthy, because the row
+    itself is not being retracted: a stale note is still *found*, still ranked
+    and still named, and its path and title were refreshed by the scan. That is
+    the whole trade — a silently wrong answer becomes a visibly degraded one
+    whose remedy is one call away.
+    """
+    out: list[str] = []
+    if stale_count == 1:
+        out.append(
+            "\n**One of these notes changed after it was embedded.** Its "
+            "preview is withheld and its ranking reflects its previous "
+            "content; its path and title are current. Read it with `read_note`."
+        )
+    elif stale_count:
+        out.append(
+            f"\n**{stale_count} of these notes changed after they were "
+            "embedded.** Their previews are withheld and their ranking "
+            "reflects their previous content; their paths and titles are "
+            "current. Read them with `read_note`."
+        )
+    if truncated_count == 1:
+        out.append(
+            "\n**One of these notes was embedded only up to the first "
+            f"{MAX_CHUNKS_PER_NOTE} chunks.** A match against it is a match "
+            "against its head — its tail is not reachable by semantic search "
+            "at all, though `keyword_search` still covers the whole note."
+        )
+    elif truncated_count:
+        out.append(
+            f"\n**{truncated_count} of these notes were embedded only up to "
+            f"the first {MAX_CHUNKS_PER_NOTE} chunks.** A match against one of "
+            "them is a match against its head — its tail is not reachable by "
+            "semantic search at all, though `keyword_search` still covers the "
+            "whole note."
+        )
+    return out
 
 # The write gate's marker (#192). `_require_write` records it at its single
 # definition, so all nine gated call sites inherit it without being touched —
@@ -1442,7 +1545,15 @@ async def semantic_search_impl(
     tags: list[str] | None = None,
     frontmatter: dict | None = None,
 ) -> str:
-    """Vector similarity search over the configured embedding provider's vectors."""
+    """Vector similarity search over the configured embedding provider's vectors.
+
+    Reports `stale: true` for a note whose stored vectors predate its indexed
+    content, and **withholds that row's preview** rather than quoting text the
+    note no longer has (#200); `embedding_truncated: true` for a note the
+    indexer capped at `MAX_CHUNKS_PER_NOTE` chunks (#202). Both counts are on
+    the header line whether or not they are zero, for the reason
+    `get_links`'s `truncated` is: an absent token is not evidence of absence.
+    """
     limit = _clamp_limit(limit, _MAX_SEMANTIC_RESULTS)
     uid = current_user_id.get()
     async with async_session() as session:
@@ -1457,11 +1568,30 @@ async def semantic_search_impl(
         )
     if not results:
         return f"No semantic results for '{query}' (embeddings may still be building)"
-    lines = [f"Found {len(results)} semantic matches for '{query}':\n"]
+    stale_count = sum(1 for r in results if r["stale"])
+    truncated_count = sum(1 for r in results if r["embedding_truncated"])
+    lines = [
+        f"Found {len(results)} semantic matches for '{query}' — "
+        f"{stale_count} stale, {truncated_count} truncated:\n"
+    ]
     for r in results:
         tags_str = f" [{', '.join(r['tags'])}]" if r.get("tags") else ""
-        lines.append(f"- **{r['title']}** (`{r['path']}`){tags_str} — similarity: {r['similarity']:.3f}")
-        lines.append(f"  > {r['chunk'][:200]}...")
+        lines.append(
+            f"- **{r['title']}** (`{r['path']}`){tags_str} — "
+            f"similarity: {r['similarity']:.3f}"
+            f"{_degradation_suffix(r['stale'], r['embedding_truncated'])}"
+        )
+        # `chunk` is `None` for a stale row — the service withholds it there,
+        # so no caller can obtain the superseded text at all. The substitute is
+        # a notice and **never the note's current leading text**: that is a
+        # different span from the one that matched, presented where the
+        # matching span goes, which is a fabricated excerpt and worse than
+        # none.
+        if r["chunk"] is None:
+            lines.append(f"  > {_STALE_PREVIEW_NOTICE}")
+        else:
+            lines.append(f"  > {r['chunk'][:200]}...")
+    lines.extend(_degradation_footer(stale_count, truncated_count))
     return "\n".join(lines)
 
 
@@ -2209,6 +2339,12 @@ def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int |
     `tests/integration/test_search_recall.py` can EXPLAIN and re-run *this*
     statement rather than a hand-copied lookalike — a benchmark that measures a
     query production does not issue measures nothing.
+
+    The three metadata columns the degradation markers read (#200, #202) are
+    **projected, never filtered on**: they are scalar columns of a table the
+    statement already joins, so they change no plan and the benchmark's EXPLAIN
+    assertions hold unchanged. A staleness predicate was rejected outright —
+    see `semantic_search`.
     """
     from sqlalchemy import select
     from src.models.db import NoteEmbedding, NoteMetadata
@@ -2224,6 +2360,9 @@ def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int |
             NoteMetadata.file_path,
             NoteMetadata.title,
             NoteMetadata.tags,
+            NoteMetadata.content_hash,
+            NoteMetadata.embedded_content_hash,
+            NoteMetadata.chunks_truncated,
             distance.label("distance"),
         )
         .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
@@ -2239,7 +2378,15 @@ def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int |
 
 @_tracked("find_related", ["path", "limit"])
 async def find_related_impl(path: str, limit: int = 10) -> str:
-    """Semantic neighbors via averaged chunk embeddings."""
+    """Semantic neighbors via averaged chunk embeddings.
+
+    Carries `semantic_search`'s per-row `stale` / `embedding_truncated`
+    markers, and one more that only this tool can have: **the source note can
+    itself be stale**, in which case the averaged query vector describes the
+    source's *previous* content and every neighbour answers a superseded
+    question. No per-row flag can express that, so it is stated once, on every
+    return path where the source row was loaded — the empty one included.
+    """
     import numpy as np
     from sqlalchemy import select
     from src.models.db import NoteEmbedding, NoteMetadata
@@ -2273,6 +2420,12 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
             timing.record("error", _RELATED_SOURCE_NOT_FOUND_MARKER)
             timing.record_results(())
             return f"Note not found: {path}"
+
+        # `IS DISTINCT FROM`, so a NULL `embedded_content_hash` is stale rather
+        # than NULL-propagating into "fresh" — Python's `!=` against `None` is
+        # already that operator. Computed here, from the row every return path
+        # below has in hand, so no path can quietly omit it.
+        source_stale = source.embedded_content_hash != source.content_hash
 
         chunks = (await session.execute(
             select(NoteEmbedding.embedding).where(NoteEmbedding.note_id == source.id)
@@ -2338,7 +2491,16 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         # near it. No marker — this is precisely the row the zero-result view
         # is built to count.
         timing.record_results(())
-        return f"No related notes for `{path}`"
+        # **The empty result is where the stale-source line matters most.** A
+        # bare "no related notes" from a stale source is the reading a caller
+        # acts on — that the note has no neighbours — when the truth is that
+        # the vector searched with describes content the note no longer has.
+        # A first draft put this line only above a non-empty list, which loses
+        # it exactly where it explains the most.
+        empty = [f"No related notes for `{path}`"]
+        if source_stale:
+            empty.append(_stale_source_line(path))
+        return "\n".join(empty)
 
     # Dedupe by note_id, keeping the nearest chunk — ranked by the *same*
     # cosine distance the database ordered by, never by a distance recomputed
@@ -2352,26 +2514,50 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         dist = float(r.distance)
         prev = best.get(r.note_id)
         if prev is None or dist < prev["distance"]:
+            stale = r.embedded_content_hash != r.content_hash
             best[r.note_id] = {
                 "path": r.file_path,
                 "title": r.title,
                 "tags": r.tags,
                 "distance": dist,
-                "chunk": r.chunk_text,
+                # Withheld for a stale row, exactly as `semantic_search` does
+                # it: the chunk is the one field that is a verbatim quotation
+                # of the note's text and the one a caller reproduces in an
+                # answer. Both vector tools must behave the same way, or the
+                # remedy depends on which tool the caller happened to reach
+                # for.
+                "chunk": None if stale else r.chunk_text,
+                "stale": stale,
+                # From the durable column, never inferred from the number of
+                # chunk rows: a capped note holds exactly the cap.
+                "embedding_truncated": bool(r.chunks_truncated),
             }
 
     ranked = sorted(best.values(), key=lambda x: x["distance"])[:limit]
     # After the dedupe and the truncation to `limit`: the telemetry names what
     # the caller was handed, not what the overfetch scanned.
     timing.record_results(r["path"] for r in ranked)
-    lines = [f"Top {len(ranked)} related notes for `{path}`:\n"]
+    stale_count = sum(1 for r in ranked if r["stale"])
+    truncated_count = sum(1 for r in ranked if r["embedding_truncated"])
+    lines = [
+        f"Top {len(ranked)} related notes for `{path}` — "
+        f"{stale_count} stale, {truncated_count} truncated:\n"
+    ]
+    if source_stale:
+        lines.append(_stale_source_line(path) + "\n")
     for r in ranked:
         tags_str = f" [{', '.join(r['tags'])}]" if r["tags"] else ""
-        snippet = r["chunk"].replace("\n", " ")[:200]
         lines.append(
-            f"- **{r['title']}** (`{r['path']}`){tags_str} — sim: {1 - r['distance']:.3f}"
+            f"- **{r['title']}** (`{r['path']}`){tags_str} — "
+            f"sim: {1 - r['distance']:.3f}"
+            f"{_degradation_suffix(r['stale'], r['embedding_truncated'])}"
         )
-        lines.append(f"  > {snippet}…")
+        if r["chunk"] is None:
+            lines.append(f"  > {_STALE_PREVIEW_NOTICE}")
+        else:
+            snippet = r["chunk"].replace("\n", " ")[:200]
+            lines.append(f"  > {snippet}…")
+    lines.extend(_degradation_footer(stale_count, truncated_count))
     return "\n".join(lines)
 
 

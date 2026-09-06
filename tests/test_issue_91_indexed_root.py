@@ -38,6 +38,7 @@ from sqlalchemy.sql.elements import TextClause
 from sqlalchemy.sql.selectable import Select
 
 from src.services import embeddings, indexer, transfer
+from src.services.embeddings import EmbedNoteResult, NoteEmbedOutcome
 
 
 # ── the recording fake session ─────────────────────────────────────────────
@@ -65,6 +66,21 @@ class _LockNotAvailable(Exception):
         self.orig = dialect_level
 
 
+def _embedded(chunks: int = 1):
+    """What a healthy `embed_note` returns now that it is typed (#201).
+
+    It used to return a bare chunk count and `0` meant three unrelated things
+    at once; the fakes here return the typed result so these modules keep
+    asserting about roots, hashes and certification rather than about a shape.
+    """
+    return EmbedNoteResult(
+        outcome=NoteEmbedOutcome.EMBEDDED,
+        chunks_submitted=chunks,
+        chunks_embedded=chunks,
+        truncated=False,
+    )
+
+
 class _Result:
     def __init__(self, rows=(), rowcount=0):
         self.rows = list(rows)
@@ -80,6 +96,13 @@ class _Result:
         return self.rows[0] if self.rows else None
 
     def scalar(self):
+        return self.rows[0] if self.rows else None
+
+    def scalar_one_or_none(self):
+        # `get_state`, reading a fingerprint out of `indexer_state`. `None` is
+        # **absent**, the state startup adopts — so the generation interlock
+        # inside `embed_note` and the pass's keyword re-validation both proceed
+        # and these fixtures stay about roots and hashes.
         return self.rows[0] if self.rows else None
 
 
@@ -1871,7 +1894,7 @@ async def test_embed_vault_refuses_to_certify_content_it_did_not_read(
 
     async def fake_embed_note(session, note, content, **kwargs):
         embedded.append((note.file_path, kwargs.get("certified_hash")))
-        return 1
+        return _embedded()
 
     monkeypatch.setattr(indexer, "embed_note", fake_embed_note)
 
@@ -2006,7 +2029,7 @@ async def test_embed_vault_applies_no_provenance_gate_at_all(monkeypatch, tmp_pa
 
     async def fake_embed_note(session, note, content, **kwargs):
         embedded.append((note.file_path, kwargs.get("certified_hash")))
-        return 1
+        return _embedded()
 
     monkeypatch.setattr(indexer, "embed_note", fake_embed_note)
 
@@ -2200,7 +2223,7 @@ async def test_one_unreadable_note_does_not_freeze_a_readable_notes_vectors(
 
     async def fake_embed_note(session, note, content, **kwargs):
         embedded.append(note.file_path)
-        return 1
+        return _embedded()
 
     monkeypatch.setattr(indexer, "embed_note", fake_embed_note)
 
