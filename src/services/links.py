@@ -28,7 +28,7 @@ class ExtractedLink:
     target: str  # target string with alias and anchor stripped
     link_text: str  # full original text (e.g. "[[Foo|Bar]]")
     kind: str  # "link" | "embed" | "markdown"
-    position: int  # byte offset in the (un-stripped) source
+    position: int  # code-point offset in the (un-stripped) source
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -716,6 +716,12 @@ def extract_links_bounded(
     overflowed = False
 
     for m in _WIKILINK_RE.finditer(masked):
+        # Compare the raw deciding span BEFORE strip/cap accounting (#218).
+        # Masking `x` in [[`x`Old]] must not invent a link to Old; changes
+        # confined to the alias or anchor do not decide the target.
+        start, end = m.span("target")
+        if content[start:end] != masked[start:end]:
+            continue
         target = m.group("target").strip()
         if not target:
             continue
@@ -731,6 +737,12 @@ def extract_links_bounded(
         ))
 
     for link in scan_md_links(masked):
+        # href_start excludes angle brackets and uses the same code-point
+        # offsets as the original string. Labels and anchors stay outside
+        # this comparison; rejected candidates cannot cause truncation.
+        end = link.href_start + len(link.href)
+        if content[link.href_start:end] != link.href:
+            continue
         href = link.href.strip()
         if not href:
             continue

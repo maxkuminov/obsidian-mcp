@@ -219,6 +219,9 @@ _EXTRACTION_CLEANERS = {
     # re-embedded. Binding the same function is what makes that true by
     # construction rather than by inspection.
     2: clean_for_embedding,
+    # Version 3 only rejects mask-decided link targets (#218). Re-deriving
+    # their graph rows must preserve version-2 embedding certification.
+    3: clean_for_embedding,
 }
 
 

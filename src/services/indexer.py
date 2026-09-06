@@ -708,6 +708,9 @@ def _content_hash(content: str) -> str:
 # `_grammar_changed_the_embedding_text` therefore compares equal for every v1
 # row and **no note is re-embedded** on account of this bump. The pass
 # re-extracts links and tags for every note once and re-stamps the marker.
+# Version 3 rejects links whose deciding target/href was changed by code
+# masking (#218). It also shares the version-1/2 cleaner: unchanged bytes
+# need repaired link rows, but no embedding invalidation from this bump.
 #
 # Embedding invalidation is scoped, not blanket: the pass compares the text the
 # row's *stamped* version would have embedded against the text the current one
@@ -719,7 +722,7 @@ def _content_hash(content: str) -> str:
 # CLEARS, so it can never suppress an invalidation another rule mandates — a
 # content change, a `file_path` change, a provider change, exclusion
 # reconciliation.
-CURRENT_EXTRACTION_VERSION = 2
+CURRENT_EXTRACTION_VERSION = 3
 
 
 def _grammar_changed_the_embedding_text(stamped_version: int, body: str) -> bool:

@@ -1,6 +1,6 @@
 - [x] 1. Confirm #218 remains in current code and record scope.
-- [ ] 2. Independent proposal review before implementation.
-- [ ] 3. Reject mask-decided targets before cap accounting; bump extraction version with equivalent cleaner.
-- [ ] 4. Add regressions for rejection, valid labels/aliases/anchors, caps and unchanged-note re-derivation; update architecture notes.
+- [x] 2. Independent proposal review before implementation — PASS, no findings; cap-zero, Unicode/angle-href and real-PG coverage requested.
+- [x] 3. Reject mask-decided targets before cap accounting; bump extraction version with equivalent cleaner.
+- [x] 4. Add regressions for rejection, valid labels/aliases/anchors, caps and unchanged-note re-derivation; update architecture notes.
 - [ ] 5. Independent defensive implementation/spec review and relevant offline/integration validation.
 - [ ] 6. Record triage and validation; publish reviewable branch/PR.
