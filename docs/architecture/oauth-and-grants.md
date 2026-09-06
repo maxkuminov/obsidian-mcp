@@ -214,7 +214,110 @@ vanished from the page, so the operator saw a blank space that read as success.
   minted 30 days ago and revoked a minute ago would be purged at once. Once
   age-gated the revoked branch is a strict subset of the expiry branch, which
   is why the predicate is a single comparison rather than an `or_`.
+  **That argument is specific to tokens and does not transfer to the panel
+  session rows the same function purges** (#198): `user_sessions` *does* store
+  a revocation time, and an administrative reset revokes every unrevoked row of
+  a user including already-expired ones, so the session predicate takes the
+  later of `expires_at` and `revoked_at`. Do not unify the two — see
+  [control-panel.md](control-panel.md).
 
 ## The consent page preselect
 
 - **OAuth consent preselects "Read only" unconditionally — never bind `checked` to the requested scope.** On an HTML form the checked radio *is* the submitted value, so the preselect is the default grant, not a display detail. `/register` is unauthenticated and a DCR client that omits `scope` is registered `read readwrite offline_access`, so a requested-scope preselect lets one unchanged **Approve** click hand vault-wide write to any self-registered client (#63; #62 introduced exactly that and it was reverted). What #62 was right about is kept as *prose*: `authorize_get` passes `requested_write` (from the validated scope alone, ungated by the registered scope — display only) and `write_unavailable`, and the request box names the level asked for and says when the client cannot hold it. `_clamp_scope` in `authorize_post` is the enforcement boundary and is unrelated to any of this. The markup default is not enough on its own: Firefox restores a control's dynamic checked state across page loads in preference to it, so the form **and** every `name="scope"` radio carry `autocomplete="off"` — without them a user who once picked write gets that radio re-checked on a repeat visit to the same `/authorize` URL (clients reuse `state`/PKCE) and one Approve re-grants write after a revocation. The `.scope-option:has(:checked)` highlight lives in standalone rule blocks: a selector list is dropped wholesale when any part fails to parse, so grouping it would take the native-radio fallback down with it.
+
+## The consent card identifies the client (#183)
+
+`/register` is unauthenticated (RFC 7591), so **every** OAuth client on this
+server registered itself, and every string it supplied — its `client_name`
+above all — is attacker-chosen text. Before this, `authorize_get` passed that
+name and nothing else: no destination, no identifier, no registration date, no
+statement about what the server does and does not vouch for. A client calling
+itself "Claude" with a redirect to an attacker's host rendered a page
+indistinguishable from the real connector's, and `/authorize` sits behind
+`chain-oauth@file`, so the reachable victims are exactly the panel users who
+hold vaults. The card now carries an identity block, and
+`src/oauth/trust.py` is the single definition of the two values derived from
+the redirect URI.
+
+| Element | Source | Notes |
+| --- | --- | --- |
+| Application | `client.client_name` | client-supplied text, escaped, never `\|safe` |
+| **Destination** | `redirect_display_host(uri)` | host only — no scheme, path, port or userinfo. An unnameable host renders "Destination could not be determined" |
+| **Client ID** | `client.client_id` | server-generated hex, the one identifier the client did not choose |
+| **Registered** | `client.created_at`, date only | `getattr(..., None)` and "unknown" when absent: the column is server-defaulted, so a row constructed and not yet flushed carries `None` |
+| **Standing notice** | static | unconditional, on every render |
+| Badge or warning | `known_redirect_host(uri)` | exact host equality against `OAUTH_KNOWN_REDIRECT_HOSTS` |
+
+- **`hostname`, never `netloc`.**
+  `urlparse("https://claude.ai@evil.example/cb").netloc` is
+  `"claude.ai@evil.example"`, whose left edge reads as the brand while the code
+  goes to the right edge. `.hostname` strips userinfo and port and answers
+  `evil.example`. Rendering `netloc` would hand an attacker the entire
+  disclosure for the cost of one `@`.
+
+- **The host is displayed as ASCII and is never decoded back.** A non-ASCII
+  host is shown in its IDNA A-label (`xn--…`) form. A homograph host rendered
+  decoded — `аpple.com` with a Cyrillic `а` — is indistinguishable on screen
+  from the real one, which defeats the disclosure exactly as `netloc` does. So
+  the path converts *to* punycode and never converts back. `to_ascii_host`
+  uses the standard library's `idna` codec and answers `None` for an empty
+  label, an over-long one, or one that cannot be encoded at all; every raise
+  becomes the sentinel rather than an exception in a request handler.
+
+- **Registration now requires a resolvable ASCII host, and stores the converted
+  form.** `_valid_redirect_uri` used to check only `scheme == "https"`, a
+  truthy `netloc` and the absence of a fragment — and `urlparse("https://@/cb")`
+  has a `netloc` of `"@"`, truthy, while its `hostname` is empty. Such a row
+  registered happily and would render a consent card with **no destination at
+  all**. `_normalized_redirect_uri` therefore requires a non-empty host and a
+  successful IDNA conversion and stores the A-label form, which is also what
+  stops one host being registered in two spellings that render alike and
+  compare differently: a Unicode row and its punycode twin show the same text
+  while only one of them could ever match the allow-list. An **already-ASCII**
+  URI is returned byte-identical rather than reassembled — rebuilding an
+  authority is where an IPv6 literal loses its brackets and a percent-encoded
+  userinfo character is lost — so the reassembly runs only on the narrow
+  non-ASCII case, which cannot be an IPv6 literal. A registration naming two
+  spellings that normalise to one host is refused as a duplicate; refusals
+  reuse the existing `oauth_client_registration_refused` event with
+  `reason="invalid_redirect_uri"`, no new event and no new reason code. Rows
+  registered *before* this change may still carry an empty or non-ASCII host,
+  so the sentinel is a live runtime state rather than a defensive
+  impossibility: the template says the destination could not be determined and
+  always takes the warning branch, never the badge.
+
+- **The self-registration notice is unconditional.** Every render — badged or
+  not — says the application registered itself, that registration is open to
+  anyone, and that the displayed name was chosen by the application.
+  Suppressing it for a recognised destination would restore exactly the page
+  #183 was filed about, and an allow-listed *destination* still says nothing
+  about the application that reaches it.
+
+- **The badge is a statement about the destination, never "verified
+  application".** Nothing on this server verifies an application; the only
+  thing behind the badge is the operator's list of redirect hosts. A
+  non-allow-listed host gets the stronger branch, which names the host, states
+  that the authorization code for the vault is sent there, and advises Deny
+  unless the user began the flow from that application.
+
+- **Matching is exact host equality — a suffix test is the bug it looks like a
+  convenience.** `endswith("claude.ai")` matches `evilclaude.ai`,
+  `"claude.ai" in host` matches `claude.ai.evil.example`, and even
+  `endswith(".claude.ai")` hands the badge to any subdomain an attacker can
+  obtain, which neither real connector needs. So `known_redirect_host` is `==`
+  against a lower-cased configured entry, and `src/config.py` **rejects at
+  settings construction** an entry containing `*`, `/`, `@` or internal
+  whitespace: a pattern is a container that will not start rather than a badge
+  that silently never appears. Entries are stripped of outer whitespace (an
+  operator writing `claude.ai, chatgpt.com` means two hosts), lower-cased and
+  deduped; the field carries `NoDecode` for `fts_configs`' reason, because a
+  bare `list[str]` is JSON-decoded by pydantic-settings and the CSV form an
+  operator naturally writes would abort startup. **An empty list means
+  everything is unverified**, which is the safe direction: clearing the setting
+  produces warnings, never badges.
+
+- **`authorize_post` is unchanged, and that is what makes the card honest.** It
+  already re-validates the submitted `redirect_uri` against the client's
+  registered list before minting anything, so the destination shown on the GET
+  is the destination the code is delivered to. The read-only preselect below is
+  also untouched.

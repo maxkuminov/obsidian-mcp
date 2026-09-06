@@ -457,3 +457,269 @@
   and the wait for that lock is precisely the window in which another admin's
   demotion of *this* actor commits; serializing the writes is no use if the
   loser of the race then performs the mutation anyway.
+
+- **The guard's key now lives in `src/oauth/grants.py`, and its contention set
+  is wider than the two admin handlers** (#197, #198). `ACCOUNT_GUARD_LOCK_KEY`
+  and `lock_account_guard(session)` moved there because
+  `src/control_panel/users.py` imports `src/control_panel/routes.py` and the
+  reverse import is impossible, and `grants.py` is already this codebase's home
+  for advisory-lock primitives (`USER_BOOTSTRAP_LOCK_KEY`,
+  `lock_user_bootstrap`, `lock_grant`). `_lock_admin_guard` delegates to it
+  with the **value unchanged** — it is a wire constant, and two builds holding
+  different constants would not exclude each other for exactly the window of a
+  rolling deploy. Three more callers now take the same key: the self-service
+  password change, and **every session mint** through `start_session`. That is
+  deliberate rather than incidental: a mint that does not serialize against the
+  deactivating handlers can insert a live session row for an account an
+  administrator has just disabled. Lock order stays acyclic — these handlers
+  take the account guard and nothing else, the bootstrap takes
+  `USER_BOOTSTRAP_LOCK_KEY`, the OAuth paths take bootstrap-then-grant, and no
+  path takes two of them in opposing orders.
+
+## The panel session is a row, not just a cookie (#198)
+
+- **A signed cookie cannot be un-signed, which is why `logout` did not log
+  anyone out.** `logout()` called `request.session.clear()` and nothing else;
+  Starlette answers that with an expiring `Set-Cookie`, while the copy already
+  taken stays a correctly-signed credential until its itsdangerous timestamp
+  passes `session_max_age` — seven days. The verification on #198 replayed a
+  pre-logout cookie against the container's installed Starlette and got the
+  user back. This panel has **no CSP and will not get one** (see the top of
+  this note), so "an XSS steals the cookie" is a live path rather than a
+  theoretical one, and the panel that cookie reaches mints `readwrite` `omcp_`
+  keys and approves OAuth grants. The only thing that can be revoked is a row,
+  so `user_sessions` (migration 024) is the row and `src/auth/session.py` is
+  its single implementation.
+
+- **The table stores `sha256(sid)`, never `sid`.** The cookie carries a
+  `secrets.token_urlsafe(32)` identifier under `sid`; `hash_session_id` is the
+  one definition of the primary key derived from it. The identifier *is* a
+  bearer credential for seven days, and a `pg_dump` is taken before every
+  migration and kept thirty days — the invariant in
+  [schema-and-migrations.md](schema-and-migrations.md) is that a dump holds
+  hashes and no plaintext credential, and storing the identifier verbatim would
+  make every retained dump a file full of live panel sessions. The digest is
+  **unkeyed on purpose**: 256 bits of CSPRNG output has nothing to
+  brute-force, and an HMAC under `SECRET_KEY` would make the table unreadable
+  after a rotation an operator may need to perform.
+
+- **`session_version` stays beside the registry rather than being replaced by
+  it.** The registry is the per-session control; `users.session_version` is the
+  account-wide one, is already load-bearing for a shipped requirement
+  ("password reset invalidates consent session"), and is the one invalidator
+  that still works if a registry write is lost. Both have to pass.
+
+The lifecycle, in one table — one implementation per phase:
+
+| Phase | Trigger | What happens | Where |
+| --- | --- | --- | --- |
+| **Mint** | login; bootstrap registration; the re-issue after a password change | **under the account guard**: re-read the user `FOR UPDATE` with `populate_existing=True`, require it to exist and be active, insert a row keyed on `sha256(sid)` with `expires_at = now + session_max_age` and `user_agent_hash`, **commit**, and only then write `sid` into the signed cookie | `start_session()`, three callers |
+| **Validate** | every request that resolves a browser identity | the cookie must carry **both** `user_id` and `sid`; refused when the row is absent, revoked, expired, or `row.user_id` disagrees with the cookie's; then the existing user-exists / `is_active` / `session_version` checks. Every refusal clears the cookie | `get_active_session_user()`, reached from `require_user_panel`, `login_form`, `authorize_get`, `authorize_post` — the only four entry points |
+| **Touch** | a `GET`/`HEAD` whose row is more than `SESSION_TOUCH_INTERVAL_SECONDS` stale | `last_seen_at = now()` on the **request's own** session, committed in the dependency before the handler runs; skipped on every other method and on any failure | `touch_session()` |
+| **Revoke — one** | logout | `revoked_at` for that row, commit, cookie cleared | `logout` in `src/auth/routes.py` |
+| **Revoke — all** | self-service password change; admin password reset; deactivation through the user edit form; soft delete | `revoked_at` for every unrevoked row of that user, **in the caller's transaction**, under the account guard | `change_password`; `reset_password`, `edit_user_submit`, `delete_user` |
+| **Revoke — implicit** | permanent user delete | the database's `ON DELETE CASCADE` removes the rows; `User.sessions` declares `passive_deletes=True`, so that cascade is what fires rather than a per-row ORM delete | `delete_user` |
+| **Purge** | every indexer tick, in **both** modes | `expires_at < cutoff AND (revoked_at IS NULL OR revoked_at < cutoff)`, `cutoff = now() - SESSION_PURGE_RETAIN_DAYS` | `cleanup_expired_tokens()` |
+
+- **The mint commits and the revoke helpers do not; that asymmetry is the
+  contract.** `get_session` neither commits nor rolls back, so an insert left
+  to a caller's discretion is an insert that may never happen — and the cookie
+  handed to the browser beside it would authenticate nothing, which is a hard
+  logout loop on the very next request. Making `start_session` own its
+  transaction makes "the row exists before the cookie leaves" a property of one
+  function rather than of three call sites' discipline.
+  `revoke_session` / `revoke_user_sessions` are the opposite by the same
+  reasoning: every one of their callers holds the account guard, and the
+  documented rule for that critical section is that nothing may commit between
+  taking the lock and writing the flags it protects. A helper that committed
+  would silently break the last-admin guard from inside. Both carry
+  `AND revoked_at IS NULL`, so a second revocation does not rewrite a
+  historical revocation time, and both return the row count so a caller can
+  record it without a second query.
+
+- **The mint runs *inside* the guard, not after it.** A mint placed after its
+  caller's guard was released can be overtaken by an administrator's
+  deactivation and will then insert a **live row for a just-disabled account**.
+  Validation refuses that row while `is_active` is false, which hides it — and
+  the day the account is reactivated it becomes a working credential nobody
+  granted and nobody saw. `populate_existing=True` on the locked re-read is
+  load-bearing for the reason [oauth-and-grants.md](oauth-and-grants.md)
+  already records: a `SELECT … FOR UPDATE` whose row is in the session's
+  identity map hands back the loaded object's pre-lock attribute values, and
+  every caller arrives with that row already loaded. A refusal is not an error
+  a caller recovers from — the user is simply not signed in — so
+  `start_session` rolls back to release the guard and returns `None`. It also
+  `clear()`s the cookie before writing the new session into it, which is
+  session-fixation hygiene and means **a caller must flash after the mint,
+  never before**, or the message is thrown away with the old cookie.
+
+- **The touch never opens a second `AsyncSession`, and only ever runs on a safe
+  method.** A request holding two connection-pool leases halves a pool that
+  tops out at `pool_size + max_overflow` = fifteen; the sixteenth caller
+  anywhere in the process — an MCP tool call, `/token`, the indexer — waits
+  `pool_timeout` and then 500s, so a telemetry field must not be able to take
+  the server down. `GET`/`HEAD` only, and committed **inside the dependency
+  before the handler body runs**, closes a second failure: the `UPDATE` takes a
+  row lock on the actor's session row, and a mutating panel handler then waits
+  on the account-guard advisory lock, which an administrator may be holding
+  while revoking that same actor's sessions — A waits on the advisory lock, B
+  waits on A's row lock. Committing before any handler starts releases the row
+  lock before any advisory lock can be requested, and on a safe request there
+  is no partial handler work a commit could publish. Any failure rolls back,
+  logs a WARNING carrying the exception's class name, and serves the page:
+  `last_seen_at` is telemetry throttled to once a minute and nothing authorizes
+  on it.
+
+- **`user_agent_hash` is forensic and is never an authorization input.** It is
+  useful when reconstructing an incident. As a *binding* it is bad: whoever
+  stole the cookie also has the header, so it stops nobody, and enforcing it
+  signs real users out on every browser auto-update — training them to
+  re-authenticate after an unexplained logout, which is the habit phishing
+  depends on. The same argument rules out IP binding.
+
+- **`login_form` must resolve through `get_active_session_user`, never read
+  `request.session["user_id"]` raw.** That raw read was a fifth validation
+  entry point, and with a revoked cookie it is an infinite loop: the login page
+  saw a user id and redirected to `/admin/`, `require_user_panel` refused the
+  session and redirected back, and nobody holding a dead cookie could reach the
+  login page to fix it. "Four entry points, one implementation" is the property
+  worth re-checking after any change here; a fifth reader of the cookie is the
+  shape of this defect returning. (`src/csrf.py`'s nonce read is not an
+  identity decision and is not one of them.)
+
+- **A logout that cannot revoke still signs the browser out, and records a
+  class name only.** If the `UPDATE` or its commit raises, `logout` attempts a
+  rollback — **itself guarded**, because a failing rollback escaping would turn
+  the sign-out into a 500 — records an ERROR, and still clears the cookie and
+  redirects. Failing closed here would leave the user signed in *and* the
+  cookie alive, which is strictly worse than the state we are leaving: clearing
+  it removes this browser's copy, the common case of somebody walking away from
+  a shared machine, and the replay window then survives only for a copy already
+  taken, which is what the record is for. The record carries the exception's
+  **class name only** — never `str(exc)`, never `exc_info` — because SQLAlchemy
+  renders the failing statement *and its bound parameters* into the message,
+  the engine does not set `hide_parameters`, and one of those parameters on
+  this path is the stored session hash, i.e. the name of a specific live
+  session. Every event this surface emits is declared in the catalogue in
+  [security-event-logging.md](security-event-logging.md); where a session must
+  be named it is by `token_tag`, never by the identifier and never by its
+  stored SHA-256.
+
+- **Pre-registry cookies are refused, not grandfathered, and the first deploy
+  therefore signs everyone out once.** A correctly-signed cookie carrying
+  `user_id` and no `sid` is refused with `reason="no_session_id"`.
+  Grandfathering would keep #198's replay window open for a further seven days
+  after the fix shipped; the cost is one forced login per live session at the
+  deploy, and production has two users.
+
+- **The purge takes the *later* of `expires_at` and `revoked_at`, unlike the
+  OAuth half of the same function.** The OAuth argument — a token can only be
+  revoked while it exists, so `R <= expires_at` — does not transfer: an
+  administrative reset revokes every unrevoked row of a user *including
+  already-expired ones*, and such a row is immediately past its expiry, so an
+  expiry-only rule would delete the record of a revocation minutes after an
+  operator performed it. That is the #64 blank space in a new table. Both
+  windows are `ge=1` at settings construction, so a zero retention (which would
+  delete a revocation the moment it was made) or a zero touch interval (which
+  would turn a throttled hint into a write on every request) stops the
+  container instead of degrading it silently.
+
+- **Accepted, and stated rather than hidden:** revocation takes effect at the
+  *next* request and one already in flight completes (the posture OAuth
+  revocation already documents); `last_seen_at` may be up to a minute stale and
+  is never recorded for a session that only ever POSTs; and a stolen cookie
+  still works until logout, expiry or an account event — this change makes
+  those three effective, it does not detect theft.
+
+## The account page and the self-service password change (#197)
+
+- **A user can rotate their own password; the admin reset stays the recovery
+  path.** Before this, every route that wrote `password_hash` outside bootstrap
+  was on the admin router, so a non-admin who suspected their password was
+  compromised had to ask an administrator — who then knew the replacement.
+  `GET /admin/account` and `POST /admin/account/password` sit on the panel
+  router behind `require_user_panel`, **not** `require_admin_panel`, and take
+  the router-wide `verify_csrf`.
+
+- **Both methods 404 in single-user mode.** There is no `users` row and no
+  local password there — the panel's identity is the sentinel and the
+  credential is Traefik's OAuth chain — so the page's only content would be a
+  form that cannot exist, and the sidebar entry is already gated on
+  `multi_user_mode`. One rule for both methods (`_require_account_route`) is
+  also one thing to test. A 404 rather than a 403: a route that can do nothing
+  here should not advertise that it exists elsewhere.
+
+- **The handler verifies against a row it re-read under the guard, never
+  against the `User` a dependency loaded.** Between the dependency's read and
+  the write, an administrator's reset or deactivation can commit — and the
+  self-change would then overwrite the administrator's new hash with one
+  authorised by a stale verification, restoring access that had just been
+  removed. So: `lock_account_guard(session)`, a `SELECT … FOR UPDATE` with
+  **`execution_options(populate_existing=True)`** (without which SQLAlchemy
+  hands back the loaded object's pre-lock attribute values and the re-read
+  proves nothing), a re-check that the row exists and `is_active` is exactly
+  true, and only then `verify_password` against the **freshly read** hash.
+
+- **Success is one transaction and then a second, guarded one.** The new hash,
+  `session_version += 1` and `revoke_user_sessions(session, user.id)` —
+  **every** row of that user, this browser's included — commit together, which
+  releases the lock. Only then does `start_session` run, re-taking the guard
+  and re-checking the account, because the guard is released between the two
+  and an administrator can deactivate in exactly that gap. The user-visible
+  effect is the one asked for: other devices signed out, this one still signed
+  in under a new identifier. **The password change is the durable half.** A
+  re-issue that refuses or raises signs this browser out and is recorded; it
+  never rolls the change back.
+
+- **Two independent throttles, not one composite key.**
+  `@limiter.limit("5/minute", key_func=session_user_key)` **and**
+  `@limiter.limit("5/minute", key_func=get_remote_address)`, stacked. Neither
+  subsumes the other: an account-keyed limit bounds guessing against one
+  account however many addresses an attacker rotates through, an address-keyed
+  limit bounds one address walking many accounts, and a single `(ip, user)` key
+  does neither — it hands out a fresh allowance per address. Successes count
+  against both, so the allowance cannot be drained by guessing.
+  `session_user_key` must stay **synchronous** (slowapi computes the key before
+  the handler and cannot await, and reading the body there would consume the
+  stream the handler needs) and must degrade to `ANONYMOUS_SESSION_KEY` where
+  no `SessionMiddleware` is mounted, or a throttled route 500s for every
+  caller. The cookie's `user_id` is a bucket name, never an authorization
+  decision — the validator refuses the request a moment later if the row behind
+  it is dead. Both buckets are per-process, in slowapi's in-memory storage, and
+  reset on restart; one uvicorn worker makes that per-server today.
+
+- **The rate-limited request is the one deliberate exception to the
+  flash-and-303 rule.** Every refusal that reaches the handler flashes on the
+  session and redirects 303 to a bare `/admin/account`, never a query parameter
+  (#138). A request either limit rejects never reaches the handler at all:
+  slowapi's `RateLimitExceeded` is answered by the application-wide
+  `_rate_limit_exceeded_handler` with its own JSON 429, and **that response
+  stands**. Wrapping it would mean either duplicating the limiter's decision
+  inside the handler — where it is no longer a limit but a second, divergent
+  counter — or replacing a process-wide error handler for one route. The cost
+  is that the sixth attempt in a minute renders as JSON rather than as the
+  account page with a flash.
+
+- **One constant message for both credential refusals.** A wrong current
+  password and a new password that is already the current one answer with the
+  same `CREDENTIAL_REFUSAL` text, which names both possibilities. A message
+  that said *which* check failed would say something about the stored password;
+  one naming only the wrong-password case would tell an honest reuser something
+  untrue, since the reuse branch is reached *after* the current password
+  verified. The `reason` that separates them lives in the event record only.
+
+- **One password policy, one constant, four setters.** `MIN_PASSWORD_LENGTH =
+  12` and `validate_new_password(new, confirm=None)` live in
+  `src/auth/passwords.py`; the self-service handler, `register_submit`, the
+  administrator `reset_password` and the administrator `create_user` all route
+  through them — the last three were at 8, and `create_user` handed form input
+  straight to `hash_password`. Length is measured in **characters**, there are
+  no composition rules (they push people to `Password1!`), there is no maximum
+  and no forced rotation: nothing re-checks policy at login, so existing
+  accounts keep working and are never re-checked against the new minimum. The
+  validator also rejects an embedded **NUL**, which is not tidiness:
+  `hash_password` *raises* on one, preserving passlib's semantics, so a NUL in
+  a password field was a latent 500 on four handlers and is now a form error.
+  **The 72-byte truncation and the NUL rejection themselves are untouched** —
+  every stored hash depends on them; read the module docstring before
+  "fixing" either.

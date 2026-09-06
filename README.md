@@ -856,12 +856,27 @@ to multi-user later resumes where you left off without re-bootstrapping
 
 - The indexer iterates active users sequentially each cycle. Fine for
   tens of users; hundreds would need parallelization.
-- Password reset is admin-driven only — there's no email-based
-  self-service flow.
-- No rate limiting on `/admin/auth/login`. The Traefik OAuth gate in
-  front of the panel is the main brute-force defense; if you expose
-  `/admin/auth/login` to the open internet, put a rate-limit
-  middleware in front of it.
+- Password recovery is admin-driven — there's no email-based reset. A
+  signed-in user *can* rotate their own password at `/admin/account`
+  (current password, new password, confirmation; minimum 12
+  characters), which signs their other browsers out and keeps the one
+  they changed it from signed in. The admin reset stays the recovery
+  path for somebody who cannot sign in at all, and it also ends every
+  live session of the account it resets.
+- `/admin/auth/login` and `/admin/account/password` are rate-limited
+  at 5 requests per minute; the login limit is keyed on the client
+  address, and the password change carries two independent limits —
+  one per account, one per address. The limiter's storage is in-memory
+  and per-process, so counters reset on restart. The Traefik OAuth
+  gate in front of the panel is still the main brute-force defense; if
+  you expose `/admin/auth/login` to the open internet, put a rate-limit
+  middleware in front of it as well.
+- Panel sessions are server-side rows (`user_sessions`), so logging
+  out, changing a password, a deactivation or a delete really ends
+  them. The trade-off: **the first deploy of the build that introduced
+  the registry signs every live panel session out once**, because a
+  cookie issued before it carries no session id and is refused rather
+  than grandfathered. Everyone signs in again; nothing else changes.
 - The `vault_path` validator does not resolve symlinks, so an admin
   can technically point a user at host files via a symlinked
   `/vaults/<name>`. Treat `/vaults/` as an admin-trust boundary.
@@ -881,6 +896,9 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `ALLOWED_HOSTS` | derived | Accepted `Host` headers, JSON list. `localhost` is always added. |
 | `SESSION_MAX_AGE` | `604800` | Panel session cookie lifetime, seconds (multi-user mode) |
 | `SESSION_COOKIE_NAME` | `omcp_session` | Panel session cookie name |
+| `SESSION_TOUCH_INTERVAL_SECONDS` | `60` | How stale a session's `last_seen_at` may get before a validated `GET`/`HEAD` rewrites it. Telemetry only — nothing authorizes on it. Must be ≥ 1. |
+| `SESSION_PURGE_RETAIN_DAYS` | `7` | How long a dead panel session row is kept, measured from the *later* of its expiry and its revocation, so a revocation stays visible for the full window. Must be ≥ 1. |
+| `OAUTH_KNOWN_REDIRECT_HOSTS` | `claude.ai,chatgpt.com` | Redirect **hosts** the consent screen badges as known connector destinations. JSON or CSV. Matched by exact host equality — no wildcards, no suffixes; entries containing `*`, `/`, `@` or internal whitespace are refused at startup. An empty list means every client is shown as unverified. |
 | `MAX_FILE_READ_BYTES` | `10485760` | `read_file` cap (10 MB); bounds what the server reads from disk |
 | `MAX_FILE_WRITE_BYTES` | `26214400` | `write_file` cap (25 MB), decoded byte length |
 | `MAX_READ_RESPONSE_CHARS` | `40000` | `read_note` / `read_file` cap on what is returned to the caller (≈10K tokens). See [Response size limits](#response-size-limits). |
@@ -1230,6 +1248,7 @@ ignores mtime jitter. Stale embeddings are caught by the
 | `oauth_clients`, `oauth_codes`, `oauth_tokens` | OAuth 2.0 PKCE state, including the grant id that ties a consent's tokens together |
 | `transfer_tokens` | Capability rows behind the `/transfer/*` links: direction, destination path, state, fingerprint, expiry |
 | `users` | Multi-user mode: login, role, per-user `vault_path`, and the vault the index was last built under |
+| `user_sessions` | One revocable row per live panel browser session, keyed on the SHA-256 of the cookie's session id. Cascades with the user. |
 
 GIN indexes on `content_tsvector` and `tags[]`. B-tree indexes on the
 hot foreign keys. pgvector HNSW index on the embedding column
@@ -1314,6 +1333,18 @@ backup, `alembic upgrade head`, then recreate the container. Run
 - The control panel is intended to sit behind an external auth
   gateway. The included `docker-compose.yml` uses Traefik with an
   OAuth chain. Don't expose `/admin` directly to the internet.
+- Panel sessions are server-side rows. The signed cookie carries a
+  256-bit random id; the database stores only its SHA-256, so a
+  database dump contains no usable session. Logging out revokes that
+  row, and a password change, an admin reset, a deactivation or a
+  delete revokes every session of the account.
+- The OAuth consent screen identifies the client it is asking about:
+  the redirect **host** the authorization code would be sent to (taken
+  from the URI's hostname, never its `netloc`, and shown in punycode
+  rather than decoded), the server-generated client id, and the
+  registration date. Every render says the application registered
+  itself and is not verified by this server; a host outside
+  `OAUTH_KNOWN_REDIRECT_HOSTS` is called out as unrecognised.
 - The OpenAI key is rendered on the settings page as
   `key[:8] + "..." + key[-4:]` and never appears in full in HTML or
   JS sources.
