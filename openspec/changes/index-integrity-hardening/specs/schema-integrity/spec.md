@@ -90,13 +90,14 @@ Asserting the catalogue directly is required because `alembic check` does not co
 ## MODIFIED Requirements
 
 ### Requirement: The schema gate covers both migrations of this wave before deploy
-The schema gate SHALL exercise every migration whose behaviour it asserts on a throwaway database, in the same run, and SHALL assert `alembic check` clean at the resulting head. **The gate SHALL carry a single literal naming the current head revision and SHALL assert that a migrated database reads exactly that**, and it SHALL assert that **`023` is present in the applied chain** — so a later migration added without updating the gate fails loudly rather than silently widening what "head" means.
 
-The head literal is named as "whatever the chain's last revision is at the time", not as `023`. `023` is this change's migration and is not the head for long: the sibling `panel-sessions-and-consent` change chains `024` (`user_sessions`) from it, so a requirement pinning the gate's literal to `023` would be false the moment either change merged after the other, and would put two changes in conflict over one line for no behavioural reason. What must hold is the property, and it does not name a number: the gate asserts a head somebody chose, and this change's revision is in the chain that leads to it.
+The schema gate SHALL exercise every migration whose behaviour it asserts, including both migrations of the current wave, on a throwaway database in the same run, and SHALL assert `alembic check` clean at the resulting head. The gate SHALL carry a single literal naming the current head revision and SHALL assert that a migrated database reads exactly that literal. The current head literal SHALL be **`024`**, with **`023` present in the applied chain**. The requirement keeps its original heading so this block modifies the existing requirement rather than adding a second one; the current wave is not limited to the 016/017 pair for which it was first written.
 
-Raising the asserted head is a required part of adding a migration, not a chore that accompanies it. The assertion is the only thing that makes "head" a value somebody chose; left at an earlier revision it would pass on a database migrated past it, and the gate's guarantee — that the revisions it exercises are the revisions that will run — would quietly become a guarantee about a prefix of them.
+`023` is the index-state migration of `index-integrity-hardening`; `024` is the session-registry migration of `panel-sessions-and-consent`. `024`'s recorded predecessor SHALL be `023`, and migration to head SHALL apply `023` before `024`. The head assertion moves to `024` only with `023` present in the merged history. If `023` is abandoned, `024` SHALL be rebased onto the then-current head before merge and this requirement updated to name it.
 
-The historical checks SHALL be kept, not replaced. 016's and 017's cases assert facts about those migrations' bodies that no later revision restates, and 013's and 014's before them; a gate rewritten around only the newest wave stops testing the reconciliations the earlier ones exist to perform.
+Raising the asserted head is a required part of adding a migration. A later migration added without updating the gate SHALL fail the head assertion, rather than silently widening what "head" means or treating `023` as a permanent head. The literal is the current chosen head, while each covered migration remains asserted in its applied chain.
+
+The historical checks SHALL be kept, not replaced. The cases covering 013, 014, 016, 017 and 022 SHALL continue to execute alongside the 023 and 024 cases; raising the head SHALL NOT remove the earlier reconciliations' coverage.
 
 Idempotence SHALL be exercised by stamping the revision back and upgrading again, not by a second `upgrade head` — the latter is a no-op at the alembic level and proves nothing about the migration body.
 
@@ -117,3 +118,15 @@ Idempotence SHALL be exercised by stamping the revision back and upgrading again
 
 - **WHEN** the gate tests that any covered migration can re-run
 - **THEN** it SHALL stamp the database to the preceding revision and upgrade again, so the migration body genuinely re-executes
+
+#### Scenario: Head at 024
+
+- **WHEN** a throwaway database is migrated to head
+- **THEN** `alembic_version` SHALL read `024`
+- **AND** `alembic check` SHALL report no new upgrade operations
+
+#### Scenario: The ordering against the sibling migration holds
+
+- **WHEN** the merged migration history is inspected
+- **THEN** `024`'s recorded predecessor SHALL be `023`
+- **AND** migrating to head SHALL apply `023` before `024`

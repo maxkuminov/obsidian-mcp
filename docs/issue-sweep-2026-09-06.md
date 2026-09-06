@@ -45,5 +45,36 @@ These remain open; they are not silently accepted or marked fixed by this batch.
 Read-only production preflight: zero ownerless notes; both retained user scopes
 are active, assigned and have settled provenance. Production was on revision
 022 before this rollout. The dependency audit found no known vulnerabilities.
-Schema, full integration, deployment, live-tool verification and archive status
-must be recorded from their actual results, not inferred from passing slices.
+Completed release checks on runtime commit `2db9fde`:
+
+- Full real-PostgreSQL integration suite: **553 passed** (one existing warning).
+- Explicit schema gate: **182 passed**, including migration/model checks.
+- All five GitHub checks passed: tests, schema gate, audit, OpenSpec and Trivy.
+- Release image built and scanned: no fixable HIGH/CRITICAL vulnerabilities.
+- The staged image migrated a disposable database and started healthy. Real HTTP
+  authentication smoke passed logout replay rejection, password change, sibling
+  session revocation and retention of the changing session. Synthetic account
+  cleanup and disposal of the isolated environment completed successfully.
+
+Staged registry digest:
+`sha256:a90b136f4a3d6494bad50e63a9eb3d4ff89095f8033e9e0dc8fdef08ea44d41f`.
+The previous production image is retained under the local rollback tag
+`obsidian-mcp:pre-codex-20260906`. A database backup is still required before
+migration; an image rollback alone does not reverse schema changes.
+
+**Production rollout is awaiting explicit user approval.** Automatic approval
+review rejected migration/recreation because the issue-triage request did not
+explicitly authorize production deployment. No production migration, service
+recreation or compose update ran. Production remains on revision 022.
+
+After approval: deploy the staged image through the project backup/migration
+pipeline (023/024), run `make db-check`, verify health, execute the prepared live
+MCP write/search and session smoke checks, then reconcile/archive eligible
+OpenSpec changes and finish the PR. Existing browser sessions will need to sign
+in again. Confirmation from both existing users remains an owner task; the
+isolated synthetic-account smoke does not satisfy that confirmation.
+
+Overlapping pending OpenSpec deltas now carry the same union of schema and
+latency requirements so later archival cannot erase a sibling change's
+scenarios. No changes have been archived and no issues have been closed by this
+recovery PR yet.
