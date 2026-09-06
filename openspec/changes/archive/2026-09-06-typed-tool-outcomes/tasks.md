@@ -4,4 +4,4 @@
 - [x] 4. Migrate every refusal and partial branch in the inventory; preserve successes and precedence.
 - [x] 5. Add meaningful unit/integration regressions and update architecture notes.
 - [x] 6. Independent implementation/spec and defensive write-safety reviews; resolve blocking findings.
-- [ ] 7. Combined offline/PostgreSQL/OpenSpec/audit/build gates and PR to main with #261.
+- [x] 7. Combined offline/PostgreSQL/OpenSpec/audit/build gates and PR to main with #261.

@@ -6,4 +6,4 @@
 - [x] 6. Independent spec/defensive implementation reviews; resolve blocking findings.
 - [x] 7. Combined offline/PostgreSQL/OpenSpec/audit/build/scan validation.
 - [x] 8. Deploy default shadow mode, db-check, live owned-fixture MCP exercise and cleanup.
-- [ ] 9. Archive completed changes and publish tested PR to main for #263/#261.
+- [x] 9. Archive completed changes and publish tested PR to main for #263/#261.

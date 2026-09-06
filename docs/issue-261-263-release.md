@@ -108,3 +108,9 @@ because expiry of unused dynamic OAuth client registrations is explicitly
 outstanding; the existing rate controls do not implement it. Both received
 comments explaining the remaining work. #261 and #263 received coordination
 comments identifying this branch and the approved scope.
+
+## Pull request
+
+[PR #271](https://github.com/maxkuminov/obsidian-mcp/pull/271) targets main and
+closes #263 and #261 on merge. The branch and completed specification records
+are published; merging remains a separate action.
