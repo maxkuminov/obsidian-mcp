@@ -2,5 +2,6 @@
 - [x] 2. Independent proposal review before implementation — PASS, no findings; cap-zero, Unicode/angle-href and real-PG coverage requested.
 - [x] 3. Reject mask-decided targets before cap accounting; bump extraction version with equivalent cleaner.
 - [x] 4. Add regressions for rejection, valid labels/aliases/anchors, caps and unchanged-note re-derivation; update architecture notes.
-- [ ] 5. Independent defensive implementation/spec review and relevant offline/integration validation.
+- [x] 5. Independent defensive implementation/spec review — PASS, no findings; offline 4,685 passed / 557 skipped; real-PG 554 passed; OpenSpec 33 passed; audit clean.
 - [ ] 6. Record triage and validation; publish reviewable branch/PR.
+- [ ] 7. Release follow-up: deploy, confirm version-3 re-derivation and exercise affected live MCP graph tools, then archive the change.

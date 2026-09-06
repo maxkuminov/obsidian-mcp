@@ -50,4 +50,17 @@ Tracked in `openspec/changes/reject-mask-decided-links/`. Rejected candidates
 must not consume the extraction cap, and code only in an alias, anchor or label
 must not remove a valid target. Version 3 must repair existing link rows while
 preserving embedding certification when the cleaned content is unchanged.
-Validation and publication results will be recorded after independent review.
+Independent proposal and defensive implementation/spec reviews both returned
+PASS with no blocking findings. Strict OpenSpec validation passed all 33 items;
+`make audit` found no known vulnerabilities. The complete offline suite passed
+with **4,685 passed, 557 skipped**, and two existing dependency warnings. The
+sandboxed offline run stalled in an existing async filesystem test; its isolated
+unsandboxed run passed, followed by the complete unsandboxed suite. The stalled
+runs were stopped and are not counted as validation.
+
+`make test-integration` passed **554 tests**, including the new version-2 graph
+repair regression, with one existing warning. It used a dedicated disposable
+container; production was untouched. The feature branch is
+`codex-fix-mask-decided-links`; publication is the final implementation step. No production
+deployment or live MCP exercise has run for this change; the OpenSpec change
+remains active for release checks.
