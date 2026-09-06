@@ -65,14 +65,55 @@ The enumerated set:
   `docs/architecture/usage-attribution.md` says so. All three are pre-body by
   construction: the gate runs before the body, which is the same position
   `no_vault_assigned` holds.
+* `error = 'rate_limited'` — either per-principal token bucket (#188). The
+  buckets are the *first* gates in `_tracked`, above the admission gate, so a
+  row carrying this value did nothing at all: no vault resolution, no argument
+  walk, no quota statement, no body. Which bucket fired travels in
+  `rate_limit_scope`, a string this module never casts and never branches on —
+  both scopes are the same fact for a latency percentile.
+* `error = 'argument_too_long'` — the declarative argument length cap (#194),
+  refused beside the unpaired-surrogate screen and therefore before the
+  embedding call, the `tsquery` parse and the quota statement.
 
-The five string values are mirrored from `_NO_VAULT_MARKER`,
-`_UNENCODABLE_ARG_MARKER` and the three `_VAULT_ROOT_*_MARKER` constants in
-`src/mcp_server/tools.py`. They are *mirrored*
+**`provider_input_rejected` is deliberately not enumerated** (#194). The
+embedding provider rejected the input against *its own* token limit, which can
+only be learned by asking it: the body ran, resolved a vault and made a network
+round trip before that branch could be reached, and enumerating it here would
+drop the slowest kind of call there is out of the percentiles — the same
+classification error `vault_anchor_lost_at_publish` exists to record. Its
+*caller-facing code* is `argument_too_long`, so an agent sees one actionable
+failure mode whichever limit applied; the marker and the code answer different
+questions and are allowed to differ. The character cap is necessary and not
+sufficient, so both halves exist, on opposite sides of the body/no-body line —
+which is exactly why they must not share a marker.
+
+The seven string values are mirrored from `_NO_VAULT_MARKER`,
+`_UNENCODABLE_ARG_MARKER`, the three `_VAULT_ROOT_*_MARKER` constants and the
+two rate-control markers in `src/mcp_server/tools.py`. They are *mirrored*
 rather than imported because #162's quota gate will import this module from
 `tools.py`, and an import in the other direction closes the cycle.
 `tests/test_issue_160_refusal_predicate.py` asserts the copies are equal,
 so the mirror cannot drift silently.
+
+## The refusal count is a sum, not a row count
+
+`rate_limited` rows are **coalesced** at the write site: at most one row per
+`(principal, tool, marker, scope)` per `MCP_REFUSAL_LOG_INTERVAL_SECONDS`,
+carrying the integer `suppressed` — the refusals folded into it that no other
+row represents. A reader that counted rows would therefore undercount every
+coalesced window, and by an unbounded factor: the whole point of the coalescer
+is that the row count stops tracking the refusal rate. So the per-tool refusal
+count sums `1 + suppressed` (`refusal_weight_sql()`), which is exact for every
+other marker too — a row with no `suppressed` key weighs 1, which is what an
+uncoalesced refusal is. `argument_too_long` is deliberately uncoalesced and so
+always weighs 1.
+
+The cast is **guarded**, on the `result_count` precedent in
+`src/services/search_analytics.py`: `params` is caller-influenced JSONB and an
+unguarded `::bigint` on a value that is not a number aborts the statement,
+which takes the whole window's page down rather than one row's figure. A value
+that does not match the guard weighs 1 — the row is still a refusal, only its
+suppressed tail is unreadable — and the page renders.
 """
 from __future__ import annotations
 
@@ -91,6 +132,22 @@ UNENCODABLE_ARG_MARKER = "argument_not_encodable"
 VAULT_ROOT_OVERLAP_MARKER = "vault_root_overlap"
 VAULT_ROOT_UNEXAMINABLE_MARKER = "vault_root_unexaminable"
 VAULT_ROOT_NOT_READY_MARKER = "vault_root_not_ready"
+
+# The rate controls' two pre-body markers (#188, #194), mirrored the same way
+# and pinned by the same test. Both are written by gates that run *above* the
+# tool body — the token buckets are the first gates in `_tracked` and the
+# length cap sits beside the unencodable-argument screen — so, like the five
+# above, they are pre-body by construction rather than by judgement.
+#
+# `provider_input_rejected` is the third marker that change added and it is
+# **deliberately not here**: the provider learned the input was too large by
+# being asked, which means the body ran, resolved a vault and paid for a
+# network round trip. Enumerating it would drop the most expensive class of
+# call in the server out of the percentiles — the `vault_anchor_lost_at_publish`
+# mistake, repeated. Its caller-facing *code* is `argument_too_long`; the code
+# and the marker answer different questions and are allowed to differ.
+RATE_LIMITED_MARKER = "rate_limited"
+ARGUMENT_TOO_LONG_MARKER = "argument_too_long"
 
 #: The `params.error` values `_tracked` writes *before* a tool body runs.
 #:
@@ -121,6 +178,8 @@ PRE_BODY_REFUSAL_ERROR_MARKERS: tuple[str, ...] = (
     VAULT_ROOT_OVERLAP_MARKER,
     VAULT_ROOT_UNEXAMINABLE_MARKER,
     VAULT_ROOT_NOT_READY_MARKER,
+    RATE_LIMITED_MARKER,
+    ARGUMENT_TOO_LONG_MARKER,
 )
 
 #: The boolean `params` key the quota gate (#162) sets on a refusal.
@@ -128,6 +187,18 @@ PRE_BODY_REFUSAL_ERROR_MARKERS: tuple[str, ...] = (
 #: own — the one direction the import can run without closing a cycle — so the
 #: writer and the predicate below cannot name different keys.
 OVER_QUOTA_PARAM = "over_quota"
+
+#: The integer `params` key a coalesced `rate_limited` row carries: the
+#: refusals folded into that row which no other row represents. A reader takes
+#: the row to stand for `1 + suppressed` refusals. Mirrored from
+#: `_SUPPRESSED_PARAM` in `src/mcp_server/tools.py` for the same reason the
+#: markers are, and pinned by the same test.
+#:
+#: Its companion `rate_limit_scope` has no constant here on purpose: it is a
+#: **string no reader casts**, this module never branches on it, and a name
+#: nothing reads is a name that drifts. It exists so `/admin/usage` can tell a
+#: write-bucket refusal from a general one.
+SUPPRESSED_PARAM = "suppressed"
 
 # The marker values travel as bind parameters, not as interpolated literals.
 # They are module constants today, so quoting them would be safe — but a
@@ -168,6 +239,46 @@ def executed_sql(alias: str = "ul", params_column: str = "params") -> str:
     latency view that hides them is worse than no latency view.
     """
     return f"(NOT {pre_body_refusal_sql(alias, params_column)})"
+
+
+#: How many digits of `suppressed` are read. The guard is the point: `params`
+#: is JSONB whose contents this module does not control, and an unguarded
+#: `::bigint` on a value that is not a number — or on a number too large for
+#: the type — does not return NULL, it **aborts the statement**, which renders
+#: the whole window as an error page instead of one row with a wrong figure.
+#: Bounded rather than a bare `+` for the second half of that: `'^[0-9]+$'`
+#: happily admits a forty-digit literal, and `::bigint` on it raises exactly
+#: the way an unguarded cast would. Nine digits is the `result_count`
+#: precedent in `src/services/search_analytics.py`, and a billion suppressed
+#: refusals in one interval is already far past anything the coalescer can
+#: produce. No sign: `suppressed` is a count and can never be negative.
+_SUPPRESSED_DIGITS = "^[0-9]{1,9}$"
+
+
+def refusal_weight_sql(alias: str = "ul", params_column: str = "params") -> str:
+    """How many refusals one refusal row stands for. Never NULL, never zero.
+
+    `1 + suppressed`, because `rate_limited` rows are coalesced at the write
+    site and the row count therefore stopped being the refusal count. Every
+    other pre-body marker — `argument_too_long` deliberately included, it is
+    not coalesced — carries no `suppressed` key, reads as NULL and weighs 1,
+    which is what an uncoalesced refusal is; so the same expression is correct
+    for the whole enumerated set and there is no second code path.
+
+    A malformed `suppressed` also weighs 1. The row is still a refusal and
+    still counted; only its suppressed tail is unreadable, and losing a tail
+    beats losing the window.
+
+    Sum this `FILTER (WHERE pre_body_refusal_sql())` — the weight says nothing
+    about which rows are refusals, and applying it without that filter would
+    weigh executed rows too.
+    """
+    value = f"{alias}.{params_column}->>'{SUPPRESSED_PARAM}'"
+    guarded = (
+        f"CASE WHEN {value} ~ '{_SUPPRESSED_DIGITS}'"
+        f" THEN ({value})::bigint END"
+    )
+    return f"(1 + COALESCE({guarded}, 0))"
 
 
 # --- Windows --------------------------------------------------------------
@@ -230,14 +341,23 @@ async def tool_aggregates(session, window: str, user_id: int | None) -> list[dic
     the window's rows for that tool. A tool that only ever refused in the window
     still appears — with `executed = 0` and NULL percentiles, which the template
     renders as an em dash rather than a zero it would be wrong to draw.
+
+    **The refusal count is a sum of weights, not a count of rows.**
+    `rate_limited` rows are coalesced at the write site, so one row can stand
+    for a whole interval's refusals; `refusal_weight_sql()` is what makes the
+    figure a refusal count again rather than a row count. `sum` over an empty
+    filtered set is NULL, so it is wrapped — the template draws a 0 for a tool
+    that refused nothing, and an em dash means "not measured", which a zero
+    refusal count is not.
     """
     executed = executed_sql()
     refused = pre_body_refusal_sql()
+    weight = refusal_weight_sql()
     sql = f"""
         SELECT
             ul.tool AS tool,
             count(*) FILTER (WHERE {executed})                       AS executed,
-            count(*) FILTER (WHERE {refused})                        AS refusals,
+            COALESCE(sum({weight}) FILTER (WHERE {refused}), 0)      AS refusals,
             percentile_cont(0.5) WITHIN GROUP (ORDER BY ul.duration_ms)
                 FILTER (WHERE {executed} AND ul.duration_ms IS NOT NULL) AS p50,
             percentile_cont(0.95) WITHIN GROUP (ORDER BY ul.duration_ms)

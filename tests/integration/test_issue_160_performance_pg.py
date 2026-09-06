@@ -12,6 +12,12 @@ assert *is* the database's behaviour:
 * **`percentile_cont` over a seeded window.** The reason the page exists is that
   nobody wants to write this SQL by hand; a test that does not run it has not
   checked it.
+* **The refusal count sums `1 + suppressed`.** `rate_limited` rows are
+  coalesced at the write site, so the row count stopped being the refusal
+  count; whether `sum(...) FILTER (...)` over a guarded `::bigint` produces the
+  right figure — and whether a malformed `suppressed` yields NULL rather than
+  aborting the statement and taking the whole window down — is a fact about
+  PostgreSQL, not about the fragment's text.
 * **The prune leaves exactly 500 rows**, the `trigger` CHECK rejects a fifth
   value, and `ON DELETE SET NULL` keeps a pass's history past its user.
 
@@ -210,6 +216,163 @@ async def test_a_tool_that_only_refused_reports_no_percentiles(clean):
     assert row["refusals"] == 3
     assert row["p50"] is None and row["p95"] is None and row["p99"] is None
     assert row["mean_size"] is None and row["max_size"] is None
+
+
+async def test_coalesced_rate_refusals_are_counted_in_full(clean):
+    """The coalescer's arithmetic, read back through the page's SQL.
+
+    `rate_limited` rows are written at most once per
+    `(principal, tool, marker, scope)` per interval, and each carries the
+    `suppressed` count of the refusals folded into it that no other row
+    represents. The row count is therefore no longer the refusal count —
+    `1 + suppressed` is — and a reader that counted rows would report three
+    refusals for a window holding three thousand. That is not a rounding error:
+    the coalescer exists precisely so the row count stops tracking the arrival
+    rate, so the undercount grows with exactly the traffic an operator opened
+    the page to see.
+
+    `argument_too_long` is in the same window and deliberately **not**
+    coalesced — refused below the general bucket, so its rate is already
+    bounded by that bucket. It carries no `suppressed` key, weighs 1, and goes
+    through the same expression rather than a second code path.
+    """
+    async with clean() as session:
+        session.add_all([
+            # 40 executed calls: the only rows the percentiles may see.
+            _log("semantic_search", duration=100 + i, size=50) for i in range(40)
+        ])
+        session.add_all([
+            # Three coalesced rows standing for 2997 refusals between them.
+            # Two scopes, because `principal` and `principal_write` are
+            # different facts about the same tool and both are pre-body.
+            _log("semantic_search", duration=0, size=1, params={
+                "error": "rate_limited", "rate_limit_scope": "principal",
+                "suppressed": 1499,
+            }),
+            _log("semantic_search", duration=0, size=1, params={
+                "error": "rate_limited", "rate_limit_scope": "principal",
+                "suppressed": 1000,
+            }),
+            _log("semantic_search", duration=0, size=1, params={
+                "error": "rate_limited", "rate_limit_scope": "principal_write",
+                "suppressed": 495,
+            }),
+            # A window-opening row: `suppressed = 0` stands for exactly itself.
+            _log("semantic_search", duration=0, size=1, params={
+                "error": "rate_limited", "rate_limit_scope": "principal",
+                "suppressed": 0,
+            }),
+            # Two uncoalesced over-long-argument refusals, one row each.
+            _log("semantic_search", duration=0, size=1,
+                 params={"error": "argument_too_long"}),
+            _log("semantic_search", duration=0, size=1,
+                 params={"error": "argument_too_long"}),
+        ])
+        await session.commit()
+
+        rows = await tool_aggregates(session, "24h", None)
+
+    row = next(r for r in rows if r["tool"] == "semantic_search")
+    assert row["executed"] == 40, "no refusal row may reach the executed count"
+    # (1+1499) + (1+1000) + (1+495) + (1+0) + 1 + 1 = 3000.
+    assert row["refusals"] == 3000, (
+        f"the refusal count must sum 1 + suppressed; got {row['refusals']} "
+        "(6 would be the row count)"
+    )
+    # The percentiles come from the 40 executed rows alone. The refusal rows
+    # carry duration 0, so a leak would drag p50 toward zero.
+    assert 115 <= row["p50"] <= 125, row["p50"]
+    assert row["p99"] >= 130
+    assert row["max_size"] == 50
+    assert row["mean_size"] == 50
+
+
+async def test_a_malformed_suppressed_value_renders_the_window(clean):
+    """The guard on the cast, which is why there is a guard.
+
+    `params` is JSONB and `->>` yields text. An unguarded `::bigint` on a value
+    that is not a number does not return NULL — it **aborts the statement**, so
+    one bad row takes down the whole window's page rather than reporting one
+    wrong figure. A value that fails the guard still weighs 1: the row is a
+    refusal either way, and only its suppressed tail is unreadable.
+
+    Both shapes of malformed are here — a non-numeric string, and a numeric one
+    far too large for `bigint`, which a length-unbounded guard would admit and
+    then overflow on.
+    """
+    async with clean() as session:
+        session.add_all([
+            _log("keyword_search", duration=70, size=10),
+            _log("keyword_search", duration=0, size=1, params={
+                "error": "rate_limited", "suppressed": "lots",
+            }),
+            _log("keyword_search", duration=0, size=1, params={
+                "error": "rate_limited", "suppressed": "9" * 40,
+            }),
+            _log("keyword_search", duration=0, size=1, params={
+                "error": "rate_limited", "suppressed": -3,
+            }),
+            _log("keyword_search", duration=0, size=1, params={
+                "error": "rate_limited", "suppressed": None,
+            }),
+            # And one readable row alongside them, so the aggregate is not
+            # trivially right by every value being unreadable.
+            _log("keyword_search", duration=0, size=1, params={
+                "error": "rate_limited", "suppressed": 9,
+            }),
+        ])
+        await session.commit()
+
+        rows = await tool_aggregates(session, "24h", None)
+
+    row = next(r for r in rows if r["tool"] == "keyword_search")
+    assert row["executed"] == 1
+    # Four unreadable rows weigh 1 each; the readable one weighs 10.
+    assert row["refusals"] == 14, row["refusals"]
+    assert row["p50"] == pytest.approx(70.0)
+
+
+async def test_a_provider_input_rejection_is_an_executed_row(clean):
+    """The marker whose caller-facing *code* is `argument_too_long` and whose
+    *marker* is not.
+
+    The character cap refuses before any provider call; this branch is reached
+    only after the body resolved a vault and paid for a network round trip to
+    the embedding provider, which is the slowest kind of call the server makes.
+    Enumerating it as a pre-body refusal would drop that round trip out of the
+    percentiles — the `vault_anchor_lost_at_publish` mistake exactly. An
+    unrelated `params.error` value is here for the same reason: the predicate
+    enumerates, it does not broadly match "this row carries an error".
+    """
+    from src.mcp_server import tools
+
+    async with clean() as session:
+        session.add_all([
+            _log("semantic_search", duration=60, size=10),
+            _log("semantic_search", duration=5000, size=20, params={
+                "error": tools._PROVIDER_INPUT_REJECTED_MARKER,
+            }),
+            _log("semantic_search", duration=800, size=30, params={
+                "error": "some_other_marker_nobody_enumerated",
+            }),
+            # The pre-body half of the same caller-facing code, for contrast.
+            _log("semantic_search", duration=0, size=1, params={
+                "error": tools._ARGUMENT_TOO_LONG_MARKER,
+            }),
+        ])
+        await session.commit()
+
+        rows = await tool_aggregates(session, "24h", None)
+        slowest = await slowest_requests(session, "24h", None)
+
+    row = next(r for r in rows if r["tool"] == "semantic_search")
+    assert row["executed"] == 3, (
+        "the provider rejection and the unenumerated error both ran a body"
+    )
+    assert row["refusals"] == 1, "only the pre-body cap refusal is a refusal"
+    assert row["p99"] >= 4000, "the provider round trip must reach the percentiles"
+    # And it is visible where an operator would go looking for it.
+    assert [r.duration_ms for r in slowest] == [5000, 800, 60]
 
 
 # --------------------------------------------------------------------------
