@@ -47,7 +47,8 @@ credential and then opens the Usage page to see what it did was shown
   the one caller that has to *report* the audit could not otherwise tell:
   `_tracked`'s exception handler emits `tool_usage_log_failed` on `False`, so
   the log distinguishes "the tool failed and here is its row" from "the tool
-  failed and the row is missing". Every other caller ignores the value. The
+  failed and the row is missing". Coalesced refusal writers also retain their
+  pending counts when a row does not land. The
   error arrives wrapped twice and the layers carry different things: SQLAlchemy's
   `.orig` is the asyncpg *dialect's* error (SQLSTATE, no constraint name),
   whose `__cause__` is asyncpg's own (constraint name). `_error_chain` walks
@@ -143,14 +144,15 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   hand-written predicates agree until somebody adds a third marker to one of
   them.
 
-  It matches exactly eight things and nothing else: `over_quota: true` (the
+  It matches exactly nine things and nothing else: `over_quota: true` (the
   quota gate, #162, declared here ahead of the gate that writes it so the two
   land as one contract), `error = 'no_vault_assigned'`,
   `error = 'argument_not_encodable'`, the three vault-root quarantine
   markers the same admission gate writes (#199) —
   `error = 'vault_root_overlap'`, `error = 'vault_root_unexaminable'` and
   `error = 'vault_root_not_ready'` — and the rate controls' two (#188, #194),
-  `error = 'rate_limited'` and `error = 'argument_too_long'`. A broad match — `params ? 'error'`, or
+  `error = 'rate_limited'` and `error = 'argument_too_long'`, plus enforced
+  concurrency admission's `error = 'slot_timeout'` (#261). A broad match — `params ? 'error'`, or
   `params->>'error' IS NOT NULL` — is wrong in a way that is invisible on the
   page: `_VAULT_REASSIGNED_MARKER`, `_CONFIRMATION_UNAVAILABLE_MARKER` and
   `_ANCHOR_LOST_AT_PUBLISH_MARKER` are written by tools whose bodies *ran*,
@@ -174,14 +176,15 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   string; a new value costs nothing and a shared one mis-measures in a
   direction nobody can see from the page.
 
-  **The register, as of #194.** Pre-body: `no_vault_assigned`,
+  **The register, as of #261.** Pre-body: `no_vault_assigned`,
   `argument_not_encodable`, the three vault-root quarantine markers
   `vault_root_overlap`, `vault_root_unexaminable` and `vault_root_not_ready`
   (#199), the boolean `over_quota` (#162), and the rate controls' two —
   `rate_limited` (either per-principal token bucket, with `rate_limit_scope`
   saying which) and `argument_too_long` (the declarative argument length cap),
   both written by gates that run *above* the tool body and neither of which
-  did any work at all (#188, #194). Post-body:
+  did any work at all (#188, #194), plus `slot_timeout` for an enforced tool
+  admission miss before quota. Post-body:
   `vault_assignment_changed`, `vault_confirmation_unavailable`,
   `vault_anchor_lost_at_publish`, `find_related`'s two operational
   failures, `related_source_not_found` and `related_source_not_embedded`, and
@@ -211,6 +214,30 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   deliberately **not** coalesced: it is refused below the general bucket, so
   its rate is already bounded by that bucket and a second mechanism would buy
   nothing.
+
+  `slot_timeout` uses the same coalescer and guarded refusal weight, with
+  `concurrency_scope` naming the saturated dimension and `queue_ms` recording
+  the measured wait. An immediate miss has a zero wait budget; positive waits
+  share one deadline. The admission gate precedes quota and opens no database
+  session while waiting. Its permit, once granted, covers quota, the body and
+  the audit tail, and is released even on cancellation.
+
+  Shadow pressure is attached only to the existing real usage row under
+  `concurrency_shadow`, whose `basis` is `observed_occupancy_zero_wait`.
+  Request/auth, tool and writer observations share that bounded namespace;
+  they neither replace actual `error`/`body_outcome`/quota fields nor enter
+  the pre-body predicate. Earlier calls still ran, so this is an occupancy
+  projection, not a replay of which requests enforcement would have admitted.
+  Transport pressure without a tool uses the bounded security event instead
+  of inventing an unattributed usage row.
+
+  Every `write_usage_row` caller, including background coalescer flushes,
+  acquires the shared writer permit before opening any database connection.
+  The permit covers initial insert, rollback and FK retry; the failed session
+  closes before the retry opens. Enforced writer-capacity failure returns
+  `False` and emits `usage_log_failed` with `reason=concurrency_capacity`.
+  Coalesced counts remain pending on either `False` or cancellation; cancellation
+  still propagates. Writer shadow pressure does not delay or drop a row.
 
   **What the page does with that, concretely.** The per-tool refusal count on
   `/admin/performance` is `sum(1 + suppressed) FILTER (WHERE <the predicate>)`,
