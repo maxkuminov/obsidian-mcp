@@ -49,6 +49,16 @@ TEMPLATES_DIR = os.path.join(os.path.dirname(users_mod.__file__), "templates")
 
 
 class _Result:
+    """A canned result. `rowcount` is what the session revocation reads (#198).
+
+    `delete_user` and `edit_user_submit` now issue an `UPDATE user_sessions`
+    inside the same critical section, and `revoke_user_sessions` reads
+    `result.rowcount` off it. Zero is the honest answer for a fake that holds
+    no session rows: these tests are about the guard, not about the registry.
+    """
+
+    rowcount = 0
+
     def __init__(self, value):
         self._value = value
 

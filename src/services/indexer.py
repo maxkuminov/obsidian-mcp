@@ -35,6 +35,7 @@ from src.models.db import (
     OAuthCode,
     OAuthToken,
     User,
+    UserSession,
 )
 from src.services.embeddings import (
     StaleCertification,
@@ -3227,8 +3228,35 @@ async def cleanup_expired_tokens():
     therefore disappear sooner than seven days after that flip — but it was
     already dead and already displayed as "Expired" before the revocation
     touched it, so no revocation the operator performed becomes invisible.
+
+    **Panel session rows are purged here too, on a different predicate (#198).**
+    They are dead credential rows on the same schedule, which is why they share
+    this function and why it keeps its name. What they do not share is the
+    single `expires_at` comparison above, and the difference is not cosmetic:
+    `user_sessions` *does* record a revocation time, and an administrative
+    password reset, a deactivation or a soft delete revokes **every** unrevoked
+    row of that user — including rows that had already expired. Such a row is
+    immediately past `expires_at`, so the expiry-only rule would delete the
+    record of a revocation minutes after an operator performed it, which is the
+    #64 blank space in a new table. The predicate therefore takes the *later*
+    of the two timestamps: `expires_at < cutoff AND (revoked_at IS NULL OR
+    revoked_at < cutoff)`. A revoked row is readable for the full retention
+    window after the revocation, whenever the revocation happened.
+
+    The session window is `SESSION_PURGE_RETAIN_DAYS` (7, `ge=1` — a zero
+    window would delete a revocation the moment it was made) rather than the
+    literal above, so an operator can lengthen session retention without
+    touching OAuth retention.
+
+    **This runs in both modes.** Single-user mode never creates or validates a
+    session row, but a deployment that flipped from multi-user to single-user
+    still has rows, and maintenance that skipped them would strand them
+    forever.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
+    session_cutoff = datetime.now(timezone.utc) - timedelta(
+        days=settings.session_purge_retain_days
+    )
 
     async with async_session() as session:
         # Clean up expired/used auth codes
@@ -3251,10 +3279,27 @@ async def cleanup_expired_tokens():
         )
         tokens_deleted = result.rowcount
 
+        # Panel browser sessions, on the later of expiry and revocation. See
+        # the docstring for why the token half's single comparison is wrong
+        # here.
+        result = await session.execute(
+            delete(UserSession).where(
+                UserSession.expires_at < session_cutoff,
+                or_(
+                    UserSession.revoked_at.is_(None),
+                    UserSession.revoked_at < session_cutoff,
+                ),
+            )
+        )
+        sessions_deleted = result.rowcount
+
         await session.commit()
 
-        if codes_deleted or tokens_deleted:
-            logger.info(f"Token cleanup: {codes_deleted} codes, {tokens_deleted} tokens removed")
+        if codes_deleted or tokens_deleted or sessions_deleted:
+            logger.info(
+                f"Token cleanup: {codes_deleted} codes, {tokens_deleted} tokens, "
+                f"{sessions_deleted} panel sessions removed"
+            )
 
 
 def _is_paused() -> bool:
