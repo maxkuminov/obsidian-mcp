@@ -1,11 +1,12 @@
 """The one shared executed/refused predicate, and the performance page's copy.
 
 Hermetic. What is pinned here is the *enumeration* — that the predicate names
-exactly the pre-body markers `_tracked` writes, that its mirror of those two
-string constants has not drifted from `src/mcp_server/tools.py`, and that it is
-not a broad "params carries an error" match. That it actually partitions rows
-that way on PostgreSQL is
-`tests/integration/test_issue_160_performance_pg.py`.
+exactly the pre-body markers `_tracked` writes, that its mirror of those
+string constants has not drifted from `src/mcp_server/tools.py`, that it is
+not a broad "params carries an error" match, and that the refusal count is a
+sum of `1 + suppressed` rather than a count of rows. That the predicate
+actually partitions rows that way on PostgreSQL, and that the sum comes out
+right there, is `tests/integration/test_issue_160_performance_pg.py`.
 """
 import re
 from pathlib import Path
@@ -21,7 +22,7 @@ _TEMPLATES = Path(__file__).resolve().parent.parent / "src" / "control_panel" / 
 
 
 def test_the_marker_values_match_the_writer():
-    """`usage_stats` mirrors these two constants rather than importing them,
+    """`usage_stats` mirrors these constants rather than importing them,
     because #162's quota gate will import `usage_stats` from `tools.py` and an
     import the other way closes the cycle. A mirror needs a pin."""
     from src.mcp_server import tools
@@ -38,6 +39,13 @@ def test_the_marker_values_match_the_writer():
     assert (
         usage_stats.VAULT_ROOT_NOT_READY_MARKER == tools._VAULT_ROOT_NOT_READY_MARKER
     )
+    # The rate controls' two pre-body markers (#188, #194), mirrored the same
+    # way for the same reason. Byte-equal or the page counts a marker the
+    # writer never writes and misses the one it does.
+    assert usage_stats.RATE_LIMITED_MARKER == tools._RATE_LIMITED_MARKER
+    assert usage_stats.ARGUMENT_TOO_LONG_MARKER == tools._ARGUMENT_TOO_LONG_MARKER
+    # And the `params` key the coalescer writes, which the refusal count casts.
+    assert usage_stats.SUPPRESSED_PARAM == tools._SUPPRESSED_PARAM
 
 
 def test_exactly_the_pre_body_markers_are_enumerated():
@@ -47,16 +55,24 @@ def test_exactly_the_pre_body_markers_are_enumerated():
         "vault_root_overlap",
         "vault_root_unexaminable",
         "vault_root_not_ready",
+        "rate_limited",
+        "argument_too_long",
     )
     assert usage_stats.OVER_QUOTA_PARAM == "over_quota"
 
 
 def test_the_post_body_markers_are_not_in_the_predicate():
-    """`vault_assignment_changed`, `vault_confirmation_unavailable` and
+    """Every marker `_tracked` writes after a body has run must stay out.
+
+    `vault_assignment_changed`, `vault_confirmation_unavailable` and
     `vault_anchor_lost_at_publish` are written by tools whose bodies *ran* —
     they resolved a vault, did the work, and then refused to publish. Excluding
     them would hide the slowest write path in the server from the one view built
-    to find slow paths."""
+    to find slow paths. The same holds for `find_related`'s two operational
+    markers, for the security-event pair, and — the one this change adds — for
+    `provider_input_rejected`, whose body made a network round trip to the
+    embedding provider before the provider said no.
+    """
     from src.mcp_server import tools
 
     fragment = usage_stats.pre_body_refusal_sql()
@@ -65,9 +81,88 @@ def test_the_post_body_markers_are_not_in_the_predicate():
         tools._VAULT_REASSIGNED_MARKER,
         tools._CONFIRMATION_UNAVAILABLE_MARKER,
         tools._ANCHOR_LOST_AT_PUBLISH_MARKER,
+        tools._RELATED_SOURCE_NOT_FOUND_MARKER,
+        tools._RELATED_SOURCE_NOT_EMBEDDED_MARKER,
+        tools._PERMISSION_DENIED_MARKER,
+        tools._TOOL_EXCEPTION_MARKER,
+        tools._PROVIDER_INPUT_REJECTED_MARKER,
     ):
-        assert marker not in fragment
-        assert marker not in binds.values()
+        assert marker not in fragment, marker
+        assert marker not in binds.values(), marker
+        assert marker not in usage_stats.PRE_BODY_REFUSAL_ERROR_MARKERS, marker
+
+
+def test_the_provider_rejection_is_post_body_though_its_code_is_not():
+    """The classification rule at its sharpest.
+
+    The caller-facing *code* for a provider input rejection is
+    `argument_too_long` — one actionable failure mode for the agent whichever
+    limit applied — while the operator-facing *marker* is
+    `provider_input_rejected`. They answer different questions and are allowed
+    to differ; what may not happen is the two landing on the same side of the
+    body/no-body line. The character cap refuses before any provider call; the
+    provider rejection is only knowable after one. Sharing a value between them
+    would file a network round trip as a call that never started, which is the
+    `vault_anchor_lost_at_publish` mistake exactly.
+    """
+    from src.mcp_server import tools
+
+    assert tools._PROVIDER_INPUT_REJECTED_MARKER != tools._ARGUMENT_TOO_LONG_MARKER
+    assert tools._ARGUMENT_TOO_LONG_MARKER in usage_stats.PRE_BODY_REFUSAL_ERROR_MARKERS
+    assert (
+        tools._PROVIDER_INPUT_REJECTED_MARKER
+        not in usage_stats.PRE_BODY_REFUSAL_ERROR_MARKERS
+    )
+
+
+# --------------------------------------------------------------------------
+# 1b. The refusal count is a sum of weights, not a count of rows.
+# --------------------------------------------------------------------------
+
+
+def test_the_refusal_weight_is_one_plus_suppressed():
+    """`rate_limited` rows are coalesced, so a row stands for `1 + suppressed`
+    refusals. A reader that counted rows would undercount every coalesced
+    window by an unbounded factor — the coalescer exists precisely so the row
+    count stops tracking the refusal rate."""
+    weight = usage_stats.refusal_weight_sql()
+    assert weight.startswith("(1 + COALESCE(")
+    assert "ul.params->>'suppressed'" in weight
+    assert "::bigint" in weight
+
+
+def test_the_suppressed_cast_is_guarded_and_bounded():
+    """`params` is JSONB this module does not control. An unguarded `::bigint`
+    on a non-numeric — or on a number too large for the type — aborts the
+    statement, which renders the whole window as an error rather than one row
+    with a wrong figure. The guard is the `result_count` precedent, and it is
+    length-bounded: a bare `^[0-9]+$` admits a forty-digit literal that
+    overflows `bigint` and raises exactly the way no guard at all would."""
+    weight = usage_stats.refusal_weight_sql()
+    assert "~ '^[0-9]{1,9}$'" in weight
+    assert "CASE WHEN" in weight
+    # A value that fails the guard must still weigh 1: the row is a refusal
+    # either way, only its suppressed tail is unreadable.
+    assert "COALESCE(" in weight and ", 0)" in weight
+
+
+def test_an_uncoalesced_marker_weighs_one_through_the_same_expression():
+    """`argument_too_long` is deliberately not coalesced — it is refused below
+    the general bucket, so its rate is already bounded and a second mechanism
+    would buy nothing. It therefore carries no `suppressed` key, reads as NULL
+    and weighs 1 through the same expression. One code path, not two."""
+    import inspect
+
+    source = inspect.getsource(usage_stats.tool_aggregates)
+    assert "weight = refusal_weight_sql()" in source
+    assert "sum({weight}) FILTER (WHERE {refused})" in source
+    assert "count(*) FILTER (WHERE {refused})" not in source, (
+        "counting rows undercounts every coalesced window"
+    )
+
+
+def test_the_alias_reaches_the_weight_too():
+    assert "logs.params->>'suppressed'" in usage_stats.refusal_weight_sql(alias="logs")
 
 
 def test_a_publish_time_anchor_loss_is_an_executed_row_not_a_refusal():

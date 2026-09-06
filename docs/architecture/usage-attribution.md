@@ -143,13 +143,14 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   hand-written predicates agree until somebody adds a third marker to one of
   them.
 
-  It matches exactly six things and nothing else: `over_quota: true` (the
+  It matches exactly eight things and nothing else: `over_quota: true` (the
   quota gate, #162, declared here ahead of the gate that writes it so the two
   land as one contract), `error = 'no_vault_assigned'`,
-  `error = 'argument_not_encodable'`, and the three vault-root quarantine
+  `error = 'argument_not_encodable'`, the three vault-root quarantine
   markers the same admission gate writes (#199) —
   `error = 'vault_root_overlap'`, `error = 'vault_root_unexaminable'` and
-  `error = 'vault_root_not_ready'`. A broad match — `params ? 'error'`, or
+  `error = 'vault_root_not_ready'` — and the rate controls' two (#188, #194),
+  `error = 'rate_limited'` and `error = 'argument_too_long'`. A broad match — `params ? 'error'`, or
   `params->>'error' IS NOT NULL` — is wrong in a way that is invisible on the
   page: `_VAULT_REASSIGNED_MARKER`, `_CONFIRMATION_UNAVAILABLE_MARKER` and
   `_ANCHOR_LOST_AT_PUBLISH_MARKER` are written by tools whose bodies *ran*,
@@ -210,6 +211,27 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   deliberately **not** coalesced: it is refused below the general bucket, so
   its rate is already bounded by that bucket and a second mechanism would buy
   nothing.
+
+  **What the page does with that, concretely.** The per-tool refusal count on
+  `/admin/performance` is `sum(1 + suppressed) FILTER (WHERE <the predicate>)`,
+  not `count(*)` — `refusal_weight_sql()` in `src/services/usage_stats.py`.
+  Every non-coalesced marker carries no `suppressed` key, reads as NULL and
+  weighs 1, which is what an uncoalesced refusal is, so one expression is
+  correct for the whole enumerated set and there is no second code path. The
+  figure is exact only *after a flush*: a window still open holds refusals no
+  row represents yet, and the tick or the shutdown is what lands them.
+
+  The cast is guarded on the `result_count` precedent
+  (`src/services/search_analytics.py`) and **length-bounded** —
+  `~ '^[0-9]{1,9}$'`, no sign, since a count cannot be negative. Both halves of
+  that matter: `params` is JSONB whose contents this module does not control,
+  and an unguarded `::bigint` on a non-numeric *aborts the statement* rather
+  than returning NULL, which renders the whole window as an error page instead
+  of one row with a wrong figure — while a length-unbounded `^[0-9]+$` admits a
+  forty-digit literal that overflows `bigint` and raises in exactly the same
+  way. A value failing the guard weighs 1: the row is still a refusal, only its
+  suppressed tail is unreadable, and losing a tail beats losing the window.
+
   `related_source_not_found` and `related_source_not_embedded` were classified
   by the rule above and land on the post-body side: the body ran, resolved the vault and queried the database before
   either branch could be reached, so enumerating them as refusals would drop a
