@@ -122,7 +122,7 @@ type) — neither creates a shared file.
 
 - [x] 9.1 End backlog/sweep discovery and per-note read transactions before provider I/O; preserve verified hash/path snapshots and the after-provider generation interlock.
 - [x] 9.2 Add a real PostgreSQL regression for both callers using the actual reset driver, including DROP INDEX, ALTER TABLE and CREATE INDEX.
-- [ ] 9.3 Independent review and PostgreSQL validation of the discovery-lock fix; this does not replace the outstanding deployment/archive gates.
+- [x] 9.3 Independent review and PostgreSQL validation of the discovery-lock fix; this does not replace the outstanding deployment/archive gates.
 
 ### Codex recovery gate record — 2026-09-06
 

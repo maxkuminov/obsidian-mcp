@@ -62,19 +62,39 @@ The previous production image is retained under the local rollback tag
 `obsidian-mcp:pre-codex-20260906`. A database backup is still required before
 migration; an image rollback alone does not reverse schema changes.
 
-**Production rollout is awaiting explicit user approval.** Automatic approval
-review rejected migration/recreation because the issue-triage request did not
-explicitly authorize production deployment. No production migration, service
-recreation or compose update ran. Production remains on revision 022.
+The user explicitly authorized production deployment and restart after the
+initial approval-review rejection. Deployment then completed successfully:
+a fresh compressed database backup was taken, migrations advanced from 022 to
+**024 (head)**, and the service was recreated using the tested image.
+`make db-check` reported **No new upgrade operations detected**. Docker health
+is healthy, `WRITE_PRECONDITION_REQUIRED` remains false, and sandbox mode is
+false. The rollback image remains retained.
 
-After approval: deploy the staged image through the project backup/migration
-pipeline (023/024), run `make db-check`, verify health, execute the prepared live
-MCP write/search and session smoke checks, then reconcile/archive eligible
-OpenSpec changes and finish the PR. Existing browser sessions will need to sign
-in again. Confirmation from both existing users remains an owner task; the
-isolated synthetic-account smoke does not satisfy that confirmation.
+Live MCP smoke passed **314 assertions**, exercising `create_note`, `read_note`,
+`edit_note`, `set_frontmatter`, `read_file`, `write_file`, `move_note`,
+`delete_note`, `delete_file`, `keyword_search`, `semantic_search`, `get_links`
+and `list_notes`. Matching/stale/malformed preconditions, refusal immutability,
+read hashes and move destination hashes passed. All owned test files were
+removed; an empty diagnostics directory may remain.
+
+Live session smoke passed real HTTP logout replay rejection, password change,
+sibling-session revocation and retention of the changing session. The synthetic
+account and all its owned authentication rows were removed. These checks do
+not claim the entire outstanding live matrix of every pending change.
+
+Post-startup logs contained no ERROR/CRITICAL events. Initial embedding and FTS
+fingerprint adoption warnings were expected for the new state table; both stored
+fingerprints match the running configuration. Embedding warm-up completed and
+the periodic indexer started. Two completed runs scanned 3,951 notes with zero
+run errors. Historical embedding provenance remains assumed under the existing
+adoption contract. Strict OpenSpec validation after the move archive passed
+all 32 remaining items.
+Existing browser sessions need to sign in again. Confirmation from both
+existing users remains an owner task; a synthetic-account smoke does not
+satisfy that confirmation.
 
 Overlapping pending OpenSpec deltas now carry the same union of schema and
 latency requirements so later archival cannot erase a sibling change's
-scenarios. No changes have been archived and no issues have been closed by this
-recovery PR yet.
+scenarios. The completed `move-inode-lifetime` change is archived after its live check.
+Other changes remain active with their outstanding gates and owner decisions;
+no issues have been closed by this recovery PR yet.
