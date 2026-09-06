@@ -62,6 +62,13 @@ class _FakeResult:
     def scalar_one(self):
         raise AssertionError("scalar_one not expected in this test")
 
+    def scalar_one_or_none(self):
+        # `get_state` reads the keyword fingerprint at the head of the pass
+        # transaction. `None` is *absent*, which proceeds — startup adopts, and
+        # a database with no recorded fingerprint makes no claim this pass
+        # could contradict.
+        return None
+
 
 class _FakeSession:
     """Records executed statements and triggers a concurrent delete.

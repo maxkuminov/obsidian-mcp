@@ -1,5 +1,6 @@
 """Recompute every note's `content_tsvector` under the currently configured
-`FTS_CONFIGS` (see `src/config.py` and `src/services/fts.py`).
+`FTS_CONFIGS` (see `src/config.py` and `src/services/fts.py`), and record the
+keyword fingerprint that certifies the result.
 
 Run this after changing `FTS_CONFIGS` in `.env` and redeploying. Stored
 tsvectors are built at index time and go stale when the config list changes;
@@ -9,6 +10,29 @@ Invoked by `make rebuild-tsvectors`. This rebuilds the KEYWORD index only — it
 does NOT touch embeddings/vectors and makes NO API calls, so it completes in
 seconds for a few thousand notes (unlike the expensive `make reset-embeddings`
 flow, which it must not be confused with).
+
+**It rebuilds every scope that holds rows, not every active user, and it is
+all-or-nothing.** The fingerprint it writes is one stored row asserting
+something about *every* retained row in the database, and that is not a claim
+that can be established one tenant at a time: a scope the rebuild skipped —
+provenance unsettled, no assigned vault path, ownerless rows under
+`MULTI_USER_MODE` — keeps its previous-configuration vectors, and a startup
+that fails closed on the fingerprint would then pass while keyword search was
+exactly as wrong as before. So a skipped scope aborts the whole operation,
+names itself and its reason, rolls every rebuilt scope back and records
+nothing.
+
+**It waits for an in-flight index pass.** The rebuild takes the index
+generation lock before it reads its first row, and the periodic pass holds that
+lock for the duration of its transaction — so this command blocks until the
+pass commits rather than interleaving with it. That is the required behaviour,
+and it is why nothing here sets a short `lock_timeout`.
+
+Three ways forward when it refuses, in order of preference: settle the scope
+(assign or delete that user, or let an in-progress re-derive finish), delete or
+reassign ownerless rows, or put `FTS_CONFIGS` back to the value the stored
+fingerprint names — which clears the startup refusal immediately with no
+rebuild at all.
 """
 import asyncio
 import sys
@@ -16,24 +40,29 @@ import sys
 from src.config import settings
 from src.database import async_session, engine
 from src.services.fts import validate_fts_configs
-from src.services.indexer import _active_user_ids, rebuild_tsvectors
+from src.services.indexer import rebuild_tsvectors_all_scopes
 
 
 async def main() -> None:
     print(f"Rebuilding tsvectors for FTS_CONFIGS={settings.fts_configs}...")
-    async with async_session() as session:
-        # Fail fast on an unknown config name before touching any rows.
-        await validate_fts_configs(session)
-        if settings.multi_user_mode:
-            total = 0
-            for uid in await _active_user_ids():
-                total += await rebuild_tsvectors(session, user_id=uid)
-        else:
-            total = await rebuild_tsvectors(session, user_id=None)
-    await engine.dispose()
     print(
-        f"Done. Recomputed tsvectors for {total} note(s). Keyword search now "
-        "reflects FTS_CONFIGS; embeddings were not touched."
+        "Waiting for any in-flight index pass to commit before the first row "
+        "is read (the generation lock)."
+    )
+    async with async_session() as session:
+        # Fail fast on an unknown config name before touching any rows — and
+        # before taking the lock, so a typo does not queue behind a long pass.
+        await validate_fts_configs(session)
+        outcomes = await rebuild_tsvectors_all_scopes(session)
+    await engine.dispose()
+    total = sum(outcome.rows for outcome in outcomes.values())
+    for owner, outcome in outcomes.items():
+        label = "single-user scope" if owner is None else f"user_id={owner}"
+        print(f"  {label}: {outcome.describe()}")
+    print(
+        f"Done. Recomputed tsvectors for {total} note(s) across "
+        f"{len(outcomes)} scope(s), and recorded the keyword fingerprint. "
+        "Keyword search now reflects FTS_CONFIGS; embeddings were not touched."
     )
 
 

@@ -13,6 +13,11 @@ import asyncio
 import pytest
 
 import src.services.indexer as indexer
+from src.services.embeddings import (
+    EmbedNoteFailure,
+    EmbedNoteResult,
+    NoteEmbedOutcome,
+)
 
 
 # --------------------------------------------------------------------------
@@ -603,6 +608,42 @@ class _EmbedResult:
     def scalar(self):
         return self.rows[0] if self.rows else None
 
+    def scalar_one_or_none(self):
+        # `get_state`: no stored embedding fingerprint, which is **absent** —
+        # the state startup adopts — so the stage-head early exit proceeds and
+        # this section stays about the outage it is named for.
+        return self.rows[0] if self.rows else None
+
+
+def _provider_failed(message: str, *, chunks: int = 1) -> EmbedNoteResult:
+    """What `embed_note` returns for a provider raise now that it is typed.
+
+    The exception no longer escapes `embed_note` — it is swallowed there and
+    described by an `EmbedNoteFailure`, because `_reconcile_exclusions` calls
+    the same function and its declared convergence exception requires the row
+    to be left unstamped and retried. So the pass's record is built from the
+    structured failure, and `first_error` reads the provider's message rather
+    than `None`.
+    """
+    return EmbedNoteResult(
+        outcome=NoteEmbedOutcome.PROVIDER_FAILED,
+        chunks_submitted=chunks,
+        chunks_embedded=0,
+        truncated=False,
+        failure=EmbedNoteFailure(
+            exc_type="RuntimeError", message=message, requested=chunks
+        ),
+    )
+
+
+def _embedded(chunks: int = 1) -> EmbedNoteResult:
+    return EmbedNoteResult(
+        outcome=NoteEmbedOutcome.EMBEDDED,
+        chunks_submitted=chunks,
+        chunks_embedded=chunks,
+        truncated=False,
+    )
+
 
 def _embed_fixture(monkeypatch, tmp_path, contents: dict[str, str]):
     """A real vault (the pass pins a root and reads through it) plus rows whose
@@ -651,7 +692,7 @@ def test_a_total_provider_outage_is_not_a_clean_run_row(monkeypatch, tmp_path):
     })
 
     async def _provider_is_down(*_a, **_k):
-        raise RuntimeError("Ollama: connection refused")
+        return _provider_failed("Ollama: connection refused")
 
     monkeypatch.setattr(indexer, "embed_note", _provider_is_down)
 
@@ -685,8 +726,8 @@ def test_a_partial_outage_keeps_the_successful_count(monkeypatch, tmp_path):
 
     async def _flaky(_session, note, _content, **_kwargs):
         if note.file_path == "B.md":
-            raise RuntimeError("read timeout")
-        return 2
+            return _provider_failed("read timeout", chunks=2)
+        return _embedded(2)
 
     monkeypatch.setattr(indexer, "embed_note", _flaky)
 
@@ -713,7 +754,7 @@ def test_a_pass_with_nothing_wrong_still_records_no_error(monkeypatch, tmp_path)
     _embed_fixture(monkeypatch, tmp_path, {"A.md": "alpha\n"})
 
     async def _ok(*_a, **_k):
-        return 1
+        return _embedded()
 
     monkeypatch.setattr(indexer, "embed_note", _ok)
 

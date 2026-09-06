@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import ctypes
+import enum
 import errno
 import fnmatch
 import hashlib
@@ -25,7 +26,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import ARRAY, insert
 
-from src.config import MAX_LINKS_PER_NOTE, settings
+from src.config import MAX_CHUNKS_PER_NOTE, MAX_LINKS_PER_NOTE, settings
 from src.database import async_session
 from src.models.db import (
     IndexerRun,
@@ -37,14 +38,31 @@ from src.models.db import (
     User,
 )
 from src.services.embeddings import (
+    EmbedNoteFailure,
+    NoteEmbedOutcome,
     StaleCertification,
     certify_embedded,
     chunk_text,
+    chunk_text_bounded,
     clean_at_version,
     clean_for_embedding,
     embed_note,
 )
 from src.services.fts import index_tsvector_sql
+from src.services.index_state import (
+    KEY_EMBEDDING_FINGERPRINT,
+    KEY_FTS_FINGERPRINT,
+    KEY_ROTATION_CURSOR,
+    FingerprintStatus,
+    acquire_generation_lock,
+    compare_fingerprint,
+    embedding_fingerprint,
+    fts_fingerprint,
+    get_state,
+    parse_rotation_cursor,
+    set_state,
+    state_table_exists,
+)
 from src.services.links import (
     build_vault_index,
     extract_links_bounded,
@@ -123,7 +141,21 @@ class EmbedPassResult:
     """
 
     embedded: int = 0
-    #: The backlog this pass was handed — the "of M" in the summary.
+    #: **Notes for which an embedding provider call was issued** — the "of M"
+    #: in the summary. It used to be initialised from the backlog's size, which
+    #: counted work *contemplated* rather than work done: a sweep that decided
+    #: about 16,700 certification-current rows without calling anything would
+    #: have rendered three failures out of three calls as "3 of 16,700", and a
+    #: pass over 400 notes of which 50 cleaned to zero chunks would have
+    #: claimed 400 provider calls it never made.
+    #:
+    #: **One rule, one increment point**: `record_attempt()` is called exactly
+    #: once per note whose `EmbedNoteResult.chunks_submitted` is non-zero, at
+    #: the two `embed_note` call sites and nowhere else. Every non-attempt is a
+    #: consequence of that rule rather than an enumerated exception — a
+    #: zero-chunk certification, an excluded note, a hash mismatch, a note left
+    #: by a pause or a budget stop and a sweep row that agreed with the
+    #: configuration all issue no call, so none of them moves the denominator.
     attempted: int = 0
     failures: int = 0
     #: The first failure's message. One, not all: the row's `error` is bounded
@@ -131,10 +163,42 @@ class EmbedPassResult:
     #: does not already say.
     first_error: str | None = None
 
+    def record_attempt(self) -> None:
+        """One note issued a provider call. The only writer of `attempted`."""
+        self.attempted += 1
+
     def record_failure(self, exc: BaseException) -> None:
+        """A failure the caller still holds an exception for.
+
+        Kept for the exceptions that genuinely escape around the call — a
+        database error, a rollback failure — so the two entry points converge
+        on one counter and one summary.
+        """
         self.failures += 1
         if self.first_error is None:
             self.first_error = f"{type(exc).__name__}: {exc}"
+
+    def record_failure_detail(self, failure: EmbedNoteFailure) -> None:
+        """A failure `embed_note` swallowed, described by its own record.
+
+        `embed_note` catches the provider exception itself, so by the time the
+        pass sees a `PROVIDER_FAILED` there is no exception left to inspect and
+        `first_error` would read `"... first: None"` — the operator's only view
+        of a total outage, saying nothing. The structured failure is what the
+        message is built from instead: `"{exc_type}: {message}"` for a raise,
+        and the cardinality mismatch's own rendering for the mismatch. Both
+        increment the same counter as `record_failure`, because the run row
+        distinguishes them by their message and not by a second count.
+        """
+        self.failures += 1
+        if self.first_error is None:
+            if failure.exc_type == "CardinalityMismatch":
+                self.first_error = (
+                    f"CardinalityMismatch: {failure.received} vectors for "
+                    f"{failure.requested} chunks"
+                )
+            else:
+                self.first_error = f"{failure.exc_type}: {failure.message}"
 
     @property
     def failure_summary(self) -> str | None:
@@ -1480,6 +1544,39 @@ async def _index_vault_pinned(
     skips: list[str] = []
 
     async with async_session() as session:
+        # ── The generation lock, at the HEAD of this transaction ───────────
+        # **Not at the tsvector write, and this is a deadlock regression, not
+        # a matter of taste** (D7c3). This pass is one transaction and it takes
+        # row locks long before it reaches the keyword vector: the id-preserving
+        # move UPDATE and its `note_links.target_path` rewrite, the changed-note
+        # upsert, the grammar-invalidation `UPDATE … SET
+        # embedded_content_hash = NULL`, the prune DELETE and the
+        # `note_links` delete-and-insert. Acquiring the advisory lock at the
+        # tsvector write would leave this pass holding those row locks while it
+        # waited for the lock, and the rebuild driver holding the lock while it
+        # waited for those rows — a cycle the database resolves by killing one
+        # side, and a direct violation of "the advisory lock before any row or
+        # table lock".
+        #
+        # The rule is therefore a property of the **transaction**: a
+        # transaction that will write any configuration-dependent derived row
+        # takes the lock and re-validates the fingerprint before its first
+        # row-locking mutation. Anyone adding a mutation to this function must
+        # keep it below this line — auditing what the transaction touches, not
+        # reasoning backwards from the write that consumes the fingerprint.
+        #
+        # `_reconcile_provenance` above is not in scope: it runs in its own
+        # session and its transaction has committed before this one opens.
+        #
+        # The consequence is accepted and documented (L5b): the pass holds the
+        # lock for its whole transaction — minutes on a large vault — so
+        # `make reset-embeddings` and `make rebuild-tsvectors` *wait* for an
+        # in-flight pass instead of interleaving with it. That is the required
+        # behaviour, and those paths deliberately do not defeat it with a short
+        # `lock_timeout`.
+        await acquire_generation_lock(session)
+        await _assert_fts_generation_current(session)
+
         # Get existing hashes (scoped to this user when set)
         existing_stmt = select(
             NoteMetadata.file_path,
@@ -2427,6 +2524,262 @@ async def _link_backfill_pinned(
             link_backfill_in_progress = False
 
 
+class GenerationMismatch(RuntimeError):
+    """A stored settings fingerprint no longer describes this process.
+
+    Raised by the incremental index pass when the keyword fingerprint it
+    re-read under the generation lock is not the one this build would write.
+    Deliberately fatal to the pass rather than a skip: a keyword vector is only
+    ever rewritten when a note's `content_hash` changes, so a row this pass
+    wrote under the previous `FTS_CONFIGS` would keep that vector for ever
+    behind a fingerprint claiming otherwise — `'running'` stored as the english
+    stem `run`, matching a `simple` query for `run` on a note that does not
+    contain the word. The pass aborts with nothing committed, exactly as a
+    tsvector floor failure does, and retries on the next tick under whichever
+    configuration is then current.
+    """
+
+
+async def _fingerprint_verdict(session, key: str, current: str):
+    """Compare the fingerprint stored under `key` against `current`.
+
+    Returns `None` when there is nothing to compare — `indexer_state` has not
+    been migrated in yet. `to_regclass` answers without raising, which is what
+    lets this run as the first statement of a transaction that must go on: a
+    `SELECT` against a missing table aborts the transaction outright.
+    """
+    if not await state_table_exists(session):
+        return None
+    return compare_fingerprint(await get_state(session, key), current)
+
+
+async def _assert_fts_generation_current(session) -> None:
+    """Re-read the keyword fingerprint under the generation lock, or abort.
+
+    Acquiring the lock buys nothing on its own: the stored value may have
+    changed while this transaction waited for it, so the read has to happen
+    *after* the acquisition and inside the same transaction. `ABSENT` proceeds
+    — startup adopts, and a database that has never recorded a fingerprint has
+    no claim for this pass to contradict.
+    """
+    verdict = await _fingerprint_verdict(
+        session, KEY_FTS_FINGERPRINT, fts_fingerprint()
+    )
+    if verdict is None or verdict.status in (
+        FingerprintStatus.ABSENT,
+        FingerprintStatus.MATCH,
+    ):
+        return
+    if verdict.status is FingerprintStatus.UNREADABLE:
+        detail = f"the stored value could not be interpreted: {verdict.reason}"
+    else:
+        detail = (
+            "the stored value differs in "
+            f"{', '.join(verdict.fields) or 'an unnamed field'}"
+        )
+    raise GenerationMismatch(
+        "index pass aborted before its first write: the stored keyword "
+        f"fingerprint does not describe this process's FTS_CONFIGS — {detail}. "
+        f"stored={verdict.stored!r} current={verdict.current!r}. Nothing has "
+        "been committed. Run `make rebuild-tsvectors`, or restore the "
+        "FTS_CONFIGS the stored fingerprint names."
+    )
+
+
+async def _embedding_generation_current(session, log_suffix: str) -> bool:
+    """Whether this process's embedding configuration is the stored one.
+
+    A per-user-stage read, and **an optimisation rather than the guarantee**:
+    `embed_note` takes the generation lock and re-reads this fingerprint
+    between its provider call and its certification, which is the only window
+    where the check and the act are not separated by a network round trip. This
+    one simply stops an old container from working through a backlog whose
+    every certification the lock is going to refuse.
+
+    Anything other than a difference proceeds. `ABSENT` is startup's to adopt,
+    and a database with no recorded fingerprint makes no claim this stage could
+    contradict.
+    """
+    verdict = await _fingerprint_verdict(
+        session, KEY_EMBEDDING_FINGERPRINT, embedding_fingerprint()
+    )
+    if verdict is None or verdict.status in (
+        FingerprintStatus.ABSENT,
+        FingerprintStatus.MATCH,
+    ):
+        return True
+    logger.error(
+        "Embedding stage skipped%s: the stored embedding fingerprint does not "
+        "describe this process (%s). stored=%r current=%r. Nothing was "
+        "attempted and nothing recorded — every certification this stage could "
+        "reach would be refused under the generation lock anyway. Run "
+        "`make reset-embeddings`, or restore the configuration the stored "
+        "fingerprint names.",
+        log_suffix,
+        (
+            verdict.reason
+            if verdict.status is FingerprintStatus.UNREADABLE
+            else "differs in " + (", ".join(verdict.fields) or "an unnamed field")
+        ),
+        verdict.stored,
+        verdict.current,
+    )
+    return False
+
+
+async def _clear_chunks_truncated(session, row) -> None:
+    """Drop a chunk-cap marker from a row that is about to have no vectors.
+
+    Written as a conditional UPDATE rather than an unconditional one so a pass
+    over an untruncated vault dirties no rows: the marker's lifecycle is
+    `links_truncated`'s, and the overwhelmingly common value is `false`.
+
+    `getattr` with a default because the callers' rows come from raw SQL that
+    the offline test fakes answer with hand-built namespaces; a row without the
+    column has no marker to clear.
+    """
+    if not getattr(row, "chunks_truncated", False):
+        return
+    await session.execute(
+        update(NoteMetadata)
+        .where(NoteMetadata.id == row.id)
+        .values(chunks_truncated=False)
+        .execution_options(synchronize_session=False)
+    )
+
+
+@dataclass
+class EmbedBudget:
+    """One tenant's embed-stage allowance for one pass (#202, D5).
+
+    **Checked only at a note boundary, and never inside a note.** `embed_note`
+    refuses partial certification, so a note abandoned between chunks is left
+    uncertified, re-selected by the backlog on the next tick, and re-performs
+    every provider call it already made — #127's permanent burn arriving by a
+    new route. Bounding at the boundary means the overrun is at most one note,
+    which `MAX_CHUNKS_PER_NOTE` has already bounded.
+
+    **It debits chunks *submitted*, never chunks stored.** A failing provider
+    stores nothing, so a budget debited by stored chunks is not debited at all
+    by an outage — and a tenant whose every note fails would burn the whole
+    pass, every pass, without ever reaching its own bound: the starvation this
+    exists to stop, surviving inside the fix for it. A raise and a cardinality
+    mismatch therefore debit exactly as a success does.
+
+    **At least one note, always.** The check runs only after a note of this
+    user's pass has completed, so a tenant whose very first note exceeds the
+    whole budget still advances by one note per pass instead of zero for ever.
+
+    **Only when the pass serves more than one scope.** With one active scope
+    there is no other tenant to be fair to, and a budget there would spread a
+    first index of a few thousand notes over several five-minute-spaced passes
+    for no benefit. That clause is what keeps the default deployment's
+    behaviour identical to today's.
+
+    A stop is **not** a failure: it writes nothing to `indexer_runs.error` and
+    logs once per user per pass, the same class of event as a pause. The
+    operator-visible signal for a tenant permanently over budget is the
+    dashboard's pending count, which is a property of the index rather than of
+    one pass.
+    """
+
+    chunk_budget: int = 0
+    time_budget: float = 0.0
+    enforced: bool = False
+    chunks_submitted: int = 0
+    notes_completed: int = 0
+    started_at: float = field(default_factory=time.monotonic)
+    #: One WARNING per user per pass, shared by the backlog loop and the sweep.
+    announced: bool = False
+
+    @property
+    def active(self) -> bool:
+        """Whether this budget can ever stop anything."""
+        return self.enforced and bool(self.chunk_budget or self.time_budget)
+
+    def debit(self, chunks_submitted: int) -> None:
+        self.chunks_submitted += chunks_submitted
+
+    def note_finished(self) -> None:
+        """One note of this user's embed stage reached its boundary."""
+        self.notes_completed += 1
+
+    def exhausted(self) -> bool:
+        if not self.active or self.notes_completed < 1:
+            return False
+        if self.chunk_budget and self.chunks_submitted >= self.chunk_budget:
+            return True
+        if (
+            self.time_budget
+            and (time.monotonic() - self.started_at) >= self.time_budget
+        ):
+            return True
+        return False
+
+    def stop(self, log_suffix: str, stage: str) -> None:
+        """Log the stop once per user per pass, whichever stage reached it."""
+        if self.announced:
+            return
+        self.announced = True
+        logger.warning(
+            "Embed budget exhausted%s during %s: %d chunk(s) submitted against "
+            "a budget of %s, %.1fs elapsed against %ss. Stopping this user at a "
+            "note boundary so the next tenant is served in this pass; the "
+            "remaining backlog stays visible as the dashboard's pending count. "
+            "This is not a failure and is not recorded in the run row's error.",
+            log_suffix,
+            stage,
+            self.chunks_submitted,
+            self.chunk_budget or "off",
+            time.monotonic() - self.started_at,
+            self.time_budget or "off",
+        )
+
+
+async def _active_scope_count(session) -> int:
+    """How many scopes this pass is serving — the budget's on/off switch.
+
+    Counted from `users` rather than threaded down from the loop so that the
+    panel's reindex, the startup pass and the periodic tick all get the same
+    answer without three call sites agreeing about it. A failure to count
+    returns 1, which leaves the pass **unbudgeted** — today's behaviour, and
+    the safe direction: a bookkeeping query that fails must not start stopping
+    tenants short.
+    """
+    if not settings.multi_user_mode:
+        return 1
+    try:
+        result = await session.execute(
+            text(
+                "SELECT count(*) FROM users "
+                "WHERE is_active = true AND vault_path IS NOT NULL"
+            )
+        )
+        return int(result.scalar() or 0)
+    except Exception as e:
+        logger.warning(
+            "Could not count active scopes for the embed budget (%s); this "
+            "pass runs unbudgeted",
+            e,
+        )
+        return 1
+
+
+async def _budget_for_pass(session, log_suffix: str) -> EmbedBudget:
+    chunk_budget = int(settings.embed_chunk_budget_per_user or 0)
+    time_budget = float(settings.embed_time_budget_seconds_per_user or 0)
+    if not (chunk_budget or time_budget):
+        # Both settings at 0 disables the machinery entirely — no scope count,
+        # no clock, nothing to reason about.
+        return EmbedBudget()
+    scopes = await _active_scope_count(session)
+    return EmbedBudget(
+        chunk_budget=chunk_budget,
+        time_budget=time_budget,
+        enforced=scopes > 1,
+    )
+
+
 async def embed_vault(user_id: int | None = None):
     """Embed notes that don't have embeddings yet or have changed.
 
@@ -2484,13 +2837,30 @@ async def _embed_vault_pinned(
     user_id: int | None, root_fd: int, log_suffix: str
 ) -> EmbedPassResult:
     async with async_session() as session:
+        # ── The cheap early exit, and it is only that (D7c, task 5.7a) ─────
+        # A stage-head fingerprint read cannot bind a certification that
+        # happens after a provider call — the check and the act are separated
+        # by a network round trip, which is exactly why the enforcement is the
+        # generation lock inside `embed_note`. What this buys is that a
+        # container running the previous configuration abandons the stage
+        # within one tick instead of grinding through a backlog whose every
+        # certification the lock will refuse. It records nothing: a skipped
+        # stage did no work and had no failure.
+        if not await _embedding_generation_current(session, log_suffix):
+            return EmbedPassResult()
+
         # Find notes without embeddings or with stale embeddings, scoped
         # to this user when set. We bind the user_id parameter even in
         # single-user mode and compare with `IS NOT DISTINCT FROM` so the
         # NULL case still selects all rows without a separate branch.
+        #
+        # `chunks_truncated` rides along so the marker is only *written* when
+        # it has to change: the certifying branch below sets or clears it from
+        # `EmbedNoteResult.truncated`, and re-stamping an unchanged boolean on
+        # every note of every pass would dirty every row for nothing.
         if user_id is None:
             sql = """
-                SELECT nm.id, nm.file_path, nm.content_hash
+                SELECT nm.id, nm.file_path, nm.content_hash, nm.chunks_truncated
                 FROM notes_metadata nm
                 WHERE nm.user_id IS NULL
                   AND (nm.embedded_content_hash IS NULL
@@ -2500,7 +2870,7 @@ async def _embed_vault_pinned(
             params: dict = {}
         else:
             sql = """
-                SELECT nm.id, nm.file_path, nm.content_hash
+                SELECT nm.id, nm.file_path, nm.content_hash, nm.chunks_truncated
                 FROM notes_metadata nm
                 WHERE nm.user_id = :uid
                   AND (nm.embedded_content_hash IS NULL
@@ -2510,6 +2880,7 @@ async def _embed_vault_pinned(
             params = {"uid": user_id}
         result = await session.execute(text(sql), params)
         unembedded = result.fetchall()
+        budget = await _budget_for_pass(session, log_suffix)
 
         exclude_patterns = settings.embedding_exclude_patterns or []
         if not unembedded:
@@ -2521,14 +2892,22 @@ async def _embed_vault_pinned(
         # Notes this pass embedded and certified, plus the failures it
         # swallowed. `embedded` is incremented only after the per-note commit
         # lands, so a note whose certification was rolled back is not reported
-        # as embedded.
-        outcome = EmbedPassResult(attempted=len(unembedded))
+        # as embedded. `attempted` starts at zero and rises with each provider
+        # call — never from `len(unembedded)`, which counts work contemplated.
+        outcome = EmbedPassResult()
         for i, row in enumerate(unembedded):
             # Re-check the pause flag every iteration so a panel-driven pause
             # (e.g. reset-embeddings) stops an in-flight embed pass promptly
             # instead of grinding through the whole backlog first (issue #19).
             if _is_paused():
                 logger.info(f"Embedding pass paused, stopping early{log_suffix}")
+                break
+            # The budget sits beside the pause and is exactly as much of a
+            # decision: between notes, never inside one, and never before this
+            # user's pass has completed a note. A stop is not a failure and
+            # moves neither counter.
+            if budget.exhausted():
+                budget.stop(log_suffix, "the hash-mismatch backlog")
                 break
             try:
                 # Skip files matching exclude patterns. Drop any pre-existing
@@ -2552,12 +2931,25 @@ async def _embed_vault_pinned(
                     # Stamp first, delete second: the conditional UPDATE is what
                     # takes the row lock, so nothing is dropped on the strength
                     # of a row that has since moved.
+                    #
+                    # **No generation lock here, deliberately — do not "fix"
+                    # the asymmetry** (D7c). This branch issues no provider
+                    # call and writes no vector; it stamps a row to record that
+                    # an *excluded* note has been dealt with, and "the correct
+                    # vector set for an excluded note is the empty one" is true
+                    # under every embedding configuration. There is nothing a
+                    # generation change could invalidate, so there is nothing
+                    # for the lock to protect.
                     await certify_embedded(
                         session, row.id, row.content_hash, row.file_path
                     )
                     await session.execute(
                         delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
                     )
+                    # The note ends this branch with no vectors at all, so a
+                    # chunk-cap marker left from a previous embed would claim a
+                    # truncation of a set that no longer exists.
+                    await _clear_chunks_truncated(session, row)
                     await session.commit()
                     skipped_excluded += 1
                     continue
@@ -2618,17 +3010,91 @@ async def _embed_vault_pinned(
                 # with a conditional, row-locking UPDATE before it replaces a
                 # single vector, and raises `StaleCertification` if the row has
                 # moved.
-                chunks = await embed_note(
+                was_truncated = bool(getattr(note, "chunks_truncated", False))
+                result = await embed_note(
                     session,
                     note,
                     content,
                     certified_hash=row.content_hash,
                     certified_path=row.file_path,
                 )
-                total_chunks += chunks
-                await session.commit()
-                outcome.embedded += 1
 
+                # ── Read the result by field, never as a number ────────────
+                # `embed_note` used to return an int and `0` meant three
+                # unrelated things — a zero-chunk certification, a swallowed
+                # provider exception and a cardinality mismatch — with
+                # `outcome.embedded += 1` running after all three. A total
+                # provider outage therefore wrote `notes_embedded = N,
+                # error = NULL`: the row a healthy pass writes, with a
+                # *positive* count (#201).
+                if result.chunks_submitted:
+                    # The one increment point for `attempted`: a provider call
+                    # was issued. Everything that does not reach here — a
+                    # zero-chunk certification, an exclusion, a hash mismatch,
+                    # a pause, a budget stop — is a consequence of that rule
+                    # rather than an exception to it.
+                    outcome.record_attempt()
+                    budget.debit(result.chunks_submitted)
+
+                if result.outcome in (
+                    NoteEmbedOutcome.EMBEDDED,
+                    NoteEmbedOutcome.CERTIFIED_EMPTY,
+                ):
+                    total_chunks += result.chunks_embedded
+                    # `CERTIFIED_EMPTY` leaves the note with no vectors at all,
+                    # so its marker is cleared for the exclusion branch's
+                    # reason; `EMBEDDED` sets it from what the chunker actually
+                    # did. Written in the certifying transaction, so the marker
+                    # and the vectors it describes land or roll back together.
+                    if bool(result.truncated) != was_truncated:
+                        note.chunks_truncated = bool(result.truncated)
+                    await session.commit()
+                    outcome.embedded += 1
+                    if result.truncated:
+                        # **After the commit, never before** (D3). Logging it
+                        # first would leave a permanent ERROR in a bounded,
+                        # process-lifetime buffer for a truncation that then
+                        # rolled back on a `StaleCertification`, sending an
+                        # operator after a note that was never stored that way.
+                        # The line cannot name the note's true chunk count —
+                        # obtaining it means the unbounded chunking the cap
+                        # exists to prevent.
+                        logger.error(
+                            "Chunking truncated at MAX_CHUNKS_PER_NOTE=%d for "
+                            "%s: its first %d chunks are embedded and the note "
+                            "is certified, but the tail of it is not "
+                            "semantically searchable. notes_metadata."
+                            "chunks_truncated is set and every vector-search "
+                            "row for this note reports the truncation.",
+                            MAX_CHUNKS_PER_NOTE,
+                            row.file_path,
+                            MAX_CHUNKS_PER_NOTE,
+                        )
+                elif result.outcome is NoteEmbedOutcome.GENERATION_MISMATCH:
+                    # Neither embedded nor a failure: nothing went wrong with
+                    # the provider, the configuration moved under the call and
+                    # the interlock refused the certification. Nothing was
+                    # written, so the note is simply left for a later pass
+                    # running whichever configuration is then current.
+                    logger.error(
+                        "Refused to certify %s: the embedding configuration "
+                        "changed while its provider call was in flight, so "
+                        "these vectors describe a generation the database no "
+                        "longer records. Nothing was written; a later pass "
+                        "will embed it.%s",
+                        row.file_path,
+                        log_suffix,
+                    )
+                    await session.rollback()
+                else:
+                    # `PROVIDER_FAILED` / `PROVIDER_CARDINALITY_MISMATCH`.
+                    # `embed_note` swallowed the exception, so the pass's own
+                    # record is built from the structured failure and from
+                    # nothing else.
+                    outcome.record_failure_detail(result.failure)
+                    await session.rollback()
+
+                budget.note_finished()
                 if (i + 1) % 50 == 0:
                     logger.info(f"Embedded {i + 1}/{len(unembedded)} notes ({total_chunks} chunks)")
             except StaleCertification as e:
@@ -2674,7 +3140,8 @@ async def _embed_vault_pinned(
         # new configuration reached only notes that happened to be edited
         # afterwards — see `_reconcile_exclusions`.
         await _reconcile_exclusions(
-            session, user_id, root_fd, exclude_patterns, log_suffix
+            session, user_id, root_fd, exclude_patterns, log_suffix,
+            outcome, budget,
         )
 
     return outcome
@@ -2686,6 +3153,8 @@ async def _reconcile_exclusions(
     root_fd: int,
     exclude_patterns: list[str],
     log_suffix: str,
+    outcome: EmbedPassResult,
+    budget: EmbedBudget,
 ) -> None:
     """Make the stored vectors agree with the *current* exclusion patterns
     (#127, D2).
@@ -2719,11 +3188,24 @@ async def _reconcile_exclusions(
     unstamped, retried). A pause stops it between notes; the next pass runs a
     fresh sweep from the start, and the per-note commits make re-visiting an
     already-repaired row a no-op.
+
+    **It reports into the pass's own accumulator** (#201, D9). On a fully
+    indexed vault the backlog is empty and this sweep is the only stage making
+    provider calls, so a sweep that swallowed its failures into a log line
+    reproduced the falsely-clean run row in the one code path a backlog-only
+    fix does not touch. It calls `record_attempt` for the rows it actually
+    sends to the provider and **never for the rows it decides about without
+    one** — it scans every certification-current row in the scope (~16,700 on
+    the production vault), and counting those would render three failures out
+    of three calls as "3 of 16,700".
+
+    It draws on the **same per-user budget** as the backlog, since both call
+    the provider, and stops at a note boundary exactly as a pause does.
     """
     owner_clause = "nm.user_id IS NULL" if user_id is None else "nm.user_id = :uid"
     params: dict = {} if user_id is None else {"uid": user_id}
     rows = (await session.execute(text(f"""
-        SELECT nm.id, nm.file_path, nm.content_hash,
+        SELECT nm.id, nm.file_path, nm.content_hash, nm.chunks_truncated,
                EXISTS (
                    SELECT 1 FROM note_embeddings ne WHERE ne.note_id = nm.id
                ) AS has_vectors
@@ -2746,6 +3228,12 @@ async def _reconcile_exclusions(
                 f"Exclusion reconciliation paused, stopping early{log_suffix}"
             )
             break
+        # Same budget, same boundary. A sweep stopped here behaves exactly as
+        # one stopped by the pause: already-repaired rows stay repaired and the
+        # next unexhausted pass runs a fresh, idempotent sweep.
+        if budget.exhausted():
+            budget.stop(log_suffix, "the exclusion-reconciliation sweep")
+            break
 
         excluded = any(
             fnmatch.fnmatch(row.file_path, pat) for pat in exclude_patterns
@@ -2764,12 +3252,16 @@ async def _reconcile_exclusions(
                 # `file_path` without touching `content_hash`, so the predicate
                 # misses and `StaleCertification` rolls the note back rather
                 # than deleting the vectors of a row that is now included.
+                # No generation lock, for the backlog exclusion branch's
+                # reason: no provider call, no vector written, and a claim that
+                # holds under every configuration.
                 await certify_embedded(
                     session, row.id, row.content_hash, row.file_path
                 )
                 await session.execute(
                     delete(NoteEmbedding).where(NoteEmbedding.note_id == row.id)
                 )
+                await _clear_chunks_truncated(session, row)
                 await session.commit()
                 removed += 1
                 continue
@@ -2793,11 +3285,17 @@ async def _reconcile_exclusions(
                 continue
 
             _, content = parse_frontmatter(raw)
-            if not chunk_text(
+            # The **bounded** chunker, so "this note produces no chunks" means
+            # the same thing here as it does in `embed_note`, and so the probe
+            # stops at the first chunk instead of chunking a 10 MiB note to
+            # find out it is non-empty.
+            probe_chunks, _probe_truncated = chunk_text_bounded(
                 clean_for_embedding(content),
                 chunk_size=settings.chunk_size,
                 overlap=settings.chunk_overlap,
-            ):
+                max_chunks=MAX_CHUNKS_PER_NOTE,
+            )
+            if not probe_chunks:
                 # Zero chunks: the row is already exactly right — current
                 # certification, zero vectors. Writing anything here would
                 # re-stamp an unchanged row on every single pass.
@@ -2806,20 +3304,59 @@ async def _reconcile_exclusions(
             note = (await session.execute(
                 select(NoteMetadata).where(NoteMetadata.id == row.id)
             )).scalar_one()
-            chunks = await embed_note(
+            was_truncated = bool(getattr(note, "chunks_truncated", False))
+            result = await embed_note(
                 session,
                 note,
                 content,
                 certified_hash=row.content_hash,
                 certified_path=row.file_path,
             )
-            await session.commit()
-            if chunks:
-                restored += 1
+            if result.chunks_submitted:
+                outcome.record_attempt()
+                budget.debit(result.chunks_submitted)
+            budget.note_finished()
+
+            if result.outcome in (
+                NoteEmbedOutcome.EMBEDDED,
+                NoteEmbedOutcome.CERTIFIED_EMPTY,
+            ):
+                if bool(result.truncated) != was_truncated:
+                    note.chunks_truncated = bool(result.truncated)
+                await session.commit()
+                if result.truncated:
+                    logger.error(
+                        "Chunking truncated at MAX_CHUNKS_PER_NOTE=%d for %s "
+                        "during exclusion reconciliation: its first %d chunks "
+                        "are embedded and the note is certified, but the tail "
+                        "of it is not semantically searchable.",
+                        MAX_CHUNKS_PER_NOTE,
+                        row.file_path,
+                        MAX_CHUNKS_PER_NOTE,
+                    )
+                if result.chunks_embedded:
+                    restored += 1
+            elif result.outcome is NoteEmbedOutcome.GENERATION_MISMATCH:
+                logger.error(
+                    "Reconciliation refused to certify %s: the embedding "
+                    "configuration changed while its provider call was in "
+                    "flight. Nothing was written.",
+                    row.file_path,
+                )
+                await session.rollback()
+            else:
+                # The sweep's own provider failures ride back on the pass's
+                # accumulator rather than dying in a log line — the whole point
+                # of D9.
+                outcome.record_failure_detail(result.failure)
+                await session.rollback()
         except StaleCertification as e:
             logger.info("Reconciliation skipped %s: %s", row.file_path, e)
             await session.rollback()
         except Exception as e:
+            # Counted, for the same reason the backlog counts its own: the log
+            # line scrolls away and the run row is what survives a redeploy.
+            outcome.record_failure(e)
             logger.warning(
                 "Reconciliation failed for %s: %s", row.file_path, e
             )
@@ -2833,10 +3370,232 @@ async def _reconcile_exclusions(
         )
 
 
+class RebuildSkip(enum.Enum):
+    """Why one owner scope's keyword rebuild wrote nothing."""
+
+    #: `_ancillary_pass_is_permitted` refused: that owner's index provenance is
+    #: not settled, so an unverified writer of rows the provenance is a claim
+    #: about may not run for them.
+    PROVENANCE_UNSETTLED = "provenance unsettled"
+    #: The owner has no assigned `vault_path`, or the assigned path could not
+    #: be pinned.
+    ROOT_UNPINNABLE = "root unpinnable"
+
+
+@dataclass(frozen=True)
+class RebuildOutcome:
+    """What one owner scope's rebuild did — **typed, never a row count**.
+
+    The per-owner rebuild returned an `int`, and `0` meant two irreconcilable
+    things: "this scope had nothing to do" and "this scope was **skipped**
+    because its provenance is not settled". A driver reading `0` as success
+    would record a global fingerprint certifying a scope the rebuild
+    deliberately declined to touch — precisely the false claim the coverage
+    proof exists to remove, and invisible because a skip and an empty scope
+    look identical from the outside.
+    """
+
+    #: `None` on a completed rebuild; the reason otherwise.
+    skip: RebuildSkip | None = None
+    #: Rows written. Meaningful only when `completed`.
+    rows: int = 0
+    #: Free text for the operator — which path could not be pinned, and why.
+    detail: str | None = None
+
+    @property
+    def completed(self) -> bool:
+        return self.skip is None
+
+    def describe(self) -> str:
+        if self.completed:
+            return f"completed ({self.rows} row(s))"
+        return self.skip.value + (f": {self.detail}" if self.detail else "")
+
+
+class RebuildCoverageAborted(RuntimeError):
+    """The all-scopes rebuild could not prove it rebuilt every retained row.
+
+    Raised instead of recording the keyword fingerprint. A fingerprint is one
+    stored row asserting something about *every* retained row in the database,
+    so "all scopes rebuilt" is not a fact that can be established one user at a
+    time: a scope that was skipped, or one the driver could not reach at all,
+    falsifies the claim, and a startup that fails closed on that fingerprint
+    would then pass while keyword search was exactly as wrong as before.
+
+    The whole operation is one transaction, so raising rolls every scope's
+    rebuilt vectors back with it. Three remedies, and the message names them:
+    settle the scope (assign or delete the user, or let an in-progress
+    re-derive finish), delete or reassign ownerless rows, or put `FTS_CONFIGS`
+    back to the value the stored fingerprint names — which clears the refusal
+    immediately with no rebuild at all.
+    """
+
+
+async def _scope_vault_path(session, owner: int | None) -> Path | None:
+    """The vault root for one retained owner scope, resolved by the driver.
+
+    **Read directly from `users.vault_path`, read-only, inside the operation**
+    (D7b, round 3). `_vault_root` and `warm_user_vault_cache` are keyed to
+    *active* users because that is whom the periodic pass serves; the coverage
+    proof asks a different question — which rows **exist** — and an inactive
+    user's rows are as retained, and as returnable by `keyword_search`, as
+    anyone's. So an inactive owner with an assigned vault is rebuilt rather
+    than skipped, and nothing about the active-user machinery is widened to do
+    it: this read is local to the maintenance command and changes which users
+    the periodic pass serves not at all.
+
+    `None` means "no assigned path", which the caller turns into
+    `ROOT_UNPINNABLE`.
+    """
+    if owner is None:
+        # Only reachable in single-user mode: the driver aborts on a NULL-owned
+        # retained scope while `MULTI_USER_MODE` is on, because
+        # `_vault_root(None)` refuses there and substituting
+        # `settings.vault_path` would read one tenant's notes under an unowned
+        # scope.
+        return Path(settings.vault_path)
+    row = (await session.execute(
+        text("SELECT vault_path FROM users WHERE id = :id"), {"id": owner}
+    )).first()
+    if row is None or not row.vault_path:
+        return None
+    return Path(row.vault_path)
+
+
+async def _rebuild_scope(session, owner: int | None) -> RebuildOutcome:
+    """Rebuild one retained owner scope. Does **not** commit."""
+    log_suffix = f" (user_id={owner})" if owner is not None else ""
+    try:
+        vault = await _scope_vault_path(session, owner)
+    except Exception as exc:
+        return RebuildOutcome(
+            skip=RebuildSkip.ROOT_UNPINNABLE,
+            detail=f"could not resolve a vault path for user_id={owner}: {exc}",
+        )
+    if vault is None:
+        return RebuildOutcome(
+            skip=RebuildSkip.ROOT_UNPINNABLE,
+            detail=(
+                f"user_id={owner} holds notes_metadata rows but has no "
+                "assigned vault_path"
+            ),
+        )
+    try:
+        with pinned_root(vault) as root_fd:
+            return await _rebuild_tsvectors_pinned(
+                session, owner, vault, root_fd, log_suffix
+            )
+    except OSError as exc:
+        return RebuildOutcome(
+            skip=RebuildSkip.ROOT_UNPINNABLE, detail=f"{vault}: {exc}"
+        )
+
+
+async def rebuild_tsvectors_all_scopes(session) -> dict:
+    """Rebuild **every retained owner scope** and record the keyword
+    fingerprint, in one transaction. Returns `{owner: RebuildOutcome}`.
+
+    This is the operation `make rebuild-tsvectors` runs, and — beside startup's
+    adoption — the only writer of `fts_fingerprint`.
+
+    **Why the driver and not the per-owner rebuild writes it.** A fingerprint
+    written inside a per-owner rebuild claims something a per-owner rebuild
+    cannot establish: that *every retained row* was rebuilt. Two ordinary
+    shapes falsify it — user B's rebuild raising after user A's already wrote
+    it, and a scope holding rows the loop never visits at all (an inactive or
+    unassigned user; the ownerless scope in a database that also holds named
+    users). Either way the stored value certifies rows still carrying the
+    previous configuration, and the startup guard that now fails closed on it
+    would pass while keyword search was exactly as wrong as before.
+
+    So: take the generation lock **before reading the first row**, enumerate
+    the scopes from the rows that exist (`SELECT DISTINCT user_id FROM
+    notes_metadata` — not `_active_user_ids()`), rebuild each, and write the
+    fingerprint in the same transaction as all of them. Any retained scope
+    whose outcome is not completed aborts the whole thing.
+
+    The cost is that a multi-tenant rebuild is all-or-nothing rather than per
+    tenant (L5). That is the price of the fingerprint meaning what it says, and
+    this is the cheap maintenance path — keyword index only, no provider calls,
+    seconds for a few thousand notes.
+    """
+    # Before the first row is read, so nothing can commit a keyword vector
+    # between this snapshot and the record. A wait here is a wait for an
+    # in-flight index pass to commit, which is the intended behaviour.
+    await acquire_generation_lock(session)
+
+    scopes = [
+        row[0]
+        for row in (await session.execute(text(
+            "SELECT DISTINCT user_id FROM notes_metadata ORDER BY user_id"
+        ))).all()
+    ]
+
+    if settings.multi_user_mode and None in scopes:
+        # **Aborts by decision** (L6). `_vault_root(None)` refuses in this mode
+        # by design, and substituting `settings.vault_path` would read one
+        # tenant's notes under an unowned scope — a tenancy violation performed
+        # to satisfy a bookkeeping row. Nor may they be quietly excluded from
+        # the coverage proof: they are retained rows `keyword_search` can still
+        # return.
+        ownerless = (await session.execute(text(
+            "SELECT count(*) FROM notes_metadata WHERE user_id IS NULL"
+        ))).scalar() or 0
+        raise RebuildCoverageAborted(
+            f"keyword rebuild aborted: {ownerless} notes_metadata row(s) have "
+            "user_id IS NULL while MULTI_USER_MODE is on. They cannot be "
+            "rebuilt — there is no vault root to pin for an unowned scope — "
+            "and they must not be excluded from the coverage proof, because "
+            "keyword_search can still return them. Nothing has been rebuilt "
+            "and no fingerprint was recorded. Delete or reassign those rows "
+            "and re-run, or restore the FTS_CONFIGS the stored fingerprint "
+            "names, which clears the startup refusal with no rebuild at all."
+        )
+
+    outcomes: dict = {}
+    for owner in scopes:
+        outcome = await _rebuild_scope(session, owner)
+        outcomes[owner] = outcome
+        if not outcome.completed:
+            raise RebuildCoverageAborted(
+                "keyword rebuild aborted at scope "
+                f"user_id={owner!r}: {outcome.describe()}. The fingerprint "
+                "asserts that every retained row was rebuilt under the "
+                "current FTS_CONFIGS, so one scope it could not rebuild means "
+                "the claim cannot be made at all — a skip's zero row count is "
+                "not a completed rebuild. Nothing has been committed: every "
+                "scope rebuilt so far is rolled back and no fingerprint was "
+                "recorded. Settle the scope (assign or delete that user, or "
+                "let an in-progress re-derive finish), delete or reassign its "
+                "rows, or restore the FTS_CONFIGS the stored fingerprint "
+                "names, which clears the startup refusal with no rebuild at "
+                "all."
+            )
+
+    # Same transaction as every row above. A failure here is **not** swallowed
+    # (D7d): a fingerprint is not instrumentation but the claim a later startup
+    # refuses on, and a rebuild that rebuilt everything and lost its write
+    # would refuse at every subsequent startup over a database that is actually
+    # correct.
+    await set_state(session, KEY_FTS_FINGERPRINT, fts_fingerprint())
+    await session.commit()
+    logger.info(
+        "Keyword rebuild complete across %d scope(s); fts_fingerprint recorded "
+        "as %s",
+        len(outcomes),
+        fts_fingerprint(),
+    )
+    return outcomes
+
+
 async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
     """Recompute `content_tsvector` for every indexed note under the currently
     configured `FTS_CONFIGS` (see `src/services/fts.py`). Returns the count of
     notes updated.
+
+    **The single-scope entry point, and it records no fingerprint.** A
+    per-owner rebuild cannot establish the global claim a fingerprint makes, so
+    that is `rebuild_tsvectors_all_scopes`'s job and only its job.
 
     Run this after changing `FTS_CONFIGS`, since `notes_metadata` stores no raw
     body column — the tsvector must be rebuilt by re-reading each note's file.
@@ -2857,9 +3616,14 @@ async def rebuild_tsvectors(session, user_id: int | None = None) -> int:
     vault = _vault_root(user_id)
     log_suffix = f" (user_id={user_id})" if user_id is not None else ""
     with pinned_root(vault) as root_fd:
-        return await _rebuild_tsvectors_pinned(
+        outcome = await _rebuild_tsvectors_pinned(
             session, user_id, vault, root_fd, log_suffix
         )
+    # The per-owner rebuild no longer commits — the coverage driver needs every
+    # scope and the fingerprint in one transaction — so this entry point owns
+    # the commit for the single scope it rebuilt.
+    await session.commit()
+    return outcome.rows
 
 
 class TsvectorRebuildAborted(RuntimeError):
@@ -2898,11 +3662,28 @@ async def _reread_rebuild_target(session, note_id: int, owner: int | None):
 
 async def _rebuild_tsvectors_pinned(
     session, user_id: int | None, vault: Path, root_fd: int, log_suffix: str
-) -> int:
+) -> RebuildOutcome:
+    """One owner scope's rebuild. **Does not commit** — the caller owns the
+    transaction, which is what lets the coverage driver put every scope and the
+    fingerprint in one.
+
+    Returns a `RebuildOutcome` rather than a row count. `0` used to mean both
+    "nothing to do" and "skipped, provenance unsettled", and the driver's whole
+    job is to tell those apart: recording a global fingerprint over a scope the
+    rebuild declined to touch is the false claim the coverage proof exists to
+    remove.
+    """
     if not await _ancillary_pass_is_permitted(
         session, user_id, vault, root_fd, "Keyword-vector rebuild"
     ):
-        return 0
+        return RebuildOutcome(
+            skip=RebuildSkip.PROVENANCE_UNSETTLED,
+            detail=(
+                f"user_id={user_id}: the index provenance for the assigned "
+                "root is not settled, so this pass wrote nothing for that "
+                "scope"
+            ),
+        )
 
     tsv_frag, tsv_params = index_tsvector_sql("content")
     # ── The rebuild certifies what it writes ──────────────────────────────
@@ -3037,14 +3818,19 @@ async def _rebuild_tsvectors_pinned(
             # re-selected). Atomic is the only shape an operator can act on —
             # either the rebuild happened or it did not.
             logger.info(f"rebuild_tsvectors: {updated}/{len(rows)} notes{log_suffix}")
-    # One commit, at the end. In multi-user mode the script calls this once per
-    # user, so the unit of atomicity is one user's index — never half of one.
-    await session.commit()
+    # **No commit here.** It used to commit at the end of each scope, which
+    # made one user's index the unit of atomicity; the coverage driver needs a
+    # wider one — every retained scope and the fingerprint that describes them,
+    # or nothing. The single-scope entry point (`rebuild_tsvectors`) commits on
+    # this function's behalf. The every-500 intermediate commits are still
+    # gone, for #127's reason: a floor failure must roll the whole rebuild back
+    # rather than leave a keyword index half-migrated between two
+    # configurations that no periodic pass would ever repair.
     logger.info(
         f"rebuild_tsvectors complete: {updated} notes{log_suffix}"
         + (f", {vanished} gone before they could be written" if vanished else "")
     )
-    return updated
+    return RebuildOutcome(rows=updated)
 
 
 async def cleanup_expired_tokens():
@@ -3128,19 +3914,119 @@ def _is_paused() -> bool:
 
 
 async def _active_user_ids() -> list[int]:
-    """Return ids of active users with a non-null `vault_path`. Empty list in
-    single-user mode (the caller already takes the legacy NULL-user path)."""
+    """Active users with a non-null `vault_path`, **in ascending id order**.
+
+    Empty list in single-user mode (the caller already takes the legacy
+    NULL-user path).
+
+    The `ORDER BY` is what makes the order a fact rather than the planner's
+    opinion. Without it the same tenant went first on every cycle in practice
+    and nothing could be asserted about it in principle — and a rotation over
+    an unspecified order is not a rotation.
+    """
     async with async_session() as session:
         # Warm the in-process vault-path cache for every active user before
         # the indexer kicks off — saves a per-user lookup later.
         await warm_user_vault_cache(session)
         result = await session.execute(
-            select(User.id).where(
+            select(User.id)
+            .where(
                 User.is_active.is_(True),
                 User.vault_path.isnot(None),
             )
+            .order_by(User.id)
         )
         return [row[0] for row in result.all()]
+
+
+async def _read_rotation_cursor() -> int | None:
+    """The persisted `embed_rotation_cursor`, or `None` to start at the first.
+
+    Never raises for the pass's benefit: a read that fails, a table that has
+    not been migrated in yet and a value that cannot be parsed all resolve to
+    "start at the first tenant", which is a complete and correct pass and is
+    precisely today's behaviour. Logged once at WARNING when the stored value
+    was there and unusable, so drift is visible without being fatal.
+    """
+    try:
+        async with async_session() as session:
+            if not await state_table_exists(session):
+                return None
+            raw = await get_state(session, KEY_ROTATION_CURSOR)
+    except Exception as e:
+        logger.warning(
+            "Could not read the embed rotation cursor (%s); this cycle starts "
+            "at the first tenant",
+            e,
+        )
+        return None
+    cursor = parse_rotation_cursor(raw)
+    if raw is not None and cursor is None:
+        logger.warning(
+            "Ignoring the stored embed rotation cursor %r: it is not a usable "
+            "user id. This cycle starts at the first tenant in id order. A "
+            "cursor is scheduling state — its worst consequence is an order, "
+            "so it is never allowed to stop a tenant's indexing.",
+            raw,
+        )
+    return cursor
+
+
+async def _rotated_user_ids() -> list[int]:
+    """`_active_user_ids()` rotated to begin after the persisted cursor.
+
+    Used by `run_indexer_loop` only — the startup pass and the periodic tick.
+    `_reindex_background` and the keyword rebuild keep the unrotated list: an
+    operator-triggered reindex is not the starvation vector, and letting a
+    panel click move the periodic pass's rotation would make the schedule a
+    function of who clicked what.
+
+    **The cursor stores a user id, never a positional offset.** The active list
+    changes when a user is added, deactivated or deleted, so an offset points
+    somewhere else on the next cycle; "resume after id 7" is well defined
+    whether or not user 7 still exists, because "the smallest id strictly
+    greater than 7" does not require it to. An out-of-range value needs no
+    special case either — it selects nothing and wraps to the first, which is
+    the same outcome by the ordinary rule.
+    """
+    ordered = await _active_user_ids()
+    if len(ordered) < 2:
+        return ordered
+    cursor = await _read_rotation_cursor()
+    if cursor is None:
+        return ordered
+    for index, uid in enumerate(ordered):
+        if uid > cursor:
+            return ordered[index:] + ordered[:index]
+    # Nothing is greater: the cycle wraps to the first tenant.
+    return ordered
+
+
+async def _advance_rotation_cursor(user_id: int) -> None:
+    """Record that this user's per-user sequence has finished.
+
+    **Its own short session, opened by the holder of `index_pass_lock` after
+    the wrapped body's session has closed** — `_write_indexer_run`'s discipline,
+    so one task never holds two pooled connections while another waits for the
+    lock.
+
+    **Swallow on failure, and this is the one write in this change that does.**
+    A lost cursor costs an order; the fingerprints are claims a later startup
+    refuses on, and they abort their operation instead.
+    """
+    try:
+        async with async_session() as session:
+            if not await state_table_exists(session):
+                return
+            await set_state(session, KEY_ROTATION_CURSOR, str(user_id))
+            await session.commit()
+    except Exception as e:
+        logger.warning(
+            "Could not record the embed rotation cursor at user_id=%s (%s); "
+            "the next cycle starts where the previous stored value points",
+            user_id,
+            e,
+        )
 
 
 # One wall-clock bound for the whole pre-warm. It runs while holding
@@ -3355,7 +4241,11 @@ async def run_indexer_loop():
             # wrote). What changes is that one user's failed backfill no longer
             # aborts the backfill of every user after them; it is now isolated
             # exactly like the index and embed stages already were.
-            for uid in await _active_user_ids():
+            # Rotated, so a startup that a deploy truncated resumes where the
+            # previous one stopped rather than sending the tail of the order to
+            # the tail again — which is exactly the case an in-process cursor
+            # would reset in.
+            for uid in await _rotated_user_ids():
                 async with record_indexer_run("startup", uid) as stats:
                     try:
                         stats.record_index(await index_vault(user_id=uid))
@@ -3378,6 +4268,10 @@ async def run_indexer_loop():
                         startup_ok = False
                         stats.record_error("embed", e)
                         logger.error(f"Initial embedding failed (user_id={uid}): {e}")
+                # After this user's whole sequence, success or failure, and
+                # **outside** the recorder's context so its own short session
+                # has closed first.
+                await _advance_rotation_cursor(uid)
         else:
             async with record_indexer_run("startup", None) as stats:
                 try:
@@ -3428,9 +4322,14 @@ async def run_indexer_loop():
                     # newly-deactivated users are picked up without a restart.
                     # One user's failure does not abort the others, but it
                     # does make the whole tick a failed run.
-                    for uid in await _active_user_ids():
+                    for uid in await _rotated_user_ids():
                         if not await _index_pass_once(uid):
                             tick_ok = False
+                        # Advanced whether the pass succeeded or failed: the
+                        # cursor records where the cycle got to, not whether it
+                        # went well, and a failing tenant that pinned it would
+                        # starve every tenant after them.
+                        await _advance_rotation_cursor(uid)
                 else:
                     # Not routed through `_index_pass_once`: that helper
                     # swallows per-stage exceptions so one user cannot stop the
