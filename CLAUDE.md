@@ -76,6 +76,8 @@ browser pass — is defined once in `~/.claude/rules/engineering-workflow.md` an
 applies here. Read it; don't restate it. This section records only what is
 specific to this MCP server.
 
+**Review budget (from the workflow file):** triage adversarial findings on plausible input and real impact, two full Codex rounds by default and verification-only after that, accepted limitations recorded in the spec rather than polished away, and say which findings were declined. Rigor on what matters; ship in a day what can ship in a day.
+
 **Local gates**
 
 | Gate | Command |
@@ -136,8 +138,9 @@ update it in the same change.** What stays here is the short list:
   refused by every MCP tool, pass stage and transfer redemption, and nothing is
   deleted. **Until a snapshot is published, `_vault_root` refuses every
   multi-user caller** — the lifespan publishes synchronously before serving.
-  A bind-mount *graft* is still undetected (L1/L2, owner decision pending) and
-  the consequence is cross-tenant read/overwrite/delete — see
+  A bind-mount *graft* is undetected **by decision** (L1/L2, owner-accepted
+  2026-09-21, #262: never mount one tenant's directory inside another's root)
+  and the consequence is cross-tenant read/overwrite/delete — see
   [vault roots and tenancy](docs/architecture/vault-roots-and-tenancy.md).
 - **`/mcp` rate control is in-process, and `--workers 1` is part of the
   contract.** Two per-principal token buckets in `_tracked` (general 120/min
