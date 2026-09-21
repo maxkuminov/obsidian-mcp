@@ -15,13 +15,19 @@ An MCP request accepted through the bearer-authenticated root-path fallback SHAL
 - **THEN** the response SHALL contain the same CORS policy applied to canonical application routes
 
 ### Requirement: Tool calls are admitted only while the caller holds a vault assignment
-Every MCP tool call SHALL resolve the caller's vault root once, before the tool
-body runs, and SHALL fail the call with a tool error when the root cannot be
-resolved. The check MUST live in the shared tool decorator rather than in
-individual tools, so that a tool served entirely from the database is covered
-without opting in. Refusal MUST NOT depend on whether the process cache was
-previously warmed, and MUST NOT delete the caller's `notes_metadata`,
-`note_embeddings` or `note_links` rows.
+Every MCP tool call that reaches its tool body SHALL have resolved the caller's
+vault root once beforehand, and SHALL fail the call with a tool error when the
+root cannot be resolved. A call refused by an earlier gate in the same shared
+decorator — a per-principal rate bucket, or any other gate the decorator runs
+before vault resolution — SHALL be refused without resolving the vault root.
+That is sound because no tool body runs and the refusal reveals nothing about
+the vault: it names no note path, title, tag, frontmatter value or chunk
+excerpt, and its content depends only on the caller's own request rate. The
+vault check MUST live in the shared tool decorator rather than in individual
+tools, so that a tool served entirely from the database is covered without
+opting in. Refusal MUST NOT depend on whether the process cache was previously
+warmed, and MUST NOT delete the caller's `notes_metadata`, `note_embeddings`
+or `note_links` rows.
 
 #### Scenario: Database-backed search after unassignment
 - **WHEN** an administrator clears a multi-user account's vault path and the
@@ -46,6 +52,18 @@ previously warmed, and MUST NOT delete the caller's `notes_metadata`,
   vault root receives a tool call from that user
 - **THEN** the call SHALL be refused with the same tool error rather than
   raising an unhandled exception
+
+#### Scenario: A rate-refused call is refused without resolving the vault
+- **WHEN** a caller whose vault path has been cleared exceeds its per-principal
+  rate bucket
+- **THEN** the call SHALL be refused by the rate gate, no vault resolution SHALL
+  be attempted, no tool body SHALL run, and the refusal SHALL name no note path,
+  title, tag, frontmatter value or chunk excerpt
+
+#### Scenario: An unassigned caller within its rate limit is still refused for the vault
+- **WHEN** the same caller makes a call that its rate buckets admit
+- **THEN** the vault gate SHALL refuse it with the unchanged no-vault tool error
+  and the unchanged `no_vault_assigned` marker
 
 #### Scenario: Operator-facing label matches the enforcement
 - **WHEN** an administrator opens the vault-path selector on the user edit page
