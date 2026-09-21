@@ -41,7 +41,8 @@
 #     `proxy_buffering off;` in the Advanced tab).
 #
 # The app already honors X-Forwarded-* via its built-in ProxyHeadersMiddleware,
-# scoped in main.py to loopback + private (RFC1918) ranges — which covers both a
+# scoped by TRUSTED_PROXY_IPS (default: loopback + private RFC1918 ranges; set
+# it in .env if your proxy's address is outside them) — which covers both a
 # loopback-published port (pattern B) and a shared Docker network (pattern A). So
 # no `--proxy-headers` flag or `FORWARDED_ALLOW_IPS=*` is needed here, and we
 # avoid the trust-any-peer footgun. Still keep the published port private to the

@@ -188,6 +188,19 @@ WebSocket / streaming passthrough on `/mcp`. The file's header comment
 walks through both patterns and the exact headers your proxy must
 forward.
 
+**Which peers may set those headers is one setting: `TRUSTED_PROXY_IPS`.**
+The default trusts loopback and the three private (RFC 1918) ranges, which
+covers a loopback-published port and a shared Docker network without any
+configuration — and also trusts every *other* container on that network.
+Narrow it to your proxy's address (`TRUSTED_PROXY_IPS=172.18.0.2`, a CSV or
+JSON list of addresses and CIDRs) once the proxy has a fixed one; a proxy
+outside the default ranges must be listed or every request will appear to
+come from the proxy, and every per-address rate limit will be shared. The
+value is validated at boot, the canonical list is logged once at startup,
+and uvicorn's own `--forwarded-allow-ips` / `FORWARDED_ALLOW_IPS` is
+switched off in the image (`--no-proxy-headers`), so there is no second
+control to keep in step.
+
 If you plan to use the file-transfer tools (`request_upload`,
 `request_download`), the proxy must also forward **`/transfer/*`** —
 unauthenticated at the proxy, since the capability token is checked by
