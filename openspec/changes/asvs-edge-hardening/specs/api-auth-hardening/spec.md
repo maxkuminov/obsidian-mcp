@@ -29,7 +29,7 @@ The refusal produced by the account budget SHALL be equivalent in content to an 
 #### Scenario: An unknown username consumes no account budget
 - **WHEN** login attempts are submitted for usernames that resolve to no account
 - **THEN** no account budget SHALL be consumed or created for them
-- **AND** an existing account's correct password SHALL still be accepted however many such attempts were made
+- **AND** an existing account's correct password SHALL still be accepted, however many such attempts were made, **while the address budget for the submitting client is unexhausted** — the retained 5/min address limit still applies to those attempts and answers 429 on its own terms
 
 #### Scenario: The budget is bounded by the number of accounts
 - **WHEN** attempts arrive for an unbounded number of distinct submitted usernames

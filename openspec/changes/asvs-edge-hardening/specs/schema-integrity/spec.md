@@ -4,7 +4,7 @@
 
 The schema gate SHALL exercise every migration whose behaviour it asserts, including both migrations of the current wave, on a throwaway database in the same run, and SHALL assert `alembic check` clean at the resulting head. The gate SHALL carry a single literal naming the current head revision and SHALL assert that a migrated database reads exactly that literal. The current head literal SHALL be **`025`**, with **`024` present in the applied chain**. The requirement keeps its original heading so this block modifies the existing requirement rather than adding a second one; the current wave is not limited to the 016/017 pair for which it was first written.
 
-`025` is the OAuth client use-marker migration of `asvs-edge-hardening`. `025`'s recorded predecessor SHALL be `024`, and migration to head SHALL apply `024` before `025`. Raising the asserted head is a required part of adding a migration: a later migration added without updating the gate SHALL fail the head assertion rather than silently widening what "head" means. A second requirement naming a different head SHALL NOT be introduced alongside this one — two requirements disagreeing about the head is the exact contradiction the single literal exists to prevent.
+`025` is the OAuth client use-marker migration of `asvs-edge-hardening`. `025`'s recorded predecessor SHALL be `024`, whose own recorded predecessor SHALL remain `023`, and migration to head SHALL apply `023`, then `024`, then `025`. The sibling-ordering guarantee this requirement already carried is preserved rather than replaced: raising the head extends the chain it asserts, it does not narrow it to the newest pair. Raising the asserted head is a required part of adding a migration: a later migration added without updating the gate SHALL fail the head assertion rather than silently widening what "head" means. A second requirement naming a different head SHALL NOT be introduced alongside this one — two requirements disagreeing about the head is the exact contradiction the single literal exists to prevent.
 
 The gate module carrying this literal is the one `make test-schema` invokes. A new migration's marker, drift, downgrade and stamp-back cases SHALL live in that module, not in a separate module the gate does not run.
 
@@ -29,6 +29,19 @@ Idempotence SHALL be exercised by stamping the revision back and upgrading again
 
 - **WHEN** `make test-schema` runs
 - **THEN** 025's marker, drift, downgrade and stamp-back cases SHALL be among the tests it executes
+
+#### Scenario: Head at 025
+
+- **WHEN** a throwaway database is migrated to head
+- **THEN** `alembic_version` SHALL read `025`
+- **AND** `alembic check` SHALL report no new upgrade operations
+
+#### Scenario: The ordering against the sibling migration holds
+
+- **WHEN** the merged migration history is inspected
+- **THEN** `024`'s recorded predecessor SHALL be `023`
+- **AND** `025`'s recorded predecessor SHALL be `024`
+- **AND** migrating to head SHALL apply `023`, then `024`, then `025`
 
 #### Scenario: Idempotence is exercised by stamping back
 
