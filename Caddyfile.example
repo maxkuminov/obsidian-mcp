@@ -66,3 +66,67 @@
         -Server
     }
 }
+
+# ── Plaintext (:80): refuse the machine-facing paths, redirect the rest ──
+#
+# #196 / ASVS V4.1.2. Without this block Caddy's automatic HTTP→HTTPS
+# redirect answers every plaintext request, including an MCP client
+# misconfigured with `http://…/mcp`. That client has already put
+# `Authorization: Bearer omcp_…` on the wire in cleartext; the redirect is a
+# 301/308 that preserves the method, and the MCP SDK follows it with the
+# Authorization header intact (httpx keeps it across a direct http→https
+# hop), so the call SUCCEEDS over TLS and the operator never learns that the
+# credential leaked. Same for `POST /token`, which carries the authorization
+# code, `code_verifier` and `client_secret` in the body. A hard failure on
+# the first request is the only outcome that surfaces the mistake.
+#
+# Defining this block turns OFF Caddy's automatic redirect for this host,
+# which is why the trailing `handle` below redirects explicitly — the
+# browser-facing paths must keep behaving exactly as they did.
+http://{$MCP_HOSTNAME} {
+    # ACME HTTP-01 carve-out, FIRST so neither rule below can ever capture
+    # the prefix. Caddy's own challenge handler runs ahead of site routes, so
+    # a live challenge is answered by it and never reaches here; this block
+    # exists so that the refusal and the redirect are both structurally
+    # incapable of intercepting certificate issuance.
+    @acmeChallenge path /.well-known/acme-challenge/*
+    handle @acmeChallenge {
+        respond 404
+    }
+
+    # Machine-facing paths: refuse, never redirect. Mirrors the @mcp matcher
+    # in the HTTPS block above — keep the two in step.
+    @plaintextMachine path /mcp* /transfer* /health /.well-known* /register /token /revoke
+    handle @plaintextMachine {
+        respond "This endpoint requires HTTPS" 403
+    }
+
+    # Root path carrying a bearer credential — the same entry point the
+    # HTTPS block's @rootMcp serves for clients that strip the /mcp prefix.
+    #
+    # This is a SEPARATE matcher and deliberately carries NO `method` line.
+    # Do not "tidy" it into a reuse of @rootMcp: that matcher lists
+    # `method POST GET DELETE`, so a `HEAD /` with a bearer header would fall
+    # through to the redirect below and replay the credential over TLS —
+    # exactly the leak this block exists to close. A refusal must cover every
+    # method; the HTTPS block's method list is a routing decision and stays
+    # as it is.
+    @plaintextRootBearer {
+        path /
+        header Authorization Bearer*
+    }
+    handle @plaintextRootBearer {
+        respond "This endpoint requires HTTPS" 403
+    }
+
+    # Everything else — /admin, /authorize, /api, and a plain `/` with no
+    # Authorization header — is a person who typed a hostname. They leak no
+    # long-lived credential by being redirected, and refusing them would
+    # break the panel for no security gain. The asymmetry IS the control.
+    # 308 rather than `permanent` (301): 308 is what Caddy's automatic
+    # redirect issues, and it preserves the method, so these paths behave
+    # exactly as they did before this block existed.
+    handle {
+        redir https://{$MCP_HOSTNAME}{uri} 308
+    }
+}
