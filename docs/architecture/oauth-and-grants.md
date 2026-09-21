@@ -221,6 +221,106 @@ vanished from the page, so the operator saw a blank space that read as success.
   later of `expires_at` and `revoked_at`. Do not unify the two — see
   [control-panel.md](control-panel.md).
 
+## Unused dynamic client registrations expire (#194)
+
+`/register` is unauthenticated dynamic client registration by RFC 7591 and
+`cleanup_expired_tokens` never touched a client row, so `oauth_clients` only
+grew. The sweep that bounds it lives in the same function, on the same
+five-minute tick, and deletes a registration only when **all three** of these
+hold — re-checked under a row lock before anything is removed.
+
+- **`last_used_at IS NULL`, a marker the OAuth routes stamp, and not a signal
+  derived from what was already there.** All three derivable candidates are
+  unsound, and the reasons are why the column exists rather than a note about
+  how it was chosen. `user_id` is the first authorizing user, and in
+  single-user mode the session user is `None`, so it stays NULL for *every*
+  client in the deployment `DEPLOYMENT.md` walks a new operator through — "no
+  owner" cannot mean "never used". Child rows cannot mean it either: a **used**
+  `oauth_codes` row is deleted the instant it is spent, with no age gate at
+  all, and an `oauth_tokens` row seven days after it expires, so a client that
+  was genuinely used, whose grant was revoked and whose rows aged out, is
+  indistinguishable from one that never was. And `usage_logs.actor_ref`
+  survives credential deletion by design but records *tool calls*, not
+  issuance, so a client that authorized and never called a tool has no row
+  there — besides coupling OAuth retention to an analytics table whose own
+  retention may change.
+- **No `oauth_codes` and no `oauth_tokens` row, of any state.** Live, expired
+  and revoked all count. A revoked token the operator can still see in the
+  panel must never be cascaded away by this delete, which is #64's argument
+  applied one table up.
+- **`created_at` older than `OAUTH_CLIENT_UNUSED_EXPIRY_DAYS`** (30, `ge=1`).
+  A dynamically registered client authorizes within seconds, so any gap over a
+  few hours is already anomalous; thirty days is two orders of magnitude of
+  slack while still bounding the table at about a month of the 3/min
+  registration limiter's output. **The kill switch is `null`, not `0`** — the
+  house rule: a control that deletes a registration the moment it is made
+  reads to an operator as an outage rather than as a setting.
+
+**Migration 025's backfill is what makes the first guard mean anything.** It
+stamps a non-NULL marker on *every* row that existed when it ran — the newest
+of the client's surviving code and token `created_at` values, or, where
+neither survives, the migration's own transaction timestamp. So after 025 a
+NULL marker can only mean "registered after 025 and never used", and the sweep
+acts only on registrations whose entire history it can see. Leaving the
+ambiguous rows NULL was the first draft, justified by "a dynamically
+registered client re-registers transparently" — which is false in a reachable
+case: RFC 7591 permits credentials to be packaged into client software by a
+developer, and a confidential client configured by hand months ago, whose
+token rows have long since been purged, would have lost its registration *and
+its secret hash* on the first sweep, with no automatic recovery, because
+registering again mints a different `client_id` and secret. A marker already
+present is never overwritten, so the migration is safe to re-run.
+
+**The lock ordering, and what the loser of the race sees.** A single
+`DELETE ... WHERE NOT EXISTS (…)` looks equivalent and is not. Inserting an
+`oauth_codes` row takes a `FOR KEY SHARE` lock on the parent client row
+through the foreign key; the delete takes `FOR UPDATE`, so the two conflict
+and serialise — but under READ COMMITTED, when the delete unblocks PostgreSQL
+re-evaluates only the *target row's* own predicate and **not** the existence
+subquery. The delete proceeds and `ON DELETE CASCADE` removes the
+authorization code that was just issued. So the sweep:
+
+1. `SELECT client_id … FOR UPDATE SKIP LOCKED`, a bounded batch in `id` order;
+2. **re-reads the marker, the owner, the age and both child tables in a
+   separate statement inside that lock** — a separate statement is the point,
+   because it gets a fresh READ COMMITTED snapshot;
+3. deletes only what still qualifies.
+
+`/authorize`, the code exchange and the refresh each stamp the marker with an
+`UPDATE … RETURNING` on the same parent row, in the same transaction as the
+credential they issue, so the two paths contend for one row lock and one of
+them wins cleanly. If the sweep wins, the stamp matches zero rows and the
+handler returns **`invalid_client`** — an ordinary OAuth error, never a 500
+and never a half-written grant. `SKIP LOCKED` leaves a contended row for the
+next pass instead of stalling the maintenance tick behind one in-flight
+consent. Each pass logs one INFO line with the count when it deletes anything:
+a job that silently removes credentials cannot be audited.
+
+**Accepted limitations, recorded so they are not re-fixed when re-reported.**
+
+- **Never-used registrations created before 025 are never collected.** The
+  backfill stamps them rather than risk deleting a hand-configured
+  confidential client whose evidence was purged. The table is bounded going
+  forward, not retroactively; an operator can remove such rows in the panel.
+- **A client can be deleted between registering and first authorizing** if
+  that gap exceeds the configured age. The *concurrent* race is safe; a
+  30-day-delayed first authorization is not, and its response is a clean
+  `invalid_client`.
+- **`/register` still admits roughly 4,300 registrations per day per
+  address.** This sweep bounds the residue, not the arrival rate.
+- **A client registered *and* authorized inside `make deploy`'s
+  migrate-then-recreate gap can end up NULL-marked**, because the previous
+  image serves for those seconds without knowing the column. Declined as a
+  code or process change: a client actually in use re-stamps itself at its
+  next code exchange or refresh and an access token lives one hour, and before
+  that the no-child-row guard covers it for about 37 days (a refresh token row
+  survives 30 days and is purged seven days after it expires) — beyond the
+  30-day age. The only registration that can still be NULL when the sweep can
+  reach it is one created in a seconds-long window and then unused for over a
+  month, which is exactly the population the sweep exists to remove. The cost
+  if it happens is one re-registration; the lever for certainty during a
+  rollback is setting the age to `null`.
+
 ## The consent page preselect
 
 - **OAuth consent preselects "Read only" unconditionally — never bind `checked` to the requested scope.** On an HTML form the checked radio *is* the submitted value, so the preselect is the default grant, not a display detail. `/register` is unauthenticated and a DCR client that omits `scope` is registered `read readwrite offline_access`, so a requested-scope preselect lets one unchanged **Approve** click hand vault-wide write to any self-registered client (#63; #62 introduced exactly that and it was reverted). What #62 was right about is kept as *prose*: `authorize_get` passes `requested_write` (from the validated scope alone, ungated by the registered scope — display only) and `write_unavailable`, and the request box names the level asked for and says when the client cannot hold it. `_clamp_scope` in `authorize_post` is the enforcement boundary and is unrelated to any of this. The markup default is not enough on its own: Firefox restores a control's dynamic checked state across page loads in preference to it, so the form **and** every `name="scope"` radio carry `autocomplete="off"` — without them a user who once picked write gets that radio re-checked on a repeat visit to the same `/authorize` URL (clients reuse `state`/PKCE) and one Approve re-grants write after a revocation. The `.scope-option:has(:checked)` highlight lives in standalone rule blocks: a selector list is dropped wholesale when any part fails to parse, so grouping it would take the native-radio fallback down with it.

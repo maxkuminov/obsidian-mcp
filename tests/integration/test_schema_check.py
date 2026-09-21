@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "024"
+HEAD_REVISION = "025"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -5113,4 +5113,375 @@ def test_downgrade_024_refuses_a_table_it_did_not_create():
         assert result.returncode != 0
         assert "024's comment marker" in result.stdout + result.stderr
         assert fetchval(url, "SELECT to_regclass('public.user_sessions')") is not None
+        assert alembic_version(url) == HEAD_REVISION
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 025 — oauth_clients.last_used_at, the expiry sweep's marker (#194)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `alembic check` sees the column, its type and its nullability, so the
+# declarative half is covered on every path that asserts a clean check. What
+# it cannot see is the **backfill**, and the backfill is the whole safety
+# argument: after 025 a NULL marker must mean "registered after 025 and never
+# used" and nothing else, because the maintenance sweep deletes a registration
+# — cascading its codes and tokens — on the strength of that NULL. A row this
+# migration left unmarked is a hand-configured confidential client the sweep
+# would collect, and dynamic registration does not re-provision one.
+
+LAST_USED_COLUMN = "last_used_at"
+LAST_USED_MARKER = (
+    "client use marker, stamped at code and token issuance "
+    "(025_oauth_client_last_used)"
+)
+LAST_USED_TYPE = "timestamp with time zone"
+
+
+def last_used_state(url):
+    """`(coltype, attnotnull, default, comment)` for the column, or None."""
+    rows = fetch(
+        url,
+        "SELECT format_type(a.atttypid, a.atttypmod) AS coltype, a.attnotnull, "
+        "       pg_get_expr(d.adbin, d.adrelid) AS coldefault, "
+        "       col_description(a.attrelid, a.attnum) AS comment "
+        "FROM pg_attribute a "
+        "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+        "WHERE a.attrelid = 'public.oauth_clients'::regclass "
+        "  AND a.attname = 'last_used_at' AND a.attnum > 0 AND NOT a.attisdropped",
+    )
+    return tuple(rows[0]) if rows else None
+
+
+def last_used_of(url, client_id):
+    return fetchval(
+        url,
+        "SELECT last_used_at FROM oauth_clients WHERE client_id = $1",
+        client_id,
+    )
+
+
+def insert_code(url, code_hash, client_id, *, created_at=None, used=False):
+    """One `oauth_codes` row. `created_at` is written explicitly where a case
+    needs the backfill to pick a *known* value out of several."""
+    sql(
+        url,
+        "INSERT INTO oauth_codes (code_hash, client_id, redirect_uri, scope, "
+        " code_challenge, code_challenge_method, expires_at, used, created_at) "
+        "VALUES ($1, $2, 'https://example.invalid/cb', 'read', $3, 'S256', $4, "
+        "        $5, COALESCE($6, now()))",
+        code_hash,
+        client_id,
+        "c" * 43,
+        FUTURE,
+        used,
+        created_at,
+    )
+
+
+def insert_client_token(url, token_hash, client_id, *, created_at=None):
+    """One `oauth_tokens` row, seeded on a post-014 schema.
+
+    Not the 014-era `insert_token` above: that helper predates `grant_id` being
+    NOT NULL and these cases run against a database migrated to 024, where the
+    column is. `created_at` is written explicitly where a case needs the
+    backfill to pick a *known* value out of several.
+    """
+    sql(
+        url,
+        "INSERT INTO oauth_tokens (token_hash, token_type, client_id, scope, "
+        " grant_id, user_id, expires_at, revoked, created_at) "
+        "VALUES ($1, 'access', $2, 'read', $3, NULL, $4, false, "
+        "        COALESCE($5, now()))",
+        token_hash,
+        client_id,
+        token_hash[:32],
+        FUTURE,
+        created_at,
+    )
+
+
+def refuse_025(url, *, must_mention):
+    """Stamp back to 024, re-run 025, require a refusal, return the message.
+
+    Stamping back is what makes this adversarial rather than theatrical: it is
+    the same path `make test-schema` exercises for idempotence, so a shape
+    waved through here would be waved through on a real database somebody had
+    altered.
+    """
+    _harness.run_alembic(url, "stamp", "024", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "025 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "024", "nothing should have been recorded"
+    return combined
+
+
+def test_025_creates_a_nullable_marked_column_with_no_default():
+    """The three properties the sweep's correctness rests on, asserted
+    separately because each fails differently: NOT NULL means no row can ever
+    say "never used" (the sweep collects nothing, silently and for ever), and
+    a server default means every fresh registration is born with a use it has
+    not had (same outcome, opposite cause)."""
+    with throwaway_db("schema_last_used_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+
+        coltype, notnull, default, comment = last_used_state(url)
+        assert coltype == LAST_USED_TYPE
+        assert notnull is False
+        assert default is None
+        assert comment == LAST_USED_MARKER
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_025_chains_from_024_and_is_the_head():
+    """The ordering the `schema-integrity` delta names, asserted rather than
+    assumed: 025 must not migrate ahead of 024, whose own predecessor is 023.
+    """
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    config = Config()
+    config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
+    script = ScriptDirectory.from_config(config)
+
+    assert script.get_current_head() == HEAD_REVISION == "025"
+    assert script.get_revision("025").down_revision == "024"
+    assert script.get_revision("024").down_revision == "023"
+
+    ordered = [rev.revision for rev in script.walk_revisions("base", "025")]
+    # `walk_revisions` yields newest-first, so an earlier revision appears
+    # *later* in the list.
+    assert ordered.index("024") > ordered.index("025")
+    assert ordered.index("023") > ordered.index("024")
+
+
+def test_025_marks_a_client_from_its_newest_token():
+    with throwaway_db("schema_last_used_from_token", revision="024") as url:
+        insert_client(url, "client-tok", "none", None)
+        older = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+        newer = datetime.datetime(2021, 6, 1, tzinfo=datetime.timezone.utc)
+        insert_client_token(url, "a" * 64, "client-tok", created_at=older)
+        insert_client_token(url, "b" * 64, "client-tok", created_at=newer)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert last_used_of(url, "client-tok") == newer
+
+
+def test_025_marks_a_client_from_its_newest_code_when_it_has_no_token():
+    with throwaway_db("schema_last_used_from_code", revision="024") as url:
+        insert_client(url, "client-code", "none", None)
+        older = datetime.datetime(2020, 3, 3, tzinfo=datetime.timezone.utc)
+        newer = datetime.datetime(2020, 9, 9, tzinfo=datetime.timezone.utc)
+        insert_code(url, "c" * 64, "client-code", created_at=older)
+        insert_code(url, "d" * 64, "client-code", created_at=newer)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert last_used_of(url, "client-code") == newer
+
+
+def test_025_takes_the_newest_of_both_kinds():
+    """`GREATEST` over both subqueries, not "tokens, else codes": a client
+    whose newest evidence is a code must not be aged backwards to its oldest
+    token."""
+    with throwaway_db("schema_last_used_both", revision="024") as url:
+        insert_client(url, "client-both", "none", None)
+        old_token = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
+        new_code = datetime.datetime(2022, 1, 1, tzinfo=datetime.timezone.utc)
+        insert_client_token(url, "e" * 64, "client-both", created_at=old_token)
+        insert_code(url, "f" * 64, "client-both", created_at=new_code)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert last_used_of(url, "client-both") == new_code
+
+
+def test_025_stamps_a_client_with_no_child_row_rather_than_leaving_it_null():
+    """The correction the spec review forced, and the invariant the whole
+    sweep rests on. Leaving this row NULL would expose a confidential client
+    whose credentials a developer configured by hand and whose token rows have
+    long since been purged — the sweep would delete its registration *and its
+    secret hash*, and registering again mints a different identifier and
+    secret the configured client does not have."""
+    before = datetime.datetime.now(datetime.timezone.utc)
+    with throwaway_db("schema_last_used_orphan", revision="024") as url:
+        insert_client(url, "client-bare", "none", None)
+        assert fetchval(url, "SELECT count(*) FROM oauth_tokens") == 0
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        stamped = last_used_of(url, "client-bare")
+        assert stamped is not None, (
+            "a pre-existing row with no surviving child row must be stamped "
+            "with the migration's own timestamp, never left NULL"
+        )
+        assert stamped >= before
+        assert stamped <= datetime.datetime.now(datetime.timezone.utc)
+
+
+def test_025_leaves_no_pre_existing_row_unmarked():
+    """The invariant stated directly: *no* row that existed before 025 may
+    come out NULL, whatever mixture of evidence it carries."""
+    with throwaway_db("schema_last_used_no_nulls", revision="024") as url:
+        insert_client(url, "client-1", "none", None)
+        insert_client(url, "client-2", "client_secret_post", "h" * 64)
+        insert_client(url, "client-3", "none", None)
+        insert_client_token(url, "1" * 64, "client-1")
+        insert_code(url, "2" * 64, "client-2")
+        # client-3 carries neither.
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert (
+            fetchval(
+                url, "SELECT count(*) FROM oauth_clients WHERE last_used_at IS NULL"
+            )
+            == 0
+        )
+
+
+def test_rerunning_025_does_not_re_stamp_an_existing_marker():
+    """Stamp-back idempotence, the shape the gate itself performs. The
+    application stamps this column on every issuance, so a re-run that
+    recomputed every marker would age a *live* client backwards towards the
+    sweep's cutoff — 016's reassignment-lag mistake in a new column."""
+    recorded = datetime.datetime(2030, 5, 5, tzinfo=datetime.timezone.utc)
+    with throwaway_db("schema_last_used_rerun", revision="024") as url:
+        insert_client(url, "client-live", "none", None)
+        insert_client(url, "client-bare", "none", None)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        # What the application would have written since the migration ran.
+        sql(
+            url,
+            "UPDATE oauth_clients SET last_used_at = $1 WHERE client_id = $2",
+            recorded,
+            "client-live",
+        )
+        bare_stamp = last_used_of(url, "client-bare")
+
+        _harness.run_alembic(url, "stamp", "024", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert last_used_of(url, "client-live") == recorded
+        assert last_used_of(url, "client-bare") == bare_stamp
+        assert last_used_state(url)[3] == LAST_USED_MARKER
+        assert fetchval(url, "SELECT count(*) FROM oauth_clients") == 2
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "wrong_type",
+            "ALTER TABLE oauth_clients ADD COLUMN last_used_at timestamp",
+            "not timestamp with time zone",
+        ),
+        (
+            "not_null",
+            "ALTER TABLE oauth_clients ADD COLUMN last_used_at timestamptz "
+            "NOT NULL DEFAULT now()",
+            "it is NOT NULL",
+        ),
+        (
+            "server_default",
+            "ALTER TABLE oauth_clients ADD COLUMN last_used_at timestamptz "
+            "DEFAULT now()",
+            "server default",
+        ),
+    ],
+)
+def test_025_refuses_a_pre_existing_column_of_another_shape(label, ddl, fragment):
+    """013's rule: reconcile a database that demonstrably has our shape, refuse
+    to guess for one that does not, and name what disagreed. Each of these
+    passes `alembic check`'s type comparison or slips past it entirely while
+    disabling the sweep — a NOT NULL column has no way to say "never used"."""
+    with throwaway_db(f"schema_last_used_foreign_{label}", revision="024") as url:
+        sql(url, ddl)
+        refuse_025(url, must_mention=[fragment])
+
+
+def test_025_refuses_an_unmarked_column_of_its_own_shape():
+    """The marker is the only evidence of authorship, so a column of exactly
+    the right shape that 025 did not create is still refused — `downgrade()`
+    would otherwise drop somebody else's column."""
+    with throwaway_db("schema_last_used_unmarked", revision="024") as url:
+        sql(url, "ALTER TABLE oauth_clients ADD COLUMN last_used_at timestamptz")
+        refuse_025(url, must_mention=["025's comment marker"])
+
+
+def test_a_025_refusal_changes_no_row():
+    """The refusal is atomic: an operator who hits it still has every
+    registration, and no marker was invented for any of them."""
+    with throwaway_db("schema_last_used_refusal_rows", revision="024") as url:
+        insert_client(url, "client-keep", "none", None)
+        sql(
+            url,
+            "ALTER TABLE oauth_clients ADD COLUMN last_used_at timestamptz NOT NULL "
+            "DEFAULT now()",
+        )
+        refuse_025(url, must_mention=["it is NOT NULL"])
+        assert fetchval(url, "SELECT count(*) FROM oauth_clients") == 1
+
+
+def test_025_accepts_its_own_column_on_a_stamp_back():
+    """Complete does not mean brittle: a column 025 itself created must still
+    reconcile, or every re-run of the migration would refuse."""
+    with throwaway_db("schema_last_used_reconcile_clean") as url:
+        insert_client(url, "client-a", "none", None)
+        _harness.run_alembic(url, "stamp", "024", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert last_used_state(url)[3] == LAST_USED_MARKER
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_025_drops_the_marked_column_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_last_used_downgrade") as url:
+        insert_client(url, "client-a", "none", None)
+        insert_client_token(url, "a" * 64, "client-a")
+
+        _harness.run_alembic(url, "downgrade", "024", dimensions=DIM)
+        assert alembic_version(url) == "024"
+        assert last_used_state(url) is None
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert last_used_state(url)[3] == LAST_USED_MARKER
+        # A re-upgrade re-derives the marker from the surviving child row, so
+        # a client that is in use comes back marked rather than collectable.
+        assert last_used_of(url, "client-a") is not None
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_025_refuses_a_column_it_did_not_create():
+    """013's rule on the way back down: undo *this* migration, not delete
+    somebody else's column of the same name."""
+    with throwaway_db("schema_last_used_downgrade_foreign") as url:
+        sql(
+            url,
+            "COMMENT ON COLUMN oauth_clients.last_used_at IS 'somebody else made this'",
+        )
+        result = _harness.run_alembic(
+            url, "downgrade", "024", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0
+        assert "025's comment marker" in result.stdout + result.stderr
+        assert last_used_state(url) is not None
         assert alembic_version(url) == HEAD_REVISION
