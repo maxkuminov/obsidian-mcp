@@ -98,3 +98,61 @@ latency requirements so later archival cannot erase a sibling change's
 scenarios. The completed `move-inode-lifetime` change is archived after its live check.
 Other changes remain active with their outstanding gates and owner decisions;
 no issues have been closed by this recovery PR yet.
+
+## Archive — 2026-09-21
+
+Bookkeeping only: no `src/`, `tests/`, `alembic/`, Dockerfile or compose change.
+The seven changes deployed on 2026-09-06 were archived sequentially, each
+followed by `openspec validate --all --strict` and a diff of the touched
+`openspec/specs/**/spec.md`. **No requirement or scenario that existed before an
+archive was lost, and no near-duplicate requirement was added.** The harmonized
+overlaps held: the three `panel-performance-views` "Per-tool latency aggregates"
+MODIFIED blocks and the two `schema-integrity` "The schema gate covers both
+migrations of this wave before deploy" MODIFIED blocks were byte-identical, so
+the later archives applied them as no-ops (`panel-sessions-and-consent` task 8.6
+confirmed in place). The one superseded scenario is `schema-integrity`'s
+"Head at 017", deliberately replaced by "The gate asserts the current head and
+023 is in the chain", "Head at 024" and "The earlier waves' cases still run".
+No delta header or requirement name needed fixing. Final validation: **30
+passed, 0 failed**.
+
+Archived, in order: `reject-mask-decided-links`, `security-event-logging`,
+`vault-root-overlap-guard`, `write-preconditions`, `mcp-rate-limits`,
+`index-integrity-hardening`, `panel-sessions-and-consent`.
+
+Stale checkboxes were reconciled against this record, `git log` and the issue
+tracker. Tasks that the record does **not** evidence were left unchecked and
+annotated in place rather than ticked:
+
+- **reject-mask-decided-links** — 7: deployed, but no record of version-3
+  re-derivation being confirmed or of a live graph-tool exercise; the fix merged
+  as PR #270 after the release image was built.
+- **write-preconditions** — 5.8: the ASVS report row for #205 in the vault.
+- **panel-sessions-and-consent** — 8.4: production-caller grep for the nine new
+  exports; 8.5: the mint-site / validate-entry-point / second-`AsyncSession`
+  enumeration on the merged tree; 8.10: the browser pass with a replayed cookie
+  and the `/authorize` consent flows (the live smoke was synthetic-account HTTP
+  only); 8.11: sign-in confirmation from both production users, which this
+  document already records as an outstanding owner task.
+- **security-event-logging** — 5.5: `make logs` inspected for one JSON object
+  per line and populated `auth_failure` fields (the deploy and clean
+  `make db-check` are evidenced); 5.6: the read-only-credential refusal exercise
+  and the `/admin/usage` confirmation; 5.7: the tool-exception path; 5.8: the
+  ASVS vault rows and residuals R1–R9 as follow-up issues.
+- **vault-root-overlap-guard** — 8.9: the panel users-page live check against
+  production's two users, including the nested-path refusal and restore.
+- **mcp-rate-limits** — 6.6: the auth-failure WARNING and boot-time settings
+  validation in `make logs`; 6.7: the whole live rate-limit exercise (8,193-char
+  query, bucket bursts, transfer 429, unauthenticated burst,
+  `/admin/performance`, restart flush); 6.8: the operator follow-up setting a
+  daily limit on the five pre-existing keys; 6.10: #194 and #188 are still open
+  and the accepted residuals are not recorded on #194; 7.4: follows from those.
+- **index-integrity-hardening** — 8.9: the deterministic stale-embedding
+  exercise with the provider blocked; 8.10: the post-deploy dashboard pending
+  count and coverage bar; 8.11: the ASVS vault rows and L1/L2/L3/L10 as
+  follow-up issues.
+
+Follow-up issues that **were** filed, so those tasks are ticked: #261
+(`mcp-concurrency-slots`, since shipped and closed), #262
+(`vault-root-mount-graft-detection`, open pending the owner's L1/L2 decision)
+and #263 (typed in-band tool outcomes, since shipped and closed).
