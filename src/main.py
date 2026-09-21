@@ -566,12 +566,38 @@ def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_handler)
 
-# Honor X-Forwarded-Proto/For from upstream reverse proxy so that scheme-aware
-# redirects (e.g. trailing-slash on /mcp) keep the https:// scheme.
-app.add_middleware(
-    ProxyHeadersMiddleware,
-    trusted_hosts=["127.0.0.1", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
-)
+def _install_proxy_headers(target: FastAPI) -> list[str]:
+    """Honour `X-Forwarded-Proto`/`-For` from the peers `TRUSTED_PROXY_IPS` names.
+
+    Scheme-aware redirects (the trailing-slash one on `/mcp`) need the header
+    to keep the `https://` scheme, and every limiter in the process keys on the
+    address this middleware resolves — which is why the list is one setting and
+    not a literal here (#189). The value is already canonical: `Settings`
+    rewrites `192.168.0.10/24` to `192.168.0.0/24` at boot, because the
+    un-canonicalised string is what uvicorn's own parse turns into a literal
+    matching no peer.
+
+    An empty setting installs **no** middleware rather than a middleware
+    trusting nobody. The two behave identically, and not adding it says so in
+    the middleware stack, which is where an operator looks.
+
+    The effective list is logged once at import, i.e. at startup: a trust
+    boundary nobody can read from the logs is a trust boundary nobody audits.
+    """
+    trusted = list(settings.trusted_proxy_ips)
+    log = logging.getLogger(__name__)
+    if not trusted:
+        log.info(
+            "Proxy header trust: TRUSTED_PROXY_IPS is empty — X-Forwarded-* "
+            "ignored from every peer"
+        )
+        return trusted
+    target.add_middleware(ProxyHeadersMiddleware, trusted_hosts=trusted)
+    log.info("Proxy header trust: TRUSTED_PROXY_IPS = %s", ", ".join(trusted))
+    return trusted
+
+
+_trusted_proxy_ips = _install_proxy_headers(app)
 
 # Reject forged Host headers at the application boundary. This complements
 # FastMCP's DNS-rebinding checks and also protects OAuth/admin routes.

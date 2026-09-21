@@ -42,7 +42,7 @@ from src.database import get_session
 from src.limiter import limiter
 from src.models.db import APIKey, NoteMetadata, OAuthClient, OAuthCode, OAuthToken, UsageLog, User
 from src.oauth.grants import USER_BOOTSTRAP_LOCK_KEY
-from src.services import security_events
+from src.services import rate_limits, security_events
 from src.services.vault import validate_vault_root_path, warm_user_vault_cache
 
 router = APIRouter(tags=["auth"], dependencies=[Depends(verify_csrf)])
@@ -228,6 +228,47 @@ async def login_submit(
     result = await session.execute(select(User).where(User.username == normalized))
     user = result.scalar_one_or_none()
 
+    # The per-account budget, additive to the 5/min per-address limit above and
+    # replacing neither (#189): an address-keyed limit hands an attacker a
+    # fresh allowance for every address they rotate through, and an
+    # account-keyed one alone lets one address walk many accounts.
+    #
+    # Here, and nowhere else: **after** the lookup, because the key is the row
+    # id, and **before** `verify_password`, because a budget consulted after
+    # the comparison bounds nothing. Only a username that resolved is charged —
+    # there is no credential behind a name that matches no account, so there is
+    # nothing to bound, and giving it a counter is what would make the map grow
+    # with the attacker's imagination instead of with the users table. The
+    # check precedes the `is_active` branch deliberately: keying by row rather
+    # than by the flag keeps budget behaviour from becoming a side channel for
+    # account state.
+    #
+    # The response is the same `_render_login(..., 401)` the three credential
+    # branches return, with the same arguments and the same message, so no
+    # response *content* distinguishes a throttle from an ordinary failure;
+    # only this record does. Timing does differ (bcrypt is skipped), which is
+    # inherent to checking a budget before the expensive comparison and is
+    # recorded as an accepted limitation rather than dressed up.
+    if user is not None:
+        throttled = rate_limits.check_login_failures(user.id)
+        if throttled is not None:
+            security_events.emit(
+                "panel_login_account_throttled",
+                subject=security_events.subject_for(request=request),
+                username_submitted=normalized,
+                limit_count=throttled.limit,
+                window_seconds=throttled.window_seconds,
+                client_ip=security_events.client_ip(request),
+                route=request.url.path,
+            )
+            return _render_login(
+                request,
+                error=invalid_msg,
+                next_url=target,
+                username=normalized,
+                status_code=status.HTTP_401_UNAUTHORIZED,
+            )
+
     # The merged condition is split **for the reason code only**. All three
     # branches fall into one `_render_login(..., status_code=401)`, so the
     # response is byte-identical across them and the log is the only place the
@@ -257,6 +298,12 @@ async def login_submit(
             client_ip=security_events.client_ip(request),
             route=request.url.path,
         )
+        # Only the two branches that evaluated a password against a real row
+        # charge the budget. `unknown_user` has no row to charge, and charging
+        # it would need a key the submitted text supplies — the thing the exact
+        # keying exists to avoid.
+        if reason in ("inactive_user", "bad_password"):
+            rate_limits.record_login_failure(user.id)
         return _render_login(
             request,
             error=invalid_msg,
