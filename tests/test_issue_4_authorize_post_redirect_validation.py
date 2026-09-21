@@ -88,6 +88,13 @@ class _FakeSession:
         # transaction's snapshot was read last. Interpreting it here keeps the
         # fake honest: the claim applies only when the row really is unowned,
         # and returns nothing when it is not.
+        # The use-marker stamp (#194) is also an `UPDATE oauth_clients`, so it
+        # is matched on its SET column before the claim branch: answering "no
+        # row" would turn every consent into an `invalid_client` refusal.
+        from _oauth_grant_fakes import is_client_use_stamp
+
+        if is_client_use_stamp(stmt):
+            return _FakeResult(self._client.client_id)
         if isinstance(stmt, Update):
             if self._client is not None and self._client.user_id is None:
                 self._client.user_id = dict(stmt.compile().params).get("user_id")

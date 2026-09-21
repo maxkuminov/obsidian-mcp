@@ -314,6 +314,13 @@ _LINKS_TRUNCATED_COLUMN_MARKER = (
 # `alembic/versions/023_indexer_state.py`.
 _CHUNKS_TRUNCATED_COLUMN_MARKER = "chunk-cap truncation marker (023_indexer_state)"
 
+# Same device, same rule: byte identical to `COLUMN_MARKER` in
+# `alembic/versions/025_oauth_client_last_used.py`.
+_OAUTH_CLIENT_LAST_USED_COLUMN_MARKER = (
+    "client use marker, stamped at code and token issuance "
+    "(025_oauth_client_last_used)"
+)
+
 
 class UsageLog(Base):
     __tablename__ = "usage_logs"
@@ -538,7 +545,42 @@ class NoteLink(Base):
 
 
 class OAuthClient(Base):
+    """One RFC 7591 dynamic registration.
+
+    ## Why `last_used_at` exists
+
+    `/register` is unauthenticated by design, so nothing but the maintenance
+    sweep bounds this table — and the sweep needs to know whether a
+    registration has ever been used. **No column that already existed can say
+    that**, which is why 025 added one rather than deriving the answer:
+
+    * `user_id` is the first authorizing user, but it is NULL for **every**
+      client in a single-user deployment — the configuration `DEPLOYMENT.md`
+      walks a new operator through — so "no owner" cannot mean "never used".
+    * Child rows cannot mean it either. A **used** `OAuthCode` is deleted the
+      moment it is spent, with no age gate at all, and an `OAuthToken` is
+      deleted seven days after it expires. A client that was genuinely used,
+      whose grant was revoked and whose rows aged out, is indistinguishable
+      from one that never was.
+    * `usage_logs.actor_ref` survives credential deletion by design, but it
+      records *tool calls*, not issuance, so a client that authorized and never
+      called a tool has no row there.
+
+    The column is stamped in the same transaction that inserts an `OAuthCode`
+    at consent approval and again at each token issuance (code exchange and
+    refresh). Migration 025 stamped **every** row that existed when it ran, so
+    `last_used_at IS NULL` can only mean "registered after 025 and never
+    used" — the sweep therefore only ever acts on a registration whose entire
+    history is visible to it. The absence of child rows is still required as a
+    second, independent guard; see
+    `docs/architecture/oauth-and-grants.md`.
+    """
+
     __tablename__ = "oauth_clients"
+
+    # 025's ownership marker, reachable from the class so a caller checking
+    # model/migration agreement names the column it is checking.
+    _LAST_USED_COLUMN_MARKER: ClassVar[str] = _OAUTH_CLIENT_LAST_USED_COLUMN_MARKER
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int | None] = mapped_column(
@@ -556,6 +598,14 @@ class OAuthClient(Base):
     scope: Mapped[str] = mapped_column(String(50), nullable=False, default="read")
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
+    )
+    # Nullable and with **no server default**, both load-bearing: NULL is the
+    # value that means "never used", and a default would hand every fresh
+    # registration a use it has not had. See the class docstring and 025.
+    last_used_at: Mapped[datetime.datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment=_OAUTH_CLIENT_LAST_USED_COLUMN_MARKER,
     )
 
     user: Mapped["User | None"] = relationship(back_populates="oauth_clients")
