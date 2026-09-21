@@ -17,7 +17,10 @@ properties that must survive every edit:
   make the control stricter, and nobody can *choose* to collide with a victim.
   Principals are authenticated, so their cardinality is bounded by the
   credentials that exist: a dict with a hard cap and an amortised sweep, past
-  which further principals share one overflow entry.
+  which further principals share one overflow entry. The panel login budget is
+  the third registry and the only **exactly** keyed one: its key space is the
+  `users` table, so it gets a plain dict swept on access, and merging two keys
+  there would be a cross-account denial rather than a bound.
 * **An entry is evictable only when it is full and idle.** A fresh entry starts
   full, so evicting a *depleted* one would hand back free capacity — idling
   through the sweep would be a way to reset a spent bucket. An entry holding an
@@ -194,12 +197,24 @@ _sweep_queue: list[Principal] = []
 _address_salt: bytes = secrets.token_bytes(16)
 _address_table: list["_AddressSlot | None"] = []
 
+#: The panel login budget's counters, keyed **exactly** on `users.id`. Not the
+#: salted slot table above: see `check_login_failures`.
+_login_failures: dict[int, "_LoginWindow"] = {}
+
 
 @dataclass
 class _AddressSlot:
     window_start: float
     count: int
     warned: bool = False
+
+
+@dataclass
+class _LoginWindow:
+    """One account's failed-login counter, for one fixed window."""
+
+    window_start: float
+    count: int
 
 
 def reset_state_for_tests() -> None:
@@ -215,6 +230,7 @@ def reset_state_for_tests() -> None:
     _sweep_queue = []
     _address_salt = secrets.token_bytes(16)
     _address_table = []
+    _login_failures.clear()
 
 
 # ── Configuration ───────────────────────────────────────────────────────────
@@ -765,3 +781,99 @@ def record_auth_failure(address: str | None) -> None:
         table[index] = _AddressSlot(window_start=now, count=1)
         return
     slot.count += 1
+
+
+# ── The per-account panel login budget ──────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class LoginBudgetRefusal:
+    """What the login route needs to record an over-budget account.
+
+    It carries no `retry_after_seconds` and no `first` flag, unlike
+    `AuthBudgetRefusal`: the refusal this drives is an ordinary 401 login page,
+    not a 429, so there is nothing to quote in a `Retry-After`, and the
+    suppression subject is the client address, which the security-event
+    suppressor already bounds per subject.
+    """
+
+    limit: int
+    window_seconds: int
+
+
+def _sweep_login_failures(now: float, window: int) -> None:
+    """Drop every counter whose window has passed.
+
+    A full scan, deliberately. The key space is `users.id` — administrator-
+    controlled and small — so this is O(recently-failing accounts) and the map
+    provably cannot grow past that. The fixed-size salted table the `/mcp`
+    budget uses exists because addresses are free to mint; nothing here needs
+    it, and using it would be a defect (`check_login_failures`).
+    """
+    expired = [
+        user_id
+        for user_id, entry in _login_failures.items()
+        if now - entry.window_start >= window
+    ]
+    for user_id in expired:
+        del _login_failures[user_id]
+
+
+def check_login_failures(user_id: int) -> LoginBudgetRefusal | None:
+    """Is this **account** over its failed-login budget? `None` means carry on.
+
+    Called from `login_submit` after the username has resolved to a row and
+    **before** `verify_password` — a budget consulted after the comparison
+    bounds nothing, because the guess has already been answered. It is the
+    account-keyed half of the pair slowapi cannot express: `src/limiter.py`'s
+    `key_func` is synchronous, runs before the handler, and reading the form
+    body there would consume the stream the handler needs.
+
+    **Exactly keyed, and never on a hash.** The `/mcp` failed-auth table merges
+    colliding keys, which is a *bound* there (addresses are unbounded and
+    free to mint, so a merged slot only makes the control stricter) and would
+    be a cross-account denial here: ten failures against a colliding name would
+    refuse a different account's **correct password**, and an attacker
+    submitting random names could saturate every slot without knowing any
+    victim's. A dict keyed on the row id cannot do either.
+
+    The caller passes an id only for a username that resolved, so an unknown
+    name creates no counter and consumes no account allowance; those attempts
+    stay under the 5/min address limit, which is the control appropriate to a
+    name with no credential behind it.
+
+    The threshold is inclusive on the recorded count — with a limit of 10 the
+    11th attempt is the first refused — and a refused attempt does **not**
+    increment, because no password was compared. Both halves of that arithmetic
+    live here so they cannot drift.
+    """
+    limit = settings.panel_login_failure_limit
+    if limit is None:
+        return None
+    window = settings.panel_login_failure_window_seconds
+    now = time.monotonic()
+    _sweep_login_failures(now, window)
+    entry = _login_failures.get(user_id)
+    if entry is None or entry.count < limit:
+        return None
+    return LoginBudgetRefusal(limit=limit, window_seconds=window)
+
+
+def record_login_failure(user_id: int) -> None:
+    """Charge one failed sign-in to this account's counter.
+
+    Called only from the branches where a password was actually evaluated
+    against a real row — never for a username that resolved to nothing, which
+    has no account to protect, and never on success, which is what makes the
+    counter measure guessing rather than traffic.
+    """
+    if settings.panel_login_failure_limit is None:
+        return
+    window = settings.panel_login_failure_window_seconds
+    now = time.monotonic()
+    _sweep_login_failures(now, window)
+    entry = _login_failures.get(user_id)
+    if entry is None:
+        _login_failures[user_id] = _LoginWindow(window_start=now, count=1)
+        return
+    entry.count += 1

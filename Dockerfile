@@ -33,8 +33,13 @@ EXPOSE 8000
 # and splits the coalescer so the same key writes a row per worker. Raising it
 # means revisiting docs/architecture/rate-limits.md first.
 #
-# --forwarded-allow-ips: trust X-Forwarded-* only from private ranges (the
-# reverse proxy lives in the Docker network), not from "*" which would let any
-# client spoof its forwarded IP. Narrow to the specific compose subnet CIDR if
-# desired.
-CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "172.16.0.0/12,10.0.0.0/8"]
+# --no-proxy-headers is deliberate, not a removal of a control (#189).
+# TRUSTED_PROXY_IPS is now the single place that states which peers may set
+# X-Forwarded-*, and it drives the app's own ProxyHeadersMiddleware. uvicorn's
+# layer is switched OFF rather than aligned with it, because uvicorn's
+# proxy_headers defaults to *enabled* and its forwarded_allow_ips reads
+# $FORWARDED_ALLOW_IPS: two lists that happen to agree is a state an operator
+# can break from the environment without editing either file, and the previous
+# --forwarded-allow-ips value here excluded the real proxy subnet and was
+# therefore inert. Narrow the trust list in .env, not here.
+CMD ["uvicorn", "src.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-proxy-headers"]

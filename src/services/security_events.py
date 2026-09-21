@@ -95,6 +95,17 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "panel_login_failed": frozenset(
         {"reason", "username_submitted", "user_id", "client_ip", "route"}
     ),
+    # The per-account failed-login budget's refusal. The subject is the client
+    # address, never `username_submitted` — a caller-supplied subject mints a
+    # fresh logging allowance for every value rotated through it. No `reason`:
+    # this event *is* the reason, and no `user_id` either, because the record
+    # would then confirm that the submitted name resolves to an account, which
+    # the response deliberately does not. `username_submitted` carries the
+    # formatter's existing 64-character bound (`src/logging_setup.py`), so the
+    # event introduces no unbounded field.
+    "panel_login_account_throttled": frozenset(
+        {"client_ip", "route", "username_submitted", "limit_count", "window_seconds"}
+    ),
     "panel_logout": frozenset({"user_id_session", "username_session", "client_ip"}),
     "panel_bootstrap_admin_created": frozenset({"user_id", "username", "client_ip"}),
     "panel_bootstrap_refused": frozenset({"reason", "client_ip"}),
