@@ -5,7 +5,11 @@ The `ProxyHeadersMiddleware` SHALL trust `X-Forwarded-For` and `X-Forwarded-Prot
 
 The setting exists because the hard-coded list spans a Docker network shared with other containers, several of which run user-supplied code, and every slowapi limiter keys on the address this middleware resolves. Narrowing the list is the operator's decision and must not require a code change. Two controls that happen to agree is not one control: uvicorn's own allow-list defaults to enabled and reads an environment variable, so an operator can break the agreement without editing either file.
 
-Every entry SHALL be validated at startup as an IP address or CIDR network, and a malformed entry SHALL refuse startup naming the offending entry rather than being silently dropped — a trust list that quietly loses a range is worse than one that fails loudly. The effective list SHALL be logged once at startup, because a trust boundary that cannot be read from the logs cannot be audited. An empty setting means no peer is trusted, which is the correct configuration for a directly exposed deployment.
+Every entry SHALL be validated at startup as an IP address or CIDR network, and a malformed entry SHALL refuse startup naming the offending entry rather than being silently dropped — a trust list that quietly loses a range is worse than one that fails loudly.
+
+Validation alone is insufficient: an entry SHALL be stored in its **canonical** network form, and that canonical value SHALL be what reaches the middleware and the startup log. A CIDR carrying host bits, such as `192.168.0.10/24`, is accepted by a permissive parse but rejected by the middleware's own stricter one, which then keeps the string as a literal that matches no peer. The failure is silent and inverts the intent: every proxied request retains the proxy's address, so all callers collapse into one limiter bucket. Canonicalising at the boundary is what prevents a setting that appears valid from disabling the control it configures.
+
+The effective canonical list SHALL be logged once at startup, because a trust boundary that cannot be read from the logs cannot be audited. An empty setting means no peer is trusted, which is the correct configuration for a directly exposed deployment.
 
 #### Scenario: Request from Docker network trusted
 - **WHEN** a request arrives from IP `172.18.0.2` with `X-Forwarded-For: 203.0.113.1` under the default setting
@@ -22,6 +26,15 @@ Every entry SHALL be validated at startup as an IP address or CIDR network, and 
 #### Scenario: A narrowed list excludes a former peer
 - **WHEN** `TRUSTED_PROXY_IPS` is set to a single proxy address and a request arrives from a different address on the same subnet carrying `X-Forwarded-For`
 - **THEN** the header SHALL be ignored and the application SHALL see the peer's own address
+
+#### Scenario: A CIDR with host bits is canonicalised, not passed through
+- **WHEN** `TRUSTED_PROXY_IPS` is set to `192.168.0.10/24`
+- **THEN** the stored and logged value SHALL be `192.168.0.0/24`
+- **AND** a request arriving from `192.168.0.10` carrying `X-Forwarded-For` SHALL be trusted by the installed middleware, proving the canonical form reached it rather than an unmatched literal
+
+#### Scenario: A bare address stays bare
+- **WHEN** `TRUSTED_PROXY_IPS` contains a bare address such as `127.0.0.1`
+- **THEN** it SHALL be stored and logged unchanged, not rewritten into a prefixed form
 
 #### Scenario: A malformed entry refuses startup
 - **WHEN** `TRUSTED_PROXY_IPS` contains a value that is neither an IP address nor a CIDR network

@@ -5,6 +5,8 @@ The maintenance job SHALL delete a dynamically registered OAuth client when it h
 
 "Never been used" SHALL be read from a durable per-client marker stamped whenever an authorization code or a token is issued for that client, and MUST NOT be inferred from the absence of child rows alone: a used authorization code is deleted immediately and a token seven days after it expires, so a client that was genuinely used becomes indistinguishable from one that never was. It MUST NOT be inferred from the client having no owner either, because a client authorized in single-user mode is never bound to a user.
 
+The sweep SHALL act only on registrations whose entire history the marker covers. Every client that existed before the marker was introduced is stamped by the migration that introduced it, so an absent marker can only mean a registration made after that point and never used. A client whose evidence of use was purged before the marker existed SHALL therefore never be a candidate — it cannot be distinguished from a hand-configured confidential client, which dynamic registration does not re-provision, because registering again mints a different identifier and secret.
+
 The age SHALL be configurable with a sane default, SHALL refuse a zero-day window, and SHALL be disable-able outright. Each pass SHALL log the number of clients it deleted, because a job that silently removes credentials cannot be audited.
 
 #### Scenario: A never-used client older than the age is deleted
@@ -30,6 +32,10 @@ The age SHALL be configurable with a sane default, SHALL refuse a zero-day windo
 #### Scenario: A client with a pending authorization code is kept
 - **WHEN** a client has an unused, unexpired authorization code
 - **THEN** it SHALL NOT be deleted
+
+#### Scenario: A registration predating the marker is never swept
+- **WHEN** the sweep runs against a client that was registered before the use marker existed and holds no surviving code or token row
+- **THEN** it SHALL NOT be deleted, whatever its age, because the migration stamped its marker rather than leaving it absent
 
 #### Scenario: A client bound to a user is kept
 - **WHEN** a client has been claimed by an authorizing user
