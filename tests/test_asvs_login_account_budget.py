@@ -114,7 +114,9 @@ def verify_calls(monkeypatch):
     return calls
 
 
-def _make_request() -> Request:
+def _make_request(client_ip: str | None = None) -> Request:
+    """One attempt. `client_ip` pins the address instead of rotating it, which
+    is how the retained 5/min address limit can be exercised deliberately."""
     path = "/admin/auth/login"
     return Request(
         {
@@ -127,10 +129,17 @@ def _make_request() -> Request:
             "root_path": "",
             "query_string": b"",
             "headers": [(b"host", b"testserver")],
-            "client": (f"10.0.0.{next(_client_ips) % 250 + 1}", 12345),
+            "client": (
+                client_ip or f"10.0.0.{next(_client_ips) % 250 + 1}",
+                12345,
+            ),
             "server": ("testserver", 80),
             "session": {},
             "state": {},
+            # slowapi's own 429 delegate reads `request.app.state.limiter`, so
+            # the address-limit case below can hand a real request to the
+            # application's handler rather than a stand-in.
+            "app": SimpleNamespace(state=SimpleNamespace(limiter=limiter)),
         }
     )
 
@@ -157,9 +166,9 @@ def _session_returning(user):
     return session
 
 
-async def _login(user, password=PASSWORD, username=USERNAME):
+async def _login(user, password=PASSWORD, username=USERNAME, client_ip=None):
     return await auth_routes.login_submit(
-        request=_make_request(),
+        request=_make_request(client_ip),
         username=username,
         password=password,
         next="/admin/",
@@ -248,6 +257,78 @@ async def test_unknown_usernames_consume_no_account_allowance(verify_calls):
 
     assert response.status_code == 302
     assert verify_calls == [1]
+
+
+async def test_an_authenticated_session_is_unaffected_by_a_flood(verify_calls):
+    """The second of the four properties that make this not a lockout.
+
+    A flood can delay a *fresh password* sign-in for the name it attacks; it
+    cannot evict anyone, because `login_form` resolves an existing session and
+    short-circuits to the panel before any of this machinery is consulted.
+    The session's own validation is `get_active_session_user`'s contract and is
+    tested where it lives (#198); what is asserted here is that the exhausted
+    budget is not in that path at all — no password is compared, the redirect
+    is the ordinary one, and the account's counter is left exactly as the
+    flood left it.
+    """
+    user = _stored_user()
+    for _ in range(4):
+        await _login(user, password=PASSWORD + "!")
+    assert verify_calls == [1, 1, 1], "the budget is exhausted"
+
+    async def _resolve(_request, _session):
+        return user
+
+    saved = auth_routes.get_active_session_user
+    auth_routes.get_active_session_user = _resolve
+    try:
+        response = await auth_routes.login_form(
+            request=_make_request(),
+            next="/admin/",
+            session=_session_returning(user),
+        )
+    finally:
+        auth_routes.get_active_session_user = saved
+
+    assert response.status_code == 302
+    assert response.headers["location"] == "/admin/"
+    assert verify_calls == [1, 1, 1], "the session path compares no password"
+    assert list(rate_limits._login_failures) == [1], "and clears no allowance"
+
+
+async def test_the_address_limit_still_answers_on_the_sixth_rapid_attempt():
+    """The retained 5/min per-address limit, asserted rather than assumed.
+
+    The account budget is *additive* to it and replaces neither: this one is
+    what bounds an attacker walking many usernames from one address, where no
+    single account counter ever fills. Every other case in this file rotates
+    addresses precisely to stay under it, so without this the restated
+    scenario would rest on nothing.
+
+    slowapi raises; the application turns that into the 429 the scenario
+    names, through the one handler every limited route shares.
+    """
+    from slowapi.errors import RateLimitExceeded
+
+    from src import main
+
+    for index in range(5):
+        response = await _login(
+            None, username=f"walk{index}", client_ip="198.51.100.9"
+        )
+        assert response.status_code == 401
+
+    sixth = _make_request("198.51.100.9")
+    with pytest.raises(RateLimitExceeded) as exceeded:
+        await auth_routes.login_submit(
+            request=sixth,
+            username="walk5",
+            password=PASSWORD,
+            next="/admin/",
+            session=_session_returning(None),
+        )
+
+    assert main._rate_limit_handler(sixth, exceeded.value).status_code == 429
 
 
 # --- what is counted, and what is not -------------------------------------

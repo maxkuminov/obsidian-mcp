@@ -192,14 +192,19 @@ forward.
 The default trusts loopback and the three private (RFC 1918) ranges, which
 covers a loopback-published port and a shared Docker network without any
 configuration — and also trusts every *other* container on that network.
-Narrow it to your proxy's address (`TRUSTED_PROXY_IPS=172.18.0.2`, a CSV or
-JSON list of addresses and CIDRs) once the proxy has a fixed one; a proxy
-outside the default ranges must be listed or every request will appear to
-come from the proxy, and every per-address rate limit will be shared. The
-value is validated at boot, the canonical list is logged once at startup,
-and uvicorn's own `--forwarded-allow-ips` / `FORWARDED_ALLOW_IPS` is
-switched off in the image (`--no-proxy-headers`), so there is no second
-control to keep in step.
+Narrow it to your proxy's own address —
+`TRUSTED_PROXY_IPS=<your proxy's address>` — once the proxy has a fixed
+one. The value is a CSV or JSON list whose entries are each a single
+address or one CIDR network (`10.0.0.5`, `10.0.0.0/24`); read your
+proxy's address off your own deployment rather than copying an example,
+since a literal here that is not your proxy trusts the wrong peer. A
+proxy outside the default ranges must be listed or every request will
+appear to come from the proxy, and every per-address rate limit will be
+shared. The value is validated at boot, the canonical list is logged
+once at startup, and uvicorn's own `--forwarded-allow-ips` /
+`FORWARDED_ALLOW_IPS` is switched off in the image and in both reference
+compose files (`--no-proxy-headers`), so there is no second control to
+keep in step.
 
 If you plan to use the file-transfer tools (`request_upload`,
 `request_download`), the proxy must also forward **`/transfer/*`** —

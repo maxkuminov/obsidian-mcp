@@ -317,6 +317,30 @@ def _cross_user_client_error(
     )
 
 
+def _client_vanished_error() -> JSONResponse:
+    """The refusal for a registration that is no longer there (#194).
+
+    Two branches of the consent path reach this and they must answer
+    identically, because they are the same event: the expiry sweep won the race
+    for the client row. One is the stamp's `False` return; the other is the
+    ownership claim finding **no row at all** when it re-reads. Treating the
+    second as a cross-user conflict would return `access_denied` naming an
+    owner that does not exist, and would write an
+    `oauth_cross_user_client_refused` record about a user who did nothing —
+    a misleading security record for the sweep's ordinary work.
+    """
+    return _oauth_json(
+        {
+            "error": "invalid_client",
+            "error_description": (
+                "This client registration no longer exists. Register "
+                "again and re-authorize."
+            ),
+        },
+        status_code=400,
+    )
+
+
 def _client_belongs_to_another_user(client_row, session_user_id: int | None) -> bool:
     """Is this client owned by a *different* user than the one consenting?
 
@@ -911,10 +935,9 @@ async def authorize_post(
                 )
             ).scalar_one_or_none()
             if claimed is None:
-                # Somebody else got there first. Re-read in a fresh statement
-                # (a new snapshot, so the winner's commit is visible) and
-                # refuse unless the winner happens to be this same user, which
-                # is the ordinary case of one person opening two tabs.
+                # Either somebody else got there first, or the row is gone.
+                # Re-read in a fresh statement (a new snapshot, so the winner's
+                # commit is visible).
                 owner = (
                     await session.execute(
                         select(OAuthClient.user_id).where(
@@ -922,6 +945,23 @@ async def authorize_post(
                         )
                     )
                 ).scalar_one_or_none()
+                if owner is None:
+                    # The registration is **gone**, not owned by a stranger
+                    # (#194). A surviving row cannot read NULL here: the
+                    # conditional `UPDATE ... WHERE user_id IS NULL` matched
+                    # nothing, so at that instant the row either did not exist
+                    # or already carried an owner — and an owner is never
+                    # cleared, the client never rebinds. So NULL means the
+                    # expiry sweep won the race for this row.
+                    #
+                    # Answering `access_denied` here would name an owner that
+                    # does not exist and would write an
+                    # `oauth_cross_user_client_refused` record about a user who
+                    # did nothing. The sweep's win is not a conflict; it gets
+                    # the same `invalid_client` the stamp below returns.
+                    return _client_vanished_error()
+                # Refuse unless the winner happens to be this same user, which
+                # is the ordinary case of one person opening two tabs.
                 if owner != session_user_id:
                     return _cross_user_client_error(
                         request,
@@ -939,16 +979,7 @@ async def authorize_post(
         # sweep's ordinary work, not a rejected authorization attempt, and the
         # sweep logs its own count.
         if not await _stamp_client_use(session, client_id):
-            return _oauth_json(
-                {
-                    "error": "invalid_client",
-                    "error_description": (
-                        "This client registration no longer exists. Register "
-                        "again and re-authorize."
-                    ),
-                },
-                status_code=400,
-            )
+            return _client_vanished_error()
 
         oauth_code = OAuthCode(
             code_hash=_hash(code),
