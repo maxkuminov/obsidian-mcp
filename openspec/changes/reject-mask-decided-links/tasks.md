@@ -4,4 +4,4 @@
 - [x] 4. Add regressions for rejection, valid labels/aliases/anchors, caps and unchanged-note re-derivation; update architecture notes.
 - [x] 5. Independent defensive implementation/spec review — PASS, no findings; offline 4,685 passed / 557 skipped; real-PG 554 passed; OpenSpec 33 passed; audit clean.
 - [x] 6. Record triage and validation; published branch and draft PR #270.
-- [ ] 7. Release follow-up: deploy, confirm version-3 re-derivation and exercise affected live MCP graph tools, then archive the change.
+- [ ] 7. Release follow-up: deploy, confirm version-3 re-derivation and exercise affected live MCP graph tools, then archive the change. (NOT EVIDENCED at archive — the change merged as PR #270 after the 2026-09-06 release image was built, and no record confirms version-3 re-derivation or a live exercise of the graph tools; `get_links` in the 314-assertion smoke predates this fix.)

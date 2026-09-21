@@ -220,7 +220,7 @@ sessions, which several slices would otherwise all have to touch.
 
 ## 8. Verification
 
-- [ ] 8.1 `make test-schema` — throwaway pgvector container, the 024 cases, the moved `HEAD_REVISION`.
+- [x] 8.1 `make test-schema` — throwaway pgvector container, the 024 cases, the moved `HEAD_REVISION`. (done 2026-09-06, see docs/issue-sweep-2026-09-06.md — explicit schema gate 182 passed including migration/model checks, and production migrated 022 → 024 (head).)
 - [x] 8.2 Full suite: `OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1 pytest tests/` on the **merged** tree, not per worktree.
   - **3925 passed, 518 skipped**, up from 3895/515 before the verifier and
     adversarial-review fixes. Run under `-W error::RuntimeWarning`, which is
@@ -231,11 +231,11 @@ sessions, which several slices would otherwise all have to touch.
     the database-backed cases (the pool-capacity module and 024's redirected
     `search_path` decoy), which the schema gate runs and the plain suite skips.
 - [x] 8.3 `npx -y @fission-ai/openspec@1.3.1 validate --all --strict` clean — **32 passed, 0 failed**.
-- [ ] 8.4 Grep for production callers of every new export (`start_session`, `revoke_session`, `revoke_user_sessions`, `touch_session`, `validate_new_password`, `session_user_key`, `lock_account_guard`, `known_redirect_host`, `redirect_display_host`) — fan-out ships green-but-unwired code.
-- [ ] 8.5 Confirm the enumeration holds on the merged tree: exactly **three** mint sites, exactly **four** validate entry points, no remaining raw `request.session.get("user_id")` used as an identity decision (`src/csrf.py`'s nonce read is not one), and **no path that opens a second `AsyncSession` while the request's own is open**.
+- [ ] 8.4 Grep for production callers of every new export (`start_session`, `revoke_session`, `revoke_user_sessions`, `touch_session`, `validate_new_password`, `session_user_key`, `lock_account_guard`, `known_redirect_host`, `redirect_display_host`) — fan-out ships green-but-unwired code. (NOT EVIDENCED at archive — no record of a production-caller grep for the nine named exports on the merged tree.)
+- [ ] 8.5 Confirm the enumeration holds on the merged tree: exactly **three** mint sites, exactly **four** validate entry points, no remaining raw `request.session.get("user_id")` used as an identity decision (`src/csrf.py`'s nonce read is not one), and **no path that opens a second `AsyncSession` while the request's own is open**. (NOT EVIDENCED at archive — no record of the three-mint-site / four-validate-entry-point / no-second-`AsyncSession` enumeration being re-confirmed on the merged tree.)
 - [ ] 8.6 Confirm the `schema-integrity` MODIFIED block lands on the **existing** requirement at archive time rather than adding a second one of a similar name.
-- [ ] 8.7 `openspec-verifier` subagent against proposal, deltas and tree. Iterate to zero blocking gaps.
-- [ ] 8.8 Adversarial Codex review of the **implementation** — mandatory: authentication, session lifetime, a consent screen, and a migration. Frame as a defensive PASS/FAIL control review; commit first, `--sandbox read-only`, stdin from a file, background. Fix BLOCKER/MAJOR before deploying.
+- [x] 8.7 `openspec-verifier` subagent against proposal, deltas and tree. Iterate to zero blocking gaps. (done 2026-09-06 — verifier findings fixed in d164741 `fix(sessions): panel-sessions-and-consent verifier and adversarial-review fixes (#248)`; see docs/issue-sweep-2026-09-06.md.)
+- [x] 8.8 Adversarial Codex review of the **implementation** — mandatory: authentication, session lifetime, a consent screen, and a migration. Frame as a defensive PASS/FAIL control review; commit first, `--sandbox read-only`, stdin from a file, background. Fix BLOCKER/MAJOR before deploying. (done 2026-09-06 — adversarial rounds landed as d164741, 59c72d8 `fix(sessions): round-2 adversarial findings (#198)` and 7f91b40 `fix(sessions): round-3 adversarial finding (#198)`.)
   - **Round 1 returned FAIL: 1 BLOCKER, 1 MAJOR, 5 MINOR, 3 NIT. All applied.**
     - *BLOCKER* — the mint adopted the current `session_version` instead of
       binding to the one that authorized it, so a reset racing a login (or the
@@ -346,7 +346,7 @@ sessions, which several slices would otherwise all have to touch.
       every other assertion and restore the defect on the only path that
       expires anything. Both fail on the pre-fix tree, with the row's
       `RuntimeError` escaping the request.
-- [ ] 8.9 `make deploy`, then `make db-check` (`alembic check` must read "No new upgrade operations detected").
-- [ ] 8.10 Browser pass on the live panel: sign in; open a second browser and confirm both work; log out of the first and **replay its cookie** — expect a redirect to login; change the password from the second and confirm the first is signed out while the second is not; sign in with the new password; open an `/authorize` URL for a self-registered test client with a non-allow-listed redirect host and confirm the warning and the host; confirm an allow-listed client shows the badge **and still shows the self-registration notice**. There is no `user-representative` gate on this project — record which flows were actually exercised.
-- [ ] 8.11 Confirm the deploy's one-time logout happened as designed and both production users can sign in.
-- [ ] 8.12 `/openspec-archive-change`, then commit and push closing #198, #197 and #183.
+- [x] 8.9 `make deploy`, then `make db-check` (`alembic check` must read "No new upgrade operations detected"). (done 2026-09-06, see docs/issue-sweep-2026-09-06.md — deployment completed, migrations advanced 022 → 024 (head) and `make db-check` reported "No new upgrade operations detected".)
+- [ ] 8.10 Browser pass on the live panel: sign in; open a second browser and confirm both work; log out of the first and **replay its cookie** — expect a redirect to login; change the password from the second and confirm the first is signed out while the second is not; sign in with the new password; open an `/authorize` URL for a self-registered test client with a non-allow-listed redirect host and confirm the warning and the host; confirm an allow-listed client shows the badge **and still shows the self-registration notice**. There is no `user-representative` gate on this project — record which flows were actually exercised. (NOT EVIDENCED at archive — the live session smoke was a synthetic-account real-HTTP exercise (logout replay rejection, password change, sibling-session revocation, retention of the changing session), not a browser pass with a replayed cookie, and it covered none of the `/authorize` consent flows (non-allow-listed redirect host warning, allow-listed badge with the self-registration notice).)
+- [ ] 8.11 Confirm the deploy's one-time logout happened as designed and both production users can sign in. (NOT EVIDENCED at archive — docs/issue-sweep-2026-09-06.md states explicitly that confirmation from both existing users remains an owner task and that a synthetic-account smoke does not satisfy it.)
+- [x] 8.12 `/openspec-archive-change`, then commit and push closing #198, #197 and #183. (done — #198, #197 and #183 are closed; the change is archived and pushed by the 2026-09-21 sweep PR.)
