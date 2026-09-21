@@ -22,6 +22,15 @@ they assert *is* the database's behaviour:
   under the identical interleaving, so the case fails if the two ever start
   behaving the same way.
 
+  Every one of those cases forces its interleaving rather than sleeping
+  through it. One transaction holds the row and the other is either awaited to
+  completion inside that lock (where the assertion is that it does *not*
+  block) or polled in `pg_stat_activity` until PostgreSQL reports it waiting
+  (`_wait_until_lock_blocked`, bounded, failing the test if the wait never
+  happens). A `sleep` standing in for that is not synchronisation: it lets a
+  slow container run the two serially, which passes the positive case having
+  proved nothing and fails the negative control for no reason.
+
 The migration's own marker, drift, downgrade and stamp-back cases live in
 `tests/integration/test_schema_check.py`, which is the module `make
 test-schema` actually runs.
@@ -36,6 +45,7 @@ Skipped unless `PGVECTOR_TEST_ADMIN_URL` names a throwaway Postgres *server*
     docker rm -f pgvector-test
 """
 import asyncio
+import json
 import os
 import subprocess
 import sys
@@ -258,6 +268,54 @@ async def seed_token(
             )
         )
         await session.commit()
+
+
+async def _wait_until_lock_blocked(engine, *, pid=None, timeout=20.0):
+    """Wait until PostgreSQL itself reports a backend waiting on a lock.
+
+    This is the synchronisation the race cases below need, and the reason a
+    `sleep` is not one. A fixed sleep asserts nothing about the interleaving:
+    on a loaded container the other transaction can commit inside it, after
+    which the "concurrent" case runs serially and passes having proved nothing
+    — and its negative control can fail for the same reason, spuriously.
+
+    Polling `pg_stat_activity` waits on the **lock manager's own view** of
+    progress instead, so the case proceeds at the instant the contention is
+    real. The deadline is bounded and expiring it FAILS the test rather than
+    letting it continue unsynchronised.
+
+    `pid` is an optional callable naming the backend that must be the blocked
+    one; it is late-bound because the waiting task usually learns its own pid
+    only after it has started.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    async with engine.connect() as observer:
+        while loop.time() < deadline:
+            blocked = list(
+                (
+                    await observer.execute(
+                        text(
+                            "SELECT pid FROM pg_stat_activity "
+                            "WHERE datname = current_database() "
+                            "  AND state = 'active' "
+                            "  AND wait_event_type = 'Lock' "
+                            "  AND pid <> pg_backend_pid()"
+                        )
+                    )
+                ).scalars()
+            )
+            # A fresh transaction each poll, or the view never moves.
+            await observer.rollback()
+            wanted = pid() if pid is not None else None
+            if blocked and (wanted is None or wanted in blocked):
+                return blocked
+            await asyncio.sleep(0.02)
+    pytest.fail(
+        "no backend ever blocked on a lock within "
+        f"{timeout}s — the interleaving this case asserts did not happen, so "
+        "its result says nothing about concurrency"
+    )
 
 
 async def seed_code(sessionmaker, client_id, *, used=False, expires_at=FUTURE):
@@ -484,6 +542,84 @@ async def test_the_authorization_fails_cleanly_when_the_sweep_committed_first(cl
     assert await client_ids(clean) == []
 
 
+class _ConsentRequest:
+    """The handful of attributes `authorize_post` reads off the request."""
+
+    def __init__(self, signed_cookie):
+        self.cookies = {"oauth_state": signed_cookie}
+        self.session = {}
+        self.client = None
+        self.url = None
+        self.headers = {}
+
+
+async def test_a_real_authorization_blocked_on_the_sweeps_lock_gets_invalid_client(
+    clean, engine
+):
+    """The reverse ordering, forced on the lock rather than on a clock.
+
+    The sweep holds its candidate lock — the same `SELECT ... FOR UPDATE` the
+    real pass takes — and the **real consent handler** is started against that
+    row. Its stamp is an `UPDATE` on the locked row, so it blocks; the case
+    proceeds only once PostgreSQL reports that backend waiting, which is what
+    makes this an interleaving rather than a sequence. The sweep then deletes
+    and commits, and the unblocked authorization must discover the row is gone
+    and answer an ordinary `invalid_client` — never a foreign-key violation
+    into a 500, and never half a grant.
+    """
+    await seed_client(clean, "doomed")
+
+    sweeper_maker = async_sessionmaker(
+        engine, class_=AsyncSession, expire_on_commit=False
+    )
+    server_state = "csrfstatetoken1234567890"
+    signed = oauth._state_serializer().dumps(server_state)
+
+    async with sweeper_maker() as sweeping:
+        # The sweep's own candidate statement, held open.
+        locked = (
+            await sweeping.execute(
+                text(
+                    "SELECT client_id FROM oauth_clients "
+                    "WHERE client_id = 'doomed' FOR UPDATE"
+                )
+            )
+        ).scalars().all()
+        assert list(locked) == ["doomed"]
+
+        consent = asyncio.create_task(
+            oauth.authorize_post(
+                _ConsentRequest(signed),
+                action="approve",
+                client_id="doomed",
+                redirect_uri=REDIRECT_URI,
+                code_challenge="A" * 43,
+                code_challenge_method="S256",
+                scope="read",
+                state=server_state,
+                client_state="clientecho",
+            )
+        )
+
+        # Not a sleep: the consent must be observably waiting on this lock.
+        await _wait_until_lock_blocked(engine)
+        assert not consent.done(), "the authorization should still be blocked"
+
+        await sweeping.execute(
+            text("DELETE FROM oauth_clients WHERE client_id = 'doomed'")
+        )
+        await sweeping.commit()
+
+        response = await asyncio.wait_for(consent, timeout=20)
+
+    assert response.status_code == 400
+    assert json.loads(bytes(response.body))["error"] == "invalid_client"
+    assert await client_ids(clean) == []
+    async with clean() as session:
+        codes = (await session.execute(select(OAuthCode.id))).scalars().all()
+    assert list(codes) == [], "a refused authorization may write nothing"
+
+
 async def test_the_naive_conditional_delete_really_does_cascade_the_new_code(
     clean, engine
 ):
@@ -517,8 +653,13 @@ async def test_the_naive_conditional_delete_really_does_cascade_the_new_code(
         )
         await authorizing.flush()
 
+        sweeper_pid: dict[str, int] = {}
+
         async def _naive_delete():
             async with other() as sweeper:
+                sweeper_pid["pid"] = (
+                    await sweeper.execute(text("SELECT pg_backend_pid()"))
+                ).scalar()
                 await sweeper.execute(
                     text(
                         "DELETE FROM oauth_clients c "
@@ -533,8 +674,12 @@ async def test_the_naive_conditional_delete_really_does_cascade_the_new_code(
                 await sweeper.commit()
 
         task = asyncio.create_task(_naive_delete())
-        # Let it reach the lock, then release it by committing the insert.
-        await asyncio.sleep(0.5)
+        # Wait until the delete is *observably* blocked on the foreign key's
+        # lock, then release it by committing the insert. A sleep here would
+        # let a slow container run the two serially, and this control would
+        # then fail spuriously — the naive delete would find the committed
+        # code and correctly skip the row.
+        await _wait_until_lock_blocked(engine, pid=lambda: sweeper_pid.get("pid"))
         await authorizing.commit()
         await asyncio.wait_for(task, timeout=10)
 
@@ -553,6 +698,12 @@ async def test_the_real_sweep_survives_the_interleaving_the_naive_delete_loses(
     naive statement's inserting-only equivalent did not), so the candidate
     scan's `SKIP LOCKED` defers it; and even once the lock is released the
     in-lock re-read sees the committed marker and the committed code.
+
+    **The interleaving is forced by construction, with no sleep.** The whole
+    sweep is awaited to completion *inside* the uncommitted authorization
+    transaction, so the row lock provably covers every statement the sweep
+    issues. Nothing is polled because there is nothing to wait for: the real
+    sweep must not block here, and `SKIP LOCKED` is what makes that true.
     """
     await seed_client(clean, "real-survivor")
 
@@ -574,10 +725,13 @@ async def test_the_real_sweep_survives_the_interleaving_the_naive_delete_loses(
         )
         await authorizing.flush()
 
-        task = asyncio.create_task(indexer._expire_unused_oauth_clients())
-        await asyncio.sleep(0.5)
+        # Held lock, whole sweep, bounded wait: a sweep that blocked instead of
+        # skipping would expire this timeout rather than pass.
+        deleted = await asyncio.wait_for(
+            indexer._expire_unused_oauth_clients(), timeout=15
+        )
+        assert deleted == 0
         await authorizing.commit()
-        assert await asyncio.wait_for(task, timeout=10) == 0
 
     assert await client_ids(clean) == ["real-survivor"]
     async with clean() as session:
@@ -594,6 +748,55 @@ async def test_the_real_sweep_survives_the_interleaving_the_naive_delete_loses(
     # committed by the authorization is what the sweep now reads.
     assert await indexer._expire_unused_oauth_clients() == 0
     assert await client_ids(clean) == ["real-survivor"]
+
+
+# ── what the delete does not take with it ──────────────────────────────────
+
+
+async def test_usage_attribution_survives_the_expiry(clean):
+    """The audit trail outlives the registration it describes.
+
+    The premise has to be built deliberately, because the sweep only ever
+    deletes a client with **no** token rows: a `usage_logs` line can only meet
+    the sweep if its own token was purged first, which is exactly what happens
+    seven days after a token expires. So the row is left as that purge leaves
+    it — `oauth_token_id` already NULL by `ON DELETE SET NULL` — and the
+    denormalised actor columns (#77, migration 015) are what must still be
+    readable once the client row is gone. They are written at call time from
+    the credential that authenticated the request, precisely so that deleting
+    the credential cannot rewrite history into "unknown".
+    """
+    await seed_client(clean, "retired")
+
+    async with clean() as session:
+        await session.execute(
+            text(
+                "INSERT INTO usage_logs (oauth_token_id, tool, actor_kind, "
+                " actor_label, actor_ref) "
+                "VALUES (NULL, 'keyword_search', 'oauth', 'Retired Connector', "
+                "        'retired')"
+            )
+        )
+        await session.commit()
+
+    assert await indexer._expire_unused_oauth_clients() == 1
+    assert await client_ids(clean) == []
+
+    async with clean() as session:
+        rows = (
+            await session.execute(
+                text(
+                    "SELECT tool, actor_kind, actor_label, actor_ref "
+                    "FROM usage_logs"
+                )
+            )
+        ).all()
+        await session.execute(text("DELETE FROM usage_logs"))
+        await session.commit()
+
+    assert [tuple(row) for row in rows] == [
+        ("keyword_search", "oauth", "Retired Connector", "retired")
+    ]
 
 
 # ── the backfill ───────────────────────────────────────────────────────────

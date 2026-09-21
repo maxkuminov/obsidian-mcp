@@ -32,7 +32,36 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from src.config import Settings
 
-DOCKERFILE = Path(__file__).resolve().parent.parent / "Dockerfile"
+REPO = Path(__file__).resolve().parent.parent
+DOCKERFILE = REPO / "Dockerfile"
+# Every tracked file that starts the server. Discovered by glob rather than
+# listed, so a compose file added later is covered without anyone remembering
+# to extend this: a `command:` override REPLACES the image CMD, which is how
+# the two reference stacks kept uvicorn's forwarded-header layer on after the
+# Dockerfile had switched it off.
+START_COMMAND_FILES = sorted(
+    [DOCKERFILE, *REPO.glob("docker-compose*.yml")], key=lambda path: path.name
+)
+
+
+def _uvicorn_launches(path: Path) -> list[str]:
+    """Every uvicorn invocation in `path`, one string of flags each.
+
+    Compose folds a `command: >` block across continuation lines, so the YAML is
+    whitespace-joined first and each launch is cut at the closing quote of the
+    `sh -c "…"` it lives in. The Dockerfile's exec-form `CMD` is one line.
+    """
+    text = path.read_text(encoding="utf-8")
+    if path.suffix in {".yml", ".yaml"}:
+        joined = " ".join(text.split())
+        return [
+            segment.split('"')[0] for segment in joined.split("uvicorn src.main:app")[1:]
+        ]
+    return [
+        line
+        for line in text.splitlines()
+        if line.startswith("CMD ") and "uvicorn" in line
+    ]
 
 
 def _settings(value=None) -> Settings:
@@ -85,7 +114,8 @@ def test_the_default_is_the_list_that_was_hard_coded():
     ]
 
 
-async def test_the_default_trusts_a_private_network_peer():
+@pytest.mark.parametrize("peer", ["192.168.0.10", "172.18.0.2"])
+async def test_the_default_trusts_a_private_network_peer(peer):
     """The regression the Dockerfile flag would have shipped.
 
     `192.168.0.10` is inside the app-level literal and outside
@@ -93,10 +123,14 @@ async def test_the_default_trusts_a_private_network_peer():
     Dockerfile's list — the tempting "align the two" fix — this peer would have
     stopped resolving its clients' addresses on a deploy that changed no
     environment value.
+
+    `172.18.0.2` is the second case because it is the address the requirement
+    itself uses for a containerised proxy: a default that did not cover a
+    Docker bridge peer would break the reference stacks on the first tick.
     """
     trusted = _settings().trusted_proxy_ips
 
-    assert await _resolved_client(trusted, "192.168.0.10") == "203.0.113.7"
+    assert await _resolved_client(trusted, peer) == "203.0.113.7"
 
 
 async def test_a_public_peer_is_not_trusted():
@@ -245,18 +279,51 @@ def test_the_disabled_spelling_installs_no_middleware(monkeypatch):
 # --- exactly one control --------------------------------------------------
 
 
-def test_the_dockerfile_leaves_forwarded_headers_to_the_application():
+@pytest.mark.parametrize("path", START_COMMAND_FILES, ids=lambda path: path.name)
+def test_every_start_command_leaves_forwarded_headers_to_the_application(path):
     """`--no-proxy-headers`, and no second allow-list to diverge from the first.
 
     Merely aligning the two lists was rejected: uvicorn's `proxy_headers`
     defaults to *enabled* and its `forwarded_allow_ips` reads
     `$FORWARDED_ALLOW_IPS`, so "two controls that happen to agree" is a state
     an operator can break from the environment without editing either file.
-    """
-    text = DOCKERFILE.read_text(encoding="utf-8")
-    cmd = [line for line in text.splitlines() if line.startswith("CMD ")]
 
-    assert len(cmd) == 1
-    assert "--no-proxy-headers" in cmd[0]
-    assert "--forwarded-allow-ips" not in cmd[0]
-    assert '"--proxy-headers"' not in cmd[0]
+    Asserting this of the `Dockerfile` alone was not enough. A compose
+    `command:` override replaces the image CMD wholesale, so both reference
+    stacks launched uvicorn with its forwarded-header layer *on* — and that
+    layer rewrites `scope["client"]` before the application's middleware runs,
+    which is the one ordering `TRUSTED_PROXY_IPS` cannot reach past. Every
+    tracked file that starts the server is checked, discovered by glob.
+    """
+    for command in _uvicorn_launches(path):
+        assert "--no-proxy-headers" in command, path.name
+        assert "--forwarded-allow-ips" not in command, path.name
+        # `--proxy-headers` is a substring of the flag required above, so the
+        # negative is asserted against the text with that flag removed.
+        assert "--proxy-headers" not in command.replace(
+            "--no-proxy-headers", ""
+        ), path.name
+        # In-process rate control; a second worker multiplies every rate.
+        assert "--workers 1" in command or '"--workers", "1"' in command, path.name
+
+
+def test_the_start_command_files_are_the_ones_we_think_they_are():
+    """The glob's own coverage, pinned.
+
+    A discovery rule that silently matched nothing would make the test above
+    vacuous. The `Dockerfile` carries exactly one launch; the maintainer's
+    `docker-compose.yml` carries none and inherits the image CMD — and if it
+    ever gains a `command:`, the rule above covers it with no further edit.
+    """
+    names = {path.name for path in START_COMMAND_FILES}
+
+    assert names == {
+        "Dockerfile",
+        "docker-compose.yml",
+        "docker-compose.proxy.yml",
+        "docker-compose.simple.yml",
+    }
+    assert len(_uvicorn_launches(DOCKERFILE)) == 1
+    assert _uvicorn_launches(REPO / "docker-compose.yml") == []
+    for name in ("docker-compose.proxy.yml", "docker-compose.simple.yml"):
+        assert len(_uvicorn_launches(REPO / name)) == 1, name

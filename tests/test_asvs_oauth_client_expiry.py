@@ -470,6 +470,151 @@ def test_the_stamp_precedes_the_code_insert(monkeypatch):
     assert session.added == []
 
 
+# ── the sweep's win is not a cross-user conflict ───────────────────────────
+#
+# Multi-user consent claims an unclaimed client with a conditional
+# `UPDATE ... WHERE user_id IS NULL RETURNING`. When that matches nothing the
+# handler re-reads the owner, and the sweep deleting the row mid-consent used
+# to land in the *other-owner* branch: a 403 `access_denied` naming an owner
+# that does not exist, plus an `oauth_cross_user_client_refused` record about a
+# user who did nothing. A vanished registration is the sweep's ordinary work
+# and answers `invalid_client`, exactly as the stamp's own loss does.
+
+
+def _selects_only_owner(stmt) -> bool:
+    """Is this the `select(OAuthClient.user_id)` owner re-read?"""
+    try:
+        descriptions = stmt.column_descriptions
+    except Exception:
+        return False
+    return (
+        len(descriptions) == 1
+        and getattr(descriptions[0].get("expr"), "key", None) == "user_id"
+    )
+
+
+class _ClaimRaceSession(_ConsentSession):
+    """A consent whose conditional claim matches nothing.
+
+    `owner_after_claim` is what the follow-up re-read finds: another user's id
+    for a genuine conflict, `None` for a row the sweep has deleted.
+    """
+
+    def __init__(self, owner_after_claim):
+        super().__init__(FakeClient(redirect_uris=[REGISTERED_URI], user_id=None))
+        self._owner_after_claim = owner_after_claim
+        self.claim_attempts = 0
+
+    async def execute(self, stmt, *_a, **_kw):
+        from _oauth_grant_fakes import _Result
+
+        if is_client_use_stamp(stmt):
+            self.stamps.append(dict(stmt.compile().params).get("client_id_1"))
+            return _Result(["client123"])
+        if isinstance(stmt, Update):
+            self.claim_attempts += 1
+            return _Result([])
+        if _selects_only_owner(stmt):
+            return _Result(
+                [] if self._owner_after_claim is None else [self._owner_after_claim]
+            )
+        return _Result([self._client])
+
+
+class _EventCapture(logging.Handler):
+    def __init__(self):
+        super().__init__(level=logging.DEBUG)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+def _approve_multi_user(session, monkeypatch):
+    """The approve path with a signed-in user, capturing security events."""
+    from src.services import security_events
+
+    monkeypatch.setattr(oauth.settings, "multi_user_mode", True, raising=False)
+    monkeypatch.setattr(oauth, "async_session", lambda: session)
+
+    class _SessionUser:
+        id = 2
+
+    async def _resolve(_request, _session):
+        return _SessionUser()
+
+    monkeypatch.setattr(oauth, "get_active_session_user", _resolve)
+
+    handler = _EventCapture()
+    logger = security_events.logger
+    logger.addHandler(handler)
+    propagate, level = logger.propagate, logger.level
+    logger.propagate = False
+    logger.setLevel(logging.DEBUG)
+    server_state = "csrfstatetoken1234567890"
+    signed = oauth._state_serializer().dumps(server_state)
+    try:
+        with security_events.suppression_disabled():
+            response = asyncio.run(
+                oauth.authorize_post(
+                    _FakeRequest(signed),
+                    action="approve",
+                    client_id="client123",
+                    redirect_uri=REGISTERED_URI,
+                    code_challenge="A" * 43,
+                    code_challenge_method="S256",
+                    scope="readwrite",
+                    state=server_state,
+                    client_state="clientecho",
+                )
+            )
+    finally:
+        logger.removeHandler(handler)
+        logger.propagate = propagate
+        logger.setLevel(level)
+    return response, [record.getMessage() for record in handler.records]
+
+
+def test_a_client_the_sweep_deleted_mid_consent_is_not_a_cross_user_conflict(
+    monkeypatch,
+):
+    """`invalid_client`, and no security record naming an innocent owner."""
+    session = _ClaimRaceSession(owner_after_claim=None)
+    response, events = _approve_multi_user(session, monkeypatch)
+
+    assert session.claim_attempts == 1
+    assert response.status_code == 400
+    assert json.loads(response.body)["error"] == "invalid_client"
+    assert "oauth_cross_user_client_refused" not in events, events
+    assert session.added == [], "no authorization code may be minted"
+    assert session.committed is False
+
+
+def test_the_vanished_client_answers_exactly_as_a_lost_stamp_does(monkeypatch):
+    """The two branches are the same event and must not drift apart."""
+    vanished, _ = _approve_multi_user(_ClaimRaceSession(None), monkeypatch)
+    lost_stamp = _approve(
+        _ConsentSession(FakeClient(redirect_uris=[REGISTERED_URI]), client_present=False),
+        monkeypatch,
+    )
+
+    assert vanished.status_code == lost_stamp.status_code
+    assert json.loads(vanished.body) == json.loads(lost_stamp.body)
+
+
+def test_a_client_another_user_claimed_is_still_refused_as_before(monkeypatch):
+    """The genuine conflict is untouched: 403 and the cross-user record."""
+    session = _ClaimRaceSession(owner_after_claim=1)
+    response, events = _approve_multi_user(session, monkeypatch)
+
+    assert session.claim_attempts == 1
+    assert response.status_code == 403
+    assert json.loads(response.body)["error"] == "access_denied"
+    assert events.count("oauth_cross_user_client_refused") == 1, events
+    assert session.added == []
+    assert session.committed is False
+
+
 def _exchange(session, monkeypatch, form):
     monkeypatch.setattr(oauth.settings, "multi_user_mode", False, raising=False)
     monkeypatch.setattr(oauth, "async_session", lambda: session)
