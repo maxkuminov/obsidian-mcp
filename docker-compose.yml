@@ -114,6 +114,83 @@ services:
       - "traefik.http.routers.obsidian-mcp-root-rtr.tls.certresolver=dns-namecheap"
       - "traefik.http.routers.obsidian-mcp-root-rtr.priority=100"
       - "traefik.http.routers.obsidian-mcp-root-rtr.service=obsidian-mcp-svc"
+      # Plaintext refusal on the `http` entrypoint (#196, ASVS V4.1.2)
+      #
+      # Traefik's own `http-catchall` router redirects every plaintext request
+      # to https, and every router above binds `https` only — so before this
+      # block NOTHING in this tree refused plaintext. An agent misconfigured
+      # with `http://<host>/mcp` put `Authorization: Bearer omcp_…` on the wire
+      # in cleartext, got a 307 (which preserves method AND body), and the MCP
+      # SDK — `follow_redirects=True`, and httpx deliberately KEEPS the
+      # Authorization header across a direct http→https hop — replayed it over
+      # TLS and succeeded. Same for `POST /token`, which carries the
+      # authorization code, `code_verifier` and `client_secret` in the body.
+      # The leak was silent by construction: every request worked, so the
+      # operator never found out. A hard failure on the FIRST request is the
+      # only outcome that surfaces the mistake.
+      #
+      # `ipAllowList` and not `errors`: `errors` only fires on a status the
+      # BACKEND returned, so it forwards first — it cannot refuse. `ipAllowList`
+      # terminates the request in the proxy and never contacts the service, so
+      # the credential goes no further than Traefik. (An app route answering
+      # 4xx was rejected too: it carries the cleartext credential into the app
+      # over the internal network, and the app cannot tell which entrypoint it
+      # was reached on, since `X-Forwarded-Proto` is untrusted on `:80`.)
+      #
+      # `192.0.2.0/32` is RFC 5737 TEST-NET-1 — reserved for documentation and
+      # never routable — so the allow-list is empty in practice while staying a
+      # syntactically valid CIDR. This is NOT a placeholder and must not be
+      # "fixed" to a real address: making it match anything reopens the leak.
+      # No `ipstrategy` is set, deliberately, so the check reads the direct TCP
+      # peer; that is correct because the `http` entrypoint trusts no forwarded
+      # headers, and a forged `X-Forwarded-For` therefore cannot fabricate an
+      # allowed source.
+      #
+      # 403 is CHOSEN, not merely inherited: it is `ipAllowList`'s default and
+      # it is the accurate meaning ("this source may not use this endpoint").
+      # `…ipallowlist.rejectstatuscode` exists and is deliberately NOT set —
+      # a status the middleware returns natively cannot drift.
+      #
+      # `priority=200` is explicit rather than length-derived. The catch-all's
+      # default priority is the length of its rule, `HostRegexp(`.+`)` = 16, so
+      # we would outrank it anyway — but a security control that depends on a
+      # string length is not a contract.
+      #
+      # `/health` is IN the refusal set and `/admin`/`/authorize` are OUT: that
+      # asymmetry is the whole point. A person who typed a hostname leaks no
+      # long-lived credential by being redirected; a machine holding a bearer
+      # token benefits from a failure. The container's own healthcheck calls
+      # `http://localhost:8000/health` INSIDE the container (see below),
+      # bypassing Traefik entirely, so refusing plaintext here cannot affect it.
+      #
+      # The root clause is header-qualified — `Path(`/`)` AND an
+      # `Authorization: Bearer` header — because `obsidian-mcp-root-rtr` above
+      # serves exactly that pair on https and the app rewrites `/` → `/mcp/`.
+      # Omitting it would leave the original leak open on a supported entry
+      # point. The qualifier keeps a plain browser `GET http://<host>/`, which
+      # carries no Authorization header, matching nothing here and still
+      # redirecting. The matcher is spelled `(?i)^Bearer ` where the https root
+      # router spells it `^Bearer `: the asymmetry is deliberate and safe in one
+      # direction only — a lowercase `authorization: bearer …` is refused on
+      # :80 but would not have matched the https router anyway, so the refusal
+      # is strictly broader than the route it protects. Broader on a refusal
+      # costs nothing; narrower would reopen the hole.
+      #
+      # The ACME carve-out is FIRST in the rule so it cannot be lost by someone
+      # editing the path group. An HTTP-01 certificate resolver answers on this
+      # same entrypoint for every other host behind this proxy. Traefik's
+      # internal ACME router carries a maximal priority and should win
+      # regardless — but "should" is not a design, and a control that depends
+      # on an undocumented internal priority breaks on a Traefik upgrade.
+      #
+      # The router still needs a `service`; Traefik requires one and the
+      # middleware short-circuits before it is reached.
+      - "traefik.http.routers.obsidian-mcp-plaintext-rtr.entrypoints=http"
+      - "traefik.http.routers.obsidian-mcp-plaintext-rtr.rule=Host(`${MCP_HOSTNAME:-obsidian-mcp.localhost}`) && !PathPrefix(`/.well-known/acme-challenge/`) && (PathPrefix(`/mcp`) || PathPrefix(`/transfer`) || Path(`/health`) || PathPrefix(`/.well-known`) || Path(`/register`) || Path(`/token`) || Path(`/revoke`) || (Path(`/`) && HeaderRegexp(`Authorization`, `(?i)^Bearer `)))"
+      - "traefik.http.routers.obsidian-mcp-plaintext-rtr.priority=200"
+      - "traefik.http.routers.obsidian-mcp-plaintext-rtr.middlewares=obsidian-mcp-no-plaintext"
+      - "traefik.http.routers.obsidian-mcp-plaintext-rtr.service=obsidian-mcp-svc"
+      - "traefik.http.middlewares.obsidian-mcp-no-plaintext.ipallowlist.sourcerange=192.0.2.0/32"
       # Shared service
       - "traefik.http.services.obsidian-mcp-svc.loadbalancer.server.port=8000"
     healthcheck:
