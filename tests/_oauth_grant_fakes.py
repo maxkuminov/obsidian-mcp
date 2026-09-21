@@ -186,6 +186,23 @@ def _is_advisory_lock(stmt) -> bool:
     return _normalized_sql(stmt) == ADVISORY_LOCK_SQL
 
 
+def is_client_use_stamp(stmt) -> bool:
+    """Is this `_stamp_client_use`'s `UPDATE oauth_clients SET last_used_at`?
+
+    Every issuance path stamps the client's use marker (#194), so the fakes
+    have to recognise the statement or a handler that takes it would look like
+    it had issued one of the queries they *do* model. Matched on the target
+    table **and** the SET column, never on the table alone: the first-authorizer
+    claim is also an `UPDATE oauth_clients`, and conflating the two would let a
+    handler that never claimed a client read as one that had.
+    """
+    return (
+        isinstance(stmt, Update)
+        and stmt.table.name == "oauth_clients"
+        and "last_used_at" in {col.key for col in stmt._values}
+    )
+
+
 def _window_value(clause):
     return None if clause is None else clause.value
 
@@ -226,6 +243,8 @@ class FakeSession:
         # itself the property under test -- the bootstrap lock must precede the
         # grant lock, and both must precede any family read or write.
         self.advisory_locks: list[int] = []
+        # Every client whose use marker the handler stamped (#194).
+        self.use_stamps: list = []
 
     @property
     def locked_grants(self) -> list[int]:
@@ -269,6 +288,14 @@ class FakeSession:
             assert params and "key" in params, "advisory lock issued without a key"
             self.advisory_locks.append(params["key"])
             return _Result([])
+
+        # The use-marker stamp (#194). Recorded rather than interpreted: the
+        # row it writes carries no state any handler here reads back, and the
+        # fake answers "the row was there" so the issuance proceeds. A test
+        # that wants the *vanished* case builds its own double.
+        if is_client_use_stamp(stmt):
+            self.use_stamps.append(_params(stmt).get("client_id_1"))
+            return _Result(["stamped"])
 
         if isinstance(stmt, Update):
             return self._apply_update(stmt)
@@ -442,11 +469,16 @@ class SeqSession:
     subsequent canned row by one.
     """
 
-    def __init__(self, results=()):
+    def __init__(self, results=(), *, client_present=True):
         self._results = iter(results)
         self.added: list = []
         self.committed = False
         self.advisory_locks: list[int] = []
+        # Every client whose use marker the handler stamped (#194).
+        self.use_stamps: list = []
+        # False stages the race the sweep can win: the registration is gone by
+        # the time the issuance stamps it.
+        self.client_present = client_present
 
     async def __aenter__(self):
         return self
@@ -459,6 +491,13 @@ class SeqSession:
             assert params and "key" in params, "advisory lock issued without a key"
             self.advisory_locks.append(params["key"])
             return _Result([])
+        # Recorded rather than consumed from the sequence, for the reason the
+        # advisory lock is: every issuance path stamps the client's use marker
+        # (#194), and taking a canned row for it would silently shift every
+        # subsequent result by one.
+        if is_client_use_stamp(stmt):
+            self.use_stamps.append(_params(stmt).get("client_id_1"))
+            return _Result(["stamped"] if self.client_present else [])
         value = next(self._results)
         return _Result([value] if value is not None else [])
 

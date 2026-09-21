@@ -48,8 +48,22 @@ class _FrozenDatetime(datetime.datetime):
         return FROZEN_NOW if tz is None else FROZEN_NOW.astimezone(tz)
 
 
+class _Scalars:
+    def all(self):
+        return []
+
+
 class _Result:
     rowcount = 0
+
+    def scalars(self):
+        """The client-expiry sweep (#194) reads its candidates with a SELECT.
+
+        An empty candidate set is the right answer for this module: these cases
+        are about the code/token/session DELETEs, and the sweep then does
+        nothing — `statement_for` below ignores its SELECT for the same reason.
+        """
+        return _Scalars()
 
 
 class _RecordingSession:
@@ -84,7 +98,11 @@ def run_cleanup(monkeypatch) -> _RecordingSession:
 
 def statement_for(session, entity) -> Delete:
     for stmt in session.statements:
-        assert isinstance(stmt, Delete), stmt
+        # The client-expiry sweep (#194) issues a SELECT of its own; this
+        # module is about the DELETEs, so anything else is skipped rather than
+        # rejected.
+        if not isinstance(stmt, Delete):
+            continue
         if stmt.table.name == entity.__tablename__:
             return stmt
     raise AssertionError(f"no DELETE emitted for {entity.__name__}")

@@ -484,8 +484,14 @@ class _AuthorizeSession:
     async def execute(self, stmt, *_a, **_kw):
         from sqlalchemy.sql.dml import Update
 
-        from _oauth_grant_fakes import _Result
+        from _oauth_grant_fakes import _Result, is_client_use_stamp
 
+        # The use-marker stamp (#194). It is an `UPDATE oauth_clients` like the
+        # first-authorizer claim below, so it is matched on its SET column
+        # first; answering "no row" here would turn every consent into an
+        # `invalid_client` refusal.
+        if is_client_use_stamp(stmt):
+            return _Result(["stamped"])
         if isinstance(stmt, Update):
             if self._client is not None and self._client.user_id is None:
                 self._client.user_id = dict(stmt.compile().params).get("user_id")

@@ -690,6 +690,31 @@ class Settings(BaseSettings):
         "chatgpt.com",
     ]
 
+    # How long a dynamically registered OAuth client may sit **never used**
+    # before the maintenance pass deletes it. `/register` is unauthenticated by
+    # RFC 7591 and nothing else bounds `oauth_clients`, so without this the
+    # table only grows.
+    #
+    # **Thirty days, measured against the actual use.** A DCR client registers
+    # and authorizes within seconds, so any gap over a few hours is already
+    # anomalous; thirty days is two orders of magnitude of slack while still
+    # bounding the table at roughly a month of the 3/min registration
+    # limiter's output.
+    #
+    # "Never used" is `oauth_clients.last_used_at IS NULL`, and migration 025
+    # stamped every row that existed when it ran — so that can only mean a
+    # registration made *after* 025 which has never issued a code or a token.
+    # The sweep additionally requires no surviving code or token row of any
+    # state and no owning user; see
+    # `docs/architecture/oauth-and-grants.md`.
+    #
+    # `NullableLimit`, so the house "off" spellings (empty, `null`, `none`)
+    # disable the sweep entirely and `ge=1` refuses zero: a zero-day window
+    # would delete a registration the moment it was made, which reads to an
+    # operator as an outage rather than as a setting (#162's reason). Env:
+    # OAUTH_CLIENT_UNUSED_EXPIRY_DAYS.
+    oauth_client_unused_expiry_days: NullableLimit = 30
+
     # Registry-eval only: when true, lifespan skips the DB dim check,
     # indexer, and embedding provider, and the /mcp auth middleware
     # short-circuits. Lets Glama's sandbox build the image and validate

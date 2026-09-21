@@ -594,8 +594,13 @@ class _AuthorizeSession:
     async def execute(self, stmt, *_a, **_kw):
         from sqlalchemy.sql.dml import Update
 
-        from _oauth_grant_fakes import _Result
+        from _oauth_grant_fakes import _Result, is_client_use_stamp
 
+        # The use-marker stamp (#194) must answer "the row was there", or the
+        # consent refuses with `invalid_client` and mints no code at all —
+        # which is not the path this canary is watching.
+        if is_client_use_stamp(stmt):
+            return _Result(["stamped"])
         if isinstance(stmt, Update):
             return _Result([])
         return _Result([self._client])
