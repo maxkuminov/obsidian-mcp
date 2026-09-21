@@ -765,7 +765,12 @@ def test_the_r10_reason_is_recorded_verbatim_everywhere_it_applies():
     }
     for source in (
         ROOT / "docs" / "architecture" / "security-event-logging.md",
-        ROOT / "openspec" / "changes" / "security-event-logging" / "design.md",
+        ROOT
+        / "openspec"
+        / "changes"
+        / "archive"
+        / "2026-09-21-security-event-logging"
+        / "design.md",
     ):
         assert "R10" in source.read_text(), (
             f"{source.name} must record the accepted limitation, not just the "
