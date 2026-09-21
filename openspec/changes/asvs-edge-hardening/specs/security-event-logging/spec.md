@@ -3,7 +3,7 @@
 ### Requirement: A throttled login is recorded, and its subject is the client address
 The server SHALL emit a bounded `panel_login_account_throttled` event whenever the per-account failed-login budget refuses an attempt, carrying only `client_ip`, `route`, `username_submitted`, `limit_count` and `window_seconds`. Its suppression subject SHALL be the trusted client address and never the submitted username, because a caller-supplied subject lets an attacker mint a fresh logging allowance for every value they rotate through.
 
-The event is the only place the throttle is distinguishable from an ordinary failed login. The response is equivalent in content by design, so without this record an operator has no way to tell a password-guessing campaign from a user who forgot their password.
+No **response content** distinguishes the throttle from an ordinary failed login, so this record is the only place an operator can tell a password-guessing campaign from a user who forgot their password. The qualification matters: response *timing* does differ, because a throttled attempt skips the password comparison, and claiming the log is the sole distinction without saying so would overstate the guarantee.
 
 #### Scenario: The throttle is recorded
 - **WHEN** a login attempt is refused by the per-account budget
