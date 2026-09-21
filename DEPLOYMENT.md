@@ -203,6 +203,78 @@ an APM capture request headers, or you will log live capabilities.
 > loopback/firewalled published port). Do not expose the MCP container
 > port publicly.
 
+### Plaintext HTTP is refused, not redirected, on machine-facing paths
+
+Both bundled reverse-proxy configurations answer a plaintext `http://`
+request for a machine-facing path with **403 and no `Location` header**,
+instead of redirecting it to HTTPS.
+
+This looks unhelpful and is deliberate. An MCP client configured with an
+`http://` server URL has already put its `Authorization: Bearer omcp_…`
+on the wire in cleartext by the time the proxy sees it. A redirect on a
+`POST` is a 307/308 that preserves the method and body, and MCP client
+stacks follow redirects with the `Authorization` header intact — httpx,
+which the MCP Python SDK uses, deliberately keeps it across a direct
+http→https hop. So the call succeeds over TLS and **every request keeps
+working**, which means nobody ever finds out that the credential was
+sent in the clear. The same applies to `POST /token`, which carries the
+authorization code, the `code_verifier` and the client secret in the
+body. A hard failure on the first request is the only outcome that
+reaches the operator.
+
+| Plaintext request | Answer |
+| --- | --- |
+| `/mcp*`, `/transfer*`, `/health`, `/.well-known*`, `/register`, `/token`, `/revoke` | 403, no `Location` |
+| `/` **with** an `Authorization: Bearer` header, any method | 403, no `Location` |
+| `/admin*`, `/api*`, `/authorize` | redirect to `https://` |
+| `/` with no `Authorization` header | redirect to `https://` |
+| `/.well-known/acme-challenge/*` | not refused — certificate issuance must work |
+
+The asymmetry is the control, not an oversight. A person who typed a
+hostname into a browser leaks nothing by being redirected; a machine
+holding a long-lived bearer token benefits from a failure. The root path
+is split by the *header* rather than by the path, because there the
+credential — not the URL — is what makes the request machine-facing.
+`/health` is on the refusing side: it is machine-facing and has no
+browser use, and the container's own healthcheck calls
+`http://localhost:8000/health` **inside** the container, bypassing the
+proxy entirely. If you point an external uptime monitor at this host,
+configure it with `https://`; the monitor is corrected, not the rule.
+
+**Traefik (`docker-compose.yml`).** The rule is a router on the `http`
+entrypoint with an explicit `priority=200`, carrying an `ipAllowList`
+middleware whose source range is `192.0.2.0/32`.
+
+That range is RFC 5737 TEST-NET-1 — reserved for documentation, never
+routable — so the allow-list matches nobody and `ipAllowList` refuses
+every request with its default 403, in the proxy, without contacting the
+application. **It is not a placeholder. Do not "fix" it to a real
+address**; giving it anything matchable reopens the leak. `ipAllowList`
+was chosen over the `errors` middleware because `errors` only fires on a
+status the backend already returned, so it forwards the request first
+and cannot refuse at all. The priority is written out rather than left
+to Traefik's default, which is derived from the length of the rule
+string — that would outrank the `http-catchall` redirect today, but a
+control resting on a string length is not a contract.
+
+**Caddy (`Caddyfile.example`).** An `http://{$MCP_HOSTNAME}` site block
+`respond`s 403 for the same set and `redir`s everything else. Note that
+defining it disables Caddy's automatic HTTP→HTTPS redirect for that
+host, which is why the block ends with an explicit `redir`.
+
+**Bring-your-own proxy (`docker-compose.proxy.yml`).** There is no proxy
+in that file for this repository to configure, so this is prose and
+nothing else: on your own proxy, add a plaintext (port 80) rule that
+returns 403 for the paths in the table above — including `/` when the
+request carries an `Authorization: Bearer` header, for every method —
+exempts `/.well-known/acme-challenge/`, and redirects the rest. If you
+skip it, a misconfigured client leaks its bearer token silently and the
+deployment still appears to work.
+
+**Rollback** is reverting the label block (or the Caddy site block) and
+redeploying. There is no migration, no database row and no cached state
+to unwind — plaintext requests simply go back to being redirected.
+
 ## Step 4. Get your vault onto the VPS
 
 This is the hardest design decision in the whole stack. The MCP server
