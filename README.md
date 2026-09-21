@@ -1482,7 +1482,7 @@ mock httpx, so no real network access is required.
 To run the server outside Docker:
 
 ```bash
-DATABASE_URL=... SECRET_KEY=... VAULT_PATH=... uvicorn src.main:app --reload
+DATABASE_URL=... SECRET_KEY=... VAULT_PATH=... uvicorn src.main:app --reload --no-proxy-headers
 ```
 
 ## Make targets

@@ -327,3 +327,22 @@ def test_the_start_command_files_are_the_ones_we_think_they_are():
     assert _uvicorn_launches(REPO / "docker-compose.yml") == []
     for name in ("docker-compose.proxy.yml", "docker-compose.simple.yml"):
         assert len(_uvicorn_launches(REPO / name)) == 1, name
+
+
+def test_the_documented_dev_command_leaves_forwarded_headers_to_the_application():
+    """The README's outside-Docker launch is a start command too.
+
+    It is not a deployment (so `--workers 1` is not demanded of a `--reload`
+    dev server), but uvicorn's layer rewrites the client address ahead of the
+    application either way, so a developer following it with a narrowed
+    `TRUSTED_PROXY_IPS` would still see forged addresses.
+    """
+    launches = [
+        line
+        for line in (REPO / "README.md").read_text(encoding="utf-8").splitlines()
+        if "uvicorn src.main:app" in line
+    ]
+
+    assert launches, "README no longer documents the outside-Docker launch"
+    for command in launches:
+        assert "--no-proxy-headers" in command, command
