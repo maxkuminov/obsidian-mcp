@@ -141,7 +141,8 @@ async def test_the_startup_assertion_exits_under_a_strict_mode(monkeypatch, capl
 async def test_the_per_connection_listener_discards_a_plaintext_connection():
     """D3b through SQLAlchemy's real async-adapted cursor: a plaintext session
     (here admitted by `prefer`, since the server offers nothing else) is
-    refused by the listener before any statement runs on it."""
+    refused by the listener before any application statement runs on it
+    (SQLAlchemy's own dialect setup queries may precede it — design.md, N1)."""
     settings = _settings("prefer")
     engine = _engine(settings)
     ts.install_strict_transport_listener(engine)

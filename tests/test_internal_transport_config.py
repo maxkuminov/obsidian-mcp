@@ -885,3 +885,31 @@ def test_classify_reports_what_the_client_dials():
     assert ep == ts.EmbeddingEndpoint("http", "::1", 11434, True)
     assert ts.classify_embedding_url("https://x.example/v1").port == 443
     assert ts.classify_embedding_url("http://127.0.0.1.evil.example").is_loopback is False
+
+
+def test_a_refused_setting_is_not_echoed_into_the_startup_traceback():
+    """Codex impl r1: pydantic appends the raw input to a ValidationError.
+
+    Imported in a clean subprocess with a short credential-bearing URL, so the
+    assertion does not depend on repr truncation hiding it.
+    """
+    import subprocess
+    import sys
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "SECRET_KEY": "test",
+        "EMBEDDING_PROVIDER": "openai",
+        "OPENAI_API_KEY": "sk-test",
+        "OPENAI_BASE_URL": "https://u:s3cr3tpw@x",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", "import src.config"],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0, "the userinfo URL must be refused"
+    assert "s3cr3tpw" not in result.stdout + result.stderr

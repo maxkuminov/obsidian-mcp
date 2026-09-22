@@ -827,7 +827,10 @@ class Settings(BaseSettings):
     # `extra` stays at pydantic-settings' default ("forbid") so a misspelled
     # constructor kwarg or an unknown init value is still a hard error; only the
     # dotenv source is filtered (see `settings_customise_sources` below).
-    model_config = {"env_file": ".env"}
+    # A refused setting must not be echoed back: pydantic appends the raw input
+    # to a ValidationError, which would print a credential-bearing URL (or any
+    # secret) into the startup traceback.
+    model_config = {"env_file": ".env", "hide_input_in_errors": True}
 
     @classmethod
     def settings_customise_sources(

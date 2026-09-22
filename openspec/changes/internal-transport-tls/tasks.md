@@ -60,7 +60,7 @@ Two slices with one shared new module. Slice A owns the database hop, Slice B th
 ## 6. Merge, verify, deploy
 
 - [ ] 6.1 Merge both slices; run `pytest tests`, `make test-integration` and `make audit` **once on the merged result**.
-- [ ] 6.2 Own the seams: `log_embedding_transport()` is called from the lifespan right after `check_database_transport()`; grep for production callers of every new export (`database_ssl_connect_args` ×2, `validate_database_url_transport` ×2, `install_strict_transport_listener` ×2, `check_database_transport`, `log_embedding_transport`, `embedding_http_client` ×3).
+- [x] 6.2 Own the seams: `log_embedding_transport()` is called from the lifespan right after `check_database_transport()`; grep for production callers of every new export (`database_ssl_connect_args` ×2, `validate_database_url_transport` ×2, `install_strict_transport_listener` ×2, `check_database_transport`, `log_embedding_transport`, `embedding_http_client` ×3).
 - [ ] 6.3 `openspec-verifier` subagent audits the merged tree against both spec deltas.
 - [ ] 6.4 Adversarial Codex round(s) against the implementation (mandatory: embedding path + boot refusal). Two rounds by default; triage per the review budget; declined findings go to design.md's accepted limitations.
 

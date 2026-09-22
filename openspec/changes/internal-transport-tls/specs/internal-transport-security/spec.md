@@ -128,7 +128,7 @@ A Unix socket never carries TLS and the driver ignores the TLS context for it, s
 
 #### Scenario: Every new strict connection is checked
 - **WHEN** the mode is `require` and a newly opened pooled connection reports `pg_stat_ssl.ssl` false
-- **THEN** that connection SHALL be discarded with an error and SHALL NOT be used for any statement
+- **THEN** that connection SHALL be discarded with an error and SHALL NOT be used for any application statement
 
 ### Requirement: The server SHALL assert the database session's transport at startup
 Before any other database startup check, and outside sandbox mode, the server SHALL read `pg_stat_ssl` for its own backend. Under `require`, `verify-ca` or `verify-full` it SHALL exit with a critical log record when the session is not encrypted, when no row is returned, or when the connection could not be established. Under `prefer` or `disable` it SHALL continue and SHALL emit one `internal_transport_plaintext` security event with `reason` `database` and `outcome` set to the mode when the session is not encrypted. In every case it SHALL log the effective database transport once, naming the mode, whether the session is encrypted, the TLS version when encrypted, and whether the server was verified — the last derived from the mode, never inferred from the session.
