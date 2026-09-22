@@ -15,13 +15,19 @@ An MCP request accepted through the bearer-authenticated root-path fallback SHAL
 - **THEN** the response SHALL contain the same CORS policy applied to canonical application routes
 
 ### Requirement: Tool calls are admitted only while the caller holds a vault assignment
-Every MCP tool call SHALL resolve the caller's vault root once, before the tool
-body runs, and SHALL fail the call with a tool error when the root cannot be
-resolved. The check MUST live in the shared tool decorator rather than in
-individual tools, so that a tool served entirely from the database is covered
-without opting in. Refusal MUST NOT depend on whether the process cache was
-previously warmed, and MUST NOT delete the caller's `notes_metadata`,
-`note_embeddings` or `note_links` rows.
+Every MCP tool call that reaches its tool body SHALL have resolved the caller's
+vault root once beforehand, and SHALL fail the call with a tool error when the
+root cannot be resolved. A call refused by an earlier gate in the same shared
+decorator — a per-principal rate bucket, or any other gate the decorator runs
+before vault resolution — SHALL be refused without resolving the vault root.
+That is sound because no tool body runs and the refusal reveals nothing about
+the vault: it names no note path, title, tag, frontmatter value or chunk
+excerpt, and its content depends only on the caller's own request rate. The
+vault check MUST live in the shared tool decorator rather than in individual
+tools, so that a tool served entirely from the database is covered without
+opting in. Refusal MUST NOT depend on whether the process cache was previously
+warmed, and MUST NOT delete the caller's `notes_metadata`, `note_embeddings`
+or `note_links` rows.
 
 #### Scenario: Database-backed search after unassignment
 - **WHEN** an administrator clears a multi-user account's vault path and the
@@ -47,6 +53,18 @@ previously warmed, and MUST NOT delete the caller's `notes_metadata`,
 - **THEN** the call SHALL be refused with the same tool error rather than
   raising an unhandled exception
 
+#### Scenario: A rate-refused call is refused without resolving the vault
+- **WHEN** a caller whose vault path has been cleared exceeds its per-principal
+  rate bucket
+- **THEN** the call SHALL be refused by the rate gate, no vault resolution SHALL
+  be attempted, no tool body SHALL run, and the refusal SHALL name no note path,
+  title, tag, frontmatter value or chunk excerpt
+
+#### Scenario: An unassigned caller within its rate limit is still refused for the vault
+- **WHEN** the same caller makes a call that its rate buckets admit
+- **THEN** the vault gate SHALL refuse it with the unchanged no-vault tool error
+  and the unchanged `no_vault_assigned` marker
+
 #### Scenario: Operator-facing label matches the enforcement
 - **WHEN** an administrator opens the vault-path selector on the user edit page
 - **THEN** the unassigned option SHALL state that every MCP tool refuses and
@@ -63,19 +81,33 @@ previously warmed, and MUST NOT delete the caller's `notes_metadata`,
   resume without a full re-index
 
 ### Requirement: A refused tool call is recorded in the usage log
-A tool call refused for a missing vault assignment SHALL be written to
-`usage_logs` like any other tool error, carrying an error marker and the same
-allow-listed parameters as a successful call, and no additional field.
+
+A tool call refused for one of the enumerated refusal causes SHALL be written to `usage_logs` like any other tool error, carrying that cause's marker and the same allow-listed parameters as a successful call, and no field outside that allow-list, the marker, and — for a call whose body raised — the exception's class name. The enumerated causes are the three decided before the body runs (a missing vault assignment, an unencodable argument, an exhausted quota), the write refused for a read-only credential (marked `permission_denied`), a body that raised (marked `tool_exception`), and the post-body markers already in the register. Other in-band refusals a tool body returns as a message — a create over an existing path, a path or size validation, a write conflict — are **not** marked by this requirement and remain ordinary rows. Each marker SHALL be classified as pre-body or post-body when it is introduced, and two branches on opposite sides of that line SHALL NOT share a marker value.
 
 #### Scenario: Refusal is auditable
+
 - **WHEN** a tool call is refused for a missing vault assignment
-- **THEN** a `usage_logs` row SHALL be written for that tool with an error
-  marker in `params` and the tool's normal allow-listed parameters
+- **THEN** a `usage_logs` row SHALL be written for that tool with an error marker in `params` and the tool's normal allow-listed parameters
 
 #### Scenario: Refusal adds no new logged field
+
 - **WHEN** that row is written
-- **THEN** `params` SHALL contain no parameter outside the tool's existing
-  allow-list plus the error marker
+- **THEN** `params` SHALL contain no parameter outside the tool's existing allow-list plus the error marker
+
+#### Scenario: A write refused for permission is auditable
+
+- **WHEN** a read-only credential calls a write tool
+- **THEN** a `usage_logs` row SHALL be written carrying the `permission_denied` marker, so that the row is distinguishable from a successful write by the same tool
+
+#### Scenario: A raising body is auditable
+
+- **WHEN** a tool body raises an exception
+- **THEN** a `usage_logs` row SHALL be written carrying the `tool_exception` marker, the exception's class name, and the duration measured up to the raise
+
+#### Scenario: An unenumerated in-band refusal is an ordinary row
+
+- **WHEN** `create_note` refuses because a note already exists at the path
+- **THEN** the row SHALL be written as an ordinary call with no error marker, as it is today
 
 ### Requirement: Single-user mode is unaffected by the admission gate
 In single-user mode the vault root SHALL continue to come from configuration
@@ -170,12 +202,24 @@ reports no assignment.
   or notes
 
 ### Requirement: The admission gate performs no database work
-Resolving the caller's vault root for admission SHALL NOT issue a database
-statement, so the check costs nothing on the hot path.
+Resolving the caller's vault root for admission SHALL NOT issue a database statement and SHALL NOT perform filesystem I/O, so the check costs nothing on the hot path. The quarantine and readiness tests the gate performs SHALL be lookups into a snapshot already published by the shared detection, and they SHALL be able only to refuse — they MUST NOT be capable of admitting a caller the rest of the gate would refuse.
+
+The gate runs on every tool call and the per-request cache warm is what makes a cache read correct there; a query would be a query per call, and detection needs a query for every other user's assignment plus an `open`, `fstat` and `realpath` per root — the latter dispatched to a worker thread under a deadline, which is not something a per-call gate can do. All of it belongs in the detection, which already does it once per pass. Because the tests can only refuse, it is safe to consult them ahead of the request's immutable vault-root snapshot: unlike an assignment — where a stale read must never re-admit a revoked caller, which is why the snapshot outranks the process-global cache — a quarantine has no direction in which staleness admits anyone.
 
 #### Scenario: Assigned caller invokes a tool
+
 - **WHEN** an assigned caller's tool call passes the admission gate
 - **THEN** the gate SHALL have opened no database session
+
+#### Scenario: The quarantine test opens nothing
+
+- **WHEN** a tool call is refused for a quarantine or for readiness
+- **THEN** the gate SHALL have opened no database session and made no filesystem call
+
+#### Scenario: The quarantine test cannot admit
+
+- **WHEN** a caller has no vault assignment and is also absent from the quarantine snapshot
+- **THEN** the call SHALL still be refused for having no assignment
 
 ### Requirement: Usage attribution survives deletion of the credential
 Every `usage_logs` row written for an authenticated MCP tool call SHALL record the calling credential's identity denormalised onto the row itself — `actor_kind` (`api_key` or `oauth`), `actor_label` (the API key's name or the OAuth client's `client_name`) and `actor_ref` (the API key's `omcp_` prefix or the `client_id`) — captured at call time from the credential the request authenticated with. Those values MUST NOT be derived from a join at read time, MUST NOT be modified when the credential is later revoked, renamed or deleted, and MUST NOT be read for any authorization decision.
@@ -313,9 +357,9 @@ The control panel usage view SHALL render the actor recorded on the row in prefe
 - **THEN** every statement it issues SHALL be filtered to that user's own rows
 
 ### Requirement: The users list MUST NOT report a note count the tools will not serve
-The control panel's user list SHALL NOT render a note count for an account that holds no vault assignment. It SHALL render an explicit not-served state instead, stating that every MCP tool is refused for that account and that the index is kept for reassignment, so the operator reads the same fact the admission gate enforces.
+The control panel's user list SHALL NOT render a note count for an account that holds no vault assignment, nor for an account the published quarantine snapshot names. It SHALL render an explicit not-served state instead, stating for an unassigned account that every MCP tool is refused and the index is kept for reassignment, and stating for a quarantined account which reason applies — an overlap with a named account, or a root that could not be examined — so the operator reads the same fact the admission gate enforces.
 
-A number rendered beside `(unassigned)` reads as capacity the account has, when in fact every tool call from that account is refused before its body runs. This is the same over-reporting of liveness as the revoked-key count the panel used to present as an unqualified total, and the same class as a control offered for a credential the middleware already rejects.
+A number rendered beside `(unassigned)` reads as capacity the account has, when in fact every tool call from that account is refused before its body runs. This is the same over-reporting of liveness as the revoked-key count the panel used to present as an unqualified total. A quarantined account is in exactly that position and worse: it is assigned, it is indexed, its row count is real, and nothing will serve it. Rendering the count unqualified beside a healthy-looking assignment is the most misleading of the three states, because the operator has no other cue that the account is dark.
 
 #### Scenario: Unassigned account
 
@@ -323,15 +367,21 @@ A number rendered beside `(unassigned)` reads as capacity the account has, when 
 - **THEN** the note column SHALL show a not-served state rather than a number
 - **AND** SHALL state that the tools are refused and the index is retained for reassignment
 
+#### Scenario: Quarantined account
+
+- **WHEN** the user list renders an account the quarantine snapshot names
+- **THEN** the note column SHALL show a not-served state rather than a number
+- **AND** SHALL state the reason, naming the conflicting account for an overlap and stating that the root could not be examined for the other reason
+
 #### Scenario: Assigned account
 
-- **WHEN** the user list renders an account that holds a vault assignment
+- **WHEN** the user list renders an account that holds a vault assignment and is not named by the snapshot
 - **THEN** the note column SHALL show that account's note count as before
 
 #### Scenario: The retained rows are not deleted to make the display true
 
-- **WHEN** the display changes for an unassigned account
-- **THEN** the account's `notes_metadata`, `note_embeddings` and `note_links` rows SHALL remain in the database, so a reassignment to the same directory still resumes without a full re-index
+- **WHEN** the display changes for an unassigned or quarantined account
+- **THEN** the account's `notes_metadata`, `note_embeddings` and `note_links` rows SHALL remain in the database, so a corrected assignment still resumes without a full re-index
 
 ### Requirement: Terminal tool-body outcomes are typed
 The server SHALL identify every returned in-body refusal or partial completion
@@ -449,4 +499,106 @@ lease or pending waiter still belongs to the overflow epoch.
 - **WHEN** an identity is active in overflow and another dedicated entry drains
 - **THEN** a new request from that overflow identity SHALL remain subject to the same shared allowance
 - **AND** identities without a dedicated entry SHALL remain in overflow until the epoch drains
+
+### Requirement: A tool call whose body raises MUST NOT be lost, and its audit write MUST NOT mask the failure
+
+The tracking decorator SHALL record a tool body's exception before re-raising it, and the record SHALL consist of one ERROR log entry carrying exception information and one best-effort `usage_logs` row whose insertion reports success or failure to the handler; a failed or interrupted insertion SHALL be logged and discarded rather than raised, so the caller always receives the original exception. The decorator SHALL guard only the tool body's invocation, so that a failure of an admission gate before it, or of the parameter and logging work after a body has completed, is never recorded as a tool exception. It SHALL catch `Exception` for the body, so that a cancellation propagates without being recorded as a tool failure and without writing a row.
+
+#### Scenario: The row is best effort, the exception is not
+
+- **WHEN** a tool body raises and the audit insert also fails
+- **THEN** the caller SHALL receive the tool body's original exception and the failed audit write SHALL appear only as a warning record
+
+#### Scenario: A completed write is never reported as failed
+
+- **WHEN** a write tool completes and publishes, and the usage-logging work that follows then raises
+- **THEN** no row SHALL carry the `tool_exception` marker for that call and no exception record SHALL be emitted for it
+
+#### Scenario: Cancellation writes nothing
+
+- **WHEN** a tool call is cancelled while its body is running
+- **THEN** no `usage_logs` row SHALL be written for that call and no exception record SHALL be emitted for it
+
+#### Scenario: The refusal count on a raising tool is not inflated
+
+- **WHEN** a tool body raises after doing real work
+- **THEN** the written row SHALL NOT match the pre-body refusal predicate, so the call's duration SHALL remain in the latency aggregates
+
+### Requirement: A caller the quarantine snapshot names SHALL be refused by the admission gate
+Every MCP tool call by a user the published quarantine snapshot names SHALL be refused by the shared admission gate, through the same mechanism as a caller with no vault assignment: the root resolution SHALL raise and the decorator SHALL fail the call before the tool body runs. The refusal SHALL apply to every registered tool with no exemptions, SHALL NOT delete the caller's index rows, and SHALL be recorded in `usage_logs` under a marker distinct from the no-assignment marker and distinct per reason — one marker for an overlap, another for a root that could not be examined.
+
+Refusing to *index* a quarantined pair is not sufficient and must not be mistaken for the whole control. The database-backed tools answer from `notes_metadata` and `note_embeddings` and never touch the disk, so rows a previous pass already wrote for the other tenant's notes stay queryable; and the write tools resolve beneath the caller's root, which physically contains the other tenant's files, so `edit_note`, `move_note`, `delete_note` and `write_file` reach them and the beneath-root containment check agrees they are contained. The write path consults no indexer. A cross-tenant destructive write is the failure this product ranks highest, and the admission gate is the only control that is total over it.
+
+The markers are distinct because the markers already distinguish things an operator would act on differently. Recording a quarantine as "no vault assigned" tells an operator that an administrator unassigned a user whose users page plainly shows an assignment; recording an unexaminable root as an overlap sends them looking for a second account that does not exist.
+
+The refusal message the caller receives SHALL name no other user, no other vault path and no note path, for any reason. The caller is a tenant's agent; the operator-facing surfaces are where the affected accounts, reasons and roots are named.
+
+#### Scenario: Database-backed tools are refused
+
+- **WHEN** a user the snapshot names calls `semantic_search`, `keyword_search`, `list_notes`, `get_recent`, `get_tags` or any graph tool with an unchanged, still-active credential
+- **THEN** the call SHALL be refused with a tool error naming no note path, title, tag, frontmatter value or chunk excerpt
+
+#### Scenario: Write tools are refused
+
+- **WHEN** the same caller calls `create_note`, `edit_note`, `move_note`, `delete_note`, `set_frontmatter`, `write_file` or `delete_file`
+- **THEN** the call SHALL be refused before any path is resolved beneath the root and before any byte is written
+
+#### Scenario: The refusal names no other tenant
+
+- **WHEN** any tool call is refused for a quarantine, under either reason
+- **THEN** the message SHALL NOT contain another user's username, another user's vault path, or any note path
+
+#### Scenario: Each reason carries its own marker
+
+- **WHEN** one call is refused for an overlap and another for a root that could not be examined
+- **THEN** the two `usage_logs` rows SHALL carry different error markers
+- **AND** both SHALL differ from the marker used for a caller with no vault assignment
+
+#### Scenario: The index survives the refusal
+
+- **WHEN** the quarantine is corrected and the caller's assignment is unchanged
+- **THEN** the caller's previously indexed rows SHALL still be present
+
+#### Scenario: Unrelated callers are unaffected
+
+- **WHEN** a user the snapshot does not name calls any tool
+- **THEN** the call SHALL be admitted exactly as before
+
+#### Scenario: Single-user mode is unaffected
+
+- **WHEN** the server runs in single-user mode, where the caller has no user id and the root comes from settings
+- **THEN** no quarantine test SHALL apply and admission SHALL behave exactly as it does today
+
+#### Scenario: The panel vault browser refuses the same user
+
+- **WHEN** a user the snapshot names opens the panel's vault browser
+- **THEN** the page SHALL render the existing unavailable-vault empty state rather than listing a directory tree that may contain another tenant's notes
+
+### Requirement: A tool call SHALL be refused until a quarantine snapshot has been published in this process
+Until the shared detection has published a snapshot in the serving process, the admission gate SHALL refuse every multi-user tool call with a refusal typed distinctly from both the overlap refusal and the no-assignment refusal. The startup path SHALL publish synchronously before the application serves, so this state is normally never observed; it SHALL remain reachable and SHALL fail closed when it is.
+
+Publishing asynchronously and serving permissively in the meantime has two failure modes and both are silent. A tool call between the first accepted connection and the first published snapshot is served against roots nothing has checked — the whole window the guard exists to close, reopened once per restart. And a first detection that *raised* would leave the process permissive for the life of the container, because nothing would ever revisit the decision.
+
+Failing closed is cheap here precisely because a detection failure is not a per-root failure. A root that cannot be opened is a per-user verdict; the routine itself fails only when the user enumeration fails, which means the database is unavailable and the tools cannot serve anyway. Single-user mode and sandbox mode SHALL NOT be affected: the former never consults the snapshot, and the latter publishes an empty one at startup without touching the filesystem.
+
+#### Scenario: A call before the first snapshot is refused
+
+- **WHEN** a multi-user tool call reaches the gate in a process where no snapshot has been published
+- **THEN** the call SHALL be refused
+- **AND** the refusal SHALL be typed distinctly from the overlap and no-assignment refusals
+
+#### Scenario: The startup publication precedes serving
+
+- **WHEN** the application starts normally
+- **THEN** the snapshot SHALL be published before the first request is served, so an ordinary caller never observes the not-ready refusal
+
+#### Scenario: A failed first detection keeps the gate closed
+
+- **WHEN** the first detection raises and a tool call arrives
+- **THEN** the call SHALL be refused rather than admitted on the strength of a detection that did not complete
+
+#### Scenario: Single-user mode is never gated on readiness
+
+- **WHEN** the server runs in single-user mode
+- **THEN** the readiness state SHALL not be consulted and every tool call SHALL be admitted as it is today
 

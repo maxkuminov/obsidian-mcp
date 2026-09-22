@@ -32,17 +32,44 @@ When an index operation is invoked with no user identifier, the operation SHALL 
 - **AND** user-owned metadata, vectors, and links SHALL remain unchanged
 
 ### Requirement: Embedding completion has exact cardinality
-The system SHALL accept an embedding batch only when it contains exactly one vector for every requested chunk. It SHALL record an empty or fully-cleaned note as current with zero vectors.
+The system SHALL accept an embedding batch only when it contains exactly one vector for every **requested** chunk, where the requested chunks are the chunks the bounded chunker produced for that note. It SHALL record an empty or fully-cleaned note as current with zero vectors. A batch that returns the wrong number of vectors, and a provider call that raises, SHALL each be a **distinct outcome** from that zero-chunk certification: neither certifies, neither counts as a note the pass embedded, and both count as failures of the pass.
+
+The three used to be one value. `embed_note` returned `0` for a note that cleaned to zero chunks *and was certified*, for a provider exception it swallowed, and for a cardinality mismatch — and the caller incremented its embedded count after all three. A total provider outage therefore produced a pass record reading `notes_embedded = N, error = NULL`, which is the record a healthy pass writes, with a positive count.
+
+Each failing outcome SHALL carry a **bounded, structured description of what went wrong** — the exception class and a message truncated at the source, the number of chunks requested, and for a cardinality mismatch the number of vectors received — because the pass's own record of the failure is built from it and there is no exception left for the caller to inspect. The message SHALL be truncated where it is captured rather than where the run record is written: the run record's total error budget is shared with the pass's stage labels, and one untruncated provider message can evict them.
 
 #### Scenario: Provider returns too few vectors
+
 - **WHEN** the provider returns fewer embeddings than requested chunks
 - **THEN** the note SHALL NOT be marked current
 - **AND** previously valid embeddings SHALL remain intact
+- **AND** the outcome SHALL be reported to the pass as a failure, not as an embedded note
+- **AND** the failure description SHALL name both the requested chunk count and the received vector count
 
 #### Scenario: Note has no embeddable chunks
+
 - **WHEN** cleaning and chunking produces zero chunks
 - **THEN** the note's embedded content hash SHALL be marked current
 - **AND** the note SHALL have zero embedding rows
+- **AND** the outcome SHALL be reported to the pass as a note it embedded, not as a failure
+
+#### Scenario: A provider failure is not a zero-chunk certification
+
+- **WHEN** the embedding provider raises for a note whose cleaned content produces at least one chunk
+- **THEN** the outcome reported to the pass SHALL be distinguishable from the zero-chunk certification above
+- **AND** the note SHALL NOT be certified, so a later pass selects it again
+- **AND** the failure description SHALL carry the exception's class name and a bounded message
+
+#### Scenario: A long provider message cannot crowd out the pass record
+
+- **WHEN** the provider raises with a message longer than the per-failure bound
+- **THEN** the captured message SHALL be truncated to that bound before it reaches the pass record
+
+#### Scenario: Cardinality is exact over the capped chunk list
+
+- **WHEN** a note produces more chunks than the per-note chunk cap and the provider returns one vector for each of the first N chunks
+- **THEN** the batch SHALL be accepted, because the requested chunks are the capped list
+- **AND** a batch returning fewer vectors than that capped list SHALL still be refused
 
 ### Requirement: The index records the vault assignment its rows were scanned under
 The system SHALL record, per user, the **provenance** of that user's `notes_metadata` rows — the vault assignment the index pass ran under, and the directory that assignment named at the moment it ran — in a record that is independent of the user's current assignment and therefore survives an unassignment. That record SHALL be written only by the index pass that establishes the state it describes, and MUST NOT be written by any operator-facing handler that changes the assignment.
@@ -246,6 +273,16 @@ The one-shot link backfill and the keyword-vector rebuild SHALL each run, for a 
 
 The skip SHALL be **per user**, not global: a user whose provenance is unsettled SHALL NOT prevent these passes from running for every other user.
 
+**One narrow exception: the operator-invoked keyword rebuild that records a global configuration fingerprint.** That operation asserts, in one stored row, that *every retained row in the database* was rebuilt under the current text-search configuration — a claim that cannot be established one user at a time. When it runs, a scope it must skip SHALL abort the whole operation: no fingerprint is recorded, every scope's rebuild is rolled back, and the skipped scope and its reason are named to the operator.
+
+The exception SHALL be read narrowly, and its three limits are what keep it from swallowing the rule:
+
+- It applies **only** to that operator-invoked, fingerprint-recording operation. The one-shot link backfill is untouched, and no pass on the periodic loop is covered.
+- It does **not** weaken the per-user gate itself. The skipped user still gets nothing written — which is exactly what the rule above demands — and the gate is still computed by the same classification function.
+- The rule's purpose is preserved. What "per user, not global" protects against is one tenant's unsettled provenance blocking another tenant's *ongoing* indexing; this operation is a one-shot an operator invoked, not the loop that keeps the index fresh, and it makes no claim about any user until it can make the claim about all of them.
+
+**The maintenance operation SHALL be able to rebuild an inactive owner's scope.** Eligibility here is a question about *retained rows*, not about which users the periodic pass serves: an inactive user's rows are as present in the index, and as returnable by keyword search, as anyone's. The operation SHALL therefore resolve that owner's assigned vault path directly and read-only, within the operation, and pin it as any file-reading pass pins a root. It SHALL NOT widen the active-user root resolution or the active-user cache to do so. A scope with **no** assigned vault path, or one whose path cannot be pinned, remains a skip — and the provenance gate applies to an inactive owner exactly as it applies to an active one.
+
 The classification SHALL be computed by the same function the scan uses, so that "settled" cannot come to mean two different things in two places.
 
 **The embedding pass is deliberately not among them**, and the reason is stated in "The embedding pass is not gated on provenance, because it verifies every hash it certifies" below: it is the only one of the three that binds what it writes to the content the metadata row records, so it is safe by construction against the root mixing this gate exists to prevent, and gating it is the one gate whose cost is unbounded.
@@ -266,6 +303,29 @@ Skipping costs those two passes nothing even for a user whose provenance never s
 
 - **WHEN** one user's provenance is unsettled and another user's is settled, and a gated pass runs
 - **THEN** the settled user's work SHALL be performed in that same pass
+
+#### Scenario: The fingerprint-recording rebuild is the exception
+
+- **WHEN** the operator-invoked keyword rebuild that records the configuration fingerprint reaches a retained scope it must skip
+- **THEN** it SHALL record no fingerprint, SHALL roll back every scope it had rebuilt, and SHALL name the skipped scope and its reason
+- **AND** the skipped scope SHALL still have had no row written for it
+
+#### Scenario: The exception does not reach the link backfill
+
+- **WHEN** the one-shot link backfill encounters an unsettled user alongside settled ones
+- **THEN** it SHALL skip that user and complete for the others, exactly as before
+
+#### Scenario: An inactive but assigned owner is rebuilt
+
+- **WHEN** the fingerprint-recording rebuild reaches a scope whose owner is inactive, has an assigned vault path, and whose provenance classification is same assignment
+- **THEN** that scope SHALL be rebuilt
+- **AND** the operation SHALL resolve and pin that owner's assigned path itself, without changing which users the periodic pass serves
+
+#### Scenario: An unassigned owner remains a skip
+
+- **WHEN** a retained scope's owner has no assigned vault path
+- **THEN** it SHALL be a skip with its own named reason
+- **AND** in the fingerprint-recording rebuild that skip SHALL abort the operation
 
 #### Scenario: A reassignment between the scan and a later pass writes nothing
 
@@ -716,11 +776,15 @@ The rebuild's snapshot SHALL therefore retain each row's owner, relative path an
 
 ### Requirement: A many-chunk note completes, and certifies only on full coverage
 
-The Ollama (local, sequential) embedding batch SHALL have no aggregate deadline: its per-chunk timeout (30 s per provider call) is the liveness bound, so a note cannot be structurally unable to finish while every chunk is individually healthy. A note SHALL be certified only when every one of its chunks produced a vector; no partial chunk coverage may ever be stamped complete.
+The Ollama (local, sequential) embedding batch SHALL have no aggregate deadline: its per-chunk timeout (30 s per provider call) is the liveness bound, so a note cannot be structurally unable to finish while every chunk is individually healthy. A note SHALL be certified only when every one of its **requested** chunks produced a vector; no partial coverage of the requested chunks may ever be stamped complete.
+
+**"Requested chunks" is the bounded chunk list**, not every chunk the note's text could yield. The chunker caps a note at `MAX_CHUNKS_PER_NOTE` in document order, and a capped note is certified on full coverage of that capped list. Certification is what makes the cap safe: a capped note that were left uncertified would be re-selected by the backlog on every pass for ever and would re-perform every provider call it already made, which is the never-finishing note the removal of the aggregate deadline exists to prevent. The degradation is declared on the row and in every result that names the note; it is not expressed by withholding the stamp.
+
+**No aggregate deadline SHALL be reintroduced in place of the cap.** The cap bounds a *count*, deterministically, and says so on the row; a time budget fires on a note whose chunks are all individually healthy, certifies nothing, and repeats every tick.
 
 #### Scenario: A giant note eventually embeds and stops being retried
 
-- **WHEN** a note produces more chunks than the former fixed 300 s deadline allowed at normal provider latency
+- **WHEN** a note produces more chunks than the former fixed 300 s deadline allowed at normal provider latency, and fewer than the chunk cap
 - **THEN** the embed pass SHALL process all of its chunks, certify it, and not select it again while its content is unchanged
 
 #### Scenario: A hung provider still fails fast
@@ -730,7 +794,18 @@ The Ollama (local, sequential) embedding batch SHALL have no aggregate deadline:
 
 #### Scenario: Partial coverage is never certified
 
-- **WHEN** the provider returns fewer vectors than chunks for a note
+- **WHEN** the provider returns fewer vectors than the requested chunks for a note
+- **THEN** the note SHALL NOT be certified and its previous vectors SHALL remain in place
+
+#### Scenario: A capped note is certified on full coverage of its capped list
+
+- **WHEN** a note yields more chunks than the cap and every one of the first N chunks produces a vector
+- **THEN** the note SHALL be certified
+- **AND** it SHALL NOT be selected by the backlog again while its content is unchanged
+
+#### Scenario: A capped note with one chunk missing is not certified
+
+- **WHEN** a note is capped at N chunks and the provider returns N-1 vectors
 - **THEN** the note SHALL NOT be certified and its previous vectors SHALL remain in place
 
 ### Requirement: A masker grammar change forces re-derivation without corrupting note identity
@@ -801,4 +876,649 @@ The frozen v0 cleaning function retained for `extraction_version` comparison SHA
 
 - **WHEN** the differential test generates inputs from the covered classes
 - **THEN** for every input the scanner's output SHALL equal the oracle regex pair's output byte for byte
+
+### Requirement: No pass over a vault root SHALL begin without a quarantine snapshot published by the shared detection
+Every code path that can begin an index, link-backfill, embed or tsvector-rebuild pass over a vault root SHALL first call one shared detection routine, and that routine SHALL be the only thing in the process that computes and publishes a quarantine snapshot. The routine SHALL evaluate the identity and containment conditions across the roots of all active users holding an assignment, taking each root's device, inode and canonical real path from **one opened directory descriptor** rather than from the assignment string, and SHALL issue no database write.
+
+Installing detection in the periodic loop alone leaves it installed in one of five places. The panel's on-demand reindex — reached by **Reindex Now**, by *re-embed* and by *reset embeddings* — mirrors the loop and shares only `index_pass_lock` with it, and the standalone tsvector rebuild (`make rebuild-tsvectors`) is a **separate process** with its own user enumeration, no loop and no lifespan. Both reach a pass, and neither would consult a check placed in the loop. The requirement is therefore stated over the property — no pass begins unchecked — and the per-user stage skip SHALL live in the shared pass helpers rather than in each caller's loop, so a sixth entry point added later inherits the guard by routing through the same helper instead of by remembering to add a call.
+
+The startup entry point SHALL run the detection **synchronously before the application serves its first request**, and SHALL NOT rely on the asynchronous startup pass for it: between accepting connections and that pass completing, a tool call would otherwise be served against roots nothing had checked.
+
+#### Scenario: The scheduled loop publishes before it indexes
+
+- **WHEN** a periodic iteration begins
+- **THEN** a snapshot SHALL be published before any note beneath any root is read
+
+#### Scenario: The startup path publishes before the application serves
+
+- **WHEN** the application starts
+- **THEN** the first snapshot SHALL be published before the first request is served and before the indexer task is created
+
+#### Scenario: The panel's on-demand reindex publishes
+
+- **WHEN** an administrator triggers Reindex Now, re-embed, or reset embeddings
+- **THEN** the resulting pass SHALL publish a snapshot before it takes the pass lock
+- **AND** SHALL skip a quarantined user exactly as a scheduled pass does
+
+#### Scenario: The standalone tsvector rebuild publishes
+
+- **WHEN** the standalone rebuild process is run
+- **THEN** it SHALL publish its own snapshot before rebuilding any keyword vector
+- **AND** SHALL rebuild nothing for a quarantined user
+
+#### Scenario: The skip is enforced in the shared pass helper
+
+- **WHEN** the pass helpers are inspected
+- **THEN** the per-user skip SHALL be enforced inside them, so that every caller inherits it
+- **AND** no caller SHALL be relied upon to re-implement it
+
+#### Scenario: Single-user mode has nothing to detect
+
+- **WHEN** the server runs in single-user mode, where the root comes from settings and no `users` row carries an assignment
+- **THEN** the published snapshot SHALL be empty and every pass SHALL behave exactly as it does today
+
+#### Scenario: Single-user mode publishes without reading anything
+
+- **WHEN** the server runs in single-user mode and the `users` table nevertheless holds active rows carrying overlapping assignments — a flag flipped back, or a deployment that was multi-user before
+- **THEN** the detection SHALL publish an empty snapshot **without** enumerating those rows and **without** opening any root
+- **AND** the snapshot SHALL still be published, because the never-published state is a refusal and single-user mode must never sit in it
+
+### Requirement: Each root's observation SHALL be bounded by a finite deadline
+Observing a root — opening it, stating the descriptor and resolving its canonical real path — SHALL be dispatched off the event loop and bounded by a finite, configurable deadline. Expiry SHALL be a per-user verdict of **root unexaminable with a timeout cause**, distinguishable from an error number, and the detection SHALL continue to the remaining roots and publish. Expiry MUST NOT be treated as a failure of the detection as a whole.
+
+Vault roots are bind mounts, and a network- or FUSE-backed one blocks in the kernel for as long as it likes. Two things break together without a deadline. The startup detection is deliberately synchronous — it is what makes the process closed rather than permissive before it serves — so an unbounded observation would hold the application before its first request, taking the control panel down at exactly the moment an operator opens it to find out why. And the detection critical section would be held for the whole stall, queuing every other entry point behind one hung mount.
+
+Treating expiry as a detection failure would be the other error: the previous snapshot would be retained on every iteration a slow mount was slow, so a genuine overlap appearing later would never be published. A timed-out root is one user's verdict, and the users beside it are still observable.
+
+The cause is recorded as a timeout rather than folded into the error numbers because the two need different responses — a hung filesystem and a deleted directory are different incidents — and the operator surfaces word them apart.
+
+#### Scenario: A hung root does not stall startup
+
+- **WHEN** one active user's root blocks indefinitely on being opened and the application starts
+- **THEN** the startup detection SHALL complete within the deadline for that root
+- **AND** the application SHALL begin serving, with the control panel available
+
+#### Scenario: A timed-out root is one user's verdict
+
+- **WHEN** one root's observation exceeds the deadline and two other roots are observable
+- **THEN** that user SHALL be quarantined with a timeout cause
+- **AND** the other two SHALL be observed and the snapshot SHALL be published
+
+#### Scenario: A timeout is not a detection failure
+
+- **WHEN** an iteration times out observing a root
+- **THEN** the resulting snapshot SHALL be published rather than the previous one retained
+
+#### Scenario: The timeout cause is distinguishable
+
+- **WHEN** one user is quarantined for a timeout and another for a root that could not be opened
+- **THEN** the two reasons SHALL be distinguishable wherever they are surfaced
+
+### Requirement: Detection SHALL be serialized, and a publication SHALL NOT replace a newer one
+The whole detect-and-publish operation — observing the roots, evaluating the conditions and publishing the result — SHALL run inside one process-global critical section, so that a second detection cannot begin until the first has published. Each snapshot SHALL carry a sequence number assigned when its detection begins, taken inside that critical section, and publication SHALL discard a snapshot whose sequence is not greater than the sequence of the snapshot already published.
+
+Every entry point calls the detection *before* taking the pass lock, which is correct — the check must not queue behind the pass it exists to gate — and it means two detections are trivially concurrent: a periodic iteration and a panel-triggered reindex overlap, and the panel path is reached from three separate controls. The resulting failure is not theoretical and it fails **open**. A detection that began before an overlap appeared, stalled on a slow `open` of a network or FUSE-backed root, and finished after a newer detection had published the quarantine would publish its own **empty** result over it and re-admit both tenants until some later entry point ran. Atomicity of the swap does not address this: both writes are individually atomic and the wrong one is last.
+
+Holding the critical section across the publication alone is insufficient and MUST NOT be substituted, because it permits exactly that interleaving. The sequence number is not redundant with the critical section: the section is the mechanism and the sequence is the invariant, and the invariant is what remains true for a future caller — a test, a fixture, an entry point added later — that publishes without entering the section.
+
+#### Scenario: A stalled older detection does not overwrite a newer quarantine
+
+- **WHEN** one detection begins, is delayed while observing a root, and completes after a second detection has already published a snapshot naming two overlapping users
+- **THEN** the published snapshot SHALL still name those two users
+- **AND** the older detection's result SHALL NOT replace it
+
+#### Scenario: Detections do not interleave
+
+- **WHEN** two entry points call the detection concurrently
+- **THEN** the second SHALL NOT begin observing roots until the first has published
+
+#### Scenario: An out-of-order publication is discarded
+
+- **WHEN** a snapshot is published whose sequence is not greater than that of the snapshot already published
+- **THEN** it SHALL be discarded and the published snapshot SHALL be unchanged
+
+### Requirement: The published snapshot SHALL be atomic, tri-state, and SHALL NOT regress on a failed detection
+Publication SHALL replace the snapshot with one immutable value in a single assignment, so no reader observes a partially built snapshot, and SHALL be monotonic in the sequence number described above. The snapshot SHALL be tri-state — never published, published and empty, or published with quarantine reasons — and a detection that raises **after** a snapshot has been published SHALL retain the previous snapshot and log at ERROR. It MUST NOT clear the snapshot back to the never-published state.
+
+The three states answer three different questions and collapsing any two is a defect. "Never published" means nothing has been checked and the correct response is to refuse; "published and empty" means everything was checked and nothing overlaps; and a failed re-detection means the last complete answer is the best available one. Clearing on failure would turn a transient database blip into a deployment-wide refusal, and treating a failure as an all-clear would serve overlapping roots on the strength of a query that never returned.
+
+A detection failure is not a per-root failure: a root that cannot be opened is a per-user verdict, so the only way the routine itself fails is that the user enumeration failed — which means the database is unavailable and the tools are unusable regardless. The routine SHALL therefore log and let the process keep serving the panel rather than exiting, and SHALL retry at the next entry point.
+
+#### Scenario: A failed re-detection keeps the last snapshot
+
+- **WHEN** a snapshot has been published and a later detection raises
+- **THEN** the previously published snapshot SHALL remain in force
+- **AND** the failure SHALL be logged at ERROR
+
+#### Scenario: A failed first detection does not become an all-clear
+
+- **WHEN** the first detection of the process raises
+- **THEN** the snapshot SHALL remain in the never-published state
+- **AND** the process SHALL keep serving the panel rather than exiting
+
+#### Scenario: No reader sees a partial snapshot
+
+- **WHEN** a detection is publishing while a request reads the snapshot
+- **THEN** the reader SHALL observe either the previous snapshot or the new one in full
+
+#### Scenario: Sandbox mode is ready without touching the filesystem
+
+- **WHEN** the server starts in sandbox mode, where there are no users and the indexer is skipped
+- **THEN** an empty snapshot SHALL be published without opening any root
+
+### Requirement: The snapshot SHALL record why each user is quarantined, and an unexaminable root SHALL NOT be reported as an overlap
+The snapshot SHALL map each quarantined user to a structured reason: an **overlap** carrying the peer user and the relation found (identical, contains, or contained by), or a **root unexaminable** carrying its cause and naming no peer. The cause SHALL be one of three, kept distinguishable wherever it is surfaced: an **error number**, a **timeout** (the observation exceeded its deadline), or an **unstable pathname** — the root opened but its canonical real path did not name the inode that was opened, so nothing observed describes one directory. Each entry SHALL additionally carry, as immutable facts observed at detection time, the subject's username and canonical assignment, the peer's username and canonical assignment for an overlap, and the moment the detection ran. Each reason SHALL be worded separately wherever it is surfaced — the control panel, the log line, the `indexer_runs` row and the usage-log marker.
+
+Three causes and not two, for the same reason there are two reasons and not one: they are different incidents an operator acts on differently. A missing directory is a mount that was not applied; a timeout is a mount that is not answering; an unstable pathname is a root being retargeted *while the check runs*, which is the only one of the three that says something is moving underneath the server rather than absent from it. Folding the third into an error number would name an `errno` no syscall returned.
+
+A root that could not be opened is not an overlap, whichever of the three causes it carries. Reporting it as one sends an operator looking for a second account that does not exist, and reporting it under the overlap marker makes the two indistinguishable in the usage log. The user is quarantined because their status could not be established, which is a different fact requiring a different fix.
+
+Recording the facts rather than the ids alone is what keeps the condition legible while the operator acts on it. The first response to "this root overlaps that account's" is to edit or delete one of the two accounts, and between that edit and the next detection a surface that resolved names at render time would show a changed path — or a blank, where a deleted peer was — beside a condition still in force. The recorded facts also make the staleness honest, because a surface can label them as of the last check rather than presenting them as the present state.
+
+An unexaminable root SHALL quarantine **only that user**. The peers it could not be compared against SHALL keep being indexed and served — fail closed for the user whose status is unknown, fail open for users against whom nothing was observed, so that one broken mount does not take the deployment offline.
+
+#### Scenario: An overlap names the peer and the relation
+
+- **WHEN** two users' roots are detected as overlapping
+- **THEN** each user's reason SHALL name the other user and the relation found
+
+#### Scenario: An unexaminable root names no peer
+
+- **WHEN** a user's assigned root cannot be opened
+- **THEN** that user's reason SHALL record that the root could not be examined, with the error number
+- **AND** SHALL NOT name any peer user or claim an overlap was observed
+
+#### Scenario: A pathname moving under the check is its own cause
+
+- **WHEN** a user's root opens but its canonical real path does not name the inode that was opened
+- **THEN** that user SHALL be quarantined as root unexaminable with the unstable-pathname cause
+- **AND** that cause SHALL be distinguishable from both an error number and a timeout wherever it is surfaced
+- **AND** it SHALL NOT be reported as an overlap
+
+#### Scenario: The pair stays nameable after the peer is changed
+
+- **WHEN** an overlap is published and an administrator then corrects or deletes one of the two accounts, before a later detection publishes
+- **THEN** the surfaces SHALL still name both accounts and both roots from the facts recorded in the snapshot
+- **AND** SHALL present them as observed at the last check rather than as the current state
+
+#### Scenario: An unexaminable root quarantines only its own user
+
+- **WHEN** one active user's root cannot be opened and two other users hold unrelated, examinable roots
+- **THEN** only the first user SHALL be quarantined
+- **AND** the other two SHALL be indexed normally
+
+### Requirement: The all-scopes keyword rebuild SHALL check every root it will open, before it takes the generation lock
+The maintenance rebuild that enumerates scopes from the rows that exist — rather than from the active users the server serves — SHALL evaluate the identity and containment conditions across **every root it would open**, including the retained root of an inactive owner, together with the roots of all active users holding an assignment. Any relation involving a root it would open SHALL abort the whole operation, naming both sides and the relation; a root it would open that cannot be observed SHALL be a non-completed outcome and SHALL abort the operation in the same way. The observation SHALL be complete before the index generation lock is taken, and **no pathname SHALL be resolved while that lock is held**: the observation SHALL retain the directory descriptor it opened for each scope, the rebuild SHALL read through that descriptor, and the only filesystem call made on a root inside the locked section SHALL be a status check of the descriptor already held.
+
+Retaining the descriptor answers two failures that reopening the pathname does not. The reopen is an unbounded synchronous call, so a network- or FUSE-backed mount that stops answering holds the index generation lock for as long as the kernel takes and every pass in every process queues behind it. And it is a second lookup, so it may resolve to a directory the observation never examined; a descriptor is the only reference that still names the same directory across the wait for the lock. The assignment SHALL nevertheless still be compared, because a scope reassigned in that interval holds a descriptor that is the wrong directory to rebuild — correct in identity, wrong in tenancy.
+
+Every retained descriptor SHALL be closed on completion, on abort, and on an unexpected failure, and a descriptor opened by an observation that had already exceeded its deadline SHALL be closed when that observation completes. Descriptors for roots the command would not open SHALL be released as soon as the checks are done.
+
+#### Scenario: No pathname is resolved after the lock
+
+- **WHEN** the survey has succeeded and the rebuild runs
+- **THEN** no vault-root pathname SHALL be opened after the generation lock is acquired
+- **AND** each scope SHALL be rebuilt through the descriptor the survey retained for it
+
+#### Scenario: A root renamed after the survey does not redirect the read
+
+- **WHEN** a scope's assigned pathname is repointed to a different directory between the survey and the rebuild
+- **THEN** the rebuild SHALL still read the directory the survey examined
+
+#### Scenario: Every retained descriptor is released
+
+- **WHEN** the rebuild completes, aborts, or raises
+- **THEN** every descriptor the survey retained SHALL be closed
+
+### Requirement: The all-scopes keyword rebuild SHALL hold the account-administration guard across its survey and its reads
+The maintenance rebuild SHALL acquire the same cross-process advisory guard that the account-administration handlers take — the one held by the administrative user-management handlers, the self-service password change and every session mint — **before** it enumerates the roots it will open, and SHALL hold it until its transaction commits or rolls back. The lock order SHALL be **account guard, then index generation lock, then row locks**, in that direction on every path that takes more than one, and the ordering rule SHALL be recorded at each lock's definition.
+
+Without it the survey is check-then-act across processes. The survey accepts a layout in which two roots nest whenever the conflicting user is inactive — which is correct, because nothing serves or indexes an inactive user — and an administrator may reactivate or reassign that user while the command is still running. The reads that follow are then the cross-tenant read the survey exists to prevent, and no re-check inside the command's own transaction can prevent it, because the edit is a separate connection committing between the check and the read. Serializing against the handlers that make those edits is the only mechanism that closes it, and that guard already exists for exactly this class of check-then-act.
+
+The cost SHALL be accepted rather than mitigated: while the rebuild runs, account edits and session mints wait. It is an operator-initiated one-off command, the alternative is a cross-tenant read, and the guard is transaction-scoped so a crashed rebuild releases it with no operator action.
+
+#### Scenario: An assignment edit cannot land between the survey and the reads
+
+- **WHEN** the rebuild has completed its survey and has not yet read a row
+- **THEN** another connection SHALL NOT be able to acquire the account-administration guard
+
+#### Scenario: The guard precedes the enumeration
+
+- **WHEN** the rebuild runs
+- **THEN** the account guard SHALL be acquired before the roots it will open are enumerated
+
+#### Scenario: The guard is released by the transaction
+
+- **WHEN** the rebuild commits or rolls back
+- **THEN** the account-administration guard SHALL be released without operator action
+
+#### Scenario: The rebuild reads only scopes the surveyed population examined
+
+- **WHEN** the rebuild reads any scope
+- **THEN** that scope SHALL have been examined by the survey in force
+
+The published quarantine snapshot cannot answer for this command, and this is a population difference rather than an oversight. The snapshot observes active users holding an assignment because that is exactly whom the server serves and indexes; this command opens the scope of an **inactive** owner too, because an inactive user's retained rows are as returnable by keyword search as anyone's and the coverage proof is about rows that exist. An inactive owner retaining a root that is an ancestor or an alias of an active tenant's is therefore named by nothing the snapshot publishes, and the rebuild would read that tenant's notes under the inactive owner's scope and record a fingerprint asserting that every retained row was rebuilt correctly.
+
+This check SHALL be maintenance-only: it SHALL publish nothing and SHALL NOT change which users the serving snapshot names. The serving population MUST stay "active users holding an assignment" — quarantining an inactive account refuses nothing, because nothing serves it, while making an active peer appear implicated.
+
+Completing the observation before the lock is a separate requirement from the check itself and neither substitutes for the other. Opening a root synchronously after the lock lets one hung mount hold the index generation lock for as long as the kernel takes to answer, and every pass in the process queues behind it — so the verdict is taken through the same bounded, off-loop observation the detection uses, and carried into the locked section.
+
+A root that this command would **not** open and that cannot be observed SHALL NOT abort it. Nothing was observed to relate that root to anything, which is the same residual already recorded for an inaccessible peer, and failing a maintenance command because one unrelated tenant's mount is down is the false-positive direction this system treats as the expensive error.
+
+#### Scenario: An inactive owner's retained root containing an active tenant's aborts the rebuild
+
+- **WHEN** an inactive user retains rows under a root that contains an active user's assigned root, and the all-scopes rebuild is run
+- **THEN** the rebuild SHALL abort, naming both roots and the relation
+- **AND** no vault root SHALL have been opened
+- **AND** no keyword vector and no fingerprint SHALL have been written
+
+#### Scenario: The check happens before the generation lock
+
+- **WHEN** the all-scopes rebuild runs
+- **THEN** every root it will open SHALL have been observed before the generation lock is acquired
+- **AND** no root that was not observed SHALL be opened while the lock is held
+
+#### Scenario: A scope whose root cannot be observed aborts like any other skip
+
+- **WHEN** a root the rebuild would open cannot be observed within the deadline, or cannot be opened at all
+- **THEN** that scope's outcome SHALL be a non-completed one naming the cause
+- **AND** the rebuild SHALL abort and record no fingerprint
+
+#### Scenario: The maintenance check does not move the serving snapshot
+
+- **WHEN** the all-scopes rebuild runs its check and aborts
+- **THEN** the published quarantine snapshot SHALL be unchanged
+- **AND** the users the admission gate refuses SHALL be exactly the users it refused before
+
+#### Scenario: Sibling roots rebuild normally
+
+- **WHEN** every scope's root is unrelated to every other
+- **THEN** the rebuild SHALL proceed and record the fingerprint exactly as before
+
+### Requirement: A quarantined user SHALL NOT be indexed, and unrelated users SHALL be
+A pass SHALL skip the index, link-backfill, embed and tsvector-rebuild stages for every user the published snapshot names, and SHALL run all of them normally for every active user it does not name. The skip SHALL NOT delete, prune or otherwise mutate any `notes_metadata`, `note_embeddings` or `note_links` row belonging to a skipped user, and SHALL NOT write that user's provenance record.
+
+Continuing to index an overlapping pair files one tenant's notes under the other tenant's `user_id`, which makes them answerable by `semantic_search`, `keyword_search` and every graph tool — a silently wrong search result delivered to an agent, which is the failure this server ranks highest. Refusing the named users is the narrowest control that stops it: the condition is a property of specific roots and says nothing about a third tenant's vault, so quarantining the deployment would convert a two-tenant misconfiguration into an outage for everyone.
+
+Nothing is deleted for the same reason unassignment deletes nothing: preserving the rows is what makes a corrected assignment cheap, and the repair the operator's correction triggers — a discard or a re-derive from the provenance classification, plus the ordinary prune of rows whose files are no longer beneath the root — is machinery that already exists and is already reviewed. A blanket delete would be a second, unreviewed deletion path over index contents.
+
+#### Scenario: Unrelated tenants keep indexing
+
+- **WHEN** users A and B hold overlapping roots and user C holds an unrelated root
+- **THEN** the pass SHALL index, backfill and embed C exactly as before
+- **AND** SHALL perform none of those stages for A or B
+
+#### Scenario: No rows are destroyed by the refusal
+
+- **WHEN** a pass skips a user named by the snapshot
+- **THEN** that user's `notes_metadata`, `note_embeddings` and `note_links` rows SHALL be unchanged
+- **AND** the user's recorded vault provenance SHALL be unchanged
+
+#### Scenario: A root that becomes aliased after assignment is detected at the next entry point
+
+- **WHEN** two users hold non-overlapping assignments, both are indexing normally, and one user's assigned path is subsequently made a symbolic link to — or a bind mount of — the other user's root
+- **THEN** the next detection SHALL name both users
+- **AND** neither SHALL be indexed until the condition is corrected
+
+#### Scenario: A root that becomes nested after assignment is detected
+
+- **WHEN** one user's assigned path is subsequently replaced by a symbolic link resolving to a directory inside another active user's root
+- **THEN** the next detection SHALL find it through the canonical real paths, not through the unchanged assignment strings
+
+#### Scenario: A corrected condition resumes indexing
+
+- **WHEN** an administrator changes one of the two roots so that no condition holds
+- **THEN** the next detection SHALL publish a snapshot naming neither user
+- **AND** both SHALL be indexed again, with the existing provenance classification deciding whether the previous rows are kept, re-derived or discarded
+
+### Requirement: A quarantine SHALL be recorded durably for each affected user, and a pause SHALL NOT suppress the record
+A pass that skips a user because the snapshot names them SHALL log the fact at ERROR with the reason-specific wording, and SHALL record it in that user's `indexer_runs` row so the record survives a container restart. An iteration that finds the indexer **paused** SHALL still publish the snapshot, still emit the ERROR log and still write those per-user run rows before returning; the pause suppresses index and embed work only.
+
+Two records because they answer different questions over different lifetimes. The log line reaches the in-process error ring buffer, which is 100 entries and process-lifetime: the line naming a quarantine at deploy time is gone by the next restart while the misconfiguration persists. The run row is what an operator reads after a restart, and a pass that quietly did no work for a user would otherwise be indistinguishable from a pass that found nothing to do. A pause is entered precisely when an operator is doing something destructive and watching the panel, which is the worst moment for a quarantine to become invisible; and the row cadence is unchanged, because a running deployment already writes one row per user per iteration.
+
+#### Scenario: The skip reaches the run row
+
+- **WHEN** a pass skips a user for a quarantine
+- **THEN** an `indexer_runs` row SHALL be written for that user
+- **AND** its error text SHALL carry the reason-specific wording, naming the peer for an overlap and the error number for an unexaminable root
+
+#### Scenario: The skip reaches the error buffer
+
+- **WHEN** the same pass runs
+- **THEN** it SHALL log at ERROR, so the health page's recent-errors section shows it while the process lives
+
+#### Scenario: A paused iteration still records
+
+- **WHEN** an iteration begins while the indexer is paused and the snapshot names at least one user
+- **THEN** the snapshot SHALL still be published, the ERROR SHALL still be logged, and the per-user run rows SHALL still be written before the iteration returns
+- **AND** no index or embed work SHALL be performed
+
+#### Scenario: A skip is not reported as a healthy pass
+
+- **WHEN** every active user in a deployment is skipped for a quarantine
+- **THEN** the pass SHALL NOT be recorded as a clean run for those users
+
+### Requirement: A non-finite frontmatter number never fails an index pass
+
+The indexer SHALL store a non-finite YAML float from a note's frontmatter as the canonical YAML token — `.nan`, `.inf`, or `-.inf` — in the `notes_metadata.frontmatter` JSONB column, and a note carrying one SHALL NOT be able to abort, stall, or repeatedly retry an index pass.
+
+`NaN`, `Infinity` and `-Infinity` are not valid JSON and PostgreSQL's `jsonb` parser rejects them, so a float that reaches the column unconverted raises inside the batch upsert. That batch has no per-note retreat: the pass's single transaction aborts, nothing commits, no note's `content_hash` advances, and every subsequent tick retries the same fatal batch — one note taking indexing down for the whole owner. The conversion SHALL therefore happen at the indexer's own JSON boundary — the sanitisation applied to a parsed frontmatter mapping before it is written — which is the same boundary that already stringifies dates and non-string keys.
+
+The token SHALL be the canonical lowercase form whatever spelling the note used (`.NaN`, `.INF`, `+.inf` and the rest all load to the same float, and the parse preserves none of the spelling), and it SHALL be YAML's spelling rather than Python's `nan` / `inf`, so that the indexed value, the note's own frontmatter and every tool that displays it agree, and so `keyword_search(frontmatter=…)` matches the token a person would write.
+
+The coercion SHALL apply to mapping **keys** as well as values, since the sanitiser stringifies non-string keys on the same walk. When two keys collide after coercion, **the first key in document order SHALL win**, stated as a rule rather than left as an accident of iteration order — today's dict comprehension silently keeps the *last*. The index has no channel through which to report the loss and SHALL NOT fail the pass for it; a deterministic, documented winner is the available remedy.
+
+The shared frontmatter representability boundary SHALL NOT be changed to remove or coerce non-finite floats: it drops only what nothing can render, both Python and YAML render these, and the parsed mapping is what `set_frontmatter` re-serialises — a coerced string there would rewrite the note's own bytes as a side effect of an unrelated key.
+
+#### Scenario: A note with a non-finite frontmatter number indexes
+
+- **WHEN** a note whose frontmatter contains `x: .nan` is discovered by an index pass
+- **THEN** the pass SHALL complete, the note SHALL be upserted with `frontmatter` carrying `x` as the string `.nan`, and every other note in the same batch SHALL be committed
+
+#### Scenario: One such note cannot wedge the index
+
+- **WHEN** a vault contains a note with `a: .inf` and `b: -.inf` in its frontmatter, that note's body is edited between two index passes, and both passes run
+- **THEN** both passes SHALL complete, the note's stored `content_hash` SHALL advance to the hash of the edited note, and neither pass SHALL raise on the JSONB write
+
+#### Scenario: An alternate spelling is stored canonically
+
+- **WHEN** a note's frontmatter contains `x: .NaN` and `y: +.inf`
+- **THEN** the stored JSONB values SHALL be `.nan` and `.inf`
+
+#### Scenario: A non-finite mapping key is stored canonically, first key winning
+
+- **WHEN** a note's frontmatter maps `.nan: 1` and, after it, `".nan": 2`
+- **THEN** the stored JSONB object SHALL carry the key `.nan` with the value from the **first** of the two, and the pass SHALL complete
+
+#### Scenario: The note's own bytes are never rewritten
+
+- **WHEN** `set_frontmatter` sets an unrelated key on a note whose frontmatter contains `x: .nan`
+- **THEN** the published block SHALL still contain `x: .nan` byte-identically, and no coerced string form SHALL appear in the note
+
+### Requirement: One title normalization is shared by every consumer that shows a title
+
+The coercion that turns a frontmatter `title` into a displayable string SHALL be a single shared rule applied identically by the indexer's `notes_metadata.title`, by the read path that serves `read_note`, and by the control panel's note viewer.
+
+**That rule SHALL be the indexer's present `_note_title` behaviour** — the sanitised value, falling back to the filename stem when it is falsy, rendered with `str()` and bounded to 512 characters, where the sanitisation stringifies non-string mapping keys and non-JSON scalars *inside* a container before the outer rendering — **with exactly one exception: a non-finite number SHALL render as its canonical YAML token.** The indexer's is the rule to standardise on because it is already the value search results, listings and the panel's lists show, it is bounded to the column's width, and it is the one of the three that a titling incident has already hardened.
+
+The indexer's JSONB sanitisation and its title coercion SHALL be separate functions over the shared token helper rather than one function whose return value silently answers both questions — "what may this value become in a JSONB document?" and "what is this note called?" — because today one function decides both, so a change made for the column silently re-keys titles.
+
+Adopting it changes what the read path and the panel show in three cases besides the non-finite one, and those changes SHALL be stated with their expected outputs rather than discovered: a date inside a container renders as the stringified element (`['2026-08-25']`, not a Python `repr` of a date object); a non-string mapping key renders stringified (`{'1': 'a'}`); and a title longer than 512 characters is bounded to its first 512. A date at the top level, a list of strings, a numeric title, and every falsy title (`0`, `false`, an empty string, an empty list — all of which fall back to the filename stem) SHALL be unchanged.
+
+#### Scenario: A non-finite title agrees across tools
+
+- **WHEN** a note's frontmatter is `title: .nan` and the note is indexed
+- **THEN** `notes_metadata.title`, the `title` field of `read_note`'s response, and the title the control panel shows SHALL all be `.nan`
+
+#### Scenario: A date inside a container
+
+- **WHEN** a note's frontmatter is `title: [2026-08-25]`
+- **THEN** all three surfaces SHALL show `['2026-08-25']`
+
+#### Scenario: A non-string mapping key in a title
+
+- **WHEN** a note's frontmatter title is a mapping with the non-string key `1`
+- **THEN** all three surfaces SHALL show the key stringified, as `{'1': 'a'}` for the value `a`
+
+#### Scenario: A title longer than the column
+
+- **WHEN** a note's frontmatter title is a 600-character string
+- **THEN** all three surfaces SHALL show its first 512 characters
+
+#### Scenario: Ordinary and falsy titles are unaffected
+
+- **WHEN** notes carry a plain string title, a top-level date, a list of strings, a numeric title, and each falsy title (`0`, `false`, `""`, `[]`)
+- **THEN** every one of those SHALL render exactly as the indexer renders it today, with each falsy title falling back to the filename stem
+
+### Requirement: A provider failure is excluded from the pass's embedded count and marks the run
+An embed pass SHALL count into `notes_embedded` only the notes it actually certified, and SHALL route every per-note provider failure — a raised provider call and a returned-vector-count mismatch alike — through the pass's failure accumulator, so that the pass record carries a non-null `error` summarising them beside a truthful `notes_embedded`. The summary SHALL name the failure count, the attempted count, and the class and bounded message of the first failure.
+
+**The exclusion-reconciliation sweep SHALL report into the same accumulator as the hash-mismatch backlog.** On a fully-indexed vault the backlog is empty and the sweep is the only stage making provider calls, so a sweep that swallowed its own failures would reproduce this defect in the one code path a backlog-only fix does not touch.
+
+**`attempted` SHALL be incremented exactly once per note for which an embedding provider call is issued, at that call site and nowhere else.** It SHALL NOT be initialised from the size of the backlog the pass selected, and it SHALL NOT count rows the pass or the sweep decided about without calling the provider.
+
+**"At that call site" means at the point of issuance, not at the point a result is read.** The certification runs after the provider call and can raise — the row moved under it — and a database error can escape anywhere between the two, so a pass that increments from a returned value counts nothing for a note whose call was made, whose provider time was spent, and whose outcome never came back as a result. A stage in which every note lost that race reported an attempted count of zero while consuming the whole stage. The same point SHALL debit the per-tenant chunk budget, and the note SHALL count as having reached a note boundary, so that a tenant losing that race on every note still becomes budget-exhaustible.
+
+That single rule determines every case, and the cases SHALL NOT be enumerated as independent exceptions that could drift apart from it:
+
+- a note whose cleaned content produces no chunks is certified without a provider call, so it counts into `notes_embedded` and **not** into `attempted`;
+- a sweep row whose stored vectors already agree with the current configuration is decided without a call, so it is not an attempt — the sweep scans every certification-current row in the scope, so counting those would render three failures out of three calls as "3 of 16,700";
+- a note skipped by an exclusion pattern, a note whose bytes no longer hash to its row, a note left behind by a pause or a budget stop, and a certification that matched no row all issue no call for that note, so none of them moves the denominator.
+
+None of those SHALL be counted as failures either: each is a deliberate decision rather than something that went wrong.
+
+**The failure summary SHALL NOT present a ratio it cannot support.** Failures that reach the accumulator without a provider call having been issued — a database error around the call, a rollback that itself failed — move the failure count and not the attempted count, so a pass that never reached the provider would otherwise report "1 of 0". "Of 0" asserts that no call was made, which makes the whole line read as a broken counter and costs the operator their trust in the number that reports a real outage. When the failures outnumber the calls, the summary SHALL state the failure count and the call count as two separate facts; otherwise it SHALL keep the ratio.
+
+The in-process "last run" heartbeat SHALL remain unaffected by these swallowed per-note failures. The heartbeat answers "is this process's loop alive" and the run record answers "did the work succeed"; a provider outage leaves the first green and the second failed, and collapsing them would change the heartbeat's meaning.
+
+#### Scenario: A total provider outage marks the run as failed
+
+- **WHEN** every note in a pass's backlog fails at the embedding provider
+- **THEN** the pass's record SHALL carry a non-null `error` naming the failure count, the attempted count and the first failure's class and message
+- **AND** `notes_embedded` on that record SHALL be zero
+- **AND** the record SHALL be distinguishable from the record a pass with an empty backlog writes
+
+#### Scenario: A reconciliation-only outage marks the run as failed
+
+- **WHEN** a pass's backlog is empty, the reconciliation sweep attempts to re-embed notes whose exclusion pattern was removed, and every one of those provider calls fails
+- **THEN** the pass's record SHALL carry a non-null `error`
+- **AND** its attempted count SHALL be the number of notes the sweep actually sent to the provider, not the number of rows it scanned
+
+#### Scenario: A certification that raises after the provider call is still an attempt
+
+- **WHEN** a note's provider call returns and its certification then raises because the row moved
+- **THEN** that note SHALL be counted as an attempt and its submitted chunks SHALL be debited from the tenant's budget
+- **AND** it SHALL NOT be counted as embedded and SHALL NOT be counted as a failure
+- **AND** the note SHALL count as having reached a note boundary
+
+#### Scenario: A repairing sweep counts the notes it certified
+
+- **WHEN** a pass's backlog is empty and the reconciliation sweep re-embeds and certifies two notes whose exclusion pattern was removed, alongside rows that need no call
+- **THEN** `notes_embedded` on that pass's record SHALL be 2
+- **AND** the attempted count SHALL be 2
+
+#### Scenario: A zero-chunk note is embedded but not attempted
+
+- **WHEN** a pass selects 400 backlog rows of which 50 clean to zero chunks and the remaining 350 all embed successfully
+- **THEN** `notes_embedded` SHALL be 400
+- **AND** the attempted count SHALL be 350, because 50 of the notes issued no provider call
+
+#### Scenario: One failing note among many does not suppress the rest
+
+- **WHEN** one note's provider call fails and the remaining notes embed successfully
+- **THEN** `notes_embedded` SHALL count only the successful notes
+- **AND** the record's `error` SHALL name one failure out of the attempted count
+- **AND** the pass SHALL continue to the end of the backlog
+
+#### Scenario: A failure with no provider call is not rendered as a ratio
+
+- **WHEN** a pass records a failure for a note whose provider call was never issued
+- **THEN** the summary SHALL name the failure count and the number of provider calls issued as separate facts
+- **AND** it SHALL NOT read as "of 0"
+
+#### Scenario: Deliberate decisions are not failures
+
+- **WHEN** a pass skips a note because its path matches an exclusion pattern, skips a note whose bytes no longer hash to its row, and stops at a note boundary because the pause flag was set
+- **THEN** none of the three SHALL increment the failure count or the attempted count
+- **AND** a pass in which nothing else went wrong SHALL record a null `error`
+
+#### Scenario: The heartbeat stays green through the outage
+
+- **WHEN** a periodic pass completes with every note failing at the provider
+- **THEN** the in-process last-run heartbeat SHALL record the pass as ok
+- **AND** the pass record SHALL record it as failed
+
+### Requirement: Chunking is capped per note, and a capped note is certified and marked
+The chunker SHALL produce at most `MAX_CHUNKS_PER_NOTE` chunks for one note, keeping the first N in document order. A note that hits the cap SHALL be a **declared degradation**, not a skip and not a refusal: its first N chunks SHALL be embedded, the note SHALL be certified through the ordinary conditional certification, a durable marker (`notes_metadata.chunks_truncated`) SHALL be set on the row and cleared when a later embed of that note fits under the cap, and one ERROR line SHALL name the path and the cap.
+
+**The ERROR line SHALL be emitted only after the certifying transaction has committed.** Logging it before the commit records a permanent truncation in a bounded, process-lifetime error buffer for a write that may then roll back on a failed certification, sending an operator after a note that was never stored that way.
+
+The ERROR line SHALL NOT name the note's true chunk count, which could only be obtained by the unbounded chunking the cap exists to prevent.
+
+The marker SHALL be a column rather than only a log line, for the reason the link-truncation marker is one: the error buffer is bounded and process-lifetime while the truncated vector set persists, and the vector tools would otherwise answer from a note's head as though it were the whole note.
+
+The cap SHALL bound the emptiness probe the exclusion-reconciliation sweep performs as well, so that "this note produces no chunks" means the same thing in both places.
+
+**The configured chunk overlap SHALL be strictly less than the configured chunk size, validated at startup.** The chunker's step is the chunk size minus the overlap, floored at one character to prevent a non-terminating loop; at equality that floor takes effect and the step becomes one character, so a few kilobytes of ordinary prose produce thousands of chunks and every ordinary note in the vault is silently truncated at the cap while the truncation ERROR fires thousands of times. The floor turns a hang into a quiet catastrophe and is not a substitute for rejecting the configuration. The refusal SHALL name both configured values.
+
+#### Scenario: A capped note keeps its first N chunks and is marked
+
+- **WHEN** a note whose cleaned content would produce more than `MAX_CHUNKS_PER_NOTE` chunks is embedded
+- **THEN** exactly `MAX_CHUNKS_PER_NOTE` embedding rows SHALL be written for it, holding the first N chunks in document order
+- **AND** `chunks_truncated` SHALL be true on its row and one ERROR line SHALL name the path and the cap
+- **AND** the note SHALL be certified, so the next pass does not select it again while its content is unchanged
+
+#### Scenario: A truncation that does not commit is not logged
+
+- **WHEN** a capped note's certification matches no row and its transaction is rolled back
+- **THEN** no truncation ERROR line SHALL have been emitted for that attempt
+
+#### Scenario: The marker is cleared when the note fits
+
+- **WHEN** a capped note is edited down to fewer than `MAX_CHUNKS_PER_NOTE` chunks and embedded again
+- **THEN** `chunks_truncated` SHALL be false on its row after that pass
+
+#### Scenario: A capped note is not a skip and does not withhold a re-derive's record
+
+- **WHEN** a re-deriving pass processes a note whose chunking was capped and every other discovered file without a skip
+- **THEN** the pass SHALL record the provenance of the directory it scanned
+- **AND** the capped note SHALL NOT appear in the pass's skip list
+
+#### Scenario: A note under the cap is unaffected
+
+- **WHEN** a note produces fewer chunks than the cap
+- **THEN** every chunk SHALL be embedded, `chunks_truncated` SHALL be false, and no ERROR line SHALL be logged for it
+
+#### Scenario: An overlap equal to the chunk size is refused at startup
+
+- **WHEN** the configured chunk overlap equals or exceeds the configured chunk size
+- **THEN** the server SHALL refuse to start with an error naming both values
+- **AND** it SHALL NOT start with a chunker whose step has collapsed to the floor
+
+### Requirement: The embed pass rotates tenants from a cursor that survives a restart
+The multi-tenant index pass SHALL iterate active users in a deterministic order and SHALL begin each cycle at the user following the one recorded in a **persisted** rotation cursor, wrapping around. The cursor SHALL be advanced to a user's id after that user's per-user pass finishes, whether it succeeded or failed, and SHALL be stored in the database rather than in process memory.
+
+The cursor SHALL record a **user id**, never a positional offset: the active-user list changes when a user is added, deactivated or deleted, so an offset points somewhere else on the next cycle, whereas "resume after this id" is well defined whether or not that user still exists.
+
+Persisting it is the requirement, not an implementation detail. Rotating a list the pass re-fetches every cycle with state that resets on restart is a no-op in exactly the case that matters: a deploy or a crash truncates a pass, and the tenants at the tail — the ones the truncated pass never reached — are the ones an in-memory cursor would send to the tail again.
+
+Operator-triggered reindex paths SHALL NOT consume or advance the cursor, so that a panel action cannot move the periodic pass's rotation.
+
+The cursor is scheduling instrumentation: a failure to write it SHALL be logged and swallowed and SHALL NOT fail the pass.
+
+**A stored cursor value the pass cannot use SHALL be logged once and ignored, and the cycle SHALL begin at the first user in the deterministic order.** The value lives as text in a key/value table, so it can be non-numeric, negative, or larger than any live id through drift, a hand-edited row, or a downgrade. This disposition is deliberately the opposite of the settings fingerprints': a cursor is scheduling state whose worst consequence is an order, while a fingerprint is a claim about what the stored rows *are* and whose worst consequence is a permanently wrong answer. Failing closed on a stray character in a bookkeeping row would stop every tenant's indexing to protect nothing. An out-of-range numeric value needs no separate rule — "the smallest id strictly greater than N" selects nothing and wraps to the first — but it SHALL reach the same outcome rather than raising.
+
+#### Scenario: A malformed cursor does not fail the pass
+
+- **WHEN** the stored rotation cursor is not a valid user id — non-numeric, negative, or otherwise unusable
+- **THEN** the pass SHALL log it once and begin the cycle at the first user in the deterministic order
+- **AND** the pass SHALL complete normally and SHALL NOT raise
+
+#### Scenario: An out-of-range cursor wraps
+
+- **WHEN** the stored cursor is a number larger than every active user id
+- **THEN** the cycle SHALL begin at the first user in the deterministic order
+
+#### Scenario: A truncated pass resumes where it stopped
+
+- **WHEN** a pass serving users in the order A, B, C finishes A and B and the process restarts before C
+- **THEN** the first pass after the restart SHALL begin at C
+
+#### Scenario: The cursor survives the tenant it names
+
+- **WHEN** the cursor records a user who is then deleted
+- **THEN** the next cycle SHALL begin at the smallest active user id greater than the recorded one, wrapping if none is greater
+- **AND** the pass SHALL NOT fail on the missing user
+
+#### Scenario: A complete cycle wraps
+
+- **WHEN** a pass serves every active user without interruption
+- **THEN** the cursor SHALL name the last user served and the next cycle SHALL begin at the first user in the deterministic order
+
+#### Scenario: A manual reindex does not move the rotation
+
+- **WHEN** an operator triggers a reindex from the control panel
+- **THEN** the rotation cursor SHALL be unchanged by that request
+
+#### Scenario: Recording the cursor cannot fail a pass
+
+- **WHEN** the cursor write raises
+- **THEN** the failure SHALL be logged and swallowed, and the pass's own outcome SHALL be unaffected
+
+### Requirement: A per-tenant embed budget is checked only at a note boundary
+The embed pass SHALL bound the work it performs for one user in one pass by a configurable chunk budget and a configurable wall-clock budget, and SHALL evaluate that bound **only between notes**, at the same points the pause flag is already checked. It SHALL NOT abandon a note that has already begun embedding.
+
+**The chunk budget SHALL be debited by the chunks a note *submitted* to the provider, never by the chunks it stored.** Every provider call debits what it sent, whatever came back: a call that raised and a call that returned the wrong number of vectors debit exactly as a successful one does. A budget debited by stored chunks is not debited at all when the provider fails, so a tenant whose notes all fail would consume the whole pass, every pass, without ever reaching its bound — the starvation this requirement exists to stop, reappearing inside it. The wall-clock budget does not cover that case, because an operator may disable it and keep only the chunk budget.
+
+Mid-note preemption is forbidden because a note is certified only on full coverage of its requested chunks: a note abandoned between chunks is left uncertified, is re-selected by the backlog on the next pass, and re-performs every provider call it already made — a burn that repeats for as long as the note stays over budget and that no pass can ever finish. Bounding at the note boundary means the overrun is at most one note, which the per-note chunk cap has already bounded.
+
+**The bound this provides SHALL be stated as the budget plus one note's embedding time**, and one note's embedding time is bounded by the chunk cap multiplied by the provider's per-call timeout, not by any aggregate deadline. That arithmetic worst case is hours on a provider answering every call at the edge of its timeout, and it is an **accepted limitation**: the alternative is an aggregate deadline, which is the construct that produced a note the pass could never finish and which SHALL NOT be reintroduced.
+
+**This requirement's fairness claim covers the embedding stage only.** The scan and the one-shot link backfill run before it in each user's sequence and are deliberately not budgeted: each is a single transaction over a walk of the vault, so stopping one part-way means either committing a partial derive — which the re-derive completeness rule forbids — or discarding the pass's work, and neither is a cheap bound. This scoping SHALL be documented rather than left implied, so that "one tenant cannot starve another" is not read as a claim about the whole pass.
+
+The pass SHALL process **at least one note** for a user before the budget can stop it, so that a user whose first note alone exceeds the budget still advances by one note per pass rather than never advancing.
+
+The budget SHALL be enforced only when the pass is serving more than one active user scope. With a single scope there is no other tenant for the budget to be fair to, and stopping there would only spread an initial index across several passes.
+
+A budget stop SHALL NOT be recorded as a failure and SHALL NOT be written into the pass record's `error`: it is a deliberate decision of the same class as a pause, and recording it as an error would make a healthy server report the outage signal. It SHALL be logged once per user per pass, and the remaining backlog SHALL remain visible as the pending count the panel reports.
+
+Both the hash-mismatch backlog and the exclusion-reconciliation sweep SHALL draw on the same per-user budget, since both call the embedding provider. A sweep stopped by the budget SHALL behave exactly as a sweep stopped by the pause flag: it stops between notes, already-repaired rows stay repaired, and the next unpaused pass runs a fresh sweep.
+
+#### Scenario: One tenant's backlog does not consume the whole embed stage
+
+- **WHEN** two users are active, the first has a backlog far exceeding the chunk budget, and a pass runs
+- **THEN** the first user's embedding SHALL stop at a note boundary once the budget is exhausted
+- **AND** the second user's notes SHALL be indexed and embedded in that same pass
+
+#### Scenario: A note in flight is never abandoned
+
+- **WHEN** the budget is exhausted partway through a note's chunks
+- **THEN** the pass SHALL finish that note's chunks and certify it
+- **AND** the stop SHALL take effect before the next note begins
+
+#### Scenario: A single oversized note still makes progress
+
+- **WHEN** a user's first note alone consumes more than the entire chunk budget
+- **THEN** that note SHALL be embedded and certified in that pass
+- **AND** the user SHALL advance by one note per pass rather than being blocked indefinitely
+
+#### Scenario: A failing provider still debits the budget
+
+- **WHEN** the wall-clock budget is disabled, a user's notes each submit chunks to the provider, and every one of those calls fails
+- **THEN** the chunk budget SHALL be debited by the chunks each call submitted
+- **AND** the user's embedding SHALL stop at a note boundary once the budget is exhausted, rather than continuing for the whole pass
+
+#### Scenario: A certification race still debits the budget
+
+- **WHEN** the wall-clock budget is disabled and every one of a user's notes has its certification raise after the provider call returned
+- **THEN** the chunk budget SHALL be debited by the chunks each of those calls submitted
+- **AND** the user's embedding SHALL stop at a note boundary once the budget is exhausted, rather than continuing for the whole pass
+
+#### Scenario: A cardinality mismatch debits the budget
+
+- **WHEN** a provider call returns the wrong number of vectors for a note
+- **THEN** the chunks that call submitted SHALL be debited from the budget
+
+#### Scenario: A budget stop is not an error
+
+- **WHEN** a pass stops a user at the budget and nothing else goes wrong
+- **THEN** the pass record's `error` SHALL be null and its failure count SHALL be zero
+- **AND** one warning SHALL be logged naming the user and the budget
+
+#### Scenario: A single-scope deployment is unbudgeted
+
+- **WHEN** the pass serves exactly one scope — single-user mode, or a multi-user deployment with one active user — and that scope's backlog exceeds the budget
+- **THEN** the pass SHALL embed the whole backlog without stopping at the budget
+
+#### Scenario: A budget-stopped sweep converges on a later pass
+
+- **WHEN** the exclusion-reconciliation sweep is stopped by the budget partway through
+- **THEN** already-repaired rows SHALL stay repaired
+- **AND** the next unbudgeted-or-unexhausted pass SHALL run a fresh sweep that completes the remainder
+
+#### Scenario: The scan is not budgeted
+
+- **WHEN** a user's scan and link backfill run before that user's embed stage in the same pass
+- **THEN** neither SHALL be stopped by the embed budget
+- **AND** the delay they can impose on a later tenant SHALL be recorded as a declared residual rather than as a bound this requirement provides
 

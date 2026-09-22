@@ -1005,3 +1005,127 @@ The database engine SHALL set `pool_timeout` explicitly (30 seconds, the library
 - **WHEN** every pooled connection is checked out and a further session requests one
 - **THEN** the request SHALL fail after the configured `pool_timeout` with the library's timeout error
 
+### Requirement: Every capability-token refusal SHALL be recorded server-side without weakening the uniform 404
+
+Each refusal that the bearer-protected transfer endpoints answer with the uniform 404 SHALL emit one structured server-side record naming the reason the response deliberately withholds, the request route and method, the trusted client address, and — where a token was presented — its redacted SHA-256 tag; and the response SHALL remain identical in status, headers and body across every refusal cause. The reason SHALL come from a typed refusal result carrying a reason code and, where one resolved, the token row: the predicates that decide the refusal SHALL be unchanged, and the reasons those predicates collapse SHALL be separated afterwards by a **read-only diagnosis** that takes no admission decision, is performed only once a suppression permit for the record has been acquired, and is never performed for a request that was not refused. A failure of the diagnosis itself SHALL NOT change the response: it SHALL be caught outside the admission decision, SHALL produce a best-effort record naming a diagnosis-failure reason, and the endpoint SHALL still return its uniform refusal. The refusal decided by the locked pre-publication gate SHALL carry a single generic reason, because that gate exposes no cause — an accepted limitation, meaning an operator cannot distinguish a revoked credential from a reassigned root within that window. That diagnosis SHALL apply a **total precedence** — no row for the token hash, then a direction mismatch, then the row's state, then expiry, then a lost claim race — so that a row matching more than one condition always yields the same reason. The suppression subject for these records SHALL be the trusted client address, which is known before the diagnosis runs. The record SHALL carry the minting identity (`user_id`, `key_id` or `oauth_token_id`) only on the branches where a token row actually resolved, SHALL carry no tag when no token was presented, and SHALL never carry the token itself or any prefix of it. Refusal records SHALL be subject to the shared per-subject rate limit, so an enumeration burst cannot flood the log sink — and because the diagnosis runs behind that limit, it cannot amplify the load either.
+
+#### Scenario: Distinct reasons, one response
+
+- **WHEN** `/transfer/upload/info` is requested with no `Authorization` header, an unknown token, an expired token, a completed upload token, a token minted by a since-revoked API key, and a token minted for a user whose vault root was since reassigned
+- **THEN** every response SHALL be identical in status, headers and body, and six records SHALL be emitted carrying six distinct reason codes
+
+#### Scenario: The set of accepted tokens is unchanged
+
+- **WHEN** the full existing redemption suite runs with the refusal logging in place
+- **THEN** every token that redeemed before SHALL still redeem, every token that was refused before SHALL still be refused, and the diagnosis SHALL never change an outcome
+
+#### Scenario: The tag correlates without disclosing
+
+- **WHEN** the same unknown token is presented repeatedly
+- **THEN** every record SHALL carry the same `token_tag` of the form `sha:` plus eight hexadecimal characters, and no record SHALL contain any substring of the token twelve characters or longer
+
+#### Scenario: No credential, no tag
+
+- **WHEN** a bearer-protected transfer endpoint is requested with no `Authorization` header
+- **THEN** the record SHALL carry the missing-credential reason and SHALL have no `token_tag` field
+
+#### Scenario: No identity is invented
+
+- **WHEN** a refusal occurs before any token row resolved
+- **THEN** the record SHALL carry the reason, the route and the client address, and SHALL carry no user, key or OAuth token identifier
+
+#### Scenario: A failed diagnosis still returns the uniform refusal
+
+- **WHEN** the diagnosis read fails — a dead connection or an exhausted pool — on a request that was already refused
+- **THEN** the response SHALL be byte-identical to any other refusal, and the record SHALL name a diagnosis-failure reason rather than being lost or raised
+
+#### Scenario: Overlapping conditions resolve by the declared precedence
+
+- **WHEN** a token is both expired and consumed, and separately a token is both expired and of the wrong direction
+- **THEN** the first SHALL be reported as consumed and the second as a direction mismatch, and both SHALL still return the uniform response
+
+#### Scenario: The accepted and the suppressed path both pay nothing
+
+- **WHEN** a redemption succeeds, and separately when a refusal's source is already at its per-window allowance
+- **THEN** no diagnosis read SHALL be issued in either case and no refusal record SHALL be emitted, while the refused request SHALL still return the uniform response
+
+#### Scenario: A publication refusal keeps its existing record
+
+- **WHEN** a mount-boundary or unsupported-filesystem refusal occurs on the upload route
+- **THEN** the existing 503 responses and their existing log lines SHALL be unchanged
+
+### Requirement: A capability SHALL NOT be redeemed while its owner is named by the quarantine snapshot
+The transfer redemption gate SHALL refuse a capability whose owning user the published quarantine snapshot names, for either reason, and SHALL also refuse while no snapshot has been published in this process. It SHALL refuse in the same place and the same manner as it already refuses a capability whose owner has become inactive or whose vault root no longer matches the one pinned at mint.
+
+A capability is a delayed write — or a delayed read — into a root, authorised at mint and redeemed later on the public `/transfer/*` routes, which carry no OAuth chain and never call the vault-root admission gate. A token minted before the condition appeared pins a `vault_root` that is still, byte for byte, the owner's current assignment, so every existing check agrees and the redemption proceeds into a directory the server has just determined is shared with another tenant, or into one whose status it could not establish. Refusing every MCP tool while leaving an outstanding capability redeemable would leave the cross-tenant write reachable through the one path designed to outlive the session that created it.
+
+The gate is where this belongs because it already re-reads the owner row and already fails closed on what it finds there; the check is one more condition at a point whose refusal semantics, error surface and locking are already established.
+
+#### Scenario: An upload capability minted before the quarantine is refused
+
+- **WHEN** a capability was minted while its owner's root was unambiguous, the owner is subsequently named by the snapshot for an overlap, and the capability is presented for upload
+- **THEN** the redemption SHALL be refused
+- **AND** no byte SHALL be published into the vault
+
+#### Scenario: A download capability is refused on the same condition
+
+- **WHEN** the same owner's outstanding download capability is presented
+- **THEN** the redemption SHALL be refused
+- **AND** no vault content SHALL be streamed
+
+#### Scenario: An unexaminable root refuses redemption too
+
+- **WHEN** the owner is named by the snapshot because their root could not be examined
+- **THEN** the redemption SHALL be refused, for the same reason it is refused for an overlap: the root's status could not be established
+
+#### Scenario: An unpublished snapshot refuses redemption
+
+- **WHEN** a capability is presented in a process where no snapshot has been published
+- **THEN** the redemption SHALL be refused rather than proceeding against roots nothing has checked
+
+#### Scenario: Minting is already refused
+
+- **WHEN** a user the snapshot names calls `request_upload`, `request_download` or `import_from_url`
+- **THEN** the call SHALL be refused by the tool admission gate, so no new capability is minted
+
+#### Scenario: An unrelated owner's capability is unaffected
+
+- **WHEN** a capability owned by an active user the snapshot does not name is presented
+- **THEN** the redemption SHALL proceed exactly as before
+
+#### Scenario: A corrected condition restores redemption
+
+- **WHEN** the condition is corrected, a later snapshot no longer names the owner, and an unexpired capability whose pinned root still matches the owner's assignment is presented
+- **THEN** this requirement SHALL NOT refuse it
+
+#### Scenario: Single-user mode is unaffected
+
+- **WHEN** the server runs in single-user mode, where a capability's owner is the ownerless single-user shape and the root comes from settings
+- **THEN** no quarantine test SHALL apply and redemption SHALL behave exactly as it does today
+
+### Requirement: Upload redemption is bounded by the minting principal's write rate
+
+`PUT /transfer/upload` SHALL consume one token of the write rate bucket belonging to the principal that **minted** the capability, before any request body is read and before any bytes are staged, so that vault writes performed by redeeming a capability are bounded by the same rate as vault writes performed through the write tools. The principal SHALL be derived from the transfer token row and the minting credential that identity resolution already loads — `("api_key", key_id)` where the row names a key, and `("oauth", grant_id)` from the minting token row — requiring no additional query and no schema change. A redemption refused by the bucket SHALL return **HTTP 429** with a `Retry-After` header and SHALL **release the claim** rather than consuming it, mirroring the treatment a queue-timeout 503 already receives, so a refused redemption can be retried against the same capability once the bucket refills. The refusal SHALL NOT stage, publish or delete any bytes.
+
+Minting SHALL NOT consume the write bucket: `request_upload`, `request_download` and `check_upload` create or read capability rows only, and charging both mint and redemption would bill one write twice.
+
+#### Scenario: Redemptions above the write rate are refused
+
+- **WHEN** the principal that minted a set of upload capabilities redeems them faster than the write rate allows
+- **THEN** the excess redemptions SHALL receive HTTP 429 with `Retry-After`, no bytes SHALL be staged or published for them, and the writes SHALL NOT have escaped the write rate by using the transfer route
+
+#### Scenario: A refused redemption releases its claim
+
+- **WHEN** a redemption is refused by the write bucket
+- **THEN** the claim SHALL be released rather than consumed, and the same capability SHALL be redeemable once the bucket has refilled and while the token is still valid
+
+#### Scenario: The bucket belongs to the minter, not the presenter
+
+- **WHEN** a capability minted by one principal is redeemed
+- **THEN** the tokens SHALL be drawn from the minting principal's write bucket, so a capability cannot be used to spend another principal's allowance
+
+#### Scenario: Minting alone consumes no write tokens
+
+- **WHEN** a principal calls `request_upload` or `request_download` without redeeming
+- **THEN** no write-bucket token SHALL be consumed
+
