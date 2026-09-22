@@ -170,6 +170,38 @@ update it in the same change.** What stays here is the short list:
   leases remain held through telemetry. Its pool budget leaves four shared
   connections of headroom, not a reservation against other consumers. See
   [rate limits](docs/architecture/rate-limits.md) before changing settings.
+- **`TRUSTED_PROXY_IPS` is the single control of forwarded-header trust**
+  (#189). It is validated at boot, stored **canonicalised** (`192.168.0.10/24`
+  → `192.168.0.0/24`, because uvicorn's middleware silently matches nothing on
+  a host-bit CIDR), logged once at startup, and it drives the app's
+  `ProxyHeadersMiddleware`. uvicorn's own layer is switched **off**
+  (`--no-proxy-headers` in the Dockerfile and every compose `command:`
+  override) — it rewrites the client address *before* the app's middleware
+  runs, so a narrowed setting could not undo it. Do not re-enable it or set
+  `FORWARDED_ALLOW_IPS`.
+- **The panel login has a per-account failed-login budget** (10 / 15 min,
+  `PANEL_LOGIN_FAILURE_*`), additive to the 5/min address limit. It is an
+  exact in-process map keyed by `users.id`, consulted *before*
+  `verify_password`, counts only failures against an existing row (an unknown
+  username gets no account budget), and refuses with a response that is
+  content-identical to an ordinary failed login — not a 429, not a lockout;
+  the window expires on its own. The new timing signal (attempt 11 skips
+  bcrypt) is an accepted limitation.
+- **Unused dynamically registered OAuth clients expire** (#194).
+  `oauth_clients.last_used_at` is stamped by consent approval, code exchange
+  and refresh; migration 025 stamped every pre-existing row, so **NULL means
+  "registered after 025 and never used"** and nothing registered before 025 is
+  ever swept. The periodic cleanup deletes NULL-marked, unclaimed clients older
+  than `OAUTH_CLIENT_UNUSED_EXPIRY_DAYS` (30; `null` disables, `0` is refused)
+  with no child rows, via `FOR UPDATE SKIP LOCKED` and a re-check *inside* the
+  lock — a single `DELETE … WHERE NOT EXISTS` cascades away a just-issued code
+  under READ COMMITTED. See [oauth and grants](docs/architecture/oauth-and-grants.md).
+- **Machine-facing paths refuse plaintext HTTP** (#196): a priority-200
+  Traefik router on the `http` entrypoint, in `docker-compose.yml`'s labels,
+  answers 403 via `ipAllowList` on `192.0.2.0/32` for `/mcp`, `/transfer`,
+  `/health`, `/token`, `/register`, `/revoke`, `/.well-known` (except the ACME
+  challenge) and the Bearer-qualified root. Browser paths keep redirecting.
+  The documentation range is the mechanism, not a placeholder — do not "fix" it.
 - **Tool-body outcomes are typed internally.** Only the terminal `BodyOutcome`
   (or `ReadNoteResult` private outcome) drives usage classification; never
   infer failure from prose or a note's forged `MCP-REFUSAL` text. Partial writes
