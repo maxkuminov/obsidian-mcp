@@ -30,6 +30,7 @@ from src.services.index_state import (
     state_table_exists,
 )
 from src.services.links import BODY, scan_fences
+from src.services.transport_security import embedding_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -537,7 +538,7 @@ class OllamaProvider:
     (often infrequent) calls instead of paying a cold reload each time."""
 
     async def embed_one(self, text: str) -> list[float]:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with embedding_http_client(30.0) as client:
             response = await client.post(
                 f"{settings.ollama_url}/api/embed",
                 json={
@@ -611,7 +612,7 @@ class OpenAIProvider:
         }
 
         last_exc: Exception | None = None
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with embedding_http_client(60.0) as client:
             for attempt in range(1, self.MAX_ATTEMPTS + 1):
                 try:
                     response = await client.post(url, headers=headers, json=payload)

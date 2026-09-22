@@ -431,6 +431,19 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_embedding_model: str = "text-embedding-3-small"
+    # ── Embedding transport (#185) ─────────────────────────────────────────
+    #
+    # The **active** provider's URL (`OLLAMA_URL` or `OPENAI_BASE_URL`) must be
+    # `https`, or `http` to a literal loopback host — or `http` to anything
+    # else only when this override is true. Default false (owner decision
+    # 2026-09-22): an `http://` URL never becomes encrypted by itself, so the
+    # plaintext hop has to be a written decision in the operator's `.env`.
+    # See "Embedding providers" in docs/architecture/indexing-and-embeddings.md.
+    embedding_allow_plaintext: bool = False
+    # Pins the trust anchor for an `https` embedding endpoint to this PEM file
+    # only (replacing certifi's bundle; the OS store is never consulted).
+    # Parsed once, at settings construction, in every mode including sandbox.
+    embedding_ca_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
 
     # Caps for the raw file-access tools (read_file / write_file). Read is
     # checked against on-disk size before reading; write against the decoded
@@ -1266,6 +1279,54 @@ class Settings(BaseSettings):
         if self.embedding_provider == "openai" and not (self.openai_api_key or "").strip():
             raise ValueError(
                 "OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai"
+            )
+        return self
+
+    # The `ssl.SSLContext` parsed from `EMBEDDING_CA_FILE` by the validator
+    # below, or `None`. Reused by `embedding_http_client`; the file is never
+    # re-read.
+    _embedding_ssl_context: Any = PrivateAttr(default=None)
+
+    @property
+    def embedding_ssl_context(self):
+        """The parsed `EMBEDDING_CA_FILE` context, or `None` (certifi applies)."""
+        return self._embedding_ssl_context
+
+    @model_validator(mode="after")
+    def _validate_embedding_transport(self) -> "Settings":
+        """Design D6: the active embedding URL's scheme policy and the CA file.
+
+        The CA file is checked and **parsed in every mode**, sandbox included:
+        a broken trust anchor is a broken configuration whatever the process
+        is for. Everything that depends on the endpoint URL — the scheme
+        policy and the CA-with-`http` refusal — is skipped under
+        `MCP_SANDBOX_MODE`, which never calls a provider. The inactive
+        provider's URL is never dialled and is therefore never validated.
+        """
+        from src.services.transport_security import (
+            check_embedding_url_policy,
+            load_embedding_ca_context,
+        )
+
+        self._embedding_ssl_context = (
+            load_embedding_ca_context(self.embedding_ca_file)
+            if self.embedding_ca_file is not None
+            else None
+        )
+        if self.mcp_sandbox_mode:
+            return self
+        if self.embedding_provider == "openai":
+            setting, url = "OPENAI_BASE_URL", self.openai_base_url
+        else:
+            setting, url = "OLLAMA_URL", self.ollama_url
+        endpoint = check_embedding_url_policy(
+            url, setting=setting, allow_plaintext=self.embedding_allow_plaintext
+        )
+        if self.embedding_ca_file is not None and endpoint.scheme != "https":
+            raise ValueError(
+                f"EMBEDDING_CA_FILE is set but {setting} uses plaintext http, "
+                "where a trust anchor verifies nothing. Use an https endpoint "
+                "or unset EMBEDDING_CA_FILE."
             )
         return self
 

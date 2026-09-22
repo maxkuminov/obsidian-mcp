@@ -438,3 +438,190 @@ async def check_database_transport() -> None:
         tls_version or "-",
         mode in VERIFYING_DB_MODES,
     )
+
+
+# ── Embedding endpoint ──────────────────────────────────────────────────────
+
+
+class EmbeddingEndpoint(NamedTuple):
+    scheme: str
+    host: str
+    port: int
+    is_loopback: bool
+
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def classify_embedding_url(url: str, setting: str = "the embedding URL") -> EmbeddingEndpoint:
+    """Parse an embedding endpoint the way the HTTP client will (D6 rules 0–1).
+
+    The raw string is checked first — no surrounding whitespace, no C0 control
+    character or DEL anywhere — so the string approved here is byte-for-byte
+    the one the providers interpolate. It is then parsed with `httpx.URL`, the
+    clients' own parser (`urlsplit` strips and removes characters httpx does
+    not). Raises `ValueError` naming `setting`; never echoes userinfo.
+    """
+    if not isinstance(url, str) or not url:
+        raise ValueError(f"{setting} is empty")
+    if url != url.strip():
+        raise ValueError(f"{setting} has leading or trailing whitespace")
+    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in url):
+        raise ValueError(f"{setting} contains a control character")
+    try:
+        parsed = httpx.URL(url)
+    except Exception:  # noqa: BLE001 - httpx's message may echo the URL
+        raise ValueError(f"{setting} is not a valid URL") from None
+    scheme = parsed.scheme
+    if scheme not in _DEFAULT_PORTS:
+        raise ValueError(f"{setting} must use http or https")
+    if parsed.userinfo:
+        raise ValueError(
+            f"{setting} must not carry credentials (user:password@) in the URL"
+        )
+    host = parsed.host
+    if not host:
+        raise ValueError(f"{setting} has no host")
+    port = parsed.port if parsed.port is not None else _DEFAULT_PORTS[scheme]
+    if not 1 <= port <= 65535:
+        raise ValueError(f"{setting} has an invalid port")
+
+    from src.config import _is_loopback_host
+
+    return EmbeddingEndpoint(scheme, host, port, _is_loopback_host(host))
+
+
+def check_embedding_url_policy(
+    url: str, *, setting: str, allow_plaintext: bool
+) -> EmbeddingEndpoint:
+    """D6 rules 0–4: `https`, loopback `http`, or `http` under the override."""
+    endpoint = classify_embedding_url(url, setting)
+    if endpoint.scheme == "http" and not endpoint.is_loopback and not allow_plaintext:
+        raise ValueError(
+            f"{setting} uses plaintext http to the non-loopback host "
+            f"{endpoint.host!r}, so every chunk and query would cross the "
+            "network unencrypted. Use an https endpoint (with EMBEDDING_CA_FILE "
+            "for an internal CA), or set EMBEDDING_ALLOW_PLAINTEXT=true to "
+            "acknowledge the plaintext hop."
+        )
+    return endpoint
+
+
+def check_certificate_file(path: str, setting: str) -> None:
+    """Exists, is a regular file, is readable — or `ValueError` naming `setting`."""
+    import stat
+
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        raise ValueError(f"{setting} names a file that does not exist") from None
+    except OSError as exc:
+        raise ValueError(f"{setting} cannot be inspected ({type(exc).__name__})") from None
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"{setting} does not name a regular file")
+    if not os.access(path, os.R_OK):
+        raise ValueError(f"{setting} names a file this process cannot read")
+
+
+def load_embedding_ca_context(path: str) -> ssl.SSLContext:
+    """Parse `EMBEDDING_CA_FILE` once, at settings construction (D6).
+
+    `ssl.create_default_context(cafile=…)` loads only that file — no system
+    store — and the result is the trust anchor every embedding client uses.
+    """
+    check_certificate_file(path, "EMBEDDING_CA_FILE")
+    try:
+        ctx = ssl.create_default_context(cafile=path)
+    except (ssl.SSLError, OSError, ValueError) as exc:
+        raise ValueError(
+            "EMBEDDING_CA_FILE could not be loaded as a PEM CA certificate "
+            f"({type(exc).__name__})"
+        ) from None
+    if not ctx.get_ca_certs():
+        raise ValueError("EMBEDDING_CA_FILE contains no CA certificate")
+    return ctx
+
+
+_certifi_context: ssl.SSLContext | None = None
+
+
+def certifi_ssl_context() -> ssl.SSLContext:
+    """The default embedding trust anchor: certifi's bundle, built once.
+
+    What `verify=True` already meant under httpx; stated explicitly so the
+    choice does not depend on `trust_env` and the report can name it. The
+    operating-system store is never consulted.
+    """
+    global _certifi_context
+    if _certifi_context is None:
+        import certifi
+
+        _certifi_context = ssl.create_default_context(cafile=certifi.where())
+    return _certifi_context
+
+
+def embedding_http_client(timeout: float) -> httpx.AsyncClient:
+    """The only way to build an HTTP client aimed at the embedding endpoint (D7).
+
+    * `trust_env=False` — no `HTTP(S)_PROXY`/`ALL_PROXY` routing, no
+      `SSL_CERT_FILE`/`SSL_CERT_DIR` replacing the trust anchor, no `.netrc`.
+      The policy judged the URL; with the environment off, the URL is the hop.
+    * `verify=` the context parsed from `EMBEDDING_CA_FILE` at settings
+      construction (never re-read), else certifi's bundle.
+    * `follow_redirects=False` — a redirect is how a validated `https`
+      endpoint could hand the request to an `http://` one after boot.
+    """
+    from src.config import settings
+
+    ctx = settings.embedding_ssl_context or certifi_ssl_context()
+    return httpx.AsyncClient(
+        timeout=timeout,
+        verify=ctx,
+        follow_redirects=False,
+        trust_env=False,
+    )
+
+
+def log_embedding_transport() -> None:
+    """D8: one INFO line for the embedding hop, plus the event for plaintext.
+
+    Scheme, host and port only — the URL's path, query and userinfo never
+    reach the line. A non-loopback `http` endpoint (admitted only by
+    `EMBEDDING_ALLOW_PLAINTEXT`) also emits `internal_transport_plaintext`
+    with `reason=embedding outcome=override`; loopback `http` does not.
+    """
+    from src.config import settings
+    from src.services import security_events
+
+    provider = settings.embedding_provider
+    if provider == "openai":
+        setting, url = "OPENAI_BASE_URL", settings.openai_base_url
+    else:
+        setting, url = "OLLAMA_URL", settings.ollama_url
+    try:
+        endpoint = classify_embedding_url(url, setting)
+    except ValueError as exc:
+        # Unreachable after the settings validator; report without the URL.
+        logger.error("Embedding transport: provider=%s unparseable (%s)", provider, exc)
+        return
+    plaintext_remote = endpoint.scheme == "http" and not endpoint.is_loopback
+    if endpoint.scheme == "http":
+        verify = "n/a"
+    elif settings.embedding_ssl_context is not None:
+        verify = "ca-file"
+    else:
+        verify = "certifi"
+    logger.info(
+        "Embedding transport: provider=%s scheme=%s host=%s port=%s verify=%s "
+        "plaintext_override=%s",
+        provider,
+        endpoint.scheme,
+        endpoint.host,
+        endpoint.port,
+        verify,
+        plaintext_remote,
+    )
+    if plaintext_remote:
+        security_events.emit(
+            "internal_transport_plaintext", reason="embedding", outcome="override"
+        )

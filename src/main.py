@@ -37,7 +37,10 @@ from src.services.index_state import (
     state_table_exists,
 )
 from src.services.indexer import run_indexer_loop
-from src.services.transport_security import check_database_transport
+from src.services.transport_security import (
+    check_database_transport,
+    log_embedding_transport,
+)
 from src.services.rate_limits import flush_all
 from src.services import concurrency
 from src.services import vault_fs
@@ -469,9 +472,10 @@ async def lifespan(app: FastAPI):
         _check_mount_identity_support()
         # First database contact, deliberately: a strict `DATABASE_SSL_MODE`
         # whose session is not encrypted (or cannot be established) must fail
-        # as itself, not as whatever the first query happened to be. Below the
-        # sandbox short-circuit (#184).
+        # as itself, not as whatever the first query happened to be. Then the
+        # embedding hop's line. Both below the sandbox short-circuit (#184/#185).
         await check_database_transport()
+        log_embedding_transport()
         await _check_embedding_dim()
         await _check_pgvector_version()
         await _validate_fts_configs()
