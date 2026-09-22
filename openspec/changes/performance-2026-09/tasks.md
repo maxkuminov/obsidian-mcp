@@ -15,12 +15,12 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 | File | S1 | S2 | S3 | S4 | S5 |
 | --- | --- | --- | --- | --- | --- |
 | `src/mcp_server/tools.py` | `_insert_usage` only | `list_notes_impl`, `get_recent_impl`, `find_orphans_impl`, `get_neighborhood_impl`'s hydration (`meta_stmt`) | `move_note_impl`'s `nm_update` `.values(...)` only | `find_related_stmt` and `find_related_impl`'s vector statement / re-sort | — |
-| `src/services/embeddings.py` | — | `semantic_search` | `embed_note` from its first line down to `chunk_text_bounded(...)` (the clean+chunk offload) | `semantic_search` query expression, full-precision re-sort, and the `random_page_cost` comment (on top of S2) | `OllamaProvider`, `OpenAIProvider`, `get_provider`/client lifecycle, and `embed_note` from the provider call to the insert loop (reuse) |
+| `src/services/embeddings.py` | — | `semantic_search` | `embed_note`'s `clean_for_embedding(...)` + `chunk_text_bounded(...)` statements only (wrapping them in `to_thread`) | `semantic_search` query expression, full-precision re-sort, and the `random_page_cost` comment (on top of S2) | `OllamaProvider`, `OpenAIProvider`, `get_provider`/client lifecycle, and all of `embed_note` **after** chunking: the post-chunking reuse lookup (before the provider call), the provider call and accounting, `_generation_matches`' reused-row check, and the delete/insert loop |
 | `src/services/indexer.py` | — | — | `_index_vault_pinned` and its helpers, `_scan_vault` (new), the backlog read/parse (`_embed_vault_pinned` lines ~3240–3310), `_reconcile_exclusions`, `run_indexer_loop` (backstop scheduling) | the prewarm block: `_HNSW_INDEX_NAME`, `_hnsw_index_exists`, `probe_statement` | — |
 | `src/models/db.py` | — | `NoteMetadata.content_tsvector` column line | the four `stat_*` columns (after `modified_at`) and the CHECK, **appended as the last element** of `NoteMetadata.__table_args__`, plus its marker constant | `NoteEmbedding.__table_args__` (drop the `vector` HNSW `Index` if the gate passes), plus a comment on the reloptions above `NoteMetadata.__table_args__` | — |
 | `src/config.py` | — | — | `index_stat_shortcut`, `index_full_hash_interval_hours`, immediately after `index_interval_seconds` | — | `ollama_embed_batch_size`, immediately after `ollama_keep_alive` |
 | `src/services/vault.py` | `apply_user_vault_row` (new, directly below `warm_user_vault_cache`) | — | — | — | — |
-| `src/control_panel/routes.py` | — | — | `_reindex_background` / `trigger_reindex` (force a full-hash pass) | `reset_embeddings`' index DDL (through `vector_index`) | — |
+| `src/control_panel/routes.py` | — | — | `_reindex_background` / `trigger_reindex` (force a full-hash pass), plus **one line each** in `reset_embeddings` and `trigger_reembed` calling `indexer.clear_sweep_state()`, placed beside `invalidate_hnsw_index_cache()` and outside the DDL block | `reset_embeddings`' index DDL (through `vector_index`); S4 rebases onto S3's call line and does not move it | — |
 | `src/main.py` | — | — | — | — | lifespan shutdown: close the provider client |
 | `.env.example` | — | — | the two index settings | — | `OLLAMA_EMBED_BATCH_SIZE` |
 | `Makefile` | — | — | — | `db-vacuum-notes` target | — |
@@ -32,8 +32,11 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 **Base check, first thing in every brief.** Agent worktrees branch from `origin/main`, not from local HEAD. Each brief must confirm the following, and stop and report if any check fails:
 - `openspec/changes/performance-2026-09/proposal.md` exists.
-- `alembic/versions/` ends at `025_oauth_client_last_used.py`, or at 026 for S4.
-- For S5 only: `src/services/transport_security.py` defines `embedding_http_client`.
+- The migration head matches the slice's merged prerequisites:
+  - **S1 and S2:** `alembic/versions/` ends at `025_oauth_client_last_used.py`, or at 026/027 if S3/S4 have already merged. Neither slice cares which.
+  - **S3:** it ends at `025`.
+  - **S4:** it ends at `026_note_stat_columns.py`, and S2's projected `semantic_search` is present.
+  - **S5:** `026_note_stat_columns.py` exists (S3 merged); the head may be `026` or `027`. `src/services/transport_security.py` defines `embedding_http_client` (#284 merged). `_scan_vault` exists in `indexer.py`.
 
 **Integration tests.** Every slice that changes database behaviour runs `make test-integration`. A local `pytest tests` run skips `tests/integration/`, so it does not count as proof. `make test-integration` and `make test-schema` share a container and port: never run them concurrently.
 
@@ -85,9 +88,9 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - Set `similarity = 1 - float(distance)`.
   - Remove the NumPy recomputation and the `numpy` import if nothing else in the module uses it.
   - Keep the staleness, truncation and exact-fallback logic byte for byte.
-- [ ] 2.4 `tools.py`: project the columns D6 lists for `list_notes`, `get_recent` and `find_orphans`, and add `file_path ASC` after `modified_at DESC`. Project `get_neighborhood`'s hydration as `id, file_path, title, tags`. Rendering must be unchanged.
+- [ ] 2.4 `tools.py`: project the columns D6 lists for `list_notes`, `get_recent` and `find_orphans`, and add `file_path ASC` after the existing `modified_at` ordering. `find_orphans` keeps `modified_at DESC NULLS LAST`. Project `get_neighborhood`'s hydration as `id, file_path, title, tags`. Rendering must be unchanged.
 - [ ] 2.5 `tests/test_perf_projection.py`: compile each statement and assert that `content_tsvector`, `embedding` and `frontmatter` are absent from its SELECT list. Also add a raiseload guard: loading `NoteMetadata` and touching `content_tsvector` raises.
-- [ ] 2.6 `tests/integration/test_perf_projection_identity_pg.py`. On the recall corpus plus a keyword corpus, run the **pre-change** implementations (copied into the test as oracles) and the new ones. They must produce the same result set, the same order apart from exact ties, byte-equal non-similarity fields, and similarity within 1e-5, across stale, truncated, filtered, unfiltered and exact-fallback cases. `test_search_recall.py`, `test_keyword_plan.py` and `test_pgvector_search.py` must pass unchanged.
+- [ ] 2.6 `tests/integration/test_perf_projection_identity_pg.py`. On the recall corpus plus a keyword corpus, run the **pre-change** implementations (copied into the test as oracles) and the new ones. They must produce the same result set, the same order, byte-equal non-similarity fields, and similarity within 1e-5, across stale, truncated, filtered, unfiltered and exact-fallback cases. The corpus must deliberately include both permitted tie cases, and the oracle must accept them and reject every other difference. The two cases are more notes with an identical `modified_at` (and identical `rank`) than the limit, where membership at the cutoff may differ, and one note with two chunks at exactly equal distance, where the representative chunk may differ. It must also include orphans with NULL `modified_at`, which must stay last. `test_search_recall.py`, `test_keyword_plan.py` and `test_pgvector_search.py` must pass unchanged.
 - [ ] 2.7 Docs:
   - `search.md`: a "Read paths project what they render" section, covering D5–D7 and the definition of identical.
   - `indexing-and-embeddings.md`: strike L10 as resolved.
@@ -107,7 +110,7 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - It performs the walk, the shortcut stat, the read, `fstat`-before-read, and the SHA-256.
   - Retain a body only where D8 says so.
   - A `threading.Event` checked between files provides stop-on-cancel.
-  - Record the racy-stat decision (D10), with `STAT_RACY_WINDOW_NS = 2_000_000_000`.
+  - Record the racy-stat decision (D10), with `STAT_RACY_WINDOW_NS = 2_000_000_000`, measured against `t_start = time.time_ns()` taken immediately **before** the pre-read `fstat`, not after the read. A future timestamp is also racy.
   - Convert `stat_ino` to signed 64-bit.
 - [ ] 3.4 `indexer.py` `_index_vault_pinned` restructure (D9):
   - The provenance reconcile runs first, as today.
@@ -119,13 +122,13 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - Carry the new path's stat on the id-preserving move.
   - Carry the stat on the upsert (insert values and `on_conflict` set).
   - Keep the single commit.
-- [ ] 3.5 `indexer.py` backstop (D12): add `_last_full_hash[scope]`, which is monotonic and in memory. The first pass for a scope after process start is a full-hash pass, and so is every pass after `INDEX_FULL_HASH_INTERVAL_HOURS`. `control_panel/routes.py`'s reindex forces one. A full-hash pass also forces the sweep (task 3.7).
+- [ ] 3.5 `indexer.py` backstop (D12): add `_last_full_hash[scope]`, which is monotonic and in memory. It is set **only when a full-hash scan pass for that scope commits**. An aborted, refused or cancelled full-hash pass leaves the scope due, so the next pass is again a full-hash pass. The first pass for a scope after process start is a full-hash pass, and so is every pass once `INDEX_FULL_HASH_INTERVAL_HOURS` have elapsed since the last successful one. `control_panel/routes.py`'s reindex forces one. A full-hash pass also forces the sweep (task 3.7).
 - [ ] 3.6 `indexer.py`: move the embed-path work to `to_thread`. That covers the backlog's `read_note_beneath` + `_content_hash` + `parse_frontmatter`, the sweep probe's read, hash, parse, `clean_for_embedding` and `chunk_text_bounded`, and, in `embeddings.py` `embed_note`, `clean_for_embedding` + `chunk_text_bounded`.
 - [ ] 3.7 `indexer.py` `_reconcile_exclusions` gate (D13):
   - Add `_swept[scope]` in memory.
   - Skip the sweep when it equals the current pattern fingerprint and the pass is not a backstop pass.
-  - Set it only on a **clean** completion, meaning no pause, no budget stop, no exception, no provider failure, no read failure and no `StaleCertification`. Hash-mismatch skips and zero-chunk rows do not block it.
-  - Clear it on a re-derive and on the in-process reset paths.
+  - Set it only on a **clean** completion, meaning no pause, no budget stop, no exception, no provider failure, no read failure, no `StaleCertification` and **no hash-mismatch skip**. Only zero-chunk rows do not block it.
+  - Clear it on a re-derive, and through `clear_sweep_state()` on the two in-process reset routes (`reset_embeddings`, `trigger_reembed`; see the region table).
 - [ ] 3.8 `tools.py` `move_note`: the `nm_update` `.values(...)` sets the four stat columns to NULL.
 - [ ] 3.9 `config.py` and `.env.example`: add `index_stat_shortcut: bool = True` and `index_full_hash_interval_hours: int = Field(24, ge=1)`, with the D11/L3 guidance for network, FUSE and FAT mounts.
 - [ ] 3.10 `tests/test_perf_scan_offload.py`:
@@ -136,7 +139,9 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 - [ ] 3.11 `tests/test_perf_stat_shortcut.py`:
   - Unchanged stat → no read. Changed stat with the same hash → stat refreshed, no upsert. Changed stat with a new hash → upsert.
   - Each of these reads: a NULL stat, a stale extraction marker, a re-derive, a backstop pass, and `INDEX_STAT_SHORTCUT=false`.
-  - A racy stat, whether in the future or within 2 s, is recorded NULL.
+  - A racy stat, whether in the future or within 2 s before `t_start`, is recorded NULL.
+  - **Slow-read, same-tick rewrite.** Freeze the file timestamps with a fake clock, so the rewrite shares the tick. Patch the read to rewrite already-read bytes at the same size mid-read and then block for more than 2 s. The row's stat must be recorded NULL, and the next pass must index the rewritten bytes.
+  - A backstop pass that aborts before committing leaves the scope due: the next pass is again a full-hash pass.
   - A retargeted symlink is re-read.
   - Same-size in-place rewrite with a forced identical stat (monkeypatched `os.stat`) is missed until the backstop, then picked up. This documents L3.
   - `move_note` NULLs the stat.
@@ -146,7 +151,8 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - No transaction is open during the walk. Assert this via `pg_stat_activity` from a probe connection while the patched scan blocks.
   - The generation lock is the first lock the pass transaction takes. Extend `test_issue_206_lock_ordering_pg.py` so it still passes.
   - A reset running concurrently with a walk neither deadlocks nor lets old decisions land.
-  - The sweep is skipped on a second clean pass, runs again after a provider failure, and runs on a backstop pass. `test_issue_127_exclusion_reconciliation_pg.py` passes with the gate in place: its assertions run on backstop or first passes.
+  - The sweep is skipped on a second clean pass, runs again after a provider failure, and runs on a backstop pass.
+  - **A→B→A.** An excluded note (content A, certified with zero vectors) has its pattern removed, then a restart. The scan reads A. Before the sweep reaches the note it is saved as B, so the sweep skips it on a hash mismatch. It is restored to A before the next scan. The sweep must not record clean, the next pass must sweep again, and the note must end up embedded. `test_issue_127_exclusion_reconciliation_pg.py` passes with the gate in place: its assertions run on backstop or first passes.
 - [ ] 3.13 `tests/integration/test_schema_check.py`:
   - Raise `HEAD_REVISION` to `026`.
   - Add 026's marker, drift, downgrade, stamp-back and impostor cases (a same-named column of the wrong type is refused), plus a CHECK case resolved through `pg_constraint`.
@@ -223,8 +229,8 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 - [ ] 5.5 `embed_note` reuse (D16):
   - The lookup of `(id, chunk_text, embedding)` and of the stored fingerprint runs in a read-only transaction that is **committed before the provider call on every path**.
   - Reuse only when the fingerprint is present and equal.
-  - Send only the new texts, and check cardinality over that subset.
-  - `on_provider_call(len(subset))`, and nothing at all when the subset is empty.
+  - Send only the new texts, and check cardinality over that subset. Certify only on full coverage of the requested list.
+  - `on_provider_call(len(subset))`, and nothing at all when the subset is empty. A `GENERATION_MISMATCH` counts as an attempt only if a provider call was issued (the MODIFIED interlock requirement).
   - Under `_generation_matches`, verify that every reused row id still exists with the same text. If not, return `GENERATION_MISMATCH`.
   - Then certify, delete and reinsert all rows in order, as today.
 - [ ] 5.6 `tests/test_perf_provider_batching.py`:
@@ -240,6 +246,7 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - With a fingerprint mismatch, nothing is reused and nothing is certified.
   - A reset committed during the provider call → `GENERATION_MISMATCH`, nothing written, and no deadlock. Reuse the `test_issue_206_generation_lock_pg.py` reset driver.
   - A metadata-only edit that yields identical chunks makes no provider call, certifies, and leaves `attempted` unchanged.
+  - **All-reuse reset race.** Every chunk is reusable, and a reset deletes the rows between the lookup and the under-lock check. The outcome is `GENERATION_MISMATCH`, nothing is written, and `attempted` is unchanged.
   - The budget is debited by the subset only.
 - [ ] 5.8 Docs, `indexing-and-embeddings.md`:
   - The "Embedding providers" section: the shared client through the factory, and batching.

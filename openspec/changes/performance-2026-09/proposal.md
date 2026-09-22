@@ -23,7 +23,7 @@ The consumer is an agent, and the vault is the owner's single source of truth. T
   - `NoteMetadata.content_tsvector` becomes `deferred` with raise-on-load.
   - `semantic_search`, `keyword_search`, `list_notes`, `get_recent`, `find_orphans` and `get_neighborhood` project only the columns they render.
   - `semantic_search` drops the `embedding` from its result set and reports `similarity = 1 − distance`.
-  - Results are identical except for the ordering of exact ties, which is now deterministic. `find_related`'s overfetch is out of scope.
+  - Results are identical except where sort keys are exactly tied: membership at a tied cutoff and the representative chunk among exact distance ties may differ, and that ordering is now deterministic. `find_related`'s overfetch is out of scope.
 - **#278**
   - The scan's walk, read and hash run in a worker thread.
   - `clean_for_embedding`, the chunker and `parse_frontmatter` run in a worker thread on every embed path.
@@ -64,8 +64,8 @@ None. Every requirement modifies or extends an existing capability.
 - `mcp-request-routing`: the per-request vault refresh is folded into the credential read (MODIFIED). Authentication bookkeeping is throttled and asynchronously committed, and the usage row commits asynchronously with an unchanged return contract (ADDED).
 - `usage-quotas`: quota admission commits asynchronously, so a crash can only undercount (ADDED).
 - `search-quality`: read paths project what they render; similarity is the database distance; a reduced-precision vector index ships only behind the recall SLO, and the pre-warm probes the index the search uses (ADDED).
-- `index-integrity`: scan work is off the loop and ahead of the lock; the stat shortcut and its backstop (ADDED). The exclusion sweep is gated (MODIFIED). The per-request Ollama bound (MODIFIED). Chunk-vector reuse (ADDED).
-- `embedding-providers`: Ollama batching (MODIFIED); one pooled client per provider, built through the transport factory (ADDED).
+- `index-integrity`: scan work is off the loop and ahead of the lock; the stat shortcut and its backstop (ADDED). The exclusion sweep is gated (MODIFIED). The per-request Ollama bound and batch cardinality over chunks sent (MODIFIED). Chunk-vector reuse (ADDED).
+- `embedding-providers`: Ollama batching, and a generation mismatch counted as an attempt only when a provider call was issued (MODIFIED); one pooled client per provider, built through the transport factory (ADDED).
 - `schema-integrity`: the head literal moves to `027`, with `026` in the chain (MODIFIED). 026 and 027 each own their units (ADDED).
 
 ## Impact
@@ -90,4 +90,4 @@ None. Every requirement modifies or extends an existing capability.
 
 ## Spec review
 
-Not yet run. Task 0.2 is the Codex spec review. Because the stat shortcut, the sweep gate, chunk-vector reuse and the projection change are search-correctness surfaces, the implementation also goes through a mandatory adversarial pass (task 5.2).
+Codex round 1 (against `75e5d58`): REJECT, 2 MAJOR + 5 MINOR, D9 kept. All seven findings accepted and folded in; see "Spec review history" in `design.md`. Because the stat shortcut, the sweep gate, chunk-vector reuse and the projection change are search-correctness surfaces, the implementation also goes through a mandatory adversarial pass (task 7.2).

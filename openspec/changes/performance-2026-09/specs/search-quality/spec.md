@@ -5,12 +5,13 @@
 
 The change SHALL NOT alter any predicate, `SET LOCAL`, overfetch, or exact-fallback condition. It SHALL NOT alter any rendered field, including the staleness fields (`content_hash`, `embedded_content_hash`) and `chunks_truncated`, which SHALL remain selected wherever they are rendered today.
 
-`list_notes`, `get_recent` and `find_orphans` SHALL order by `modified_at DESC, file_path ASC`, so that rows with exactly equal `modified_at` have a deterministic order.
+`list_notes` and `get_recent` SHALL order by `modified_at DESC, file_path ASC`. `find_orphans` SHALL keep its existing `modified_at DESC NULLS LAST` and add `file_path ASC` after it. Rows with exactly equal `modified_at` therefore have a deterministic order.
 
-Results SHALL be identical to the pre-change implementation in these respects:
-- the same result set;
-- the same order, except among rows whose sort key is exactly equal;
-- every non-similarity field byte-equal.
+Results SHALL be identical to the pre-change implementation (the same result set, the same order, and every non-similarity field byte-equal) with exactly two permitted exceptions, both confined to exact ties:
+- **membership at a tied cutoff**: when more rows share the boundary sort key (`modified_at`, `rank` or distance) than fit under the limit, which of them are returned MAY differ;
+- **the representative chunk among exact distance ties**: when two chunks of one note have exactly equal distance, the kept `chunk_index` and its preview MAY differ.
+
+No other difference is permitted.
 
 #### Scenario: No detoasted column is selected
 - **WHEN** each of the six statements is compiled
@@ -22,7 +23,15 @@ Results SHALL be identical to the pre-change implementation in these respects:
 
 #### Scenario: Results match the previous implementation
 - **WHEN** the same fixed corpus and query set are run through the previous and the new implementation, covering stale, truncated, filtered, unfiltered and exact-fallback cases
-- **THEN** the result sets SHALL be equal, the order SHALL be equal except among exact ties, and every field other than `similarity` SHALL be byte-equal
+- **THEN** the result sets SHALL be equal, the order SHALL be equal, and every field other than `similarity` SHALL be byte-equal, except for the two permitted tie cases
+
+#### Scenario: The permitted tie differences are exercised
+- **WHEN** the corpus contains more notes with an identical `modified_at` than the requested limit, and one note with two chunks at exactly equal distance
+- **THEN** the oracle SHALL accept a different membership at that cutoff and a different representative chunk for that note, and SHALL reject any other difference
+
+#### Scenario: Orphans with no modification time stay last
+- **WHEN** `find_orphans` returns notes some of which have a NULL `modified_at`
+- **THEN** those notes SHALL be ordered after every note with a non-NULL `modified_at`, as before
 
 ### Requirement: Vector similarity SHALL be derived from the database's distance
 `semantic_search` SHALL report `similarity = 1 − distance`, where the distance is the full-precision cosine distance the database returned for that row, as `find_related` already does. It SHALL NOT fetch stored vectors to recompute similarity. Its in-service re-sort SHALL key on `(distance, file_path, chunk_index)`, so the presented order is monotone in distance and deterministic among exact ties. The reported similarity SHALL differ from the previous NumPy recomputation by no more than 1e-5.

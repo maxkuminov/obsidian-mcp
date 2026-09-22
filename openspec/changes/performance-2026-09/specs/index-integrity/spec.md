@@ -59,7 +59,7 @@ All mutations SHALL still commit in the pass's single transaction.
 ### Requirement: An unchanged file SHALL be skipped only when its recorded stat matches, and the stat SHALL describe the bytes that were hashed
 `notes_metadata` SHALL record, per row, the `(size, mtime_ns, ctime_ns, inode)` of the file whose bytes produced `content_hash`. The tuple SHALL be taken from the file descriptor that was read, before the read. The four fields SHALL be all NULL or all non-NULL.
 
-A stat whose modification or change time is within 2 seconds of the moment its hash completed, or in the future, SHALL be recorded as NULL.
+Racy recency SHALL be measured against the wall-clock instant taken immediately before that pre-read `fstat` (`t_start`), not against the end of the read or hash. A stat whose modification or change time is at or after `t_start − 2 s`, including any time later than `t_start`, SHALL be recorded as NULL.
 
 An index pass SHALL skip reading and hashing a discovered file only if all of the following hold:
 - `INDEX_STAT_SHORTCUT` is enabled;
@@ -85,8 +85,12 @@ When a file is re-read and its hash is unchanged but its stat differs from the r
 - **THEN** the file SHALL be read and hashed
 
 #### Scenario: A racy stat is not trusted
-- **WHEN** a file's modification or change time is within 2 seconds of the moment its hash completed, or in the future
+- **WHEN** a file's modification or change time is within 2 seconds before the instant the pass took before its pre-read `fstat`, or later than that instant
 - **THEN** its row's stat SHALL be recorded as NULL, so the next pass reads it
+
+#### Scenario: A slow read does not launder a fresh timestamp
+- **WHEN** a file's timestamp is fresh at read start, a writer rewrites already-read bytes in the same timestamp tick without changing the size, and the read then takes longer than 2 seconds to complete
+- **THEN** the row's stat SHALL still be recorded as NULL, and the next pass SHALL read the file and index the rewritten bytes
 
 #### Scenario: A retargeted symlink is re-read
 - **WHEN** a discovered `.md` symlink is repointed at a different file
@@ -95,12 +99,16 @@ When a file is re-read and its hash is unchanged but its stat differs from the r
 ### Requirement: A full-hash pass SHALL bound every edit the stat shortcut can miss
 For each scope, a full-hash pass SHALL run:
 - on the first pass after process start;
-- whenever `INDEX_FULL_HASH_INTERVAL_HOURS` (default 24, at least 1) have elapsed since that scope's last full-hash pass;
+- whenever `INDEX_FULL_HASH_INTERVAL_HOURS` (default 24, at least 1) have elapsed since that scope's last **successful** full-hash pass;
 - whenever an operator triggers a reindex from the panel.
+
+A full-hash pass is successful only when its scan transaction commits. A full-hash pass that aborts, is refused, or is cancelled SHALL leave the scope due, and every following pass for that scope SHALL be a full-hash pass until one commits. Incomplete verification SHALL NOT postpone outstanding backstop work by another interval.
 
 A full-hash pass SHALL read and hash every discovered file regardless of recorded stats. It SHALL also run the exclusion reconciliation sweep regardless of that sweep's gate.
 
-The architecture note SHALL list every known way a file's content can change while its `(size, mtime_ns, ctime_ns, inode)` does not, and the bound on each. The consequence SHALL be declared as an accepted limitation: such an edit is invisible to search for at most `INDEX_FULL_HASH_INTERVAL_HOURS` plus one pass.
+The architecture note SHALL list every known way a file's content can change while its `(size, mtime_ns, ctime_ns, inode)` does not, and the bound on each. The consequence SHALL be declared as an accepted limitation, as two separate bounds:
+- **Detection.** Such an edit SHALL be detected (its new `content_hash` committed, making keyword search current and vector results mark the note stale) no later than the scope's next successful full-hash pass.
+- **Semantic convergence.** Re-embedding follows under the existing per-tenant budgets, provider availability and pause flag, and MAY take further passes.
 
 #### Scenario: The first pass after a restart hashes everything
 - **WHEN** the process starts and runs its first pass for a scope
@@ -108,7 +116,11 @@ The architecture note SHALL list every known way a file's content can change whi
 
 #### Scenario: A missed edit is caught by the backstop
 - **WHEN** a file's bytes change while all four recorded stat fields stay equal
-- **THEN** the change SHALL be indexed no later than the next full-hash pass
+- **THEN** the change SHALL be detected and its new hash committed no later than the next successful full-hash pass
+
+#### Scenario: A failed backstop is retried, not postponed
+- **WHEN** a scope's full-hash pass aborts before committing
+- **THEN** that scope's next pass SHALL again be a full-hash pass
 
 #### Scenario: The interval is honoured
 - **WHEN** `INDEX_FULL_HASH_INTERVAL_HOURS` have elapsed since a scope's last full-hash pass
@@ -122,7 +134,7 @@ The architecture note SHALL list every known way a file's content can change whi
 
 The cardinality check SHALL apply to the chunks actually sent. The note SHALL be certified only when every requested chunk has a vector, whether reused or fresh. After certification, all of the note's rows SHALL be deleted and re-inserted in document order.
 
-A note whose chunks are all reusable SHALL make no provider call. It SHALL not be counted as a provider attempt, and it SHALL debit no chunk budget.
+A note whose chunks are all reusable SHALL make no provider call. It SHALL NOT be counted as a provider attempt, even when the under-lock check fails and it reports `GENERATION_MISMATCH`, and it SHALL debit no chunk budget.
 
 #### Scenario: An append re-embeds only the new tail
 - **WHEN** a note's content is extended so that every earlier chunk's text is unchanged
@@ -139,6 +151,10 @@ A note whose chunks are all reusable SHALL make no provider call. It SHALL not b
 #### Scenario: Nothing to send
 - **WHEN** every chunk of a changed note has a byte-identical stored chunk
 - **THEN** no provider call SHALL be made, the note SHALL be certified, and the pass's attempt count and chunk budget SHALL be unchanged
+
+#### Scenario: An all-reuse note loses a reset race without an attempt
+- **WHEN** every chunk of a note is reusable and a reset deletes the stored rows between the lookup and the under-lock check
+- **THEN** the outcome SHALL be `GENERATION_MISMATCH`, nothing SHALL be written, and the pass's attempt count SHALL be unchanged
 
 ## MODIFIED Requirements
 
@@ -164,9 +180,10 @@ A sweep interrupted by the pause flag SHALL stop between notes, and a later pass
 A clean completion is one with:
 - no pause and no budget stop;
 - no exception, no `StaleCertification` and no read failure;
-- no provider failure.
+- no provider failure;
+- **no row skipped because its bytes no longer hash to its `content_hash`.**
 
-Rows skipped for a hash mismatch or left alone for zero chunks do not prevent a clean completion. The record SHALL be held in process memory, set only by a clean completion, and cleared for a scope on a re-derive and by the in-process reset paths. A sweep that is not clean SHALL leave the scope due, so the next pass sweeps again.
+Rows left alone for zero chunks do not prevent a clean completion. A hash-mismatch skip does, because the backlog is not guaranteed to select that row later: an edit that is undone before the next scan restores a matching hash and certification. The record SHALL be held in process memory, set only by a clean completion, and cleared for a scope on a re-derive and by the in-process reset paths. A sweep that is not clean SHALL leave the scope due, so the next pass sweeps again.
 
 #### Scenario: Adding a pattern removes existing vectors
 
@@ -211,6 +228,10 @@ Rows skipped for a hash mismatch or left alone for zero chunks do not prevent a 
 - **WHEN** a sweep's re-embed of an included note fails at the provider
 - **THEN** the sweep SHALL not be recorded as clean and the next pass SHALL sweep that scope again
 
+#### Scenario: An edit undone between scan and sweep does not hide a note
+- **WHEN** an excluded note's pattern is removed and the process restarts, the scan reads content A, the note is saved as B before the sweep reaches it (so the sweep skips it on a hash mismatch), and the note is restored to A before the next scan
+- **THEN** that sweep SHALL NOT be recorded as clean, and the next pass SHALL sweep the scope again and embed the note
+
 #### Scenario: The backstop sweeps regardless
 
 - **WHEN** a pass is a full-hash pass
@@ -249,3 +270,48 @@ The Ollama embedding batch SHALL have no aggregate deadline. Its liveness bound 
 
 - **WHEN** a note is capped at N chunks and only N-1 of them have a vector
 - **THEN** the note SHALL NOT be certified and its previous vectors SHALL remain in place
+
+### Requirement: Embedding completion has exact cardinality
+The system SHALL accept a provider's answer only when it contains exactly one vector for every chunk **sent** to the provider, and SHALL certify a note only when every **requested** chunk has a vector — returned by the provider for this note or reused under the chunk-reuse requirement — where the requested chunks are the chunks the bounded chunker produced for that note. It SHALL record an empty or fully-cleaned note as current with zero vectors. A provider answer that returns the wrong number of vectors, and a provider call that raises, SHALL each be a **distinct outcome** from that zero-chunk certification: neither certifies, neither counts as a note the pass embedded, and both count as failures of the pass.
+
+The three used to be one value. `embed_note` returned `0` for a note that cleaned to zero chunks *and was certified*, for a provider exception it swallowed, and for a cardinality mismatch — and the caller incremented its embedded count after all three. A total provider outage therefore produced a pass record reading `notes_embedded = N, error = NULL`, which is the record a healthy pass writes, with a positive count.
+
+Each failing outcome SHALL carry a **bounded, structured description of what went wrong** — the exception class and a message truncated at the source, the number of chunks sent, and for a cardinality mismatch the number of vectors received — because the pass's own record of the failure is built from it and there is no exception left for the caller to inspect. The message SHALL be truncated where it is captured rather than where the run record is written: the run record's total error budget is shared with the pass's stage labels, and one untruncated provider message can evict them.
+
+#### Scenario: Provider returns too few vectors
+
+- **WHEN** the provider returns fewer embeddings than the chunks it was sent
+- **THEN** the note SHALL NOT be marked current
+- **AND** previously valid embeddings SHALL remain intact
+- **AND** the outcome SHALL be reported to the pass as a failure, not as an embedded note
+- **AND** the failure description SHALL name both the sent chunk count and the received vector count
+
+#### Scenario: Note has no embeddable chunks
+
+- **WHEN** cleaning and chunking produces zero chunks
+- **THEN** the note's embedded content hash SHALL be marked current
+- **AND** the note SHALL have zero embedding rows
+- **AND** the outcome SHALL be reported to the pass as a note it embedded, not as a failure
+
+#### Scenario: A provider failure is not a zero-chunk certification
+
+- **WHEN** the embedding provider raises for a note whose cleaned content produces at least one chunk
+- **THEN** the outcome reported to the pass SHALL be distinguishable from the zero-chunk certification above
+- **AND** the note SHALL NOT be certified, so a later pass selects it again
+- **AND** the failure description SHALL carry the exception's class name and a bounded message
+
+#### Scenario: A long provider message cannot crowd out the pass record
+
+- **WHEN** the provider raises with a message longer than the per-failure bound
+- **THEN** the captured message SHALL be truncated to that bound before it reaches the pass record
+
+#### Scenario: Cardinality is exact over the capped chunk list
+
+- **WHEN** a note produces more chunks than the per-note chunk cap and every one of the first N chunks has a vector
+- **THEN** the note SHALL be certified, because the requested chunks are the capped list
+- **AND** a provider answer returning fewer vectors than the chunks sent SHALL still be refused
+
+#### Scenario: Reused and fresh vectors together cover the note
+
+- **WHEN** some of a note's requested chunks reuse stored vectors and the provider returns exactly one vector for each remaining chunk sent
+- **THEN** the note SHALL be certified with one row per requested chunk, in document order
