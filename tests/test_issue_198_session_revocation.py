@@ -146,6 +146,15 @@ class _Result:
     def all(self):
         return self._rows
 
+    def scalars(self):
+        """The client-expiry sweep (#194) reads its candidates with a SELECT.
+
+        These cases are about the session purge, so an empty candidate set is
+        the right answer: the sweep then does nothing and `_session_delete`
+        below ignores its SELECT.
+        """
+        return _Result(rows=self._rows)
+
 
 class _ActorRow:
     def __init__(self, is_admin=True, is_active=True):
@@ -809,7 +818,11 @@ def _run_cleanup(monkeypatch) -> _RecordingSession:
 
 def _session_delete(session) -> Delete:
     for stmt in session.statements:
-        assert isinstance(stmt, Delete), stmt
+        # The client-expiry sweep (#194) issues a SELECT of its own; this
+        # section is about the purge DELETEs, so anything else is skipped
+        # rather than rejected.
+        if not isinstance(stmt, Delete):
+            continue
         if stmt.table.name == "user_sessions":
             return stmt
     raise AssertionError("no DELETE emitted for user_sessions")

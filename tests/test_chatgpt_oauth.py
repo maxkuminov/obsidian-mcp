@@ -47,6 +47,13 @@ class _Session:
         # result, so skip it rather than letting it shift the sequence.
         if "pg_advisory_xact_lock" in str(query):
             return _Result(None)
+        # Every issuance path stamps the client's use marker (#194). Like the
+        # lock above it consumes no canned result; answering with the client id
+        # says "the row is still there", which is this test's premise.
+        from _oauth_grant_fakes import is_client_use_stamp
+
+        if is_client_use_stamp(query):
+            return _Result("stamped")
         return _Result(next(self.results))
 
     def add(self, value):

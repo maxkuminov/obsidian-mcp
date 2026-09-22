@@ -63,6 +63,14 @@ class _FakeSession:
         return False
 
     async def execute(self, stmt, *_a, **_kw):
+        # The use-marker stamp (#194) is also an `UPDATE oauth_clients`, so it
+        # is recognised by its SET column before the claim branch below: it
+        # writes no state this test reads, and answering "no row" would turn
+        # every consent into an `invalid_client` refusal.
+        from _oauth_grant_fakes import is_client_use_stamp
+
+        if is_client_use_stamp(stmt):
+            return _Result("stamped")
         # The first-authorizer claim is a conditional `UPDATE oauth_clients ...
         # WHERE user_id IS NULL RETURNING client_id`, so the database — not
         # whichever transaction read its snapshot last — decides who wins when
@@ -308,6 +316,13 @@ class _ContendedSession(_FakeSession):
         self.claim_attempts = 0
 
     async def execute(self, stmt, *_a, **_kw):
+        from _oauth_grant_fakes import is_client_use_stamp
+
+        # The use-marker stamp (#194) is not a claim attempt, and the row is
+        # still there — the race this double stages is over the *owner*, not
+        # over the registration's existence.
+        if is_client_use_stamp(stmt):
+            return _Result("stamped")
         if isinstance(stmt, Update):
             self.claim_attempts += 1
             # The winner got there between our snapshot and this statement.

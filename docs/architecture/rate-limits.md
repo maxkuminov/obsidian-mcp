@@ -478,10 +478,10 @@ a comment there recording the decision.
 Three details make the in-app control correct.
 
 - **The address comes from `ProxyHeadersMiddleware`**, which is added on the
-  app and therefore wraps the mount, and is honoured only for peers inside the
-  trusted private ranges (`--forwarded-allow-ips`). A budget keyed on a
-  spoofable header is **worse than none**; `request-trust`'s restricted
-  proxy-header requirement is the dependency.
+  app and therefore wraps the mount, and is honoured only for the peers
+  `TRUSTED_PROXY_IPS` names. A budget keyed on a spoofable header is **worse
+  than none**; `request-trust`'s restricted proxy-header requirement is the
+  dependency.
 - **Every 401 branch increments** — missing bearer, unknown credential,
   ownerless, inactive user, expired, cross-user grant, missing vault scope —
   because a prober picks the cheapest one, and a budget covering six of seven
@@ -513,6 +513,108 @@ against credential guessing; #194's own verification withdrew that (256-bit
 > failures / 5 minutes — no working client fails 60 times in 5 minutes), by
 > `MCP_AUTH_FAILURE_LIMIT=null`, and by the one WARNING naming the address the
 > first time a slot engages.
+
+## The panel login budget is keyed by account, exactly, and is not a lockout
+
+`POST /admin/auth/login` keeps its 5/min per-address slowapi limit and gains a
+per-**account** failed-attempt budget beside it (#189). The two are additive
+and neither subsumes the other: an address-keyed limit hands an attacker a
+fresh allowance for every address they can rotate through, and an
+account-keyed limit alone lets one address walk many accounts.
+
+**slowapi cannot express it.** `src/limiter.py` says why in as many words: its
+`key_func` is synchronous and runs before the handler, and the submitted
+username is in the form body — reading it there would consume the stream the
+handler needs. So the budget lives in `src/services/rate_limits.py`, next to
+the other in-process controls.
+
+**It does not reuse the salted slot table, and that is the load-bearing
+decision.** That table merges colliding keys, which is a *bound* for the `/mcp`
+failed-auth budget — addresses are unbounded and free to mint, so a shared slot
+only makes the control stricter and nobody can choose whom to collide with. For
+this key space it would be a **cross-account denial**: ten failures against a
+colliding name would refuse a different account's *correct* password, and an
+attacker submitting random non-existent usernames could saturate every slot
+without knowing any victim's name. The budget is therefore a plain
+`dict[users.id, window]` — exact keys, no salt, no capacity policy to get
+wrong — swept on access so it holds at most one counter per account that has
+failed recently. The key space is the users table, which is small and
+administrator-controlled; that is the whole bound.
+
+A failure is counted **only when the submitted username resolves to a row**.
+There is nothing to brute-force behind a name that matches no account, so there
+is nothing to bound, and those attempts stay under the address limit alone —
+which is what makes "a different username is unaffected" literally true rather
+than probabilistically true. Keying is by row and not by the `is_active` flag,
+so budget behaviour never becomes a side channel for account state.
+
+The check runs **after** the user lookup, because it needs the id, and
+**before** `verify_password`, because a budget consulted after the comparison
+bounds nothing — the guess has already been answered.
+
+**Four properties make it a bound rather than a lockout.** Only failures are
+counted and the window is short (ten in fifteen minutes, self-healing, no
+durable state, no administrative unlock). An authenticated session is
+unaffected — `login_form` short-circuits a valid session to the panel, so a
+flood can delay a *fresh* password sign-in and nothing else. The threshold sits
+far above a human typo rate and far below an online guessing budget worth
+having. And the refusal is equivalent in content to an ordinary failed login.
+
+**"Equivalent in content" has an exact scope, and it excludes two things.**
+Equivalence means the same HTTP status, the same rendered template and the same
+user-visible message for the same submitted inputs — a 401 login page, never a
+429. Excluded: **timing**, because a throttled attempt skips bcrypt, and part
+of that signal is new (for one active account, attempts 1–10 run the comparison
+and attempt 11 does not, so an observer who can time responses can tell an
+exhausted budget from an unexhausted one for a name they already know exists);
+and **per-response nondeterminism** — a freshly rendered page carries a CSRF
+token and may carry a session cookie, which differ between any two responses.
+The guarantee is over response content, and it is stated that way rather than
+as an unqualified "only the log knows". The only place the distinction is
+recorded is `panel_login_account_throttled` (see
+[security event logging](security-event-logging.md)), whose subject is the
+client address and never the submitted username.
+
+What remains, stated rather than hidden: a sustained flood can deny *password*
+sign-in for one named account for the flood's duration plus the window.
+Accepted, strictly preferable to unbounded per-account guessing against
+credentials that guard other tenants' vaults, and recoverable without waiting
+by restarting the container — which clears in-process state, like every other
+control in this file.
+
+## Proxy trust is one setting, canonicalised, and uvicorn's layer is off
+
+Every control in this file keys on the address `ProxyHeadersMiddleware`
+resolves, so the list of peers allowed to set `X-Forwarded-*` is part of the
+rate-limit design and not an unrelated deployment detail. It was expressed
+twice and inconsistently until #189: a hard-coded literal in `src/main.py` and
+a `--forwarded-allow-ips` in the `Dockerfile` that excluded the real proxy
+subnet and was therefore inert.
+
+`TRUSTED_PROXY_IPS` (pydantic, CSV or JSON) is now the only statement of it.
+Its default is exactly the previously effective list, so a deploy that changes
+no environment value changes no client-IP resolution. Narrowing it to the
+proxy's own address is an operator decision that must not need a code change —
+the deployment's Docker network is shared with containers that run user-
+supplied code by design, and any of them can forge the header.
+
+**uvicorn's layer is switched off (`--no-proxy-headers`), not aligned.** Merely
+agreeing is a state an operator can break from the environment: uvicorn's
+`proxy_headers` defaults to *enabled* and its `forwarded_allow_ips` reads
+`$FORWARDED_ALLOW_IPS`. One control means one control.
+
+**Entries are stored canonicalised, and that is not cosmetic.**
+`ip_network("192.168.0.10/24", strict=False)` accepts host bits and answers
+`192.168.0.0/24`, but the un-canonicalised string is what uvicorn's stricter
+parse rejects, keeping it as a literal that matches no peer. The failure is
+silent and inverts the intent: every proxied request then retains the *proxy's*
+address, so all callers collapse into one limiter bucket. `Settings` therefore
+stores `str(ip_network(...))` — a bare address stays bare — and the regression
+test drives that case through the **real** installed middleware rather than
+through our own parser. A malformed entry refuses startup naming it; a trust
+list that quietly loses a range is worse than one that fails. The effective
+canonical list is logged once at startup, because a trust boundary nobody can
+read from the logs is a trust boundary nobody audits.
 
 ## Limiter state is bounded by construction, and each registry says how
 
@@ -557,11 +659,20 @@ last used.
 > fail-closed was rejected (it turns a bookkeeping cap into an outage for a
 > legitimate credential).
 
+**Accounts** are the third key space and the only **exactly** keyed one. The
+panel login budget is a plain dict keyed on `users.id`, swept on access, so it
+holds at most one counter per account that has failed recently and cannot grow
+with the number of usernames an attacker submits. No table, no salt, no cap:
+merging two keys here would refuse an unrelated account's correct password,
+which is why the salted address table is deliberately not reused for it.
+
 ## Limiter state is in-process, and `--workers 1` is part of the contract
 
-All bucket, coalescing and failed-authentication state lives in the worker
-process and is **not** persisted, replicated or shared. A restart begins with
-every bucket full and every counter zero.
+All bucket, coalescing, failed-authentication and panel-login-budget state
+lives in the worker process and is **not** persisted, replicated or shared. A
+restart begins with every bucket full and every counter zero — which is also
+the login budget's recovery path if an operator does not want to wait out a
+flood's window.
 
 That is sound because there is exactly **one** uvicorn worker; because
 instantaneous pressure is meaningless to persist across a process that no
@@ -639,6 +750,9 @@ the page to see. The full reading rules are in
 | `MCP_AUTH_FAILURE_LIMIT` | `60` | Failed `/mcp` authentications per address per window before a 429. Null disables. |
 | `MCP_AUTH_FAILURE_WINDOW_SECONDS` | `300` | The window that limit is counted over. |
 | `MCP_AUTH_FAILURE_TABLE_SIZE` | `4096` | Counter slots in the salted fixed-size address table. Memory is O(size). |
+| `TRUSTED_PROXY_IPS` | `127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16` | The peers whose `X-Forwarded-*` headers are honoured — the address every control here keys on. CSV or JSON, stored canonicalised, empty trusts nobody. The only such control; uvicorn's is off. |
+| `PANEL_LOGIN_FAILURE_LIMIT` | `10` | Failed panel sign-ins one **account** may accrue per window before further attempts are refused without comparing the password. Null disables. |
+| `PANEL_LOGIN_FAILURE_WINDOW_SECONDS` | `900` | The window that budget is counted over. |
 | `MCP_RATE_LIMIT_PER_MINUTE` | `120` | Sustained tool calls per minute per principal. Null (with the burst) disables the general bucket. |
 | `MCP_RATE_LIMIT_BURST` | `30` | Capacity of the general bucket. |
 | `MCP_WRITE_RATE_LIMIT_PER_MINUTE` | `60` | Sustained vault-mutating calls per minute per principal (the eight write tools plus `PUT /transfer/upload`). |

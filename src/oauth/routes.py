@@ -10,7 +10,7 @@ from fastapi import APIRouter, Form, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy import update as sa_update
 
 from src.auth.session import get_active_session_user
@@ -317,6 +317,30 @@ def _cross_user_client_error(
     )
 
 
+def _client_vanished_error() -> JSONResponse:
+    """The refusal for a registration that is no longer there (#194).
+
+    Two branches of the consent path reach this and they must answer
+    identically, because they are the same event: the expiry sweep won the race
+    for the client row. One is the stamp's `False` return; the other is the
+    ownership claim finding **no row at all** when it re-reads. Treating the
+    second as a cross-user conflict would return `access_denied` naming an
+    owner that does not exist, and would write an
+    `oauth_cross_user_client_refused` record about a user who did nothing —
+    a misleading security record for the sweep's ordinary work.
+    """
+    return _oauth_json(
+        {
+            "error": "invalid_client",
+            "error_description": (
+                "This client registration no longer exists. Register "
+                "again and re-authorize."
+            ),
+        },
+        status_code=400,
+    )
+
+
 def _client_belongs_to_another_user(client_row, session_user_id: int | None) -> bool:
     """Is this client owned by a *different* user than the one consenting?
 
@@ -330,6 +354,42 @@ def _client_belongs_to_another_user(client_row, session_user_id: int | None) -> 
         and client_row.user_id is not None
         and client_row.user_id != session_user_id
     )
+
+
+async def _stamp_client_use(session, client_id: str) -> bool:
+    """Record that `client_id` issued a credential. True when the row was there.
+
+    The marker the expiry sweep reads (#194). It is stamped **in the same
+    transaction** that inserts the code or the tokens, never afterwards and
+    never best-effort: a grant that commits without the stamp is a live
+    credential whose client still reads as never used.
+
+    The `UPDATE ... RETURNING` is also the race control, and that is the half
+    worth not simplifying away. Inserting an `oauth_codes` row takes a
+    `FOR KEY SHARE` lock on the parent through the foreign key, while the
+    sweep takes `FOR UPDATE` — they conflict, so the two serialise. But under
+    READ COMMITTED a plain `DELETE ... WHERE NOT EXISTS (...)` that unblocks
+    re-evaluates only the *target row's* own predicate and not the subquery,
+    so it would proceed and cascade away the code that was just issued. This
+    `UPDATE` puts the authorization on the same row lock and makes the
+    stamped marker visible to the sweep's in-lock re-read, so one of the two
+    wins cleanly. The sweep's side of the contract is in
+    `src/services/indexer.py`.
+
+    A `False` return means the sweep won: the row is gone, so there is nothing
+    to hang a grant on. The caller answers `invalid_client` — an ordinary
+    OAuth error — rather than letting the foreign key raise into a 500 and
+    rather than writing half a grant.
+    """
+    stamped = (
+        await session.execute(
+            sa_update(OAuthClient)
+            .where(OAuthClient.client_id == client_id)
+            .values(last_used_at=func.now())
+            .returning(OAuthClient.client_id)
+        )
+    ).scalar_one_or_none()
+    return stamped is not None
 
 
 def _state_serializer() -> URLSafeTimedSerializer:
@@ -875,10 +935,9 @@ async def authorize_post(
                 )
             ).scalar_one_or_none()
             if claimed is None:
-                # Somebody else got there first. Re-read in a fresh statement
-                # (a new snapshot, so the winner's commit is visible) and
-                # refuse unless the winner happens to be this same user, which
-                # is the ordinary case of one person opening two tabs.
+                # Either somebody else got there first, or the row is gone.
+                # Re-read in a fresh statement (a new snapshot, so the winner's
+                # commit is visible).
                 owner = (
                     await session.execute(
                         select(OAuthClient.user_id).where(
@@ -886,6 +945,23 @@ async def authorize_post(
                         )
                     )
                 ).scalar_one_or_none()
+                if owner is None:
+                    # The registration is **gone**, not owned by a stranger
+                    # (#194). A surviving row cannot read NULL here: the
+                    # conditional `UPDATE ... WHERE user_id IS NULL` matched
+                    # nothing, so at that instant the row either did not exist
+                    # or already carried an owner — and an owner is never
+                    # cleared, the client never rebinds. So NULL means the
+                    # expiry sweep won the race for this row.
+                    #
+                    # Answering `access_denied` here would name an owner that
+                    # does not exist and would write an
+                    # `oauth_cross_user_client_refused` record about a user who
+                    # did nothing. The sweep's win is not a conflict; it gets
+                    # the same `invalid_client` the stamp below returns.
+                    return _client_vanished_error()
+                # Refuse unless the winner happens to be this same user, which
+                # is the ordinary case of one person opening two tabs.
                 if owner != session_user_id:
                     return _cross_user_client_error(
                         request,
@@ -893,6 +969,17 @@ async def authorize_post(
                         actor_user_id=session_user_id,
                         owner_user_id=owner,
                     )
+
+        # Stamp the client's use marker in the transaction that mints the code
+        # (#194), and before the insert rather than after it: the `UPDATE`
+        # takes the row lock the sweep's `FOR UPDATE` contends for, so if the
+        # sweep has already deleted this registration we learn it here, with
+        # nothing written, instead of from a foreign-key violation on the
+        # INSERT. `_authorize_refused` is not emitted — the refusal is the
+        # sweep's ordinary work, not a rejected authorization attempt, and the
+        # sweep logs its own count.
+        if not await _stamp_client_use(session, client_id):
+            return _client_vanished_error()
 
         oauth_code = OAuthCode(
             code_hash=_hash(code),
@@ -1151,6 +1238,28 @@ async def _handle_auth_code(form, request=None):
         # what lets the panel revoke or downgrade the pair as one unit instead
         # of a row whose sibling immediately undoes the change.
         grant_id = new_grant_id()
+
+        # The second issuance path that stamps the client's use marker (#194),
+        # in the same transaction as the tokens it mints. The code row this
+        # exchange is consuming holds a foreign key on the client, so the row
+        # is here and the sweep could not have reached it — the return value
+        # is checked anyway rather than assumed, because "the FK guarantees
+        # it" is exactly the kind of invariant a later refactor breaks
+        # quietly.
+        if not await _stamp_client_use(session, client_id):
+            _token_refused(
+                request, "invalid_client.client_vanished", client_id=client_id
+            )
+            return JSONResponse(
+                {
+                    "error": "invalid_client",
+                    "error_description": (
+                        "This client registration no longer exists. Register "
+                        "again and re-authorize."
+                    ),
+                },
+                status_code=400,
+            )
 
         session.add(OAuthToken(
             token_hash=_hash(access_token),
@@ -1559,6 +1668,33 @@ async def _handle_refresh(form, request=None):
                         "error": "invalid_scope",
                         "error_description": (
                             "This client is not registered for any vault access."
+                        ),
+                    },
+                    status_code=400,
+                )
+
+            # The third issuance path that stamps the client's use marker
+            # (#194), in the same transaction as the rotation. A long-lived
+            # connector may refresh for months without ever exchanging another
+            # code, so a refresh that did not stamp would let a client in daily
+            # use age towards the sweep's cutoff on paper — the child-row guard
+            # would still save it, but a marker that lies is a marker nobody
+            # can reason about. Nothing is committed on the refusal, so the old
+            # refresh token is left exactly as it was.
+            if not await _stamp_client_use(session, client_id):
+                _token_refused(
+                    request,
+                    "invalid_client.client_vanished",
+                    client_id=client_id,
+                    user_id=old_token.user_id,
+                    grant_id=grant_id,
+                )
+                return JSONResponse(
+                    {
+                        "error": "invalid_client",
+                        "error_description": (
+                            "This client registration no longer exists. "
+                            "Register again and re-authorize."
                         ),
                     },
                     status_code=400,

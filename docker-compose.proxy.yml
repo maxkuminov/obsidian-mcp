@@ -41,11 +41,16 @@
 #     `proxy_buffering off;` in the Advanced tab).
 #
 # The app already honors X-Forwarded-* via its built-in ProxyHeadersMiddleware,
-# scoped in main.py to loopback + private (RFC1918) ranges — which covers both a
-# loopback-published port (pattern B) and a shared Docker network (pattern A). So
-# no `--proxy-headers` flag or `FORWARDED_ALLOW_IPS=*` is needed here, and we
-# avoid the trust-any-peer footgun. Still keep the published port private to the
-# proxy.
+# scoped by TRUSTED_PROXY_IPS (default: loopback + private RFC1918 ranges; set
+# it in .env if your proxy's address is outside them) — which covers both a
+# loopback-published port (pattern B) and a shared Docker network (pattern A).
+# That setting is the ONLY place that states which peers may set X-Forwarded-*,
+# so uvicorn's own forwarded-header layer is switched off with
+# `--no-proxy-headers` in the start command below. Do not re-enable it and do not
+# set FORWARDED_ALLOW_IPS: uvicorn's layer defaults to *enabled* and reads that
+# variable, and it rewrites the client address BEFORE the app's middleware runs,
+# so a narrowed TRUSTED_PROXY_IPS cannot undo a peer uvicorn already trusted.
+# Still keep the published port private to the proxy.
 #
 # Note: /mcp is always API-key protected at the application layer. The proxy is
 # only responsible for TLS and (optionally) protecting the human-facing /admin UI.
@@ -82,8 +87,10 @@ services:
     env_file:
       - .env
     # Forwarded headers (X-Forwarded-Proto/For) are handled by the app's built-in
-    # ProxyHeadersMiddleware (main.py), scoped to loopback + private ranges — no
-    # FORWARDED_ALLOW_IPS / --proxy-headers needed here.
+    # ProxyHeadersMiddleware (main.py), scoped by TRUSTED_PROXY_IPS to loopback +
+    # private ranges. Do not set FORWARDED_ALLOW_IPS or --proxy-headers: uvicorn's
+    # layer is off deliberately (see the start command below) because it would
+    # rewrite the client address ahead of that middleware.
     # Pattern B: publish a host port for a proxy that forwards by IP/port.
     # Default is loopback-only; change to "${MCP_PORT:-8000}:8000" only if your
     # proxy runs on another host and you firewall the port to that proxy.
@@ -103,9 +110,16 @@ services:
       timeout: 10s
       retries: 5
       start_period: 60s
+    # This override replaces the image CMD, so it must carry the CMD's flags.
+    # --no-proxy-headers: TRUSTED_PROXY_IPS is the single statement of which
+    # peers may set X-Forwarded-* (see the Dockerfile). uvicorn's own layer
+    # defaults to *enabled* and reads $FORWARDED_ALLOW_IPS, so leaving it on
+    # would rewrite the client address before the app's middleware runs and the
+    # narrowed setting could not undo it. --workers 1 is load-bearing: every
+    # rate control is in-process worker memory.
     command: >
       sh -c "alembic upgrade head &&
-             uvicorn src.main:app --host 0.0.0.0 --port 8000"
+             uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers 1 --no-proxy-headers"
 
 networks:
   mcp_internal:

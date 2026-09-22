@@ -188,6 +188,24 @@ WebSocket / streaming passthrough on `/mcp`. The file's header comment
 walks through both patterns and the exact headers your proxy must
 forward.
 
+**Which peers may set those headers is one setting: `TRUSTED_PROXY_IPS`.**
+The default trusts loopback and the three private (RFC 1918) ranges, which
+covers a loopback-published port and a shared Docker network without any
+configuration — and also trusts every *other* container on that network.
+Narrow it to your proxy's own address —
+`TRUSTED_PROXY_IPS=<your proxy's address>` — once the proxy has a fixed
+one. The value is a CSV or JSON list whose entries are each a single
+address or one CIDR network (`10.0.0.5`, `10.0.0.0/24`); read your
+proxy's address off your own deployment rather than copying an example,
+since a literal here that is not your proxy trusts the wrong peer. A
+proxy outside the default ranges must be listed or every request will
+appear to come from the proxy, and every per-address rate limit will be
+shared. The value is validated at boot, the canonical list is logged
+once at startup, and uvicorn's own `--forwarded-allow-ips` /
+`FORWARDED_ALLOW_IPS` is switched off in the image and in both reference
+compose files (`--no-proxy-headers`), so there is no second control to
+keep in step.
+
 If you plan to use the file-transfer tools (`request_upload`,
 `request_download`), the proxy must also forward **`/transfer/*`** —
 unauthenticated at the proxy, since the capability token is checked by
@@ -202,6 +220,78 @@ an APM capture request headers, or you will log live capabilities.
 > upstream private to the proxy (shared Docker network, or a
 > loopback/firewalled published port). Do not expose the MCP container
 > port publicly.
+
+### Plaintext HTTP is refused, not redirected, on machine-facing paths
+
+Both bundled reverse-proxy configurations answer a plaintext `http://`
+request for a machine-facing path with **403 and no `Location` header**,
+instead of redirecting it to HTTPS.
+
+This looks unhelpful and is deliberate. An MCP client configured with an
+`http://` server URL has already put its `Authorization: Bearer omcp_…`
+on the wire in cleartext by the time the proxy sees it. A redirect on a
+`POST` is a 307/308 that preserves the method and body, and MCP client
+stacks follow redirects with the `Authorization` header intact — httpx,
+which the MCP Python SDK uses, deliberately keeps it across a direct
+http→https hop. So the call succeeds over TLS and **every request keeps
+working**, which means nobody ever finds out that the credential was
+sent in the clear. The same applies to `POST /token`, which carries the
+authorization code, the `code_verifier` and the client secret in the
+body. A hard failure on the first request is the only outcome that
+reaches the operator.
+
+| Plaintext request | Answer |
+| --- | --- |
+| `/mcp*`, `/transfer*`, `/health`, `/.well-known*`, `/register`, `/token`, `/revoke` | 403, no `Location` |
+| `/` **with** an `Authorization: Bearer` header, any method | 403, no `Location` |
+| `/admin*`, `/api*`, `/authorize` | redirect to `https://` |
+| `/` with no `Authorization` header | redirect to `https://` |
+| `/.well-known/acme-challenge/*` | not refused — certificate issuance must work |
+
+The asymmetry is the control, not an oversight. A person who typed a
+hostname into a browser leaks nothing by being redirected; a machine
+holding a long-lived bearer token benefits from a failure. The root path
+is split by the *header* rather than by the path, because there the
+credential — not the URL — is what makes the request machine-facing.
+`/health` is on the refusing side: it is machine-facing and has no
+browser use, and the container's own healthcheck calls
+`http://localhost:8000/health` **inside** the container, bypassing the
+proxy entirely. If you point an external uptime monitor at this host,
+configure it with `https://`; the monitor is corrected, not the rule.
+
+**Traefik (`docker-compose.yml`).** The rule is a router on the `http`
+entrypoint with an explicit `priority=200`, carrying an `ipAllowList`
+middleware whose source range is `192.0.2.0/32`.
+
+That range is RFC 5737 TEST-NET-1 — reserved for documentation, never
+routable — so the allow-list matches nobody and `ipAllowList` refuses
+every request with its default 403, in the proxy, without contacting the
+application. **It is not a placeholder. Do not "fix" it to a real
+address**; giving it anything matchable reopens the leak. `ipAllowList`
+was chosen over the `errors` middleware because `errors` only fires on a
+status the backend already returned, so it forwards the request first
+and cannot refuse at all. The priority is written out rather than left
+to Traefik's default, which is derived from the length of the rule
+string — that would outrank the `http-catchall` redirect today, but a
+control resting on a string length is not a contract.
+
+**Caddy (`Caddyfile.example`).** An `http://{$MCP_HOSTNAME}` site block
+`respond`s 403 for the same set and `redir`s everything else. Note that
+defining it disables Caddy's automatic HTTP→HTTPS redirect for that
+host, which is why the block ends with an explicit `redir`.
+
+**Bring-your-own proxy (`docker-compose.proxy.yml`).** There is no proxy
+in that file for this repository to configure, so this is prose and
+nothing else: on your own proxy, add a plaintext (port 80) rule that
+returns 403 for the paths in the table above — including `/` when the
+request carries an `Authorization: Bearer` header, for every method —
+exempts `/.well-known/acme-challenge/`, and redirects the rest. If you
+skip it, a misconfigured client leaks its bearer token silently and the
+deployment still appears to work.
+
+**Rollback** is reverting the label block (or the Caddy site block) and
+redeploying. There is no migration, no database row and no cached state
+to unwind — plaintext requests simply go back to being redirected.
 
 ## Step 4. Get your vault onto the VPS
 

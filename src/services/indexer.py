@@ -33,6 +33,7 @@ from src.models.db import (
     NoteEmbedding,
     NoteLink,
     NoteMetadata,
+    OAuthClient,
     OAuthCode,
     OAuthToken,
     User,
@@ -4823,6 +4824,57 @@ async def cleanup_expired_tokens():
     session row, but a deployment that flipped from multi-user to single-user
     still has rows, and maintenance that skipped them would strand them
     forever.
+
+    **Never-used dynamic client registrations are swept here too (#194).**
+    `/register` is unauthenticated by RFC 7591 and nothing else bounds
+    `oauth_clients`, so the table only grew. It belongs in this function for
+    the reason the session purge does: same tick, same mandate — delete what
+    is provably dead — and the same "nothing is deleted that an operator can
+    still see" rule. What it does not share is the age predicate, and the
+    difference is the whole design:
+
+    * **"Never used" is `last_used_at IS NULL`, a marker the OAuth routes
+      stamp** in the same transaction that issues a code or a token. It is not
+      derived, because nothing derivable is sound: `user_id` is NULL for every
+      client in single-user mode, a used code is deleted the instant it is
+      spent, and a token seven days after it expires — so neither "no owner"
+      nor "no child rows" can mean "never used".
+    * **Migration 025 stamped every row that existed when it ran**, from the
+      newest surviving child row or, failing that, with its own timestamp. So
+      a NULL marker can only mean "registered after 025 and never used", and
+      the sweep only ever acts on a registration whose entire history is
+      visible to it. A pre-025 client whose evidence was purged is therefore
+      unreachable — deliberately: it cannot be told apart from a confidential
+      client a developer configured by hand, which dynamic registration does
+      **not** re-provision, since registering again mints a different
+      identifier and secret.
+    * **The absence of child rows stays a mandatory second guard**, of *any*
+      state — live, expired or revoked. A revoked token the operator can still
+      see in the panel must not be cascaded away by a client delete.
+
+    **The lock, and why a single conditional DELETE is not enough.** Inserting
+    an `oauth_codes` row takes a `FOR KEY SHARE` lock on the parent
+    `oauth_clients` row through the foreign key, and a `DELETE` takes
+    `FOR UPDATE`; they conflict, so they serialise. But under READ COMMITTED,
+    when the delete unblocks PostgreSQL re-evaluates only the *target row's*
+    own predicate and **not** a `NOT EXISTS` subquery — so
+    `DELETE ... WHERE NOT EXISTS (...)` would proceed and `ON DELETE CASCADE`
+    would remove the authorization code that had just been issued. The sweep
+    therefore selects its candidates `FOR UPDATE SKIP LOCKED`, **re-reads the
+    marker and both child tables in a separate statement inside that lock** (a
+    fresh READ COMMITTED snapshot, which is the point), and deletes only what
+    still qualifies. `/authorize` stamps with an `UPDATE ... RETURNING` on the
+    same row, so one side wins cleanly and the loser gets an ordinary
+    `invalid_client` — never a 500, never half a grant. `SKIP LOCKED` leaves a
+    contended row for the next pass rather than blocking the whole
+    maintenance tick behind one in-flight consent.
+
+    The age is `OAUTH_CLIENT_UNUSED_EXPIRY_DAYS` (30, `ge=1`), and its
+    disabled spelling skips the sweep entirely — the kill switch is `null`,
+    not `0`, because a control that deletes on every pass reads as an outage
+    rather than as a setting. One INFO line carries the count whenever it
+    deletes anything: a job that silently removes credentials cannot be
+    audited.
     """
     cutoff = datetime.now(timezone.utc) - timedelta(days=7)
     session_cutoff = datetime.now(timezone.utc) - timedelta(
@@ -4871,6 +4923,126 @@ async def cleanup_expired_tokens():
                 f"Token cleanup: {codes_deleted} codes, {tokens_deleted} tokens, "
                 f"{sessions_deleted} panel sessions removed"
             )
+
+    # A transaction of its own, after the purge above has committed. The
+    # deletes above are what *make* a client collectable (they are the reason
+    # a child row stops existing), so reading the child tables in the same
+    # transaction that removed rows from them would have the sweep act on a
+    # snapshot no other session has seen yet.
+    await _expire_unused_oauth_clients()
+
+
+#: How many never-used registrations one pass may delete. A bound, not a
+#: target: the batch is what keeps the `FOR UPDATE` lock set — and the sweep's
+#: transaction — small on a table that has been accumulating registrations
+#: since before anything collected them. The remainder is collected by the
+#: next tick, five minutes later. A module constant rather than a setting
+#: because no operator has a reason to tune it; the *age* is the knob.
+OAUTH_CLIENT_EXPIRY_BATCH = 200
+
+
+async def _expire_unused_oauth_clients() -> int:
+    """Delete never-used dynamic client registrations. Returns the count.
+
+    The full argument — why the marker exists, why the child-row guard stays,
+    and why a single conditional `DELETE` races — is in
+    `cleanup_expired_tokens`' docstring, which is this file's contract for the
+    maintenance tick.
+
+    The shape here is the part that has to stay exactly as it is:
+
+    1. `SELECT ... FOR UPDATE SKIP LOCKED` a bounded batch of candidates;
+    2. **re-check every condition inside that lock**, in separate statements,
+       so each gets a fresh READ COMMITTED snapshot and sees an authorization
+       that committed while we were queueing on the row;
+    3. delete only what still qualifies.
+
+    Step 2 is not belt and braces. Step 1's predicate was evaluated against
+    this transaction's first snapshot; PostgreSQL re-evaluates a blocked
+    statement's *target row* predicate when it unblocks, but never a
+    subquery's, so without the re-read a client that was stamped and given a
+    code microseconds ago would be deleted and its code cascaded away.
+    """
+    days = settings.oauth_client_unused_expiry_days
+    if days is None:
+        # The kill switch, and the only one: `ge=1` refuses zero at boot.
+        return 0
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    async with async_session() as session:
+        candidates = (
+            await session.execute(
+                select(OAuthClient.client_id)
+                .where(
+                    OAuthClient.last_used_at.is_(None),
+                    OAuthClient.user_id.is_(None),
+                    OAuthClient.created_at < cutoff,
+                )
+                # A stable order so a contended row is retried in the same
+                # place on the next pass rather than the batch reshuffling
+                # around it.
+                .order_by(OAuthClient.id)
+                .limit(OAUTH_CLIENT_EXPIRY_BATCH)
+                # `SKIP LOCKED` rather than `NOWAIT` or a plain wait: a row
+                # another transaction holds is a row an authorization is in
+                # flight for, which is precisely a row that is about to stop
+                # qualifying. Waiting on it would stall the maintenance tick;
+                # failing on it would abort a pass that has real work left.
+                .with_for_update(skip_locked=True)
+            )
+        ).scalars().all()
+
+        if not candidates:
+            return 0
+
+        # The re-read, inside the lock. One statement over the locked set, in
+        # this transaction but with its own snapshot, so anything committed
+        # between the SELECT above and the lock being granted is visible.
+        still_eligible = (
+            await session.execute(
+                select(OAuthClient.client_id).where(
+                    OAuthClient.client_id.in_(candidates),
+                    OAuthClient.last_used_at.is_(None),
+                    OAuthClient.user_id.is_(None),
+                    OAuthClient.created_at < cutoff,
+                    # Any code row and any token row of any state — live,
+                    # expired or revoked — disqualifies. A revoked token the
+                    # operator can still see in the panel must never be
+                    # cascaded away by this delete.
+                    ~select(OAuthCode.id)
+                    .where(OAuthCode.client_id == OAuthClient.client_id)
+                    .exists(),
+                    ~select(OAuthToken.id)
+                    .where(OAuthToken.client_id == OAuthClient.client_id)
+                    .exists(),
+                )
+            )
+        ).scalars().all()
+
+        if not still_eligible:
+            await session.commit()
+            return 0
+
+        result = await session.execute(
+            delete(OAuthClient).where(OAuthClient.client_id.in_(still_eligible))
+        )
+        deleted = result.rowcount
+        await session.commit()
+
+    if deleted:
+        # One line, always, when anything was removed: a job that silently
+        # deletes credentials cannot be audited. The `client_id`s themselves
+        # are not rendered — the count is what an operator reconciles against,
+        # and `usage_logs.actor_ref` keeps the per-client record that survives
+        # the deletion.
+        logger.info(
+            "OAuth client cleanup: %d never-used registration(s) older than "
+            "%d days removed",
+            deleted,
+            days,
+        )
+    return deleted
 
 
 def _is_paused() -> bool:

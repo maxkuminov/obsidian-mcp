@@ -553,6 +553,57 @@ class Settings(BaseSettings):
         4096, ge=1, le=AUTH_FAILURE_TABLE_SIZE_MAX
     )
 
+    # ── Proxy trust and the panel login budget (#189) ──────────────────────
+    #
+    # Interjected here, between L1 and L2, because both settings below are the
+    # *inputs* to L1: every limiter in this file keys on the address
+    # `ProxyHeadersMiddleware` resolves, and the login budget is the
+    # account-keyed half of the pair slowapi's address-keyed limit cannot
+    # express. The L2/L3 buckets resume below.
+
+    # The **only** statement in the tree of which peers may set `X-Forwarded-*`.
+    # The default is exactly the list that was hard-coded in `src/main.py`
+    # before this setting existed, so a deploy that changes no environment
+    # value changes no client-IP resolution. Narrowing it to the proxy's own
+    # address is the operator's job and must not need a code change — the
+    # deployment's Docker network is shared with containers that run
+    # user-supplied code, and any of them can forge the header that keys every
+    # limiter.
+    #
+    # `NoDecode` for `fts_configs`' reason: a bare `list[str]` is JSON-decoded
+    # by pydantic-settings, so the comma-separated form an operator naturally
+    # writes would abort startup. Env `TRUSTED_PROXY_IPS` accepts JSON
+    # (`["127.0.0.1"]`) or CSV (`127.0.0.1,10.0.0.0/8`); the `_OFF_SPELLINGS`
+    # convention disables the middleware entirely, which is the correct
+    # configuration for a directly-exposed deployment.
+    #
+    # Entries are stored **canonicalised** — see `_parse_trusted_proxy_ips`.
+    # uvicorn's own `--forwarded-allow-ips` is switched off in the `Dockerfile`
+    # rather than aligned with this list: two controls that happen to agree is
+    # not one control, and uvicorn's reads `$FORWARDED_ALLOW_IPS`.
+    trusted_proxy_ips: Annotated[list[str], NoDecode] = [
+        "127.0.0.1",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+    ]
+
+    # The per-**account** failed-login budget on `POST /admin/auth/login`,
+    # additive to the 5/min per-address slowapi limit and replacing neither: an
+    # address-keyed limit hands an attacker a fresh allowance for every address
+    # they rotate through. Keyed exactly on `users.id` and counted only for a
+    # username that resolves to a row, so it can never reach another account
+    # and an unknown name creates nothing — **no table-size setting**, because
+    # the key space is the set of accounts rather than free-to-mint addresses.
+    # Ten failures in fifteen minutes is far above a human typo rate and far
+    # below an online guessing budget worth having. Not a lockout: nothing
+    # durable is written, there is no unlock, and the counter self-heals a
+    # window after the last failure (`docs/architecture/rate-limits.md`).
+    panel_login_failure_limit: NullableLimit = 10
+    panel_login_failure_window_seconds: int = Field(
+        900, ge=1, le=LIMITER_WINDOW_SECONDS_MAX
+    )
+
     # L2 — the general velocity bucket, on every tool call. Far above observed
     # usage (~1,600 calls per 30 days across all credentials), and it stops a
     # hot loop within a second; the burst covers a post-search fan-out.
@@ -689,6 +740,31 @@ class Settings(BaseSettings):
         "claude.ai",
         "chatgpt.com",
     ]
+
+    # How long a dynamically registered OAuth client may sit **never used**
+    # before the maintenance pass deletes it. `/register` is unauthenticated by
+    # RFC 7591 and nothing else bounds `oauth_clients`, so without this the
+    # table only grows.
+    #
+    # **Thirty days, measured against the actual use.** A DCR client registers
+    # and authorizes within seconds, so any gap over a few hours is already
+    # anomalous; thirty days is two orders of magnitude of slack while still
+    # bounding the table at roughly a month of the 3/min registration
+    # limiter's output.
+    #
+    # "Never used" is `oauth_clients.last_used_at IS NULL`, and migration 025
+    # stamped every row that existed when it ran — so that can only mean a
+    # registration made *after* 025 which has never issued a code or a token.
+    # The sweep additionally requires no surviving code or token row of any
+    # state and no owning user; see
+    # `docs/architecture/oauth-and-grants.md`.
+    #
+    # `NullableLimit`, so the house "off" spellings (empty, `null`, `none`)
+    # disable the sweep entirely and `ge=1` refuses zero: a zero-day window
+    # would delete a registration the moment it was made, which reads to an
+    # operator as an outage rather than as a setting (#162's reason). Env:
+    # OAUTH_CLIENT_UNUSED_EXPIRY_DAYS.
+    oauth_client_unused_expiry_days: NullableLimit = 30
 
     # Registry-eval only: when true, lifespan skips the DB dim check,
     # indexer, and embedding provider, and the /mcp auth middleware
@@ -873,6 +949,91 @@ class Settings(BaseSettings):
                 continue
             seen.add(host)
             out.append(host)
+        return out
+
+    @field_validator("trusted_proxy_ips", mode="before")
+    @classmethod
+    def _parse_trusted_proxy_ips(cls, v):
+        """Accept a JSON list, a comma-separated string, or a list of peers —
+        then validate every entry and store it in its **canonical** form.
+
+        Parsing mirrors `_parse_known_redirect_hosts`. Two rules are this
+        setting's own.
+
+        **A malformed entry refuses startup, naming it.** A trust list that
+        quietly drops a range is worse than one that fails: the operator
+        believes they configured a boundary that is not there, and every
+        limiter keyed on the resolved address silently changes meaning.
+
+        **Validation alone is not enough; the stored value must be canonical.**
+        `ip_network("192.168.0.10/24", strict=False)` *accepts* host bits and
+        answers `192.168.0.0/24`, but if the original string is what reaches
+        `ProxyHeadersMiddleware`, uvicorn's stricter parse rejects it and keeps
+        it as a literal matching no peer. The failure is silent and inverts the
+        intent: every proxied request then retains the **proxy's** address, so
+        all callers collapse into one limiter bucket. A bare address stays bare
+        (`127.0.0.1`, not `127.0.0.1/32`) so the logged list reads as what the
+        operator wrote.
+
+        An **empty** list is accepted and means no peer is trusted, which is
+        the correct configuration for a directly-exposed deployment; the
+        middleware is then not installed at all.
+        """
+        if isinstance(v, str):
+            s = v.strip()
+            if s.casefold() in _OFF_SPELLINGS:
+                return []
+            if s.startswith("["):
+                import json
+
+                try:
+                    parsed = json.loads(s)
+                except ValueError as e:
+                    # Looks like JSON (leading "[") but isn't — fail loudly
+                    # rather than CSV-splitting into junk addresses.
+                    raise ValueError(
+                        "TRUSTED_PROXY_IPS looks like JSON but failed to "
+                        f"parse: {e}. Use a JSON list "
+                        '(["127.0.0.1","10.0.0.0/8"]) or a comma-separated '
+                        "string (127.0.0.1,10.0.0.0/8)."
+                    ) from e
+                if not isinstance(parsed, list):
+                    raise ValueError(
+                        "TRUSTED_PROXY_IPS JSON must be a list of addresses "
+                        "or CIDR networks"
+                    )
+                v = parsed
+            else:
+                v = s.split(",")
+        if v is None:
+            return []
+        if not isinstance(v, (list, tuple)):
+            raise ValueError(
+                "TRUSTED_PROXY_IPS must be a list of IP addresses or CIDR "
+                "networks (JSON or comma-separated)"
+            )
+        seen: set[str] = set()
+        out: list[str] = []
+        for item in v:
+            entry = str(item).strip()
+            if not entry:
+                continue
+            try:
+                if "/" in entry:
+                    canonical = str(ipaddress.ip_network(entry, strict=False))
+                else:
+                    canonical = str(ipaddress.ip_address(entry))
+            except ValueError as e:
+                raise ValueError(
+                    f"TRUSTED_PROXY_IPS entry {entry!r} is neither an IP "
+                    f"address nor a CIDR network: {e}. Each entry is one peer "
+                    "or one network; there is no wildcard spelling — clear the "
+                    "setting to trust nobody."
+                ) from e
+            if canonical in seen:
+                continue
+            seen.add(canonical)
+            out.append(canonical)
         return out
 
     # Set by `_record_public_origin`, which must run *before*
