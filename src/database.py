@@ -2,6 +2,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from src.config import settings
 from src.services.pool_budget import POOL_SIZE, POOL_OVERFLOW
+from src.services.transport_security import (
+    STRICT_DB_MODES,
+    database_ssl_connect_args,
+    install_strict_transport_listener,
+)
 
 engine = create_async_engine(
     settings.database_url,
@@ -45,9 +50,24 @@ engine = create_async_engine(
         # index can take a few seconds each on a large vault. 10s (the old
         # value) caused QueryCanceledError on occasional notes and may have
         # left the indexer's session in a stuck state.
-        "server_settings": {"statement_timeout": "60000"}
+        "server_settings": {"statement_timeout": "60000"},
+        # **The one place engine TLS is decided** (#184), shared with
+        # `alembic/env.py`. A strict `DATABASE_SSL_MODE` is an explicit
+        # `ssl.SSLContext`, not asyncpg's mode string: the string path consults
+        # `$PGSSLROOTCERT` and `~/.postgresql/root.crt` and silently turns
+        # `require` into verification when such a file exists, and only a
+        # context is non-advisory by construction (no plaintext retry). The
+        # settings validator already refused a TLS key in the URL, `PGSSL*`
+        # variables and, under a strict mode, every Unix-socket route.
+        **database_ssl_connect_args(settings),
     },
 )
+
+if settings.database_ssl_mode in STRICT_DB_MODES:
+    # D3b: every *new* pooled connection is checked against `pg_stat_ssl` and
+    # discarded if it is not encrypted — one query per connection, never per
+    # checkout. The lifespan's startup assertion checks only the first.
+    install_strict_transport_listener(engine)
 
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 

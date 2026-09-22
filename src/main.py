@@ -37,6 +37,7 @@ from src.services.index_state import (
     state_table_exists,
 )
 from src.services.indexer import run_indexer_loop
+from src.services.transport_security import check_database_transport
 from src.services.rate_limits import flush_all
 from src.services import concurrency
 from src.services import vault_fs
@@ -466,6 +467,11 @@ async def lifespan(app: FastAPI):
             return
         _check_openat2_support()
         _check_mount_identity_support()
+        # First database contact, deliberately: a strict `DATABASE_SSL_MODE`
+        # whose session is not encrypted (or cannot be established) must fail
+        # as itself, not as whatever the first query happened to be. Below the
+        # sandbox short-circuit (#184).
+        await check_database_transport()
         await _check_embedding_dim()
         await _check_pgvector_version()
         await _validate_fts_configs()

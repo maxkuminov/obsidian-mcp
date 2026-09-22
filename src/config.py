@@ -15,6 +15,8 @@ from pydantic import (
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
 
+from src.services.transport_security import normalise_db_ssl_mode
+
 
 # ── One representation for "off" ────────────────────────────────────────────
 #
@@ -305,6 +307,30 @@ class _FieldFilteredSource(PydanticBaseSettingsSource):
 
 class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://obsidian_mcp:changeme@postgres:5432/obsidian_mcp"
+    # ── Database transport (#184) ──────────────────────────────────────────
+    #
+    # The **only** statement of TLS for the database hop; see "Database
+    # transport" in docs/architecture/schema-and-migrations.md. libpq's
+    # vocabulary minus `allow`, stripped and case-folded. Default `prefer` is
+    # exactly the behaviour every deployment had before this setting existed
+    # (asyncpg's advisory TLS with a plaintext fallback); the downgrade it
+    # permits is made visible by the lifespan's transport assertion, not
+    # prevented. `require` / `verify-ca` / `verify-full` are an explicit
+    # `ssl.SSLContext` with no plaintext retry (`src/services/
+    # transport_security.py`). A TLS key in `DATABASE_URL`'s query or a
+    # `PGSSL*` variable is refused rather than merged — `_validate_database_
+    # transport` below.
+    database_ssl_mode: Annotated[
+        Literal["disable", "prefer", "require", "verify-ca", "verify-full"],
+        BeforeValidator(normalise_db_ssl_mode),
+    ] = "prefer"
+    # Trust anchor for `verify-ca` / `verify-full`, required by both and
+    # refused with any other mode (a CA with `require` is not silently
+    # upgraded to verification, as libpq would). No system-store fallback.
+    database_ssl_ca_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
+    # Optional client certificate pair, strict modes only, both or neither.
+    database_ssl_cert_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
+    database_ssl_key_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
     ollama_url: str = "http://ollama:11434"
     # How long Ollama keeps the embedding model resident after a call.
     # "-1" pins it in VRAM indefinitely (sent as the integer Ollama requires),
@@ -1066,6 +1092,71 @@ class Settings(BaseSettings):
         if not isinstance(v, str):
             return v
         return v.strip().lower() or None
+
+    @model_validator(mode="after")
+    def _validate_database_transport(self) -> "Settings":
+        """Design D3/D2a/D3a: refuse every ambiguous database TLS input.
+
+        TLS for the database has one source, `DATABASE_SSL_*`. A TLS key in
+        the URL's query or a `PGSSL*` variable would be merged with it by
+        driver rules nobody can see, so each is refused; so is a CA with a
+        non-verifying mode (libpq would silently upgrade `require`), a
+        verifying mode without a CA, half a client pair, a client pair under
+        a lax mode, and any named file that is missing, not regular, not
+        readable or not loadable. Under a strict mode every Unix-socket route
+        is refused too, before any connection exists. Messages never echo the
+        URL or its password.
+        """
+        from src.services.transport_security import (
+            STRICT_DB_MODES,
+            VERIFYING_DB_MODES,
+            build_database_ssl_context,
+            check_certificate_file,
+            validate_database_url_transport,
+        )
+
+        mode = self.database_ssl_mode
+        validate_database_url_transport(self.database_url, mode)
+        ca, cert, key = (
+            self.database_ssl_ca_file,
+            self.database_ssl_cert_file,
+            self.database_ssl_key_file,
+        )
+        if mode in VERIFYING_DB_MODES and ca is None:
+            raise ValueError(
+                f"DATABASE_SSL_MODE={mode} requires DATABASE_SSL_CA_FILE: a "
+                "verifying mode needs a stated trust anchor (point it at the "
+                "system bundle explicitly for a publicly-trusted certificate)."
+            )
+        if ca is not None and mode not in VERIFYING_DB_MODES:
+            raise ValueError(
+                f"DATABASE_SSL_CA_FILE is set but DATABASE_SSL_MODE={mode} does "
+                "not verify the server. Use DATABASE_SSL_MODE=verify-ca or "
+                "verify-full, or unset DATABASE_SSL_CA_FILE."
+            )
+        if (cert is None) != (key is None):
+            raise ValueError(
+                "DATABASE_SSL_CERT_FILE and DATABASE_SSL_KEY_FILE must be set "
+                "together: a client certificate needs its key."
+            )
+        if cert is not None and mode not in STRICT_DB_MODES:
+            raise ValueError(
+                "DATABASE_SSL_CERT_FILE / DATABASE_SSL_KEY_FILE are set but "
+                f"DATABASE_SSL_MODE={mode} does not require TLS. Use require, "
+                "verify-ca or verify-full, or unset the client certificate."
+            )
+        for setting, path in (
+            ("DATABASE_SSL_CA_FILE", ca),
+            ("DATABASE_SSL_CERT_FILE", cert),
+            ("DATABASE_SSL_KEY_FILE", key),
+        ):
+            if path is not None:
+                check_certificate_file(path, setting)
+        if mode in STRICT_DB_MODES:
+            # Parse now, so an unloadable file refuses the boot here rather
+            # than at `src.database` import; the engine builds its own copy.
+            build_database_ssl_context(mode, ca, cert, key)
+        return self
 
     @model_validator(mode="after")
     def _record_public_origin(self) -> "Settings":
