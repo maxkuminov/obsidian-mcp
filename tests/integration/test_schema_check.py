@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "025"
+HEAD_REVISION = "026"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -5239,9 +5239,11 @@ def test_025_creates_a_nullable_marked_column_with_no_default():
         )
 
 
-def test_025_chains_from_024_and_is_the_head():
+def test_025_chains_from_024_and_026_from_025():
     """The ordering the `schema-integrity` delta names, asserted rather than
-    assumed: 025 must not migrate ahead of 024, whose own predecessor is 023.
+    assumed: 025 must not migrate ahead of 024, whose own predecessor is 023,
+    and 026 (performance-2026-09) chains from 025. The head is the module's
+    single literal, raised by every new revision.
     """
     from alembic.config import Config
     from alembic.script import ScriptDirectory
@@ -5250,13 +5252,15 @@ def test_025_chains_from_024_and_is_the_head():
     config.set_main_option("script_location", str(_harness.ROOT / "alembic"))
     script = ScriptDirectory.from_config(config)
 
-    assert script.get_current_head() == HEAD_REVISION == "025"
+    assert script.get_current_head() == HEAD_REVISION
+    assert script.get_revision("026").down_revision == "025"
     assert script.get_revision("025").down_revision == "024"
     assert script.get_revision("024").down_revision == "023"
 
-    ordered = [rev.revision for rev in script.walk_revisions("base", "025")]
+    ordered = [rev.revision for rev in script.walk_revisions("base", HEAD_REVISION)]
     # `walk_revisions` yields newest-first, so an earlier revision appears
     # *later* in the list.
+    assert ordered.index("025") > ordered.index("026")
     assert ordered.index("024") > ordered.index("025")
     assert ordered.index("023") > ordered.index("024")
 
@@ -5485,3 +5489,259 @@ def test_downgrade_025_refuses_a_column_it_did_not_create():
         assert "025's comment marker" in result.stdout + result.stderr
         assert last_used_state(url) is not None
         assert alembic_version(url) == HEAD_REVISION
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 026 — notes_metadata.stat_*, the scan's stat shortcut (#282)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `alembic check` sees the four columns, their type, nullability and comment.
+# It cannot see the all-or-none CHECK (autogenerate does not compare CHECK
+# predicates), and that CHECK is what keeps a half-recorded tuple — neither a
+# stat nor its absence — out of the table the shortcut trusts. So the CHECK is
+# asserted through `pg_constraint` by definition, and enforced by an insert.
+
+STAT_COLUMNS = ("stat_size", "stat_mtime_ns", "stat_ctime_ns", "stat_ino")
+STAT_MARKER = (
+    "stat of the bytes content_hash was computed from (026_note_stat_columns)"
+)
+STAT_CHECK_MARKER = "all-or-none stat tuple (026_note_stat_columns)"
+STAT_CHECK_NAME = "ck_notes_metadata_stat_all_or_none"
+# What PostgreSQL 16 prints for 026's predicate. The migration measures the
+# same string off a scratch table at runtime; this pin tells us if either
+# side moves.
+CANONICAL_STAT_CHECK = (
+    "CHECK ((((stat_size IS NULL) AND (stat_mtime_ns IS NULL) AND "
+    "(stat_ctime_ns IS NULL) AND (stat_ino IS NULL)) OR "
+    "((stat_size IS NOT NULL) AND (stat_mtime_ns IS NOT NULL) AND "
+    "(stat_ctime_ns IS NOT NULL) AND (stat_ino IS NOT NULL))))"
+)
+
+
+def stat_column_state(url, column):
+    """`(coltype, attnotnull, default, comment)` for the column, or None."""
+    rows = fetch(
+        url,
+        "SELECT format_type(a.atttypid, a.atttypmod) AS coltype, a.attnotnull, "
+        "       pg_get_expr(d.adbin, d.adrelid) AS coldefault, "
+        "       col_description(a.attrelid, a.attnum) AS comment "
+        "FROM pg_attribute a "
+        "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+        "WHERE a.attrelid = 'public.notes_metadata'::regclass "
+        "  AND a.attname = $1 AND a.attnum > 0 AND NOT a.attisdropped",
+        column,
+    )
+    return tuple(rows[0]) if rows else None
+
+
+def stat_checks(url):
+    """Every CHECK on notes_metadata whose definition is 026's predicate —
+    resolved by definition, never by name."""
+    rows = fetch(
+        url,
+        "SELECT conname, convalidated, pg_get_constraintdef(oid) AS def, "
+        "       obj_description(oid, 'pg_constraint') AS comment "
+        "FROM pg_constraint "
+        "WHERE conrelid = 'public.notes_metadata'::regclass AND contype = 'c'",
+    )
+    return [
+        (r["conname"], r["convalidated"], r["comment"])
+        for r in rows
+        if " ".join(r["def"].split()) == CANONICAL_STAT_CHECK
+    ]
+
+
+def insert_stat_note(url, note_id, path, stat):
+    sql(
+        url,
+        "INSERT INTO notes_metadata (id, user_id, file_path, title, content_hash, "
+        " stat_size, stat_mtime_ns, stat_ctime_ns, stat_ino) "
+        "VALUES ($1, NULL, $2, 't', 'h', $3, $4, $5, $6)",
+        note_id,
+        path,
+        *stat,
+    )
+
+
+def refuse_026(url, *, must_mention):
+    """Stamp back to 025, re-run 026, require a refusal naming the problem."""
+    _harness.run_alembic(url, "stamp", "025", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "026 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "025", "nothing should have been recorded"
+    return combined
+
+
+def test_026_adds_four_nullable_marked_bigints_and_the_check():
+    with throwaway_db("schema_stat_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+        for column in STAT_COLUMNS:
+            coltype, notnull, default, comment = stat_column_state(url, column)
+            assert coltype == "bigint", column
+            assert notnull is False, column
+            assert default is None, column
+            assert comment == STAT_MARKER, column
+
+        checks = stat_checks(url)
+        assert checks == [(STAT_CHECK_NAME, True, STAT_CHECK_MARKER)], checks
+
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_026_chains_from_025_and_applies_it_first():
+    with throwaway_db("schema_stat_chain", revision="025") as url:
+        assert alembic_version(url) == "025"
+        assert stat_column_state(url, "stat_size") is None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert stat_column_state(url, "stat_size") is not None
+
+
+def test_026_leaves_every_existing_row_null_and_backfills_nothing():
+    with throwaway_db("schema_stat_no_backfill", revision="025") as url:
+        sql(
+            url,
+            "INSERT INTO notes_metadata (id, user_id, file_path, title, "
+            " content_hash) VALUES (1, NULL, 'A.md', 'A', 'ha'), "
+            " (2, NULL, 'B.md', 'B', 'hb')",
+        )
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM notes_metadata WHERE stat_size IS NULL "
+            "AND stat_mtime_ns IS NULL AND stat_ctime_ns IS NULL "
+            "AND stat_ino IS NULL",
+        ) == 2
+
+
+def test_026_check_refuses_a_half_recorded_stat():
+    with throwaway_db("schema_stat_enforced") as url:
+        insert_stat_note(url, 1, "Full.md", (10, 1, 2, -5))
+        insert_stat_note(url, 2, "None.md", (None, None, None, None))
+        with pytest.raises(asyncpg.CheckViolationError):
+            insert_stat_note(url, 3, "Half.md", (10, 1, None, None))
+        with pytest.raises(asyncpg.CheckViolationError):
+            insert_stat_note(url, 4, "OnlyIno.md", (None, None, None, 7))
+        assert fetchval(url, "SELECT count(*) FROM notes_metadata") == 2
+
+
+def test_026_accepts_its_own_shape_on_a_stamp_back_and_keeps_rows():
+    with throwaway_db("schema_stat_rerun") as url:
+        insert_stat_note(url, 1, "A.md", (10, 111, 222, 333))
+        _harness.run_alembic(url, "stamp", "025", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        row = fetch(
+            url,
+            "SELECT stat_size, stat_mtime_ns, stat_ctime_ns, stat_ino "
+            "FROM notes_metadata WHERE id = 1",
+        )[0]
+        assert tuple(row) == (10, 111, 222, 333)
+        assert len(stat_checks(url)) == 1
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_026_refuses_an_impostor_column_of_the_wrong_type():
+    """The spec's own example: an `integer` `stat_ino` truncates inode
+    numbers into false matches, so it is refused by name."""
+    with throwaway_db("schema_stat_impostor_type", revision="025") as url:
+        sql(url, "ALTER TABLE notes_metadata ADD COLUMN stat_ino integer")
+        refuse_026(url, must_mention=["notes_metadata.stat_ino is integer"])
+        assert stat_column_state(url, "stat_size") is None
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "not_null",
+            "ALTER TABLE notes_metadata ADD COLUMN stat_size bigint NOT NULL "
+            "DEFAULT 0",
+            "notes_metadata.stat_size is NOT NULL",
+        ),
+        (
+            "server_default",
+            "ALTER TABLE notes_metadata ADD COLUMN stat_mtime_ns bigint DEFAULT 0",
+            "server default",
+        ),
+        (
+            "unmarked",
+            "ALTER TABLE notes_metadata ADD COLUMN stat_ctime_ns bigint",
+            "does not carry 026's comment marker",
+        ),
+    ],
+)
+def test_026_refuses_a_pre_existing_column_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_stat_foreign_{label}", revision="025") as url:
+        sql(url, ddl)
+        refuse_026(url, must_mention=[fragment])
+
+
+def test_026_refuses_an_impostor_check_under_its_name():
+    """Resolved by definition: a `CHECK (true)` carrying 026's name is not
+    026's CHECK, and is refused rather than adopted."""
+    with throwaway_db("schema_stat_impostor_check") as url:
+        sql(url, f"ALTER TABLE notes_metadata DROP CONSTRAINT {STAT_CHECK_NAME}")
+        sql(
+            url,
+            f"ALTER TABLE notes_metadata ADD CONSTRAINT {STAT_CHECK_NAME} "
+            "CHECK (true)",
+        )
+        refuse_026(url, must_mention=[f"a CHECK named {STAT_CHECK_NAME}"])
+
+
+def test_026_refuses_an_unmarked_check_with_its_definition():
+    with throwaway_db("schema_stat_unmarked_check") as url:
+        sql(
+            url,
+            f"COMMENT ON CONSTRAINT {STAT_CHECK_NAME} ON notes_metadata IS NULL",
+        )
+        refuse_026(url, must_mention=["does not carry 026's constraint marker"])
+
+
+def test_downgrade_026_drops_the_marked_unit_and_upgrade_rebuilds_it():
+    with throwaway_db("schema_stat_downgrade") as url:
+        insert_stat_note(url, 1, "A.md", (10, 1, 2, 3))
+        _harness.run_alembic(url, "downgrade", "025", dimensions=DIM)
+        assert alembic_version(url) == "025"
+        for column in STAT_COLUMNS:
+            assert stat_column_state(url, column) is None
+        assert stat_checks(url) == []
+        assert fetchval(url, "SELECT count(*) FROM notes_metadata") == 1
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(
+            url, "SELECT count(*) FROM notes_metadata WHERE stat_size IS NULL"
+        ) == 1
+        assert len(stat_checks(url)) == 1
+        check = _harness.run_alembic(url, "check", dimensions=DIM, check=False)
+        assert check.returncode == 0, (
+            f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+        )
+
+
+def test_downgrade_026_leaves_a_column_it_did_not_create():
+    """Per object, 023's rule: an unmarked column is left in place and named,
+    and the marked ones are still dropped."""
+    with throwaway_db("schema_stat_downgrade_foreign") as url:
+        sql(
+            url,
+            "COMMENT ON COLUMN notes_metadata.stat_ino IS 'somebody else made this'",
+        )
+        result = _harness.run_alembic(url, "downgrade", "025", dimensions=DIM)
+        assert "leaving notes_metadata.stat_ino in place" in result.stdout
+        assert alembic_version(url) == "025"
+        assert stat_column_state(url, "stat_ino") is not None
+        for column in ("stat_size", "stat_mtime_ns", "stat_ctime_ns"):
+            assert stat_column_state(url, column) is None

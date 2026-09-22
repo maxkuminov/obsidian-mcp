@@ -98,21 +98,21 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 ## 3. Slice S3 — scan off the loop, stat shortcut, sweep gate (#278, #282), branch `perf-s3-scan`
 
-- [ ] 3.1 `alembic/versions/026_note_stat_columns.py` (`down_revision = "025"`). House shape:
+- [x] 3.1 `alembic/versions/026_note_stat_columns.py` (`down_revision = "025"`). House shape:
   - A module-level `MARKER` is stamped as a column comment on each of the four columns. Mirror it in `models/db.py`.
   - Add `stat_size`, `stat_mtime_ns`, `stat_ctime_ns`, `stat_ino`, all `BIGINT NULL`, and the CHECK `ck_notes_metadata_stat_all_or_none`, resolved through `pg_constraint` and never by name.
   - It is metadata-only: no backfill, no default.
   - Pin `search_path`, and set and reset `lock_timeout`/`statement_timeout`, as 024 does.
   - `downgrade()` drops only marked columns.
   - Reconcile, don't adopt: a pre-existing column of the same name and a different shape is refused, and the refusal names it.
-- [ ] 3.2 `models/db.py`: add the four columns and the CHECK, appended last in `NoteMetadata.__table_args__`.
-- [ ] 3.3 `indexer.py`: add `_scan_vault(...)` (D8), which runs in `asyncio.to_thread`.
+- [x] 3.2 `models/db.py`: add the four columns and the CHECK, appended last in `NoteMetadata.__table_args__`.
+- [x] 3.3 `indexer.py`: add `_scan_vault(...)` (D8), which runs in `asyncio.to_thread`.
   - It performs the walk, the shortcut stat, the read, `fstat`-before-read, and the SHA-256.
   - Retain a body only where D8 says so.
   - A `threading.Event` checked between files provides stop-on-cancel.
   - Record the racy-stat decision (D10), with `STAT_RACY_WINDOW_NS = 2_000_000_000`, measured against `t_start = time.time_ns()` taken immediately **before** the pre-read `fstat`, not after the read. A future timestamp is also racy.
   - Convert `stat_ino` to signed 64-bit.
-- [ ] 3.4 `indexer.py` `_index_vault_pinned` restructure (D9):
+- [x] 3.4 `indexer.py` `_index_vault_pinned` restructure (D9):
   - The provenance reconcile runs first, as today.
   - The pre-walk snapshot is read in its own session and **committed**.
   - Then comes `_scan_vault`.
@@ -122,21 +122,21 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - Carry the new path's stat on the id-preserving move.
   - Carry the stat on the upsert (insert values and `on_conflict` set).
   - Keep the single commit.
-- [ ] 3.5 `indexer.py` backstop (D12): add `_last_full_hash[scope]`, which is monotonic and in memory. It is set **only when a full-hash scan pass for that scope commits with an empty `skips` list** (every discovered file read and hashed). An aborted, refused or cancelled full-hash pass, or one that commits with any skipped path, leaves the scope due. Test: a committed full-hash pass containing one unreadable file leaves the scope due, and the next pass is a full-hash pass, so the next pass is again a full-hash pass. The first pass for a scope after process start is a full-hash pass, and so is every pass once `INDEX_FULL_HASH_INTERVAL_HOURS` have elapsed since the last successful one. `control_panel/routes.py`'s reindex forces one. A full-hash pass also forces the sweep (task 3.7).
-- [ ] 3.6 `indexer.py`: move the embed-path work to `to_thread`. That covers the backlog's `read_note_beneath` + `_content_hash` + `parse_frontmatter`, the sweep probe's read, hash, parse, `clean_for_embedding` and `chunk_text_bounded`, and, in `embeddings.py` `embed_note`, `clean_for_embedding` + `chunk_text_bounded`.
-- [ ] 3.7 `indexer.py` `_reconcile_exclusions` gate (D13):
+- [x] 3.5 `indexer.py` backstop (D12): add `_last_full_hash[scope]`, which is monotonic and in memory. It is set **only when a full-hash scan pass for that scope commits with an empty `skips` list** (every discovered file read and hashed). An aborted, refused or cancelled full-hash pass, or one that commits with any skipped path, leaves the scope due. Test: a committed full-hash pass containing one unreadable file leaves the scope due, and the next pass is a full-hash pass, so the next pass is again a full-hash pass. The first pass for a scope after process start is a full-hash pass, and so is every pass once `INDEX_FULL_HASH_INTERVAL_HOURS` have elapsed since the last successful one. `control_panel/routes.py`'s reindex forces one. A full-hash pass also forces the sweep (task 3.7).
+- [x] 3.6 `indexer.py`: move the embed-path work to `to_thread`. That covers the backlog's `read_note_beneath` + `_content_hash` + `parse_frontmatter`, the sweep probe's read, hash, parse, `clean_for_embedding` and `chunk_text_bounded`, and, in `embeddings.py` `embed_note`, `clean_for_embedding` + `chunk_text_bounded`.
+- [x] 3.7 `indexer.py` `_reconcile_exclusions` gate (D13):
   - Add `_swept[scope]` in memory.
   - Skip the sweep when it equals the current pattern fingerprint and the pass is not a backstop pass.
   - Set it only on a **clean** completion, meaning no pause, no budget stop, no exception, no provider failure, no read failure, no `StaleCertification` and **no hash-mismatch skip**. Only zero-chunk rows do not block it.
   - Clear it on a re-derive, and through `clear_sweep_state()` on the two in-process reset routes (`reset_embeddings`, `trigger_reembed`; see the region table).
-- [ ] 3.8 `tools.py` `move_note`: the `nm_update` `.values(...)` sets the four stat columns to NULL.
-- [ ] 3.9 `config.py` and `.env.example`: add `index_stat_shortcut: bool = True` and `index_full_hash_interval_hours: int = Field(24, ge=1)`, with the D11/L3 guidance for network, FUSE and FAT mounts.
-- [ ] 3.10 `tests/test_perf_scan_offload.py`:
+- [x] 3.8 `tools.py` `move_note`: the `nm_update` `.values(...)` sets the four stat columns to NULL.
+- [x] 3.9 `config.py` and `.env.example`: add `index_stat_shortcut: bool = True` and `index_full_hash_interval_hours: int = Field(24, ge=1)`, with the D11/L3 guidance for network, FUSE and FAT mounts.
+- [x] 3.10 `tests/test_perf_scan_offload.py`:
   - The scan's read and hash execute on a non-main thread, asserted inside the patched read.
   - `parse_frontmatter`, `clean_for_embedding` and `chunk_text_bounded` are dispatched through `to_thread` on all three embed paths.
   - **The /health acceptance criterion:** with the read patched to block for 2 s per file, a concurrent coroutine completes at least one iteration and `/health`, served by the test client, answers while the scan is in progress. This is a binary progress assertion, not a timing bound.
   - Cancellation sets the stop event and returns within one file.
-- [ ] 3.11 `tests/test_perf_stat_shortcut.py`:
+- [x] 3.11 `tests/test_perf_stat_shortcut.py`:
   - Unchanged stat → no read. Changed stat with the same hash → stat refreshed, no upsert. Changed stat with a new hash → upsert.
   - Each of these reads: a NULL stat, a stale extraction marker, a re-derive, a backstop pass, and `INDEX_STAT_SHORTCUT=false`.
   - A racy stat, whether in the future or within 2 s before `t_start`, is recorded NULL.
@@ -145,7 +145,7 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - A retargeted symlink is re-read.
   - Same-size in-place rewrite with a forced identical stat (monkeypatched `os.stat`) is missed until the backstop, then picked up. This documents L3.
   - `move_note` NULLs the stat.
-- [ ] 3.12 `tests/integration/test_perf_scan_pg.py` (real Postgres):
+- [x] 3.12 `tests/integration/test_perf_scan_pg.py` (real Postgres):
   - A `move_note` committed between the snapshot and the lock does not prune the moved row (C5), and the next pass settles it.
   - Another process's committed upsert between the snapshot and the lock is re-decided under the lock (C4).
   - No transaction is open during the walk. Assert this via `pg_stat_activity` from a probe connection while the patched scan blocks.
@@ -153,11 +153,11 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - A reset running concurrently with a walk neither deadlocks nor lets old decisions land.
   - The sweep is skipped on a second clean pass, runs again after a provider failure, and runs on a backstop pass.
   - **A→B→A.** An excluded note (content A, certified with zero vectors) has its pattern removed, then a restart. The scan reads A. Before the sweep reaches the note it is saved as B, so the sweep skips it on a hash mismatch. It is restored to A before the next scan. The sweep must not record clean, the next pass must sweep again, and the note must end up embedded. `test_issue_127_exclusion_reconciliation_pg.py` passes with the gate in place: its assertions run on backstop or first passes.
-- [ ] 3.13 `tests/integration/test_schema_check.py`:
+- [x] 3.13 `tests/integration/test_schema_check.py`:
   - Raise `HEAD_REVISION` to `026`.
   - Add 026's marker, drift, downgrade, stamp-back and impostor cases (a same-named column of the wrong type is refused), plus a CHECK case resolved through `pg_constraint`.
   - Keep every earlier case.
-- [ ] 3.14 Docs:
+- [x] 3.14 Docs:
   - `indexing-and-embeddings.md`: sections for D8, D9 (with C1–C8 verbatim), D10–D13, and L3/L4/L7. Update the "Indexer runs on startup then every 5 minutes, hash-based change detection" bullet, and correct `database.py`'s idle-in-transaction comment. That comment's claim that the pass "holds one transaction … across the whole synchronous walk" stops being true. Coordinate with #284 if it has touched the file.
   - `schema-and-migrations.md`: a "026" section.
   - Validate with `make test-schema`, then `make test-integration`.
