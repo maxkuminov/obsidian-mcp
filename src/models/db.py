@@ -462,7 +462,16 @@ class NoteMetadata(Base):
         server_default=text("false"),
         comment=_CHUNKS_TRUNCATED_COLUMN_MARKER,
     )
-    content_tsvector: Mapped[str | None] = mapped_column(TSVECTOR, nullable=True)
+    # Deferred with raise-on-load (#280, design D5). No read path renders the
+    # tsvector: `keyword_search` uses it only server-side (`@@`, `ts_rank_cd`),
+    # and every writer is SQL text or `insert().values`, which deferral does
+    # not touch. Raise, not lazy-load: under `AsyncSession` a lazy load is an
+    # implicit-IO error anyway, and raising names the offending access in a
+    # test instead of surfacing as `MissingGreenlet` in production. A reader
+    # that genuinely needs it selects the column explicitly.
+    content_tsvector: Mapped[str | None] = mapped_column(
+        TSVECTOR, nullable=True, deferred=True, deferred_raiseload=True
+    )
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     modified_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     indexed_at: Mapped[datetime.datetime] = mapped_column(

@@ -2142,13 +2142,18 @@ async def list_notes_impl(
     limit = _clamp_limit(limit)
     uid = current_user_id.get()
     async with async_session() as session:
-        stmt = select(NoteMetadata).order_by(NoteMetadata.modified_at.desc())
+        # Only the columns the listing renders (#280, D6); `file_path` breaks
+        # exact `modified_at` ties so membership and order at the LIMIT no
+        # longer depend on the plan.
+        stmt = select(
+            NoteMetadata.file_path, NoteMetadata.file_size, NoteMetadata.modified_at
+        ).order_by(NoteMetadata.modified_at.desc(), NoteMetadata.file_path.asc())
         stmt = apply_note_filters(
             stmt, folder=folder or None, tags=tags, frontmatter=frontmatter, user_id=uid
         )
         stmt = stmt.limit(limit)
         result = await session.execute(stmt)
-        notes = result.scalars().all()
+        notes = result.all()
 
     if not notes:
         return f"No markdown files in '{folder or '/'}'"
@@ -2211,13 +2216,20 @@ async def get_recent_impl(
     limit = _clamp_limit(limit)
     uid = current_user_id.get()
     async with async_session() as session:
-        query = select(NoteMetadata).order_by(NoteMetadata.modified_at.desc())
+        # Only the columns the listing renders (#280, D6), with the same
+        # `file_path` tie-break as `list_notes`.
+        query = select(
+            NoteMetadata.file_path,
+            NoteMetadata.title,
+            NoteMetadata.tags,
+            NoteMetadata.modified_at,
+        ).order_by(NoteMetadata.modified_at.desc(), NoteMetadata.file_path.asc())
         query = apply_note_filters(
             query, folder=folder, tags=tags, frontmatter=frontmatter, user_id=uid
         )
         query = query.limit(limit)
         result = await session.execute(query)
-        notes = result.scalars().all()
+        notes = result.all()
 
     if not notes:
         return "No recent notes found"
@@ -3484,10 +3496,13 @@ async def get_neighborhood_impl(path: str, depth: int = 1, limit: int = 50) -> s
         ids = [nid for nid in seen if nid != source.id]
         if not ids:
             return f"`{path}` has no resolved-link neighbors"
-        meta_stmt = select(NoteMetadata).where(
+        # Only the columns the listing renders (#280, D6).
+        meta_stmt = select(
+            NoteMetadata.id, NoteMetadata.file_path, NoteMetadata.title, NoteMetadata.tags
+        ).where(
             NoteMetadata.id.in_(ids), _note_owner_predicate(uid)
         )
-        meta_rows = (await session.execute(meta_stmt)).scalars().all()
+        meta_rows = (await session.execute(meta_stmt)).all()
         meta_by_id = {m.id: m for m in meta_rows}
         # Drop any ids that the user_id filter excluded (shouldn't happen
         # under normal operation but keeps the output consistent).
@@ -3786,10 +3801,19 @@ async def find_orphans_impl(folder: str | None = None, limit: int = 50) -> str:
             NoteLink.target_note_id.isnot(None), edge_within_owned_set
         )
         connected = union(sources, targets).subquery()
-        stmt = select(NoteMetadata).where(NoteMetadata.id.notin_(select(connected.c.nid)))
+        # Only the columns the listing renders (#280, D6). NULL `modified_at`
+        # stays last; `file_path` breaks exact ties deterministically.
+        stmt = select(
+            NoteMetadata.file_path,
+            NoteMetadata.title,
+            NoteMetadata.tags,
+            NoteMetadata.modified_at,
+        ).where(NoteMetadata.id.notin_(select(connected.c.nid)))
         stmt = apply_note_filters(stmt, folder=folder, user_id=uid)
-        stmt = stmt.order_by(NoteMetadata.modified_at.desc().nullslast()).limit(limit)
-        notes = (await session.execute(stmt)).scalars().all()
+        stmt = stmt.order_by(
+            NoteMetadata.modified_at.desc().nullslast(), NoteMetadata.file_path.asc()
+        ).limit(limit)
+        notes = (await session.execute(stmt)).all()
 
     if not notes:
         scope = f" in `{folder}`" if folder else ""

@@ -140,7 +140,7 @@ def _semantic_row(note_id=1, path="a.md"):
         "note_id": note_id, "chunk_index": 0, "embedding": [1.0, 0.0, 0.0],
         "chunk_text": "x",
     })()
-    return (chunk, _Note(note_id, path), 0.1)
+    return _projected_row(chunk, _Note(note_id, path), 0.1)
 
 
 @pytest.mark.asyncio
@@ -164,7 +164,7 @@ async def test_semantic_search_logs_embed_db_and_fallback(monkeypatch, captured)
 
 @pytest.mark.asyncio
 async def test_exact_fallback_is_recorded_when_it_fires(monkeypatch, captured):
-    rows = [(
+    rows = [_projected_row(
         type("C", (), {"note_id": 1, "chunk_index": 0, "embedding": [1.0, 0.0, 0.0],
                        "chunk_text": "x"})(),
         _Note(1, "B/a.md"),
@@ -331,3 +331,26 @@ def test_add_ms_accumulates():
         assert timing.current()["db_ms"] == 30
     finally:
         timing.clear(token)
+
+
+def _projected_row(chunk, note, distance):
+    """One row of `semantic_search`'s projected select (#280, D6).
+
+    The statement selects columns, not entities, so a row is flat. It carries
+    no `embedding`: similarity comes from the database's distance (D7), and a
+    service that reached for a stored vector would fail here.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        note_id=chunk.note_id,
+        chunk_index=chunk.chunk_index,
+        chunk_text=chunk.chunk_text,
+        file_path=note.file_path,
+        title=note.title,
+        tags=note.tags,
+        content_hash=note.content_hash,
+        embedded_content_hash=note.embedded_content_hash,
+        chunks_truncated=note.chunks_truncated,
+        distance=distance,
+    )

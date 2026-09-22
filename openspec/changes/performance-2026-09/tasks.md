@@ -80,18 +80,18 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 ## 2. Slice S2 — read-path projection (#280), branch `perf-s2-projection`
 
-- [ ] 2.1 `models/db.py`: `content_tsvector` gets `deferred=True, deferred_raiseload=True`. Leave `frontmatter` eager, as D5 decided.
-- [ ] 2.2 `search.py`: project `file_path, title, tags, rank`. Keep the `SET LOCAL`, the predicate and the ordering exactly as they are.
-- [ ] 2.3 `embeddings.py` `semantic_search`:
+- [x] 2.1 `models/db.py`: `content_tsvector` gets `deferred=True, deferred_raiseload=True`. Leave `frontmatter` eager, as D5 decided.
+- [x] 2.2 `search.py`: project `file_path, title, tags, rank`. Keep the `SET LOCAL`, the predicate and the ordering exactly as they are.
+- [x] 2.3 `embeddings.py` `semantic_search`:
   - Project D6's columns, which is the `find_related_stmt` shape.
   - Re-sort by `(distance, file_path, chunk_index)`.
   - Set `similarity = 1 - float(distance)`.
   - Remove the NumPy recomputation and the `numpy` import if nothing else in the module uses it.
   - Keep the staleness, truncation and exact-fallback logic byte for byte.
-- [ ] 2.4 `tools.py`: project the columns D6 lists for `list_notes`, `get_recent` and `find_orphans`, and add `file_path ASC` after the existing `modified_at` ordering. `find_orphans` keeps `modified_at DESC NULLS LAST`. Project `get_neighborhood`'s hydration as `id, file_path, title, tags`. Rendering must be unchanged.
-- [ ] 2.5 `tests/test_perf_projection.py`: compile each statement and assert that `content_tsvector`, `embedding` and `frontmatter` are absent from its SELECT list. Also add a raiseload guard: loading `NoteMetadata` and touching `content_tsvector` raises.
-- [ ] 2.6 `tests/integration/test_perf_projection_identity_pg.py`. On the recall corpus plus a keyword corpus, run the **pre-change** implementations (copied into the test as oracles) and the new ones. They must produce the same result set, the same order, byte-equal non-similarity fields, and similarity within 1e-5, across stale, truncated, filtered, unfiltered and exact-fallback cases. The corpus must deliberately include all three permitted tie cases, and the oracle must accept them and reject every other difference. The three cases are: more notes with an identical `modified_at` (and identical `rank`) than the limit, where membership at the cutoff may differ; two notes with an identical `modified_at` that both fit under the limit, whose relative order may differ; and one note with two chunks at exactly equal distance, where the representative chunk may differ. It must also include orphans with NULL `modified_at`, which must stay last. `test_search_recall.py`, `test_keyword_plan.py` and `test_pgvector_search.py` must pass unchanged.
-- [ ] 2.7 Docs:
+- [x] 2.4 `tools.py`: project the columns D6 lists for `list_notes`, `get_recent` and `find_orphans`, and add `file_path ASC` after the existing `modified_at` ordering. `find_orphans` keeps `modified_at DESC NULLS LAST`. Project `get_neighborhood`'s hydration as `id, file_path, title, tags`. Rendering must be unchanged.
+- [x] 2.5 `tests/test_perf_projection.py`: compile each statement and assert that `content_tsvector`, `embedding` and `frontmatter` are absent from its SELECT list. Also add a raiseload guard: loading `NoteMetadata` and touching `content_tsvector` raises.
+- [x] 2.6 `tests/integration/test_perf_projection_identity_pg.py`. On the recall corpus plus a keyword corpus, run the **pre-change** implementations (copied into the test as oracles) and the new ones. They must produce the same result set, the same order, byte-equal non-similarity fields, and similarity within 1e-5, across stale, truncated, filtered, unfiltered and exact-fallback cases. The corpus must deliberately include all three permitted tie cases, and the oracle must accept them and reject every other difference. The three cases are: more notes with an identical `modified_at` (and identical `rank`) than the limit, where membership at the cutoff may differ; two notes with an identical `modified_at` that both fit under the limit, whose relative order may differ; and one note with two chunks at exactly equal distance, where the representative chunk may differ. It must also include orphans with NULL `modified_at`, which must stay last. `test_search_recall.py`, `test_keyword_plan.py` and `test_pgvector_search.py` must pass unchanged.
+- [x] 2.7 Docs:
   - `search.md`: a "Read paths project what they render" section, covering D5–D7 and the definition of identical.
   - `indexing-and-embeddings.md`: strike L10 as resolved.
   - Validate with `make test-integration`.

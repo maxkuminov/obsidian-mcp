@@ -1407,10 +1407,13 @@ Every residual is listed here, so none of them is discovered later as a defect.
 - **L9 — a capped note's tail is not semantically searchable at all.** That is
   what the cap is; the note stays fully keyword-searchable, and the truncation
   is marked on the row, in every vector result and on the dashboard.
-- **L10 — `semantic_search` still hydrates every candidate's full vector** to
+- ~~**L10 — `semantic_search` still hydrates every candidate's full vector** to
   recompute a similarity the query already returned as `distance`. Pre-existing
   and unrelated to these four findings; filed as a follow-up rather than
-  widened into a change that already touches both read paths.
+  widened into a change that already touches both read paths.~~ **Resolved by
+  #280** (performance-2026-09, D7): `semantic_search` projects its columns and
+  reports `similarity = 1 − distance`; no stored vector is fetched. See "Read
+  paths project what they render" in [search](search.md).
 
 ## Re-deriving after a grammar change (#150)
 
