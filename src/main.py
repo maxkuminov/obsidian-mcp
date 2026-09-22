@@ -24,7 +24,7 @@ from src.limiter import limiter
 from src.mcp_server.auth import APIKeyMiddleware
 from src.mcp_server.server import mcp
 from src.oauth.routes import router as oauth_router
-from src.services import error_log, security_events, vault, vault_overlap
+from src.services import error_log, panel_csp, security_events, vault, vault_overlap
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
     KEY_FTS_FINGERPRINT,
@@ -436,6 +436,27 @@ async def _publish_first_root_snapshot() -> None:
         )
 
 
+def _log_panel_csp_mode() -> None:
+    """Say once, at startup, which panel CSP mode is in force (#195).
+
+    `PANEL_CSP` is the rollback lever: `report-only` and `off` exist so a
+    policy that breaks a panel control can be backed out with one `.env` line
+    and a recreate. A rollback nobody remembers to undo leaves the panel
+    without an enforced policy indefinitely, so anything other than `enforce`
+    is also logged at WARNING, where it is seen.
+    """
+    log = logging.getLogger(__name__)
+    mode = settings.panel_csp
+    log.info("Panel CSP: PANEL_CSP = %s", mode)
+    if mode != "enforce":
+        log.warning(
+            "Panel CSP is not enforced (PANEL_CSP = %s): panel, login and "
+            "consent pages are served without an enforcing "
+            "Content-Security-Policy",
+            mode,
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # First, before any guard can fail: the panel's health page reads this
@@ -444,6 +465,7 @@ async def lifespan(app: FastAPI):
     # ERROR, so it sees every module's errors without any of them opting in;
     # process-lifetime only, no schema — see `src/services/error_log.py`.
     error_log.attach()
+    _log_panel_csp_mode()
     concurrency_controller = concurrency.reset_controller(settings)
     # Wrapped so the suppressor's outstanding counts are flushed on **every**
     # exit path, the sandbox-mode early return included. A window still holding
@@ -637,6 +659,12 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
+    # The panel CSP (#195). Applied only to HTML rendered by the panel, auth
+    # and consent template instances — their context processor marks the
+    # request — so the transfer pages keep their own stricter policy and
+    # FastAPI's /docs pages get none. An enforcing policy already on the
+    # response is never overwritten. See `src/services/panel_csp.py`.
+    panel_csp.apply_policy(request, response, settings.panel_csp)
     return response
 
 
