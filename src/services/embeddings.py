@@ -8,7 +8,6 @@ from functools import lru_cache
 from typing import Callable, Protocol
 
 import httpx
-import numpy as np
 from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1204,8 +1203,26 @@ async def semantic_search(
     # gives the per-note dedup enough headroom when a note contributes many chunks.
     overfetch = max(limit * 5, 50)
     distance = NoteEmbedding.embedding.cosine_distance(query_embedding)
+    # Explicit projection (#280, design D6) — the `find_related_stmt` shape.
+    # Every field the result renders, plus the two hashes and the truncation
+    # marker the annotations below read, and nothing else: no stored vector
+    # (similarity comes from the database's own distance, D7), no tsvector, no
+    # frontmatter. Projection changes no predicate and no plan-relevant
+    # expression, so the SET LOCALs, overfetch and exact fallback are exactly
+    # as they were.
     stmt = (
-        select(NoteEmbedding, NoteMetadata, distance.label("distance"))
+        select(
+            NoteEmbedding.note_id,
+            NoteEmbedding.chunk_index,
+            NoteEmbedding.chunk_text,
+            NoteMetadata.file_path,
+            NoteMetadata.title,
+            NoteMetadata.tags,
+            NoteMetadata.content_hash,
+            NoteMetadata.embedded_content_hash,
+            NoteMetadata.chunks_truncated,
+            distance.label("distance"),
+        )
         .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
     )
     stmt = apply_note_filters(
@@ -1247,24 +1264,26 @@ async def semantic_search(
 
     # Re-sort by distance before dedupe/truncate: `relaxed_order` does not
     # promise a globally sorted stream, and the dedupe below keeps the *first*
-    # chunk seen per note.
-    rows = sorted(rows, key=lambda r: r[2])
+    # chunk seen per note. `file_path, chunk_index` break exact distance ties
+    # deterministically (#280, D6): which chunk represents a note, and the
+    # order of equidistant notes, no longer depend on scan iteration order.
+    rows = sorted(rows, key=lambda r: (r.distance, r.file_path, r.chunk_index))
 
     seen: set[int] = set()
-    deduped: list[tuple] = []
-    for ne, nm, _distance in rows:
-        if ne.note_id in seen:
+    deduped: list = []
+    for row in rows:
+        if row.note_id in seen:
             continue
-        seen.add(ne.note_id)
-        deduped.append((ne, nm))
+        seen.add(row.note_id)
+        deduped.append(row)
         if len(deduped) >= limit:
             break
 
     # ── Staleness and truncation, annotated from the already-hydrated row ──
     #
     # `stale` is `embedded_content_hash IS DISTINCT FROM content_hash`,
-    # computed in Python: the statement above already hydrates the whole
-    # `NoteMetadata` entity, so both hashes are in hand and **no predicate, no
+    # computed in Python: the statement above already projects both hashes,
+    # so they are in hand and **no predicate, no
     # `SET LOCAL`, no overfetch and no exact-fallback eligibility changes** —
     # which is the point. Filtering on the hashes was rejected outright: it
     # would remove every note edited since the last completed embed pass (the
@@ -1299,24 +1318,29 @@ async def semantic_search(
     # every search and would still race the writer.
     results = [
         {
-            "path": nm.file_path,
-            "title": nm.title,
-            "tags": nm.tags,
-            "chunk": None if stale else ne.chunk_text[:500],
-            "chunk_index": ne.chunk_index,
-            "similarity": float(np.dot(ne.embedding, query_embedding) / (
-                np.linalg.norm(ne.embedding) * np.linalg.norm(query_embedding)
-            )),
+            "path": row.file_path,
+            "title": row.title,
+            "tags": row.tags,
+            "chunk": None if stale else row.chunk_text[:500],
+            "chunk_index": row.chunk_index,
+            # The database's own cosine distance, as `find_related` reports it
+            # (#280, D7). The order above is this distance's order, so the
+            # displayed similarity is monotone in the displayed order by
+            # construction — the NumPy recomputation it replaces (double
+            # precision over the fetched vectors) could disagree with the
+            # single-precision distance the rows were sorted by in the last
+            # digit, and fetched every vector to do so.
+            "similarity": 1.0 - float(row.distance),
             "stale": stale,
             # Read from the durable column, never inferred from the number of
             # chunk rows: a capped note holds exactly the cap and is
             # indistinguishable by count from a note that legitimately produces
             # that many.
-            "embedding_truncated": bool(nm.chunks_truncated),
+            "embedding_truncated": bool(row.chunks_truncated),
         }
-        for ne, nm, stale in (
-            (ne, nm, nm.embedded_content_hash != nm.content_hash)
-            for ne, nm in deduped
+        for row, stale in (
+            (row, row.embedded_content_hash != row.content_hash)
+            for row in deduped
         )
     ]
     # Result telemetry, recorded after the dedupe so the count and the paths

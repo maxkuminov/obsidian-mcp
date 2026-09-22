@@ -36,8 +36,18 @@ async def full_text_search(
     # other tenants, so no global setting is touched.
     await session.execute(text("SET LOCAL random_page_cost = 1.1"))
 
+    # Explicit projection (#280, design D6): the four columns the result
+    # renders. `ts_rank_cd` and `@@` still read the tsvector server-side; what
+    # is gone is shipping it (and `frontmatter`) to Python and hydrating an
+    # entity per row. `content_tsvector` is deferred with raiseload on the
+    # model, so a whole-entity select here would no longer carry it anyway.
     stmt = (
-        select(NoteMetadata, rank)
+        select(
+            NoteMetadata.file_path,
+            NoteMetadata.title,
+            NoteMetadata.tags,
+            rank,
+        )
         .where(NoteMetadata.content_tsvector.op("@@")(tsquery))
     )
     stmt = apply_note_filters(
@@ -53,12 +63,12 @@ async def full_text_search(
     rows = result.all()
     results = [
         {
-            "path": nm.file_path,
-            "title": nm.title,
-            "tags": nm.tags,
-            "rank": float(row_rank),
+            "path": row.file_path,
+            "title": row.title,
+            "tags": row.tags,
+            "rank": float(row.rank),
         }
-        for nm, row_rank in rows
+        for row in rows
     ]
     # Result telemetry, recorded where the result set is final (#161). The
     # bounds live in `timing.record_results`, which is the record site the
