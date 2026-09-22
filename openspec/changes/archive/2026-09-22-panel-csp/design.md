@@ -192,7 +192,27 @@ Every HTML route is behind the SSO forward-auth chain. `curl` from outside sees 
 
 ## Implementation review history
 
-(Filled in by tasks 5.x.)
+Codex spec review round 2: **PASS** (round 1's four MAJOR and two MINOR are in the table above). `openspec-verifier` on the merged implementation: 0 blocking; its non-blocking notes were fixed. Adversarial Codex implementation round 1: **PASS**, no findings. Round 2 was not run because round 1 left no fixes to verify, and no findings were declined.
+
+## Deploy and live check (2026-09-22)
+
+- Merged via PR #285 (`536e8eb`). Deployed 2026-09-22 with `PANEL_CSP=report-only`. No migration; `alembic check` clean.
+- In-container probe: `/admin/auth/login` carried the `Content-Security-Policy-Report-Only` policy with a nonce. `/health` and `/docs` carried no panel policy.
+- **Browser pass (task 6.3), substituted and extended.** Max walked the admin panel by hand and reported it looked fine. That was a visual check only, under report-only, which cannot visibly break anything. So the supervisor also ran an automated headless-Chromium (Playwright) pass against a local instance of main under **`PANEL_CSP=enforce`**:
+  - 75/75 checks passed, with zero CSP violations. The `securitypolicyviolation` listener was proven by a positive control: an injected unnonced script and an `onclick` were blocked and recorded.
+  - All 18 HTML documents carried the enforcing header, and each body nonce matched its header nonce.
+  - Every converted control worked:
+    - all 8 confirm controls: dismissing sent 0 POSTs, and accepting sent exactly 1;
+    - the modals, copy, edit-limit and autosubmit;
+    - the reindex fetch, which carried the CSRF header;
+    - the sidebar at 390px width;
+    - the theme toggle on panel, login and consent pages;
+    - Chart.js.
+  - OAuth consent: Approve redirected to the HTTPS callback with a code, and that code exchanged at `/token` with a 200. Deny redirected with `error=access_denied`.
+  - Not tested: vault breadcrumb hover inside a subfolder, and a note-link click (the test vault was empty).
+  - No real-connector approve or deny was performed in production. The local consent flow stands in for it.
+- **Enforce flip (task 6.4).** `PANEL_CSP=enforce` was set in the deploy `.env` and the container recreated on 2026-09-22. The startup log shows `Panel CSP: PANEL_CSP = enforce`. The login page now sends the enforcing `Content-Security-Policy` and no Report-Only header. `semantic_search` was checked working afterwards.
+- Follow-up for accepted limitation 1 (style attributes) filed as #289.
 
 ## Risks / Trade-offs
 
@@ -227,7 +247,7 @@ The code default stays `enforce`, so a fresh deployment is protected without ope
 
 ## Open Questions
 
-- **Follow-up to file:** move inline `style=` attributes to classes and drop `style-src-attr 'unsafe-inline'`.
+- **Follow-up filed as #289:** move inline `style=` attributes to classes and drop `style-src-attr 'unsafe-inline'`.
 - **Follow-up to consider (not filed by default):** disable the unused FastAPI documentation routes.
 
 Resolved by the owner after Codex round 1: the consent `form-action` (`'self' https:`, D5), the first-deploy mode (report-only, then enforce — Migration Plan), and who runs the browser pass (Max, by hand).
