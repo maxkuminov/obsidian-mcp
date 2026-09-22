@@ -74,6 +74,7 @@ def test_transport_body_limit_cases_pass_in_an_isolated_process(tmp_path):
         # sandbox mode is refused on a publicly-routed deployment.
         "DATABASE_URL": "postgresql+asyncpg://test:test@localhost/test",
         "SECRET_KEY": "test",
+        "EMBEDDING_ALLOW_PLAINTEXT": "true",  # #185: default OLLAMA_URL is plaintext
         "MCP_HOSTNAME": "",
         # This env dict *is* the controlled environment: `tests/conftest.py`
         # otherwise scrubs every Settings-shaped variable before importing

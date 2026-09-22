@@ -112,6 +112,7 @@ def _alembic(url: str, *args: str) -> subprocess.CompletedProcess:
             **os.environ,
             "DATABASE_URL": url,
             "SECRET_KEY": os.environ.get("SECRET_KEY") or "test-migration-key",
+            "EMBEDDING_ALLOW_PLAINTEXT": "true",  # #185: default OLLAMA_URL is plaintext
         },
         capture_output=True,
         text=True,

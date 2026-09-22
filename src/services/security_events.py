@@ -382,6 +382,11 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "panel_ondemand_index_failed": frozenset({"user_id", "error_type"}),
     "panel_ondemand_embed_failed": frozenset({"user_id", "error_type"}),
     "panel_health_strip_failed": frozenset({"error_type"}),
+    # ── Internal transport (#184, #185) ──
+    # At most once per hop per process start, from the lifespan. `reason` is
+    # the hop (`database` / `embedding`), `outcome` what admitted the plaintext
+    # session (`prefer` / `disable` / `override`). Never a host, port or URL.
+    "internal_transport_plaintext": frozenset({"reason", "outcome"}),
     # ── The suppressor's own record (this module) ──
     "events_suppressed": frozenset({"reason", "count", "window_seconds"}),
 }

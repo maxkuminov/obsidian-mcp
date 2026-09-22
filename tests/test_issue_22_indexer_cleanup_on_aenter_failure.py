@@ -35,6 +35,7 @@ os.environ.setdefault("VAULT_PATH", "/tmp/test-vault")
 os.chdir(tempfile.gettempdir())
 
 import src.main as main  # noqa: E402
+from _lifespan_stubs import stub_transport_checks
 
 
 class _RaisingSessionManager:
@@ -87,6 +88,7 @@ def _install_fakes(monkeypatch, session_manager):
     async def _noop_check():
         return None
 
+    stub_transport_checks(monkeypatch, main)
     monkeypatch.setattr(main, "_check_embedding_dim", _noop_check)
     monkeypatch.setattr(main, "_check_pgvector_version", _noop_check)
     monkeypatch.setattr(main, "_validate_fts_configs", _noop_check)

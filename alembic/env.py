@@ -30,7 +30,29 @@ def do_run_migrations(connection):
 
 
 async def run_async_migrations():
-    connectable = create_async_engine(get_url(), poolclass=pool.NullPool)
+    # The same transport policy as the application engine (#184). The URL is
+    # validated **before** the engine exists, because alembic may resolve a
+    # different URL than the settings validator saw (`alembic.ini`'s fallback):
+    # a TLS key in its query is refused, and under a strict mode so is every
+    # Unix-socket route — no socket is ever opened, and no startup assertion
+    # runs in this process to notice one afterwards.
+    from src.config import settings
+    from src.services.transport_security import (
+        STRICT_DB_MODES,
+        database_ssl_connect_args,
+        install_strict_transport_listener,
+        validate_database_url_transport,
+    )
+
+    url = get_url()
+    validate_database_url_transport(url, settings.database_ssl_mode)
+    connectable = create_async_engine(
+        url,
+        poolclass=pool.NullPool,
+        connect_args=database_ssl_connect_args(settings),
+    )
+    if settings.database_ssl_mode in STRICT_DB_MODES:
+        install_strict_transport_listener(connectable)
     async with connectable.connect() as connection:
         await connection.run_sync(do_run_migrations)
     await connectable.dispose()

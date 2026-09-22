@@ -22,6 +22,11 @@ if str(ROOT) not in sys.path:
 # adding it here is a test failure rather than a silent hole.
 SETTINGS_ENV_KEYS = (
     "DATABASE_URL",
+    # Database transport (#184).
+    "DATABASE_SSL_MODE",
+    "DATABASE_SSL_CA_FILE",
+    "DATABASE_SSL_CERT_FILE",
+    "DATABASE_SSL_KEY_FILE",
     "OLLAMA_URL",
     "OLLAMA_KEEP_ALIVE",
     "VAULT_PATH",
@@ -44,6 +49,9 @@ SETTINGS_ENV_KEYS = (
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_EMBEDDING_MODEL",
+    # Embedding transport (#185).
+    "EMBEDDING_ALLOW_PLAINTEXT",
+    "EMBEDDING_CA_FILE",
     "MAX_FILE_READ_BYTES",
     "MAX_FILE_WRITE_BYTES",
     "MAX_READ_RESPONSE_CHARS",
@@ -107,7 +115,43 @@ CONTROLLED_TEST_ENV = {
     "DATABASE_URL": "postgresql+asyncpg://test:test@localhost/test",
     "SECRET_KEY": "test",
     "VAULT_PATH": "/tmp/test-vault",
+    # The default `OLLAMA_URL` (`http://ollama:11434`) is plaintext to a
+    # non-loopback host, which the embedding scheme policy refuses unless the
+    # operator acknowledges it (#185). Every construction in the suite gets it
+    # through `_embedding_plaintext_override` below; this covers the singleton.
+    "EMBEDDING_ALLOW_PLAINTEXT": "true",
 }
+
+# Driver and HTTP-client variables that change the database or embedding hop
+# without being `Settings` fields (#184, #185). Scrubbed from the test process
+# for the whole session, so a developer's shell can neither fail the suite (a
+# `PGSSLMODE` is a boot refusal now) nor mask a regression (an ambient proxy or
+# CA bundle is exactly what the embedding client factory must ignore).
+TRANSPORT_AMBIENT_ENV_KEYS = frozenset(
+    k.casefold()
+    for k in (
+        "PGHOST",
+        "PGHOSTADDR",
+        "PGSERVICE",
+        "PGSERVICEFILE",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+    )
+)
+
+
+def _scrub_transport_ambient_env() -> None:
+    for key in list(os.environ):
+        folded = key.casefold()
+        if folded in TRANSPORT_AMBIENT_ENV_KEYS or folded.startswith("pgssl"):
+            os.environ.pop(key, None)
+
+
+_scrub_transport_ambient_env()
 
 # Escape hatch for the import-isolated subprocess suites
 # (`tests/_transport_body_limit_cases.py`), which deliberately choose
@@ -235,6 +279,43 @@ def unpublished_vault_root_snapshot():
     vault_overlap.reset_snapshot_state()
     yield
     vault_overlap.reset_snapshot_state()
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "transport_defaults: run without the suite-wide "
+        "EMBEDDING_ALLOW_PLAINTEXT=true, so the real unset default applies",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _embedding_plaintext_override(request):
+    """Acknowledge the default plaintext `OLLAMA_URL` for every test (#185).
+
+    `CONTROLLED_TEST_ENV` applies only while the singleton is imported; every
+    later `Settings(...)` a test builds would otherwise meet the embedding
+    scheme policy's refusal of `http://ollama:11434`. A process variable wins
+    over a dotenv value in pydantic-settings, so a test that means the override
+    to be **false** must carry the `transport_defaults` marker, which removes
+    it instead.
+    """
+    # By hand rather than through `monkeypatch`: requesting that fixture from
+    # an autouse fixture would set it up before every other autouse fixture
+    # and so tear a test's own patches down *after* theirs.
+    key = "EMBEDDING_ALLOW_PLAINTEXT"
+    previous = os.environ.get(key)
+    if request.node.get_closest_marker("transport_defaults"):
+        os.environ.pop(key, None)
+    else:
+        os.environ[key] = "true"
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = previous
 
 
 @pytest.fixture(autouse=True)

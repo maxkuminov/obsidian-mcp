@@ -208,6 +208,16 @@ update it in the same change.** What stays here is the short list:
   retain publication uncertainty and cannot claim `nothing_written`. Body
   refusals remain executed work; shadow pressure cannot replace their actual
   outcome. See [usage attribution](docs/architecture/usage-attribution.md).
+- **Internal hops have one transport policy each** (#184, #185). Database TLS
+  is `DATABASE_SSL_MODE` only (default `prefer`; a TLS key in `DATABASE_URL`
+  or any `PGSSL*` variable is refused); strict modes are an explicit
+  `SSLContext` in both engines, refuse every Unix-socket route before
+  connecting, and the lifespan exits on an unencrypted session. The active
+  embedding URL must be `https` or loopback unless `EMBEDDING_ALLOW_PLAINTEXT`,
+  and every embedding HTTP client comes from `embedding_http_client`
+  (`trust_env=False`, no redirects). See
+  [schema and migrations](docs/architecture/schema-and-migrations.md) and
+  [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 

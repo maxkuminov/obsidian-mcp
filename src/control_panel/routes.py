@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
-import httpx
 from fastapi import APIRouter, Depends, Form, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
@@ -113,6 +112,7 @@ from src.services.usage_stats import (
     tool_aggregates,
 )
 from src.services.vault import warm_user_vault_cache
+from src.services.transport_security import embedding_http_client
 
 logger = logging.getLogger(__name__)
 
@@ -2578,7 +2578,7 @@ async def settings_page(
     provider_ok = False
     try:
         if provider == "ollama":
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with embedding_http_client(5.0) as client:
                 r = await client.get(f"{settings.ollama_url}/api/tags")
                 provider_ok = r.status_code == 200
         else:

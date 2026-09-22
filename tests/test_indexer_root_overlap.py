@@ -26,6 +26,7 @@ import pytest
 
 import src.main as main
 import src.services.indexer as indexer
+from _lifespan_stubs import stub_transport_checks
 from src.services import vault, vault_overlap
 from src.services.vault_overlap import (
     RELATION_CONTAINS,
@@ -135,6 +136,7 @@ def _install_lifespan_fakes(monkeypatch):
         monkeypatch.setattr(main, name, _noop_check)
     monkeypatch.setattr(main, "_check_openat2_support", lambda: None)
     monkeypatch.setattr(main, "_check_mount_identity_support", lambda: None)
+    stub_transport_checks(monkeypatch, main)
     monkeypatch.setattr(main, "run_indexer_loop", _forever)
     monkeypatch.setattr(main, "mcp", _StubMcp())
 

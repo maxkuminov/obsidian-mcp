@@ -15,6 +15,8 @@ from pydantic import (
 from pydantic.fields import FieldInfo
 from pydantic_settings import BaseSettings, NoDecode, PydanticBaseSettingsSource
 
+from src.services.transport_security import normalise_db_ssl_mode
+
 
 # ── One representation for "off" ────────────────────────────────────────────
 #
@@ -305,6 +307,30 @@ class _FieldFilteredSource(PydanticBaseSettingsSource):
 
 class Settings(BaseSettings):
     database_url: str = "postgresql+asyncpg://obsidian_mcp:changeme@postgres:5432/obsidian_mcp"
+    # ── Database transport (#184) ──────────────────────────────────────────
+    #
+    # The **only** statement of TLS for the database hop; see "Database
+    # transport" in docs/architecture/schema-and-migrations.md. libpq's
+    # vocabulary minus `allow`, stripped and case-folded. Default `prefer` is
+    # exactly the behaviour every deployment had before this setting existed
+    # (asyncpg's advisory TLS with a plaintext fallback); the downgrade it
+    # permits is made visible by the lifespan's transport assertion, not
+    # prevented. `require` / `verify-ca` / `verify-full` are an explicit
+    # `ssl.SSLContext` with no plaintext retry (`src/services/
+    # transport_security.py`). A TLS key in `DATABASE_URL`'s query or a
+    # `PGSSL*` variable is refused rather than merged — `_validate_database_
+    # transport` below.
+    database_ssl_mode: Annotated[
+        Literal["disable", "prefer", "require", "verify-ca", "verify-full"],
+        BeforeValidator(normalise_db_ssl_mode),
+    ] = "prefer"
+    # Trust anchor for `verify-ca` / `verify-full`, required by both and
+    # refused with any other mode (a CA with `require` is not silently
+    # upgraded to verification, as libpq would). No system-store fallback.
+    database_ssl_ca_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
+    # Optional client certificate pair, strict modes only, both or neither.
+    database_ssl_cert_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
+    database_ssl_key_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
     ollama_url: str = "http://ollama:11434"
     # How long Ollama keeps the embedding model resident after a call.
     # "-1" pins it in VRAM indefinitely (sent as the integer Ollama requires),
@@ -405,6 +431,19 @@ class Settings(BaseSettings):
     openai_api_key: str | None = None
     openai_base_url: str = "https://api.openai.com/v1"
     openai_embedding_model: str = "text-embedding-3-small"
+    # ── Embedding transport (#185) ─────────────────────────────────────────
+    #
+    # The **active** provider's URL (`OLLAMA_URL` or `OPENAI_BASE_URL`) must be
+    # `https`, or `http` to a literal loopback host — or `http` to anything
+    # else only when this override is true. Default false (owner decision
+    # 2026-09-22): an `http://` URL never becomes encrypted by itself, so the
+    # plaintext hop has to be a written decision in the operator's `.env`.
+    # See "Embedding providers" in docs/architecture/indexing-and-embeddings.md.
+    embedding_allow_plaintext: bool = False
+    # Pins the trust anchor for an `https` embedding endpoint to this PEM file
+    # only (replacing certifi's bundle; the OS store is never consulted).
+    # Parsed once, at settings construction, in every mode including sandbox.
+    embedding_ca_file: Annotated[str | None, BeforeValidator(_off_means_none)] = None
 
     # Caps for the raw file-access tools (read_file / write_file). Read is
     # checked against on-disk size before reading; write against the decoded
@@ -788,7 +827,10 @@ class Settings(BaseSettings):
     # `extra` stays at pydantic-settings' default ("forbid") so a misspelled
     # constructor kwarg or an unknown init value is still a hard error; only the
     # dotenv source is filtered (see `settings_customise_sources` below).
-    model_config = {"env_file": ".env"}
+    # A refused setting must not be echoed back: pydantic appends the raw input
+    # to a ValidationError, which would print a credential-bearing URL (or any
+    # secret) into the startup traceback.
+    model_config = {"env_file": ".env", "hide_input_in_errors": True}
 
     @classmethod
     def settings_customise_sources(
@@ -1068,6 +1110,71 @@ class Settings(BaseSettings):
         return v.strip().lower() or None
 
     @model_validator(mode="after")
+    def _validate_database_transport(self) -> "Settings":
+        """Design D3/D2a/D3a: refuse every ambiguous database TLS input.
+
+        TLS for the database has one source, `DATABASE_SSL_*`. A TLS key in
+        the URL's query or a `PGSSL*` variable would be merged with it by
+        driver rules nobody can see, so each is refused; so is a CA with a
+        non-verifying mode (libpq would silently upgrade `require`), a
+        verifying mode without a CA, half a client pair, a client pair under
+        a lax mode, and any named file that is missing, not regular, not
+        readable or not loadable. Under a strict mode every Unix-socket route
+        is refused too, before any connection exists. Messages never echo the
+        URL or its password.
+        """
+        from src.services.transport_security import (
+            STRICT_DB_MODES,
+            VERIFYING_DB_MODES,
+            build_database_ssl_context,
+            check_certificate_file,
+            validate_database_url_transport,
+        )
+
+        mode = self.database_ssl_mode
+        validate_database_url_transport(self.database_url, mode)
+        ca, cert, key = (
+            self.database_ssl_ca_file,
+            self.database_ssl_cert_file,
+            self.database_ssl_key_file,
+        )
+        if mode in VERIFYING_DB_MODES and ca is None:
+            raise ValueError(
+                f"DATABASE_SSL_MODE={mode} requires DATABASE_SSL_CA_FILE: a "
+                "verifying mode needs a stated trust anchor (point it at the "
+                "system bundle explicitly for a publicly-trusted certificate)."
+            )
+        if ca is not None and mode not in VERIFYING_DB_MODES:
+            raise ValueError(
+                f"DATABASE_SSL_CA_FILE is set but DATABASE_SSL_MODE={mode} does "
+                "not verify the server. Use DATABASE_SSL_MODE=verify-ca or "
+                "verify-full, or unset DATABASE_SSL_CA_FILE."
+            )
+        if (cert is None) != (key is None):
+            raise ValueError(
+                "DATABASE_SSL_CERT_FILE and DATABASE_SSL_KEY_FILE must be set "
+                "together: a client certificate needs its key."
+            )
+        if cert is not None and mode not in STRICT_DB_MODES:
+            raise ValueError(
+                "DATABASE_SSL_CERT_FILE / DATABASE_SSL_KEY_FILE are set but "
+                f"DATABASE_SSL_MODE={mode} does not require TLS. Use require, "
+                "verify-ca or verify-full, or unset the client certificate."
+            )
+        for setting, path in (
+            ("DATABASE_SSL_CA_FILE", ca),
+            ("DATABASE_SSL_CERT_FILE", cert),
+            ("DATABASE_SSL_KEY_FILE", key),
+        ):
+            if path is not None:
+                check_certificate_file(path, setting)
+        if mode in STRICT_DB_MODES:
+            # Parse now, so an unloadable file refuses the boot here rather
+            # than at `src.database` import; the engine builds its own copy.
+            build_database_ssl_context(mode, ca, cert, key)
+        return self
+
+    @model_validator(mode="after")
     def _record_public_origin(self) -> "Settings":
         """Record whether a public origin was operator-supplied.
 
@@ -1175,6 +1282,54 @@ class Settings(BaseSettings):
         if self.embedding_provider == "openai" and not (self.openai_api_key or "").strip():
             raise ValueError(
                 "OPENAI_API_KEY is required when EMBEDDING_PROVIDER=openai"
+            )
+        return self
+
+    # The `ssl.SSLContext` parsed from `EMBEDDING_CA_FILE` by the validator
+    # below, or `None`. Reused by `embedding_http_client`; the file is never
+    # re-read.
+    _embedding_ssl_context: Any = PrivateAttr(default=None)
+
+    @property
+    def embedding_ssl_context(self):
+        """The parsed `EMBEDDING_CA_FILE` context, or `None` (certifi applies)."""
+        return self._embedding_ssl_context
+
+    @model_validator(mode="after")
+    def _validate_embedding_transport(self) -> "Settings":
+        """Design D6: the active embedding URL's scheme policy and the CA file.
+
+        The CA file is checked and **parsed in every mode**, sandbox included:
+        a broken trust anchor is a broken configuration whatever the process
+        is for. Everything that depends on the endpoint URL — the scheme
+        policy and the CA-with-`http` refusal — is skipped under
+        `MCP_SANDBOX_MODE`, which never calls a provider. The inactive
+        provider's URL is never dialled and is therefore never validated.
+        """
+        from src.services.transport_security import (
+            check_embedding_url_policy,
+            load_embedding_ca_context,
+        )
+
+        self._embedding_ssl_context = (
+            load_embedding_ca_context(self.embedding_ca_file)
+            if self.embedding_ca_file is not None
+            else None
+        )
+        if self.mcp_sandbox_mode:
+            return self
+        if self.embedding_provider == "openai":
+            setting, url = "OPENAI_BASE_URL", self.openai_base_url
+        else:
+            setting, url = "OLLAMA_URL", self.ollama_url
+        endpoint = check_embedding_url_policy(
+            url, setting=setting, allow_plaintext=self.embedding_allow_plaintext
+        )
+        if self.embedding_ca_file is not None and endpoint.scheme != "https":
+            raise ValueError(
+                f"EMBEDDING_CA_FILE is set but {setting} uses plaintext http, "
+                "where a trust anchor verifies nothing. Use an https endpoint "
+                "or unset EMBEDDING_CA_FILE."
             )
         return self
 
