@@ -453,6 +453,7 @@ def test_nested_mount_cases_pass_in_a_mount_namespace(tmp_path):
         "BASE_URL": "http://localhost:8000",
         "DATABASE_URL": "postgresql+asyncpg://test:test@localhost/test",
         "SECRET_KEY": "test",
+        "EMBEDDING_ALLOW_PLAINTEXT": "true",  # #185: default OLLAMA_URL is plaintext
         "MCP_HOSTNAME": "",
         "OMCP_TEST_TRUST_ENV": "1",
         "OMCP_NESTED_MOUNT_VAULT": str(vault),

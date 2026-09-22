@@ -143,6 +143,7 @@ def run_alembic(
             # subprocess would fail to import `src.config` depending on which
             # modules pytest collected first. Give it a real one.
             "SECRET_KEY": secrets.token_hex(32),
+            "EMBEDDING_ALLOW_PLAINTEXT": "true",  # #185: default OLLAMA_URL is plaintext
         },
         capture_output=True,
         text=True,

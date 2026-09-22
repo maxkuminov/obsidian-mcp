@@ -42,6 +42,7 @@ from src.services.index_state import (
 )
 
 import scripts.reset_embeddings as reset_module
+from _lifespan_stubs import stub_transport_checks
 
 
 # --------------------------------------------------------------------------
@@ -418,6 +419,7 @@ async def _noop():
 def _stub_earlier_guards(monkeypatch):
     monkeypatch.setattr(main_module, "_check_openat2_support", lambda: None)
     monkeypatch.setattr(main_module, "_check_mount_identity_support", lambda: None)
+    stub_transport_checks(monkeypatch, main_module)
     monkeypatch.setattr(main_module, "_check_embedding_dim", _noop)
     monkeypatch.setattr(main_module, "_check_pgvector_version", _noop)
     monkeypatch.setattr(main_module, "mcp", _FakeMcp())

@@ -43,6 +43,7 @@ PAIRED = {
 
 BASE = {
     "SECRET_KEY": "an-actual-secret-not-a-placeholder",
+    "EMBEDDING_ALLOW_PLAINTEXT": "true",  # #185: default OLLAMA_URL is plaintext
     "DATABASE_URL": "postgresql+asyncpg://test:test@localhost/test",
     "VAULT_PATH": "/tmp/test-vault",
 }

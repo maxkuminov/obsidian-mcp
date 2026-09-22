@@ -150,6 +150,7 @@ def migrated_database():
                 # every test in this module errored in setup. `_harness.py`
                 # (this fixture's shared descendant) carries the same fix.
                 "SECRET_KEY": secrets.token_hex(32),
+                "EMBEDDING_ALLOW_PLAINTEXT": "true",  # #185: default OLLAMA_URL is plaintext
             },
             capture_output=True,
             text=True,

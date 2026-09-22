@@ -68,6 +68,7 @@ def _run(tmp_path, probe=None):
         # reach a database or an embedding provider at import.
         "DATABASE_URL": "postgresql+asyncpg://test:test@localhost/test",
         "SECRET_KEY": "test",
+        "EMBEDDING_ALLOW_PLAINTEXT": "true",  # #185: default OLLAMA_URL is plaintext
         "VAULT_PATH": str(vault),
         "MCP_HOSTNAME": "",
         "MCP_SANDBOX_MODE": "true",
