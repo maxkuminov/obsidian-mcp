@@ -92,6 +92,44 @@ TLS for the database has one source. The driver stack would otherwise merge a UR
 - **WHEN** `DATABASE_SSL_CERT_FILE` is set and `DATABASE_SSL_KEY_FILE` is not
 - **THEN** startup SHALL fail
 
+### Requirement: Strict database modes MUST refuse every Unix-socket route before connecting
+When `DATABASE_SSL_MODE` is `require`, `verify-ca` or `verify-full`, the server MUST refuse to proceed, before any database connection is attempted, if any effective host candidate could be a Unix socket. The check SHALL cover the URL's host after percent-decoding, every `host` query value including repeated keys and comma-separated multi-host lists, an empty host list (which would fall through to `PGHOST` and to the driver's implicit default of socket directories), a `service` or `servicefile` query key, and the environment variables `PGHOST`, `PGHOSTADDR`, `PGSERVICE` and `PGSERVICEFILE`. A candidate beginning with `/` or `@` SHALL be treated as a socket. The check SHALL run both at settings construction for the application's URL and in the migration environment for the URL alembic resolves. Under `disable` and `prefer` a socket SHALL remain permitted. In addition, under a strict mode every new pooled connection of the application and migration engines SHALL be checked against `pg_stat_ssl` and discarded with an error when it is not encrypted.
+
+A Unix socket never carries TLS and the driver ignores the TLS context for it, so without this rule a strict mode could open a plaintext session in exactly the processes that run no startup assertion — migrations, maintenance scripts and the stdio entry point.
+
+#### Scenario: Socket path in the query
+- **WHEN** the mode is `require` and `DATABASE_URL` is `postgresql+asyncpg://u:p@/db?host=/var/run/postgresql`
+- **THEN** settings construction SHALL fail naming the socket route
+- **AND** running `alembic upgrade head` with that URL SHALL fail before any connection is attempted
+
+#### Scenario: Mixed multi-host list
+- **WHEN** the mode is `verify-full` and the URL's `host` query is `db.internal.example:5432,/run/postgresql`
+- **THEN** startup SHALL fail, although one candidate is TCP
+
+#### Scenario: Percent-encoded socket in the netloc
+- **WHEN** the mode is `require` and the URL's host is `%2Frun%2Fpostgresql`
+- **THEN** startup SHALL fail
+
+#### Scenario: Empty host
+- **WHEN** the mode is `require` and the URL names no host
+- **THEN** startup SHALL fail, because the driver would fall back to `PGHOST` and then to socket directories
+
+#### Scenario: Environment or service host source
+- **WHEN** the mode is `require` and `PGHOST`, `PGHOSTADDR`, `PGSERVICE` or `PGSERVICEFILE` is set, or the URL carries a `service` query key
+- **THEN** startup SHALL fail naming that source
+
+#### Scenario: No socket is ever opened
+- **WHEN** any of the refused configurations above is exercised
+- **THEN** no call SHALL reach the driver's connect function or the event loop's Unix-connection function
+
+#### Scenario: Lax modes keep sockets
+- **WHEN** the mode is `prefer` and the URL names a Unix socket
+- **THEN** startup SHALL NOT be refused on that account
+
+#### Scenario: Every new strict connection is checked
+- **WHEN** the mode is `require` and a newly opened pooled connection reports `pg_stat_ssl.ssl` false
+- **THEN** that connection SHALL be discarded with an error and SHALL NOT be used for any statement
+
 ### Requirement: The server SHALL assert the database session's transport at startup
 Before any other database startup check, and outside sandbox mode, the server SHALL read `pg_stat_ssl` for its own backend. Under `require`, `verify-ca` or `verify-full` it SHALL exit with a critical log record when the session is not encrypted, when no row is returned, or when the connection could not be established. Under `prefer` or `disable` it SHALL continue and SHALL emit one `internal_transport_plaintext` security event with `reason` `database` and `outcome` set to the mode when the session is not encrypted. In every case it SHALL log the effective database transport once, naming the mode, whether the session is encrypted, the TLS version when encrypted, and whether the server was verified — the last derived from the mode, never inferred from the session.
 
@@ -122,7 +160,7 @@ Before any other database startup check, and outside sandbox mode, the server SH
 - **THEN** no transport probe SHALL run
 
 ### Requirement: The active embedding endpoint MUST satisfy a scheme policy at startup
-The server MUST validate the URL of the active embedding provider — `OLLAMA_URL` when `EMBEDDING_PROVIDER` is `ollama`, `OPENAI_BASE_URL` when it is `openai` — at settings construction, and MUST refuse to start when the scheme is neither `http` nor `https`, the URL has no host, the URL carries userinfo, or the port is invalid. An `https` URL SHALL be accepted. An `http` URL SHALL be accepted when its host is literally loopback (`localhost`, an IPv4 address in 127.0.0.0/8, or `::1`, bracketed or not), and otherwise SHALL be accepted only when `EMBEDDING_ALLOW_PLAINTEXT` is true. `EMBEDDING_ALLOW_PLAINTEXT` SHALL default to false. The host SHALL be the one the HTTP client will dial, with no DNS resolution. The inactive provider's URL SHALL NOT be validated. The policy SHALL be skipped under `MCP_SANDBOX_MODE`.
+The server MUST validate the URL of the active embedding provider — `OLLAMA_URL` when `EMBEDDING_PROVIDER` is `ollama`, `OPENAI_BASE_URL` when it is `openai` — at settings construction, and MUST refuse to start when the raw value has leading or trailing whitespace or contains a control character, when the HTTP client's own URL parser rejects it, when the scheme is neither `http` nor `https`, the URL has no host, the URL carries userinfo, or the port is invalid. The host, scheme and port SHALL be those produced by the HTTP client's URL parser, and the validated string SHALL be used unchanged by every client and by the startup report. An `https` URL SHALL be accepted. An `http` URL SHALL be accepted when its host is literally loopback (`localhost`, an IPv4 address in 127.0.0.0/8, or `::1`, bracketed or not), and otherwise SHALL be accepted only when `EMBEDDING_ALLOW_PLAINTEXT` is true. `EMBEDDING_ALLOW_PLAINTEXT` SHALL default to false. The host SHALL be the one the HTTP client will dial, with no DNS resolution. The inactive provider's URL SHALL NOT be validated. Under `MCP_SANDBOX_MODE` every rule that depends on the endpoint URL SHALL be skipped, while the validity of a configured `EMBEDDING_CA_FILE` SHALL still be enforced.
 
 #### Scenario: HTTPS endpoint
 - **WHEN** the active URL is `https://embeddings.internal.example/v1`
@@ -145,6 +183,14 @@ The server MUST validate the URL of the active embedding provider — `OLLAMA_UR
 - **THEN** startup SHALL fail
 - **AND** the message SHALL NOT contain the userinfo
 
+#### Scenario: Whitespace and control characters are refused
+- **WHEN** the active URL is ` https://embeddings.internal.example/v1` (leading space), `http://127.0.0.1:11434\n` (trailing newline), or contains a tab or carriage return anywhere
+- **THEN** startup SHALL fail, with or without the override
+
+#### Scenario: The client's parser decides
+- **WHEN** a URL is interpreted differently by the standard library's URL splitter and by the HTTP client's parser
+- **THEN** the policy's verdict SHALL follow the HTTP client's parser
+
 #### Scenario: Other schemes are refused
 - **WHEN** the active URL is `ftp://ollama:11434`, `ollama:11434` or `file:///tmp/x`
 - **THEN** startup SHALL fail even with the override set
@@ -161,16 +207,32 @@ The server MUST validate the URL of the active embedding provider — `OLLAMA_UR
 - **WHEN** `MCP_SANDBOX_MODE=true` and the active URL is the default `http://ollama:11434` without the override
 - **THEN** settings construction SHALL succeed
 
-### Requirement: Every embedding HTTP client SHALL be built by one factory that pins trust and refuses redirects
-Every HTTP client the server opens to the configured embedding endpoint — the Ollama provider, the OpenAI-compatible provider, and the control panel's Ollama reachability check — SHALL be constructed by one factory that sets `follow_redirects` to false explicitly and, when `EMBEDDING_CA_FILE` is set, verifies the server against that CA file only. `EMBEDDING_CA_FILE` SHALL be refused at startup when it does not exist, is not a readable regular file, cannot be loaded as a certificate, or is set while the active embedding URL uses `http`.
+#### Scenario: Sandbox does not excuse a broken CA file
+- **WHEN** `MCP_SANDBOX_MODE=true` and `EMBEDDING_CA_FILE` names a file that is not a PEM certificate
+- **THEN** settings construction SHALL fail
+
+### Requirement: Every embedding HTTP client SHALL be built by one factory that pins trust, ignores the environment and refuses redirects
+Every HTTP client the server opens to the configured embedding endpoint — the Ollama provider, the OpenAI-compatible provider, and the control panel's Ollama reachability check — SHALL be constructed by one factory that sets `follow_redirects` to false and `trust_env` to false explicitly, so that no proxy variable, CA-location variable or netrc file affects the hop. The trust anchor SHALL be the TLS context parsed from `EMBEDDING_CA_FILE` at settings construction when that setting is set, and otherwise a context built from the certifi bundle; the operating-system store and the `SSL_CERT_FILE` / `SSL_CERT_DIR` variables SHALL NOT be consulted. `EMBEDDING_CA_FILE` SHALL be parsed at settings construction, and startup SHALL be refused when it does not exist, is not a readable regular file, cannot be loaded as a certificate, or is set while the active embedding URL uses `http`; the parsed context SHALL be reused and the file SHALL NOT be re-read.
 
 #### Scenario: CA pinning
 - **WHEN** `EMBEDDING_CA_FILE` is set and a provider posts to an `https` endpoint
-- **THEN** the client SHALL verify the server against that CA and not against the system trust store
+- **THEN** the client SHALL verify the server against that CA only, not against the certifi bundle or the system store
 
 #### Scenario: Default trust
 - **WHEN** `EMBEDDING_CA_FILE` is unset
-- **THEN** the client SHALL verify `https` endpoints against the system trust store
+- **THEN** the client SHALL verify `https` endpoints against the certifi bundle
+
+#### Scenario: Ambient proxy is ignored
+- **WHEN** the active URL is `http://127.0.0.1:11434`, the override is unset, and `HTTP_PROXY` names a remote proxy with `NO_PROXY` unset
+- **THEN** the embedding request SHALL be sent directly to the loopback endpoint and not to the proxy
+
+#### Scenario: Ambient CA variables are ignored
+- **WHEN** `SSL_CERT_FILE` or `SSL_CERT_DIR` is set in the environment
+- **THEN** the embedding client's trust anchor SHALL be unchanged by it
+
+#### Scenario: Unparseable CA refuses startup for either provider
+- **WHEN** `EMBEDDING_CA_FILE` is a readable regular file that is not a PEM certificate and the active provider is `ollama` with an `https` URL, or `openai` with an `https` base URL
+- **THEN** settings construction SHALL fail naming `EMBEDDING_CA_FILE`, before any request is served
 
 #### Scenario: A redirect is not followed
 - **WHEN** the embedding endpoint answers with a 3xx redirect to another URL
@@ -185,7 +247,7 @@ Every HTTP client the server opens to the configured embedding endpoint — the 
 - **THEN** no HTTP client directed at `OLLAMA_URL` or `OPENAI_BASE_URL` SHALL be constructed except through the factory
 
 ### Requirement: The server SHALL report each outbound hop's transport once at startup
-Outside sandbox mode, the server SHALL log one line per hop at startup: the database line required above, and an embedding line naming the active provider, the scheme, the host, the port, the trust source (`system`, `ca-file`, or `n/a` for `http`) and whether the plaintext override is in effect. The embedding line SHALL NOT contain the URL's path, query or userinfo. When the active embedding URL is `http` to a non-loopback host, the server SHALL also emit one `internal_transport_plaintext` event with `reason` `embedding` and `outcome` `override`; a loopback `http` endpoint SHALL NOT produce the event.
+Outside sandbox mode, the server SHALL log one line per hop at startup: the database line required above, and an embedding line naming the active provider, the scheme, the host, the port, the trust source (`certifi`, `ca-file`, or `n/a` for `http`) and whether the plaintext override is in effect. The embedding line SHALL NOT contain the URL's path, query or userinfo. When the active embedding URL is `http` to a non-loopback host, the server SHALL also emit one `internal_transport_plaintext` event with `reason` `embedding` and `outcome` `override`; a loopback `http` endpoint SHALL NOT produce the event.
 
 #### Scenario: Plaintext embedding hop admitted by the override
 - **WHEN** the server starts with `OLLAMA_URL=http://ollama:11434` and `EMBEDDING_ALLOW_PLAINTEXT=true`
