@@ -147,6 +147,14 @@ def _admissions(spy):
     return [s for s, _ in spy.statements if "INSERT INTO quota_counters" in s]
 
 
+def _admission_params(spy):
+    """The admission's bound parameters. Not `statements[0]`: the
+    transaction's first statement is its `SET LOCAL synchronous_commit = off`
+    (performance-2026-09 D2)."""
+    (params,) = [p for s, p in spy.statements if "INSERT INTO quota_counters" in s]
+    return params
+
+
 # --------------------------------------------------------------------------
 # 1. one marker, imported and not mirrored
 # --------------------------------------------------------------------------
@@ -365,7 +373,10 @@ def test_a_refusal_issues_no_second_statement():
         assert not asyncio.run(quotas.admit(7, 100)).admitted
     finally:
         mp.undo()
-    assert len(refused.statements) == 1
+    # The transaction's `SET LOCAL synchronous_commit = off`
+    # (performance-2026-09 D2) and the admission itself; no prune.
+    sqls = [s for s, _ in refused.statements]
+    assert sqls == [str(quotas.ASYNC_COMMIT_SQL), str(quotas.ADMISSION_SQL)]
 
 
 # --------------------------------------------------------------------------
@@ -456,13 +467,19 @@ class _MiddlewareSession:
         sql = str(stmt)
         if sql.startswith("UPDATE"):
             return _EmptyResult()
+        # The user's `is_active`/`vault_path` ride the credential statement
+        # (performance-2026-09 D3).
         if "FROM api_keys" in sql:
-            return _RowsResult([self.api_key] if self.api_key else [])
+            return _RowsResult(
+                [(self.api_key, True, "/vaults/x")] if self.api_key else []
+            )
         if "FROM oauth_tokens" in sql:
             if self.oauth_token is None:
                 return _RowsResult([])
             owner, name = self.client_row if self.client_row else (None, None)
-            return _RowsResult([(self.oauth_token, owner, name)])
+            return _RowsResult(
+                [(self.oauth_token, owner, name, True, "/vaults/x")]
+            )
         if "vault_path" in sql:
             return _RowsResult([])
         return _EmptyResult()
@@ -908,7 +925,7 @@ def test_a_refusal_straddling_utc_midnight_names_the_right_midnight(monkeypatch)
 
     # The statement was bound to the day the first reading fell in.
     assert decision.day == _dt.date(2026, 8, 29)
-    assert spy.statements[0][1]["day"] == _dt.date(2026, 8, 29)
+    assert _admission_params(spy)["day"] == _dt.date(2026, 8, 29)
     assert decision.admitted is False
 
     message = quotas.quota_refusal_message(5, decision.reset_at)
@@ -997,7 +1014,7 @@ def test_the_retry_interval_survives_a_decision_taken_at_utc_midnight(monkeypatc
     )
 
     assert params["over_quota"] is True
-    assert spy.statements[0][1]["day"] == _dt.date(2026, 8, 29)
+    assert _admission_params(spy)["day"] == _dt.date(2026, 8, 29)
     assert len(reads) == 1, (
         f"the clock was read {len(reads)} times; the decision is one reading "
         "and everything downstream is arithmetic on it"

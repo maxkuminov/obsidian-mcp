@@ -241,8 +241,20 @@ def _violated_user_fk(exc: Exception) -> bool:
 
 
 async def _insert_usage(values: dict) -> None:
+    """Insert one `usage_logs` row in its own, asynchronously committed
+    transaction.
+
+    `SET LOCAL synchronous_commit = off` is the transaction's first statement
+    (performance-2026-09 D2), for the initial insert and the FK-cleared retry
+    alike, since both come through here. The commit is still visible to every
+    other session when it returns, so `write_usage_row`'s `True` keeps meaning
+    "committed and visible"; only durability across a PostgreSQL server or
+    host crash is weakened, by at most ~600 ms (L2). `SET LOCAL` ends with the
+    transaction, so the pooled connection does not carry it further.
+    """
     async with async_session() as session:
         try:
+            await session.execute(text("SET LOCAL synchronous_commit = off"))
             session.add(UsageLog(**values))
             await session.commit()
         except Exception:
