@@ -47,14 +47,19 @@ _client = TestClient(app, base_url="http://localhost:8000")
 # --- Item 1: the panel's JS is served from this app, not from a CDN --------
 
 
-@pytest.mark.parametrize(
-    "asset", ["htmx-2.0.4.min.js", "chart-4.4.7.umd.min.js"]
-)
+@pytest.mark.parametrize("asset", ["chart-4.4.7.umd.min.js"])
 def test_the_vendored_asset_is_actually_served(asset):
     response = _client.get(f"/admin/static/vendor/{asset}")
 
     assert response.status_code == 200
     assert response.content == (_VENDOR / asset).read_bytes()
+
+
+def test_htmx_is_no_longer_served():
+    # panel-csp (#195, D6): htmx was loaded by every panel page and used by
+    # none, and under a nonce policy its attribute-driven requests are a
+    # script gadget. It is removed, not configured.
+    assert _client.get("/admin/static/vendor/htmx-2.0.4.min.js").status_code == 404
 
 
 def test_no_template_loads_htmx_or_chartjs_from_a_cdn():
@@ -74,8 +79,11 @@ def test_no_template_loads_htmx_or_chartjs_from_a_cdn():
 def test_base_html_points_at_the_local_copies():
     markup = (_TEMPLATES / "base.html").read_text()
 
-    assert '<script src="/admin/static/vendor/htmx-2.0.4.min.js">' in markup
-    assert '<script src="/admin/static/vendor/chart-4.4.7.umd.min.js">' in markup
+    assert "htmx" not in markup
+    assert (
+        '<script src="/admin/static/vendor/chart-4.4.7.umd.min.js" nonce="{{ csp_nonce }}">'
+        in markup
+    )
 
 
 def test_the_static_mount_cannot_reach_outside_its_directory():
@@ -365,24 +373,43 @@ def test_safe_next_keeps_an_in_app_path(value):
     assert _safe_next(value) == value
 
 
-# --- Item 10: no user-controlled interpolation inside confirm() -----------
+# --- Item 10: no user-controlled interpolation into a confirmation ---------
 
 
-def test_no_template_interpolates_a_jinja_expression_into_confirm():
+def test_no_template_carries_an_inline_confirm():
     # The `client_name`-in-confirm() defect class: Jinja escapes an apostrophe
     # to `&#39;`, the HTML parser restores it before the JS string is parsed,
     # the handler throws — and a throwing `onclick` submits the form
-    # *unconfirmed*.
-    pattern = re.compile(r"confirm\('[^']*\{\{\s*(?P<expr>[^}]+?)\s*\}\}")
+    # *unconfirmed*. panel-csp (#195) moved every confirmation to a
+    # `data-confirm` attribute on a non-submitting button, which is read as a
+    # string and never parsed as JavaScript; no inline `confirm(` may return.
+    offenders = [
+        f"{path.name}:{lineno}"
+        for path in _TEMPLATES.glob("*.html")
+        for lineno, line in enumerate(path.read_text().splitlines(), 1)
+        if "confirm(" in line
+    ]
+
+    assert offenders == []
+
+
+def test_no_confirmation_text_interpolates_anything_but_the_revoked_count():
+    # Attribute text cannot break out into script any more, but what the
+    # operator is asked should still be fixed text: an attacker-influenced
+    # name (an OAuth `client_name` arrives unauthenticated) has no business
+    # in the question that guards a destructive action.
+    pattern = re.compile(r'data-confirm="(?P<text>[^"]*)"')
     offenders = []
     for path in _TEMPLATES.glob("*.html"):
         for match in pattern.finditer(path.read_text()):
-            expr = match.group("expr")
-            # keys.html counts revoked rows and pluralises the word "key".
-            # Both expressions are computed in the template from an integer,
-            # carry no user or vault input, and cannot produce a quote.
-            if expr not in ("revoked_count", "'s' if revoked_count != 1"):
-                offenders.append(f"{path.name}: {expr}")
+            for expr in re.findall(r"\{\{\s*(.+?)\s*\}\}", match.group("text")):
+                # keys.html counts revoked rows and pluralises the word "key".
+                # Both expressions are computed in the template from an
+                # integer and carry no user or vault input.
+                if expr not in ("revoked_count", "'s' if revoked_count != 1"):
+                    offenders.append(f"{path.name}: {expr}")
+            if "{%" in match.group("text"):
+                offenders.append(f"{path.name}: statement in data-confirm")
 
     assert offenders == []
 
@@ -390,6 +417,6 @@ def test_no_template_interpolates_a_jinja_expression_into_confirm():
 def test_the_user_edit_confirms_are_static():
     markup = (_TEMPLATES / "user_edit.html").read_text()
 
-    assert "confirm('Deactivate this user?" in markup
-    assert "confirm('PERMANENTLY DELETE this user" in markup
+    assert 'data-confirm="Deactivate this user?' in markup
+    assert 'data-confirm="PERMANENTLY DELETE this user' in markup
     assert "target.username }}?" not in markup

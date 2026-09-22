@@ -62,7 +62,7 @@ from src.csrf import verify_csrf
 from src.database import get_session
 from src.models.db import APIKey, NoteMetadata, UsageLog, User
 from src.oauth.grants import ACCOUNT_GUARD_LOCK_KEY, lock_account_guard
-from src.services import security_events, vault_overlap
+from src.services import panel_csp, security_events, vault_overlap
 from src.services.vault import clear_user_vault_cache, validate_vault_root_path
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/admin/users", tags=["users"])
 
 templates = Jinja2Templates(
-    directory=os.path.join(os.path.dirname(__file__), "templates")
+    directory=os.path.join(os.path.dirname(__file__), "templates"),
+    # The panel CSP (#195): `csp_nonce` for the templates, and the marker that
+    # puts this response under the policy.
+    context_processors=[panel_csp.template_context],
 )
 
 

@@ -451,7 +451,7 @@ def test_the_delete_confirm_states_the_real_blast_radius():
         csrf_token="t",
         flash_error=None,
     )
-    confirms = [line for line in rendered.splitlines() if "/delete" in line or "confirm(" in line]
+    confirms = [line for line in rendered.splitlines() if "/delete" in line or "data-confirm" in line]
     blob = "\n".join(confirms)
     assert "revoke all its tokens?" not in blob
     assert "tokens are deleted" in blob

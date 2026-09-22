@@ -9,12 +9,12 @@
         {% if revoked_count > 0 %}
         <form method="POST" action="/admin/keys/delete-revoked" style="display:inline;">
             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-            <button type="submit" class="btn btn-danger" onclick="return confirm('Permanently delete all {{ revoked_count }} revoked key{{ 's' if revoked_count != 1 }}?')">
+            <button type="button" class="btn btn-danger" data-confirm="Permanently delete all {{ revoked_count }} revoked key{{ 's' if revoked_count != 1 }}?">
                 Delete Revoked ({{ revoked_count }})
             </button>
         </form>
         {% endif %}
-        <button onclick="document.getElementById('create-modal').classList.add('open')" class="btn btn-primary">
+        <button type="button" data-modal-open="create-modal" class="btn btn-primary">
             <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
                 <line x1="6" y1="1" x2="6" y2="11"/><line x1="1" y1="6" x2="11" y2="6"/>
             </svg>
@@ -34,7 +34,7 @@
         <div style="font-size:11px;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px;opacity:0.75;">New key created — copy now, won't be shown again</div>
         <div style="display:flex;align-items:center;gap:10px;">
             <code id="new-key-val" class="mono" style="flex:1;background:var(--code-bg);padding:10px 14px;border-radius:5px;font-size:12px;word-break:break-all;color:var(--key-text);">{{ new_key }}</code>
-            <button onclick="navigator.clipboard.writeText(document.getElementById('new-key-val').textContent).then(()=>{this.textContent='Copied!';setTimeout(()=>this.textContent='Copy',2000);})" class="btn btn-ghost" style="flex-shrink:0;">Copy</button>
+            <button type="button" data-copy-from="new-key-val" class="btn btn-ghost" style="flex-shrink:0;">Copy</button>
         </div>
     </div>
     {% endif %}
@@ -87,7 +87,7 @@
                         <button type="button"
                                 class="btn btn-link"
                                 style="font-size:11px;"
-                                onclick="omcpEditLimit({{ key.id }}, '{{ key.daily_request_limit if key.daily_request_limit else '' }}')">Edit</button>
+                                data-limit-edit data-key-id="{{ key.id }}" data-limit="{{ key.daily_request_limit if key.daily_request_limit else '' }}">Edit</button>
                     </td>
                     <td>
                         {% if not key.is_active %}
@@ -114,12 +114,12 @@
                         {% if key.is_active %}
                         <form method="POST" action="/admin/keys/{{ key.id }}/revoke" style="display:inline;">
                             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                            <button type="submit" class="btn btn-link" onclick="return confirm('Revoke this key?')">Revoke</button>
+                            <button type="button" class="btn btn-link" data-confirm="Revoke this key?">Revoke</button>
                         </form>
                         {% else %}
                         <form method="POST" action="/admin/keys/{{ key.id }}/delete" style="display:inline;">
                             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                            <button type="submit" class="btn btn-link" onclick="return confirm('Permanently delete this key?')">Delete</button>
+                            <button type="button" class="btn btn-link" data-confirm="Permanently delete this key?">Delete</button>
                         </form>
                         {% endif %}
                     </td>
@@ -174,7 +174,7 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button type="button" onclick="document.getElementById('create-modal').classList.remove('open')" class="btn btn-ghost">Cancel</button>
+                <button type="button" data-modal-close="create-modal" class="btn btn-ghost">Cancel</button>
                 <button type="submit" class="btn btn-primary">Create</button>
             </div>
         </form>
@@ -182,8 +182,8 @@
 </div>
 
 <!-- Edit-limit modal. One modal reused for every row: the form's action is
-     rewritten to the key being edited, so the page carries one dialog rather
-     than one per key. -->
+     rewritten to the key being edited (by `data-limit-edit` in panel.js), so
+     the page carries one dialog rather than one per key. -->
 <div id="limit-modal" class="modal">
     <div class="modal-panel">
         <div class="modal-title">Daily request limit</div>
@@ -205,20 +205,11 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button type="button" onclick="document.getElementById('limit-modal').classList.remove('open')" class="btn btn-ghost">Cancel</button>
+                <button type="button" data-modal-close="limit-modal" class="btn btn-ghost">Cancel</button>
                 <button type="submit" class="btn btn-primary">Save</button>
             </div>
         </form>
     </div>
 </div>
-
-<script>
-function omcpEditLimit(keyId, current) {
-    var form = document.getElementById('limit-form');
-    form.action = '/admin/keys/' + keyId + '/limit';
-    document.getElementById('limit-input').value = current;
-    document.getElementById('limit-modal').classList.add('open');
-}
-</script>
 
 {% endblock %}

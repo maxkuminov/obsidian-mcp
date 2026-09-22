@@ -14,7 +14,7 @@
     </div>
     <div class="page-actions">
         <span id="reindex-status" class="inline-status ok" role="status" aria-live="polite"></span>
-        <form id="reindex-form" onsubmit="event.preventDefault(); triggerReindex(this);" style="display:inline;">
+        <form id="reindex-form" data-async-reindex style="display:inline;">
             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
             <button type="submit" class="btn btn-primary btn-lg" title="Scan the vault for new or changed notes and embed them">
                 <svg class="btn-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -342,7 +342,7 @@
 
 </div>
 
-<script>
+<script nonce="{{ csp_nonce }}">
 // ── Count-up animation ──
 (function() {
     function easeOut(t) { return 1 - Math.pow(1 - t, 3); }
@@ -379,52 +379,6 @@
         }, 200 + i * 55);
     });
 })();
-
-// ── Reindex action with inline feedback ──
-async function triggerReindex(form) {
-    const btn = form.querySelector('button');
-    const label = btn.querySelector('.btn-label');
-    const icon  = btn.querySelector('.btn-icon');
-    const status = document.getElementById('reindex-status');
-    if (btn.disabled) return;
-
-    btn.disabled = true;
-    icon.classList.add('spin');
-    const originalLabel = label.textContent;
-    label.textContent = 'Starting…';
-    status.classList.remove('show', 'err');
-    status.classList.add('ok');
-    status.textContent = '';
-
-    try {
-        const csrf = form.querySelector('input[name="csrf_token"]');
-        const r = await fetch('/admin/settings/reindex', {
-            method: 'POST',
-            headers: {
-                'Accept': 'application/json',
-                ...(csrf ? { 'X-CSRF-Token': csrf.value } : {}),
-            },
-        });
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        status.textContent = '✓ Reindex started — new notes will appear shortly';
-        status.classList.add('show');
-        label.textContent = 'Started';
-    } catch (e) {
-        status.classList.remove('ok');
-        status.classList.add('err', 'show');
-        status.textContent = '✗ Failed to start reindex';
-        label.textContent = 'Failed';
-    }
-
-    setTimeout(function() {
-        icon.classList.remove('spin');
-        label.textContent = originalLabel;
-        btn.disabled = false;
-    }, 2500);
-    setTimeout(function() {
-        status.classList.remove('show');
-    }, 5000);
-}
 </script>
 
 {% endblock %}

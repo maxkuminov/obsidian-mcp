@@ -107,6 +107,7 @@ SETTINGS_ENV_KEYS = (
     "DEFAULT_DAILY_REQUEST_LIMIT",
     "LOG_LEVEL",
     "LOG_FORMAT",
+    "PANEL_CSP",
 )
 
 # The values the singleton is built from. Everything else in SETTINGS_ENV_KEYS
