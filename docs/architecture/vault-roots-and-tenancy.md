@@ -604,9 +604,23 @@ snapshot does not name is indexed and served normally in the same pass.
 ### Accepted limitations
 
 Every residual is listed, so none is discovered later as a defect. **L1 and L2
-are the two with a destructive consequence**, and both go to the follow-up
-issue `vault-root-mount-graft-detection`; the owner decision on them is
-**pending**.
+are the two with a destructive consequence**, and both went to the follow-up
+issue `vault-root-mount-graft-detection` (#262). **The owner decision is taken
+(2026-09-21): both are accepted permanently, and detection is not funded.** A
+detector that misses a new mount topology in each of three review rounds is a
+heuristic, and a heuristic guarding a tenant boundary is worse than a stated
+rule, because it reads as a guarantee. The rule that replaces it is the
+operator's:
+
+> **Never mount one tenant's directory — or anything nested in it — at a path
+> inside another tenant's root, and never assign a root that cannot be opened
+> while a peer's root may alias it.** The host's mount table and the compose
+> file's `volumes:` are an admin-trust boundary; the server does not and will
+> not check them.
+
+Do not reopen this as a defect when it is re-reported; a change that revisits
+it starts from the attack-vector list in the archived
+`vault-root-overlap-guard` design (review history), not from a fresh parser.
 
 - **L1 — a bind mount that grafts a peer's vault, or any mount nested inside
   it, to a path *inside* another tenant's root is not detected.**

@@ -930,6 +930,11 @@ to multi-user later resumes where you left off without re-bootstrapping
   Both require an administrator to write a bind mount into the deploy
   configuration — which is why `/vaults/` **and the compose file's
   mounts** are the admin-trust boundary, not just the path strings.
+  This is a permanent, stated limit rather than a pending fix: mount
+  detection was specified, failed on a new topology in each of three
+  review rounds, and was dropped. **The operator rule: never mount one
+  user's directory, or anything nested in it, inside another user's
+  root.**
 
 ## Configuration
 
