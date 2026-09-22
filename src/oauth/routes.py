@@ -34,7 +34,7 @@ from src.oauth.trust import (
     normalize_redirect_uri,
     redirect_display_host,
 )
-from src.services import security_events
+from src.services import panel_csp, security_events
 
 # No module logger, deliberately. Everything this module records is an
 # authentication outcome a caller can drive on demand, so it goes through
@@ -45,7 +45,10 @@ from src.services import security_events
 
 router = APIRouter(tags=["oauth"])
 templates = Jinja2Templates(
-    directory=os.path.join(os.path.dirname(__file__), "..", "control_panel", "templates")
+    directory=os.path.join(os.path.dirname(__file__), "..", "control_panel", "templates"),
+    # The panel CSP (#195): `csp_nonce` for the consent template, and the
+    # marker that puts the response under the policy.
+    context_processors=[panel_csp.template_context],
 )
 
 # Valid OAuth scopes live in `src/oauth/scope.py` alongside the helpers that
@@ -715,6 +718,13 @@ async def authorize_get(
         registered_at.date().isoformat() if registered_at is not None else None
     )
 
+    # The consent form posts to `/authorize`, which redirects to the registered
+    # `redirect_uri`, and browsers check `form-action` on every hop — so this
+    # page, and only this page, gets `form-action 'self' https:` (#195). A
+    # constant, not the redirect origin: nothing from the request reaches the
+    # header, and the registration rule plus `authorize_post`'s exact match
+    # still decide where a code can go.
+    panel_csp.mark_consent(request)
     response = templates.TemplateResponse(request, "authorize.html", {
         "client_name": client.client_name,
         "redirect_host": redirect_host,

@@ -42,7 +42,7 @@ from src.database import get_session
 from src.limiter import limiter
 from src.models.db import APIKey, NoteMetadata, OAuthClient, OAuthCode, OAuthToken, UsageLog, User
 from src.oauth.grants import USER_BOOTSTRAP_LOCK_KEY
-from src.services import rate_limits, security_events
+from src.services import panel_csp, rate_limits, security_events
 from src.services.vault import validate_vault_root_path, warm_user_vault_cache
 
 router = APIRouter(tags=["auth"], dependencies=[Depends(verify_csrf)])
@@ -50,7 +50,10 @@ router = APIRouter(tags=["auth"], dependencies=[Depends(verify_csrf)])
 # Templates resolved from the panel directory so all auth templates can
 # extend `auth_base.html` co-located with the existing panel templates.
 templates = Jinja2Templates(
-    directory=os.path.join(os.path.dirname(__file__), "..", "control_panel", "templates")
+    directory=os.path.join(os.path.dirname(__file__), "..", "control_panel", "templates"),
+    # The panel CSP (#195): `csp_nonce` for the templates, and the marker that
+    # puts this response under the policy — including the 401/400 re-renders.
+    context_processors=[panel_csp.template_context],
 )
 
 # Advisory-lock key for the bootstrap-registration critical section. Any

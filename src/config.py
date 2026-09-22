@@ -785,6 +785,17 @@ class Settings(BaseSettings):
     # else when `Settings()` is constructed, i.e. at startup.
     log_format: Literal["json", "text"] = "json"
 
+    # ── Panel Content-Security-Policy (#195) ─────────────────────────────────
+    # The rollback lever for the nonce policy on the panel, login and consent
+    # pages (see docs/architecture/control-panel.md). `enforce` sends
+    # `Content-Security-Policy`; `report-only` sends the identical value as
+    # `Content-Security-Policy-Report-Only`; `off` sends neither. Changing it
+    # needs only an `.env` edit and a container recreate — no rebuild. The
+    # transfer pages' own policy is unaffected by every value. `Literal`
+    # refuses anything else at startup; the effective mode is logged once, and
+    # at WARNING when it is not `enforce`.
+    panel_csp: Literal["enforce", "report-only", "off"] = "enforce"
+
     # `extra` stays at pydantic-settings' default ("forbid") so a misspelled
     # constructor kwarg or an unknown init value is still a hard error; only the
     # dotenv source is filtered (see `settings_customise_sources` below).

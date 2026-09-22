@@ -57,7 +57,7 @@ from src.oauth.scope import (
     has_vault_scope,
     token_has_write,
 )
-from src.services import security_events, vault_overlap
+from src.services import panel_csp, security_events, vault_overlap
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
     acquire_generation_lock_unbounded,
@@ -180,7 +180,10 @@ def _humanize_delta(dt: datetime | None) -> str:
 
 router = APIRouter(prefix="/admin", tags=["panel"])
 templates = Jinja2Templates(
-    directory=os.path.join(os.path.dirname(__file__), "templates")
+    directory=os.path.join(os.path.dirname(__file__), "templates"),
+    # The panel CSP (#195): `csp_nonce` for the templates, and the marker that
+    # puts this response under the policy.
+    context_processors=[panel_csp.template_context],
 )
 
 
