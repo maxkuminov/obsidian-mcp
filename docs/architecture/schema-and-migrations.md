@@ -285,6 +285,121 @@ would leave the validator finding no row for any cookie, i.e. every user locked
 out of the panel. `lock_timeout` / `statement_timeout` are set and `RESET` for
 013's reason.
 
+## Database transport (#184)
+
+Before this change the engine passed no `ssl` argument and `DATABASE_URL`
+carried none, so asyncpg's default `sslmode=prefer` applied: it tries TLS, and
+against a server with `ssl=off` it is told no and **silently** reconnects in
+cleartext. Every note body, every credential-hash lookup and every usage row
+crossed a shared bridge network in the clear, and nothing said so. The code is
+`src/services/transport_security.py`; the validator is
+`Settings._validate_database_transport`.
+
+**One setting.** `DATABASE_SSL_MODE`, libpq's vocabulary, stripped and
+case-folded, default `prefer`:
+
+| Mode | `connect_args["ssl"]` | Semantics |
+| --- | --- | --- |
+| `disable` | `False` | plaintext |
+| `prefer` (default) | `"prefer"` | asyncpg's advisory TLS with plaintext fallback — exactly the pre-change behaviour |
+| `require` | `SSLContext`, `CERT_NONE`, no hostname check, TLS ≥ 1.2 | encrypted, **unauthenticated**, no fallback |
+| `verify-ca` | `SSLContext`, `CERT_REQUIRED`, `DATABASE_SSL_CA_FILE` only | chain verified, hostname not checked |
+| `verify-full` | as `verify-ca`, plus `check_hostname` | chain and hostname (the host in `DATABASE_URL`) verified |
+
+`allow` is not offered — it tries plaintext first. `prefer` is the default
+because any stricter one is an outage on a server without TLS; the downgrade
+it permits is made **visible**, not prevented (below).
+
+**Why a context and not asyncpg's mode strings.** With a *string* mode of
+`require` or above, asyncpg consults `sslrootcert`, `$PGSSLROOTCERT` and
+`~/.postgresql/root.crt`, and — libpq-style — `require` **silently upgrades
+to verification** when such a file exists. With an `ssl.SSLContext`, asyncpg
+sets its internal mode to non-advisory and wraps the connection with that
+context: no plaintext retry, no environment variable, no home-directory file.
+The context's own `verify_mode` / `check_hostname` are the whole policy.
+`verify-*` requires `DATABASE_SSL_CA_FILE`; there is no system-store fallback
+(point the setting at the image's bundle explicitly for a publicly-trusted
+certificate). The one deliberate difference from libpq: a CA file with
+`require` is **refused**, not treated as `verify-ca`.
+
+**Conflicting inputs are refused, never reconciled.** SQLAlchemy passes every
+`DATABASE_URL` query key to `asyncpg.connect()` as a keyword and then lets
+`connect_args` override it, so `?ssl=disable` plus a strict context silently
+becomes the context — and the reverse order is one refactor away. So at
+settings construction, in every mode: a TLS key in the URL's query (`ssl`,
+`sslmode`, `sslrootcert`, `sslcert`, `sslkey`, `sslcrl`, `sslpassword`,
+`sslnegotiation`, `direct_tls`, case-insensitive) and any `PGSSL*`
+environment variable are refused, naming `DATABASE_SSL_MODE`. So are a CA with
+a non-verifying mode, a verifying mode without a CA, half a client
+certificate pair, a client pair under `disable`/`prefer`, and any named file
+that is missing, not a regular file, unreadable or not loadable. Messages never
+echo the URL or its password.
+
+**Two connection creators, one helper.** `src/database.py`'s engine (shared by
+the app, `src/mcp_stdio.py` and both maintenance scripts) and
+`alembic/env.py`'s migration engine both take `database_ssl_connect_args()`.
+Alembic validates the URL it actually resolves (`DATABASE_URL`, else
+`alembic.ini`) with the same `validate_database_url_transport` **before** it
+builds its engine. Offline mode (`alembic upgrade --sql`) opens no
+connection. `db-init`, `db-backup`/`restore` and `record-backup.sh` run
+`psql`/`pg_dump` inside the database container over its local socket and are
+unaffected.
+
+**Unix sockets under a strict mode (D3a).** A socket never carries TLS, and
+asyncpg ignores the context for one — so a strict mode reached through a
+socket would open a plaintext session in exactly the processes that run no
+startup assertion. Under `require`/`verify-*`, before any connection:
+
+- any socket-shaped host token in the URL is refused — the netloc host
+  (also after percent-decoding; SQLAlchemy 2.0 passes `%2Frun%2F…` through
+  undecoded, so it is refused as fail-closed), and every `?host=` value, split
+  on repeats and commas, beginning with `/` or `@`. A **mixed** multi-host
+  list is refused although one entry is TCP: asyncpg would try the socket too;
+- the **effective** host list — what the asyncpg dialect's own
+  `create_connect_args` produces, so SQLAlchemy's netloc/query precedence and
+  `host=h:p` splitting are the real ones — is refused when it is empty or
+  contains an empty host (`?host=:5432` becomes `host=''` even beside a TCP
+  netloc), because asyncpg then falls back to `$PGHOST` and to its implicit
+  default, which starts with the socket directories; or when any entry is a
+  socket path;
+- a `service`/`servicefile` query key, and `PGHOST`, `PGHOSTADDR`, `PGSERVICE`
+  or `PGSERVICEFILE` in the environment, are refused: each can supply a host
+  this check cannot see.
+
+Under `disable`/`prefer` a socket is local and stays permitted.
+
+**Every new strict connection is checked (D3b).** Under a strict mode both
+engines carry a pool `connect` listener that runs `SELECT ssl FROM pg_stat_ssl
+WHERE pid = pg_backend_pid()` on each **new** connection (never per checkout)
+and discards it with `DatabaseTransportError` when it is not encrypted. D3a
+should make that unreachable, so it raises rather than exits.
+
+**The startup assertion (D4).** `check_database_transport()` is the lifespan's
+first database contact, before `_check_embedding_dim`, so a transport failure
+is reported as itself. It reads `pg_stat_ssl` for its own backend (readable by
+an unprivileged role). Under a strict mode, an unencrypted session, a missing
+row, or a connection that could not be established (the server refused TLS or
+the certificate did not verify) logs CRITICAL — the error's class only, never
+its text, which can carry the DSN — and exits. Under `prefer`/`disable` a
+plaintext session emits one `internal_transport_plaintext` security event
+(`reason=database`, `outcome=<mode>`). Either way one line is logged:
+`Database transport: mode=… encrypted=… tls_version=… server_verified=…`, where
+`server_verified` comes from the mode (`verify-*` only), never from the
+session. Sandbox mode skips it with the other database checks.
+
+**Accepted limitations.**
+1. `prefer` still downgrades: the default is a *reported* downgrade, not a
+   prevented one. Prevention is `require` or above, which needs server TLS.
+2. `require` is encrypted but unauthenticated; an active interposer can
+   terminate it with any certificate. `verify-full` is the target.
+3. Under `prefer` the startup probe inspects one connection; a later pooled
+   one could land differently if the server's TLS setting changes while the
+   app runs. Strict modes check every new connection.
+4. No `prefer` warning outside the FastAPI lifespan: alembic, `mcp_stdio` and
+   the maintenance scripts enforce strict modes but do not warn under `prefer`.
+6. `verify-full` checks the name in `DATABASE_URL`'s host, so a Docker service
+   name must appear in the server certificate's SAN — an issuance requirement.
+
 ## Backups are protected data, not just a rollback tool
 
 A `pg_dump` of this database is the complete text of every tenant's notes

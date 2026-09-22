@@ -28,6 +28,101 @@
   See "Filtered vector search" in [search.md](search.md) for why an older
   backend fails *silently* without it.
 
+### The embedding hop's transport (#185)
+
+Every chunk the indexer embeds and every `semantic_search` / `find_related`
+query crosses this hop, and an interposing peer can do worse than read it: it
+can answer with vectors of its choosing, which is a **silently wrong search
+result** an agent acts on. So the endpoint is held to a policy at boot and every
+client that talks to it is built one way. The code is
+`src/services/transport_security.py`; the validator is
+`Settings._validate_embedding_transport`.
+
+**The scheme policy** applies to the **active** provider's URL only —
+`OLLAMA_URL` under `EMBEDDING_PROVIDER=ollama`, `OPENAI_BASE_URL` under
+`openai`. The inactive one is never dialled, so validating it would refuse a
+deployment for a setting it does not use. In order:
+
+0. **The raw string is checked before any parser sees it.** Leading or trailing
+   whitespace, or any C0 control character or DEL anywhere, refuses. Nothing is
+   normalised: the string the validator approves is byte-for-byte the one the
+   providers interpolate (`f"{settings.ollama_url}/api/embed"`) and the report
+   prints.
+1. **`httpx.URL` is the only parser.** It is the parser the clients use, so the
+   host the policy judges is the host the request dials. `urllib.parse.urlsplit`
+   strips leading whitespace and deletes embedded tab/CR/LF, so it approves
+   strings httpx rejects (`' https://x/v1'` has no scheme to httpx); it is used
+   nowhere in the policy, and a differential test holds the policy to httpx's
+   verdict wherever the two disagree. A parse error, a scheme other than
+   `http`/`https`, no host, any userinfo, or a port outside 1–65535 refuses —
+   and the message never echoes userinfo.
+2. `https` is accepted.
+3. `http` to a **literal** loopback host is accepted — `localhost`, 127.0.0.0/8,
+   `::1`, bracketed or not, with a trailing dot — using the same fail-closed
+   `_is_loopback_host` as the sandbox guard. No DNS resolution: a name that
+   resolves to loopback is non-loopback. `127.0.0.1.evil.example` is a DNS name;
+   `http://127.0.0.1@evil.example` dials `evil.example` and is refused by rule 1
+   anyway.
+4. `http` to anything else is accepted **only with
+   `EMBEDDING_ALLOW_PLAINTEXT=true`**; the refusal names both remedies (`https`
+   with `EMBEDDING_CA_FILE`, or the override).
+5. **`MCP_SANDBOX_MODE`** skips rules 0–4 and the CA-with-`http` refusal —
+   everything that depends on the endpoint URL, since sandbox never calls a
+   provider. It never skips the CA file's own validity.
+
+**Why the override defaults to refusal** (owner decision, 2026-09-22), when
+the database hop's default is the permissive `prefer`: the two are not
+symmetric. `prefer` at least *attempts* TLS and becomes encrypted the day the
+server enables it; an `http://` URL never will — it stays cleartext until
+someone edits it, and a warning in a log nobody reads is how #185 went
+unnoticed. The override makes the plaintext hop a written decision in the
+operator's own `.env`, costs one line (`.env.example` ships it beside the
+`http://ollama:11434` default), and is removed the day the hop gains TLS. When
+it admits a non-loopback `http` URL, the lifespan emits
+`internal_transport_plaintext` (`reason=embedding`, `outcome=override`) once
+per start; loopback `http` does not, because that traffic never leaves the
+network namespace.
+
+**`EMBEDDING_CA_FILE`** pins the trust anchor for an internal CA. It is checked
+(exists, regular file, readable) and **parsed at settings construction** with
+`ssl.create_default_context(cafile=…)`, which loads that file only; the
+context is kept on the settings object and reused, and the file is never read
+again. Parsing lazily in the factory was wrong: the OpenAI provider makes no
+startup call and Ollama's warm-up swallows failures, so a bad CA would have
+booted "healthy" and failed every embedding. The file is refused with an
+`http` URL — a trust anchor on a hop with no TLS verifies nothing — and it is
+checked in every mode, sandbox included.
+
+**One client factory**, `embedding_http_client(timeout)`, builds every HTTP
+client aimed at the embedding endpoint: both providers and the panel's Ollama
+reachability ping. It sets:
+
+- **`trust_env=False`.** httpx otherwise reads the environment for every
+  client: `HTTP(S)_PROXY` / `ALL_PROXY` would carry an approved loopback `http`
+  hop to a remote proxy in cleartext, `SSL_CERT_FILE` / `SSL_CERT_DIR` would
+  silently replace the trust anchor, and `.netrc` would add credentials. The
+  policy judged the URL; with the environment off, the URL is the whole hop.
+  The cost is that embeddings cannot go through an ambient proxy (accepted
+  limitation 9 of the change).
+- **`verify=`** the parsed `EMBEDDING_CA_FILE` context, else **certifi's
+  bundle**, built once. That is what `verify=True` already meant, stated
+  rather than implied so it does not depend on `trust_env` and the startup
+  line can name it (`verify=certifi` / `ca-file` / `n/a`). The operating
+  system's store is never consulted.
+- **`follow_redirects=False`**, httpx's default written down: a redirect is the
+  one way a validated `https` endpoint could hand the request to an `http://`
+  one after boot.
+
+A test sweeps `src/services/embeddings.py` and `src/control_panel/routes.py`
+for any direct `httpx.AsyncClient(` / `httpx.Client(` construction, so a fourth
+call site cannot bypass the factory silently.
+
+**The startup line**, logged once by `log_embedding_transport()` right after
+the database probe: `Embedding transport: provider=… scheme=… host=… port=…
+verify=… plaintext_override=…` — scheme, host and port only, never the path,
+query or userinfo. `plaintext_override=True` means the override is what
+admitted this hop (plaintext to a non-loopback host).
+
 ## Indexing decisions
 
 - Embeddings: pluggable provider, `EmbeddingProvider` Protocol with two

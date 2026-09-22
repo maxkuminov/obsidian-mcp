@@ -275,6 +275,7 @@ nothing binds the request address into a ContextVar (residual R8).
 | `panel_ondemand_index_failed` | ERROR | `error_type`, `user_id` | the panel's on-demand index action |
 | `panel_ondemand_embed_failed` | ERROR | `error_type`, `user_id` | the panel's on-demand embed action |
 | `panel_health_strip_failed` | ERROR | `error_type` | the dashboard health strip's read and rollback failures |
+| `internal_transport_plaintext` | WARNING | `outcome`, `reason` | `src/services/transport_security.py`, from the lifespan, **at most once per hop per process start** (#184, #185). `reason` is the hop — `database` (`check_database_transport`, when `pg_stat_ssl` reports the application's own session unencrypted under `DATABASE_SSL_MODE=prefer` or `disable`) or `embedding` (`log_embedding_transport`, when the active embedding URL is `http` to a non-loopback host). `outcome` is what admitted the plaintext hop: the database mode (`prefer` / `disable`) or `override` for `EMBEDDING_ALLOW_PLAINTEXT`. **No host, port, URL, DSN or path**, and a constant message: the startup INFO lines carry scheme/host/port for the operator; a record in a shared sink carries only the closed vocabulary |
 | `events_suppressed` | *the suppressed event's own level* | `count`, `reason`, `window_seconds` | the suppressor itself; `reason` names the suppressed event |
 
 ### What stays on the bare logger, and why
@@ -286,6 +287,15 @@ indexer, the embed pass, `vault_fs` housekeeping and startup stays on the bare
 logger: those are background or once-per-pass, they are not refusals, and
 suppressing them would hide the one class of error the health page exists to
 show.
+
+**One startup record is catalogued anyway: `internal_transport_plaintext`.**
+The rule above keeps *flood* channels bounded, and this record cannot flood —
+it is emitted at most twice per process start, one per hop, so the suppressor
+is irrelevant to it. It is catalogued because it is a standing **security
+fact** an operator queries by name ("which hops of which deployment are still
+cleartext"), and a catalogued event is the only log shape with a stable name
+and a policed field set. The startup transport lines themselves (`Database
+transport: …`, `Embedding transport: …`) stay on the bare logger at INFO.
 
 **A test enforces this in the four request-path modules** —
 `src/mcp_server/auth.py`, `src/mcp_server/tools.py`, `src/transfer/routes.py`

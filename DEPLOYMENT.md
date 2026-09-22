@@ -293,6 +293,55 @@ deployment still appears to work.
 redeploying. There is no migration, no database row and no cached state
 to unwind — plaintext requests simply go back to being redirected.
 
+### Internal transport: the database and embedding hops
+
+The app also opens two connections of its own: to PostgreSQL and to the
+embedding endpoint. Both are held to a transport policy at startup.
+
+**Upgrade note.** If the active embedding URL (`OLLAMA_URL`, or
+`OPENAI_BASE_URL` with the OpenAI provider) is `http://` to anything other
+than loopback — the `http://ollama:11434` default included — add this to
+`.env` **before** deploying, or the server refuses to start with a message
+naming it:
+
+```bash
+EMBEDDING_ALLOW_PLAINTEXT=true
+```
+
+It acknowledges that every chunk and search query crosses that hop
+unencrypted. Remove it once the endpoint is `https`. Also move any TLS
+parameter out of `DATABASE_URL` (`?ssl=…`, `?sslmode=…`) into
+`DATABASE_SSL_MODE`, and unset any `PGSSL*` variable: both are refused.
+Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_FILE` and `.netrc`.
+
+**Reading the startup lines.** Each start logs one line per hop:
+
+```text
+Database transport: mode=prefer encrypted=False tls_version=- server_verified=False
+Embedding transport: provider=ollama scheme=http host=ollama port=11434 verify=n/a plaintext_override=True
+```
+
+and one `internal_transport_plaintext` security event for each hop that is
+still cleartext (`reason` = `database` or `embedding`, `outcome` = the mode or
+`override`). A deployment with neither event is encrypted on both hops.
+
+**Going strict.**
+
+1. Create an internal CA (or reuse one) and mount its root certificate
+   read-only into the app container. Issue certificates whose SANs include
+   the names the app dials (the host in `DATABASE_URL`, the embedding host).
+2. **PostgreSQL:** install the server certificate and key, set `ssl = on` and
+   `ssl_min_protocol_version = 'TLSv1.2'`, and in `pg_hba.conf` put a
+   `hostssl` row for this database and role **above** a `hostnossl … reject`
+   row for the same pair; reload. Then set `DATABASE_SSL_MODE=verify-full`
+   and `DATABASE_SSL_CA_FILE=<mounted root>`, deploy, and confirm the line
+   reads `encrypted=True … server_verified=True`. Under a strict mode the app
+   refuses a Unix-socket `DATABASE_URL` and exits if the session is not
+   encrypted.
+3. **Embeddings:** put the endpoint behind TLS with a certificate from the
+   CA, then set its URL to `https://…`, set `EMBEDDING_CA_FILE=<mounted
+   root>`, and remove `EMBEDDING_ALLOW_PLAINTEXT`.
+
 ## Step 4. Get your vault onto the VPS
 
 This is the hardest design decision in the whole stack. The MCP server
