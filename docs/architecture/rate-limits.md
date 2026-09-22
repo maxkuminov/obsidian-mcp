@@ -93,6 +93,23 @@ L2 → L3 → L4 → L5a/b → L5c (slots) → L6 (quota) → body → telemetry
   `finally` on success, quota refusal, exception or cancellation. Waiting holds
   neither partial permits nor a DB connection.
 
+**The order is unchanged by the request-path commits (performance-2026-09,
+#279), but the quota now commits asynchronously (L1, an owner decision taken
+by default).** `quotas.admit` issues `SET LOCAL synchronous_commit = off` before
+`ADMISSION_SQL`, and again before the prune in its own next transaction. An
+asynchronously committed increment is visible to every other session at commit,
+so the conditional increment under the row lock still admits exactly `limit`
+calls per key per UTC day under any concurrency
+(`tests/integration/test_perf_async_commit_pg.py` repeats the N-of-more-than-N
+case). What changes is durability across a PostgreSQL server or host crash:
+increments committed in the preceding ~600 ms can be lost. That undercounts the
+key, in the caller's favour. It can never overcount, and it can never refuse a
+call the synchronous form would have admitted. The admission is still fail
+closed and still emits `quota_admission_failed`, and a rate-refused call still
+issues no quota statement. Writes that grant or revoke (OAuth code exchange,
+refresh rotation, revocation, transfer tokens, users) stay synchronous; the
+rule is that only bookkeeping whose loss undercounts may commit asynchronously.
+
 Because L2/L3 sit *above* the vault gate, a call can be refused before its
 vault root is resolved, which the `mcp-request-routing` requirement did not
 originally contemplate. That requirement now reads "before its body, unless the

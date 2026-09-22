@@ -433,9 +433,14 @@ def test_stale_bulk_warm_cannot_readmit_a_revoked_user(as_unassigned_user):
 
 
 class _MiddlewareSession:
-    """Answers the four statements `APIKeyMiddleware` issues on the API-key
-    path, dispatching on the rendered SQL so the test does not depend on
-    call order."""
+    """Answers the statements `APIKeyMiddleware` issues on the API-key path,
+    dispatching on the rendered SQL so the test does not depend on call order.
+
+    The user's `is_active` and `vault_path` ride the credential statement
+    (performance-2026-09 D3): one joined row, `(key, is_active, vault_path)`,
+    where `vault_path` is None unless `vault_row` is given — the same answer
+    the separate warm query gave by returning no row.
+    """
 
     def __init__(self, api_key, user_active=True, vault_row=None):
         self.api_key = api_key
@@ -452,16 +457,18 @@ class _MiddlewareSession:
     async def commit(self):
         self.committed = True
 
+    def _vault_path(self):
+        return self.vault_row.vault_path if self.vault_row else None
+
     async def execute(self, stmt):
         sql = str(stmt)
-        if sql.startswith("UPDATE"):
+        if sql.startswith("UPDATE") or sql.startswith("SET LOCAL"):
             return _EmptyResult()
-        if "vault_path" in sql:
-            return _RowsResult([self.vault_row] if self.vault_row else [])
         if "FROM api_keys" in sql:
-            return _RowsResult([self.api_key])
-        # select(User.is_active)
-        return _ScalarResult(self.user_active)
+            return _RowsResult(
+                [(self.api_key, self.user_active, self._vault_path())]
+            )
+        raise AssertionError(f"unexpected statement: {sql}")
 
 
 class _ScalarResult:
@@ -666,17 +673,21 @@ class _OAuthMiddlewareSession(_MiddlewareSession):
         sql = str(stmt)
         if sql.startswith("UPDATE"):
             return _EmptyResult()
-        if "vault_path" in sql:
-            return _RowsResult([self.vault_row] if self.vault_row else [])
         if "FROM oauth_tokens" in sql:
-            # One statement joins `oauth_clients`, so the middleware reads
-            # `(token, client_owner, client_name)` with `.first()` — the owner
-            # for the cross-user check, the name for the denormalised
-            # `usage_logs` actor label (issue #77).
-            return _RowsResult(
-                [(self.api_key, self.client_owner, "Snapshot Test Client")]
-            )
-        return _ScalarResult(self.user_active)
+            # One statement joins `oauth_clients` and `users`, so the
+            # middleware reads `(token, client_owner, client_name, is_active,
+            # vault_path)` with `.first()` — the owner for the cross-user
+            # check, the name for the denormalised `usage_logs` actor label
+            # (issue #77), the user's columns for the refusal and the vault
+            # binding (performance-2026-09 D3).
+            return _RowsResult([(
+                self.api_key,
+                self.client_owner,
+                "Snapshot Test Client",
+                self.user_active,
+                self._vault_path(),
+            )])
+        raise AssertionError(f"unexpected statement: {sql}")
 
 
 def _run_middleware(credential, *, token_value, downstream=None, oauth=False,
@@ -1090,6 +1101,10 @@ class _RecordingSession:
 
     def add(self, obj):
         self.added.append(obj)
+
+    async def execute(self, stmt, *_a, **_kw):
+        # `_insert_usage`'s `SET LOCAL synchronous_commit = off`.
+        return None
 
     async def commit(self):
         self.commits += 1

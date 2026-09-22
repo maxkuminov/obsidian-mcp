@@ -55,24 +55,24 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 ## 1. Slice S1 — request-path commits (#279), branch `perf-s1-commits`
 
-- [ ] 1.1 `auth.py` API-key branch: replace the credential SELECT and the separate `User.is_active` SELECT with one statement that outer-joins `users` for `is_active` and `vault_path` (D3). Keep every refusal reason, body and order exactly as it is: invalid, ownerless, inactive user, expired.
-- [ ] 1.2 `auth.py` OAuth branch: add the same `users` outer join to the existing token statement. Remove the second `users` read.
-- [ ] 1.3 `vault.py`: add `apply_user_vault_row(user_id, is_active, vault_path) -> Path | None`, directly below `warm_user_vault_cache`. It must have exactly the single-user warm's write-or-evict semantics. Both auth branches bind its return value to `current_vault_root`. Leave `warm_user_vault_cache` and its other callers unchanged.
-- [ ] 1.4 `auth.py` `last_used_at` (D1):
+- [x] 1.1 `auth.py` API-key branch: replace the credential SELECT and the separate `User.is_active` SELECT with one statement that outer-joins `users` for `is_active` and `vault_path` (D3). Keep every refusal reason, body and order exactly as it is: invalid, ownerless, inactive user, expired.
+- [x] 1.2 `auth.py` OAuth branch: add the same `users` outer join to the existing token statement. Remove the second `users` read.
+- [x] 1.3 `vault.py`: add `apply_user_vault_row(user_id, is_active, vault_path) -> Path | None`, directly below `warm_user_vault_cache`. It must have exactly the single-user warm's write-or-evict semantics. Both auth branches bind its return value to `current_vault_root`. Leave `warm_user_vault_cache` and its other callers unchanged.
+- [x] 1.4 `auth.py` `last_used_at` (D1):
   - Add the module constant `LAST_USED_AT_RESOLUTION_SECONDS = 60`.
   - Skip the statement entirely when the loaded value is within that window.
   - Otherwise issue `SET LOCAL synchronous_commit = off`, then the conditional UPDATE (`last_used_at IS NULL OR last_used_at < :cutoff`), then commit.
   - When the UPDATE is skipped, the transaction must still end before the response. It is read-only, so it costs no flush.
-- [ ] 1.5 `tools.py` `_insert_usage`: issue `SET LOCAL synchronous_commit = off` as the first statement of its transaction, before `session.add`. Change nothing in `write_usage_row` or `_write_usage_row_admitted`.
-- [ ] 1.6 `quotas.py` `admit`: issue `SET LOCAL synchronous_commit = off` before `ADMISSION_SQL`, and again before the prune, which runs in the next transaction. The docstring must state L1 in one paragraph. Keep the fail-closed behaviour and the event.
-- [ ] 1.7 `tests/integration/test_perf_async_commit_pg.py` (real Postgres). After each of the three writes, a fresh checkout of the **same pooled connection** reports `SHOW synchronous_commit` = `on`, so the setting did not leak. The quota's concurrency boundary test is repeated with async commit: exactly N of more than N concurrent calls are admitted. `test_issue_162_quotas_pg.py`, `test_usage_log_fk_recovery.py` and `test_issue_193_tool_exception_pg.py` pass unchanged.
-- [ ] 1.8 `tests/test_perf_auth_bookkeeping.py`, counting statements:
+- [x] 1.5 `tools.py` `_insert_usage`: issue `SET LOCAL synchronous_commit = off` as the first statement of its transaction, before `session.add`. Change nothing in `write_usage_row` or `_write_usage_row_admitted`.
+- [x] 1.6 `quotas.py` `admit`: issue `SET LOCAL synchronous_commit = off` before `ADMISSION_SQL`, and again before the prune, which runs in the next transaction. The docstring must state L1 in one paragraph. Keep the fail-closed behaviour and the event.
+- [x] 1.7 `tests/integration/test_perf_async_commit_pg.py` (real Postgres). After each of the three writes, a fresh checkout of the **same pooled connection** reports `SHOW synchronous_commit` = `on`, so the setting did not leak. The quota's concurrency boundary test is repeated with async commit: exactly N of more than N concurrent calls are admitted. `test_issue_162_quotas_pg.py`, `test_usage_log_fk_recovery.py` and `test_issue_193_tool_exception_pg.py` pass unchanged.
+- [x] 1.8 `tests/test_perf_auth_bookkeeping.py`, counting statements:
   - An API-key request whose `last_used_at` is fresh issues exactly **one** statement.
   - One whose `last_used_at` is stale issues one SELECT, one `SET LOCAL` and one UPDATE.
   - OAuth issues one statement.
   - Revocation still takes effect on the next request (#66), for each of: deactivating the user, clearing `vault_path`, revoking the key, deleting the `users` row, and revoking the OAuth token.
   - The OAuth code exchange, refresh rotation, revocation and transfer-token paths issue **no** `synchronous_commit` statement. The test sweeps them with a spy.
-- [ ] 1.9 Docs, in the same branch:
+- [x] 1.9 Docs, in the same branch:
   - `rate-limits.md`: a paragraph under "Gate order" stating that the order is unchanged and that the quota commits asynchronously (L1).
   - `usage-attribution.md`: the meaning of `True` under async commit (L2).
   - `vault-roots-and-tenancy.md`: the warm is folded into the credential read, with the #66 argument from D3.

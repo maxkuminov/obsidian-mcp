@@ -128,15 +128,19 @@ _user_vault_cache: dict[int, Path] = {}
 async def warm_user_vault_cache(session, user_id: int | None = None) -> Path | None:
     """Populate `_user_vault_cache` for one user (or every active user).
 
-    Called by the indexer at the start of each multi-user pass, by the API-key
-    middleware after authenticating a user, and (in phase 4) by panel routes
-    before they hit vault tools. In single-user mode the cache is unused so
-    callers can skip the warmup; nothing breaks if they don't.
+    Called by the indexer at the start of each multi-user pass and by panel
+    routes before they hit vault tools. `APIKeyMiddleware` no longer calls it:
+    it reads the same two columns in its credential statement and applies them
+    through `apply_user_vault_row` below, which has this function's
+    single-user semantics exactly (performance-2026-09 D3). In single-user mode
+    the cache is unused so callers can skip the warmup; nothing breaks if they
+    don't.
 
     The **single-user form returns the freshly read root, or None** when the
-    user has no usable assignment. `APIKeyMiddleware` binds that answer to the
-    request via `current_vault_root`, which is what makes admission immune to
-    the bulk warm racing it — see `_vault_root`. The bulk form returns None.
+    user has no usable assignment. A caller binds that answer to the request
+    (the middleware via `current_vault_root`, from `apply_user_vault_row`),
+    which is what makes admission immune to the bulk warm racing it — see
+    `_vault_root`. The bulk form returns None.
     """
     from src.models.db import User
 
@@ -174,6 +178,32 @@ async def warm_user_vault_cache(session, user_id: int | None = None) -> Path | N
     for row in result.all():
         _user_vault_cache[row.id] = Path(row.vault_path)
     return None
+
+
+def apply_user_vault_row(
+    user_id: int, is_active: bool | None, vault_path: str | None
+) -> Path | None:
+    """Apply an already-read `users` row to the cache, exactly as the
+    single-user form of `warm_user_vault_cache` does, and return the root.
+
+    `APIKeyMiddleware` reads `users.is_active` and `users.vault_path` in the
+    credential statement itself (an outer join, performance-2026-09 D3) and
+    hands them here, instead of issuing a second read through
+    `warm_user_vault_cache`. The columns are still read fresh on every
+    request and the return value is still bound to the request via
+    `current_vault_root`, so #66's revocation-on-next-request holds.
+
+    Write-or-evict, identical to the warm's single-user predicate
+    (`is_active IS TRUE AND vault_path IS NOT NULL`): a NULL from the outer
+    join (the `users` row is gone), an inactive user or an unassigned vault
+    **evicts** the cached entry and returns None.
+    """
+    if is_active is not True or vault_path is None:
+        _user_vault_cache.pop(user_id, None)
+        return None
+    root = Path(vault_path)
+    _user_vault_cache[user_id] = root
+    return root
 
 
 def clear_user_vault_cache(user_id: int | None = None) -> None:
