@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
-### Requirement: Every HTML response the application renders SHALL carry a nonce-based Content-Security-Policy unless it sets its own
-Every response whose `Content-Type` is `text/html` SHALL carry a `Content-Security-Policy` header built from a per-response nonce, unless the route that produced it has already set a `Content-Security-Policy` header of its own, in which case that header SHALL be left byte-for-byte unchanged. This covers every panel page under `/admin`, the login and register pages, and the OAuth consent page at `GET /authorize`. Responses of any other content type SHALL NOT gain a policy from this requirement.
+### Requirement: Every HTML response rendered from the panel, auth and consent templates SHALL carry a nonce-based Content-Security-Policy
+Every `text/html` response whose body was rendered by one of the four panel, auth and consent template instances (those in `src/control_panel/routes.py`, `src/control_panel/users.py`, `src/auth/routes.py` and `src/oauth/routes.py`) SHALL carry the panel policy built from a per-response nonce, whatever the request method or response status. That set — the **panel surface** — SHALL be identified by a marker the templates' shared context processor sets during rendering, not by path or by route metadata, and every template instance in `src/` other than the transfer one SHALL register that processor. HTML not rendered by those instances — the transfer pages and the framework's `/docs`, `/redoc` and `/docs/oauth2-redirect` — SHALL NOT receive the panel policy. A response that already carries an enforcing `Content-Security-Policy` header SHALL keep it byte-for-byte; a pre-existing `Content-Security-Policy-Report-Only` header SHALL NOT suppress the panel policy. Responses of any other content type SHALL NOT gain a policy from this requirement.
 
 The nonce SHALL be generated from a cryptographically secure source with at least 128 bits of entropy, SHALL be fresh for every response, and SHALL be the same value in the header and in every `nonce` attribute of that response's body.
 
@@ -14,24 +14,36 @@ The nonce SHALL be generated from a cryptographically secure source with at leas
 - **WHEN** a visitor requests `GET /admin/auth/login`, `GET /admin/register`, or `GET /authorize` for a registered client with a valid request
 - **THEN** each HTML response SHALL carry the policy with a nonce equal to every nonce in its body
 
+#### Scenario: HTML error renders carry the policy
+- **WHEN** `POST /admin/auth/login` is submitted with a valid CSRF token and wrong credentials, answering 401 with the login page, or a bootstrap `POST /admin/register` with invalid fields answers 400 with the register page
+- **THEN** each response SHALL carry the policy, and its body SHALL contain nonced `<script>` and `<style>` elements whose nonce equals the header's
+
 #### Scenario: The nonce is fresh per response
 - **WHEN** the same page is requested twice
 - **THEN** the two responses SHALL carry different nonces
 
 #### Scenario: The transfer pages keep their own policy
-- **WHEN** `GET /transfer/upload` or `GET /transfer/download` is requested
+- **WHEN** `GET` or `HEAD` is issued for `/transfer/upload` or `/transfer/download`
 - **THEN** its `Content-Security-Policy` header SHALL be exactly the one the transfer route sets, with `default-src 'none'`, unchanged by this requirement
+
+#### Scenario: Framework documentation pages are outside the surface
+- **WHEN** `GET /docs` is requested from inside the container network
+- **THEN** the response SHALL NOT carry the panel policy
+
+#### Scenario: A report-only header does not suppress enforcement
+- **WHEN** a panel-surface HTML response already carries `Content-Security-Policy-Report-Only` and no `Content-Security-Policy`, with `PANEL_CSP=enforce`
+- **THEN** the response SHALL receive the enforcing panel policy
 
 #### Scenario: A JSON response gains no policy
 - **WHEN** a request is answered with `application/json`, such as an OAuth error from `GET /authorize`
 - **THEN** the response SHALL NOT gain a `Content-Security-Policy` header from this requirement
 
-#### Scenario: Every HTML route is covered by the test suite
+#### Scenario: Coverage is not taken from route metadata alone
 - **WHEN** the test suite runs
-- **THEN** it SHALL enumerate every route declared with an HTML response class, together with `GET /authorize`, and SHALL fail if any such route is not exercised by the header test
+- **THEN** it SHALL exercise every route declared with an HTML response class, `GET /authorize`, and the explicit HTML error renders above, and SHALL fail if a route declared with an HTML response class is not exercised
 
 ### Requirement: The panel policy SHALL consist of the enumerated directive set and SHALL NOT permit inline or evaluated script
-The policy SHALL contain exactly these directives, with `<N>` the response's nonce: `default-src 'self'`; `script-src 'nonce-<N>'`; `style-src https://fonts.googleapis.com 'unsafe-inline'`; `style-src-elem 'nonce-<N>' https://fonts.googleapis.com`; `style-src-attr 'unsafe-inline'`; `img-src 'self' data:`; `font-src https://fonts.gstatic.com`; `connect-src 'self'`; `object-src 'none'`; `base-uri 'none'`; `frame-ancestors 'none'`; `form-action 'self'`, the last extended only as the consent-page requirement permits. `script-src` SHALL NOT contain `'unsafe-inline'`, `'unsafe-eval'`, `'unsafe-hashes'`, a scheme source or a host source.
+The policy SHALL contain exactly these directives, with `<N>` the response's nonce: `default-src 'self'`; `script-src 'nonce-<N>'`; `style-src https://fonts.googleapis.com 'unsafe-inline'`; `style-src-elem 'nonce-<N>' https://fonts.googleapis.com`; `style-src-attr 'unsafe-inline'`; `img-src 'self' data:`; `font-src https://fonts.gstatic.com`; `connect-src 'self'`; `object-src 'none'`; `base-uri 'none'`; `frame-ancestors 'none'`; `form-action 'self'`, which the consent page alone widens to `'self' https:`. `script-src` SHALL NOT contain `'unsafe-inline'`, `'unsafe-eval'`, `'unsafe-hashes'`, a scheme source or a host source.
 
 `style-src` carries no nonce on purpose: it is consulted only by browsers that do not implement `style-src-elem` and `style-src-attr`, and a nonce there would make such a browser ignore `'unsafe-inline'` and refuse every inline style attribute.
 
@@ -48,27 +60,19 @@ The policy SHALL contain exactly these directives, with `<N>` the response's non
 - **WHEN** the policy header is parsed
 - **THEN** it SHALL contain `object-src 'none'`, `base-uri 'none'`, `frame-ancestors 'none'`, `img-src 'self' data:`, `font-src https://fonts.gstatic.com` and `connect-src 'self'`
 
-### Requirement: The consent page's form-action SHALL admit exactly the origin of the validated redirect URI
-The `GET /authorize` response that renders the consent form SHALL extend `form-action` to `'self' https://<host>[:<port>]`, where host and port are those of the `redirect_uri` that the request validated against the client's registered redirect URIs, the host is lower-case, and the port is written only when present and not 443. The origin SHALL be written into the header only when the host matches the DNS-label pattern of letters, digits, hyphens and dots and the port consists of digits alone; otherwise that response's `form-action` SHALL be `'self' https:`. No other response SHALL carry a form-action source beyond `'self'`, and no value derived from a request SHALL reach the header without passing that check.
+### Requirement: The consent page's form-action SHALL be 'self' https: and every other page's SHALL be 'self'
+The `GET /authorize` response that renders the consent form SHALL carry `form-action 'self' https:`, and every other panel-surface response SHALL carry `form-action 'self'`. No request-derived value SHALL be interpolated into the policy; the only variable part of the header is the server-generated nonce. Where an authorization code may be delivered SHALL continue to be decided by the existing rules — a registered `redirect_uri` must be `https` with a non-empty host, and `POST /authorize` re-validates the submitted `redirect_uri` by exact match against the client's registered list — which this change does not alter.
 
-The consent form posts to `/authorize`, which answers with a redirect to the registered redirect URI for both approve and deny; browsers that apply `form-action` to redirects following a form submission would otherwise block the OAuth flow.
+The consent form posts to `/authorize`, which answers with a redirect to the registered redirect URI for both approve and deny, and browsers apply `form-action` to every redirect hop of a form-submission navigation; an HTTPS scheme source keeps multi-hop callbacks and non-canonically spelled hosts working while still refusing non-HTTPS form targets.
 
 #### Scenario: Approve and deny reach the registered redirect URI
-- **WHEN** a client registered with `https://client.example/cb` is authorized and the user approves, or denies, on the consent page
-- **THEN** the consent page's policy SHALL contain `form-action 'self' https://client.example`
-- **AND** the browser SHALL follow the 302 to `https://client.example/cb?…` without a policy violation
+- **WHEN** a user approves, or denies, on the consent page for a client whose registered callback redirects on to another HTTPS origin
+- **THEN** the consent page's policy SHALL contain `form-action 'self' https:`
+- **AND** the browser SHALL follow every hop without a policy violation
 
-#### Scenario: A non-default port is carried
-- **WHEN** the validated redirect URI is `https://client.example:8443/cb`
-- **THEN** the consent page's `form-action` SHALL be `'self' https://client.example:8443`
-
-#### Scenario: An inexpressible host falls back without omitting the directive
-- **WHEN** the validated redirect URI's host is an IPv6 literal or otherwise fails the host check
-- **THEN** that response's `form-action` SHALL be `'self' https:`
-
-#### Scenario: Header metacharacters never reach the header
-- **WHEN** a host value containing `;`, `,`, whitespace or a quote reaches the origin builder
-- **THEN** the emitted header SHALL NOT contain that value and SHALL use the fallback
+#### Scenario: Non-HTTPS form targets stay refused on the consent page
+- **WHEN** the consent page's policy is parsed
+- **THEN** `form-action` SHALL consist of exactly `'self'` and `https:`
 
 #### Scenario: Other pages keep form-action 'self'
 - **WHEN** any panel, login or register page is rendered
@@ -89,6 +93,11 @@ The application SHALL read `PANEL_CSP` with accepted values `enforce`, `report-o
 - **WHEN** `PANEL_CSP=off`
 - **THEN** panel HTML responses SHALL carry neither header
 - **AND** `/transfer/upload` SHALL still carry its own `Content-Security-Policy`
+
+#### Scenario: The first production deploy runs report-only
+- **WHEN** this change is first deployed to production
+- **THEN** the deployment SHALL set `PANEL_CSP=report-only`
+- **AND** it SHALL be switched to `enforce` only after a browser pass over the panel pages, including one approve and one deny through a real connector, reports zero violations
 
 #### Scenario: An invalid value refuses startup
 - **WHEN** `PANEL_CSP=strict`
@@ -113,8 +122,8 @@ No template under `src/control_panel/templates/` SHALL contain an HTML event-han
 - **WHEN** an administrator uses the create-key modal, the copy button, the edit-limit modal, the OAuth scope select, the settings reset modal, the mobile sidebar, the dashboard reindex button and the usage chart under the enforced policy
 - **THEN** each SHALL behave as before this change and the browser SHALL report no policy violation
 
-### Requirement: Confirmation-guarded controls MUST fail closed
-Every control that asks for confirmation before submitting a form SHALL be a non-submitting button (`type="button"`) carrying the confirmation text in a `data-confirm` attribute, and its form SHALL contain no other submit control. The form SHALL be submitted only by script, after the user accepts the confirmation, using `requestSubmit()`. If the script does not run, activating the control SHALL submit nothing. The confirmation text SHALL be read as an attribute string and SHALL NOT be evaluated as script.
+### Requirement: The eight existing confirm() controls MUST fail closed
+Each of the eight controls that used an inline `confirm()` before this change — revoke key, delete key and delete revoked keys (`keys.html`), delete client and revoke grant (`oauth.html`), trigger reindex (`settings.html`), deactivate user and permanently delete user (`user_edit.html`) — SHALL be a non-submitting button (`type="button"`) carrying its confirmation text in a `data-confirm` attribute, and its form SHALL contain no other submit control. The form SHALL be submitted only by script, after the user accepts the confirmation, using `requestSubmit()`. If the script does not run, activating the control SHALL submit nothing. The confirmation text SHALL be read as an attribute string and SHALL NOT be evaluated as script. The settings page's reset-embeddings modal and the `reembed_confirm.html` confirmation page are separate mechanisms and SHALL keep their native submit buttons.
 
 #### Scenario: Declining submits nothing
 - **WHEN** an administrator activates "Revoke" on an API key and declines the confirmation
@@ -131,6 +140,10 @@ Every control that asks for confirmation before submitting a form SHALL be a non
 #### Scenario: A quote in the confirmation text cannot bypass it
 - **WHEN** the rendered confirmation text contains an apostrophe
 - **THEN** the confirmation SHALL still be shown and the form SHALL still require acceptance
+
+#### Scenario: The other confirmation mechanisms are unchanged
+- **WHEN** an administrator opens the reset-embeddings modal, or the re-embed confirmation page
+- **THEN** its final button SHALL remain a native submit button, reachable only through the modal or the dedicated page as before
 
 ### Requirement: The panel SHALL NOT load a script library that turns markup attributes into requests or code
 The panel, auth and consent templates SHALL NOT load htmx or any other library that issues requests or evaluates code from declarative HTML attributes, and the vendored htmx file SHALL be removed from the static directory. Chart.js MAY remain loaded because it evaluates no markup and requires no `'unsafe-eval'`.

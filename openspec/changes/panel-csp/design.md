@@ -2,7 +2,9 @@
 
 The panel, auth and consent surface has no Content-Security-Policy because its controls are inline event handlers. This change removes the handlers and then adds the policy. The facts below come from reading the tree at `f2ec082` and the vendored bytes, not from assumption.
 
-**What renders HTML.** Four `Jinja2Templates` instances render from `src/control_panel/templates/`: `src/control_panel/routes.py` (dashboard, account, keys, oauth, usage, performance, health, search-analytics, vault, settings, reembed-confirm), `src/control_panel/users.py` (users, user edit), `src/auth/routes.py` (login, register — the latter doubling as first-admin bootstrap) and `src/oauth/routes.py` (`GET /authorize`, the consent page). A fifth, in `src/transfer/routes.py`, renders the two transfer pages under their own per-response nonce policy (`_page`, `default-src 'none'`). No other route returns HTML; error paths on these surfaces return JSON or a redirect.
+**What renders HTML.** Four `Jinja2Templates` instances render from `src/control_panel/templates/`: `src/control_panel/routes.py` (dashboard, account, keys, oauth, usage, performance, health, search-analytics, vault, settings, reembed-confirm), `src/control_panel/users.py` (users, user edit), `src/auth/routes.py` (login, register — the latter doubling as first-admin bootstrap) and `src/oauth/routes.py` (`GET /authorize`, the consent page). A fifth, in `src/transfer/routes.py`, renders the two transfer pages under their own per-response nonce policy (`_page`, `default-src 'none'`). Some **error paths render HTML too**, through the same instances and without `response_class=HTMLResponse` on their decorator: a failed `POST /admin/auth/login` renders `login.html` with 401, and a failed bootstrap `POST /admin/register` renders `register.html` with 400. **Route metadata is therefore not an HTML inventory** (Codex round 1, finding 4).
+
+**Framework HTML.** `src/main.py` constructs `FastAPI()` with its default documentation routes, so `/docs`, `/redoc` and `/docs/oauth2-redirect` also answer `text/html` — with un-nonced inline scripts and, for the first two, scripts from `cdn.jsdelivr.net`. They are Starlette `Route`s, not `APIRoute`s. No proxy router in `docker-compose.yml` matches them, so they are reachable only from inside the container network, and nothing in the repo (README, DEPLOYMENT, tests) references them.
 
 **The three roots.** `base.html` (panel), `auth_base.html` (login, register) and `authorize.html` (consent, standalone) each include `_theme.html` — one `<style>` block of tokens plus the inline pre-paint theme bootstrap `<script>` — and `_theme_toggle.html`. Page templates add their own `<style>` (`vault.html`) and `<script>` blocks (`dashboard.html`, `keys.html`, `usage.html`, `user_edit.html`, and `base.html`'s footer script). `usage.html` interpolates `{{ chart_data | tojson }}` into its script; `tojson` escapes `<`, `>`, `&` and `'`, so that is safe inside a nonced script as it is today.
 
@@ -67,7 +69,9 @@ A `data-confirm` control is a `type="button"`, not a submit button. The delegate
 
 Implicit submission is closed too: none of the eight forms has a text field (only the hidden `csrf_token`), and the spec forbids a confirm-guarded form from carrying any other submit button, so Enter cannot submit around the prompt. `disabled` on the self-delete buttons (`user_edit.html`, `is_self`) is kept as is.
 
-The settings page's "Reset embeddings" flow is a custom modal, not a `confirm()`; its final "Yes, reset" is a real submit button inside the modal and stays one — the modal is the confirmation, and opening it requires script (D1), so it too fails closed.
+**Scope: exactly the eight existing `confirm()` controls** (Codex round 1, finding 6). Two other confirmation mechanisms keep what they have:
+- The settings page's "Reset embeddings" flow is a custom modal, not a `confirm()`; its final "Yes, reset" is a real submit button inside the modal and stays one — the modal is the confirmation, and opening it requires script (D1), so without script the submit is never reachable.
+- `reembed_confirm.html` is a dedicated server-rendered confirmation page; its "Yes, Re-embed All" is a native submit button and stays one. The page itself is the confirmation step and needs no script.
 
 ### D3 — Style elements are nonced; style attributes stay, under `style-src-attr 'unsafe-inline'`
 
@@ -97,28 +101,32 @@ connect-src 'self'
 object-src 'none'
 base-uri 'none'
 frame-ancestors 'none'
-form-action 'self'            (consent page: 'self' <redirect origin>, D5)
+form-action 'self'            (consent page: 'self' https:, D5)
 ```
 
 Each source is justified by something in the templates: `script-src` — every script, inline or `src=`, carries the nonce, so no host-source (not even `'self'`) is listed and an injected `<script src="/admin/static/…">` is still refused; `style-src-elem` — nonced `<style>` blocks plus the Google Fonts stylesheet `<link>`; `img-src data:` — the SVG noise and select-arrow backgrounds, `'self'` for the favicon request; `font-src` — Google's font files; `connect-src 'self'` — the reindex `fetch`. `default-src 'self'` covers what is not enumerated (manifest, media, frames, workers); none is used. `frame-ancestors 'none'` duplicates `X-Frame-Options: DENY`, which stays for older browsers.
 
 No `'unsafe-eval'`: Chart.js does not need it (Context) and htmx is removed (D6). No `'strict-dynamic'`: nothing loads scripts dynamically.
 
-### D5 — The consent page's `form-action` admits exactly the validated redirect origin
+### D5 — The consent page's `form-action` is `'self' https:` (owner decision, Codex round 1)
 
-`form-action` is the policy of the **page that submits the form**, so the fix lives on the `GET /authorize` response, which already knows the `redirect_uri` it validated against `client.redirect_uris` (exact match) before rendering.
+`form-action` is the policy of the **page that submits the form**, so the question is decided on the `GET /authorize` response. Its form posts to `/authorize`, which answers 302 to the client's registered `redirect_uri` for approve and deny alike, and Chromium checks `form-action` on **every hop** of a form-submission navigation.
 
-`authorize_get` records the redirect **origin** on the request; the header builder emits `form-action 'self' https://<host>[:<port>]` for that response only. The origin is derived with the same parser the rest of the OAuth code uses, lower-case, scheme always `https` (registration refuses anything else), port written only when present and not 443.
+**Decision: the consent page's `form-action` is `'self' https:`, unconditionally.** Every other page keeps `'self'`. No value from the request reaches the header; the directive is a constant selected by which template rendered the response.
 
-Header-injection guard: the host must match `^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$` and the port must be 1–5 digits. An A-label host and an IPv4 literal pass; anything else (an IPv6 literal, which has no CSP host-source spelling; anything carrying `;`, `,`, whitespace or a quote) does not, and that one response falls back to `form-action 'self' https:`. It never omits the directive and never interpolates an unchecked string into the header.
+The first draft emitted the exact origin of the validated `redirect_uri`. Codex round 1 showed two ways that breaks a working connector, and the owner ruled that a broken approve/deny on a live connector is the most expensive failure this change can cause:
+- **Multi-hop callbacks.** A callback on `api.client.example` that 302s to `app.client.example` is blocked on the second hop, after the code has already been delivered.
+- **Non-canonical hosts.** Registration keeps an already-ASCII host as written, so `https://127.1/cb` is stored and would be emitted as the source `https://127.1`, while the browser navigates to its canonical `https://127.0.0.1/cb`. Chromium compares the source spelling against the canonical URL host, so even a single hop can fail. Matching browser canonicalisation is a parser-fidelity problem this change does not need to take on.
+
+What `'self' https:` still refuses on the consent page: a form (or `formaction`) posting to `http:`, `javascript:`, `data:` or any other non-HTTPS scheme. What it gives up: an injected form posting the hidden fields to an arbitrary HTTPS origin. Reaching that needs an HTML-injection primitive on a page whose attacker-influenced strings (`client_name`, the redirect host) are autoescaped, and injected script is refused outright by the nonce-only `script-src`. Accepted limitation 3.
+
+Unchanged and relied on: the existing registration rule that every `redirect_uri` is `https` with a non-empty host (`_normalized_redirect_uri`), and `authorize_post`'s exact-match re-validation of the submitted `redirect_uri` against the registered list. Those, not the CSP, decide where a code can be delivered; `https:` in `form-action` never admits a destination registration would refuse.
 
 Alternatives rejected:
-- **Flat `'self'`** breaks every OAuth approve and deny in Chromium. Not viable.
-- **Omit `form-action` on the consent page** leaves an injected form free to post the hidden fields (`state`, `code_challenge`) anywhere.
-- **`'self' https:` always** survives any redirect chain but gives up nearly all of the directive's value on the one page where posting off-origin is the attack.
-- **Answer the POST with a page that navigates by script or meta refresh** changes the OAuth protocol surface to satisfy a header. No.
-
-**The residual:** Chromium checks *every* hop. A client whose registered callback itself 302s to a different origin (callback on `api.example`, app on `app.example`) is blocked after its own callback has already received the code — the client-side exchange may complete, but the user's browser lands on a CSP error. The live check (tasks 6.3) connects the clients actually in use; if one breaks, `PANEL_CSP=report-only` restores it while the owner decides between keeping the exact origin and relaxing the consent page to `https:`. Accepted limitation 3 and the first Open Question.
+- **Flat `'self'`** breaks every OAuth approve and deny in Chromium.
+- **Exact redirect origin** — the first draft; rejected for the two reasons above.
+- **Omit `form-action` on the consent page** would also admit `http:` and `javascript:` targets, for no gain over `https:`.
+- **Answer the POST with a page that navigates by script or meta refresh** changes the OAuth protocol surface to satisfy a header.
 
 `POST /authorize` returns a redirect, not HTML, and carries no policy — none is needed on a 302.
 
@@ -130,17 +138,20 @@ Two options once the policy exists:
 
 A static test forbids `hx-*` attributes in templates and any `<script src>` naming htmx, so a reintroduction is a deliberate act.
 
-### D7 — Where the nonce and the header come from
+### D7 — Where the nonce and the header come from, and which responses get it
 
-A new `src/services/panel_csp.py` owns three things:
+**Scope is decided by a marker from the four panel template instances, not by path or by content type alone** (Codex round 1, finding 3). A new `src/services/panel_csp.py` owns:
 
 - `nonce_for(request) -> str`: lazily creates `secrets.token_urlsafe(16)` (the transfer pages' size) on first call and stores it in `request.state`, so every call during one request returns the same value and a new request gets a new one.
-- `template_context(request) -> {"csp_nonce": …}`: a Starlette `Jinja2Templates` context processor, registered on each of the four panel/auth/consent `Jinja2Templates` instances. Templates write `nonce="{{ csp_nonce }}"`. A context processor rather than a Jinja global because several tests render templates through their own `Environment` with `ChainableUndefined`, where a missing *variable* renders empty but a missing *callable* raises.
-- `build_policy(nonce, form_action_origin=None) -> str`: the D4 string, with D5's origin appended to `form-action` when given and valid.
+- `template_context(request) -> {"csp_nonce": …}`: a Starlette `Jinja2Templates` context processor, registered on each of the four panel/auth/consent `Jinja2Templates` instances and **not** on the transfer instance. Besides returning the nonce it marks the request as a **panel surface** on `request.state`. Templates write `nonce="{{ csp_nonce }}"`. A context processor rather than a Jinja global because several tests render templates through their own `Environment` with `ChainableUndefined`, where a missing *variable* renders empty but a missing *callable* raises.
+- `mark_consent(request)`: called by `authorize_get` immediately before it renders `authorize.html`, so that response gets the D5 `form-action`.
+- `build_policy(nonce, consent: bool) -> str`: the D4 string; `form-action 'self' https:` when `consent`, `form-action 'self'` otherwise. No request-derived value is ever interpolated except the server-generated nonce.
 
-`add_security_headers` in `src/main.py` gains one step after `call_next`: if the mode is not `off`, the response's `content-type` is `text/html`, and the response does not already carry `Content-Security-Policy` (the transfer pages set theirs in `_page`), set the header — `Content-Security-Policy` under `enforce`, `Content-Security-Policy-Report-Only` under `report-only` — from `nonce_for(request)` and the recorded consent origin. Using `nonce_for` rather than reading a value guarantees a policy even for an HTML response that rendered no nonce (it then admits no inline script at all). `request.state` is shared between the middleware and the endpoint because both wrap the same ASGI `scope["state"]`; the header test proves the header nonce equals every body nonce, which is the property that matters.
+`add_security_headers` in `src/main.py` gains one step after `call_next`: when the mode is not `off`, the request carries the panel-surface marker, and the response is `text/html`, it writes the policy — as `Content-Security-Policy` under `enforce`, as `Content-Security-Policy-Report-Only` under `report-only` — **unless the response already carries an enforcing `Content-Security-Policy` header**, which is left byte-for-byte alone. A pre-existing `Content-Security-Policy-Report-Only` header does **not** suppress the enforcing panel policy (Codex round 1, finding 5); under `report-only` mode the panel value replaces any report-only value (no route sets one today). Using `nonce_for` in the middleware guarantees a policy even for a marked response that rendered no nonce (it then admits no inline script at all). `request.state` is shared between middleware and endpoint because both wrap the same ASGI `scope["state"]`; the header test proves header nonce equals every body nonce.
 
-The transfer pages keep their own template variable (`{{ nonce }}`) and their own policy. The middleware's "already set" check is what keeps them byte-identical, and `panel-theming`'s existing transfer-page scenario plus a new one here assert it.
+**Why a marker and not a path prefix** (`/admin`, `/authorize`): the policy is only correct for markup written to carry its nonce, and "rendered by one of the four instances" is exactly that set. It covers the HTML error renders (login 401, register 400) and any future panel route with no inventory to maintain, and it excludes by construction everything that is not panel markup — the transfer pages (own instance, own policy) and FastAPI's `/docs`, `/redoc` and `/docs/oauth2-redirect`, which would break under a nonce-only policy. A path prefix would need its own exception list and would still miss a panel template rendered from a new prefix. A static test asserts that every `Jinja2Templates(` in `src/` other than the transfer one registers the processor, so a fifth instance cannot silently escape.
+
+**The FastAPI documentation pages stay enabled and outside the policy.** Nothing in the repo relies on them, and no proxy router exposes them, so they are reachable only from inside the container network; disabling them is an unrelated hardening call and is not bundled here. A test asserts `/docs` receives no panel policy, which is what keeps them working.
 
 ### D8 — `PANEL_CSP` kill switch
 
@@ -154,7 +165,8 @@ Rollback: set the value in the deploy directory's `.env`, recreate the container
 
 ### D9 — Tests
 
-- `tests/test_panel_csp_headers.py`: for every HTML route (the full list is derived from the app's routes — every `APIRoute` whose `response_class` is `HTMLResponse`, plus the authorize page — and an inventory assertion fails if a route exists that the parametrised cases do not cover), a request through the real app middleware stack, using the existing fake-session harness patterns, asserts: the `Content-Security-Policy` header is present; it contains every D4 directive; its nonce is at least 16 bytes of URL-safe base64; every `nonce="…"` in the body equals it; two consecutive requests carry different nonces. Plus: the consent page's `form-action` is `'self' https://<registered host>` for a registered client, a port is carried when non-default, an IPv6-literal or otherwise inexpressible host falls back to `'self' https:`, and a host containing CSP metacharacters never reaches the header; `report-only` moves the value to the report-only header and `off` removes it; the two transfer pages' policy is unchanged; a JSON response carries no policy.
+- `tests/test_panel_csp_headers.py`, all through the real app middleware stack with the existing fake-session harness patterns. **Route metadata is a starting list, not an exhaustive inventory** — it misses HTML rendered by decorators without `response_class`, and error renders — so the test combines three sources: (1) every `APIRoute` whose `response_class` is `HTMLResponse`, with an inventory assertion that fails if one is not in the parametrised set; (2) `GET /authorize` for a registered client; (3) **explicit method/status cases**: `POST /admin/auth/login` with a valid CSRF token and wrong credentials → 401 rendering `login.html`; bootstrap `POST /admin/register` with invalid fields → 400 rendering `register.html`. For each: the enforcing header is present, it contains every D4 directive, `script-src` is exactly one nonce source, the nonce is at least 22 URL-safe characters, the body contains at least one nonced `<script>` and one nonced `<style>`, and every `nonce="…"` in the body equals the header's; two consecutive requests carry different nonces. Plus: the consent page's `form-action` is exactly `'self' https:` and every other page's is exactly `'self'`; `report-only` moves the value and `off` removes it; `GET` **and `HEAD`** of both transfer pages keep their own policy unchanged in all three modes; a marked HTML response that already carries only a `Content-Security-Policy-Report-Only` header still receives the enforcing panel policy (a test-only route or a patched response); `GET /docs` receives no panel policy; a JSON response (an `/authorize` validation error) carries no policy.
+- A static assertion, in the same file, that every `Jinja2Templates(` construction under `src/` except `src/transfer/routes.py` passes the context processor.
 - `tests/test_panel_csp_templates.py` (static, no app): over every file in `src/control_panel/templates/`, after stripping `{# … #}` and `<!-- … -->` comments — no attribute matching `\son[a-z]+\s*=`; no `javascript:` in any `href`/`src`/`action`/`formaction`; no `hx-` attribute; every `<script` and `<style` opening tag carries `nonce="{{ csp_nonce }}"` (transfer templates: `nonce="{{ nonce }}"`); every `<script src=` is under `/admin/static/`; no `<link rel="stylesheet">` outside `https://fonts.googleapis.com`; every `data-confirm` element is `type="button"` and its form contains no `type="submit"` control; `vault.html` hover is expressed in CSS.
 - `tests/test_panel_csp_config.py`: default `enforce`; each accepted value; an unknown value raises at settings construction; the startup log lines.
 - `panel.js` behaviour has no JS test runner in this repo; it is covered by the live browser pass (tasks §6) and by the static test's structural assertions. Adding a JS test harness is out of scope.
@@ -165,11 +177,18 @@ Every HTML route is behind the SSO forward-auth chain. `curl` from outside sees 
 
 - **Scriptable, on the host:** a request from inside the container network straight to the app (`docker exec` into the container, a Python one-liner against `http://localhost:8000/admin/auth/login` with the configured hostname as `Host`) — the login page renders without a panel session in multi-user mode — asserting the header, the mode, and that the body nonces match. Also `GET /transfer/upload` to confirm the transfer policy is unchanged. This proves the app emits the policy on the deployed build.
 - **Not scriptable:** that the header survives the proxy chain on an authenticated request, and that every control works in a real browser under it. Traefik does not strip response headers by default, but that is exactly the kind of "should" the in-container probe cannot see.
-- **The pragmatic check:** one browser pass by the owner (or a `user-representative` run if its browser holds an SSO session), with devtools open, over a fixed list: dashboard (count-up, reindex button), keys (new-key modal, copy, edit-limit modal, revoke confirm — cancel and accept on a throwaway key), OAuth page (scope select auto-submit on a throwaway grant, revoke confirm cancel), usage (chart renders, theme toggle recolours it), settings (reset modal open and cancel), users and user edit (create modal; deactivate confirm cancel), vault (hover), mobile width (sidebar open/close), login and consent pages (theme toggle), and one full OAuth connect → approve with a real client in use, plus one deny. Pass criterion: the response headers show the policy, and the console and the Issues panel show **zero** CSP violations.
+- **The pragmatic check:** one browser pass by Max, by hand (owner decision), with devtools open, first under `report-only` and then again briefly under `enforce` (Migration Plan), over a fixed list: dashboard (count-up, reindex button), keys (new-key modal, copy, edit-limit modal, revoke confirm — cancel and accept on a throwaway key), OAuth page (scope select auto-submit on a throwaway grant, revoke confirm cancel), usage (chart renders, theme toggle recolours it), settings (reset modal open and cancel), users and user edit (create modal; deactivate confirm cancel), vault (hover), mobile width (sidebar open/close), login and consent pages (theme toggle), and one full OAuth connect → approve with a real client in use, plus one deny. Pass criterion: the response headers show the policy, and the console and the Issues panel show **zero** CSP violations (under `report-only`, zero *reported* violations). Only that result authorises the flip to `enforce`.
 
 ## Spec review history
 
-(Filled in by task 0.2.)
+| Round | Finding | Severity | Resolution |
+| --- | --- | --- | --- |
+| 1 | Enforcement precedes the only connector-compatibility check; multi-hop callbacks break under an exact-origin `form-action` | MAJOR | Owner decision: consent `form-action 'self' https:` (D5); mandatory report-only first deploy with a real approve and deny before enforcing (Migration Plan, tasks §6) |
+| 1 | Exact-origin derivation diverges from browser canonicalisation (`https://127.1`) | MAJOR | Moot: the derivation is removed (D5) |
+| 1 | `/docs`, `/redoc`, `/docs/oauth2-redirect` would receive an incompatible policy and escape the inventory | MAJOR | Scope by a panel-surface marker from the four template instances (D7); framework pages excluded and tested; accepted limitation 4 |
+| 1 | HTML error renders (login 401, register 400) and transfer `HEAD` missing from coverage; route metadata is not an inventory | MAJOR | Explicit method/status cases through the real stack; stated that metadata is not exhaustive (D9, task 2.7) |
+| 1 | Task 2.5 let an existing Report-Only header suppress the enforcing policy | MINOR | Aligned: only an enforcing header suppresses; tested (D7, tasks 2.5, 2.7) |
+| 1 | `data-confirm` requirement broader than the plan (reset modal, reembed page) | MINOR | Requirement scoped to the eight existing `confirm()` controls; the two other mechanisms kept and named (D2, spec) |
 
 ## Implementation review history
 
@@ -178,7 +197,8 @@ Every HTML route is behind the SSO forward-auth chain. `curl` from outside sees 
 ## Risks / Trade-offs
 
 - [A panel control silently stops working under the policy] → the static scan makes an inline handler a test failure; the browser pass exercises every control; `PANEL_CSP=report-only` is a one-line rollback that keeps nonces and delegation in place.
-- [The OAuth consent redirect is blocked] → D5 adds the exact origin; the live check connects real clients; rollback as above. The multi-hop residual is accepted limitation 3.
+- [The OAuth consent redirect is blocked] → D5 admits any HTTPS target on the consent page, so neither multi-hop callbacks nor non-canonical hosts can break it; the rollout (Migration Plan) runs report-only through a real approve and deny before enforcing.
+- [The policy lands on HTML it was not written for and breaks it] → D7's marker scopes it to the four template instances; `/docs` and the transfer pages are asserted untouched.
 - [A delegated confirm regresses to fail-open] → D2 makes the button non-submitting; the static test asserts `type="button"` and no sibling submit.
 - [The nonce reaches an attacker] → it is per-response, 128 bits, rendered only in attributes of elements this server wrote; browsers hide `nonce` from CSS selectors and from `getAttribute` on script elements. A page that reflects attacker markup *before* a nonced tag could still dangle it — autoescape stands in front of that, as today.
 - [A cached panel page replays a stale nonce] → the header is cached with the body, so they stay consistent; nothing new is exposed.
@@ -187,14 +207,19 @@ Every HTML route is behind the SSO forward-auth chain. `curl` from outside sees 
 
 ## Migration Plan
 
-No schema change, no data change. Deploy with `make deploy`. The default is `enforce`; the deploy directory's `.env` needs no edit unless the owner prefers to take the first live pass in `report-only` and flip to `enforce` after it (Open Questions). Rollback is `PANEL_CSP=off` (or `report-only`) plus a recreate.
+No schema change, no data change. **Rollout is two steps (owner decision):**
+
+1. The first production deploy sets `PANEL_CSP=report-only` in the deploy directory's `.env` before `make deploy`. Nothing is blocked; violations appear in the browser console.
+2. Max runs the D10 browser pass by hand, with devtools, over the fixed page list, including **one real connector approve and one deny**. When it shows zero violations, `PANEL_CSP=enforce` goes into the `.env` and the container is recreated (no rebuild). A short second pass confirms the enforcing header on a panel page and one more approve.
+
+The code default stays `enforce`, so a fresh deployment is protected without operator action; report-only is this deployment's rollout step, not the product default. Rollback at any time is `PANEL_CSP=report-only` (or `off`) plus a recreate.
 
 ## Accepted limitations
 
 1. **Inline style attributes remain allowed** (`style-src-attr 'unsafe-inline'`). Under an HTML-injection bug an attacker can restyle the injected element itself — overlay, hide, UI redress — but cannot run script, scrape other elements through selectors, or beacon off-origin. D3. Converting to classes is a follow-up.
 2. **A browser without CSP3 `style-src-elem`/`-attr` support gets `style-src 'unsafe-inline'`** for style elements too. Script policy is unaffected.
-3. **A client whose registered callback redirects to a different origin is blocked by Chromium** after its callback has run, because `form-action` applies to every hop of the form-submission navigation. D5. Found, if it exists, by the live check; rollback by `PANEL_CSP=report-only`.
-4. **An IPv6-literal redirect host gets `form-action 'self' https:`** on its consent page, because CSP has no host-source spelling for it.
+3. **The consent page's `form-action` admits any HTTPS origin** (`'self' https:`), owner-decided (D5). An HTML-injection bug on the consent page could post the form's hidden fields to an attacker's HTTPS origin; `http:`, `javascript:` and other schemes stay refused, script stays refused, and where a code can be delivered is still decided by registration (HTTPS-only) and exact-match re-validation, not by CSP.
+4. **The FastAPI documentation pages (`/docs`, `/redoc`, `/docs/oauth2-redirect`) carry no CSP.** They are framework HTML, not proxy-routed, and outside the panel surface by D7's marker. Disabling them is a separate call.
 5. **A panel POST made after the SSO session has expired** is answered by the forward-auth chain with a redirect to the identity provider — a different origin — which `form-action 'self'` blocks in Chromium. The user sees a blocked-navigation page instead of the SSO login; a reload (a GET) proceeds to SSO. The POST was never going to be replayed after SSO anyway, so nothing is lost that is not lost today.
 6. **`report-only` mode reports only to the browser console.** No collection endpoint (non-goal).
 7. **`panel.js` has no automated behavioural test.** No JS runner exists here; the static structure test and the live browser pass cover it.
@@ -202,7 +227,7 @@ No schema change, no data change. Deploy with `make deploy`. The default is `enf
 
 ## Open Questions
 
-- **Owner call — consent `form-action`: exact origin or `https:`?** D5 chooses the exact origin (stronger; residual 3). If the owner prefers zero risk of a broken connector over that strength, the consent page's `form-action` becomes `'self' https:` — a one-line change in `build_policy`.
-- **Owner call — first live pass in `report-only`?** The code default is `enforce`. The owner may set `PANEL_CSP=report-only` in the deploy `.env` for the first browser pass and flip it afterwards; the extra step buys a pass with nothing blocked.
-- **Owner call — who runs the browser pass?** It needs an SSO session. Either the owner by hand, or a `user-representative` run if its Playwright browser can be given one.
 - **Follow-up to file:** move inline `style=` attributes to classes and drop `style-src-attr 'unsafe-inline'`.
+- **Follow-up to consider (not filed by default):** disable the unused FastAPI documentation routes.
+
+Resolved by the owner after Codex round 1: the consent `form-action` (`'self' https:`, D5), the first-deploy mode (report-only, then enforce — Migration Plan), and who runs the browser pass (Max, by hand).
