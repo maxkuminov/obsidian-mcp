@@ -23,6 +23,14 @@ MCP server itself. You handle 3 and 4 separately. If you already run a
 reverse proxy, use `docker-compose.proxy.yml` instead — see
 [Already have a reverse proxy?](#already-have-a-reverse-proxy) below.
 
+> **Upgrading an existing deployment?** Read
+> [Internal transport](#internal-transport-the-database-and-embedding-hops)
+> and [Panel Content-Security-Policy](#panel-content-security-policy)
+> before you deploy. An `http://` embedding URL to a non-loopback host
+> (the `http://ollama:11434` default included) now refuses to start
+> unless `.env` has `EMBEDDING_ALLOW_PLAINTEXT=true`, and a TLS
+> parameter in `DATABASE_URL` or any `PGSSL*` variable is refused.
+
 ## What you need before starting
 
 - A VPS with at least 2 GB RAM and 20 GB disk. 4 GB / 40 GB is more
@@ -342,6 +350,31 @@ still cleartext (`reason` = `database` or `embedding`, `outcome` = the mode or
    CA, then set its URL to `https://…`, set `EMBEDDING_CA_FILE=<mounted
    root>`, and remove `EMBEDDING_ALLOW_PLAINTEXT`.
 
+If the database requires a client certificate, set
+`DATABASE_SSL_CERT_FILE` and `DATABASE_SSL_KEY_FILE` (PEM, mounted
+read-only). They apply to the strict modes only (`require`, `verify-ca`,
+`verify-full`), and must be set together or not at all; either one
+alone, or both with `disable`/`prefer`, refuses to start.
+
+### Panel Content-Security-Policy
+
+The admin panel, the login/register pages and the OAuth consent page
+send a per-response nonce Content-Security-Policy with no inline script.
+`PANEL_CSP` in `.env` selects it:
+
+| Value | Effect |
+| --- | --- |
+| `enforce` (default) | `Content-Security-Policy` header; violations are blocked |
+| `report-only` | the same policy as `Content-Security-Policy-Report-Only`: violations appear in the browser console, nothing is blocked |
+| `off` | neither header |
+
+`report-only` and `off` are rollback settings for a policy that breaks a
+panel control: edit `.env` and recreate the container (`docker compose
+-f <file> up -d`, or `make deploy`); no rebuild. Any value other than
+`enforce` is logged at WARNING on every start, so a forgotten rollback
+shows up. The `/transfer` pages keep their own policy under every value,
+and any other value refuses to start.
+
 ## Step 4. Get your vault onto the VPS
 
 This is the hardest design decision in the whole stack. The MCP server
@@ -616,7 +649,8 @@ deployment; on a compose-file deployment the equivalents are plain
   plus `transfer_mount_check_available` and
   `vault_named_staging_fallback_active` — the two capability facts that
   are otherwise only visible in the startup log.
-- **Upgrades.** Pull, rebuild, and bring the stack up again; migrations
+- **Upgrades.** Check the upgrade note at the top of this guide first,
+  then pull, rebuild, and bring the stack up again; migrations
   run on start. After a release that carries one, confirm the schema
   agrees with the models:
   `docker compose -f docker-compose.simple.yml exec obsidian-mcp alembic check`

@@ -45,6 +45,7 @@ embeddings (Ollama bge-m3, or OpenAI `text-embedding-3-{small,large}`).
 - [Who this is for](#who-this-is-for)
 - [Control panel](#control-panel)
 - [Quick start](#quick-start)
+- [Upgrading](#upgrading)
 - [Cost expectations](#cost-expectations)
 - [The self-describing vault](#the-self-describing-vault)
 - [Multi-user mode](#multi-user-mode)
@@ -705,12 +706,23 @@ Option B, Ollama (self-hosted, GPU recommended):
 ```env
 EMBEDDING_PROVIDER=ollama
 OLLAMA_URL=http://your-ollama-host:11434
+EMBEDDING_ALLOW_PLAINTEXT=true
 EMBEDDING_MODEL=bge-m3
 EMBEDDING_DIMENSIONS=1024
 ```
 
 This is the default. Omitting `EMBEDDING_PROVIDER` falls back to
 Ollama.
+
+The embedding URL must be `https`, or `http` to a loopback host
+(`localhost`, `127.x`, `::1`). Plaintext `http` to any other host —
+another container such as `http://ollama:11434` included — refuses to
+start unless `EMBEDDING_ALLOW_PLAINTEXT=true` acknowledges that chunks
+and queries cross that hop unencrypted. `.env.example` ships with it
+set for that reason; drop it once the endpoint is `https` (use
+`EMBEDDING_CA_FILE` for an internal CA). Inside a container, `localhost`
+is the container itself, so an Ollama on the Docker host still needs
+the override.
 
 ### 3. Deploy
 
@@ -757,6 +769,37 @@ claude mcp add obsidian --transport http \
 The first thing any agent should do in a new session is call
 `get_vault_guide()`. That's how it learns your folder structure,
 naming conventions, and YAML schema before it writes anything.
+
+## Upgrading
+
+Pull, then `make deploy` (or rebuild your compose stack); migrations
+run on start. Read this first when upgrading across the internal-transport
+and panel-CSP release:
+
+- **Breaking: plaintext embedding endpoints must be acknowledged.** If
+  the active embedding URL (`OLLAMA_URL`, or `OPENAI_BASE_URL` with the
+  OpenAI provider) is `http://` to a non-loopback host — the
+  `http://ollama:11434` default included — add
+  `EMBEDDING_ALLOW_PLAINTEXT=true` to `.env` **before** deploying, or
+  the server refuses to start with a message naming the setting.
+- **Database TLS has one source.** A TLS parameter in `DATABASE_URL`
+  (`?ssl=…`, `?sslmode=…`) or any `PGSSL*` environment variable is
+  refused at startup; move it to `DATABASE_SSL_MODE`. The default,
+  `prefer`, is the behaviour you had before.
+- **Embedding clients ignore the environment's network settings.**
+  `HTTP(S)_PROXY`, `SSL_CERT_FILE` / `SSL_CERT_DIR` and `.netrc` no
+  longer apply to the embedding hop. Use `EMBEDDING_CA_FILE` for an
+  internal CA.
+- **The panel now sends a nonce-based Content-Security-Policy**
+  (`PANEL_CSP=enforce`), and htmx is gone from it. If a panel control
+  misbehaves, set `PANEL_CSP=report-only` (or `off`) and recreate the
+  container; no rebuild.
+- **New optional settings:** `DATABASE_SSL_MODE`,
+  `DATABASE_SSL_CA_FILE`, `DATABASE_SSL_CERT_FILE`,
+  `DATABASE_SSL_KEY_FILE`, `EMBEDDING_ALLOW_PLAINTEXT`,
+  `EMBEDDING_CA_FILE`, `PANEL_CSP`. See [Configuration](#configuration),
+  and [`DEPLOYMENT.md`](./DEPLOYMENT.md#internal-transport-the-database-and-embedding-hops)
+  for moving both hops to verified TLS.
 
 ## Cost expectations
 
@@ -941,7 +984,11 @@ to multi-user later resumes where you left off without re-bootstrapping
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | — | `postgresql+asyncpg://user:pass@host/db` |
+| `DATABASE_URL` | — | `postgresql+asyncpg://user:pass@host/db`. No TLS parameters here — they are refused; use `DATABASE_SSL_MODE`. |
+| `DATABASE_SSL_MODE` | `prefer` | Database TLS: `disable`, `prefer` (try TLS, fall back to plaintext), `require` (encrypt, no verification), `verify-ca`, `verify-full`. Strict modes exit if the session is not encrypted. Any `PGSSL*` variable is refused. |
+| `DATABASE_SSL_CA_FILE` | — | CA bundle (PEM) for `verify-ca` / `verify-full`; required by both, refused with any other mode. No system-store fallback. |
+| `DATABASE_SSL_CERT_FILE` | — | Client certificate (PEM). Strict modes (`require`, `verify-ca`, `verify-full`) only; set together with `DATABASE_SSL_KEY_FILE` or not at all. |
+| `DATABASE_SSL_KEY_FILE` | — | Client private key for `DATABASE_SSL_CERT_FILE`. Both or neither. |
 | `VAULT_PATH` | `/obsidian` | In-container vault mount |
 | `SECRET_KEY` | — | itsdangerous signer key |
 | `INDEX_INTERVAL_SECONDS` | `300` | Periodic reindex cadence |
@@ -953,6 +1000,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `ALLOWED_HOSTS` | derived | Accepted `Host` headers, JSON list. `localhost` is always added. |
 | `SESSION_MAX_AGE` | `604800` | Panel session lifetime, seconds (multi-user mode). Absolute — the server-side row is never extended, so a session used daily still expires |
 | `SESSION_COOKIE_NAME` | `omcp_session` | Panel session cookie name |
+| `PANEL_CSP` | `enforce` | Content-Security-Policy on the panel, login and consent pages: `enforce`, `report-only` (same policy, reports only), or `off`. A rollback lever — change it and recreate the container, no rebuild. Anything but `enforce` logs a WARNING at each start. |
 | `SESSION_TOUCH_INTERVAL_SECONDS` | `60` | How stale a session's `last_seen_at` may get before a validated `GET`/`HEAD` rewrites it. Telemetry only — nothing authorizes on it. Must be ≥ 1. |
 | `SESSION_PURGE_RETAIN_DAYS` | `7` | How long a dead panel session row is kept, measured from the *later* of its expiry and its revocation, so a revocation stays visible for the full window. Must be ≥ 1. |
 | `OAUTH_KNOWN_REDIRECT_HOSTS` | `claude.ai,chatgpt.com` | Redirect **hosts** the consent screen badges as known connector destinations. JSON or CSV. Matched by exact host equality — no wildcards, no suffixes; entries containing `*`, `/`, `@` or internal whitespace are refused at startup. An empty list means every client is shown as unverified. |
@@ -968,11 +1016,13 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `WRITE_PRECONDITION_REQUIRED` | `false` | Require `expected_hash` on supported destructive calls. Creation is exempt; enable after clients adopt read hashes. |
 | `EMBEDDING_PROVIDER` | `ollama` | `ollama` or `openai` |
 | `EMBEDDING_DIMENSIONS` | `1024` | pgvector column width |
-| `OLLAMA_URL` | — | Used when provider is Ollama |
+| `OLLAMA_URL` | `http://ollama:11434` | Used when provider is Ollama. Must be `https`, loopback `http`, or covered by `EMBEDDING_ALLOW_PLAINTEXT`. |
 | `EMBEDDING_MODEL` | `bge-m3` | Ollama model name. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `OLLAMA_KEEP_ALIVE` | `-1` | How long Ollama keeps the model resident. `-1` pins it; a Go duration (`30m`) frees VRAM when idle. Ollama only. |
 | `OPENAI_API_KEY` | — | Required when provider is OpenAI |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies |
+| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | Override for Azure or proxies. Same transport rule as `OLLAMA_URL` when this provider is active. |
+| `EMBEDDING_ALLOW_PLAINTEXT` | `false` | Permit `http` to a non-loopback embedding host. Without it such a URL refuses to start. `.env.example` sets it `true` to match its `http://ollama:11434` default. |
+| `EMBEDDING_CA_FILE` | — | Trust anchor (PEM) for an `https` embedding endpoint behind an internal CA; replaces the default certifi bundle. Refused with an `http` URL. Embedding clients ignore `HTTP(S)_PROXY`, `SSL_CERT_*` and `.netrc`. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | OpenAI model. Changing it post-deploy requires `make reset-embeddings`; the server refuses to start until the stored vectors match. See [Switching providers or models](#switching-providers-or-models). |
 | `CHUNK_SIZE` | `512` | Approx tokens per chunk (4-char heuristic) |
 | `CHUNK_OVERLAP` | `0` | Token overlap between chunks |
@@ -1568,7 +1618,14 @@ backup, `alembic upgrade head`, then recreate the container. Run
   [Rate limits](#rate-limits).
 - Parameterized queries everywhere. No string interpolation into SQL.
 - Response headers include HSTS, `X-Content-Type-Options: nosniff`,
-  and `X-Frame-Options: DENY`.
+  `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`. The panel,
+  login and consent pages add a per-response nonce
+  Content-Security-Policy with no inline script (`PANEL_CSP`).
+- The app's own hops are checked at startup: the database follows
+  `DATABASE_SSL_MODE`, and the embedding endpoint must be `https` or
+  loopback unless `EMBEDDING_ALLOW_PLAINTEXT` says otherwise. Each start
+  logs one transport line per hop and an `internal_transport_plaintext`
+  security event for each hop still in cleartext.
 
 ## Status
 
