@@ -57,9 +57,6 @@ TEMPLATES = ROOT / "src" / "control_panel" / "templates"
 NONCE_RE = re.compile(r"^[A-Za-z0-9_-]{22,}$")
 BODY_NONCE_RE = re.compile(r'\bnonce="([^"]*)"')
 
-#: Whether the templates have been converted to carry the nonce (Slice A).
-SLICE_A_LANDED = "csp_nonce" in (TEMPLATES / "base.html").read_text(encoding="utf-8")
-
 VALID_PKCE_CHALLENGE = "a" * 43
 CLIENT_ID = "a3f19c7e5b2d4081a3f19c7e5b2d4081"
 REDIRECT_URI = "https://client.example/callback"
@@ -475,14 +472,6 @@ def test_panel_surface_carries_the_enforced_policy(case, client, monkeypatch):
     assert "strict-transport-security" in response.headers
 
 
-@pytest.mark.skipif(
-    not SLICE_A_LANDED,
-    reason=(
-        "panel-csp Slice A (templates writing nonce=\"{{ csp_nonce }}\") has not "
-        "landed on this tree; this becomes a real assertion once base.html "
-        "references csp_nonce"
-    ),
-)
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
 def test_body_nonces_equal_the_header_nonce(case, client, monkeypatch):
     response = _run(case, client, monkeypatch)

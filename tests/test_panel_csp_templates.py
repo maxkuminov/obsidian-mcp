@@ -184,6 +184,18 @@ def _submit_controls(form_body: str):
             yield m
 
 
+def _implicit_submitters(form_body: str):
+    """Fields through which Enter can submit a form with no submit button
+    (HTML implicit submission): any non-hidden `<input>`, `<select>` or
+    `<textarea>`. The eight confirm forms carry only the hidden CSRF field."""
+    for m in _TAG.finditer(form_body):
+        name, attrs = m.group(1).lower(), m.group(2)
+        if name in ("select", "textarea"):
+            yield m
+        elif name == "input" and _type_of(attrs) != "hidden":
+            yield m
+
+
 def test_the_eight_confirm_controls_are_where_the_spec_says():
     counts = {}
     for path in _TEMPLATE_FILES:
@@ -216,6 +228,12 @@ def test_confirm_controls_are_buttons_in_forms_with_no_other_submit(path):
             offenders.append(
                 f"{path.name}:{_line(text, start + s.start())}: "
                 f"submit control in a confirm-guarded form: {s.group(0)}"
+            )
+        for s in _implicit_submitters(body):
+            offenders.append(
+                f"{path.name}:{_line(text, start + s.start())}: "
+                f"a user-editable field lets Enter submit a confirm-guarded "
+                f"form without the confirm: {s.group(0)}"
             )
     assert offenders == []
 
