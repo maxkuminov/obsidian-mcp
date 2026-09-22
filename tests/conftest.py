@@ -32,6 +32,9 @@ SETTINGS_ENV_KEYS = (
     "VAULT_PATH",
     "SECRET_KEY",
     "INDEX_INTERVAL_SECONDS",
+    # The scan's stat shortcut and its backstop (#282).
+    "INDEX_STAT_SHORTCUT",
+    "INDEX_FULL_HASH_INTERVAL_HOURS",
     "EMBEDDING_MODEL",
     "EMBEDDING_DIMENSIONS",
     "CHUNK_SIZE",
@@ -368,3 +371,25 @@ def _reset_rate_limiter_state():
     rate_limits.reset_state_for_tests()
     yield
     rate_limits.reset_state_for_tests()
+
+
+@pytest.fixture(autouse=True)
+def _reset_indexer_scan_state():
+    """Start every test with no backstop clock and no clean-sweep record (#282).
+
+    Both are deliberately in-process memory: a restart forgets them, which is
+    what makes the first pass after a start a full-hash pass and the first
+    embed pass a sweeping one. A test suite is one long process, so without
+    this a test that completed a clean sweep would silently switch the next
+    test's sweep off, in an order-dependent way. Only touched when the indexer
+    is already imported, so this fixture imports nothing on its own.
+    """
+    indexer = sys.modules.get("src.services.indexer")
+    if indexer is not None:
+        indexer._last_full_hash.clear()
+        indexer.clear_sweep_state()
+    yield
+    indexer = sys.modules.get("src.services.indexer")
+    if indexer is not None:
+        indexer._last_full_hash.clear()
+        indexer.clear_sweep_state()

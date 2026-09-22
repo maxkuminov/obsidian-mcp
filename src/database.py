@@ -22,12 +22,14 @@ engine = create_async_engine(
     # visible; a number that load-bearing belongs in the engine configuration.
     #
     # Deliberately **no** `idle_in_transaction_session_timeout` in
-    # `server_settings`: the steady-state index pass holds one transaction from
-    # its first select to its commit across the whole synchronous walk (minutes
-    # on a large vault), the embed pass calls the provider before its first
-    # statement, and the link backfill scans the vault before its first insert.
-    # A server-side idle-in-transaction timeout would kill all three on the
-    # COMMIT, every tick. See the Non-Goals in the
+    # `server_settings`. The index pass no longer holds a transaction across
+    # its walk — since #278 (D9) the snapshot commits before the walk and the
+    # locked transaction opens after it — but that transaction still awaits
+    # worker threads between statements (C4 re-reads, parsing, tag and link
+    # extraction of every changed note), which is idle-in-transaction time
+    # that grows with how much changed, and the link backfill scans the vault
+    # before its first insert. A server-side idle-in-transaction timeout would
+    # kill those on the COMMIT. See the Non-Goals in the
     # `asvs-high-availability-hardening` design.
     pool_timeout=30,
     pool_pre_ping=True,

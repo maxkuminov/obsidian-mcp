@@ -1004,8 +1004,12 @@ async def embed_note(
             "certified_hash and certified_path are one unit: pass both or "
             "neither"
         )
-    cleaned = clean_for_embedding(content)
-    chunks, truncated = chunk_text_bounded(
+    # Off the event loop (#278, D8): the cleaner and the chunker are pure
+    # functions of the body, and on a large note they are seconds of CPU that
+    # would otherwise freeze every other request, `/health` included.
+    cleaned = await asyncio.to_thread(clean_for_embedding, content)
+    chunks, truncated = await asyncio.to_thread(
+        chunk_text_bounded,
         cleaned,
         chunk_size=settings.chunk_size,
         overlap=settings.chunk_overlap,

@@ -262,6 +262,26 @@ class FakeSession:
             # recognised before the vault-index branch below.
             if rendered.startswith("SELECT count("):
                 return _Result([self.link_count])
+            # The scan's snapshot and its locked re-read (#282, D9). Both name
+            # `extraction_version` and the four stat columns, and the locked
+            # re-read also names `notes_metadata.id` — so it is matched here,
+            # before the rebuild snapshot's branch below. Stats are NULL: these
+            # fixtures stand for an index whose stats were never recorded, so
+            # every file is read and hashed exactly as before the shortcut.
+            if "extraction_version" in rendered and "stat_size" in rendered:
+                return _Result([
+                    SimpleNamespace(
+                        id=self.note_ids.get(p, 0),
+                        file_path=p,
+                        content_hash=h,
+                        extraction_version=indexer.CURRENT_EXTRACTION_VERSION,
+                        stat_size=None,
+                        stat_mtime_ns=None,
+                        stat_ctime_ns=None,
+                        stat_ino=None,
+                    )
+                    for p, h in self.existing.items()
+                ])
             # `_rebuild_tsvectors_single_scope_for_tests`'s snapshot names id, owner, path *and* hash
             # since #127, so it has to be matched before the scan's
             # path+hash select — both mention `content_hash`.
@@ -1362,9 +1382,12 @@ async def test_a_complete_re_derive_stamps_all_three_and_the_next_pass_no_ops(
 
     await indexer.index_vault(user_id=7)
 
-    # Stamped after the pass's last write, and committed with it.
+    # Stamped after the pass's last write, and committed with it. The pass's
+    # commit is the *last* one: the scan's snapshot commits its own read-only
+    # transaction before the walk (#278, D9 C2).
     assert len(first.stamps) == 1
-    assert first.timeline.index("stamp") < first.timeline.index("commit")
+    last_commit = len(first.timeline) - 1 - first.timeline[::-1].index("commit")
+    assert first.timeline.index("stamp") < last_commit
     stamp = first.stamps[0]
     assert set(stamp) == {
         "indexed_vault_assignment",

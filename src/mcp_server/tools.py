@@ -5269,6 +5269,15 @@ async def _move_note_locked(
                         file_path=to_rel,
                         title=title,
                         embedded_content_hash=None,
+                        # The scan's stat shortcut (#282, D10): NULL makes the
+                        # next pass read and hash the moved file rather than
+                        # trust a stat recorded for the old path. Carrying it
+                        # would be sound (it names an inode state), but one
+                        # extra read per move buys not having to argue it.
+                        stat_size=None,
+                        stat_mtime_ns=None,
+                        stat_ctime_ns=None,
+                        stat_ino=None,
                     )
                 )
                 await session.execute(nm_update)

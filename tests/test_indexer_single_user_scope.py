@@ -63,13 +63,21 @@ class _Session:
 
 @pytest.mark.asyncio
 async def test_index_vault_reads_and_deletes_only_null_owned_rows(monkeypatch, tmp_path):
-    # `extraction_version` joined the scan's select with #150.
+    # `extraction_version` joined the scan's select with #150, and the four
+    # stat columns and (on the locked re-read) the row id with #282. The pass
+    # reads the rows twice — the committed snapshot before the walk and the
+    # locked re-read after it (D9) — so the queue carries the same row twice.
     old = SimpleNamespace(
+        id=1,
         file_path="gone.md",
         content_hash="hash",
         extraction_version=indexer.CURRENT_EXTRACTION_VERSION,
+        stat_size=None,
+        stat_mtime_ns=None,
+        stat_ctime_ns=None,
+        stat_ino=None,
     )
-    session = _Session([_Result([old])])
+    session = _Session([_Result([old]), _Result([old])])
     monkeypatch.setattr(indexer, "async_session", lambda: session)
     monkeypatch.setattr(indexer, "_vault_root", lambda _uid: tmp_path)
 
@@ -79,8 +87,10 @@ async def test_index_vault_reads_and_deletes_only_null_owned_rows(monkeypatch, t
     # the generation lock and the `indexer_state` probe (D7c3), so the scoped
     # scan query is no longer the first statement — and this module is about
     # owner scoping, not statement order.
-    scan = next(s for s in session.statements if isinstance(s, Select))
-    assert "notes_metadata.user_id IS NULL" in _sql(scan)
+    scans = [s for s in session.statements if isinstance(s, Select)]
+    assert len(scans) >= 2
+    for scan in scans[:2]:
+        assert "notes_metadata.user_id IS NULL" in _sql(scan)
     deletion = next(s for s in session.statements if isinstance(s, Delete))
     assert "notes_metadata.user_id IS NULL" in _sql(deletion)
 

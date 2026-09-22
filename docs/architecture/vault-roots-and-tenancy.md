@@ -924,6 +924,12 @@ highest — and never toward discarding, which costs a full re-embed.
   before the next pass, so that is the same frozen answer in a new place, and
   it would give the move path a dependency on embedding configuration it has no
   other reason to know.
+- **The same two statements handle the recorded stat** (#282, migration 026).
+  `move_note` sets the four `stat_*` columns to NULL, so the next pass reads
+  and hashes the moved file rather than trusting a stat recorded for the old
+  path; the indexer's id-preserving move writes the stat of the bytes it just
+  hashed at the new path. See "The stat shortcut" in
+  [indexing and embeddings](indexing-and-embeddings.md).
 
 
 

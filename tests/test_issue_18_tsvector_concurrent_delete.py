@@ -85,6 +85,11 @@ class _FakeSession:
         self._on_metadata_insert = on_metadata_insert
         self.tsvector_params = []
         self.commits = 0
+        # Commits after the pass's first write. The scan's snapshot commits a
+        # read-only transaction of its own before the walk (#278, D9 C2); the
+        # property these tests are about is the *mutating* transaction's.
+        self.wrote = False
+        self.commits_after_write = 0
 
     async def __aenter__(self):
         return self
@@ -119,6 +124,7 @@ class _FakeSession:
         # Simulate the concurrent on-disk delete the instant the row is
         # committed-ready (mirrors the real "row exists, file gone" window).
         if isinstance(stmt, Insert) and stmt.table.name == "notes_metadata":
+            self.wrote = True
             self._on_metadata_insert()
             return _FakeResult()
 
@@ -127,6 +133,8 @@ class _FakeSession:
 
     async def commit(self):
         self.commits += 1
+        if self.wrote:
+            self.commits_after_write += 1
 
     async def rollback(self):
         return None
@@ -168,7 +176,9 @@ async def test_tsvector_written_despite_concurrent_delete(monkeypatch, tmp_path)
     assert body in matching[0]["content"], (
         "tsvector content did not come from the in-memory scan body"
     )
-    assert fake.commits == 1, "the index snapshot must commit exactly once"
+    assert fake.commits_after_write == 1, (
+        "the index snapshot must commit exactly once"
+    )
 
 
 @pytest.mark.asyncio
@@ -189,4 +199,5 @@ async def test_link_failure_does_not_commit_new_metadata_hash(monkeypatch, tmp_p
     with pytest.raises(RuntimeError, match="link insert failed"):
         await indexer.index_vault()
 
-    assert fake.commits == 0
+    assert fake.wrote
+    assert fake.commits_after_write == 0

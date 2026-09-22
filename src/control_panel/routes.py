@@ -63,7 +63,7 @@ from src.services.index_state import (
     embedding_fingerprint,
     set_state,
 )
-from src.services.indexer import invalidate_hnsw_index_cache
+from src.services.indexer import clear_sweep_state, invalidate_hnsw_index_cache
 from src.services.quotas import (
     apply_daily_request_limit,
     consumed_today,
@@ -2725,7 +2725,9 @@ async def trigger_reindex(
     request: Request,
     user=Depends(require_admin_panel),
 ):
-    _spawn(_reindex_background())
+    # An operator's Reindex is a full-hash pass (#282, D12): every note read
+    # and hashed whatever its recorded stat, and the exclusion sweep forced.
+    _spawn(_reindex_background(full_hash=True))
     if "application/json" in request.headers.get("accept", ""):
         return JSONResponse({"status": "started"})
     return RedirectResponse("/admin/settings", status_code=303)
@@ -2797,6 +2799,9 @@ async def trigger_reembed(
                 if not await _record_embedding_fingerprint(fresh, request):
                     return RedirectResponse("/admin/settings", status_code=303)
                 await fresh.commit()
+        # Every certification was just rewritten: forget the clean-sweep
+        # record so the next embed pass sweeps (#282, D13).
+        clear_sweep_state()
 
     _spawn(_reindex_background())
     return RedirectResponse("/admin/settings", status_code=303)
@@ -2896,6 +2901,7 @@ async def reset_embeddings(
         # cached answer is right again — re-probing costs one query and being
         # wrong here costs a dropped index nobody notices.
         invalidate_hnsw_index_cache()
+        clear_sweep_state()
 
     if not recorded:
         if "application/json" in request.headers.get("accept", ""):
@@ -2947,7 +2953,7 @@ async def reset_progress(
     })
 
 
-async def _reindex_background():
+async def _reindex_background(full_hash: bool = False):
     # Panel-triggered on-demand reindex. Mirrors `run_indexer_loop` so the
     # multi-user-mode case fans out to every active user; in single-user
     # mode it stays a single legacy pass with user_id=None.
@@ -2981,7 +2987,9 @@ async def _reindex_background():
             for uid in await _active_user_ids():
                 async with record_indexer_run("manual", uid) as stats:
                     try:
-                        stats.record_index(await index_vault(user_id=uid))
+                        stats.record_index(
+                            await index_vault(user_id=uid, full_hash=full_hash)
+                        )
                     except Exception as e:
                         stats.record_error("index", e)
                         security_events.emit(
@@ -3004,5 +3012,5 @@ async def _reindex_background():
                         )
         else:
             async with record_indexer_run("manual", None) as stats:
-                stats.record_index(await index_vault())
+                stats.record_index(await index_vault(full_hash=full_hash))
                 stats.record_embedded(await embed_vault())
