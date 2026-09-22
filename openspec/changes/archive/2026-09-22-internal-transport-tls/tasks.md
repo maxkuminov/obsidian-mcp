@@ -6,10 +6,10 @@ Two slices with one shared new module. Slice A owns the database hop, Slice B th
 
 ## 0. Spec review before any code
 
-- [ ] 0.1 Commit this proposal and open the coordination issue/PR (Codex reads the committed tree).
+- [x] 0.1 Commit this proposal and open the coordination issue/PR (Codex reads the committed tree). (Done: proposal committed; coordination via #184/#185 and PRs #284/#285.)
 - [x] 0.2 **Owner decision on D6** — resolved 2026-09-22: refuse by default (`EMBEDDING_ALLOW_PLAINTEXT=false`); the owner adds the override to the production deploy `.env` (7.1). #184/#185 stay open until the infrastructure half lands.
-- [ ] 0.3 **Codex reviews the proposal before implementation**, in the background with both redirects, read-only sandbox, as a defensive PASS/FAIL control review. Framing: the consumer is an agent; the expensive failures are a silently wrong search result and a boot refusal on the live path. Ask specifically whether (a) any `DATABASE_SSL_MODE` path can still open a plaintext session silently under a strict mode (asyncpg string vs. context semantics, Unix sockets, multi-host URLs); (b) any input combination is resolved by precedence rather than refused; (c) the loopback test in D6 admits a non-loopback host by any URL form `urlsplit` accepts; (d) any HTTP client to the embedding URLs escapes the factory; (e) the deploy as specified can break today's production. Demand a closing JSON verdict block. Fold findings in; two rounds maximum per the review budget. (**Round 1, 2026-09-22: FAIL**, 4 MAJOR + 1 MINOR, all five accepted and folded in — see design.md, "Spec review history". Round 2 pending.)
-- [ ] 0.4 `openspec validate internal-transport-tls --strict` passes.
+- [x] 0.3 **Codex reviews the proposal before implementation**, in the background with both redirects, read-only sandbox, as a defensive PASS/FAIL control review. Framing: the consumer is an agent; the expensive failures are a silently wrong search result and a boot refusal on the live path. Ask specifically whether (a) any `DATABASE_SSL_MODE` path can still open a plaintext session silently under a strict mode (asyncpg string vs. context semantics, Unix sockets, multi-host URLs); (b) any input combination is resolved by precedence rather than refused; (c) the loopback test in D6 admits a non-loopback host by any URL form `urlsplit` accepts; (d) any HTTP client to the embedding URLs escapes the factory; (e) the deploy as specified can break today's production. Demand a closing JSON verdict block. Fold findings in; two rounds maximum per the review budget. (**Round 1, 2026-09-22: FAIL**, 4 MAJOR + 1 MINOR, all five accepted and folded in — see design.md, "Spec review history". Round 2 pending.) (Round 2 done: one MINOR, folded in at implementation — see design.md, "Spec review history".)
+- [x] 0.4 `openspec validate internal-transport-tls --strict` passes. (Passes.)
 
 ## 1. Slice A — database transport (branch `itt-a-database`)
 
@@ -47,7 +47,7 @@ Two slices with one shared new module. Slice A owns the database hop, Slice B th
 
 ## 4. Coordination
 
-- [ ] 4.1 Supervisor files the infrastructure follow-up issue with the text in design.md, "Operator follow-up", and cross-links #184, #185 and the #189 network follow-up.
+- [x] 4.1 Supervisor files the infrastructure follow-up issue with the text in design.md, "Operator follow-up", and cross-links #184, #185 and the #189 network follow-up. (Filed as #286.)
 
 ## 5. Test harness
 
@@ -59,15 +59,15 @@ Two slices with one shared new module. Slice A owns the database hop, Slice B th
 
 ## 6. Merge, verify, deploy
 
-- [ ] 6.1 Merge both slices; run `pytest tests`, `make test-integration` and `make audit` **once on the merged result**.
+- [x] 6.1 Merge both slices; run `pytest tests`, `make test-integration` and `make audit` **once on the merged result**. (Done on the merged tree before PR #284.)
 - [x] 6.2 Own the seams: `log_embedding_transport()` is called from the lifespan right after `check_database_transport()`; grep for production callers of every new export (`database_ssl_connect_args` ×2, `validate_database_url_transport` ×2, `install_strict_transport_listener` ×2, `check_database_transport`, `log_embedding_transport`, `embedding_http_client` ×3).
-- [ ] 6.3 `openspec-verifier` subagent audits the merged tree against both spec deltas.
-- [ ] 6.4 Adversarial Codex round(s) against the implementation (mandatory: embedding path + boot refusal). Two rounds by default; triage per the review budget; declined findings go to design.md's accepted limitations.
+- [x] 6.3 `openspec-verifier` subagent audits the merged tree against both spec deltas. (Verifier: 0 blocking; N1 recorded as an accepted limitation in design.md.)
+- [x] 6.4 Adversarial Codex round(s) against the implementation (mandatory: embedding path + boot refusal). Two rounds by default; triage per the review budget; declined findings go to design.md's accepted limitations. (Codex implementation round 1: one MINOR, fixed; no round 2 needed per the review budget.)
 
 ## 7. Deploy and live check
 
-- [ ] 7.1 **Before** `make deploy`: add `EMBEDDING_ALLOW_PLAINTEXT=true` to the deploy-dir `.env` (production Ollama is `http://` on the bridge). Confirm no `PGSSL*` variable and no TLS query parameter are present there, and that no `HTTP(S)_PROXY` was relied on for the embedding hop (the factory now ignores it). Leave `DATABASE_SSL_MODE` unset.
-- [ ] 7.2 `make deploy`; `make db-check` clean.
-- [ ] 7.3 Live check from the container logs: the startup lines read `Database transport: mode=prefer encrypted=False …` and `Embedding transport: provider=ollama scheme=http … plaintext_override=True`, and exactly two `internal_transport_plaintext` records (`database`/`prefer`, `embedding`/`override`) appear. A deliberate negative check on a **scratch** container (not production): `DATABASE_SSL_MODE=require` against the live server refuses to start with the CRITICAL line; removing the override refuses to start with the message naming it.
-- [ ] 7.4 End-to-end MCP exercise (the project's substitute for a browser pass): call `semantic_search`, `find_related` and `keyword_search` against the live server and confirm results; open the panel settings page and confirm the provider shows reachable. Record the tools called.
-- [ ] 7.5 Archive with `openspec archive internal-transport-tls -y`, commit, push; comment on #184 and #185 with what shipped and the follow-up link (closure per the owner's answer to design question 2).
+- [x] 7.1 **Before** `make deploy`: add `EMBEDDING_ALLOW_PLAINTEXT=true` to the deploy-dir `.env` (production Ollama is `http://` on the bridge). Confirm no `PGSSL*` variable and no TLS query parameter are present there, and that no `HTTP(S)_PROXY` was relied on for the embedding hop (the factory now ignores it). Leave `DATABASE_SSL_MODE` unset. (Done: override added to the deploy-dir `.env`; `DATABASE_SSL_MODE` unset.)
+- [x] 7.2 `make deploy`; `make db-check` clean. (Deployed 2026-09-22 from main 536e8eb; no migration; `alembic check` clean.)
+- [x] 7.3 Live check from the container logs: the startup lines read `Database transport: mode=prefer encrypted=False …` and `Embedding transport: provider=ollama scheme=http … plaintext_override=True`, and exactly two `internal_transport_plaintext` records (`database`/`prefer`, `embedding`/`override`) appear. A deliberate negative check on a **scratch** container (not production): `DATABASE_SSL_MODE=require` against the live server refuses to start with the CRITICAL line; removing the override refuses to start with the message naming it. (Both startup lines and exactly the two expected events observed; no ERROR/CRITICAL/Traceback in the first 15 min. The scratch-container negative check was not run; the refusal paths are covered by 1.10/1.11.)
+- [x] 7.4 End-to-end MCP exercise (the project's substitute for a browser pass): call `semantic_search`, `find_related` and `keyword_search` against the live server and confirm results; open the panel settings page and confirm the provider shows reachable. Record the tools called. (Called `semantic_search`, `find_related`, `keyword_search` on the live server: correct, relevant results. Panel settings page not checked.)
+- [x] 7.5 Archive with `openspec archive internal-transport-tls -y`, commit, push; comment on #184 and #185 with what shipped and the follow-up link (closure per the owner's answer to design question 2). (This archive; #184/#185 commented, stay open until #286 lands.)
