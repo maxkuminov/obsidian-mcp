@@ -7,9 +7,10 @@ The change SHALL NOT alter any predicate, `SET LOCAL`, overfetch, or exact-fallb
 
 `list_notes` and `get_recent` SHALL order by `modified_at DESC, file_path ASC`. `find_orphans` SHALL keep its existing `modified_at DESC NULLS LAST` and add `file_path ASC` after it. Rows with exactly equal `modified_at` therefore have a deterministic order.
 
-Results SHALL be identical to the pre-change implementation (the same result set, the same order, and every non-similarity field byte-equal) with exactly two permitted exceptions, both confined to exact ties:
+Results SHALL be identical to the pre-change implementation (the same result set, the same order, and every non-similarity field byte-equal) with exactly three permitted exceptions, both confined to exact ties:
 - **membership at a tied cutoff**: when more rows share the boundary sort key (`modified_at`, `rank` or distance) than fit under the limit, which of them are returned MAY differ;
 - **the representative chunk among exact distance ties**: when two chunks of one note have exactly equal distance, the kept `chunk_index` and its preview MAY differ.
+- **order among exact ties**: rows whose sort key (`modified_at`, `rank` or distance) is exactly equal MAY appear in a different relative order, even when all of them fit under the limit (the previous order among such rows was unspecified; the new `file_path ASC` tie-break makes it deterministic).
 
 No other difference is permitted.
 
@@ -23,11 +24,11 @@ No other difference is permitted.
 
 #### Scenario: Results match the previous implementation
 - **WHEN** the same fixed corpus and query set are run through the previous and the new implementation, covering stale, truncated, filtered, unfiltered and exact-fallback cases
-- **THEN** the result sets SHALL be equal, the order SHALL be equal, and every field other than `similarity` SHALL be byte-equal, except for the two permitted tie cases
+- **THEN** the result sets SHALL be equal, the order SHALL be equal, and every field other than `similarity` SHALL be byte-equal, except for the three permitted tie cases
 
 #### Scenario: The permitted tie differences are exercised
-- **WHEN** the corpus contains more notes with an identical `modified_at` than the requested limit, and one note with two chunks at exactly equal distance
-- **THEN** the oracle SHALL accept a different membership at that cutoff and a different representative chunk for that note, and SHALL reject any other difference
+- **WHEN** the corpus contains more notes with an identical `modified_at` than the requested limit, two notes with an identical `modified_at` that both fit under the limit, and one note with two chunks at exactly equal distance
+- **THEN** the oracle SHALL accept a different membership at that cutoff, a different relative order of the two tied notes, and a different representative chunk for that note, and SHALL reject any other difference
 
 #### Scenario: Orphans with no modification time stay last
 - **WHEN** `find_orphans` returns notes some of which have a NULL `modified_at`

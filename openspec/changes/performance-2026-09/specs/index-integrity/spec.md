@@ -99,10 +99,10 @@ When a file is re-read and its hash is unchanged but its stat differs from the r
 ### Requirement: A full-hash pass SHALL bound every edit the stat shortcut can miss
 For each scope, a full-hash pass SHALL run:
 - on the first pass after process start;
-- whenever `INDEX_FULL_HASH_INTERVAL_HOURS` (default 24, at least 1) have elapsed since that scope's last **successful** full-hash pass;
+- whenever `INDEX_FULL_HASH_INTERVAL_HOURS` (default 24, at least 1) have elapsed since that scope's last **successful** full-hash pass (the interval is when the pass becomes due, not a completion guarantee);
 - whenever an operator triggers a reindex from the panel.
 
-A full-hash pass is successful only when its scan transaction commits. A full-hash pass that aborts, is refused, or is cancelled SHALL leave the scope due, and every following pass for that scope SHALL be a full-hash pass until one commits. Incomplete verification SHALL NOT postpone outstanding backstop work by another interval.
+A full-hash pass is successful only when its scan transaction commits and every discovered file was read and hashed (no skipped path). A full-hash pass that aborts, is refused, is cancelled, or commits with any skipped path SHALL leave the scope due, and every following pass for that scope SHALL be a full-hash pass until one commits. Incomplete verification SHALL NOT postpone outstanding backstop work by another interval.
 
 A full-hash pass SHALL read and hash every discovered file regardless of recorded stats. It SHALL also run the exclusion reconciliation sweep regardless of that sweep's gate.
 
