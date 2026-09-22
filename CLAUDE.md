@@ -11,9 +11,9 @@ Self-hosted MCP server exposing an Obsidian vault (~2,577 markdown files) via se
   - `OllamaProvider` — bge-m3 by default, set `OLLAMA_URL` in `.env`
   - `OpenAIProvider` — `text-embedding-3-{small,large}` over httpx, supports
     Azure OpenAI / OpenAI-compatible base URLs
-- Jinja2 control panel; htmx and Chart.js vendored under
-  `src/control_panel/static/vendor/`, no CDN, hand-written CSS, **no CSP** —
-  see [control panel](docs/architecture/control-panel.md) for why.
+- Jinja2 control panel; Chart.js vendored under
+  `src/control_panel/static/vendor/`, no CDN, hand-written CSS, **nonce-based
+  CSP** (`PANEL_CSP`) — see [control panel](docs/architecture/control-panel.md).
 
 ## Project Layout
 - `src/main.py` — FastAPI app, lifespan, MCP mount
@@ -113,9 +113,13 @@ which an agent will act on without a human ever seeing the query. Treat any
 change to the write tools, section addressing, or the chunking/embedding path
 as a mandatory adversarial-pass trigger.
 
-**No `user-representative` pass** — there is no browser UI. Substitute an
-end-to-end exercise of the affected MCP tools against the live server, and say
-in the report which tools were actually called.
+**No `user-representative` pass** for MCP-side changes — the consumer is an
+agent. Substitute an end-to-end exercise of the affected MCP tools against the
+live server, and say in the report which tools were actually called. Changes to
+panel, auth or consent templates (or `panel.js`) do get a browser pass: the
+panel sits behind SSO, so Max walks the affected controls by hand with devtools
+open and zero CSP violations is part of the bar (see the `panel-csp` change,
+tasks §6).
 
 ## Key decisions
 
@@ -202,6 +206,17 @@ update it in the same change.** What stays here is the short list:
   `/health`, `/token`, `/register`, `/revoke`, `/.well-known` (except the ACME
   challenge) and the Bearer-qualified root. Browser paths keep redirecting.
   The documentation range is the mechanism, not a placeholder — do not "fix" it.
+- **The panel has a nonce-based CSP** (#195). No inline `on*=` handlers and no
+  `javascript:` URLs — a control is a `data-*` attribute plus a delegated
+  listener in `panel.js`; every `<script>`/`<style>` carries
+  `nonce="{{ csp_nonce }}"`; confirm buttons are `type="button"` and fail
+  closed. Style *attributes* are allowed (`style-src-attr 'unsafe-inline'`) by
+  decision; the consent page's `form-action` is `'self' https:` by owner
+  decision (multi-hop OAuth callbacks). Scope is a marker set by the context
+  processor on the four panel/auth/consent template instances — not a path, so
+  transfer pages and `/docs` are untouched. `PANEL_CSP=report-only|off` is the
+  rollback (recreate, no rebuild). htmx is deliberately absent: its `hx-*`
+  attributes are a nonce-bypass gadget. See [control panel](docs/architecture/control-panel.md).
 - **Tool-body outcomes are typed internally.** Only the terminal `BodyOutcome`
   (or `ReadNoteResult` private outcome) drives usage classification; never
   infer failure from prose or a note's forged `MCP-REFUSAL` text. Partial writes

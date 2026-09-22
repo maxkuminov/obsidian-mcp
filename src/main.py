@@ -682,7 +682,7 @@ app.include_router(api_router)
 # it. Each handler authenticates its own request from the token row.
 app.include_router(transfer_router)
 
-# Panel assets (htmx, Chart.js) served from this app rather than a CDN — see
+# Panel assets (Chart.js, panel.js) served from this app rather than a CDN — see
 # the comment in `src/control_panel/templates/base.html`. Mounted under
 # `/admin/` because that is the prefix Traefik already routes to this app for
 # the panel; a top-level `/static` would match no router on the production

@@ -379,7 +379,8 @@ origin the mint tools refuse rather than emit a localhost link.
   including ChatGPT, Claude Desktop, and claude.ai. Dynamic registration
   defaults to both vault permission levels; the user chooses the actual
   grant on the consent screen.
-- Control panel (Jinja2, htmx, Tailwind) for keys, usage logs,
+- Control panel (Jinja2, hand-written CSS, vendored Chart.js, nonce-based
+  CSP) for keys, usage logs,
   indexer status, embedding-provider info, and a danger-zone reset.
 - Every tool call is logged to `usage_logs` with name, params
   (truncated to 200 chars), duration, response size, and the calling

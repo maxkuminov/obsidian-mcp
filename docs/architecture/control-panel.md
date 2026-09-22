@@ -2,17 +2,190 @@
 
 > Deep rationale extracted from `CLAUDE.md`. Read before touching panel templates, flash messages, the admin guards, or the Danger zone.
 
-## No CSP, and vendored assets
+## The panel CSP, and vendored assets
 
-- Jinja2 control panel. htmx and Chart.js are **vendored** under
+- Jinja2 control panel. Chart.js is **vendored** under
   `src/control_panel/static/vendor/` and served from `/admin/static` — no CDN,
   no `integrity` to keep in sync (#130). There is no Tailwind; the styling is
   hand-written CSS in `base.html`. Google Fonts is the one remaining remote
-  origin and ships no executable code. **No CSP on the panel**, deliberately:
-  every template drives its controls with inline `onclick`/`onsubmit` and htmx
-  attributes, so the only policy they survive is one carrying `unsafe-inline`
-  for scripts — which permits exactly the injection a CSP is bought to stop.
+  origin and ships no executable code.
 
+- **The panel, auth and consent pages carry a nonce-based
+  Content-Security-Policy (#195).** This used to read "no CSP, deliberately":
+  every control ran from an inline `onclick`/`onsubmit`, so the only policy
+  the templates survived was one with `'unsafe-inline'` for scripts — which
+  permits exactly the injection a CSP is bought to stop. The handlers went
+  first, then the policy came. The value, from `build_policy` in
+  `src/services/panel_csp.py`:
+
+  ```
+  default-src 'self'
+  script-src 'nonce-N'
+  style-src https://fonts.googleapis.com 'unsafe-inline'
+  style-src-elem 'nonce-N' https://fonts.googleapis.com
+  style-src-attr 'unsafe-inline'
+  img-src 'self' data:
+  font-src https://fonts.gstatic.com
+  connect-src 'self'
+  object-src 'none'
+  base-uri 'none'
+  frame-ancestors 'none'
+  form-action 'self'        (the consent page: 'self' https:)
+  ```
+
+  Each source is there for something the templates do. `script-src` lists
+  the nonce and **no host source, not even `'self'`** — every script, inline
+  or `src=`, carries the nonce, so an injected `<script
+  src="/admin/static/…">` is refused as surely as an inline one. No
+  `'unsafe-eval'` (Chart.js evaluates nothing; htmx is gone, below) and no
+  `'strict-dynamic'` (nothing loads script dynamically). `style-src-elem`:
+  the nonced `<style>` blocks and the Google Fonts stylesheet `<link>`.
+  `img-src data:`: the SVG noise and select-arrow backgrounds; `'self'` for
+  the favicon request. `font-src`: Google's font files. `connect-src
+  'self'`: the dashboard's reindex `fetch`. `frame-ancestors 'none'`
+  duplicates `X-Frame-Options: DENY`, which stays for older browsers. The
+  only variable in the string is the server-generated nonce, and
+  `build_policy` refuses anything that is not a `token_urlsafe` value, so no
+  request-derived byte can reach the header.
+
+- **One nonce per response, and the policy is scoped by a marker, not by a
+  path.** `nonce_for(request)` makes `secrets.token_urlsafe(16)` on first use
+  and keeps it on `request.state`, which the endpoint and the middleware
+  share through the one ASGI `scope["state"]` — the template render and the
+  header read the same value, and the next request gets a new one.
+  `template_context` is a `Jinja2Templates` context processor registered on
+  exactly the four panel/auth/consent instances (`src/control_panel/routes.py`,
+  `src/control_panel/users.py`, `src/auth/routes.py`, `src/oauth/routes.py`)
+  and **not** on the transfer one; it returns `csp_nonce` and marks the
+  request as panel surface. `add_security_headers` in `src/main.py` writes the
+  policy only on a marked `text/html` response. The policy is correct only
+  for markup written to carry its nonce, and "rendered by one of those four
+  instances" is exactly that set: it covers the HTML error renders (login
+  401, bootstrap register 400) and any future panel route with no inventory
+  to keep, and it excludes by construction the transfer pages (own instance,
+  own stricter policy) and FastAPI's `/docs`, `/redoc` and
+  `/docs/oauth2-redirect`, whose un-nonced inline and CDN scripts a nonce-only
+  policy would break. A path prefix would need an exception list and would
+  still miss a panel template rendered under a new prefix. A context
+  processor rather than a Jinja global because tests render templates
+  through their own `Environment`, where a missing variable renders empty but
+  a missing callable raises. `tests/test_panel_csp_headers.py` asserts that
+  every `Jinja2Templates(` under `src/` except the transfer one registers the
+  processor, so a fifth instance cannot silently escape. **A response that
+  already carries an enforcing `Content-Security-Policy` is never
+  overwritten** (that is what keeps the transfer policy byte-for-byte); a
+  pre-existing report-only header does not count, because it enforces
+  nothing and must not switch enforcement off.
+
+- **No inline handlers and no `javascript:` URLs, ever.** Behaviour is
+  declared with `data-*` attributes and implemented by document-level
+  delegated listeners in `src/control_panel/static/panel.js`, loaded by
+  `base.html` with the nonce: `data-confirm`, `data-modal-open` / `-close` /
+  `-backdrop`, `data-autosubmit`, `data-copy-from`, `data-limit-edit` (with
+  `data-key-id` / `data-limit`), `data-sidebar-open` / `-close`,
+  `data-async-reindex`. **A new template control is a `data-*` attribute
+  plus a delegated listener in `panel.js`, never an `on*=`.** Attribute
+  values are read as strings or element ids — never evaluated, never
+  assigned as markup — which also closes the old `confirm()` quoting defect
+  class: an apostrophe in an interpolated name once broke the JS string, the
+  handler threw, and a throwing `onclick` submits unconfirmed. The page
+  `<script>` blocks (count-up, chart build, timestamp localisation and the
+  rest) stay inline and nonced; moving them to files buys nothing under a
+  nonce policy and would turn `usage.html`'s `tojson` interpolation into a
+  data-attribute round trip. `vault.html`'s hover colours are CSS `:hover`
+  rules. `tests/test_panel_csp_templates.py` fails on any `on*=` attribute,
+  any `javascript:` URL, any `hx-` attribute, or any `<script>`/`<style>`
+  without `nonce="{{ csp_nonce }}"`.
+
+- **Destructive confirmations fail closed.** The eight `data-confirm`
+  controls (keys ×3, OAuth ×2, settings ×1, user edit ×2) are
+  `type="button"`, not submit buttons; the listener calls `confirm()` and, on
+  yes, `form.requestSubmit()`, so the form's own validation and `submit`
+  event still run. Without script — blocked, failed to load, disabled — the
+  button does nothing. The old `onclick="return confirm(…)"` failed open: a
+  missing or throwing handler let the destructive POST through. None of
+  those forms has a text field, and none may carry any other submit control
+  (the static test asserts it), so Enter cannot submit around the prompt.
+  The settings reset modal and `reembed_confirm.html` are confirmations of a
+  different kind and keep real submit buttons: the modal needs script to
+  open, and the re-embed page *is* the confirmation step.
+
+- **htmx is removed, not configured.** It was loaded on every panel page and
+  used by none. Configured (`includeIndicatorStyles: false`, `allowEval:
+  false`) it would stop inserting un-nonced styles and stop evaluating, but
+  its attribute-driven request machinery remains: an injected `<div
+  hx-post="/admin/keys/create" hx-include="[name=csrf_token]"
+  hx-trigger="load">` needs no script and no eval and makes an
+  authenticated, CSRF-valid request — a script gadget that bypasses the nonce
+  policy by construction. A change that wants htmx back reintroduces it with
+  that configuration and re-argues the gadget; the static test forbids `hx-`
+  attributes and any htmx reference, so the reintroduction is deliberate.
+
+- **Style attributes stay allowed, by decision: `style-src-attr
+  'unsafe-inline'`.** The templates carry about 430 `style=""` attributes,
+  including the SVG marks that must use `style` (below). Style *elements* are
+  the real CSS-injection primitive — attribute-selector scraping of the CSRF
+  token's value, font-based text probes — so they are nonce-only under
+  `style-src-elem`. An injected style *attribute* can restyle the element it
+  sits on (overlay, hide, UI redress) but cannot select anything else and
+  cannot beacon off-origin, because every `url()` is still bound by `img-src`
+  and `font-src`. The `style-src` fallback carries **no nonce** on purpose:
+  only a browser without CSP3 `-elem`/`-attr` reads it, and there a nonce
+  would make it ignore `'unsafe-inline'` and refuse every style attribute,
+  breaking the panel. Moving the attributes to classes and dropping
+  `'unsafe-inline'` is a follow-up. CSSOM writes (`el.style.display = …`,
+  Chart.js canvas sizing) are not governed by CSP.
+
+- **The consent page's `form-action` is `'self' https:`, by owner decision.**
+  `form-action` belongs to the page that *submits* the form. The consent form
+  posts to `/authorize`, which answers 302 to the client's registered
+  redirect URI for approve and deny alike, and Chromium checks `form-action`
+  on every hop of a form-submission navigation — so a flat `'self'` breaks
+  every OAuth connection. The exact origin of the redirect URI was the first
+  draft and was rejected: a callback that 302s on to another HTTPS origin is
+  blocked on the second hop, after the code is already delivered, and a host
+  registered in a non-canonical spelling (`https://127.1/cb`) does not match
+  the canonical URL the browser navigates to. A broken approve on a live
+  connector is the most expensive failure this policy can cause. `https:`
+  still refuses `http:`, `javascript:` and `data:` targets; where a code can
+  go is decided by the HTTPS-only registration rule and `authorize_post`'s
+  exact-match re-validation, never by this header. `authorize_get` calls
+  `mark_consent` before rendering; every other page keeps `'self'`.
+
+- **`PANEL_CSP` is the rollback lever** (`enforce` | `report-only` | `off`,
+  default `enforce`, boot-validated — an unknown value refuses startup).
+  `report-only` sends the same value as
+  `Content-Security-Policy-Report-Only`; `off` sends none. Templates keep
+  their nonces and their delegation in every mode, so behaviour is
+  identical. The effective mode is logged at INFO on startup, and at WARNING
+  when it is not `enforce`, so a forgotten rollback shows in the logs.
+  Changing it is an `.env` edit plus a container recreate, no rebuild. The
+  rollout is **report-only first**: the first production deploy runs
+  `report-only` through a by-hand browser pass with devtools — every
+  control, one real connector approve and one deny, zero violations — and
+  only that result authorises the flip to `enforce`. A violation found later
+  goes back to `report-only` and is fixed forward. The code default stays
+  `enforce`, so a fresh deployment is protected without operator action.
+
+- **Accepted limitations** (owner-accepted with the change; the reasoning is
+  in the `panel-csp` design):
+  1. Inline style attributes remain allowed — an HTML-injection bug can
+     restyle the injected element, not run script or scrape by selector.
+  2. A browser without CSP3 `style-src-elem`/`-attr` gets `style-src
+     'unsafe-inline'` for style elements too; its script policy is the same.
+  3. The consent page's `form-action` admits any HTTPS origin; an injection
+     there could post the form's hidden fields to an HTTPS origin.
+  4. `/docs`, `/redoc` and `/docs/oauth2-redirect` carry no CSP. They are not
+     proxy-routed; disabling them is a separate call.
+  5. A panel POST after the SSO session has expired is redirected by the
+     forward-auth chain to the identity provider, which `form-action 'self'`
+     blocks; the user sees a blocked navigation, and a reload proceeds to SSO.
+  6. `report-only` reports to the browser console only; there is no
+     collection endpoint (it would be a new unauthenticated write surface).
+  7. `panel.js` has no automated behavioural test — no JS runner exists; the
+     static structure test and the browser pass cover it.
+  8. CSP is not a CSRF control: `form-action 'self'` still admits an injected
+     form posting to the panel's own endpoints. The CSRF token is the control.
 
 ## Theming: one token source, dark canonical
 
@@ -91,14 +264,15 @@
   `--bg` into `<meta name="theme-color">`, because no stylesheet can reach a
   meta tag.
 
-- **The bootstrap is an inline `<script>` with no nonce, and that is
-  consistent, not an oversight.** There is deliberately no CSP on the panel
-  (above); every control here already runs from an inline `onclick`. A theme
-  bootstrap *must* be inline and synchronous in `<head>` — an external file
-  is a network round trip in front of first paint, which is the flash the
-  script exists to prevent. If a CSP is ever added to the panel, this script
-  needs a nonce along with every other inline handler; it is not a special
-  case.
+- **The bootstrap is an inline `<script>`, nonced like every other.** It
+  carries `nonce="{{ csp_nonce }}"` and is admitted by the panel CSP (above)
+  on all three roots. It stays inline because a theme bootstrap *must* be
+  inline and synchronous in `<head>` — an external file is a network round
+  trip in front of first paint, which is the flash the script exists to
+  prevent. It also registers the toggle's delegated `click` listener on
+  `document` for `[data-theme-toggle]`: the toggle renders on the login and
+  consent pages, which do not load `panel.js`, and a listener on `document`
+  works before the body exists. The toggle button itself has no handler.
 
 - **SVG colors ride in `style=""`, not in `fill=`/`stroke=`.** SVG2 parses
   presentation attributes with the property's own grammar rather than as CSS
@@ -111,10 +285,15 @@
   under a strict per-request nonce CSP with static-response discipline
   (`src/transfer/routes.py`). They carry their own local `--t-*` token block,
   keep their light-first `prefers-color-scheme` behaviour, and have no
-  toggle, no `localStorage`, and no shared panel partial — including the
-  panel's would drag an unnonced inline script into a page whose whole point
-  is that everything inline is nonced. Their security headers must stay
-  byte-identical once each response's per-request nonce is canonicalized.
+  toggle, no `localStorage`, and no shared panel partial — the panel's
+  partial carries `{{ csp_nonce }}`, which the transfer instance does not
+  provide (it renders `{{ nonce }}` under its own `default-src 'none'`
+  policy), so including it would put an unnonced inline script into a page
+  whose whole point is that everything inline is nonced. The panel CSP never
+  touches these pages: their instance does not mark the request, and an
+  enforcing policy already on a response is left alone. Their security
+  headers must stay byte-identical once each response's per-request nonce is
+  canonicalized.
 
 - The archived ops-health and usage-slicing sweep wrappers locate their
   shared `colorscan` module by walking ancestors, then use its `repo_root()`
@@ -566,9 +745,10 @@ how the panel says so.
   taken stays a correctly-signed credential until its itsdangerous timestamp
   passes `session_max_age` — seven days. The verification on #198 replayed a
   pre-logout cookie against the container's installed Starlette and got the
-  user back. This panel has **no CSP and will not get one** (see the top of
-  this note), so "an XSS steals the cookie" is a live path rather than a
-  theoretical one, and the panel that cookie reaches mints `readwrite` `omcp_`
+  user back. When this was written the panel had **no CSP**; it has
+  a nonce policy now (see the top of this note), which narrows script
+  injection but does not retire "an XSS steals the cookie" as a path to
+  design for, and the panel that cookie reaches mints `readwrite` `omcp_`
   keys and approves OAuth grants. The only thing that can be revoked is a row,
   so `user_sessions` (migration 024) is the row and `src/auth/session.py` is
   its single implementation.
