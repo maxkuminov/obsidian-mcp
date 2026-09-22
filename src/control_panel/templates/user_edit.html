@@ -135,22 +135,21 @@
                     </div>
                 </div>
                 {#
-                  Both confirm() strings below are static. Interpolating
-                  `target.username` into an inline handler is the same defect
-                  class as the OAuth `client_name` one (see CLAUDE.md): Jinja
-                  escapes an apostrophe to `&#39;`, the HTML parser turns it
-                  back before the JS string is parsed, the handler throws — and
-                  a throwing `onclick` submits the form *unconfirmed*. It is
-                  safe here only because `_USERNAME_RE` allows nothing but
-                  `[a-z0-9_]`, which makes the safety a property of a
-                  validator two files away rather than of this markup. The
-                  page names the user in its heading, so nothing is lost.
+                  Both confirmations below are static `data-confirm` strings on
+                  `type="button"` controls: panel.js shows the text and only
+                  then calls `requestSubmit()`, so without script nothing is
+                  submitted. The text is read as an attribute, never parsed as
+                  JavaScript, so the old inline-handler defect (an apostrophe
+                  in an interpolated name broke the JS string, the handler
+                  threw, and a throwing `onclick` submitted *unconfirmed*)
+                  cannot recur — but the strings stay static anyway: the page
+                  names the user in its heading, so nothing is lost.
                 #}
                 <form method="POST" action="/admin/users/{{ target.id }}/delete">
                     {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                    <button type="submit" class="btn btn-danger"
+                    <button type="button" class="btn btn-danger"
                             {% if is_self %}disabled{% endif %}
-                            onclick="return confirm('Deactivate this user? They will no longer be able to log in.')">
+                            data-confirm="Deactivate this user? They will no longer be able to log in.">
                         Deactivate
                     </button>
                 </form>
@@ -166,9 +165,9 @@
                 </div>
                 <form method="POST" action="/admin/users/{{ target.id }}/delete?permanent=true">
                     {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                    <button type="submit" class="btn btn-danger"
+                    <button type="button" class="btn btn-danger"
                             {% if is_self %}disabled{% endif %}
-                            onclick="return confirm('PERMANENTLY DELETE this user and all their data? This cannot be undone.')">
+                            data-confirm="PERMANENTLY DELETE this user and all their data? This cannot be undone.">
                         Permanently delete
                     </button>
                 </form>
@@ -178,7 +177,7 @@
 
 </div>
 
-<script>
+<script nonce="{{ csp_nonce }}">
 // Toggle custom-path input visibility based on dropdown selection.
 (function() {
     const sel = document.getElementById('vault-select');

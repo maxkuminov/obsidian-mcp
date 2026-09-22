@@ -11,7 +11,7 @@
     {# This page extends neither base, so it includes the token partial
        directly. Its historical shades survive as the `--consent-*` group. #}
     {% include "_theme.html" %}
-    <style>
+    <style nonce="{{ csp_nonce }}">
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
         body {

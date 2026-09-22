@@ -44,7 +44,7 @@
                     <span style="font-size:11px;color:var(--text-3);">Registered <time datetime="{{ client.created_at }}" data-localize="date">{{ client.created_at }}</time></span>
                     <form method="POST" action="/admin/oauth/{{ client.client_id }}/delete" style="display:inline;">
                         {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                        <button type="submit" class="btn btn-danger" style="font-size:11px;padding:4px 12px;" onclick="return confirm('Delete this client?\n\nIts access and refresh tokens are deleted, so it can no longer call this server, and any outstanding upload or download links minted under those tokens stop working.\n\nIts usage history stays on the Usage page, still labelled with this client name.')">Delete</button>
+                        <button type="button" class="btn btn-danger" style="font-size:11px;padding:4px 12px;" data-confirm="Delete this client?&#10;&#10;Its access and refresh tokens are deleted, so it can no longer call this server, and any outstanding upload or download links minted under those tokens stop working.&#10;&#10;Its usage history stays on the Usage page, still labelled with this client name.">Delete</button>
                     </form>
                 </div>
             </div>
@@ -89,7 +89,7 @@
                         {% if grant.token_id %}
                         <form method="POST" action="/admin/oauth/token/{{ grant.token_id }}/scope" style="display:inline;">
                             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                            <select name="scope" onchange="this.form.submit()" class="field-select" style="width:auto;padding:3px 28px 3px 8px;font-size:11px;">
+                            <select name="scope" data-autosubmit class="field-select" style="width:auto;padding:3px 28px 3px 8px;font-size:11px;">
                                 <option value="read"      {% if not grant.has_write %}selected{% endif %}>read</option>
                                 {# Only offered when the client is registered for it. The panel
                                    must not raise a grant above what the client was registered
@@ -110,7 +110,7 @@
                         {% if grant.token_id %}
                         <form method="POST" action="/admin/oauth/token/{{ grant.token_id }}/revoke" style="display:inline;">
                             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                            <button type="submit" class="btn btn-danger" style="font-size:11px;padding:4px 12px;" onclick="return confirm('Revoke this grant? Every access and refresh token issued from it stops working immediately and the app must be reconnected.')">Revoke access</button>
+                            <button type="button" class="btn btn-danger" style="font-size:11px;padding:4px 12px;" data-confirm="Revoke this grant? Every access and refresh token issued from it stops working immediately and the app must be reconnected.">Revoke access</button>
                         </form>
                         {% endif %}
                     </div>

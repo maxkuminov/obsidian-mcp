@@ -770,11 +770,11 @@ def test_the_keys_page_renders_both_a_limited_and_an_unlimited_key():
 
     assert "7 / 100" in html, "the limited key's consumption is not rendered"
     assert "Unlimited" in html, "the unlimited key is not labelled"
-    # The edit control carries the key's id and its current value, and both are
-    # numeric — nothing quotable is interpolated into the `onclick`, which is
-    # the trap documented for the OAuth delete's confirm().
-    assert "omcpEditLimit(4, '100')" in html
-    assert "omcpEditLimit(5, '')" in html
+    # The edit control carries the key's id and its current value as data
+    # attributes, both numeric; panel.js reads them as strings, so nothing is
+    # parsed as script (the trap the old inline handler documented).
+    assert 'data-key-id="4" data-limit="100"' in html
+    assert 'data-key-id="5" data-limit=""' in html
     # The create form offers the field, with the domain the CHECK enforces.
     assert 'name="daily_request_limit"' in html
     assert 'max="1000000"' in html

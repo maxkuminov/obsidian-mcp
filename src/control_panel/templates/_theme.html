@@ -25,7 +25,7 @@
   discipline, so they carry their own local token block, stay OS-responsive,
   and have no toggle and no localStorage.
 -#}
-<style>
+<style nonce="{{ csp_nonce }}">
     :root {
         color-scheme: dark;
 
@@ -469,15 +469,19 @@
         :root:not([data-theme="dark"]) .theme-toggle .icon-moon { display: block; }
     }
 </style>
-<script>
+<script nonce="{{ csp_nonce }}">
 /* Pre-paint theme bootstrap. It runs in <head>, before the body is parsed, so
    a stored choice is on <html> before the first paint and there is no flash of
    the other theme.
 
-   There is deliberately no CSP on this panel (see
-   docs/architecture/control-panel.md), so this inline script needs no nonce —
-   the same reason every control here uses an inline onclick. The script is
-   kept free of Jinja delimiters so `{` and `}` never have to be escaped.
+   It stays inline, carrying the response's CSP nonce (see
+   docs/architecture/control-panel.md): a script file would be fetched after
+   first paint and bring the flash back. The panel policy refuses inline event
+   handlers, so the toggle's click listener is registered here too, delegated
+   from `document` — this partial is included by all three roots, including
+   the login and consent pages that do not load panel.js, and a listener on
+   `document` works before the body exists. The script body is kept free of
+   Jinja delimiters so `{` and `}` never have to be escaped.
 
    The attribute is stamped ONLY when an explicit choice is stored. With no
    choice the attribute stays absent and the `prefers-color-scheme` block above
@@ -552,6 +556,15 @@
         if (mq.addEventListener) { mq.addEventListener('change', onSystemChange); }
         else if (mq.addListener) { mq.addListener(onSystemChange); }
     }
+
+    /* The toggle button carries `data-theme-toggle` and no handler of its own. */
+    document.addEventListener('click', function (event) {
+        var t = event.target;
+        if (t && t.nodeType !== 1) { t = t.parentElement; }
+        if (t && t.closest && t.closest('[data-theme-toggle]')) {
+            window.__themeToggle();
+        }
+    });
 
     syncMeta();
     if (document.readyState === 'loading') {

@@ -11,7 +11,7 @@
     {# Same token source as the panel — auth pages used to carry a duplicate
        copy of the palette, which is exactly how the two drifted apart. #}
     {% include "_theme.html" %}
-    <style>
+    <style nonce="{{ csp_nonce }}">
         *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
         html { -webkit-text-size-adjust: 100%; }

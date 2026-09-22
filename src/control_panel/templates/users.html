@@ -5,7 +5,7 @@
 <div class="page-top">
     <h1 class="page-title">Users</h1>
     <div class="page-actions">
-        <button onclick="document.getElementById('create-modal').classList.add('open')" class="btn btn-primary">
+        <button type="button" data-modal-open="create-modal" class="btn btn-primary">
             <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
                 <line x1="6" y1="1" x2="6" y2="11"/><line x1="1" y1="6" x2="11" y2="6"/>
             </svg>
@@ -151,7 +151,7 @@
                 </div>
             </div>
             <div class="modal-footer">
-                <button type="button" onclick="document.getElementById('create-modal').classList.remove('open')" class="btn btn-ghost">Cancel</button>
+                <button type="button" data-modal-close="create-modal" class="btn btn-ghost">Cancel</button>
                 <button type="submit" class="btn btn-primary">Create</button>
             </div>
         </form>

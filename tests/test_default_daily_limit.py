@@ -422,13 +422,13 @@ def test_the_create_form_is_prefilled_with_the_default():
 
 def test_the_edit_modal_is_not_prefilled():
     """The default belongs to *creation*. The edit modal's input carries the
-    key's own value, written by `omcpEditLimit`, and no default."""
+    key's own value, written by panel.js from `data-limit`, and no default."""
     _, html = _render_keys_page()
 
     edit_modal = html.split('id="limit-modal"', 1)[1]
     assert "5000" not in edit_modal
     # The row's edit control still carries the key's own (empty) value.
-    assert "omcpEditLimit(4, '')" in html
+    assert 'data-key-id="4" data-limit=""' in html
 
 
 def test_no_default_configured_leaves_the_field_empty(monkeypatch):

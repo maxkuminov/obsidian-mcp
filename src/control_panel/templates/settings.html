@@ -16,7 +16,7 @@
                 <div style="display:flex;gap:8px;flex-wrap:wrap;">
                     <form method="POST" action="/admin/settings/reindex" style="display:inline;">
                         {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                        <button type="submit" class="btn btn-primary" onclick="return confirm('Trigger incremental reindex?')">
+                        <button type="button" class="btn btn-primary" data-confirm="Trigger incremental reindex?">
                             <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                                 <path d="M13.5 8 A5.5 5.5 0 1 1 11.5 3.8"/>
                                 <polyline points="11.5,1 11.5,4 14.5,4"/>
@@ -116,7 +116,7 @@
                 </div>
                 <button type="button"
                         class="btn btn-danger"
-                        onclick="document.getElementById('reset-modal').style.display='flex';">
+                        data-modal-open="reset-modal">
                     Reset embeddings
                 </button>
             </div>
@@ -127,7 +127,7 @@
 <!-- Reset confirmation modal -->
 <div id="reset-modal"
      style="display:none;position:fixed;inset:0;background:var(--modal-scrim-2);align-items:center;justify-content:center;z-index:50;"
-     onclick="if(event.target===this)this.style.display='none';">
+     data-modal-backdrop>
     <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:22px 24px;max-width:440px;width:90%;">
         <h3 style="margin:0 0 8px;font-size:16px;color:var(--error);">Confirm reset</h3>
         <p style="color:var(--text-2);font-size:13px;line-height:1.55;margin:0 0 18px;">
@@ -140,7 +140,7 @@
             <button type="button"
                     class="btn btn-ghost"
                     style="font-size:13px;padding:8px 16px;"
-                    onclick="document.getElementById('reset-modal').style.display='none';">
+                    data-modal-close="reset-modal">
                 Cancel
             </button>
             <form method="POST" action="/admin/settings/reset-embeddings" style="display:inline;">
