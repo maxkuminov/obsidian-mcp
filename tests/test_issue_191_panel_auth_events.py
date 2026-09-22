@@ -21,6 +21,7 @@ why they are asserted together:
 """
 import itertools
 import logging
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -197,6 +198,10 @@ async def _login(user, password=PASSWORD, username=USERNAME, commit_error=None):
 # --- login failures: three reasons, one response -------------------------
 
 
+def _mask_nonces(body: bytes) -> bytes:
+    return re.sub(rb'nonce="[^"]*"', b'nonce="N"', body)
+
+
 async def test_the_three_login_failures_are_byte_identical(events):
     """The reason exists in the log and nowhere else.
 
@@ -213,7 +218,8 @@ async def test_the_three_login_failures_are_byte_identical(events):
 
     # Same username submitted, so the rendered form is the same form.
     _, unknown_same = await _login(None)
-    assert unknown_same.body == inactive.body == wrong.body
+    # The panel CSP nonce is fresh per response (#195) and carries no state.
+    assert _mask_nonces(unknown_same.body) == _mask_nonces(inactive.body) == _mask_nonces(wrong.body)
     assert (
         unknown_same.headers["content-type"]
         == inactive.headers["content-type"]

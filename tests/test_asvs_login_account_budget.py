@@ -25,6 +25,7 @@ forced:
 """
 import itertools
 import logging
+import re
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -202,6 +203,10 @@ async def test_rotating_addresses_cannot_outrun_the_account_budget(verify_calls)
     assert verify_calls == [1, 1, 1], "the throttled attempt compared no password"
 
 
+def _mask_nonces(body: bytes) -> bytes:
+    return re.sub(rb'nonce="[^"]*"', b'nonce="N"', body)
+
+
 async def test_the_refusal_is_content_identical_to_an_ordinary_failure(verify_calls):
     """Same status, same template, same message — and not a 429.
 
@@ -216,7 +221,9 @@ async def test_the_refusal_is_content_identical_to_an_ordinary_failure(verify_ca
     throttled = await _login(user, password=PASSWORD + "!")
 
     assert throttled.status_code == ordinary.status_code == 401
-    assert throttled.body == ordinary.body
+    # The panel CSP nonce is fresh per response (#195) and carries no state,
+    # so it is masked before comparing; everything else must match byte-for-byte.
+    assert _mask_nonces(throttled.body) == _mask_nonces(ordinary.body)
     assert throttled.headers["content-type"] == ordinary.headers["content-type"]
 
 
