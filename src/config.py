@@ -838,7 +838,7 @@ class Settings(BaseSettings):
     # (`folders=` for `folder=`) returns unfiltered results the agent believes
     # are filtered. Read at import, when the tools are registered. `false` is
     # the rollback — the SDK's ignore behaviour and unmodified schemas — for a
-    # client found to send extras; it is logged at WARNING on every start.
+    # client found to send extras; it is logged at WARNING on every HTTP server start.
     # Env: MCP_REJECT_UNKNOWN_ARGUMENTS.
     mcp_reject_unknown_arguments: bool = True
 

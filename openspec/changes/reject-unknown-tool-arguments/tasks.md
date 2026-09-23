@@ -15,7 +15,7 @@
 
 ## 3. Verify and ship
 
-- [ ] 3.1 `openspec validate reject-unknown-tool-arguments --strict`
-- [ ] 3.2 openspec-verifier pass; one adversarial Codex round (tool-argument surface for every write tool)
+- [x] 3.1 `openspec validate reject-unknown-tool-arguments --strict`
+- [x] 3.2 openspec-verifier pass; one adversarial Codex round (tool-argument surface for every write tool)
 - [ ] 3.3 Deploy; live end-to-end: `keyword_search` with `foo` refused, `keyword_search`/`semantic_search`/`read_note` with valid args succeed, `tools/list` shows `additionalProperties: false`
 - [ ] 3.4 Archive, commit, push (`Closes #295`)

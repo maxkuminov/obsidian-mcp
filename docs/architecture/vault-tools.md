@@ -21,7 +21,7 @@ refusal is the SDK's own validation error — a tool error naming each extra
 argument, raised before `_tracked`, so like a type error it charges no bucket
 or quota and writes no `usage_logs` row, and carries no `MCP-REFUSAL` line.
 `MCP_REJECT_UNKNOWN_ARGUMENTS=false` is the rollback (ignore behaviour and
-unmodified schemas, WARNING at every start). The mechanism reaches into SDK
+unmodified schemas, WARNING at every HTTP server start). The mechanism reaches into SDK
 internals (`_tool_manager`, `Tool.fn_metadata.arg_model`, `Tool.parameters`);
 `tests/test_issue_295_unknown_arguments.py` pins them, so an SDK upgrade that
 moves them fails the suite instead of silently reverting to ignore.

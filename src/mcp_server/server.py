@@ -1308,7 +1308,7 @@ def _forbid_unknown_arguments(server: FastMCP) -> None:
             {
                 "__module__": base.__module__,
                 "__doc__": base.__doc__,
-                "model_config": ConfigDict(**base.model_config, extra="forbid"),
+                "model_config": ConfigDict({**base.model_config, "extra": "forbid"}),
             },
         )
         tool.parameters["additionalProperties"] = False

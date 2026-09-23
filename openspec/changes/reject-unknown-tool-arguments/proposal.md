@@ -27,4 +27,6 @@ No migration, no dependency, no change to any tool's declared arguments or resul
 ## Accepted limitations
 
 - L1: the refusal text is pydantic's, not an `MCP-REFUSAL` line, and is not recorded in `usage_logs` — same as every existing argument-type error.
+- L1a: pydantic's refusal text echoes the undeclared argument's value (`input_value=…`). It is the caller's own input, so nothing leaks; it is only extra text in the error.
+- L3: the rollback WARNING is emitted by the HTTP lifespan only; `src/mcp_stdio.py` (registry introspection) honours the flag but does not log it (Codex round 1, declined).
 - L2: the mechanism depends on FastMCP 1.29 private attributes; guarded by the pinning test, not by a public API.
