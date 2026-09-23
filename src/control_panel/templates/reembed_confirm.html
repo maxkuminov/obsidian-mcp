@@ -1,5 +1,13 @@
 {% extends "base.html" %}
 {% block title %}Confirm Re-embed — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+    /* Re-embed confirmation page classes (#289, design D1). */
+    .reembed-lead { color: var(--text); font-size: 14px; margin-bottom: 8px; font-weight: 500; }
+    .reembed-text { color: var(--text-2); font-size: 13px; margin-bottom: 16px; line-height: 1.6; }
+    .reembed-expiry { font-size: 11px; color: var(--text-3); font-family: 'JetBrains Mono',monospace; background: var(--code-bg); padding: 10px 14px; border-radius: 4px; border: 1px solid var(--border); margin-bottom: 22px; }
+</style>
+{% endblock %}
 {% block content %}
 
 <div class="page-top">
@@ -7,29 +15,29 @@
 </div>
 
 <div class="page-body">
-    <div class="card anim-1" style="max-width:480px;border-color:var(--danger-border);">
-        <div class="card-header" style="border-bottom-color:var(--danger-border-soft);">
-            <span class="card-title" style="color:var(--error);">Destructive Operation</span>
+    <div class="card anim-1 u-max-width-480px u-border-color-danger-border">
+        <div class="card-header u-border-bottom-color-danger-border-soft">
+            <span class="card-title u-color-error">Destructive Operation</span>
         </div>
         <div class="card-body">
-            <p style="color:var(--text);font-size:14px;margin-bottom:8px;font-weight:500;">
+            <p class="reembed-lead">
                 This will delete all existing embeddings and re-embed the entire vault from scratch.
             </p>
-            <p style="color:var(--text-2);font-size:13px;margin-bottom:16px;line-height:1.6;">
+            <p class="reembed-text">
                 This is a long-running background operation. Semantic search will be degraded until re-embedding completes.
             </p>
-            <div style="font-size:11px;color:var(--text-3);font-family:'JetBrains Mono',monospace;background:var(--code-bg);padding:10px 14px;border-radius:4px;border:1px solid var(--border);margin-bottom:22px;">
+            <div class="reembed-expiry">
                 ⚠ This confirmation link expires in 60 seconds
             </div>
-            <div style="display:flex;gap:10px;">
+            <div class="u-display-flex u-gap-10px">
                 <form method="POST" action="/admin/settings/reembed">
                     <input type="hidden" name="token" value="{{ token }}">
                     {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                    <button type="submit" class="btn btn-danger" style="font-size:13px;padding:9px 18px;">
+                    <button type="submit" class="btn btn-danger u-font-size-13px u-padding-9px-18px">
                         Yes, Re-embed All
                     </button>
                 </form>
-                <a href="/admin/settings" class="btn btn-ghost" style="font-size:13px;padding:9px 18px;">
+                <a href="/admin/settings" class="btn btn-ghost u-font-size-13px u-padding-9px-18px">
                     Cancel
                 </a>
             </div>
