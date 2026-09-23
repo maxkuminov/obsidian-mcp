@@ -93,6 +93,8 @@ SETTINGS_ENV_KEYS = (
     "MCP_CONCURRENCY_WRITER_WAITERS",
     "MCP_CONCURRENCY_WRITER_WAIT_SECONDS",
     "MCP_SANDBOX_MODE",
+    # Unknown-argument refusal on MCP tools (#295).
+    "MCP_REJECT_UNKNOWN_ARGUMENTS",
     # The /mcp rate controls (#188, #194). Every one is a `Settings` field, so
     # a developer with any of them exported would otherwise change what the
     # suite measures — which for a *limiter* means a green run on a machine

@@ -832,6 +832,16 @@ class Settings(BaseSettings):
     # production — tools register but cannot run.
     mcp_sandbox_mode: bool = False
 
+    # Refuse MCP tool calls carrying an argument the tool does not declare, and
+    # publish `additionalProperties: false` on every input schema (#295). The
+    # SDK otherwise drops unknown names silently, so a misspelled filter
+    # (`folders=` for `folder=`) returns unfiltered results the agent believes
+    # are filtered. Read at import, when the tools are registered. `false` is
+    # the rollback — the SDK's ignore behaviour and unmodified schemas — for a
+    # client found to send extras; it is logged at WARNING on every start.
+    # Env: MCP_REJECT_UNKNOWN_ARGUMENTS.
+    mcp_reject_unknown_arguments: bool = True
+
     # ── Logging (see docs/architecture/security-event-logging.md) ───────────
     # The root level `src/logging_setup.configure_logging()` applies. Accepts
     # any standard level name, case-insensitively; an unknown name is refused

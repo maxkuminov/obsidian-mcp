@@ -2,6 +2,30 @@
 
 > Deep rationale extracted from `CLAUDE.md`. Read before touching any note or file tool — this is the destructive-write surface.
 
+## Unknown arguments are refused (#295)
+
+FastMCP 1.29 builds each tool's argument model on `ArgModelBase`, which sets no
+`extra`, so pydantic's default `ignore` dropped any argument a tool does not
+declare — silently. `keyword_search(folders="Projects/")` (for `folder=`)
+returned unfiltered results that the calling agent believed were filtered: the
+silently-wrong-results failure this product ranks alongside destructive
+writes. A wrong *type* on a declared argument was always refused; only extra
+names passed.
+
+`_forbid_unknown_arguments` in `src/mcp_server/server.py` runs once, after the
+last `@mcp.tool()`, over every registered tool: it swaps
+`fn_metadata.arg_model` for a same-named subclass carrying `extra="forbid"`
+(other config inherited) and sets `additionalProperties: false` on the
+published `parameters`. A tool added later is covered without opting in. The
+refusal is the SDK's own validation error — a tool error naming each extra
+argument, raised before `_tracked`, so like a type error it charges no bucket
+or quota and writes no `usage_logs` row, and carries no `MCP-REFUSAL` line.
+`MCP_REJECT_UNKNOWN_ARGUMENTS=false` is the rollback (ignore behaviour and
+unmodified schemas, WARNING at every start). The mechanism reaches into SDK
+internals (`_tool_manager`, `Tool.fn_metadata.arg_model`, `Tool.parameters`);
+`tests/test_issue_295_unknown_arguments.py` pins them, so an SDK upgrade that
+moves them fails the suite instead of silently reverting to ignore.
+
 ## Write tools
 Returned body refusals carry a pure `BodyOutcome` and an authoritative final
 `MCP-REFUSAL` line (#263). `_tracked` classifies only the terminal typed value;
