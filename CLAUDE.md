@@ -210,9 +210,11 @@ update it in the same change.** What stays here is the short list:
   `javascript:` URLs — a control is a `data-*` attribute plus a delegated
   listener in `panel.js`; every `<script>`/`<style>` carries
   `nonce="{{ csp_nonce }}"`; confirm buttons are `type="button"` and fail
-  closed. Style *attributes* are allowed (`style-src-attr 'unsafe-inline'`) by
-  decision; the consent page's `form-action` is `'self' https:` by owner
-  decision (multi-hop OAuth callbacks). Scope is a marker set by the context
+  closed. No inline `style=` anywhere (#289): `style-src-attr 'none'`, dynamic
+  presentation through `el.style.*` or classes, SVG colours via classes, no
+  `!important`; `_utilities.html` is generated. The consent page's
+  `form-action` is `'self' https:` by owner decision (multi-hop OAuth
+  callbacks). Scope is a marker set by the context
   processor on the four panel/auth/consent template instances — not a path, so
   transfer pages and `/docs` are untouched. `PANEL_CSP=report-only|off` is the
   rollback (recreate, no rebuild). htmx is deliberately absent: its `hx-*`
