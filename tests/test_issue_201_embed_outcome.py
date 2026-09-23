@@ -23,7 +23,7 @@ import os
 import tempfile
 
 import pytest
-from sqlalchemy import Delete, Update
+from sqlalchemy import Delete, Select, Update
 from sqlalchemy.sql.elements import TextClause
 
 os.environ.setdefault("SECRET_KEY", "test")
@@ -57,6 +57,11 @@ class _StateResult:
         # different questions with different dispositions: "has 023 run" and
         # "what does it say".
         return self._value
+
+
+class _NoRows:
+    def all(self):
+        return []
 
 
 class _RowcountResult:
@@ -115,6 +120,11 @@ class _Session:
                 self.fingerprint_reads += 1
                 return _StateResult(self.fingerprint)
             return None
+        if isinstance(clause, Select):
+            # The chunk-reuse lookup (#281, D16): this note has no stored
+            # rows, so nothing is reused and every chunk is sent.
+            self.reuse_lookups = getattr(self, "reuse_lookups", 0) + 1
+            return _NoRows()
         if isinstance(clause, Update):
             values = dict(clause._values or {})
             self.certified.append(
@@ -128,6 +138,11 @@ class _Session:
 
     def add(self, obj):
         self.added.append(obj)
+
+    async def commit(self):
+        # Ends the reuse lookup's read-only transaction before the
+        # provider call (#281, D16).
+        self.commits = getattr(self, "commits", 0) + 1
 
     async def flush(self):
         self.flushed += 1
@@ -319,7 +334,7 @@ async def test_a_fingerprint_that_moves_during_the_provider_call_refuses(
     assert note.embedded_content_hash == "h-old"
     # And the refusal happened under the lock, after the provider answered.
     assert session.lock_taken is True
-    assert session.fingerprint_reads == 1
+    assert session.fingerprint_reads == 2  # the reuse lookup (#281) and the guard
 
 
 @pytest.mark.asyncio
@@ -474,8 +489,8 @@ async def test_the_embed_path_proceeds_when_indexer_state_is_absent(
 
     assert result.outcome is NoteEmbedOutcome.EMBEDDED
     assert session.added, "nothing was stored with the state table absent"
-    assert session.state_table_probes == 1, (
-        "the guard must ask `to_regclass` exactly once per note"
+    assert session.state_table_probes == 2, (
+        "the guard must ask `to_regclass` once for the reuse lookup (#281) and once for the guard"
     )
     assert session.fingerprint_reads == 0, (
         "a fingerprint SELECT was issued against a table that does not exist"
@@ -504,8 +519,8 @@ async def test_a_migrated_database_still_takes_the_lock_and_reads(
     )
 
     assert result.outcome is NoteEmbedOutcome.EMBEDDED
-    assert session.state_table_probes == 1
-    assert session.fingerprint_reads == 1
+    assert session.state_table_probes == 2  # reuse lookup (#281) + guard
+    assert session.fingerprint_reads == 2
     assert session.lock_taken is True
 
 

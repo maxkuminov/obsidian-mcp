@@ -338,6 +338,11 @@ class Settings(BaseSettings):
     # and the model has been evicted. A Go duration like "30m" instead frees
     # VRAM when idle. Ollama provider only — ignored by the OpenAI provider.
     ollama_keep_alive: str = "-1"
+    # Inputs per Ollama `/api/embed` request (#281, D15). A *fixed* size, so
+    # the 30 s per-request bound stays constant whatever the note's size; there
+    # is deliberately no aggregate deadline over the batch (#127 D5). `1`
+    # reproduces the pre-batching request shape, one chunk per request.
+    ollama_embed_batch_size: int = Field(16, ge=1, le=256)
     vault_path: str = "/obsidian"
     secret_key: str = "changeme"
     index_interval_seconds: int = Field(300, ge=1)
