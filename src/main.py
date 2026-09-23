@@ -36,6 +36,7 @@ from src.services.index_state import (
     set_state,
     state_table_exists,
 )
+from src.services.embeddings import close_provider_client
 from src.services.indexer import run_indexer_loop
 from src.services.transport_security import (
     check_database_transport,
@@ -531,6 +532,16 @@ async def lifespan(app: FastAPI):
                 await asyncio.wait_for(asyncio.shield(indexer_task), timeout=10.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 pass
+            # The embedding provider's pooled client (#281, D14): after the
+            # indexer has stopped issuing requests, before the engine goes.
+            # Best-effort — a close that fails must not turn a clean shutdown
+            # into a traceback.
+            try:
+                await close_provider_client()
+            except Exception as e:  # noqa: BLE001 - shutdown, never fatal
+                logging.getLogger(__name__).error(
+                    f"Closing the embedding provider client failed: {e}"
+                )
             # The refusal coalescer's last flush, **before `engine.dispose()`**:
             # every window still holding a pending count writes the row it owes
             # while a connection is still obtainable. After the dispose there

@@ -21,7 +21,7 @@ import os
 import tempfile
 
 import pytest
-from sqlalchemy import Delete, Update
+from sqlalchemy import Delete, Select, Update
 from sqlalchemy.sql.elements import TextClause
 
 os.environ.setdefault("SECRET_KEY", "test")
@@ -57,6 +57,11 @@ class _StateResult:
         return self._value
 
 
+class _NoRows:
+    def all(self):
+        return []
+
+
 class _RowcountResult:
     def __init__(self, rowcount):
         self.rowcount = rowcount
@@ -78,6 +83,11 @@ class _Session:
             if "indexer_state" in clause.text:
                 return _StateResult(self.fingerprint)
             return None
+        if isinstance(clause, Select):
+            # The chunk-reuse lookup (#281, D16): this note has no stored
+            # rows, so nothing is reused and every chunk is sent.
+            self.reuse_lookups = getattr(self, "reuse_lookups", 0) + 1
+            return _NoRows()
         if isinstance(clause, Update):
             values = dict(clause._values or {})
             self.certified.append(str(next(iter(values.values())).effective_value))
@@ -89,6 +99,11 @@ class _Session:
 
     def add(self, obj):
         self.added.append(obj)
+
+    async def commit(self):
+        # Ends the reuse lookup's read-only transaction before the
+        # provider call (#281, D16).
+        self.commits = getattr(self, "commits", 0) + 1
 
     async def flush(self):
         pass

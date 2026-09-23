@@ -531,62 +531,163 @@ def _input_limit_reason(
     return None
 
 
+# ── One pooled client per provider (#281, D14) ──────────────────────────────
+#
+# Every provider request used to open and tear down its own `httpx` client, so
+# every chunk and every search query paid a fresh TCP (and TLS) handshake. Each
+# provider now keeps **one** client, and it is built **only** by calling
+# `transport_security.embedding_http_client` — never `httpx.AsyncClient(...)`
+# here — so the shared instance carries the factory's three properties by
+# construction: `trust_env=False`, `follow_redirects=False`, and the CA context
+# parsed once at settings construction. `tests/test_internal_transport_http_clients.py`
+# sweeps this module for any other construction.
+#
+# **Keyed to the running event loop.** An `httpx.AsyncClient`'s pooled
+# connections belong to the loop that opened them; reusing one from another
+# loop fails in ways that look like provider outages. pytest runs each test on
+# its own loop and the maintenance scripts run their own `asyncio.run`, so a
+# client created on a loop that is no longer the running one is discarded and
+# a new one is built. The lifespan closes the live one at shutdown
+# (`close_provider_client`), after the indexer task is cancelled and before the
+# engine is disposed. Pool limits are httpx's defaults.
+
+
+class _SharedClient:
+    """A lazily built, loop-keyed holder for one provider's pooled client."""
+
+    def __init__(self) -> None:
+        self._client: httpx.AsyncClient | None = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    def get(self, build: Callable[[], httpx.AsyncClient]) -> httpx.AsyncClient:
+        loop = asyncio.get_running_loop()
+        client = self._client
+        if client is not None and self._loop is loop and not client.is_closed:
+            return client
+        # Absent, closed, or bound to another loop. A client from another loop
+        # is dropped, not closed: closing it needs that loop, and this one must
+        # never touch its pool.
+        self._client = build()
+        self._loop = loop
+        return self._client
+
+    async def aclose(self) -> None:
+        client, loop = self._client, self._loop
+        self._client = None
+        self._loop = None
+        if client is None or client.is_closed:
+            return
+        if loop is asyncio.get_running_loop():
+            await client.aclose()
+
+
+_OLLAMA_CLIENT = _SharedClient()
+_OPENAI_CLIENT = _SharedClient()
+
+#: Per-request bounds, passed on every `post(...)`. Unchanged values; the
+#: client-level timeout is the same number, so the two cannot disagree.
+OLLAMA_REQUEST_TIMEOUT_SECONDS = 30.0
+OPENAI_REQUEST_TIMEOUT_SECONDS = 60.0
+
+
+def _ollama_client() -> httpx.AsyncClient:
+    return _OLLAMA_CLIENT.get(
+        lambda: embedding_http_client(OLLAMA_REQUEST_TIMEOUT_SECONDS)
+    )
+
+
+def _openai_client() -> httpx.AsyncClient:
+    return _OPENAI_CLIENT.get(
+        lambda: embedding_http_client(OPENAI_REQUEST_TIMEOUT_SECONDS)
+    )
+
+
+async def close_provider_client() -> None:
+    """Close every provider's shared client. Idempotent; the lifespan calls it
+    at shutdown, after the indexer task has stopped and before the engine is
+    disposed."""
+    await _OLLAMA_CLIENT.aclose()
+    await _OPENAI_CLIENT.aclose()
+
+
 class OllamaProvider:
-    """Default provider — POSTs to a self-hosted Ollama instance, one input
-    per request. Sends `keep_alive` so the model stays resident between
-    (often infrequent) calls instead of paying a cold reload each time."""
+    """Default provider — POSTs to a self-hosted Ollama instance through the
+    shared client, at most `OLLAMA_EMBED_BATCH_SIZE` inputs per `/api/embed`
+    request. Sends `keep_alive` so the model stays resident between (often
+    infrequent) calls instead of paying a cold reload each time."""
+
+    async def _embed_inputs(self, inputs: list[str]) -> list[list[float]]:
+        """One `/api/embed` request carrying `inputs`: exactly one vector per
+        input, in input order, or it raises."""
+        response = await _ollama_client().post(
+            f"{settings.ollama_url}/api/embed",
+            json={
+                "model": settings.embedding_model,
+                "input": inputs,
+                "keep_alive": _coerce_keep_alive(settings.ollama_keep_alive),
+            },
+            timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS,
+        )
+        if response.status_code >= 400:
+            # Ollama **truncates** rather than rejecting on the ordinary
+            # path: `/api/embed` takes a `truncate` flag that defaults to
+            # true and we do not send it, so an over-long input normally
+            # comes back as a vector computed over the model's context
+            # window. This branch is for the deployments and models that
+            # report the limit instead of silently shortening the input;
+            # where it is not taken, nothing about this call changes.
+            reason = _input_limit_reason(response, codes=_OLLAMA_INPUT_LIMIT_CODES)
+            if reason is not None:
+                raise refusals.ProviderInputTooLarge(reason, provider="ollama")
+        response.raise_for_status()
+        vectors = response.json().get("embeddings")
+        if not isinstance(vectors, list) or len(vectors) != len(inputs):
+            # Per request, not only per note: a short answer cannot be
+            # attributed to the right inputs, so no vector of it is used.
+            got = len(vectors) if isinstance(vectors, list) else "no"
+            raise RuntimeError(
+                f"Ollama returned {got} vectors for {len(inputs)} inputs"
+            )
+        return vectors
 
     async def embed_one(self, text: str) -> list[float]:
-        async with embedding_http_client(30.0) as client:
-            response = await client.post(
-                f"{settings.ollama_url}/api/embed",
-                json={
-                    "model": settings.embedding_model,
-                    "input": text,
-                    "keep_alive": _coerce_keep_alive(settings.ollama_keep_alive),
-                },
-            )
-            if response.status_code >= 400:
-                # Ollama **truncates** rather than rejecting on the ordinary
-                # path: `/api/embed` takes a `truncate` flag that defaults to
-                # true and we do not send it, so an over-long input normally
-                # comes back as a vector computed over the model's context
-                # window. This branch is for the deployments and models that
-                # report the limit instead of silently shortening the input;
-                # where it is not taken, nothing about this call changes.
-                reason = _input_limit_reason(
-                    response, codes=_OLLAMA_INPUT_LIMIT_CODES
-                )
-                if reason is not None:
-                    raise refusals.ProviderInputTooLarge(reason, provider="ollama")
-            response.raise_for_status()
-            data = response.json()
-            return data["embeddings"][0]
+        # The query path: a one-element `input` array, the request shape the
+        # batch sends, so one code path answers both.
+        return (await self._embed_inputs([text]))[0]
 
     async def embed_batch(self, texts: list[str]) -> list[list[float]]:
-        """Embed each chunk in turn. **The per-call timeout is the only
-        deadline, deliberately** (#127, D5).
+        """Embed in consecutive fixed-size slices, one `/api/embed` request per
+        slice. **The per-request timeout is the only deadline, deliberately**
+        (#127 D5; #281 D15).
 
         There used to be a fixed 300 s budget over the whole batch. It could
-        only ever fire when every individual chunk was healthy — a hung
+        only ever fire when every individual request was healthy — a hung
         provider trips the 30 s `wait_for` long before it — so the one thing it
         actually caught was a note with more chunks than 300 s of normal
         latency covers. Such a note timed out, was never certified, and was
         re-selected on the next pass: a permanent 300 s burn per tick, under
         `index_pass_lock`, that could never complete. A *proportional* budget
         was rejected in review for re-introducing the same boundary one size
-        class up — chunks that each answer just under 30 s exhaust any
-        per-chunk allowance once loop overhead is counted.
+        class up.
 
-        Liveness is unaffected: a provider that stops responding still fails in
-        ≤ 30 s. The cost is that a giant note holds the pass for 30 s × chunks
-        in the worst case, once, and the pause flag is honoured at the next
-        note boundary as it always was. `OpenAIProvider` is untouched — it
-        batches natively and never had this defect.
+        The batch size is **fixed** (`OLLAMA_EMBED_BATCH_SIZE`), never derived
+        from the note, for the same reason: a per-note or proportional batch
+        makes one request's answer time grow with the note and reintroduces
+        the size class D5 removed. With a fixed size, the 30 s bound covers the
+        same amount of work on a two-chunk note and on a thousand-chunk one.
+
+        Liveness is unaffected: a provider that stops responding still fails
+        in ≤ 30 s. `OpenAIProvider` keeps its native 96-input batches.
         """
+        size = settings.ollama_embed_batch_size
         results: list[list[float]] = []
-        for t in texts:
-            results.append(await asyncio.wait_for(self.embed_one(t), timeout=30.0))
+        for start in range(0, len(texts), size):
+            results.extend(
+                await asyncio.wait_for(
+                    self._embed_inputs(texts[start : start + size]),
+                    timeout=OLLAMA_REQUEST_TIMEOUT_SECONDS,
+                )
+            )
         return results
 
 
@@ -611,49 +712,55 @@ class OpenAIProvider:
         }
 
         last_exc: Exception | None = None
-        async with embedding_http_client(60.0) as client:
-            for attempt in range(1, self.MAX_ATTEMPTS + 1):
-                try:
-                    response = await client.post(url, headers=headers, json=payload)
-                except httpx.HTTPError as e:
-                    last_exc = e
-                    if attempt >= self.MAX_ATTEMPTS:
-                        raise
-                    await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
-                    continue
-
-                status = response.status_code
-                if status == 200:
-                    data = response.json()
-                    rows = sorted(data["data"], key=lambda r: r["index"])
-                    return [r["embedding"] for r in rows]
-
-                # Decided **before** `retryable`, deliberately: an input
-                # the provider will not accept fails identically on every
-                # attempt, so retrying it would turn one refusal into three
-                # provider round trips and three times the latency before the
-                # caller hears the one thing it can act on. No status in
-                # `_INPUT_LIMIT_STATUSES` is retryable today — this ordering is
-                # what keeps that true if one ever becomes so.
-                reason = _input_limit_reason(
-                    response, codes=_OPENAI_INPUT_LIMIT_CODES
+        # The shared client (D14) outlives this call, so no `async with`.
+        client = _openai_client()
+        for attempt in range(1, self.MAX_ATTEMPTS + 1):
+            try:
+                response = await client.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=OPENAI_REQUEST_TIMEOUT_SECONDS,
                 )
-                if reason is not None:
-                    raise refusals.ProviderInputTooLarge(reason, provider="openai")
+            except httpx.HTTPError as e:
+                last_exc = e
+                if attempt >= self.MAX_ATTEMPTS:
+                    raise
+                await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
+                continue
 
-                retryable = status == 429 or 500 <= status < 600
-                if retryable and attempt < self.MAX_ATTEMPTS:
-                    logger.warning(
-                        "OpenAI embeddings %d on attempt %d/%d, retrying",
-                        status,
-                        attempt,
-                        self.MAX_ATTEMPTS,
-                    )
-                    await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
-                    continue
+            status = response.status_code
+            if status == 200:
+                data = response.json()
+                rows = sorted(data["data"], key=lambda r: r["index"])
+                return [r["embedding"] for r in rows]
 
-                response.raise_for_status()
-                raise RuntimeError(f"Unexpected OpenAI response: {status}")
+            # Decided **before** `retryable`, deliberately: an input
+            # the provider will not accept fails identically on every
+            # attempt, so retrying it would turn one refusal into three
+            # provider round trips and three times the latency before the
+            # caller hears the one thing it can act on. No status in
+            # `_INPUT_LIMIT_STATUSES` is retryable today — this ordering is
+            # what keeps that true if one ever becomes so.
+            reason = _input_limit_reason(
+                response, codes=_OPENAI_INPUT_LIMIT_CODES
+            )
+            if reason is not None:
+                raise refusals.ProviderInputTooLarge(reason, provider="openai")
+
+            retryable = status == 429 or 500 <= status < 600
+            if retryable and attempt < self.MAX_ATTEMPTS:
+                logger.warning(
+                    "OpenAI embeddings %d on attempt %d/%d, retrying",
+                    status,
+                    attempt,
+                    self.MAX_ATTEMPTS,
+                )
+                await asyncio.sleep(self.BASE_DELAY * (2 ** (attempt - 1)))
+                continue
+
+            response.raise_for_status()
+            raise RuntimeError(f"Unexpected OpenAI response: {status}")
 
         if last_exc:
             raise last_exc
@@ -897,7 +1004,11 @@ class EmbedNoteResult:
             )
 
 
-async def _generation_matches(session: AsyncSession, note: NoteMetadata) -> bool:
+async def _generation_matches(
+    session: AsyncSession,
+    note: NoteMetadata,
+    reused_rows: dict[int, str] | None = None,
+) -> bool:
     """Take the generation lock and re-read the embedding fingerprint under it.
 
     **This is the whole enforcement of D7c**, and it lives here because this is
@@ -938,18 +1049,77 @@ async def _generation_matches(session: AsyncSession, note: NoteMetadata) -> bool
     This matches the startup guard's ABSENT disposition. It does not make an
     otherwise unmigrated schema supported: the other required columns and
     tables must still exist.
+
+    **`reused_rows` (#281, D16)** maps the id of every stored row whose vector
+    `embed_note` is reusing to the chunk text it was looked up with. Reuse was
+    licensed by a lookup that has since committed, so the licence is
+    re-established here, under the lock: the fingerprint must still be
+    *present* and equal (an absent one, or an absent table, licensed nothing),
+    and every reused row must still exist, for this note, with the same text.
+    A reset between the lookup and this point deletes every row, so this
+    check fails and the attempt has the mismatch disposition. It is the one
+    interleaving the fingerprint cannot see: a reset under an unchanged
+    fingerprint (L1). Row ids come from a sequence and `note_embeddings` rows
+    are never updated in place, so a surviving id is the same row, carrying
+    the same vector.
     """
     if not await state_table_exists(session):
         # Before the lock, deliberately: nothing to compare means nothing to
         # serialise against, and `to_regclass` takes no row or table lock, so
         # the ordering rule is untouched either way.
+        if reused_rows:
+            # Reuse required a present fingerprint; the table that held it is
+            # gone, so nothing licenses the reused vectors any more.
+            logger.warning(
+                "Refusing to certify %s: its reused vectors were licensed by a "
+                "stored fingerprint, and the indexer_state table is now absent.",
+                note.file_path,
+            )
+            return False
         return True
     await acquire_generation_lock(session)
     current = embedding_fingerprint()
     verdict = compare_fingerprint(
         await get_state(session, KEY_EMBEDDING_FINGERPRINT), current
     )
+    if verdict.status is FingerprintStatus.ABSENT and reused_rows:
+        logger.warning(
+            "Refusing to certify %s: its reused vectors were licensed by a "
+            "stored fingerprint that is now absent. Nothing was written; a "
+            "later pass will embed it.",
+            note.file_path,
+        )
+        return False
     if verdict.status in (FingerprintStatus.MATCH, FingerprintStatus.ABSENT):
+        if reused_rows:
+            # After the advisory lock, so this SELECT's table lock keeps the
+            # lock-first ordering.
+            surviving = dict(
+                (
+                    await session.execute(
+                        select(NoteEmbedding.id, NoteEmbedding.chunk_text).where(
+                            NoteEmbedding.note_id == note.id,
+                            NoteEmbedding.id.in_(list(reused_rows)),
+                        )
+                    )
+                ).all()
+            )
+            lost = sum(
+                1
+                for row_id, chunk in reused_rows.items()
+                if surviving.get(row_id) != chunk
+            )
+            if lost:
+                logger.warning(
+                    "Refusing to certify %s: %d of the %d stored rows whose "
+                    "vectors it reused no longer exist as they were looked up "
+                    "(a reset or another pass replaced them during this "
+                    "attempt). Nothing was written; a later pass will embed it.",
+                    note.file_path,
+                    lost,
+                    len(reused_rows),
+                )
+                return False
         return True
     logger.error(
         "Refusing to certify %s: the embedding configuration changed under "
@@ -1043,6 +1213,34 @@ async def embed_note(
             truncated=False,
         )
 
+    # ── Chunk-vector reuse: the lookup (#281, D16) ───────────────────────
+    # A stored vector is reused for a chunk whose text is byte-identical to a
+    # stored chunk of this note, and only while the stored embedding
+    # fingerprint is present and equal to this process's. The lookup's
+    # transaction is **ended before any provider I/O on every path** — see
+    # `_lookup_reusable_vectors`. Only the certified path reuses: ending the
+    # transaction is only safe for a caller that has already ended its own,
+    # which both production callers do before they call this function.
+    reusable: dict[str, tuple[int, object]] = {}
+    if certified_hash is not None:
+        reusable = await _lookup_reusable_vectors(session, note.id)
+
+    vectors: list[object | None] = [None] * len(chunks)
+    #: Stored row id → the chunk text it was looked up with. Re-checked under
+    #: the generation lock before anything is certified.
+    reused_rows: dict[int, str] = {}
+    to_send: list[int] = []
+    for i, chunk in enumerate(chunks):
+        hit = reusable.get(chunk)
+        if hit is None:
+            to_send.append(i)
+            continue
+        row_id, stored_vector = hit
+        vectors[i] = stored_vector
+        reused_rows[row_id] = chunk
+    reusable.clear()
+    sent = [chunks[i] for i in to_send]
+
     # ── The accounting boundary, and it is *here* ────────────────────────
     # The caller used to account for the provider call from the returned
     # `chunks_submitted`, which is correct for every path that returns — and
@@ -1061,64 +1259,81 @@ async def embed_note(
     # failure below, the cardinality refusal, the generation mismatch, the
     # successful embed, and every exception that escapes this function.
     # `CERTIFIED_EMPTY` never reaches it, because it makes no provider call —
-    # which is the same rule stated once rather than reconstructed by the
-    # caller from a field on a result it may never receive.
-    if on_provider_call is not None:
-        on_provider_call(len(chunks))
-    try:
-        embeddings = await get_embeddings_batch(chunks)
-    except Exception as e:
-        # Swallowed here rather than raised, deliberately: `_reconcile_exclusions`
-        # calls this function too and its declared convergence exception is that
-        # a row whose provider call fails is left unstamped and retried, so a
-        # raise would have to be re-caught there anyway — and a raise makes a
-        # provider blip indistinguishable from a database error at the call
-        # site, which is the conflation the typed outcome exists to remove.
-        # Nothing is written, so the note's previous vectors survive (#11).
-        #
-        # `refusals.ProviderInputTooLarge` lands here with every other provider
-        # exception, deliberately (#194): the indexer is not a caller that can
-        # shorten its input, so there is nobody to translate the refusal for.
-        # The pass record is the ordinary `PROVIDER_FAILED` carrying the class
-        # name, which is the honest one — nothing certified, previous vectors
-        # intact, the note retried next pass. Only the search tools translate
-        # this exception into a caller-facing refusal.
-        logger.warning(f"Failed to embed {note.file_path}: {e}")
-        return EmbedNoteResult(
-            outcome=NoteEmbedOutcome.PROVIDER_FAILED,
-            chunks_submitted=len(chunks),
-            chunks_embedded=0,
-            truncated=truncated,
-            failure=EmbedNoteFailure.capture(e, requested=len(chunks)),
-        )
+    # and neither does a note whose every chunk reused a stored vector (#281):
+    # it is not an attempt and debits no budget, even if it then loses the
+    # generation check. What is debited is the chunks *sent*, not the note's.
+    if sent:
+        if on_provider_call is not None:
+            on_provider_call(len(sent))
+        try:
+            fresh = await get_embeddings_batch(sent)
+        except Exception as e:
+            # Swallowed here rather than raised, deliberately:
+            # `_reconcile_exclusions` calls this function too and its declared
+            # convergence exception is that a row whose provider call fails is
+            # left unstamped and retried, so a raise would have to be re-caught
+            # there anyway — and a raise makes a provider blip
+            # indistinguishable from a database error at the call site, which
+            # is the conflation the typed outcome exists to remove. Nothing is
+            # written, so the note's previous vectors survive (#11).
+            #
+            # `refusals.ProviderInputTooLarge` lands here with every other
+            # provider exception, deliberately (#194): the indexer is not a
+            # caller that can shorten its input, so there is nobody to
+            # translate the refusal for. The pass record is the ordinary
+            # `PROVIDER_FAILED` carrying the class name, which is the honest
+            # one — nothing certified, previous vectors intact, the note
+            # retried next pass. Only the search tools translate this
+            # exception into a caller-facing refusal.
+            logger.warning(f"Failed to embed {note.file_path}: {e}")
+            return EmbedNoteResult(
+                outcome=NoteEmbedOutcome.PROVIDER_FAILED,
+                chunks_submitted=len(sent),
+                chunks_embedded=0,
+                truncated=truncated,
+                failure=EmbedNoteFailure.capture(e, requested=len(sent)),
+            )
 
-    if len(embeddings) != len(chunks):
-        # Cardinality is exact over the *requested* list, which the cap has
-        # already bounded: one vector short of the capped list is still a
-        # refusal.
-        logger.warning(
-            "Embedding provider returned %d vectors for %d chunks in %s",
-            len(embeddings), len(chunks), note.file_path,
-        )
-        return EmbedNoteResult(
-            outcome=NoteEmbedOutcome.PROVIDER_CARDINALITY_MISMATCH,
-            chunks_submitted=len(chunks),
-            chunks_embedded=0,
-            truncated=truncated,
-            failure=EmbedNoteFailure.cardinality(
-                requested=len(chunks), received=len(embeddings)
-            ),
+        if len(fresh) != len(sent):
+            # Cardinality is exact over the chunks *sent* — the capped list
+            # minus the reused ones: one vector short is still a refusal.
+            logger.warning(
+                "Embedding provider returned %d vectors for %d chunks in %s",
+                len(fresh), len(sent), note.file_path,
+            )
+            return EmbedNoteResult(
+                outcome=NoteEmbedOutcome.PROVIDER_CARDINALITY_MISMATCH,
+                chunks_submitted=len(sent),
+                chunks_embedded=0,
+                truncated=truncated,
+                failure=EmbedNoteFailure.cardinality(
+                    requested=len(sent), received=len(fresh)
+                ),
+            )
+        for i, vector in zip(to_send, fresh):
+            vectors[i] = vector
+
+    # Full coverage of the *requested* list, reused and fresh together. True
+    # by construction above; checked because certifying a hole is the one
+    # outcome this function must never produce.
+    missing = sum(1 for v in vectors if v is None)
+    if missing:
+        raise RuntimeError(
+            f"{missing} of {len(chunks)} chunks of {note.file_path} have no "
+            "vector; refusing to certify partial coverage"
         )
 
     # ── The generation interlock (D7c) ───────────────────────────────────
     # After the provider call, before the certification, before this
     # transaction's first row lock. A mismatch certifies nothing, inserts
     # nothing and deletes nothing — the disposition `StaleCertification`
-    # already has — and is neither an embedded note nor a failure.
-    if not await _generation_matches(session, note):
+    # already has — and is neither an embedded note nor a failure. With
+    # reused vectors it also re-establishes, under the lock, that every reused
+    # row still exists as it was looked up (D16).
+    if not await _generation_matches(session, note, reused_rows):
         return EmbedNoteResult(
             outcome=NoteEmbedOutcome.GENERATION_MISMATCH,
-            chunks_submitted=len(chunks),
+            chunks_submitted=len(sent),
             chunks_embedded=0,
             truncated=truncated,
         )
@@ -1136,12 +1351,13 @@ async def embed_note(
 
     # Only delete the old embeddings once new ones are in hand. If the provider
     # call above had failed, deleting first would let embed_vault commit the
-    # DELETE and drop good vectors (issue #11).
+    # DELETE and drop good vectors (issue #11). Every row — reused and fresh —
+    # is deleted and re-inserted in document order: no partial row surgery.
     await session.execute(
         delete(NoteEmbedding).where(NoteEmbedding.note_id == note.id)
     )
 
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+    for i, (chunk, embedding) in enumerate(zip(chunks, vectors)):
         session.add(NoteEmbedding(
             note_id=note.id,
             chunk_index=i,
@@ -1154,10 +1370,63 @@ async def embed_note(
         note.embedded_content_hash = note.content_hash
     return EmbedNoteResult(
         outcome=NoteEmbedOutcome.EMBEDDED,
-        chunks_submitted=len(chunks),
+        chunks_submitted=len(sent),
         chunks_embedded=len(chunks),
         truncated=truncated,
     )
+
+
+async def _lookup_reusable_vectors(
+    session: AsyncSession, note_id: int
+) -> dict[str, tuple[int, object]]:
+    """This note's stored vectors that may be reused, keyed by exact chunk text.
+
+    Empty — reuse disabled — unless the stored embedding fingerprint is
+    **present** and equal to `embedding_fingerprint()`. An absent fingerprint
+    claims nothing about the stored rows, an absent state table the same, and
+    a differing or unreadable one says they were built under something else.
+
+    **The transaction is ended before this returns, on every path.** A
+    lookup that held `AccessShareLock` on `note_embeddings` across the
+    provider call would close the cycle #206 documents against a reset, which
+    takes the generation lock and then needs that table exclusively. The
+    lookup only reads, so the success path commits; an exception rolls back
+    and propagates, which is the disposition any other database error in the
+    pass has.
+    """
+    try:
+        found: dict[str, tuple[int, object]] = {}
+        if await state_table_exists(session):
+            verdict = compare_fingerprint(
+                await get_state(session, KEY_EMBEDDING_FINGERPRINT),
+                embedding_fingerprint(),
+            )
+            if verdict.status is FingerprintStatus.MATCH:
+                rows = (
+                    await session.execute(
+                        select(
+                            NoteEmbedding.id,
+                            NoteEmbedding.chunk_text,
+                            NoteEmbedding.embedding,
+                        )
+                        .where(NoteEmbedding.note_id == note_id)
+                        .order_by(NoteEmbedding.chunk_index, NoteEmbedding.id)
+                    )
+                ).all()
+                for row_id, chunk, vector in rows:
+                    if chunk is None or vector is None:
+                        continue
+                    # First occurrence wins; a duplicate text has one vector
+                    # per (model, text), so either would do.
+                    found.setdefault(chunk, (row_id, vector))
+    except BaseException:
+        try:
+            await session.rollback()
+        except Exception:  # noqa: BLE001 - the original error is the one to raise
+            logger.debug("Rollback after a failed reuse lookup failed", exc_info=True)
+        raise
+    await session.commit()
+    return found
 
 
 async def semantic_search(

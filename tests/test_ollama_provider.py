@@ -52,7 +52,9 @@ async def test_embed_one_pins_model_with_int_keep_alive(ollama_settings, monkeyp
     # so this asserts the integer form Ollama requires.
     assert body["keep_alive"] == -1
     assert body["model"] == "bge-m3"
-    assert body["input"] == "hello"
+    # A one-element array (#281, D15): the query path sends the request
+    # shape the batch sends.
+    assert body["input"] == ["hello"]
 
 
 @pytest.mark.asyncio

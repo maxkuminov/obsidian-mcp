@@ -212,35 +212,35 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 ## 5. Slice S5 — provider transport, batching, chunk reuse (#281), branch `perf-s5-provider`, after #284 and S3 merge
 
-- [ ] 5.1 `embeddings.py`: add one shared client per provider, **built only by calling `transport_security.embedding_http_client(timeout)`** (D14).
+- [x] 5.1 `embeddings.py`: add one shared client per provider, **built only by calling `transport_security.embedding_http_client(timeout)`** (D14).
   - Create it lazily. Key it to the running loop, and rebuild it if the loop changed.
   - Pass per-request `timeout=` on each call: 30 s for Ollama, 60 s for OpenAI.
   - Add `close_provider_client()`.
   - `tests/test_internal_transport_http_clients.py`'s AST sweep must stay green, with no new exemption.
-- [ ] 5.2 `main.py` lifespan: in shutdown, `await close_provider_client()` after the indexer task is cancelled and before the engine is disposed.
-- [ ] 5.3 `OllamaProvider.embed_batch` (D15):
+- [x] 5.2 `main.py` lifespan: in shutdown, `await close_provider_client()` after the indexer task is cancelled and before the engine is disposed.
+- [x] 5.3 `OllamaProvider.embed_batch` (D15):
   - Split into consecutive slices of `settings.ollama_embed_batch_size`.
   - Send one `/api/embed` request per slice with an `input` array, under `asyncio.wait_for(..., 30.0)`.
   - Check cardinality per slice.
   - Add no aggregate deadline.
   - `embed_one` sends a one-element array.
   - Keep the input-limit translation.
-- [ ] 5.4 `config.py` and `.env.example`: add `ollama_embed_batch_size: int = Field(16, ge=1, le=256)`, noting that `1` gives the pre-change request shape.
-- [ ] 5.5 `embed_note` reuse (D16):
+- [x] 5.4 `config.py` and `.env.example`: add `ollama_embed_batch_size: int = Field(16, ge=1, le=256)`, noting that `1` gives the pre-change request shape.
+- [x] 5.5 `embed_note` reuse (D16):
   - The lookup of `(id, chunk_text, embedding)` and of the stored fingerprint runs in a read-only transaction that is **committed before the provider call on every path**.
   - Reuse only when the fingerprint is present and equal.
   - Send only the new texts, and check cardinality over that subset. Certify only on full coverage of the requested list.
   - `on_provider_call(len(subset))`, and nothing at all when the subset is empty. A `GENERATION_MISMATCH` counts as an attempt only if a provider call was issued (the MODIFIED interlock requirement).
   - Under `_generation_matches`, verify that every reused row id still exists with the same text. If not, return `GENERATION_MISMATCH`.
   - Then certify, delete and reinsert all rows in order, as today.
-- [ ] 5.6 `tests/test_perf_provider_batching.py`:
+- [x] 5.6 `tests/test_perf_provider_batching.py`:
   - 40 chunks at batch 16 → three requests of 16, 16 and 8, in order.
   - A short response is refused.
   - A hung request fails at 30 s, and so does the next slice.
   - Exactly one client is built per loop.
   - The client is closed at shutdown.
   - The factory's `trust_env=False` and `follow_redirects=False` properties are observed on the shared instance.
-- [ ] 5.7 `tests/integration/test_perf_chunk_reuse_pg.py` (real Postgres):
+- [x] 5.7 `tests/integration/test_perf_chunk_reuse_pg.py` (real Postgres):
   - An append-only edit sends only the new tail chunk to a counting provider, and the result equals a from-scratch embed, apart from the reused vectors themselves.
   - With the fingerprint absent, nothing is reused.
   - With a fingerprint mismatch, nothing is reused and nothing is certified.
@@ -248,7 +248,7 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - A metadata-only edit that yields identical chunks makes no provider call, certifies, and leaves `attempted` unchanged.
   - **All-reuse reset race.** Every chunk is reusable, and a reset deletes the rows between the lookup and the under-lock check. The outcome is `GENERATION_MISMATCH`, nothing is written, and `attempted` is unchanged.
   - The budget is debited by the subset only.
-- [ ] 5.8 Docs, `indexing-and-embeddings.md`:
+- [x] 5.8 Docs, `indexing-and-embeddings.md`:
   - The "Embedding providers" section: the shared client through the factory, and batching.
   - Rewrite the #127 D5 bullet for per-request batches: why a fixed size keeps the bound constant.
   - A "Chunk-vector reuse" subsection, covering D16 and L6.
