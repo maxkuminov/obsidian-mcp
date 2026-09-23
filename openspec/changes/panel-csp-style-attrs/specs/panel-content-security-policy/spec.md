@@ -73,4 +73,8 @@ No template under `src/control_panel/templates/` SHALL contain a `style` attribu
 
 #### Scenario: The panel looks the same after the conversion
 - **WHEN** each panel, auth and consent page is rendered from the same seeded data before and after the conversion, in both themes, at desktop and mobile widths
-- **THEN** the computed values of the compared style properties SHALL be identical for every element, except entries on a recorded allow-list, each with its reason
+- **THEN** every element's bounding box, and the computed values of the compared style properties (including every longhand of every migrated declaration), SHALL be identical, except for entries on a recorded allow-list, each with its reason
+
+#### Scenario: The look-the-same comparison can fail
+- **WHEN** the comparison is run against a copy of the converted tree from which the `max-width` that replaced `reembed_confirm.html`'s inline style has been removed
+- **THEN** it SHALL report that page as different at desktop width
