@@ -462,6 +462,22 @@ def _log_panel_csp_mode() -> None:
         )
 
 
+def _log_unknown_arguments_mode() -> None:
+    """Warn once, at startup, when undeclared tool arguments are ignored (#295).
+
+    `MCP_REJECT_UNKNOWN_ARGUMENTS=false` is the rollback for a client found to
+    send extras. While it is in force a misspelled filter silently returns
+    unfiltered results again, so — like a `PANEL_CSP` rollback — it is logged
+    at WARNING, where a forgotten rollback is seen.
+    """
+    if not settings.mcp_reject_unknown_arguments:
+        logging.getLogger(__name__).warning(
+            "MCP tools accept unknown arguments "
+            "(MCP_REJECT_UNKNOWN_ARGUMENTS = false): undeclared arguments are "
+            "silently ignored and input schemas do not forbid them"
+        )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # First, before any guard can fail: the panel's health page reads this
@@ -471,6 +487,7 @@ async def lifespan(app: FastAPI):
     # process-lifetime only, no schema — see `src/services/error_log.py`.
     error_log.attach()
     _log_panel_csp_mode()
+    _log_unknown_arguments_mode()
     concurrency_controller = concurrency.reset_controller(settings)
     # Wrapped so the suppressor's outstanding counts are flushed on **every**
     # exit path, the sandbox-mode early return included. A window still holding

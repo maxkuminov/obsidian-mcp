@@ -1043,6 +1043,7 @@ to multi-user later resumes where you left off without re-bootstrapping
 | `MCP_CONCURRENCY_AUTH` | `2` | Authentication database-session ceiling. Released before response delivery or downstream work. |
 | `MCP_CONCURRENCY_WRITERS` | `1` | Usage-log writer ceiling; includes fallback inserts. Defaults: 64 pending writers and a 0.25-second enforce-mode wait. |
 | `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** API key receives when the caller does not say otherwise. Existing keys are untouched; an explicit null (or a blank panel field) still means unlimited. |
+| `MCP_REJECT_UNKNOWN_ARGUMENTS` | `true` | Refuse a tool call carrying an argument the tool does not declare (a tool error naming it), and publish `additionalProperties: false` on every input schema. `false` restores the SDK's silent ignore — a rollback for a client that sends extras; change it and recreate the container. `false` logs a WARNING at each start. |
 | `MCP_SANDBOX_MODE` | `false` | Registry-eval only. Skips DB, indexer, embedding provider, and `/mcp` auth so introspection works without external deps. Do not enable in production. |
 
 See `.env.example` for the full set with comments. For first-index
