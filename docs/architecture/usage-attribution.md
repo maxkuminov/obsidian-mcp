@@ -57,6 +57,24 @@ credential and then opens the Usage page to see what it did was shown
   `user_id`". An unresolvable name deliberately clears all three: losing the
   scoping beats losing the row. The broad `except` stays last: usage logging
   must never fail a call that already did its work.
+- **`True` means "committed and visible", not "durable across a server
+  crash" (L2, performance-2026-09 #279).** `_insert_usage` issues
+  `SET LOCAL synchronous_commit = off` as the first statement of its
+  transaction, for the initial insert and the FK-cleared retry alike, so the
+  usage row no longer waits on a WAL flush (~40–50 ms on the HDD-backed
+  server). An asynchronously committed row is visible to every other session
+  at commit, so `write_usage_row` still returns `True` only after a commit a
+  second session can read, and the writer lease, the single FK retry and the
+  #193 coalescer requeue are unchanged. What is weakened is durability across
+  a **PostgreSQL server or host crash**: rows committed in the preceding
+  ~600 ms (`3 × wal_writer_delay`) can be lost. An application crash or
+  restart loses nothing committed, and WAL is flushed in order, so a later
+  synchronous commit (a revocation, say) is never kept while an earlier async
+  row is lost. `SET LOCAL` ends with the transaction; it does not ride the
+  pooled connection into the next checkout
+  (`tests/integration/test_perf_async_commit_pg.py`). The same window applies
+  to the `api_keys.last_used_at` stamp, which is also written at most once per
+  60 s per key now (L5), so the panel's "last used" is accurate to a minute.
 - **It is a snapshot, not a view.** 015's backfill is guarded on
   `actor_kind IS NULL` and so is any re-run. Re-deriving the label from the
   credential's present state would rewrite history on every rename. A row

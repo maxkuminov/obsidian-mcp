@@ -341,6 +341,21 @@ class Settings(BaseSettings):
     vault_path: str = "/obsidian"
     secret_key: str = "changeme"
     index_interval_seconds: int = Field(300, ge=1)
+    # The scan's stat shortcut (#282): skip reading and hashing a note whose
+    # current `(size, mtime_ns, ctime_ns, inode)` equals the tuple recorded for
+    # the bytes that produced its row. Safe on local Linux filesystems (every
+    # bypass is enumerated in docs/architecture/indexing-and-embeddings.md,
+    # "The stat shortcut"). **Set it false for a vault on NFS, CIFS/SMB, any
+    # FUSE mount or FAT/exFAT**: attribute caching can serve a stale stat,
+    # inode numbers can be synthetic, FAT has 2 s mtime granularity and no
+    # real ctime, and a remote server's clock defeats the racy-stat rule. Off,
+    # every pass reads and hashes every file, as before.
+    index_stat_shortcut: bool = True
+    # The backstop that bounds every edit the shortcut can miss: a pass that
+    # reads and hashes everything runs for each scope at process start, from
+    # the panel's Reindex, and once this many hours have elapsed since that
+    # scope's last *successful* one (one that committed with nothing skipped).
+    index_full_hash_interval_hours: int = Field(24, ge=1)
     embedding_model: str = "bge-m3"
     embedding_dimensions: int = Field(1024, ge=1, le=16000)
     # bge-m3 design point. Must stay strictly greater than `chunk_overlap`:

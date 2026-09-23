@@ -27,12 +27,31 @@ told the operator "vault tools error".
   transition was the weaker fix: it forces a full re-embed on reassignment and
   leaves the credential itself unaddressed.
 - **`_vault_root` must stay a pure cache lookup.** What makes that correct is
-  `APIKeyMiddleware` calling `warm_user_vault_cache(session, user_id)` on
-  *every* authenticated MCP request. Do not add a DB query to the gate.
+  `APIKeyMiddleware` refreshing the user's row on *every* authenticated MCP
+  request (since #279 through the credential statement and
+  `apply_user_vault_row`, below). Do not add a DB query to the gate.
 - **The single-user form of that warm is authoritative — it evicts**, and it
   returns the root it read. It used to be a silent no-op for a NULL
   `vault_path`, so a previously cached root survived; the panel's
   `clear_user_vault_cache` only clears the worker that served the POST.
+- **The middleware's warm is folded into the credential read
+  (performance-2026-09 D3, #279).** The API-key lookup outer-joins `users` for
+  `is_active` and `vault_path`, and the OAuth token statement gains the same
+  join beside its `oauth_clients` join. The columns go through
+  `apply_user_vault_row(user_id, is_active, vault_path)` in `vault.py`, which
+  has exactly the single-user warm's write-or-evict rule, and the middleware
+  binds its return value to `current_vault_root` as before. `#66` still holds.
+  Its requirement is a *fresh read per request*, bound to the request so that
+  it outranks the process-global dict. The joined columns are read in the same
+  request, from the same snapshot as the credential, one statement earlier than
+  the separate warm used to run. No revocation contract distinguishes that. The
+  per-request binding and the bulk-warm-cannot-re-admit property are untouched.
+  A missing `users` row outer-joins to NULL and is refused as `inactive_user`
+  with the same body, exactly as `scalar_one_or_none() is not True` did, and an
+  inactive or absent user is now also evicted on that refusal. The API-key path
+  went from two transactions and three SELECTs to one SELECT; OAuth from three
+  statements to one. `warm_user_vault_cache` keeps its signature and its other
+  callers (the indexer's bulk warm, the panel).
 - **`_vault_root` prefers the request's own snapshot over the shared dict, and
   that is the part that fails closed.** `_user_vault_cache` is process-global
   and the indexer's bulk warm is add-only, so a bulk `SELECT` issued *before*
@@ -905,6 +924,12 @@ highest — and never toward discarding, which costs a full re-embed.
   before the next pass, so that is the same frozen answer in a new place, and
   it would give the move path a dependency on embedding configuration it has no
   other reason to know.
+- **The same two statements handle the recorded stat** (#282, migration 026).
+  `move_note` sets the four `stat_*` columns to NULL, so the next pass reads
+  and hashes the moved file rather than trusting a stat recorded for the old
+  path; the indexer's id-preserving move writes the stat of the bytes it just
+  hashed at the new path. See "The stat shortcut" in
+  [indexing and embeddings](indexing-and-embeddings.md).
 
 
 

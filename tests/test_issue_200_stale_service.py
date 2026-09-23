@@ -87,7 +87,7 @@ class _Note:
 
 
 def _row(note, *, text="the note's stored chunk text", distance=0.1):
-    return (_Chunk(note.id, text), note, distance)
+    return _projected_row(_Chunk(note.id, text), note, distance)
 
 
 @pytest.fixture(autouse=True)
@@ -377,3 +377,26 @@ async def test_the_dedupe_keeps_the_best_chunk_and_annotates_it(holder):
     assert len(results) == 1
     assert results[0]["stale"] is True
     assert results[0]["chunk"] is None
+
+
+def _projected_row(chunk, note, distance):
+    """One row of `semantic_search`'s projected select (#280, D6).
+
+    The statement selects columns, not entities, so a row is flat. It carries
+    no `embedding`: similarity comes from the database's distance (D7), and a
+    service that reached for a stored vector would fail here.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        note_id=chunk.note_id,
+        chunk_index=chunk.chunk_index,
+        chunk_text=chunk.chunk_text,
+        file_path=note.file_path,
+        title=note.title,
+        tags=note.tags,
+        content_hash=note.content_hash,
+        embedded_content_hash=note.embedded_content_hash,
+        chunks_truncated=note.chunks_truncated,
+        distance=distance,
+    )

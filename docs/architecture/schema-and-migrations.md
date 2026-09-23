@@ -285,6 +285,52 @@ would leave the validator finding no row for any cookie, i.e. every user locked
 out of the panel. `lock_timeout` / `statement_timeout` are set and `RESET` for
 013's reason.
 
+## 026: `notes_metadata.stat_*`, and why the CHECK is the point (#282)
+
+The index pass skips reading a note when the file's current
+`(size, mtime_ns, ctime_ns, inode)` equals the tuple recorded for the bytes
+that produced the row's `content_hash` (the stat shortcut, see
+[indexing and embeddings](indexing-and-embeddings.md#the-stat-shortcut-282-d10d11)).
+026 adds the four columns — `stat_size`, `stat_mtime_ns`, `stat_ctime_ns`,
+`stat_ino`, all `BIGINT NULL`, no default, no backfill — and the CHECK
+`ck_notes_metadata_stat_all_or_none`.
+
+- **Not `file_size` / `modified_at`.** `modified_at` is `timestamptz`, i.e.
+  microseconds, which rounds away exactly the precision the racy rule reasons
+  about, and both keep a display meaning a comparison key must not be coupled
+  to.
+- **The inode is stored signed** (`ino − 2**64` when `ino ≥ 2**63`): `BIGINT`
+  is signed, and some filesystems issue inode numbers above `2**63`.
+- **NULL is load-bearing**: it means "read and hash this file on the next
+  pass". It is what every pre-existing row reads after 026 (so the first pass
+  after deploy records stats through the unchanged-hash refresh, ~4 k UPDATEs
+  once), what a racy stat is recorded as, and what `move_note` writes. A
+  backfill would have to invent a stat for bytes the migration never read.
+- **The CHECK keeps a half-recorded tuple out**: neither a stat nor its
+  absence. Alembic does not compare CHECK predicates, so the model declares it
+  (last in `NoteMetadata.__table_args__`) and the schema gate asserts it
+  through `pg_constraint` **by definition**, never by name — 013's rule, since
+  a `CHECK (true)` under the right name enforces nothing. The canonical
+  rendering is measured off a scratch TEMP table at migration time (013/019/
+  023's device) and pinned in the gate.
+- **Reconcile, don't adopt.** The stamp-back re-run meets its own columns, so
+  each column is verified — `bigint`, nullable, no default, 026's comment
+  marker — and a same-named column of any other shape is refused by name (an
+  `integer` `stat_ino` would truncate inode numbers into false matches, i.e. a
+  note whose edits are never read). A CHECK carrying 026's name with another
+  definition, more than one CHECK with 026's definition, a `NOT VALID` one, or
+  one without 026's constraint marker is refused likewise.
+- **`downgrade()` drops only marked objects**, each decided on its own marker
+  (023's per-object skip, printed to stdout). Dropping them loses every
+  recorded stat, which is safe: the previous build neither reads nor writes
+  them, and a re-upgrade leaves every row NULL.
+
+`search_path` is pinned and asserted, and `lock_timeout` / `statement_timeout`
+set and `RESET`, for 024's and 025's reasons. The gate's head literal is
+`026`; its 026 cases cover the fresh shape, the chain from 025, no backfill,
+CHECK enforcement, stamp-back idempotence with row data preserved, the
+impostor column and CHECK refusals, and both downgrade directions.
+
 ## Database transport (#184)
 
 Before this change the engine passed no `ssl` argument and `DATABASE_URL`

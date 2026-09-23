@@ -116,7 +116,13 @@ class _Note:
 
 
 def _keyword_row(path):
-    return (_Note(1, path), 0.5)
+    from types import SimpleNamespace
+
+    # `keyword_search` projects four columns (#280, D6), so a row is flat.
+    note = _Note(1, path)
+    return SimpleNamespace(
+        file_path=note.file_path, title=note.title, tags=note.tags, rank=0.5
+    )
 
 
 def _semantic_row(note_id, path):
@@ -124,7 +130,7 @@ def _semantic_row(note_id, path):
         "note_id": note_id, "chunk_index": 0, "embedding": [1.0, 0.0, 0.0],
         "chunk_text": "x",
     })()
-    return (chunk, _Note(note_id, path), 0.1)
+    return _projected_row(chunk, _Note(note_id, path), 0.1)
 
 
 def _related_row(note_id, path, distance=0.1):
@@ -332,7 +338,7 @@ async def test_the_budget_reaches_usage_logs_untruncated_by_the_wrapper(
     assert timing._json_bytes(params["result_paths"]) <= timing.MAX_RESULT_PATHS_BYTES
     # And nothing shortened the individual paths: a cut path is a path to a
     # note that does not exist.
-    assert all(p in [r[0].file_path for r in rows] for p in params["result_paths"])
+    assert all(p in [r.file_path for r in rows] for p in params["result_paths"])
 
 
 @pytest.mark.asyncio
@@ -508,3 +514,26 @@ async def test_a_direct_service_call_outside_a_tracked_tool_records_nothing():
     assert await semantic_search(_Session([[]]), "needle", limit=5) == []
     assert await full_text_search(_Session([[]]), "needle") == []
     assert timing.current() is None
+
+
+def _projected_row(chunk, note, distance):
+    """One row of `semantic_search`'s projected select (#280, D6).
+
+    The statement selects columns, not entities, so a row is flat. It carries
+    no `embedding`: similarity comes from the database's distance (D7), and a
+    service that reached for a stored vector would fail here.
+    """
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        note_id=chunk.note_id,
+        chunk_index=chunk.chunk_index,
+        chunk_text=chunk.chunk_text,
+        file_path=note.file_path,
+        title=note.title,
+        tags=note.tags,
+        content_hash=note.content_hash,
+        embedded_content_hash=note.embedded_content_hash,
+        chunks_truncated=note.chunks_truncated,
+        distance=distance,
+    )

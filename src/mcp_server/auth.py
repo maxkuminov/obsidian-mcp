@@ -2,9 +2,9 @@ import hashlib
 import logging
 import time
 from contextvars import ContextVar
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, text, update
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -21,9 +21,20 @@ from src.database import async_session
 from src.models.db import APIKey, OAuthClient, OAuthToken, User
 from src.oauth.scope import has_vault_scope, token_has_write
 from src.services import concurrency, rate_limits, security_events
-from src.services.vault import warm_user_vault_cache
+from src.services.vault import apply_user_vault_row
 
 logger = logging.getLogger(__name__)
+
+#: `api_keys.last_used_at` is written at most once per this many seconds per
+#: key (performance-2026-09 D1). A module constant, not a setting: the only
+#: reader is the panel's "last used" display, and display resolution does not
+#: need a knob (L5).
+LAST_USED_AT_RESOLUTION_SECONDS = 60
+
+#: Issued first in the `last_used_at` UPDATE's transaction, and nowhere else in
+#: this module. `SET LOCAL`, so it ends with that transaction; every write that
+#: grants or revokes a credential stays synchronous (D2).
+ASYNC_COMMIT_SQL = "SET LOCAL synchronous_commit = off"
 
 # Context variables for current request's auth state
 current_permission: ContextVar[str] = ContextVar("current_permission", default="read")
@@ -324,13 +335,32 @@ class APIKeyMiddleware:
             key_hash = hash_key(token)
 
             async with async_session() as session:
+                # One statement: the key, and its user's `is_active` and
+                # `vault_path` (performance-2026-09 D3). The user columns
+                # used to cost a second SELECT here and a third inside
+                # `warm_user_vault_cache`, in a second transaction. They
+                # are still read fresh on every request, from the same
+                # snapshot as the credential, and bound to the request
+                # below, so #66's revocation-on-next-request is unchanged.
+                # `outerjoin`: a key whose `users` row is gone yields NULLs,
+                # which the inactive-user check refuses exactly as the
+                # separate `scalar_one_or_none() is not True` did.
                 result = await session.execute(
-                    select(APIKey).where(
+                    select(
+                        APIKey,
+                        User.is_active.label("user_is_active"),
+                        User.vault_path.label("user_vault_path"),
+                    )
+                    .outerjoin(User, User.id == APIKey.user_id)
+                    .where(
                         APIKey.key_hash == key_hash,
                         APIKey.is_active == True,
                     )
                 )
-                api_key = result.scalar_one_or_none()
+                row = result.first()
+                api_key, user_is_active, user_vault_path = (
+                    row if row is not None else (None, None, None)
+                )
 
                 if api_key is None:
                     _emit_auth_failure(request, "invalid_key", token=token)
@@ -365,10 +395,13 @@ class APIKeyMiddleware:
                     return response
 
                 if api_key.user_id is not None:
-                    result = await session.execute(
-                        select(User.is_active).where(User.id == api_key.user_id)
-                    )
-                    if result.scalar_one_or_none() is not True:
+                    if user_is_active is not True:
+                        # The folded read *is* this request's refresh, so an
+                        # inactive or absent user is evicted here as well
+                        # (write-or-evict; the refusal itself is unchanged).
+                        apply_user_vault_row(
+                            api_key.user_id, user_is_active, user_vault_path
+                        )
                         _emit_auth_failure(
                             request,
                             "inactive_user",
@@ -397,13 +430,37 @@ class APIKeyMiddleware:
                     )
                     return response
 
-                # Update last_used_at
-                await session.execute(
-                    update(APIKey).where(APIKey.id == api_key.id).values(
-                        last_used_at=datetime.now(timezone.utc)
+                # `last_used_at` is display-only bookkeeping (the panel's
+                # "last used"), so it is written at most once per
+                # LAST_USED_AT_RESOLUTION_SECONDS per key, and without
+                # waiting on a WAL flush (performance-2026-09 D1/D2, L2/L5).
+                # A fresh stamp issues no statement at all; the read-only
+                # transaction then ends when the session context exits,
+                # before the response. A stale one issues a *conditional*
+                # UPDATE, so two concurrent requests that both saw the old
+                # value advance it once: the second re-evaluates the
+                # predicate under the row lock and matches nothing.
+                # `SET LOCAL` ends with this transaction and cannot reach a
+                # later checkout of the pooled connection; nothing that
+                # grants or revokes is written in it.
+                now = datetime.now(timezone.utc)
+                cutoff = now - timedelta(seconds=LAST_USED_AT_RESOLUTION_SECONDS)
+                last_used = api_key.last_used_at
+                if last_used is None or last_used < cutoff:
+                    await session.execute(text(ASYNC_COMMIT_SQL))
+                    await session.execute(
+                        update(APIKey)
+                        .where(
+                            APIKey.id == api_key.id,
+                            or_(
+                                APIKey.last_used_at.is_(None),
+                                APIKey.last_used_at < cutoff,
+                            ),
+                        )
+                        .values(last_used_at=now)
+                        .execution_options(synchronize_session=False)
                     )
-                )
-                await session.commit()
+                    await session.commit()
 
                 # Store key info in scope for tools to access
                 scope["state"] = scope.get("state", {})
@@ -430,17 +487,21 @@ class APIKeyMiddleware:
                 # quota ceiling follow.
                 current_principal.set(("api_key", api_key.id))
                 # In single-user mode `api_key.user_id` is None so this
-                # is skipped entirely. In multi-user mode, read the user's
-                # `vault_path` now and bind the answer to this request:
-                # it both warms the shared cache (so sync
-                # `_vault_root(user_id)` calls don't hit a cold one) and
-                # gives `_vault_root` a snapshot no other task can
-                # overwrite. A None here means "unassigned", and every
-                # tool call in this request is refused (issue #66).
+                # is skipped entirely. In multi-user mode, apply the user's
+                # `is_active`/`vault_path` read *in the credential statement
+                # above* and bind the answer to this request: it both warms
+                # the shared cache (so sync `_vault_root(user_id)` calls
+                # don't hit a cold one) and gives `_vault_root` a snapshot
+                # no other task can overwrite. A None here means
+                # "unassigned", and every tool call in this request is
+                # refused (issue #66). Same write-or-evict rule as
+                # `warm_user_vault_cache`'s single-user form.
                 if api_key.user_id is not None:
                     current_vault_root.set((
                         api_key.user_id,
-                        await warm_user_vault_cache(session, api_key.user_id),
+                        apply_user_vault_row(
+                            api_key.user_id, user_is_active, user_vault_path
+                        ),
                     ))
         else:
             # OAuth token auth
@@ -458,16 +519,26 @@ class APIKeyMiddleware:
                 # a client row impossible, and if that ever stopped holding
                 # an inner join would silently turn the token into a 401,
                 # which is a different decision than the one made here.
+                #
+                # The token's user rides the same statement too
+                # (performance-2026-09 D3): `is_active` for the refusal
+                # below and `vault_path` for the per-request vault binding,
+                # both read fresh per request. `outerjoin` again: a token
+                # whose `users` row is gone reads NULL and is refused as
+                # inactive, as the former separate SELECT did.
                 result = await session.execute(
                     select(
                         OAuthToken,
                         OAuthClient.user_id.label("client_owner"),
                         OAuthClient.client_name,
+                        User.is_active.label("user_is_active"),
+                        User.vault_path.label("user_vault_path"),
                     )
                     .outerjoin(
                         OAuthClient,
                         OAuthClient.client_id == OAuthToken.client_id,
                     )
+                    .outerjoin(User, User.id == OAuthToken.user_id)
                     .where(
                         OAuthToken.token_hash == token_hash,
                         OAuthToken.token_type == "access",
@@ -475,9 +546,13 @@ class APIKeyMiddleware:
                     )
                 )
                 row = result.first()
-                oauth_token, client_owner, client_name = (
-                    row if row is not None else (None, None, None)
-                )
+                (
+                    oauth_token,
+                    client_owner,
+                    client_name,
+                    user_is_active,
+                    user_vault_path,
+                ) = row if row is not None else (None, None, None, None, None)
 
                 if oauth_token is None:
                     _emit_auth_failure(request, "invalid_key", token=token)
@@ -505,10 +580,13 @@ class APIKeyMiddleware:
                     return response
 
                 if oauth_token.user_id is not None:
-                    result = await session.execute(
-                        select(User.is_active).where(User.id == oauth_token.user_id)
-                    )
-                    if result.scalar_one_or_none() is not True:
+                    if user_is_active is not True:
+                        # The folded read *is* this request's refresh, so an
+                        # inactive or absent user is evicted here as well
+                        # (write-or-evict; the refusal itself is unchanged).
+                        apply_user_vault_row(
+                            oauth_token.user_id, user_is_active, user_vault_path
+                        )
                         _emit_auth_failure(
                             request,
                             "inactive_user",
@@ -605,7 +683,9 @@ class APIKeyMiddleware:
                 if oauth_token.user_id is not None:
                     current_vault_root.set((
                         oauth_token.user_id,
-                        await warm_user_vault_cache(session, oauth_token.user_id),
+                        apply_user_vault_row(
+                            oauth_token.user_id, user_is_active, user_vault_path
+                        ),
                     ))
 
         return None

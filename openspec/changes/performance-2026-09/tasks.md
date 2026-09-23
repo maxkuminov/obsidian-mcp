@@ -55,24 +55,24 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 ## 1. Slice S1 — request-path commits (#279), branch `perf-s1-commits`
 
-- [ ] 1.1 `auth.py` API-key branch: replace the credential SELECT and the separate `User.is_active` SELECT with one statement that outer-joins `users` for `is_active` and `vault_path` (D3). Keep every refusal reason, body and order exactly as it is: invalid, ownerless, inactive user, expired.
-- [ ] 1.2 `auth.py` OAuth branch: add the same `users` outer join to the existing token statement. Remove the second `users` read.
-- [ ] 1.3 `vault.py`: add `apply_user_vault_row(user_id, is_active, vault_path) -> Path | None`, directly below `warm_user_vault_cache`. It must have exactly the single-user warm's write-or-evict semantics. Both auth branches bind its return value to `current_vault_root`. Leave `warm_user_vault_cache` and its other callers unchanged.
-- [ ] 1.4 `auth.py` `last_used_at` (D1):
+- [x] 1.1 `auth.py` API-key branch: replace the credential SELECT and the separate `User.is_active` SELECT with one statement that outer-joins `users` for `is_active` and `vault_path` (D3). Keep every refusal reason, body and order exactly as it is: invalid, ownerless, inactive user, expired.
+- [x] 1.2 `auth.py` OAuth branch: add the same `users` outer join to the existing token statement. Remove the second `users` read.
+- [x] 1.3 `vault.py`: add `apply_user_vault_row(user_id, is_active, vault_path) -> Path | None`, directly below `warm_user_vault_cache`. It must have exactly the single-user warm's write-or-evict semantics. Both auth branches bind its return value to `current_vault_root`. Leave `warm_user_vault_cache` and its other callers unchanged.
+- [x] 1.4 `auth.py` `last_used_at` (D1):
   - Add the module constant `LAST_USED_AT_RESOLUTION_SECONDS = 60`.
   - Skip the statement entirely when the loaded value is within that window.
   - Otherwise issue `SET LOCAL synchronous_commit = off`, then the conditional UPDATE (`last_used_at IS NULL OR last_used_at < :cutoff`), then commit.
   - When the UPDATE is skipped, the transaction must still end before the response. It is read-only, so it costs no flush.
-- [ ] 1.5 `tools.py` `_insert_usage`: issue `SET LOCAL synchronous_commit = off` as the first statement of its transaction, before `session.add`. Change nothing in `write_usage_row` or `_write_usage_row_admitted`.
-- [ ] 1.6 `quotas.py` `admit`: issue `SET LOCAL synchronous_commit = off` before `ADMISSION_SQL`, and again before the prune, which runs in the next transaction. The docstring must state L1 in one paragraph. Keep the fail-closed behaviour and the event.
-- [ ] 1.7 `tests/integration/test_perf_async_commit_pg.py` (real Postgres). After each of the three writes, a fresh checkout of the **same pooled connection** reports `SHOW synchronous_commit` = `on`, so the setting did not leak. The quota's concurrency boundary test is repeated with async commit: exactly N of more than N concurrent calls are admitted. `test_issue_162_quotas_pg.py`, `test_usage_log_fk_recovery.py` and `test_issue_193_tool_exception_pg.py` pass unchanged.
-- [ ] 1.8 `tests/test_perf_auth_bookkeeping.py`, counting statements:
+- [x] 1.5 `tools.py` `_insert_usage`: issue `SET LOCAL synchronous_commit = off` as the first statement of its transaction, before `session.add`. Change nothing in `write_usage_row` or `_write_usage_row_admitted`.
+- [x] 1.6 `quotas.py` `admit`: issue `SET LOCAL synchronous_commit = off` before `ADMISSION_SQL`, and again before the prune, which runs in the next transaction. The docstring must state L1 in one paragraph. Keep the fail-closed behaviour and the event.
+- [x] 1.7 `tests/integration/test_perf_async_commit_pg.py` (real Postgres). After each of the three writes, a fresh checkout of the **same pooled connection** reports `SHOW synchronous_commit` = `on`, so the setting did not leak. The quota's concurrency boundary test is repeated with async commit: exactly N of more than N concurrent calls are admitted. `test_issue_162_quotas_pg.py`, `test_usage_log_fk_recovery.py` and `test_issue_193_tool_exception_pg.py` pass unchanged.
+- [x] 1.8 `tests/test_perf_auth_bookkeeping.py`, counting statements:
   - An API-key request whose `last_used_at` is fresh issues exactly **one** statement.
   - One whose `last_used_at` is stale issues one SELECT, one `SET LOCAL` and one UPDATE.
   - OAuth issues one statement.
   - Revocation still takes effect on the next request (#66), for each of: deactivating the user, clearing `vault_path`, revoking the key, deleting the `users` row, and revoking the OAuth token.
   - The OAuth code exchange, refresh rotation, revocation and transfer-token paths issue **no** `synchronous_commit` statement. The test sweeps them with a spy.
-- [ ] 1.9 Docs, in the same branch:
+- [x] 1.9 Docs, in the same branch:
   - `rate-limits.md`: a paragraph under "Gate order" stating that the order is unchanged and that the quota commits asynchronously (L1).
   - `usage-attribution.md`: the meaning of `True` under async commit (L2).
   - `vault-roots-and-tenancy.md`: the warm is folded into the credential read, with the #66 argument from D3.
@@ -80,39 +80,39 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 ## 2. Slice S2 — read-path projection (#280), branch `perf-s2-projection`
 
-- [ ] 2.1 `models/db.py`: `content_tsvector` gets `deferred=True, deferred_raiseload=True`. Leave `frontmatter` eager, as D5 decided.
-- [ ] 2.2 `search.py`: project `file_path, title, tags, rank`. Keep the `SET LOCAL`, the predicate and the ordering exactly as they are.
-- [ ] 2.3 `embeddings.py` `semantic_search`:
+- [x] 2.1 `models/db.py`: `content_tsvector` gets `deferred=True, deferred_raiseload=True`. Leave `frontmatter` eager, as D5 decided.
+- [x] 2.2 `search.py`: project `file_path, title, tags, rank`. Keep the `SET LOCAL`, the predicate and the ordering exactly as they are.
+- [x] 2.3 `embeddings.py` `semantic_search`:
   - Project D6's columns, which is the `find_related_stmt` shape.
   - Re-sort by `(distance, file_path, chunk_index)`.
   - Set `similarity = 1 - float(distance)`.
   - Remove the NumPy recomputation and the `numpy` import if nothing else in the module uses it.
   - Keep the staleness, truncation and exact-fallback logic byte for byte.
-- [ ] 2.4 `tools.py`: project the columns D6 lists for `list_notes`, `get_recent` and `find_orphans`, and add `file_path ASC` after the existing `modified_at` ordering. `find_orphans` keeps `modified_at DESC NULLS LAST`. Project `get_neighborhood`'s hydration as `id, file_path, title, tags`. Rendering must be unchanged.
-- [ ] 2.5 `tests/test_perf_projection.py`: compile each statement and assert that `content_tsvector`, `embedding` and `frontmatter` are absent from its SELECT list. Also add a raiseload guard: loading `NoteMetadata` and touching `content_tsvector` raises.
-- [ ] 2.6 `tests/integration/test_perf_projection_identity_pg.py`. On the recall corpus plus a keyword corpus, run the **pre-change** implementations (copied into the test as oracles) and the new ones. They must produce the same result set, the same order, byte-equal non-similarity fields, and similarity within 1e-5, across stale, truncated, filtered, unfiltered and exact-fallback cases. The corpus must deliberately include all three permitted tie cases, and the oracle must accept them and reject every other difference. The three cases are: more notes with an identical `modified_at` (and identical `rank`) than the limit, where membership at the cutoff may differ; two notes with an identical `modified_at` that both fit under the limit, whose relative order may differ; and one note with two chunks at exactly equal distance, where the representative chunk may differ. It must also include orphans with NULL `modified_at`, which must stay last. `test_search_recall.py`, `test_keyword_plan.py` and `test_pgvector_search.py` must pass unchanged.
-- [ ] 2.7 Docs:
+- [x] 2.4 `tools.py`: project the columns D6 lists for `list_notes`, `get_recent` and `find_orphans`, and add `file_path ASC` after the existing `modified_at` ordering. `find_orphans` keeps `modified_at DESC NULLS LAST`. Project `get_neighborhood`'s hydration as `id, file_path, title, tags`. Rendering must be unchanged.
+- [x] 2.5 `tests/test_perf_projection.py`: compile each statement and assert that `content_tsvector`, `embedding` and `frontmatter` are absent from its SELECT list. Also add a raiseload guard: loading `NoteMetadata` and touching `content_tsvector` raises.
+- [x] 2.6 `tests/integration/test_perf_projection_identity_pg.py`. On the recall corpus plus a keyword corpus, run the **pre-change** implementations (copied into the test as oracles) and the new ones. They must produce the same result set, the same order, byte-equal non-similarity fields, and similarity within 1e-5, across stale, truncated, filtered, unfiltered and exact-fallback cases. The corpus must deliberately include all three permitted tie cases, and the oracle must accept them and reject every other difference. The three cases are: more notes with an identical `modified_at` (and identical `rank`) than the limit, where membership at the cutoff may differ; two notes with an identical `modified_at` that both fit under the limit, whose relative order may differ; and one note with two chunks at exactly equal distance, where the representative chunk may differ. It must also include orphans with NULL `modified_at`, which must stay last. `test_search_recall.py`, `test_keyword_plan.py` and `test_pgvector_search.py` must pass unchanged.
+- [x] 2.7 Docs:
   - `search.md`: a "Read paths project what they render" section, covering D5–D7 and the definition of identical.
   - `indexing-and-embeddings.md`: strike L10 as resolved.
   - Validate with `make test-integration`.
 
 ## 3. Slice S3 — scan off the loop, stat shortcut, sweep gate (#278, #282), branch `perf-s3-scan`
 
-- [ ] 3.1 `alembic/versions/026_note_stat_columns.py` (`down_revision = "025"`). House shape:
+- [x] 3.1 `alembic/versions/026_note_stat_columns.py` (`down_revision = "025"`). House shape:
   - A module-level `MARKER` is stamped as a column comment on each of the four columns. Mirror it in `models/db.py`.
   - Add `stat_size`, `stat_mtime_ns`, `stat_ctime_ns`, `stat_ino`, all `BIGINT NULL`, and the CHECK `ck_notes_metadata_stat_all_or_none`, resolved through `pg_constraint` and never by name.
   - It is metadata-only: no backfill, no default.
   - Pin `search_path`, and set and reset `lock_timeout`/`statement_timeout`, as 024 does.
   - `downgrade()` drops only marked columns.
   - Reconcile, don't adopt: a pre-existing column of the same name and a different shape is refused, and the refusal names it.
-- [ ] 3.2 `models/db.py`: add the four columns and the CHECK, appended last in `NoteMetadata.__table_args__`.
-- [ ] 3.3 `indexer.py`: add `_scan_vault(...)` (D8), which runs in `asyncio.to_thread`.
+- [x] 3.2 `models/db.py`: add the four columns and the CHECK, appended last in `NoteMetadata.__table_args__`.
+- [x] 3.3 `indexer.py`: add `_scan_vault(...)` (D8), which runs in `asyncio.to_thread`.
   - It performs the walk, the shortcut stat, the read, `fstat`-before-read, and the SHA-256.
   - Retain a body only where D8 says so.
   - A `threading.Event` checked between files provides stop-on-cancel.
   - Record the racy-stat decision (D10), with `STAT_RACY_WINDOW_NS = 2_000_000_000`, measured against `t_start = time.time_ns()` taken immediately **before** the pre-read `fstat`, not after the read. A future timestamp is also racy.
   - Convert `stat_ino` to signed 64-bit.
-- [ ] 3.4 `indexer.py` `_index_vault_pinned` restructure (D9):
+- [x] 3.4 `indexer.py` `_index_vault_pinned` restructure (D9):
   - The provenance reconcile runs first, as today.
   - The pre-walk snapshot is read in its own session and **committed**.
   - Then comes `_scan_vault`.
@@ -122,30 +122,30 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - Carry the new path's stat on the id-preserving move.
   - Carry the stat on the upsert (insert values and `on_conflict` set).
   - Keep the single commit.
-- [ ] 3.5 `indexer.py` backstop (D12): add `_last_full_hash[scope]`, which is monotonic and in memory. It is set **only when a full-hash scan pass for that scope commits with an empty `skips` list** (every discovered file read and hashed). An aborted, refused or cancelled full-hash pass, or one that commits with any skipped path, leaves the scope due. Test: a committed full-hash pass containing one unreadable file leaves the scope due, and the next pass is a full-hash pass, so the next pass is again a full-hash pass. The first pass for a scope after process start is a full-hash pass, and so is every pass once `INDEX_FULL_HASH_INTERVAL_HOURS` have elapsed since the last successful one. `control_panel/routes.py`'s reindex forces one. A full-hash pass also forces the sweep (task 3.7).
-- [ ] 3.6 `indexer.py`: move the embed-path work to `to_thread`. That covers the backlog's `read_note_beneath` + `_content_hash` + `parse_frontmatter`, the sweep probe's read, hash, parse, `clean_for_embedding` and `chunk_text_bounded`, and, in `embeddings.py` `embed_note`, `clean_for_embedding` + `chunk_text_bounded`.
-- [ ] 3.7 `indexer.py` `_reconcile_exclusions` gate (D13):
+- [x] 3.5 `indexer.py` backstop (D12): add `_last_full_hash[scope]`, which is monotonic and in memory. It is set **only when a full-hash scan pass for that scope commits with an empty `skips` list** (every discovered file read and hashed). An aborted, refused or cancelled full-hash pass, or one that commits with any skipped path, leaves the scope due. Test: a committed full-hash pass containing one unreadable file leaves the scope due, and the next pass is a full-hash pass, so the next pass is again a full-hash pass. The first pass for a scope after process start is a full-hash pass, and so is every pass once `INDEX_FULL_HASH_INTERVAL_HOURS` have elapsed since the last successful one. `control_panel/routes.py`'s reindex forces one. A full-hash pass also forces the sweep (task 3.7).
+- [x] 3.6 `indexer.py`: move the embed-path work to `to_thread`. That covers the backlog's `read_note_beneath` + `_content_hash` + `parse_frontmatter`, the sweep probe's read, hash, parse, `clean_for_embedding` and `chunk_text_bounded`, and, in `embeddings.py` `embed_note`, `clean_for_embedding` + `chunk_text_bounded`.
+- [x] 3.7 `indexer.py` `_reconcile_exclusions` gate (D13):
   - Add `_swept[scope]` in memory.
   - Skip the sweep when it equals the current pattern fingerprint and the pass is not a backstop pass.
   - Set it only on a **clean** completion, meaning no pause, no budget stop, no exception, no provider failure, no read failure, no `StaleCertification` and **no hash-mismatch skip**. Only zero-chunk rows do not block it.
   - Clear it on a re-derive, and through `clear_sweep_state()` on the two in-process reset routes (`reset_embeddings`, `trigger_reembed`; see the region table).
-- [ ] 3.8 `tools.py` `move_note`: the `nm_update` `.values(...)` sets the four stat columns to NULL.
-- [ ] 3.9 `config.py` and `.env.example`: add `index_stat_shortcut: bool = True` and `index_full_hash_interval_hours: int = Field(24, ge=1)`, with the D11/L3 guidance for network, FUSE and FAT mounts.
-- [ ] 3.10 `tests/test_perf_scan_offload.py`:
+- [x] 3.8 `tools.py` `move_note`: the `nm_update` `.values(...)` sets the four stat columns to NULL.
+- [x] 3.9 `config.py` and `.env.example`: add `index_stat_shortcut: bool = True` and `index_full_hash_interval_hours: int = Field(24, ge=1)`, with the D11/perf-L3 guidance for network, FUSE and FAT mounts.
+- [x] 3.10 `tests/test_perf_scan_offload.py`:
   - The scan's read and hash execute on a non-main thread, asserted inside the patched read.
   - `parse_frontmatter`, `clean_for_embedding` and `chunk_text_bounded` are dispatched through `to_thread` on all three embed paths.
   - **The /health acceptance criterion:** with the read patched to block for 2 s per file, a concurrent coroutine completes at least one iteration and `/health`, served by the test client, answers while the scan is in progress. This is a binary progress assertion, not a timing bound.
   - Cancellation sets the stop event and returns within one file.
-- [ ] 3.11 `tests/test_perf_stat_shortcut.py`:
+- [x] 3.11 `tests/test_perf_stat_shortcut.py`:
   - Unchanged stat → no read. Changed stat with the same hash → stat refreshed, no upsert. Changed stat with a new hash → upsert.
   - Each of these reads: a NULL stat, a stale extraction marker, a re-derive, a backstop pass, and `INDEX_STAT_SHORTCUT=false`.
   - A racy stat, whether in the future or within 2 s before `t_start`, is recorded NULL.
   - **Slow-read, same-tick rewrite.** Freeze the file timestamps with a fake clock, so the rewrite shares the tick. Patch the read to rewrite already-read bytes at the same size mid-read and then block for more than 2 s. The row's stat must be recorded NULL, and the next pass must index the rewritten bytes.
   - A backstop pass that aborts before committing leaves the scope due: the next pass is again a full-hash pass.
   - A retargeted symlink is re-read.
-  - Same-size in-place rewrite with a forced identical stat (monkeypatched `os.stat`) is missed until the backstop, then picked up. This documents L3.
+  - Same-size in-place rewrite with a forced identical stat (monkeypatched `os.stat`) is missed until the backstop, then picked up. This documents perf-L3.
   - `move_note` NULLs the stat.
-- [ ] 3.12 `tests/integration/test_perf_scan_pg.py` (real Postgres):
+- [x] 3.12 `tests/integration/test_perf_scan_pg.py` (real Postgres):
   - A `move_note` committed between the snapshot and the lock does not prune the moved row (C5), and the next pass settles it.
   - Another process's committed upsert between the snapshot and the lock is re-decided under the lock (C4).
   - No transaction is open during the walk. Assert this via `pg_stat_activity` from a probe connection while the patched scan blocks.
@@ -153,12 +153,12 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - A reset running concurrently with a walk neither deadlocks nor lets old decisions land.
   - The sweep is skipped on a second clean pass, runs again after a provider failure, and runs on a backstop pass.
   - **A→B→A.** An excluded note (content A, certified with zero vectors) has its pattern removed, then a restart. The scan reads A. Before the sweep reaches the note it is saved as B, so the sweep skips it on a hash mismatch. It is restored to A before the next scan. The sweep must not record clean, the next pass must sweep again, and the note must end up embedded. `test_issue_127_exclusion_reconciliation_pg.py` passes with the gate in place: its assertions run on backstop or first passes.
-- [ ] 3.13 `tests/integration/test_schema_check.py`:
+- [x] 3.13 `tests/integration/test_schema_check.py`:
   - Raise `HEAD_REVISION` to `026`.
   - Add 026's marker, drift, downgrade, stamp-back and impostor cases (a same-named column of the wrong type is refused), plus a CHECK case resolved through `pg_constraint`.
   - Keep every earlier case.
-- [ ] 3.14 Docs:
-  - `indexing-and-embeddings.md`: sections for D8, D9 (with C1–C8 verbatim), D10–D13, and L3/L4/L7. Update the "Indexer runs on startup then every 5 minutes, hash-based change detection" bullet, and correct `database.py`'s idle-in-transaction comment. That comment's claim that the pass "holds one transaction … across the whole synchronous walk" stops being true. Coordinate with #284 if it has touched the file.
+- [x] 3.14 Docs:
+  - `indexing-and-embeddings.md`: sections for D8, D9 (with C1–C8 verbatim), D10–D13, and perf-L3/perf-L4/perf-L7. Update the "Indexer runs on startup then every 5 minutes, hash-based change detection" bullet, and correct `database.py`'s idle-in-transaction comment. That comment's claim that the pass "holds one transaction … across the whole synchronous walk" stops being true. Coordinate with #284 if it has touched the file.
   - `schema-and-migrations.md`: a "026" section.
   - Validate with `make test-schema`, then `make test-integration`.
 
@@ -259,7 +259,7 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 - [ ] 6.1 Merge in dependency order: S1 and S2 (any order), then S3, then S4, then S5 once #284 has merged. After each merge, resolve the region seams named above.
 - [ ] 6.2 Check the seams by grepping for production callers of every new export: `apply_user_vault_row`, `_scan_vault`, `vector_index.*`, `close_provider_client`, the two index settings and the batch setting. None may be green-but-unwired.
 - [ ] 6.3 On the merged tree, run once: `make test-schema`, then `make test-integration`, then the offline suite, then `make audit`. These are authoritative; the per-worktree runs are not.
-- [ ] 6.4 Supervisor: update the CLAUDE.md key decisions with one bullet per surface: async bookkeeping commits (L1/L2), the stat shortcut and its backstop (L3), and the `halfvec` index if it shipped.
+- [ ] 6.4 Supervisor: update the CLAUDE.md key decisions with one bullet per surface: async bookkeeping commits (L1/L2), the stat shortcut and its backstop (perf-L3), and the `halfvec` index if it shipped.
 
 ## 7. Verification by non-authors
 

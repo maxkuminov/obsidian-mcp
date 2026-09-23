@@ -163,6 +163,58 @@ async def test_the_pass_locks_before_its_first_row_locking_statement(
     )
 
 
+async def test_the_walk_moved_ahead_but_the_lock_is_still_the_pass_transactions_first(
+    world,
+):
+    """#278, D9: the walk now runs before the generation lock, so the pass has
+    three transactions — provenance (multi-user only), the snapshot, and the
+    mutating one. The ordering rule is about the last: its first lock-taking
+    statement is still the advisory lock (C1), preceded only by the
+    `SET LOCAL` that lifts `statement_timeout` for the wait, and the snapshot's
+    read-only transaction has committed before it begins (C2) — so no table
+    lock is held across the advisory wait."""
+    issued: list[str] = []
+    sync_engine = world["engine_a"].sync_engine
+
+    def _record(conn, cursor, statement, parameters, context, executemany):
+        issued.append(" ".join(statement.split()).lower())
+
+    def _begin(conn):
+        issued.append("<begin>")
+
+    def _commit(conn):
+        issued.append("<commit>")
+
+    event.listen(sync_engine, "before_cursor_execute", _record)
+    event.listen(sync_engine, "begin", _begin)
+    event.listen(sync_engine, "commit", _commit)
+    try:
+        await indexer.index_vault(user_id=None, full_hash=True)
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", _record)
+        event.remove(sync_engine, "begin", _begin)
+        event.remove(sync_engine, "commit", _commit)
+
+    lock_at = next(
+        i for i, sql in enumerate(issued) if "pg_advisory_xact_lock" in sql
+    )
+    begin_at = max(i for i in range(lock_at) if issued[i] == "<begin>")
+    between = issued[begin_at + 1:lock_at]
+    assert all(sql.startswith("set local statement_timeout") for sql in between), (
+        f"the pass transaction ran {between!r} before the generation lock"
+    )
+
+    snapshot_at = next(
+        i for i, sql in enumerate(issued)
+        if sql.startswith("select") and "stat_size" in sql
+        and "from notes_metadata" in sql
+    )
+    assert snapshot_at < begin_at, "the snapshot was read inside the locked transaction"
+    assert "<commit>" in issued[snapshot_at:begin_at], (
+        "the snapshot's transaction was still open when the locked one began"
+    )
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # The interleaving itself
 # ══════════════════════════════════════════════════════════════════════════

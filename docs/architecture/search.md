@@ -85,8 +85,8 @@ quotable as the note's content.
 `!=`.** A note that was never embedded, or whose certification a move cleared,
 holds `NULL`, and under `!=` that yields `NULL`, which a `WHERE` reads as false
 — every never-embedded note would count as *fresh*, the exact inversion of what
-the flag is for. `semantic_search` already hydrates the whole `NoteMetadata`
-entity, so both hashes are in hand and the comparison is done in Python, where
+the flag is for. `semantic_search` projects both hashes (it hydrated the whole
+`NoteMetadata` entity until #280), so they are in hand and the comparison is done in Python, where
 `!= None` **is** that operator; do not "fix" it into an `is not None` guard.
 `find_related_stmt` gained `content_hash`, `embedded_content_hash` and
 `chunks_truncated` as projected columns of a table it already joins — scalar
@@ -194,6 +194,81 @@ docstrings, and the post-deploy exercise sets the state up explicitly — edit a
 note, search *before* the pass and observe the row is **not** marked, then search
 after the pass and observe that it is. Writing the test that way is what keeps
 the residual from being re-described as a guarantee later.
+
+## Read paths project what they render (#280)
+
+Six read statements select an explicit column list instead of whole entities:
+
+| Path | Projected columns |
+| --- | --- |
+| `semantic_search` | `ne.note_id, ne.chunk_index, ne.chunk_text, nm.file_path, nm.title, nm.tags, nm.content_hash, nm.embedded_content_hash, nm.chunks_truncated, distance` (the `find_related_stmt` shape) |
+| `keyword_search` | `nm.file_path, nm.title, nm.tags, rank` |
+| `list_notes` | `file_path, file_size, modified_at` |
+| `get_recent` / `find_orphans` | `file_path, title, tags, modified_at` |
+| `get_neighborhood` hydration | `id, file_path, title, tags` |
+
+None of them ships `notes_metadata.content_tsvector` (the largest TOASTed
+column, which the planner does not cost), `note_embeddings.embedding` or
+`notes_metadata.frontmatter`. `ts_rank_cd` and `@@` still read the tsvector
+*server-side*; what is gone is shipping and hydrating it. **No predicate, no
+`SET LOCAL`, no overfetch and no exact-fallback condition changed.** The
+staleness fields (`content_hash`, `embedded_content_hash`) and
+`chunks_truncated` are still selected wherever they are rendered. A new read
+path should follow the same rule: select the columns it renders.
+
+**`content_tsvector` is deferred with raiseload** (D5):
+`mapped_column(TSVECTOR, deferred=True, deferred_raiseload=True)`. A
+whole-entity `select(NoteMetadata)` (the path lookups in the graph tools, the
+indexer's per-note loads) no longer carries it, and code that reads
+`.content_tsvector` from a loaded entity raises `InvalidRequestError` instead
+of lazy-loading. Under `AsyncSession` a lazy load is an implicit-IO error
+anyway (`MissingGreenlet`); raising names the offending access in a test
+instead. Every writer is SQL text or `insert().values`, which deferral does not
+touch. A reader that genuinely needs the vector selects the column explicitly.
+`frontmatter` was assessed and **left eager**: it is small on the median note,
+filtered in SQL, and deferring it would turn any future entity reader on a
+write path into a runtime error for little gain, because every hot path above
+already projects it away.
+
+**Similarity is `1 − distance`** (D7), as `find_related` already reported it.
+The result order was always the database's distance order, and the old NumPy
+recomputation ran *after* the sort, over vectors fetched only for that. It
+differed from the distance the rows were sorted by only in float error
+(pgvector accumulates in single precision, NumPy in double, ~1e-6). That error
+could make the displayed similarity non-monotone against the displayed order.
+It cannot now. This resolved L10 in [indexing and
+embeddings](indexing-and-embeddings.md).
+
+**Exact ties are deterministic.** `list_notes` and `get_recent` order by
+`modified_at DESC, file_path ASC`. `find_orphans` orders by
+`modified_at DESC NULLS LAST, file_path ASC`, so notes with no modification time
+stay last. `semantic_search`'s in-Python re-sort keys on
+`(distance, file_path, chunk_index)`. `keyword_search` already broke rank ties
+on `file_path`. Before this, an exact tie was resolved by whatever row the sort
+saw first.
+
+**What "identical" means for this change.** The results are the same as the
+pre-change implementation: the same result set, the same order, every field
+other than `similarity` byte-equal, and `similarity` within 1e-5. There are
+exactly three permitted exceptions, and all of them are confined to exact ties
+of the sort key (`modified_at`, `rank` or distance):
+
+1. **membership at a tied cutoff**: when more rows share the boundary key than
+   fit under the limit, which of them are returned may differ;
+2. **order among exact ties**: rows with an equal key may appear in a different
+   relative order, even when all of them fit (L9 in the change);
+3. **the representative chunk among exact distance ties**: when two chunks of
+   one note are exactly equidistant, the kept `chunk_index` and its preview may
+   differ (the lower index now wins).
+
+`tests/integration/test_perf_projection_identity_pg.py` enforces this. It runs
+the pre-change implementations, copied in as oracles, next to the production
+ones on the recall benchmark's corpus plus keyword, link, tie and orphan
+structure. It covers stale, truncated, filtered, unfiltered and exact-fallback
+cases, and plants each of the three tie cases on purpose. Its comparator is
+itself tested to reject every other difference. The offline half,
+`tests/test_perf_projection.py`, compiles each statement and asserts the
+projection and the raiseload mapping.
 
 ## The query length cap (`MAX_SEARCH_QUERY_CHARS`, #194)
 

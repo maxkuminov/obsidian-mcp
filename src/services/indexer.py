@@ -5,8 +5,10 @@ import enum
 import errno
 import fnmatch
 import hashlib
+import json
 import logging
 import os
+import threading
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -1584,6 +1586,357 @@ def read_note_beneath(root_fd: int, rel_path: str) -> tuple[str, os.stat_result]
         os.close(parent_fd)
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# The scan, off the loop, and the stat shortcut (#278, #282)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# The walk, the stat, the read and the SHA-256 used to run on the event loop,
+# inside the pass's locked transaction: a cold pass over ~2,600 notes froze
+# every request — `/health` included — for minutes, and held the generation
+# lock and an open transaction for the whole walk. `_scan_vault` is one
+# synchronous function that `asyncio.to_thread` runs whole, **before** the
+# locked transaction opens (D8, D9); every row decision is still taken under
+# the lock, against rows re-read under it.
+#
+# The stat shortcut (D10): a file whose current `(size, mtime_ns, ctime_ns,
+# inode)` equals the tuple recorded for the bytes that produced its row is not
+# read. The complete list of ways a file can change without changing those four
+# fields, and the bound on each, is in docs/architecture/indexing-and-
+# embeddings.md ("The stat shortcut"); the backstop that bounds all of them is
+# the full-hash pass below.
+
+#: A stat whose modification or change time is within this window before the
+#: read began — or later than it — is never recorded (git's racy-clean rule).
+#: Two seconds covers the coarse kernel clock's lag behind `time.time_ns()` and
+#: FAT's 2 s mtime granularity.
+STAT_RACY_WINDOW_NS = 2_000_000_000
+
+#: `(size, mtime_ns, ctime_ns, ino_signed)`, as stored in `notes_metadata`.
+StatTuple = tuple[int, int, int, int]
+
+
+def _wall_clock_ns() -> int:
+    """The wall clock the racy rule measures against. A seam for the tests."""
+    return time.time_ns()
+
+
+def _stat_follow(parent_fd: int, name: str) -> os.stat_result:
+    """The shortcut's comparison stat: **following** a leaf symlink, as the
+    read does, so a retargeted `.md` symlink presents its new target's inode."""
+    return os.stat(name, dir_fd=parent_fd)
+
+
+def _signed_ino(ino: int) -> int:
+    """`st_ino` reinterpreted as signed 64-bit, which is what `BIGINT` holds."""
+    return ino - 2**64 if ino >= 2**63 else ino
+
+
+def _stat_tuple(st: os.stat_result) -> StatTuple:
+    return (st.st_size, st.st_mtime_ns, st.st_ctime_ns, _signed_ino(st.st_ino))
+
+
+def _recordable_stat(st: os.stat_result, t_start: int) -> StatTuple | None:
+    """The tuple to record for bytes read after `t_start`, or None if racy.
+
+    `t_start` is taken **before** the pre-read `fstat` (Codex spec review r1,
+    MAJOR): measured at hash completion instead, a slow read could launder a
+    timestamp that was fresh when the read began. Any write landing after
+    `t_start` either gets a timestamp in a later tick — a changed stat, so the
+    file is re-read — or shares a tick that is within the window of `t_start`,
+    which is therefore never trusted. A timestamp *later* than `t_start` (a
+    future timestamp, or a write between `t_start` and the `fstat`) is racy by
+    definition.
+    """
+    if st.st_mtime_ns > t_start or st.st_ctime_ns > t_start:
+        return None
+    if max(st.st_mtime_ns, st.st_ctime_ns) >= t_start - STAT_RACY_WINDOW_NS:
+        return None
+    return _stat_tuple(st)
+
+
+def _row_stat(row) -> StatTuple | None:
+    """A `notes_metadata` row's recorded stat, or None. The CHECK makes the
+    four columns all-or-none; a partial tuple is treated as none regardless."""
+    values = (row.stat_size, row.stat_mtime_ns, row.stat_ctime_ns, row.stat_ino)
+    if any(v is None for v in values):
+        return None
+    return tuple(int(v) for v in values)  # type: ignore[return-value]
+
+
+@dataclass(frozen=True)
+class SnapshotRow:
+    """One owner-scoped `notes_metadata` row, as C4 compares it."""
+
+    content_hash: str
+    extraction_version: int
+    stat: StatTuple | None
+
+    @classmethod
+    def of(cls, row) -> "SnapshotRow":
+        return cls(
+            content_hash=row.content_hash,
+            extraction_version=row.extraction_version,
+            stat=_row_stat(row),
+        )
+
+
+@dataclass
+class ScannedFile:
+    """What the scan learned about one discovered note.
+
+    `read` is False when the stat shortcut decided the file was unchanged; its
+    `content_hash` and `stat` are then the snapshot row's. Otherwise
+    `content_hash` is the hash of the bytes read, `stat` is the pre-read
+    `fstat` if it was not racy (else None), and `raw` is retained only where
+    the caller will need the body: the path is absent from the snapshot, its
+    hash differs, its extraction marker is stale, or the pass re-derives.
+    """
+
+    rel: str
+    name: str
+    content_hash: str
+    stat: StatTuple | None
+    read: bool
+    size: int | None = None
+    mtime: float | None = None
+    raw: str | None = None
+
+
+@dataclass
+class ScanResult:
+    files: dict[str, ScannedFile] = field(default_factory=dict)
+    seen: set[str] = field(default_factory=set)
+    skips: list[str] = field(default_factory=list)
+    #: The subset of `skips` whose bytes were **not obtained**: a directory the
+    #: walk could not list, a file whose read raised. These block the
+    #: backstop's clock (D12). A file that was read in full but is not valid
+    #: UTF-8 is in `skips` and not here: its bytes were obtained, it is never
+    #: indexed from them, and re-reading it every tick could not change that
+    #: outcome (a row left from when it still decoded is kept, not pruned, as
+    #: before this change; its stat no longer matches, so every pass re-reads
+    #: it and logs the skip).
+    unverified: list[str] = field(default_factory=list)
+    reads: int = 0
+    shortcut: int = 0
+
+
+class ScanCancelled(RuntimeError):
+    """The scan thread saw its stop event between two files."""
+
+
+def _read_and_hash(
+    parent_fd: int, name: str, rel: str
+) -> tuple[str, str, os.stat_result, StatTuple | None]:
+    """`(raw, content_hash, fstat, recordable_stat)` for one note.
+
+    `t_start` is taken before `read_note_at` opens the file, i.e. before its
+    pre-read `fstat` — strictly earlier than "immediately before the fstat",
+    which can only make more stats racy, never fewer. Called on the scan
+    thread and, for re-processed paths, through `to_thread` under the lock.
+    """
+    t_start = _wall_clock_ns()
+    raw, st = read_note_at(parent_fd, name)
+    return raw, _content_hash(raw), st, _recordable_stat(st, t_start)
+
+
+def _needs_body(
+    rel: str, h: str, snapshot: dict[str, SnapshotRow], re_derive: bool
+) -> bool:
+    row = snapshot.get(rel)
+    return (
+        re_derive
+        or row is None
+        or row.content_hash != h
+        or row.extraction_version != CURRENT_EXTRACTION_VERSION
+    )
+
+
+def _scan_vault(
+    root_fd: int,
+    snapshot: dict[str, SnapshotRow],
+    *,
+    force_read: bool,
+    re_derive: bool,
+    stop: threading.Event,
+) -> ScanResult:
+    """Walk, stat, read and hash the pinned root. **Runs on a worker thread.**
+
+    Synchronous on purpose: the walk's generator is drained here, so its
+    one-descriptor-per-depth property holds and every parent descriptor is used
+    while it is open. It touches no database and takes no lock. `stop` is
+    checked between files; a set event raises `ScanCancelled`, so a cancelled
+    pass waits for at most one file.
+
+    A file is read unless **all** of these hold (D10's eligibility): the
+    shortcut is allowed (`force_read` is False — not a backstop pass, not a
+    re-derive, `INDEX_STAT_SHORTCUT` on), the snapshot has a row for the path
+    with a current extraction marker and a non-NULL stat, and the file's
+    current stat equals it in all four fields.
+    """
+    result = ScanResult()
+    # Walk failures (a directory that could not be listed or opened) are
+    # **unverified**: the files beneath it were never read. Collected apart
+    # and appended to both lists once the walk is drained (a scan that raises
+    # instead is discarded whole).
+    walk_failures: list[str] = []
+    walk = discover_markdown_files_at(root_fd, skips=walk_failures)
+    with contextlib.closing(walk):
+        for found in walk:
+            if stop.is_set():
+                raise ScanCancelled("the index pass was cancelled mid-walk")
+            rel = found.rel
+            result.seen.add(rel)
+            row = snapshot.get(rel)
+            if (
+                not force_read
+                and row is not None
+                and row.stat is not None
+                and row.extraction_version == CURRENT_EXTRACTION_VERSION
+            ):
+                try:
+                    current = _stat_tuple(_stat_follow(found.parent_fd, found.name))
+                except OSError:
+                    current = None
+                if current is not None and current == row.stat:
+                    result.shortcut += 1
+                    result.files[rel] = ScannedFile(
+                        rel=rel,
+                        name=found.name,
+                        content_hash=row.content_hash,
+                        stat=row.stat,
+                        read=False,
+                    )
+                    continue
+            try:
+                raw, h, st, recorded = _read_and_hash(found.parent_fd, found.name, rel)
+            except UnicodeDecodeError:
+                # Bytes read in full; decoded-content-only. A skip (A.7a), not
+                # unverified (D12).
+                logger.warning(f"Skipping non-UTF8 file: {rel}")
+                result.skips.append(f"{rel} (not valid UTF-8)")
+                continue
+            except Exception as e:
+                # Bytes not obtained: unverified, blocks the backstop's clock.
+                logger.warning(f"Failed to read {rel}: {e}")
+                result.skips.append(f"{rel} ({e})")
+                result.unverified.append(f"{rel} ({e})")
+                continue
+            result.reads += 1
+            result.files[rel] = ScannedFile(
+                rel=rel,
+                name=found.name,
+                content_hash=h,
+                stat=recorded,
+                read=True,
+                size=st.st_size,
+                mtime=st.st_mtime,
+                raw=raw if _needs_body(rel, h, snapshot, re_derive) else None,
+            )
+    result.skips.extend(walk_failures)
+    result.unverified.extend(walk_failures)
+    return result
+
+
+def _rescan_one(root_fd: int, rel: str) -> ScannedFile:
+    """Read and hash one path beneath the pinned root, body retained.
+
+    For the paths C4 re-processes under the lock. Always reads: the shortcut
+    is a statement about the snapshot, and the snapshot is exactly what this
+    path's locked row disagrees with.
+    """
+    parent_fd, name = open_beneath(root_fd, rel)
+    try:
+        raw, h, st, recorded = _read_and_hash(parent_fd, name, rel)
+    finally:
+        os.close(parent_fd)
+    return ScannedFile(
+        rel=rel, name=name, content_hash=h, stat=recorded, read=True,
+        size=st.st_size, mtime=st.st_mtime, raw=raw,
+    )
+
+
+async def _run_scan(
+    root_fd: int,
+    snapshot: dict[str, SnapshotRow],
+    *,
+    force_read: bool,
+    re_derive: bool,
+) -> ScanResult:
+    """`_scan_vault` in a worker thread, with stop-on-cancel.
+
+    A thread cannot be cancelled. On `CancelledError` the stop event is set and
+    the thread is awaited — it stops before its next file — and only then is
+    the cancellation re-raised, so the pinned root descriptor the walk reads
+    through is not closed (and its number reused) underneath a live walk.
+    """
+    stop = threading.Event()
+    future = asyncio.ensure_future(
+        asyncio.to_thread(
+            _scan_vault,
+            root_fd,
+            snapshot,
+            force_read=force_read,
+            re_derive=re_derive,
+            stop=stop,
+        )
+    )
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        stop.set()
+        with contextlib.suppress(BaseException):
+            await future
+        raise
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The backstop (D12) and the exclusion-sweep gate (D13), both in memory
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Keyed by scope: the user id in multi-user mode, None in single-user mode.
+# Deliberately process memory, not a table: a restart forgets both, which is
+# exactly what makes the first pass after a start a full-hash pass and the
+# first embed pass after a start a sweeping one.
+
+#: Monotonic time of each scope's last **successful** full-hash pass: one that
+#: committed having read and hashed every discovered file (non-UTF-8 files do
+#: not block; see `_index_vault_pinned`). Absent means due; a forced pass
+#: removes the entry before it starts.
+_last_full_hash: dict[int | None, float] = {}
+
+#: Each scope's exclusion-pattern fingerprint as of its last **clean** sweep.
+_swept: dict[int | None, str] = {}
+
+
+def _full_hash_due(scope: int | None) -> bool:
+    last = _last_full_hash.get(scope)
+    if last is None:
+        return True
+    interval = settings.index_full_hash_interval_hours * 3600
+    return time.monotonic() - last >= interval
+
+
+def exclusion_fingerprint(patterns: list[str] | None) -> str:
+    """SHA-256 of the exclusion patterns, as the sweep gate compares them."""
+    return hashlib.sha256(
+        json.dumps(list(patterns or []), separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def clear_sweep_state(scope: int | None = ..., /) -> None:  # type: ignore[assignment]
+    """Forget the clean-sweep record, so the next embed pass sweeps.
+
+    With no argument, for every scope — what the in-process reset paths call
+    (`reset_embeddings`, `trigger_reembed`), since a reset rewrites every
+    certification. With a scope, for that scope only (a re-derive, a backstop
+    pass).
+    """
+    if scope is ...:
+        _swept.clear()
+    else:
+        _swept.pop(scope, None)
+
+
 async def _reconcile_provenance(
     user_id: int, vault: Path, root_fd: int, log_suffix: str
 ) -> tuple[bool, RootFacts | None]:
@@ -1694,7 +2047,7 @@ async def _reconcile_provenance(
     return True, facts
 
 
-async def index_vault(user_id: int | None = None):
+async def index_vault(user_id: int | None = None, *, full_hash: bool = False):
     """Scan vault, upsert notes_metadata with tsvector, remove deleted files.
 
     Single-user mode (`user_id is None`) keeps the legacy behavior: queries
@@ -1711,6 +2064,14 @@ async def index_vault(user_id: int | None = None):
     the startup pass, the periodic tick and an operator-triggered reindex all
     inherit it.
 
+    **Full-hash (backstop) passes** (#282, D12). The pass reads and hashes
+    every discovered file, ignoring recorded stats, when `full_hash` is passed
+    (the panel's Reindex) or the scope is due: no successful full-hash pass
+    since process start, or none within `INDEX_FULL_HASH_INTERVAL_HOURS`. The
+    decision lives here, not in any one caller, so every entry point inherits
+    it. A backstop pass also forgets the scope's clean-sweep record, so the
+    embed pass that follows runs the exclusion sweep (D13).
+
     Returns `(notes_scanned, notes_indexed)` for the pass recorder (#160):
     every markdown file the walk discovered, and the subset whose row this pass
     wrote — the upserts plus the moves it repaired in place. Callers that do
@@ -1721,24 +2082,84 @@ async def index_vault(user_id: int | None = None):
     provenance-stamped for such a user; the refusal happens before the root is
     resolved.
     """
+    if full_hash:
+        # A forced pass marks the scope due **before** any refusal or
+        # filesystem work (Codex r1). The clock is re-set only by a clean
+        # committed full-hash pass below, so a forced pass that is refused,
+        # aborts or commits with an unverified file leaves the next ordinary
+        # pass a full-hash pass too, instead of falling back to a recent
+        # earlier timestamp and taking stat shortcuts.
+        _last_full_hash.pop(user_id, None)
     _refuse_quarantined_pass(user_id, "index")
     vault = _vault_root(user_id)
     log_suffix = f" (user_id={user_id})" if user_id is not None else ""
-    logger.info(f"Starting vault index scan...{log_suffix}")
+    backstop = full_hash or _full_hash_due(user_id)
+    if backstop:
+        clear_sweep_state(user_id)
+    logger.info(
+        f"Starting vault index scan{' (full hash)' if backstop else ''}..."
+        f"{log_suffix}"
+    )
 
     with pinned_root(vault) as root_fd:
-        return await _index_vault_pinned(user_id, vault, root_fd, log_suffix)
+        return await _index_vault_pinned(
+            user_id, vault, root_fd, log_suffix, backstop=backstop
+        )
+
+
+def _owner_scoped_rows_stmt(user_id: int | None, *, with_id: bool):
+    """The rows C4 compares: path, hash, extraction marker and stat."""
+    columns = [
+        NoteMetadata.file_path,
+        NoteMetadata.content_hash,
+        NoteMetadata.extraction_version,
+        NoteMetadata.stat_size,
+        NoteMetadata.stat_mtime_ns,
+        NoteMetadata.stat_ctime_ns,
+        NoteMetadata.stat_ino,
+    ]
+    if with_id:
+        columns.insert(0, NoteMetadata.id)
+    stmt = select(*columns)
+    if user_id is None:
+        return stmt.where(NoteMetadata.user_id.is_(None))
+    return stmt.where(NoteMetadata.user_id == user_id)
+
+
+def _stat_params(stat: StatTuple | None) -> dict:
+    """The four stat columns for a write: all set, or all NULL."""
+    if stat is None:
+        return {
+            "stat_size": None, "stat_mtime_ns": None,
+            "stat_ctime_ns": None, "stat_ino": None,
+        }
+    size, mtime_ns, ctime_ns, ino = stat
+    return {
+        "stat_size": size, "stat_mtime_ns": mtime_ns,
+        "stat_ctime_ns": ctime_ns, "stat_ino": ino,
+    }
 
 
 async def _index_vault_pinned(
-    user_id: int | None, vault: Path, root_fd: int, log_suffix: str
+    user_id: int | None,
+    vault: Path,
+    root_fd: int,
+    log_suffix: str,
+    *,
+    backstop: bool = True,
 ) -> tuple[int, int]:
+    # C6: provenance is reconciled first, in its own committed session, and
+    # decides `re_derive` before a single file is read.
     re_derive = False
     facts: RootFacts | None = None
     if user_id is not None:
         re_derive, facts = await _reconcile_provenance(
             user_id, vault, root_fd, log_suffix
         )
+    if re_derive:
+        # A re-derive rewrites the scope's rows from a root whose identity
+        # moved; nothing a previous sweep established about them stands.
+        clear_sweep_state(user_id)
 
     # Anything the pass discovered but could not fully process. **A non-empty
     # list makes a re-derive incomplete and withholds the stamp** (A.7a): the
@@ -1747,6 +2168,14 @@ async def _index_vault_pinned(
     # it — the ordinary prune keeps a row whose relative path exists under the
     # new root, which is exactly the row a re-derive exists to replace. The
     # repairs are still performed; only the certification is withheld.
+    #
+    # **It also withholds the backstop's clock** (D12), with one exception: a
+    # file whose bytes were read in full but are not valid UTF-8. The clock
+    # asks "was every discovered file's bytes read and hashed", and such a
+    # file's were; it is never indexed, so no row can go stale from it, and a
+    # full-hash pass every tick could not change that. Every other skip
+    # blocks the clock; each source is classified where it is appended, and
+    # the rule is applied after the commit (`unverified`, `blocking_skips`).
     #
     # **Carve-out: a note whose link extraction was truncated at
     # `MAX_LINKS_PER_NOTE` is NOT a skip** (#203, D4). The claim A.7a makes is
@@ -1761,8 +2190,39 @@ async def _index_vault_pinned(
     # from `get_links` — so it is visible without being fatal.
     skips: list[str] = []
 
+    # ── The snapshot S, in its own committed transaction (C2) ─────────────
+    # A plain SELECT holds `AccessShareLock` until its transaction ends, so a
+    # snapshot held open across the walk would be a table lock held across the
+    # generation lock's wait — the cycle #206 documents. It is read, committed,
+    # and only then is the walk started. It decides nothing on its own: it is
+    # the walk's shortcut input and C4's comparison baseline.
     async with async_session() as session:
-        # ── The generation lock, at the HEAD of this transaction ───────────
+        snapshot_rows = (
+            await session.execute(_owner_scoped_rows_stmt(user_id, with_id=False))
+        ).fetchall()
+        await session.commit()
+    snapshot = {row.file_path: SnapshotRow.of(row) for row in snapshot_rows}
+
+    # ── The walk, off the loop and outside any transaction (D8, D9) ───────
+    # C7: `index_pass_lock` (held by every caller) covers the walk too, so no
+    # two passes of this process interleave. C8: the quarantine refusal ran in
+    # `index_vault` before the root was even resolved.
+    force_read = backstop or re_derive or not settings.index_stat_shortcut
+    scan = await _run_scan(
+        root_fd, snapshot, force_read=force_read, re_derive=re_derive
+    )
+    skips.extend(scan.skips)
+    # Backstop-blocking failures (D12). From the scan: walk failures and read
+    # errors (`ScanResult.unverified`); its non-UTF-8 skips are not in it.
+    unverified: list[str] = list(scan.unverified)
+    seen = scan.seen
+    logger.info(
+        f"Found {len(seen)} markdown files{log_suffix}: {scan.reads} read, "
+        f"{scan.shortcut} unchanged by stat"
+    )
+
+    async with async_session() as session:
+        # ── The generation lock, at the HEAD of this transaction (C1) ──────
         # **Not at the tsvector write, and this is a deadlock regression, not
         # a matter of taste** (D7c3). This pass is one transaction and it takes
         # row locks long before it reaches the keyword vector: the id-preserving
@@ -1783,15 +2243,16 @@ async def _index_vault_pinned(
         # keep it below this line — auditing what the transaction touches, not
         # reasoning backwards from the write that consumes the fingerprint.
         #
-        # `_reconcile_provenance` above is not in scope: it runs in its own
-        # session and its transaction has committed before this one opens.
+        # `_reconcile_provenance` and the snapshot above are not in scope:
+        # each runs in its own session and has committed before this one
+        # opens. The walk is filesystem-only and takes no database lock.
         #
-        # The consequence is accepted and documented (L5b): the pass holds the
-        # lock for its whole transaction — minutes on a large vault — so
-        # `make reset-embeddings` and `make rebuild-tsvectors` *wait* for an
-        # in-flight pass instead of interleaving with it. That is the required
-        # behaviour, and those paths deliberately do not defeat it with a short
-        # `lock_timeout`.
+        # The lock is held for this transaction only — the mutation phase,
+        # seconds — not for the walk, which now runs before it (#278, D9). So
+        # `make reset-embeddings` and `make rebuild-tsvectors` still *wait* for
+        # an in-flight pass (L5b), but only for its writes. That waiting is the
+        # required behaviour, and those paths deliberately do not defeat it
+        # with a short `lock_timeout`.
         #
         # The *unbounded* form, and it is the same argument in the other
         # direction: this pass is on the waiting side whenever a rebuild or a
@@ -1808,32 +2269,74 @@ async def _index_vault_pinned(
         await acquire_generation_lock_unbounded(session)
         await _assert_fts_generation_current(session)
 
-        # Get existing hashes (scoped to this user when set)
-        existing_stmt = select(
-            NoteMetadata.file_path,
-            NoteMetadata.content_hash,
-            NoteMetadata.extraction_version,
-        )
-        if user_id is None:
-            existing_stmt = existing_stmt.where(NoteMetadata.user_id.is_(None))
-        else:
-            existing_stmt = existing_stmt.where(NoteMetadata.user_id == user_id)
-        existing_rows = (await session.execute(existing_stmt)).fetchall()
-        existing = {row.file_path: row.content_hash for row in existing_rows}
+        # ── The locked re-read L (C4) ─────────────────────────────────────
+        # Every decision below is taken against these rows, never against the
+        # snapshot: `existing`, move detection and the prune set all come from
+        # here.
+        locked_rows = (
+            await session.execute(_owner_scoped_rows_stmt(user_id, with_id=True))
+        ).fetchall()
+        locked = {row.file_path: SnapshotRow.of(row) for row in locked_rows}
+        locked_ids = {row.file_path: row.id for row in locked_rows}
+        existing = {p: r.content_hash for p, r in locked.items()}
         # Kept beside `existing` rather than folded into it: that dict is the
         # move-detection input, keyed and reverse-keyed by content hash alone.
-        stamped_version = {
-            row.file_path: row.extraction_version for row in existing_rows
-        }
+        stamped_version = {p: r.extraction_version for p, r in locked.items()}
+
+        # C4: a walked path whose locked row differs from its snapshot row in
+        # presence, hash, extraction marker or stat — another process's pass,
+        # a `move_note`, a reset — is **re-processed under the lock**, so the
+        # walk's verdict about it (including a shortcut skip) is never applied
+        # to a row it was not made against. A path the walk already failed to
+        # read stays the skip it is.
+        reprocessed = 0
+        for rel in sorted(seen):
+            if snapshot.get(rel) == locked.get(rel) or rel not in scan.files:
+                continue
+            try:
+                scan.files[rel] = await asyncio.to_thread(_rescan_one, root_fd, rel)
+                reprocessed += 1
+            except UnicodeDecodeError:
+                # C4 re-read, bytes read in full: decoded-content-only, so a
+                # skip that does not block the clock.
+                logger.warning(f"Skipping non-UTF8 file: {rel}")
+                skips.append(f"{rel} (not valid UTF-8)")
+                del scan.files[rel]
+            except Exception as e:
+                # C4 re-read failure, bytes not obtained: blocks the clock.
+                logger.warning(f"Failed to read {rel}: {e}")
+                skips.append(f"{rel} ({e})")
+                unverified.append(f"{rel} ({e})")
+                del scan.files[rel]
+        if reprocessed:
+            logger.info(
+                "Re-read %d path(s) whose row changed between the snapshot "
+                "and the lock%s",
+                reprocessed,
+                log_suffix,
+            )
+
+        # Every skip appended from here on blocks the backstop's clock, none
+        # of them being a decoded-content-only failure: a missing buffered
+        # body (read failure, including a non-UTF-8 re-read, left a row this
+        # pass did not rewrite), a parse failure (bytes hashed but the row not
+        # rewritten, so it can be stale), a C5 deferral under re-derive (a row
+        # the walk could not speak for), the keyword vector's missing body and
+        # the link rebuild's skips (derived rows this pass did not write).
+        downstream_skips_from = len(skips)
 
         # Determine changes
         to_upsert = []
+        # Unchanged notes whose recorded stat is stale or absent (a `touch`, a
+        # no-op save, `move_note`'s NULL, the first pass after 026): the bytes
+        # hash as the row says, so nothing but the stat is written.
+        stat_refreshes: list[dict] = []
         # Notes whose vectors this grammar change invalidates: their marker was
         # stale AND their recognised fence spans differ between the stamped
         # grammar and the current one. `embedded_content_hash` is cleared for
         # exactly these, in the same transaction as the stamp.
         grammar_invalidated: list[str] = []
-        # Body text parsed during this scan, keyed by rel_path. The tsvector
+        # Body text parsed during this pass, keyed by rel_path. The tsvector
         # loop and the link rebuild below both reuse these instead of
         # re-reading from disk — a concurrent delete between the passes would
         # otherwise raise FileNotFoundError and leave the just-committed row's
@@ -1845,111 +2348,134 @@ async def _index_vault_pinned(
         # pass treats every note as changed and therefore holds the whole
         # vault's parsed bodies for the duration of the pass.
         path_to_content: dict[str, str] = {}
-        # The set of discovered relative paths, accumulated as the walk yields
-        # them. Discovery is a generator rather than a dict so the walk can
-        # close each directory once its children are done — one descriptor per
-        # level of depth, not one per file — which means each file must be read
-        # *now*, while its parent descriptor is open.
-        seen: set[str] = set()
-        walk = discover_markdown_files_at(root_fd, skips=skips)
-        with contextlib.closing(walk):
-            for found in walk:
-                rel_path = found.rel
-                seen.add(rel_path)
+        for rel_path, found in scan.files.items():
+            h = found.content_hash
+            # A stale extraction marker makes a note changed even when its
+            # bytes are not: the derived state (links, tags, vectors) came
+            # out of a fence grammar this build no longer uses, and nothing
+            # else on the row can see that.
+            marker_stale = (
+                stamped_version.get(rel_path, CURRENT_EXTRACTION_VERSION)
+                != CURRENT_EXTRACTION_VERSION
+            )
+            # **Content-hash change detection is disabled under a
+            # re-derive**, so every discovered file is parsed and upserted
+            # regardless of its hash — which is also what makes every note
+            # "changed" for the link rebuild below, and therefore what
+            # deletes and re-extracts every one of this user's link rows.
+            if (
+                not re_derive
+                and not marker_stale
+                and rel_path in existing
+                and existing[rel_path] == h
+            ):
+                # No change. The stat refresh (D10) records the stat of the
+                # bytes just hashed — and only of bytes actually read: a
+                # shortcut entry carries the row's own stat back.
+                if found.read and locked[rel_path].stat != found.stat:
+                    stat_refreshes.append({
+                        "id": locked_ids[rel_path],
+                        "path": rel_path,
+                        "hash": h,
+                        **_stat_params(found.stat),
+                    })
+                continue
+
+            if found.raw is None:
+                # Unreachable by construction — the body is retained against
+                # the snapshot, and every path whose locked row differs from
+                # it was re-read with its body. Read it rather than trust that.
                 try:
-                    raw, stat = read_note_at(found.parent_fd, found.name)
-                except UnicodeDecodeError:
-                    logger.warning(f"Skipping non-UTF8 file: {rel_path}")
-                    skips.append(f"{rel_path} (not valid UTF-8)")
-                    continue
+                    found = await asyncio.to_thread(_rescan_one, root_fd, rel_path)
                 except Exception as e:
                     logger.warning(f"Failed to read {rel_path}: {e}")
                     skips.append(f"{rel_path} ({e})")
                     continue
+                h = found.content_hash
+            raw = found.raw
 
-                h = _content_hash(raw)
-                # A stale extraction marker makes a note changed even when its
-                # bytes are not: the derived state (links, tags, vectors) came
-                # out of a fence grammar this build no longer uses, and nothing
-                # else on the row can see that.
-                marker_stale = (
-                    stamped_version.get(rel_path, CURRENT_EXTRACTION_VERSION)
-                    != CURRENT_EXTRACTION_VERSION
+            try:
+                frontmatter, content = await asyncio.to_thread(
+                    parse_frontmatter, raw
                 )
-                # **Content-hash change detection is disabled under a
-                # re-derive**, so every discovered file is parsed and upserted
-                # regardless of its hash — which is also what makes every note
-                # "changed" for the link rebuild below, and therefore what
-                # deletes and re-extracts every one of this user's link rows.
-                if (
-                    not re_derive
-                    and not marker_stale
-                    and rel_path in existing
-                    and existing[rel_path] == h
-                ):
-                    continue  # No change
+                # Off the loop (#180, D3). `extract_tags` is a pure
+                # function of the body that runs regexes over the whole of
+                # it, and this branch runs once per *changed* note — every
+                # note of every user on the pass that follows an extraction
+                # bump. A thread only yields between `re` calls, never
+                # inside one, so this bounds the stall to the longest
+                # single scan step rather than to zero; that step is short
+                # because the grammars are linear.
+                tags = await asyncio.to_thread(extract_tags, content, frontmatter)
+            except Exception as e:
+                logger.warning(f"Failed to parse {rel_path}: {e}")
+                skips.append(f"{rel_path} (parse: {e})")
+                continue
+            path_to_content[rel_path] = content
+            title = _note_title(frontmatter, found.name)
 
-                try:
-                    frontmatter, content = parse_frontmatter(raw)
-                    # Off the loop (#180, D3). `extract_tags` is a pure
-                    # function of the body that runs regexes over the whole of
-                    # it, and this branch runs once per *changed* note — every
-                    # note of every user on the pass that follows an extraction
-                    # bump. A thread only yields between `re` calls, never
-                    # inside one, so this bounds the stall to the longest
-                    # single scan step rather than to zero; that step is short
-                    # because the grammars are linear.
-                    tags = await asyncio.to_thread(extract_tags, content, frontmatter)
-                except Exception as e:
-                    logger.warning(f"Failed to parse {rel_path}: {e}")
-                    skips.append(f"{rel_path} (parse: {e})")
-                    continue
-                path_to_content[rel_path] = content
-                title = _note_title(frontmatter, found.name)
+            # Grammar-attributable embedding invalidation, scoped to notes
+            # whose recognised spans actually moved. Only asked where it
+            # can be the deciding factor: a new path has no vectors, and a
+            # changed hash already invalidates through the ordinary
+            # predicate. Clearing is additive — it never suppresses an
+            # invalidation another rule mandates.
+            #
+            # Off the loop for the same reason `extract_tags` above is: it
+            # runs both versions' whole cleaning function over the body,
+            # and the v0 cleaner is a Python line scanner — which, unlike a
+            # single `re` step, yields the GIL as it goes, so the thread
+            # actually buys concurrency here rather than merely bounding
+            # the stall. The `await` sits last in the chain, so the three
+            # cheap predicates still short-circuit before any dispatch.
+            if (
+                marker_stale
+                and rel_path in existing
+                and existing[rel_path] == h
+                and await asyncio.to_thread(
+                    _grammar_changed_the_embedding_text,
+                    stamped_version[rel_path],
+                    content,
+                )
+            ):
+                grammar_invalidated.append(rel_path)
 
-                # Grammar-attributable embedding invalidation, scoped to notes
-                # whose recognised spans actually moved. Only asked where it
-                # can be the deciding factor: a new path has no vectors, and a
-                # changed hash already invalidates through the ordinary
-                # predicate. Clearing is additive — it never suppresses an
-                # invalidation another rule mandates.
-                #
-                # Off the loop for the same reason `extract_tags` above is: it
-                # runs both versions' whole cleaning function over the body,
-                # and the v0 cleaner is a Python line scanner — which, unlike a
-                # single `re` step, yields the GIL as it goes, so the thread
-                # actually buys concurrency here rather than merely bounding
-                # the stall. The `await` sits last in the chain, so the three
-                # cheap predicates still short-circuit before any dispatch.
-                if (
-                    marker_stale
-                    and rel_path in existing
-                    and existing[rel_path] == h
-                    and await asyncio.to_thread(
-                        _grammar_changed_the_embedding_text,
-                        stamped_version[rel_path],
-                        content,
-                    )
-                ):
-                    grammar_invalidated.append(rel_path)
-
-                to_upsert.append({
-                    "user_id": user_id,
-                    "file_path": rel_path,
-                    "title": title,
-                    "tags": tags,
-                    "frontmatter": _sanitize_frontmatter(frontmatter),
-                    "content_hash": h,
-                    "extraction_version": CURRENT_EXTRACTION_VERSION,
-                    "file_size": stat.st_size,
-                    "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
-                })
-
-        logger.info(f"Found {len(seen)} markdown files{log_suffix}")
+            to_upsert.append({
+                "user_id": user_id,
+                "file_path": rel_path,
+                "title": title,
+                "tags": tags,
+                "frontmatter": _sanitize_frontmatter(frontmatter),
+                "content_hash": h,
+                "extraction_version": CURRENT_EXTRACTION_VERSION,
+                "file_size": found.size,
+                "modified_at": datetime.fromtimestamp(found.mtime, tz=timezone.utc),
+                **_stat_params(found.stat),
+            })
 
         # Compute deleted paths up front so the move-detection block can
         # repair them before the delete/insert pipeline tears them apart.
-        deleted_paths = set(existing.keys()) - seen
+        #
+        # C5: a locked row the walk did not see is pruned (or paired as a
+        # move) **only if it is exactly the row the snapshot saw**. One that
+        # changed since — including one absent from the snapshot, which is
+        # what a `move_note` landing mid-walk looks like — was not seen by
+        # this walk because the walk is older than it, not because its file
+        # is gone. It is deferred to the next pass (perf-L7), and under a
+        # re-derive the deferral is a skip, so A.7a withholds the stamp.
+        deleted_paths: set[str] = set()
+        for p in set(existing.keys()) - seen:
+            if snapshot.get(p) == locked[p]:
+                deleted_paths.add(p)
+                continue
+            logger.info(
+                "Deferring %s to the next pass: its row changed after this "
+                "pass's snapshot, so the walk cannot speak for it%s",
+                p,
+                log_suffix,
+            )
+            if re_derive:
+                skips.append(f"{p} (row changed mid-walk; deferred)")
 
         # ── Move detection ────────────────────────────────────────────────
         # An external move (file dragged in Obsidian) looks like
@@ -2027,7 +2553,11 @@ async def _index_vault_pinned(
                 "SET file_path = :new, title = :title, tags = :tags, "
                 "file_size = :size, modified_at = :mtime, indexed_at = now(), "
                 "extraction_version = :xver, "
-                "embedded_content_hash = NULL "
+                "embedded_content_hash = NULL, "
+                # The new path's stat (D10): the bytes this pass hashed for the
+                # new path are the bytes whose hash identified the move.
+                "stat_size = :stat_size, stat_mtime_ns = :stat_mtime_ns, "
+                "stat_ctime_ns = :stat_ctime_ns, stat_ino = :stat_ino "
                 f"WHERE file_path = :old AND {user_clause}"
             )
             # `tags` is `varchar[]`; a bare `:tags` leaves the driver to guess
@@ -2054,6 +2584,10 @@ async def _index_vault_pinned(
                     "new": new, "old": old, "title": e["title"],
                     "tags": e["tags"], "xver": CURRENT_EXTRACTION_VERSION,
                     "size": e["file_size"], "mtime": e["modified_at"],
+                    "stat_size": e["stat_size"],
+                    "stat_mtime_ns": e["stat_mtime_ns"],
+                    "stat_ctime_ns": e["stat_ctime_ns"],
+                    "stat_ino": e["stat_ino"],
                 }
                 if user_id is not None:
                     params["uid"] = user_id
@@ -2105,11 +2639,39 @@ async def _index_vault_pinned(
                         "extraction_version": stmt.excluded.extraction_version,
                         "file_size": stmt.excluded.file_size,
                         "modified_at": stmt.excluded.modified_at,
+                        # The stat of the bytes whose hash this row now
+                        # carries, or NULL when it was racy (D10).
+                        "stat_size": stmt.excluded.stat_size,
+                        "stat_mtime_ns": stmt.excluded.stat_mtime_ns,
+                        "stat_ctime_ns": stmt.excluded.stat_ctime_ns,
+                        "stat_ino": stmt.excluded.stat_ino,
                         "indexed_at": text("now()"),
                     },
                 )
                 await session.execute(stmt)
             logger.info(f"Upserted {len(to_upsert)} notes")
+
+        # The unchanged-hash stat refresh (D10). Conditional on the row's id,
+        # path **and** hash, so it can only ever record a stat against the row
+        # whose `content_hash` the re-read bytes reproduced — never against a
+        # row another writer changed after the locked re-read. Without it a
+        # touched file would be re-read on every tick. Not an `indexed_at`
+        # bump: nothing the index derives from the note changed.
+        if stat_refreshes:
+            await session.execute(
+                text(
+                    "UPDATE notes_metadata SET stat_size = :stat_size, "
+                    "stat_mtime_ns = :stat_mtime_ns, "
+                    "stat_ctime_ns = :stat_ctime_ns, stat_ino = :stat_ino "
+                    "WHERE id = :id AND file_path = :path "
+                    "AND content_hash = :hash"
+                ),
+                stat_refreshes,
+            )
+            logger.info(
+                f"Refreshed the recorded stat of {len(stat_refreshes)} "
+                f"unchanged note(s){log_suffix}"
+            )
 
         # Grammar-attributable embedding invalidation. A separate statement
         # because the upsert deliberately does NOT carry
@@ -2304,6 +2866,24 @@ async def _index_vault_pinned(
         # later stage cannot leave a new hash paired with stale search data
         # (which would make the next scan incorrectly skip the note).
         await session.commit()
+
+    # The backstop's clock advances only on a full-hash pass that committed
+    # **and read and hashed every discovered file's bytes** (D12). One that
+    # aborted, was refused or cancelled never reaches this line; one that
+    # committed with a blocking skip leaves the scope due, so its next pass is
+    # again a full-hash pass. A non-UTF-8 file does not block (see `skips`).
+    blocking_skips = unverified + skips[downstream_skips_from:]
+    if backstop and not blocking_skips:
+        _last_full_hash[user_id] = time.monotonic()
+    elif backstop:
+        logger.warning(
+            "Full-hash pass%s committed with %d path(s) unread or not fully "
+            "processed: %s; the scope stays due, so its next pass is again a "
+            "full-hash pass.",
+            log_suffix,
+            len(blocking_skips),
+            _format_skips(blocking_skips),
+        )
 
     logger.info(f"Vault index scan complete{log_suffix}")
     # For the run recorder: what the walk saw, and what this pass wrote. The
@@ -2624,6 +3204,23 @@ async def link_backfill_pass(user_id: int | None = None):
             await _link_backfill_pinned(user_id, vault, root_fd, stats)
 
 
+def _read_body_beneath(root_fd: int, rel_path: str) -> str | None:
+    """The parsed body of one note, or None if it cannot be read or decoded.
+    For the link backfill; runs on a worker thread."""
+    try:
+        raw, _stat = read_note_beneath(root_fd, rel_path)
+    except (UnicodeDecodeError, OSError):
+        return None
+    return parse_frontmatter(raw)[1]
+
+
+def _read_body_and_hash(root_fd: int, rel_path: str) -> tuple[str, str]:
+    """`(parsed body, content_hash)` of one note, for the keyword-vector
+    rebuild; runs on a worker thread. Raises what `read_note_beneath` raises."""
+    raw, _stat = read_note_beneath(root_fd, rel_path)
+    return parse_frontmatter(raw)[1], _content_hash(raw)
+
+
 async def _link_backfill_pinned(
     user_id: int | None, vault: Path, root_fd: int, stats: "PassStats | None" = None
 ):
@@ -2686,15 +3283,17 @@ async def _link_backfill_pinned(
             truncated_ids: list[int] = []
             complete_ids: list[int] = []
             for i, row in enumerate(rows, start=1):
-                try:
-                    raw, _stat = read_note_beneath(root_fd, row.file_path)
-                except (UnicodeDecodeError, OSError):
+                # The read and the parse off the loop (#278): this walks the
+                # whole vault. The DB work stays here, in this transaction.
+                content = await asyncio.to_thread(
+                    _read_body_beneath, root_fd, row.file_path
+                )
+                if content is None:
                     continue
                 # Counted as indexed only once its bytes were read: an
                 # unreadable note is scanned and not rebuilt, and the two
                 # numbers differing is exactly how an operator sees that.
                 stats.notes_indexed += 1
-                _, content = parse_frontmatter(raw)
                 links, truncated = await asyncio.to_thread(
                     extract_links_bounded, content, max_links=MAX_LINKS_PER_NOTE
                 )
@@ -3258,8 +3857,13 @@ async def _embed_vault_pinned(
                     skipped_excluded += 1
                     continue
 
+                # The read, the hash and the parse each run off the loop
+                # (#278, D8): a changed large note is seconds of I/O and CPU
+                # that would otherwise freeze every other request.
                 try:
-                    raw, _stat = read_note_beneath(root_fd, row.file_path)
+                    raw, _stat = await asyncio.to_thread(
+                        read_note_beneath, root_fd, row.file_path
+                    )
                 except UnicodeDecodeError:
                     logger.warning(f"Skipping non-UTF8 file: {row.file_path}")
                     continue
@@ -3283,7 +3887,7 @@ async def _embed_vault_pinned(
                 #
                 # Anyone removing this must re-gate `embed_vault` on settled
                 # provenance in the same change.
-                if _content_hash(raw) != row.content_hash:
+                if await asyncio.to_thread(_content_hash, raw) != row.content_hash:
                     logger.info(
                         "Skipping %s: its bytes no longer hash to the indexed "
                         "content_hash, so nothing may be certified against that "
@@ -3293,7 +3897,7 @@ async def _embed_vault_pinned(
                     )
                     continue
 
-                _, content = parse_frontmatter(raw)
+                _, content = await asyncio.to_thread(parse_frontmatter, raw)
 
                 # Get the NoteMetadata object
                 note_result = await session.execute(
@@ -3519,7 +4123,33 @@ async def _reconcile_exclusions(
 
     It draws on the **same per-user budget** as the backlog, since both call
     the provider, and stops at a note boundary exactly as a pause does.
+
+    **Gated, in memory, on a clean completion** (#282, D13). The sweep runs
+    for a scope unless `_swept[scope]` equals the current patterns'
+    fingerprint. That record is written only by a **clean** sweep — every
+    selected row visited with no pause, no budget stop, no exception, no
+    `StaleCertification`, no read failure, no provider failure or generation
+    mismatch, and **no hash-mismatch skip** (the A→B→A edit: a row skipped
+    because its bytes changed can hash-match again before the next scan, and
+    then the backlog never selects it). Zero-chunk rows do not block it. The
+    record is forgotten on every backstop pass (so the sweep runs regardless),
+    on a re-derive, and by the in-process reset paths (`clear_sweep_state`).
+    Once the invariant holds under patterns *P*, every other route to a
+    certification-current row applies the current *P* or clears the stamp, so
+    re-running the sweep every tick only repeats ~16,700 `EXISTS` probes.
     """
+    scope = user_id
+    fingerprint = exclusion_fingerprint(exclude_patterns)
+    if _swept.get(scope) == fingerprint:
+        logger.debug(
+            "Exclusion reconciliation skipped%s: the last sweep under these "
+            "patterns completed cleanly",
+            log_suffix,
+        )
+        return
+    # Falsified by anything that leaves a row unexamined or unrepaired.
+    clean = True
+
     owner_clause = "nm.user_id IS NULL" if user_id is None else "nm.user_id = :uid"
     params: dict = {} if user_id is None else {"uid": user_id}
     rows = (await session.execute(text(f"""
@@ -3540,6 +4170,7 @@ async def _reconcile_exclusions(
     await session.commit()
 
     if not rows:
+        _swept[scope] = fingerprint
         return
 
     removed = 0
@@ -3556,12 +4187,14 @@ async def _reconcile_exclusions(
             logger.info(
                 f"Exclusion reconciliation paused, stopping early{log_suffix}"
             )
+            clean = False
             break
         # Same budget, same boundary. A sweep stopped here behaves exactly as
         # one stopped by the pause: already-repaired rows stay repaired and the
         # next unexhausted pass runs a fresh, idempotent sweep.
         if budget.exhausted():
             budget.stop(log_suffix, "the exclusion-reconciliation sweep")
+            clean = False
             break
 
         excluded = any(
@@ -3597,29 +4230,40 @@ async def _reconcile_exclusions(
 
             # Included, and no vectors. The stamp is either a stale exclusion
             # stamp (repair it) or a genuinely empty note (leave it alone).
+            # Read, hash, parse, clean and chunk each run off the loop (#278,
+            # D8).
             try:
-                raw, _stat = read_note_beneath(root_fd, row.file_path)
+                raw, _stat = await asyncio.to_thread(
+                    read_note_beneath, root_fd, row.file_path
+                )
             except UnicodeDecodeError:
                 logger.warning(
                     "Skipping non-UTF8 file during reconciliation: %s",
                     row.file_path,
                 )
+                clean = False
                 continue
 
             # The same verification the backlog runs, and for the same reason:
             # nothing may be certified against a row whose content the bytes do
             # not describe. A mismatch means the scan has not caught up, so the
-            # ordinary backlog owns this row on a later pass.
-            if _content_hash(raw) != row.content_hash:
+            # ordinary backlog owns this row on a later pass — **if** the scan
+            # sees the change. An edit undone before the next scan (A→B→A)
+            # leaves the row hash-equal and never selected, so a mismatch makes
+            # this sweep unclean and the next pass sweeps again (D13).
+            if await asyncio.to_thread(_content_hash, raw) != row.content_hash:
+                clean = False
                 continue
 
-            _, content = parse_frontmatter(raw)
+            _, content = await asyncio.to_thread(parse_frontmatter, raw)
             # The **bounded** chunker, so "this note produces no chunks" means
             # the same thing here as it does in `embed_note`, and so the probe
             # stops at the first chunk instead of chunking a 10 MiB note to
             # find out it is non-empty.
-            probe_chunks, _probe_truncated = chunk_text_bounded(
-                clean_for_embedding(content),
+            cleaned = await asyncio.to_thread(clean_for_embedding, content)
+            probe_chunks, _probe_truncated = await asyncio.to_thread(
+                chunk_text_bounded,
+                cleaned,
                 chunk_size=settings.chunk_size,
                 overlap=settings.chunk_overlap,
                 max_chunks=MAX_CHUNKS_PER_NOTE,
@@ -3686,19 +4330,23 @@ async def _reconcile_exclusions(
                     "flight. Nothing was written.",
                     row.file_path,
                 )
+                clean = False
                 await session.rollback()
             else:
                 # The sweep's own provider failures ride back on the pass's
                 # accumulator rather than dying in a log line — the whole point
                 # of D9.
                 outcome.record_failure_detail(result.failure)
+                clean = False
                 await session.rollback()
         except StaleCertification as e:
             logger.info("Reconciliation skipped %s: %s", row.file_path, e)
+            clean = False
             await session.rollback()
         except Exception as e:
             # Counted, for the same reason the backlog counts its own: the log
             # line scrolls away and the run row is what survives a redeploy.
+            clean = False
             outcome.record_failure(e)
             logger.warning(
                 "Reconciliation failed for %s: %s", row.file_path, e
@@ -3717,6 +4365,8 @@ async def _reconcile_exclusions(
             "%d re-embedded",
             log_suffix, removed, restored,
         )
+    if clean:
+        _swept[scope] = fingerprint
 
 
 class RebuildSkip(enum.Enum):
@@ -4667,12 +5317,15 @@ async def _rebuild_tsvectors_pinned(
         for _attempt in range(MAX_REBUILD_REREADS + 1):
             stale_reason: str | None = None
             try:
-                raw, _stat = read_note_beneath(root_fd, path)
+                # The read, parse and hash off the loop (#278): the rebuild
+                # walks every row of the scope. The UPDATE stays here.
+                content, got_hash = await asyncio.to_thread(
+                    _read_body_and_hash, root_fd, path
+                )
             except (UnicodeDecodeError, OSError) as exc:
                 stale_reason = f"could not be read at {path!r} ({exc})"
             else:
-                _, content = parse_frontmatter(raw)
-                if _content_hash(raw) != chash:
+                if got_hash != chash:
                     stale_reason = (
                         f"the bytes at {path!r} no longer hash to the "
                         "content_hash the rebuild selected"

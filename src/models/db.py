@@ -321,6 +321,22 @@ _OAUTH_CLIENT_LAST_USED_COLUMN_MARKER = (
     "(025_oauth_client_last_used)"
 )
 
+# Same device, same rule: byte identical to `MARKER` in
+# `alembic/versions/026_note_stat_columns.py`, stamped on each of the four
+# `notes_metadata.stat_*` columns (#282).
+_NOTE_STAT_COLUMN_MARKER = (
+    "stat of the bytes content_hash was computed from (026_note_stat_columns)"
+)
+# The all-or-none CHECK over those four columns. The predicate is the
+# migration's `STAT_PREDICATE`, byte for byte.
+_NOTE_STAT_CHECK_NAME = "ck_notes_metadata_stat_all_or_none"
+_NOTE_STAT_PREDICATE = (
+    "(stat_size IS NULL AND stat_mtime_ns IS NULL "
+    "AND stat_ctime_ns IS NULL AND stat_ino IS NULL) OR "
+    "(stat_size IS NOT NULL AND stat_mtime_ns IS NOT NULL "
+    "AND stat_ctime_ns IS NOT NULL AND stat_ino IS NOT NULL)"
+)
+
 
 class UsageLog(Base):
     __tablename__ = "usage_logs"
@@ -462,9 +478,40 @@ class NoteMetadata(Base):
         server_default=text("false"),
         comment=_CHUNKS_TRUNCATED_COLUMN_MARKER,
     )
-    content_tsvector: Mapped[str | None] = mapped_column(TSVECTOR, nullable=True)
+    # Deferred with raise-on-load (#280, design D5). No read path renders the
+    # tsvector: `keyword_search` uses it only server-side (`@@`, `ts_rank_cd`),
+    # and every writer is SQL text or `insert().values`, which deferral does
+    # not touch. Raise, not lazy-load: under `AsyncSession` a lazy load is an
+    # implicit-IO error anyway, and raising names the offending access in a
+    # test instead of surfacing as `MissingGreenlet` in production. A reader
+    # that genuinely needs it selects the column explicitly.
+    content_tsvector: Mapped[str | None] = mapped_column(
+        TSVECTOR, nullable=True, deferred=True, deferred_raiseload=True
+    )
     file_size: Mapped[int | None] = mapped_column(Integer, nullable=True)
     modified_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # The `(size, mtime_ns, ctime_ns, inode)` of the descriptor whose bytes
+    # produced `content_hash`, taken *before* the read (#282, migration 026).
+    # All NULL or all set (the CHECK below); NULL means "read and hash this
+    # file on the next pass" — a racy stat, a stat never recorded, and every
+    # row `move_note` rewrote. The scan skips a file's read only when all four
+    # equal its current stat; see "The stat shortcut" in
+    # docs/architecture/indexing-and-embeddings.md. Not `file_size` /
+    # `modified_at`, which keep their display meaning and whose microsecond
+    # precision is too coarse to compare. `stat_ino` is the inode
+    # reinterpreted as signed 64-bit.
+    stat_size: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment=_NOTE_STAT_COLUMN_MARKER
+    )
+    stat_mtime_ns: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment=_NOTE_STAT_COLUMN_MARKER
+    )
+    stat_ctime_ns: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment=_NOTE_STAT_COLUMN_MARKER
+    )
+    stat_ino: Mapped[int | None] = mapped_column(
+        BigInteger, nullable=True, comment=_NOTE_STAT_COLUMN_MARKER
+    )
     indexed_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -492,6 +539,9 @@ class NoteMetadata(Base):
         ),
         Index("ix_notes_metadata_tsvector", "content_tsvector", postgresql_using="gin"),
         Index("ix_notes_metadata_tags", "tags", postgresql_using="gin"),
+        # Migration 026. Alembic does not compare CHECK predicates; the schema
+        # gate asserts this one through `pg_constraint`.
+        CheckConstraint(_NOTE_STAT_PREDICATE, name=_NOTE_STAT_CHECK_NAME),
     )
 
 

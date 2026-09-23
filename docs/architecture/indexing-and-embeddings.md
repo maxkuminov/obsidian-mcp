@@ -148,6 +148,9 @@ admitted this hop (plaintext to a non-loopback host).
   sweep repeats per pass), bytes that no longer hash to the row (the backlog
   owns it next pass), and a failed provider call (left unstamped). A pause
   stops it between notes; the next pass runs a fresh, idempotent sweep.
+  **It no longer runs every tick** (#282, D13): it is gated in memory on the
+  patterns' fingerprint plus a *clean* completion — see
+  [the sweep gate](#the-exclusion-sweep-gate-d13).
 - **Both move paths recompute the stem-derived `title`** (#127). It falls back
   to the filename stem, so a rename left `Alpha` on a note called `Beta.md`
   for ever — a move changes no content, so the scan never revisits the row.
@@ -210,7 +213,13 @@ admitted this hop (plaintext to a non-loopback host).
   holding the pass for 30 s × chunks once; the pause is honoured at the next
   note boundary, as always. `embed_note` still refuses to certify partial chunk
   coverage.
-- Indexer runs on startup then every 5 minutes, hash-based change detection.
+- Indexer runs on startup then every 5 minutes. Change detection is by
+  content hash, **with a stat shortcut** (#282): a file whose
+  `(size, mtime_ns, ctime_ns, inode)` equals the tuple recorded for its row's
+  bytes is not read, and a full-hash pass — at process start, from the panel's
+  Reindex, and every `INDEX_FULL_HASH_INTERVAL_HOURS` — reads everything. The
+  walk runs off the event loop and ahead of the generation lock (#278). See
+  [the scan section](#the-scan-off-the-loop-and-ahead-of-the-lock-278-282).
   Each periodic tick ends with `prewarm_search_caches()` **inside**
   `index_pass_lock`: one `get_embedding("warmup")` (Ollama only — a remote API
   has no warm state) and one HNSW probe with a deterministic non-zero unit
@@ -277,7 +286,8 @@ admitted this hop (plaintext to a non-loopback host).
   write-side note cap times the number of changed notes and is unchanged here —
   an accepted residual on #203, recorded rather than quietly conflated with the
   link-row bound this fixed.
-- **Extraction runs off the event loop.** The indexer's changed-path rebuild,
+- **Extraction runs off the event loop.** The scan itself does too since #278
+  — see the section below. The indexer's changed-path rebuild,
   the one-shot backfill and the scan's `extract_tags` all dispatch through
   `asyncio.to_thread`. The honest caveat, which the tests state rather than
   hide: a thread only yields between `re` calls, never inside one, so this
@@ -287,6 +297,236 @@ admitted this hop (plaintext to a non-loopback host).
   it. The observable the tests assert is the dispatch itself — a timing
   assertion against a concurrent request is a flake generator on a shared
   runner.
+
+## The scan, off the loop and ahead of the lock (#278, #282)
+
+A cold pass over the production vault froze the event loop for 235 s — every
+request, `/health` included — because the walk, the stat, the read and the
+SHA-256 ran on the loop, inside the pass's locked transaction. And every idle
+tick re-read and re-hashed every note to learn that none had changed.
+
+### The scan runs in one worker-thread call (D8)
+
+`_scan_vault(root_fd, snapshot, *, force_read, re_derive, stop)` is one
+synchronous function that `asyncio.to_thread` runs whole: the
+`discover_markdown_files_at` walk, the shortcut stat, the read, the pre-read
+`fstat` and the hash. It returns, per discovered path, the hash, the recordable
+stat and — only where the pass will need it (path absent from the snapshot,
+hash differs, stale extraction marker, or a re-derive) — the body; plus the
+`skips` list. The walk's one-descriptor-per-depth property is unchanged
+because the generator is drained inside the thread. `parse_frontmatter`,
+`extract_tags` and the grammar check are dispatched per changed note.
+
+The embed paths offload per note: the backlog's read, hash and parse; the
+exclusion sweep probe's read, hash, parse, `clean_for_embedding` and
+`chunk_text_bounded`; and `embed_note`'s clean and chunk.
+
+**Cancellation.** A thread cannot be cancelled, so the scan checks a
+`threading.Event` between files. `_run_scan` awaits the thread under
+`asyncio.shield`; on `CancelledError` it sets the event, **waits for the
+thread to stop** (at most one file) and only then re-raises — so lifespan
+shutdown waits for one file, not a 177 s walk, and the pinned root descriptor
+is never closed (and its number reused) under a live walk. The honest bound
+from the extraction note applies: SHA-256 and `read()` release the GIL, so the
+loop is free during the I/O-bound walk; a single pathological `re` step is
+still one step.
+
+The acceptance criterion — `/health` answers and a concurrent coroutine makes
+progress while a pass is reading — is `tests/test_perf_scan_offload.py`, as a
+binary progress assertion, not a timing bound.
+
+### The walk moves ahead of the generation lock (D9)
+
+The pass is now: provenance (multi-user, own committed session) → the
+**snapshot** `S` (owner-scoped `file_path, content_hash, extraction_version`
+and the four stat columns, read in its own session and **committed**) → the
+walk → the locked transaction. The constraints, and how each is kept:
+
+- **C1 — advisory before any row or table lock** (D7c3). The pass
+  transaction's first lock-taking statement stays
+  `acquire_generation_lock_unbounded`. Unchanged: the walk takes no database
+  lock at all.
+- **C2 — no table lock held across an advisory wait.** A plain SELECT holds
+  `AccessShareLock` until transaction end ("Discovery SELECTs end their
+  transaction before provider work"). So the pre-walk snapshot —
+  `file_path, content_hash, extraction_version` and the four stat columns,
+  owner-scoped — is read in **its own session and committed before the walk
+  starts**. It is never held open across the walk or the lock wait.
+- **C3 — one commit for one filesystem snapshot.** Every mutation (move
+  UPDATE, upsert, grammar invalidation, prune, link rebuild, tsvector write,
+  stat refresh, provenance stamp) stays in the single locked transaction and
+  commits together, so a failure cannot pair a new hash with stale derived
+  rows. Unchanged.
+- **C4 — decisions are made against the locked state.** Under the lock the
+  pass re-reads the same owner-scoped rows (`L`). For every walked path whose
+  `L` row equals its snapshot row (`S`) in presence, hash, extraction version
+  and stat, the walk's result stands. For any path where they differ — another
+  process's pass, `move_note`, or a reset committed in between — the path is
+  **re-processed under the lock** (read + hash via `to_thread`, decided against
+  `L`). `existing`, move detection and `deleted_paths` are computed from `L`,
+  never from `S`.
+- **C5 — a row that changed since the snapshot is never pruned by an older
+  walk.** A path in `L` that the walk did not see and whose `L` row differs
+  from `S` (including "absent from `S`" — e.g. a `move_note` that landed
+  mid-walk) is **deferred**: not pruned, not paired as a move, left for the
+  next pass. Under a re-derive a deferral is appended to `skips`, so A.7a
+  withholds the stamp exactly as for any other unprocessed path. Today's pass
+  has the same race at a narrower width (the walk and `move_note` already
+  interleave); this rule makes the wider window no worse.
+- **C6 — provenance and the FTS fingerprint.** `_reconcile_provenance` still
+  runs first in its own committed session and decides `re_derive` before the
+  walk; `_assert_fts_generation_current` still runs immediately after the
+  lock. Unchanged.
+- **C7 — `index_pass_lock` covers the whole pass**, walk included, so no two
+  passes in one process interleave. Unchanged.
+- **C8 — the quarantine snapshot is consulted before the pass**
+  (`_refuse_quarantined_pass`). Unchanged.
+
+The safety argument: the walk is filesystem-only and was never protected by
+the database lock (a file could change under a locked walk before this too);
+the lock protects *rows*, and every row decision is still taken under it
+against rows read under it. What moved is only the time at which bytes are
+read, which C4/C5 reconcile. What it buys: the lock and the open transaction
+are held for the mutation phase (seconds), not the walk (minutes), so L5b
+shrinks and no transaction sits idle holding back the vacuum horizon. The
+regressions are `tests/integration/test_perf_scan_pg.py` (a `move_note`
+between snapshot and lock is not pruned; another process's upsert is
+re-decided; `pg_stat_activity` shows no open transaction during the walk; a
+reset racing the walk neither deadlocks nor lets old decisions land) and the
+extended `test_issue_206_lock_ordering_pg.py`.
+
+### The stat shortcut (#282, D10–D11)
+
+Migration 026 records, per row, `stat_size`, `stat_mtime_ns`, `stat_ctime_ns`
+and `stat_ino` (signed 64-bit) — all NULL or all set (the CHECK).
+
+- **Source.** The recorded tuple is always the `os.fstat` of the descriptor
+  whose bytes were hashed, taken **before** the read (`read_note_at`). A write
+  after the fstat changes the stat, so the next pass re-reads: the failure
+  direction is a wasted read, never a stale row. The comparison uses
+  `os.stat(name, dir_fd=parent_fd)`, **following** a leaf symlink as the read
+  does, so a retargeted `.md` symlink presents its new target's inode.
+- **Racy stats are not recorded, and recency is measured at read start**
+  (Codex spec review r1, MAJOR). `t_start = time.time_ns()` is taken before
+  the pre-read `fstat` (in code: before `read_note_at` opens the file, which
+  is strictly earlier and can only make more stats racy). If
+  `max(mtime_ns, ctime_ns) ≥ t_start − STAT_RACY_WINDOW_NS` (2 s), or either
+  is later than `t_start`, the stat is written NULL and the next pass hashes
+  the file — git's racy-clean rule. Measuring at hash completion was wrong: a
+  slow read could outlast the window while a writer rewrote already-read bytes
+  in the same timestamp tick. Measured at read start, any later write either
+  lands in a later tick (a changed stat) or shares a tick within 2 s of
+  `t_start`, which is never trusted. The kernel's coarse clock lags
+  `time.time_ns()` by at most a tick; the window absorbs it.
+- **Eligibility.** A path skips its read iff `INDEX_STAT_SHORTCUT` is on, the
+  pass is not a full-hash pass, not a re-derive, the row's extraction marker is
+  current, the row's stat is non-NULL, and all four fields equal. Otherwise it
+  is read and hashed exactly as before.
+- **Refresh.** When a read's hash equals the row's but the stat differs or is
+  NULL (a `touch`, a no-op save, the first pass after 026), the pass writes the
+  new stat with a conditional UPDATE (`WHERE id AND file_path AND
+  content_hash`) inside the locked transaction; otherwise such a file would be
+  re-read every tick. New and changed rows carry the stat in their upsert; the
+  id-preserving move carries the new path's stat. **`move_note` writes NULL**
+  (carrying it would be sound — the stat names an inode state — but one extra
+  read per move buys not having to argue it).
+
+**Every way a file can change without changing those four fields, and what
+bounds it (D11).** The expensive failure is a silently stale row; this is the
+complete list known.
+
+| # | Mechanism | Plausible here? | Bound |
+| --- | --- | --- | --- |
+| 1 | Same-size in-place rewrite sharing the recorded stat's timestamp tick, landing during or after the read (including a slow read that outlasts the window) | Rare (editors and this server write by rename → new inode; appends change size) | **Closed on local filesystems** by the racy rule measured at read start. Remote/FUSE clocks: row 6 |
+| 2 | `mmap` writes: mtime/ctime move at the first write fault after writeback, so later same-page writes can leave them unchanged until the next cycle | Unusual for notes | Backstop |
+| 3 | Restore with preserved mtime (`rsync -a`, `cp -p`, `tar x`, restic/borg) | Yes | **Not a hole**: userspace cannot set ctime (`utimensat` sets it to now), and these tools usually create a new inode |
+| 4 | btrfs/zstd: transparent compression, CoW, reflinks, dedupe, defrag | This host | **Not a hole**: `st_size` is logical; CoW and dedupe change extents, not content; a content write moves mtime/ctime as anywhere. Inodes are per-subvolume, but comparison is per path |
+| 5 | Subvolume/snapshot rollback or replacement — of the root, or of a child subvolume inside it | Possible | **Partially covered.** Provenance re-derive runs only for multi-user scopes and observes only the pinned root. Otherwise btrfs snapshots preserve inode *and* ctime, so a restored file presents the `(ino, ctime_ns)` of the state it was snapshotted in, which matches a row only if the row was recorded from those same bytes. The residual (one content state reached twice with identical fields, or a colliding inode from another subvolume at the same path) falls to the backstop |
+| 6 | Network / FUSE: attribute caching (NFS `actimeo`, CIFS, FUSE `attr_timeout`), synthetic inodes, server clock skew defeating the racy rule | Not on this host | `INDEX_STAT_SHORTCUT=false` for such mounts; backstop |
+| 7 | FAT/exFAT: 2 s mtime granularity, no true ctime, synthesised inodes | Not on this host | The 2 s window; `INDEX_STAT_SHORTCUT=false` recommended; backstop |
+| 8 | Clock set backwards so a later same-size write reproduces an earlier `(mtime_ns, ctime_ns)` | Needs root and a ns coincidence | Backstop |
+| 9 | Offline modification (disk image edited, fsck/debugfs) while the server is down | Operator action | The first pass after process start is a full-hash pass |
+| 10 | Row changed by another writer between the snapshot and the lock | Yes (deploy overlap, `move_note`) | C4/C5 re-decide or defer under the lock |
+
+### The backstop: a full-hash pass (D12)
+
+`index_vault` decides it, so every entry point inherits it: a pass is a
+full-hash pass when the panel's Reindex passes `full_hash=True`, or the
+scope's `_last_full_hash[scope]` (process memory, monotonic clock) is absent —
+the first pass after a restart — or older than
+`INDEX_FULL_HASH_INTERVAL_HOURS` (default 24, `ge=1`). A full-hash pass reads
+and hashes every file, ignoring stats, and forgets the scope's clean-sweep
+record so the embed pass that follows sweeps.
+
+**The clock advances only on success.** `_last_full_hash[scope]` is set only
+when a full-hash pass commits having **read and hashed every discovered
+file's bytes**, with no other path left unprocessed (Codex r2: the scan
+catches read and parse failures and still commits, so commit alone would let
+a skipped file hide for another interval). **Files that are not valid UTF-8
+do not block** (verifier, wave 1): their bytes were read in full and such a
+file is never indexed, so a full-hash pass every tick could verify nothing
+more; it is still a skip for the re-derive stamp and still logged. Everything
+else blocks — walk failures and read errors (`ScanResult.unverified`, plus
+C4's re-read), a missing buffered body, a parse failure, the keyword-vector
+and link-rebuild skips, a C5 deferral under re-derive. A pass that aborts, is
+refused or cancelled, or commits with a blocking skip leaves the scope due,
+and every following pass for it is again a full-hash pass until one succeeds.
+A forced pass (`full_hash=True`) removes the scope's timestamp before any
+refusal or filesystem work (Codex r1, wave 1), so a forced pass that fails
+cannot fall back on an earlier success. A persistently unreadable file keeps
+its scope on full-hash passes every tick, and it is visible as a logged
+warning.
+
+### The exclusion-sweep gate (D13)
+
+For each scope the sweep runs iff the pass is a backstop pass **or**
+`_swept[scope]` is not `sha256(json(EMBEDDING_EXCLUDE_PATTERNS))`. `_swept`
+is set only by a **clean** sweep: every selected row visited with no pause, no
+budget stop, no exception, no read failure, no provider failure or generation
+mismatch, no `StaleCertification`, **and no hash-mismatch skip**. Zero-chunk
+rows do not block it. It is forgotten on a backstop pass (so "the backstop
+sweeps regardless"), on a re-derive, and by `clear_sweep_state()` in the two
+in-process reset routes (`reset_embeddings`, `trigger_reembed`).
+
+*Why a hash-mismatch skip blocks the record* (Codex spec review r1, MAJOR):
+the A→B→A edit. The scan reads A; the note is saved as B before the sweep
+reaches it, so the sweep skips it on a mismatch; undo restores A before the
+next scan. The row is hash-equal and certification-current again, so the
+backlog never selects it — a gate that recorded completion would leave a
+now-included note absent from search until the backstop.
+
+*Why it preserves #127's convergence.* Once the invariant holds under
+patterns *P*, every other route to a certification-current row applies the
+current *P* or clears the stamp: the backlog's two branches read the current
+patterns; both move paths NULL the stamp; a reset NULLs every stamp.
+`EMBEDDING_EXCLUDE_PATTERNS` has no runtime writer, so a pattern change means a
+restart, and a restart forgets `_swept`. *Rejected:* a persisted fingerprint
+(buys skipping one 0.2 s startup sweep, costs a cross-process false agreement
+and an `indexer_state` key), and a persisted zero-chunk marker (removes only
+the zero-chunk re-reads, not the per-row `EXISTS` probes behind the 7.98 M
+index scans, and a stale marker is exactly a silently absent note).
+
+### Accepted limitations (performance-2026-09)
+
+Labelled `perf-L*` as in the change's design, so distinct from the #200–#206 `L*` list below.
+
+- **perf-L3 — stat-shortcut staleness.** An edit that changes none of
+  `(size, mtime_ns, ctime_ns, inode)` is not *detected* until the next
+  **successful** full-hash pass of its scope — at most
+  `INDEX_FULL_HASH_INTERVAL_HOURS` (24 h) after the previous successful one; a
+  failed or incomplete one does not restart the clock. It is detected earlier
+  if the file's stat changes again. Detection commits the new `content_hash`,
+  which makes keyword search current at once and makes `semantic_search` mark
+  the note `stale: true` (#200). **Semantic convergence** then follows the
+  ordinary backlog under the existing budgets, provider availability and
+  pause flag, and can take further passes. Network, FUSE and FAT mounts should
+  set `INDEX_STAT_SHORTCUT=false`.
+- **perf-L4 — exclusion sweep skipped between backstops.** A second process running
+  with different `EMBEDDING_EXCLUDE_PATTERNS` (a deploy overlap, a one-off
+  container) could certify rows that disagree with this process's patterns
+  without triggering a sweep here. Bounded by the 24 h backstop sweep.
+- **perf-L7 — deferred rows.** C5 defers a row changed mid-walk to the next pass;
+  that note's row, and its search presence, can lag by one extra pass.
 
 ## Non-finite frontmatter numbers, and the one title rule (#154)
 
@@ -1298,8 +1538,9 @@ makes it cheap.
 
 ### Maintenance waits for an in-flight pass, and that is correct (L5b)
 
-The pass holds the generation lock for the duration of its transaction —
-minutes on a large vault — so `make reset-embeddings` and
+The pass holds the generation lock for the duration of its transaction — the
+mutation phase since #278 moved the walk ahead of it (D9), minutes on a large
+vault before that — so `make reset-embeddings` and
 `make rebuild-tsvectors` **wait** for an in-flight pass instead of interleaving
 with it. That is the behaviour we want: a reset must not land mid-pass. The
 maintenance paths therefore deliberately do **not** set a short `lock_timeout`
@@ -1392,8 +1633,10 @@ Every residual is listed here, so none of them is discovered later as a defect.
   Recourses: settle the scope, delete or reassign the rows, or revert
   `FTS_CONFIGS`.
 - **L5b — the incremental pass holds the generation lock for its whole
-  transaction**, so the maintenance commands wait minutes on a large vault.
-  Waiting is the correct behaviour and the maintenance paths do not defeat it.
+  transaction**, so the maintenance commands wait for it. Waiting is the
+  correct behaviour and the maintenance paths do not defeat it. Since #278
+  the walk runs *before* that transaction (D9), so the wait is the mutation
+  phase — seconds — rather than minutes on a large vault.
 - **L6 — NULL-owned `notes_metadata` rows abort the rebuild** while
   `MULTI_USER_MODE` is on. Delete or reassign them.
 - **L7 — raising `MAX_CHUNKS_PER_NOTE` forces a full re-embed**, although it
@@ -1407,10 +1650,13 @@ Every residual is listed here, so none of them is discovered later as a defect.
 - **L9 — a capped note's tail is not semantically searchable at all.** That is
   what the cap is; the note stays fully keyword-searchable, and the truncation
   is marked on the row, in every vector result and on the dashboard.
-- **L10 — `semantic_search` still hydrates every candidate's full vector** to
+- ~~**L10 — `semantic_search` still hydrates every candidate's full vector** to
   recompute a similarity the query already returned as `distance`. Pre-existing
   and unrelated to these four findings; filed as a follow-up rather than
-  widened into a change that already touches both read paths.
+  widened into a change that already touches both read paths.~~ **Resolved by
+  #280** (performance-2026-09, D7): `semantic_search` projects its columns and
+  reports `similarity = 1 − distance`; no stored vector is fetched. See "Read
+  paths project what they render" in [search](search.md).
 
 ## Re-deriving after a grammar change (#150)
 

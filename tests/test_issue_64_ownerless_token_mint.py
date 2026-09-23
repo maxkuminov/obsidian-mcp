@@ -319,10 +319,16 @@ class _MiddlewareSession:
             # `(token, client_owner, client_name)` with `.first()`: the owner
             # for the cross-user check, the name for the denormalised
             # `usage_logs` actor label (issue #77). There is no second
-            # `oauth_clients` query on any path.
-            return _RowsResult(
-                [(self.token, self.client_owner, "Ownerless Test Client")]
-            )
+            # `oauth_clients` query on any path. The token's user rides the
+            # same statement (performance-2026-09 D3): `is_active`,
+            # `vault_path`.
+            return _RowsResult([(
+                self.token,
+                self.client_owner,
+                "Ownerless Test Client",
+                self.user_active,
+                "/vaults/x",
+            )])
         if "vault_path" in sql:
             return _RowsResult([])
         return _ScalarResult(self.user_active)
