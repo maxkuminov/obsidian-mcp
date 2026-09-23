@@ -1707,6 +1707,15 @@ class ScanResult:
     files: dict[str, ScannedFile] = field(default_factory=dict)
     seen: set[str] = field(default_factory=set)
     skips: list[str] = field(default_factory=list)
+    #: The subset of `skips` whose bytes were **not obtained**: a directory the
+    #: walk could not list, a file whose read raised. These block the
+    #: backstop's clock (D12). A file that was read in full but is not valid
+    #: UTF-8 is in `skips` and not here: its bytes were obtained, it is never
+    #: indexed from them, and re-reading it every tick could not change that
+    #: outcome (a row left from when it still decoded is kept, not pruned, as
+    #: before this change; its stat no longer matches, so every pass re-reads
+    #: it and logs the skip).
+    unverified: list[str] = field(default_factory=list)
     reads: int = 0
     shortcut: int = 0
 
@@ -1765,7 +1774,12 @@ def _scan_vault(
     current stat equals it in all four fields.
     """
     result = ScanResult()
-    walk = discover_markdown_files_at(root_fd, skips=result.skips)
+    # Walk failures (a directory that could not be listed or opened) are
+    # **unverified**: the files beneath it were never read. Collected apart
+    # and appended to both lists once the walk is drained (a scan that raises
+    # instead is discarded whole).
+    walk_failures: list[str] = []
+    walk = discover_markdown_files_at(root_fd, skips=walk_failures)
     with contextlib.closing(walk):
         for found in walk:
             if stop.is_set():
@@ -1796,12 +1810,16 @@ def _scan_vault(
             try:
                 raw, h, st, recorded = _read_and_hash(found.parent_fd, found.name, rel)
             except UnicodeDecodeError:
+                # Bytes read in full; decoded-content-only. A skip (A.7a), not
+                # unverified (D12).
                 logger.warning(f"Skipping non-UTF8 file: {rel}")
                 result.skips.append(f"{rel} (not valid UTF-8)")
                 continue
             except Exception as e:
+                # Bytes not obtained: unverified, blocks the backstop's clock.
                 logger.warning(f"Failed to read {rel}: {e}")
                 result.skips.append(f"{rel} ({e})")
+                result.unverified.append(f"{rel} ({e})")
                 continue
             result.reads += 1
             result.files[rel] = ScannedFile(
@@ -1814,6 +1832,8 @@ def _scan_vault(
                 mtime=st.st_mtime,
                 raw=raw if _needs_body(rel, h, snapshot, re_derive) else None,
             )
+    result.skips.extend(walk_failures)
+    result.unverified.extend(walk_failures)
     return result
 
 
@@ -1879,7 +1899,9 @@ async def _run_scan(
 # first embed pass after a start a sweeping one.
 
 #: Monotonic time of each scope's last **successful** full-hash pass: one that
-#: committed with an empty `skips` list. Absent means due.
+#: committed having read and hashed every discovered file (non-UTF-8 files do
+#: not block; see `_index_vault_pinned`). Absent means due; a forced pass
+#: removes the entry before it starts.
 _last_full_hash: dict[int | None, float] = {}
 
 #: Each scope's exclusion-pattern fingerprint as of its last **clean** sweep.
@@ -2060,6 +2082,14 @@ async def index_vault(user_id: int | None = None, *, full_hash: bool = False):
     provenance-stamped for such a user; the refusal happens before the root is
     resolved.
     """
+    if full_hash:
+        # A forced pass marks the scope due **before** any refusal or
+        # filesystem work (Codex r1). The clock is re-set only by a clean
+        # committed full-hash pass below, so a forced pass that is refused,
+        # aborts or commits with an unverified file leaves the next ordinary
+        # pass a full-hash pass too, instead of falling back to a recent
+        # earlier timestamp and taking stat shortcuts.
+        _last_full_hash.pop(user_id, None)
     _refuse_quarantined_pass(user_id, "index")
     vault = _vault_root(user_id)
     log_suffix = f" (user_id={user_id})" if user_id is not None else ""
@@ -2139,9 +2169,13 @@ async def _index_vault_pinned(
     # new root, which is exactly the row a re-derive exists to replace. The
     # repairs are still performed; only the certification is withheld.
     #
-    # **It also withholds the backstop's clock** (D12): a full-hash pass that
-    # commits with any skip has not verified every file, so its scope stays
-    # due and the next pass is again a full-hash pass.
+    # **It also withholds the backstop's clock** (D12), with one exception: a
+    # file whose bytes were read in full but are not valid UTF-8. The clock
+    # asks "was every discovered file's bytes read and hashed", and such a
+    # file's were; it is never indexed, so no row can go stale from it, and a
+    # full-hash pass every tick could not change that. Every other skip
+    # blocks the clock; each source is classified where it is appended, and
+    # the rule is applied after the commit (`unverified`, `blocking_skips`).
     #
     # **Carve-out: a note whose link extraction was truncated at
     # `MAX_LINKS_PER_NOTE` is NOT a skip** (#203, D4). The claim A.7a makes is
@@ -2178,6 +2212,9 @@ async def _index_vault_pinned(
         root_fd, snapshot, force_read=force_read, re_derive=re_derive
     )
     skips.extend(scan.skips)
+    # Backstop-blocking failures (D12). From the scan: walk failures and read
+    # errors (`ScanResult.unverified`); its non-UTF-8 skips are not in it.
+    unverified: list[str] = list(scan.unverified)
     seen = scan.seen
     logger.info(
         f"Found {len(seen)} markdown files{log_suffix}: {scan.reads} read, "
@@ -2260,12 +2297,16 @@ async def _index_vault_pinned(
                 scan.files[rel] = await asyncio.to_thread(_rescan_one, root_fd, rel)
                 reprocessed += 1
             except UnicodeDecodeError:
+                # C4 re-read, bytes read in full: decoded-content-only, so a
+                # skip that does not block the clock.
                 logger.warning(f"Skipping non-UTF8 file: {rel}")
                 skips.append(f"{rel} (not valid UTF-8)")
                 del scan.files[rel]
             except Exception as e:
+                # C4 re-read failure, bytes not obtained: blocks the clock.
                 logger.warning(f"Failed to read {rel}: {e}")
                 skips.append(f"{rel} ({e})")
+                unverified.append(f"{rel} ({e})")
                 del scan.files[rel]
         if reprocessed:
             logger.info(
@@ -2274,6 +2315,15 @@ async def _index_vault_pinned(
                 reprocessed,
                 log_suffix,
             )
+
+        # Every skip appended from here on blocks the backstop's clock, none
+        # of them being a decoded-content-only failure: a missing buffered
+        # body (read failure, including a non-UTF-8 re-read, left a row this
+        # pass did not rewrite), a parse failure (bytes hashed but the row not
+        # rewritten, so it can be stale), a C5 deferral under re-derive (a row
+        # the walk could not speak for), the keyword vector's missing body and
+        # the link rebuild's skips (derived rows this pass did not write).
+        downstream_skips_from = len(skips)
 
         # Determine changes
         to_upsert = []
@@ -2411,7 +2461,7 @@ async def _index_vault_pinned(
         # changed since — including one absent from the snapshot, which is
         # what a `move_note` landing mid-walk looks like — was not seen by
         # this walk because the walk is older than it, not because its file
-        # is gone. It is deferred to the next pass (L7), and under a
+        # is gone. It is deferred to the next pass (perf-L7), and under a
         # re-derive the deferral is a skip, so A.7a withholds the stamp.
         deleted_paths: set[str] = set()
         for p in set(existing.keys()) - seen:
@@ -2818,17 +2868,21 @@ async def _index_vault_pinned(
         await session.commit()
 
     # The backstop's clock advances only on a full-hash pass that committed
-    # **and verified every discovered file** (D12). One that aborted, was
-    # refused or cancelled never reaches this line; one that committed with a
-    # skip leaves the scope due, so the next pass is again a full-hash pass.
-    if backstop and not skips:
+    # **and read and hashed every discovered file's bytes** (D12). One that
+    # aborted, was refused or cancelled never reaches this line; one that
+    # committed with a blocking skip leaves the scope due, so its next pass is
+    # again a full-hash pass. A non-UTF-8 file does not block (see `skips`).
+    blocking_skips = unverified + skips[downstream_skips_from:]
+    if backstop and not blocking_skips:
         _last_full_hash[user_id] = time.monotonic()
     elif backstop:
         logger.warning(
-            "Full-hash pass%s committed with %d path(s) not fully processed; "
-            "the scope stays due and the next pass reads every file again.",
+            "Full-hash pass%s committed with %d path(s) unread or not fully "
+            "processed: %s; the scope stays due, so its next pass is again a "
+            "full-hash pass.",
             log_suffix,
-            len(skips),
+            len(blocking_skips),
+            _format_skips(blocking_skips),
         )
 
     logger.info(f"Vault index scan complete{log_suffix}")
@@ -3150,6 +3204,23 @@ async def link_backfill_pass(user_id: int | None = None):
             await _link_backfill_pinned(user_id, vault, root_fd, stats)
 
 
+def _read_body_beneath(root_fd: int, rel_path: str) -> str | None:
+    """The parsed body of one note, or None if it cannot be read or decoded.
+    For the link backfill; runs on a worker thread."""
+    try:
+        raw, _stat = read_note_beneath(root_fd, rel_path)
+    except (UnicodeDecodeError, OSError):
+        return None
+    return parse_frontmatter(raw)[1]
+
+
+def _read_body_and_hash(root_fd: int, rel_path: str) -> tuple[str, str]:
+    """`(parsed body, content_hash)` of one note, for the keyword-vector
+    rebuild; runs on a worker thread. Raises what `read_note_beneath` raises."""
+    raw, _stat = read_note_beneath(root_fd, rel_path)
+    return parse_frontmatter(raw)[1], _content_hash(raw)
+
+
 async def _link_backfill_pinned(
     user_id: int | None, vault: Path, root_fd: int, stats: "PassStats | None" = None
 ):
@@ -3212,15 +3283,17 @@ async def _link_backfill_pinned(
             truncated_ids: list[int] = []
             complete_ids: list[int] = []
             for i, row in enumerate(rows, start=1):
-                try:
-                    raw, _stat = read_note_beneath(root_fd, row.file_path)
-                except (UnicodeDecodeError, OSError):
+                # The read and the parse off the loop (#278): this walks the
+                # whole vault. The DB work stays here, in this transaction.
+                content = await asyncio.to_thread(
+                    _read_body_beneath, root_fd, row.file_path
+                )
+                if content is None:
                     continue
                 # Counted as indexed only once its bytes were read: an
                 # unreadable note is scanned and not rebuilt, and the two
                 # numbers differing is exactly how an operator sees that.
                 stats.notes_indexed += 1
-                _, content = parse_frontmatter(raw)
                 links, truncated = await asyncio.to_thread(
                     extract_links_bounded, content, max_links=MAX_LINKS_PER_NOTE
                 )
@@ -5244,12 +5317,15 @@ async def _rebuild_tsvectors_pinned(
         for _attempt in range(MAX_REBUILD_REREADS + 1):
             stale_reason: str | None = None
             try:
-                raw, _stat = read_note_beneath(root_fd, path)
+                # The read, parse and hash off the loop (#278): the rebuild
+                # walks every row of the scope. The UPDATE stays here.
+                content, got_hash = await asyncio.to_thread(
+                    _read_body_and_hash, root_fd, path
+                )
             except (UnicodeDecodeError, OSError) as exc:
                 stale_reason = f"could not be read at {path!r} ({exc})"
             else:
-                _, content = parse_frontmatter(raw)
-                if _content_hash(raw) != chash:
+                if got_hash != chash:
                     stale_reason = (
                         f"the bytes at {path!r} no longer hash to the "
                         "content_hash the rebuild selected"

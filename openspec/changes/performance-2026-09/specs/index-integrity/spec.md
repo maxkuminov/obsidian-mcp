@@ -102,7 +102,7 @@ For each scope, a full-hash pass SHALL run:
 - whenever `INDEX_FULL_HASH_INTERVAL_HOURS` (default 24, at least 1) have elapsed since that scope's last **successful** full-hash pass (the interval is when the pass becomes due, not a completion guarantee);
 - whenever an operator triggers a reindex from the panel.
 
-A full-hash pass is successful only when its scan transaction commits and every discovered file was read and hashed (no skipped path). A full-hash pass that aborts, is refused, is cancelled, or commits with any skipped path SHALL leave the scope due, and every following pass for that scope SHALL be a full-hash pass until one commits. Incomplete verification SHALL NOT postpone outstanding backstop work by another interval.
+A full-hash pass is successful only when its scan transaction commits and every discovered file's bytes were read and hashed, with no other path left unprocessed; files that are not valid UTF-8 do not block (their bytes were read in full and they are never indexed). A full-hash pass that aborts, is refused, is cancelled, or commits with any path whose bytes could not be read (or any other unprocessed path) SHALL leave the scope due, and every following pass for that scope SHALL be a full-hash pass until one succeeds. An operator-triggered full-hash pass SHALL mark its scope due before any other work, so a forced pass that does not succeed is not superseded by an earlier success. Incomplete verification SHALL NOT postpone outstanding backstop work by another interval.
 
 A full-hash pass SHALL read and hash every discovered file regardless of recorded stats. It SHALL also run the exclusion reconciliation sweep regardless of that sweep's gate.
 
@@ -121,6 +121,18 @@ The architecture note SHALL list every known way a file's content can change whi
 #### Scenario: A failed backstop is retried, not postponed
 - **WHEN** a scope's full-hash pass aborts before committing
 - **THEN** that scope's next pass SHALL again be a full-hash pass
+
+#### Scenario: A forced backstop that fails is retried, not superseded
+- **WHEN** a scope had a recent successful full-hash pass and an operator-triggered full-hash pass for it is refused, aborts, or commits with an unreadable file
+- **THEN** that scope's next pass SHALL be a full-hash pass
+
+#### Scenario: A file that is not valid UTF-8 does not block the backstop
+- **WHEN** a full-hash pass reads every discovered file and one of them is not valid UTF-8
+- **THEN** the pass SHALL count as successful and the scope SHALL not stay due on that file's account
+
+#### Scenario: A file whose bytes cannot be read blocks the backstop
+- **WHEN** a full-hash pass cannot read one discovered file's bytes (an I/O error)
+- **THEN** the scope SHALL stay due and its next pass SHALL again be a full-hash pass
 
 #### Scenario: The interval is honoured
 - **WHEN** `INDEX_FULL_HASH_INTERVAL_HOURS` have elapsed since a scope's last full-hash pass

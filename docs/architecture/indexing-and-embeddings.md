@@ -459,11 +459,23 @@ and hashes every file, ignoring stats, and forgets the scope's clean-sweep
 record so the embed pass that follows sweeps.
 
 **The clock advances only on success.** `_last_full_hash[scope]` is set only
-when a full-hash pass **commits with an empty `skips` list** (Codex r2: the
-scan catches read and parse failures and still commits, so commit alone would
-let a skipped file hide for another interval). A pass that aborts, is refused
-or cancelled, or commits with any skip leaves the scope due, and every
-following pass for it is again a full-hash pass until one succeeds.
+when a full-hash pass commits having **read and hashed every discovered
+file's bytes**, with no other path left unprocessed (Codex r2: the scan
+catches read and parse failures and still commits, so commit alone would let
+a skipped file hide for another interval). **Files that are not valid UTF-8
+do not block** (verifier, wave 1): their bytes were read in full and such a
+file is never indexed, so a full-hash pass every tick could verify nothing
+more; it is still a skip for the re-derive stamp and still logged. Everything
+else blocks — walk failures and read errors (`ScanResult.unverified`, plus
+C4's re-read), a missing buffered body, a parse failure, the keyword-vector
+and link-rebuild skips, a C5 deferral under re-derive. A pass that aborts, is
+refused or cancelled, or commits with a blocking skip leaves the scope due,
+and every following pass for it is again a full-hash pass until one succeeds.
+A forced pass (`full_hash=True`) removes the scope's timestamp before any
+refusal or filesystem work (Codex r1, wave 1), so a forced pass that fails
+cannot fall back on an earlier success. A persistently unreadable file keeps
+its scope on full-hash passes every tick, and it is visible as a logged
+warning.
 
 ### The exclusion-sweep gate (D13)
 
@@ -496,9 +508,9 @@ index scans, and a stale marker is exactly a silently absent note).
 
 ### Accepted limitations (performance-2026-09)
 
-Numbered as in the change's design, so distinct from the #200–#206 list below.
+Labelled `perf-L*` as in the change's design, so distinct from the #200–#206 `L*` list below.
 
-- **L3 — stat-shortcut staleness.** An edit that changes none of
+- **perf-L3 — stat-shortcut staleness.** An edit that changes none of
   `(size, mtime_ns, ctime_ns, inode)` is not *detected* until the next
   **successful** full-hash pass of its scope — at most
   `INDEX_FULL_HASH_INTERVAL_HOURS` (24 h) after the previous successful one; a
@@ -509,11 +521,11 @@ Numbered as in the change's design, so distinct from the #200–#206 list below.
   ordinary backlog under the existing budgets, provider availability and
   pause flag, and can take further passes. Network, FUSE and FAT mounts should
   set `INDEX_STAT_SHORTCUT=false`.
-- **L4 — exclusion sweep skipped between backstops.** A second process running
+- **perf-L4 — exclusion sweep skipped between backstops.** A second process running
   with different `EMBEDDING_EXCLUDE_PATTERNS` (a deploy overlap, a one-off
   container) could certify rows that disagree with this process's patterns
   without triggering a sweep here. Bounded by the 24 h backstop sweep.
-- **L7 — deferred rows.** C5 defers a row changed mid-walk to the next pass;
+- **perf-L7 — deferred rows.** C5 defers a row changed mid-walk to the next pass;
   that note's row, and its search presence, can lag by one extra pass.
 
 ## Non-finite frontmatter numbers, and the one title rule (#154)

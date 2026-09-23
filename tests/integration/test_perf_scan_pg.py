@@ -230,6 +230,76 @@ async def test_a_move_committed_mid_walk_is_not_pruned_and_settles_next_pass(
     assert settled["Public/B.md"].stat_size is not None
 
 
+async def test_a_move_committed_during_the_walk_that_it_sees_neither_side_of_is_deferred(
+    world, monkeypatch, caplog
+):
+    """C5, the literal scenario (verifier, wave 1). The snapshot is taken; a
+    `move_note` commits **while the walk is running**, at the one point where
+    the walk sees neither path: `Private/` has already been listed (without
+    the new path) and `Public/` has not been yet (it will list without the
+    old one). The walk is held inside its read of `Private/Sentinel.md` to make
+    that interleaving deterministic. The moved row is absent from the snapshot
+    and unseen by the walk, so it must be neither pruned nor paired, only
+    deferred; the next pass settles it."""
+    import logging
+
+    root, maker = world["root"], world["maker"]
+    (root / "Private" / "Sentinel.md").write_text("sentinel\n", encoding="utf-8")
+    (root / "Public" / "A.md").write_text(BODY, encoding="utf-8")
+    await indexer.index_vault()
+    before = await rows(maker)
+    note_id = before["Public/A.md"].id
+    sentinel_id = before["Private/Sentinel.md"].id
+
+    in_private = threading.Event()
+    release = threading.Event()
+    walked: list[str] = []
+    real = indexer.read_note_at
+
+    def held(parent_fd, name):
+        walked.append(name)
+        if name == "Sentinel.md" and not in_private.is_set():
+            in_private.set()
+            release.wait(30)
+        return real(parent_fd, name)
+
+    monkeypatch.setattr(indexer, "read_note_at", held)
+
+    # A full-hash pass, so the walk reads the sentinel (and blocks there).
+    pass_task = asyncio.create_task(indexer.index_vault(full_hash=True))
+    try:
+        await wait_for(in_private)
+        result = await tools.move_note_impl("Public/A.md", "Private/A.md")
+        assert "Moved" in result, result
+    finally:
+        release.set()
+    with caplog.at_level(logging.INFO, logger=indexer.logger.name):
+        await asyncio.wait_for(pass_task, timeout=60)
+
+    assert walked == ["Sentinel.md"], (
+        f"the walk saw a side of the move, so the interleaving did not happen: {walked}"
+    )
+    after = await rows(maker)
+    assert sorted(after) == ["Private/A.md", "Private/Sentinel.md"], after
+    assert after["Private/A.md"].id == note_id, (
+        "the moved row was pruned, re-inserted or paired on the strength of a "
+        "walk older than it"
+    )
+    assert after["Private/A.md"].content_hash == content_hash(BODY)
+    assert after["Private/Sentinel.md"].id == sentinel_id
+    assert any(
+        "Deferring Private/A.md to the next pass" in r.getMessage()
+        for r in caplog.records
+    ), "the unseen, changed row was not deferred"
+
+    monkeypatch.setattr(indexer, "read_note_at", real)
+    await indexer.index_vault()
+    settled = await rows(maker)
+    assert sorted(settled) == ["Private/A.md", "Private/Sentinel.md"]
+    assert settled["Private/A.md"].id == note_id
+    assert settled["Private/A.md"].stat_size is not None
+
+
 async def test_a_row_another_process_changed_is_re_decided_under_the_lock(
     world, monkeypatch
 ):

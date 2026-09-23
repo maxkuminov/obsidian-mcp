@@ -326,3 +326,167 @@ async def test_embed_note_cleans_and_chunks_off_the_loop(monkeypatch):
     assert result.outcome is NoteEmbedOutcome.CERTIFIED_EMPTY
     assert {label for label, _ in record} == {"clean_for_embedding", "chunk_text_bounded"}
     assert [label for label, on_main in record if on_main] == []
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# The other two whole-vault reads: the link backfill and the keyword rebuild
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _blocking_beneath(monkeypatch, record: list):
+    """`read_note_beneath` that blocks for 0.5 s and records its thread."""
+    reading = threading.Event()
+    real = indexer.read_note_beneath
+
+    def blocking(root_fd, rel):
+        _off_main(record, "read")
+        reading.set()
+        time.sleep(0.5)
+        return real(root_fd, rel)
+
+    monkeypatch.setattr(indexer, "read_note_beneath", blocking)
+    return reading
+
+
+async def _loop_progresses_while(reading: threading.Event, coro):
+    """Run `coro`; once its read has started, a concurrent coroutine must
+    iterate while it is still running. Binary, no timing bound."""
+    ticks = 0
+    stop_ticking = False
+
+    async def ticker():
+        nonlocal ticks
+        while not stop_ticking:
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    task = asyncio.create_task(coro)
+    tick_task = asyncio.create_task(ticker())
+    try:
+        while not reading.is_set():
+            await asyncio.sleep(0.01)
+        ticks_at_read = ticks
+        await asyncio.sleep(0.1)
+        assert not task.done(), "the work finished before the probe; no evidence"
+        assert ticks > ticks_at_read, "the event loop made no progress during the read"
+    finally:
+        stop_ticking = True
+        await tick_task
+    return await task
+
+
+class _BackfillResult:
+    def __init__(self, rows=()):
+        self._rows = list(rows)
+
+    def scalar(self):
+        return 0
+
+    def all(self):
+        return self._rows
+
+
+class _BackfillSession:
+    def __init__(self, rows):
+        self.rows = rows
+        self.inserts = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def execute(self, stmt, *_a, **_k):
+        from sqlalchemy.sql.dml import Insert
+
+        if isinstance(stmt, Insert):
+            self.inserts += 1
+        return _BackfillResult(self.rows)
+
+    async def commit(self):
+        pass
+
+
+async def test_the_link_backfill_reads_and_parses_off_the_loop(monkeypatch, vault):
+    import os
+
+    (vault / "A.md").write_text("---\ntitle: A\n---\nsee [[B]]\n", encoding="utf-8")
+    session = _BackfillSession([SimpleNamespace(id=1, file_path="A.md")])
+    monkeypatch.setattr(indexer, "async_session", lambda: session)
+
+    async def permitted(*_a, **_k):
+        return True
+
+    monkeypatch.setattr(indexer, "_ancillary_pass_is_permitted", permitted)
+    record: list = []
+    reading = _blocking_beneath(monkeypatch, record)
+    _wrap(monkeypatch, indexer, "parse_frontmatter", record, "parse")
+
+    root_fd = os.open(vault, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        stats = indexer.PassStats()
+        await _loop_progresses_while(
+            reading, indexer._link_backfill_pinned(None, vault, root_fd, stats)
+        )
+    finally:
+        os.close(root_fd)
+
+    assert {label for label, _ in record} == {"read", "parse"}
+    assert [label for label, on_main in record if on_main] == []
+    assert stats.notes_indexed == 1 and session.inserts == 1
+
+
+async def test_the_keyword_rebuild_reads_parses_and_hashes_off_the_loop(
+    monkeypatch, vault
+):
+    body = "---\ntitle: A\n---\nalpha body\n"
+    (vault / "A.md").write_text(body, encoding="utf-8")
+    monkeypatch.setattr(indexer.settings, "vault_path", str(vault), raising=False)
+    monkeypatch.setattr(indexer.settings, "fts_configs", ["simple"], raising=False)
+    rows = [SimpleNamespace(
+        id=1, user_id=None, file_path="A.md", content_hash=indexer._content_hash(body)
+    )]
+
+    class _Result:
+        rowcount = 1
+
+        def all(self):
+            return rows
+
+    class _Savepoint:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Session:
+        def __init__(self):
+            self.updates = 0
+
+        def begin_nested(self):
+            return _Savepoint()
+
+        async def execute(self, stmt, params=None):
+            if isinstance(stmt, TextClause) and "content_tsvector" in stmt.text:
+                self.updates += 1
+            return _Result()
+
+        async def commit(self):
+            pass
+
+    record: list = []
+    reading = _blocking_beneath(monkeypatch, record)
+    _wrap(monkeypatch, indexer, "parse_frontmatter", record, "parse")
+    _wrap(monkeypatch, indexer, "_content_hash", record, "hash")
+
+    session = _Session()
+    n = await _loop_progresses_while(
+        reading,
+        indexer._rebuild_tsvectors_single_scope_for_tests(session, user_id=None),
+    )
+
+    assert n == 1 and session.updates == 1
+    assert {label for label, _ in record} == {"read", "parse", "hash"}
+    assert [label for label, on_main in record if on_main] == []

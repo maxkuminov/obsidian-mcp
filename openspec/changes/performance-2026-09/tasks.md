@@ -130,7 +130,7 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - Set it only on a **clean** completion, meaning no pause, no budget stop, no exception, no provider failure, no read failure, no `StaleCertification` and **no hash-mismatch skip**. Only zero-chunk rows do not block it.
   - Clear it on a re-derive, and through `clear_sweep_state()` on the two in-process reset routes (`reset_embeddings`, `trigger_reembed`; see the region table).
 - [x] 3.8 `tools.py` `move_note`: the `nm_update` `.values(...)` sets the four stat columns to NULL.
-- [x] 3.9 `config.py` and `.env.example`: add `index_stat_shortcut: bool = True` and `index_full_hash_interval_hours: int = Field(24, ge=1)`, with the D11/L3 guidance for network, FUSE and FAT mounts.
+- [x] 3.9 `config.py` and `.env.example`: add `index_stat_shortcut: bool = True` and `index_full_hash_interval_hours: int = Field(24, ge=1)`, with the D11/perf-L3 guidance for network, FUSE and FAT mounts.
 - [x] 3.10 `tests/test_perf_scan_offload.py`:
   - The scan's read and hash execute on a non-main thread, asserted inside the patched read.
   - `parse_frontmatter`, `clean_for_embedding` and `chunk_text_bounded` are dispatched through `to_thread` on all three embed paths.
@@ -143,7 +143,7 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - **Slow-read, same-tick rewrite.** Freeze the file timestamps with a fake clock, so the rewrite shares the tick. Patch the read to rewrite already-read bytes at the same size mid-read and then block for more than 2 s. The row's stat must be recorded NULL, and the next pass must index the rewritten bytes.
   - A backstop pass that aborts before committing leaves the scope due: the next pass is again a full-hash pass.
   - A retargeted symlink is re-read.
-  - Same-size in-place rewrite with a forced identical stat (monkeypatched `os.stat`) is missed until the backstop, then picked up. This documents L3.
+  - Same-size in-place rewrite with a forced identical stat (monkeypatched `os.stat`) is missed until the backstop, then picked up. This documents perf-L3.
   - `move_note` NULLs the stat.
 - [x] 3.12 `tests/integration/test_perf_scan_pg.py` (real Postgres):
   - A `move_note` committed between the snapshot and the lock does not prune the moved row (C5), and the next pass settles it.
@@ -158,7 +158,7 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - Add 026's marker, drift, downgrade, stamp-back and impostor cases (a same-named column of the wrong type is refused), plus a CHECK case resolved through `pg_constraint`.
   - Keep every earlier case.
 - [x] 3.14 Docs:
-  - `indexing-and-embeddings.md`: sections for D8, D9 (with C1–C8 verbatim), D10–D13, and L3/L4/L7. Update the "Indexer runs on startup then every 5 minutes, hash-based change detection" bullet, and correct `database.py`'s idle-in-transaction comment. That comment's claim that the pass "holds one transaction … across the whole synchronous walk" stops being true. Coordinate with #284 if it has touched the file.
+  - `indexing-and-embeddings.md`: sections for D8, D9 (with C1–C8 verbatim), D10–D13, and perf-L3/perf-L4/perf-L7. Update the "Indexer runs on startup then every 5 minutes, hash-based change detection" bullet, and correct `database.py`'s idle-in-transaction comment. That comment's claim that the pass "holds one transaction … across the whole synchronous walk" stops being true. Coordinate with #284 if it has touched the file.
   - `schema-and-migrations.md`: a "026" section.
   - Validate with `make test-schema`, then `make test-integration`.
 
@@ -259,7 +259,7 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 - [ ] 6.1 Merge in dependency order: S1 and S2 (any order), then S3, then S4, then S5 once #284 has merged. After each merge, resolve the region seams named above.
 - [ ] 6.2 Check the seams by grepping for production callers of every new export: `apply_user_vault_row`, `_scan_vault`, `vector_index.*`, `close_provider_client`, the two index settings and the batch setting. None may be green-but-unwired.
 - [ ] 6.3 On the merged tree, run once: `make test-schema`, then `make test-integration`, then the offline suite, then `make audit`. These are authoritative; the per-worktree runs are not.
-- [ ] 6.4 Supervisor: update the CLAUDE.md key decisions with one bullet per surface: async bookkeeping commits (L1/L2), the stat shortcut and its backstop (L3), and the `halfvec` index if it shipped.
+- [ ] 6.4 Supervisor: update the CLAUDE.md key decisions with one bullet per surface: async bookkeeping commits (L1/L2), the stat shortcut and its backstop (perf-L3), and the `halfvec` index if it shipped.
 
 ## 7. Verification by non-authors
 

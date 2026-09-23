@@ -17,7 +17,7 @@ case here is about *when the file is read*:
 * a backstop pass that aborts, or commits with a skipped file, leaves the
   scope due;
 * the one class the rule cannot see (same size, forced identical stat) is
-  missed until the backstop, then picked up — accepted limitation L3, pinned.
+  missed until the backstop, then picked up — accepted limitation perf-L3, pinned.
 
 Offline: an in-memory `notes_metadata` stands in for the database, because the
 property is which files the scan opens and what it writes, not SQL. The
@@ -514,13 +514,26 @@ async def test_a_backstop_that_aborts_leaves_the_scope_due(monkeypatch, vault):
     assert db.commits >= 1
 
 
+def _failing_read(monkeypatch, bad_name: str):
+    """`read_note_at` raising an I/O error for one file: bytes not obtained."""
+    real = indexer.read_note_at
+
+    def failing(parent_fd, name):
+        if name == bad_name:
+            raise OSError(5, "Input/output error")
+        return real(parent_fd, name)
+
+    monkeypatch.setattr(indexer, "read_note_at", failing)
+
+
 async def test_a_backstop_with_an_unreadable_file_leaves_the_scope_due(
     monkeypatch, vault
 ):
     """D12 (Codex r2): the scan catches a read failure and still commits, so
     "committed" alone would let the skipped file hide for another interval."""
     await _recorded_world(monkeypatch, vault)
-    (vault / "Bad.md").write_bytes(b"\xff\xfe not utf-8")
+    (vault / "Bad.md").write_text("bad\n", encoding="utf-8")
+    _failing_read(monkeypatch, "Bad.md")
     indexer._last_full_hash.clear()
 
     await indexer.index_vault()
@@ -529,6 +542,60 @@ async def test_a_backstop_with_an_unreadable_file_leaves_the_scope_due(
     reads = count_reads(monkeypatch)
     await indexer.index_vault()
     assert "Note.md" in reads, "the next pass was not a full-hash pass"
+
+
+async def test_a_non_utf8_file_does_not_block_the_backstop(monkeypatch, vault):
+    """Verifier (wave 1): its bytes were read in full and it is never indexed,
+    so re-reading it every tick verifies nothing more. It stays a skip, and
+    the clock advances."""
+    db = await _recorded_world(monkeypatch, vault)
+    (vault / "Bad.md").write_bytes(b"\xff\xfe not utf-8")
+    indexer._last_full_hash.clear()
+
+    await indexer.index_vault()
+    assert not indexer._full_hash_due(None), (
+        "a permanently undecodable note kept its scope on full-hash passes"
+    )
+    assert "Bad.md" not in db.rows
+
+    reads = count_reads(monkeypatch)
+    await indexer.index_vault()
+    assert "Note.md" not in reads, "the next pass did not take the shortcut"
+
+
+async def test_a_forced_backstop_that_fails_leaves_the_scope_due(
+    monkeypatch, vault
+):
+    """Codex r1: a forced pass must not fall back to a recent earlier
+    timestamp. After a clean backstop, a forced pass that aborts (or commits
+    with an unread file) must leave the next ordinary pass a full-hash one."""
+    await _recorded_world(monkeypatch, vault)
+    indexer._last_full_hash.clear()
+    await indexer.index_vault()  # the recent clean backstop
+    assert not indexer._full_hash_due(None)
+
+    # (a) The forced pass is refused before any filesystem work.
+    def refuse(*_a, **_k):
+        raise RuntimeError("quarantined")
+
+    monkeypatch.setattr(indexer, "_refuse_quarantined_pass", refuse)
+    with pytest.raises(RuntimeError):
+        await indexer.index_vault(full_hash=True)
+    monkeypatch.setattr(indexer, "_refuse_quarantined_pass", lambda *_a, **_k: None)
+    assert indexer._full_hash_due(None), "a refused forced pass kept the old clock"
+    reads = count_reads(monkeypatch)
+    await indexer.index_vault()
+    assert reads == ["Note.md"], "the next ordinary pass took a stat shortcut"
+    assert not indexer._full_hash_due(None)
+
+    # (b) The forced pass commits with an unreadable file.
+    (vault / "Bad.md").write_text("bad\n", encoding="utf-8")
+    _failing_read(monkeypatch, "Bad.md")
+    await indexer.index_vault(full_hash=True)
+    assert indexer._full_hash_due(None), "a forced pass with a skip kept the old clock"
+    reads = count_reads(monkeypatch)
+    await indexer.index_vault()
+    assert "Note.md" in reads, "the next ordinary pass took a stat shortcut"
 
 
 async def test_a_clean_backstop_advances_the_clock(monkeypatch, vault):
@@ -567,7 +634,7 @@ async def test_a_retargeted_symlink_is_reread(monkeypatch, vault):
 async def test_a_same_size_rewrite_behind_an_identical_stat_waits_for_the_backstop(
     monkeypatch, vault
 ):
-    """Accepted limitation L3, pinned rather than hidden: an edit that changes
+    """Accepted limitation perf-L3, pinned rather than hidden: an edit that changes
     none of the four fields is not detected until the next full-hash pass."""
     note = vault / "Note.md"
     note.write_text("AAAA\n", encoding="utf-8")
