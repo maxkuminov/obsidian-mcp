@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "026"
+HEAD_REVISION = "027"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -5242,8 +5242,8 @@ def test_025_creates_a_nullable_marked_column_with_no_default():
 def test_025_chains_from_024_and_026_from_025():
     """The ordering the `schema-integrity` delta names, asserted rather than
     assumed: 025 must not migrate ahead of 024, whose own predecessor is 023,
-    and 026 (performance-2026-09) chains from 025. The head is the module's
-    single literal, raised by every new revision.
+    and 026 then 027 (performance-2026-09) chain from 025. The head is the
+    module's single literal, raised by every new revision.
     """
     from alembic.config import Config
     from alembic.script import ScriptDirectory
@@ -5253,6 +5253,7 @@ def test_025_chains_from_024_and_026_from_025():
     script = ScriptDirectory.from_config(config)
 
     assert script.get_current_head() == HEAD_REVISION
+    assert script.get_revision("027").down_revision == "026"
     assert script.get_revision("026").down_revision == "025"
     assert script.get_revision("025").down_revision == "024"
     assert script.get_revision("024").down_revision == "023"
@@ -5260,6 +5261,7 @@ def test_025_chains_from_024_and_026_from_025():
     ordered = [rev.revision for rev in script.walk_revisions("base", HEAD_REVISION)]
     # `walk_revisions` yields newest-first, so an earlier revision appears
     # *later* in the list.
+    assert ordered.index("026") > ordered.index("027")
     assert ordered.index("025") > ordered.index("026")
     assert ordered.index("024") > ordered.index("025")
     assert ordered.index("023") > ordered.index("024")
@@ -5745,3 +5747,207 @@ def test_downgrade_026_leaves_a_column_it_did_not_create():
         assert stat_column_state(url, "stat_ino") is not None
         for column in ("stat_size", "stat_mtime_ns", "stat_ctime_ns"):
             assert stat_column_state(url, column) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 027 — notes_metadata reloptions, the halfvec HNSW index (#283)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# Neither half is visible to `alembic check`. Table reloptions are not
+# compared at all, and the expression index is excluded from the comparison by
+# `alembic/env.py`'s `include_object` (autogenerate on SQLAlchemy 2 would strip
+# its `::halfvec` cast and report spurious drift). So both are asserted here
+# through the catalogue: `pg_class.reloptions`, and the index through
+# `pg_get_indexdef`, `indisvalid` and its operator class — the house rule for
+# indexes (019/021/024). What `alembic check` *can* still say is that removing
+# the legacy index from the model left no drift, and the cases below ask it.
+
+from src.services import vector_index  # noqa: E402
+
+HALFVEC_INDEX = vector_index.INDEX_NAME
+LEGACY_VECTOR_INDEX = vector_index.LEGACY_INDEX_NAME
+NOTES_RELOPTIONS = {
+    "autovacuum_vacuum_scale_factor=0.02",
+    "autovacuum_vacuum_insert_scale_factor=0.02",
+}
+
+
+@contextlib.contextmanager
+def throwaway_db_at(prefix: str, dim: int, revision: str = "head"):
+    """`throwaway_db` at an explicit embedding dimension — 027 builds its
+    index at the configured one, so the dimension is part of the case."""
+    generator = _harness.throwaway_database(prefix, dim, revision=revision)
+    url = next(generator)
+    try:
+        yield url
+    finally:
+        generator.close()
+
+
+def notes_reloptions(url) -> set:
+    value = fetchval(
+        url,
+        "SELECT reloptions FROM pg_class "
+        "WHERE oid = 'public.notes_metadata'::regclass",
+    )
+    return set(value or [])
+
+
+def vector_indexes(url) -> dict:
+    """Every HNSW index on note_embeddings: name -> (indexdef, valid, opclass, oid)."""
+    rows = fetch(
+        url,
+        "SELECT c.relname, pg_get_indexdef(i.indexrelid) AS def, i.indisvalid, "
+        "       opc.opcname, i.indexrelid::bigint AS oid "
+        "FROM pg_index i "
+        "JOIN pg_class c ON c.oid = i.indexrelid "
+        "JOIN pg_am am ON am.oid = c.relam "
+        "JOIN pg_opclass opc ON opc.oid = i.indclass[0] "
+        "WHERE i.indrelid = 'public.note_embeddings'::regclass "
+        "  AND am.amname = 'hnsw'",
+    )
+    return {
+        r["relname"]: (r["def"], r["indisvalid"], r["opcname"], r["oid"])
+        for r in rows
+    }
+
+
+def assert_alembic_check_clean(url, dim):
+    check = _harness.run_alembic(url, "check", dimensions=dim, check=False)
+    assert check.returncode == 0, (
+        f"alembic check reported drift\n{check.stdout}\n{check.stderr}"
+    )
+
+
+def test_027_sets_reloptions_and_builds_the_halfvec_index_at_1024():
+    """The spec's scenario at the default dimension: exactly one valid HNSW
+    index, over `halfvec(1024)` with `halfvec_cosine_ops`, and 008's gone."""
+    with throwaway_db_at("schema_027_fresh", 1024) as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert NOTES_RELOPTIONS <= notes_reloptions(url)
+
+        indexes = vector_indexes(url)
+        assert set(indexes) == {HALFVEC_INDEX}, indexes
+        indexdef, valid, opclass, _oid = indexes[HALFVEC_INDEX]
+        assert valid is True
+        assert opclass == "halfvec_cosine_ops"
+        assert (
+            "USING hnsw (((embedding)::halfvec(1024)) halfvec_cosine_ops)" in indexdef
+        ), indexdef
+        assert "m='16'" in indexdef and "ef_construction='64'" in indexdef
+        assert LEGACY_VECTOR_INDEX not in indexes
+        assert_alembic_check_clean(url, 1024)
+
+
+def test_027_builds_at_the_configured_dimension_not_a_literal():
+    with throwaway_db("schema_027_dim64") as url:
+        indexes = vector_indexes(url)
+        assert set(indexes) == {HALFVEC_INDEX}, indexes
+        assert "::halfvec(64)" in indexes[HALFVEC_INDEX][0]
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_027_builds_no_index_above_2000_dimensions():
+    """Above 2000 no index of either kind exists before or after: an exact
+    scan stays exact. The reloptions still apply."""
+    with throwaway_db_at("schema_027_dim3072", 3072) as url:
+        assert alembic_version(url) == HEAD_REVISION
+        assert vector_indexes(url) == {}
+        assert NOTES_RELOPTIONS <= notes_reloptions(url)
+        assert_alembic_check_clean(url, 3072)
+
+
+def test_027_chains_from_026_and_replaces_the_legacy_index():
+    with throwaway_db("schema_027_chain", revision="026") as url:
+        assert alembic_version(url) == "026"
+        before = vector_indexes(url)
+        assert set(before) == {LEGACY_VECTOR_INDEX}, before
+        assert before[LEGACY_VECTOR_INDEX][2] == "vector_cosine_ops"
+        assert not NOTES_RELOPTIONS & notes_reloptions(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        assert set(vector_indexes(url)) == {HALFVEC_INDEX}
+        assert NOTES_RELOPTIONS <= notes_reloptions(url)
+
+
+def test_027_accepts_its_own_index_on_a_stamp_back_without_rebuilding_it():
+    """Stamp-back idempotence: the body re-runs, reconciles the index it built
+    (same OID — verified, not rebuilt), and re-applies the reloptions."""
+    with throwaway_db("schema_027_rerun") as url:
+        oid = vector_indexes(url)[HALFVEC_INDEX][3]
+        _harness.run_alembic(url, "stamp", "026", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+
+        assert alembic_version(url) == HEAD_REVISION
+        indexes = vector_indexes(url)
+        assert set(indexes) == {HALFVEC_INDEX}
+        assert indexes[HALFVEC_INDEX][1] is True
+        assert indexes[HALFVEC_INDEX][3] == oid
+        assert NOTES_RELOPTIONS <= notes_reloptions(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+@pytest.mark.parametrize(
+    "label,ddl",
+    [
+        (
+            "vector_opclass",
+            f"CREATE INDEX {HALFVEC_INDEX} ON note_embeddings "
+            "USING hnsw (embedding vector_cosine_ops)",
+        ),
+        (
+            "other_dimension",
+            f"CREATE INDEX {HALFVEC_INDEX} ON note_embeddings "
+            "USING hnsw ((embedding::halfvec(32)) halfvec_cosine_ops) "
+            "WITH (m = 16, ef_construction = 64)",
+        ),
+        (
+            "other_build_params",
+            f"CREATE INDEX {HALFVEC_INDEX} ON note_embeddings "
+            "USING hnsw ((embedding::halfvec(64)) halfvec_cosine_ops) "
+            "WITH (m = 8, ef_construction = 64)",
+        ),
+    ],
+)
+def test_027_refuses_an_impostor_index_under_its_name(label, ddl):
+    """Reconcile, don't adopt: an index of 027's name the queries' ORDER BY
+    does not match would leave semantic search on a sequential scan."""
+    with throwaway_db(f"schema_027_impostor_{label}") as url:
+        sql(url, f"DROP INDEX {HALFVEC_INDEX}")
+        sql(url, ddl)
+        _harness.run_alembic(url, "stamp", "026", dimensions=DIM)
+        result = _harness.run_alembic(
+            url, "upgrade", "head", dimensions=DIM, check=False
+        )
+        assert result.returncode != 0, "027 should have refused"
+        combined = result.stdout + result.stderr
+        assert f"027 found an index named {HALFVEC_INDEX}" in combined, combined
+        assert alembic_version(url) == "026", "nothing should have been recorded"
+
+
+def test_downgrade_027_restores_the_legacy_index_and_resets_reloptions():
+    with throwaway_db("schema_027_downgrade") as url:
+        _harness.run_alembic(url, "downgrade", "026", dimensions=DIM)
+        assert alembic_version(url) == "026"
+        indexes = vector_indexes(url)
+        assert set(indexes) == {LEGACY_VECTOR_INDEX}, indexes
+        _def, valid, opclass, _oid = indexes[LEGACY_VECTOR_INDEX]
+        assert valid is True
+        assert opclass == "vector_cosine_ops"
+        assert not NOTES_RELOPTIONS & notes_reloptions(url)
+
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert set(vector_indexes(url)) == {HALFVEC_INDEX}
+        assert NOTES_RELOPTIONS <= notes_reloptions(url)
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_027_above_2000_dimensions_builds_nothing():
+    with throwaway_db_at("schema_027_downgrade_3072", 3072) as url:
+        _harness.run_alembic(url, "downgrade", "026", dimensions=3072)
+        assert alembic_version(url) == "026"
+        assert vector_indexes(url) == {}
+        assert not NOTES_RELOPTIONS & notes_reloptions(url)

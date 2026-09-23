@@ -331,6 +331,72 @@ set and `RESET`, for 024's and 025's reasons. The gate's head literal is
 CHECK enforcement, stamp-back idempotence with row data preserved, the
 impostor column and CHECK refusals, and both downgrade directions.
 
+## 027: `notes_metadata` reloptions, the `halfvec` index, and an `include_object` hook (#283)
+
+027 does two things, both invisible to `alembic check`
+(rationale in [search](search.md#the-halfvec-index-half-precision-picks-candidates-full-precision-ranks-them-283)):
+
+- sets `autovacuum_vacuum_scale_factor = 0.02` and
+  `autovacuum_vacuum_insert_scale_factor = 0.02` on `notes_metadata` — **no
+  VACUUM** in the migration, because VACUUM cannot run in the one transaction
+  alembic runs the chain in (`make db-vacuum-notes` is the fallback);
+- when `EMBEDDING_DIMENSIONS` ≤ 2000, builds
+  `ix_note_embeddings_embedding_halfvec_hnsw` over
+  `(embedding::halfvec(D)) halfvec_cosine_ops` from
+  `src/services/vector_index.py`, then drops 008's
+  `ix_note_embeddings_embedding_hnsw`. New first, old second, so a failed build
+  leaves the database as it was. Above 2000 neither exists.
+
+**Why the index is excluded from autogenerate, and exactly it.** It is not on
+the model. Declaring it would put an operator class inside an index
+expression, and Alembic 1.19 on SQLAlchemy 2 *does* compare expression indexes
+on PostgreSQL (`_skip_functional_indexes` runs only when `not sqla_2`): it
+strips `::type` casts by regex and then either reports spurious drift or skips
+with a warning. Left undeclared and uncompared, the reflected index would read
+as a drop and `alembic check` would be dirty for ever. So `alembic/env.py`
+passes `include_object` to **both** `context.configure` calls, and it returns
+false for one object only: `type_ == "index"` and `name ==
+vector_index.INDEX_NAME`. Every other index — the legacy name included — is
+compared as before. `tests/test_perf_vector_index.py` evaluates the hook
+against every name the metadata carries, under every object type, and pins
+that exactly one is excluded. Widening the exclusion is how real drift gets
+hidden; the test exists so it cannot happen quietly. 008's index was removed
+from `NoteEmbedding.__table_args__` in the same change that drops it — which
+also ends a latent dirty check on deployments above 2000 dimensions, where the
+model declared an index the database never had.
+
+**The catalogue is the check.** Because Alembic sees neither half, the schema
+gate asserts them directly: `pg_class.reloptions` for both scale factors; for
+the index, `pg_get_indexdef` (the `((embedding)::halfvec(D))` expression at the
+configured dimension, `m='16'`, `ef_construction='64'`), `indisvalid`, and the
+operator class through `pg_opclass` (`halfvec_cosine_ops`), plus the legacy
+index's absence. It is 019/021/024's rule for indexes: a name is not evidence.
+
+**Reconcile, don't adopt.** A stamp-back re-run finds the index already built.
+It is accepted only if it is valid and its `pg_get_indexdef` equals, text for
+text, what `create_index_sql(D)` produces on a scratch TEMP table of the same
+column type — measured on the running server, not guessed (026's device). The
+gate asserts the OID is unchanged, i.e. reconciled rather than rebuilt. Any
+other index under that name — `vector_cosine_ops`, another dimension, other
+build parameters — is refused and named, because the queries' ORDER BY would
+match nothing and search would silently become a sequential scan.
+
+**Build cost and timeouts.** The build is non-concurrent under `SET LOCAL
+maintenance_work_mem = '512MB'` and a 15-minute `statement_timeout`, with a
+10 s `lock_timeout` so a migration queued behind a live pass fails fast.
+~17.5 k × 1024 builds in tens of seconds, during which writes to
+`note_embeddings` wait — acceptable in the deploy's migrate step. `search_path`
+is pinned and asserted, and everything set is `RESET` at the end.
+
+**`downgrade()`** resets both reloptions, recreates 008's index
+(`IF NOT EXISTS`) when *D* ≤ 2000, and drops the half-precision one.
+
+The gate's head literal is `027`, with `026` in the chain. Its 027 cases: the
+fresh shape at 1024 (the spec's scenario) and at the gate's own 64, no index
+above 2000, the chain from 026 replacing the legacy index, stamp-back
+idempotence without a rebuild, three impostor refusals, and downgrade at both
+sides of the 2000 limit. Each asks `alembic check` too.
+
 ## Database transport (#184)
 
 Before this change the engine passed no `ssl` argument and `DATABASE_URL`

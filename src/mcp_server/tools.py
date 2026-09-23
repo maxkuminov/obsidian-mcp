@@ -3553,11 +3553,16 @@ def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int |
     """
     from sqlalchemy import select
     from src.models.db import NoteEmbedding, NoteMetadata
+    from src.services import vector_index
 
     # Pull more than `limit` so we can dedupe by note. Same overfetch as
     # semantic_search so both vector paths share one recall contract.
     overfetch = max(limit * 5, 50)
-    distance = NoteEmbedding.embedding.cosine_distance(avg_embedding)
+    # As in `semantic_search` (#283, D19): ORDER BY the half-precision index
+    # expression, so the HNSW index picks the candidates; select, re-sort by
+    # and report the full-precision distance. Above 2000 dimensions there is
+    # no index and the two are one expression.
+    order, distance = vector_index.order_and_full_distance(avg_embedding)
     stmt = (
         select(
             NoteEmbedding.note_id,
@@ -3578,7 +3583,7 @@ def find_related_stmt(source_id: int, avg_embedding: list[float], user_id: int |
     # why the caller's zero-row exact fallback is unconditional — there is no
     # unfiltered form of this statement left (D1a).
     stmt = stmt.where(_note_owner_predicate(user_id))
-    return stmt.order_by(distance).limit(overfetch)
+    return stmt.order_by(order).limit(overfetch)
 
 
 @_tracked("find_related", ["path", "limit"])
@@ -3684,8 +3689,11 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
         timing.record("exact_fallback", exact_fallback)
         timing.add_ms("db_ms", time.monotonic() - vector_start)
 
-        # `relaxed_order` does not promise a globally sorted stream; re-sort
-        # before dedupe so the presented order is monotone in distance.
+        # `relaxed_order` does not promise a globally sorted stream, and the
+        # scan was ordered by the half-precision index expression (#283, D19).
+        # Re-sort by the selected full-precision `distance` **before** the
+        # dedupe, so the nearest chunk per note and the presented order are
+        # both full precision.
         rows = sorted(rows, key=lambda r: r.distance)
 
     if not rows:
@@ -3705,9 +3713,10 @@ async def find_related_impl(path: str, limit: int = 10) -> str:
             empty.append(_stale_source_line(path))
         return "\n".join(empty)
 
-    # Dedupe by note_id, keeping the nearest chunk — ranked by the *same*
-    # cosine distance the database ordered by, never by a distance recomputed
-    # here. pgvector compares float32 vectors; NumPy would recompute in
+    # Dedupe by note_id, keeping the nearest chunk — ranked by the
+    # full-precision cosine distance the database selected (#283: the scan
+    # itself is ordered by the half-precision index expression), never by a
+    # distance recomputed here. pgvector compares float32 vectors; NumPy would recompute in
     # float64 from the round-tripped values and order near-ties differently,
     # so a recomputed ranking could invert two rows relative to the ORDER BY
     # that selected them (and relative to the recall baseline). `similarity`

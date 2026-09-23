@@ -33,7 +33,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 import _harness
 from src.config import settings
 from src.models.db import NoteEmbedding, NoteMetadata
-from src.services import indexer
+from src.services import indexer, vector_index
 
 pytestmark = [
     _harness.requires_pgvector,
@@ -49,7 +49,9 @@ DIM = int(settings.embedding_dimensions)
 SEED = 8765
 N_NOTES = 1500
 CHUNKS_PER_NOTE = 2  # 3,000 vectors — enough for the planner to prefer HNSW.
-HNSW_INDEX = "ix_note_embeddings_embedding_hnsw"
+# The index production builds and the probe must walk (#283): named and built
+# through its one definition, so this test cannot pass against a lookalike.
+HNSW_INDEX = vector_index.INDEX_NAME
 
 
 def _random_unit(rng: random.Random) -> list[float]:
@@ -77,7 +79,7 @@ async def corpus(sessionmaker):
     single-threaded, with the same `m`/`ef_construction` production uses."""
     rng = random.Random(SEED)
     async with sessionmaker() as session:
-        await session.execute(text(f"DROP INDEX IF EXISTS {HNSW_INDEX}"))
+        await session.execute(text(vector_index.drop_index_sql()))
         notes = [
             NoteMetadata(
                 file_path=f"P/note-{i:04d}.md",
@@ -100,11 +102,7 @@ async def corpus(sessionmaker):
         await session.commit()
 
         await session.execute(text("SET LOCAL max_parallel_maintenance_workers = 0"))
-        await session.execute(text(
-            f"CREATE INDEX {HNSW_INDEX} ON note_embeddings "
-            "USING hnsw (embedding vector_cosine_ops) "
-            "WITH (m = 16, ef_construction = 64)"
-        ))
+        await session.execute(text(vector_index.create_index_sql(DIM)))
         await session.execute(text("ANALYZE note_embeddings"))
         await session.commit()
 
@@ -168,10 +166,6 @@ async def test_probe_is_skipped_when_no_hnsw_index_exists(
             await session.execute(
                 text("SET LOCAL max_parallel_maintenance_workers = 0")
             )
-            await session.execute(text(
-                f"CREATE INDEX {HNSW_INDEX} ON note_embeddings "
-                "USING hnsw (embedding vector_cosine_ops) "
-                "WITH (m = 16, ef_construction = 64)"
-            ))
+            await session.execute(text(vector_index.create_index_sql(DIM)))
             await session.commit()
         indexer.invalidate_hnsw_index_cache()

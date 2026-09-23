@@ -33,7 +33,7 @@ import src.database
 from src.config import settings
 from src.models.db import NoteEmbedding, NoteMetadata
 from src.services import embeddings as embeddings_service
-from src.services import index_state, indexer
+from src.services import index_state, indexer, vector_index
 from src.services.index_state import (
     INDEX_GENERATION_LOCK_KEY,
     KEY_EMBEDDING_FINGERPRINT,
@@ -565,7 +565,7 @@ async def test_real_reset_ddl_during_provider_has_no_discovery_lock_cycle(
 
     def before_statement(conn, cursor, statement, parameters, context, executemany):
         statements.append(statement)
-        if statement.startswith("DROP INDEX IF EXISTS ix_note_embeddings_embedding_hnsw"):
+        if statement.startswith(vector_index.drop_index_sql()):
             ddl_started.set()
 
     event.listen(reset_engine.sync_engine, "before_cursor_execute", before_statement)
@@ -589,7 +589,7 @@ async def test_real_reset_ddl_during_provider_has_no_discovery_lock_cycle(
         event.remove(reset_engine.sync_engine, "before_cursor_execute", before_statement)
 
     assert any("ALTER TABLE note_embeddings ALTER COLUMN embedding TYPE" in sql for sql in statements)
-    assert any("CREATE INDEX ix_note_embeddings_embedding_hnsw" in sql for sql in statements)
+    assert any(vector_index.create_index_sql(DIM) in sql for sql in statements)
     assert outcome.attempted == 1
     assert outcome.embedded == 0
     assert outcome.failures == 0, outcome.failure_summary

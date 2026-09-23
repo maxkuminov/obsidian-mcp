@@ -1171,11 +1171,16 @@ async def semantic_search(
 ) -> list[dict]:
     """Embed query and return the best-matching chunk per note (dedup), ordered by cosine distance.
 
-    The HNSW index handles ranking; we over-fetch chunks and dedup per note in Python
+    The HNSW index picks the candidates; they are re-ranked by full-precision
+    distance, and we over-fetch chunks and dedup per note in Python
     so a single verbose note can't dominate the result set. Each result is a pointer
     to a note plus its most-relevant chunk as preview — the caller should `read_note`
     for full content.
     """
+    # Local, so this function's region is the only part of the module #283
+    # touches (see the performance-2026-09 slice table).
+    from src.services import vector_index
+
     limit = max(1, min(limit, 50))
     embed_start = time.monotonic()
     query_embedding = await get_embedding(query)
@@ -1183,10 +1188,15 @@ async def semantic_search(
 
     db_start = time.monotonic()
     # ef_search=80 lifts HNSW recall@10 to ~98% at modest latency cost.
-    # random_page_cost=1.1 reflects SSD storage; the postgres default of 4
-    # makes the planner avoid the HNSW index in favor of a seq+sort, which
-    # is faster on small tables but degrades linearly as the vault grows.
-    # All three SET LOCALs scope to the current transaction.
+    # random_page_cost=1.1 is a planner correction, not a storage claim (D20).
+    # The planner costs the join's heap side at `relpages`, but every row this
+    # statement touches detoasts a vector (and `notes_metadata` a tsvector)
+    # from TOAST pages `relpages` does not count, so at the default of 4 it
+    # overprices the index path and picks a seq scan + sort that degrades
+    # linearly with the vault. The working set is mostly cached, so the lower
+    # page cost is right on an HDD too — `search.py` states the same
+    # rationale for its own hint. All three SET LOCALs scope to the current
+    # transaction.
     await session.execute(text("SET LOCAL hnsw.ef_search = 80"))
     await session.execute(text("SET LOCAL random_page_cost = 1.1"))
     # iterative_scan (pgvector >= 0.8; guarded at startup by
@@ -1206,7 +1216,13 @@ async def semantic_search(
     # Over-fetch by 5x: HNSW is logarithmic so this is essentially free, and it
     # gives the per-note dedup enough headroom when a note contributes many chunks.
     overfetch = max(limit * 5, 50)
-    distance = NoteEmbedding.embedding.cosine_distance(query_embedding)
+    # Two expressions (#283, D19). `order` is the index expression verbatim —
+    # `embedding::halfvec(D) <=> q::halfvec(D)` — so the planner can use the
+    # half-precision HNSW index; it decides only *which* candidates are
+    # fetched. `distance` is the full-precision `vector` distance: it is what
+    # is selected, re-sorted by below and reported. Above 2000 dimensions no
+    # index exists and the two are the same expression.
+    order, distance = vector_index.order_and_full_distance(query_embedding)
     # Explicit projection (#280, design D6) — the `find_related_stmt` shape.
     # Every field the result renders, plus the two hashes and the truncation
     # marker the annotations below read, and nothing else: no stored vector
@@ -1232,7 +1248,7 @@ async def semantic_search(
     stmt = apply_note_filters(
         stmt, folder=folder, tags=tags, frontmatter=frontmatter, user_id=user_id
     )
-    stmt = stmt.order_by(distance).limit(overfetch)
+    stmt = stmt.order_by(order).limit(overfetch)
 
     result = await session.execute(stmt)
     rows = result.fetchall()
@@ -1266,9 +1282,11 @@ async def semantic_search(
     timing.record("exact_fallback", exact_fallback)
     timing.add_ms("db_ms", time.monotonic() - db_start)
 
-    # Re-sort by distance before dedupe/truncate: `relaxed_order` does not
-    # promise a globally sorted stream, and the dedupe below keeps the *first*
-    # chunk seen per note. `file_path, chunk_index` break exact distance ties
+    # Re-sort by the full-precision distance before dedupe/truncate:
+    # `relaxed_order` does not promise a globally sorted stream, the scan was
+    # ordered by the half-precision expression (D19), and the dedupe below
+    # keeps the *first* chunk seen per note — so this sort is what makes the
+    # representative chunk and the note order full precision. `file_path, chunk_index` break exact distance ties
     # deterministically (#280, D6): which chunk represents a note, and the
     # order of equidistant notes, no longer depend on scan iteration order.
     rows = sorted(rows, key=lambda r: (r.distance, r.file_path, r.chunk_index))

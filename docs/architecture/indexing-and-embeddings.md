@@ -229,7 +229,13 @@ admitted this hop (plaintext to a non-loopback host).
   `shared_buffers`) and the median gap between calls has grown to ~28 min.
   It logs and swallows ordinary failures (the indexer's `consecutive_failures`
   must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
-  still stops the loop.
+  still stops the loop. Since #283 the probe (`probe_statement()`) orders by
+  `vector_index.order_expr` — the same half-precision expression the two
+  vector queries order by — so it warms the `halfvec` index the search
+  actually walks, and `_hnsw_index_exists` looks up `vector_index.INDEX_NAME`.
+  Above 2000 dimensions there is no index and the probe is skipped, as before.
+  `tests/integration/test_prewarm_probe.py` EXPLAINs the probe against an index
+  built by `vector_index.create_index_sql`.
 - **The dashboard's "Last run" is an in-process heartbeat, not
   `max(notes_metadata.indexed_at)`.** `indexer.last_index_run_at` /
   `last_index_run_ok` are stamped at the end of the startup pass and of every

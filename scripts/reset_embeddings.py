@@ -66,6 +66,7 @@ from sqlalchemy import text
 
 from src.config import settings
 from src.database import async_session, engine
+from src.services import vector_index
 from src.services.index_state import (
     KEY_EMBEDDING_FINGERPRINT,
     acquire_generation_lock_unbounded,
@@ -76,8 +77,10 @@ from src.services.index_state import (
 #: pgvector refuses to build an HNSW index above 2000 dimensions. The panel's
 #: reset path and the pre-warm probe already apply this condition; this script
 #: used to create the index unconditionally, so a deployment configured above
-#: the limit got a wiped column, no index, and an aborted transaction.
-HNSW_MAX_DIMENSIONS = 2000
+#: the limit got a wiped column, no index, and an aborted transaction. The
+#: condition, the name and the DDL now live in `src/services/vector_index.py`
+#: (#283); this alias stays for the log line below.
+HNSW_MAX_DIMENSIONS = vector_index.MAX_INDEXED_DIMENSIONS
 
 
 async def reset() -> None:
@@ -85,7 +88,7 @@ async def reset() -> None:
     # Rendered before the transaction opens so the value written is the one
     # this process is configured with, read from the edited `.env`.
     fingerprint = embedding_fingerprint()
-    hnsw = dim <= HNSW_MAX_DIMENSIONS
+    hnsw = vector_index.index_enabled(dim)
     print(f"Resetting embeddings to vector({dim})...")
     async with async_session() as session:
         # FIRST — before the DROP INDEX, before the DELETE, before any row or
@@ -113,9 +116,9 @@ async def reset() -> None:
         await session.execute(text("SET LOCAL statement_timeout = '5min'"))
         # ALTER COLUMN TYPE on a vector column with a dependent HNSW index
         # is unsafe across pgvector versions — drop and recreate explicitly.
-        await session.execute(
-            text("DROP INDEX IF EXISTS ix_note_embeddings_embedding_hnsw")
-        )
+        # Both names: the halfvec index, and 008's `vector` one on a database
+        # that has not reached 027.
+        await session.execute(text(vector_index.drop_index_sql()))
         await session.execute(text("DELETE FROM note_embeddings"))
         await session.execute(
             text(f"ALTER TABLE note_embeddings ALTER COLUMN embedding TYPE vector({dim})")
@@ -124,13 +127,7 @@ async def reset() -> None:
             text("UPDATE notes_metadata SET embedded_content_hash = NULL")
         )
         if hnsw:
-            await session.execute(
-                text(
-                    "CREATE INDEX ix_note_embeddings_embedding_hnsw "
-                    "ON note_embeddings USING hnsw (embedding vector_cosine_ops) "
-                    "WITH (m = 16, ef_construction = 64)"
-                )
-            )
+            await session.execute(text(vector_index.create_index_sql(dim)))
         else:
             print(
                 f"Skipping HNSW index: EMBEDDING_DIMENSIONS={dim} exceeds "

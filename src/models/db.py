@@ -527,6 +527,12 @@ class NoteMetadata(Base):
     )
     user: Mapped["User | None"] = relationship(back_populates="notes")
 
+    # Migration 027 sets `autovacuum_vacuum_scale_factor = 0.02` and
+    # `autovacuum_vacuum_insert_scale_factor = 0.02` on this table (#283, D17),
+    # so autovacuum keeps the dead tuples, the visibility map and the GIN
+    # metapage statistics current. They are storage parameters, which Alembic
+    # does not compare and this model cannot declare; the schema gate asserts
+    # them through `pg_class.reloptions`.
     __table_args__ = (
         # NULLS NOT DISTINCT so single-user-mode rows (user_id IS NULL)
         # collide on file_path alone and the indexer's upsert fires.
@@ -556,15 +562,16 @@ class NoteEmbedding(Base):
 
     note: Mapped["NoteMetadata"] = relationship(back_populates="embeddings")
 
+    # The vector index is deliberately **not** declared here (#283, migration
+    # 027). It is the half-precision expression index
+    # `ix_note_embeddings_embedding_halfvec_hnsw` over
+    # `(embedding::halfvec(D)) halfvec_cosine_ops`, defined once in
+    # `src/services/vector_index.py`, built only when D <= 2000, excluded from
+    # autogenerate by `alembic/env.py`'s `include_object`, and verified by the
+    # schema gate through the catalogue. 008's `vector_cosine_ops` index that
+    # used to be declared here is dropped by 027.
     __table_args__ = (
         Index("ix_note_embeddings_note_id", "note_id"),
-        Index(
-            "ix_note_embeddings_embedding_hnsw",
-            "embedding",
-            postgresql_using="hnsw",
-            postgresql_ops={"embedding": "vector_cosine_ops"},
-            postgresql_with={"m": "16", "ef_construction": "64"},
-        ),
     )
 
 

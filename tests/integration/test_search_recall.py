@@ -70,6 +70,7 @@ from src.services import timing
 from src.services import vault as vault_service
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
+from src.services import vector_index
 import _harness
 from src.config import settings
 
@@ -127,7 +128,9 @@ SATELLITE_COSINE_STEP = 0.03
 CHUNK_JITTER = 0.001
 
 EF_SEARCH = 80
-HNSW_INDEX = "ix_note_embeddings_embedding_hnsw"
+# The index production builds and queries (#283): the half-precision
+# expression index, named and built through its one definition.
+HNSW_INDEX = vector_index.INDEX_NAME
 
 
 # ── vector helpers ──────────────────────────────────────────────────────────
@@ -168,13 +171,16 @@ async def _build_hnsw_index(session) -> None:
     next, which turns any assertion about *which* rows an approximate scan
     reaches into a coin flip. Single-threaded keeps the benchmark comparable
     across the three rebuilds and across runs.
+
+    The DDL is production's (`vector_index.create_index_sql`), so the recall
+    SLO is measured on the index migration 027 and both reset paths build —
+    not on a hand-copied lookalike. Any index of either name is dropped first,
+    so a database migrated to head (which already carries 027's index) can be
+    rebuilt the same way as one that does not.
     """
     await session.execute(text("SET LOCAL max_parallel_maintenance_workers = 0"))
-    await session.execute(text(
-        f"CREATE INDEX {HNSW_INDEX} ON note_embeddings "
-        "USING hnsw (embedding vector_cosine_ops) "
-        "WITH (m = 16, ef_construction = 64)"
-    ))
+    await session.execute(text(vector_index.drop_index_sql()))
+    await session.execute(text(vector_index.create_index_sql(DIM)))
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
@@ -240,7 +246,7 @@ async def corpus(sessionmaker, queries):
     async with sessionmaker() as session:
         # Build the index *after* the bulk load: inserting into an HNSW index
         # row by row is an order of magnitude slower and buys nothing.
-        await session.execute(text(f"DROP INDEX IF EXISTS {HNSW_INDEX}"))
+        await session.execute(text(vector_index.drop_index_sql()))
         await session.commit()
 
     async with sessionmaker() as session:
@@ -368,7 +374,6 @@ async def rebuild(request, sessionmaker, corpus):
     parametrised over this.
     """
     async with sessionmaker() as session:
-        await session.execute(text(f"DROP INDEX IF EXISTS {HNSW_INDEX}"))
         await _build_hnsw_index(session)
         await session.execute(text("ANALYZE note_embeddings"))
         await session.commit()
@@ -446,16 +451,25 @@ def _assert_the_tool_body_ran(out: str, *, tool: str) -> None:
 
 
 # ── the query under test, run three ways ────────────────────────────────────
-def _build_stmt(vec, overfetch, **filters):
-    """The statement `semantic_search` builds, so the three modes below differ
-    only in their `SET LOCAL`s."""
-    distance = NoteEmbedding.embedding.cosine_distance(vec)
+def _build_stmt(vec, overfetch, *, exact=False, **filters):
+    """The statement `semantic_search` builds, so the approximate modes differ
+    only in their `SET LOCAL`s.
+
+    Since #283 production orders by the half-precision index expression and
+    selects the full-precision distance (`vector_index.order_and_full_distance`).
+    The **exact baseline** (`exact=True`) orders by the full-precision `vector`
+    distance instead: a `halfvec` baseline, even a sequential one, would share
+    the precision loss being measured and hide it (design D19).
+    """
+    order, distance = vector_index.order_and_full_distance(vec)
+    if exact:
+        order = distance
     stmt = (
         select(NoteEmbedding, NoteMetadata, distance.label("distance"))
         .join(NoteMetadata, NoteEmbedding.note_id == NoteMetadata.id)
     )
     stmt = apply_note_filters(stmt, **filters)
-    return stmt.order_by(distance).limit(overfetch)
+    return stmt.order_by(order).limit(overfetch)
 
 
 def _dedupe(rows, limit):
@@ -498,7 +512,7 @@ async def _run(sessionmaker, vec, limit=10, *, mode, **filters):
     overfetch = max(limit * 5, 50)
     async with sessionmaker() as session:
         await _apply_mode(session, mode)
-        stmt = _build_stmt(vec, overfetch, **filters)
+        stmt = _build_stmt(vec, overfetch, exact=(mode == "exact"), **filters)
         rows = (await session.execute(stmt)).fetchall()
     return _dedupe(rows, limit)
 
@@ -507,7 +521,9 @@ async def _explain(sessionmaker, vec, limit=10, *, mode, **filters):
     overfetch = max(limit * 5, 50)
     async with sessionmaker() as session:
         await _apply_mode(session, mode)
-        return await _harness.explain(session, _build_stmt(vec, overfetch, **filters))
+        return await _harness.explain(
+            session, _build_stmt(vec, overfetch, exact=(mode == "exact"), **filters)
+        )
 
 
 def _recall(returned, baseline) -> float:
@@ -635,6 +651,9 @@ async def test_filtered_recall_meets_the_baseline(
                 )
                 continue
             recall = _recall(got, baseline)
+            # Benchmark output — visible with `-s`; #283's gate records it.
+            print(f"semantic recall rebuild={rebuild} [{case}] query {i}: "
+                  f"{recall:.2f} (returned {len(got)} of {len(baseline)})")
             if recall < 0.9:
                 failures.append(
                     f"[{case}] query {i}: recall {recall:.2f} < 0.90 "
@@ -820,6 +839,10 @@ async def _find_related_baseline(sessionmaker, source_id, avg, user_id):
         await session.execute(text("SET LOCAL enable_indexscan = off"))
         await session.execute(text("SET LOCAL enable_bitmapscan = off"))
         stmt = tools.find_related_stmt(source_id, avg, user_id, FIND_RELATED_LIMIT)
+        # Production's statement, re-ordered by its own selected
+        # full-precision `distance`: the baseline must not order by the
+        # half-precision index expression it is measuring (#283, D19).
+        stmt = stmt.order_by(None).order_by(stmt.selected_columns.distance)
         rows = (await session.execute(stmt)).all()
 
     seen, out = set(), []

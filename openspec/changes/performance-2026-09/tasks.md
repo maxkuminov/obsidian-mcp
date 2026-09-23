@@ -164,26 +164,26 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 ## 4. Slice S4 — database: migration 027 (#283), branch `perf-s4-db`, after S2 and S3 merge
 
-- [ ] 4.1 `src/services/vector_index.py` (D19). Contents:
+- [x] 4.1 `src/services/vector_index.py` (D19). Contents:
   - `INDEX_NAME = "ix_note_embeddings_embedding_halfvec_hnsw"` and `LEGACY_INDEX_NAME = "ix_note_embeddings_embedding_hnsw"`.
   - `index_enabled(dim)`, true when `dim ≤ 2000`.
   - `create_index_sql(dim)`, with `m = 16, ef_construction = 64`.
   - `drop_index_sql()`, which drops both names `IF EXISTS`.
   - `order_expr(query_vec)`: the `halfvec(dim)` cast expression when enabled, else the plain `cosine_distance`.
   - `full_distance_expr(query_vec)`.
-- [ ] 4.2 **The recall gate, before 027 is written with the index.**
+- [x] 4.2 **The recall gate, before 027 is written with the index.**
   - Adapt `tests/integration/test_search_recall.py`, `test_prewarm_probe.py` and `test_pgvector_search.py` to build and name the index through `vector_index`.
   - Keep the recall test's exact baseline a **full-precision `vector` sequential scan**.
   - Run `make test-integration`.
   - **Pass** (recall ≥ 0.9 on each of three rebuilds, every filter shape, and `find_related`): continue with 4.3–4.6 including the index.
   - **Fail**: drop the index and the query casts from this slice. Record the measured recall in design D19 and in `search.md` under "Rejected: halfvec index (recall)". Continue with the reloptions only.
-- [ ] 4.3 `alembic/versions/027_notes_vacuum_and_halfvec.py` (`down_revision = "026"`):
+- [x] 4.3 `alembic/versions/027_notes_vacuum_and_halfvec.py` (`down_revision = "026"`):
   - `ALTER TABLE notes_metadata SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_insert_scale_factor = 0.02)`.
   - If the gate passed and `index_enabled(dim)`: under `SET LOCAL maintenance_work_mem = '512MB'` and a build-sized `statement_timeout`, `create_index_sql(dim)`, then drop the legacy index.
   - No VACUUM (D18).
   - `downgrade()` resets the reloptions, recreates the legacy `vector` index when `dim ≤ 2000`, and drops the new one.
   - Pin `search_path` as 024 does.
-- [ ] 4.4 Query side, if the gate passed.
+- [x] 4.4 Query side, if the gate passed.
   - `embeddings.py` `semantic_search` and `tools.py` `find_related_stmt`/`find_related_impl`:
     - order by `order_expr`;
     - also select `full_distance_expr`;
@@ -191,20 +191,20 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
     - `similarity = 1 - full_distance`.
   - `indexer.py` prewarm: `probe_statement` orders by `order_expr(_probe_vector())`, and `_hnsw_index_exists` looks up `vector_index.INDEX_NAME`.
   - `control_panel/routes.py` `reset_embeddings` and `scripts/reset_embeddings.py`: drop and create through `vector_index`.
-- [ ] 4.5 `alembic/env.py`: add an `include_object` hook that excludes exactly the index named `vector_index.INDEX_NAME`, with `type_ == "index"`. Pass it to both `context.configure` calls. PR #284 also edits this file, in `run_async_migrations`; rebase onto whichever landed first.
-- [ ] 4.6 `models/db.py`: remove the legacy `Index` from `NoteEmbedding.__table_args__` if the gate passed. Add the reloptions comment above `NoteMetadata.__table_args__`, explaining that Alembic does not compare reloptions and the schema gate asserts them.
-- [ ] 4.7 `embeddings.py`: correct the `random_page_cost` comment (D20).
-- [ ] 4.8 `Makefile`: add a `db-vacuum-notes` target that runs `VACUUM (ANALYZE) notes_metadata` in an autocommit session through the application container, with a `make help` line.
-- [ ] 4.9 `tests/integration/test_schema_check.py`:
+- [x] 4.5 `alembic/env.py`: add an `include_object` hook that excludes exactly the index named `vector_index.INDEX_NAME`, with `type_ == "index"`. Pass it to both `context.configure` calls. PR #284 also edits this file, in `run_async_migrations`; rebase onto whichever landed first.
+- [x] 4.6 `models/db.py`: remove the legacy `Index` from `NoteEmbedding.__table_args__` if the gate passed. Add the reloptions comment above `NoteMetadata.__table_args__`, explaining that Alembic does not compare reloptions and the schema gate asserts them.
+- [x] 4.7 `embeddings.py`: correct the `random_page_cost` comment (D20).
+- [x] 4.8 `Makefile`: add a `db-vacuum-notes` target that runs `VACUUM (ANALYZE) notes_metadata` in an autocommit session through the application container, with a `make help` line.
+- [x] 4.9 `tests/integration/test_schema_check.py`:
   - Raise `HEAD_REVISION` to `027` and keep `026` in the chain.
   - Add 027's cases: reloptions via `pg_class.reloptions`; the index via `pg_get_indexdef`, `indisvalid` and the opclass `halfvec_cosine_ops` at the configured dimension; the legacy index absent; downgrade restores the legacy index; stamp-back idempotence.
   - `alembic check` is clean at head.
-- [ ] 4.10 `tests/test_perf_vector_index.py`:
+- [x] 4.10 `tests/test_perf_vector_index.py`:
   - `include_object` excludes exactly one name.
   - `index_enabled` is false above 2000, and then the queries use the plain expression.
   - The query's order expression compiles to text identical to the index expression.
   - The full-precision re-sort precedes the dedupe.
-- [ ] 4.11 Docs:
+- [x] 4.11 Docs:
   - `search.md`: the `halfvec` decision (or its rejection with the measured recall), the full-precision re-rank, D17, D18, and the corrected `random_page_cost` rationale.
   - `schema-and-migrations.md`: a "027" section, covering the `include_object` exclusion and why, and the catalogue verification.
   - `indexing-and-embeddings.md`: the prewarm bullet.

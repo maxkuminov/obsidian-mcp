@@ -347,4 +347,8 @@ async def test_hnsw_index_exists_and_query_settings_apply(sessionmaker, seeded):
                 )
             )
         ).scalars().all()
-    assert "ix_note_embeddings_embedding_hnsw" in indexes
+    # The half-precision index 027 builds (#283), and not 008's, which it drops.
+    from src.services import vector_index
+
+    assert vector_index.INDEX_NAME in indexes
+    assert vector_index.LEGACY_INDEX_NAME not in indexes

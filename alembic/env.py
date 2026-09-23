@@ -12,19 +12,49 @@ from src.models.db import Base
 
 target_metadata = Base.metadata
 
+def include_object(object, name, type_, reflected, compare_to):
+    """Exclude exactly one object from autogenerate: the half-precision vector
+    index (#283, design D19).
+
+    It is an expression index — `(embedding::halfvec(D)) halfvec_cosine_ops` —
+    and deliberately not declared on the model: Alembic on SQLAlchemy 2
+    compares expression indexes, strips the `::halfvec` cast by regex, and
+    then either reports spurious drift or skips it with a warning. Left in the
+    comparison undeclared, `alembic check` would report it as a drop. The
+    schema gate verifies it through the catalogue instead (`pg_get_indexdef`,
+    `indisvalid`, the operator class). Every other object — every other index
+    included — is compared as before; `tests/test_perf_vector_index.py` pins
+    that this names exactly one.
+    """
+    from src.services.vector_index import INDEX_NAME
+
+    if type_ == "index" and name == INDEX_NAME:
+        return False
+    return True
+
+
 def get_url():
     return os.environ.get("DATABASE_URL", context.config.get_main_option("sqlalchemy.url"))
 
 
 def run_migrations_offline():
     url = get_url()
-    context.configure(url=url, target_metadata=target_metadata, literal_binds=True)
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        include_object=include_object,
+    )
     with context.begin_transaction():
         context.run_migrations()
 
 
 def do_run_migrations(connection):
-    context.configure(connection=connection, target_metadata=target_metadata)
+    context.configure(
+        connection=connection,
+        target_metadata=target_metadata,
+        include_object=include_object,
+    )
     with context.begin_transaction():
         context.run_migrations()
 
