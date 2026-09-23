@@ -1,5 +1,18 @@
 {% extends "base.html" %}
 {% block title %}Settings — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+    /* Settings page classes (#289, design D1/D3). The reset scrim starts
+       hidden here; panel.js showModal/hideModal still set el.style.display,
+       an inline (CSSOM) declaration that overrides this class. */
+    .settings-danger-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
+    .settings-danger-title { color: var(--text); font-size: 14px; margin: 0 0 4px; font-weight: 500; }
+    .settings-danger-text { color: var(--text-2); font-size: 13px; margin: 0; line-height: 1.55; }
+    .settings-reset-scrim { display: none; position: fixed; inset: 0; background: var(--modal-scrim-2); align-items: center; justify-content: center; z-index: 50; }
+    .settings-reset-panel { background: var(--bg-2); border: 1px solid var(--border); border-radius: 8px; padding: 22px 24px; max-width: 440px; width: 90%; }
+    .settings-reset-text { color: var(--text-2); font-size: 13px; line-height: 1.55; margin: 0 0 18px; }
+</style>
+{% endblock %}
 {% block content %}
 
 <div class="page-top">
@@ -13,8 +26,8 @@
         <div class="card anim-1">
             <div class="card-header">
                 <span class="card-title">Indexer</span>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                    <form method="POST" action="/admin/settings/reindex" style="display:inline;">
+                <div class="u-display-flex u-gap-8px u-flex-wrap-wrap">
+                    <form method="POST" action="/admin/settings/reindex" class="u-display-inline">
                         {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                         <button type="button" class="btn btn-primary" data-confirm="Trigger incremental reindex?">
                             <svg width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -60,11 +73,11 @@
             <div class="card-body">
                 <div class="kv">
                     <span class="kv-k">Provider</span>
-                    <span class="kv-v mono" style="font-size:12px;">{{ provider.name }}</span>
+                    <span class="kv-v mono u-font-size-12px">{{ provider.name }}</span>
                 </div>
                 <div class="kv">
                     <span class="kv-k">Model</span>
-                    <span class="kv-v mono" style="font-size:12px;">{{ provider.model }}</span>
+                    <span class="kv-v mono u-font-size-12px">{{ provider.model }}</span>
                 </div>
                 <div class="kv">
                     <span class="kv-k">Dimensions</span>
@@ -73,21 +86,21 @@
                 {% if provider.name == "openai" %}
                 <div class="kv">
                     <span class="kv-k">Base URL</span>
-                    <span class="kv-v mono" style="font-size:11px;color:var(--text-2);">{{ provider.base_url }}</span>
+                    <span class="kv-v mono u-font-size-11px u-color-text-2">{{ provider.base_url }}</span>
                 </div>
                 <div class="kv">
                     <span class="kv-k">API key</span>
-                    <span class="kv-v mono" style="font-size:12px;">{{ provider.masked_key }}</span>
+                    <span class="kv-v mono u-font-size-12px">{{ provider.masked_key }}</span>
                 </div>
                 {% else %}
                 <div class="kv">
                     <span class="kv-k">Ollama URL</span>
-                    <span class="kv-v mono" style="font-size:11px;color:var(--text-2);">{{ provider.ollama_url }}</span>
+                    <span class="kv-v mono u-font-size-11px u-color-text-2">{{ provider.ollama_url }}</span>
                 </div>
                 {% endif %}
                 <div class="kv">
                     <span class="kv-k">Vault path</span>
-                    <span class="kv-v mono" style="font-size:11px;color:var(--text-2);">{{ vault_path }}</span>
+                    <span class="kv-v mono u-font-size-11px u-color-text-2">{{ vault_path }}</span>
                 </div>
             </div>
         </div>
@@ -95,17 +108,17 @@
     </div>
 
     <!-- Danger zone -->
-    <div class="card anim-3" style="margin-top:24px;border-color:var(--danger-border);">
-        <div class="card-header" style="border-bottom-color:var(--danger-border-soft);">
-            <span class="card-title" style="color:var(--error);">Danger zone</span>
+    <div class="card anim-3 u-margin-top-24px u-border-color-danger-border">
+        <div class="card-header u-border-bottom-color-danger-border-soft">
+            <span class="card-title u-color-error">Danger zone</span>
         </div>
         <div class="card-body">
-            <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:18px;flex-wrap:wrap;">
-                <div style="flex:1;min-width:240px;">
-                    <p style="color:var(--text);font-size:14px;margin:0 0 4px;font-weight:500;">
+            <div class="settings-danger-row">
+                <div class="u-flex-1 u-min-width-240px">
+                    <p class="settings-danger-title">
                         Reset embeddings
                     </p>
-                    <p style="color:var(--text-2);font-size:13px;margin:0;line-height:1.55;">
+                    <p class="settings-danger-text">
                         Drops and recreates the embedding column at the
                         currently configured dimension
                         ({{ provider.dimensions }}) and clears every note's
@@ -126,26 +139,25 @@
 
 <!-- Reset confirmation modal -->
 <div id="reset-modal"
-     style="display:none;position:fixed;inset:0;background:var(--modal-scrim-2);align-items:center;justify-content:center;z-index:50;"
+     class="settings-reset-scrim"
      data-modal-backdrop>
-    <div style="background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:22px 24px;max-width:440px;width:90%;">
-        <h3 style="margin:0 0 8px;font-size:16px;color:var(--error);">Confirm reset</h3>
-        <p style="color:var(--text-2);font-size:13px;line-height:1.55;margin:0 0 18px;">
+    <div class="settings-reset-panel">
+        <h3 class="u-margin-0-0-8px u-font-size-16px u-color-error">Confirm reset</h3>
+        <p class="settings-reset-text">
             This will delete every embedding row and clear the embedded hash
             on all notes. The indexer is paused while the reset runs and
             resumes afterwards. Re-embedding takes time and may incur cost
             for OpenAI.
         </p>
-        <div style="display:flex;gap:10px;justify-content:flex-end;">
+        <div class="u-display-flex u-gap-10px u-justify-content-flex-end">
             <button type="button"
-                    class="btn btn-ghost"
-                    style="font-size:13px;padding:8px 16px;"
+                    class="btn btn-ghost u-font-size-13px u-padding-8px-16px"
                     data-modal-close="reset-modal">
                 Cancel
             </button>
-            <form method="POST" action="/admin/settings/reset-embeddings" style="display:inline;">
+            <form method="POST" action="/admin/settings/reset-embeddings" class="u-display-inline">
                 {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                <button type="submit" class="btn btn-danger" style="font-size:13px;padding:8px 16px;">
+                <button type="submit" class="btn btn-danger u-font-size-13px u-padding-8px-16px">
                     Yes, reset
                 </button>
             </form>
