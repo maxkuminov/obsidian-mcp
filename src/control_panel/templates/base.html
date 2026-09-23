@@ -777,7 +777,28 @@
             .page-actions > form { width: 100%; }
             .page-actions > form .btn-lg { width: 100%; }
         }
+
+        /* Gem marks (sidebar and mobile header). Stylesheet rules, not
+           fill=/stroke= presentation attributes: var() in a presentation
+           attribute does not substitute dependably and falls back to black
+           (#289, design D2). */
+        .gem-edge { stroke: var(--primary); }
+        .gem-facet { fill: var(--gem-facet); stroke: none; }
+        .gem-facet-2 { fill: var(--gem-facet-2); stroke: none; }
+
+        /* Signed-in user row above the page content (multi-user mode). */
+        .base-user-bar {
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 10px;
+            padding: 14px 48px 0;
+        }
     </style>
+    {# Cascade order is fixed (#289, design D4): component CSS above, then the
+       generated utility vocabulary, then the page's own nonced block. #}
+    {% include "_utilities.html" %}
+    {% block page_style %}{% endblock %}
 </head>
 <body>
 
@@ -785,16 +806,16 @@
 <header class="topbar">
     <div class="topbar-brand">
         <svg viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
-            <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke-width="1.4" style="stroke:var(--primary);"/>
-            <polygon points="15,2 27,10 15,8" style="fill:var(--gem-facet);stroke:none;"/>
-            <polygon points="15,8 27,10 24,25 6,25 3,10" style="fill:var(--gem-facet-2);stroke:none;"/>
-            <line x1="15" y1="2" x2="15" y2="8" stroke-width="0.8" opacity="0.7" style="stroke:var(--primary);"/>
-            <line x1="15" y1="8" x2="3" y2="10" stroke-width="0.5" opacity="0.4" style="stroke:var(--primary);"/>
-            <line x1="15" y1="8" x2="27" y2="10" stroke-width="0.5" opacity="0.4" style="stroke:var(--primary);"/>
+            <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke-width="1.4" class="gem-edge"/>
+            <polygon points="15,2 27,10 15,8" class="gem-facet"/>
+            <polygon points="15,8 27,10 24,25 6,25 3,10" class="gem-facet-2"/>
+            <line x1="15" y1="2" x2="15" y2="8" stroke-width="0.8" opacity="0.7" class="gem-edge"/>
+            <line x1="15" y1="8" x2="3" y2="10" stroke-width="0.5" opacity="0.4" class="gem-edge"/>
+            <line x1="15" y1="8" x2="27" y2="10" stroke-width="0.5" opacity="0.4" class="gem-edge"/>
         </svg>
         Obsidian MCP
     </div>
-    <div style="display:flex;align-items:center;gap:8px;">
+    <div class="u-display-flex u-align-items-center u-gap-8px">
         {% include "_theme_toggle.html" %}
         <button type="button" class="topbar-toggle" aria-label="Open menu" data-sidebar-open>
             <svg viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
@@ -815,14 +836,14 @@
         <div class="sidebar-brand">
             <!-- Obsidian gem icon -->
             <svg class="brand-icon" viewBox="0 0 30 30" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke-width="1.4" style="stroke:var(--primary);"/>
-                <polygon points="15,2 27,10 15,8"          style="fill:var(--gem-facet);stroke:none;"/>
-                <polygon points="15,8 27,10 24,25 6,25 3,10" style="fill:var(--gem-facet-2);stroke:none;"/>
-                <line x1="15" y1="2"  x2="15" y2="8"  stroke-width="0.8" opacity="0.7" style="stroke:var(--primary);"/>
-                <line x1="15" y1="8"  x2="3"  y2="10" stroke-width="0.5" opacity="0.4" style="stroke:var(--primary);"/>
-                <line x1="15" y1="8"  x2="27" y2="10" stroke-width="0.5" opacity="0.4" style="stroke:var(--primary);"/>
-                <line x1="15" y1="8"  x2="6"  y2="25" stroke-width="0.4" opacity="0.3" style="stroke:var(--primary);"/>
-                <line x1="15" y1="8"  x2="24" y2="25" stroke-width="0.4" opacity="0.3" style="stroke:var(--primary);"/>
+                <polygon points="15,2 27,10 24,25 6,25 3,10" fill="none" stroke-width="1.4" class="gem-edge"/>
+                <polygon points="15,2 27,10 15,8"          class="gem-facet"/>
+                <polygon points="15,8 27,10 24,25 6,25 3,10" class="gem-facet-2"/>
+                <line x1="15" y1="2"  x2="15" y2="8"  stroke-width="0.8" opacity="0.7" class="gem-edge"/>
+                <line x1="15" y1="8"  x2="3"  y2="10" stroke-width="0.5" opacity="0.4" class="gem-edge"/>
+                <line x1="15" y1="8"  x2="27" y2="10" stroke-width="0.5" opacity="0.4" class="gem-edge"/>
+                <line x1="15" y1="8"  x2="6"  y2="25" stroke-width="0.4" opacity="0.3" class="gem-edge"/>
+                <line x1="15" y1="8"  x2="24" y2="25" stroke-width="0.4" opacity="0.3" class="gem-edge"/>
             </svg>
             <span class="brand-name">Obsidian</span>
             <span class="brand-tagline">MCP Control</span>
@@ -941,12 +962,12 @@
     <!-- ── Main ── -->
     <div class="main">
         {% if multi_user_mode and username %}
-        <div style="display:flex;justify-content:flex-end;align-items:center;gap:10px;padding:14px 48px 0;">
+        <div class="base-user-bar">
             <span class="user-badge">
                 <span class="user-badge-name">{{ username }}</span>
                 {% if is_admin %}<span class="user-badge-role">Admin</span>{% endif %}
             </span>
-            <form method="POST" action="/admin/auth/logout" style="margin:0;">
+            <form method="POST" action="/admin/auth/logout" class="u-margin-0">
                 {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                 <button type="submit" class="logout-btn" title="Sign out">Logout</button>
             </form>

@@ -45,7 +45,7 @@
                     <div class="kv-k">Role</div>
                     <div class="kv-v">{% if is_admin %}Admin{% else %}User{% endif %}</div>
                 </div>
-                <div style="color:var(--text-3);font-size:12px;margin-top:12px;">
+                <div class="u-color-text-3 u-font-size-12px u-margin-top-12px">
                     Your username and role are set by an administrator. If you cannot
                     sign in at all, an administrator can reset your password for you.
                 </div>
@@ -82,15 +82,15 @@
                                minlength="{{ min_password_length }}"
                                class="field-input" autocomplete="new-password">
                     </div>
-                    <div style="font-size:11px;color:var(--text-3);margin-top:6px;">
+                    <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
                         At least {{ min_password_length }} characters. There are no
                         composition rules — length is the control that works.
                     </div>
-                    <div class="alert alert-warning" style="margin-top:14px;font-size:12px;">
+                    <div class="alert alert-warning u-margin-top-14px u-font-size-12px">
                         Changing your password signs you out of every other browser and
                         device. This one stays signed in, under a new session.
                     </div>
-                    <div style="display:flex;gap:10px;margin-top:18px;">
+                    <div class="u-display-flex u-gap-10px u-margin-top-18px">
                         <button type="submit" class="btn btn-primary">Change password</button>
                     </div>
                 </form>
