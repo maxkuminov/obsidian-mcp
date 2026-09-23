@@ -1,5 +1,15 @@
 {% extends "base.html" %}
 {% block title %}OAuth — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+    /* #289: converted from inline style attributes. */
+    .oauth-grant-row { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+    /* Scoped to beat `.data-table td` and `.data-table tbody tr:hover td`
+       (0,2,3), which the inline style used to beat: equal specificity,
+       later in the cascade. */
+    .data-table tbody tr td.oauth-td-muted { font-size: 11px; color: var(--text-3); }
+</style>
+{% endblock %}
 {% block content %}
 
 <div class="page-top">
@@ -11,40 +21,40 @@
     {% if flash_error %}
     {# Why the last scope change did nothing. The select submits on `onchange`,
        so without this the option simply snaps back and reads as a browser bug. #}
-    <div class="card anim-1" style="margin-bottom:16px;padding:12px 16px;border-left:3px solid var(--error);">
-        <div style="font-size:13px;color:var(--text-2);">{{ flash_error }}</div>
+    <div class="card anim-1 u-margin-bottom-16px u-padding-12px-16px u-border-left-3px-solid-error">
+        <div class="u-font-size-13px u-color-text-2">{{ flash_error }}</div>
     </div>
     {% endif %}
 
     {% if not clients %}
-    <div class="card anim-1" style="text-align:center;padding:48px 24px;">
-        <svg width="36" height="36" viewBox="0 0 36 36" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" style="margin:0 auto 14px;opacity:0.25;">
+    <div class="card anim-1 u-text-align-center u-padding-48px-24px">
+        <svg width="36" height="36" viewBox="0 0 36 36" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" class="u-margin-0-auto-14px u-opacity-0_25">
             <circle cx="18" cy="18" r="15"/>
             <ellipse cx="18" cy="18" rx="7" ry="15"/>
             <line x1="3" y1="13" x2="33" y2="13"/>
             <line x1="3" y1="23" x2="33" y2="23"/>
         </svg>
-        <p style="color:var(--text-2);font-size:14px;margin-bottom:6px;">No OAuth clients registered.</p>
-        <p style="color:var(--text-3);font-size:12px;">Clients are created automatically when an app connects via OAuth.</p>
+        <p class="u-color-text-2 u-font-size-14px u-margin-bottom-6px">No OAuth clients registered.</p>
+        <p class="u-color-text-3 u-font-size-12px">Clients are created automatically when an app connects via OAuth.</p>
     </div>
     {% else %}
 
-    <div style="display:flex;flex-direction:column;gap:16px;">
+    <div class="u-display-flex u-flex-direction-column u-gap-16px">
         {% for client in clients %}
         <div class="card anim-1">
             <div class="card-header">
                 <div>
-                    <div style="font-size:15px;font-weight:500;color:var(--text);">{{ client.client_name }}</div>
-                    <div class="mono" style="font-size:10px;color:var(--text-3);margin-top:3px;">{{ client.client_id }}</div>
+                    <div class="u-font-size-15px u-font-weight-500 u-color-text">{{ client.client_name }}</div>
+                    <div class="mono u-font-size-10px u-color-text-3 u-margin-top-3px">{{ client.client_id }}</div>
                 </div>
-                <div style="display:flex;align-items:center;gap:14px;">
+                <div class="u-display-flex u-align-items-center u-gap-14px">
                     {# The registered scope is the ceiling on every grant below. Showing it
                        explains why the readwrite option is absent for a read-only client. #}
-                    <span class="mono" style="font-size:10px;color:var(--text-3);">registered: {{ client.scope }}</span>
-                    <span style="font-size:11px;color:var(--text-3);">Registered <time datetime="{{ client.created_at }}" data-localize="date">{{ client.created_at }}</time></span>
-                    <form method="POST" action="/admin/oauth/{{ client.client_id }}/delete" style="display:inline;">
+                    <span class="mono u-font-size-10px u-color-text-3">registered: {{ client.scope }}</span>
+                    <span class="u-font-size-11px u-color-text-3">Registered <time datetime="{{ client.created_at }}" data-localize="date">{{ client.created_at }}</time></span>
+                    <form method="POST" action="/admin/oauth/{{ client.client_id }}/delete" class="u-display-inline">
                         {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                        <button type="button" class="btn btn-danger" style="font-size:11px;padding:4px 12px;" data-confirm="Delete this client?&#10;&#10;Its access and refresh tokens are deleted, so it can no longer call this server, and any outstanding upload or download links minted under those tokens stop working.&#10;&#10;Its usage history stays on the Usage page, still labelled with this client name.">Delete</button>
+                        <button type="button" class="btn btn-danger u-font-size-11px u-padding-4px-12px" data-confirm="Delete this client?&#10;&#10;Its access and refresh tokens are deleted, so it can no longer call this server, and any outstanding upload or download links minted under those tokens stop working.&#10;&#10;Its usage history stays on the Usage page, still labelled with this client name.">Delete</button>
                     </form>
                 </div>
             </div>
@@ -54,10 +64,10 @@
             {# One block per grant — the unit the user actually approved. A token row is an
                implementation detail nobody was asked about, and giving each one its own
                Revoke and its own scope select is what made both controls near no-ops. #}
-            <div style="padding:14px 22px;border-top:1px solid var(--border);">
-                <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;">
-                    <div style="display:flex;align-items:center;gap:8px;">
-                        <span style="font-size:12px;color:var(--text-2);">Access</span>
+            <div class="u-padding-14px-22px u-border-top-1px-solid-border">
+                <div class="oauth-grant-row">
+                    <div class="u-display-flex u-align-items-center u-gap-8px">
+                        <span class="u-font-size-12px u-color-text-2">Access</span>
                         {% if grant.status == 'active' %}
                         <span class="badge badge-green">Active</span>
                         {% elif grant.status == 'owner_inactive' %}
@@ -76,8 +86,8 @@
                         {% endif %}
                     </div>
 
-                    <div style="display:flex;align-items:center;gap:8px;">
-                        <span style="font-size:12px;color:var(--text-2);">Scope</span>
+                    <div class="u-display-flex u-align-items-center u-gap-8px">
+                        <span class="u-font-size-12px u-color-text-2">Scope</span>
                         {% if grant.mixed_scope %}
                         {# Migration 014 can merge two pre-014 sessions of one client
                            and user into a single family, and they may disagree. The
@@ -87,9 +97,9 @@
                         <span class="badge badge-yellow" title="Live tokens in this grant carry different scopes: {{ grant.live_scopes | join(', ') }}. Saving a scope below applies one value to all of them.">mixed</span>
                         {% endif %}
                         {% if grant.token_id %}
-                        <form method="POST" action="/admin/oauth/token/{{ grant.token_id }}/scope" style="display:inline;">
+                        <form method="POST" action="/admin/oauth/token/{{ grant.token_id }}/scope" class="u-display-inline">
                             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                            <select name="scope" data-autosubmit class="field-select" style="width:auto;padding:3px 28px 3px 8px;font-size:11px;">
+                            <select name="scope" data-autosubmit class="field-select u-width-auto u-padding-3px-28px-3px-8px u-font-size-11px">
                                 <option value="read"      {% if not grant.has_write %}selected{% endif %}>read</option>
                                 {# Only offered when the client is registered for it. The panel
                                    must not raise a grant above what the client was registered
@@ -100,23 +110,23 @@
                             </select>
                         </form>
                         {% else %}
-                        <span class="mono" style="font-size:11px;color:var(--text-3);">{{ grant.scope }}</span>
+                        <span class="mono u-font-size-11px u-color-text-3">{{ grant.scope }}</span>
                         {% endif %}
                     </div>
 
-                    <span style="font-size:11px;color:var(--text-3);">Granted <time datetime="{{ grant.created_at }}" data-localize="date">{{ grant.created_at }}</time></span>
+                    <span class="u-font-size-11px u-color-text-3">Granted <time datetime="{{ grant.created_at }}" data-localize="date">{{ grant.created_at }}</time></span>
 
-                    <div style="margin-left:auto;">
+                    <div class="u-margin-left-auto">
                         {% if grant.token_id %}
-                        <form method="POST" action="/admin/oauth/token/{{ grant.token_id }}/revoke" style="display:inline;">
+                        <form method="POST" action="/admin/oauth/token/{{ grant.token_id }}/revoke" class="u-display-inline">
                             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
-                            <button type="button" class="btn btn-danger" style="font-size:11px;padding:4px 12px;" data-confirm="Revoke this grant? Every access and refresh token issued from it stops working immediately and the app must be reconnected.">Revoke access</button>
+                            <button type="button" class="btn btn-danger u-font-size-11px u-padding-4px-12px" data-confirm="Revoke this grant? Every access and refresh token issued from it stops working immediately and the app must be reconnected.">Revoke access</button>
                         </form>
                         {% endif %}
                     </div>
                 </div>
 
-                <div class="table-scroll" style="margin-top:10px;">
+                <div class="table-scroll u-margin-top-10px">
                 <table class="data-table">
                     <thead>
                         <tr>
@@ -131,7 +141,7 @@
                         {# Revoked and expired rows stay listed, dimmed. Removing them is what
                            made a revocation that did nothing look like one that worked. #}
                         {% for token in grant.tokens %}
-                        <tr {% if token.status in ('revoked', 'expired', 'no_vault_scope') %}style="opacity:0.5;"{% endif %}>
+                        <tr{% if token.status in ('revoked', 'expired', 'no_vault_scope') %} class="u-opacity-0_5"{% endif %}>
                             <td>
                                 {% if token.token_type == 'access' %}
                                 <span class="badge badge-purple">{{ token.token_type }}</span>
@@ -139,7 +149,7 @@
                                 <span class="badge badge-gray">{{ token.token_type }}</span>
                                 {% endif %}
                             </td>
-                            <td class="mono" style="font-size:11px;color:var(--text-3);">{{ token.scope }}</td>
+                            <td class="mono oauth-td-muted">{{ token.scope }}</td>
                             <td>
                                 {% if token.status == 'revoked' %}
                                 <span class="badge badge-red">Revoked</span>
@@ -153,10 +163,10 @@
                                 <span class="badge badge-green">Active</span>
                                 {% endif %}
                             </td>
-                            <td class="mono" style="font-size:11px;color:var(--text-3);">
+                            <td class="mono oauth-td-muted">
                                 <time datetime="{{ token.expires_at }}" data-localize>{{ token.expires_at }}</time>
                             </td>
-                            <td class="mono" style="font-size:11px;color:var(--text-3);">
+                            <td class="mono oauth-td-muted">
                                 <time datetime="{{ token.created_at }}" data-localize>{{ token.created_at }}</time>
                             </td>
                         </tr>
@@ -165,7 +175,7 @@
                 </table>
                 </div>
                 {% if grant.hidden_count %}
-                <div style="padding:6px 2px 0;font-size:11px;color:var(--text-3);">
+                <div class="u-padding-6px-2px-0 u-font-size-11px u-color-text-3">
                     {# "inactive" rather than "revoked or expired": a token can also be
                        listed here for carrying no vault scope, and naming only two of the
                        three reasons invites the reader to rule the third one out. #}
@@ -174,12 +184,12 @@
                 {% elif grant.history_truncated %}
                 {# Only history is ever truncated — live tokens are read unbounded,
                    so no grant the operator can act on is ever missing from this page. #}
-                <div style="padding:6px 2px 0;font-size:11px;color:var(--text-3);">Older tokens beyond the history window are not shown.</div>
+                <div class="u-padding-6px-2px-0 u-font-size-11px u-color-text-3">Older tokens beyond the history window are not shown.</div>
                 {% endif %}
             </div>
             {% endfor %}
             {% else %}
-            <div style="padding:20px 22px;font-size:13px;color:var(--text-3);">No tokens for this client.</div>
+            <div class="u-padding-20px-22px u-font-size-13px u-color-text-3">No tokens for this client.</div>
             {% endif %}
         </div>
         {% endfor %}

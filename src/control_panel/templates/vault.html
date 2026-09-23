@@ -1,12 +1,58 @@
 {% extends "base.html" %}
 {% block title %}Vault — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+    .vault-grid {
+        display: grid;
+        grid-template-columns: 280px 1fr;
+        gap: 16px;
+        height: calc(100vh - 210px);
+    }
+    .vault-tree { overflow-y: auto; display: flex; flex-direction: column; }
+
+    /* Hover is CSS, not inline mouseover handlers (the panel CSP refuses
+       those). The resting colour lives here rather than in the elements'
+       style attribute so the :hover rule can override it. */
+    .vault-crumb { color: var(--text-2); text-decoration: none; }
+    .vault-crumb:hover { color: var(--text); }
+    .vault-link { color: var(--text-2); }
+    .vault-link:hover { background: var(--surface-2); color: var(--text); }
+    .vault-preview { overflow-y: auto; display: flex; flex-direction: column; }
+
+    /* #289: converted from inline style attributes. */
+    .vault-crumbs { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-2); margin-top: 8px; flex-wrap: wrap; }
+    .vault-section-label { font-size: 10px; font-weight: 700; letter-spacing: 0.16em; text-transform: uppercase; color: var(--text-2); margin-bottom: 8px; }
+    /* Tree rows: layout only. Colour and background stay with .vault-link
+       and .vault-link:hover so the hover still overrides the resting state. */
+    .vault-row { display: flex; align-items: center; gap: 8px; padding: 7px 8px; border-radius: 4px; font-size: 13px; text-decoration: none; transition: background 0.12s, color 0.12s; }
+    .vault-row-note { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    /* The selected note carries this instead of .vault-link, so no hover
+       rule applies to it (as when its highlight was inline). */
+    .vault-link-selected { background: var(--primary-glow); color: var(--primary-text); }
+    .vault-note-title { font-family: 'Cormorant Garamond', serif; font-size: 22px; font-weight: 600; color: var(--text); line-height: 1.2; }
+    .vault-tags { padding: 12px 22px 0; display: flex; flex-wrap: wrap; gap: 5px; }
+    .vault-tag { display: inline-flex; align-items: center; padding: 3px 8px; border-radius: 3px; font-size: 11px; font-weight: 500; letter-spacing: 0.04em; background: var(--primary-glow); color: var(--primary-text); border: 1px solid var(--primary-border); }
+    .vault-note-body { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--text); background: var(--code-bg-soft); padding: 18px; border-radius: 5px; white-space: pre-wrap; line-height: 1.7; border: 1px solid var(--border); }
+    .vault-empty { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; color: var(--text-3); padding: 48px 20px; min-height: 200px; }
+
+    @media (max-width: 900px) {
+        .vault-grid {
+            grid-template-columns: 1fr;
+            height: auto;
+            gap: 14px;
+        }
+        .vault-tree { max-height: 360px; }
+        .vault-preview { min-height: 280px; }
+    }
+</style>
+{% endblock %}
 {% block content %}
 
 <div class="page-top">
     <div>
         <h1 class="page-title">Vault</h1>
         <!-- Breadcrumbs -->
-        <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-2);margin-top:8px;flex-wrap:wrap;">
+        <div class="vault-crumbs">
             <a href="/admin/vault" class="vault-crumb">Root</a>
             {% for crumb in breadcrumbs %}
             <svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><polyline points="3,2 7,5 3,8"/></svg>
@@ -33,10 +79,10 @@
         <!-- File tree -->
         <div class="card anim-1 vault-tree">
             {% if folders %}
-            <div style="padding:14px 16px 10px;">
-                <div style="font-size:10px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:var(--text-2);margin-bottom:8px;">Folders</div>
+            <div class="u-padding-14px-16px-10px">
+                <div class="vault-section-label">Folders</div>
                 {% for f in folders %}
-                <a href="/admin/vault?folder={{ f.path }}" class="vault-link" style="display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:4px;font-size:13px;text-decoration:none;transition:background 0.12s,color 0.12s;">
+                <a href="/admin/vault?folder={{ f.path }}" class="vault-row vault-link">
                     <svg width="13" height="13" viewBox="0 0 13 13" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" opacity="0.6">
                         <path d="M1 2.5 Q1 1 2.5 1 L5 1 L6 2 L11.5 2 Q12 2 12 2.5 L12 10.5 Q12 12 11 12 L2 12 Q1 12 1 10.5Z"/>
                     </svg>
@@ -44,21 +90,19 @@
                 </a>
                 {% endfor %}
             </div>
-            <div style="border-top:1px solid var(--border);"></div>
+            <div class="u-border-top-1px-solid-border"></div>
             {% endif %}
 
-            <div style="padding:14px 16px;flex:1;overflow-y:auto;">
-                <div style="font-size:10px;font-weight:700;letter-spacing:0.16em;text-transform:uppercase;color:var(--text-2);margin-bottom:8px;">Notes <span style="color:var(--text-3);">({{ notes | length }})</span></div>
+            <div class="u-padding-14px-16px u-flex-1 u-overflow-y-auto">
+                <div class="vault-section-label">Notes <span class="u-color-text-3">({{ notes | length }})</span></div>
                 {% for n in notes %}
                 <a href="/admin/vault?folder={{ current_folder }}&note={{ n.path }}"
-                   {% if selected_note != n.path %}class="vault-link"{% endif %}
-                   style="display:flex;align-items:center;gap:8px;padding:7px 8px;border-radius:4px;font-size:13px;text-decoration:none;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:background 0.12s,color 0.12s;
-                   {% if selected_note == n.path %}background:var(--primary-glow);color:var(--primary-text);{% endif %}">
-                    <svg width="11" height="13" viewBox="0 0 11 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" opacity="0.6" style="flex-shrink:0;">
+                   class="vault-row vault-row-note {% if selected_note == n.path %}vault-link-selected{% else %}vault-link{% endif %}">
+                    <svg width="11" height="13" viewBox="0 0 11 13" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round" opacity="0.6" class="u-flex-shrink-0">
                         <path d="M1.5 1.5 L7.5 1.5 L9.5 3.5 L9.5 11.5 Q9.5 12 9 12 L2 12 Q1.5 12 1.5 11.5Z"/>
                         <polyline points="7,1.5 7,4 9.5,4"/>
                     </svg>
-                    <span style="overflow:hidden;text-overflow:ellipsis;">{{ n.name }}</span>
+                    <span class="u-overflow-hidden u-text-overflow-ellipsis">{{ n.name }}</span>
                 </a>
                 {% endfor %}
             </div>
@@ -69,28 +113,28 @@
             {% if note_content %}
             <div class="card-header">
                 <div>
-                    <div style="font-family:'Cormorant Garamond',serif;font-size:22px;font-weight:600;color:var(--text);line-height:1.2;">{{ note_title }}</div>
-                    <div class="mono" style="font-size:11px;color:var(--text-3);margin-top:4px;">{{ selected_note }}</div>
+                    <div class="vault-note-title">{{ note_title }}</div>
+                    <div class="mono u-font-size-11px u-color-text-3 u-margin-top-4px">{{ selected_note }}</div>
                 </div>
             </div>
             {% if note_tags %}
-            <div style="padding:12px 22px 0;display:flex;flex-wrap:wrap;gap:5px;">
+            <div class="vault-tags">
                 {% for tag in note_tags %}
-                <span style="display:inline-flex;align-items:center;padding:3px 8px;border-radius:3px;font-size:11px;font-weight:500;letter-spacing:0.04em;background:var(--primary-glow);color:var(--primary-text);border:1px solid var(--primary-border);">#{{ tag }}</span>
+                <span class="vault-tag">#{{ tag }}</span>
                 {% endfor %}
             </div>
             {% endif %}
-            <div style="padding:18px 22px;flex:1;overflow-y:auto;">
-                <pre style="font-family:'JetBrains Mono',monospace;font-size:12.5px;color:var(--text);background:var(--code-bg-soft);padding:18px;border-radius:5px;white-space:pre-wrap;line-height:1.7;border:1px solid var(--border);">{{ note_content }}</pre>
+            <div class="u-padding-18px-22px u-flex-1 u-overflow-y-auto">
+                <pre class="vault-note-body">{{ note_content }}</pre>
             </div>
             {% else %}
-            <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px;color:var(--text-3);padding:48px 20px;min-height:200px;">
+            <div class="vault-empty">
                 <svg width="32" height="32" viewBox="0 0 32 32" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.5">
                     <path d="M6 4 L20 4 L26 10 L26 28 Q26 29.5 24.5 29.5 L7.5 29.5 Q6 29.5 6 28Z"/>
                     <polyline points="20,4 20,11 26,11"/>
                     <line x1="10" y1="17" x2="22" y2="17"/><line x1="10" y1="21" x2="18" y2="21"/>
                 </svg>
-                <span style="font-size:13px;">Select a note to preview</span>
+                <span class="u-font-size-13px">Select a note to preview</span>
             </div>
             {% endif %}
         </div>
@@ -98,32 +142,4 @@
     </div>
 </div>
 
-<style nonce="{{ csp_nonce }}">
-    .vault-grid {
-        display: grid;
-        grid-template-columns: 280px 1fr;
-        gap: 16px;
-        height: calc(100vh - 210px);
-    }
-    .vault-tree { overflow-y: auto; display: flex; flex-direction: column; }
-
-    /* Hover is CSS, not inline mouseover handlers (the panel CSP refuses
-       those). The resting colour lives here rather than in the elements'
-       style attribute so the :hover rule can override it. */
-    .vault-crumb { color: var(--text-2); text-decoration: none; }
-    .vault-crumb:hover { color: var(--text); }
-    .vault-link { color: var(--text-2); }
-    .vault-link:hover { background: var(--surface-2); color: var(--text); }
-    .vault-preview { overflow-y: auto; display: flex; flex-direction: column; }
-
-    @media (max-width: 900px) {
-        .vault-grid {
-            grid-template-columns: 1fr;
-            height: auto;
-            gap: 14px;
-        }
-        .vault-tree { max-height: 360px; }
-        .vault-preview { min-height: 280px; }
-    }
-</style>
 {% endblock %}
