@@ -732,7 +732,21 @@ class OpenAIProvider:
             status = response.status_code
             if status == 200:
                 data = response.json()
-                rows = sorted(data["data"], key=lambda r: r["index"])
+                rows = data.get("data") if isinstance(data, dict) else None
+                if isinstance(rows, list):
+                    rows = sorted(rows, key=lambda r: r.get("index", -1))
+                # Per request, like Ollama's slice check: exactly one vector
+                # per input with indices exactly 0..n-1, or no vector of this
+                # response is used — a short, duplicated or gapped answer
+                # cannot be attributed to the right inputs.
+                if not isinstance(rows, list) or [
+                    r.get("index") for r in rows
+                ] != list(range(len(inputs))):
+                    got = len(rows) if isinstance(rows, list) else "no"
+                    raise RuntimeError(
+                        f"OpenAI returned {got} vectors with indices not "
+                        f"exactly 0..{len(inputs) - 1} for {len(inputs)} inputs"
+                    )
                 return [r["embedding"] for r in rows]
 
             # Decided **before** `retryable`, deliberately: an input

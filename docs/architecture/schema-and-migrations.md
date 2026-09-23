@@ -379,7 +379,10 @@ column type — measured on the running server, not guessed (026's device). The
 gate asserts the OID is unchanged, i.e. reconciled rather than rebuilt. Any
 other index under that name — `vector_cosine_ops`, another dimension, other
 build parameters — is refused and named, because the queries' ORDER BY would
-match nothing and search would silently become a sequential scan.
+match nothing and search would silently become a sequential scan. The probe runs on
+every upgrade at *D* ≤ 2000, so the migration role needs the database's TEMP
+privilege (PUBLIC has it by default); a role without it fails 027
+transactionally *after* the index build, and the whole migration rolls back.
 
 **Build cost and timeouts.** The build is non-concurrent under `SET LOCAL
 maintenance_work_mem = '512MB'` and a 15-minute `statement_timeout`, with a

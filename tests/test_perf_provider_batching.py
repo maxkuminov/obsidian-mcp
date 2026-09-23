@@ -101,6 +101,45 @@ async def test_a_short_later_slice_fails_the_whole_batch(ollama):
             await OllamaProvider().embed_batch([f"c{i}" for i in range(24)])
 
 
+@pytest.fixture
+def openai(monkeypatch):
+    monkeypatch.setattr(settings, "openai_api_key", "sk-test")
+    monkeypatch.setattr(settings, "openai_base_url", "https://api.example.test/v1")
+    return settings
+
+
+def _openai_rows(indices):
+    return Response(200, json={"data": [
+        {"index": i, "embedding": [float(i)]} for i in indices
+    ]})
+
+
+async def test_openai_answer_in_index_order_is_accepted(openai):
+    with respx.mock() as mock:
+        mock.post("https://api.example.test/v1/embeddings").mock(
+            return_value=_openai_rows([2, 0, 1])
+        )
+        out = await OpenAIProvider().embed_batch(["a", "b", "c"])
+    assert out == [[0.0], [1.0], [2.0]]
+
+
+@pytest.mark.parametrize("indices", [
+    pytest.param([0, 1], id="short"),
+    pytest.param([0, 1, 1], id="duplicate-index"),
+    pytest.param([0, 2, 3], id="missing-index"),
+])
+async def test_openai_per_request_cardinality_fails_the_batch(openai, indices):
+    """Three inputs must come back as exactly indices 0, 1, 2 — a short,
+    duplicated or gapped answer fails the batch and no vector of it is used."""
+    with respx.mock() as mock:
+        route = mock.post("https://api.example.test/v1/embeddings").mock(
+            return_value=_openai_rows(indices)
+        )
+        with pytest.raises(RuntimeError, match="for 3 inputs"):
+            await OpenAIProvider().embed_batch(["a", "b", "c"])
+    assert route.call_count == 1  # a malformed answer is not retried
+
+
 async def test_embed_one_sends_a_one_element_array(ollama):
     with respx.mock(base_url="http://ollama:11434") as mock:
         route = mock.post("/api/embed").mock(side_effect=_answer_per_input)
