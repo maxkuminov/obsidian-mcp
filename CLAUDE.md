@@ -240,7 +240,9 @@ update it in the same change.** What stays here is the short list:
   can lose up to ~600 ms of usage rows or quota increments (L1/L2, the latter
   undercounting in the caller's favour). Token rotation/revocation, code
   exchange and transfer-token writes stay synchronous; an AST test pins the
-  allow-list. PGDATA is on a spinning disk: every fsync'd commit costs ~40 ms.
+  allow-list. The async commits were sized for PGDATA on a spinning disk
+  (~40–100 ms per fsync'd commit); since 2026-09-23 the reference deployment's
+  PGDATA is on NVMe (~2.5 ms), so they now matter far less, but they stay.
 - **The indexer trusts `(size, mtime_ns, ctime_ns, inode)` and runs off the
   loop** (#278, #282). The scan runs in `asyncio.to_thread`, ahead of the
   generation lock (C1–C8 in `indexing-and-embeddings.md`); an unchanged stat
