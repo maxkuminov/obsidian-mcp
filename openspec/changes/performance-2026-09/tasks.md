@@ -164,26 +164,26 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 ## 4. Slice S4 — database: migration 027 (#283), branch `perf-s4-db`, after S2 and S3 merge
 
-- [ ] 4.1 `src/services/vector_index.py` (D19). Contents:
+- [x] 4.1 `src/services/vector_index.py` (D19). Contents:
   - `INDEX_NAME = "ix_note_embeddings_embedding_halfvec_hnsw"` and `LEGACY_INDEX_NAME = "ix_note_embeddings_embedding_hnsw"`.
   - `index_enabled(dim)`, true when `dim ≤ 2000`.
   - `create_index_sql(dim)`, with `m = 16, ef_construction = 64`.
   - `drop_index_sql()`, which drops both names `IF EXISTS`.
   - `order_expr(query_vec)`: the `halfvec(dim)` cast expression when enabled, else the plain `cosine_distance`.
   - `full_distance_expr(query_vec)`.
-- [ ] 4.2 **The recall gate, before 027 is written with the index.**
+- [x] 4.2 **The recall gate, before 027 is written with the index.**
   - Adapt `tests/integration/test_search_recall.py`, `test_prewarm_probe.py` and `test_pgvector_search.py` to build and name the index through `vector_index`.
   - Keep the recall test's exact baseline a **full-precision `vector` sequential scan**.
   - Run `make test-integration`.
   - **Pass** (recall ≥ 0.9 on each of three rebuilds, every filter shape, and `find_related`): continue with 4.3–4.6 including the index.
   - **Fail**: drop the index and the query casts from this slice. Record the measured recall in design D19 and in `search.md` under "Rejected: halfvec index (recall)". Continue with the reloptions only.
-- [ ] 4.3 `alembic/versions/027_notes_vacuum_and_halfvec.py` (`down_revision = "026"`):
+- [x] 4.3 `alembic/versions/027_notes_vacuum_and_halfvec.py` (`down_revision = "026"`):
   - `ALTER TABLE notes_metadata SET (autovacuum_vacuum_scale_factor = 0.02, autovacuum_vacuum_insert_scale_factor = 0.02)`.
   - If the gate passed and `index_enabled(dim)`: under `SET LOCAL maintenance_work_mem = '512MB'` and a build-sized `statement_timeout`, `create_index_sql(dim)`, then drop the legacy index.
   - No VACUUM (D18).
   - `downgrade()` resets the reloptions, recreates the legacy `vector` index when `dim ≤ 2000`, and drops the new one.
   - Pin `search_path` as 024 does.
-- [ ] 4.4 Query side, if the gate passed.
+- [x] 4.4 Query side, if the gate passed.
   - `embeddings.py` `semantic_search` and `tools.py` `find_related_stmt`/`find_related_impl`:
     - order by `order_expr`;
     - also select `full_distance_expr`;
@@ -191,20 +191,20 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
     - `similarity = 1 - full_distance`.
   - `indexer.py` prewarm: `probe_statement` orders by `order_expr(_probe_vector())`, and `_hnsw_index_exists` looks up `vector_index.INDEX_NAME`.
   - `control_panel/routes.py` `reset_embeddings` and `scripts/reset_embeddings.py`: drop and create through `vector_index`.
-- [ ] 4.5 `alembic/env.py`: add an `include_object` hook that excludes exactly the index named `vector_index.INDEX_NAME`, with `type_ == "index"`. Pass it to both `context.configure` calls. PR #284 also edits this file, in `run_async_migrations`; rebase onto whichever landed first.
-- [ ] 4.6 `models/db.py`: remove the legacy `Index` from `NoteEmbedding.__table_args__` if the gate passed. Add the reloptions comment above `NoteMetadata.__table_args__`, explaining that Alembic does not compare reloptions and the schema gate asserts them.
-- [ ] 4.7 `embeddings.py`: correct the `random_page_cost` comment (D20).
-- [ ] 4.8 `Makefile`: add a `db-vacuum-notes` target that runs `VACUUM (ANALYZE) notes_metadata` in an autocommit session through the application container, with a `make help` line.
-- [ ] 4.9 `tests/integration/test_schema_check.py`:
+- [x] 4.5 `alembic/env.py`: add an `include_object` hook that excludes exactly the index named `vector_index.INDEX_NAME`, with `type_ == "index"`. Pass it to both `context.configure` calls. PR #284 also edits this file, in `run_async_migrations`; rebase onto whichever landed first.
+- [x] 4.6 `models/db.py`: remove the legacy `Index` from `NoteEmbedding.__table_args__` if the gate passed. Add the reloptions comment above `NoteMetadata.__table_args__`, explaining that Alembic does not compare reloptions and the schema gate asserts them.
+- [x] 4.7 `embeddings.py`: correct the `random_page_cost` comment (D20).
+- [x] 4.8 `Makefile`: add a `db-vacuum-notes` target that runs `VACUUM (ANALYZE) notes_metadata` in an autocommit session through the application container, with a `make help` line.
+- [x] 4.9 `tests/integration/test_schema_check.py`:
   - Raise `HEAD_REVISION` to `027` and keep `026` in the chain.
   - Add 027's cases: reloptions via `pg_class.reloptions`; the index via `pg_get_indexdef`, `indisvalid` and the opclass `halfvec_cosine_ops` at the configured dimension; the legacy index absent; downgrade restores the legacy index; stamp-back idempotence.
   - `alembic check` is clean at head.
-- [ ] 4.10 `tests/test_perf_vector_index.py`:
+- [x] 4.10 `tests/test_perf_vector_index.py`:
   - `include_object` excludes exactly one name.
   - `index_enabled` is false above 2000, and then the queries use the plain expression.
   - The query's order expression compiles to text identical to the index expression.
   - The full-precision re-sort precedes the dedupe.
-- [ ] 4.11 Docs:
+- [x] 4.11 Docs:
   - `search.md`: the `halfvec` decision (or its rejection with the measured recall), the full-precision re-rank, D17, D18, and the corrected `random_page_cost` rationale.
   - `schema-and-migrations.md`: a "027" section, covering the `include_object` exclusion and why, and the catalogue verification.
   - `indexing-and-embeddings.md`: the prewarm bullet.
@@ -212,35 +212,35 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 ## 5. Slice S5 — provider transport, batching, chunk reuse (#281), branch `perf-s5-provider`, after #284 and S3 merge
 
-- [ ] 5.1 `embeddings.py`: add one shared client per provider, **built only by calling `transport_security.embedding_http_client(timeout)`** (D14).
+- [x] 5.1 `embeddings.py`: add one shared client per provider, **built only by calling `transport_security.embedding_http_client(timeout)`** (D14).
   - Create it lazily. Key it to the running loop, and rebuild it if the loop changed.
   - Pass per-request `timeout=` on each call: 30 s for Ollama, 60 s for OpenAI.
   - Add `close_provider_client()`.
   - `tests/test_internal_transport_http_clients.py`'s AST sweep must stay green, with no new exemption.
-- [ ] 5.2 `main.py` lifespan: in shutdown, `await close_provider_client()` after the indexer task is cancelled and before the engine is disposed.
-- [ ] 5.3 `OllamaProvider.embed_batch` (D15):
+- [x] 5.2 `main.py` lifespan: in shutdown, `await close_provider_client()` after the indexer task is cancelled and before the engine is disposed.
+- [x] 5.3 `OllamaProvider.embed_batch` (D15):
   - Split into consecutive slices of `settings.ollama_embed_batch_size`.
   - Send one `/api/embed` request per slice with an `input` array, under `asyncio.wait_for(..., 30.0)`.
   - Check cardinality per slice.
   - Add no aggregate deadline.
   - `embed_one` sends a one-element array.
   - Keep the input-limit translation.
-- [ ] 5.4 `config.py` and `.env.example`: add `ollama_embed_batch_size: int = Field(16, ge=1, le=256)`, noting that `1` gives the pre-change request shape.
-- [ ] 5.5 `embed_note` reuse (D16):
+- [x] 5.4 `config.py` and `.env.example`: add `ollama_embed_batch_size: int = Field(16, ge=1, le=256)`, noting that `1` gives the pre-change request shape.
+- [x] 5.5 `embed_note` reuse (D16):
   - The lookup of `(id, chunk_text, embedding)` and of the stored fingerprint runs in a read-only transaction that is **committed before the provider call on every path**.
   - Reuse only when the fingerprint is present and equal.
   - Send only the new texts, and check cardinality over that subset. Certify only on full coverage of the requested list.
   - `on_provider_call(len(subset))`, and nothing at all when the subset is empty. A `GENERATION_MISMATCH` counts as an attempt only if a provider call was issued (the MODIFIED interlock requirement).
   - Under `_generation_matches`, verify that every reused row id still exists with the same text. If not, return `GENERATION_MISMATCH`.
   - Then certify, delete and reinsert all rows in order, as today.
-- [ ] 5.6 `tests/test_perf_provider_batching.py`:
+- [x] 5.6 `tests/test_perf_provider_batching.py`:
   - 40 chunks at batch 16 → three requests of 16, 16 and 8, in order.
   - A short response is refused.
   - A hung request fails at 30 s, and so does the next slice.
   - Exactly one client is built per loop.
   - The client is closed at shutdown.
   - The factory's `trust_env=False` and `follow_redirects=False` properties are observed on the shared instance.
-- [ ] 5.7 `tests/integration/test_perf_chunk_reuse_pg.py` (real Postgres):
+- [x] 5.7 `tests/integration/test_perf_chunk_reuse_pg.py` (real Postgres):
   - An append-only edit sends only the new tail chunk to a counting provider, and the result equals a from-scratch embed, apart from the reused vectors themselves.
   - With the fingerprint absent, nothing is reused.
   - With a fingerprint mismatch, nothing is reused and nothing is certified.
@@ -248,7 +248,7 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - A metadata-only edit that yields identical chunks makes no provider call, certifies, and leaves `attempted` unchanged.
   - **All-reuse reset race.** Every chunk is reusable, and a reset deletes the rows between the lookup and the under-lock check. The outcome is `GENERATION_MISMATCH`, nothing is written, and `attempted` is unchanged.
   - The budget is debited by the subset only.
-- [ ] 5.8 Docs, `indexing-and-embeddings.md`:
+- [x] 5.8 Docs, `indexing-and-embeddings.md`:
   - The "Embedding providers" section: the shared client through the factory, and batching.
   - Rewrite the #127 D5 bullet for per-request batches: why a fixed size keeps the bound constant.
   - A "Chunk-vector reuse" subsection, covering D16 and L6.

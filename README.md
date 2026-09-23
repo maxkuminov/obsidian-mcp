@@ -1492,8 +1492,10 @@ ignores mtime jitter. Stale embeddings are caught by the
 | `user_sessions` | One revocable row per live panel browser session, keyed on the SHA-256 of the cookie's session id. Cascades with the user. |
 
 GIN indexes on `content_tsvector` and `tags[]`. B-tree indexes on the
-hot foreign keys. pgvector HNSW index on the embedding column
-(`vector_cosine_ops`, `m=16, ef_construction=64`); queries set
+hot foreign keys. pgvector HNSW expression index
+`(embedding::halfvec(N)) halfvec_cosine_ops` (`m=16, ef_construction=64`),
+built when the dimension is ≤ 2000; results are re-ranked by the
+full-precision distance. Queries set
 `hnsw.ef_search=80` and dedupe per note in Python after a 5x overfetch.
 
 ## Project layout

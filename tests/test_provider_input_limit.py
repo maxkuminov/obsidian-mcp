@@ -357,9 +357,13 @@ async def test_ollama_5xx_still_propagates_as_today(ollama_settings):
 
 
 @pytest.mark.asyncio
-async def test_ollama_batch_propagates_the_typed_exception(ollama_settings):
+async def test_ollama_batch_propagates_the_typed_exception(
+    ollama_settings, monkeypatch
+):
     """`embed_batch` wraps each call in `asyncio.wait_for`; the exception must
-    come out of it as itself, not as a `TimeoutError` or a swallowed None."""
+    come out of it as itself, not as a `TimeoutError` or a swallowed None.
+    One input per request, so the rejection lands on the second request."""
+    monkeypatch.setattr(settings, "ollama_embed_batch_size", 1)
     provider = OllamaProvider()
     with respx.mock(base_url="http://ollama:11434") as mock:
         route = mock.post("/api/embed")
@@ -411,7 +415,7 @@ async def test_a_dense_non_ascii_query_under_the_cap_reaches_the_provider(
 
     assert out == [0.1]
     body = json.loads(route.calls[0].request.read())
-    assert body["input"] == query
+    assert body["input"] == [query]
 
 
 # ── The detection rule itself ───────────────────────────────────────────────

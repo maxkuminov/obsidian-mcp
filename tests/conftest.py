@@ -29,6 +29,8 @@ SETTINGS_ENV_KEYS = (
     "DATABASE_SSL_KEY_FILE",
     "OLLAMA_URL",
     "OLLAMA_KEEP_ALIVE",
+    # Ollama request batching (#281).
+    "OLLAMA_EMBED_BATCH_SIZE",
     "VAULT_PATH",
     "SECRET_KEY",
     "INDEX_INTERVAL_SECONDS",

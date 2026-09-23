@@ -29,9 +29,20 @@ it. The corpus plants each permitted case on purpose, and each test asserts
 that its case really occurred, so no test can pass vacuously.
 
 The vector corpus is the recall benchmark's shape (the `A/` crowd around each
-query vector owns the `ef_search` window, and `B/` is the filtered half), so
-the approximate, iterative-scan plan production uses is the plan under test.
-Stale, truncated, keyword, link, tie and orphan structure is layered on top.
+query vector, and `B/` as the filtered half). Stale, truncated, keyword, link,
+tie and orphan structure is layered on top.
+
+**`semantic_search` is compared under exact ordering in both arms.** Since
+#283 (D19) the production query orders by the half-precision expression the
+`halfvec` HNSW index is built on, while the old oracle orders by the full
+`vector` distance, which no index serves any more. Comparing an approximate
+index walk against an exact scan would measure ANN recall, not projection
+identity — and recall is `test_search_recall.py`'s job. So `_semantic_pair`
+issues `SET LOCAL enable_indexscan = off` in both arms' transactions: both are
+exact scans, and what differs between them is the projection, similarity as
+`1 - distance`, the tie-breaks and the full-precision re-sort — the things
+this module claims. The half-precision *candidate* ordering can only move rows
+at the overfetch boundary (5x the limit), far below the compared top `limit`.
 
 The old oracles select `NoteMetadata` entities, which after D5 no longer carry
 `content_tsvector`. That changes what is shipped, not what is returned, and
@@ -55,7 +66,7 @@ import _harness
 import src.mcp_server.tools as tools
 from src.config import settings
 from src.models.db import NoteEmbedding, NoteLink, NoteMetadata, User
-from src.services import timing
+from src.services import timing, vector_index
 from src.services import vault as vault_service
 from src.services.embeddings import semantic_search
 from src.services.filters import apply_note_filters
@@ -79,7 +90,6 @@ N_QUERIES = 5
 A_NOTES_PER_QUERY = 100
 B_NOTES = 1500
 CHUNKS_PER_B_NOTE = 2
-HNSW_INDEX = "ix_note_embeddings_embedding_hnsw"
 SIM_TOLERANCE = 1e-5
 
 # 40 distinct modification times over 1,500 `B/` notes: every value is shared
@@ -127,7 +137,7 @@ async def corpus(sessionmaker, queries):
             session.add(user)
             await session.flush()
             users[name] = user.id
-        await session.execute(text(f"DROP INDEX IF EXISTS {HNSW_INDEX}"))
+        await session.execute(text(vector_index.drop_index_sql()))
         await session.commit()
 
     alice, bob = users["alice"], users["bob"]
@@ -755,12 +765,17 @@ async def test_oracle_rejects_a_chunk_change_without_a_distance_tie():
 
 # ── semantic_search ─────────────────────────────────────────────────────────
 async def _semantic_pair(sessionmaker, embed_as, vec, **kw):
+    """Run both arms as exact scans (see the module docstring): the old query's
+    full-precision ordering has no index to use, so the new one must not walk
+    the `halfvec` HNSW index either, or this compares recall, not projection."""
     embed_as(vec)
     async with sessionmaker() as session:
+        await session.execute(text("SET LOCAL enable_indexscan = off"))
         old, old_fb = await _old_semantic_search(session, vec, **kw)
     token = timing.begin()
     try:
         async with sessionmaker() as session:
+            await session.execute(text("SET LOCAL enable_indexscan = off"))
             new = await semantic_search(session, "q", **kw)
         new_fb = timing.current()["exact_fallback"]
     finally:

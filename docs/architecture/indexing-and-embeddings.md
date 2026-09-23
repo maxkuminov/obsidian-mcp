@@ -4,7 +4,9 @@
 
 ## Embedding providers
 - `EMBEDDING_PROVIDER=ollama` (default) — uses `OLLAMA_URL` and
-  `EMBEDDING_MODEL`; serial single-input HTTP per chunk.
+  `EMBEDDING_MODEL`; sequential `/api/embed` requests of at most
+  `OLLAMA_EMBED_BATCH_SIZE` inputs each (default 16, 1–256; `1` is the
+  pre-#281 one-chunk-per-request shape). A query is a one-element array.
 - `EMBEDDING_PROVIDER=openai` — requires `OPENAI_API_KEY` (validated at
   startup). Uses `OPENAI_BASE_URL` (default `https://api.openai.com/v1`)
   and `OPENAI_EMBEDDING_MODEL` (default `text-embedding-3-small`). Native
@@ -123,6 +125,90 @@ verify=… plaintext_override=…` — scheme, host and port only, never the pat
 query or userinfo. `plaintext_override=True` means the override is what
 admitted this hop (plaintext to a non-loopback host).
 
+### One pooled client per provider, and Ollama batches (#281)
+
+**D14 — the shared client is built by the factory, never beside it.** Each
+provider used to open and close an `httpx` client per request, so every chunk
+and every search query paid a new TCP (and TLS) handshake. Each provider now
+keeps one pooled client (`_SharedClient` in `embeddings.py`), and it is
+obtained **only** by calling `embedding_http_client(timeout)` — so
+`trust_env=False`, `follow_redirects=False` and the pinned CA context hold for
+the pooled instance by construction, and the sweep above stays green with no
+exemption. The client is:
+
+- **created lazily and keyed to the running event loop.** A pooled
+  connection belongs to the loop that opened it; pytest's per-test loops and
+  the maintenance scripts' `asyncio.run` would otherwise inherit a client
+  bound to a dead loop and fail in ways that look like provider outages. A
+  client whose loop is not the running one (or that is closed) is dropped and
+  rebuilt — dropped, not closed, because closing it would need the loop it
+  belongs to.
+- **closed in the lifespan's shutdown** (`close_provider_client()`), after the
+  indexer task has been cancelled and awaited and before `engine.dispose()`.
+- **given its timeout per request**: every `post(..., timeout=)` carries 30 s
+  for Ollama and 60 s for OpenAI (the values are unchanged; the client-level
+  timeout is the same number). Pool limits are httpx's defaults.
+
+**D15 — Ollama embeds through fixed-size `/api/embed` batches.** `embed_batch`
+splits the chunk list into consecutive slices of `OLLAMA_EMBED_BATCH_SIZE` and
+sends each as one request with an `input` array, awaited under
+`asyncio.wait_for(..., 30.0)`. Every response must carry exactly
+`len(slice)` vectors, in input order, or the batch raises and no vector of it
+is used; `embed_note`'s whole-note cardinality check stays above it. The
+input-limit translation (#194) is unchanged. OpenAI keeps its native 96-input
+batching and its own retry contract; it is adapted to the shared client only.
+Why the size is fixed and there is still no aggregate deadline is the D5
+bullet under "Indexing decisions" below.
+
+### Chunk-vector reuse (#281, D16)
+
+A stored vector is reused for a chunk whose text is **byte-identical** to a
+stored chunk of the same note, so an append or a metadata-only edit no longer
+re-embeds the whole note. A reused vector attached to text it was not computed
+from — or computed by another model — would be a silently wrong search result,
+so reuse is gated three ways, and a doubt anywhere re-embeds:
+
+1. **Look up, then end the transaction.** On the certified path only (the two
+   production callers, which end their own read transaction before calling),
+   `_lookup_reusable_vectors` reads the note's `(id, chunk_text, embedding)`
+   rows and the stored embedding fingerprint, then **commits before any
+   provider I/O** — or rolls back and re-raises on an error. Holding even an
+   `AccessShareLock` on `note_embeddings` across the provider call would close
+   the #206 cycle against a reset, which takes the generation lock and then
+   needs the table exclusively (`ALTER TABLE … TYPE`).
+2. **Fingerprint present and equal.** Reuse is eligible only when the stored
+   fingerprint is `MATCH`. `ABSENT` claims nothing about the rows, so it
+   disables reuse (it still certifies, as before); `DIFFERS` and `UNREADABLE`
+   disable it and are then refused under the lock as always.
+3. **The reused rows survive, checked under the lock.** `_generation_matches`
+   takes `reused_rows` (row id → chunk text). After acquiring the generation
+   lock and re-reading the fingerprint, it requires the fingerprint to be
+   present (an absent table or row now refuses when anything was reused) and
+   every reused id to still exist **for this note with the same text**. Row ids
+   come from a sequence and `note_embeddings` rows are never updated in place,
+   so a surviving id is the same row with the same vector. A reset between the
+   lookup and the check deletes every row, so the check fails — the one
+   interleaving the fingerprint cannot see, a reset under an unchanged
+   fingerprint after a model-artifact change (fingerprint L1).
+
+Only the chunks without a stored vector are sent; the provider's answer must
+carry exactly one vector per chunk **sent**, and the note is certified only on
+full coverage of the **requested** (capped) list, reused and fresh together.
+Then `certify_embedded`, and every row — reused and new — is deleted and
+re-inserted in document order, exactly as before. No partial row surgery.
+
+**Accounting.** `on_provider_call` fires with the number of chunks sent and
+not at all when nothing is sent, so a note whose every chunk is reused is not
+an attempt and debits no budget. A `GENERATION_MISMATCH` counts as an attempt
+**if and only if** a provider call was issued: an all-reuse note that loses a
+reset race reports the mismatch with `attempted` unchanged.
+
+**L6 — reused vectors.** A reused vector is the provider's answer from when
+that chunk was first embedded. Batched and single requests can differ by
+numeric noise, so a note mixing reused and fresh vectors is not bit-identical
+to a from-scratch embed. The vector is assumed to be a function of (model,
+text) alone; the fingerprint names the model.
+
 ## Indexing decisions
 
 - Embeddings: pluggable provider, `EmbeddingProvider` Protocol with two
@@ -202,17 +288,23 @@ admitted this hop (plaintext to a non-loopback host).
   `MAX_REBUILD_REREADS`, and still recording the same path and hash →
   `TsvectorRebuildAborted`, rolling the single transaction back rather than
   committing around it.
-- **`OllamaProvider.embed_batch` has no aggregate deadline** (#127); the 30 s
-  per-call `wait_for` is the only liveness bound. The old fixed 300 s
-  whole-batch budget could fire only when every chunk was individually healthy
-  — i.e. exactly on a note with more chunks than 300 s of normal latency
-  covers, which then never certified and was re-selected every tick: a
+- **`OllamaProvider.embed_batch` has no aggregate deadline** (#127 D5); the
+  30 s per-request `wait_for` is the only liveness bound. The old fixed 300 s
+  whole-batch budget could fire only when every request was individually
+  healthy — i.e. exactly on a note with more chunks than 300 s of normal
+  latency covers, which then never certified and was re-selected every tick: a
   permanent 300 s burn under `index_pass_lock` that could never finish. A
   *proportional* replacement re-introduces the same boundary one size class up
-  and was rejected. `OpenAIProvider` is untouched. The cost is a giant note
-  holding the pass for 30 s × chunks once; the pause is honoured at the next
-  note boundary, as always. `embed_note` still refuses to certify partial chunk
-  coverage.
+  and was rejected. **Batching (#281, D15) keeps that argument because the
+  batch size is fixed**: each request carries at most `OLLAMA_EMBED_BATCH_SIZE`
+  inputs whatever the note's size, so the 30 s bound covers the same amount of
+  work on a two-chunk note and a thousand-chunk one. A per-note or
+  proportional batch size would make one request's answer time grow with the
+  note and bring the size class back, so neither the deadline nor a
+  note-derived batch size may return. `OpenAIProvider` keeps its own contract.
+  The cost is a giant note holding the pass for 30 s × requests once; the
+  pause is honoured at the next note boundary, as always. `embed_note` still
+  refuses to certify partial chunk coverage.
 - Indexer runs on startup then every 5 minutes. Change detection is by
   content hash, **with a stat shortcut** (#282): a file whose
   `(size, mtime_ns, ctime_ns, inode)` equals the tuple recorded for its row's
@@ -229,7 +321,13 @@ admitted this hop (plaintext to a non-loopback host).
   `shared_buffers`) and the median gap between calls has grown to ~28 min.
   It logs and swallows ordinary failures (the indexer's `consecutive_failures`
   must not react to it) but **re-raises `CancelledError`** so lifespan shutdown
-  still stops the loop.
+  still stops the loop. Since #283 the probe (`probe_statement()`) orders by
+  `vector_index.order_expr` — the same half-precision expression the two
+  vector queries order by — so it warms the `halfvec` index the search
+  actually walks, and `_hnsw_index_exists` looks up `vector_index.INDEX_NAME`.
+  Above 2000 dimensions there is no index and the probe is skipped, as before.
+  `tests/integration/test_prewarm_probe.py` EXPLAINs the probe against an index
+  built by `vector_index.create_index_sql`.
 - **The dashboard's "Last run" is an in-process heartbeat, not
   `max(notes_metadata.indexed_at)`.** `indexer.last_index_run_at` /
   `last_index_run_ok` are stamped at the end of the startup pass and of every

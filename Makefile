@@ -36,7 +36,7 @@ SCHEMA_TEST_CONTAINER ?= obsidian-mcp-schema-test
 SCHEMA_TEST_PORT ?= 55438
 SCHEMA_TEST_IMAGE ?= pgvector/pgvector:pg16
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-vacuum-notes db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -62,6 +62,7 @@ help:
 	@echo "  make db-init      - Create database, user, and extensions"
 	@echo "  make db-migrate   - Run Alembic migrations"
 	@echo "  make db-check     - Verify the schema matches the ORM models"
+	@echo "  make db-vacuum-notes - VACUUM (ANALYZE) notes_metadata now (027's fallback; autovacuum normally does it)"
 	@echo "  make test-schema  - Schema gate: migrations vs. models on a throwaway pgvector"
 	@echo "  make test-integration - Run tests/integration against a throwaway pgvector (they skip without one)"
 	@echo "  make db-backup    - Backup database"
@@ -178,6 +179,34 @@ db-migrate:
 db-check:
 	@echo "$(GREEN)Checking schema against the models...$(NC)"
 	@$(COMPOSE) exec obsidian-mcp alembic check
+
+# The deterministic fallback for migration 027 (#283, design D18). 027 sets
+# per-table autovacuum thresholds on notes_metadata but cannot VACUUM: VACUUM
+# refuses to run inside a transaction block, and alembic runs the whole chain
+# in one. Autovacuum normally visits the table within a minute of 027
+# committing; if `pg_stat_user_tables.last_autovacuum` stays NULL, run this.
+# It goes through the application container's own engine in an AUTOCOMMIT
+# session because the image does not guarantee `psql`.
+define VACUUM_NOTES_PY
+import asyncio
+from sqlalchemy import text
+from src.database import engine
+
+async def main():
+    async with engine.connect() as conn:
+        conn = await conn.execution_options(isolation_level="AUTOCOMMIT")
+        await conn.execute(text("SET statement_timeout = '10min'"))
+        await conn.execute(text("VACUUM (ANALYZE) notes_metadata"))
+    await engine.dispose()
+
+asyncio.run(main())
+endef
+export VACUUM_NOTES_PY
+
+db-vacuum-notes:
+	@echo "$(GREEN)VACUUM (ANALYZE) notes_metadata...$(NC)"
+	@printf '%s\n' "$$VACUUM_NOTES_PY" | $(COMPOSE) exec -T obsidian-mcp python -
+	@echo "$(GREEN)Done$(NC)"
 
 # The pre-deploy gate for any change that carries a migration. `db-check` only
 # runs `alembic check`, which cannot see a CHECK predicate; this stands up a

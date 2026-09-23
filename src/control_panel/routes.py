@@ -2821,12 +2821,15 @@ async def reset_embeddings(
     """
     from sqlalchemy import delete
     from src.models.db import NoteEmbedding, NoteMetadata
+    from src.services import vector_index
 
     dim = int(settings.embedding_dimensions)
-    # pgvector caps HNSW-indexable vectors at 2000 dims; above that, CREATE
-    # INDEX ... USING hnsw hard-errors. Skip the index so the reset still
-    # completes; semantic_search falls back to a sequential scan. See issue #6.
-    hnsw = dim <= 2000
+    # No vector index is built above 2000 dims (pgvector's HNSW limit for
+    # `vector`, and #283's decision not to turn those deployments' exact scan
+    # into an approximate one). Skip the index so the reset still completes;
+    # semantic_search falls back to a sequential scan. See issue #6. The name,
+    # the condition and the DDL all come from `vector_index`, the one owner.
+    hnsw = vector_index.index_enabled(dim)
 
     recorded = True
     with _pause_indexer():
@@ -2856,9 +2859,9 @@ async def reset_embeddings(
                 # service is still up (#142).
                 await acquire_generation_lock_unbounded(fresh)
                 await fresh.execute(text("SET LOCAL statement_timeout = '5min'"))
-                await fresh.execute(
-                    text("DROP INDEX IF EXISTS ix_note_embeddings_embedding_hnsw")
-                )
+                # Both names: the halfvec index, and 008's `vector` one on a
+                # database that has not reached 027.
+                await fresh.execute(text(vector_index.drop_index_sql()))
                 await fresh.execute(delete(NoteEmbedding))
                 await fresh.execute(
                     text(
@@ -2870,13 +2873,7 @@ async def reset_embeddings(
                     text("UPDATE notes_metadata SET embedded_content_hash = NULL")
                 )
                 if hnsw:
-                    await fresh.execute(
-                        text(
-                            "CREATE INDEX ix_note_embeddings_embedding_hnsw "
-                            "ON note_embeddings USING hnsw (embedding vector_cosine_ops) "
-                            "WITH (m = 16, ef_construction = 64)"
-                        )
-                    )
+                    await fresh.execute(text(vector_index.create_index_sql(dim)))
                 else:
                     # Already conditional on the configured dimension, and it
                     # stays that way: pgvector refuses an HNSW index above 2000

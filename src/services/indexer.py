@@ -5828,7 +5828,11 @@ async def _advance_rotation_cursor(user_id: int) -> None:
 # reset-embeddings actions indefinitely.
 PREWARM_TIMEOUT_SECONDS = 15.0
 
-_HNSW_INDEX_NAME = "ix_note_embeddings_embedding_hnsw"
+# The index the search path actually uses, from its one definition (#283).
+# Kept as a module name because tests and the log line below refer to it.
+from src.services import vector_index as _vector_index  # noqa: E402
+
+_HNSW_INDEX_NAME = _vector_index.INDEX_NAME
 
 # Tri-state cache for "does an HNSW index exist on note_embeddings.embedding".
 # None = not yet looked up. Deployments with EMBEDDING_DIMENSIONS > 2000 have
@@ -5886,11 +5890,15 @@ def probe_statement():
     statement production runs (under `PROBE_PLANNER_SETTING`) instead of a
     hand-copied lookalike: the whole point of the probe is that it walks the
     HNSW index, and only the plan of *this* statement can show that.
+
+    Ordered by `vector_index.order_expr` — the same expression the two vector
+    queries order by — so it warms the half-precision index the search uses
+    (#283, D19), not a full-precision one that no longer exists.
     """
     return (
         select(literal(1))
         .select_from(NoteEmbedding)
-        .order_by(NoteEmbedding.embedding.cosine_distance(_probe_vector()))
+        .order_by(_vector_index.order_expr(_probe_vector()))
         .limit(1)
     )
 
