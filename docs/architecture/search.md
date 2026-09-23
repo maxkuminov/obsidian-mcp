@@ -88,7 +88,9 @@ Migration 027 replaced 008's `ix_note_embeddings_embedding_hnsw`
 (`vector_cosine_ops`, ~146 MB live) with
 `ix_note_embeddings_embedding_halfvec_hnsw` over
 `(embedding::halfvec(D)) halfvec_cosine_ops`. On a synthetic 17.5 k × 1024
-corpus the two measured 137 MB and 46 MB. The rules that make it safe:
+corpus the two measured 137 MB and 46 MB; live after deploy (2026-09-23) the new
+index is 45 MB, and on 30 real production queries its top-15 notes overlapped an
+exact full-precision scan by a mean of 0.980 (minimum 0.800). The rules that make it safe:
 
 - **One definition.** `src/services/vector_index.py` owns the name,
   `index_enabled(D)` (*D* ≤ 2000), `create_index_sql(D)`, `drop_index_sql()`

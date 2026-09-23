@@ -33,7 +33,7 @@ When `EMBEDDING_PROVIDER=openai`, the system SHALL validate at startup that `OPE
 
 ### Requirement: Provider-native batch embedding
 
-The system SHALL embed multiple chunks per indexer pass using the provider's most efficient mechanism. For Ollama this MAY be a serial loop; for OpenAI this SHALL be a batched request that sends multiple inputs in one HTTP call.
+The system SHALL embed multiple chunks per indexer pass using the provider's batch mechanism. For OpenAI, this SHALL be a batched request that sends up to 96 inputs in one HTTP call. For Ollama, this SHALL be a sequence of `/api/embed` requests, each carrying an `input` array of at most `OLLAMA_EMBED_BATCH_SIZE` consecutive chunks. The batch size SHALL default to 16 and SHALL be bounded to 1–256. Each Ollama request SHALL be bounded by a 30 s timeout, and there SHALL be no aggregate deadline across requests. Each response SHALL carry exactly as many vectors as the request carried inputs, in input order, or the batch SHALL fail. Setting the batch size to 1 reproduces the pre-batching request shape.
 
 #### Scenario: OpenAI batch request
 - **WHEN** the indexer calls `get_embeddings_batch` with N chunks (N ≤ 96) and provider is `openai`
@@ -43,9 +43,17 @@ The system SHALL embed multiple chunks per indexer pass using the provider's mos
 - **WHEN** `get_embeddings_batch` is called with more than 96 chunks and provider is `openai`
 - **THEN** the system splits the batch into sub-batches of at most 96 inputs each, calls the API sequentially, and concatenates results in input order
 
-#### Scenario: Ollama serial behavior preserved
-- **WHEN** provider is `ollama` and `get_embeddings_batch` is called with N chunks
-- **THEN** the system issues N sequential single-input requests, matching pre-change behavior
+#### Scenario: Ollama fixed-size batches
+- **WHEN** provider is `ollama`, `OLLAMA_EMBED_BATCH_SIZE` is 16, and `get_embeddings_batch` is called with 40 chunks
+- **THEN** the system issues three sequential `/api/embed` requests carrying 16, 16 and 8 inputs, and returns the 40 vectors in input order
+
+#### Scenario: A short Ollama response fails the batch
+- **WHEN** an Ollama request carrying 16 inputs returns 15 vectors
+- **THEN** the batch SHALL fail and no vector from it SHALL be used
+
+#### Scenario: A hung Ollama request fails at the per-request bound
+- **WHEN** an Ollama request does not answer
+- **THEN** it SHALL fail after 30 s, with no longer deadline over the whole batch
 
 ### Requirement: Retry on transient OpenAI errors
 
@@ -299,7 +307,7 @@ The lock's rules:
 
 - **Every maintenance operation that changes the generation SHALL take the lock before it mutates anything** — before the embedding wipe, before the keyword rebuild reads its first row, and before either records a fingerprint.
 - **Every transaction that writes a configuration-dependent derived row SHALL take the lock, re-read the corresponding fingerprint under it, and refuse on a mismatch.** For the embedding path the lock SHALL be acquired **after** the provider call and **before** the certification — the window the existing certification requirement already reserves, so that no lock of any kind is held across a network request. On a mismatch the transaction SHALL certify nothing, insert nothing and delete nothing, leaving the row for a later pass, which is the disposition a failed certification already has.
-- **On the embedding path that acquisition SHALL live in the function that owns both statements.** The provider call and the certification are two statements of one function; no caller sits between them, so the lock and the fingerprint re-read SHALL be performed there rather than by the pass that invokes it. A mismatch SHALL be reported to the pass as its own outcome, distinct from a provider failure and from a successful embed: it SHALL NOT count as a note the pass embedded, SHALL NOT count as a failure — nothing went wrong with the provider — and SHALL count as an attempt, because a provider call was issued.
+- **On the embedding path that acquisition SHALL live in the function that owns both statements.** The provider call and the certification are two statements of one function; no caller sits between them, so the lock and the fingerprint re-read SHALL be performed there rather than by the pass that invokes it. A mismatch SHALL be reported to the pass as its own outcome, distinct from a provider failure and from a successful embed: it SHALL NOT count as a note the pass embedded, SHALL NOT count as a failure — nothing went wrong with the provider — and SHALL count as an attempt **if and only if a provider call was issued** for that note. A note whose every chunk reused a stored vector reaches the certification without a provider call; its mismatch SHALL NOT count as an attempt. When stored vectors are reused, the check under the lock SHALL also require every reused row to still exist with its chunk text, and a failure of that check SHALL have the mismatch disposition.
 - **Every writer of a note's keyword vector SHALL take the same lock and make the same re-read**, including the incremental index pass. A rebuild can otherwise complete and record its fingerprint while an old-configuration pass writes one note's keyword vector under the previous configuration — and because a keyword vector is rewritten only when a note's content hash changes, that row then stays on the previous configuration indefinitely behind a fingerprint claiming otherwise. A refusal there SHALL abort that pass with nothing committed, as a floor failure already does.
 - **The lock SHALL be transaction-scoped, never session-scoped**, so it is released by commit or rollback and a crashed pass cannot strand it in a pooled connection.
 - **The lock SHALL be acquired before any row or table lock** in every transaction that takes it, so that one ordering holds everywhere and the new lock cannot close a cycle with the row locks the pass, the panel and the index-discard branch already contend for. The embedding backlog and reconciliation discovery transactions, including their per-note ORM lookups, SHALL end before provider I/O; plain SELECT table locks SHALL NOT be retained into the later generation-lock acquisition. The verified hash/path snapshots and after-provider fingerprint recheck SHALL be preserved.
@@ -387,6 +395,11 @@ The documented ordering for any change to the embedding configuration SHALL stil
 - **WHEN** a transaction holding the generation lock fails or its connection drops
 - **THEN** the lock SHALL be released without operator action, and the next taker SHALL acquire it
 
+#### Scenario: A mismatch without a provider call is not an attempt
+
+- **WHEN** every chunk of a note reuses a stored vector and a reset deletes those rows before the certification's check under the lock
+- **THEN** the outcome SHALL be a generation mismatch, nothing SHALL be certified, inserted or deleted, and the pass's attempt count SHALL be unchanged
+
 ### Requirement: A fingerprint write that fails aborts the maintenance operation
 A failure to record a fingerprint SHALL roll back the maintenance operation that was recording it and SHALL surface to the operator who invoked it. It SHALL NOT be logged and swallowed.
 
@@ -430,4 +443,24 @@ Documenting the remedy is not made redundant by the startup guard. The guard tel
 - **WHEN** an operator reads the configuration example or the reference documentation at either model key
 - **THEN** it SHALL state that replacing the artifact behind an unchanged model name — re-pulling a mutable tag, or pointing at a host serving different weights — also requires the embedding reset
 - **AND** it SHALL state that no startup check detects that case
+
+### Requirement: Each provider SHALL use one pooled HTTP client built through the embedding transport factory
+Each embedding provider SHALL send its requests through one shared, connection-pooling `httpx.AsyncClient` per event loop, instead of creating a client per call. That covers indexer batches, single embeddings and `semantic_search` query embeddings. The shared client SHALL be obtained only by calling the embedding transport factory (`embedding_http_client`), so it has the factory's properties:
+- environment proxy and trust-store variables ignored;
+- redirects not followed;
+- the configured CA context.
+
+No code path SHALL construct an `httpx` client for the embedding endpoint by any other means. The client SHALL be created lazily. It SHALL be rebuilt if the running event loop differs from the one it was created on. It SHALL be closed during application shutdown, after the indexer task has been cancelled. Per-request timeouts SHALL be passed on each request: 30 s for Ollama and 60 s for OpenAI.
+
+#### Scenario: Connections are reused
+- **WHEN** the indexer embeds several notes in one pass
+- **THEN** one client instance SHALL serve every request of that pass
+
+#### Scenario: The client comes from the factory
+- **WHEN** the shared client is created
+- **THEN** it SHALL have been returned by `embedding_http_client`, and the transport sweep test SHALL find no other client construction aimed at the embedding endpoint
+
+#### Scenario: The client is closed at shutdown
+- **WHEN** the application shuts down
+- **THEN** the shared client SHALL be closed after the indexer task has stopped
 
