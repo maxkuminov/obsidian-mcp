@@ -25,6 +25,8 @@ The middleware SHALL control global and fingerprint request occupancy before DB 
 
 In `queue` and `enforce` modes, the request stage and the auth stage SHALL share one monotonic deadline per request of `MCP_CONCURRENCY_TRANSPORT_WAIT_SECONDS` (default 2, maximum 5). Waiters SHALL be bounded by `MCP_CONCURRENCY_REQUEST_WAITERS`, `MCP_CONCURRENCY_FINGERPRINT_WAITERS` and `MCP_CONCURRENCY_AUTH_WAITERS`. A request waiting at either stage SHALL hold no database connection and no auth permit, and SHALL be granted in eligible-FIFO order when capacity frees. In `enforce` mode, expiry of the deadline or a full waiter bound SHALL produce the transport refusal. In `queue` mode it SHALL produce an overrun admission instead.
 
+Transport waiting SHALL be disconnect-aware. While a request waits at either stage, the middleware SHALL watch ASGI `receive` for `http.disconnect`. On a disconnect it SHALL release every waiter count, registry reference and lease held for that request, and SHALL run no credential query. Request-body messages read while watching SHALL be buffered, up to 64 KiB per request, and replayed to the downstream application in order and unchanged. A request whose next body message would exceed that bound SHALL stop being watched and SHALL remain bounded by the transport deadline. After the auth permit is granted and before its session opens, the middleware SHALL skip authentication for a request whose client has disconnected.
+
 #### Scenario: Authentication capacity is full in enforce mode
 - **WHEN** a new request cannot acquire request or auth capacity before the transport deadline, or the relevant waiter bound is full
 - **THEN** it SHALL receive a transport refusal without a new credential query or per-request usage INSERT
@@ -38,8 +40,21 @@ In `queue` and `enforce` modes, the request stage and the auth stage SHALL share
 - **WHEN** a request waits 1.5 s for the request envelope under a 2 s transport deadline and then finds the auth ceiling full
 - **THEN** it SHALL wait at most the remaining 0.5 s for the auth permit before the deadline outcome for its mode applies
 
+#### Scenario: A real disconnect frees a transport waiter
+- **WHEN** `receive` delivers `http.disconnect` while a request waits for the envelope or for the auth permit, and the request task is not cancelled
+- **THEN** every waiter count, registry reference and lease captured for that request SHALL be released exactly once and promptly
+- **AND** no credential query and no usage row SHALL be issued for that request
+
+#### Scenario: Body messages read while waiting are preserved
+- **WHEN** a request's body arrives as one or several `http.request` messages totalling under 64 KiB while it waits, and it is then admitted
+- **THEN** the downstream application SHALL receive exactly those messages, in order, with byte-identical bodies and `more_body` flags
+
+#### Scenario: An oversized body stops the watch without losing bytes
+- **WHEN** a waiting request's next body message would take its buffer past 64 KiB
+- **THEN** the watcher SHALL stop calling `receive`, the buffered messages and every later message SHALL reach the downstream application unchanged, and the request SHALL be released no later than the transport deadline
+
 #### Scenario: A cancelled transport waiter leaks nothing
-- **WHEN** a client disconnects while its request waits for the envelope or for the auth permit
+- **WHEN** the request task is cancelled while it waits at either transport stage
 - **THEN** every waiter count, registry reference and lease captured for that request SHALL be released exactly once
 
 #### Scenario: A stream outlives authentication
@@ -127,57 +142,55 @@ A real-PostgreSQL test SHALL invoke every registered tool through the tracking d
 ### Requirement: Queue mode waits like enforcement and never refuses for capacity
 The server SHALL accept `MCP_CONCURRENCY_MODE=queue`. In that mode every stage (request, auth, tool and writer) SHALL wait with enforcement's deadlines, waiter bounds and eligible-FIFO order, and SHALL admit the work with an `overrun` mark wherever enforcement would have refused for capacity.
 
-A queue-mode overrun SHALL NOT return a refusal, SHALL NOT write a `slot_timeout` row, and SHALL consume quota exactly as any executed call does. Shutdown refusal SHALL remain a refusal in every mode.
+A queue-mode overrun SHALL change only the concurrency outcome. The call SHALL then proceed through the remaining non-concurrency gates, whose outcomes and classification SHALL stay authoritative. An overrun SHALL NOT return a refusal and SHALL NOT write a `slot_timeout` row. Quota SHALL be consumed only if the call passes the daily-quota gate. The `concurrency_queue` object SHALL annotate a row and SHALL NOT alter its executed or pre-body classification. Shutdown refusal SHALL remain a refusal in every mode.
 
 #### Scenario: A deadline expiry admits instead of refusing
-- **WHEN** a tool call in queue mode waits past its tool deadline
+- **WHEN** a tool call in queue mode waits past its tool deadline and then passes the daily-quota gate
 - **THEN** the call SHALL execute and return its normal result
 - **AND** its usage row SHALL carry `concurrency_queue` with `overrun: true`, `code: slot_timeout` and the waited milliseconds
 
 #### Scenario: A waiter overflow admits instead of refusing
 - **WHEN** a request arrives in queue mode while the fingerprint waiter bound is full
 - **THEN** the request SHALL proceed immediately, with no 429
-- **AND** the since-boot counter for `(request, fingerprint, overrun)` SHALL increment
+- **AND** the request SHALL be counted once in the `transport_overrun` windowed counter
 
-#### Scenario: An ordinary wait is measured
+#### Scenario: An overrun followed by a quota refusal stays a quota refusal
+- **WHEN** a queue-mode call overruns its tool deadline and the daily-quota gate then refuses it
+- **THEN** the caller SHALL receive the existing `over_quota` refusal, and the body SHALL NOT run
+- **AND** no quota SHALL be consumed, and the row SHALL be classified as a pre-body refusal by the existing predicate even though it also carries `concurrency_queue.overrun: true`
+
+#### Scenario: An ordinary wait is measured and sets no code
 - **WHEN** a queue-mode call waits 40 ms for a light slot and is then granted
-- **THEN** its row SHALL record `queue_ms` of about 40, with `concurrency_queue.overrun` false
+- **THEN** its row SHALL record `queue_ms` of about 40, with `concurrency_queue.overrun` false and `concurrency_queue.code` null
 
 #### Scenario: A writer overrun keeps the row
 - **WHEN** a usage writer in queue mode exceeds its writer wait
 - **THEN** the row SHALL still be written, and the writer overrun SHALL be counted
 
-### Requirement: Concurrency metadata names the refusal enforcement would have returned first
-The `concurrency_shadow` and `concurrency_queue` objects SHALL set `code` to the code of the earliest pipeline stage observed, in the order request, auth, tool, writer. They SHALL list that observation first and never drop it when truncating to four observations, and SHALL carry `schema: 2`.
+### Requirement: Concurrency metadata orders observations by stage and derives its code by mode
+The `concurrency_shadow` and `concurrency_queue` objects SHALL list observations in pipeline-stage order (request, auth, tool, writer), SHALL keep at most four observations, and SHALL carry `schema: 2`. They SHALL NOT contain a credential, a fingerprint or a principal identity.
 
-The stage codes SHALL be `request_concurrency_limited`, `auth_concurrency_limited`, `slot_timeout` and `writer_concurrency_limited`. Neither object SHALL contain a credential, a fingerprint or a principal identity.
+In `concurrency_shadow`, every observation is a zero-wait capacity miss. Its `code` SHALL be the code of the earliest-stage observation, and truncation SHALL always keep that observation.
+
+In `concurrency_queue`, `code` SHALL be the code of the earliest-stage observation marked `overrun: true`, and SHALL be `null` when no observation overran. Truncation SHALL always keep that overrun observation.
+
+The stage codes SHALL be `request_concurrency_limited`, `auth_concurrency_limited`, `slot_timeout` and `writer_concurrency_limited`.
 
 #### Scenario: A later writer observation does not mask tool pressure
 - **WHEN** a shadow call observes tool pressure and its usage writer then observes writer pressure
 - **THEN** the row's `concurrency_shadow.code` SHALL be `slot_timeout` and its first observation SHALL be the tool stage
 
-#### Scenario: A transport observation outranks the tool
-- **WHEN** a call observes fingerprint pressure at the request stage and class pressure at the tool stage
+#### Scenario: A transport observation outranks the tool in shadow
+- **WHEN** a shadow call observes fingerprint pressure at the request stage and class pressure at the tool stage
 - **THEN** `code` SHALL be `request_concurrency_limited`
 
-#### Scenario: Truncation keeps the worst observation
-- **WHEN** a call carries five distinct observations whose earliest stage arrived last
-- **THEN** exactly four SHALL be stored and the earliest-stage observation SHALL be among them, listed first
+#### Scenario: An earlier wait does not set the queue code
+- **WHEN** a queue-mode request waits 40 ms for the auth permit without overrunning, then overruns its tool deadline
+- **THEN** `concurrency_queue.code` SHALL be `slot_timeout`, and the auth wait SHALL be listed first with `overrun: false`
 
-### Requirement: A tool's slot lease ends when its body ends
-The tracking decorator SHALL release a tool's slot lease once the body has returned or raised, and SHALL release it before writing the usage row, recording a tool failure, or emitting tail security events. The release SHALL come after every value the usage row needs has been captured.
-
-#### Scenario: A slow usage write does not extend the slot
-- **WHEN** a light-class call's body returns while its usage writer is blocked, in enforce mode with light ceiling 1
-- **THEN** a second light-class call SHALL be granted the slot before the first call's usage write completes
-
-#### Scenario: A body exception releases before its failure row
-- **WHEN** a tool body raises
-- **THEN** the slot SHALL be released before `_record_tool_failure` runs, and the original exception SHALL still reach the caller
-
-#### Scenario: Cancellation still releases exactly once
-- **WHEN** a call is cancelled during its body
-- **THEN** its lease SHALL be released exactly once, whether by the post-body release or by the backstop in `finally`
+#### Scenario: Truncation keeps the deciding observation
+- **WHEN** a call carries five distinct observations whose deciding observation (the earliest in shadow, the earliest overrun in queue) would fall outside the first four
+- **THEN** exactly four SHALL be stored and the deciding observation SHALL be among them
 
 ### Requirement: Concurrency configuration is validated as a coherent hierarchy
 Startup SHALL refuse any concurrency configuration that breaks a hierarchy or coherence rule, and the error SHALL name the settings involved.
@@ -205,40 +218,113 @@ The rules SHALL be:
 - **WHEN** the environment carries `MCP_CONCURRENCY_OTHER=3`
 - **THEN** startup SHALL refuse with a message naming `MCP_CONCURRENCY_LIGHT` and `MCP_CONCURRENCY_SCAN`
 
+### Requirement: Every tracked usage row carries concurrency provenance
+Whenever the concurrency mode is not `off`, every `usage_logs` row written by the tracking decorator or by its refusal, coalescer or failure paths SHALL carry `params.concurrency` with `v: 2`, the current `mode`, and an `epoch`. The `epoch` SHALL be the first 12 hex digits of the SHA-256 of the canonical JSON of every `mcp_concurrency_*` setting except `mode`, together with the class-mapping version. Startup SHALL log the effective concurrency settings and the epoch once at INFO.
+
+#### Scenario: An unpressured call is still marked
+- **WHEN** a tool call runs in queue mode with no wait and no overrun
+- **THEN** its row SHALL carry `params.concurrency` with `v: 2`, `mode: queue` and the current epoch, and SHALL carry no `concurrency_queue` object
+
+#### Scenario: Refusal and coalesced rows are marked
+- **WHEN** a `rate_limited` refusal row, a coalesced `slot_timeout` row, an `over_quota` row or a `tool_exception` row is written
+- **THEN** each SHALL carry the same `params.concurrency` provenance
+
+#### Scenario: A mode change keeps the epoch and a limit change moves it
+- **WHEN** only `MCP_CONCURRENCY_MODE` changes between two boots
+- **THEN** the epoch SHALL be identical; when any other `MCP_CONCURRENCY_*` value changes, the epoch SHALL differ
+
+### Requirement: Transport, writer and pool outcomes are recorded in durable windowed counters
+The server SHALL record request totals, per-request transport outcomes, writer overruns and refusals, pool checkout timeouts, the pool checkout high-water mark, the maximum transport wait, and a heartbeat in a `concurrency_counters` table. Rows SHALL be keyed by minute bucket, epoch, mode and a metric from a closed set. The in-process accumulation SHALL be flushed by one bounded statement per flush interval (60 s) whatever the request volume, and once more at shutdown before the engine is disposed. Buckets older than 35 days SHALL be pruned.
+
+Each request SHALL contribute at most once to each transport metric: the worst transport outcome of that request, recorded when the request completes. Tool-stage figures SHALL come only from usage rows, and transport, writer and pool figures only from these counters.
+
+#### Scenario: Pressure at two transport stages counts once
+- **WHEN** one shadow request observes pressure at both the request stage and the auth stage
+- **THEN** `transport_pressured` SHALL increase by exactly 1 for that request
+
+#### Scenario: A request that never reaches a tool is still counted
+- **WHEN** an `initialize` request overruns the transport deadline in queue mode
+- **THEN** `requests` and `transport_overrun` SHALL each increase by 1, and no usage row SHALL be written for it
+
+#### Scenario: A flood does not amplify into writes
+- **WHEN** 10,000 requests arrive within one flush interval
+- **THEN** the flush SHALL issue one bounded upsert for that interval, not one statement per request
+
+#### Scenario: A heartbeat marks coverage
+- **WHEN** a flush interval passes with no traffic
+- **THEN** a `heartbeat` row SHALL still be written for that bucket
+
+### Requirement: Pool checkout timeouts are counted at the shared acquisition boundary
+The database engine SHALL count every connection-pool checkout timeout, `sqlalchemy.exc.TimeoutError` raised by pool checkout, from every consumer of the engine, and SHALL track the checked-out high-water mark. It SHALL re-raise the original exception unchanged and SHALL NOT count other exceptions named `TimeoutError`.
+
+#### Scenario: Timeouts outside tool bodies are counted
+- **WHEN** a pool checkout times out during MCP authentication, during the quota gate, in a usage writer, in a panel request, or in OAuth `/token`
+- **THEN** `pool_checkout_timeout` SHALL increase by 1 for each, and each caller SHALL see the same exception as before
+
+#### Scenario: An unrelated timeout is not a pool timeout
+- **WHEN** an embedding-provider call raises `TimeoutError` or `asyncio.TimeoutError`
+- **THEN** `pool_checkout_timeout` SHALL be unchanged
+
+### Requirement: A concurrency refusal consumes no durable quota and refunds no rate token
+A tool call refused at the slot gate SHALL consume no daily-quota slot. Rate-bucket tokens it spent at the earlier bucket gates SHALL remain spent and SHALL NOT be refunded. The guarantee that nothing durable is consumed by a refused call SHALL be stated as covering the durable daily quota only.
+
+#### Scenario: A write refused for capacity
+- **WHEN** a write-class call passes both token buckets and is then refused with `slot_timeout` in enforce mode
+- **THEN** its daily-quota counter SHALL be unchanged
+- **AND** its general-bucket and write-bucket tokens SHALL remain spent, refilling only at their configured rates
+
 ### Requirement: A readiness evaluator applies fixed numeric criteria for each mode change
-The server SHALL provide one pure evaluator. For a target mode of `queue` or `enforce`, it SHALL return PASS, FAIL or INSUFFICIENT_DATA for each fixed criterion, together with the numbers behind each verdict. It SHALL consider only usage rows written with `schema: 2` metadata, or rows carrying `queue_ms` in queue or enforce mode.
+The server SHALL provide one pure evaluator. For a target mode of `queue` or `enforce`, it SHALL return PASS, FAIL or INSUFFICIENT_DATA for each fixed criterion, together with the numbers behind each verdict. It SHALL use only usage rows carrying `params.concurrency.v = 2` and `concurrency_counters` rows, and SHALL exclude every other row unconditionally.
+
+A window SHALL qualify only when:
+- all of its rows and counters carry the source mode (`shadow` for target `queue`, `queue` for target `enforce`) and a single epoch;
+- it is covered: no gap longer than 180 s between consecutive heartbeats, and heartbeats within 180 s of both ends.
+
+A non-qualifying or uncovered window SHALL yield INSUFFICIENT_DATA for every criterion.
 
 For target `queue`, the window SHALL be at least 3 days and 300 executed tool calls, and the criteria SHALL be:
-- **Q1:** tool-pressured calls ≤ 10 % of executed calls;
-- **Q2:** transport-pressured requests ≤ 5 % of executed calls;
-- **Q3:** zero pool timeouts.
+- **Q1:** tool-pressured executed calls ≤ 10 % of executed calls (rows);
+- **Q2:** `transport_pressured` ≤ 5 % of `requests` (counters);
+- **Q3:** zero `pool_checkout_timeout` (counters).
 
-For target `enforce`, the window SHALL be at least 7 days and 1,000 executed tool calls of queue-mode data, and each criterion SHALL hold over the whole window and over its last 72 hours:
-- **E1:** tool overruns ≤ max(1, 0.1 % of executed calls);
-- **E2:** zero transport overruns;
-- **E3:** zero writer overruns;
-- **E4:** tool `queue_ms` p99 ≤ 500 ms;
-- **E5:** maximum tool wait ≤ 50 % of the tool deadline, and maximum transport wait ≤ 50 % of the transport deadline;
-- **E6:** zero pool timeouts, and a pool checkout high-water of at most 13.
+For target `enforce`, the window SHALL be at least 7 days and 1,000 executed tool calls, and each criterion SHALL hold over the whole window and over its last 72 hours:
+- **E1:** distinct calls with a tool-stage overrun ≤ max(1, 0.1 % of executed calls) (rows);
+- **E2:** zero `transport_overrun` (counters);
+- **E3:** zero `writer_overrun` (counters);
+- **E4:** tool `queue_ms` p99 ≤ 500 ms (rows);
+- **E5:** maximum tool `queue_ms` ≤ 50 % of the tool deadline (rows), and maximum `transport_wait_max_ms` ≤ 50 % of the transport deadline (counters);
+- **E6:** zero `pool_checkout_timeout`, and maximum `pool_high_water` ≤ 13 (counters).
 
-Criteria that need process counters SHALL report INSUFFICIENT_DATA when process uptime is under 72 hours. The same evaluator SHALL back both the panel verdict and `make concurrency-report`.
+The same evaluator SHALL back both the panel verdict and `make concurrency-report`.
 
 #### Scenario: A thin window is not a pass
 - **WHEN** the enforce evaluation covers 5 days, or fewer than 1,000 executed calls
 - **THEN** every enforce criterion SHALL report INSUFFICIENT_DATA and the overall verdict SHALL not be PASS
 
 #### Scenario: E1 boundary
-- **WHEN** a qualifying window holds 2,000 executed calls and 2 tool overruns
-- **THEN** E1 SHALL PASS; with 3 overruns E1 SHALL FAIL
+- **WHEN** a qualifying window holds 2,000 executed calls and 2 calls with a tool overrun
+- **THEN** E1 SHALL PASS; with 3 such calls E1 SHALL FAIL
 
 #### Scenario: Recent regression fails even when the window average passes
-- **WHEN** a 7-day window meets E4 overall but its last 72 hours have a tool `queue_ms` p99 of 800 ms
+- **WHEN** a 7-day qualifying window meets E4 overall but its last 72 hours have a tool `queue_ms` p99 of 800 ms
 - **THEN** E4 SHALL FAIL
 
-#### Scenario: Legacy shadow rows are ignored
-- **WHEN** the window contains pre-change rows whose `concurrency_shadow` has no `schema`
+#### Scenario: Legacy rows are ignored, including unpressured ones
+- **WHEN** the window contains pre-change rows carrying `queue_ms: 0` but no `params.concurrency`
 - **THEN** the evaluator SHALL exclude them from every count and denominator
 
+#### Scenario: A mixed-mode window does not qualify
+- **WHEN** a 7-day window contains queue-mode rows and, on day 2, shadow-mode rows or rows from a different epoch
+- **THEN** the enforce criteria SHALL report INSUFFICIENT_DATA, and the evaluator SHALL report the start of the latest qualifying sub-window
+
+#### Scenario: A restart gap is not a pass
+- **WHEN** a 7-day queue window has a 10-minute heartbeat gap on day 4 from a hard kill
+- **THEN** every enforce criterion, including E2, E3 and E6, SHALL report INSUFFICIENT_DATA rather than PASS
+
+#### Scenario: No double counting across sources
+- **WHEN** 300 executed calls include 12 requests that were auth-pressured
+- **THEN** Q2 SHALL use `transport_pressured` over `requests` from the counters only, and those 12 requests SHALL be counted once
+
 #### Scenario: A pool timeout blocks the flip
-- **WHEN** the window holds one `tool_exception` row with `error_type` `TimeoutError`
+- **WHEN** a qualifying window holds one `pool_checkout_timeout`, from any consumer
 - **THEN** Q3 and E6 SHALL FAIL
