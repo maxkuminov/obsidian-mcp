@@ -61,8 +61,8 @@ credential and then opens the Usage page to see what it did was shown
   crash" (L2, performance-2026-09 #279).** `_insert_usage` issues
   `SET LOCAL synchronous_commit = off` as the first statement of its
   transaction, for the initial insert and the FK-cleared retry alike, so the
-  usage row no longer waits on a WAL flush (~40–50 ms on the HDD-backed
-  server). An asynchronously committed row is visible to every other session
+  usage row no longer waits on a WAL flush (~40–50 ms when PGDATA was on an
+  HDD; ~2.5 ms since the reference deployment moved it to NVMe on 2026-09-23). An asynchronously committed row is visible to every other session
   at commit, so `write_usage_row` still returns `True` only after a commit a
   second session can read, and the writer lease, the single FK retry and the
   #193 coalescer requeue are unchanged. What is weakened is durability across
