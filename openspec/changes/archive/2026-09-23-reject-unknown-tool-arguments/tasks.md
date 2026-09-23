@@ -11,11 +11,11 @@
 - [x] 2.2 For every registered tool: the listed schema (`await mcp.list_tools()`) has `additionalProperties: false`
 - [x] 2.3 Declared arguments (all optional ones as `null` where allowed) still validate on the swapped models
 - [x] 2.4 With the setting false, the models and schemas are left untouched
-- [ ] 2.5 Existing suite green (`pytest tests`), plus `make test-integration` — offline suite green (5678 passed, 688 skipped, with `OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1`); `make test-integration` not yet run (skipped during the DB move)
+- [x] 2.5 Existing suite green (`pytest tests`), plus `make test-integration` — offline suite green (5678 passed, 688 skipped, with `OMCP_ALLOW_SKIP_TRANSFER_INTEGRATION=1`); `make test-integration` not yet run (skipped during the DB move) — offline suite green; integration green in CI on PR #297 (local run hit 22 pre-existing `no current event loop` errors in untouched `tests/integration/`)
 
 ## 3. Verify and ship
 
 - [x] 3.1 `openspec validate reject-unknown-tool-arguments --strict`
 - [x] 3.2 openspec-verifier pass; one adversarial Codex round (tool-argument surface for every write tool)
-- [ ] 3.3 Deploy; live end-to-end: `keyword_search` with `foo` refused, `keyword_search`/`semantic_search`/`read_note` with valid args succeed, `tools/list` shows `additionalProperties: false`
-- [ ] 3.4 Archive, commit, push (`Closes #295`)
+- [x] 3.3 Deploy; live end-to-end: `keyword_search` with `foo` refused, `keyword_search`/`semantic_search`/`read_note` with valid args succeed, `tools/list` shows `additionalProperties: false` — done 2026-09-23 via the claude.ai connector: `keyword_search(folders=…)` and `semantic_search(user_id=…)` refused naming the argument; valid `keyword_search`/`semantic_search`/`read_note` succeeded; 25/25 listed schemas carry `additionalProperties: false` in the deployed image
+- [x] 3.4 Archive, commit, push (`Closes #295`)
