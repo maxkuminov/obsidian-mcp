@@ -1,5 +1,29 @@
 {% extends "base.html" %}
 {% block title %}Search analytics — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+/* Search analytics page classes (#289, panel-csp-style-attrs design D1/D4).
+   Table cells are scoped to `.data-table th` / `.data-table tbody tr td`:
+   the base `.data-table th` / `.data-table td` (0,1,1) set alignment,
+   padding, font-size and colour, and `.data-table tbody tr:hover td` (0,2,3)
+   recolours a hovered row. The old inline styles beat all three; a lone class
+   would lose to them, so each cell rule matches the strongest rule it has to
+   beat and wins by cascade order (page_style comes last, design D4). */
+.sa-window-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+.sa-window-label { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-2); }
+.sa-empty-intro { color: var(--text-2); font-size: 14px; line-height: 1.6; margin: 0; }
+.sa-note { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 0; }
+.sa-note-lead { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 0 0 8px; }
+.sa-note-follow { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 8px 0 0; }
+.data-table th.sa-th-num { text-align: right; }
+.data-table tbody tr td.sa-td-num { text-align: right; font-size: 12px; }
+.data-table tbody tr td.sa-td-num-muted { text-align: right; font-size: 12px; color: var(--text-2); }
+.data-table tbody tr td.sa-td-title { font-size: 12px; color: var(--text-2); }
+.data-table tbody tr td.sa-td-date { text-align: right; font-size: 11px; color: var(--text-2); }
+.data-table tbody tr td.sa-td-empty { text-align: center; padding: 32px; color: var(--text-3); }
+.data-table tbody tr td.sa-td-empty-sm { text-align: center; padding: 24px; color: var(--text-3); }
+</style>
+{% endblock %}
 {% block content %}
 
 {#
@@ -31,58 +55,58 @@ further down a result list than the log keeps.
         {# A source path over the telemetry contract's 1024-byte bound is
            recorded as its sha256 digest, so the grouping stays non-colliding.
            Rendered as 64 unmarked hex characters it would read as a note. #}
-        <span class="mono" style="font-size:11px;color:var(--text-3);"
+        <span class="mono u-font-size-11px u-color-text-3"
               title="This source path was too long to log whole, so it is grouped by its sha256 digest.">digest {{ row.label.text[:16] }}…</span>
     {% else %}
-        <span class="mono" style="font-size:12px;color:var(--primary-text);word-break:break-word;">{{ row.label.text }}</span>
+        <span class="mono u-font-size-12px u-color-primary-text u-word-break-break-word">{{ row.label.text }}</span>
     {% endif %}
     {% if show_owner %}
-        <div class="mono" style="font-size:10px;color:var(--text-3);">
+        <div class="mono u-font-size-10px u-color-text-3">
             {% if row.owner %}{{ row.owner }}{% elif row.user_id %}user #{{ row.user_id }}{% else %}no owner{% endif %}
         </div>
     {% endif %}
 {%- endmacro %}
 
 {% macro group_tables(table, key_header) %}
-<div class="card anim-2" style="margin-bottom:20px;">
+<div class="card anim-2 u-margin-bottom-20px">
     <div class="card-header">
         <span class="card-title">{{ table.label }}</span>
-        <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
+        <span class="mono u-font-size-11px u-color-text-3">{{ window_label }}</span>
     </div>
     <div class="table-scroll">
     <table class="data-table">
         <thead>
             <tr>
                 <th>{{ key_header }}</th>
-                <th style="text-align:right;">Calls</th>
-                <th style="text-align:right;" title="Mean number of notes returned, over the calls that recorded a result count.">Mean results</th>
-                <th style="text-align:right;" title="Calls in this window that returned nothing.">Empty</th>
+                <th class="sa-th-num">Calls</th>
+                <th class="sa-th-num" title="Mean number of notes returned, over the calls that recorded a result count.">Mean results</th>
+                <th class="sa-th-num" title="Calls in this window that returned nothing.">Empty</th>
             </tr>
         </thead>
         <tbody>
             {% for row in table.top %}
             <tr>
                 <td>{{ group_cell(row) }}</td>
-                <td class="mono" style="text-align:right;font-size:12px;">{{ row.calls }}</td>
+                <td class="mono sa-td-num">{{ row.calls }}</td>
                 {# NULL mean: no call in this group recorded a result count —
                    every one predates the telemetry. An em dash says "not
                    measured"; a 0 would say "this search finds nothing". #}
-                <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if row.mean_results is not none %}{{ row.mean_results }}{% else %}<span style="color:var(--text-3);" title="No call in this group recorded a result count.">—</span>{% endif %}</td>
-                <td class="mono" style="text-align:right;font-size:12px;">
-                    {% if row.zero_calls %}<span class="badge badge-yellow">{{ row.zero_calls }}</span>{% else %}<span style="color:var(--text-3);">0</span>{% endif %}
+                <td class="mono sa-td-num-muted">{% if row.mean_results is not none %}{{ row.mean_results }}{% else %}<span class="u-color-text-3" title="No call in this group recorded a result count.">—</span>{% endif %}</td>
+                <td class="mono sa-td-num">
+                    {% if row.zero_calls %}<span class="badge badge-yellow">{{ row.zero_calls }}</span>{% else %}<span class="u-color-text-3">0</span>{% endif %}
                 </td>
             </tr>
             {% endfor %}
             {% if not table.top %}
-            <tr><td colspan="4" style="text-align:center;padding:32px;color:var(--text-3);">No {{ table.label | lower }} calls with recorded results in this window.</td></tr>
+            <tr><td colspan="4" class="sa-td-empty">No {{ table.label | lower }} calls with recorded results in this window.</td></tr>
             {% endif %}
         </tbody>
     </table>
     </div>
 
     <div class="card-body">
-        <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0 0 8px;">
-            <strong style="color:var(--text-2);">Came back empty.</strong>
+        <p class="sa-note-lead">
+            <strong class="u-color-text-2">Came back empty.</strong>
             Searches that ran to completion and found nothing — memory the vault
             was asked for and does not hold. Calls that failed before producing
             a result set are excluded: a refused call, and for related-notes a
@@ -94,20 +118,20 @@ further down a result list than the log keeps.
         <thead>
             <tr>
                 <th>{{ key_header }}</th>
-                <th style="text-align:right;">Empty calls</th>
-                <th style="text-align:right;">Total calls</th>
+                <th class="sa-th-num">Empty calls</th>
+                <th class="sa-th-num">Total calls</th>
             </tr>
         </thead>
         <tbody>
             {% for row in table.zero %}
             <tr>
                 <td>{{ group_cell(row) }}</td>
-                <td class="mono" style="text-align:right;font-size:12px;"><span class="badge badge-yellow">{{ row.zero_calls }}</span></td>
-                <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ row.calls }}</td>
+                <td class="mono sa-td-num"><span class="badge badge-yellow">{{ row.zero_calls }}</span></td>
+                <td class="mono sa-td-num-muted">{{ row.calls }}</td>
             </tr>
             {% endfor %}
             {% if not table.zero %}
-            <tr><td colspan="3" style="text-align:center;padding:24px;color:var(--text-3);">Nothing came back empty in this window.</td></tr>
+            <tr><td colspan="3" class="sa-td-empty-sm">Nothing came back empty in this window.</td></tr>
             {% endif %}
         </tbody>
     </table>
@@ -122,21 +146,20 @@ further down a result list than the log keeps.
 <div class="page-body">
 
     <!-- Window selector -->
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:20px;">
-        <span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-2);">Window</span>
+    <div class="sa-window-bar">
+        <span class="sa-window-label">Window</span>
         {% for w in windows %}
         <a href="/admin/search-analytics?window={{ w.key }}"
-           class="btn {% if w.selected %}btn-primary{% else %}btn-ghost{% endif %}"
-           style="padding:6px 14px;font-size:12px;"
+           class="btn {% if w.selected %}btn-primary{% else %}btn-ghost{% endif %} u-padding-6px-14px u-font-size-12px"
            {% if w.selected %}aria-current="page"{% endif %}>{{ w.label }}</a>
         {% endfor %}
-        <span style="font-size:12px;color:var(--text-3);margin-left:4px;">{{ window_label }}</span>
+        <span class="u-font-size-12px u-color-text-3 u-margin-left-4px">{{ window_label }}</span>
     </div>
 
     {% if not has_data %}
-    <div class="card anim-1" style="margin-bottom:20px;">
+    <div class="card anim-1 u-margin-bottom-20px">
         <div class="card-body">
-            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+            <p class="sa-empty-intro">
                 No searches with recorded results were logged in this window.
                 Result telemetry starts at the first search after the deploy
                 that added it, so a window reaching further back than that will
@@ -161,27 +184,27 @@ further down a result list than the log keeps.
     {{ group_tables(related, "Source note") }}
 
     <!-- Retrieval coverage -->
-    <div class="card anim-3" style="margin-bottom:20px;">
+    <div class="card anim-3 u-margin-bottom-20px">
         <div class="card-header">
             <span class="card-title">Top-logged retrievals</span>
-            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
+            <span class="mono u-font-size-11px u-color-text-3">{{ window_label }}</span>
         </div>
         <div class="card-body">
-            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0;">{{ cap_caveat }}</p>
+            <p class="sa-note">{{ cap_caveat }}</p>
         </div>
         <div class="table-scroll">
         <table class="data-table">
             <thead>
                 <tr>
                     <th>Note</th>
-                    <th style="text-align:right;" title="Times this note appeared in the first {{ logged_per_call }} logged results of a call.">Logged appearances</th>
+                    <th class="sa-th-num" title="Times this note appeared in the first {{ logged_per_call }} logged results of a call.">Logged appearances</th>
                 </tr>
             </thead>
             <tbody>
                 {% for row in retrievals %}
                 <tr>
                     <td>
-                        <span class="mono" style="font-size:12px;color:var(--primary-text);word-break:break-word;">{{ row.path }}</span>
+                        <span class="mono u-font-size-12px u-color-primary-text u-word-break-break-word">{{ row.path }}</span>
                         {% if not row.indexed %}
                             {# The path was retrieved in this window but no note
                                with that path exists for that owner now: renamed
@@ -190,16 +213,16 @@ further down a result list than the log keeps.
                             <span class="badge badge-gray" title="No indexed note has this path for this owner any more — renamed or deleted since it was retrieved.">not in index</span>
                         {% endif %}
                         {% if show_owner %}
-                        <div class="mono" style="font-size:10px;color:var(--text-3);">
+                        <div class="mono u-font-size-10px u-color-text-3">
                             {% if row.owner %}{{ row.owner }}{% elif row.user_id %}user #{{ row.user_id }}{% else %}no owner{% endif %}
                         </div>
                         {% endif %}
                     </td>
-                    <td class="mono" style="text-align:right;font-size:12px;">{{ row.appearances }}</td>
+                    <td class="mono sa-td-num">{{ row.appearances }}</td>
                 </tr>
                 {% endfor %}
                 {% if not retrievals %}
-                <tr><td colspan="2" style="text-align:center;padding:32px;color:var(--text-3);">No search in this window logged a result path.</td></tr>
+                <tr><td colspan="2" class="sa-td-empty">No search in this window logged a result path.</td></tr>
                 {% endif %}
             </tbody>
         </table>
@@ -209,7 +232,7 @@ further down a result list than the log keeps.
     <div class="card anim-3">
         <div class="card-header">
             <span class="card-title">Never retrieved</span>
-            <span class="mono" style="font-size:11px;color:var(--text-3);">
+            <span class="mono u-font-size-11px u-color-text-3">
                 {% if never_retrieved_total > never_retrieved | length %}
                     showing {{ never_retrieved | length }} of {{ never_retrieved_total }}
                 {% else %}
@@ -218,10 +241,10 @@ further down a result list than the log keeps.
             </span>
         </div>
         <div class="card-body">
-            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0;">{{ cap_caveat }}</p>
-            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:8px 0 0;">
+            <p class="sa-note">{{ cap_caveat }}</p>
+            <p class="sa-note-follow">
                 Indexed notes that appear in no logged result of this window.
-                An <strong style="color:var(--text-2);">upper bound</strong> on
+                An <strong class="u-color-text-2">upper bound</strong> on
                 what retrieval is missing, not a list of dead notes — the longer
                 the window, the closer it gets.
             </p>
@@ -232,28 +255,28 @@ further down a result list than the log keeps.
                 <tr>
                     <th>Note</th>
                     <th>Title</th>
-                    <th style="text-align:right;">Modified</th>
+                    <th class="sa-th-num">Modified</th>
                 </tr>
             </thead>
             <tbody>
                 {% for row in never_retrieved %}
                 <tr>
                     <td>
-                        <span class="mono" style="font-size:12px;color:var(--primary-text);word-break:break-word;">{{ row.path }}</span>
+                        <span class="mono u-font-size-12px u-color-primary-text u-word-break-break-word">{{ row.path }}</span>
                         {% if show_owner %}
-                        <div class="mono" style="font-size:10px;color:var(--text-3);">
+                        <div class="mono u-font-size-10px u-color-text-3">
                             {% if row.owner %}{{ row.owner }}{% elif row.user_id %}user #{{ row.user_id }}{% else %}no owner{% endif %}
                         </div>
                         {% endif %}
                     </td>
-                    <td style="font-size:12px;color:var(--text-2);">{{ row.title }}</td>
-                    <td class="mono" style="text-align:right;font-size:11px;color:var(--text-2);">
-                        {% if row.modified_at %}<time datetime="{{ row.modified_at }}" data-localize>{{ row.modified_at }}</time>{% else %}<span style="color:var(--text-3);">—</span>{% endif %}
+                    <td class="sa-td-title">{{ row.title }}</td>
+                    <td class="mono sa-td-date">
+                        {% if row.modified_at %}<time datetime="{{ row.modified_at }}" data-localize>{{ row.modified_at }}</time>{% else %}<span class="u-color-text-3">—</span>{% endif %}
                     </td>
                 </tr>
                 {% endfor %}
                 {% if not never_retrieved %}
-                <tr><td colspan="3" style="text-align:center;padding:32px;color:var(--text-3);">Every indexed note appeared in at least one logged result in this window.</td></tr>
+                <tr><td colspan="3" class="sa-td-empty">Every indexed note appeared in at least one logged result in this window.</td></tr>
                 {% endif %}
             </tbody>
         </table>
