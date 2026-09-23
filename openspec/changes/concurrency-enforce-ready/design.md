@@ -59,11 +59,11 @@ The 2026-09-21 shadow evidence on #188 names five blockers (proposal §Why).
 
 | # | Blocker (#188, 2026-09-21) | Decision |
 | --- | --- | --- |
-| 1 | `Controller.auth()` never waits; the fingerprint stage also refused calls. | **D1.** The request and auth stages share one bounded transport deadline (`MCP_CONCURRENCY_TRANSPORT_WAIT_SECONDS`, default 2, max 5) with bounded waiter counts and eligible-FIFO order. Waiting is **disconnect-aware**: the middleware watches ASGI `receive` for `http.disconnect` while it waits, and buffers any body messages it reads up to a fixed bound so they are replayed intact. The separate auth permit is **kept**. Defaults rise to requests 64 and fingerprint 20. A coherence rule requires `fingerprint ≥ principal + principal_waiters`. |
+| 1 | `Controller.auth()` never waits; the fingerprint stage also refused calls. | **D1.** The request and auth stages share one bounded transport deadline (`MCP_CONCURRENCY_TRANSPORT_WAIT_SECONDS`, default 2, max 5) with bounded waiter counts and eligible-FIFO order. Waiting is **disconnect-aware**: the middleware watches ASGI `receive` for `http.disconnect` while it waits, and it owns `receive` exclusively until admission ends. Every message it reads is kept losslessly and replayed to the app. A process-wide replay budget stops further consumption, but never drops anything. The separate auth permit is **kept**. Defaults rise to requests 64 and fingerprint 20. A coherence rule requires `fingerprint ≥ principal + principal_waiters`. |
 | 2a | The pool budget is exactly saturated, and the class-sum rule forces `other = 1`. | **D2.** Class ceilings become independent (each ≤ tools). The multiplier becomes per class (write 2, the others 1) and is pinned by a real-PG checkout-peak test over every tool. Budget: `auth + tool_demand + writers + 4 ≤ 15`. Defaults give 14. |
 | 2b | `other` holds 15 of 25 tools. | **D3.** Split into `light` (9 tools, ceiling 4) and `scan` (6 tools, ceiling 2). `MCP_CONCURRENCY_OTHER=1` is ignored with a WARNING; any other value is refused. |
 | 3 | `shadow_metadata` reports the last code. | **D4.** Observations are kept in pipeline-stage order and the earliest is never truncated. **Code selection is separate from ordering.** In shadow, every observation is a zero-wait would-refuse, so `code` is the earliest stage's. In queue, `code` comes from **overrun** observations only (the earliest overrun), and is `null` when nothing overran. |
-| 4 | No panel surface; the data could not answer the flip question. | **D6 + D8.** A panel section plus one evaluator. Every row that `_tracked` writes carries an unconditional provenance object `{v, mode, epoch}`. Request-level transport outcomes, writer overruns and pool checkout timeouts go to a small **durable windowed-counter table** with heartbeat coverage (migration 028). Numerators count distinct requests from exactly one source each, and uncovered windows return INSUFFICIENT_DATA. |
+| 4 | No panel surface; the data could not answer the flip question. | **D6 + D8.** A panel section plus one evaluator. Every row that `_tracked` writes carries an unconditional provenance object `{v, mode, epoch}`. Request-level transport outcomes, writer overruns and pool checkout timeouts go to **durable event-time windowed counters** plus a per-run table with a completed-interval watermark and a clean-shutdown flag (migration 028). Numerators count distinct requests from exactly one source each, and uncovered windows return INSUFFICIENT_DATA. |
 | 5 | The tool lease is held through telemetry, so a writer wait extends the slot hold. | **D5 (revised after spec review).** **The lease stays held through telemetry, as today.** Early release was rejected: it removes the backpressure that currently limits lost audit rows for completed writes (Codex SR1-1). The coupling is bounded instead: the writer wait is at most 0.25 s, and the NVMe move made writer holds ~ms. It is also **measured**: queue mode records the actual `queue_ms` that includes any writer-extended hold, so E1/E4 see its effect before enforce is possible. |
 | — | There is no evidence of how positive waits behave. | **D7.** `queue` mode waits like enforce and admits with an `overrun` mark wherever enforce would refuse **for capacity**. Every later gate and outcome stays authoritative. |
 | — | The write token is spent on a concurrency refusal (Codex SR1-7). | **D9.** Existing policy is kept and documented: the non-consumption guarantee covers the **durable daily quota only**. Rate-bucket tokens spent by the buckets-first gates stay spent, and there is no refund machinery. |
@@ -93,33 +93,73 @@ The 2026-09-21 shadow evidence on #188 names five blockers (proposal §Why).
 does not cancel the middleware's coroutine, so cancellation alone never frees a
 transport waiter.
 
-- While a request waits at either transport stage, the middleware races the
-  admission future against a watcher that calls `receive()`.
-- A received `http.disconnect` cancels the admission. The waiter count,
-  registry references and any request lease are released at once. No
-  credential query runs and no response is sent.
-- A received `http.request` message is appended to a per-request buffer, and
-  watching continues while `more_body` is true.
-  - The buffer is bounded at **64 KiB per request**. With at most 96 transport
-    waiters, that is ≤ 6 MiB process-wide.
-  - If the next message would exceed the bound, the watcher stops calling
-    `receive()` and keeps what it has.
-  - From then on that request is only deadline-bounded, like a waiter today,
-    and it cannot linger past the transport deadline (≤ 5 s).
-- On admission, the downstream app receives a wrapped `receive` that replays
-  the buffered messages in order, then delegates to the real `receive`.
-  - Body bytes are never consumed or reordered.
-  - A disconnect observed during the wait is replayed too, if the admission
-    raced it.
-- After the auth permit is granted, the middleware checks the disconnect flag
-  **before** opening its session. A request whose client left during the wait
-  runs no credential query.
-- Tests use a real `http.disconnect` delivered through `receive`, not
-  `task.cancel()`. They assert:
-  - immediate cleanup of the waiter count, the registry references and the lease;
-  - no credential query and no usage row;
-  - byte-identical body replay for the single-message and multi-message cases,
-    including the cap-exceeded case.
+**Exclusive ownership.** From the moment a request first waits until its
+admission ends (granted, refused, overrun or disconnected), one watcher task is
+the only caller of the real `receive()`.
+
+- The watcher loops on `receive()` until admission ends. It does **not** stop
+  when a body message has `more_body: false`. After the last body message, the
+  next `receive()` blocks until the client disconnects, which is exactly what
+  the watcher is waiting for.
+- `http.disconnect` sets the request's `disconnected` event and ends the loop.
+  - The controller removes the waiter, and the middleware releases the
+    registry references and any request lease at once.
+  - No credential query runs and no response is sent.
+- Every consumed message, `http.request` or `http.disconnect`, is appended to a
+  per-request replay list **as received**. Nothing is dropped, split, merged or
+  reordered.
+
+**Handoff.** When admission ends, the middleware cancels the watcher and awaits
+it.
+
+- If the pending `receive()` had already completed, its message is in the list,
+  because the append happens before the next await.
+- If it was cancelled while pending, no message was consumed. Uvicorn returns a
+  message only when the await completes.
+- The downstream app then gets a wrapper `receive` that yields the replay list
+  in order and afterwards delegates to the real `receive`. From there the app
+  is the only caller.
+
+**Disconnect before auth.** After the auth grant, and before opening its
+session, the middleware checks `disconnected`. A request whose client left runs
+no credential query.
+
+**Memory: lossless and honestly bounded.** The transport limit on an `/mcp`
+body is `Settings.mcp_max_request_body_bytes`, **61 MiB** at the defaults. It is
+enforced downstream by the SDK, not before this middleware. So "body limit ×
+waiter bound" is 96 × 61 MiB ≈ 5.7 GiB, which is not an acceptable bound. The
+SDK's 4 MiB default does not apply; the server overrides it.
+
+The watcher therefore reads under a **process-wide replay budget**,
+`MCP_CONCURRENCY_REPLAY_BUDGET_BYTES` (default 32 MiB), instead of a
+per-request cap.
+
+- Before each `receive()`, the watcher checks the budget. If it is exhausted,
+  the watcher **stops calling `receive()`** and keeps everything already
+  consumed, including a message that crossed the budget.
+  - That request stays deadline-bounded (≤ 5 s) rather than disconnect-aware.
+  - Its unread bytes remain in the transport's flow-controlled buffers, where
+    they would have been anyway.
+- Nothing already consumed is ever discarded, so replay is always byte-exact.
+- The honest bound is budget + (transport waiters × one ASGI message).
+  - Uvicorn's HTTP protocols deliver body messages of at most one socket read,
+    64 KiB.
+  - That gives 32 MiB + 96 × 64 KiB ≈ **38 MiB** process-wide.
+- The budget is released when the replay list has been yielded to the app, or
+  when the request ends.
+
+**Tests.** A real `http.disconnect` is delivered through `receive`, never
+`task.cancel()`, at both transport stages, for:
+
+- no body;
+- a complete body (`more_body: false`) followed by a disconnect;
+- a fragmented body followed by a disconnect.
+
+They assert immediate release of the waiter, the references and the lease, with
+no credential query and no usage row. Replay tests send a single oversized
+message (larger than the budget), and a fragmented body whose fragments cross
+the budget. The bytes must arrive downstream exactly, and the budget-exhausted
+request must become deadline-bounded.
 
 **Worst-case added latency for a caller** is transport wait + tool wait +
 writer wait (2 + 5 + 0.25 s at the defaults). The writer wait is part of the
@@ -303,63 +343,93 @@ changing mode is a single-line edit.
 - Legacy rows lack `params.concurrency.v` and are excluded from every readiness
   count and denominator unconditionally.
 
-**Durable windowed counters (migration 028, table `concurrency_counters`).**
+**Durable windowed counters (migration 028: tables `concurrency_counters` and `concurrency_runs`).**
+
+`concurrency_counters`:
 
 - Primary key: `(bucket_start timestamptz, epoch text, mode text, metric text)`.
-- Columns: `count bigint`, `max_value integer` (NULL except for the two gauge metrics, where it holds the bucket maximum).
-- `metric` is from a closed set, guarded by a CHECK constraint:
-  - `requests`: every `/mcp` request the middleware admitted to its admission
-    path;
-  - `transport_pressured`: shadow only, **at most once per request**;
-  - `transport_waited`;
-  - `transport_overrun`;
-  - `transport_refused`;
-  - `writer_overrun`;
-  - `writer_refused`;
-  - `pool_checkout_timeout`;
-  - `pool_high_water` (gauge);
-  - `transport_wait_max_ms` (gauge);
-  - `heartbeat`.
-- Each request reports its **worst** transport outcome exactly once, from the
-  middleware's `finally`. A request with pressure at both the request and the
-  auth stage counts once.
-- Tool-stage figures come only from usage rows. Transport, writer and pool
-  figures come only from counters. No numerator mixes the two sources, so
-  nothing is double-counted.
-- In-process accumulation is a bounded dict keyed by `(metric)` per current
-  bucket. A lifespan task flushes it every 60 s: one multi-row upsert, with a
-  synchronous commit. That is one small statement per minute whatever the
-  traffic, so an unauthenticated flood cannot amplify into DB writes.
-- The flush also writes a `heartbeat` row for the bucket and prunes buckets
-  older than 35 days. A final flush runs at shutdown, before `engine.dispose()`,
-  after the refusal coalescer's flush.
-- `bucket_start` is the minute of the flush.
+- Columns: `count bigint`, and `max_value integer`. `max_value` is NULL except
+  for the two gauge metrics, where it holds the bucket maximum.
+- `metric` is from a closed set, guarded by a CHECK:
+  - `requests`, one per `/mcp` request that reaches the admission path;
+  - `transport_pressured` (shadow), `transport_waited`, `transport_overrun` and
+    `transport_refused`, each **at most once per request**, by the request's
+    worst outcome;
+  - `writer_overrun`, `writer_refused` and `pool_checkout_timeout`;
+  - the gauges `pool_high_water` and `transport_wait_max_ms`.
+- **`bucket_start` is the event-time minute.** It is the minute in which the
+  request completed, the writer was refused or overran, or the checkout timed
+  out. The flush time is not used.
+  - The in-process accumulator is keyed `(bucket_start, metric)`.
+  - A failed flush merges its drained entries back **with their original
+    keys**, so attribution survives retries.
+  - The accumulator is bounded: one entry per metric per minute, with
+    unflushed minutes capped at 60. Past that cap, the oldest unflushed minute
+    is dropped **and the run is marked lossy** (see coverage below). Nothing
+    is ever silently re-attributed.
 
-Why a table and not the other options:
+`concurrency_runs`: one row per process run.
 
-- It is the simplest durable form that makes Q2/E2/E3/E6 computable over
-  arbitrary windows.
-- Usage rows cannot carry transport outcomes for requests that never reach a
-  tool (initialize, list, notifications), and #261 deliberately forbids
-  ownerless per-request usage rows.
-- Security-event logs are not queryable by the evaluator and rotate.
-- In-process since-boot counters cannot cover a window that contains a restart.
+- Columns:
+  - `run_id uuid` (primary key), minted in the lifespan;
+  - `epoch`, `mode`;
+  - `started_at`;
+  - `completed_through timestamptz`;
+  - `clean_shutdown bool`;
+  - `lossy bool`.
+- The flush runs every 60 s. In **one transaction** it drains the accumulator
+  at time `t`, upserts the drained buckets, and sets
+  `completed_through = floor_minute(t)`.
+  - Every event before `t` was recorded before the drain.
+  - So for this run, every bucket that ends by `floor_minute(t)` is complete
+    and durable. That is the **completed-interval watermark**.
+- The shutdown flush, after the refusal coalescer's `flush_all()` and before
+  `engine.dispose()`, sets `completed_through = t` exactly and
+  `clean_shutdown = true`.
+- Pruning deletes counters and runs older than 35 days.
+- The commit is synchronous. It is one statement per minute, and it does not
+  join the `synchronous_commit` allow-list.
 
-**Coverage.**
+**Coverage and the watermark.**
 
-- A window is covered when there is no gap longer than 180 s between
-  consecutive heartbeats for the same epoch and mode, and the window's first
-  and last heartbeats lie within 180 s of its ends. The 180 s tolerates flush
-  jitter and a normal recreate.
-- A hard kill loses up to 60 s of counts and leaves a gap. Every criterion
-  (row-based and counter-based alike) then reports INSUFFICIENT_DATA for
-  windows spanning the gap, and the operator restarts the observation window.
-- Row-based criteria also require the window to be covered. A covered window
-  with no rows is a real quiet period; an uncovered one is missing evidence.
-- A window qualifies for a target only if every row and every counter in it
-  carries the qualifying **mode and one epoch**. Any other mode or epoch inside
-  the window gives INSUFFICIENT_DATA, and the evaluator reports the latest
-  qualifying sub-window start.
+- A run covers `[started_at, completed_through]`, unless it is `lossy`, in
+  which case it covers nothing.
+- A gap between consecutive runs **is covered only if the earlier run has
+  `clean_shutdown = true`**. The process was not serving, so no incident could
+  occur.
+- A run that ended without a clean-shutdown flush (a hard kill, OOM or crash)
+  leaves `(completed_through, next run's started_at)` **uncovered**. This holds
+  however short the restart, because the partial bucket's buffered incidents
+  may be lost.
+- The evaluator's default window end is the durable watermark: the latest
+  `completed_through` over the current epoch and mode. An explicitly requested
+  end beyond the watermark gives INSUFFICIENT_DATA.
+- Window boundaries are whole minutes. The start is rounded up and the end
+  rounded down, except that a clean-shutdown end is exact. Event-time minute
+  buckets therefore never straddle a boundary.
+- A window is **covered** when the union of covered run intervals and covered
+  gaps contains it entirely. An uncovered window gives INSUFFICIENT_DATA for
+  **every** criterion, row-based and counter-based alike, because a quiet
+  covered window is real evidence and an uncovered one is not. The operator
+  then restarts the observation window.
+- A window qualifies for a target only if every row, counter and run inside it
+  carries the qualifying **mode and one epoch**. Otherwise the result is
+  INSUFFICIENT_DATA, together with the latest qualifying sub-window start.
+
+**Tool-stage figures come only from usage rows. Transport, writer and pool
+figures come only from counters.** No numerator mixes the sources, so nothing is
+double-counted. Usage rows are written with the call, and their `created_at`
+is event time. The watermark clamp applies to them too.
+
+Why tables and not the other options:
+
+- They are the simplest durable form that makes Q2/E2/E3/E6 computable over
+  arbitrary windows across restarts.
+- Usage rows cannot carry outcomes for requests that never reach a tool, and
+  #261 forbids ownerless per-request rows.
+- Security-event logs are not queryable and they rotate.
+- Heartbeat spacing alone cannot tell a clean recreate from a hard kill
+  (SR2-3). A run table with a clean-shutdown flag and a watermark can.
 
 ### D9 — Rate tokens on a concurrency refusal
 
@@ -409,8 +479,9 @@ only after the previous one's criteria pass.
   (validation alone is insufficient, D3).
 - `make db-check` must be clean after migration 028.
 - Exercise at least one tool per class live.
-- Confirm that rows carry `params.concurrency` and that a heartbeat row appears
-  every minute.
+- Confirm that rows carry `params.concurrency`, that a `concurrency_runs` row
+  exists for the new run, and that its `completed_through` advances each
+  minute.
 
 **Step 1 — shadow → queue.** `make concurrency-report TARGET=queue`, over a
 covered window of **≥ 3 days** and **≥ 300 executed calls**, all in mode
@@ -468,9 +539,19 @@ mode alone keeps the epoch, so data already collected stays attributable.
 - **Counting pool timeouts from `tool_exception` rows.** It misses auth, quota,
   writer, panel and `/token` failures, and it confuses unrelated
   `TimeoutError`s (D10).
-- **Unbounded body buffering while watching for disconnect.** Bodies can reach
-  61 MiB (`mcp_max_request_body_bytes`). A per-request 64 KiB cap bounds the
-  memory, and deadline expiry covers the rest.
+- **Unbounded body buffering while watching for disconnect**, and **body
+  limit × waiters as the bound.** Bodies can reach 61 MiB
+  (`mcp_max_request_body_bytes`), which gives about 5.7 GiB at 96 waiters. The
+  process-wide replay budget with stop-consuming semantics bounds memory at
+  about 38 MiB and loses nothing (D1).
+- **A per-request 64 KiB cap that drops the crossing message** (first
+  revision). It was lossy, because a message is sized only after `receive()`
+  has consumed it (SR2-2).
+- **Heartbeat-spacing coverage** (first revision). A hard kill with a quick
+  restart looked covered while its buffered incidents were lost (SR2-3). It is
+  replaced by run rows with a clean-shutdown flag and a watermark.
+- **Flush-time buckets** (first revision). They moved incidents across window
+  boundaries (SR2-4). Replaced by event-time buckets.
 - **Going straight from shadow to enforce with long waits**, and **per-class
   tool waits**: unchanged from the first draft.
 - **Keeping `other` and just raising its ceiling.** One tenant's scans could
@@ -480,9 +561,10 @@ mode alone keeps the epoch, so data already collected stays attributable.
 
 - **L1.** Queue mode bounds added latency, not occupancy. During an overrun,
   occupancy may exceed ceilings, as in shadow today.
-- **L2.** A hard kill loses up to 60 s of counter increments and breaks
-  coverage. The affected windows read INSUFFICIENT_DATA rather than a false
-  PASS.
+- **L2.** A hard kill loses the unflushed tail of its run, up to about 60 s of
+  counter increments. The interval from its last watermark to the next run's
+  start is uncovered, so windows spanning it read INSUFFICIENT_DATA rather than
+  a false PASS, however quick the restart.
 - **L3.** Worst-case added latency is transport + tool + writer wait (7.25 s at
   the defaults).
 - **L4.** The pool budget bounds only MCP's configured contribution, and
@@ -492,10 +574,13 @@ mode alone keeps the epoch, so data already collected stays attributable.
   day, two tenants). Re-run the report after a tenant is added.
 - **L7.** The per-class multiplier is measured on fixtures. Input-size-dependent
   paths keep `write` at 2 for exactly that reason.
-- **L8.** A request whose body exceeds the 64 KiB watch buffer during a
-  transport wait is not disconnect-aware for the rest of that wait. It is freed
-  at the transport deadline (≤ 5 s), and a request whose client left may
-  authenticate once.
+- **L8.** While the process-wide replay budget (32 MiB) is exhausted, a waiting
+  request stops being disconnect-aware for the rest of its wait. This takes
+  several concurrently waiting large write bodies. Such a request is freed at
+  the transport deadline (≤ 5 s), and one whose client left may authenticate
+  once. It never loses body bytes.
+- **L11.** Worst-case replay memory is about 38 MiB process-wide
+  (budget + 96 × 64 KiB).
 - **L9.** Rate tokens spent by a request refused for concurrency are not
   refunded (D9).
 - **L10.** Writer-extended slot holds remain (D5). Their effect is measured by
@@ -512,16 +597,15 @@ mode alone keeps the epoch, so data already collected stays attributable.
 | SR1-5 | Codex | `tool_exception`/`TimeoutError` does not measure pool timeouts. | MAJOR | **Accepted.** Pool subclass at the checkout boundary for all consumers, distinguishing `sqlalchemy.exc.TimeoutError` (D10). |
 | SR1-6 | Codex | A queue overrun is not executed work when quota refuses next. | MAJOR | **Accepted.** Existing outcome and pre-body classification stay authoritative, the queue requirement is qualified, and a scenario is added (D7). |
 | SR1-7 | Codex | A write token is spent on a slot refusal, which contradicts "nothing consumed". | MAJOR | **Accepted as documentation.** Existing policy is kept: the guarantee covers durable quota only, and rate tokens stay spent (D9, L9). |
-| SR1-8 | Codex | S1 cannot be green alone (async callers, `tests/conftest.py` env-key list). | MINOR | **Accepted.** S1 owns `tests/conftest.py` and a minimal compatibility edit in `auth.py`; S1 has a focused gate, and the full suite gates after S2 (tasks). |
+| SR1-8 | Codex | S1 cannot be green alone (async callers, `tests/conftest.py` env-key list). | MINOR | **Accepted.** S1 owns `tests/conftest.py` and a minimal compatibility edit in `auth.py`. S1's gate is focused, and the full offline suite is authoritative only after S2 merges (tasks; completed in SR2-5). |
 | SR1-9 | Codex | The queue `code` rule contradicts the earliest-stage rule. | MINOR | **Accepted.** Ordering is separated from code selection: queue `code` comes from overruns only and is `null` when none (D4). |
 | SR1-note | Codex | A pinned legacy `.env` validates, so validation does not prove the intended settings. | note | **Accepted.** Startup INFO line with effective settings and epoch, compared at deploy (D3, Step 0). |
+| SR2-1 | Codex | The watcher stops at `more_body: false`, so a disconnect after a complete body is missed. | MAJOR | **Accepted.** The watcher owns `receive` exclusively until admission ends and keeps watching after the last body message. The handoff cancels and awaits the watcher, then a replay wrapper yields the buffered messages and delegates. Tests cover a complete body followed by a disconnect at both stages (D1). |
+| SR2-2 | Codex | The 64 KiB overflow is either lossy or its bound is dishonest. | MAJOR | **Accepted, with one deviation from the supervisor's triage.** There is no per-request cap: every consumed message is kept losslessly. The supervisor's proposed bound, body limit × waiters, is **61 MiB × 96 ≈ 5.7 GiB**, not the ~4 MiB assumed: the server overrides the SDK's 4 MiB default with `mcp_max_request_body_bytes`. So a process-wide replay budget (32 MiB) stops *consuming*, never drops, and the honest bound is about 38 MiB. Tests cover an oversized single message and a fragmented body arriving byte-exact (D1, L8, L11). |
+| SR2-3 | Codex | A hard kill inside the heartbeat tolerance loses buffered incidents yet looks covered. | MAJOR | **Accepted.** `concurrency_runs` records `run_id`, a completed-interval watermark and `clean_shutdown`. A gap after an unclean run end is uncovered whatever its length. Test: a hard kill and restart under 180 s gives INSUFFICIENT_DATA (D8, L2). |
+| SR2-4 | Codex | Flush-time buckets move incidents across window boundaries, and reports can certify an unflushed tail. | MAJOR | **Accepted.** Buckets use event time, keyed through retries. Evaluation runs only through the durable watermark, and an end beyond it gives INSUFFICIENT_DATA. Minute-aligned boundaries. Tests cover incidents at both boundaries and before the next flush (D8). |
+| SR2-5 | Codex | S1's full-suite gate still conflicts with S2-owned auth tests. | MINOR | **Accepted.** S1's gate is focused: its own modules and tests plus an import smoke test. The full offline suite is authoritative after S2 merges (tasks). |
 
-## Open question for the owner
+## Owner decisions
 
-- Is the fourth mode (`queue`) acceptable? It is still recommended. It is the
-  only way to get positive-wait evidence without refusing a caller.
-- Migration 028 (`concurrency_counters`) is new durable state added for
-  observability only. It is the simplest durable option the review left. The
-  owner may prefer to accept "transport criteria from rows only, requests that
-  never reach a tool unmeasured" as a limitation instead. That would drop the
-  table, and Q2/E2 would then cover tool-bearing requests only.
+- 2026-09-23: the owner **approved** migration 028 and the `queue` mode.

@@ -13,7 +13,7 @@ subagent that needs to edit outside its files or region stops and reports.
 | --- | --- | --- | --- |
 | S1: controller, config, budget, accumulator | `wt-ce-s1-core` | none | `src/services/concurrency.py`, `src/services/pool_budget.py`, `src/config.py` (the `mcp_concurrency_*` fields and `_validate_concurrency` only), `.env.example` (the MCP concurrency block only), `tests/conftest.py` (the env-key list only), `src/mcp_server/auth.py` (**compatibility only**: await the now-async `request()`/`auth()` with behaviour unchanged, since S2 rewrites this block), `tests/test_issue_261_controller.py`, `tests/test_issue_261_config.py`, new `tests/test_concurrency_queue_mode.py`, new `tests/test_concurrency_metadata.py`, new `tests/test_concurrency_counters_accumulator.py`; plus, **mechanically only**, the literal `resource_class="other"` → `"light"` in every test file that carries it (14 today: `grep -rln "resource_class=[\"']other[\"']" tests`) |
 | S2: middleware and `_tracked` wiring | `wt-ce-s2-wiring` | **after S1 merges** | `src/mcp_server/auth.py` (`_concurrency_response`, `_emit_concurrency_pressure`, the admission block in `APIKeyMiddleware.__call__`, a new receive-watch helper), `src/mcp_server/tools.py` (`write_usage_row`, `_rate_refusal_template`, the concurrency region of `_tracked`, and the provenance stamp in every row-building path of `_tracked`/`_record_tool_failure`/the coalescer template), `src/services/security_events.py` (the `mcp_concurrency_pressure` outcome set only), `tests/test_issue_261_auth.py`, `tests/test_issue_261_tool_admission.py`, new `tests/test_concurrency_disconnect.py`, new `tests/test_concurrency_provenance.py`, `tests/integration/test_issue_261_concurrency_pg.py`, new `tests/integration/test_concurrency_tool_checkout_peaks_pg.py` |
-| S3: durable counters and pool boundary | `wt-ce-s3-counters` | **after S1 merges** (parallel with S2) | new `alembic/versions/028_concurrency_counters.py`, `src/models/db.py` (the new `ConcurrencyCounter` model, appended), new `src/services/concurrency_counters.py` (flush, prune, coverage query), `src/database.py` (the pool subclass and `poolclass=` only), `src/main.py` (flush task start/stop and the shutdown flush, placed after the refusal `flush_all()` and before `engine.dispose()`), `tests/integration/test_schema_check.py` (head `027 → 028` and 028's cases), new `tests/integration/test_concurrency_counters_pg.py`, new `tests/integration/test_pool_timeout_boundary_pg.py` |
+| S3: durable counters and pool boundary | `wt-ce-s3-counters` | **after S1 merges** (parallel with S2) | new `alembic/versions/028_concurrency_counters.py`, `src/models/db.py` (the new `ConcurrencyCounter` and `ConcurrencyRun` models, appended), new `src/services/concurrency_counters.py` (run registration, flush, watermark, prune, coverage query), `src/database.py` (the pool subclass and `poolclass=` only), `src/main.py` (flush task start/stop and the shutdown flush, placed after the refusal `flush_all()` and before `engine.dispose()`), `tests/integration/test_schema_check.py` (head `027 → 028` and 028's cases), new `tests/integration/test_concurrency_counters_pg.py`, new `tests/integration/test_pool_timeout_boundary_pg.py` |
 | S4: readiness, report, panel | `wt-ce-s4-readiness` | **after S3 merges** (and after S2, for realistic row fixtures) | new `src/services/concurrency_readiness.py`, new `scripts/concurrency_report.py`, `Makefile` (a `concurrency-report` target and its help line), `src/control_panel/routes.py` (`performance_page` only), `src/control_panel/templates/performance.html`, new `tests/test_concurrency_readiness.py`, new `tests/test_panel_concurrency_section.py`, new `tests/integration/test_concurrency_readiness_pg.py` |
 | S5: docs | supervisor | after S1–S4 merge | `docs/architecture/rate-limits.md`, `docs/architecture/usage-attribution.md`, `docs/architecture/security-event-logging.md`, `docs/architecture/control-panel.md`, `docs/architecture/schema-and-migrations.md` |
 
@@ -39,16 +39,33 @@ exists (S3 merged). Stop and report if any check fails.
   `concurrency.provenance() -> {"v": 2, "mode", "epoch"}`.
 - `concurrency.shadow_metadata(observations, *, configured_wait_ms)` and
   `concurrency.queue_metadata(observations)`, per design D4.
-- `concurrency.counters()` is a process-wide in-memory accumulator. It has
-  `record_request(worst)` (worst ∈ {none, pressured, waited, overrun,
-  refused}), `record(metric, n=1)`, `gauge(metric, value)` and
-  `drain() -> dict`. Its metric set is closed (design D8). It creates no
-  asyncio primitive at import time.
+- `concurrency.counters()` is a process-wide in-memory accumulator. Its API:
+  - `record_request(worst, at)`, where `worst` is one of none, pressured,
+    waited, overrun or refused;
+  - `record(metric, n=1, at=None)` and `gauge(metric, value, at=None)`. `at`
+    defaults to now, and entries are keyed by the **event-time minute** of `at`;
+  - `drain() -> {(bucket_start, metric): (count, max)}`;
+  - `merge_back(drained)`, which keeps the original keys;
+  - a `lossy` flag, set when the 60-unflushed-minute cap drops a minute.
+
+  Its metric set is closed (design D8), and it creates no asyncio primitive at
+  import time.
+- `concurrency.replay_budget()` is the process-wide replay-byte budget:
+  `try_reserve(n)` and `release(n)`. It never refuses an already-consumed
+  message: reservation happens after `receive`, and the watcher stops when the
+  budget reports exhaustion.
 - `pool_budget.tool_demand(tools, caps)` and `CLASS_CONNECTIONS`.
 
-**Test gates.** S1's gate is the full offline suite (`pytest tests`); its
-compatibility edit to `auth.py` keeps that suite green. S2, S3 and S4 each
-run `pytest tests` and `make test-integration`. S3 also runs `make
+**Test gates.**
+
+- **S1's gate is focused.** It runs S1's own test files, the mechanically
+  renamed test files, and an import smoke check (`python -c "import src.main"`).
+  S1 does not claim the full offline suite: `tests/test_issue_261_auth.py`
+  calls the now-async `controller.auth()` directly, and those tests belong to
+  S2.
+- **The full offline suite (`pytest tests`) is authoritative only after S2
+  merges.** S2, S3 and S4 each run it on their merged base, together with
+  `make test-integration`. S3 also runs `make
 test-schema` (migration 028). `make test-integration` and `make test-schema`
 share a container and must never run concurrently. The authoritative gate is
 the full offline + integration + schema run on the merged tree (task 5.1).
@@ -57,8 +74,9 @@ the full offline + integration + schema run on the merged tree (task 5.1).
 
 - [x] 0.1 Commit the proposal on `wt-concurrency-enforce`.
 - [x] 0.2 Codex spec review round 1: FAIL (7 MAJOR, 2 MINOR), with every finding folded in (see design "Spec review history").
-- [ ] 0.3 Codex spec review round 2, verification of the SR1 fixes only.
-- [ ] 0.4 Owner decisions on the design's open questions (`queue` mode; migration 028 versus limiting transport criteria to tool-bearing requests).
+- [x] 0.3 Codex spec review round 2: FAIL (4 MAJOR, 1 MINOR; SR1-8 partial), with every finding folded in (SR2-1 to SR2-5).
+- [ ] 0.3a Codex spec review round 3, verification only.
+- [x] 0.4 Owner decisions: `queue` mode and migration 028 approved (2026-09-23).
 
 ## 1. S1: controller, config, budget, accumulator
 
@@ -67,9 +85,9 @@ the full offline + integration + schema run on the merged tree (task 5.1).
 - [ ] 1.3 `concurrency.py`: `shadow_metadata` and `queue_metadata` per D4. Ordering is by stage. The shadow code is the earliest stage's. The queue code is the earliest **overrun**, or `null`. The deciding observation is never truncated.
 - [ ] 1.4 `concurrency.py`: mode `queue`. `_admit_wait` grants with `overrun` wherever enforce would refuse for capacity, grants exactly once when a grant races the timeout, and still refuses on shutdown.
 - [ ] 1.5 `concurrency.py`: async `request()` and `auth()` with the shared deadline, the waiter dimensions (request global/fingerprint, auth), fingerprint-entry retention while waiting, and a `disconnected` event that releases the waiter.
-- [ ] 1.6 `concurrency.py`: `epoch()`, `provenance()`, `snapshot()` and the `counters()` accumulator (a closed metric set, `record_request` counting each request once by worst outcome, gauges as bucket maxima, and `drain()`).
+- [ ] 1.6 `concurrency.py`: `epoch()`, `provenance()`, `snapshot()`, `replay_budget()`, and the `counters()` accumulator (a closed metric set, event-time minute keys, `record_request` counting each request once by worst outcome, gauges as bucket maxima, `drain()`/`merge_back()` preserving keys, and the lossy flag).
 - [ ] 1.7 `config.py`:
-  - add `queue` to the mode literal, and the new settings with their defaults per D1 and D3;
+  - add `queue` to the mode literal, and the new settings with their defaults per D1 and D3, including `mcp_concurrency_replay_budget_bytes` (default 32 MiB, range 1 MiB..256 MiB);
   - `mcp_concurrency_other: int | None`, where `1` warns and anything else is refused;
   - remove the shadow-requires-zero-wait rule and the class-sum rule;
   - add the full hierarchy, coherence and per-class budget validation, naming every term;
@@ -89,16 +107,20 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - `OTHER=1` warns and `OTHER=3` refuses, through a real env file;
   - all modes validate on the `.env.example` block;
   - the epoch is stable across a mode change and changes on a limit change;
-  - the accumulator counts a two-stage-pressured request once.
-- [ ] 1.12 `pytest tests` green, then commit on `wt-ce-s1-core`.
+  - the accumulator counts a two-stage-pressured request once;
+  - an event at 12:00:50 drained at 12:01:10 keys to 12:00;
+  - `merge_back` preserves keys;
+  - the lossy flag is set at the cap.
+- [ ] 1.12 S1's focused gate is green (see Test gates), then commit on `wt-ce-s1-core`.
 
 ## 2. S2: middleware and `_tracked` wiring
 
 - [ ] 2.1 `auth.py`, the disconnect watch (D1).
-  - While awaiting `request()` or `auth()`, race a watcher calling `receive()`.
+  - From the first wait until admission ends, a single watcher task is the only caller of `receive()`. It loops **past `more_body: false`** until admission ends, a disconnect arrives, or `replay_budget()` is exhausted.
+  - Every consumed message is appended as-is and reserved against the budget.
   - On `http.disconnect`, set the event and return without any response or credential query.
-  - Buffer `http.request` messages up to 64 KiB per request, then stop watching.
-  - Wrap `receive` for the downstream app so it replays the buffer in order, then delegates.
+  - At handoff, cancel and await the watcher. A completed `receive()` result is already in the list; a cancelled pending one consumed nothing.
+  - Wrap `receive` for the downstream app so it yields the list in order, releases the budget, and then delegates.
   - Check the disconnect flag after the auth grant and before opening the session.
 - [ ] 2.2 `auth.py`:
   - record `transport_queue_ms`;
@@ -118,8 +140,9 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - in enforce, a writer refusal records `writer_refused`.
 - [ ] 2.5 `security_events.py`: the outcome set and catalogue comment.
 - [ ] 2.6 Offline tests:
-  - a **real `http.disconnect`** delivered through `receive`, without `task.cancel()`, at both transport stages: immediate cleanup, no credential query, no usage row;
-  - body replay byte-identity for single-message, multi-message and cap-exceeded bodies;
+  - a **real `http.disconnect`** delivered through `receive`, without `task.cancel()`, at both transport stages, for three cases: no body, a **complete body (`more_body: false`) followed by a disconnect**, and a fragmented body followed by a disconnect. Each must show immediate cleanup, no credential query and no usage row;
+  - byte-exact replay for a single-message body, a multi-message body, **a single message larger than the whole replay budget**, and **fragments crossing the budget**, with the budget-exhausted request deadline-bounded;
+  - a handoff race: `receive` completes as admission is granted, and the message is replayed exactly once;
   - provenance on an unpressured row, and on `rate_limited`, coalesced `slot_timeout`, `over_quota` and `tool_exception` rows;
   - a queue overrun followed by a quota refusal stays `over_quota`, with no body and no quota consumed;
   - enforce slot refusal: quota unchanged and both bucket tokens spent (D9);
@@ -134,20 +157,25 @@ the full offline + integration + schema run on the merged tree (task 5.1).
 
 ## 3. S3: durable counters and pool boundary
 
-- [ ] 3.1 Migration 028 and the `ConcurrencyCounter` model, per D8.
-  - Primary key `(bucket_start, epoch, mode, metric)`; columns `count bigint NOT NULL DEFAULT 0` and `max_value integer NULL`.
-  - CHECKs on `mode` and on `metric` (the closed set), plus an index on `bucket_start`.
+- [ ] 3.1 Migration 028 and the models, per D8.
+  - `concurrency_counters`: primary key `(bucket_start, epoch, mode, metric)`, columns `count bigint NOT NULL DEFAULT 0` and `max_value integer NULL`, CHECKs on `mode` and on `metric` (the closed set), and an index on `bucket_start`.
+  - `concurrency_runs`: `run_id uuid` primary key, `epoch`, `mode`, `started_at`, `completed_through`, `clean_shutdown bool NOT NULL DEFAULT false` and `lossy bool NOT NULL DEFAULT false`, with an index on `started_at`.
   - `alembic check` must stay clean.
 - [ ] 3.2 `concurrency_counters.py`:
-  - `flush()` drains `counters()` and writes one multi-row `INSERT … ON CONFLICT DO UPDATE` (count added, `max_value` taken as the greater) including a `heartbeat` row, with a synchronous commit. Do **not** add to the `synchronous_commit` allow-list.
-  - Prune buckets older than 35 days.
-  - A drain whose write fails is merged back into the accumulator, bounded.
-  - Also `coverage(session, start, end, epoch, mode) -> gaps` for S4.
+  - `register_run()` at lifespan start mints a `run_id` and inserts the run row with `completed_through = started_at`.
+  - `flush(clean=False)` runs in one transaction. It reads `t`, drains `counters()`, writes one multi-row `INSERT … ON CONFLICT DO UPDATE` keyed by the **event-time** buckets (count added, `max_value` taken as the greater), and updates the run row: `completed_through = floor_minute(t)`, or `t` with `clean_shutdown = true` when `clean`, plus `lossy` from the accumulator. The commit is synchronous; do **not** add to the `synchronous_commit` allow-list.
+  - A failed flush calls `merge_back`, which keeps the original keys, and does not advance the watermark.
+  - Prune counters and runs older than 35 days.
+  - `coverage(session, start, end, epoch, mode) -> (watermark, uncovered_intervals)` for S4, per the design D8 rules.
 - [ ] 3.3 `database.py`: an `AsyncAdaptedQueuePool` subclass overriding `_do_get`. It counts `sqlalchemy.exc.TimeoutError` as `pool_checkout_timeout` and re-raises unchanged, and updates the `pool_high_water` gauge on success. Wire it with `poolclass=`. If the hook is unstable, report and propose the fallback; do not switch silently.
 - [ ] 3.4 `main.py`: the 60 s flush task, cancelled at shutdown, and a final `flush()` after `flush_all()` and before `engine.dispose()`. Sandbox mode skips it.
 - [ ] 3.5 Tests (integration):
   - flush idempotence and addition across two flushes;
-  - a heartbeat on idle;
+  - the watermark advancing on idle;
+  - an incident at 12:00:50 flushed at 12:01:10 landing in bucket 12:00;
+  - a failed flush followed by a retry keeping bucket attribution;
+  - **a hard kill (no shutdown flush) with a restart under 180 s**, where coverage reports the interval from the killed run's watermark to the new start as uncovered;
+  - a clean shutdown with a restart, where the gap is covered;
   - prune;
   - a failed flush re-merges;
   - 10,000 recorded requests produce one statement;
@@ -162,8 +190,9 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - Rows are filtered on `params->'concurrency'->>'v' = '2'` only.
   - Executed and pre-body classification uses the existing `executed_sql` / `pre_body_refusal_sql`, with the weighted `slot_timeout` through the existing guarded cast. Import these; do not edit `usage_stats.py`.
   - Tool-pressured calls are read from `observations`.
-  - Counters are read from `concurrency_counters`.
-  - It reports the mode and epoch sets present, the coverage gaps, and the latest qualifying sub-window start.
+  - Counters are read from `concurrency_counters`. Coverage and the durable watermark come from S3's `coverage()` over `concurrency_runs`.
+  - Window boundaries are aligned to whole minutes. The default end is the watermark, and an explicit end past it is INSUFFICIENT_DATA.
+  - It reports the mode and epoch sets present, the uncovered intervals, the watermark, and the latest qualifying sub-window start.
   - It computes the full window and the last 72 h.
 - [ ] 4.2 Pure `evaluate(stats, target)`: Q1–Q3 and E1–E6, the minimum windows, the single-mode/single-epoch rule, coverage, INSUFFICIENT_DATA, and the both-windows rule. Thresholds are module constants referencing the design.
 - [ ] 4.3 `scripts/concurrency_report.py` and `make concurrency-report DAYS=… TARGET=queue|enforce`, run through `docker exec`. Output a table plus one JSON line. The exit code is 0 only when every criterion is PASS.
@@ -174,7 +203,10 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - an E4 regression in the last 72 h;
   - a thin window;
   - a mixed mode/epoch window;
-  - a heartbeat gap;
+  - an uncovered interval after an unclean run end, including one under 180 s;
+  - an explicit end beyond the watermark giving INSUFFICIENT_DATA, and the default end clamped to the watermark;
+  - incidents at 11:59:50 and at 12:59:50 against a 12:00–13:00 window;
+  - an incident recorded but not yet flushed not being certified;
   - legacy rows with `queue_ms` but no provenance excluded;
   - Q2 duplicate-source immunity;
   - one pool timeout fails Q3/E6;
@@ -215,13 +247,13 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - one tool per class (`read_note`, `keyword_search`, `semantic_search`, `find_related`, and `create_note` + `delete_note` on a scratch note);
   - a parallel batch of 6 `read_note` calls.
 
-  Confirm that every row carries `params.concurrency`, that pressured rows carry v2 metadata, and that heartbeat rows appear each minute. Remove the fixtures, and report which tools were called.
+  Confirm that every row carries `params.concurrency`, that pressured rows carry v2 metadata, and that the current run's `completed_through` advances each minute. Remove the fixtures, and report which tools were called.
 - [ ] 6.4 Owner browser pass on `/admin/performance`: the section renders, the admin block is visible, and there are zero CSP violations.
 - [ ] 6.5 `openspec archive concurrency-enforce-ready -y`, commit, push, and link #188. #188 stays open as the rollout tracker.
 
 ## 7. Rollout (operator, tracked on #188)
 
-- [ ] 7.1 After a covered shadow window of ≥ 3 days and ≥ 300 calls on one epoch, run `make concurrency-report TARGET=queue` and read the panel verdict. If Q1–Q3 pass, set `MCP_CONCURRENCY_MODE=queue` and recreate. Post the JSON on #188.
+- [ ] 7.1 After a covered shadow window (through the durable watermark) of ≥ 3 days and ≥ 300 calls on one epoch, run `make concurrency-report TARGET=queue` and read the panel verdict. If Q1–Q3 pass, set `MCP_CONCURRENCY_MODE=queue` and recreate. Post the JSON on #188.
 - [ ] 7.2 Check the queue rollback triggers daily for 7 days (p95 `queue_ms` > 1,000 ms in any 24 h, or an agent timeout attributable to queueing, means back to shadow).
 - [ ] 7.3 After a covered queue window of ≥ 7 days and ≥ 1,000 calls on one epoch, run `make concurrency-report TARGET=enforce` and read the panel verdict. If E1–E6 pass over both the whole window and the last 72 h, set `MCP_CONCURRENCY_MODE=enforce` and recreate. Post the JSON on #188.
 - [ ] 7.4 Check the enforce rollback triggers daily for 7 days (`transport_refused` > 0; weighted `slot_timeout` > max(2, 0.2 %) in 24 h; any `pool_checkout_timeout`), which mean back to queue. Close #188 after 7 clean days, and record the final settings in `rate-limits.md`.

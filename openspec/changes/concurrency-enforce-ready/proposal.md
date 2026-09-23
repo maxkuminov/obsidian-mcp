@@ -42,8 +42,11 @@ A false refusal of a legitimate agent call breaks the live path. The design
     `MCP_CONCURRENCY_TRANSPORT_WAIT_SECONDS` (default 2 s, max 5 s), with
     bounded waiters. A waiting request holds no DB connection.
   - While a request waits, the middleware watches ASGI `receive` for
-    `http.disconnect`. Body messages read meanwhile are buffered, up to
-    64 KiB per request, and replayed intact to the app.
+    `http.disconnect` until admission ends, including after the body is
+    complete. It is the only caller of `receive` during that time.
+  - Every message it consumes is kept and replayed intact to the app.
+  - A process-wide replay budget (32 MiB) stops further consumption but never
+    drops anything. Worst-case memory is about 38 MiB.
   - A disconnected waiter is freed immediately and runs no credential query.
   - The auth permit is kept.
 - **Tunable pool budget and reclassification (blocker 2).**
@@ -71,9 +74,14 @@ A false refusal of a legitimate agent call breaks the live path. The design
 - **Durable, request-level evidence (blocker 4).**
   - Every tracked usage row carries `params.concurrency {v: 2, mode, epoch}`.
   - Request totals, per-request worst transport outcomes, writer overruns,
-    pool checkout timeouts and high-water, and a heartbeat go to a small
-    windowed table, `concurrency_counters` (**migration 028**). It is written
-    by one bounded upsert per minute.
+    and pool checkout timeouts and high-water go to event-time minute buckets
+    in `concurrency_counters`.
+  - A per-run `concurrency_runs` row carries a completed-interval watermark
+    and a clean-shutdown flag.
+  - Both tables are added by **migration 028** (owner-approved) and written by
+    one bounded transaction per minute.
+  - Evidence counts only through the durable watermark. The gap after an
+    unclean run end is uncovered, however short.
   - Pool timeouts are counted at the shared pool checkout boundary, for every
     consumer.
 - **Panel and readiness.** `/admin/performance` gains a Concurrency section.
@@ -136,7 +144,7 @@ None.
     `scripts/concurrency_report.py`
   - the panel's `performance_page` and template
   - `Makefile`, `.env.example`, `tests/conftest.py`
-- **Schema.** Migration 028 adds one table. `make test-schema` and `make
+- **Schema.** Migration 028 adds two tables, `concurrency_counters` and `concurrency_runs`. `make test-schema` and `make
   db-check` apply.
 - **Operations.** The deploy-dir `.env` pins the old concurrency block. Validation
   can pass on those legacy values, so the deploy task reconciles the block and

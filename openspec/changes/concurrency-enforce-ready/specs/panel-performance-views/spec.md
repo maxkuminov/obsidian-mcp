@@ -50,8 +50,8 @@ The section SHALL add no inline script or handler and SHALL render under the exi
 - **THEN** each such row SHALL still be counted as tool-pressured
 
 #### Scenario: Coverage gaps are visible
-- **WHEN** the selected window contains a heartbeat gap longer than 180 s
-- **THEN** the administrator view SHALL list each gap's start and length, and the readiness verdict SHALL read INSUFFICIENT_DATA for every criterion
+- **WHEN** the selected window contains an uncovered interval, such as the gap after a run that ended without a clean-shutdown flush
+- **THEN** the administrator view SHALL list each uncovered interval's start and length, and the durable watermark, and the readiness verdict SHALL read INSUFFICIENT_DATA for every criterion
 
 #### Scenario: Empty window
 - **WHEN** the window holds no rows carrying concurrency data

@@ -25,7 +25,17 @@ The middleware SHALL control global and fingerprint request occupancy before DB 
 
 In `queue` and `enforce` modes, the request stage and the auth stage SHALL share one monotonic deadline per request of `MCP_CONCURRENCY_TRANSPORT_WAIT_SECONDS` (default 2, maximum 5). Waiters SHALL be bounded by `MCP_CONCURRENCY_REQUEST_WAITERS`, `MCP_CONCURRENCY_FINGERPRINT_WAITERS` and `MCP_CONCURRENCY_AUTH_WAITERS`. A request waiting at either stage SHALL hold no database connection and no auth permit, and SHALL be granted in eligible-FIFO order when capacity frees. In `enforce` mode, expiry of the deadline or a full waiter bound SHALL produce the transport refusal. In `queue` mode it SHALL produce an overrun admission instead.
 
-Transport waiting SHALL be disconnect-aware. While a request waits at either stage, the middleware SHALL watch ASGI `receive` for `http.disconnect`. On a disconnect it SHALL release every waiter count, registry reference and lease held for that request, and SHALL run no credential query. Request-body messages read while watching SHALL be buffered, up to 64 KiB per request, and replayed to the downstream application in order and unchanged. A request whose next body message would exceed that bound SHALL stop being watched and SHALL remain bounded by the transport deadline. After the auth permit is granted and before its session opens, the middleware SHALL skip authentication for a request whose client has disconnected.
+Transport waiting SHALL be disconnect-aware.
+
+From the first wait until admission ends, one watcher SHALL be the only caller of ASGI `receive`. It SHALL keep calling `receive` after a body message with `more_body: false`, and SHALL stop only when admission ends, when a disconnect arrives, or when the replay budget is exhausted.
+
+On `http.disconnect` the middleware SHALL release every waiter count, registry reference and lease held for that request, and SHALL run no credential query.
+
+Every message the watcher consumes SHALL be kept and replayed to the downstream application in order and unchanged, before the application's own calls are delegated to `receive`. At handoff the watcher SHALL be cancelled and awaited, and a message whose `receive` had already completed SHALL be included in the replay.
+
+Consumed messages SHALL count against a process-wide replay budget, `MCP_CONCURRENCY_REPLAY_BUDGET_BYTES` (default 32 MiB). When the budget is exhausted, the watcher SHALL stop consuming, SHALL NOT discard anything already consumed, and the request SHALL remain bounded by the transport deadline.
+
+After the auth permit is granted and before its session opens, the middleware SHALL skip authentication for a request whose client has disconnected.
 
 #### Scenario: Authentication capacity is full in enforce mode
 - **WHEN** a new request cannot acquire request or auth capacity before the transport deadline, or the relevant waiter bound is full
@@ -45,13 +55,18 @@ Transport waiting SHALL be disconnect-aware. While a request waits at either sta
 - **THEN** every waiter count, registry reference and lease captured for that request SHALL be released exactly once and promptly
 - **AND** no credential query and no usage row SHALL be issued for that request
 
-#### Scenario: Body messages read while waiting are preserved
-- **WHEN** a request's body arrives as one or several `http.request` messages totalling under 64 KiB while it waits, and it is then admitted
-- **THEN** the downstream application SHALL receive exactly those messages, in order, with byte-identical bodies and `more_body` flags
+#### Scenario: A disconnect after a complete body is still seen
+- **WHEN** a waiting request's complete body arrives in one message with `more_body: false`, and the client then disconnects while the request still waits for the envelope or for the auth permit
+- **THEN** the waiter SHALL be released promptly, with no credential query and no usage row
 
-#### Scenario: An oversized body stops the watch without losing bytes
-- **WHEN** a waiting request's next body message would take its buffer past 64 KiB
-- **THEN** the watcher SHALL stop calling `receive`, the buffered messages and every later message SHALL reach the downstream application unchanged, and the request SHALL be released no later than the transport deadline
+#### Scenario: Body messages read while waiting are preserved
+- **WHEN** a request's body arrives as one or several `http.request` messages while it waits, and it is then admitted
+- **THEN** the downstream application SHALL receive exactly those messages, in order, with byte-identical bodies and `more_body` flags, and SHALL then read any later messages from the real `receive`
+
+#### Scenario: An oversized message is kept losslessly
+- **WHEN** a waiting request receives one body message larger than the whole replay budget, or fragments whose total crosses the budget
+- **THEN** the message that crossed the budget SHALL be kept, the watcher SHALL stop consuming, and the downstream application SHALL receive the full body byte-exact
+- **AND** the request SHALL be released no later than the transport deadline
 
 #### Scenario: A cancelled transport waiter leaks nothing
 - **WHEN** the request task is cancelled while it waits at either transport stage
@@ -233,10 +248,20 @@ Whenever the concurrency mode is not `off`, every `usage_logs` row written by th
 - **WHEN** only `MCP_CONCURRENCY_MODE` changes between two boots
 - **THEN** the epoch SHALL be identical; when any other `MCP_CONCURRENCY_*` value changes, the epoch SHALL differ
 
-### Requirement: Transport, writer and pool outcomes are recorded in durable windowed counters
-The server SHALL record request totals, per-request transport outcomes, writer overruns and refusals, pool checkout timeouts, the pool checkout high-water mark, the maximum transport wait, and a heartbeat in a `concurrency_counters` table. Rows SHALL be keyed by minute bucket, epoch, mode and a metric from a closed set. The in-process accumulation SHALL be flushed by one bounded statement per flush interval (60 s) whatever the request volume, and once more at shutdown before the engine is disposed. Buckets older than 35 days SHALL be pruned.
+### Requirement: Transport, writer and pool outcomes are recorded in durable event-time counters with a run watermark
+The server SHALL record, in a `concurrency_counters` table keyed by event-time minute bucket, epoch, mode and a metric from a closed set:
+- request totals;
+- per-request transport outcomes;
+- writer overruns and refusals;
+- pool checkout timeouts;
+- the pool checkout high-water mark;
+- the maximum transport wait.
 
-Each request SHALL contribute at most once to each transport metric: the worst transport outcome of that request, recorded when the request completes. Tool-stage figures SHALL come only from usage rows, and transport, writer and pool figures only from these counters.
+Each observation SHALL be attributed to the minute in which it occurred, and that attribution SHALL be preserved when a failed flush is retried.
+
+Each process run SHALL have a `run_id` and a `concurrency_runs` row carrying its epoch, mode, start time, completed-interval watermark (`completed_through`), clean-shutdown flag and lossy flag. The flush SHALL run every 60 s, whatever the request volume, as one bounded transaction that drains the accumulator at time t, upserts the drained buckets and sets `completed_through` to t rounded down to the minute. The shutdown flush, before the engine is disposed, SHALL set `completed_through` to t exactly and mark the run cleanly shut down. Data older than 35 days SHALL be pruned.
+
+Each request SHALL contribute at most once to each transport metric: its worst transport outcome, recorded when the request completes. Tool-stage figures SHALL come only from usage rows, and transport, writer and pool figures only from these counters.
 
 #### Scenario: Pressure at two transport stages counts once
 - **WHEN** one shadow request observes pressure at both the request stage and the auth stage
@@ -248,11 +273,19 @@ Each request SHALL contribute at most once to each transport metric: the worst t
 
 #### Scenario: A flood does not amplify into writes
 - **WHEN** 10,000 requests arrive within one flush interval
-- **THEN** the flush SHALL issue one bounded upsert for that interval, not one statement per request
+- **THEN** the flush SHALL issue one bounded transaction for that interval, not one statement per request
 
-#### Scenario: A heartbeat marks coverage
+#### Scenario: An incident keeps its event-time minute
+- **WHEN** a pool checkout times out at 12:00:50 and the next flush runs at 12:01:10
+- **THEN** the timeout SHALL be stored in bucket 12:00, not 12:01
+
+#### Scenario: A failed flush keeps attribution
+- **WHEN** a flush that drained a 12:00 incident fails and the next flush at 12:02 succeeds
+- **THEN** the incident SHALL be stored in bucket 12:00
+
+#### Scenario: The watermark advances with no traffic
 - **WHEN** a flush interval passes with no traffic
-- **THEN** a `heartbeat` row SHALL still be written for that bucket
+- **THEN** the run's `completed_through` SHALL still advance
 
 ### Requirement: Pool checkout timeouts are counted at the shared acquisition boundary
 The database engine SHALL count every connection-pool checkout timeout, `sqlalchemy.exc.TimeoutError` raised by pool checkout, from every consumer of the engine, and SHALL track the checked-out high-water mark. It SHALL re-raise the original exception unchanged and SHALL NOT count other exceptions named `TimeoutError`.
@@ -274,11 +307,15 @@ A tool call refused at the slot gate SHALL consume no daily-quota slot. Rate-buc
 - **AND** its general-bucket and write-bucket tokens SHALL remain spent, refilling only at their configured rates
 
 ### Requirement: A readiness evaluator applies fixed numeric criteria for each mode change
-The server SHALL provide one pure evaluator. For a target mode of `queue` or `enforce`, it SHALL return PASS, FAIL or INSUFFICIENT_DATA for each fixed criterion, together with the numbers behind each verdict. It SHALL use only usage rows carrying `params.concurrency.v = 2` and `concurrency_counters` rows, and SHALL exclude every other row unconditionally.
+The server SHALL provide one pure evaluator. For a target mode of `queue` or `enforce`, it SHALL return PASS, FAIL or INSUFFICIENT_DATA for each fixed criterion, together with the numbers behind each verdict. It SHALL use only usage rows carrying `params.concurrency.v = 2`, together with `concurrency_counters` and `concurrency_runs` rows, and SHALL exclude every other row unconditionally.
 
-A window SHALL qualify only when:
-- all of its rows and counters carry the source mode (`shadow` for target `queue`, `queue` for target `enforce`) and a single epoch;
-- it is covered: no gap longer than 180 s between consecutive heartbeats, and heartbeats within 180 s of both ends.
+A window SHALL qualify only when all of these hold:
+- All of its rows, counters and runs carry the source mode (`shadow` for target `queue`, `queue` for target `enforce`) and a single epoch.
+- Its end is no later than the durable watermark, the latest `completed_through` of the qualifying runs. The default end SHALL be that watermark.
+- It is covered:
+  - every instant lies within some non-lossy run's `[started_at, completed_through]`, or in a gap that follows a run with a clean-shutdown flush;
+  - a gap after a run that ended without a clean-shutdown flush SHALL be uncovered, however short it is.
+- Its boundaries are whole minutes: the start is rounded up and the end rounded down, except that a clean-shutdown end is exact.
 
 A non-qualifying or uncovered window SHALL yield INSUFFICIENT_DATA for every criterion.
 
@@ -317,9 +354,21 @@ The same evaluator SHALL back both the panel verdict and `make concurrency-repor
 - **WHEN** a 7-day window contains queue-mode rows and, on day 2, shadow-mode rows or rows from a different epoch
 - **THEN** the enforce criteria SHALL report INSUFFICIENT_DATA, and the evaluator SHALL report the start of the latest qualifying sub-window
 
-#### Scenario: A restart gap is not a pass
-- **WHEN** a 7-day queue window has a 10-minute heartbeat gap on day 4 from a hard kill
-- **THEN** every enforce criterion, including E2, E3 and E6, SHALL report INSUFFICIENT_DATA rather than PASS
+#### Scenario: A quick restart after a hard kill is not a pass
+- **WHEN** a run flushes at 12:00, records a transport overrun at 12:00:20, is killed without a shutdown flush at 12:00:40, and a new run with the same settings starts at 12:01, a gap under 180 s
+- **THEN** every enforce criterion over a window containing 12:00–12:01, including E2, E3 and E6, SHALL report INSUFFICIENT_DATA rather than PASS
+
+#### Scenario: A clean recreate stays covered
+- **WHEN** a run shuts down with its shutdown flush and a new run with the same epoch and mode starts 40 s later
+- **THEN** the interval between them SHALL count as covered
+
+#### Scenario: An unflushed tail is not certified
+- **WHEN** a pool checkout times out after the latest `completed_through`, and a report is requested with an explicit end after that watermark
+- **THEN** the criteria SHALL report INSUFFICIENT_DATA; with the default end, the evaluation SHALL stop at the watermark and report that end
+
+#### Scenario: Incidents at the window boundaries
+- **WHEN** a pool timeout occurs at 11:59:50, just before a window starting at 12:00, and another at 12:59:50, inside a window ending at 13:00 whose watermark is 13:00
+- **THEN** the first SHALL be outside the window and the second SHALL make Q3 FAIL
 
 #### Scenario: No double counting across sources
 - **WHEN** 300 executed calls include 12 requests that were auth-pressured
