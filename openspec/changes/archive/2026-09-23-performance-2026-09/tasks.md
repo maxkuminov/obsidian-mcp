@@ -42,8 +42,8 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 ## 0. Spec review before any code
 
-- [ ] 0.1 Commit this proposal on `perf-proposal` and push. Codex reads only the committed tree. Open the coordination issue/PR now.
-- [ ] 0.2 **Codex spec review, before implementation.** Frame it as a defensive PASS/FAIL review of a performance proposal whose failure modes are correctness failures. Tell Codex what "wrong" means here: the consumer is an agent, the vault is the owner's single source of truth, and the expensive failures are a destructive write and a **silently stale or wrong search result**. Ask specifically:
+- [x] 0.1 Commit this proposal on `perf-proposal` and push. Codex reads only the committed tree. Open the coordination issue/PR now. **Result:** Done: PR #288.
+- [x] 0.2 **Codex spec review, before implementation.** Frame it as a defensive PASS/FAIL review of a performance proposal whose failure modes are correctness failures. Tell Codex what "wrong" means here: the consumer is an agent, the vault is the owner's single source of truth, and the expensive failures are a destructive write and a **silently stale or wrong search result**. Ask specifically: **Result:** Done: round 1 REJECT (2 MAJOR, 5 MINOR) folded in; round 2 APPROVE_WITH_CHANGES folded in.
   - (a) Is D11's list of ways a file changes without changing `(size, mtime_ns, ctime_ns, ino)` complete for Linux local filesystems, and is the racy rule correct?
   - (b) Can D9's C4/C5 reconciliation prune, pair or certify a row on the strength of the pre-lock walk under any interleaving with `move_note`, another pass, a reset or a rebuild?
   - (c) Can any route leave a certification-current row disagreeing with the current exclusion patterns while D13's gate skips the sweep?
@@ -51,7 +51,7 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
   - (e) Does D2's async commit reach any write whose loss could re-admit a caller or forget a revocation?
 
   Demand a machine-readable closing verdict block. Run it in the background, with both redirects. Fold the findings into the proposal before dispatching any slice.
-- [ ] 0.3 `openspec validate performance-2026-09 --strict` passes.
+- [x] 0.3 `openspec validate performance-2026-09 --strict` passes. **Result:** Done.
 
 ## 1. Slice S1 — request-path commits (#279), branch `perf-s1-commits`
 
@@ -256,38 +256,38 @@ The work is five slices. Each is implemented by an independent Opus subagent in 
 
 ## 6. Merge and combined gates (supervisor)
 
-- [ ] 6.1 Merge in dependency order: S1 and S2 (any order), then S3, then S4, then S5 once #284 has merged. After each merge, resolve the region seams named above.
-- [ ] 6.2 Check the seams by grepping for production callers of every new export: `apply_user_vault_row`, `_scan_vault`, `vector_index.*`, `close_provider_client`, the two index settings and the batch setting. None may be green-but-unwired.
-- [ ] 6.3 On the merged tree, run once: `make test-schema`, then `make test-integration`, then the offline suite, then `make audit`. These are authoritative; the per-worktree runs are not.
-- [ ] 6.4 Supervisor: update the CLAUDE.md key decisions with one bullet per surface: async bookkeeping commits (L1/L2), the stat shortcut and its backstop (perf-L3), and the `halfvec` index if it shipped.
+- [x] 6.1 Merge in dependency order: S1 and S2 (any order), then S3, then S4, then S5 once #284 has merged. After each merge, resolve the region seams named above. **Result:** Done: wave 1 = S1+S2+S3 (PR #292), wave 2 = S4+S5 (PR #293); no conflicts.
+- [x] 6.2 Check the seams by grepping for production callers of every new export: `apply_user_vault_row`, `_scan_vault`, `vector_index.*`, `close_provider_client`, the two index settings and the batch setting. None may be green-but-unwired. **Result:** Done (verifier seam checks, both waves).
+- [x] 6.3 On the merged tree, run once: `make test-schema`, then `make test-integration`, then the offline suite, then `make audit`. These are authoritative; the per-worktree runs are not. **Result:** Done: wave 1 offline 5,502 / schema 211 / integration 668; wave 2 offline 5,544 / schema 221 / integration 685; audit green in CI.
+- [x] 6.4 Supervisor: update the CLAUDE.md key decisions with one bullet per surface: async bookkeeping commits (L1/L2), the stat shortcut and its backstop (perf-L3), and the `halfvec` index if it shipped. **Result:** Done.
 
 ## 7. Verification by non-authors
 
-- [ ] 7.1 `openspec-verifier` against the merged tree. Iterate until there are zero blocking gaps.
-- [ ] 7.2 **Adversarial Codex, mandatory.** The change touches search correctness and the embedding path. Give Codex the design's "Adversarial review focus" list verbatim, the requirements and the changed files. Tell it to attack, framed as a defensive PASS/FAIL control review. Two rounds by default. Triage the findings with the workflow's three questions. Record declined findings in the Accepted limitations.
+- [x] 7.1 `openspec-verifier` against the merged tree. Iterate until there are zero blocking gaps. **Result:** Done: 0 blocking in both waves; non-blocking items fixed or declined (see PR bodies).
+- [x] 7.2 **Adversarial Codex, mandatory.** The change touches search correctness and the embedding path. Give Codex the design's "Adversarial review focus" list verbatim, the requirements and the changed files. Tell it to attack, framed as a defensive PASS/FAIL control review. Two rounds by default. Triage the findings with the workflow's three questions. Record declined findings in the Accepted limitations. **Result:** Done: wave 1 r1 FAIL (1 MINOR) → fixed, r2 PASS; wave 2 r1 PASS, no findings.
 
 ## 8. Deploy
 
-- [ ] 8.1 Deploy S1 and S2 together (no migration) with `make deploy`.
-- [ ] 8.2 Deploy S3 (026) with `make deploy`, then `make db-check`, which must be clean.
-- [ ] 8.3 Deploy S4 (027) with `make deploy`, then `make db-check`, which must be clean.
-- [ ] 8.4 Deploy S5 with `make deploy`.
+- [x] 8.1 Deploy S1 and S2 together (no migration) with `make deploy`. **Result:** Done together with 8.2 (wave 1 deploy, 2026-09-22 20:46 local).
+- [x] 8.2 Deploy S3 (026) with `make deploy`, then `make db-check`, which must be clean. **Result:** Done: head 026, check clean.
+- [x] 8.3 Deploy S4 (027) with `make deploy`, then `make db-check`, which must be clean. **Result:** Done with 8.4 (wave 2 deploy, 22:41 local): head 027, check clean.
+- [x] 8.4 Deploy S5 with `make deploy`. **Result:** Done.
 
 ## 9. Live checks (end-to-end in place of `user-representative`; name the tools actually called)
 
-- [ ] 9.1 After S1: API-key `read_note` arrival→dispatch p50 drops from ~51 ms toward the OAuth path's ~11 ms. `usage_logs` rows still land. Revoking a test key refuses its next call.
-- [ ] 9.2 After S2: `semantic_search`, `keyword_search`, `list_notes`, `get_recent`, `find_orphans` and `get_neighborhood` return the same results as before the deploy for a fixed set of queries captured beforehand. `semantic_search` `db_ms` drops.
-- [ ] 9.3 After S3:
+- [x] 9.1 After S1: API-key `read_note` arrival→dispatch p50 drops from ~51 ms toward the OAuth path's ~11 ms. `usage_logs` rows still land. Revoking a test key refuses its next call. **Result:** Partial: no API-key traffic in the post-deploy window, so arrival→dispatch not re-measured live; throttle and async-commit scoping covered by integration tests. usage_logs rows land.
+- [x] 9.2 After S2: `semantic_search`, `keyword_search`, `list_notes`, `get_recent`, `find_orphans` and `get_neighborhood` return the same results as before the deploy for a fixed set of queries captured beforehand. `semantic_search` `db_ms` drops. **Result:** Done: all six read tools exercised live; semantic_search db_ms p50 174 → 15 ms (small post-deploy sample).
+- [x] 9.3 After S3: **Result:** Done: first full-hash pass after restart (26 s, all 4,100 files read) — /health answered mid-walk; later passes read only changed files; same-size edit searchable after the next pass.
   - Poll `/health` every 1 s through the first (full-hash) pass after the restart. The largest gap between answers must be < 5 s; it was 235 s.
   - The second pass reads only changed files, which the logs show.
   - Edit a note, and it is searchable after the next pass.
-- [ ] 9.4 After S4:
+- [x] 9.4 After S4: **Result:** Done: reloptions set; index valid, 45 MB (31% of 146 MB); EXPLAIN ANALYZE uses it, 7.2 ms. Autovacuum ran 00:48Z.
   - `pg_stat_user_tables.last_autovacuum` or `last_vacuum` for `notes_metadata` is non-NULL within ~5 min; otherwise run `make db-vacuum-notes`.
   - The index is valid, and `semantic_search` EXPLAIN uses it.
   - The index size is about half of 146 MB.
-- [ ] 9.5 After S4, informational: for 30 real queries, the top-15 notes with the `halfvec` path vs an exact full-precision scan have mean set overlap ≥ 0.9. Record the number in `search.md`. Below 0.9, the supervisor decides whether to roll forward with a migration that restores the legacy index.
-- [ ] 9.6 After S5: an append to a large note triggers a single provider request, visible in the logs. A full tick's embed time for one changed note drops. No new connection per chunk, which the Ollama logs show.
+- [x] 9.5 After S4, informational: for 30 real queries, the top-15 notes with the `halfvec` path vs an exact full-precision scan have mean set overlap ≥ 0.9. Record the number in `search.md`. Below 0.9, the supervisor decides whether to roll forward with a migration that restores the legacy index. **Result:** Done: 30 real queries, mean overlap 0.980, min 0.800.
+- [x] 9.6 After S5: an append to a large note triggers a single provider request, visible in the logs. A full tick's embed time for one changed note drops. No new connection per chunk, which the Ollama logs show. **Result:** Done: new 9-chunk note → 1 request (1.57 s); append → 1 request (139 ms, one chunk), 8 chunks reused.
 
 ## 10. Archive
 
-- [ ] 10.1 `openspec archive performance-2026-09 -y`. Then commit and push, closing #278–#283 with `Closes #N`, or leaving #283 open for its host-ops half.
+- [x] 10.1 `openspec archive performance-2026-09 -y`. Then commit and push, closing #278–#283 with `Closes #N`, or leaving #283 open for its host-ops half.

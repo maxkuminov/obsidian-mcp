@@ -233,6 +233,29 @@ update it in the same change.** What stays here is the short list:
   (`trust_env=False`, no redirects). See
   [schema and migrations](docs/architecture/schema-and-migrations.md) and
   [indexing and embeddings](docs/architecture/indexing-and-embeddings.md).
+- **Bookkeeping writes commit asynchronously; credential writes never do**
+  (#279). `SET LOCAL synchronous_commit = off` is issued in exactly three
+  places — the `api_keys.last_used_at` UPDATE (itself skipped when the stamp
+  is < 60 s old), `_insert_usage`, and quota admission — so a Postgres crash
+  can lose up to ~600 ms of usage rows or quota increments (L1/L2, the latter
+  undercounting in the caller's favour). Token rotation/revocation, code
+  exchange and transfer-token writes stay synchronous; an AST test pins the
+  allow-list. PGDATA is on a spinning disk: every fsync'd commit costs ~40 ms.
+- **The indexer trusts `(size, mtime_ns, ctime_ns, inode)` and runs off the
+  loop** (#278, #282). The scan runs in `asyncio.to_thread`, ahead of the
+  generation lock (C1–C8 in `indexing-and-embeddings.md`); an unchanged stat
+  skips the read. Stats inside the 2 s racy window of read start are not
+  recorded. A full-hash pass runs at process start, every
+  `INDEX_FULL_HASH_INTERVAL_HOURS` (24) and on panel Reindex, and the scope
+  stays due until one commits with no read failure — so an edit that keeps all
+  four stat fields is found within that interval (perf-L3).
+  `INDEX_STAT_SHORTCUT=false` for network/FUSE/FAT vault mounts.
+- **The vector index is a `halfvec` expression index** (#283, migration 027),
+  defined once in `src/services/vector_index.py` and excluded from `alembic
+  check` by `include_object`; queries cast to match it and re-rank by
+  full-precision distance. Recall measured 1.00 → 1.00; ~146 MB → 45 MB.
+  Embedding reuses a stored vector only on exact chunk text and a matching
+  model fingerprint, re-verified under the generation lock (#281).
 - Wikilink graph extracted from note bodies into `note_links`; resolved at index time with same-folder-first preference
 - `MCP_SANDBOX_MODE=true` is a registry-eval-only switch: lifespan skips `_check_embedding_dim` and the indexer, and `APIKeyMiddleware` bypasses auth on `/mcp/*`. Lets Glama's sandbox build the image and validate MCP introspection without external deps. Never enable in production — tools register but cannot run.
 
