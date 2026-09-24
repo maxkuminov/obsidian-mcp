@@ -12,6 +12,8 @@ markup to the contract that header relies on (design D1, D2, D6, D9):
 - the eight destructive confirmations fail closed: a `type="button"` with
   `data-confirm`, in a form with no other submit control;
 - `panel.js` never evaluates or renders markup from an attribute value.
+- no `style` attribute in any template, and no script that builds one
+  (panel-csp-style-attrs, #289: the policy carries `style-src-attr 'none'`).
 
 Jinja (`{# … #}`) and HTML (`<!-- … -->`) comments are stripped first, with
 their newlines kept so a failure still names the right line.
@@ -307,3 +309,193 @@ def test_the_theme_toggle_listener_lives_in_the_bootstrap():
 
 def test_htmx_is_not_vendored():
     assert not list(_STATIC.rglob("htmx*"))
+
+
+# --- panel-csp-style-attrs (#289) D7: no inline style attributes -------------
+#
+# The panel policy carries `style-src-attr 'none'`, so a `style=""` anywhere in
+# panel, auth or consent markup is refused by the browser and the element
+# silently loses its presentation. These gates keep the attribute out at the
+# source: in template markup (every branch of every Jinja conditional, since
+# the scan reads the template, not a render), in markup built by a script, and
+# in the vendored Chart.js. CSSOM (`el.style.*`, `style.setProperty`) is the
+# sanctioned dynamic path and is never flagged.
+
+_CHART_FILES = sorted((_STATIC / "vendor").glob("chart-*.umd.min.js"))
+
+# An attribute named `style`, preceded by whitespace, a quote, or the close of
+# a Jinja tag or expression (`%}style=`, `}}style=`). `data-style=`,
+# `:style=` and `<style ` are not matches.
+_STYLE_ATTR = re.compile(r"""(?:(?<=\s)|(?<=["'}]))style\s*=""", re.I)
+
+# `setAttribute` whose first argument is the literal name `style`.
+_SET_STYLE = re.compile(r"""setAttribute\s*\(\s*(["'`])style\1""", re.I)
+
+_SCRIPT_BODY = re.compile(r"(?is)<script\b[^>]*>(.*?)</script\s*>")
+
+
+def _style_attribute_offenders(name: str, text: str) -> list[str]:
+    """`file:line` for each `style` attribute in template text.
+
+    Comments are stripped and `<script>`/`<style>` bodies blanked first, so
+    JavaScript and CSS are never read as markup; newlines survive both, so
+    the line number is the file's.
+    """
+    markup = _strip_element_bodies(_strip_comments(text))
+    return [
+        f"{name}:{_line(markup, m.start())}: {markup[max(0, m.start() - 30):m.end() + 30].strip()}"
+        for m in _STYLE_ATTR.finditer(markup)
+    ]
+
+
+def _scan_js(js: str) -> tuple[list[tuple[int, str]], str]:
+    """`(literals, code)`: every string and template literal in `js` as
+    `(offset, body)`, and `js` with its `//` and `/* */` comments blanked
+    (newlines kept). A tokenizer, not a parser: regex literals are not
+    recognised, which is fine for the panel's own scripts."""
+    literals: list[tuple[int, str]] = []
+    code = list(js)
+    i, n = 0, len(js)
+    while i < n:
+        c = js[i]
+        if js.startswith("//", i) or js.startswith("/*", i):
+            if js[i + 1] == "/":
+                end = js.find("\n", i)
+                end = n if end == -1 else end
+            else:
+                end = js.find("*/", i + 2)
+                end = n if end == -1 else end + 2
+            for k in range(i, end):
+                if code[k] != "\n":
+                    code[k] = " "
+            i = end
+        elif c in "'\"`":
+            start, i = i, i + 1
+            while i < n and js[i] != c:
+                if js[i] == "\\":
+                    i += 1
+                elif c != "`" and js[i] == "\n":
+                    break  # unterminated: not a string after all
+                i += 1
+            literals.append((start, js[start + 1:i]))
+            i += 1
+        else:
+            i += 1
+    return literals, "".join(code)
+
+
+def _script_offenders(name: str, js: str) -> list[str]:
+    """A `style=` inside a string literal (markup built as a string), or a
+    `setAttribute` with the literal name `style`."""
+    literals, code = _scan_js(js)
+    offenders = [
+        f"{name}:{_line(js, offset)}: string literal builds a style attribute: {body[:60]!r}"
+        for offset, body in literals
+        if re.search(r"\bstyle\s*=", body, flags=re.I)
+    ]
+    offenders += [
+        f"{name}:{_line(code, m.start())}: setAttribute('style', …)"
+        for m in _SET_STYLE.finditer(code)
+    ]
+    return offenders
+
+
+def _template_scripts(path: Path):
+    """`(name, body)` for each inline `<script>` body, the body padded with
+    the newlines before it so a line number is the template's."""
+    text = _source(path)
+    for m in _SCRIPT_BODY.finditer(text):
+        pad = "\n" * text.count("\n", 0, m.start(1))
+        yield path.name, pad + m.group(1)
+
+
+@pytest.mark.parametrize("path", _TEMPLATE_FILES, ids=_ids(_TEMPLATE_FILES))
+def test_no_style_attribute_in_templates(path):
+    assert _style_attribute_offenders(path.name, path.read_text()) == []
+
+
+def test_no_script_builds_a_style_attribute():
+    offenders = _script_offenders(_PANEL_JS.name, _PANEL_JS.read_text())
+    for path in _TEMPLATE_FILES:
+        for name, body in _template_scripts(path):
+            offenders += _script_offenders(name, body)
+    assert offenders == []
+
+
+def test_chart_js_renders_no_markup_or_style_attribute():
+    """A tripwire on a Chart.js upgrade, not a proof: the enforce-mode
+    browser pass that renders every chart is the real check."""
+    assert _CHART_FILES, "no vendored chart-*.umd.min.js"
+    for path in _CHART_FILES:
+        text = path.read_text()
+        for needle in (
+            "innerHTML",
+            "insertAdjacentHTML",
+            'setAttribute("style"',
+            "setAttribute('style'",
+            "style=",
+        ):
+            assert needle not in text, f"{path.name} contains {needle}"
+
+
+# Self-tests: each spec-delta scenario, fed to the scanner as a synthetic
+# string. They prove the scanner, not the templates.
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        '<div style="margin:0">',
+        "<div class=\"a\" STYLE='margin:0'>",
+        '<tr {% if revoked %}style="opacity:0.5"{% endif %}>',
+        '<td class="x"{{ extra }}style="color:red">',
+        '<svg><polygon points="0,0" style="fill:var(--gem-facet)"/></svg>',
+    ],
+    ids=["static", "upper-case", "conditional", "after-expression", "svg"],
+)
+def test_the_template_scan_catches(markup):
+    offenders = _style_attribute_offenders("t.html", "<p>\n" + markup)
+    assert offenders and offenders[0].startswith("t.html:2:"), offenders
+
+
+@pytest.mark.parametrize(
+    "markup",
+    [
+        '<div class="a" data-style="x">',
+        '<style nonce="{{ csp_nonce }}">.a { color: red }</style>',
+        "<script nonce=\"n\">el.style.display = 'flex';</script>",
+        '{# <div style="margin:0"> #}',
+        '<!-- <div style="margin:0"> -->',
+    ],
+    ids=["data-attribute", "style-element", "cssom-in-script", "jinja-comment", "html-comment"],
+)
+def test_the_template_scan_passes(markup):
+    assert _style_attribute_offenders("t.html", markup) == []
+
+
+@pytest.mark.parametrize(
+    "js",
+    [
+        "el.setAttribute('style', 'display:none');",
+        'el.setAttribute( "style" , css);',
+        "row.innerHTML = '<td style=\"color:red\">' + v + '</td>';",
+        "var html = `<div style=\"${css}\">`;",
+    ],
+    ids=["setattribute-single", "setattribute-double", "markup-string", "template-literal"],
+)
+def test_the_script_scan_catches(js):
+    assert _script_offenders("x.js", js)
+
+
+@pytest.mark.parametrize(
+    "js",
+    [
+        "el.style.display = 'flex';",
+        "el.style.setProperty('width', pct + '%');",
+        "el.setAttribute('data-theme', choice);",
+        "// el.setAttribute('style', 'x');  and 'style=' in a comment\nel.style.opacity = '1';",
+    ],
+    ids=["cssom-write", "set-property", "other-attribute", "comment"],
+)
+def test_the_script_scan_passes(js):
+    assert _script_offenders("x.js", js) == []

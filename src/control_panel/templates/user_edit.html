@@ -1,9 +1,18 @@
 {% extends "base.html" %}
 {% block title %}Edit {{ target.username }} — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+    /* #289: converted from inline style attributes. */
+    /* Initial state only (design D3): the toggle script below writes
+       `style.display` through CSSOM, which beats this non-important rule. */
+    .ue-vault-custom { margin-top: 8px; display: none; }
+    .ue-check-hint { color: var(--text-3); font-size: 12px; display: block; margin-top: 2px; }
+</style>
+{% endblock %}
 {% block content %}
 
 <div class="page-top">
-    <h1 class="page-title">Edit user: <span style="color:var(--primary-text);">{{ target.username }}</span></h1>
+    <h1 class="page-title">Edit user: <span class="u-color-primary-text">{{ target.username }}</span></h1>
     <div class="page-actions">
         <a href="/admin/users/" class="btn btn-ghost">← Back to users</a>
     </div>
@@ -38,46 +47,45 @@
                             <option value="__custom__" {% if target.vault_path and target.vault_path not in available_vaults %}selected{% endif %}>Custom path…</option>
                         </select>
                         <input type="text" name="vault_path_custom" id="vault-custom"
-                               class="field-input"
-                               style="margin-top:8px;display:none;"
+                               class="field-input ue-vault-custom"
                                placeholder="/vaults/<name>"
                                value="{{ target.vault_path if target.vault_path and target.vault_path not in available_vaults else '' }}">
-                        <div style="font-size:11px;color:var(--text-3);margin-top:6px;">
+                        <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
                             Must be a subpath of <code class="mono">/vaults/</code> or the legacy mount.
                             Directory must exist in the container.
                         </div>
                     </div>
-                    <div class="field" style="display:flex;align-items:center;gap:10px;">
+                    <div class="field u-display-flex u-align-items-center u-gap-10px">
                         <input type="checkbox" name="is_admin" id="is_admin" {% if target.is_admin %}checked{% endif %}
                                {% if is_self %}disabled{% endif %}
-                               style="width:18px;height:18px;accent-color:var(--primary);">
-                        <label for="is_admin" style="font-size:14px;color:var(--text);cursor:pointer;">
+                               class="u-width-18px u-height-18px u-accent-color-primary">
+                        <label for="is_admin" class="u-font-size-14px u-color-text u-cursor-pointer">
                             Admin
-                            <span style="color:var(--text-3);font-size:12px;display:block;margin-top:2px;">
+                            <span class="ue-check-hint">
                                 Sees all users' control-plane data; can manage users + settings.
                             </span>
                         </label>
                     </div>
-                    <div class="field" style="display:flex;align-items:center;gap:10px;">
+                    <div class="field u-display-flex u-align-items-center u-gap-10px">
                         <input type="checkbox" name="is_active" id="is_active" {% if target.is_active %}checked{% endif %}
                                {% if is_self %}disabled{% endif %}
-                               style="width:18px;height:18px;accent-color:var(--primary);">
-                        <label for="is_active" style="font-size:14px;color:var(--text);cursor:pointer;">
+                               class="u-width-18px u-height-18px u-accent-color-primary">
+                        <label for="is_active" class="u-font-size-14px u-color-text u-cursor-pointer">
                             Active
-                            <span style="color:var(--text-3);font-size:12px;display:block;margin-top:2px;">
+                            <span class="ue-check-hint">
                                 Inactive users cannot log in and are skipped by the indexer.
                             </span>
                         </label>
                     </div>
                     {% if is_self %}
-                    <div class="alert alert-warning" style="margin-top:8px;font-size:12px;">
+                    <div class="alert alert-warning u-margin-top-8px u-font-size-12px">
                         This is your own account — you can't remove your own admin role or
                         deactivate yourself here. Both toggles are locked, and the server
                         refuses the change even if the form is bypassed. Another admin can
                         do it from this page.
                     </div>
                     {% endif %}
-                    <div style="display:flex;gap:10px;margin-top:18px;">
+                    <div class="u-display-flex u-gap-10px u-margin-top-18px">
                         <button type="submit" class="btn btn-primary">Save</button>
                     </div>
                 </form>
@@ -97,7 +105,7 @@
                         {# As on the users list: the server's constant, not a literal. #}
                         <input type="password" name="new_password" required minlength="{{ min_password_length }}"
                                class="field-input" placeholder="≥ {{ min_password_length }} characters" autocomplete="new-password">
-                        <div style="font-size:11px;color:var(--text-3);margin-top:6px;">
+                        <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
                             Replaces the user's current password. Communicate the new one
                             to them out-of-band.
                         </div>
@@ -110,13 +118,13 @@
     </div>
 
     <!-- Danger zone -->
-    <div class="card anim-3" style="margin-top:20px;border-color:var(--error-border);">
+    <div class="card anim-3 u-margin-top-20px u-border-color-error-border">
         <div class="card-header">
-            <span class="card-title" style="color:var(--error);">Danger zone</span>
+            <span class="card-title u-color-error">Danger zone</span>
         </div>
         <div class="card-body">
             {% if is_self %}
-            <div class="alert alert-warning" style="margin-bottom:14px;font-size:12px;">
+            <div class="alert alert-warning u-margin-bottom-14px u-font-size-12px">
                 This is your own account — you can't deactivate or permanently
                 delete it here. Both controls are locked, and the server refuses
                 the request even if the form is bypassed. The permanent form is
@@ -129,7 +137,7 @@
             <div class="kv">
                 <div>
                     <div class="kv-k">Deactivate user</div>
-                    <div style="color:var(--text-3);font-size:12px;margin-top:4px;">
+                    <div class="u-color-text-3 u-font-size-12px u-margin-top-4px">
                         Soft-delete: sets <code class="mono">is_active=false</code>. Data preserved;
                         the user can no longer log in. Reversible by re-saving the form above.
                     </div>
@@ -156,8 +164,8 @@
             </div>
             <div class="kv">
                 <div>
-                    <div class="kv-k" style="color:var(--error);">Permanent delete</div>
-                    <div style="color:var(--text-3);font-size:12px;margin-top:4px;">
+                    <div class="kv-k u-color-error">Permanent delete</div>
+                    <div class="u-color-text-3 u-font-size-12px u-margin-top-4px">
                         Cascades: removes the user row plus all their api_keys / oauth_clients /
                         oauth_tokens / notes_metadata via FK. Usage logs persist with
                         <code class="mono">user_id=NULL</code>. <strong>Irreversible.</strong>

@@ -1,20 +1,48 @@
 {% extends "base.html" %}
 {% block title %}Dashboard — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+    /* Dashboard page classes (#289, design D1/D3): declarations that are not
+       utility-eligible, and the two initial states the page script overrides
+       through CSSOM (the progress fill's width, the activity rows' opacity and
+       transform). The script's el.style writes are inline, so they win. */
+    .dash-health-strip { padding-top: 14px; padding-bottom: 14px; display: flex; align-items: center; gap: 26px; flex-wrap: wrap; }
+    .dash-health-cell { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+    .dash-health-label { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-2); }
+    .dash-health-link { margin-left: auto; font-size: 12px; color: var(--primary-text); text-decoration: none; }
+    .dash-quarantine-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+    .dash-quarantine-item { font-size: 13px; color: var(--text-2); line-height: 1.6; margin-bottom: 6px; word-break: break-word; }
+    .dash-quarantine-note { font-size: 12px; color: var(--text-3); line-height: 1.6; margin: 10px 0 0; }
+    .dash-progress-track { height: 4px; background: var(--border); border-radius: 99px; overflow: hidden; }
+    .dash-progress-fill { height: 100%; width: 0%; background: linear-gradient(90deg,var(--primary-dim),var(--primary)); border-radius: 99px; transition: width 1.1s cubic-bezier(0.22,1,0.36,1); }
+    .dash-activity-row { opacity: 0; transform: translateX(-6px); display: flex; align-items: center; justify-content: space-between; padding: 11px 0; border-bottom: 1px solid var(--border); gap: 14px; transition: background 0.15s; }
+    .dash-activity-main { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+    .dash-activity-tool { display: inline-flex; align-items: center; padding: 3px 9px; border-radius: 4px; background: var(--primary-glow); border: 1px solid var(--primary-border); color: var(--primary-text); font-size: 12px; font-weight: 500; white-space: nowrap; }
+    .dash-activity-detail { color: var(--text-2); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+    .dash-activity-time { color: var(--text-3); font-size: 11px; white-space: nowrap; flex-shrink: 0; }
+    .dash-reindexed-row { display: flex; align-items: flex-end; gap: 12px; padding: 4px 0 22px; flex-wrap: wrap; }
+    .dash-reindexed-num { font-family: 'DM Sans',sans-serif; font-size: 52px; font-weight: 700; line-height: 1; color: var(--primary-text); letter-spacing: -0.03em; font-variant-numeric: tabular-nums; }
+    .dash-reindexed-caption { color: var(--text-2); font-size: 14px; line-height: 1.4; padding-bottom: 6px; }
+    .dash-reindex-hint { margin-top: 16px; padding: 14px; border-radius: 6px; background: var(--primary-glow-xs); border: 1px solid var(--primary-border-soft); font-size: 13px; color: var(--text-2); line-height: 1.5; }
+    .dash-hub-row { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; border-bottom: 1px solid var(--border); gap: 14px; }
+    .dash-hub-link { color: var(--text); text-decoration: none; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
+</style>
+{% endblock %}
 {% block content %}
 
 <div class="page-top">
     <div>
         <h1 class="page-title">Dashboard</h1>
-        <div style="font-size:13px;color:var(--text-3);margin-top:8px;">
+        <div class="u-font-size-13px u-color-text-3 u-margin-top-8px">
             Indexer last ran
-            <span style="color:var(--text-2);font-weight:500;">{{ last_run_rel }}</span>
-            {% if last_run_ok is false %}<span class="badge badge-yellow" style="margin-left:6px;">last pass failed</span>{% endif %}
-            <span style="opacity:0.75;">· last change detected {{ last_indexed_rel }}</span>
+            <span class="u-color-text-2 u-font-weight-500">{{ last_run_rel }}</span>
+            {% if last_run_ok is false %}<span class="badge badge-yellow u-margin-left-6px">last pass failed</span>{% endif %}
+            <span class="u-opacity-0_75">· last change detected {{ last_indexed_rel }}</span>
         </div>
     </div>
     <div class="page-actions">
         <span id="reindex-status" class="inline-status ok" role="status" aria-live="polite"></span>
-        <form id="reindex-form" data-async-reindex style="display:inline;">
+        <form id="reindex-form" data-async-reindex class="u-display-inline">
             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
             <button type="submit" class="btn btn-primary btn-lg" title="Scan the vault for new or changed notes and embed them">
                 <svg class="btn-icon" width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
@@ -40,8 +68,8 @@
       health page states: neither has an owner to scope by, and the error buffer
       holds whatever the process logged.
     #}
-    <div class="card anim-1" style="margin-bottom:20px;">
-        <div class="card-body" style="padding-top:14px;padding-bottom:14px;display:flex;align-items:center;gap:26px;flex-wrap:wrap;">
+    <div class="card anim-1 u-margin-bottom-20px">
+        <div class="card-body dash-health-strip">
 
             {% if health.unavailable %}
             {#
@@ -51,50 +79,50 @@
               and 500ing the page would lose the whole dashboard over three
               cells. The failure is logged at ERROR, so the health page has it.
             #}
-            <div style="font-size:13px;color:var(--text-3);">
+            <div class="u-font-size-13px u-color-text-3">
                 Health summary unavailable — its queries failed. The rest of this
                 page is unaffected; the error is logged.
             </div>
-            <a href="/admin/health" style="margin-left:auto;font-size:12px;color:var(--primary-text);text-decoration:none;">Health &rarr;</a>
+            <a href="/admin/health" class="dash-health-link">Health &rarr;</a>
             {% else %}
 
-            <div style="display:flex;align-items:center;gap:8px;font-size:13px;">
-                <span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-2);">Last pass</span>
+            <div class="dash-health-cell">
+                <span class="dash-health-label">Last pass</span>
                 {% if health.last_run and health.last_run.error %}
-                    <a href="/admin/health#run-{{ health.last_run.id }}" class="badge badge-red" style="text-decoration:none;">failed</a>
+                    <a href="/admin/health#run-{{ health.last_run.id }}" class="badge badge-red u-text-decoration-none">failed</a>
                 {% elif health.last_run %}
                     <span class="badge badge-green">ok</span>
                 {% else %}
-                    <span style="color:var(--text-3);">none recorded</span>
+                    <span class="u-color-text-3">none recorded</span>
                 {% endif %}
             </div>
 
             {% if health.show_ops %}
-            <div style="display:flex;align-items:center;gap:8px;font-size:13px;">
-                <span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-2);">Backup</span>
+            <div class="dash-health-cell">
+                <span class="dash-health-label">Backup</span>
                 {% if health.backup and health.backup.stale %}
                     <span class="badge badge-yellow" title="Older than {{ health.stale_after_days }} days.">{{ health.backup.age_rel }}</span>
                 {% elif health.backup %}
-                    <span style="color:var(--text);">{{ health.backup.age_rel }}</span>
+                    <span class="u-color-text">{{ health.backup.age_rel }}</span>
                 {% else %}
-                    <span style="color:var(--text-3);">none recorded</span>
+                    <span class="u-color-text-3">none recorded</span>
                 {% endif %}
             </div>
 
-            <div style="display:flex;align-items:center;gap:8px;font-size:13px;">
-                <span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-2);">Errors</span>
+            <div class="dash-health-cell">
+                <span class="dash-health-label">Errors</span>
                 {% if health.error_count %}
                     <span class="badge badge-red">{{ health.error_count }}</span>
                 {% else %}
-                    <span style="color:var(--text-3);">0</span>
+                    <span class="u-color-text-3">0</span>
                 {% endif %}
                 {# The window, not just the number: "0 errors" without "since
                    the process started" reads as a claim about the server. #}
-                <span style="font-size:12px;color:var(--text-3);">since process start{% if health.observing_since_rel %} ({{ health.observing_since_rel }}){% endif %}</span>
+                <span class="u-font-size-12px u-color-text-3">since process start{% if health.observing_since_rel %} ({{ health.observing_since_rel }}){% endif %}</span>
             </div>
             {% endif %}
 
-            <a href="/admin/health" style="margin-left:auto;font-size:12px;color:var(--primary-text);text-decoration:none;">Health &rarr;</a>
+            <a href="/admin/health" class="dash-health-link">Health &rarr;</a>
             {% endif %}
         </div>
 
@@ -123,38 +151,38 @@
           being mistaken for one.
         #}
         {% if health.quarantine and (not health.quarantine.checked or health.quarantine.accounts) %}
-        <div class="card-body" style="border-top:1px solid var(--border);padding-top:14px;padding-bottom:14px;">
+        <div class="card-body u-border-top-1px-solid-border u-padding-top-14px u-padding-bottom-14px">
             {% if not health.quarantine.checked %}
-            <div style="font-size:13px;color:var(--text-2);line-height:1.6;">
-                <span class="badge badge-yellow" style="margin-right:8px;">not yet checked</span>
+            <div class="u-font-size-13px u-color-text-2 u-line-height-1_6">
+                <span class="badge badge-yellow u-margin-right-8px">not yet checked</span>
                 The vault roots have not been checked in this process yet, so no
                 account has been cleared. Startup publishes the first check
                 before the server accepts a request, so this normally never
                 shows; while it does, every multi-user tool call is refused.
                 A detection that failed is logged — see
-                <a href="/admin/health" style="color:var(--primary-text);text-decoration:none;">Health</a>.
+                <a href="/admin/health" class="u-color-primary-text u-text-decoration-none">Health</a>.
             </div>
             {% else %}
-            <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px;">
+            <div class="dash-quarantine-head">
                 <span class="badge badge-red">vault-root quarantine</span>
-                <span style="font-size:12px;color:var(--text-3);">
+                <span class="u-font-size-12px u-color-text-3">
                     Facts as at the last check{% if health.quarantine.detected_at_iso %},
                     <time datetime="{{ health.quarantine.detected_at_iso }}" data-localize>{{ health.quarantine.detected_at_iso }}</time>{% endif %}
                     — recorded when the roots were observed, not re-read now.
                 </span>
             </div>
-            <ul style="margin:0;padding-left:18px;">
+            <ul class="u-margin-0 u-padding-left-18px">
                 {% for a in health.quarantine.accounts %}
-                <li style="font-size:13px;color:var(--text-2);line-height:1.6;margin-bottom:6px;word-break:break-word;">
-                    <span class="badge {% if a.overlap %}badge-red{% else %}badge-yellow{% endif %}" style="margin-right:6px;">{% if a.overlap %}overlap{% else %}root unexaminable{% endif %}</span>
+                <li class="dash-quarantine-item">
+                    <span class="badge {% if a.overlap %}badge-red{% else %}badge-yellow{% endif %} u-margin-right-6px">{% if a.overlap %}overlap{% else %}root unexaminable{% endif %}</span>
                     {{ a.text }}
                 </li>
                 {% endfor %}
             </ul>
-            <p style="font-size:12px;color:var(--text-3);line-height:1.6;margin:10px 0 0;">
+            <p class="dash-quarantine-note">
                 No tool call is served for these accounts and no pass indexes
                 them; nothing was deleted. Correct the assignment on
-                <a href="/admin/users/" style="color:var(--primary-text);text-decoration:none;">Users</a>,
+                <a href="/admin/users/" class="u-color-primary-text u-text-decoration-none">Users</a>,
                 or restore the mount, and the next check clears it.
             </p>
             {% endif %}
@@ -172,18 +200,18 @@
 
         <div class="stat-card anim-2">
             <div class="stat-label">Embedded</div>
-            <div style="display:flex;align-items:baseline;gap:10px;">
+            <div class="u-display-flex u-align-items-baseline u-gap-10px">
                 <div class="stat-num" data-countup="{{ stats.notes_with_embeddings | default(0) }}">0</div>
-                <span style="font-size:17px;font-weight:500;color:var(--text-3);">/ {{ stats.notes_indexed | default(0) }}</span>
+                <span class="u-font-size-17px u-font-weight-500 u-color-text-3">/ {{ stats.notes_indexed | default(0) }}</span>
             </div>
             <!-- Coverage progress bar -->
-            <div style="margin-top:16px;">
-                <div style="display:flex;justify-content:space-between;margin-bottom:6px;">
-                    <span style="font-size:12px;color:var(--text-3);">Coverage</span>
-                    <span style="font-size:12px;color:var(--text);font-weight:600;">{{ stats.embedding_pct | default(0) }}%</span>
+            <div class="u-margin-top-16px">
+                <div class="u-display-flex u-justify-content-space-between u-margin-bottom-6px">
+                    <span class="u-font-size-12px u-color-text-3">Coverage</span>
+                    <span class="u-font-size-12px u-color-text u-font-weight-600">{{ stats.embedding_pct | default(0) }}%</span>
                 </div>
-                <div style="height:4px;background:var(--border);border-radius:99px;overflow:hidden;">
-                    <div style="height:100%;width:0%;background:linear-gradient(90deg,var(--primary-dim),var(--primary));border-radius:99px;transition:width 1.1s cubic-bezier(0.22,1,0.36,1);" data-progress="{{ stats.embedding_pct | default(0) }}"></div>
+                <div class="dash-progress-track">
+                    <div class="dash-progress-fill" data-progress="{{ stats.embedding_pct | default(0) }}"></div>
                 </div>
                 {# Currency, beside coverage. The bar answers "is this note
                    represented at all"; these two answer "is that
@@ -201,21 +229,21 @@
 
                    "not current" and not "pending", because the number beside
                    it is coverage: same rows, different question. #}
-                <div style="display:flex;justify-content:space-between;margin-top:6px;">
-                    <span style="font-size:12px;color:var(--text-3);" title="Notes never embedded, or edited since they were last embedded. The indexer works through these; a figure that does not shrink across passes is the signal.">{{ stats.notes_pending | default(0) }} not current</span>
-                    <span style="font-size:12px;color:{% if stats.notes_chunks_truncated %}var(--warning){% else %}var(--text-3){% endif %};" title="Notes whose embedding stopped at the per-note chunk cap; the tail of such a note is not semantically searchable.">{{ stats.notes_chunks_truncated | default(0) }} truncated</span>
+                <div class="u-display-flex u-justify-content-space-between u-margin-top-6px">
+                    <span class="u-font-size-12px u-color-text-3" title="Notes never embedded, or edited since they were last embedded. The indexer works through these; a figure that does not shrink across passes is the signal.">{{ stats.notes_pending | default(0) }} not current</span>
+                    <span class="u-font-size-12px {% if stats.notes_chunks_truncated %}u-color-warning{% else %}u-color-text-3{% endif %}" title="Notes whose embedding stopped at the per-note chunk cap; the tail of such a note is not semantically searchable.">{{ stats.notes_chunks_truncated | default(0) }} truncated</span>
                 </div>
             </div>
         </div>
 
         <div class="stat-card anim-3">
             <div class="stat-label">Active Keys</div>
-            <div class="stat-num" style="color:var(--success);" data-countup="{{ stats.active_keys | default(0) }}">0</div>
+            <div class="stat-num u-color-success" data-countup="{{ stats.active_keys | default(0) }}">0</div>
         </div>
 
         <div class="stat-card anim-4">
             <div class="stat-label">Requests Today</div>
-            <div class="stat-num" style="color:var(--warning);" data-countup="{{ stats.requests_today | default(0) }}">0</div>
+            <div class="stat-num u-color-warning" data-countup="{{ stats.requests_today | default(0) }}">0</div>
         </div>
 
     </div>
@@ -228,25 +256,25 @@
             <div class="card-header">
                 <span class="card-title">Recent Activity</span>
             </div>
-            <div class="card-body" style="padding-top:12px;padding-bottom:12px;">
+            <div class="card-body u-padding-top-12px u-padding-bottom-12px">
                 {% if recent_usage %}
                 <div id="activity-list">
                     {% for log in recent_usage %}
-                    <div class="activity-row" style="opacity:0;transform:translateX(-6px);display:flex;align-items:center;justify-content:space-between;padding:11px 0;border-bottom:1px solid var(--border);gap:14px;transition:background 0.15s;">
-                        <div style="display:flex;align-items:center;gap:10px;min-width:0;flex:1;">
-                            <span style="display:inline-flex;align-items:center;padding:3px 9px;border-radius:4px;background:var(--primary-glow);border:1px solid var(--primary-border);color:var(--primary-text);font-size:12px;font-weight:500;white-space:nowrap;">{{ log.tool }}</span>
+                    <div class="activity-row dash-activity-row">
+                        <div class="dash-activity-main">
+                            <span class="dash-activity-tool">{{ log.tool }}</span>
                             {% if log.detail %}
-                            <span style="color:var(--text-2);font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;" title="{{ log.detail }}">{{ log.detail }}</span>
+                            <span class="dash-activity-detail" title="{{ log.detail }}">{{ log.detail }}</span>
                             {% endif %}
                         </div>
-                        <span class="mono" style="color:var(--text-3);font-size:11px;white-space:nowrap;flex-shrink:0;">
+                        <span class="mono dash-activity-time">
                             <time datetime="{{ log.created_at }}" data-localize>{{ log.created_at }}</time>
                         </span>
                     </div>
                     {% endfor %}
                 </div>
                 {% else %}
-                <p style="color:var(--text-3);font-size:14px;padding:10px 0;">No activity yet.</p>
+                <p class="u-color-text-3 u-font-size-14px u-padding-10px-0">No activity yet.</p>
                 {% endif %}
             </div>
         </div>
@@ -257,35 +285,35 @@
                 <span class="card-title">Indexer</span>
                 {# The heartbeat beside the title is this process's; the link
                    goes to the persisted per-pass history and timings. #}
-                <span style="display:flex;align-items:center;gap:10px;">
-                    <span class="mono" style="font-size:11px;color:var(--text-3);">{{ last_run_rel }}</span>
-                    <a href="/admin/performance" style="font-size:11px;color:var(--primary-text);text-decoration:none;">Performance →</a>
+                <span class="u-display-flex u-align-items-center u-gap-10px">
+                    <span class="mono u-font-size-11px u-color-text-3">{{ last_run_rel }}</span>
+                    <a href="/admin/performance" class="u-font-size-11px u-color-primary-text u-text-decoration-none">Performance →</a>
                 </span>
             </div>
             <div class="card-body">
-                <div style="display:flex;align-items:flex-end;gap:12px;padding:4px 0 22px;flex-wrap:wrap;">
-                    <div style="font-family:'DM Sans',sans-serif;font-size:52px;font-weight:700;line-height:1;color:var(--primary-text);letter-spacing:-0.03em;font-variant-numeric:tabular-nums;" data-countup="{{ reindexed_24h | default(0) }}">0</div>
-                    <div style="color:var(--text-2);font-size:14px;line-height:1.4;padding-bottom:6px;">
+                <div class="dash-reindexed-row">
+                    <div class="dash-reindexed-num" data-countup="{{ reindexed_24h | default(0) }}">0</div>
+                    <div class="dash-reindexed-caption">
                         notes reindexed<br>
-                        <span style="color:var(--text-3);font-size:13px;">in the last 24h</span>
+                        <span class="u-color-text-3 u-font-size-13px">in the last 24h</span>
                     </div>
                 </div>
-                <div class="kv" style="padding:12px 0;border-top:1px solid var(--border);">
+                <div class="kv u-padding-12px-0 u-border-top-1px-solid-border">
                     <span class="kv-k" title="When the indexer last completed a pass, whether or not anything had changed.">Last run</span>
-                    <span class="kv-v mono" style="font-size:12px;">
+                    <span class="kv-v mono u-font-size-12px">
                         {% if last_run_iso %}<time datetime="{{ last_run_iso }}" data-localize>{{ last_run_iso }}</time>{% else %}Never{% endif %}
-                        {% if last_run_ok is false %}<span class="badge badge-yellow" style="margin-left:6px;">failed</span>{% endif %}
+                        {% if last_run_ok is false %}<span class="badge badge-yellow u-margin-left-6px">failed</span>{% endif %}
                     </span>
                 </div>
-                <div class="kv" style="padding:12px 0;border-top:1px solid var(--border);">
+                <div class="kv u-padding-12px-0 u-border-top-1px-solid-border">
                     <span class="kv-k" title="The newest indexed_at on any note — i.e. the last time a pass found a change to write. Older than 'Last run' just means the vault has been quiet.">Last change detected</span>
-                    <span class="kv-v mono" style="font-size:12px;">
+                    <span class="kv-v mono u-font-size-12px">
                         {% if last_indexed_iso %}<time datetime="{{ last_indexed_iso }}" data-localize>{{ last_indexed_iso }}</time>{% else %}Never{% endif %}
                     </span>
                 </div>
-                <div style="margin-top:16px;padding:14px;border-radius:6px;background:var(--primary-glow-xs);border:1px solid var(--primary-border-soft);font-size:13px;color:var(--text-2);line-height:1.5;">
+                <div class="dash-reindex-hint">
                     Added a note to Obsidian? Hit
-                    <strong style="color:var(--primary-text);font-weight:600;">Reindex Now</strong>
+                    <strong class="u-color-primary-text u-font-weight-600">Reindex Now</strong>
                     above to pick it up immediately — or wait for the next scan (every {{ index_interval // 60 }} min).
                 </div>
             </div>
@@ -294,46 +322,46 @@
     </div>
 
     <!-- Graph -->
-    <div class="card anim-4" style="margin-top:24px;">
+    <div class="card anim-4 u-margin-top-24px">
         <div class="card-header">
             <span class="card-title">Graph</span>
             {% if graph_backfill_running %}
-            <span class="mono" style="font-size:11px;color:var(--warning);">
+            <span class="mono u-font-size-11px u-color-warning">
                 Link extraction in progress…
             </span>
             {% endif %}
         </div>
         <div class="card-body">
-            <div class="stats-grid" style="margin-bottom:18px;">
+            <div class="stats-grid u-margin-bottom-18px">
                 <div class="stat-card">
                     <div class="stat-label">Total Links</div>
                     <div class="stat-num" data-countup="{{ graph.total_links | default(0) }}">0</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Dangling</div>
-                    <div class="stat-num" style="color:var(--warning);" data-countup="{{ graph.dangling_links | default(0) }}">0</div>
+                    <div class="stat-num u-color-warning" data-countup="{{ graph.dangling_links | default(0) }}">0</div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-label">Orphans</div>
-                    <div class="stat-num" style="color:var(--text-2);" data-countup="{{ graph.orphan_count | default(0) }}">0</div>
+                    <div class="stat-num u-color-text-2" data-countup="{{ graph.orphan_count | default(0) }}">0</div>
                 </div>
             </div>
             {% if graph.top_hubs %}
-            <div style="font-size:13px;color:var(--text-3);margin-bottom:8px;">Top hub notes</div>
+            <div class="u-font-size-13px u-color-text-3 u-margin-bottom-8px">Top hub notes</div>
             <div>
                 {% for hub in graph.top_hubs %}
-                <div style="display:flex;align-items:center;justify-content:space-between;padding:9px 0;border-bottom:1px solid var(--border);gap:14px;">
+                <div class="dash-hub-row">
                     <a href="/admin/vault?note={{ hub.path | urlencode }}"
-                       style="color:var(--text);text-decoration:none;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;min-width:0;"
+                       class="dash-hub-link"
                        title="{{ hub.path }}">
                         {{ hub.title }}
                     </a>
-                    <span class="mono" style="color:var(--text-3);font-size:12px;flex-shrink:0;">{{ hub.hits }} backlinks</span>
+                    <span class="mono u-color-text-3 u-font-size-12px u-flex-shrink-0">{{ hub.hits }} backlinks</span>
                 </div>
                 {% endfor %}
             </div>
             {% else %}
-            <p style="color:var(--text-3);font-size:14px;padding:6px 0;">
+            <p class="u-color-text-3 u-font-size-14px u-padding-6px-0">
                 No hub notes yet — the link graph may still be building.
             </p>
             {% endif %}
