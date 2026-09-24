@@ -231,7 +231,8 @@ async def test_single_message_larger_than_the_budget_is_kept(harness):
 
     async def consumed():
         await until(lambda: wire.delivered == 1)
-        assert concurrency.replay_budget().exhausted
+        # The watcher appends one loop step after the receive task finishes.
+        await until(lambda: concurrency.replay_budget().exhausted)
 
     received = await admitted_after_wait(harness, c, wire, release_when=consumed)
     assert received == [body(big, False)]
@@ -476,3 +477,156 @@ async def test_enforce_deadline_refusal_keeps_the_429_shape_and_counts(harness):
     assert counted['requests'] == 1 and counted['transport_refused'] == 1
     assert harness.sessions == 0
     assert_clean(c, held)
+
+
+# ── handoff through the production middleware stack (impl review R1-1) ────
+
+def production_stack(inner):
+    """`inner` behind `APIKeyMiddleware`, behind the security-header wrapper.
+
+    The same `BaseHTTPMiddleware` wrapping `src/main.py` installs with
+    `@app.middleware("http")`, with the same dispatch function. Its `receive`
+    runs in an anyio task group and suspends in the group's cleanup *after*
+    it has taken a message from the server and *before* it returns it, which
+    is the window a cancelling handoff lost messages in.
+    """
+    from starlette.middleware.base import BaseHTTPMiddleware
+    from src import main
+    return BaseHTTPMiddleware(auth.APIKeyMiddleware(inner),
+                              dispatch=main.add_security_headers)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['enforce', 'queue'])
+@pytest.mark.parametrize('spins', [0, 1, 2, 3, 5])
+async def test_body_arriving_at_handoff_survives_the_security_header_wrapper(
+        harness, monkeypatch, mode, spins):
+    c = harness.install(mode, mcp_concurrency_transport_wait_seconds=5)
+    authenticated(monkeypatch)
+    payload = body(b'{"jsonrpc":"2.0","id":9,"method":"ping"}', False)
+    received = []
+
+    async def app(scope_, receive, send):
+        while True:
+            message = await receive()
+            received.append(message)
+            if message['type'] == 'http.disconnect' or not message.get('more_body'):
+                break
+        await send({'type': 'http.response.start', 'status': 200,
+                    'headers': [(b'content-type', b'application/json')]})
+        await send({'type': 'http.response.body', 'body': b'{}'})
+
+    wire = Wire()
+    holders = await hold(c, 'auth')
+    task = asyncio.create_task(production_stack(app)(scope(), wire.receive,
+                                                     record(harness)))
+    await until(lambda: c.pending)
+    # The body arrives while the watcher's receive is inside the wrapper, and
+    # the grant lands `spins` loop steps later: the wrapper has taken the
+    # message from the server but not yet returned it to the watcher.
+    wire.push(payload)
+    for _ in range(spins):
+        await asyncio.sleep(0)
+    holders.pop().lease.release()
+    await asyncio.wait_for(task, 2)
+
+    assert received == [payload], 'the body taken at handoff was lost or altered'
+    assert wire.delivered == 1 and wire.queue.qsize() == 0
+    assert harness.sent[0]['type'] == 'http.response.start'
+    assert harness.sent[0]['status'] == 200
+    assert b''.join(m.get('body', b'') for m in harness.sent
+                    if m['type'] == 'http.response.body') == b'{}'
+    assert harness.sent[-1].get('more_body', False) is False
+    assert c.requests.active == 0, 'the request lease was not released'
+    assert_clean(c, holders)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['enforce', 'queue'])
+async def test_in_flight_receive_is_settled_after_a_bodyless_response(harness, monkeypatch,
+                                                                      mode):
+    # A GET: the watcher took the empty body and is parked in the next
+    # receive (it waits for a disconnect). The app never reads; after the
+    # response the in-flight receive is cancelled, not leaked.
+    c = harness.install(mode, mcp_concurrency_transport_wait_seconds=5)
+    authenticated(monkeypatch)
+    wire = Wire(body(b'', False))
+    holders = await hold(c, 'auth')
+    watches = []
+    original = auth.ReceiveWatch.__init__
+
+    def spy(self, receive):
+        original(self, receive)
+        watches.append(self)
+
+    monkeypatch.setattr(auth.ReceiveWatch, '__init__', spy)
+    task = asyncio.create_task(auth.APIKeyMiddleware(ok_app)(
+        scope(method='GET'), wire.receive, record(harness)))
+    await until(lambda: c.pending and wire.delivered == 1)
+    # The second receive: parked in the transport, waiting for a disconnect.
+    await until(lambda: watches[0].messages and watches[0]._pending is not None)
+    pending = watches[0]._pending
+    assert not pending.done()
+    holders.pop().lease.release()
+    await asyncio.wait_for(task, 2)
+    await asyncio.sleep(0)
+    assert harness.sent[0]['status'] == 200
+    assert pending.done() and pending.cancelled()
+    assert watches[0]._pending is None
+    assert_clean(c, holders)
+
+
+@pytest.mark.asyncio
+async def test_in_flight_disconnect_is_delivered_to_the_app(harness, monkeypatch):
+    c = harness.install('enforce', mcp_concurrency_transport_wait_seconds=5)
+    authenticated(monkeypatch)
+    wire = Wire(body(b'{}', False))
+    holders = await hold(c, 'auth')
+    received = []
+
+    async def app(scope_, receive, send):
+        received.append(await receive())
+        # The watcher's receive past the complete body is still in flight;
+        # the next call awaits that same call, which yields the disconnect.
+        wire.push(DISCONNECT)
+        received.append(await receive())
+
+    task = asyncio.create_task(auth.APIKeyMiddleware(app)(scope(), wire.receive,
+                                                           record(harness)))
+    await until(lambda: c.pending and wire.delivered == 1)
+    for _ in range(5):
+        await asyncio.sleep(0)
+    holders.pop().lease.release()
+    await asyncio.wait_for(task, 2)
+    assert received == [body(b'{}', False), DISCONNECT]
+    assert wire.delivered == 2
+    assert_clean(c, holders)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_app_receive_keeps_the_in_flight_message(harness, monkeypatch):
+    # The app's own wait on the handed-over receive is cancelled; the message
+    # that arrives afterwards still reaches its next call, exactly once.
+    c = harness.install('enforce', mcp_concurrency_transport_wait_seconds=5)
+    authenticated(monkeypatch)
+    wire = Wire()
+    holders = await hold(c, 'auth')
+    payload = body(b'{"id":3}', False)
+    received = []
+
+    async def app(scope_, receive, send):
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(receive(), 0.01)
+        wire.push(payload)
+        received.append(await receive())
+
+    task = asyncio.create_task(auth.APIKeyMiddleware(app)(scope(), wire.receive,
+                                                           record(harness)))
+    await until(lambda: c.pending)
+    for _ in range(3):
+        await asyncio.sleep(0)
+    holders.pop().lease.release()
+    await asyncio.wait_for(task, 2)
+    assert received == [payload]
+    assert wire.delivered == 1 and wire.queue.qsize() == 0
+    assert_clean(c, holders)

@@ -109,16 +109,23 @@ the only caller of the real `receive()`.
   per-request replay list **as received**. Nothing is dropped, split, merged or
   reordered.
 
-**Handoff.** When admission ends, the middleware cancels the watcher and awaits
-it.
+**Handoff.** The handoff never cancels a `receive()` (impl-R1-1). Each real
+`receive()` runs in its own task, which the watcher awaits through a shield.
+When admission ends, the middleware cancels only the watcher loop and awaits it.
+The `receive` it holds may be wrapped (the security-header `BaseHTTPMiddleware`
+in `src/main.py`), and a wrapper can suspend after taking a message from the
+server and before returning it, so cancelling that call would lose the message.
 
-- If the pending `receive()` had already completed, its message is in the list,
-  because the append happens before the next await.
-- If it was cancelled while pending, no message was consumed. Uvicorn returns a
-  message only when the await completes.
+- If the pending `receive()` had already completed and been appended, its
+  message is in the list: the append and the clearing of the pending call are
+  one step, with no await between.
+- Otherwise the in-flight call passes to the replay wrapper as it is.
 - The downstream app then gets a wrapper `receive` that yields the replay list
-  in order and afterwards delegates to the real `receive`. From there the app
-  is the only caller.
+  in order, then that in-flight call's own result (a message or a disconnect,
+  exactly once), and afterwards delegates to the real `receive`. From there the
+  app is the only caller.
+- If the app never calls `receive` again (a GET), request teardown cancels the
+  in-flight call after the response is complete, when nobody needs its result.
 
 **Disconnect before auth.** After the auth grant, and before opening its
 session, the middleware checks `disconnected`. A request whose client left runs
@@ -628,7 +635,7 @@ mode alone keeps the epoch, so data already collected stays attributable.
 | SR1-8 | Codex | S1 cannot be green alone (async callers, `tests/conftest.py` env-key list). | MINOR | **Accepted.** S1 owns `tests/conftest.py` and a minimal compatibility edit in `auth.py`. S1's gate is focused, and the full offline suite is authoritative only after S2 merges (tasks; completed in SR2-5). |
 | SR1-9 | Codex | The queue `code` rule contradicts the earliest-stage rule. | MINOR | **Accepted.** Ordering is separated from code selection: queue `code` comes from overruns only and is `null` when none (D4). |
 | SR1-note | Codex | A pinned legacy `.env` validates, so validation does not prove the intended settings. | note | **Accepted.** Startup INFO line with effective settings and epoch, compared at deploy (D3, Step 0). |
-| SR2-1 | Codex | The watcher stops at `more_body: false`, so a disconnect after a complete body is missed. | MAJOR | **Accepted.** The watcher owns `receive` exclusively until admission ends and keeps watching after the last body message. The handoff cancels and awaits the watcher, then a replay wrapper yields the buffered messages and delegates. Tests cover a complete body followed by a disconnect at both stages (D1). |
+| SR2-1 | Codex | The watcher stops at `more_body: false`, so a disconnect after a complete body is missed. | MAJOR | **Accepted.** The watcher owns `receive` exclusively until admission ends and keeps watching after the last body message. The handoff ends the watcher without cancelling an in-flight `receive` (impl-R1-1), then a replay wrapper yields the buffered messages, the in-flight call's result, and delegates. Tests cover a complete body followed by a disconnect at both stages (D1). |
 | SR2-2 | Codex | The 64 KiB overflow is either lossy or its bound is dishonest. | MAJOR | **Accepted, with one deviation from the supervisor's triage.** There is no per-request cap: every consumed message is kept losslessly. The supervisor's proposed bound, body limit × waiters, is **61 MiB × 96 ≈ 5.7 GiB**, not the ~4 MiB assumed: the server overrides the SDK's 4 MiB default with `mcp_max_request_body_bytes`. So a process-wide replay budget (32 MiB) stops *consuming*, never drops, and the honest bound is about 38 MiB. Tests cover an oversized single message and a fragmented body arriving byte-exact (D1, L8, L11). |
 | SR2-3 | Codex | A hard kill inside the heartbeat tolerance loses buffered incidents yet looks covered. | MAJOR | **Accepted.** `concurrency_runs` records `run_id`, a completed-interval watermark and `clean_shutdown`. A gap after an unclean run end is uncovered whatever its length. Test: a hard kill and restart under 180 s gives INSUFFICIENT_DATA (D8, L2). |
 | SR2-4 | Codex | Flush-time buckets move incidents across window boundaries, and reports can certify an unflushed tail. | MAJOR | **Accepted.** Buckets use event time, keyed through retries. Evaluation runs only through the durable watermark, and an end beyond it gives INSUFFICIENT_DATA. Minute-aligned boundaries. Tests cover incidents at both boundaries and before the next flush (D8). |
@@ -638,6 +645,12 @@ mode alone keeps the epoch, so data already collected stays attributable.
 | SR3-2 | Codex | SR2-2 was partial: the 38 MiB figure assumed 64 KiB messages, but uvicorn returns everything accumulated up to its flow-control threshold plus the crossing read. | MAJOR (partial) | **Accepted.** The bound is re-derived from the code: `HIGH_WATER_LIMIT` is 64 KiB (`flow_control.py:7`, `httptools_impl.py:316–318, 575`) plus one socket read of at most 256 KiB, so about 320 KiB per message and **about 62 MiB** process-wide. Stated in D1, L8 and L11, and pinned by a guard test on the constant. |
 
 Round 3 was the final spec round.
+
+## Implementation review history
+
+| Round | Reviewer | Finding | Severity | Disposition |
+| --- | --- | --- | --- | --- |
+| impl-R1-1 | Codex | The handoff cancels the watcher's in-flight `receive`. The security-header `BaseHTTPMiddleware` wraps `receive` and can suspend in task-group cleanup after taking a message from uvicorn and before returning it, so the cancel loses the message: the app receives nothing, the request hangs and keeps its request lease (queue/enforce only). | BLOCKER | **Fixed.** The handoff is cancellation-free: each `receive` runs in its own task awaited through a shield, the in-flight call passes to the replay wrapper and its result is delivered exactly once after the buffered messages; teardown cancels it only after the response. Regression through the production `BaseHTTPMiddleware` wrapping in queue and enforce (D1). |
 
 ## Owner decisions
 
