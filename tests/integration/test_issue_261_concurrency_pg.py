@@ -187,7 +187,7 @@ def assert_released(env):
     assert max(env.meter.task_peaks.values(), default=0) <= TOOL_CONNECTION_MULTIPLIER
 
 
-@tools._tracked('checkout_hold', [], resource_class='other')
+@tools._tracked('checkout_hold', [], resource_class='light')
 async def held_tool(maker, entered, release):
     async with maker() as session:
         await session.execute(text('SELECT 1'))

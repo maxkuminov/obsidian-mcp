@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import logging
 import time
@@ -148,6 +149,14 @@ def _concurrency_response(admission):
     )
 
 
+def _reportable_pressure(admission):
+    # Exactly the pre-#188 emission set: a shadow observation or a refusal. A
+    # grant after a wait (now possible in enforce/queue) is not reported until
+    # S2 adds the waited/overrun outcomes.
+    return admission.pressure is not None and (
+        admission.shadow is not None or not admission.admitted)
+
+
 def _emit_concurrency_pressure(request, admission):
     pressure = admission.pressure
     try:
@@ -285,8 +294,14 @@ class APIKeyMiddleware:
         token_principal = current_principal.set(None)
 
         controller = concurrency.get_controller()
-        request_admission = controller.request(hash_key(token))
-        if request_admission.pressure is not None:
+        # S1 compatibility shim (#188): the admission points are coroutines
+        # sharing one transport deadline. The disconnect event is fresh and
+        # never set here; S2 replaces this block with the receive watcher.
+        transport_deadline = controller.transport_deadline()
+        disconnected = asyncio.Event()
+        request_admission = await controller.request(
+            hash_key(token), transport_deadline, disconnected)
+        if _reportable_pressure(request_admission):
             _emit_concurrency_pressure(request, request_admission)
         if not request_admission.admitted:
             # No session was opened; the full-request envelope is already full.
@@ -299,8 +314,8 @@ class APIKeyMiddleware:
         observation_token = concurrency.request_observations.set(observed)
         try:
             if response is None:
-                auth_admission = controller.auth()
-                if auth_admission.pressure is not None:
+                auth_admission = await controller.auth(transport_deadline, disconnected)
+                if _reportable_pressure(auth_admission):
                     _emit_concurrency_pressure(request, auth_admission)
                     if controller.mode == "shadow":
                         concurrency.request_observations.set(observed + (auth_admission.pressure,))

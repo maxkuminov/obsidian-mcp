@@ -703,50 +703,102 @@ class Settings(BaseSettings):
     # day.
     default_daily_request_limit: NullableDailyLimit = 5000
 
-    # Process-local concurrency. Shadow observes arrivals without delaying them.
-    mcp_concurrency_mode: Literal["off", "shadow", "enforce"] = "shadow"
-    mcp_concurrency_wait_seconds: float = Field(0, ge=0, le=5, allow_inf_nan=False)
-    mcp_concurrency_requests: int = Field(32, ge=1, le=10000)
-    mcp_concurrency_fingerprint: int = Field(4, ge=1, le=10000)
+    # Process-local concurrency (#261, #188 `concurrency-enforce-ready`).
+    # Modes: `off`; `shadow` (observe, never wait: configured waits are only
+    # reported); `queue` (wait like enforce, admit with an overrun mark where
+    # enforce would refuse for capacity); `enforce`. A mode change is one line:
+    # every other setting validates identically in all four modes.
+    mcp_concurrency_mode: Literal["off", "shadow", "queue", "enforce"] = "shadow"
+    # Tool-stage wait (one deadline across every tool dimension).
+    mcp_concurrency_wait_seconds: float = Field(5, ge=0, le=10, allow_inf_nan=False)
+    # One per-request deadline shared by the request and auth stages (D1).
+    mcp_concurrency_transport_wait_seconds: float = Field(2, ge=0, le=5, allow_inf_nan=False)
+    mcp_concurrency_requests: int = Field(64, ge=1, le=10000)
+    mcp_concurrency_fingerprint: int = Field(20, ge=1, le=10000)
+    mcp_concurrency_request_waiters: int = Field(64, ge=1, le=10000)
+    mcp_concurrency_fingerprint_waiters: int = Field(16, ge=1, le=10000)
     mcp_concurrency_auth: int = Field(2, ge=1, le=15)
-    mcp_concurrency_tools: int = Field(4, ge=1, le=15)
-    mcp_concurrency_tenant: int = Field(3, ge=1, le=15)
-    mcp_concurrency_principal: int = Field(2, ge=1, le=15)
+    mcp_concurrency_auth_waiters: int = Field(32, ge=1, le=10000)
+    mcp_concurrency_tools: int = Field(6, ge=1, le=15)
+    mcp_concurrency_tenant: int = Field(4, ge=1, le=15)
+    mcp_concurrency_principal: int = Field(3, ge=1, le=15)
+    # Independent class ceilings, each <= TOOLS (D2/D3); they need not sum to it.
     mcp_concurrency_embedding: int = Field(1, ge=1, le=15)
     mcp_concurrency_vector: int = Field(1, ge=1, le=15)
     mcp_concurrency_write: int = Field(1, ge=1, le=15)
-    mcp_concurrency_other: int = Field(1, ge=1, le=15)
-    mcp_concurrency_waiters: int = Field(32, ge=1, le=10000)
-    mcp_concurrency_tenant_waiters: int = Field(4, ge=1, le=10000)
-    mcp_concurrency_principal_waiters: int = Field(2, ge=1, le=10000)
+    mcp_concurrency_scan: int = Field(2, ge=1, le=15)
+    mcp_concurrency_light: int = Field(4, ge=1, le=15)
+    # Legacy #261 class, split into LIGHT and SCAN. `1` (the old .env.example
+    # default, which expressed no intent) is ignored with one WARNING; any
+    # other value is refused at boot.
+    mcp_concurrency_other: int | None = None
+    mcp_concurrency_waiters: int = Field(64, ge=1, le=10000)
+    mcp_concurrency_tenant_waiters: int = Field(32, ge=1, le=10000)
+    mcp_concurrency_principal_waiters: int = Field(16, ge=1, le=10000)
     mcp_concurrency_registry_size: int = Field(1024, ge=1, le=100000)
     mcp_concurrency_writers: int = Field(1, ge=1, le=15)
     mcp_concurrency_writer_waiters: int = Field(64, ge=1, le=10000)
     mcp_concurrency_writer_wait_seconds: float = Field(.25, ge=0, le=.25, allow_inf_nan=False)
+    # Process-wide byte budget for `/mcp` messages the transport watcher reads
+    # while a request waits (D1). Exhaustion stops *consuming*; nothing already
+    # consumed is ever dropped.
+    mcp_concurrency_replay_budget_bytes: int = Field(
+        32 * 1024 * 1024, ge=1024 * 1024, le=256 * 1024 * 1024)
 
     @model_validator(mode="after")
     def _validate_concurrency(self) -> "Settings":
-        from src.services.pool_budget import (
-            MCP_POOL_HEADROOM, POOL_CAPACITY, TOOL_CONNECTION_MULTIPLIER,
-        )
-        if self.mcp_concurrency_mode == "shadow" and self.mcp_concurrency_wait_seconds != 0:
-            raise ValueError("MCP_CONCURRENCY_MODE=shadow requires MCP_CONCURRENCY_WAIT_SECONDS=0")
+        """Hierarchy, coherence and pool budget; every error names its settings."""
+        from src.services.pool_budget import CLASS_CONNECTIONS, budget_terms
+
+        def env(name: str) -> str:
+            return "MCP_CONCURRENCY_" + name.upper()
+
+        def val(name: str) -> int:
+            return getattr(self, "mcp_concurrency_" + name)
+
+        other = self.mcp_concurrency_other
+        if other is not None:
+            if other != 1:
+                raise ValueError(
+                    f"MCP_CONCURRENCY_OTHER={other} is no longer supported: the "
+                    "`other` class was split into MCP_CONCURRENCY_LIGHT and "
+                    "MCP_CONCURRENCY_SCAN; set those and remove MCP_CONCURRENCY_OTHER")
+            logging.getLogger(__name__).warning(
+                "MCP_CONCURRENCY_OTHER=1 is ignored: the `other` class was split "
+                "into MCP_CONCURRENCY_LIGHT (default 4) and MCP_CONCURRENCY_SCAN "
+                "(default 2); remove the legacy line")
+        classes = ("embedding", "vector", "write", "scan", "light")
         pairs = (
-            ("fingerprint", "requests"), ("principal", "tenant"),
-            ("tenant", "tools"), ("principal_waiters", "tenant_waiters"),
+            ("fingerprint", "requests"),
+            ("principal", "tenant"),
+            ("tenant", "tools"),
+            *((cls, "tools") for cls in classes),
+            ("principal_waiters", "tenant_waiters"),
             ("tenant_waiters", "waiters"),
+            ("fingerprint_waiters", "request_waiters"),
         )
         for child, parent in pairs:
-            if getattr(self, "mcp_concurrency_" + child) > getattr(self, "mcp_concurrency_" + parent):
-                raise ValueError(f"MCP_CONCURRENCY_{child.upper()} exceeds {parent.upper()}")
-        total_classes = sum(getattr(self, "mcp_concurrency_" + name)
-                            for name in ("embedding", "vector", "write", "other"))
-        if total_classes > self.mcp_concurrency_tools:
-            raise ValueError("MCP_CONCURRENCY class sum exceeds global TOOLS ceiling")
-        demand = (self.mcp_concurrency_auth + TOOL_CONNECTION_MULTIPLIER *
-                  self.mcp_concurrency_tools + self.mcp_concurrency_writers + MCP_POOL_HEADROOM)
-        if demand > POOL_CAPACITY:
-            raise ValueError(f"MCP_CONCURRENCY pool budget: auth + 2*tools + writers + headroom = {demand} > {POOL_CAPACITY}")
+            if val(child) > val(parent):
+                raise ValueError(
+                    f"{env(child)} ({val(child)}) must not exceed {env(parent)} ({val(parent)})")
+        # The transport envelope must not refuse what the tool stage would
+        # queue: one principal's admitted plus waiting tools each hold a request.
+        if val("fingerprint") < val("principal") + val("principal_waiters"):
+            raise ValueError(
+                f"MCP_CONCURRENCY_FINGERPRINT ({val('fingerprint')}) must be at least "
+                f"MCP_CONCURRENCY_PRINCIPAL ({val('principal')}) + "
+                f"MCP_CONCURRENCY_PRINCIPAL_WAITERS ({val('principal_waiters')})")
+        caps = {cls: val(cls) for cls in classes}
+        terms = budget_terms(auth=val("auth"), tools=val("tools"), caps=caps,
+                             writers=val("writers"))
+        if terms["total"] > terms["capacity"]:
+            mix = ", ".join(f"{env(c)} {caps[c]}x{CLASS_CONNECTIONS[c]}" for c in caps)
+            raise ValueError(
+                "MCP_CONCURRENCY pool budget exceeded: "
+                f"MCP_CONCURRENCY_AUTH {terms['auth']} + tool demand {terms['tool_demand']} "
+                f"(MCP_CONCURRENCY_TOOLS {val('tools')}; {mix}) + "
+                f"MCP_CONCURRENCY_WRITERS {terms['writers']} + headroom {terms['headroom']} "
+                f"= {terms['total']} > pool capacity {terms['capacity']}")
         return self
 
     multi_user_mode: bool = False
