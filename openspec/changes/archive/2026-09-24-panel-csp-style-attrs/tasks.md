@@ -88,15 +88,15 @@ Six implementation slices in two waves. Each slice is one worktree and one indep
 
 ## 6. Deploy and live checks (report-only first, then enforce; owner decision in design.md Migration Plan)
 
-- [ ] 6.1 Set a Kuma maintenance window for the recreate. Set `PANEL_CSP=report-only` in the deploy directory's `.env`, then `make deploy` from the repo. There is no migration, and `make db-check` stays clean. The startup log shows `report-only` and its WARNING.
-- [ ] 6.2 In-container probe (as archived task 6.2): `GET /admin/auth/login` with the configured `Host` returns `Content-Security-Policy-Report-Only` with `style-src-attr 'none'`, `style-src 'nonce-…' https://fonts.googleapis.com`, no `'unsafe-inline'`, and matching body nonces. `/transfer/upload` keeps its own policy unchanged. `/docs` carries no panel policy.
-- [ ] 6.3 **The supervisor runs a headless Playwright walk under report-only. The step does not wait on a walk by Max (owner decision).**
+- [x] 6.1 Set a Kuma maintenance window for the recreate. Set `PANEL_CSP=report-only` in the deploy directory's `.env`, then `make deploy` from the repo. There is no migration, and `make db-check` stays clean. The startup log shows `report-only` and its WARNING.
+- [x] 6.2 In-container probe (as archived task 6.2): `GET /admin/auth/login` with the configured `Host` returns `Content-Security-Policy-Report-Only` with `style-src-attr 'none'`, `style-src 'nonce-…' https://fonts.googleapis.com`, no `'unsafe-inline'`, and matching body nonces. `/transfer/upload` keeps its own policy unchanged. `/docs` carries no panel policy.
+- [x] 6.3 **The supervisor runs a headless Playwright walk under report-only. The step does not wait on a walk by Max (owner decision).**
   - Use the D8 `securitypolicyviolation` listener installed by `add_init_script`. Report-only violations fire the same event.
   - Run the positive controls (a), (b) and (d) first. Under report-only they must *report*, even though nothing is blocked.
   - Cover the fixed page list: dashboard, keys, OAuth, usage, performance, health, search analytics, settings (reset modal open and cancel), users and user edit (custom vault path toggle), vault (subfolder, note), account, and login and consent, in both themes and at 390 px.
   - **Target:** the deployed panel if an authenticated session can be driven there headlessly. Otherwise, use a local instance of the deployed image and commit, with the D8 seed, `PANEL_CSP=report-only` and the same fixed list. Record which target was used and why.
   - **Pass:** the header is the report-only policy with `style-src-attr 'none'`, there are **zero** reported violations, and the controls behave as before.
-- [ ] 6.4 **Flip to enforce as soon as 6.3 passes.** Set `PANEL_CSP=enforce` and recreate (no rebuild). Re-run 6.2, expecting the enforcing header. Load one panel page headlessly and confirm zero violations. Tell Max the flip is done, so that anything he notices in normal use gets reported against this change.
+- [x] 6.4 **Flip to enforce as soon as 6.3 passes.** Set `PANEL_CSP=enforce` and recreate (no rebuild). Re-run 6.2, expecting the enforcing header. Load one panel page headlessly and confirm zero violations. Tell Max the flip is done, so that anything he notices in normal use gets reported against this change.
 - [ ] 6.5 If a violation or a layout glitch appears at any point: fix forward if it is cosmetic. If it blocks use, return to `PANEL_CSP=report-only` and recreate, fix, and repeat 6.3 before flipping. Last resort: `git revert` the merge.
 
 ## 7. Docs (Slice G, supervisor) and archive
