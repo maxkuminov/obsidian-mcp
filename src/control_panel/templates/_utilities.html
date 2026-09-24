@@ -1,0 +1,133 @@
+{#- Utility vocabulary for the panel (#289, panel-csp-style-attrs design D1).
+
+    GENERATED from the pre-change inline style attributes; do not hand-edit.
+    A page that needs a declaration not listed here adds a page-prefixed
+    class in its own {% block page_style %} instead.
+
+    Naming: u-<css-property>-<value-slug>. The property is spelled in full;
+    the value slug is lower-cased, var(--name) -> name, % -> pct, . -> _,
+    a leading - -> neg-, whitespace -> -. One declaration per class, sorted
+    by property then value, never marked important (an element's CSSOM writes must
+    still win, design D3).
+
+    Included by base.html after its component <style> and before
+    {% block page_style %} (design D4 cascade order). -#}
+<style nonce="{{ csp_nonce }}">
+.u-accent-color-primary { accent-color: var(--primary); }
+.u-align-items-baseline { align-items: baseline; }
+.u-align-items-center { align-items: center; }
+.u-align-items-flex-start { align-items: flex-start; }
+.u-border-bottom-color-danger-border-soft { border-bottom-color: var(--danger-border-soft); }
+.u-border-color-danger-border { border-color: var(--danger-border); }
+.u-border-color-error-border { border-color: var(--error-border); }
+.u-border-left-3px-solid-error { border-left: 3px solid var(--error); }
+.u-border-top-1px-solid-border { border-top: 1px solid var(--border); }
+.u-color-error { color: var(--error); }
+.u-color-primary-text { color: var(--primary-text); }
+.u-color-success { color: var(--success); }
+.u-color-text { color: var(--text); }
+.u-color-text-2 { color: var(--text-2); }
+.u-color-text-3 { color: var(--text-3); }
+.u-color-warning { color: var(--warning); }
+.u-cursor-pointer { cursor: pointer; }
+.u-display-block { display: block; }
+.u-display-flex { display: flex; }
+.u-display-inline { display: inline; }
+.u-flex-1 { flex: 1; }
+.u-flex-direction-column { flex-direction: column; }
+.u-flex-shrink-0 { flex-shrink: 0; }
+.u-flex-wrap-wrap { flex-wrap: wrap; }
+.u-font-size-10px { font-size: 10px; }
+.u-font-size-11px { font-size: 11px; }
+.u-font-size-12px { font-size: 12px; }
+.u-font-size-13px { font-size: 13px; }
+.u-font-size-14px { font-size: 14px; }
+.u-font-size-15px { font-size: 15px; }
+.u-font-size-16px { font-size: 16px; }
+.u-font-size-17px { font-size: 17px; }
+.u-font-weight-500 { font-weight: 500; }
+.u-font-weight-600 { font-weight: 600; }
+.u-gap-10px { gap: 10px; }
+.u-gap-14px { gap: 14px; }
+.u-gap-16px { gap: 16px; }
+.u-gap-8px { gap: 8px; }
+.u-height-18px { height: 18px; }
+.u-justify-content-flex-end { justify-content: flex-end; }
+.u-justify-content-space-between { justify-content: space-between; }
+.u-line-height-1_3 { line-height: 1.3; }
+.u-line-height-1_6 { line-height: 1.6; }
+.u-margin-0 { margin: 0; }
+.u-margin-0-0-8px { margin: 0 0 8px; }
+.u-margin-0-auto-14px { margin: 0 auto 14px; }
+.u-margin-bottom-0 { margin-bottom: 0; }
+.u-margin-bottom-14px { margin-bottom: 14px; }
+.u-margin-bottom-16px { margin-bottom: 16px; }
+.u-margin-bottom-18px { margin-bottom: 18px; }
+.u-margin-bottom-20px { margin-bottom: 20px; }
+.u-margin-bottom-6px { margin-bottom: 6px; }
+.u-margin-bottom-8px { margin-bottom: 8px; }
+.u-margin-left-4px { margin-left: 4px; }
+.u-margin-left-6px { margin-left: 6px; }
+.u-margin-left-auto { margin-left: auto; }
+.u-margin-right-6px { margin-right: 6px; }
+.u-margin-right-8px { margin-right: 8px; }
+.u-margin-top-10px { margin-top: 10px; }
+.u-margin-top-12px { margin-top: 12px; }
+.u-margin-top-14px { margin-top: 14px; }
+.u-margin-top-16px { margin-top: 16px; }
+.u-margin-top-18px { margin-top: 18px; }
+.u-margin-top-20px { margin-top: 20px; }
+.u-margin-top-24px { margin-top: 24px; }
+.u-margin-top-2px { margin-top: 2px; }
+.u-margin-top-3px { margin-top: 3px; }
+.u-margin-top-4px { margin-top: 4px; }
+.u-margin-top-6px { margin-top: 6px; }
+.u-margin-top-8px { margin-top: 8px; }
+.u-max-width-480px { max-width: 480px; }
+.u-min-height-0 { min-height: 0; }
+.u-min-width-0 { min-width: 0; }
+.u-min-width-150px { min-width: 150px; }
+.u-min-width-170px { min-width: 170px; }
+.u-min-width-180px { min-width: 180px; }
+.u-min-width-240px { min-width: 240px; }
+.u-opacity-0_25 { opacity: 0.25; }
+.u-opacity-0_5 { opacity: 0.5; }
+.u-opacity-0_75 { opacity: 0.75; }
+.u-overflow-hidden { overflow: hidden; }
+.u-overflow-y-auto { overflow-y: auto; }
+.u-padding-10px-0 { padding: 10px 0; }
+.u-padding-12px-0 { padding: 12px 0; }
+.u-padding-12px-16px { padding: 12px 16px; }
+.u-padding-14px-16px { padding: 14px 16px; }
+.u-padding-14px-16px-10px { padding: 14px 16px 10px; }
+.u-padding-14px-22px { padding: 14px 22px; }
+.u-padding-18px-22px { padding: 18px 22px; }
+.u-padding-20px-22px { padding: 20px 22px; }
+.u-padding-24px { padding: 24px; }
+.u-padding-32px { padding: 32px; }
+.u-padding-3px-28px-3px-8px { padding: 3px 28px 3px 8px; }
+.u-padding-48px-24px { padding: 48px 24px; }
+.u-padding-4px-12px { padding: 4px 12px; }
+.u-padding-6px-0 { padding: 6px 0; }
+.u-padding-6px-12px { padding: 6px 12px; }
+.u-padding-6px-14px { padding: 6px 14px; }
+.u-padding-6px-2px-0 { padding: 6px 2px 0; }
+.u-padding-8px-16px { padding: 8px 16px; }
+.u-padding-9px-18px { padding: 9px 18px; }
+.u-padding-bottom-12px { padding-bottom: 12px; }
+.u-padding-bottom-14px { padding-bottom: 14px; }
+.u-padding-bottom-18px { padding-bottom: 18px; }
+.u-padding-left-18px { padding-left: 18px; }
+.u-padding-top-12px { padding-top: 12px; }
+.u-padding-top-14px { padding-top: 14px; }
+.u-padding-top-18px { padding-top: 18px; }
+.u-text-align-center { text-align: center; }
+.u-text-align-left { text-align: left; }
+.u-text-align-right { text-align: right; }
+.u-text-decoration-none { text-decoration: none; }
+.u-text-overflow-ellipsis { text-overflow: ellipsis; }
+.u-white-space-nowrap { white-space: nowrap; }
+.u-width-18px { width: 18px; }
+.u-width-auto { width: auto; }
+.u-word-break-break-word { word-break: break-word; }
+</style>

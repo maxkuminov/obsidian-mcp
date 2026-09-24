@@ -1,5 +1,28 @@
 {% extends "base.html" %}
 {% block title %}Usage — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+/* Usage page classes (#289, panel-csp-style-attrs design D1/D4).
+   Table cells are scoped to `.data-table th` / `.data-table tbody tr td`:
+   the base `.data-table th` / `.data-table td` (0,1,1) set alignment,
+   padding, font-size and colour, and `.data-table tbody tr:hover td` (0,2,3)
+   recolours a hovered row. The old inline styles beat all three; a lone class
+   would lose to them, so each cell rule matches the strongest rule it has to
+   beat and wins by cascade order (page_style comes last, design D4). */
+/* The chart's container is sized by utilities on its card body; Chart.js's
+   own CSSOM writes to the canvas are untouched (design D3). */
+.usage-window-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.usage-window-label { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-2); }
+.usage-filters { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
+.data-table th.usage-th-num { text-align: right; }
+.data-table tbody tr td.usage-td-stack { font-size: 12px; line-height: 1.3; }
+.data-table tbody tr td.usage-td-count { text-align: right; font-size: 12px; color: var(--primary-text); }
+.data-table tbody tr td.usage-td-meta { font-size: 11px; color: var(--text-2); }
+.data-table tbody tr td.usage-td-tool { color: var(--primary-text); font-size: 13px; font-weight: 500; }
+.data-table tbody tr td.usage-td-empty { text-align: center; padding: 32px; color: var(--text-3); }
+.data-table tbody tr td.usage-td-empty-sm { text-align: center; padding: 24px; color: var(--text-3); }
+</style>
+{% endblock %}
 {% block content %}
 
 <div class="page-top">
@@ -16,25 +39,24 @@
 
     <!-- Window selector. Each link carries the other filters, so changing the
          window never silently clears them. -->
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
-        <span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-2);">Window</span>
+    <div class="usage-window-bar">
+        <span class="usage-window-label">Window</span>
         {% for w in windows %}
         <a href="/admin/usage?{{ w.query }}"
-           class="btn {% if w.selected %}btn-primary{% else %}btn-ghost{% endif %}"
-           style="padding:6px 14px;font-size:12px;"
+           class="btn {% if w.selected %}btn-primary{% else %}btn-ghost{% endif %} u-padding-6px-14px u-font-size-12px"
            {% if w.selected %}aria-current="page"{% endif %}>{{ w.label }}</a>
         {% endfor %}
-        <span style="font-size:12px;color:var(--text-3);margin-left:4px;">{{ window_label }}</span>
+        <span class="u-font-size-12px u-color-text-3 u-margin-left-4px">{{ window_label }}</span>
     </div>
 
     <!-- Actor filters. A GET form so the state is the URL: the page is
          linkable and reloadable, and the back button does what it looks like. -->
-    <form method="GET" action="/admin/usage" style="display:flex;align-items:flex-end;gap:12px;flex-wrap:wrap;margin-bottom:20px;">
+    <form method="GET" action="/admin/usage" class="usage-filters">
         <input type="hidden" name="window" value="{{ window }}">
         {% if filter_users %}
-        <div class="field" style="margin-bottom:0;">
+        <div class="field u-margin-bottom-0">
             <label class="field-label">User</label>
-            <select name="user" class="field-select" style="min-width:150px;">
+            <select name="user" class="field-select u-min-width-150px">
                 <option value="">All users</option>
                 {% for u in filter_users %}
                 <option value="{{ u.id }}" {% if selected_user == u.id %}selected{% endif %}>{{ u.label }}</option>
@@ -42,78 +64,78 @@
             </select>
         </div>
         {% endif %}
-        <div class="field" style="margin-bottom:0;">
+        <div class="field u-margin-bottom-0">
             <label class="field-label">API key</label>
-            <select name="key" class="field-select" style="min-width:180px;">
+            <select name="key" class="field-select u-min-width-180px">
                 <option value="">All keys</option>
                 {% for k in filter_keys %}
                 <option value="{{ k.id }}" {% if selected_key == k.id %}selected{% endif %}>{{ k.label }} ({{ k.detail }}···)</option>
                 {% endfor %}
             </select>
         </div>
-        <div class="field" style="margin-bottom:0;">
+        <div class="field u-margin-bottom-0">
             <label class="field-label">Tool</label>
-            <select name="tool" class="field-select" style="min-width:170px;">
+            <select name="tool" class="field-select u-min-width-170px">
                 <option value="">All tools</option>
                 {% for t in filter_tools %}
                 <option value="{{ t }}" {% if selected_tool == t %}selected{% endif %}>{{ t }}</option>
                 {% endfor %}
             </select>
         </div>
-        <button type="submit" class="btn btn-primary" style="padding:8px 16px;font-size:12px;">Apply</button>
+        <button type="submit" class="btn btn-primary u-padding-8px-16px u-font-size-12px">Apply</button>
         {% if filters_active %}
-        <a href="/admin/usage?window={{ window }}" class="btn btn-ghost" style="padding:8px 16px;font-size:12px;">Clear</a>
+        <a href="/admin/usage?window={{ window }}" class="btn btn-ghost u-padding-8px-16px u-font-size-12px">Clear</a>
         {% endif %}
     </form>
 
     <!-- Chart -->
-    <div class="card anim-1" style="margin-bottom:20px;">
+    <div class="card anim-1 u-margin-bottom-20px">
         <div class="card-header">
             <span class="card-title">Requests</span>
-            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
+            <span class="mono u-font-size-11px u-color-text-3">{{ window_label }}</span>
         </div>
-        <div class="card-body" style="padding-top:18px;padding-bottom:18px;">
+        <div class="card-body u-padding-top-18px u-padding-bottom-18px">
             <canvas id="usage-chart" height="60"></canvas>
         </div>
     </div>
 
     <!-- Per-actor totals -->
-    <div class="card anim-2" style="margin-bottom:20px;">
+    <div class="card anim-2 u-margin-bottom-20px">
         <div class="card-header">
             <span class="card-title">By actor</span>
-            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
+            <span class="mono u-font-size-11px u-color-text-3">{{ window_label }}</span>
         </div>
         <div class="table-scroll">
         <table class="data-table">
             <thead>
                 <tr>
                     <th>Actor</th>
-                    <th style="text-align:right;">Requests</th>
+                    <th class="usage-th-num">Requests</th>
                     <th>Last seen</th>
                 </tr>
             </thead>
             <tbody>
                 {% for row in totals %}
                 <tr>
-                    <td style="font-size:12px;line-height:1.3;">
+                    <td class="usage-td-stack">
                         {% if row.actor_name %}
-                            <div style="color:var(--primary-text);">{{ row.actor_name }}</div>
+                            <div class="u-color-primary-text">{{ row.actor_name }}</div>
                             {% if row.actor_detail %}
-                                <div class="mono" style="font-size:10px;color:var(--text-3);">{{ row.actor_detail }}</div>
+                                <div class="mono u-font-size-10px u-color-text-3">{{ row.actor_detail }}</div>
                             {% endif %}
                         {% else %}
-                            <div class="mono" style="font-size:11px;color:var(--text-3);">unknown (credential deleted)</div>
+                            <div class="mono u-font-size-11px u-color-text-3">unknown (credential deleted)</div>
                         {% endif %}
                     </td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--primary-text);">{{ row.requests }}</td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono usage-td-count">{{ row.requests }}</td>
+                    <td class="mono usage-td-meta">
                         {% if row.last_seen %}<time datetime="{{ row.last_seen }}" data-localize>{{ row.last_seen }}</time>{% else %}—{% endif %}
                     </td>
                 </tr>
                 {% endfor %}
                 {% if not totals %}
                 <tr>
-                    <td colspan="3" style="text-align:center;padding:24px;color:var(--text-3);">No requests match these filters.</td>
+                    <td colspan="3" class="usage-td-empty-sm">No requests match these filters.</td>
                 </tr>
                 {% endif %}
             </tbody>
@@ -125,7 +147,7 @@
     <div class="card anim-2">
         <div class="card-header">
             <span class="card-title">Request Log</span>
-            <span class="mono" style="font-size:11px;color:var(--text-3);">newest {{ log_limit }}</span>
+            <span class="mono u-font-size-11px u-color-text-3">newest {{ log_limit }}</span>
         </div>
         <div class="table-scroll">
         <table class="data-table">
@@ -141,14 +163,14 @@
             <tbody>
                 {% for log in logs %}
                 <tr>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono usage-td-meta">
                         <time datetime="{{ log.created_at }}" data-localize>{{ log.created_at }}</time>
                     </td>
-                    <td style="font-size:12px;line-height:1.3;">
+                    <td class="usage-td-stack">
                         {% if log.actor_name %}
-                            <div style="color:var(--primary-text);">{{ log.actor_name }}</div>
+                            <div class="u-color-primary-text">{{ log.actor_name }}</div>
                             {% if log.actor_detail %}
-                                <div class="mono" style="font-size:10px;color:var(--text-3);">{{ log.actor_detail }}</div>
+                                <div class="mono u-font-size-10px u-color-text-3">{{ log.actor_detail }}</div>
                             {% endif %}
                         {% else %}
                             {# Both the denormalised label and the join are empty, which
@@ -156,10 +178,10 @@
                                was deleted before 015 could copy the label across. Say
                                that, rather than a bare "unknown" that reads like the
                                server failed to record who called. #}
-                            <div class="mono" style="font-size:11px;color:var(--text-3);">unknown (credential deleted)</div>
+                            <div class="mono u-font-size-11px u-color-text-3">unknown (credential deleted)</div>
                         {% endif %}
                     </td>
-                    <td style="color:var(--primary-text);font-size:13px;font-weight:500;">{{ log.tool }}</td>
+                    <td class="usage-td-tool">{{ log.tool }}</td>
                     {# The outcome the route derived (design D9). A row with no
                        marker shows an em dash, exactly as it did before this
                        column existed; a *failure* is red and a *refusal*
@@ -167,24 +189,24 @@
                        than by reading the reason. The reason is whatever was
                        recorded — including a value the mapping did not
                        recognise, which is shown raw rather than dropped. #}
-                    <td style="font-size:12px;line-height:1.3;">
+                    <td class="usage-td-stack">
                         {% if log.outcome %}
                             <span class="badge {% if log.outcome.kind == 'failed' %}badge-red{% else %}badge-yellow{% endif %}">{{ log.outcome.label }}</span>
                             {% if log.outcome.detail %}
-                                <div class="mono" style="font-size:10px;color:var(--text-3);margin-top:3px;">{{ log.outcome.detail }}</div>
+                                <div class="mono u-font-size-10px u-color-text-3 u-margin-top-3px">{{ log.outcome.detail }}</div>
                             {% endif %}
                         {% else %}
-                            <span style="color:var(--text-3);">—</span>
+                            <span class="u-color-text-3">—</span>
                         {% endif %}
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono usage-td-meta">
                         {% if log.duration_ms %}{{ log.duration_ms }} ms{% else %}—{% endif %}
                     </td>
                 </tr>
                 {% endfor %}
                 {% if not logs %}
                 <tr>
-                    <td colspan="5" style="text-align:center;padding:32px;color:var(--text-3);">{% if filters_active %}No requests match these filters.{% else %}No usage data yet.{% endif %}</td>
+                    <td colspan="5" class="usage-td-empty">{% if filters_active %}No requests match these filters.{% else %}No usage data yet.{% endif %}</td>
                 </tr>
                 {% endif %}
             </tbody>

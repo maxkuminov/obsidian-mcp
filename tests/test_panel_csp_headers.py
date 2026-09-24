@@ -32,6 +32,7 @@ import ast
 import logging
 import pathlib
 import re
+from html.parser import HTMLParser
 from types import SimpleNamespace
 
 import pytest
@@ -61,13 +62,14 @@ VALID_PKCE_CHALLENGE = "a" * 43
 CLIENT_ID = "a3f19c7e5b2d4081a3f19c7e5b2d4081"
 REDIRECT_URI = "https://client.example/callback"
 
-# The D4 directive set, in order, with `N` for the nonce.
+# The directive set (panel-csp D4, as tightened by panel-csp-style-attrs D6),
+# in order, with `N` for the nonce.
 EXPECTED_DIRECTIVES = [
     ("default-src", ["'self'"]),
     ("script-src", ["'nonce-N'"]),
-    ("style-src", ["https://fonts.googleapis.com", "'unsafe-inline'"]),
+    ("style-src", ["'nonce-N'", "https://fonts.googleapis.com"]),
     ("style-src-elem", ["'nonce-N'", "https://fonts.googleapis.com"]),
-    ("style-src-attr", ["'unsafe-inline'"]),
+    ("style-src-attr", ["'none'"]),
     ("img-src", ["'self'", "data:"]),
     ("font-src", ["https://fonts.gstatic.com"]),
     ("connect-src", ["'self'"]),
@@ -444,7 +446,7 @@ def test_panel_surface_carries_the_enforced_policy(case, client, monkeypatch):
     nonce = _nonce_of(policy)
     assert NONCE_RE.match(nonce), nonce
 
-    # Exactly the D4 set, in order, nothing more.
+    # Exactly the D6 set, in order, nothing more.
     parsed = _parse(policy)
     assert [name for name, _ in parsed] == [name for name, _ in EXPECTED_DIRECTIVES]
     for (name, sources), (_, expected) in zip(parsed, EXPECTED_DIRECTIVES):
@@ -453,10 +455,15 @@ def test_panel_surface_carries_the_enforced_policy(case, client, monkeypatch):
         assert sources == [s.replace("N", nonce) if s == "'nonce-N'" else s for s in expected], name
     directives = dict(parsed)
     assert directives["script-src"] == [f"'nonce-{nonce}'"]
-    for forbidden in ("'unsafe-inline'", "'unsafe-eval'", "'unsafe-hashes'"):
-        assert forbidden not in directives["script-src"]
-    assert "'unsafe-inline'" not in directives["style-src-elem"]
-    assert f"'nonce-{nonce}'" not in directives["style-src"]
+    # #289: no directive admits inline or evaluated code of any kind.
+    for name, sources in parsed:
+        for forbidden in ("'unsafe-inline'", "'unsafe-eval'", "'unsafe-hashes'"):
+            assert forbidden not in sources, (name, forbidden)
+    # Style attributes are refused in their own directive, not by fallback.
+    assert directives["style-src-attr"] == ["'none'"]
+    # The CSP2 fallback carries this response's nonce, the one in script-src.
+    assert f"'nonce-{nonce}'" in directives["style-src"]
+    assert directives["style-src"] == [f"'nonce-{nonce}'", "https://fonts.googleapis.com"]
 
     if consent:
         assert directives["form-action"] == ["'self'", "https:"]
@@ -482,6 +489,52 @@ def test_body_nonces_equal_the_header_nonce(case, client, monkeypatch):
     assert re.search(r"<style\b[^>]*\bnonce=\"", body), "no nonced <style>"
     found = BODY_NONCE_RE.findall(body)
     assert found and set(found) == {nonce}, (nonce, sorted(set(found)))
+
+
+class _StyleAttributeFinder(HTMLParser):
+    """Collects every start or self-closing tag, HTML or SVG, with a `style`
+    attribute. `html.parser` lower-cases attribute names, so `STYLE=` counts."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.offenders: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        for name, value in attrs:
+            if name == "style":
+                line, _ = self.getpos()
+                self.offenders.append(f"line {line}: <{tag} style={value!r}>")
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+
+def _style_attributes_in(body: str) -> list[str]:
+    finder = _StyleAttributeFinder()
+    finder.feed(body)
+    finder.close()
+    return finder.offenders
+
+
+def test_the_rendered_body_scan_finds_a_style_attribute():
+    """The body scanner itself: it must see HTML, SVG, self-closing and
+    upper-case attributes, and must not mistake text or a `data-` name."""
+    assert _style_attributes_in('<div style="margin:0">x</div>')
+    assert _style_attributes_in('<svg><polygon STYLE="fill:red"/></svg>')
+    assert _style_attributes_in("<br style='x' />")
+    assert not _style_attributes_in(
+        '<p data-style="x">style="not an attribute"</p><style nonce="n">a{}</style>'
+    )
+
+
+@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
+def test_rendered_body_carries_no_style_attribute(case, client, monkeypatch):
+    """#289 D7: no element in a panel, auth or consent response carries a
+    `style` attribute — `style-src-attr 'none'` would refuse it. The
+    fake-session renders are mostly empty states, so this is the secondary
+    gate; the static template scan is the primary one."""
+    response = _run(case, client, monkeypatch)
+    assert _style_attributes_in(response.text) == []
 
 
 @pytest.mark.parametrize(

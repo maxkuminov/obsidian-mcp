@@ -21,9 +21,9 @@
   ```
   default-src 'self'
   script-src 'nonce-N'
-  style-src https://fonts.googleapis.com 'unsafe-inline'
+  style-src 'nonce-N' https://fonts.googleapis.com
   style-src-elem 'nonce-N' https://fonts.googleapis.com
-  style-src-attr 'unsafe-inline'
+  style-src-attr 'none'
   img-src 'self' data:
   font-src https://fonts.gstatic.com
   connect-src 'self'
@@ -121,20 +121,40 @@
   that configuration and re-argues the gadget; the static test forbids `hx-`
   attributes and any htmx reference, so the reintroduction is deliberate.
 
-- **Style attributes stay allowed, by decision: `style-src-attr
-  'unsafe-inline'`.** The templates carry about 430 `style=""` attributes,
-  including the SVG marks that must use `style` (below). Style *elements* are
-  the real CSS-injection primitive — attribute-selector scraping of the CSRF
-  token's value, font-based text probes — so they are nonce-only under
-  `style-src-elem`. An injected style *attribute* can restyle the element it
-  sits on (overlay, hide, UI redress) but cannot select anything else and
-  cannot beacon off-origin, because every `url()` is still bound by `img-src`
-  and `font-src`. The `style-src` fallback carries **no nonce** on purpose:
-  only a browser without CSP3 `-elem`/`-attr` reads it, and there a nonce
-  would make it ignore `'unsafe-inline'` and refuse every style attribute,
-  breaking the panel. Moving the attributes to classes and dropping
-  `'unsafe-inline'` is a follow-up. CSSOM writes (`el.style.display = …`,
-  Chart.js canvas sizing) are not governed by CSP.
+- **No inline style attributes; `style-src-attr 'none'`** (#289). Style
+  *elements* are the real CSS-injection primitive (attribute-selector
+  scraping of the CSRF token's value, font-based text probes), so they are
+  nonce-only under `style-src-elem`. An injected style *attribute* can
+  restyle the element it sits on (overlay, hide, UI redress), and since #289
+  that is refused too: the templates carry no `style=""` at all.
+  `'none'` is spelled out rather than the directive left out, so the ban
+  does not depend on what the `style-src` fallback happens to hold. The
+  fallback carries the nonce, so a browser without CSP3 `-elem`/`-attr`
+  gets the same nonce-only rule for elements and refuses attributes too.
+  **Not a static stylesheet under `'self'`**: it would admit any current or
+  future same-origin `text/css` response. Today's `/transfer/*` byte routes
+  need an `Authorization: Bearer` header and so cannot be loaded as a
+  stylesheet, but the panel's style policy should not depend on that staying
+  true. The CSS therefore stays in nonced `<style>` blocks, in this order in
+  `base.html`'s `<head>`: the component stylesheet, then
+  `_utilities.html`, then `{% block page_style %}`.
+  - `_utilities.html` is **generated, not hand-edited**: one
+    `u-<property>-<value-slug>` rule per short declaration found in the
+    pre-#289 templates. A new one-off style goes in the page's `page_style`
+    block as a page-prefixed class (`dash-`, `keys-`, `ue-`, …).
+  - **No `!important`.** Script sets dynamic presentation through CSSOM
+    (`el.style.display = …`, the progress width, the activity-row stagger,
+    Chart.js canvas sizing), which CSP does not govern and which beats any
+    class. `!important` would silently defeat those writes. Initial states
+    that script later changes are plain classes.
+  - Table cells need `.data-table tbody tr td.<cls>` (0,2,3), not a single
+    class: the base `.data-table td` and the hover-colour rule outrank one,
+    where the old inline style beat both.
+  - `tests/test_panel_csp_templates.py` fails on any template `style`
+    attribute (Jinja conditionals included), any script that builds one
+    (`style=` in a string, `setAttribute('style', …)`), and a vendored
+    Chart.js that starts writing them; `tests/test_panel_csp_headers.py`
+    scans every rendered panel page.
 
 - **The consent page's `form-action` is `'self' https:`, by owner decision.**
   `form-action` belongs to the page that *submits* the form. The consent form
@@ -161,18 +181,21 @@
   when it is not `enforce`, so a forgotten rollback shows in the logs.
   Changing it is an `.env` edit plus a container recreate, no rebuild. The
   rollout is **report-only first**: the first production deploy runs
-  `report-only` through a by-hand browser pass with devtools — every
-  control, one real connector approve and one deny, zero violations — and
-  only that result authorises the flip to `enforce`. A violation found later
+  `report-only` through a browser pass — every control, one real connector
+  approve and one deny, zero violations — and only that result authorises
+  the flip to `enforce`. Since #289 the pass is a headless Playwright walk
+  with a `securitypolicyviolation` listener installed before any page script,
+  plus positive controls proving the listener fires; report-only violations
+  fire the same event, which a by-hand look at the page cannot show. A violation found later
   goes back to `report-only` and is fixed forward. The code default stays
   `enforce`, so a fresh deployment is protected without operator action.
 
 - **Accepted limitations** (owner-accepted with the change; the reasoning is
   in the `panel-csp` design):
-  1. Inline style attributes remain allowed — an HTML-injection bug can
-     restyle the injected element, not run script or scrape by selector.
-  2. A browser without CSP3 `style-src-elem`/`-attr` gets `style-src
-     'unsafe-inline'` for style elements too; its script policy is the same.
+  1. *(Closed by #289.)* Inline style attributes were allowed; they are now
+     refused by `style-src-attr 'none'`.
+  2. *(Closed by #289.)* A browser without CSP3 `style-src-elem`/`-attr` got
+     `style-src 'unsafe-inline'`; the fallback now carries the nonce.
   3. The consent page's `form-action` admits any HTTPS origin; an injection
      there could post the form's hidden fields to an HTTPS origin.
   4. `/docs`, `/redoc` and `/docs/oauth2-redirect` carry no CSP. They are not
@@ -274,11 +297,14 @@
   consent pages, which do not load `panel.js`, and a listener on `document`
   works before the body exists. The toggle button itself has no handler.
 
-- **SVG colors ride in `style=""`, not in `fill=`/`stroke=`.** SVG2 parses
-  presentation attributes with the property's own grammar rather than as CSS
-  declarations, so `var()` substitution in them is not dependable across
-  browsers — a `fill="var(--gem-facet)"` that fails to substitute falls back
-  to black. `style=""` is real CSS and is already this panel's idiom.
+- **SVG colours ride in stylesheet classes, never in `fill=`/`stroke=` with
+  `var()`.** SVG2 parses presentation attributes with the property's own
+  grammar rather than as CSS declarations, so `var()` substitution in them is
+  not dependable across browsers — a `fill="var(--gem-facet)"` that fails to
+  substitute falls back to black. The gem marks use `.gem-edge`,
+  `.gem-facet` and `.gem-facet-2` in the nonced stylesheet (`base.html`,
+  `auth_base.html`, and `authorize.html` with the `--consent-*` tokens); the
+  pre-#289 `style=""` form is refused by `style-src-attr 'none'`.
 
 - **The transfer pages are a different surface and must stay one.**
   `transfer_upload.html` and `transfer_download.html` serve third parties

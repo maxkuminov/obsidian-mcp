@@ -1,5 +1,17 @@
 {% extends "base.html" %}
 {% block title %}Users — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+    /* #289: converted from inline style attributes. Cell classes are scoped
+       to beat `.data-table td` and `.data-table tbody tr:hover td` (0,2,3),
+       which the inline style used to beat: equal specificity, later in the
+       cascade. */
+    .data-table tbody tr td.users-td-name { color: var(--text); font-weight: 500; }
+    .data-table tbody tr td.users-td-vault { font-size: 11px; color: var(--text-2); max-width: 280px; overflow: hidden; text-overflow: ellipsis; }
+    .data-table tbody tr td.users-td-meta { font-size: 11px; color: var(--text-2); }
+    .data-table tbody tr td.users-td-empty { text-align: center; padding: 32px; color: var(--text-3); }
+</style>
+{% endblock %}
 {% block content %}
 
 <div class="page-top">
@@ -42,7 +54,7 @@
             <tbody>
                 {% for u in users %}
                 <tr>
-                    <td style="color:var(--text);font-weight:500;">{{ u.username }}</td>
+                    <td class="users-td-name">{{ u.username }}</td>
                     <td>
                         {% if u.is_admin %}
                         <span class="badge badge-purple">Admin</span>
@@ -57,10 +69,10 @@
                         <span class="badge badge-red">Inactive</span>
                         {% endif %}
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);max-width:280px;overflow:hidden;text-overflow:ellipsis;">
-                        {% if u.vault_path %}{{ u.vault_path }}{% else %}<span style="color:var(--warning);">(unassigned)</span>{% endif %}
+                    <td class="mono users-td-vault">
+                        {% if u.vault_path %}{{ u.vault_path }}{% else %}<span class="u-color-warning">(unassigned)</span>{% endif %}
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);"
+                    <td class="mono users-td-meta"
                         title="Revoked keys are kept for the audit trail; only active ones can authenticate.">
                         {{ u.api_keys_active }} active / {{ u.api_keys_total }} total
                     </td>
@@ -88,15 +100,15 @@
                       edits or deletes it; "as at" is what makes that honest
                       rather than presented as the present state.
                     #}
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono users-td-meta">
                         {% if not u.vault_path %}
-                        <span style="color:var(--warning);">(not served)</span>
-                        <span style="color:var(--text-3);display:block;margin-top:2px;">
+                        <span class="u-color-warning">(not served)</span>
+                        <span class="u-color-text-3 u-display-block u-margin-top-2px">
                             every MCP tool refuses; index kept for reassignment
                         </span>
                         {% elif u.quarantine %}
-                        <span style="color:var(--error);">(quarantined — not served)</span>
-                        <span style="color:var(--text-3);display:block;margin-top:2px;">
+                        <span class="u-color-error">(quarantined — not served)</span>
+                        <span class="u-color-text-3 u-display-block u-margin-top-2px">
                             {{ u.quarantine.detail }}; every MCP tool refuses;
                             index retained — as at
                             <time datetime="{{ u.quarantine.detected_at }}" data-localize>{{ u.quarantine.detected_at }}</time>
@@ -105,20 +117,20 @@
                         {{ u.notes }}
                         {% endif %}
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono users-td-meta">
                         {% if u.last_login_at %}<time datetime="{{ u.last_login_at }}" data-localize>{{ u.last_login_at }}</time>{% else %}—{% endif %}
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono users-td-meta">
                         <time datetime="{{ u.created_at }}" data-localize="date">{{ u.created_at }}</time>
                     </td>
-                    <td style="white-space:nowrap;">
-                        <a href="/admin/users/{{ u.id }}/edit" class="btn btn-ghost" style="padding:6px 12px;font-size:12px;min-height:0;">Edit</a>
+                    <td class="u-white-space-nowrap">
+                        <a href="/admin/users/{{ u.id }}/edit" class="btn btn-ghost u-padding-6px-12px u-font-size-12px u-min-height-0">Edit</a>
                     </td>
                 </tr>
                 {% endfor %}
                 {% if not users %}
                 <tr>
-                    <td colspan="9" style="text-align:center;padding:32px;color:var(--text-3);">No users yet.</td>
+                    <td colspan="9" class="users-td-empty">No users yet.</td>
                 </tr>
                 {% endif %}
             </tbody>
@@ -146,7 +158,7 @@
                    the browser stops what `create_user` would refuse anyway. #}
                 <input type="password" name="initial_password" required minlength="{{ min_password_length }}"
                        class="field-input" placeholder="≥ {{ min_password_length }} characters" autocomplete="new-password">
-                <div style="font-size:11px;color:var(--text-3);margin-top:6px;">
+                <div class="u-font-size-11px u-color-text-3 u-margin-top-6px">
                     Share with the user out-of-band. They can change it after first login.
                 </div>
             </div>

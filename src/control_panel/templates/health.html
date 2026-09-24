@@ -1,5 +1,35 @@
 {% extends "base.html" %}
 {% block title %}Health — Obsidian MCP{% endblock %}
+{% block page_style %}
+{#
+  Page classes for what the utility vocabulary cannot express (#289, design
+  D1/D4). Table-cell classes carry the `.data-table tbody tr td.x` /
+  `.data-table th.x` prefix on purpose: the inline styles they replace beat
+  `.data-table td` / `th` (padding, font-size, colour, and the 900 px media
+  override) and `.data-table tbody tr:hover td` (colour). A bare class would
+  lose to all three; at (0,2,3) the cell class ties the hover rule and wins by
+  order, which is what the inline style did.
+#}
+<style nonce="{{ csp_nonce }}">
+.health-note { color: var(--text-2); font-size: 14px; line-height: 1.6; margin: 0; }
+.health-fine-before-12 { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 0 0 12px; }
+.health-fine-before-14 { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 0 0 14px; }
+.health-fine-after-10 { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 10px 0 0; }
+.health-fine-after-14 { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 14px 0 0; }
+.health-stale-warning { color: var(--warning); font-size: 13px; line-height: 1.6; margin: 14px 0 0; }
+.health-run-error { font-size: 10px; color: var(--text-3); white-space: pre-wrap; word-break: break-word; max-width: 420px; }
+
+.data-table th.health-th-num { text-align: right; }
+.data-table tbody tr td.health-td-time { font-size: 11px; color: var(--text-2); }
+.data-table tbody tr td.health-td-time-nowrap { font-size: 11px; color: var(--text-2); white-space: nowrap; }
+.data-table tbody tr td.health-td-logger { font-size: 11px; color: var(--text-3); }
+.data-table tbody tr td.health-td-message { font-size: 12px; color: var(--error); word-break: break-word; }
+.data-table tbody tr td.health-td-num-muted { text-align: right; font-size: 12px; color: var(--text-2); }
+.data-table tbody tr td.health-td-owner { font-size: 12px; line-height: 1.3; }
+.data-table tbody tr td.health-td-sm { font-size: 12px; }
+.data-table tbody tr td.health-td-empty { text-align: center; padding: 32px; color: var(--text-3); }
+</style>
+{% endblock %}
 {% block content %}
 
 {#
@@ -19,7 +49,7 @@
 <div class="page-top">
     <div>
         <h1 class="page-title">Health</h1>
-        <div style="font-size:13px;color:var(--text-3);margin-top:8px;">
+        <div class="u-font-size-13px u-color-text-3 u-margin-top-8px">
             Index passes, recent errors, and backup recency.
         </div>
     </div>
@@ -43,7 +73,7 @@
       of those accounts now.
     #}
     {% if quarantine and (not quarantine.checked or quarantine.accounts) %}
-    <div class="card anim-1" style="margin-bottom:20px;">
+    <div class="card anim-1 u-margin-bottom-20px">
         <div class="card-header">
             <span class="card-title">Vault-root quarantine</span>
             {% if quarantine.checked %}
@@ -54,12 +84,12 @@
         </div>
         <div class="card-body">
             {% if not quarantine.checked %}
-            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+            <p class="health-note">
                 The vault roots have not been checked in this process yet, so no
                 account has been cleared and none has been quarantined — this is
                 not an all-clear.
             </p>
-            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:10px 0 0;">
+            <p class="health-fine-after-10">
                 Startup runs the check before the server accepts its first
                 request, so this state is normally never seen. While it stands,
                 every multi-user tool call is refused rather than served against
@@ -68,25 +98,25 @@
                 retries it.
             </p>
             {% else %}
-            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0 0 14px;">
+            <p class="health-fine-before-14">
                 Facts as at the last check{% if quarantine.detected_at_iso %},
                 <time datetime="{{ quarantine.detected_at_iso }}" data-localize>{{ quarantine.detected_at_iso }}</time>{% endif %}
                 — recorded when the roots were observed, not re-read now, so an
                 account or a path named here may already have been changed.
             </p>
             {% for a in quarantine.accounts %}
-            <div class="kv" style="align-items:flex-start;">
-                <span class="kv-k" style="white-space:nowrap;">
+            <div class="kv u-align-items-flex-start">
+                <span class="kv-k u-white-space-nowrap">
                     {% if a.overlap %}
                     <span class="badge badge-red">overlap</span>
                     {% else %}
                     <span class="badge badge-yellow">root unexaminable</span>
                     {% endif %}
                 </span>
-                <span class="kv-v" style="text-align:left;font-size:13px;line-height:1.6;">{{ a.text }}</span>
+                <span class="kv-v u-text-align-left u-font-size-13px u-line-height-1_6">{{ a.text }}</span>
             </div>
             {% endfor %}
-            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:14px 0 0;">
+            <p class="health-fine-after-14">
                 These accounts are served by nothing — every tool call is refused
                 before its body runs and no pass indexes them — and nothing was
                 deleted: a corrected assignment or a restored mount resumes both.
@@ -104,7 +134,7 @@
     {% if show_ops %}
 
     <!-- Backups -->
-    <div class="card anim-1" style="margin-bottom:20px;">
+    <div class="card anim-1 u-margin-bottom-20px">
         <div class="card-header">
             <span class="card-title">Last backup</span>
             {% if backup and backup.stale %}
@@ -117,15 +147,15 @@
                 <span class="kv-k">Taken</span>
                 <span class="kv-v">
                     <time datetime="{{ backup.created_at_iso }}" data-localize>{{ backup.created_at_iso }}</time>
-                    <span style="color:var(--text-3);">· {{ backup.age_rel }}</span>
+                    <span class="u-color-text-3">· {{ backup.age_rel }}</span>
                 </span>
             </div>
             <div class="kv">
                 <span class="kv-k">File</span>
-                <span class="kv-v mono" style="font-size:12px;">{{ backup.filename }}<span style="color:var(--text-3);"> · {{ backup.size_human }}</span></span>
+                <span class="kv-v mono u-font-size-12px">{{ backup.filename }}<span class="u-color-text-3"> · {{ backup.size_human }}</span></span>
             </div>
             {% if backup.stale %}
-            <p style="color:var(--warning);font-size:13px;line-height:1.6;margin:14px 0 0;">
+            <p class="health-stale-warning">
                 The last recorded backup is more than {{ stale_after_days }} days
                 old. A deploy runs migrations against the live database and the
                 backup is the only way back from a bad one — take one with
@@ -139,17 +169,17 @@
               restores. A page that implied otherwise would be worse than one
               that showed nothing.
             #}
-            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:14px 0 0;">
+            <p class="health-fine-after-14">
                 Recorded by <span class="mono">make db-backup</span> when the dump
                 completed. This is the age of that record — the panel cannot see
                 the backups directory, so it does not verify that the file is
                 still there or that it restores.
             </p>
             {% else %}
-            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+            <p class="health-note">
                 No backup recorded yet.
             </p>
-            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:10px 0 0;">
+            <p class="health-fine-after-10">
                 Backups are recorded by <span class="mono">make db-backup</span>.
                 A deploy takes its backup <em>before</em> it migrates, so the
                 deploy that first shipped this table wrote its dump without
@@ -162,10 +192,10 @@
     </div>
 
     <!-- Recent errors -->
-    <div class="card anim-2" style="margin-bottom:20px;">
+    <div class="card anim-2 u-margin-bottom-20px">
         <div class="card-header">
             <span class="card-title">Recent errors</span>
-            <span class="mono" style="font-size:11px;color:var(--text-3);">
+            <span class="mono u-font-size-11px u-color-text-3">
                 {% if errors_capped %}newest {{ error_buffer_size }}{% else %}{{ error_count }} since start{% endif %}
             </span>
         </div>
@@ -177,7 +207,7 @@
               since it started", and a container restarted two minutes ago has an
               empty buffer for reasons that have nothing to do with health.
             #}
-            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0 0 12px;">
+            <p class="health-fine-before-12">
                 {% if observing_since_iso %}
                 Observing since process start,
                 <time datetime="{{ observing_since_iso }}" data-localize>{{ observing_since_iso }}</time>
@@ -208,22 +238,22 @@
                 <tbody>
                     {% for e in errors %}
                     <tr>
-                        <td class="mono" style="font-size:11px;color:var(--text-2);white-space:nowrap;">
+                        <td class="mono health-td-time-nowrap">
                             <time datetime="{{ e.timestamp }}" data-localize>{{ e.timestamp }}</time>
                         </td>
-                        <td class="mono" style="font-size:11px;color:var(--text-3);">
-                            {% if e.level != 'ERROR' %}<span class="badge badge-red" style="margin-right:6px;">{{ e.level }}</span>{% endif %}{{ e.logger }}
+                        <td class="mono health-td-logger">
+                            {% if e.level != 'ERROR' %}<span class="badge badge-red u-margin-right-6px">{{ e.level }}</span>{% endif %}{{ e.logger }}
                         </td>
                         {# First line only. A hundred full tracebacks is a page
                            nobody can read; this is a pointer to `make logs`. #}
-                        <td style="font-size:12px;color:var(--error);word-break:break-word;">{{ e.message }}</td>
+                        <td class="health-td-message">{{ e.message }}</td>
                     </tr>
                     {% endfor %}
                 </tbody>
             </table>
             </div>
             {% else %}
-            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+            <p class="health-note">
                 No errors logged since this process started.
             </p>
             {% endif %}
@@ -237,9 +267,9 @@
       identifiers included — and the backup covers the whole database; neither
       has an owner to scope by, so both are admin-only rather than filtered.
     #}
-    <div class="card anim-1" style="margin-bottom:20px;">
+    <div class="card anim-1 u-margin-bottom-20px">
         <div class="card-body">
-            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+            <p class="health-note">
                 Application errors and backup recency are server-wide and are
                 shown to administrators only. Below are the index passes over
                 your own vault.
@@ -252,19 +282,19 @@
     <div class="card anim-3">
         <div class="card-header">
             <span class="card-title">Index passes</span>
-            <span class="mono" style="font-size:11px;color:var(--text-3);">newest {{ runs_limit }}</span>
+            <span class="mono u-font-size-11px u-color-text-3">newest {{ runs_limit }}</span>
         </div>
         <div class="table-scroll">
         <table class="data-table">
             <thead>
                 <tr>
                     <th>Started</th>
-                    <th style="text-align:right;">Duration</th>
+                    <th class="health-th-num">Duration</th>
                     <th>Trigger</th>
                     <th>Owner</th>
-                    <th style="text-align:right;" title="Notes the scan walked.">Scanned</th>
-                    <th style="text-align:right;" title="Notes the scan wrote or rewrote.">Indexed</th>
-                    <th style="text-align:right;" title="Notes this pass embedded and certified.">Embedded</th>
+                    <th class="health-th-num" title="Notes the scan walked.">Scanned</th>
+                    <th class="health-th-num" title="Notes the scan wrote or rewrote.">Indexed</th>
+                    <th class="health-th-num" title="Notes this pass embedded and certified.">Embedded</th>
                     <th>Result</th>
                 </tr>
             </thead>
@@ -273,34 +303,34 @@
                 {# The row is an anchor target: the dashboard's health strip
                    links a failed pass straight to its row here. #}
                 <tr id="run-{{ r.id }}">
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono health-td-time">
                         <time datetime="{{ r.started_at }}" data-localize>{{ r.started_at }}</time>
                     </td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if r.duration %}{{ r.duration }}{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
-                    <td style="font-size:12px;"><span class="badge badge-gray">{{ r.trigger }}</span></td>
-                    <td style="font-size:12px;line-height:1.3;">
+                    <td class="mono health-td-num-muted">{% if r.duration %}{{ r.duration }}{% else %}<span class="u-color-text-3">—</span>{% endif %}</td>
+                    <td class="health-td-sm"><span class="badge badge-gray">{{ r.trigger }}</span></td>
+                    <td class="health-td-owner">
                         {% if r.owner %}
-                            <span style="color:var(--primary-text);">{{ r.owner }}</span>
+                            <span class="u-color-primary-text">{{ r.owner }}</span>
                         {% elif r.owner_missing %}
                             {# A non-NULL user_id that joined to nothing. The FK
                                forbids it, so say so rather than quietly
                                rendering it as an ownerless pass. #}
-                            <span class="mono" style="font-size:11px;color:var(--error);">user #{{ r.user_id }} (missing)</span>
+                            <span class="mono u-font-size-11px u-color-error">user #{{ r.user_id }} (missing)</span>
                         {% else %}
                             {# ON DELETE SET NULL: when the user goes, the row's
                                claim about whose vault it indexed stops being
                                true. Single-user and global passes land here too,
                                and both are honestly "no owner". #}
-                            <span class="mono" style="font-size:11px;color:var(--text-3);" title="A single-user or global pass, or a pass whose user has since been deleted.">no owner</span>
+                            <span class="mono u-font-size-11px u-color-text-3" title="A single-user or global pass, or a pass whose user has since been deleted.">no owner</span>
                         {% endif %}
                     </td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_scanned }}</td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_indexed }}</td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_embedded }}</td>
-                    <td style="font-size:12px;">
+                    <td class="mono health-td-num-muted">{{ r.notes_scanned }}</td>
+                    <td class="mono health-td-num-muted">{{ r.notes_indexed }}</td>
+                    <td class="mono health-td-num-muted">{{ r.notes_embedded }}</td>
+                    <td class="health-td-sm">
                         {% if r.error %}
                             <div><span class="badge badge-red">failed</span></div>
-                            <div class="mono" style="font-size:10px;color:var(--text-3);white-space:pre-wrap;word-break:break-word;max-width:420px;">{{ r.error }}</div>
+                            <div class="mono health-run-error">{{ r.error }}</div>
                         {% else %}
                             <span class="badge badge-green">ok</span>
                         {% endif %}
@@ -309,7 +339,7 @@
                 {% endfor %}
                 {% if not runs %}
                 <tr>
-                    <td colspan="8" style="text-align:center;padding:32px;color:var(--text-3);">No index or embed pass has been recorded yet. The first pass after a deploy writes the first row.</td>
+                    <td class="health-td-empty" colspan="8">No index or embed pass has been recorded yet. The first pass after a deploy writes the first row.</td>
                 </tr>
                 {% endif %}
             </tbody>

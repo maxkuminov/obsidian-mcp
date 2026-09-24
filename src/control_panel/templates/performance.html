@@ -1,5 +1,33 @@
 {% extends "base.html" %}
 {% block title %}Performance — Obsidian MCP{% endblock %}
+{% block page_style %}
+{#
+  Page classes for what the utility vocabulary cannot express (#289, design
+  D1/D4). Table-cell classes carry the `.data-table tbody tr td.x` /
+  `.data-table th.x` prefix on purpose: the inline styles they replace beat
+  `.data-table td` / `th` (padding, font-size, colour, and the 900 px media
+  override) and `.data-table tbody tr:hover td` (colour). A bare class would
+  lose to all three; at (0,2,3) the cell class ties the hover rule and wins by
+  order, which is what the inline style did.
+#}
+<style nonce="{{ csp_nonce }}">
+.perf-window-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 20px; }
+.perf-window-label { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-2); }
+.perf-empty-note { color: var(--text-2); font-size: 14px; line-height: 1.6; margin: 0; }
+.perf-phase-intro { color: var(--text-3); font-size: 12px; line-height: 1.6; margin: 0 0 6px; }
+.perf-run-error { font-size: 10px; color: var(--text-3); white-space: pre-wrap; word-break: break-word; max-width: 420px; }
+
+.data-table th.perf-th-num { text-align: right; }
+.data-table tbody tr td.perf-td-tool { color: var(--primary-text); font-size: 13px; font-weight: 500; }
+.data-table tbody tr td.perf-td-num { text-align: right; font-size: 12px; }
+.data-table tbody tr td.perf-td-num-muted { text-align: right; font-size: 12px; color: var(--text-2); }
+.data-table tbody tr td.perf-td-num-sm { text-align: right; font-size: 11px; color: var(--text-2); }
+.data-table tbody tr td.perf-td-time { font-size: 11px; color: var(--text-2); }
+.data-table tbody tr td.perf-td-actor { font-size: 12px; line-height: 1.3; }
+.data-table tbody tr td.perf-td-sm { font-size: 12px; }
+.data-table tbody tr td.perf-td-empty { text-align: center; padding: 32px; color: var(--text-3); }
+</style>
+{% endblock %}
 {% block content %}
 
 {#
@@ -16,21 +44,20 @@
 <div class="page-body">
 
     <!-- Window selector -->
-    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:20px;">
-        <span style="font-size:12px;font-weight:600;letter-spacing:0.08em;text-transform:uppercase;color:var(--text-2);">Window</span>
+    <div class="perf-window-bar">
+        <span class="perf-window-label">Window</span>
         {% for w in windows %}
         <a href="/admin/performance?window={{ w.key }}"
-           class="btn {% if w.selected %}btn-primary{% else %}btn-ghost{% endif %}"
-           style="padding:6px 14px;font-size:12px;"
+           class="btn {% if w.selected %}btn-primary{% else %}btn-ghost{% endif %} u-padding-6px-14px u-font-size-12px"
            {% if w.selected %}aria-current="page"{% endif %}>{{ w.label }}</a>
         {% endfor %}
-        <span style="font-size:12px;color:var(--text-3);margin-left:4px;">{{ window_label }}</span>
+        <span class="u-font-size-12px u-color-text-3 u-margin-left-4px">{{ window_label }}</span>
     </div>
 
     {% if not has_data %}
-    <div class="card anim-1" style="margin-bottom:20px;">
+    <div class="card anim-1 u-margin-bottom-20px">
         <div class="card-body">
-            <p style="color:var(--text-2);font-size:14px;line-height:1.6;margin:0;">
+            <p class="perf-empty-note">
                 No MCP requests were logged in this window. Percentiles need at
                 least one call to compute — pick a longer window, or make a
                 request and reload.
@@ -40,47 +67,47 @@
     {% endif %}
 
     <!-- Per-tool latency -->
-    <div class="card anim-1" style="margin-bottom:20px;">
+    <div class="card anim-1 u-margin-bottom-20px">
         <div class="card-header">
             <span class="card-title">Per-tool latency</span>
-            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
+            <span class="mono u-font-size-11px u-color-text-3">{{ window_label }}</span>
         </div>
         <div class="table-scroll">
         <table class="data-table">
             <thead>
                 <tr>
                     <th>Tool</th>
-                    <th style="text-align:right;">Executed</th>
-                    <th style="text-align:right;" title="Calls refused before the tool body ran — no vault assigned, an argument that is not valid UTF-8, or an exhausted daily request quota. Excluded from every figure to the left.">Refused</th>
-                    <th style="text-align:right;">p50</th>
-                    <th style="text-align:right;">p95</th>
-                    <th style="text-align:right;">p99</th>
-                    <th style="text-align:right;">Mean size</th>
-                    <th style="text-align:right;">Max size</th>
+                    <th class="perf-th-num">Executed</th>
+                    <th class="perf-th-num" title="Calls refused before the tool body ran — no vault assigned, an argument that is not valid UTF-8, or an exhausted daily request quota. Excluded from every figure to the left.">Refused</th>
+                    <th class="perf-th-num">p50</th>
+                    <th class="perf-th-num">p95</th>
+                    <th class="perf-th-num">p99</th>
+                    <th class="perf-th-num">Mean size</th>
+                    <th class="perf-th-num">Max size</th>
                 </tr>
             </thead>
             <tbody>
                 {% for t in tools %}
                 <tr>
-                    <td style="color:var(--primary-text);font-size:13px;font-weight:500;">{{ t.tool }}</td>
-                    <td class="mono" style="text-align:right;font-size:12px;">{{ t.executed }}</td>
-                    <td class="mono" style="text-align:right;font-size:12px;">
-                        {% if t.refusals %}<span class="badge badge-yellow">{{ t.refusals }}</span>{% else %}<span style="color:var(--text-3);">0</span>{% endif %}
+                    <td class="perf-td-tool">{{ t.tool }}</td>
+                    <td class="mono perf-td-num">{{ t.executed }}</td>
+                    <td class="mono perf-td-num">
+                        {% if t.refusals %}<span class="badge badge-yellow">{{ t.refusals }}</span>{% else %}<span class="u-color-text-3">0</span>{% endif %}
                     </td>
                     {# A NULL percentile means the filtered set was empty — every
                        row for this tool in the window was a refusal. An em dash
                        says "not measured"; a 0 would be a measurement, and a
                        false one. #}
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if t.p50 is not none %}{{ t.p50 }} ms{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if t.p95 is not none %}{{ t.p95 }} ms{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if t.p99 is not none %}{{ t.p99 }} ms{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if t.mean_size is not none %}{{ t.mean_size }}{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if t.max_size is not none %}{{ t.max_size }}{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
+                    <td class="mono perf-td-num-muted">{% if t.p50 is not none %}{{ t.p50 }} ms{% else %}<span class="u-color-text-3">—</span>{% endif %}</td>
+                    <td class="mono perf-td-num-muted">{% if t.p95 is not none %}{{ t.p95 }} ms{% else %}<span class="u-color-text-3">—</span>{% endif %}</td>
+                    <td class="mono perf-td-num-muted">{% if t.p99 is not none %}{{ t.p99 }} ms{% else %}<span class="u-color-text-3">—</span>{% endif %}</td>
+                    <td class="mono perf-td-num-muted">{% if t.mean_size is not none %}{{ t.mean_size }}{% else %}<span class="u-color-text-3">—</span>{% endif %}</td>
+                    <td class="mono perf-td-num-muted">{% if t.max_size is not none %}{{ t.max_size }}{% else %}<span class="u-color-text-3">—</span>{% endif %}</td>
                 </tr>
                 {% endfor %}
                 {% if not tools %}
                 <tr>
-                    <td colspan="8" style="text-align:center;padding:32px;color:var(--text-3);">No calls logged in this window.</td>
+                    <td class="perf-td-empty" colspan="8">No calls logged in this window.</td>
                 </tr>
                 {% endif %}
             </tbody>
@@ -89,13 +116,13 @@
     </div>
 
     <!-- Phase breakdown -->
-    <div class="card anim-2" style="margin-bottom:20px;">
+    <div class="card anim-2 u-margin-bottom-20px">
         <div class="card-header">
             <span class="card-title">Search phases</span>
-            <span class="mono" style="font-size:11px;color:var(--text-3);">{{ window_label }}</span>
+            <span class="mono u-font-size-11px u-color-text-3">{{ window_label }}</span>
         </div>
         <div class="card-body">
-            <p style="color:var(--text-3);font-size:12px;line-height:1.6;margin:0 0 6px;">
+            <p class="perf-phase-intro">
                 Measured inside the search tools. Calls that record no phase
                 timing — every tool that does not embed or query vectors, and
                 every row written before the timings existed — are left out
@@ -104,12 +131,12 @@
             {% for p in phases %}
             <div class="kv">
                 <span class="kv-k">{{ p.label }}</span>
-                <span class="kv-v mono" style="font-size:12px;">
+                <span class="kv-v mono u-font-size-12px">
                     {% if p.count %}
                         mean {{ p.mean }} ms · p95 {{ p.p95 }} ms
-                        <span style="color:var(--text-3);">· {{ p.count }} call{{ '' if p.count == 1 else 's' }}</span>
+                        <span class="u-color-text-3">· {{ p.count }} call{{ '' if p.count == 1 else 's' }}</span>
                     {% else %}
-                        <span style="color:var(--text-3);">no calls recorded this phase in this window</span>
+                        <span class="u-color-text-3">no calls recorded this phase in this window</span>
                     {% endif %}
                 </span>
             </div>
@@ -118,10 +145,10 @@
     </div>
 
     <!-- Slowest requests -->
-    <div class="card anim-3" style="margin-bottom:20px;">
+    <div class="card anim-3 u-margin-bottom-20px">
         <div class="card-header">
             <span class="card-title">Slowest requests</span>
-            <span class="mono" style="font-size:11px;color:var(--text-3);">top {{ slowest | length }}</span>
+            <span class="mono u-font-size-11px u-color-text-3">top {{ slowest | length }}</span>
         </div>
         <div class="table-scroll">
         <table class="data-table">
@@ -130,32 +157,32 @@
                     <th>Time</th>
                     <th>Actor</th>
                     <th>Tool</th>
-                    <th style="text-align:right;">Duration</th>
-                    <th style="text-align:right;">Response</th>
+                    <th class="perf-th-num">Duration</th>
+                    <th class="perf-th-num">Response</th>
                 </tr>
             </thead>
             <tbody>
                 {% for r in slowest %}
                 <tr>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono perf-td-time">
                         <time datetime="{{ r.created_at }}" data-localize>{{ r.created_at }}</time>
                     </td>
-                    <td style="font-size:12px;line-height:1.3;">
+                    <td class="perf-td-actor">
                         {% if r.actor_name %}
-                            <div style="color:var(--primary-text);">{{ r.actor_name }}</div>
+                            <div class="u-color-primary-text">{{ r.actor_name }}</div>
                             {% if r.actor_detail %}
-                                <div class="mono" style="font-size:10px;color:var(--text-3);">{{ r.actor_detail }}</div>
+                                <div class="mono u-font-size-10px u-color-text-3">{{ r.actor_detail }}</div>
                             {% endif %}
                         {% else %}
                             {# Denormalised label and join both empty: the row
                                predates migration 015 and its credential is
                                gone. Same wording as /admin/usage. #}
-                            <div class="mono" style="font-size:11px;color:var(--text-3);">unknown (credential deleted)</div>
+                            <div class="mono u-font-size-11px u-color-text-3">unknown (credential deleted)</div>
                         {% endif %}
                     </td>
-                    <td style="color:var(--primary-text);font-size:13px;font-weight:500;">{{ r.tool }}</td>
-                    <td class="mono" style="text-align:right;font-size:11px;color:var(--text-2);">{{ r.duration_ms }} ms</td>
-                    <td class="mono" style="text-align:right;font-size:11px;color:var(--text-2);">{% if r.response_size is not none %}{{ r.response_size }}{% else %}—{% endif %}</td>
+                    <td class="perf-td-tool">{{ r.tool }}</td>
+                    <td class="mono perf-td-num-sm">{{ r.duration_ms }} ms</td>
+                    <td class="mono perf-td-num-sm">{% if r.response_size is not none %}{{ r.response_size }}{% else %}—{% endif %}</td>
                 </tr>
                 {% endfor %}
                 {% if not slowest %}
@@ -165,7 +192,7 @@
                        hold executed requests and still have nothing to order by
                        here. Saying "no executed requests" would be a claim the
                        page cannot make. #}
-                    <td colspan="5" style="text-align:center;padding:32px;color:var(--text-3);">No executed requests with recorded duration in this window.</td>
+                    <td class="perf-td-empty" colspan="5">No executed requests with recorded duration in this window.</td>
                 </tr>
                 {% endif %}
             </tbody>
@@ -183,57 +210,57 @@
     <div class="card anim-3">
         <div class="card-header">
             <span class="card-title">Recent passes</span>
-            <span class="mono" style="font-size:11px;color:var(--text-3);">newest {{ runs_limit }}</span>
+            <span class="mono u-font-size-11px u-color-text-3">newest {{ runs_limit }}</span>
         </div>
         <div class="table-scroll">
         <table class="data-table">
             <thead>
                 <tr>
                     <th>Started</th>
-                    <th style="text-align:right;">Duration</th>
+                    <th class="perf-th-num">Duration</th>
                     <th>Trigger</th>
                     <th>Owner</th>
-                    <th style="text-align:right;" title="Notes the scan walked.">Scanned</th>
-                    <th style="text-align:right;" title="Notes the scan wrote or rewrote.">Indexed</th>
-                    <th style="text-align:right;" title="Notes this pass embedded and certified.">Embedded</th>
+                    <th class="perf-th-num" title="Notes the scan walked.">Scanned</th>
+                    <th class="perf-th-num" title="Notes the scan wrote or rewrote.">Indexed</th>
+                    <th class="perf-th-num" title="Notes this pass embedded and certified.">Embedded</th>
                     <th>Result</th>
                 </tr>
             </thead>
             <tbody>
                 {% for r in runs %}
                 <tr>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono perf-td-time">
                         <time datetime="{{ r.started_at }}" data-localize>{{ r.started_at }}</time>
                     </td>
                     {# A row with no duration is a pass with no `finished_at`:
                        the writer sets both in one INSERT, so this means a row
                        written by something other than the recorder. #}
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{% if r.duration %}{{ r.duration }}{% else %}<span style="color:var(--text-3);">—</span>{% endif %}</td>
-                    <td style="font-size:12px;"><span class="badge badge-gray">{{ r.trigger }}</span></td>
-                    <td style="font-size:12px;line-height:1.3;">
+                    <td class="mono perf-td-num-muted">{% if r.duration %}{{ r.duration }}{% else %}<span class="u-color-text-3">—</span>{% endif %}</td>
+                    <td class="perf-td-sm"><span class="badge badge-gray">{{ r.trigger }}</span></td>
+                    <td class="perf-td-actor">
                         {% if r.owner %}
-                            <span style="color:var(--primary-text);">{{ r.owner }}</span>
+                            <span class="u-color-primary-text">{{ r.owner }}</span>
                         {% elif r.owner_missing %}
                             {# A non-NULL user_id that joined to nothing. The FK
                                forbids it, so say so rather than quietly
                                rendering it as an ownerless pass. #}
-                            <span class="mono" style="font-size:11px;color:var(--error);">user #{{ r.user_id }} (missing)</span>
+                            <span class="mono u-font-size-11px u-color-error">user #{{ r.user_id }} (missing)</span>
                         {% else %}
                             {# The owner is joined live, never denormalised: this
                                table's FK is ON DELETE SET NULL, so when the user
                                goes the row's claim about whose vault it indexed
                                stops being true. Single-user and global passes
                                land here too, and both are honestly "no owner". #}
-                            <span class="mono" style="font-size:11px;color:var(--text-3);" title="A single-user or global pass, or a pass whose user has since been deleted.">no owner</span>
+                            <span class="mono u-font-size-11px u-color-text-3" title="A single-user or global pass, or a pass whose user has since been deleted.">no owner</span>
                         {% endif %}
                     </td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_scanned }}</td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_indexed }}</td>
-                    <td class="mono" style="text-align:right;font-size:12px;color:var(--text-2);">{{ r.notes_embedded }}</td>
-                    <td style="font-size:12px;">
+                    <td class="mono perf-td-num-muted">{{ r.notes_scanned }}</td>
+                    <td class="mono perf-td-num-muted">{{ r.notes_indexed }}</td>
+                    <td class="mono perf-td-num-muted">{{ r.notes_embedded }}</td>
+                    <td class="perf-td-sm">
                         {% if r.error %}
                             <div><span class="badge badge-red">failed</span></div>
-                            <div class="mono" style="font-size:10px;color:var(--text-3);white-space:pre-wrap;word-break:break-word;max-width:420px;">{{ r.error }}</div>
+                            <div class="mono perf-run-error">{{ r.error }}</div>
                         {% else %}
                             <span class="badge badge-green">ok</span>
                         {% endif %}
@@ -242,7 +269,7 @@
                 {% endfor %}
                 {% if not runs %}
                 <tr>
-                    <td colspan="8" style="text-align:center;padding:32px;color:var(--text-3);">No index or embed pass has been recorded yet. The first pass after a deploy writes the first row.</td>
+                    <td class="perf-td-empty" colspan="8">No index or embed pass has been recorded yet. The first pass after a deploy writes the first row.</td>
                 </tr>
                 {% endif %}
             </tbody>

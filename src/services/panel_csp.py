@@ -13,17 +13,26 @@ refused as surely as an inline one. No `'unsafe-inline'`, no `'unsafe-eval'`,
 no `'strict-dynamic'`: every template script carries the nonce, Chart.js
 evaluates nothing, and nothing loads script dynamically.
 
-**Styles are split on purpose.** Style *elements* are the real CSS injection
-primitive — attribute-selector scraping of the CSRF token's value, font-based
-text probes — so `style-src-elem` admits only the nonce and the Google Fonts
-stylesheet. Style *attributes* stay allowed through `style-src-attr
-'unsafe-inline'`: the templates carry a few hundred of them, and an injected
-one can only restyle the element it sits on, cannot select anything else, and
-cannot beacon off-origin because every `url()` is still bound by `img-src` and
-`font-src`. Moving them to classes is a follow-up. The `style-src` fallback
-carries **no nonce**, deliberately: it is read only by a browser without the
-CSP3 `-elem`/`-attr` directives, and in such a browser a nonce would make it
-ignore `'unsafe-inline'` and refuse every style attribute, breaking the panel.
+**Styles: the nonce and nothing else, and no style attributes (#289).**
+Style *elements* are the real CSS injection primitive — attribute-selector
+scraping of the CSRF token's value, font-based text probes — so
+`style-src-elem` admits only the nonce and the Google Fonts stylesheet; no
+`'self'`, because that would admit every same-origin `text/css` response, now
+and in the future, and keep the panel's style policy hostage to whatever else
+the origin serves. Style *attributes* are refused outright by
+`style-src-attr 'none'`, spelled out rather than left to fall back to
+`style-src`, so the ban does not rest on the fallback's contents: an
+`'unsafe-inline'` someone later adds to `style-src` for an old browser would
+otherwise silently re-allow attributes everywhere. The templates carry no
+`style=""` (a static and a rendered-body test hold them to it), presentation
+lives in nonced `<style>` classes, and presentation that changes at runtime
+goes through CSSOM — `element.style.*`, which CSP does not govern — or through
+class toggles. The `style-src` fallback now **carries the nonce**: it is read
+only by a browser without the CSP3 `-elem`/`-attr` directives, and with no
+attributes left there is nothing for `'unsafe-inline'` to keep working, so
+such a browser gets the same nonce-only elements and no attributes as a CSP3
+one. No directive carries `'unsafe-inline'`, `'unsafe-eval'` or
+`'unsafe-hashes'`.
 
 **The consent page's `form-action` is `'self' https:`.** Its form posts to
 `/authorize`, which answers with a 302 to the client's registered redirect URI
@@ -122,9 +131,9 @@ def build_policy(nonce: str, consent: bool) -> str:
     return (
         "default-src 'self'; "
         f"script-src 'nonce-{nonce}'; "
-        "style-src https://fonts.googleapis.com 'unsafe-inline'; "
+        f"style-src 'nonce-{nonce}' https://fonts.googleapis.com; "
         f"style-src-elem 'nonce-{nonce}' https://fonts.googleapis.com; "
-        "style-src-attr 'unsafe-inline'; "
+        "style-src-attr 'none'; "
         "img-src 'self' data:; "
         "font-src https://fonts.gstatic.com; "
         "connect-src 'self'; "

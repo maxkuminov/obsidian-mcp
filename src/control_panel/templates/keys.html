@@ -1,5 +1,21 @@
 {% extends "base.html" %}
 {% block title %}API Keys — Obsidian MCP{% endblock %}
+{% block page_style %}
+<style nonce="{{ csp_nonce }}">
+    /* #289: converted from inline style attributes. */
+    .keys-new-key-label { font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 10px; opacity: 0.75; }
+    .keys-new-key { flex: 1; background: var(--code-bg); padding: 10px 14px; border-radius: 5px; font-size: 12px; word-break: break-all; color: var(--key-text); }
+    .keys-field-help { font-size: 11px; color: var(--text-3); margin-top: 6px; line-height: 1.5; }
+    /* Cell classes are scoped to beat `.data-table td` and
+       `.data-table tbody tr:hover td` (0,2,3), which the inline style used
+       to beat: equal specificity, later in the cascade. */
+    .data-table tbody tr td.keys-td-name { color: var(--text); font-weight: 500; }
+    .data-table tbody tr td.keys-td-owner { font-size: 12px; color: var(--text-2); }
+    .data-table tbody tr td.keys-td-prefix { color: var(--text-2); }
+    .data-table tbody tr td.keys-td-meta { font-size: 11px; color: var(--text-2); }
+    .data-table tbody tr td.keys-td-empty { text-align: center; padding: 32px; color: var(--text-3); }
+</style>
+{% endblock %}
 {% block content %}
 
 <div class="page-top">
@@ -7,7 +23,7 @@
     <div class="page-actions">
         {% set revoked_count = keys | selectattr('is_active', 'equalto', false) | list | length %}
         {% if revoked_count > 0 %}
-        <form method="POST" action="/admin/keys/delete-revoked" style="display:inline;">
+        <form method="POST" action="/admin/keys/delete-revoked" class="u-display-inline">
             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
             <button type="button" class="btn btn-danger" data-confirm="Permanently delete all {{ revoked_count }} revoked key{{ 's' if revoked_count != 1 }}?">
                 Delete Revoked ({{ revoked_count }})
@@ -31,10 +47,10 @@
 
     {% if new_key %}
     <div class="alert alert-success anim-1">
-        <div style="font-size:11px;font-weight:600;letter-spacing:0.1em;text-transform:uppercase;margin-bottom:10px;opacity:0.75;">New key created — copy now, won't be shown again</div>
-        <div style="display:flex;align-items:center;gap:10px;">
-            <code id="new-key-val" class="mono" style="flex:1;background:var(--code-bg);padding:10px 14px;border-radius:5px;font-size:12px;word-break:break-all;color:var(--key-text);">{{ new_key }}</code>
-            <button type="button" data-copy-from="new-key-val" class="btn btn-ghost" style="flex-shrink:0;">Copy</button>
+        <div class="keys-new-key-label">New key created — copy now, won't be shown again</div>
+        <div class="u-display-flex u-align-items-center u-gap-10px">
+            <code id="new-key-val" class="mono keys-new-key">{{ new_key }}</code>
+            <button type="button" data-copy-from="new-key-val" class="btn btn-ghost u-flex-shrink-0">Copy</button>
         </div>
     </div>
     {% endif %}
@@ -58,13 +74,13 @@
             <tbody>
                 {% for key in keys %}
                 <tr>
-                    <td style="color:var(--text);font-weight:500;">{{ key.name }}</td>
+                    <td class="keys-td-name">{{ key.name }}</td>
                     {% if multi_user_mode %}
-                    <td style="font-size:12px;color:var(--text-2);">
-                        {% if key.owner_username %}{{ key.owner_username }}{% else %}<span style="color:var(--text-3);">—</span>{% endif %}
+                    <td class="keys-td-owner">
+                        {% if key.owner_username %}{{ key.owner_username }}{% else %}<span class="u-color-text-3">—</span>{% endif %}
                     </td>
                     {% endif %}
-                    <td class="mono" style="color:var(--text-2);">{{ key.key_prefix }}···</td>
+                    <td class="mono keys-td-prefix">{{ key.key_prefix }}···</td>
                     <td>
                         {% if key.permission == 'readwrite' %}
                         <span class="badge badge-yellow">readwrite</span>
@@ -72,21 +88,20 @@
                         <span class="badge badge-blue">read</span>
                         {% endif %}
                     </td>
-                    <td style="white-space:nowrap;">
+                    <td class="u-white-space-nowrap">
                         {% if key.daily_request_limit %}
                         {# Consumption is admissions since the limit was set, not
                            requests since midnight — the counter row is deleted
                            when a limit is enabled. The header spells that out;
                            here the day is named so "today" is never the
                            reader's local one. #}
-                        <span class="mono" style="font-size:12px;color:var(--primary-text);"
+                        <span class="mono u-font-size-12px u-color-primary-text"
                               title="{{ key.quota_used }} of {{ key.daily_request_limit }} calls admitted on the UTC day {{ quota_day }}, counted since the limit was set. Refused calls do not count. Resets at the next UTC midnight.">{{ key.quota_used }} / {{ key.daily_request_limit }}</span>
                         {% else %}
-                        <span style="font-size:12px;color:var(--text-3);">Unlimited</span>
+                        <span class="u-font-size-12px u-color-text-3">Unlimited</span>
                         {% endif %}
                         <button type="button"
-                                class="btn btn-link"
-                                style="font-size:11px;"
+                                class="btn btn-link u-font-size-11px"
                                 data-limit-edit data-key-id="{{ key.id }}" data-limit="{{ key.daily_request_limit if key.daily_request_limit else '' }}">Edit</button>
                     </td>
                     <td>
@@ -104,20 +119,20 @@
                         <span class="badge badge-green">Active</span>
                         {% endif %}
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono keys-td-meta">
                         {% if key.last_used_at %}<time datetime="{{ key.last_used_at }}" data-localize>{{ key.last_used_at }}</time>{% else %}—{% endif %}
                     </td>
-                    <td class="mono" style="font-size:11px;color:var(--text-2);">
+                    <td class="mono keys-td-meta">
                         <time datetime="{{ key.created_at }}" data-localize="date">{{ key.created_at }}</time>
                     </td>
-                    <td style="white-space:nowrap;">
+                    <td class="u-white-space-nowrap">
                         {% if key.is_active %}
-                        <form method="POST" action="/admin/keys/{{ key.id }}/revoke" style="display:inline;">
+                        <form method="POST" action="/admin/keys/{{ key.id }}/revoke" class="u-display-inline">
                             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                             <button type="button" class="btn btn-link" data-confirm="Revoke this key?">Revoke</button>
                         </form>
                         {% else %}
-                        <form method="POST" action="/admin/keys/{{ key.id }}/delete" style="display:inline;">
+                        <form method="POST" action="/admin/keys/{{ key.id }}/delete" class="u-display-inline">
                             {% if csrf_token %}<input type="hidden" name="csrf_token" value="{{ csrf_token }}">{% endif %}
                             <button type="button" class="btn btn-link" data-confirm="Permanently delete this key?">Delete</button>
                         </form>
@@ -127,7 +142,7 @@
                 {% endfor %}
                 {% if not keys %}
                 <tr>
-                    <td colspan="{{ 9 if multi_user_mode else 8 }}" style="text-align:center;padding:32px;color:var(--text-3);">No API keys yet.</td>
+                    <td colspan="{{ 9 if multi_user_mode else 8 }}" class="keys-td-empty">No API keys yet.</td>
                 </tr>
                 {% endif %}
             </tbody>
@@ -159,7 +174,7 @@
                 <input type="number" name="daily_request_limit" class="field-input"
                        min="1" max="{{ quota_limit_max }}" step="1" placeholder="Leave empty for unlimited"
                        value="{{ quota_limit_default|default(none) if quota_limit_default|default(none) is not none else '' }}">
-                <div style="font-size:11px;color:var(--text-3);margin-top:6px;line-height:1.5;">
+                <div class="keys-field-help">
                     Tool calls this key may make per UTC day. Empty means unlimited.
                     Calls over the limit are refused before they run and do not
                     count toward it; the counter resets at UTC midnight. To stop a
@@ -193,7 +208,7 @@
                 <label class="field-label">Calls per UTC day</label>
                 <input type="number" id="limit-input" name="daily_request_limit" class="field-input"
                        min="1" max="{{ quota_limit_max }}" step="1" placeholder="Leave empty for unlimited">
-                <div style="font-size:11px;color:var(--text-3);margin-top:6px;line-height:1.5;">
+                <div class="keys-field-help">
                     Empty clears the limit and returns the key to unlimited.
                     <strong>Setting a limit on an unlimited key restarts its
                     count at zero</strong> — consumption is counted from the
