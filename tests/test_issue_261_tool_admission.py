@@ -38,7 +38,7 @@ def configured(monkeypatch):
     current_principal.reset(principal)
 
 
-@tools._tracked('occupancy_probe', [], resource_class='other')
+@tools._tracked('occupancy_probe', [], resource_class='light')
 async def probe(started, finish, *, refused=False, explode=False):
     started.set()
     await finish.wait()
