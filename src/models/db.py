@@ -1,4 +1,5 @@
 import datetime
+import uuid
 from typing import ClassVar
 
 from pgvector.sqlalchemy import Vector
@@ -19,7 +20,7 @@ from sqlalchemy import (
     func,
     text,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, TSVECTOR, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from src.config import settings
@@ -1285,4 +1286,114 @@ class UserSession(Base):
         # revoked_at < cutoff)` on every indexer tick.
         Index("ix_user_sessions_expires_at", "expires_at"),
         {"comment": _USER_SESSIONS_TABLE_MARKER},
+    )
+
+
+# ── migration 028: durable concurrency counters and run coverage (#188) ──
+#
+# Ownership markers, mirrored for the reason 019's through 024's are: `alembic
+# check` compares a table comment. Keep byte identical to `COUNTERS_MARKER` /
+# `RUNS_MARKER` in `alembic/versions/028_concurrency_counters.py`.
+_CONCURRENCY_COUNTERS_TABLE_MARKER = (
+    "event-time minute concurrency counters (028_concurrency_counters)"
+)
+_CONCURRENCY_RUNS_TABLE_MARKER = (
+    "one row per process run, coverage watermark (028_concurrency_counters)"
+)
+
+# The closed sets the CHECKs enforce. Mirrors `concurrency.METRICS` and the
+# `MCP_CONCURRENCY_MODE` literal; the schema gate pins all three together.
+CONCURRENCY_MODES = ("off", "shadow", "queue", "enforce")
+CONCURRENCY_METRICS = (
+    "requests",
+    "transport_pressured",
+    "transport_waited",
+    "transport_overrun",
+    "transport_refused",
+    "writer_overrun",
+    "writer_refused",
+    "pool_checkout_timeout",
+    "pool_high_water",
+    "transport_wait_max_ms",
+)
+
+
+def _closed_set(column: str, values) -> str:
+    return f"{column} IN (" + ", ".join(f"'{v}'" for v in values) + ")"
+
+
+class ConcurrencyCounter(Base):
+    """One event-time minute of one concurrency metric (design D8, #188).
+
+    `bucket_start` is the minute the event **happened** in, never the flush
+    time, and a failed flush merges back under the original key — so an
+    incident at 12:00:50 flushed at 12:01:10 stays in 12:00. Written only by
+    `src.services.concurrency_counters.flush`, one multi-row upsert per 60 s.
+    `max_value` is NULL except for the gauges (`pool_high_water`,
+    `transport_wait_max_ms`), where it is the bucket maximum.
+    """
+
+    __tablename__ = "concurrency_counters"
+    _TABLE_MARKER: ClassVar[str] = _CONCURRENCY_COUNTERS_TABLE_MARKER
+
+    bucket_start: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), primary_key=True
+    )
+    epoch: Mapped[str] = mapped_column(Text, primary_key=True)
+    mode: Mapped[str] = mapped_column(Text, primary_key=True)
+    metric: Mapped[str] = mapped_column(Text, primary_key=True)
+    count: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, server_default=text("0")
+    )
+    max_value: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint(
+            _closed_set("mode", CONCURRENCY_MODES), name="ck_concurrency_counters_mode"
+        ),
+        CheckConstraint(
+            _closed_set("metric", CONCURRENCY_METRICS),
+            name="ck_concurrency_counters_metric",
+        ),
+        # The window scan and the 35-day prune.
+        Index("ix_concurrency_counters_bucket_start", "bucket_start"),
+        {"comment": _CONCURRENCY_COUNTERS_TABLE_MARKER},
+    )
+
+
+class ConcurrencyRun(Base):
+    """One row per process run: the coverage record (design D8, SR2-3).
+
+    A run covers `[started_at, completed_through]` unless `lossy`. The gap to
+    the next run is covered only when this run's shutdown flush set
+    `clean_shutdown`; after a hard kill the gap is uncovered however short.
+    `completed_through` is the completed-interval watermark: every bucket that
+    ends by it is durable.
+    """
+
+    __tablename__ = "concurrency_runs"
+    _TABLE_MARKER: ClassVar[str] = _CONCURRENCY_RUNS_TABLE_MARKER
+
+    run_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    epoch: Mapped[str] = mapped_column(Text, nullable=False)
+    mode: Mapped[str] = mapped_column(Text, nullable=False)
+    started_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    completed_through: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    clean_shutdown: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+    lossy: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, server_default=text("false")
+    )
+
+    __table_args__ = (
+        CheckConstraint(
+            _closed_set("mode", CONCURRENCY_MODES), name="ck_concurrency_runs_mode"
+        ),
+        Index("ix_concurrency_runs_started_at", "started_at"),
+        {"comment": _CONCURRENCY_RUNS_TABLE_MARKER},
     )

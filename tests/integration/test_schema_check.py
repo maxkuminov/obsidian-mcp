@@ -60,7 +60,7 @@ DIM = 64  # irrelevant here; keeps the migration cheap.
 # The current head. Every case that migrates forward asserts it, so adding a
 # revision without teaching this module about it fails loudly rather than
 # leaving the new migration unexercised.
-HEAD_REVISION = "027"
+HEAD_REVISION = "028"
 
 CONSTRAINT = "ck_oauth_clients_auth_method_secret"
 MARKER = "created by 013_schema_reconciliation"
@@ -5951,3 +5951,344 @@ def test_downgrade_027_above_2000_dimensions_builds_nothing():
         assert alembic_version(url) == "026"
         assert vector_indexes(url) == {}
         assert not NOTES_RELOPTIONS & notes_reloptions(url)
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 028 — concurrency_counters and concurrency_runs (#188, design D8)
+# ══════════════════════════════════════════════════════════════════════════
+#
+# `alembic check` sees the columns, the table comments and the indexes. It
+# cannot see the closed-set CHECKs on `mode` and `metric` — and those are what
+# keep a typo'd metric (a pool timeout filed under a name the readiness
+# evaluator never reads, i.e. a false PASS) out of the table. So the CHECKs are
+# asserted by definition through `pg_constraint`, enforced by inserts, and the
+# primary keys, defaults and complete index sets are read from the catalogue.
+
+COUNTERS_MARKER_028 = "event-time minute concurrency counters (028_concurrency_counters)"
+RUNS_MARKER_028 = "one row per process run, coverage watermark (028_concurrency_counters)"
+CHECK_MARKER_028 = "closed set (028_concurrency_counters)"
+MODES_028 = ("off", "shadow", "queue", "enforce")
+METRICS_028 = (
+    "requests", "transport_pressured", "transport_waited", "transport_overrun",
+    "transport_refused", "writer_overrun", "writer_refused",
+    "pool_checkout_timeout", "pool_high_water", "transport_wait_max_ms",
+)
+
+
+def _any_array(column, values):
+    return (
+        f"CHECK (({column} = ANY (ARRAY["
+        + ", ".join(f"'{v}'::text" for v in values)
+        + "])))"
+    )
+
+
+# What PostgreSQL 16 prints for 028's predicates; the migration measures the
+# same strings off a scratch table at runtime, this pins them.
+CANONICAL_MODE_CHECK_028 = _any_array("mode", MODES_028)
+CANONICAL_METRIC_CHECK_028 = _any_array("metric", METRICS_028)
+BUCKET_028 = datetime.datetime(2026, 9, 23, 12, 0, tzinfo=datetime.timezone.utc)
+
+
+def table_comment_028(url, table):
+    return fetchval(url, f"SELECT obj_description('public.{table}'::regclass, 'pg_class')")
+
+
+def columns_028(url, table):
+    return [
+        tuple(r)
+        for r in fetch(
+            url,
+            "SELECT a.attname, format_type(a.atttypid, a.atttypmod), a.attnotnull, "
+            "       pg_get_expr(d.adbin, d.adrelid) "
+            "FROM pg_attribute a "
+            "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+            f"WHERE a.attrelid = 'public.{table}'::regclass "
+            "  AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum",
+        )
+    ]
+
+
+def pk_028(url, table):
+    value = fetchval(
+        url,
+        "SELECT array_agg(a.attname ORDER BY k.ord) FROM pg_constraint c "
+        "CROSS JOIN LATERAL unnest(c.conkey) WITH ORDINALITY AS k(attnum, ord) "
+        "JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = k.attnum "
+        f"WHERE c.conrelid = 'public.{table}'::regclass AND c.contype = 'p'",
+    )
+    return list(value) if value else None
+
+
+def checks_028(url, table):
+    """`{definition: (validated, comment)}` for every CHECK — by definition."""
+    return {
+        " ".join(r["def"].split()): (r["convalidated"], r["comment"])
+        for r in fetch(
+            url,
+            "SELECT pg_get_constraintdef(oid) AS def, convalidated, "
+            "       obj_description(oid, 'pg_constraint') AS comment "
+            f"FROM pg_constraint WHERE conrelid = 'public.{table}'::regclass "
+            "  AND contype = 'c'",
+        )
+    }
+
+
+def indexes_028(url, table):
+    return {
+        r["relname"]: (list(r["cols"]), r["indisunique"], r["indisvalid"])
+        for r in fetch(
+            url,
+            "SELECT c.relname, i.indisunique, i.indisvalid, "
+            "  (SELECT array_agg(a.attname ORDER BY k.ord) "
+            "     FROM unnest(string_to_array(i.indkey::text, ' ')) "
+            "          WITH ORDINALITY AS k(attnum, ord) "
+            "     JOIN pg_attribute a ON a.attrelid = i.indrelid "
+            "                        AND a.attnum = k.attnum::smallint) AS cols "
+            "FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid "
+            f"WHERE i.indrelid = 'public.{table}'::regclass",
+        )
+    }
+
+
+def insert_counter_028(url, metric="requests", mode="queue", count=1, max_value=None):
+    sql(
+        url,
+        "INSERT INTO concurrency_counters (bucket_start, epoch, mode, metric, count, "
+        " max_value) VALUES ($1, 'abcdef012345', $2, $3, $4, $5)",
+        BUCKET_028, mode, metric, count, max_value,
+    )
+
+
+def insert_run_028(url, mode="queue"):
+    sql(
+        url,
+        "INSERT INTO concurrency_runs (run_id, epoch, mode, started_at, "
+        " completed_through) VALUES (gen_random_uuid(), 'abcdef012345', $1, now(), now())",
+        mode,
+    )
+
+
+def refuse_028(url, *, must_mention):
+    _harness.run_alembic(url, "stamp", "027", dimensions=DIM)
+    result = _harness.run_alembic(url, "upgrade", "head", dimensions=DIM, check=False)
+    assert result.returncode != 0, "028 should have refused"
+    combined = result.stdout + result.stderr
+    for phrase in must_mention:
+        assert phrase in combined, f"refusal did not mention {phrase!r}:\n{combined}"
+    assert alembic_version(url) == "027", "nothing should have been recorded"
+    return combined
+
+
+def test_028_closed_sets_match_the_application():
+    """The migration pins its own copies; they must equal what the flush writes
+    and what the settings accept, or a metric would be refused at flush time."""
+    import importlib.util
+    import typing
+
+    from src.config import Settings
+    from src.models import db as models
+    from src.services import concurrency
+
+    spec = importlib.util.spec_from_file_location(
+        "m028", _harness.ROOT / "alembic" / "versions" / "028_concurrency_counters.py"
+    )
+    m028 = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m028)
+    assert set(m028.METRICS) == set(METRICS_028) == set(concurrency.METRICS)
+    assert tuple(m028.METRICS) == tuple(models.CONCURRENCY_METRICS)
+    mode_literal = typing.get_args(Settings.model_fields["mcp_concurrency_mode"].annotation)
+    assert set(m028.MODES) == set(MODES_028) == set(mode_literal)
+    assert tuple(m028.MODES) == tuple(models.CONCURRENCY_MODES)
+
+
+def test_028_creates_both_tables_typed_marked_and_enforced_on_a_fresh_db():
+    with throwaway_db("schema_028_fresh") as url:
+        assert alembic_version(url) == HEAD_REVISION
+
+        assert table_comment_028(url, "concurrency_counters") == COUNTERS_MARKER_028
+        assert columns_028(url, "concurrency_counters") == [
+            ("bucket_start", "timestamp with time zone", True, None),
+            ("epoch", "text", True, None),
+            ("mode", "text", True, None),
+            ("metric", "text", True, None),
+            ("count", "bigint", True, "0"),
+            ("max_value", "integer", False, None),
+        ]
+        assert pk_028(url, "concurrency_counters") == [
+            "bucket_start", "epoch", "mode", "metric"]
+        assert checks_028(url, "concurrency_counters") == {
+            CANONICAL_MODE_CHECK_028: (True, CHECK_MARKER_028),
+            CANONICAL_METRIC_CHECK_028: (True, CHECK_MARKER_028),
+        }
+        assert indexes_028(url, "concurrency_counters") == {
+            "concurrency_counters_pkey": (
+                ["bucket_start", "epoch", "mode", "metric"], True, True),
+            "ix_concurrency_counters_bucket_start": (["bucket_start"], False, True),
+        }
+
+        assert table_comment_028(url, "concurrency_runs") == RUNS_MARKER_028
+        assert columns_028(url, "concurrency_runs") == [
+            ("run_id", "uuid", True, None),
+            ("epoch", "text", True, None),
+            ("mode", "text", True, None),
+            ("started_at", "timestamp with time zone", True, None),
+            ("completed_through", "timestamp with time zone", True, None),
+            ("clean_shutdown", "boolean", True, "false"),
+            ("lossy", "boolean", True, "false"),
+        ]
+        assert pk_028(url, "concurrency_runs") == ["run_id"]
+        assert checks_028(url, "concurrency_runs") == {
+            CANONICAL_MODE_CHECK_028: (True, CHECK_MARKER_028),
+        }
+        assert indexes_028(url, "concurrency_runs") == {
+            "concurrency_runs_pkey": (["run_id"], True, True),
+            "ix_concurrency_runs_started_at": (["started_at"], False, True),
+        }
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_028_rejects_a_metric_or_mode_outside_the_closed_set():
+    with throwaway_db("schema_028_enforced") as url:
+        insert_counter_028(url, metric="pool_checkout_timeout")
+        insert_counter_028(url, metric="pool_high_water", max_value=7)
+        with pytest.raises(asyncpg.CheckViolationError):
+            insert_counter_028(url, metric="pool_checkout_timout")
+        with pytest.raises(asyncpg.CheckViolationError):
+            insert_counter_028(url, metric="requests", mode="rehearse")
+        insert_run_028(url, mode="shadow")
+        with pytest.raises(asyncpg.CheckViolationError):
+            insert_run_028(url, mode="Queue")
+        with pytest.raises(asyncpg.UniqueViolationError):
+            insert_counter_028(url, metric="pool_checkout_timeout")
+        assert fetchval(url, "SELECT count(*) FROM concurrency_counters") == 2
+        assert fetchval(
+            url, "SELECT clean_shutdown OR lossy FROM concurrency_runs") is False
+
+
+def test_028_chains_from_027_and_writes_no_rows():
+    with throwaway_db("schema_028_chain", revision="027") as url:
+        assert alembic_version(url) == "027"
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_runs')") is None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT count(*) FROM concurrency_counters") == 0
+        assert fetchval(url, "SELECT count(*) FROM concurrency_runs") == 0
+
+
+def test_028_accepts_its_own_shape_on_a_stamp_back_and_keeps_rows():
+    with throwaway_db("schema_028_rerun") as url:
+        insert_counter_028(url, count=41)
+        insert_run_028(url)
+        oid = fetchval(url, "SELECT 'public.concurrency_counters'::regclass::oid")
+        _harness.run_alembic(url, "stamp", "027", dimensions=DIM)
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT 'public.concurrency_counters'::regclass::oid") == oid
+        assert fetchval(url, "SELECT count FROM concurrency_counters") == 41
+        assert fetchval(url, "SELECT count(*) FROM concurrency_runs") == 1
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_028_creates_in_public_under_a_redirected_search_path():
+    with throwaway_db("schema_028_path", revision="027") as url:
+        dbname = fetchval(url, "SELECT current_database()")
+        sql(url, "CREATE SCHEMA decoy")
+        sql(url, f'ALTER DATABASE "{dbname}" SET search_path TO decoy, public')
+        assert fetchval(url, "SHOW search_path") == "decoy, public"
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        for table in ("concurrency_counters", "concurrency_runs"):
+            assert fetchval(url, f"SELECT to_regclass('public.{table}')") is not None
+            assert fetchval(url, f"SELECT to_regclass('decoy.{table}')") is None
+        assert fetchval(
+            url,
+            "SELECT count(*) FROM pg_class c WHERE c.relnamespace = 'decoy'::regnamespace",
+        ) == 0
+        assert fetchval(url, "SHOW search_path") == "decoy, public"
+        _harness.run_alembic(url, "downgrade", "027", dimensions=DIM)
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_runs')") is None
+
+
+@pytest.mark.parametrize(
+    "label,ddl,fragment",
+    [
+        (
+            "unmarked_table",
+            ["COMMENT ON TABLE concurrency_counters IS NULL"],
+            "concurrency_counters already exists but it does not carry 028's "
+            "comment marker",
+        ),
+        (
+            "impostor_metric_check",
+            [
+                "ALTER TABLE concurrency_counters DROP CONSTRAINT "
+                "ck_concurrency_counters_metric",
+                "ALTER TABLE concurrency_counters ADD CONSTRAINT "
+                "ck_concurrency_counters_metric CHECK (true)",
+            ],
+            "not one of 028's closed-set predicates",
+        ),
+        (
+            "unmarked_check",
+            ["COMMENT ON CONSTRAINT ck_concurrency_runs_mode ON concurrency_runs IS NULL"],
+            "does not carry 028's constraint marker",
+        ),
+        (
+            "missing_check",
+            ["ALTER TABLE concurrency_runs DROP CONSTRAINT ck_concurrency_runs_mode"],
+            "missing the closed-set CHECK ck_concurrency_runs_mode",
+        ),
+        (
+            "extra_unique_index",
+            ["CREATE UNIQUE INDEX squat ON concurrency_runs (epoch)"],
+            "unexpected index 'squat'",
+        ),
+        (
+            "missing_index",
+            ["DROP INDEX ix_concurrency_counters_bucket_start"],
+            "missing index ix_concurrency_counters_bucket_start",
+        ),
+        (
+            "wrong_default",
+            ["ALTER TABLE concurrency_runs ALTER COLUMN clean_shutdown SET DEFAULT true"],
+            "clean_shutdown default",
+        ),
+        (
+            "missing_pk",
+            ["ALTER TABLE concurrency_counters DROP CONSTRAINT concurrency_counters_pkey"],
+            "its primary key is absent",
+        ),
+    ],
+)
+def test_028_refuses_a_table_of_another_shape(label, ddl, fragment):
+    with throwaway_db(f"schema_028_foreign_{label}") as url:
+        insert_counter_028(url, count=3)
+        for statement in ddl:
+            sql(url, statement)
+        refuse_028(url, must_mention=[fragment])
+        # A refusal changes nothing.
+        assert fetchval(url, "SELECT count FROM concurrency_counters") == 3
+
+
+def test_downgrade_028_drops_the_marked_tables_and_upgrade_rebuilds_them():
+    with throwaway_db("schema_028_downgrade") as url:
+        insert_counter_028(url)
+        _harness.run_alembic(url, "downgrade", "027", dimensions=DIM)
+        assert alembic_version(url) == "027"
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_counters')") is None
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_runs')") is None
+        _harness.run_alembic(url, "upgrade", "head", dimensions=DIM)
+        assert alembic_version(url) == HEAD_REVISION
+        assert fetchval(url, "SELECT count(*) FROM concurrency_counters") == 0
+        assert_alembic_check_clean(url, DIM)
+
+
+def test_downgrade_028_leaves_a_table_it_did_not_create():
+    with throwaway_db("schema_028_downgrade_foreign") as url:
+        sql(url, "COMMENT ON TABLE concurrency_runs IS 'somebody else made this'")
+        result = _harness.run_alembic(url, "downgrade", "027", dimensions=DIM)
+        assert "leaving concurrency_runs in place" in result.stdout
+        assert alembic_version(url) == "027"
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_runs')") is not None
+        assert fetchval(url, "SELECT to_regclass('public.concurrency_counters')") is None
