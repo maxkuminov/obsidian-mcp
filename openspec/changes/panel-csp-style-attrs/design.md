@@ -220,4 +220,20 @@ None open. **Resolved by the owner after the Codex spec review:** the rollout st
 
 ## Verification record
 
-*(Filled in during tasks §5–§6: the D9 diff counts and allow-list, the mutation-check results, the D8 result, the report-only walk and its target.)*
+Local pass on 2026-09-23, run by an agent that did not write the change. Chromium 153 (Playwright 1.63), merge head `0b94aa0` against `f3ecba5`, throwaway pgvector database seeded so that every conditional branch renders.
+
+- **Positive controls (D8), enforce:** 4 of 4. An injected `style` attribute is refused (`style-src-attr`) and not applied. An unnonced `<style>` is refused (`style-src-elem`). A CSSOM write applies with no violation. An unnonced `<script>` is refused and does not run.
+- **Violations under enforce:** 0 in 112 loads (28 page variants for an admin and a non-admin user, including login-401 and consent, × 2 themes × 1280/390 px), plus 0 in 8 register/register-400 loads.
+  - Every document had `style-src-attr 'none'`, no `'unsafe-*'` token, matching body nonces and no rendered `style=`.
+  - `/transfer/upload`'s policy is unchanged, and `/docs` carries no panel policy.
+- **Controls:** 34 of 34, with 0 violations during the walk.
+  - All eight confirms: dismiss sends 0 POSTs, accept sends 1.
+  - The modals, copy, edit-limit, scope autosubmit, reindex fetch with its CSRF header, the 390 px sidebar, the theme toggle (panel, consent and login pages), Chart.js on usage (the only canvas), and OAuth approve followed by the `/token` exchange, and deny.
+  - The four D3 CSSOM cases, vault breadcrumb hover, a note click with the selected link's hover exclusion, and the action-button hovers.
+- **D9 mutation checks:** both caught. Removing `.u-max-width-480px` widens the reembed card from 480 to 960 px at 1280 px. Removing `.gem-facet` `fill` is caught in both themes.
+- **D9 result:** 0 differences in 108 cells (27 variants × 2 themes × 2 widths, 96 properties plus geometry), 0 settle errors, and 0 in 16 register cells. **The allow-list is empty.**
+  - Beyond D9, 1,400 interactive elements were hovered on base and new, with 0 subtree differences (the same check does detect mut1).
+- **Adversarial Codex (task 4.2):** round 1 **PASS**, with no findings.
+- **`openspec-verifier` (task 4.1):** 0 blocking gaps. Five generated utilities (`u-line-height-1_3`, `u-min-width-0`, `u-padding-24px`, `u-padding-32px`, `u-text-align-right`) are unused because every original use was on a table cell, which needs a compound selector. They are kept as generated output (accepted, harmless).
+- **Not tested:** flash and error banners on keys and users, the settings reset-embeddings progress branch, the health quarantine and overlap banners, the consent unknown-redirect branch, non-default time windows, browsers other than Chromium, and Google Fonts during the diff (blocked on both sides for determinism; loaded during the enforce sweep).
+- **Report-only step (6.3):** see the deploy notes below.
