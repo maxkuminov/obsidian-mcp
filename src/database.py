@@ -1,4 +1,6 @@
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from src.config import settings
 from src.services.pool_budget import POOL_SIZE, POOL_OVERFLOW
@@ -8,9 +10,53 @@ from src.services.transport_security import (
     install_strict_transport_listener,
 )
 
+
+class CountingQueuePool(AsyncAdaptedQueuePool):
+    """The engine's pool, counting checkout timeouts at the shared boundary
+    (#188, design D10).
+
+    Every consumer of the engine checks out through `_do_get`: MCP auth, the
+    quota gate, tool bodies, usage writers, the panel, OAuth `/token`,
+    transfer and the indexer. So this is the one place a pool-exhaustion
+    failure can be counted for all of them, into the durable
+    `pool_checkout_timeout` counter the readiness criteria block a flip on.
+
+    - Only `sqlalchemy.exc.TimeoutError` counts: the pool's own "QueuePool
+      limit … reached" raise. A provider's `TimeoutError`/`asyncio.TimeoutError`,
+      or a connect timeout while *creating* a connection, is a different class
+      and is never counted.
+    - The exception is re-raised **unchanged** (the same object), so every
+      caller sees exactly what it saw before.
+    - `QueuePool._do_get` calls itself recursively; the exception is tagged
+      once counted so a timeout raised through two frames counts once.
+    - On success the `pool_high_water` gauge takes `checkedout()` — this
+      checkout included — as its minute maximum.
+    """
+
+    _COUNTED = "_omcp_pool_timeout_counted"
+
+    def _do_get(self):
+        # Imported here so importing the engine never drags the controller in
+        # ahead of the settings it reads.
+        from src.services.concurrency import counters
+
+        try:
+            record = super()._do_get()
+        except sa_exc.TimeoutError as e:
+            if not getattr(e, self._COUNTED, False):
+                setattr(e, self._COUNTED, True)
+                counters().record("pool_checkout_timeout")
+            raise
+        counters().gauge("pool_high_water", self.checkedout())
+        return record
+
+
 engine = create_async_engine(
     settings.database_url,
     echo=False,
+    # D10: counts `pool_checkout_timeout` and the checkout high-water for
+    # every consumer; behaviour is otherwise `AsyncAdaptedQueuePool`'s own.
+    poolclass=CountingQueuePool,
     pool_size=POOL_SIZE,
     max_overflow=POOL_OVERFLOW,
     # 30s — SQLAlchemy's own default, written down rather than inherited. This

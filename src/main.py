@@ -44,6 +44,7 @@ from src.services.transport_security import (
 )
 from src.services.rate_limits import flush_all
 from src.services import concurrency
+from src.services import concurrency_counters
 from src.services import vault_fs
 from src.logging_setup import configure_logging
 from src.transfer.routes import router as transfer_router
@@ -534,6 +535,12 @@ async def lifespan(app: FastAPI):
         # reopened once per restart. Placed after the fingerprint guards so a
         # misconfigured deployment still fails with their own messages.
         await _publish_first_root_snapshot()
+        # #188 (D8): this run's coverage row, then the 60 s flush that turns
+        # the event-time counter accumulator into durable rows and advances the
+        # run's watermark whatever the traffic. Registration never blocks
+        # serving: a failed insert is retried by the next flush.
+        await concurrency_counters.register_run(controller=concurrency_controller)
+        counters_task = asyncio.create_task(concurrency_counters.run_flush_loop())
         # Fire-and-forget so a ~15s cold load doesn't block the app from serving.
         # The lifespan frame stays suspended at `yield`, keeping this referenced.
         warmup_task = asyncio.create_task(_warm_embedding_model())
@@ -545,6 +552,11 @@ async def lifespan(app: FastAPI):
         finally:
             warmup_task.cancel()
             indexer_task.cancel()
+            counters_task.cancel()
+            try:
+                await counters_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
             try:
                 await asyncio.wait_for(asyncio.shield(indexer_task), timeout=10.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
@@ -580,6 +592,17 @@ async def lifespan(app: FastAPI):
             except Exception as e:  # noqa: BLE001 - shutdown, never fatal
                 logging.getLogger(__name__).error(
                     f"Refusal flush at shutdown failed: {e}"
+                )
+            # #188 (D8): the shutdown flush — after the refusal coalescer's
+            # `flush_all()` (whose own checkouts it then counts) and before
+            # `engine.dispose()`. It sets `completed_through` to exactly now and
+            # `clean_shutdown`, which is what makes the gap to the next run
+            # covered. Without it (a hard kill) that gap reads uncovered.
+            try:
+                await concurrency_counters.flush(clean=True)
+            except Exception as e:  # noqa: BLE001 - shutdown, never fatal
+                logging.getLogger(__name__).error(
+                    f"Concurrency counter flush at shutdown failed: {e}"
                 )
             # Explicitly close pooled database connections during application
             # shutdown (important for reloads and test/application lifecycles).
