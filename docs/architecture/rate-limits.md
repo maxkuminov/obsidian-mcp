@@ -4,7 +4,10 @@
 > `src/services/rate_limits.py`, `src/services/refusals.py`, the failed-auth
 > budget in `src/mcp_server/auth.py`, the gate order in `_tracked`
 > (`src/mcp_server/tools.py`), or any `MCP_RATE_LIMIT_*` /
-> `MCP_AUTH_FAILURE_*` / `DEFAULT_DAILY_REQUEST_LIMIT` setting. The
+> `MCP_AUTH_FAILURE_*` / `DEFAULT_DAILY_REQUEST_LIMIT` setting — and, for the
+> concurrency half, `src/services/concurrency.py`, `pool_budget.py`,
+> `concurrency_counters.py`, `concurrency_readiness.py`, the pool subclass in
+> `src/database.py` and every `MCP_CONCURRENCY_*` setting. The
 > operator-facing marker register lives in
 > [usage attribution](usage-attribution.md); the daily quota's own history is
 > in there too.
@@ -28,14 +31,14 @@ nothing to slow it and nothing to tell it to stop.
 | L | Control | Where | Scope key | Default (setting) | Refusal | Marker |
 | --- | --- | --- | --- | --- | --- | --- |
 | 1 | Failed-auth budget | `APIKeyMiddleware`, before the credential lookup | address slot (salted fixed table) | 60 / 300 s (`MCP_AUTH_FAILURE_LIMIT`, `MCP_AUTH_FAILURE_WINDOW_SECONDS`; null ⇒ off) | HTTP **429** + `Retry-After` — **transport, not a tool result** | none; one WARNING per slot per window |
-| 1a | Request occupancy (#261) | `APIKeyMiddleware`, before auth session through ASGI completion | global / presented-bearer fingerprint | 32 / 4; default **shadow** | Enforcement: transport 429; shadow: observation only | bounded transport event; authenticated observations can accompany tool rows |
-| 1b | Auth-session occupancy (#261) | around the middleware's own DB session only | global | 2; default **shadow** | Enforcement: transport 429 before opening a session | same transport observation channel |
+| 1a | Request occupancy (#261, #188) | `APIKeyMiddleware`, before auth session through ASGI completion | global / presented-bearer fingerprint | 64 / 20, waiters 64 / 16, sharing one 2 s transport deadline with 1b; mode default **shadow** | enforce: transport 429 after the deadline or on waiter overflow; queue: admitted with an overrun; shadow: observation only. A disconnected waiter is released at once | `mcp_concurrency_pressure` event; request-level `concurrency_counters`; authenticated observations can accompany tool rows |
+| 1b | Auth-session occupancy (#261, #188) | around the middleware's own DB session only | global | 2, waiters 32, same deadline as 1a | enforce: transport 429 before opening a session; queue/shadow as 1a | same transport event and counters |
 | 2 | General velocity bucket | `_tracked`, first gate | principal | 120/min, burst 30 (`MCP_RATE_LIMIT_PER_MINUTE`, `MCP_RATE_LIMIT_BURST`) | in-band, sentinel line | `rate_limited`, scope `principal` — **coalesced** |
 | 3 | Write velocity bucket | `_tracked` (write tools) **and** `PUT /transfer/upload` | principal | 60/min, burst 15 (`MCP_WRITE_RATE_LIMIT_PER_MINUTE`, `MCP_WRITE_RATE_LIMIT_BURST`) | in-band on a tool; **429** on the transfer route | `rate_limited`, scope `principal_write` — **coalesced** |
 | 4 | Vault admission (#66) | `_tracked` | user | — | in-band | `no_vault_assigned` (and the three vault-root quarantine markers, #199) |
 | 5a | Unencodable-argument screen (#149) | `_tracked` | argument | — | in-band | `argument_not_encodable` |
 | 5b | Query length cap | `_tracked`, beside 5a | argument | 8,192 (`MAX_SEARCH_QUERY_CHARS`) | in-band | `argument_too_long` — **own row** |
-| 5c | Atomic tool slots (#261) | `_tracked`, after argument screens and before quota | class / principal / tenant / global | one per class; principal 2 / tenant 3 / global 4; default **shadow** | Enforcement: in-band sentinel; shadow: call runs | `slot_timeout`, coalesced only for actual enforcement refusals |
+| 5c | Atomic tool slots (#261, #188) | `_tracked`, after argument screens and before quota | class / principal / tenant / global | classes embedding 1 / vector 1 / write 1 / scan 2 / light 4; principal 3 / tenant 4 / global 6; 5 s wait; mode default **shadow** | enforce: in-band sentinel after the wait; queue: admitted with an overrun, call runs; shadow: call runs | `slot_timeout`, coalesced, only for actual enforcement refusals; `concurrency_shadow` / `concurrency_queue` annotate otherwise |
 | 6 | Daily quota (#162) | `_tracked`, last pre-body gate | api key | 5,000 for **new** keys (`DEFAULT_DAILY_REQUEST_LIMIT`) | in-band | `over_quota` |
 | 7 | Provider input rejection | inside the body, on the provider's answer | argument | the provider's own limit | in-band, `argument_too_long` **code** | `provider_input_rejected` — **post-body** |
 
@@ -91,7 +94,9 @@ L2 → L3 → L4 → L5a/b → L5c (slots) → L6 (quota) → body → telemetry
   untouched. The atomic slot gate (#261) also precedes quota, and an admitted
   lease stays held through the response-neutral telemetry tail, releasing in
   `finally` on success, quota refusal, exception or cancellation. Waiting holds
-  neither partial permits nor a DB connection.
+  neither partial permits nor a DB connection. "Durable" means the daily
+  quota: a call refused for concurrency has already spent its rate tokens, and
+  they stay spent (#188 D9, below).
 
 **The order is unchanged by the request-path commits (performance-2026-09,
 #279), but the quota now commits asynchronously (L1, an owner decision taken
@@ -731,10 +736,10 @@ allocated in full and is therefore a direct memory bound.
 so the boot failure names `ck_api_keys_daily_request_limit`'s 1..1,000,000
 rather than a bare field bound — the domain is what an operator has to satisfy.
 
-The original rate settings validate the following rules. #261 adds separate
-class hierarchy/sum and pool-budget validation, described under concurrency
-below; pool sizes remain 5 + 10, now shared constants consumed by the engine
-and validation.
+The original rate settings validate the following rules. The concurrency
+settings add hierarchy, coherence and per-class pool-budget validation,
+described under concurrency below; pool sizes remain 5 + 10, shared constants
+consumed by the engine and validation.
 
 - each bucket's rate and burst are **both set or both null** — a rate with no
   burst is not "a bucket with a default burst", it is a control an operator
@@ -780,76 +785,391 @@ the page to see. The full reading rules are in
 | `MAX_SEARCH_QUERY_CHARS` | `8192` | Module constant, not a setting: the longest `query` `keyword_search` / `semantic_search` accept. |
 
 Every nullable one accepts an **empty value**, `null` or `none` as "off". Zero
-is refused at boot.
+is refused at boot. The `MCP_CONCURRENCY_*` settings are not nullable (`off` is
+a mode); their defaults are under concurrency below, and `.env.example` carries
+the full block.
 
-## Concurrency: shadow first (#261)
+## Concurrency: four modes, earned one step at a time (#261, #188)
 
-`src/services/concurrency.py` owns one process controller. `off` bypasses only
-concurrency controls; `shadow` is the default and observes real concurrent work
-without adding waits, refusals or dropped usage rows. `enforce` is an explicit
-operator configuration change, never an automatic promotion. Keep one worker.
-The earlier rate-limit change deferred these controls because authentication,
-rotating credentials and refusal logging each exposed holes in partial designs.
+`src/services/concurrency.py` owns one process controller with four admission
+points: the **request envelope** and the **auth permit** in
+`APIKeyMiddleware` (the transport stages), the **tool lattice** in `_tracked`,
+and the **writer permit** around every `write_usage_row`. Keep one worker. The
+earlier rate-limit change deferred these controls because authentication,
+rotating credentials and refusal logging each exposed holes in partial designs;
+#261 built them in shadow, and #188 (`concurrency-enforce-ready`) made
+enforcement reachable.
 
-Shadow requires `MCP_CONCURRENCY_WAIT_SECONDS=0`. Its namespaced
-`concurrency_shadow` metadata reports the zero-wait predicate against **observed
-occupancy**, not a counterfactual replay: earlier calls which enforcement might
-have rejected actually ran and influence later observations. Existing errors,
-body outcomes, quota flags and request counts remain actual outcomes. Pressure
-before a tool exists emits a bounded transport event, not an ownerless usage row.
+| Mode | Waits | Where `enforce` would refuse for capacity | Row annotation |
+| --- | --- | --- | --- |
+| `off` | never | no accounting at all | none, not even provenance |
+| `shadow` (**default**) | never; the configured waits are only *reported* | the call runs; the miss is recorded as pressure | `concurrency_shadow` |
+| `queue` | exactly as `enforce`: deadlines, waiter bounds, eligible FIFO | the lease is **granted** with an `overrun` mark | `concurrency_queue` |
+| `enforce` | bounded | transport 429, in-band `slot_timeout`, or a dropped audit row at the writer | the refusal row |
 
-The request envelope admits global+bearer-fingerprint dimensions together before
-DB lookup. Its lease lasts until the whole downstream ASGI request finishes,
-including GET/SSE streams, initialization and notifications. SHA-256 fingerprints
-stay in bounded memory only and are erased when their final references drain.
-The separate authentication permit encloses only the middleware session, including
-cache warming and teardown. Even invalid-auth responses are sent **after** that
-session and permit have closed. Auth/request enforcement misses return transport
-429 with a backoff hint; they neither query credentials nor INSERT usage rows.
+**Promotion is an operator `.env` edit and a recreate, never automatic**, and
+each step is earned with durable numbers (the rollout below). **Rollback is one
+line**: `MCP_CONCURRENCY_MODE=<previous>`. That is why every other setting
+validates identically in all four modes — the old rule "shadow requires
+`MCP_CONCURRENCY_WAIT_SECONDS=0`" is gone, and shadow reports the waits it did
+not apply as `configured_wait_ms` instead — and why the **epoch** (below)
+excludes the mode: evidence collected in shadow stays attributable to the
+configuration queue then runs.
 
-Every tool has one explicit class: embedding (`semantic_search`), vector
-(`find_related`), write (the existing eight write-class tools), or other (the
-remaining fifteen). Unknown registrations cannot silently become other. Tenant
-ceilings share authenticated user IDs, including one stable NULL-owner identity;
-principals use key IDs or OAuth grant IDs, so refresh cannot reset them. A tool
-acquires class, tenant, principal and global counters in one non-awaiting
-transition. A queued call holds none of those active permits. Eligible FIFO wakes
-the oldest call that can acquire **all** dimensions, so a saturated class cannot
-park global capacity. There is no per-tenant embedding reservation or starvation
-SLA: one embedding slot cannot reserve work for N tenants.
+**Why shadow alone could not be flipped.** The shadow window of 2026-09-13 to
+09-21 (8.2 days, 1,073 calls, two tenants, all defaults) said enforcement as
+built would have refused about **9.6 % of legitimate tool calls** as
+`slot_timeout` (`read_note` 71, `keyword_search` 16, `get_vault_guide` 14) and
+answered up to ~153 requests with a transport 429. Five blockers followed: the
+transport stages could not wait; the pool budget was exactly saturated so only
+one configuration validated, pinning `other = 1` for 15 of the 25 tools; the
+shadow `code` was the *last* observation, under-reporting tool pressure ~11×;
+nothing surfaced the data; and a writer wait extends every slot hold with no
+evidence of what that costs. PGDATA then moved to NVMe (2026-09-23, commits
+~40–100 ms → ~2.5 ms), so **no pre-change row is evidence for any flip** — the
+evaluator excludes them unconditionally — but they remain evidence about the
+shape: zero-wait ceilings of 1–2 refuse an agent's ordinary parallel reads. A
+false refusal of a legitimate agent call breaks the live path, so the design
+**waits within bounded time before refusing**.
 
-Positive enforcement waiting has one monotonic deadline (maximum five seconds)
-and bounded global/tenant/principal waiter counts. Zero wait means immediate
-admission or refusal, not disabled control. Grants transfer ownership before
-waking a waiter; cancellation before or after grant returns every captured lease.
-Registry overflow is sticky while any overflow lease **or waiter** exists, even
-if a dedicated entry becomes free. Unknown identities share that overflow entry
-until it drains, preventing an active identity from obtaining fresh capacity.
-Dedicated entries have a bounded reverse index, so arbitrary release order does
-not cause quadratic registry scans. No active entry is evicted or migrated.
+### The transport stages wait, within one deadline, and notice a disconnect
 
-Default ceilings: requests 32/fingerprint 4, auth 2, tools 4/tenant 3/principal 2,
-one per class; pending tools 32/tenant 4/principal 2; keyed registry 1024; writers
-1 with 64 waiters and a maximum .25-second enforcement wait. Writer admission is
-independent of authenticated principal so background/coalesced refusal flushes
-cannot bypass it. Shadow writers neither wait nor drop rows because of this
-control. Writer leases encompass the entire usage write including FK retry; the
-logging integration releases its initial DB session before opening a retry.
+The request envelope admits global + bearer-fingerprint dimensions together,
+before any DB lookup, and its lease lasts until the whole downstream ASGI
+request finishes — GET/SSE streams, initialization and notifications included.
+SHA-256 fingerprints stay in bounded memory and are erased when their last
+reference drains. The separate **auth permit** encloses only the middleware's
+own session, cache warming and teardown included; even an invalid-auth
+response is sent after that session and permit have closed. The auth permit is
+**kept** rather than left to the pool: the pool's own queue is a 30 s timeout
+ending in a 500, shared with the panel and `/token`.
 
-`src/services/pool_budget.py` is the single source for pool size 5, overflow 10,
-conservative maximum two simultaneous connections per tool and four headroom
-connections. Settings validate `auth + 2*tools + writers + 4 <= 15`, the class sum
-and hierarchy. This bounds the **configured MCP contribution in enforce mode**,
-not universal pool availability: indexer/panel/OAuth/transfer consumers share the
-pool and can consume that headroom. It is not reserved capacity. Future tool paths
-with more than two overlapping connections require budget/review updates.
+- **One deadline for both stages**, `MCP_CONCURRENCY_TRANSPORT_WAIT_SECONDS`
+  (default 2, max 5), started when the middleware first asks for the request
+  lease. Waiters are bounded: request 64 (global) and fingerprint 16, auth 32.
+  A request waiting for the envelope holds a registry reference only; one
+  waiting for the auth permit holds its request lease; **neither holds a DB
+  connection**. Queueing is cheap now and refusing is not: at auth 2 and ~5 ms
+  per session, a 2 s deadline drains ~800 queued authentications.
+- **In `enforce`, deadline expiry or waiter overflow** returns the existing
+  transport 429 (`code`, `scope`, `limit`, `Retry-After: 1`), outside the
+  in-band refusal contract. It queries no credential and writes no usage row.
+- **A disconnect is not a cancellation.** uvicorn reports a client leaving
+  through ASGI `receive`; it never cancels the middleware's coroutine, so a
+  waiter nobody reads for would learn only at its deadline — and could then
+  authenticate for nobody. `ReceiveWatch` (`src/mcp_server/auth.py`) is
+  therefore the **only caller of `receive`** from the first wait until
+  transport admission ends. It keeps reading **past `more_body: false`** —
+  after the last body message the next `receive` blocks until the client
+  leaves, which is exactly what it is waiting for (a watcher that stopped at
+  the complete body missed that disconnect, SR2-1). `http.disconnect` releases
+  the waiter, the references and any request lease at once; no credential
+  query, no response. The middleware checks the flag again after the auth
+  grant and before opening its session.
+- **Every consumed message is replayed, intact.** Messages are appended as
+  received — never dropped, split, merged or reordered. The handoff cancels
+  and awaits the watcher (a completed `receive` is already in the list because
+  the append precedes the next await; a cancelled pending one consumed
+  nothing), and the app's `receive` yields the list and then delegates.
+- **Memory is a process-wide replay budget, not a per-request cap.**
+  `MCP_CONCURRENCY_REPLAY_BUDGET_BYTES` (32 MiB, range 1–256 MiB). When it is
+  exhausted the watcher **stops calling `receive`** and keeps what it holds, so
+  nothing is ever lost; that request is then deadline-bounded (≤ 5 s) instead
+  of disconnect-aware (L8). The per-request alternatives failed review: a
+  64 KiB cap that drops the crossing message is lossy, because a message is
+  sized only after `receive` consumed it (SR2-2), and "body limit × waiters" is
+  61 MiB (`mcp_max_request_body_bytes`; the SDK's 4 MiB default does not apply
+  here) × 96 ≈ 5.7 GiB. The honest bound is **budget + 96 waiters × one uvicorn
+  message**, and one message is at most `HIGH_WATER_LIMIT` (64 KiB, the point
+  at which uvicorn pauses reading and hands back everything accumulated) plus
+  one socket read (256 KiB) ≈ 320 KiB — **≈ 62 MiB** (L11, SR3-2). A guard test
+  pins `HIGH_WATER_LIMIT == 65536`; a uvicorn upgrade that changes it, or the
+  loop's read size, must re-derive the figure.
 
-Lifespan explicitly installs a controller; requests never replace live state.
-Shutdown refuses/wakes pending tool work, allows the final coalescer writer flush,
-then closes writers before engine disposal. Captured leases release their own
-controller even across explicit lifecycle/test resets. No asyncio primitives are
-created at module import. Production saturation tests are prohibited; calibrate
-shadow observations first and test enforcement only in isolated environments.
+### Five tool classes, each with an independent ceiling
+
+| Class | Tools | Ceiling | Connections |
+| --- | --- | --- | --- |
+| `embedding` | `semantic_search` | 1 | 1 |
+| `vector` | `find_related` | 1 | 1 |
+| `write` | the eight write-class tools (L3) | 1 | 2 |
+| `scan` | `keyword_search`, `list_notes`, `get_tags`, `get_neighborhood`, `find_orphans`, `list_files` | 2 | 1 |
+| `light` | `read_note`, `read_file`, `get_recent`, `get_vault_guide`, `get_backlinks`, `get_links`, `request_upload`, `check_upload`, `request_download` | 4 | 1 |
+
+#261's `other` held 15 of the 25 tools and was pinned to 1. Raising it alone
+would let one tenant's scans hold every cheap-read slot, so it was split by
+cost. `MCP_CONCURRENCY_OTHER=1` — the old `.env.example` value, which expressed
+no intent — is ignored with one WARNING; any other value is refused at boot,
+naming `MCP_CONCURRENCY_LIGHT` and `MCP_CONCURRENCY_SCAN`. Unknown
+registrations cannot silently land in a class. `CLASS_MAPPING_VERSION` is part
+of the epoch, so rows from another classification never mix into one window.
+
+A tool acquires class, tenant, principal and global counters in **one
+non-awaiting transition**, after the argument screens and before quota. A
+queued call holds none of those permits. Eligible FIFO wakes the oldest call
+that can acquire **all** dimensions, so a saturated class cannot park global
+capacity. Tenants are authenticated user IDs (with one stable NULL-owner
+identity); principals are key IDs or OAuth grant IDs, so a refresh cannot reset
+them. There is no per-tenant embedding reservation or starvation SLA: one
+embedding slot cannot reserve work for N tenants.
+
+The tool wait is one monotonic deadline (`MCP_CONCURRENCY_WAIT_SECONDS`,
+default 5, max 10). Zero means immediate admission or refusal, not disabled
+control. Grants transfer ownership before waking a waiter, a grant racing the
+timeout grants exactly once, and cancellation before or after a grant returns
+every captured lease. Registry overflow is sticky while any overflow lease **or
+waiter** exists; unknown identities share the overflow entry until it drains,
+so an active identity cannot obtain fresh capacity. Dedicated entries have a
+bounded reverse index; no active entry is evicted or migrated.
+
+**Defaults:** requests 64 / fingerprint 20; auth 2; tools 6 / tenant 4 /
+principal 3; class ceilings as tabled; tool waiters 64 global / 32 tenant / 16
+principal; keyed registry 1024; writers 1 with 64 waiters and a maximum
+0.25 s wait. Writer admission is independent of the authenticated principal, so
+background and coalesced refusal flushes cannot bypass it. Writer leases cover
+the whole usage write including the FK retry; the failed session closes before
+the retry opens.
+
+### The pool budget: per-class multipliers, no class sum
+
+`src/services/pool_budget.py` is the single source: pool 5 + overflow 10, four
+connections of headroom, and `CLASS_CONNECTIONS` (write 2, every other class
+1). `tool_demand(tools, caps)` fills the `tools` slots highest multiplier
+first, which is the exact maximum of `Σ m·n` per class under `n ≤ cap` and
+`Σ n ≤ tools`. Settings refuse `auth + tool_demand + writers + 4 > 15` and name
+every term. At the defaults: **2 + 7 + 1 + 4 = 14**.
+
+- **The multiplier is measured, not assumed.** The non-write paths are
+  sequential: quota admission commits and releases before the body, the auth
+  session closes before the tool runs, and the usage write happens after the
+  body under the writer permit (budgeted in `writers`). A real-PG test drives
+  **every registered tool** through `_tracked` and asserts its per-task
+  checkout peak ≤ `CLASS_CONNECTIONS[class]`. A tool that measures higher
+  raises its class's multiplier here; it is not waved through. `write` stays
+  at 2 because its paths depend on input size (L7). #261's flat ×2, which
+  priced a `read_note` like a `move_note`, is gone.
+- **The class-sum rule is gone, and the bound did not weaken.** The global
+  `tools` counter already bounds total admitted tools and admission is atomic;
+  independent class ceilings (each ≤ `tools`) bound class *shares* — e.g.
+  `embedding` ≤ 1 protects the provider. Under the sum rule exactly one
+  configuration validated.
+- **This bounds MCP's configured contribution, not pool availability.** The
+  indexer, panel, OAuth and transfer share the pool and can consume the
+  headroom; it is not reserved (L4). Raising the pool was rejected: the
+  Postgres instance is shared, and the pool was never the measured bottleneck.
+
+### Coherence, and a log line because validation is not proof
+
+Besides the pool budget, the validator refuses a child above its parent
+(fingerprint ≤ requests, principal ≤ tenant ≤ tools, each class ≤ tools,
+principal ≤ tenant ≤ global tool waiters, fingerprint ≤ request waiters) and
+requires **`fingerprint ≥ principal + principal_waiters`**: one principal's
+admitted and waiting tools each hold a request lease, and the transport
+envelope must not refuse what the tool stage would have queued.
+
+A fully pinned legacy `.env` can still validate (`FINGERPRINT=4 ≥ PRINCIPAL 2 +
+PRINCIPAL_WAITERS 2`), so passing validation does not prove the intended
+settings are live. Startup therefore logs **one INFO line** — `MCP concurrency
+effective settings: mode=… epoch=… pool_demand=… limits=…` — and the deploy
+compares it with the intended block.
+
+### `queue`: a rehearsal that measures the real waits
+
+Every stage (request, auth, tool, writer) runs enforcement's admission. Where
+enforcement would refuse **for capacity** — deadline expiry, waiter overflow, a
+zero-wait miss — queue grants and marks the admission `overrun`. Only the
+concurrency outcome changes:
+
+- The call proceeds through the remaining gates, and they keep their
+  authority. An overrun followed by a quota refusal is an ordinary `over_quota`
+  pre-body refusal: no body, no quota consumed, classified exactly as before.
+  `concurrency_queue` only annotates; it never changes classification.
+- An overrun writes no `slot_timeout` row and returns no refusal. A writer
+  overrun still writes its row (and counts `writer_overrun`).
+- Shutdown refusal stays a refusal in every mode.
+- Queue bounds added latency, **not occupancy**: during an overrun occupancy
+  may exceed the ceilings, as in shadow (L1).
+
+A shadow counterfactual estimator was rejected: its estimate resolves after the
+row is written, and it is biased by calls enforcement would not have run. Queue
+measures the same quantity exactly.
+
+### The lease stays held through telemetry
+
+An admitted tool lease covers quota, the body and the response-neutral
+telemetry tail, released in `finally` on success, quota refusal, exception or
+cancellation. #188 proposed releasing it before telemetry, to stop a writer wait
+from extending the slot hold, and spec review rejected that (SR1-1):
+`write_usage_row` returns `False` after its 0.25 s writer wait and an ordinary
+completed-call row is not requeued, so a lease held through its own usage write
+is the backpressure that limits how fast further completed writes queue behind
+a slow writer. Early release reproduced a **lost audit row for a completed
+write** that the current lifetime saves — worse than a few milliseconds of slot
+hold. The coupling is bounded instead (≤ 0.25 s, and ~ms writer holds since
+NVMe) and **measured**: queue-mode `queue_ms` includes any writer-extended hold,
+so E1/E4 see it before enforcement is possible (L10). Worst-case added latency
+for one call is transport + tool + writer wait, **7.25 s** at the defaults
+(L3).
+
+### A concurrency refusal spends rate tokens, and no quota
+
+Gate order is buckets → vault → argument screens → tool slots → quota. A call
+refused at the slot gate has already spent a general-bucket token — and a
+write token for a write-class tool — as every later pre-body refusal has since
+#162 ("a tool that always fails would be free"). **The guarantee "nothing
+durable is consumed by a call that does not run" covers the durable daily
+quota (`quota_counters`) only.** Rate tokens are in-memory velocity state; they
+refill and are not refunded (L9). Refunding would need reservation machinery
+on the hottest path. Queue mode never refuses for capacity, so it never
+produces the case.
+
+### Durable evidence: provenance, event-time counters and a run watermark
+
+The flip question has to be answered from numbers that survive restarts and
+can be windowed, which neither in-process since-boot counters nor the rotating
+security-event log can give.
+
+- **Row provenance.** Whenever the mode is not `off`, every row `_tracked` and
+  its refusal, coalescer and failure paths write carries `params.concurrency =
+  {v: 2, mode, epoch}` — unpressured rows included, so a v2 row is
+  distinguishable from a legacy one. The **epoch** is the first 12 hex digits
+  of the SHA-256 of every `mcp_concurrency_*` setting except `mode`, plus the
+  class mapping version. Shapes: [usage attribution](usage-attribution.md).
+- **Transport, writer and pool outcomes** go to `concurrency_counters` in
+  event-time minute buckets (migration 028; the tables are in
+  [schema and migrations](schema-and-migrations.md)). Each `/mcp` request that
+  reaches admission counts once in `requests` and at most once more, by its
+  **worst** outcome (`transport_pressured` | `_waited` | `_overrun` |
+  `_refused`); `writer_overrun`, `writer_refused` and `pool_checkout_timeout`
+  are counts; `pool_high_water` and `transport_wait_max_ms` are bucket maxima.
+  A shutdown refusal is not a capacity outcome and is not counted as
+  `transport_refused` — otherwise every deploy would trip the enforce
+  rollback. An ownerless usage row per pressured request stays forbidden (#261:
+  it turns an unauthenticated flood into writes); the counters cost one
+  statement a minute.
+- **Pool timeouts are counted at the shared checkout boundary.**
+  `CountingQueuePool` (`src/database.py`) overrides `_do_get`, counts
+  `sqlalchemy.exc.TimeoutError` — the pool's own, not a provider's
+  `TimeoutError` — and re-raises the same object, for **every** engine
+  consumer: MCP auth, quota, tool bodies, usage writers, panel, `/token`,
+  transfer, indexer. Counting `tool_exception` rows would miss most of those
+  and confuse unrelated timeouts.
+- **One transaction a minute** drains the accumulator at `t`, upserts the
+  drained buckets under their original keys, and sets the run's
+  `completed_through = floor_minute(t)` — the **completed-interval watermark**.
+  A failed flush merges back under the original keys and does not advance it.
+  The shutdown flush (after the coalescer's `flush_all()`, before
+  `engine.dispose()`) sets it to exactly `t` with `clean_shutdown = true`. The
+  commit is synchronous; it does not join #279's allow-list. More than 60
+  unflushed minutes drops the oldest and marks the run `lossy`.
+- **Coverage.** A run covers `[started_at, completed_through]` unless lossy. A
+  gap between runs is covered **only after a clean shutdown**; after a hard
+  kill, OOM or crash it is uncovered however short the restart, because the
+  killed run's unflushed tail may have held incidents (L2; heartbeat spacing
+  could not tell a recreate from a kill, SR2-3). Bucket time is event time,
+  never flush time (SR2-4). Every evaluation boundary is a whole minute — start
+  rounded up, end rounded down, **clean-shutdown ends included**, because a
+  bucket is keyed by minute, epoch and mode rather than run, and an exact end
+  would pull a same-configuration successor's incident from the shared minute
+  into the earlier window (SR3-1).
+- **One source per numerator.** Tool-stage figures come only from usage rows;
+  transport, writer and pool figures only from counters. Nothing is counted
+  twice.
+
+### Readiness and the rollout
+
+`src/services/concurrency_readiness.py` holds one read-only `window_stats` and
+one pure `evaluate(stats, target)`; the `/admin/performance` verdict and `make
+concurrency-report` both call them, so they cannot disagree. A window
+qualifies only if it is **covered**, holds v2 evidence of **exactly one mode
+and one epoch** (the target's source mode and the configured epoch), meets the
+minimum length and call count, and ends at or before the durable watermark.
+Anything else gives INSUFFICIENT_DATA for **every** criterion, with the latest
+qualifying sub-window start — a quiet covered window is evidence, an uncovered
+one is not.
+
+**Step 0 — deploy in shadow.** Reconcile the deploy-dir `.env` concurrency
+block to `.env.example` (the old block pins #261's values and can still
+validate) and dry-run the settings against it with the new image. After the
+recreate, compare the startup INFO line with the intended block; `make
+db-check` must be clean after 028. Exercise one tool per class live, and
+confirm rows carry `params.concurrency`, the new run has a `concurrency_runs`
+row, and its `completed_through` advances each minute.
+
+**Step 1 — shadow → queue.** A covered window of **≥ 3 days** and **≥ 300
+executed calls**, all shadow, one epoch:
+
+| ID | Criterion (source) | Threshold |
+| --- | --- | --- |
+| Q1 | Tool-pressured executed calls / executed calls (rows) | ≤ 10 % |
+| Q2 | `transport_pressured` / `requests` (counters) | ≤ 5 % |
+| Q3 | `pool_checkout_timeout` (counters) | 0 |
+
+Tool pressure is read from the **observations**, never from `code`, so a row
+whose tool observation is not the first still counts.
+
+**Step 2 — queue → enforce.** A covered window of **≥ 7 days** and **≥ 1,000
+executed calls**, all queue, one epoch; each criterion must hold over the whole
+window **and** over its last 72 h:
+
+| ID | Criterion (source) | Threshold |
+| --- | --- | --- |
+| E1 | Distinct calls with a tool-stage overrun (rows) | ≤ max(1, 0.1 % of executed calls) |
+| E2 | `transport_overrun` requests (counters) | 0 |
+| E3 | `writer_overrun` (counters) | 0 |
+| E4 | Tool `queue_ms` p99 across executed calls (rows) | ≤ 500 ms |
+| E5 | Max tool `queue_ms` / tool wait (rows); `transport_wait_max_ms` / transport wait (counters) | ≤ 0.5 each |
+| E6 | `pool_checkout_timeout` (counters); max `pool_high_water` | 0; ≤ 13 |
+
+**Rollback triggers**, checked daily for the first 7 days of each new mode:
+
+- **queue → shadow:** any 24 h with tool `queue_ms` p95 > 1,000 ms, or an
+  agent-side timeout attributable to queueing;
+- **enforce → queue:** any `transport_refused` > 0; weighted `slot_timeout` >
+  max(2, 0.2 % of calls) in any 24 h; or any `pool_checkout_timeout`.
+
+**`make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso]`** runs the
+evaluator inside the container from the database alone, for the configured
+epoch and the target's source mode (shadow for `queue`, queue for `enforce`).
+`DAYS` defaults to the target's minimum and must be in (0, 35] — the prune
+horizon; `END` defaults to the watermark, and an explicit end past it is
+INSUFFICIENT_DATA, so an unflushed tail is never certified. It prints a table
+and **one JSON line**, which is what gets posted on #188. Exit codes: **0**
+every criterion PASS; **1** any FAIL (FAIL outranks INSUFFICIENT_DATA);
+**2** INSUFFICIENT_DATA; **64** a usage error. The thresholds are module
+constants calibrated to ~130 calls a day across two tenants (L6): re-run the
+report after a tenant is added.
+
+### Lifecycle
+
+The lifespan installs the controller explicitly and logs the effective-settings
+line; requests never replace live state. It registers the run and starts the
+60 s counter flush (sandbox mode skips both). Shutdown refuses and wakes
+pending tool work, runs the coalescer's final `flush_all()`, then the clean
+counter flush, then closes writers before `engine.dispose()`. Captured leases
+release their own controller even across explicit lifecycle and test resets.
+No asyncio primitive is created at module import. Production saturation tests
+are prohibited: calibrate from shadow and queue evidence, and test enforcement
+only in isolated environments.
+
+### Accepted limitations (#188)
+
+- **L1** Queue bounds latency, not occupancy.
+- **L2** A hard kill loses up to ~60 s of counter increments; windows spanning
+  its gap read INSUFFICIENT_DATA, however quick the restart.
+- **L3** Worst-case added latency is transport + tool + writer wait (7.25 s).
+- **L4** The budget bounds MCP's configured contribution; headroom is not
+  reserved.
+- **L5** A shared credential is a shared fingerprint and principal.
+- **L6** Thresholds are calibrated to current traffic.
+- **L7** Per-class multipliers are measured on fixtures; `write` keeps 2.
+- **L8** While the replay budget is exhausted a waiting request is
+  deadline-bounded, not disconnect-aware, and one whose client left may
+  authenticate once. It never loses bytes.
+- **L9** Rate tokens spent before a concurrency refusal are not refunded.
+- **L10** Writer-extended slot holds remain; queue measures them.
+- **L11** Worst-case replay memory ≈ 62 MiB, derived from uvicorn's
+  `HIGH_WATER_LIMIT` and the loop's read size.
 
 ## Alternatives rejected
 
@@ -865,16 +1185,26 @@ shadow observations first and test enforcement only in isolated environments.
 - **Persisting bucket state in PostgreSQL** (the `quota_counters` shape). A
   statement on the hottest path in the server, to bound something meaningless
   once the process is gone, with the durable ceiling already one layer up.
-- **Refunding a token on a refusal.** #162's reasoning: a tool that always
-  fails would be free.
+- **Refunding a token on a refusal** — a concurrency refusal included (#188
+  D9). #162's reasoning: a tool that always fails would be free.
+- **Going straight from shadow to enforce with long waits**, and **per-class
+  tool waits** (#188). Queue exists so the waits are measured before any
+  capacity refusal is possible; one tool deadline keeps the arithmetic
+  readable.
+- **Early release of the tool lease before telemetry** (#188, SR1-1). Above:
+  it lost audit rows for completed writes.
+- **Transport evidence from security-event logs or since-boot counters**, and
+  **counting pool timeouts from `tool_exception` rows** (#188 D8, D10). Above.
 - **Enforcing the query cap inside the search bodies.** It would be a
   post-body marker polluting the percentiles.
 - **Fail-open or fail-closed on principal-registry overflow.** Above.
 
 ## Standing residuals
 
-- Default shadow mode does not enforce concurrency ceilings. Explicit enforcement
-  bounds MCP contributions only, not every shared pool consumer.
+- Default shadow mode does not enforce concurrency ceilings, and queue bounds
+  latency, not occupancy; only `enforce` bounds, and it bounds MCP's
+  contribution only, not every shared pool consumer. The #188 accepted
+  limitations L1–L11 are listed under concurrency above.
 - OAuth grants and grandfathered NULL-limit keys have **velocity bounds only**.
 - The transport 429s — L1 and the transfer redemption — sit outside the in-band
   refusal contract.

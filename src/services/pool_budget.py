@@ -19,10 +19,6 @@ CLASS_CONNECTIONS: dict[str, int] = {
     "write": 2, "embedding": 1, "vector": 1, "scan": 1, "light": 1,
 }
 
-# TODO(#188): deprecated alias of the #261 single multiplier. S2 removes its
-# last importer and S5 deletes it; new code reads CLASS_CONNECTIONS.
-TOOL_CONNECTION_MULTIPLIER = max(CLASS_CONNECTIONS.values())
-
 
 def tool_demand(tools: int, caps: Mapping[str, int]) -> int:
     """Maximum Σ multiplier(c)·n(c) over n(c) ≤ caps[c], Σ n(c) ≤ tools.
