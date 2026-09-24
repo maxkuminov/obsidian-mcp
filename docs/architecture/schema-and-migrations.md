@@ -400,6 +400,83 @@ above 2000, the chain from 026 replacing the legacy index, stamp-back
 idempotence without a rebuild, three impostor refusals, and downgrade at both
 sides of the 2000 limit. Each asks `alembic check` too.
 
+## 028: `concurrency_counters` and `concurrency_runs`, and why a flip needs a table (#188)
+
+The concurrency rollout (shadow → queue → enforce, see
+[rate limits](rate-limits.md#durable-evidence-provenance-event-time-counters-and-a-run-watermark))
+is certified by a readiness evaluator, and some of what it must know never
+reaches a usage row: a request refused or overrun at the transport stage, a
+writer overrun, a pool checkout timeout in the panel or `/token`. #261 forbids
+an ownerless usage row per pressured request (an unauthenticated flood would
+become writes), the security-event log rotates and cannot be windowed, and
+since-boot in-process counters die with the process. So 028 creates two tables
+— owner-approved 2026-09-23 — and **writes no row**: there is nothing to
+backfill from.
+
+- **`concurrency_counters`**: primary key `(bucket_start timestamptz, epoch
+  text, mode text, metric text)`, `count bigint NOT NULL DEFAULT 0`,
+  `max_value integer NULL`, and `ix_concurrency_counters_bucket_start` for the
+  window scan and the prune. `bucket_start` is the **event-time** minute — the
+  minute the request completed or the checkout timed out, never the flush
+  time; flush-time buckets moved incidents across window boundaries (SR2-4).
+  `max_value` is NULL except for the two gauges (`pool_high_water`,
+  `transport_wait_max_ms`). The primary key is what the flush's
+  `ON CONFLICT DO UPDATE` (count added, max taken as the greater) conflicts on;
+  without it two rows could claim one bucket.
+- **`concurrency_runs`**: one row per process run — `run_id uuid` primary
+  key, `epoch`, `mode`, `started_at`, `completed_through` (the
+  completed-interval watermark), `clean_shutdown bool NOT NULL DEFAULT false`,
+  `lossy bool NOT NULL DEFAULT false`, and `ix_concurrency_runs_started_at`.
+  The table exists because heartbeat spacing alone could not tell a clean
+  recreate from a hard kill with a quick restart (SR2-3): a gap is covered only
+  after a run whose `clean_shutdown` is true.
+- **The closed sets live in the database.** `ck_concurrency_counters_metric`
+  (the ten metrics), `ck_concurrency_counters_mode` and
+  `ck_concurrency_runs_mode` (`off | shadow | queue | enforce`). A typo'd
+  `pool_checkout_timout` would make a real pool timeout invisible to the
+  criterion that blocks the flip on it — a false PASS — so, as 023's closed
+  key set, adding a metric is a migration. The sets are **pinned in the
+  migration**, not imported (a migration must keep describing the schema it
+  created, 019/023's rule), mirrored in `src/models/db.py`
+  (`CONCURRENCY_METRICS`, `CONCURRENCY_MODES`), and the schema gate asserts the
+  migration, the models, `concurrency.METRICS` and the mode literal all agree.
+- **Marker-owned, and refuse rather than adopt** (023/024's shape). Each table
+  carries a `COMMENT ON TABLE` marker mirrored on the model, so `alembic check`
+  compares it; each CHECK carries a constraint-comment marker. A pre-existing
+  table of either name is verified against the **complete** shape — columns
+  and nullability, primary key, the three server defaults, the CHECK set **by
+  definition** (measured off a scratch TEMP table, 013's device, since
+  autogenerate does not compare CHECK predicates), and the exact index set —
+  and, on any disagreement, `upgrade()` refuses **as a whole before creating
+  anything**, naming what disagreed. Adopting a shape nothing verified would
+  let it certify a false PASS. A stamp-back re-run meets its own shape and
+  keeps the rows it finds.
+- **`downgrade()`** decides each table on its own marker, drops only a marked
+  one, and prints what it leaves.
+- `search_path` is pinned to `public` and asserted (the flush and the
+  evaluator read unqualified names), with `lock_timeout` 10 s /
+  `statement_timeout` 60 s set and `RESET`, for 021's, 024's and 025's
+  reasons. The CHECK probe needs the TEMP privilege, as 013's does.
+
+**Writes and retention.** `src/services/concurrency_counters.py` owns every
+write: `register_run()` at lifespan start inserts the run with
+`completed_through = started_at`; `flush()` every 60 s is **one transaction** —
+drain, one multi-row upsert, run-row update to `completed_through =
+floor_minute(t)` (exactly `t` and `clean_shutdown = true` at shutdown) — and it
+commits **synchronously**. It is one statement a minute whatever the traffic,
+and it stays off #279's `synchronous_commit` allow-list: a watermark that could
+be lost in a crash would claim coverage for buckets that are not there. Pruning
+deletes counters with `bucket_start` and runs with `completed_through` older
+than **35 days** (never the current run), at most hourly and in its own
+transaction, so a failed prune never rolls back a flush. The readiness report's
+`DAYS` is capped at 35 for that reason.
+
+The gate's head literal is `028`, with `027` in the chain. Its 028 cases: the
+closed sets agree with the application, the fresh shape typed, marked and
+enforced, a metric or mode outside the set rejected, the chain from 027 with no
+rows written, stamp-back acceptance keeping rows, creation in `public` under a
+redirected `search_path`, the impostor-shape refusals, and downgrade.
+
 ## Database transport (#184)
 
 Before this change the engine passed no `ssl` argument and `DATABASE_URL`

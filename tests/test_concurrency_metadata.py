@@ -11,7 +11,7 @@ from src.services.concurrency import (
     replay_budget, shadow_metadata,
 )
 from src.services.pool_budget import (
-    CLASS_CONNECTIONS, MCP_POOL_HEADROOM, POOL_CAPACITY, TOOL_CONNECTION_MULTIPLIER,
+    CLASS_CONNECTIONS, MCP_POOL_HEADROOM, POOL_CAPACITY,
     budget_terms, tool_demand,
 )
 
@@ -191,9 +191,8 @@ def test_replay_budget_never_refuses_a_consumed_message():
 DEFAULT_CAPS = {"write": 1, "embedding": 1, "vector": 1, "scan": 2, "light": 4}
 
 
-def test_class_connections_and_deprecated_alias():
+def test_class_connections():
     assert CLASS_CONNECTIONS == {"write": 2, "embedding": 1, "vector": 1, "scan": 1, "light": 1}
-    assert TOOL_CONNECTION_MULTIPLIER == 2
     assert POOL_CAPACITY == 15 and MCP_POOL_HEADROOM == 4
 
 

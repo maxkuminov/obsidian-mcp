@@ -167,13 +167,22 @@ update it in the same change.** What stays here is the short list:
   grandfathered** — applied in application code, never as a column default, and
   an explicit `null` (or a blank panel field) still means unlimited. OAuth
   grants and pre-existing NULL-limit keys therefore have **velocity bounds
-  only**, owner-accepted. **Concurrency admission defaults to shadow mode**:
-  observe pressure without delaying or refusing calls. `enforce` bounds full
-  MCP requests, authentication sessions, tool classes/tenants/principals, and
-  usage writers. Tool admission follows argument checks and precedes quota;
-  leases remain held through telemetry. Its pool budget leaves four shared
-  connections of headroom, not a reservation against other consumers. See
-  [rate limits](docs/architecture/rate-limits.md) before changing settings.
+  only**, owner-accepted.
+- **Concurrency admission has four modes — `off | shadow | queue | enforce` —
+  and defaults to `shadow`** (#261, #188): observe, never wait or refuse.
+  `queue` waits like `enforce` but admits with an `overrun` mark where enforce
+  would refuse. Promotion is shadow → queue → enforce by a one-line `.env`
+  edit, each step gated by `make concurrency-report TARGET=…` PASS over
+  covered, single-epoch evidence (migration 028's counters and run
+  watermark); never automatic. Transport admission (request envelope, auth
+  permit) waits on one bounded deadline and is disconnect-aware — every body
+  message it consumes is replayed intact, under a process-wide replay budget.
+  Tool admission follows argument checks and precedes quota; leases remain
+  held through telemetry (early release lost audit rows). A concurrency
+  refusal consumes no quota, but the rate tokens already spent stay spent.
+  The pool budget leaves four shared connections of headroom, not a
+  reservation. See [rate limits](docs/architecture/rate-limits.md) before
+  changing settings.
 - **`TRUSTED_PROXY_IPS` is the single control of forwarded-header trust**
   (#189). It is validated at boot, stored **canonicalised** (`192.168.0.10/24`
   → `192.168.0.0/24`, because uvicorn's middleware silently matches nothing on
@@ -313,7 +322,7 @@ summaries.
 | [search.md](docs/architecture/search.md) | `semantic_search` / `keyword_search` / `find_related` and every `SET LOCAL` they issue |
 | [indexing-and-embeddings.md](docs/architecture/indexing-and-embeddings.md) | the indexer loop, the embed pass, tsvector writers, provider abstraction |
 | [security-event-logging.md](docs/architecture/security-event-logging.md) | `src/logging_setup.py`, `src/services/security_events.py`, and any call site that logs a refusal: the field allow-list, the event catalogue, the suppressor |
-| [rate-limits.md](docs/architecture/rate-limits.md) | `src/services/rate_limits.py`, `src/services/concurrency.py`, `src/services/pool_budget.py`, `src/services/refusals.py`, the failed-auth budget in `APIKeyMiddleware`, the gate order in `_tracked`, the worker count, and every `MCP_RATE_LIMIT_*` / `MCP_AUTH_FAILURE_*` / `MCP_CONCURRENCY_*` / `DEFAULT_DAILY_REQUEST_LIMIT` setting |
+| [rate-limits.md](docs/architecture/rate-limits.md) | `src/services/rate_limits.py`, `src/services/concurrency.py`, `src/services/pool_budget.py`, `src/services/concurrency_counters.py`, `src/services/concurrency_readiness.py`, `src/services/refusals.py`, the pool subclass in `src/database.py`, the failed-auth budget in `APIKeyMiddleware`, the gate order in `_tracked`, the worker count, and every `MCP_RATE_LIMIT_*` / `MCP_AUTH_FAILURE_*` / `MCP_CONCURRENCY_*` / `DEFAULT_DAILY_REQUEST_LIMIT` setting |
 | [usage-attribution.md](docs/architecture/usage-attribution.md) | `usage_logs`, `_log_usage`, actor columns |
 | [control-panel.md](docs/architecture/control-panel.md) | panel templates, flash messages, admin guards, the Danger zone |
 

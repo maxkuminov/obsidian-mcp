@@ -170,7 +170,7 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   `error = 'vault_root_overlap'`, `error = 'vault_root_unexaminable'` and
   `error = 'vault_root_not_ready'` — and the rate controls' two (#188, #194),
   `error = 'rate_limited'` and `error = 'argument_too_long'`, plus enforced
-  concurrency admission's `error = 'slot_timeout'` (#261). A broad match — `params ? 'error'`, or
+  concurrency admission's `error = 'slot_timeout'` (#261; `enforce` only — a queue-mode overrun is not a refusal). A broad match — `params ? 'error'`, or
   `params->>'error' IS NOT NULL` — is wrong in a way that is invisible on the
   page: `_VAULT_REASSIGNED_MARKER`, `_CONFIRMATION_UNAVAILABLE_MARKER` and
   `_ANCHOR_LOST_AT_PUBLISH_MARKER` are written by tools whose bodies *ran*,
@@ -238,24 +238,92 @@ in `src/services/usage_stats.py`; two things about it are load-bearing.
   the measured wait. An immediate miss has a zero wait budget; positive waits
   share one deadline. The admission gate precedes quota and opens no database
   session while waiting. Its permit, once granted, covers quota, the body and
-  the audit tail, and is released even on cancellation.
+  the audit tail, and is released even on cancellation. Only `enforce` writes
+  this marker; `queue` never does (below).
 
-  Shadow pressure is attached only to the existing real usage row under
-  `concurrency_shadow`, whose `basis` is `observed_occupancy_zero_wait`.
-  Request/auth, tool and writer observations share that bounded namespace;
-  they neither replace actual `error`/`body_outcome`/quota fields nor enter
-  the pre-body predicate. Earlier calls still ran, so this is an occupancy
-  projection, not a replay of which requests enforcement would have admitted.
-  Transport pressure without a tool uses the bounded security event instead
-  of inventing an unattributed usage row.
+  **Provenance: which mode and configuration wrote the row (#188 D8).**
+  Whenever `MCP_CONCURRENCY_MODE` is not `off`, **every** row `_tracked`
+  writes carries `params.concurrency = {"v": 2, "mode": "<mode>", "epoch":
+  "<12 hex>"}` — executed calls, unpressured calls, every pre-body refusal,
+  the coalesced `rate_limited` / `slot_timeout` templates, `tool_exception`
+  rows and writer-merged rows. It is stamped by one helper
+  (`_with_provenance`), and a coalescer template captures it **when the window
+  opens**, so a deferred flush carries the mode and epoch the refusal happened
+  under, not the ones live at flush time. `epoch` hashes every
+  `mcp_concurrency_*` setting except `mode`, plus the tool-class mapping
+  version: a mode change keeps it, any limit change moves it. The readiness
+  evaluator reads **only** rows where `params->'concurrency'->>'v' = '2'` and
+  requires one mode and one epoch per window, so a row without the object —
+  anything written before #188, or in `off` — is invisible to every count and
+  denominator rather than read as "no pressure". It is unconditional on
+  purpose: marking only pressured rows would leave the denominator undefined
+  (SR1-2).
+
+  **`concurrency_shadow` (schema 2)** is attached only to the existing real
+  usage row:
+
+  ```json
+  {"shadow": true, "schema": 2, "code": "auth_concurrency_limited",
+   "basis": "observed_occupancy_zero_wait",
+   "configured_wait_ms": {"transport": 2000, "tool": 5000},
+   "observations": [{"stage": "auth", "scope": "global", "limit": 2},
+                    {"stage": "tool", "scope": "light", "limit": 4}]}
+  ```
+
+  Observations are deduplicated, ordered by pipeline stage (request, auth,
+  tool, writer) and capped at four, and the deciding observation is never the
+  one truncated. Every shadow observation is a zero-wait capacity miss, so
+  `code` is the **earliest** stage's — `slot_timeout` for the tool stage,
+  `<stage>_concurrency_limited` otherwise. Before #188 it was the *last*
+  observation's, which under-reported tool pressure about 11× to anyone
+  counting by `code`; **tool pressure is counted from `observations`, never
+  from `code`** (the evaluator's containment test is `observations @>
+  [{"stage": "tool"}]`). `configured_wait_ms` reports the waits shadow did
+  *not* apply. Earlier calls still ran, so this is an occupancy projection,
+  not a replay of which requests enforcement would have admitted.
+
+  **`concurrency_queue` (schema 2)** is the queue-mode counterpart:
+
+  ```json
+  {"schema": 2, "overrun": true, "code": "slot_timeout",
+   "observations": [{"stage": "auth", "scope": "global", "limit": 2,
+                     "waited_ms": 40, "overrun": false},
+                    {"stage": "tool", "scope": "light", "limit": 4,
+                     "waited_ms": 5000, "overrun": true}]}
+  ```
+
+  Observations include ordinary waits (`waited_ms > 0`, `overrun: false`) and
+  overruns, ordered the same way. `code` is the earliest **overrun**'s, and
+  `null` when nothing overran: an ordinary wait never sets a code, so the
+  example's auth wait followed by a tool overrun reads `slot_timeout`.
+  Truncation keeps the earliest overrun even behind four earlier waits.
+
+  Both objects **annotate and never classify.** They replace no actual
+  `error`, `body_outcome` or quota field and enter neither `executed_sql` nor
+  `pre_body_refusal_sql`. A queue overrun whose body ran is executed work; an
+  overrun the quota gate then refused carries `over_quota: true` and is an
+  ordinary pre-body refusal. Request and auth observations reach a row only
+  when the request got as far as a tool call; transport pressure without one
+  goes to the bounded security event and the request-level
+  `concurrency_counters` instead of an invented, unattributed usage row.
+
+  **Timing keys.** `queue_ms` (the tool-stage wait) is recorded whenever the
+  mode is not `off` — zero in shadow, which never waits — and is what E4/E5
+  read in queue. `transport_queue_ms` (request plus auth wait, from
+  `APIKeyMiddleware`) is recorded in queue and enforce only. Both are plain
+  JSON numbers read through a `jsonb_typeof` guard.
 
   Every `write_usage_row` caller, including background coalescer flushes,
   acquires the shared writer permit before opening any database connection.
   The permit covers initial insert, rollback and FK retry; the failed session
-  closes before the retry opens. Enforced writer-capacity failure returns
-  `False` and emits `usage_log_failed` with `reason=concurrency_capacity`.
-  Coalesced counts remain pending on either `False` or cancellation; cancellation
-  still propagates. Writer shadow pressure does not delay or drop a row.
+  closes before the retry opens. The writer's own observation is merged into
+  the same row through the same stage-ordered function — never a second row.
+  Enforced writer-capacity failure returns `False`, counts `writer_refused`
+  and emits `usage_log_failed` with `reason=concurrency_capacity`; a queue
+  writer overrun **still writes the row** and counts `writer_overrun`.
+  Coalesced counts remain pending on either `False` or cancellation;
+  cancellation still propagates. Writer shadow pressure does not delay or drop
+  a row.
 
   **What the page does with that, concretely.** The per-tool refusal count on
   `/admin/performance` is `sum(1 + suppressed) FILTER (WHERE <the predicate>)`,
