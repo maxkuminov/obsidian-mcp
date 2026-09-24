@@ -26,6 +26,10 @@
 .data-table tbody tr td.perf-td-actor { font-size: 12px; line-height: 1.3; }
 .data-table tbody tr td.perf-td-sm { font-size: 12px; }
 .data-table tbody tr td.perf-td-empty { text-align: center; padding: 32px; color: var(--text-3); }
+.data-table tbody tr td.perf-td-class { color: var(--text); font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase; }
+.data-table tbody tr td.perf-td-reason { font-size: 12px; color: var(--text-2); line-height: 1.5; word-break: break-word; }
+.perf-cc-subhead { font-size: 12px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-2); margin: 18px 0 6px; }
+.perf-cc-list { margin: 0; padding-left: 18px; font-size: 12px; color: var(--text-2); line-height: 1.6; }
 </style>
 {% endblock %}
 {% block content %}
@@ -114,6 +118,169 @@
         </table>
         </div>
     </div>
+
+    {#
+      Concurrency (#188, design D6). The per-tool/class table is scoped
+      exactly as the latency table above and counts only rows carrying
+      `params.concurrency.v = 2`; legacy rows are left out, never zeroed.
+      Everything in the second card is admin-only: the route does not even
+      compute it for anyone else.
+    #}
+    {% set cc = concurrency %}
+    <div class="card anim-2 u-margin-bottom-20px">
+        <div class="card-header">
+            <span class="card-title">Concurrency pressure</span>
+            <span class="mono u-font-size-11px u-color-text-3">{{ window_label }}</span>
+        </div>
+        {% if not cc.has_data %}
+        <div class="card-body">
+            <p class="perf-empty-note">
+                No calls carrying concurrency provenance were logged in this
+                window. Rows written before provenance existed, or while
+                <span class="mono">MCP_CONCURRENCY_MODE=off</span>, carry none
+                and are not counted.
+            </p>
+        </div>
+        {% else %}
+        <div class="table-scroll">
+        <table class="data-table">
+            <thead>
+                <tr>
+                    <th>Tool / class</th>
+                    <th class="perf-th-num">Executed</th>
+                    <th class="perf-th-num" title="Executed calls with a tool-stage shadow observation: enforce at zero wait would have refused them.">Tool-pressured</th>
+                    <th class="perf-th-num" title="Queue mode: calls whose tool slot overran, that is, enforce would have refused them.">Overruns</th>
+                    <th class="perf-th-num" title="Enforced slot_timeout refusals, weighted 1 + suppressed.">Slot timeouts</th>
+                    <th class="perf-th-num">Queue p50</th>
+                    <th class="perf-th-num">p95</th>
+                    <th class="perf-th-num">p99</th>
+                    <th class="perf-th-num">Max</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in cc.classes + cc.tools %}
+                <tr>
+                    {% if row.tool is none %}
+                    <td class="perf-td-class">{{ row.cls }}</td>
+                    {% else %}
+                    <td class="perf-td-tool">{{ row.tool }} <span class="mono u-font-size-10px u-color-text-3">{{ row.cls }}</span></td>
+                    {% endif %}
+                    <td class="mono perf-td-num">{{ row.executed }}</td>
+                    <td class="mono perf-td-num">{{ row.tool_pressured }}</td>
+                    <td class="mono perf-td-num">{% if row.overruns %}<span class="badge badge-yellow">{{ row.overruns }}</span>{% else %}0{% endif %}</td>
+                    <td class="mono perf-td-num">{% if row.slot_timeouts %}<span class="badge badge-red">{{ row.slot_timeouts }}</span>{% else %}0{% endif %}</td>
+                    {% for q in (row.p50, row.p95, row.p99, row.max) %}
+                    <td class="mono perf-td-num-muted">{% if q is not none %}{{ q | round | int }} ms{% else %}<span class="u-color-text-3">—</span>{% endif %}</td>
+                    {% endfor %}
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+        </div>
+        {% endif %}
+    </div>
+
+    {% if cc.admin %}
+    {% set ad = cc.admin %}
+    {% set snap = ad.snapshot %}
+    <div class="card anim-2 u-margin-bottom-20px">
+        <div class="card-header">
+            <span class="card-title">Concurrency control</span>
+            <span class="mono u-font-size-11px u-color-text-3">admin only</span>
+        </div>
+        <div class="card-body">
+            <div class="kv">
+                <span class="kv-k">Mode</span>
+                <span class="kv-v mono u-font-size-12px"><span class="badge badge-blue">{{ snap.mode }}</span> · epoch {{ snap.epoch }}</span>
+            </div>
+            <div class="kv">
+                <span class="kv-k">Pool demand</span>
+                <span class="kv-v mono u-font-size-12px">
+                    {{ snap.pool_demand.total }} of {{ snap.pool_demand.capacity }}
+                    <span class="u-color-text-3">(auth {{ snap.pool_demand.auth }} + tools {{ snap.pool_demand.tool_demand }} + writers {{ snap.pool_demand.writers }} + headroom {{ snap.pool_demand.headroom }})</span>
+                </span>
+            </div>
+            <div class="kv">
+                <span class="kv-k">Active now</span>
+                <span class="kv-v mono u-font-size-12px">
+                    requests {{ snap.active.requests }} · auth {{ snap.active.auth }} · tools {{ snap.active.tools }} · writers {{ snap.active.writers }}
+                    <span class="u-color-text-3">({% for c, n in snap.active.classes | dictsort %}{{ c }} {{ n }}{% if not loop.last %}, {% endif %}{% endfor %})</span>
+                </span>
+            </div>
+            <div class="kv">
+                <span class="kv-k">Waiting now</span>
+                <span class="kv-v mono u-font-size-12px">requests {{ snap.waiting.requests }} · auth {{ snap.waiting.auth }} · tools {{ snap.waiting.tools }} · writers {{ snap.waiting.writers }}</span>
+            </div>
+            <div class="kv">
+                <span class="kv-k">Effective limits</span>
+                <span class="kv-v mono u-font-size-11px">{% for k, lim in snap.limits | dictsort %}{% if k != "mode" %}{{ k }}={{ lim }} {% endif %}{% endfor %}</span>
+            </div>
+
+            <div class="perf-cc-subhead">Durable counters · {{ window_label }} · {{ snap.mode }}/{{ snap.epoch }}</div>
+            {% for c in ad.counters %}
+            <div class="kv">
+                <span class="kv-k">{{ c.metric }}</span>
+                <span class="kv-v mono u-font-size-12px">{% if c.count and c.metric != "requests" %}<span class="badge badge-yellow">{{ c.count }}</span>{% else %}{{ c.count }}{% endif %}</span>
+            </div>
+            {% endfor %}
+            {% for g in ad.gauges %}
+            <div class="kv">
+                <span class="kv-k">{{ g.metric }} (max)</span>
+                <span class="kv-v mono u-font-size-12px">{% if g.max is not none %}{{ g.max }}{% else %}<span class="u-color-text-3">no sample</span>{% endif %}</span>
+            </div>
+            {% endfor %}
+
+            <div class="perf-cc-subhead">Coverage</div>
+            <div class="kv">
+                <span class="kv-k">Durable watermark</span>
+                <span class="kv-v mono u-font-size-12px">{% if ad.watermark %}<time datetime="{{ ad.watermark }}" data-localize>{{ ad.watermark }}</time>{% else %}<span class="u-color-text-3">no run recorded for this mode and epoch</span>{% endif %}</span>
+            </div>
+            {% if ad.gaps %}
+            <ul class="perf-cc-list">
+                {% for gap in ad.gaps %}
+                <li>uncovered from <time datetime="{{ gap.start }}" data-localize>{{ gap.start }}</time> for {{ gap.length }}</li>
+                {% endfor %}
+            </ul>
+            {% elif ad.watermark %}
+            <p class="perf-phase-intro u-margin-top-8px">No uncovered interval in this window up to the watermark.</p>
+            {% endif %}
+
+            <div class="perf-cc-subhead">Readiness</div>
+            {% if not ad.target %}
+            <p class="perf-empty-note">No next mode to evaluate from <span class="mono">{{ snap.mode }}</span>.</p>
+            {% else %}
+            {% set verdict = ad.verdict %}
+            <div class="kv">
+                <span class="kv-k">Next mode: {{ ad.target }}</span>
+                <span class="kv-v mono u-font-size-12px">
+                    <span class="badge {% if verdict.overall == 'PASS' %}badge-green{% elif verdict.overall == 'FAIL' %}badge-red{% else %}badge-gray{% endif %}">{{ verdict.overall }}</span>
+                    {% if verdict.window %}<span class="u-color-text-3">{{ verdict.window.start }} → {{ verdict.window.end }} ({{ verdict.window.days }} d of {{ verdict.source_mode }} evidence)</span>{% endif %}
+                </span>
+            </div>
+            <div class="table-scroll">
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Criterion</th>
+                        <th>Verdict</th>
+                        <th>Reason</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for c in verdict.criteria %}
+                    <tr>
+                        <td class="perf-td-sm"><span class="mono">{{ c.id }}</span> <span class="u-color-text-3">{{ c.description }}</span></td>
+                        <td class="perf-td-sm"><span class="badge {% if c.verdict == 'PASS' %}badge-green{% elif c.verdict == 'FAIL' %}badge-red{% else %}badge-gray{% endif %}">{{ c.verdict }}</span></td>
+                        <td class="perf-td-reason">{{ c.reason }}</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+    {% endif %}
 
     <!-- Phase breakdown -->
     <div class="card anim-2 u-margin-bottom-20px">
