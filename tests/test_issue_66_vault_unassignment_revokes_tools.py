@@ -1149,7 +1149,9 @@ def test_refused_call_persists_a_usage_log_row(as_unassigned_user):
     assert isinstance(row.duration_ms, int) and row.duration_ms >= 0
 
     # Exactly the tool's allow-list plus the marker — a refusal must not become
-    # a new disclosure channel, and the marker must actually be persisted.
+    # a new disclosure channel, and the marker must actually be persisted. The
+    # one addition is the #188 row provenance (mode and settings epoch only).
+    assert row.params.pop("concurrency")["v"] == 2
     assert row.params == {
         "folder": "Private",
         "limit": 50,
@@ -1182,5 +1184,6 @@ def test_successful_call_persists_no_error_marker(as_unassigned_user, tmp_path):
     row = recording.added[0]
     assert isinstance(row, UsageLog)
     assert row.tool == "fake_tool"
+    assert row.params.pop("concurrency")["v"] == 2  # #188 row provenance
     assert row.params == {"q": "hello"}
     assert "error" not in row.params

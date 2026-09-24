@@ -141,6 +141,11 @@ def _www_authenticate(error: str | None = None) -> str:
 
 
 def _concurrency_response(admission):
+    """The transport 429: `code`, `scope`, `limit`, `Retry-After: 1` (#261).
+
+    Deliberately outside the in-band `MCP-REFUSAL` contract: there is no tool
+    call to answer and no principal yet. The shape is unchanged by #188.
+    """
     pressure = admission.pressure
     return JSONResponse(
         {"error": "MCP concurrency capacity is unavailable", "code": pressure.code,
@@ -149,22 +154,67 @@ def _concurrency_response(admission):
     )
 
 
-def _reportable_pressure(admission):
-    # Exactly the pre-#188 emission set: a shadow observation or a refusal. A
-    # grant after a wait (now possible in enforce/queue) is not reported until
-    # S2 adds the waited/overrun outcomes.
-    return admission.pressure is not None and (
-        admission.shadow is not None or not admission.admitted)
+#: A granted transport wait longer than this emits `outcome=waited` (#188 D1).
+#: Shorter waits are the ordinary, expected cost of queueing; the durable
+#: counters measure them instead of the security log.
+WAITED_EVENT_THRESHOLD_MS = 100
+
+# Worst-outcome ranking for the request's single counter entry (design D8).
+_OUTCOME_RANK = {"none": 0, "pressured": 1, "waited": 2, "overrun": 3, "refused": 4}
+
+
+def _pressure_outcome(admission) -> str | None:
+    """The `mcp_concurrency_pressure` outcome for one transport admission.
+
+    `shadow` (a zero-wait would-refuse), `refused` (enforce, or shutdown),
+    `overrun` (queue admitted where enforce would refuse) and `waited` (a
+    granted wait over `WAITED_EVENT_THRESHOLD_MS`). A short granted wait and a
+    disconnected waiter emit nothing, and a grant after a wait is never
+    reported as a refusal.
+    """
+    if admission.pressure is None or admission.disconnected:
+        return None
+    if admission.shadow is not None:
+        return "shadow"
+    if not admission.admitted:
+        return "refused"
+    if admission.overrun is not None:
+        return "overrun"
+    if admission.queue_ms > WAITED_EVENT_THRESHOLD_MS:
+        return "waited"
+    return None
+
+
+def _counter_outcome(mode: str, admission) -> str:
+    """This stage's contribution to the request's worst transport outcome."""
+    if admission.pressure is None:
+        return "none"
+    if admission.pressure.scope == "shutdown":
+        # Shutdown is not a capacity outcome. Counting it as
+        # `transport_refused` would trip the enforce rollback on every deploy.
+        return "none"
+    if mode == "shadow":
+        return "pressured"
+    if admission.overrun is not None:
+        return "overrun"
+    if not admission.admitted and not admission.disconnected:
+        return "refused"
+    return "waited" if admission.queue_ms > 0 else "none"
 
 
 def _emit_concurrency_pressure(request, admission):
-    pressure = admission.pressure
+    outcome = _pressure_outcome(admission)
+    if outcome is None:
+        return
+    pressure = admission.overrun or admission.pressure
     try:
+        if outcome not in security_events.MCP_CONCURRENCY_PRESSURE_OUTCOMES:
+            raise ValueError(f"unknown concurrency outcome {outcome!r}")
         security_events.emit(
             "mcp_concurrency_pressure",
             subject=security_events.subject_for(request=request),
             reason=f"{pressure.stage}:{pressure.scope}",
-            outcome="shadow" if admission.shadow is not None else "refused",
+            outcome=outcome,
             limit_count=pressure.limit, method=request.method,
             route=request.url.path, client_ip=security_events.client_ip(request),
         )
@@ -172,6 +222,164 @@ def _emit_concurrency_pressure(request, admission):
         # Telemetry is response-neutral, including catalogue/configuration
         # faults. No failed emission may strand a request/auth lease.
         pass
+
+
+def _message_bytes(message) -> int:
+    body = message.get("body") if isinstance(message, dict) else None
+    return len(body) if isinstance(body, (bytes, bytearray, memoryview)) else 0
+
+
+class ReceiveWatch:
+    """The single owner of ASGI `receive` while a request waits (#188 D1).
+
+    uvicorn reports a client disconnect through `receive`; it never cancels
+    the middleware. So a transport waiter whose `receive` nobody reads learns
+    its client left only at its deadline. From the first wait until transport
+    admission ends, one watcher task is the only caller of the real `receive`:
+
+    - it keeps calling `receive` **past** `more_body: false`. After the last
+      body message the next `receive` blocks until the client disconnects,
+      which is exactly what it waits for;
+    - every consumed message is appended **as received**, never dropped,
+      split, merged or reordered, and its body bytes are reserved against the
+      process-wide `replay_budget()`. The reservation follows `receive`, so a
+      consumed message is never refused;
+    - `http.disconnect` sets `disconnected`, which releases the controller's
+      waiter, and ends the loop;
+    - once the budget is exhausted it stops calling `receive` and keeps all it
+      holds. The request is then bounded by the transport deadline (L8).
+
+    `stop()` is the handoff: it cancels and awaits the watcher. A `receive`
+    that had completed is already in the list, because the append precedes the
+    next await; a pending one was cancelled before uvicorn handed anything
+    back. `downstream()` is then the app's `receive`: the list in order, the
+    budget released, then the real `receive`.
+    """
+
+    def __init__(self, receive: Receive):
+        self._receive = receive
+        self.disconnected = asyncio.Event()
+        self.messages: list = []
+        self.reserved = 0
+        self.error: Exception | None = None
+        self._task: asyncio.Task | None = None
+        self._stopped = False
+
+    def start(self) -> None:
+        if self._task is None and not self._stopped:
+            self._task = asyncio.get_running_loop().create_task(self._run())
+
+    async def _run(self) -> None:
+        budget = concurrency.replay_budget()
+        complete = False
+        while not budget.exhausted:
+            try:
+                message = await self._receive()
+            except Exception as exc:  # noqa: BLE001 - surfaced to the app
+                self.error = exc
+                return
+            self.messages.append(message)
+            size = _message_bytes(message)
+            self.reserved += size
+            room = budget.try_reserve(size)
+            kind = message.get("type") if isinstance(message, dict) else None
+            if kind == "http.disconnect":
+                self.disconnected.set()
+                return
+            if not room:
+                return
+            if complete:
+                # Only a disconnect may follow a complete body. A `receive`
+                # that keeps answering without blocking is not an ASGI server
+                # this loop may spin on: keep the message, stop watching.
+                return
+            complete = kind == "http.request" and not message.get("more_body", False)
+
+    async def stop(self) -> None:
+        """Handoff: cancel the watcher and wait for it to finish."""
+        self._stopped = True
+        task, self._task = self._task, None
+        if task is None:
+            return
+        task.cancel()
+        # `asyncio.wait` never raises the awaited task's cancellation into this
+        # one, so only a cancellation of *this* request propagates from here.
+        await asyncio.wait((task,))
+
+    def abort(self) -> None:
+        """Synchronous teardown for the outer `finally`."""
+        self._stopped = True
+        task, self._task = self._task, None
+        if task is not None and not task.done():
+            task.cancel()
+        self.release()
+
+    def release(self) -> None:
+        if self.reserved:
+            concurrency.replay_budget().release(self.reserved)
+            self.reserved = 0
+
+    def downstream(self) -> Receive:
+        """The `receive` the app sees: the replay list first, then the real one."""
+        if not self.messages and self.error is None:
+            self.release()
+            return self._receive
+        messages, self.messages = self.messages, []
+
+        async def replay():
+            if messages:
+                message = messages.pop(0)
+                if not messages:
+                    self.release()
+                return message
+            self.release()
+            if self.error is not None:
+                error, self.error = self.error, None
+                raise error
+            return await self._receive()
+
+        return replay
+
+
+async def _admit(admission_coro, watch: ReceiveWatch):
+    """Run one transport admission, starting the watcher only if it waits.
+
+    The admission coroutine runs eagerly. An immediate grant or refusal
+    completes without suspending, and no watcher task is created for it; only
+    a coroutine that actually suspends (a waiter) starts the watch.
+
+    If this request is cancelled while the admission is pending, the admission
+    is cancelled too, and the controller's own cleanup returns any grant. A
+    grant that had already completed when the cancellation arrived is
+    released here, so the race orphans no lease.
+    """
+    task = asyncio.Task(admission_coro, loop=asyncio.get_running_loop(),
+                        eager_start=True)
+    if task.done():
+        return task.result()
+    watch.start()
+    try:
+        return await task
+    except BaseException:
+        def release_orphan(t):
+            if not t.cancelled() and t.exception() is None:
+                admission = t.result()
+                if admission.lease is not None:
+                    admission.lease.release()
+        if task.done():
+            release_orphan(task)
+        else:
+            task.cancel()
+            task.add_done_callback(release_orphan)
+        raise
+
+
+#: This request's measured transport wait (request + auth stages) in ms, read
+#: by `_tracked` as `transport_queue_ms` in queue and enforce (#188). Reset
+#: with the rest of the request's context in the middleware's `finally`.
+current_transport_queue_ms: ContextVar[float] = ContextVar(
+    "current_transport_queue_ms", default=0.0
+)
 
 
 
@@ -294,45 +502,83 @@ class APIKeyMiddleware:
         token_principal = current_principal.set(None)
 
         controller = concurrency.get_controller()
-        # S1 compatibility shim (#188): the admission points are coroutines
-        # sharing one transport deadline. The disconnect event is fresh and
-        # never set here; S2 replaces this block with the receive watcher.
+        mode = controller.mode
+        # One monotonic deadline for both transport stages (#188 D1), and the
+        # single-owner receive watcher that makes their waits disconnect-aware.
+        # A request waiting at either stage holds no database connection.
         transport_deadline = controller.transport_deadline()
-        disconnected = asyncio.Event()
-        request_admission = await controller.request(
-            hash_key(token), transport_deadline, disconnected)
-        if _reportable_pressure(request_admission):
-            _emit_concurrency_pressure(request, request_admission)
-        if not request_admission.admitted:
-            # No session was opened; the full-request envelope is already full.
-            response = _concurrency_response(request_admission)
-            # Context restoration below still runs on this early refusal.
-        else:
-            response = None
-        observed = tuple(p for p in (request_admission.pressure,)
-                         if p is not None and controller.mode == "shadow")
-        observation_token = concurrency.request_observations.set(observed)
+        watch = ReceiveWatch(receive)
+        request_admission = auth_admission = None
+        worst = "none"
+        transport_ms = 0.0
+        observation_token = concurrency.request_observations.set(())
+        transport_token = current_transport_queue_ms.set(0.0)
         try:
-            if response is None:
-                auth_admission = await controller.auth(transport_deadline, disconnected)
-                if _reportable_pressure(auth_admission):
-                    _emit_concurrency_pressure(request, auth_admission)
-                    if controller.mode == "shadow":
-                        concurrency.request_observations.set(observed + (auth_admission.pressure,))
-                if auth_admission.admitted:
-                    try:
-                        response = await self._authenticate(request, scope, token)
-                    finally:
-                        auth_admission.lease.release()
-                else:
-                    response = _concurrency_response(auth_admission)
-            if response is not None:
-                await response(scope, receive, send)
+            request_admission = await _admit(
+                controller.request(hash_key(token), transport_deadline,
+                                   watch.disconnected), watch)
+            admissions = [request_admission]
+            if request_admission.admitted and not watch.disconnected.is_set():
+                auth_admission = await _admit(
+                    controller.auth(transport_deadline, watch.disconnected), watch)
+                admissions.append(auth_admission)
+            # The handoff: transport admission has ended (granted, refused,
+            # overrun or disconnected). From here the app alone calls receive.
+            await watch.stop()
+
+            for admission in admissions:
+                _emit_concurrency_pressure(request, admission)
+                outcome = _counter_outcome(mode, admission)
+                if _OUTCOME_RANK[outcome] > _OUTCOME_RANK[worst]:
+                    worst = outcome
+                transport_ms += admission.queue_ms
+            if mode == "shadow":
+                observed = tuple(a.pressure for a in admissions if a.pressure is not None)
+            elif mode == "queue":
+                observed = tuple(o for a in admissions if (o := a.observation) is not None)
             else:
-                await self.app(scope, receive, send)
+                observed = ()
+            concurrency.request_observations.set(observed)
+            if mode in ("queue", "enforce"):
+                current_transport_queue_ms.set(transport_ms)
+
+            if watch.disconnected.is_set():
+                # The client left while this request waited. Checked after the
+                # auth grant and before its session opens: no credential query,
+                # no response (there is nobody to send it to), and every lease
+                # goes back here and in the `finally` below.
+                if auth_admission is not None and auth_admission.lease is not None:
+                    auth_admission.lease.release()
+                return
+            if not request_admission.admitted:
+                # No session was opened; the full-request envelope is full.
+                response = _concurrency_response(request_admission)
+            elif not auth_admission.admitted:
+                response = _concurrency_response(auth_admission)
+            else:
+                try:
+                    response = await self._authenticate(request, scope, token)
+                finally:
+                    auth_admission.lease.release()
+            app_receive = watch.downstream()
+            if response is not None:
+                await response(scope, app_receive, send)
+            else:
+                await self.app(scope, app_receive, send)
         finally:
-            if request_admission.lease is not None:
+            watch.abort()
+            if request_admission is not None and request_admission.lease is not None:
                 request_admission.lease.release()
+            if mode != "off":
+                # Once per request, by its worst transport outcome (design D8).
+                try:
+                    counts = concurrency.counters()
+                    counts.record_request(worst)
+                    if transport_ms > 0 and mode in ("queue", "enforce"):
+                        counts.gauge("transport_wait_max_ms", transport_ms)
+                except Exception:
+                    pass  # bookkeeping is response-neutral
+            current_transport_queue_ms.reset(transport_token)
             concurrency.request_observations.reset(observation_token)
             current_permission.reset(token_perm)
             current_api_key_id.reset(token_key)

@@ -268,6 +268,11 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
         {"tool", "reason", "outcome", "user_id", "key_id", "oauth_token_id"}
     ),
     # #261 transport observer integration; no credential fingerprints.
+    # `reason` is the closed `<stage>:<scope>`; `outcome` is one of
+    # `MCP_CONCURRENCY_PRESSURE_OUTCOMES` below (#188): `shadow` (zero-wait
+    # would-refuse), `refused` (enforce, or shutdown), `overrun` (queue mode
+    # admitted where enforce would refuse) and `waited` (a granted transport
+    # wait over 100 ms).
     "mcp_concurrency_pressure": frozenset(
         {"reason", "outcome", "limit_count", "method", "route", "client_ip",
          "user_id", "key_id", "oauth_token_id"}
@@ -390,6 +395,9 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     # ── The suppressor's own record (this module) ──
     "events_suppressed": frozenset({"reason", "count", "window_seconds"}),
 }
+
+#: The closed `outcome` vocabulary of `mcp_concurrency_pressure` (#188).
+MCP_CONCURRENCY_PRESSURE_OUTCOMES = frozenset({"shadow", "refused", "overrun", "waited"})
 
 #: The suppressor's summary. Never itself suppressed, never counted.
 SUMMARY_EVENT = "events_suppressed"
