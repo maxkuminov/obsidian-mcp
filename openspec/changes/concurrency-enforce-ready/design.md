@@ -141,10 +141,24 @@ per-request cap.
   - Its unread bytes remain in the transport's flow-controlled buffers, where
     they would have been anyway.
 - Nothing already consumed is ever discarded, so replay is always byte-exact.
-- The honest bound is budget + (transport waiters × one ASGI message).
-  - Uvicorn's HTTP protocols deliver body messages of at most one socket read,
-    64 KiB.
-  - That gives 32 MiB + 96 × 64 KiB ≈ **38 MiB** process-wide.
+- The honest bound is budget + transport waiters × the largest ASGI message
+  uvicorn can hand back. That message size is set by uvicorn's code (the
+  image's CMD uses the default `auto` HTTP implementation, which is httptools
+  with uvloop):
+  - `on_body` appends every parsed chunk to `cycle.body`, and pauses reading
+    only once `len(body) > HIGH_WATER_LIMIT`, which is 65,536 bytes
+    (`flow_control.py:7`, `httptools_impl.py:316–318`). `receive` then returns
+    **everything accumulated** (`httptools_impl.py:575`).
+  - The chunk that crosses the threshold is one socket read. Both asyncio's
+    selector transport (`max_size = 256 KiB`) and uvloop read at most 256 KiB
+    at a time.
+  - h11 has the same flow-control structure.
+  - So one message is at most HIGH_WATER_LIMIT + one read ≈ 64 KiB + 256 KiB
+    = **320 KiB**.
+  - That gives 32 MiB + 96 × 320 KiB ≈ **62 MiB** process-wide.
+  - Up to 320 KiB per request already sits in uvicorn's own `cycle.body`
+    whether or not this watcher exists. The watcher moves it rather than
+    duplicating it.
 - The budget is released when the replay list has been yielded to the app, or
   when the request ends.
 
@@ -401,12 +415,20 @@ changing mode is a single-line edit.
   leaves `(completed_through, next run's started_at)` **uncovered**. This holds
   however short the restart, because the partial bucket's buffered incidents
   may be lost.
-- The evaluator's default window end is the durable watermark: the latest
-  `completed_through` over the current epoch and mode. An explicitly requested
-  end beyond the watermark gives INSUFFICIENT_DATA.
-- Window boundaries are whole minutes. The start is rounded up and the end
-  rounded down, except that a clean-shutdown end is exact. Event-time minute
-  buckets therefore never straddle a boundary.
+- The evaluator's default window end is the durable watermark, **rounded down
+  to a whole minute**: the latest `completed_through` over the current epoch
+  and mode. An explicitly requested end beyond that gives INSUFFICIENT_DATA.
+- **Every** window boundary is a whole minute. The start is rounded up and the
+  end rounded down, and **clean-shutdown ends are rounded down too**. The exact
+  `completed_through` of a clean shutdown serves only coverage, never as an
+  evaluation end.
+  - Reason: a bucket is keyed by (minute, epoch, mode), not by run. If a run
+    shuts down cleanly at 12:00:20 and a same-configuration run starts at
+    12:00:40, both write bucket 12:00. An exact 12:00:20 end would pull the
+    second run's 12:00:50 incident into the earlier window (SR3-1).
+  - Rounding down leaves that shared bucket out of the earlier window. It
+    belongs only to windows that contain the whole minute.
+- Event-time minute buckets therefore never straddle a boundary.
 - A window is **covered** when the union of covered run intervals and covered
   gaps contains it entirely. An uncovered window gives INSUFFICIENT_DATA for
   **every** criterion, row-based and counter-based alike, because a quiet
@@ -543,7 +565,7 @@ mode alone keeps the epoch, so data already collected stays attributable.
   limit × waiters as the bound.** Bodies can reach 61 MiB
   (`mcp_max_request_body_bytes`), which gives about 5.7 GiB at 96 waiters. The
   process-wide replay budget with stop-consuming semantics bounds memory at
-  about 38 MiB and loses nothing (D1).
+  about 62 MiB and loses nothing (D1).
 - **A per-request 64 KiB cap that drops the crossing message** (first
   revision). It was lossy, because a message is sized only after `receive()`
   has consumed it (SR2-2).
@@ -578,9 +600,15 @@ mode alone keeps the epoch, so data already collected stays attributable.
   request stops being disconnect-aware for the rest of its wait. This takes
   several concurrently waiting large write bodies. Such a request is freed at
   the transport deadline (≤ 5 s), and one whose client left may authenticate
-  once. It never loses body bytes.
-- **L11.** Worst-case replay memory is about 38 MiB process-wide
-  (budget + 96 × 64 KiB).
+  once. It never loses body bytes. The budget can be overshot by at most one
+  message per waiter, and one message can be up to about 320 KiB (L11).
+- **L11.** Worst-case replay memory is about **62 MiB** process-wide.
+  - It is the budget (32 MiB) plus 96 transport waiters × one uvicorn message.
+    That message is at most HIGH_WATER_LIMIT 64 KiB + one 256 KiB socket read
+    ≈ 320 KiB.
+  - The figure depends on uvicorn's flow-control constant and on the read
+    size of the event loop. A uvicorn upgrade that changes either must
+    re-derive it; S2's tests pin it by asserting the constant's value.
 - **L9.** Rate tokens spent by a request refused for concurrency are not
   refunded (D9).
 - **L10.** Writer-extended slot holds remain (D5). Their effect is measured by
@@ -605,6 +633,11 @@ mode alone keeps the epoch, so data already collected stays attributable.
 | SR2-3 | Codex | A hard kill inside the heartbeat tolerance loses buffered incidents yet looks covered. | MAJOR | **Accepted.** `concurrency_runs` records `run_id`, a completed-interval watermark and `clean_shutdown`. A gap after an unclean run end is uncovered whatever its length. Test: a hard kill and restart under 180 s gives INSUFFICIENT_DATA (D8, L2). |
 | SR2-4 | Codex | Flush-time buckets move incidents across window boundaries, and reports can certify an unflushed tail. | MAJOR | **Accepted.** Buckets use event time, keyed through retries. Evaluation runs only through the durable watermark, and an end beyond it gives INSUFFICIENT_DATA. Minute-aligned boundaries. Tests cover incidents at both boundaries and before the next flush (D8). |
 | SR2-5 | Codex | S1's full-suite gate still conflicts with S2-owned auth tests. | MINOR | **Accepted.** S1's gate is focused: its own modules and tests plus an import smoke test. The full offline suite is authoritative after S2 merges (tasks). |
+
+| SR3-1 | Codex | SR2-4 was partial, and a MAJOR: the exact clean-shutdown end lets a minute bucket shared with a later same-configuration run count toward the earlier window. | MAJOR | **Accepted.** Every evaluation end is rounded down to a whole minute, clean-shutdown ends included; the exact `completed_through` serves coverage only. A two-runs-in-one-minute scenario and test are added (D8). |
+| SR3-2 | Codex | SR2-2 was partial: the 38 MiB figure assumed 64 KiB messages, but uvicorn returns everything accumulated up to its flow-control threshold plus the crossing read. | MAJOR (partial) | **Accepted.** The bound is re-derived from the code: `HIGH_WATER_LIMIT` is 64 KiB (`flow_control.py:7`, `httptools_impl.py:316–318, 575`) plus one socket read of at most 256 KiB, so about 320 KiB per message and **about 62 MiB** process-wide. Stated in D1, L8 and L11, and pinned by a guard test on the constant. |
+
+Round 3 was the final spec round.
 
 ## Owner decisions
 

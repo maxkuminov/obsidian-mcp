@@ -141,6 +141,7 @@ the full offline + integration + schema run on the merged tree (task 5.1).
 - [ ] 2.5 `security_events.py`: the outcome set and catalogue comment.
 - [ ] 2.6 Offline tests:
   - a **real `http.disconnect`** delivered through `receive`, without `task.cancel()`, at both transport stages, for three cases: no body, a **complete body (`more_body: false`) followed by a disconnect**, and a fragmented body followed by a disconnect. Each must show immediate cleanup, no credential query and no usage row;
+  - a guard test asserting `uvicorn.protocols.http.flow_control.HIGH_WATER_LIMIT == 65536`, the input to the L11 bound (about 62 MiB), so a uvicorn upgrade that changes it fails loudly;
   - byte-exact replay for a single-message body, a multi-message body, **a single message larger than the whole replay budget**, and **fragments crossing the budget**, with the budget-exhausted request deadline-bounded;
   - a handoff race: `receive` completes as admission is granted, and the message is replayed exactly once;
   - provenance on an unpressured row, and on `rate_limited`, coalesced `slot_timeout`, `over_quota` and `tool_exception` rows;
@@ -191,7 +192,7 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - Executed and pre-body classification uses the existing `executed_sql` / `pre_body_refusal_sql`, with the weighted `slot_timeout` through the existing guarded cast. Import these; do not edit `usage_stats.py`.
   - Tool-pressured calls are read from `observations`.
   - Counters are read from `concurrency_counters`. Coverage and the durable watermark come from S3's `coverage()` over `concurrency_runs`.
-  - Window boundaries are aligned to whole minutes. The default end is the watermark, and an explicit end past it is INSUFFICIENT_DATA.
+  - Every window boundary is a whole minute, with no clean-shutdown exception: the start is rounded up and the end rounded down. The default end is the watermark rounded down, and an explicit end past it is INSUFFICIENT_DATA.
   - It reports the mode and epoch sets present, the uncovered intervals, the watermark, and the latest qualifying sub-window start.
   - It computes the full window and the last 72 h.
 - [ ] 4.2 Pure `evaluate(stats, target)`: Q1–Q3 and E1–E6, the minimum windows, the single-mode/single-epoch rule, coverage, INSUFFICIENT_DATA, and the both-windows rule. Thresholds are module constants referencing the design.
@@ -206,6 +207,7 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - an uncovered interval after an unclean run end, including one under 180 s;
   - an explicit end beyond the watermark giving INSUFFICIENT_DATA, and the default end clamped to the watermark;
   - incidents at 11:59:50 and at 12:59:50 against a 12:00–13:00 window;
+  - two runs in one minute: run A shuts down cleanly at 12:00:20, and run B, with the same configuration, starts at 12:00:40 and has a pool timeout at 12:00:50. A window ending at A's shutdown rounds down to 12:00 and excludes the timeout; a window ending at 12:01 includes it;
   - an incident recorded but not yet flushed not being certified;
   - legacy rows with `queue_ms` but no provenance excluded;
   - Q2 duplicate-source immunity;

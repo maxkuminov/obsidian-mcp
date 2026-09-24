@@ -311,11 +311,11 @@ The server SHALL provide one pure evaluator. For a target mode of `queue` or `en
 
 A window SHALL qualify only when all of these hold:
 - All of its rows, counters and runs carry the source mode (`shadow` for target `queue`, `queue` for target `enforce`) and a single epoch.
-- Its end is no later than the durable watermark, the latest `completed_through` of the qualifying runs. The default end SHALL be that watermark.
+- Its end is no later than the durable watermark, the latest `completed_through` of the qualifying runs rounded down to a whole minute. The default end SHALL be that rounded watermark.
 - It is covered:
   - every instant lies within some non-lossy run's `[started_at, completed_through]`, or in a gap that follows a run with a clean-shutdown flush;
   - a gap after a run that ended without a clean-shutdown flush SHALL be uncovered, however short it is.
-- Its boundaries are whole minutes: the start is rounded up and the end rounded down, except that a clean-shutdown end is exact.
+- Its boundaries are whole minutes, with no exception: the start is rounded up and the end rounded down, including an end that falls at a clean shutdown. A minute bucket shared by two runs SHALL count only toward windows that contain that whole minute.
 
 A non-qualifying or uncovered window SHALL yield INSUFFICIENT_DATA for every criterion.
 
@@ -365,6 +365,11 @@ The same evaluator SHALL back both the panel verdict and `make concurrency-repor
 #### Scenario: An unflushed tail is not certified
 - **WHEN** a pool checkout times out after the latest `completed_through`, and a report is requested with an explicit end after that watermark
 - **THEN** the criteria SHALL report INSUFFICIENT_DATA; with the default end, the evaluation SHALL stop at the watermark and report that end
+
+#### Scenario: Two runs in one minute do not leak into the earlier window
+- **WHEN** run A, in queue mode, shuts down cleanly at 12:00:20; run B, with the same epoch and mode, starts at 12:00:40 and records a pool checkout timeout at 12:00:50; and an evaluation is requested with an end at run A's shutdown
+- **THEN** the evaluation end SHALL be rounded down to 12:00, and bucket 12:00 and run B's timeout SHALL NOT count toward that window
+- **AND** a window ending at 12:01 or later SHALL include the timeout and fail Q3 or E6
 
 #### Scenario: Incidents at the window boundaries
 - **WHEN** a pool timeout occurs at 11:59:50, just before a window starting at 12:00, and another at 12:59:50, inside a window ending at 13:00 whose watermark is 13:00

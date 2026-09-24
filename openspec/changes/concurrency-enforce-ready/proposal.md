@@ -46,7 +46,7 @@ A false refusal of a legitimate agent call breaks the live path. The design
     complete. It is the only caller of `receive` during that time.
   - Every message it consumes is kept and replayed intact to the app.
   - A process-wide replay budget (32 MiB) stops further consumption but never
-    drops anything. Worst-case memory is about 38 MiB.
+    drops anything. Worst-case memory is about 62 MiB: the budget plus 96 waiters × one uvicorn message of up to about 320 KiB.
   - A disconnected waiter is freed immediately and runs no credential query.
   - The auth permit is kept.
 - **Tunable pool budget and reclassification (blocker 2).**
