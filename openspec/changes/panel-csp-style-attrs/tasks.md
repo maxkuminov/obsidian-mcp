@@ -64,7 +64,7 @@ Six implementation slices in two waves. Each slice is one worktree and one indep
 ## 3. Merge and gates
 
 - [x] 3.1 The supervisor merges B–E into `wt-panel-csp-style-attrs`. `grep -rnE '(\s|["'"'"'}])style\s*=' src/control_panel/templates/` returns nothing, and neither does `grep -n 'style=' src/control_panel/static/panel.js`.
-- [ ] 3.2 Full offline suite green, including F's gates, now authoritative. Then `make test-integration` and `make audit`.
+- [x] 3.2 Full offline suite green, including F's gates, now authoritative. Then `make test-integration` and `make audit`.
 - [x] 3.3 **Seam check:** every class used in a converted template is defined (the utility partial, a base `<style>`, or that page's `page_style`), and every `u-` class in `_utilities.html` is used at least once. A small scratchpad script, with its result recorded in the PR.
 - [x] 3.4 `openspec validate panel-csp-style-attrs --strict` passes.
 
