@@ -249,11 +249,22 @@ class ReceiveWatch:
     - once the budget is exhausted it stops calling `receive` and keeps all it
       holds. The request is then bounded by the transport deadline (L8).
 
-    `stop()` is the handoff: it cancels and awaits the watcher. A `receive`
-    that had completed is already in the list, because the append precedes the
-    next await; a pending one was cancelled before uvicorn handed anything
-    back. `downstream()` is then the app's `receive`: the list in order, the
-    budget released, then the real `receive`.
+    The handoff never cancels a `receive` (impl review R1-1). Each real
+    `receive` runs in its own task (`_pending`), and the watcher only awaits
+    it through `asyncio.shield`. A wrapped `receive` — the security-header
+    `BaseHTTPMiddleware` in `src/main.py` — can suspend after it has taken a
+    message from the server and before it returns it; cancelling it there
+    would lose the message. So `stop()` cancels only the watcher loop (the
+    shield absorbs it) and the in-flight call, if any, passes to
+    `downstream()` untouched. `_pending` is cleared in the same step its
+    message is appended, so a message is either in the list or still owed by
+    `_pending`, never both and never neither.
+
+    `downstream()` is then the app's `receive`: the list in order, the budget
+    released, then the in-flight call's own result (a message or a
+    disconnect, exactly once), then the real `receive`. If the app never asks
+    again (a GET), `abort()` cancels the in-flight call at teardown, after the
+    response is complete, when nobody needs what it would have returned.
     """
 
     def __init__(self, receive: Receive):
@@ -263,6 +274,7 @@ class ReceiveWatch:
         self.reserved = 0
         self.error: Exception | None = None
         self._task: asyncio.Task | None = None
+        self._pending: asyncio.Task | None = None
         self._stopped = False
 
     def start(self) -> None:
@@ -272,12 +284,19 @@ class ReceiveWatch:
     async def _run(self) -> None:
         budget = concurrency.replay_budget()
         complete = False
+        loop = asyncio.get_running_loop()
         while not budget.exhausted:
+            pending = self._pending = loop.create_task(self._receive())
             try:
-                message = await self._receive()
+                # Cancelling this loop cancels the shield, never the receive.
+                message = await asyncio.shield(pending)
             except Exception as exc:  # noqa: BLE001 - surfaced to the app
+                self._pending = None
                 self.error = exc
                 return
+            # No await between here and the append: the message moves from
+            # `_pending` to the list in one step.
+            self._pending = None
             self.messages.append(message)
             size = _message_bytes(message)
             self.reserved += size
@@ -296,7 +315,11 @@ class ReceiveWatch:
             complete = kind == "http.request" and not message.get("more_body", False)
 
     async def stop(self) -> None:
-        """Handoff: cancel the watcher and wait for it to finish."""
+        """Handoff: end the watcher loop without cancelling its `receive`.
+
+        The loop is cancelled while it awaits a shield, so an in-flight
+        `receive` keeps running and stays in `_pending` for `downstream()`.
+        """
         self._stopped = True
         task, self._task = self._task, None
         if task is None:
@@ -307,11 +330,22 @@ class ReceiveWatch:
         await asyncio.wait((task,))
 
     def abort(self) -> None:
-        """Synchronous teardown for the outer `finally`."""
+        """Synchronous teardown for the outer `finally`.
+
+        Runs after the response is complete (or when there is nobody to answer),
+        so cancelling a still-pending `receive` here loses nothing anyone needs.
+        """
         self._stopped = True
         task, self._task = self._task, None
         if task is not None and not task.done():
             task.cancel()
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            if pending.done():
+                _settle(pending)
+            else:
+                pending.cancel()
+                pending.add_done_callback(_settle)
         self.release()
 
     def release(self) -> None:
@@ -320,8 +354,12 @@ class ReceiveWatch:
             self.reserved = 0
 
     def downstream(self) -> Receive:
-        """The `receive` the app sees: the replay list first, then the real one."""
-        if not self.messages and self.error is None:
+        """The `receive` the app sees.
+
+        The replay list first, then the in-flight `receive` the watcher left
+        (its result, exactly once), then the real one.
+        """
+        if not self.messages and self.error is None and self._pending is None:
             self.release()
             return self._receive
         messages, self.messages = self.messages, []
@@ -336,9 +374,33 @@ class ReceiveWatch:
             if self.error is not None:
                 error, self.error = self.error, None
                 raise error
+            pending = self._pending
+            if pending is not None:
+                # Shielded: if the app's own call is cancelled, the in-flight
+                # receive survives for its next call instead of being lost.
+                try:
+                    message = await asyncio.shield(pending)
+                except BaseException:
+                    # Only a receive that itself failed is consumed. If this
+                    # call was cancelled, `pending` (running, or finished with
+                    # a message) stays owed to the app's next call.
+                    if self._pending is pending and pending.done() and (
+                            pending.cancelled() or pending.exception() is not None):
+                        self._pending = None
+                    raise
+                if self._pending is pending:
+                    self._pending = None
+                    return message
+                # Another caller already took this result: never duplicate.
             return await self._receive()
 
         return replay
+
+
+def _settle(task: asyncio.Task) -> None:
+    """Retrieve a finished receive task's outcome so none goes unobserved."""
+    if not task.cancelled():
+        task.exception()
 
 
 async def _admit(admission_coro, watch: ReceiveWatch):
