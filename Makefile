@@ -427,7 +427,8 @@ check-no-backups-mount:
 # The readiness verdict for the next concurrency mode (#188, design D6): the
 # same evaluator as the /admin/performance verdict, run inside the live
 # container so it reads the configured epoch and the production database.
-# Exit status is the script's: 0 only when every criterion is PASS.
+# The script exits 0 only when every criterion is PASS (1 FAIL, 2
+# INSUFFICIENT_DATA, 64 usage); make reports any non-zero as its own 2.
 concurrency-report:
 	@if [ "$(TARGET)" != "queue" ] && [ "$(TARGET)" != "enforce" ]; then \
 		echo "$(RED)Usage: make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso-8601]$(NC)"; \

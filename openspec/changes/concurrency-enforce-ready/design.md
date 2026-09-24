@@ -650,7 +650,7 @@ Round 3 was the final spec round.
 
 | Round | Reviewer | Finding | Severity | Disposition |
 | --- | --- | --- | --- | --- |
-| impl-R1-1 | Codex | The handoff cancels the watcher's in-flight `receive`. The security-header `BaseHTTPMiddleware` wraps `receive` and can suspend in task-group cleanup after taking a message from uvicorn and before returning it, so the cancel loses the message: the app receives nothing, the request hangs and keeps its request lease (queue/enforce only). | BLOCKER | **Fixed.** The handoff is cancellation-free: each `receive` runs in its own task awaited through a shield, the in-flight call passes to the replay wrapper and its result is delivered exactly once after the buffered messages; teardown cancels it only after the response. Regression through the production `BaseHTTPMiddleware` wrapping in queue and enforce (D1). |
+| impl-R1-1 | Codex | The handoff cancels the watcher's in-flight `receive`. The security-header `BaseHTTPMiddleware` wraps `receive` and can suspend in task-group cleanup after taking a message from uvicorn and before returning it, so the cancel loses the message: the app receives nothing, the request hangs and keeps its request lease (queue/enforce only). | MAJOR | **Fixed.** The handoff is cancellation-free: each `receive` runs in its own task awaited through a shield, the in-flight call passes to the replay wrapper and its result is delivered exactly once after the buffered messages; teardown cancels it only after the response. Regression through the production `BaseHTTPMiddleware` wrapping in queue and enforce (D1). |
 
 ## Owner decisions
 

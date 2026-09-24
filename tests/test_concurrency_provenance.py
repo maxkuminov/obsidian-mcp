@@ -311,7 +311,7 @@ async def test_enforce_slot_refusal_spends_both_tokens_and_no_quota(configured, 
     # Both tokens were spent by the buckets-first gates and are not refunded.
     assert entry.general.tokens < general - 0.9
     assert entry.write.tokens < write - 0.9
-    assert len(quotas) == 1, 'the refused call reached the quota gate'
+    assert len(quotas) == 1, 'only the held call reached the quota gate'
     finish.set()
     await held
     assert c.tools.active == 0

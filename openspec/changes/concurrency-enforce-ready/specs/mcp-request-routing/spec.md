@@ -31,7 +31,7 @@ From the first wait until admission ends, one watcher SHALL be the only caller o
 
 On `http.disconnect` the middleware SHALL release every waiter count, registry reference and lease held for that request, and SHALL run no credential query.
 
-Every message the watcher consumes SHALL be kept and replayed to the downstream application in order and unchanged, before the application's own calls are delegated to `receive`. At handoff the watcher SHALL be cancelled and awaited, and a message whose `receive` had already completed SHALL be included in the replay.
+Every message the watcher consumes SHALL be kept and replayed to the downstream application in order and unchanged, before the application's own calls are delegated to `receive`. At handoff the watcher SHALL end without cancelling an in-flight `receive`; a message whose `receive` had already completed SHALL be included in the replay, and a still-pending `receive` SHALL pass to the replay wrapper, which delivers its result exactly once after the replayed messages.
 
 Consumed messages SHALL count against a process-wide replay budget, `MCP_CONCURRENCY_REPLAY_BUDGET_BYTES` (default 32 MiB). When the budget is exhausted, the watcher SHALL stop consuming, SHALL NOT discard anything already consumed, and the request SHALL remain bounded by the transport deadline.
 

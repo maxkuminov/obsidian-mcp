@@ -75,27 +75,27 @@ the full offline + integration + schema run on the merged tree (task 5.1).
 - [x] 0.1 Commit the proposal on `wt-concurrency-enforce`.
 - [x] 0.2 Codex spec review round 1: FAIL (7 MAJOR, 2 MINOR), with every finding folded in (see design "Spec review history").
 - [x] 0.3 Codex spec review round 2: FAIL (4 MAJOR, 1 MINOR; SR1-8 partial), with every finding folded in (SR2-1 to SR2-5).
-- [ ] 0.3a Codex spec review round 3, verification only.
+- [x] 0.3a Codex spec review round 3, verification only.
 - [x] 0.4 Owner decisions: `queue` mode and migration 028 approved (2026-09-23).
 
 ## 1. S1: controller, config, budget, accumulator
 
-- [ ] 1.1 `pool_budget.py`: `CLASS_CONNECTIONS` (write 2, the others 1) and a pure `tool_demand`. Keep `TOOL_CONNECTION_MULTIPLIER = max(CLASS_CONNECTIONS.values())` as a deprecated alias with `TODO(#188)`; S2 removes its last importer and S5 deletes it.
-- [ ] 1.2 `concurrency.py`: the five-class `TOOL_CLASSES` per D3.
-- [ ] 1.3 `concurrency.py`: `shadow_metadata` and `queue_metadata` per D4. Ordering is by stage. The shadow code is the earliest stage's. The queue code is the earliest **overrun**, or `null`. The deciding observation is never truncated.
-- [ ] 1.4 `concurrency.py`: mode `queue`. `_admit_wait` grants with `overrun` wherever enforce would refuse for capacity, grants exactly once when a grant races the timeout, and still refuses on shutdown.
-- [ ] 1.5 `concurrency.py`: async `request()` and `auth()` with the shared deadline, the waiter dimensions (request global/fingerprint, auth), fingerprint-entry retention while waiting, and a `disconnected` event that releases the waiter.
-- [ ] 1.6 `concurrency.py`: `epoch()`, `provenance()`, `snapshot()`, `replay_budget()`, and the `counters()` accumulator (a closed metric set, event-time minute keys, `record_request` counting each request once by worst outcome, gauges as bucket maxima, `drain()`/`merge_back()` preserving keys, and the lossy flag).
-- [ ] 1.7 `config.py`:
+- [x] 1.1 `pool_budget.py`: `CLASS_CONNECTIONS` (write 2, the others 1) and a pure `tool_demand`. Keep `TOOL_CONNECTION_MULTIPLIER = max(CLASS_CONNECTIONS.values())` as a deprecated alias with `TODO(#188)`; S2 removes its last importer and S5 deletes it.
+- [x] 1.2 `concurrency.py`: the five-class `TOOL_CLASSES` per D3.
+- [x] 1.3 `concurrency.py`: `shadow_metadata` and `queue_metadata` per D4. Ordering is by stage. The shadow code is the earliest stage's. The queue code is the earliest **overrun**, or `null`. The deciding observation is never truncated.
+- [x] 1.4 `concurrency.py`: mode `queue`. `_admit_wait` grants with `overrun` wherever enforce would refuse for capacity, grants exactly once when a grant races the timeout, and still refuses on shutdown.
+- [x] 1.5 `concurrency.py`: async `request()` and `auth()` with the shared deadline, the waiter dimensions (request global/fingerprint, auth), fingerprint-entry retention while waiting, and a `disconnected` event that releases the waiter.
+- [x] 1.6 `concurrency.py`: `epoch()`, `provenance()`, `snapshot()`, `replay_budget()`, and the `counters()` accumulator (a closed metric set, event-time minute keys, `record_request` counting each request once by worst outcome, gauges as bucket maxima, `drain()`/`merge_back()` preserving keys, and the lossy flag).
+- [x] 1.7 `config.py`:
   - add `queue` to the mode literal, and the new settings with their defaults per D1 and D3, including `mcp_concurrency_replay_budget_bytes` (default 32 MiB, range 1 MiB..256 MiB);
   - `mcp_concurrency_other: int | None`, where `1` warns and anything else is refused;
   - remove the shadow-requires-zero-wait rule and the class-sum rule;
   - add the full hierarchy, coherence and per-class budget validation, naming every term;
   - log the startup INFO line of effective settings and the epoch.
-- [ ] 1.8 `.env.example` block, and `tests/conftest.py` env-key list.
-- [ ] 1.9 `auth.py` compatibility: await the new coroutines, passing `controller.transport_deadline()` and a fresh, never-set disconnect event. Behaviour in shadow and off must stay exactly as today. Add no watch logic; S2 adds it.
-- [ ] 1.10 Mechanical `resource_class="other"` → `"light"` rename in test probe decorators. Nothing else changes in those files.
-- [ ] 1.11 Tests:
+- [x] 1.8 `.env.example` block, and `tests/conftest.py` env-key list.
+- [x] 1.9 `auth.py` compatibility: await the new coroutines, passing `controller.transport_deadline()` and a fresh, never-set disconnect event. Behaviour in shadow and off must stay exactly as today. Add no watch logic; S2 adds it.
+- [x] 1.10 Mechanical `resource_class="other"` → `"light"` rename in test probe decorators. Nothing else changes in those files.
+- [x] 1.11 Tests:
   - the updated #261 controller and config tests, with no existing invariant test weakened;
   - queue overrun on deadline, overflow and zero wait;
   - a grant racing a timeout;
@@ -111,35 +111,35 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - an event at 12:00:50 drained at 12:01:10 keys to 12:00;
   - `merge_back` preserves keys;
   - the lossy flag is set at the cap.
-- [ ] 1.12 S1's focused gate is green (see Test gates), then commit on `wt-ce-s1-core`.
+- [x] 1.12 S1's focused gate is green (see Test gates), then commit on `wt-ce-s1-core`.
 
 ## 2. S2: middleware and `_tracked` wiring
 
-- [ ] 2.1 `auth.py`, the disconnect watch (D1).
+- [x] 2.1 `auth.py`, the disconnect watch (D1).
   - From the first wait until admission ends, a single watcher task is the only caller of `receive()`. It loops **past `more_body: false`** until admission ends, a disconnect arrives, or `replay_budget()` is exhausted.
   - Every consumed message is appended as-is and reserved against the budget.
   - On `http.disconnect`, set the event and return without any response or credential query.
-  - At handoff, cancel and await the watcher. A completed `receive()` result is already in the list; a cancelled pending one consumed nothing.
+  - At handoff, end the watcher without cancelling an in-flight `receive()` (impl-R1-1): a completed result is already in the list, and a still-pending call passes to the replay wrapper, which delivers its result exactly once after the list.
   - Wrap `receive` for the downstream app so it yields the list in order, releases the budget, and then delegates.
   - Check the disconnect flag after the auth grant and before opening the session.
-- [ ] 2.2 `auth.py`:
+- [x] 2.2 `auth.py`:
   - record `transport_queue_ms`;
   - in the outer `finally`, report the request's worst transport outcome once through `counters().record_request`, and the `transport_wait_max_ms` gauge;
   - put transport observations in `request_observations` for shadow and queue;
   - keep the 429 shape;
   - emit `mcp_concurrency_pressure` with outcomes `shadow`, `refused`, `overrun` and `waited` (> 100 ms).
-- [ ] 2.3 `tools.py`:
+- [x] 2.3 `tools.py`:
   - stamp `params.concurrency = provenance()` on every row `_tracked` writes, covering executed calls, every pre-body refusal and coalesced template, `_record_tool_failure`, and writer-merged rows;
   - build shadow and queue metadata through the S1 functions;
   - record `queue_ms` and `transport_queue_ms` in queue and enforce;
   - a queue overrun takes no `slot_timeout` path and continues to the quota gate unchanged;
   - **the slot lease stays held through telemetry** (D5); do not move the release.
-- [ ] 2.4 `tools.py` `write_usage_row`:
+- [x] 2.4 `tools.py` `write_usage_row`:
   - merge the writer observation through the ranked function;
   - in queue, a writer overrun still writes the row and records `writer_overrun`;
   - in enforce, a writer refusal records `writer_refused`.
-- [ ] 2.5 `security_events.py`: the outcome set and catalogue comment.
-- [ ] 2.6 Offline tests:
+- [x] 2.5 `security_events.py`: the outcome set and catalogue comment.
+- [x] 2.6 Offline tests:
   - a **real `http.disconnect`** delivered through `receive`, without `task.cancel()`, at both transport stages, for three cases: no body, a **complete body (`more_body: false`) followed by a disconnect**, and a fragmented body followed by a disconnect. Each must show immediate cleanup, no credential query and no usage row;
   - a guard test asserting `uvicorn.protocols.http.flow_control.HIGH_WATER_LIMIT == 65536`, the input to the L11 bound (about 62 MiB), so a uvicorn upgrade that changes it fails loudly;
   - byte-exact replay for a single-message body, a multi-message body, **a single message larger than the whole replay budget**, and **fragments crossing the budget**, with the budget-exhausted request deadline-bounded;
@@ -151,26 +151,26 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - an enforce batch of 8 parallel `read_note` calls at the defaults sees zero refusals;
   - the MCP-REFUSAL line is unchanged;
   - the auth-burst scenario through the real middleware.
-- [ ] 2.7 Integration:
+- [x] 2.7 Integration:
   - the per-tool checkout-peak test over **every** registered tool, asserting peak ≤ `CLASS_CONNECTIONS[class]` and naming tool, class and peak on failure. A tool above its multiplier is a **stop-and-report**.
   - Replace the `TOOL_CONNECTION_MULTIPLIER` import in `test_issue_261_concurrency_pg.py`, and add an auth-wait case whose actual checkouts stay ≤ the auth ceiling.
-- [ ] 2.8 `pytest tests` and `make test-integration` green, then commit on `wt-ce-s2-wiring`.
+- [x] 2.8 `pytest tests` and `make test-integration` green, then commit on `wt-ce-s2-wiring`.
 
 ## 3. S3: durable counters and pool boundary
 
-- [ ] 3.1 Migration 028 and the models, per D8.
+- [x] 3.1 Migration 028 and the models, per D8.
   - `concurrency_counters`: primary key `(bucket_start, epoch, mode, metric)`, columns `count bigint NOT NULL DEFAULT 0` and `max_value integer NULL`, CHECKs on `mode` and on `metric` (the closed set), and an index on `bucket_start`.
   - `concurrency_runs`: `run_id uuid` primary key, `epoch`, `mode`, `started_at`, `completed_through`, `clean_shutdown bool NOT NULL DEFAULT false` and `lossy bool NOT NULL DEFAULT false`, with an index on `started_at`.
   - `alembic check` must stay clean.
-- [ ] 3.2 `concurrency_counters.py`:
+- [x] 3.2 `concurrency_counters.py`:
   - `register_run()` at lifespan start mints a `run_id` and inserts the run row with `completed_through = started_at`.
   - `flush(clean=False)` runs in one transaction. It reads `t`, drains `counters()`, writes one multi-row `INSERT … ON CONFLICT DO UPDATE` keyed by the **event-time** buckets (count added, `max_value` taken as the greater), and updates the run row: `completed_through = floor_minute(t)`, or `t` with `clean_shutdown = true` when `clean`, plus `lossy` from the accumulator. The commit is synchronous; do **not** add to the `synchronous_commit` allow-list.
   - A failed flush calls `merge_back`, which keeps the original keys, and does not advance the watermark.
   - Prune counters and runs older than 35 days.
   - `coverage(session, start, end, epoch, mode) -> (watermark, uncovered_intervals)` for S4, per the design D8 rules.
-- [ ] 3.3 `database.py`: an `AsyncAdaptedQueuePool` subclass overriding `_do_get`. It counts `sqlalchemy.exc.TimeoutError` as `pool_checkout_timeout` and re-raises unchanged, and updates the `pool_high_water` gauge on success. Wire it with `poolclass=`. If the hook is unstable, report and propose the fallback; do not switch silently.
-- [ ] 3.4 `main.py`: the 60 s flush task, cancelled at shutdown, and a final `flush()` after `flush_all()` and before `engine.dispose()`. Sandbox mode skips it.
-- [ ] 3.5 Tests (integration):
+- [x] 3.3 `database.py`: an `AsyncAdaptedQueuePool` subclass overriding `_do_get`. It counts `sqlalchemy.exc.TimeoutError` as `pool_checkout_timeout` and re-raises unchanged, and updates the `pool_high_water` gauge on success. Wire it with `poolclass=`. If the hook is unstable, report and propose the fallback; do not switch silently.
+- [x] 3.4 `main.py`: the 60 s flush task, cancelled at shutdown, and a final `flush()` after `flush_all()` and before `engine.dispose()`. Sandbox mode skips it.
+- [x] 3.5 Tests (integration):
   - flush idempotence and addition across two flushes;
   - the watermark advancing on idle;
   - an incident at 12:00:50 flushed at 12:01:10 landing in bucket 12:00;
@@ -183,11 +183,11 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - a forced real pool checkout timeout through each of MCP auth, the quota gate, a usage writer, a panel route and `/token` counts once each and re-raises the same exception class;
   - an embedding `TimeoutError` does not count;
   - the high-water gauge.
-- [ ] 3.6 `pytest tests`, `make test-integration` and `make test-schema` green, then commit on `wt-ce-s3-counters`.
+- [x] 3.6 `pytest tests`, `make test-integration` and `make test-schema` green, then commit on `wt-ce-s3-counters`.
 
 ## 4. S4: readiness, report, panel
 
-- [ ] 4.1 `concurrency_readiness.py` `window_stats`.
+- [x] 4.1 `concurrency_readiness.py` `window_stats`.
   - Rows are filtered on `params->'concurrency'->>'v' = '2'` only.
   - Executed and pre-body classification uses the existing `executed_sql` / `pre_body_refusal_sql`, with the weighted `slot_timeout` through the existing guarded cast. Import these; do not edit `usage_stats.py`.
   - Tool-pressured calls are read from `observations`.
@@ -195,10 +195,10 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - Every window boundary is a whole minute, with no clean-shutdown exception: the start is rounded up and the end rounded down. The default end is the watermark rounded down, and an explicit end past it is INSUFFICIENT_DATA.
   - It reports the mode and epoch sets present, the uncovered intervals, the watermark, and the latest qualifying sub-window start.
   - It computes the full window and the last 72 h.
-- [ ] 4.2 Pure `evaluate(stats, target)`: Q1–Q3 and E1–E6, the minimum windows, the single-mode/single-epoch rule, coverage, INSUFFICIENT_DATA, and the both-windows rule. Thresholds are module constants referencing the design.
-- [ ] 4.3 `scripts/concurrency_report.py` and `make concurrency-report DAYS=… TARGET=queue|enforce`, run through `docker exec`. Output a table plus one JSON line. The exit code is 0 only when every criterion is PASS.
-- [ ] 4.4 Panel section per spec. The admin-only block holds live `snapshot()`, the windowed counters, gaps and the verdict. Use existing CSS, with no inline script or handler, and show an empty state.
-- [ ] 4.5 Tests:
+- [x] 4.2 Pure `evaluate(stats, target)`: Q1–Q3 and E1–E6, the minimum windows, the single-mode/single-epoch rule, coverage, INSUFFICIENT_DATA, and the both-windows rule. Thresholds are module constants referencing the design.
+- [x] 4.3 `scripts/concurrency_report.py` and `make concurrency-report DAYS=… TARGET=queue|enforce`, run through `docker exec`. Output a table plus one JSON line. The exit code is 0 only when every criterion is PASS.
+- [x] 4.4 Panel section per spec. The admin-only block holds live `snapshot()`, the windowed counters, gaps and the verdict. Use existing CSS, with no inline script or handler, and show an empty state.
+- [x] 4.5 Tests:
   - boundary tests for every criterion;
   - E1 at 2 and at 3 of 2,000;
   - an E4 regression in the last 72 h;
@@ -215,24 +215,24 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - a queue overrun with `over_quota` counted pre-body;
   - admin versus non-admin rendering, with no inline handlers;
   - integration against real PG with synthetic v2, legacy, coalesced and counter rows.
-- [ ] 4.6 `pytest tests` and `make test-integration` green, then commit on `wt-ce-s4-readiness`.
+- [x] 4.6 `pytest tests` and `make test-integration` green, then commit on `wt-ce-s4-readiness`.
 
 ## 5. Merge, seams, docs, gates (supervisor)
 
 - [ ] 5.1 Merge S1, S2, S3, then S4. On the merged tree run the full offline suite, `make test-integration`, `make test-schema`, `openspec validate concurrency-enforce-ready --strict`, `make audit`, and an image build.
-- [ ] 5.2 Seams:
+- [x] 5.2 Seams:
   - `counters()` must be drained by S3's flush and fed by S2's middleware and writer paths plus S3's pool subclass;
   - `snapshot()` and `evaluate()` must each have a production caller;
   - delete the `TOOL_CONNECTION_MULTIPLIER` alias;
   - no `other` class may remain.
-- [ ] 5.3 Docs (S5):
+- [x] 5.3 Docs (S5):
   - `rate-limits.md`: the concurrency section rewrite covering modes, transport waits and disconnects, classes, budget, D5 kept, D9 token policy, rollout and criteria; the table rows 1a, 1b and 5c.
   - `usage-attribution.md`: `params.concurrency`, `concurrency_queue`, `transport_queue_ms`.
   - `security-event-logging.md`: the outcome values.
   - `control-panel.md`: the section.
   - `schema-and-migrations.md`: a 028 section.
   - CLAUDE.md: add "four modes" and "a concurrency refusal spends rate tokens, no quota" to the concurrency bullet; **keep** "leases remain held through telemetry".
-- [ ] 5.4 `openspec-verifier` against this change; iterate to zero blocking gaps.
+- [x] 5.4 `openspec-verifier` against this change; iterate to zero blocking gaps.
 - [ ] 5.5 Adversarial Codex, two rounds by default. Attack surfaces:
   - a queue overrun turned refusal, or losing a row;
   - lease or waiter leaks across disconnect, cancellation and grant races;
