@@ -48,6 +48,7 @@ from src.mcp_server.auth import (
     current_daily_request_limit,
     current_oauth_token_id,
     current_permission,
+    current_transport_queue_ms,
 )
 from src.mcp_server.read_result import (
     ReadNoteResult,
@@ -282,7 +283,7 @@ async def _log_usage(
             oauth_token_id=current_oauth_token_id.get(),
             user_id=current_user_id.get(),
             tool=tool,
-            params=params,
+            params=_with_provenance(params),
             duration_ms=duration_ms,
             response_size=response_size,
             **_actor_columns(),
@@ -299,6 +300,9 @@ async def write_usage_row(values: dict) -> bool:
     controller = concurrency.get_controller()
     admission = await controller.writer()
     if not admission.admitted:
+        if admission.pressure is not None and admission.pressure.scope != "shutdown":
+            # Enforce only: queue mode admits with an overrun instead (D7).
+            _count_concurrency("writer_refused")
         try:
             security_events.emit(
                 "usage_log_failed",
@@ -310,20 +314,55 @@ async def write_usage_row(values: dict) -> bool:
             pass
         return False
     try:
+        if admission.overrun is not None:
+            # Queue mode: enforce would have refused this writer. The row is
+            # written all the same; the overrun is counted and annotated.
+            _count_concurrency("writer_overrun")
+        # The writer observation rides on this same actual row, merged through
+        # the same stage-ordered function as every other stage (D4). Never a
+        # second row to observe logging, and never a replaced actual error.
         if admission.shadow is not None:
-            # The writer observation rides on this same actual row. Do not
-            # emit another row to observe logging, or replace an actual error.
-            params = dict(values.get("params") or {})
-            previous = params.get("concurrency_shadow", {}).get("observations", ())
-            observations = [concurrency.Pressure(p["stage"], p["scope"], p["limit"])
-                            for p in previous]
-            params["concurrency_shadow"] = concurrency.shadow_metadata(
-                (*observations, admission.pressure)
-            )
-            values = dict(values, params=params)
+            values = _merge_observation(
+                values, "concurrency_shadow", admission.pressure,
+                lambda obs: concurrency.shadow_metadata(
+                    obs, configured_wait_ms=controller.configured_wait_ms()))
+        elif controller.mode == "queue" and admission.observation is not None:
+            values = _merge_observation(
+                values, "concurrency_queue", admission.observation,
+                concurrency.queue_metadata)
         return await _write_usage_row_admitted(values)
     finally:
         admission.lease.release()
+
+
+def _merge_observation(values: dict, key: str, observation, build) -> dict:
+    params = dict(values.get("params") or {})
+    previous = (params.get(key) or {}).get("observations", ())
+    params[key] = build((*previous, observation))
+    return dict(values, params=params)
+
+
+def _count_concurrency(metric: str) -> None:
+    """One durable-counter increment (#188 D8); bookkeeping never fails a call."""
+    try:
+        concurrency.counters().record(metric)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _with_provenance(params: dict) -> dict:
+    """`params.concurrency = {v, mode, epoch}` on a row `_tracked` writes (D8).
+
+    Unconditional whenever the mode is not `off`: an unpressured row is marked
+    too, so the readiness evaluator can tell a v2 row from a legacy one and
+    one mode or epoch from another.
+    """
+    try:
+        if concurrency.get_controller().mode == "off":
+            return params
+        return {**params, "concurrency": concurrency.provenance()}
+    except Exception:  # noqa: BLE001 - never fail a row over its provenance
+        return params
 
 
 async def _write_usage_row_admitted(values: dict) -> bool:
@@ -1289,19 +1328,22 @@ def _rate_refusal_template(tool_name: str, params: dict, scope: str) -> dict:
     """
     # Auth/request pressure belongs to the actual refusal row too, without
     # replacing its real error or creating a synthetic observed request.
-    shadow = (timing.current() or {}).get("concurrency_shadow")
-    if shadow is not None:
-        params = {**params, "concurrency_shadow": shadow}
+    measured = timing.current() or {}
+    for key in ("concurrency_shadow", "concurrency_queue"):
+        if measured.get(key) is not None:
+            params = {**params, key: measured[key]}
     return dict(
         key_id=current_api_key_id.get(),
         oauth_token_id=current_oauth_token_id.get(),
         user_id=current_user_id.get(),
         tool=tool_name,
-        params={
+        # Provenance is captured with the template, so a deferred flush
+        # carries the mode and epoch the refusal happened under (#188 D8).
+        params=_with_provenance({
             **params,
             "error": _RATE_LIMITED_MARKER,
             _RATE_LIMIT_SCOPE_PARAM: scope,
-        },
+        }),
         duration_ms=0,
         response_size=0,
         **_actor_columns(),
@@ -1456,12 +1498,25 @@ def _tracked(
                 refusal = None
                 extra: dict = {}
                 controller = concurrency.get_controller()
+                mode = controller.mode
+                # The middleware's transport observations (#188 D4): zero-wait
+                # would-refuses in shadow, waits and overruns in queue. They
+                # annotate this call's own row and never replace its outcome.
                 transport_observations = (
                     concurrency.request_observations.get()
-                    if controller.mode == "shadow" else ()
+                    if mode in ("shadow", "queue") else ()
                 )
-                if shadow := concurrency.shadow_metadata(transport_observations):
-                    timing.record("concurrency_shadow", shadow)
+                configured_wait_ms = controller.configured_wait_ms()
+                if mode == "shadow":
+                    if shadow := concurrency.shadow_metadata(
+                            transport_observations,
+                            configured_wait_ms=configured_wait_ms):
+                        timing.record("concurrency_shadow", shadow)
+                elif mode == "queue":
+                    if queued := concurrency.queue_metadata(transport_observations):
+                        timing.record("concurrency_queue", queued)
+                if mode in ("queue", "enforce"):
+                    timing.record("transport_queue_ms", current_transport_queue_ms.get())
 
                 # ── L2 and L3: the two per-principal token buckets, the first
                 # gates in the decorator (design D3).
@@ -1602,15 +1657,28 @@ def _tracked(
                             tool_name, current_user_id.get(), principal,
                             resource_class=resource_class,
                         )
+                        # The lease is held through quota, the body and the
+                        # telemetry tail, and released in the outer `finally`
+                        # (D5: the lease stays held through telemetry).
                         slot_lease = admission.lease
-                        if controller.mode != "off":
+                        if mode != "off":
                             timing.record("queue_ms", admission.queue_ms)
-                        if controller.mode == "shadow":
+                        if mode == "shadow":
                             shadow = concurrency.shadow_metadata(
-                                (*transport_observations, admission.pressure)
+                                (*transport_observations, admission.pressure),
+                                configured_wait_ms=configured_wait_ms,
                             )
                             if shadow is not None:
                                 timing.record("concurrency_shadow", shadow)
+                        elif mode == "queue":
+                            # An ordinary wait or an overrun. An overrun is a
+                            # grant: it takes no `slot_timeout` path and goes
+                            # on to the quota gate exactly like any other call
+                            # (D7); the annotation never changes its outcome.
+                            queued = concurrency.queue_metadata(
+                                (*transport_observations, admission.observation))
+                            if queued is not None:
+                                timing.record("concurrency_queue", queued)
                         if not admission.admitted:
                             pressure = admission.pressure
                             refusal = _slot_timeout_message(pressure, admission.queue_ms)

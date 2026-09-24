@@ -21,7 +21,7 @@ async def receive():
 
 @pytest.fixture
 def controller(monkeypatch):
-    c=concurrency.Controller(Settings(_env_file=None, secret_key="issue-261-test-secret-only-0123456789abcdef",mcp_concurrency_mode='enforce'))
+    c=concurrency.Controller(Settings(_env_file=None, secret_key="issue-261-test-secret-only-0123456789abcdef",mcp_concurrency_mode='enforce',mcp_concurrency_transport_wait_seconds=0))
     monkeypatch.setattr(concurrency,'_controller',c)
     monkeypatch.setattr(auth.settings,'mcp_sandbox_mode',False)
     monkeypatch.setattr(auth.settings,'multi_user_mode',False)
@@ -82,7 +82,7 @@ async def test_sse_retains_request_but_releases_auth(controller,monkeypatch):
 
 @pytest.mark.asyncio
 async def test_auth_pressure_opens_no_session(controller,monkeypatch):
-    held=[controller.auth(),controller.auth()]
+    held=[await controller.auth(),await controller.auth()]
     monkeypatch.setattr(auth,'async_session',lambda:(_ for _ in ()).throw(AssertionError('DB lookup')))
     sent=[]
     async def send(message):sent.append(message)
@@ -112,8 +112,75 @@ async def test_auth_cancellation_releases_both_leases(controller,monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_auth_burst_waits_instead_of_failing_through_real_middleware(monkeypatch):
+    # #188: enforce at auth ceiling 2; six requests arrive together and each
+    # auth session takes 10 ms. All six authenticate, none gets a 429, and no
+    # more than two sessions are ever open.
+    c=concurrency.Controller(Settings(_env_file=None, secret_key="issue-261-test-secret-only-0123456789abcdef",mcp_concurrency_mode='enforce'))
+    assert c.limits['auth']==2 and c.limits['transport_wait_seconds']==2
+    monkeypatch.setattr(concurrency,'_controller',c)
+    monkeypatch.setattr(auth.settings,'mcp_sandbox_mode',False)
+    monkeypatch.setattr(auth.settings,'multi_user_mode',False)
+    monkeypatch.setattr(auth.rate_limits,'check_auth_failures',lambda *_:None)
+    monkeypatch.setattr(auth.rate_limits,'record_auth_failure',lambda *_:None)
+    events=[]
+    monkeypatch.setattr(auth.security_events,'emit',lambda e,**kw:events.append((e,kw)))
+    open_sessions=peak=0
+    from datetime import datetime, timezone
+    key=SimpleNamespace(id=5,user_id=None,permission='read',expires_at=None,
+                        last_used_at=datetime.now(timezone.utc),name='burst',
+                        key_prefix='omcp_burst',daily_request_limit=None)
+    class Session:
+        async def __aenter__(self):
+            nonlocal open_sessions,peak
+            open_sessions+=1
+            peak=max(peak,open_sessions)
+            return self
+        async def __aexit__(self,*a):
+            nonlocal open_sessions
+            open_sessions-=1
+        async def execute(self,*a,**kw):
+            await asyncio.sleep(.01)
+            return SimpleNamespace(first=lambda:(key,None,None))
+    monkeypatch.setattr(auth,'async_session',Session)
+    statuses=[]
+    async def app(scope_,receive_,send):
+        await send({'type':'http.response.start','status':200,'headers':[]})
+        await send({'type':'http.response.body','body':b'ok'})
+    def sender():
+        async def send(message):
+            if message['type']=='http.response.start':
+                statuses.append(message['status'])
+        return send
+    concurrency.reset_counters()
+    def wire():
+        # One complete body, then block as uvicorn does until a disconnect.
+        sent_body=False
+        async def receive_():
+            nonlocal sent_body
+            if not sent_body:
+                sent_body=True
+                return {'type':'http.request','body':b'{}','more_body':False}
+            await asyncio.Future()
+        return receive_
+    await asyncio.gather(*(auth.APIKeyMiddleware(app)(scope(f'omcp_burst_{i}'),wire(),sender())
+                           for i in range(6)))
+    assert statuses==[200]*6
+    assert peak==2
+    assert c.authentication.active==c.requests.active==0 and not c.pending
+    assert not any(kw.get('outcome')=='refused' for _,kw in events)
+    drained=concurrency.counters().drain()
+    totals={}
+    for (_,metric),(n,_) in drained.items():
+        totals[metric]=totals.get(metric,0)+n
+    assert totals['requests']==6 and totals.get('transport_waited',0)>=1
+    assert 'transport_refused' not in totals
+    concurrency.reset_counters()
+
+
+@pytest.mark.asyncio
 async def test_pressure_telemetry_failure_cannot_leak_request(controller,monkeypatch):
-    held=[controller.auth(),controller.auth()]
+    held=[await controller.auth(),await controller.auth()]
     def failed_emit(*a,**kw):raise ValueError('sink unavailable')
     monkeypatch.setattr(auth.security_events,'emit',failed_emit)
     sent=[]
