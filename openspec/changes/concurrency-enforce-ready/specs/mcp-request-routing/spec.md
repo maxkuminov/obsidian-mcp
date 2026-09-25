@@ -329,7 +329,7 @@ For target `enforce`, the window SHALL be at least 7 days and 1,000 executed too
 - **E2:** zero `transport_overrun` (counters);
 - **E3:** zero `writer_overrun` (counters);
 - **E4:** tool `queue_ms` p99 ≤ 500 ms (rows);
-- **E5:** maximum tool `queue_ms` ≤ 50 % of the tool deadline (rows), and maximum `transport_wait_max_ms` ≤ 50 % of the transport deadline (counters);
+- **E5:** maximum tool `queue_ms` over every v2 row carrying one — a call later refused pre-body (such as by the daily quota) included — ≤ 50 % of the tool deadline (rows), and maximum `transport_wait_max_ms` ≤ 50 % of the transport deadline (counters);
 - **E6:** zero `pool_checkout_timeout`, and maximum `pool_high_water` ≤ 13 (counters).
 
 The same evaluator SHALL back both the panel verdict and `make concurrency-report`.

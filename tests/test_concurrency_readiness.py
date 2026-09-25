@@ -185,6 +185,32 @@ def test_e5_boundary_is_half_of_each_deadline(tool_max, transport_max, verdict):
     assert verdicts(evaluate(stats, "enforce"))["E5"] == verdict
 
 
+def test_e5_fails_on_the_wait_of_a_call_later_refused_by_quota():
+    """impl-R2-1: 1,000 executed calls with queue_ms 0 and one tool-overrun
+    call that waited 5,100 ms and was then refused by quota, all in the last
+    72 h. `queue_max_ms` carries that wait (the SQL maximum is over every row
+    with a numeric queue_ms), the executed-only p99 stays 0: E5 FAILs against
+    the 2,500 ms limit, E1 (1 overrun ≤ max(1, 1.0)) and E4 PASS."""
+    recent = window(days=3, executed=1000, queue_p99_ms=0.0, queue_max_ms=5100.0,
+                    tool_overruns=1)
+    full = window(executed=1000, queue_p99_ms=0.0, queue_max_ms=5100.0, tool_overruns=1)
+    report = evaluate(enforce_stats(full, recent=recent), "enforce")
+    v = verdicts(report)
+    assert v["E5"] == FAIL and v["E1"] == PASS and v["E4"] == PASS
+    assert report["overall"] == FAIL
+    e5 = next(c for c in report["criteria"] if c["id"] == "E5")
+    assert e5["inputs"]["last_72h"]["tool_queue_max_ms"] == 5100.0
+
+
+def test_the_tool_queue_maximum_is_not_restricted_to_executed_calls():
+    """The SQL half of impl-R2-1, pinned offline: percentiles stay executed-only,
+    the maximum does not (the real statement runs in the PG suite)."""
+    import inspect
+    src = inspect.getsource(cr.tool_table)
+    assert "max(r.queue_ms) AS qmax" in src
+    assert src.count("FILTER (WHERE r.executed AND r.queue_ms IS NOT NULL)") == 3
+
+
 @pytest.mark.parametrize("high, verdict", [(13, PASS), (14, FAIL)])
 def test_e6_high_water_boundary_is_13(high, verdict):
     stats = enforce_stats(window(gauges={"pool_high_water": high,
