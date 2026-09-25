@@ -25,7 +25,7 @@ from src.config import Settings, settings
 from src.mcp_server import auth, tools
 from src.models.db import APIKey, UsageLog, User
 from src.services import concurrency, quotas, rate_limits, transfer, vault_overlap
-from src.services.pool_budget import POOL_SIZE, POOL_OVERFLOW, TOOL_CONNECTION_MULTIPLIER
+from src.services.pool_budget import CLASS_CONNECTIONS, POOL_SIZE, POOL_OVERFLOW
 from src.services.tool_outcomes import body_refusal
 from src.services.usage_stats import PRE_BODY_REFUSAL_BINDS, executed_sql, pre_body_refusal_sql
 
@@ -181,13 +181,14 @@ def identity(env, *, limit=100):
             var.reset(token)
 
 
-def assert_released(env):
+def assert_released(env, resource_class='light'):
     c = concurrency.get_controller()
     assert env.meter.active == c.tools.active == c.writers.active == c.authentication.active == 0
-    assert max(env.meter.task_peaks.values(), default=0) <= TOOL_CONNECTION_MULTIPLIER
+    # Per-class multiplier (#188 D2): write 2, every other class 1.
+    assert max(env.meter.task_peaks.values(), default=0) <= CLASS_CONNECTIONS[resource_class]
 
 
-@tools._tracked('checkout_hold', [], resource_class='other')
+@tools._tracked('checkout_hold', [], resource_class='light')
 async def held_tool(maker, entered, release):
     async with maker() as session:
         await session.execute(text('SELECT 1'))
@@ -196,7 +197,58 @@ async def held_tool(maker, entered, release):
     return 'complete'
 
 
+def invalid_key_request(env, index, sent):
+    async def send(message):
+        assert env.meter.by_task[asyncio.current_task()] == 0
+        if message['type'] == 'http.response.start':
+            sent.append(message['status'])
+    delivered = False
+    async def receive():
+        # One complete body, then block as uvicorn does until a disconnect.
+        nonlocal delivered
+        if not delivered:
+            delivered = True
+            return {'type':'http.request','body':b'','more_body':False}
+        await asyncio.Future()
+    async def app(*args):
+        raise AssertionError('invalid key reached app')
+    scope = {'type':'http','method':'POST','path':'/mcp','raw_path':b'/mcp',
+             'query_string':b'', 'scheme':'http','server':('test',80),
+             'client':('127.0.0.2',1000+index),
+             'headers':[(b'authorization',f'Bearer omcp_invalid_{index}'.encode())]}
+    return auth.APIKeyMiddleware(app)(scope, receive, send)
+
+
+async def test_auth_waiters_hold_no_connection_and_checkouts_stay_within_auth(env):
+    # #188 D1: enforce with the default 2 s transport deadline. Six requests
+    # queue behind two held auth sessions, then all authenticate (here: are
+    # refused as invalid, after a real credential query). Actual checkouts
+    # never exceed the auth ceiling, and a waiter holds no connection.
+    c = env.install()
+    assert c.limits['auth'] == 2 and c.limits['transport_wait_seconds'] == 2
+    env.gate.auth = True
+    env.gate.expected = 2
+    sent = []
+    first = [env.spawn(invalid_key_request(env, i, sent)) for i in range(2)]
+    await asyncio.wait_for(env.gate.entered.wait(), 3)
+    waiting = [env.spawn(invalid_key_request(env, i, sent)) for i in range(2, 8)]
+    for _ in range(50):
+        await asyncio.sleep(0)
+    assert c.authentication.waiting == 6
+    assert env.meter.active == 2, 'a transport waiter checked out a connection'
+    env.gate.auth = False
+    env.gate.release.set()
+    await asyncio.wait_for(asyncio.gather(*first, *waiting), 3)
+    assert sent == [401] * 8
+    assert env.gate.reached == 2
+    assert env.meter.peak == 2
+    assert env.meter.statements['api_keys'] == 8
+    assert c.requests.active == c.authentication.active == 0 and not c.pending
+    assert_released(env)
+
+
 async def test_real_auth_checkouts_are_bounded_and_sends_happen_after_close(env):
+    env.install(mcp_concurrency_transport_wait_seconds=0)  # zero-wait refusals
     env.gate.auth = True
     env.gate.expected = 2
     sent = []
@@ -228,7 +280,7 @@ async def test_real_auth_checkouts_are_bounded_and_sends_happen_after_close(env)
     env.gate.release.set()
     await asyncio.gather(*first)
     assert sent.count(401) == 2
-    assert env.controller.requests.active == 0
+    assert concurrency.get_controller().requests.active == 0
     assert_released(env)
 
 
@@ -259,13 +311,14 @@ async def test_named_publication_move_import_quota_and_logging_real_sessions(env
     assert env.meter.statements['notes_metadata'] >= 1  # actual move metadata
     assert env.meter.statements['quota_counters'] >= 4
     assert env.meter.statements['usage_logs'] >= 4
-    assert_released(env)
+    assert_released(env, 'write')
     async with env.maker() as session:
         assert (await session.execute(text('SELECT count FROM quota_counters WHERE key_id=:kid'), {'kid':env.kid})).scalar_one() == 4
         assert (await session.execute(text('SELECT count(*) FROM usage_logs'))).scalar_one() == 4
 
 
 async def test_actual_slot_refusals_are_coalesced_without_spending_quota(env):
+    env.install(mcp_concurrency_light=1, mcp_concurrency_wait_seconds=0)
     entered, release = asyncio.Event(), asyncio.Event()
     with identity(env):
         running = env.spawn(held_tool(env.maker, entered, release))
@@ -289,7 +342,7 @@ async def test_actual_slot_refusals_are_coalesced_without_spending_quota(env):
 
 
 async def test_shadow_pressure_and_actual_body_refusal_persist_on_one_real_row(env):
-    env.install('shadow')
+    env.install('shadow', mcp_concurrency_light=1)
     entered, release = asyncio.Event(), asyncio.Event()
     with identity(env):
         running = env.spawn(held_tool(env.maker, entered, release))

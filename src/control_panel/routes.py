@@ -1982,6 +1982,15 @@ async def performance_page(
     # latencies happened around, and a quiet 24 hours with no pass in it is
     # exactly when an operator needs to see the last one that did run.
     runs = await recent_indexer_runs(session, uid)
+    # The concurrency section (#188, D6): per-tool/class pressure for
+    # everyone, scoped exactly as above; live occupancy, durable counters,
+    # coverage and the readiness verdict for admins only — never computed,
+    # let alone rendered, for anyone else.
+    from src.services.concurrency_readiness import panel_section
+
+    concurrency_section = await panel_section(
+        session, WINDOWS[window], user_id=uid, is_admin=_is_admin(user)
+    )
 
     slowest = []
     for r in slowest_rows:
@@ -2015,6 +2024,7 @@ async def performance_page(
             # deploy, a quiet weekend) and gets its own copy rather than a
             # table of zeroes that reads like a measurement.
             "has_data": any(t["executed"] or t["refusals"] for t in tools),
+            "concurrency": concurrency_section,
         }),
     )
 

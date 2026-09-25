@@ -593,6 +593,58 @@ how the panel says so.
   not recognise rather than dropping it — which is the difference between a row
   that looks ordinary and a row that says it is not.
 
+## The Concurrency cards on `/admin/performance` (#188)
+
+The shadow → queue → enforce rollout (see
+[rate limits](rate-limits.md#readiness-and-the-rollout)) is decided on numbers,
+and before #188 there was nowhere to read them. `performance_page` calls one
+function, `concurrency_readiness.panel_section`, and the template renders two
+cards between the latency table and the search phases.
+
+- **"Concurrency pressure" — everyone, scoped as the page scopes.** Per tool
+  and per class (`embedding`, `vector`, `write`, `scan`, `light`) over the
+  page's selected window: executed calls, tool-pressured calls, queue
+  overruns, weighted `slot_timeout` refusals (`1 + suppressed`, the same
+  guarded weight as the latency table) and tool `queue_ms` p50/p95/p99/max. A
+  regular user counts only their own rows; an admin every row. The executed
+  and pre-body predicates are **imported** from `usage_stats`, not
+  re-derived, so a queue overrun the quota gate then refused is a pre-body
+  refusal here exactly as on the latency table.
+- **Only rows with `params.concurrency.v = 2` are read.** Legacy rows are left
+  out, not counted as zero — a pre-#188 row with `queue_ms: 0` would otherwise
+  read as "no pressure". A window with none gets an explicit empty state that
+  says why (pre-provenance rows and `MCP_CONCURRENCY_MODE=off` carry none),
+  never a table of zeroes that reads like a measurement.
+- **Tool pressure is counted from `observations`, not `code`.** A shadow row
+  whose first observation is the auth stage still counts as tool-pressured if
+  a tool-stage observation follows it.
+- **"Concurrency control" — admin only, and not even computed otherwise.**
+  `panel_section(…, is_admin=False)` returns before the snapshot or any
+  counter query runs, so a non-admin response cannot leak it through a
+  template slip. It shows: the live `Controller.snapshot()` (mode, epoch,
+  pool demand as `total of 15` with its four terms, active and waiting counts
+  per stage and class, the effective limits); the window's durable counters
+  for the running mode and epoch (`requests`, the transport outcomes, writer
+  outcomes, `pool_checkout_timeout`, and the `pool_high_water` /
+  `transport_wait_max_ms` maxima), with non-zero incidents badged; the durable
+  watermark and every uncovered interval in the window, as start and length;
+  and the readiness verdict for the **next** mode (shadow → `queue`, queue →
+  `enforce`; `enforce` and `off` show "no next mode") with each criterion's
+  PASS / FAIL / INSUFFICIENT_DATA and reason. Admin-only because the
+  counters, occupancy and pool state are process-wide — they have no owner to
+  scope by, the health page's rule.
+- **The verdict window is not the page window.** It is max(page window, the
+  target's minimum — 3 days for queue, 7 for enforce), ending at the durable
+  watermark, and it is the **same evaluator** `make concurrency-report` runs,
+  so the page and the report cannot disagree. A 24 h page therefore shows a
+  day's numbers above a verdict computed over a longer span; that is
+  deliberate, not a mismatch.
+- **CSP.** No inline script, handler or style attribute: existing classes, a
+  few `perf-cc-*` rules in the page's `page_style` block, and `data-localize`
+  on `<time>` elements for the shared timestamp localiser. The owner's
+  browser pass on this page is part of the change's deploy step, zero CSP
+  violations included.
+
 ## Flash messages
 
 - **Panel flash messages ride the session, never the query string** (#138,

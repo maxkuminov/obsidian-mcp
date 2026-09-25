@@ -36,7 +36,7 @@ SCHEMA_TEST_CONTAINER ?= obsidian-mcp-schema-test
 SCHEMA_TEST_PORT ?= 55438
 SCHEMA_TEST_IMAGE ?= pgvector/pgvector:pg16
 
-.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-vacuum-notes db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration
+.PHONY: help init build build-cached push image deploy up down restart logs shell db-init db-migrate db-check db-vacuum-notes db-backup db-restore status check-no-backups-mount clean reindex reset-embeddings rebuild-tsvectors audit trivy test-schema test-integration concurrency-report
 
 help:
 	@echo "$(GREEN)Obsidian MCP Server$(NC)"
@@ -72,6 +72,7 @@ help:
 	@echo "  make reindex      - Explain how to trigger a reindex (panel only)"
 	@echo "  make reset-embeddings - Drop & recreate embedding column at configured dim"
 	@echo "  make rebuild-tsvectors - Recompute keyword index for FTS_CONFIGS (no embeddings, no API calls)"
+	@echo "  make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso] - Concurrency readiness verdict (#188; exit 0 only on PASS)"
 	@echo "  make status       - Show container and health status"
 	@echo "  make clean        - Remove containers and images"
 	@echo ""
@@ -422,6 +423,19 @@ check-no-backups-mount:
 		echo "$(RED)INVARIANT VIOLATED: $(CONTAINER) has a mount at /app/backups — the container must not see the backups directory (#186).$(NC)"; \
 		exit 1; \
 	fi
+
+# The readiness verdict for the next concurrency mode (#188, design D6): the
+# same evaluator as the /admin/performance verdict, run inside the live
+# container so it reads the configured epoch and the production database.
+# The script exits 0 only when every criterion is PASS (1 FAIL, 2
+# INSUFFICIENT_DATA, 64 usage); make reports any non-zero as its own 2.
+concurrency-report:
+	@if [ "$(TARGET)" != "queue" ] && [ "$(TARGET)" != "enforce" ]; then \
+		echo "$(RED)Usage: make concurrency-report TARGET=queue|enforce [DAYS=n] [END=iso-8601]$(NC)"; \
+		exit 64; \
+	fi
+	docker exec $(CONTAINER) python -m scripts.concurrency_report --target $(TARGET) \
+		$(if $(DAYS),--days $(DAYS)) $(if $(END),--end $(END))
 
 status:
 	@echo "$(GREEN)Obsidian MCP Status:$(NC)"

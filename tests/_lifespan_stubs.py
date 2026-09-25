@@ -13,7 +13,19 @@ async def _noop_async():
     return None
 
 
+async def _noop_flush(*args, **kwargs):
+    return False
+
+
 def stub_transport_checks(monkeypatch, main_module):
-    """Replace the lifespan's transport probe and report with no-ops."""
+    """Replace the lifespan's transport probe and report with no-ops.
+
+    Also the durable concurrency-counter run registration and its shutdown
+    flush (#188): both open a real session, which an offline lifespan test
+    must not attempt.
+    """
     monkeypatch.setattr(main_module, "check_database_transport", _noop_async)
     monkeypatch.setattr(main_module, "log_embedding_transport", lambda: None)
+    counters = main_module.concurrency_counters
+    monkeypatch.setattr(counters, "register_run", _noop_flush)
+    monkeypatch.setattr(counters, "flush", _noop_flush)

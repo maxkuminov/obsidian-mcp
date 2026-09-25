@@ -38,7 +38,7 @@ def configured(monkeypatch):
     current_principal.reset(principal)
 
 
-@tools._tracked('occupancy_probe', [], resource_class='other')
+@tools._tracked('occupancy_probe', [], resource_class='light')
 async def probe(started, finish, *, refused=False, explode=False):
     started.set()
     await finish.wait()
@@ -54,7 +54,7 @@ def decision(result):
 @pytest.mark.asyncio
 async def test_enforced_structured_refusal_spends_no_quota_and_is_coalesced(configured):
     install, rows, _, quotas = configured
-    c = install()
+    c = install(mcp_concurrency_light=1, mcp_concurrency_wait_seconds=0)
     entered, finish = asyncio.Event(), asyncio.Event()
     held = asyncio.create_task(probe(entered, finish))
     await entered.wait()
@@ -80,7 +80,7 @@ async def test_enforced_structured_refusal_spends_no_quota_and_is_coalesced(conf
 @pytest.mark.parametrize('explode', [False, True])
 async def test_shadow_preserves_actual_body_error_and_transport_observation(configured, explode):
     install, rows, _, quotas = configured
-    c = install('shadow')
+    c = install('shadow', mcp_concurrency_light=1)
     entered, finish = asyncio.Event(), asyncio.Event()
     held = asyncio.create_task(probe(entered, finish))
     await entered.wait()
@@ -111,7 +111,7 @@ async def test_shadow_preserves_actual_body_error_and_transport_observation(conf
 @pytest.mark.asyncio
 async def test_quota_refusal_releases_admitted_lease(configured, monkeypatch):
     install, rows, _, _ = configured
-    c = install()
+    c = install(mcp_concurrency_light=1, mcp_concurrency_wait_seconds=0)
     async def deny(): return 'over quota'
     monkeypatch.setattr(tools, '_quota_admission_error', deny)
     entered = asyncio.Event()
@@ -124,7 +124,7 @@ async def test_quota_refusal_releases_admitted_lease(configured, monkeypatch):
 @pytest.mark.asyncio
 async def test_wait_cancellation_releases_registry_without_spending_quota(configured):
     install, rows, _, quotas = configured
-    c = install(mcp_concurrency_wait_seconds=1)
+    c = install(mcp_concurrency_light=1, mcp_concurrency_wait_seconds=1)
     entered, finish = asyncio.Event(), asyncio.Event()
     held = asyncio.create_task(probe(entered, finish))
     await entered.wait()
@@ -142,7 +142,7 @@ async def test_wait_cancellation_releases_registry_without_spending_quota(config
 @pytest.mark.asyncio
 async def test_wait_timeout_records_actual_wait_and_no_quota(configured):
     install, rows, _, quotas = configured
-    c = install(mcp_concurrency_wait_seconds=.02)
+    c = install(mcp_concurrency_light=1, mcp_concurrency_wait_seconds=.02)
     entered, finish = asyncio.Event(), asyncio.Event()
     held = asyncio.create_task(probe(entered, finish)); await entered.wait()
     result = await probe(asyncio.Event(), asyncio.Event())
@@ -156,7 +156,7 @@ async def test_wait_timeout_records_actual_wait_and_no_quota(configured):
 @pytest.mark.asyncio
 async def test_lease_remains_held_during_usage_tail_and_releases_on_cancel(configured, monkeypatch):
     install, _, _, _ = configured
-    c = install()
+    c = install(mcp_concurrency_light=1, mcp_concurrency_wait_seconds=0)
     logging, finish_log = asyncio.Event(), asyncio.Event()
     async def blocked(values):
         assert c.tools.active == c.writers.active == 1
@@ -219,7 +219,7 @@ async def test_slot_coalescer_preserves_weight_on_writer_refusal_or_cancel(confi
 @pytest.mark.asyncio
 async def test_shadow_writer_pressure_appends_to_same_real_row(configured):
     install, rows, _, _ = configured
-    c = install('shadow')
+    c = install('shadow', mcp_concurrency_light=1)
     holder = await c.writer()
     params = {'error':'not_found', 'body_outcome':'refused',
               'concurrency_shadow': concurrency.shadow_metadata((concurrency.Pressure('tool','other',1),))}
@@ -246,3 +246,29 @@ def test_every_registered_tool_class_matches_wrapper_and_write_class():
                 assert getattr(tools,node.name).__concurrency_class__==cls
                 seen[name]=cls
     assert seen==concurrency.TOOL_CLASSES
+
+
+def test_registry_covers_exactly_the_five_classes():
+    assert concurrency.CLASSES == {'embedding', 'vector', 'write', 'scan', 'light'}
+    assert set(concurrency.TOOL_CLASSES.values()) == concurrency.CLASSES
+    assert 'other' not in concurrency.TOOL_CLASSES.values()
+    assert len(concurrency.TOOL_CLASSES) == 25
+
+
+@tools._tracked('read_note', [])
+async def read_note_shaped(delay=.01):
+    # The registered name, so the closed class mapping (light) decides.
+    await asyncio.sleep(delay)
+    return 'read'
+
+
+@pytest.mark.asyncio
+async def test_enforce_parallel_read_batch_at_defaults_sees_no_refusal(configured):
+    install, rows, events, quotas = configured
+    c = install()  # enforce, every other setting at its default
+    results = await asyncio.gather(*(read_note_shaped() for _ in range(8)))
+    assert results == ['read'] * 8
+    assert not any(r['params'].get('error') == 'slot_timeout' for r in rows)
+    assert len(rows) == 8 and len(quotas) == 8
+    assert max(r['params']['queue_ms'] for r in rows) > 0, 'the batch never queued'
+    assert c.tools.active == 0 and not c.pending
