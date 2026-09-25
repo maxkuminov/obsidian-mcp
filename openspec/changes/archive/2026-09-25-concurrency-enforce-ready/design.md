@@ -656,3 +656,16 @@ Round 3 was the final spec round.
 ## Owner decisions
 
 - 2026-09-23: the owner **approved** migration 028 and the `queue` mode.
+
+
+## Deploy record
+
+2026-09-25. Merges #301 (ca4bee2) and #302 (530751b, impl-R2-1). `make deploy` applied migration **028**, and `make db-check` reports "No new upgrade operations detected".
+- **Settings reconciliation (6.1):** nothing needed. The production `.env` pins no `MCP_CONCURRENCY_*` value, so the defaults apply. The startup line reads `mode=shadow epoch=6826817a4993` with `pool_demand` total 14 of 15.
+- **Live MCP exercise (6.3):** through the production connector, `create_note`, `keyword_search`, `read_note` and `delete_note` (with `expected_hash`) ran on a temporary scratch note, which was soft-deleted afterwards.
+  - Every post-deploy `usage_logs` row carries `params.concurrency = {v: 2, mode: shadow, epoch: 6826817a4993}`.
+  - A `concurrency_runs` row was registered at start. The first 60 s flush moved its watermark to the whole minute and wrote the first `concurrency_counters` rows.
+  - `scripts.concurrency_report --target queue` answers INSUFFICIENT_DATA (exit 2), because nothing before this deploy is covered for the new epoch.
+- **Adversarial Codex on the implementation:** round 1 found impl-R1-1 (MAJOR, fixed before merge); round 2 found impl-R2-1 (MAJOR, fixed in #302 before deploy). Two rounds, per the budget.
+- **Browser pass on `/admin/performance` (6.4):** not run by a browser. The rendered-body CSP scan and the panel tests cover the admin and non-admin renders; the owner's look at the live page is still open.
+- **Evidence clock:** starts 2026-09-25 00:59 UTC. Queue is eligible after 3 covered days and 300 calls (§7.1).

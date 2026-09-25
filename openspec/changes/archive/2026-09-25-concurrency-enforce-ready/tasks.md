@@ -219,7 +219,7 @@ the full offline + integration + schema run on the merged tree (task 5.1).
 
 ## 5. Merge, seams, docs, gates (supervisor)
 
-- [ ] 5.1 Merge S1, S2, S3, then S4. On the merged tree run the full offline suite, `make test-integration`, `make test-schema`, `openspec validate concurrency-enforce-ready --strict`, `make audit`, and an image build.
+- [x] 5.1 Merge S1, S2, S3, then S4. On the merged tree run the full offline suite, `make test-integration`, `make test-schema`, `openspec validate concurrency-enforce-ready --strict`, `make audit`, and an image build.
 - [x] 5.2 Seams:
   - `counters()` must be drained by S3's flush and fed by S2's middleware and writer paths plus S3's pool subclass;
   - `snapshot()` and `evaluate()` must each have a production caller;
@@ -233,7 +233,7 @@ the full offline + integration + schema run on the merged tree (task 5.1).
   - `schema-and-migrations.md`: a 028 section.
   - CLAUDE.md: add "four modes" and "a concurrency refusal spends rate tokens, no quota" to the concurrency bullet; **keep** "leases remain held through telemetry".
 - [x] 5.4 `openspec-verifier` against this change; iterate to zero blocking gaps.
-- [ ] 5.5 Adversarial Codex, two rounds by default. Attack surfaces:
+- [x] 5.5 Adversarial Codex, two rounds by default. Attack surfaces:
   - a queue overrun turned refusal, or losing a row;
   - lease or waiter leaks across disconnect, cancellation and grant races;
   - body-replay corruption;
@@ -243,9 +243,9 @@ the full offline + integration + schema run on the merged tree (task 5.1).
 
 ## 6. Deploy in shadow (step 0)
 
-- [ ] 6.1 Reconcile the deploy-dir `.env` concurrency block to the new `.env.example` block, then dry-run the settings with the new image against it.
-- [ ] 6.2 `make deploy`. Confirm migration 028 applied and `make db-check` is clean. Compare the startup INFO line (effective settings and epoch) with the intended block, since validation alone does not prove it.
-- [ ] 6.3 Live MCP exercise with owned temporary fixtures:
+- [x] 6.1 Reconcile the deploy-dir `.env` concurrency block to the new `.env.example` block, then dry-run the settings with the new image against it.
+- [x] 6.2 `make deploy`. Confirm migration 028 applied and `make db-check` is clean. Compare the startup INFO line (effective settings and epoch) with the intended block, since validation alone does not prove it.
+- [x] 6.3 Live MCP exercise with owned temporary fixtures:
   - one tool per class (`read_note`, `keyword_search`, `semantic_search`, `find_related`, and `create_note` + `delete_note` on a scratch note);
   - a parallel batch of 6 `read_note` calls.
 
