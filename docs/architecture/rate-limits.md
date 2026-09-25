@@ -1118,7 +1118,7 @@ window **and** over its last 72 h:
 | E2 | `transport_overrun` requests (counters) | 0 |
 | E3 | `writer_overrun` (counters) | 0 |
 | E4 | Tool `queue_ms` p99 across executed calls (rows) | ≤ 500 ms |
-| E5 | Max tool `queue_ms` / tool wait (rows); `transport_wait_max_ms` / transport wait (counters) | ≤ 0.5 each |
+| E5 | Max tool `queue_ms` over every v2 row carrying one, including calls then refused pre-body (e.g. `over_quota`) / tool wait (rows); `transport_wait_max_ms` / transport wait (counters) | ≤ 0.5 each |
 | E6 | `pool_checkout_timeout` (counters); max `pool_high_water` | 0; ≤ 13 |
 
 **Rollback triggers**, checked daily for the first 7 days of each new mode:

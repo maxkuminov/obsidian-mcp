@@ -236,10 +236,13 @@ async def tool_table(session, start, end, *, user_id=None, epoch=None, mode=None
     and `mode` restrict to one configuration (the evaluator). Executed and
     pre-body classification is the existing `executed_sql`; `slot_timeout`
     refusals are weighted `1 + suppressed` through the existing guarded cast.
-    `queue_ms` percentiles and the maximum are over executed calls only.
-    Tool overruns count every row carrying one, whatever its later outcome: a
-    call that overran and was then refused by quota was still a call enforce
-    would have refused.
+    `queue_ms` percentiles are over executed calls only; the **maximum** is
+    over every row carrying a numeric `queue_ms`, whatever its later outcome
+    (E5, impl-R2-1): a call that waited at the tool stage and was then refused
+    by quota still waited that long, and enforce would have made it wait too.
+    Tool overruns count every row carrying one for the same reason: a call
+    that overran and was then refused by quota was still a call enforce would
+    have refused.
     """
     executed = executed_sql()
     weight = refusal_weight_sql()
@@ -284,7 +287,7 @@ async def tool_table(session, start, end, *, user_id=None, epoch=None, mode=None
                 FILTER (WHERE r.executed AND r.queue_ms IS NOT NULL) AS p95,
             percentile_cont(0.99) WITHIN GROUP (ORDER BY r.queue_ms)
                 FILTER (WHERE r.executed AND r.queue_ms IS NOT NULL) AS p99,
-            max(r.queue_ms) FILTER (WHERE r.executed) AS qmax
+            max(r.queue_ms) AS qmax
         FROM r
         GROUP BY GROUPING SETS ((r.cls, r.tool), (r.cls), ())
     """

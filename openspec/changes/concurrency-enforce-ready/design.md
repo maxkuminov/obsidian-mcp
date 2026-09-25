@@ -532,7 +532,7 @@ over the whole window **and** over its last 72 h:
 | E2 | `transport_overrun` requests (counters) | 0 |
 | E3 | `writer_overrun` (counters) | 0 |
 | E4 | Tool `queue_ms` p99 across executed calls (rows) | ≤ 500 ms |
-| E5 | Maximum tool `queue_ms` / tool wait (rows); `transport_wait_max_ms` / transport wait (counters) | ≤ 0.5 each |
+| E5 | Maximum tool `queue_ms` over every v2 row carrying one, including calls then refused pre-body (e.g. `over_quota`) / tool wait (rows); `transport_wait_max_ms` / transport wait (counters) | ≤ 0.5 each |
 | E6 | `pool_checkout_timeout` (counters); maximum `pool_high_water` | 0; ≤ 13 |
 
 **Rollback triggers**, checked daily for the first 7 days of each new mode:
@@ -651,6 +651,7 @@ Round 3 was the final spec round.
 | Round | Reviewer | Finding | Severity | Disposition |
 | --- | --- | --- | --- | --- |
 | impl-R1-1 | Codex | The handoff cancels the watcher's in-flight `receive`. The security-header `BaseHTTPMiddleware` wraps `receive` and can suspend in task-group cleanup after taking a message from uvicorn and before returning it, so the cancel loses the message: the app receives nothing, the request hangs and keeps its request lease (queue/enforce only). | MAJOR | **Fixed.** The handoff is cancellation-free: each `receive` runs in its own task awaited through a shield, the in-flight call passes to the replay wrapper and its result is delivered exactly once after the buffered messages; teardown cancels it only after the response. Regression through the production `BaseHTTPMiddleware` wrapping in queue and enforce (D1). |
+| impl-R2-1 | Codex | E5's maximum tool `queue_ms` was taken over executed calls only, so a tool wait on a call that overran and was then refused by the daily quota (`over_quota`) was excluded: a covered queue window with 1,000 executed calls at 0 ms and one quota-refused overrun that waited 5,100 ms (tool deadline 5,000 ms) reported max 0 and overall PASS. | MAJOR | **Fixed.** The maximum (E5 and the panel's per-tool Max column, same statement) is over every qualifying v2 row carrying a numeric tool `queue_ms`, pre-body refusals included; the percentiles (E4 p99) and every denominator stay executed-only. Regression offline (evaluator) and on real Postgres. Noted, not changed: Q1's numerator is also executed-only, so a tool-pressured shadow call later refused by quota is not counted; Q1 is a ratio over executed calls and E1 already counts every overrun row. |
 
 ## Owner decisions
 

@@ -30,7 +30,11 @@ from src.services.concurrency_counters import Coverage
 from tests.test_panel_csp_headers import BODY_NONCE_RE, _nonce_of, _Session, _style_attributes_in
 
 UTC = dt.timezone.utc
-WATERMARK = dt.datetime(2026, 9, 23, 11, 59, 0, tzinfo=UTC)
+# Relative to the wall clock: the panel only lists gaps between the page
+# window's start (now − 24 h) and the watermark, so a fixed date stops
+# rendering the gap a day after it.
+WATERMARK = (dt.datetime.now(UTC) - dt.timedelta(minutes=1)).replace(second=0, microsecond=0)
+GAP_START = WATERMARK - dt.timedelta(hours=9)
 
 
 def _user(admin: bool) -> User:
@@ -72,8 +76,7 @@ def render(monkeypatch):
 
     async def fake_coverage(session, start, end, epoch, mode):
         calls["admin_reads"] += 1
-        gap = (dt.datetime(2026, 9, 23, 3, 0, tzinfo=UTC),
-               dt.datetime(2026, 9, 23, 3, 0, 40, tzinfo=UTC))
+        gap = (GAP_START, GAP_START + dt.timedelta(seconds=40))
         return Coverage(WATERMARK, [gap] if end > start else [])
 
     async def fake_readiness(session, target, *, days=None, end=None, controller=None):

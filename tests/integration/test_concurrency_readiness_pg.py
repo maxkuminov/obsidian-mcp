@@ -173,7 +173,9 @@ async def test_rows_legacy_excluded_pressure_from_observations_weighted_refusals
     assert ks["slot_timeouts"] == 5                     # 1 + suppressed
     assert ks["overruns"] == 2                          # both overrun rows
     assert ks["executed"] == 2                          # over_quota + slot_timeout are pre-body
-    assert ks["max"] == 5100.0                          # queue_ms over executed rows only
+    # The maximum is over every row carrying queue_ms, the quota-refused
+    # overrun and the enforced slot_timeout included (impl-R2-1).
+    assert ks["max"] == 5200.0
     classes = {r["cls"]: r for r in table["classes"]}
     assert classes["scan"]["overruns"] == 2 and classes["light"]["executed"] == 2
     assert table["total"]["executed"] == 4
@@ -185,8 +187,9 @@ async def test_rows_legacy_excluded_pressure_from_observations_weighted_refusals
     # Restricted to one configuration: queue rows only.
     q = await env.stats(start, end)
     # The overrun that executed and the malformed-queue_ms row are executed;
-    # the over_quota overrun is pre-body but still an overrun.
-    assert (q.executed, q.tool_overruns, q.queue_max_ms) == (2, 2, 5100.0)
+    # the over_quota overrun is pre-body but still an overrun, and its wait is
+    # still the maximum (impl-R2-1).
+    assert (q.executed, q.tool_overruns, q.queue_max_ms) == (2, 2, 5200.0)
     assert {(f["mode"], f["rows"]) for f in q.foreign} == {("shadow", 2), ("enforce", 1)}
 
 
@@ -291,6 +294,37 @@ async def test_a_quick_restart_after_a_hard_kill_is_not_a_pass(env):
     before = await env.readiness("enforce", "queue", end=end)
     assert before["window"]["uncovered"] == []
     assert before["overall"] == "PASS", before["criteria"]
+
+
+async def test_e5_counts_the_wait_of_a_call_refused_by_quota(env):
+    """impl-R2-1: a covered single-epoch queue window, 1,000+ executed calls
+    with queue_ms 0 in the last 72 h and one tool-overrun call that waited
+    5,100 ms and was then refused by the daily quota. The wait is over half the
+    5,000 ms tool deadline, so E5 FAILs although the call never executed —
+    and E4 (executed-only p99) and every other criterion stay PASS."""
+    base = at(1, 12, 0)
+    await env.register(base, mode="queue")
+    for d in range(7):
+        day = base + dt.timedelta(days=d)
+        if d >= 4:  # the last 72 h hold every executed call
+            await env.rows(spread(day + dt.timedelta(minutes=5), 334, queue_ms=0))
+            concurrency.counters().record("requests", 334, at=day + dt.timedelta(hours=1))
+        await env.flush(day + dt.timedelta(days=1))
+    await env.rows([row(base + dt.timedelta(days=6, hours=6), "keyword_search",
+                        queue_ms=5100, over_quota=True,
+                        concurrency_queue={"schema": 2, "overrun": True,
+                                           "code": "slot_timeout",
+                                           "observations": [tool_obs(True)]})])
+    report = await env.readiness("enforce", "queue", end=base + dt.timedelta(days=7))
+    assert report["window"]["uncovered"] == [] and report["window"]["foreign"] == []
+    assert report["window"]["executed"] == 1002
+    assert report["window"]["queue_max_ms"] == 5100.0
+    assert report["last_72h"]["queue_max_ms"] == 5100.0
+    v = verdicts(report)
+    assert v["E5"] == "FAIL", report["criteria"]
+    assert {k: x for k, x in v.items() if k != "E5"} == {
+        "E1": "PASS", "E2": "PASS", "E3": "PASS", "E4": "PASS", "E6": "PASS"}
+    assert report["overall"] == "FAIL"
 
 
 async def test_a_clean_recreate_stays_covered(env):
