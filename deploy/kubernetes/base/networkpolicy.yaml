@@ -1,0 +1,104 @@
+# Default deny for the namespace, then a narrow allow-list for the app.
+#
+# Ingress comes only from the ingress controller's namespace. Edit the
+# namespace name below, or no request will reach the app. (Kubelet health
+# probes are not subject to NetworkPolicy on common CNIs.)
+#
+# Egress, in order:
+#   1. DNS to the cluster DNS in kube-system. Clusters with NodeLocal DNSCache
+#      also need its link-local address (usually 169.254.20.10).
+#   2. Postgres on 5432 to the bundled postgres/ pods in this namespace. For
+#      an external or operator-managed database, add its address or selector
+#      (example commented below).
+#   3. HTTPS to the public internet. Covers the OpenAI (or compatible)
+#      embeddings API and `import_from_url`. Private, link-local and CGNAT
+#      ranges are excluded, which matches the app's own outbound deny policy
+#      for imports. An in-cluster embedding endpoint (Ollama) needs its own
+#      rule (example commented below).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: obsidian-mcp
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: obsidian-mcp
+      app.kubernetes.io/component: server
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              # CHANGE ME: the namespace your ingress controller / gateway
+              # runs in (e.g. traefik, envoy-gateway-system, kube-system).
+              kubernetes.io/metadata.name: change-me-ingress-namespace
+      ports:
+        - protocol: TCP
+          port: 8000
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+              app.kubernetes.io/part-of: obsidian-mcp
+      ports:
+        - protocol: TCP
+          port: 5432
+    # External database example:
+    # - to:
+    #     - ipBlock:
+    #         cidr: 192.0.2.10/32
+    #   ports:
+    #     - protocol: TCP
+    #       port: 5432
+    # In-cluster Ollama example (namespace "ollama", port 11434):
+    # - to:
+    #     - namespaceSelector:
+    #         matchLabels:
+    #           kubernetes.io/metadata.name: ollama
+    #   ports:
+    #     - protocol: TCP
+    #       port: 11434
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+        - ipBlock:
+            cidr: ::/0
+            except:
+              - fc00::/7
+              - fe80::/10
+              - ::1/128
+      ports:
+        - protocol: TCP
+          port: 443

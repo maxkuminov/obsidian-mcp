@@ -22,6 +22,10 @@ The included `docker-compose.simple.yml` bundles 1, 2, and 5 plus the
 MCP server itself. You handle 3 and 4 separately. If you already run a
 reverse proxy, use `docker-compose.proxy.yml` instead — see
 [Already have a reverse proxy?](#already-have-a-reverse-proxy) below.
+On a Kubernetes cluster, use
+[`docs/deployment-kubernetes.md`](./docs/deployment-kubernetes.md) and the
+manifests in [`deploy/kubernetes/`](./deploy/kubernetes/) instead. The
+vault-sync, embedding and transport sections below still apply there.
 
 > **Upgrading an existing deployment?** Read
 > [Internal transport](#internal-transport-the-database-and-embedding-hops)
@@ -695,8 +699,10 @@ deployment; on a compose-file deployment the equivalents are plain
 ## What's not covered
 
 - High availability. Single VPS, single Postgres, no replica. If you
-  want redundancy, add managed Postgres and front the MCP container
-  with a load balancer. Out of scope here.
+  want redundancy, add managed Postgres. The MCP server itself runs as
+  exactly one process (its rate limits are in-process), so a load balancer
+  over several replicas is not an option. This holds on Kubernetes too (see
+  [deployment-kubernetes.md](./docs/deployment-kubernetes.md#constraints-the-manifests-encode)).
 - Vault encryption at rest. Files on the VPS disk are plain text
   unless you set up an encrypted filesystem. If you need that, look at
   LUKS for the data volume.

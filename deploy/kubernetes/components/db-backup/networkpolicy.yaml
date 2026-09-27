@@ -1,0 +1,36 @@
+# The backup Job needs DNS and Postgres only. For an external database,
+# add its address here as in the base policy.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: obsidian-mcp-db-backup
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: obsidian-mcp
+      app.kubernetes.io/component: db-backup
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+              app.kubernetes.io/part-of: obsidian-mcp
+      ports:
+        - protocol: TCP
+          port: 5432

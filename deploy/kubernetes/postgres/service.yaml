@@ -1,0 +1,20 @@
+# The app reaches the database as `postgres:5432` (the host in
+# DATABASE_URL). Headless, as a StatefulSet's governing Service must be. With
+# one replica the name resolves to that single pod.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+      protocol: TCP

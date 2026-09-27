@@ -1,0 +1,79 @@
+# The same contract as `make db-backup` + docker/record-backup.sh:
+# dump, verify, keep it private, prune, then record it in backups_log.
+#   * umask 077. The dump is the full text of every note plus every
+#     credential hash.
+#   * An empty dump, or one that fails `gzip -t`, is deleted and the Job
+#     fails.
+#   * Prune dumps older than BACKUP_RETAIN_DAYS, but always keep the newest
+#     BACKUP_RETAIN_MIN.
+#   * Recording: no backups_log table yet (a database that predates migration
+#     021) means warn and succeed. Table present but the insert fails means
+#     the Job fails, because the panel would otherwise report an older
+#     backup than you have.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: obsidian-mcp-db-backup
+data:
+  backup.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    umask 077
+
+    : "${DATABASE_URL:?DATABASE_URL is required}"
+    BACKUP_DIR="${BACKUP_DIR:-/backups}"
+    RETAIN_DAYS="${BACKUP_RETAIN_DAYS:-30}"
+    RETAIN_MIN="${BACKUP_RETAIN_MIN:-7}"
+
+    # The app's URL names the asyncpg driver. libpq wants plain postgresql://.
+    case "$DATABASE_URL" in
+      postgresql+asyncpg://*) url="postgresql://${DATABASE_URL#postgresql+asyncpg://}" ;;
+      postgresql://*|postgres://*) url="$DATABASE_URL" ;;
+      *) echo "DATABASE_URL has an unexpected scheme" >&2; exit 2 ;;
+    esac
+
+    # Mirror the app's TLS settings onto libpq (the CA/cert files must be
+    # mounted into this Job at the same paths as in the app pod).
+    if [ -n "${DATABASE_SSL_MODE:-}" ]; then export PGSSLMODE="$DATABASE_SSL_MODE"; fi
+    if [ -n "${DATABASE_SSL_CA_FILE:-}" ]; then export PGSSLROOTCERT="$DATABASE_SSL_CA_FILE"; fi
+    if [ -n "${DATABASE_SSL_CERT_FILE:-}" ]; then export PGSSLCERT="$DATABASE_SSL_CERT_FILE"; fi
+    if [ -n "${DATABASE_SSL_KEY_FILE:-}" ]; then export PGSSLKEY="$DATABASE_SSL_KEY_FILE"; fi
+
+    ts="$(date -u +%Y%m%d_%H%M%S)"
+    final="$BACKUP_DIR/backup_${ts}.sql.gz"
+    partial="$final.partial"
+    trap 'rm -f "$partial"' EXIT
+
+    pg_dump --no-owner --dbname="$url" | gzip > "$partial"
+    if [ ! -s "$partial" ] || ! gzip -t "$partial"; then
+      echo "Backup FAILED: the dump is empty or did not verify" >&2
+      exit 1
+    fi
+    mv "$partial" "$final"
+    chmod 600 "$final"
+    echo "Backup: $final ($(wc -c < "$final") bytes)"
+
+    # Prune: past the newest RETAIN_MIN files, delete those older than
+    # RETAIN_DAYS. Never the one just taken.
+    ls -1t "$BACKUP_DIR"/backup_*.sql.gz 2>/dev/null | tail -n +"$((RETAIN_MIN + 1))" |
+      while read -r old; do
+        if [ "$old" != "$final" ] && [ -n "$(find "$old" -mtime +"$RETAIN_DAYS")" ]; then
+          rm -f "$old" && echo "Pruned $old"
+        fi
+      done
+
+    # Record it, last, so its exit status is the Job's.
+    exists="$(psql "$url" -v ON_ERROR_STOP=1 -qtAX \
+      -c "SELECT to_regclass('public.backups_log') IS NOT NULL")"
+    case "$exists" in
+      t)
+        psql "$url" -v ON_ERROR_STOP=1 -qtAX \
+          -v fn="$(basename "$final")" -v sz="$(wc -c < "$final")" <<'SQL'
+    INSERT INTO backups_log (filename, size_bytes) VALUES (:'fn', :'sz');
+    SQL
+        echo "Recorded in backups_log" ;;
+      f)
+        echo "WARNING: backup taken but not recorded: backups_log does not exist yet (pre-021 schema)" ;;
+      *)
+        echo "Backup RECORDING FAILED: unexpected answer '$exists'" >&2; exit 1 ;;
+    esac

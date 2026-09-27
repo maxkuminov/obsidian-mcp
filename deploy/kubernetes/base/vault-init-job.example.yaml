@@ -1,0 +1,68 @@
+# EXAMPLE ONLY, and only for a NEW, EMPTY vault volume.
+#
+# A freshly provisioned volume's root is usually root:root 0755, which the
+# app (uid 1000, no fsGroup) cannot write. The app pod must never carry
+# fsGroup, because the kubelet would then chown/chmod every file in the vault
+# on each mount. This one-shot Job carries it instead. The kubelet makes the
+# volume root group-owned by 1000 and group-writable (setgid), and the Job
+# checks that uid 1000 can write there.
+#
+# DO NOT run this against a volume that already holds your vault. On a
+# volume type that honours fsGroup, the kubelet changes the group and mode of
+# EVERY file on it. fsGroupChangePolicy: OnRootMismatch skips that only when
+# the root already matches. Run it once, before the first app start, then
+# delete it:
+#
+#   kubectl -n obsidian-mcp apply -f deploy/kubernetes/vault-init-job.example.yaml
+#   kubectl -n obsidian-mcp wait --for=condition=complete job/obsidian-mcp-vault-init
+#   kubectl -n obsidian-mcp delete job obsidian-mcp-vault-init
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: obsidian-mcp-vault-init
+  namespace: obsidian-mcp
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: obsidian-mcp
+        app.kubernetes.io/component: vault-init
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: probe
+          image: busybox:1.37
+          command:
+            - sh
+            - -c
+            - touch /vault/.ownership-probe && rm /vault/.ownership-probe && ls -ld /vault
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+          volumeMounts:
+            - name: vault
+              mountPath: /vault
+      volumes:
+        - name: vault
+          persistentVolumeClaim:
+            claimName: obsidian-mcp-vault

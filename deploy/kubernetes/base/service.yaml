@@ -1,0 +1,21 @@
+# Cluster-internal only. Expose the app through an ingress that
+# reproduces the route split in ingress/, never with a LoadBalancer or
+# NodePort: the panel and /api rely on the proxy for authentication in
+# single-user mode.
+apiVersion: v1
+kind: Service
+metadata:
+  name: obsidian-mcp
+  labels:
+    app.kubernetes.io/name: obsidian-mcp
+    app.kubernetes.io/component: server
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: obsidian-mcp
+    app.kubernetes.io/component: server
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+      protocol: TCP

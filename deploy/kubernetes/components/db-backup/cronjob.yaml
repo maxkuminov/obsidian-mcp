@@ -1,0 +1,95 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: obsidian-mcp-db-backup
+  labels:
+    app.kubernetes.io/name: obsidian-mcp
+    app.kubernetes.io/component: db-backup
+spec:
+  schedule: "30 3 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            app.kubernetes.io/name: obsidian-mcp
+            app.kubernetes.io/component: db-backup
+        spec:
+          restartPolicy: Never
+          automountServiceAccountToken: false
+          enableServiceLinks: false
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 999
+            runAsGroup: 999
+            # This pod mounts only the backup volume, never the vault, so
+            # fsGroup is safe here and makes a fresh volume writable.
+            fsGroup: 999
+            fsGroupChangePolicy: OnRootMismatch
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: backup
+              # Any image with pg_dump/psql/gzip works. pg_dump must be the
+              # same major version as the server or newer, so match this tag
+              # to your server.
+              image: pgvector/pgvector:0.8.2-pg16
+              imagePullPolicy: IfNotPresent
+              command: ["/bin/bash", "/scripts/backup.sh"]
+              env:
+                # Only the database URL, not the app's whole Secret.
+                - name: DATABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: obsidian-mcp-secrets
+                      key: DATABASE_URL
+                - name: DATABASE_SSL_MODE
+                  valueFrom:
+                    configMapKeyRef:
+                      name: obsidian-mcp-config
+                      key: DATABASE_SSL_MODE
+                      optional: true
+                - name: DATABASE_SSL_CA_FILE
+                  valueFrom:
+                    configMapKeyRef:
+                      name: obsidian-mcp-config
+                      key: DATABASE_SSL_CA_FILE
+                      optional: true
+                - name: BACKUP_DIR
+                  value: /backups
+                - name: BACKUP_RETAIN_DAYS
+                  value: "30"
+                - name: BACKUP_RETAIN_MIN
+                  value: "7"
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 512Mi
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+                - name: scripts
+                  mountPath: /scripts
+                  readOnly: true
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: obsidian-mcp-backups
+            - name: scripts
+              configMap:
+                name: obsidian-mcp-db-backup
+            - name: tmp
+              emptyDir: {}

@@ -1,0 +1,53 @@
+# Non-secret settings, loaded into the app and the migration initContainer
+# with `envFrom`. Every setting and its default is listed in
+# docs/deployment-kubernetes.md#configuration. Anything not set here takes
+# the application default from src/config.py.
+#
+# Credentials (DATABASE_URL, SECRET_KEY, OPENAI_API_KEY) go in the Secret
+# `obsidian-mcp-secrets`. See secret.example.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: obsidian-mcp-config
+data:
+  # Public hostname your ingress serves. BASE_URL, ALLOWED_ORIGINS and
+  # ALLOWED_HOSTS are derived from it (https://<host>; <host> + localhost).
+  MCP_HOSTNAME: obsidian-mcp.example.com
+
+  # Where the vault volume is mounted (deployment.yaml). In multi-user mode
+  # this is the admin's vault. Other users' vaults are mounted under /vaults/.
+  VAULT_PATH: /obsidian
+  MULTI_USER_MODE: "false"
+
+  # Embeddings. A typical cluster has no GPU, so the example uses OpenAI. For
+  # Ollama, set EMBEDDING_PROVIDER=ollama and OLLAMA_URL, and read "TLS to
+  # Postgres and the embedding endpoint" in the guide first: a plaintext
+  # http:// URL to a non-loopback host refuses to start unless
+  # EMBEDDING_ALLOW_PLAINTEXT=true.
+  EMBEDDING_PROVIDER: openai
+  OPENAI_BASE_URL: https://api.openai.com/v1
+  OPENAI_EMBEDDING_MODEL: text-embedding-3-small
+  EMBEDDING_DIMENSIONS: "1024"
+
+  # Database TLS. The only place TLS for the database is set. Never put
+  # sslmode/ssl in DATABASE_URL and never set PGSSL* variables: both refuse
+  # startup. Use verify-full plus DATABASE_SSL_CA_FILE when the server has a
+  # certificate. The bundled postgres/ component has none, so it stays on
+  # prefer, and every start logs one `internal_transport_plaintext` event.
+  DATABASE_SSL_MODE: prefer
+
+  # Which peers may set X-Forwarded-For / X-Forwarded-Proto. Here that means
+  # your ingress controller's pods. The default below (loopback + RFC 1918)
+  # covers most pod CIDRs. Narrow it to your cluster's pod CIDR, or better the
+  # ingress controller's own range. A CNI that uses 100.64.0.0/10 or public
+  # pod addresses MUST list its range here, or every client appears to be the
+  # ingress pod and all callers share one rate-limit bucket. See
+  # "Client addresses and TRUSTED_PROXY_IPS" in the guide.
+  TRUSTED_PROXY_IPS: 127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+
+  # Set to "false" when the vault volume is NFS, CIFS/SMB, FUSE or FAT: there
+  # a stat can be cached or too coarse to trust.
+  INDEX_STAT_SHORTCUT: "true"
+
+  LOG_LEVEL: INFO
+  LOG_FORMAT: json

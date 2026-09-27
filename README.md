@@ -620,6 +620,9 @@ old while the indexer is perfectly healthy.
 > Deploying on a VPS from scratch? See [`DEPLOYMENT.md`](./DEPLOYMENT.md)
 > for the full walkthrough: Postgres setup, Caddy and TLS, vault sync
 > via Nextcloud, and the gotchas that bite first-time deploys.
+> Running Kubernetes? See
+> [`docs/deployment-kubernetes.md`](./docs/deployment-kubernetes.md) and the
+> kustomize manifests in [`deploy/kubernetes/`](./deploy/kubernetes/).
 
 The bundled Caddy configuration fails closed on `/admin`, `/api`, and
 `/authorize`; replace its placeholder basic-auth hash before starting it.

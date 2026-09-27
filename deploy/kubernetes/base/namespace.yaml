@@ -1,0 +1,13 @@
+# Pod Security Admission `restricted`: everything in this directory
+# (the app, the migration initContainer, the optional Postgres and backup
+# CronJob) runs as non-root with every capability dropped and seccomp
+# RuntimeDefault, so nothing here needs the namespace relaxed.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: obsidian-mcp
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

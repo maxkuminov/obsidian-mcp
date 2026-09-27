@@ -1,0 +1,24 @@
+# Runs once, on the first start against an empty data directory (the
+# postgres image's /docker-entrypoint-initdb.d convention). Creates the app's
+# role and database, with the role as the database owner but not as a
+# superuser, and installs pgvector as the superuser. The app's first
+# migration runs `CREATE EXTENSION IF NOT EXISTS vector`, which is then a
+# no-op needing no privilege.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: obsidian-mcp-postgres-initdb
+data:
+  10-obsidian-mcp.sh: |
+    #!/bin/bash
+    set -euo pipefail
+    : "${APP_DB_PASSWORD:?APP_DB_PASSWORD must be set (Secret obsidian-mcp-postgres, key app-password)}"
+    # psql variables (:'pw') quote the password, so any character is safe.
+    psql -v ON_ERROR_STOP=1 -v pw="$APP_DB_PASSWORD" \
+         --username "$POSTGRES_USER" --dbname postgres <<'SQL'
+    CREATE ROLE obsidian_mcp LOGIN PASSWORD :'pw';
+    CREATE DATABASE obsidian_mcp OWNER obsidian_mcp;
+    SQL
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname obsidian_mcp <<'SQL'
+    CREATE EXTENSION IF NOT EXISTS vector;
+    SQL

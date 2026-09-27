@@ -1,0 +1,69 @@
+# An example overlay: app + bundled Postgres + nightly backups. Copy this
+# directory into your own (private) config repo, then edit it.
+#
+#   kubectl apply -k <your-copy>
+#
+# Secrets are NOT generated here. Create `obsidian-mcp-secrets` and
+# `obsidian-mcp-postgres` first (see ../../base/secret.example.yaml and
+# ../../postgres/secret.example.yaml).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Also places the db-backup component's objects, which carry no namespace.
+namespace: obsidian-mcp
+
+resources:
+  - ../../base
+  - ../../postgres
+
+components:
+  - ../../components/db-backup
+
+images:
+  - name: obsidian-mcp
+    # Your registry. Build from the repo's Dockerfile and push. Pin by digest
+    # in production (newTag -> digest: sha256:...).
+    newName: registry.example.com/obsidian-mcp
+    newTag: CHANGE-ME
+
+patches:
+  # Public hostname and trusted proxies. Narrow TRUSTED_PROXY_IPS to your
+  # cluster's pod CIDR (or the ingress controller's range).
+  - target:
+      kind: ConfigMap
+      name: obsidian-mcp-config
+    patch: |
+      - op: replace
+        path: /data/MCP_HOSTNAME
+        value: obsidian-mcp.example.com
+      - op: replace
+        path: /data/TRUSTED_PROXY_IPS
+        value: 10.42.0.0/16   # e.g. the k3s default pod CIDR
+  # The namespace your ingress controller / gateway runs in.
+  - target:
+      kind: NetworkPolicy
+      name: obsidian-mcp
+    patch: |
+      - op: replace
+        path: /spec/ingress/0/from/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name
+        value: traefik
+  # The uid/gid that owns your vault files, if not 1000.
+  # - target:
+  #     kind: Deployment
+  #     name: obsidian-mcp
+  #   patch: |
+  #     - op: replace
+  #       path: /spec/template/spec/securityContext/runAsUser
+  #       value: 1001
+  #     - op: replace
+  #       path: /spec/template/spec/securityContext/runAsGroup
+  #       value: 1001
+  # Vault storage: set the claim's size / storageClassName, or bind it to a
+  # PV you created for an existing vault (see the guide).
+  - target:
+      kind: PersistentVolumeClaim
+      name: obsidian-mcp-vault
+    patch: |
+      - op: replace
+        path: /spec/resources/requests/storage
+        value: 20Gi

@@ -1,0 +1,31 @@
+# Optional: a minimal single-instance PostgreSQL 16 + pgvector for
+# deployments that have no database yet. Apply it in the same namespace as
+# the app, after creating the Secret `obsidian-mcp-postgres`
+# (see secret.example.yaml):
+#
+#   kubectl apply -k deploy/kubernetes/postgres
+#
+# The server needs pgvector >= 0.8.0 (older versions silently lose recall on
+# filtered semantic search, so the server refuses to start on them). The
+# image tag pins the extension version.
+#
+# This is a StatefulSet, not an operator, so it adds no cluster-wide
+# dependency and uses the same image family as the compose files and CI. It
+# has no TLS, no replicas, no PITR and no automated backups. For production,
+# prefer CloudNativePG: see "Database" in docs/deployment-kubernetes.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: obsidian-mcp
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: obsidian-mcp
+    includeSelectors: false
+    includeTemplates: true
+
+resources:
+  - configmap-initdb.yaml
+  - statefulset.yaml
+  - service.yaml
+  - networkpolicy.yaml

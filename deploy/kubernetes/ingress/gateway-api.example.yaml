@@ -1,0 +1,245 @@
+# EXAMPLE, adapt to your Gateway and your SSO. Not part of the base.
+#
+# The front door for obsidian-mcp, written for the Gateway API. It works with
+# any conformant implementation (Envoy Gateway, Istio, Cilium, NGINX Gateway
+# Fabric, Traefik, ...). A Traefik IngressRoute variant is in traefik.example.yaml.
+# Read "The front door" in docs/deployment-kubernetes.md before using it.
+#
+# There are five routes, and the split between them is the security design:
+#
+#   obsidian-mcp-sso         /admin*, /api*, /authorize  -> behind YOUR SSO
+#   obsidian-mcp-app         /mcp*, /transfer*, /health, /.well-known*,
+#                            /register, /token, /revoke  -> no proxy auth
+#                            (the app authenticates every one of these)
+#   obsidian-mcp-root-bearer exactly `/` WITH `Authorization: Bearer ...`
+#                            -> the app, which rewrites it to /mcp/
+#   obsidian-mcp-http        plaintext :80. Browser paths redirect to https.
+#                            Machine paths are REFUSED, never redirected.
+#
+# Everything else on the hostname (/, /docs, /openapi.json, ...) matches no
+# route and gets the gateway's 404.
+#
+# Replace every change-me placeholder. The parentRefs assume one Gateway with an `https`
+# listener (TLS terminated at the Gateway) and an `http` listener.
+---
+# 1. Panel, REST API and the OAuth consent page: SSO in front.
+#
+# The Gateway API has no standard authentication filter. This rule carries
+# an ExtensionRef placeholder, and by the spec an ExtensionRef that cannot
+# be resolved is NOT skipped: the request gets a 5xx. So this route fails
+# closed until you wire SSO in. Then either:
+#   * replace the filter with your implementation's auth filter, or
+#   * remove the filter and attach your implementation's auth policy to THIS
+#     HTTPRoute by targetRef (for example an Envoy Gateway SecurityPolicy with
+#     extAuth/OIDC). Attach it to this route only, never to the Gateway or to
+#     obsidian-mcp-app, because MCP clients cannot do browser SSO.
+# In single-user mode (MULTI_USER_MODE=false) the panel has NO login of its
+# own. This SSO is the only thing standing between the internet and a page
+# that mints API keys. Check that `curl -si https://<host>/admin` is refused
+# or redirected to your IdP before you go live.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: obsidian-mcp-sso
+  namespace: obsidian-mcp
+spec:
+  parentRefs:
+    - name: change-me-gateway
+      namespace: change-me-gateway-namespace
+      sectionName: https
+  hostnames:
+    - obsidian-mcp.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /admin
+        - path:
+            type: PathPrefix
+            value: /api
+        - path:
+            type: Exact
+            value: /authorize
+      filters:
+        - type: ExtensionRef
+          extensionRef:
+            group: sso.example.com
+            kind: ChangeMeSSOFilter
+            name: obsidian-mcp-sso
+      backendRefs:
+        - name: obsidian-mcp
+          port: 8000
+---
+# 2. Machine-facing paths. No proxy auth: /mcp takes an API key or OAuth
+# bearer token, /transfer a capability token, /register|/token|/revoke are
+# the OAuth endpoints, /.well-known the OAuth discovery documents. Putting
+# SSO in front of any of them breaks every MCP client.
+#
+# Streaming: /mcp holds long-lived SSE responses and PUT /transfer/upload
+# streams up to MAX_FILE_WRITE_BYTES (25 MiB by default). Disable or raise
+# your implementation's route timeout (`timeouts.request: "0s"` disables it
+# where supported) and its request-body limit, and turn request buffering off
+# if the implementation buffers.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: obsidian-mcp-app
+  namespace: obsidian-mcp
+spec:
+  parentRefs:
+    - name: change-me-gateway
+      namespace: change-me-gateway-namespace
+      sectionName: https
+  hostnames:
+    - obsidian-mcp.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mcp
+        - path:
+            type: PathPrefix
+            value: /transfer
+        - path:
+            type: PathPrefix
+            value: /.well-known
+        - path:
+            type: Exact
+            value: /health
+        - path:
+            type: Exact
+            value: /register
+        - path:
+            type: Exact
+            value: /token
+        - path:
+            type: Exact
+            value: /revoke
+      timeouts:
+        request: "0s"
+      backendRefs:
+        - name: obsidian-mcp
+          port: 8000
+---
+# 3. Bare root with a bearer token, for MCP clients that strip the /mcp path.
+# The header match is the scope, and it is load-bearing: this route must
+# never match `/` without the header, or paths other than `/`. A plain
+# `GET /` from a browser stays a 404.
+# Header regex matching is "Extended" support in the Gateway API. An
+# implementation without it rejects this route, which costs only the
+# path-stripping clients. Delete the route if you have none.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: obsidian-mcp-root-bearer
+  namespace: obsidian-mcp
+spec:
+  parentRefs:
+    - name: change-me-gateway
+      namespace: change-me-gateway-namespace
+      sectionName: https
+  hostnames:
+    - obsidian-mcp.example.com
+  rules:
+    - matches:
+        - path:
+            type: Exact
+            value: /
+          headers:
+            - name: Authorization
+              type: RegularExpression
+              value: "^Bearer\\s"
+      timeouts:
+        request: "0s"
+      backendRefs:
+        - name: obsidian-mcp
+          port: 8000
+---
+# 4. Plaintext (:80). A redirect is the WRONG answer for a machine path. An
+# MCP client configured with http:// has already sent its bearer token in
+# cleartext. A 307/308 keeps the method, body and Authorization header, so
+# the retry over TLS succeeds and nobody ever notices the leak. A hard failure
+# on the first request is the only outcome an operator will see.
+#
+# The Gateway API has no "respond 403" action. The refusal rule therefore
+# points at a Service that deliberately does not exist, and by the spec a
+# request to an unresolvable backend gets a 500 from the gateway, which
+# never contacts the app. (Same idea as the TEST-NET allow-list in the
+# Traefik variant: a destination nothing can match.) Do NOT create a
+# Service with this name. The route will report ResolvedRefs=False, and that
+# is intended.
+#
+# ACME HTTP-01: cert-manager's solver adds an Exact-path route for
+# /.well-known/acme-challenge/<token>, which outranks this PathPrefix rule.
+#
+# If your Gateway also has a catch-all http->https redirect route, check that
+# it does not win for this hostname (see "The front door" in the guide):
+#   curl -si http://<host>/mcp        -> 500, no Location header
+#   curl -si http://<host>/admin      -> 301 to https
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: obsidian-mcp-http
+  namespace: obsidian-mcp
+spec:
+  parentRefs:
+    - name: change-me-gateway
+      namespace: change-me-gateway-namespace
+      sectionName: http
+  hostnames:
+    - obsidian-mcp.example.com
+  rules:
+    # Refuse: machine-facing paths, and `/` carrying a bearer token in any
+    # letter case (broader than the https root route on purpose: broader on
+    # a refusal costs nothing).
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /mcp
+        - path:
+            type: PathPrefix
+            value: /transfer
+        - path:
+            type: PathPrefix
+            value: /.well-known
+        - path:
+            type: Exact
+            value: /health
+        - path:
+            type: Exact
+            value: /register
+        - path:
+            type: Exact
+            value: /token
+        - path:
+            type: Exact
+            value: /revoke
+        - path:
+            type: Exact
+            value: /
+          headers:
+            - name: Authorization
+              type: RegularExpression
+              value: "(?i)^bearer\\s"
+      backendRefs:
+        - name: obsidian-mcp-plaintext-refused
+          port: 8000
+    # Redirect: what a person types into a browser.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /admin
+        - path:
+            type: PathPrefix
+            value: /api
+        - path:
+            type: Exact
+            value: /authorize
+        - path:
+            type: Exact
+            value: /
+      filters:
+        - type: RequestRedirect
+          requestRedirect:
+            scheme: https
+            statusCode: 301

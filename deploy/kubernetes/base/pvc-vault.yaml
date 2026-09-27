@@ -1,0 +1,37 @@
+# The vault volume. The server edits it: its write tools create, edit, move
+# and delete notes, and uploads land here. It must be mounted read-write.
+#
+# Read "Vault storage" in docs/deployment-kubernetes.md before choosing
+# storage. The short version:
+#
+#   * One volume per vault, mounted AT the vault root (deployment.yaml
+#     mounts this claim at /obsidian = VAULT_PATH). Do not use subPath into a
+#     larger volume, and nest no other mount beneath the vault. The server
+#     refuses to publish a write across a mount boundary. In multi-user mode,
+#     never mount one user's vault inside another user's vault path.
+#   * The filesystem must support hard links and renameat2(RENAME_NOREPLACE).
+#     ext4 and xfs do. O_TMPFILE is used where it is available (set
+#     VAULT_ALLOW_NAMED_STAGING_FALLBACK=true where it is not, e.g. some NFS
+#     servers).
+#   * The pod sets NO fsGroup. The kubelet would recursively chown/chmod
+#     every file in the vault on mount. The volume must therefore already be
+#     writable by the pod's uid (1000 by default). An existing vault must
+#     already be owned by that uid. A new empty dynamically provisioned
+#     volume needs a one-time ownership fix: vault-init-job.example.yaml.
+#
+# This claim uses the cluster's default StorageClass. To serve an existing
+# vault (an NFS export, or a local path on one node), bind it to a PV you
+# create instead. Both are shown in the guide.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: obsidian-mcp-vault
+  labels:
+    app.kubernetes.io/name: obsidian-mcp
+    app.kubernetes.io/component: vault
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

@@ -1,0 +1,29 @@
+# Only the app (and the optional backup CronJob) may reach Postgres. It needs
+# no egress at all, so the base's default-deny covers that. If you apply
+# this component without the base, add a default-deny of your own.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/component: database
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: obsidian-mcp
+              app.kubernetes.io/component: server
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: obsidian-mcp
+              app.kubernetes.io/component: db-backup
+      ports:
+        - protocol: TCP
+          port: 5432
+  egress: []

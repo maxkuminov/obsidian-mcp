@@ -1,0 +1,130 @@
+# EXAMPLE, adapt to your SSO. Not part of the base.
+#
+# The same front door as gateway-api.example.yaml, written with Traefik's
+# own CRDs (traefik.io/v1alpha1, Traefik v3). It is a transcription of the
+# Docker labels in the repo's docker-compose.yml, whose comments explain
+# each rule in detail. Entry point names follow the Traefik Helm chart:
+# `web` (:80) and `websecure` (:443).
+#
+# BEFORE USING, check your Traefik static configuration:
+#   If the `web` entry point has an entry-point redirection
+#   (entryPoints.web.http.redirections.entryPoint, or the Helm chart's
+#   ports.web.redirections), the router it generates defaults to priority
+#   9223372036854775806. That outranks the priority-200 refusal router
+#   below, so every plaintext request is redirected and the refusal never
+#   runs. Set that redirection's `priority` to 1, or remove it and redirect
+#   with a low-priority catch-all router instead. Then verify:
+#     curl -si http://<host>/mcp     -> 403, no Location header
+#     curl -si http://<host>/admin   -> redirect to https
+---
+# SSO for the panel, the REST API and the consent page. CHANGE ME: point it
+# at your forward-auth endpoint (oauth2-proxy's /oauth2/auth, Authelia,
+# Authentik, ...), or swap this Middleware for a chain your cluster already
+# has. The placeholder address is in the reserved .invalid TLD, so it never
+# resolves and these routes fail closed until you set it.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: obsidian-mcp-sso
+  namespace: obsidian-mcp
+spec:
+  forwardAuth:
+    address: http://change-me-forward-auth.invalid/
+    trustForwardHeader: false
+---
+# Refuses every source. 192.0.2.0/32 is RFC 5737 TEST-NET-1: reserved for
+# documentation and never routable. It is NOT a placeholder. Do not "fix"
+# it to a real address: anything matchable reopens the cleartext-token
+# leak. ipAllowList answers 403 in the proxy without contacting the app. No
+# ipStrategy is set, so the check reads the direct TCP peer.
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: obsidian-mcp-no-plaintext
+  namespace: obsidian-mcp
+spec:
+  ipAllowList:
+    sourceRange:
+      - 192.0.2.0/32
+---
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: obsidian-mcp
+  namespace: obsidian-mcp
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    # Panel + consent page: SSO.
+    - kind: Rule
+      match: Host(`obsidian-mcp.example.com`) && (PathPrefix(`/admin`) || Path(`/authorize`))
+      middlewares:
+        - name: obsidian-mcp-sso
+      services:
+        - name: obsidian-mcp
+          port: 8000
+    # REST API: SSO.
+    - kind: Rule
+      match: Host(`obsidian-mcp.example.com`) && PathPrefix(`/api`)
+      middlewares:
+        - name: obsidian-mcp-sso
+      services:
+        - name: obsidian-mcp
+          port: 8000
+    # Machine-facing paths: no proxy auth, the app authenticates. No
+    # ratelimit middleware on purpose: the app keeps per-principal and
+    # failed-auth budgets that a proxy cannot express (it cannot count only
+    # the 401s).
+    - kind: Rule
+      match: >-
+        Host(`obsidian-mcp.example.com`) && (PathPrefix(`/mcp`) || PathPrefix(`/transfer`)
+        || Path(`/health`) || PathPrefix(`/.well-known`) || Path(`/register`)
+        || Path(`/token`) || Path(`/revoke`))
+      services:
+        - name: obsidian-mcp
+          port: 8000
+    # Bare root with a bearer token (clients that strip /mcp). The Path(`/`)
+    # scope is security, not tidiness: with priority 100 and no path scope,
+    # this rule would outrank the SSO routes for EVERY path, and any request
+    # to /admin or /api carrying an `Authorization: Bearer` header would skip
+    # SSO.
+    - kind: Rule
+      match: Host(`obsidian-mcp.example.com`) && Path(`/`) && HeaderRegexp(`Authorization`, `^Bearer `)
+      priority: 100
+      services:
+        - name: obsidian-mcp
+          port: 8000
+  tls:
+    # A certificate for the hostname (for example from cert-manager), or
+    # replace with `certResolver: <your resolver>`.
+    secretName: obsidian-mcp-tls
+---
+# Plaintext refusal on :80, for machine-facing paths and for `/` carrying a
+# bearer token (in any letter case). The ACME HTTP-01 carve-out comes first so
+# certificate issuance on this entry point keeps working. Browser paths
+# (/admin, /api, /authorize, bare /) match nothing here and fall through to
+# your usual http->https redirect.
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: obsidian-mcp-plaintext
+  namespace: obsidian-mcp
+spec:
+  entryPoints:
+    - web
+  routes:
+    - kind: Rule
+      match: >-
+        Host(`obsidian-mcp.example.com`) && !PathPrefix(`/.well-known/acme-challenge/`)
+        && (PathPrefix(`/mcp`) || PathPrefix(`/transfer`) || Path(`/health`)
+        || PathPrefix(`/.well-known`) || Path(`/register`) || Path(`/token`) || Path(`/revoke`)
+        || (Path(`/`) && HeaderRegexp(`Authorization`, `(?i)^Bearer `)))
+      priority: 200
+      middlewares:
+        - name: obsidian-mcp-no-plaintext
+      # Required by Traefik. Never reached, because the middleware answers
+      # first.
+      services:
+        - name: obsidian-mcp
+          port: 8000

@@ -1,0 +1,14 @@
+# `kubectl apply -k deploy/kubernetes` applies the app base only.
+# The layout is described in docs/deployment-kubernetes.md:
+#
+#   base/                 the app: Namespace, ConfigMap, vault PVC, Deployment
+#                         (+ migration initContainer), Service, NetworkPolicy
+#   postgres/             optional single-instance Postgres 16 + pgvector
+#   components/db-backup/ optional nightly pg_dump CronJob, recorded in backups_log
+#   ingress/              front-door examples (Gateway API, Traefik), not applied
+#   overlays/example/     an overlay combining the above, to copy
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - base

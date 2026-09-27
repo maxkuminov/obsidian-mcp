@@ -1,0 +1,22 @@
+# Optional component: a nightly logical backup of the app database, kept on
+# its own volume and recorded in `backups_log`, which is where the panel's
+# Health page reads "last backup" from. It is the Kubernetes counterpart of
+# `make db-backup`. Include it from an overlay:
+#
+#   components:
+#     - ../../components/db-backup
+#
+# Take one by hand before an upgrade that carries a migration:
+#
+#   kubectl -n obsidian-mcp create job --from=cronjob/obsidian-mcp-db-backup pre-upgrade-$(date +%s)
+#
+# The backup volume is mounted only by the backup Job, never by the app
+# container. Dumps contain every note's text and every credential hash.
+apiVersion: kustomize.config.k8s.io/v1alpha1
+kind: Component
+
+resources:
+  - pvc.yaml
+  - configmap.yaml
+  - cronjob.yaml
+  - networkpolicy.yaml
