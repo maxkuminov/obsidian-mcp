@@ -1,0 +1,175 @@
+# Build -> Trivy gate -> push a PRIVATE image to GHCR (ghcr.io/maxkuminov/obsidian-mcp).
+#
+# A k3s deployment runs this image pinned BY DIGEST in a separate GitOps repo; a
+# push here changes nothing anywhere until that digest is bumped there. The
+# `make deploy` path (build locally, push to the REGISTRY in Makefile.local) is
+# independent of this workflow and unchanged by it.
+#
+# Test gating: this workflow does NOT re-run the test suite. It is triggered by
+# the CI workflow (ci.yml) completing, and only pushes when that CI run was a
+# SUCCESS for a PUSH to main in THIS repository. CI is the one place that knows
+# how to run the suite (pgvector service, unprivileged-userns relaxation, the
+# junit gate on the namespace harness, schema-gate, openspec, trivy), so the
+# image is built from exactly the commit CI has already proven, with no second
+# copy of that setup to drift.
+#
+#   workflow_run      CI succeeded on a push to main -> build, scan, push.
+#   workflow_dispatch manual re-push of main; refuses unless CI succeeded for
+#                     that exact commit on a push to main.
+#   pull_request      only when this file changes: build + scan, never push,
+#                     so a change to the workflow is exercised before merge.
+name: image
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/image.yml
+
+permissions: {}
+
+concurrency:
+  # Pushes to main are serialized (never cancelled mid-push); PR runs of this
+  # file supersede each other.
+  group: image-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/maxkuminov/obsidian-mcp
+  # Trivy runs from its container image pinned by digest (not trivy-action):
+  # 0.69.3, the same pin as the other GHCR image workflows.
+  TRIVY_IMAGE: aquasec/trivy:0.69.3@sha256:bcc376de8d77cfe086a917230e818dc9f8528e3c852f7b1aff648949b6258d1c
+
+jobs:
+  build-scan-push:
+    # workflow_run fires for EVERY completed CI run, including pull_request
+    # runs from forks whose head branch may also be called "main". Only a
+    # successful CI run for a push event in this repository may lead to a push.
+    if: >-
+      github.event_name != 'workflow_run' || (
+        github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push' &&
+        github.event.workflow_run.head_branch == 'main' &&
+        github.event.workflow_run.head_repository.full_name == github.repository
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      actions: read   # workflow_dispatch: look up the CI result for the commit
+    steps:
+      - name: Resolve commit and push decision
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          case "$EVENT" in
+            workflow_run)
+              sha="$RUN_SHA"; push=true ;;
+            workflow_dispatch)
+              if [ "$REF" != "refs/heads/main" ]; then
+                echo "::error::workflow_dispatch pushes main only (got $REF)"; exit 1
+              fi
+              sha="$GITHUB_SHA"; push=true
+              # Same gate as the workflow_run path: CI must have succeeded for
+              # this exact commit on a push to main.
+              ok=$(gh run list -R "$GITHUB_REPOSITORY" --workflow ci.yml \
+                     --commit "$sha" --event push --branch main \
+                     --json conclusion --jq '[.[] | select(.conclusion == "success")] | length')
+              if [ "${ok:-0}" -lt 1 ]; then
+                echo "::error::no successful CI run on push to main for ${sha} — refusing to push"; exit 1
+              fi ;;
+            pull_request)
+              sha="$GITHUB_SHA"; push=false ;;
+            *)
+              echo "::error::unexpected event $EVENT"; exit 1 ;;
+          esac
+          [[ "$sha" =~ ^[0-9a-f]{40}$ ]] || { echo "::error::bad sha '$sha'"; exit 1; }
+          {
+            echo "BUILD_SHA=$sha"
+            echo "SHORT_SHA=${sha::7}"
+            echo "DO_PUSH=$push"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: ${{ env.BUILD_SHA }}
+          persist-credentials: false
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${BUILD_SHA}" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            -t obsidian-mcp:ci .
+
+      # Same flags as `make trivy`: HIGH,CRITICAL with an available fix fails
+      # the job, vuln scanner only. .trivyignore is honoured when present.
+      - name: Trivy scan (HIGH/CRITICAL, ignore-unfixed)
+        run: |
+          set -euo pipefail
+          ignore=()
+          if [ -f .trivyignore ]; then ignore=(--ignorefile /src/.trivyignore); fi
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            -v "$PWD:/src:ro" \
+            "$TRIVY_IMAGE" image \
+              --severity HIGH,CRITICAL --exit-code 1 --ignore-unfixed \
+              --no-progress --scanners vuln \
+              "${ignore[@]}" \
+              obsidian-mcp:ci
+
+      - name: Push to GHCR
+        if: env.DO_PUSH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          for tag in "sha-${SHORT_SHA}" main; do
+            docker tag obsidian-mcp:ci "${IMAGE}:${tag}"
+            docker push "${IMAGE}:${tag}"
+          done
+          digest=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}:sha-${SHORT_SHA}" \
+                   | grep -m1 "^${IMAGE}@sha256:" | cut -d@ -f2)
+          test -n "$digest"
+          {
+            echo "### obsidian-mcp image"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| commit | \`${BUILD_SHA}\` |"
+            echo "| tags | \`sha-${SHORT_SHA}\`, \`main\` |"
+            echo "| digest | \`${digest}\` |"
+            echo
+            echo "Kustomize pin:"
+            echo
+            echo '```yaml'
+            echo "images:"
+            echo "  - name: ${IMAGE}"
+            echo "    newTag: sha-${SHORT_SHA}"
+            echo "    digest: ${digest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io
+
+      - name: Summary (not pushed)
+        if: env.DO_PUSH != 'true'
+        run: |
+          {
+            echo "### obsidian-mcp image"
+            echo
+            echo "Built and scanned \`${BUILD_SHA}\` — **not pushed** (${GITHUB_EVENT_NAME})."
+          } >> "$GITHUB_STEP_SUMMARY"
