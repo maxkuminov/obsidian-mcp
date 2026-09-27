@@ -762,22 +762,23 @@ component for the `backups_log` record, or record your own backups in that
 table.
 
 **Restore** (tested against the bundled Postgres, as the non-superuser app
-role):
+role). It restores into a *new* database and swaps it in only after the load
+succeeds, so the current database is never dropped on the strength of an
+unverified archive.
 
-1. Stop writers: `kubectl -n obsidian-mcp scale deploy/obsidian-mcp --replicas=0`,
-   and `kubectl -n obsidian-mcp patch cronjob obsidian-mcp-db-backup -p '{"spec":{"suspend":true}}'`.
-2. As a superuser, recreate the database empty, owned by the app role, with
+1. Pick the dump and verify it before touching anything:
+   `gzip -t "$F" && gzip -dc "$F" | tail -n 20 | grep -q 'PostgreSQL database dump complete'`.
+2. As a superuser, create an empty side database owned by the app role, with
    the extension installed. The app role cannot create `vector` itself.
 
    ```sql
-   DROP DATABASE obsidian_mcp;
-   CREATE DATABASE obsidian_mcp OWNER obsidian_mcp;
-   \c obsidian_mcp
+   CREATE DATABASE obsidian_mcp_restore OWNER obsidian_mcp;
+   \c obsidian_mcp_restore
    CREATE EXTENSION vector;
    ```
 
-3. Load the dump as the app role, in one transaction, stopping at the first
-   error. The dump's `COMMENT ON EXTENSION vector` line is filtered out
+3. Load the dump into it as the app role, in one transaction, stopping at the
+   first error. The dump's `COMMENT ON EXTENSION vector` line is filtered out
    because only the extension's owner (the superuser) may set it. It is only
    the extension's description. Run it from a pod with the postgres client,
    for example the backup image with the backup volume mounted:
@@ -785,16 +786,27 @@ role):
    ```bash
    set -euo pipefail
    F=/backups/backup_YYYYMMDD_HHMMSS.sql.gz
-   URL="postgresql://${DATABASE_URL#postgresql+asyncpg://}"
-   gzip -t "$F"
+   BASE="postgresql://${DATABASE_URL#postgresql+asyncpg://}"
+   URL="${BASE%/*}/obsidian_mcp_restore"      # same server and role, the side database
    gzip -dc "$F" | grep -v '^COMMENT ON EXTENSION ' \
      | psql -X -q -v ON_ERROR_STOP=1 --single-transaction "$URL"
    ```
 
-   A failure rolls the whole restore back and leaves the database empty. Do
-   not start the app on it.
-4. Scale the app back to 1. Its migration initContainer brings an older dump
-   up to the image's schema. Resume the CronJob.
+   A failure rolls the load back. Drop `obsidian_mcp_restore` and stop here.
+   The live database is untouched.
+4. Stop writers: `kubectl -n obsidian-mcp scale deploy/obsidian-mcp --replicas=0`,
+   and `kubectl -n obsidian-mcp patch cronjob obsidian-mcp-db-backup -p '{"spec":{"suspend":true}}'`.
+5. As a superuser, swap the databases and keep the old one until you are
+   satisfied:
+
+   ```sql
+   ALTER DATABASE obsidian_mcp RENAME TO obsidian_mcp_before_restore;
+   ALTER DATABASE obsidian_mcp_restore RENAME TO obsidian_mcp;
+   ```
+
+6. Scale the app back to 1. Its migration initContainer brings an older dump
+   up to the image's schema. Resume the CronJob. Drop
+   `obsidian_mcp_before_restore` once the restored deployment checks out.
 
 ## Troubleshooting
 
