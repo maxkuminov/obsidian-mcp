@@ -125,6 +125,9 @@ spec:
 # The header match is the scope, and it is load-bearing: this route must
 # never match `/` without the header, or paths other than `/`. A plain
 # `GET /` from a browser stays a 404.
+# The trailing `.*` matters. Implementations differ on whether a header
+# regex must match the whole value (Envoy's does), and `^Bearer\s.*` is
+# correct under both readings.
 # Header regex matching is "Extended" support in the Gateway API. An
 # implementation without it rejects this route, which costs only the
 # path-stripping clients. Delete the route if you have none.
@@ -148,7 +151,7 @@ spec:
           headers:
             - name: Authorization
               type: RegularExpression
-              value: "^Bearer\\s"
+              value: "^Bearer\\s.*"
       timeouts:
         request: "0s"
       backendRefs:
@@ -220,7 +223,7 @@ spec:
           headers:
             - name: Authorization
               type: RegularExpression
-              value: "(?i)^bearer\\s"
+              value: "(?i)^bearer\\s.*"
       backendRefs:
         - name: obsidian-mcp-plaintext-refused
           port: 8000

@@ -2,8 +2,8 @@
 # dump, verify, keep it private, prune, then record it in backups_log.
 #   * umask 077. The dump is the full text of every note plus every
 #     credential hash.
-#   * An empty dump, or one that fails `gzip -t`, is deleted and the Job
-#     fails.
+#   * A dump that fails `gzip -t`, or lacks pg_dump's end-of-dump trailer
+#     (empty or truncated), is deleted and the Job fails.
 #   * Prune dumps older than BACKUP_RETAIN_DAYS, but always keep the newest
 #     BACKUP_RETAIN_MIN.
 #   * Recording: no backups_log table yet (a database that predates migration
@@ -45,8 +45,16 @@ data:
     trap 'rm -f "$partial"' EXIT
 
     pg_dump --no-owner --dbname="$url" | gzip > "$partial"
-    if [ ! -s "$partial" ] || ! gzip -t "$partial"; then
-      echo "Backup FAILED: the dump is empty or did not verify" >&2
+    # A non-empty .gz proves nothing: an empty SQL stream still gzips to ~20
+    # bytes. Verify the archive, then that pg_dump wrote its end-of-dump
+    # trailer, which it emits only after a complete dump.
+    if ! gzip -t "$partial"; then
+      echo "Backup FAILED: the archive did not verify" >&2
+      exit 1
+    fi
+    trailer="$(gzip -dc "$partial" | tail -n 20)"
+    if ! grep -q -- '-- PostgreSQL database dump complete' <<<"$trailer"; then
+      echo "Backup FAILED: the dump is empty or incomplete (no end-of-dump trailer)" >&2
       exit 1
     fi
     mv "$partial" "$final"

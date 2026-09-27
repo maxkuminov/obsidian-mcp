@@ -9,8 +9,10 @@
 #   * the Secret `obsidian-mcp-secrets` (see secret.example.yaml; it is not
 #     listed below on purpose, so placeholder credentials cannot be applied
 #     by accident),
-#   * an image you can pull. Build it from the repo's Dockerfile and push it
-#     to your own registry, then set `images:` in your overlay.
+#   * an image you can pull. Build it from the repo's Dockerfile, push it to
+#     your own registry, then set `images:` (name: obsidian-mcp) in your
+#     overlay. The base deliberately references the bare, unpullable name
+#     `obsidian-mcp`, so a forgotten override fails with ErrImagePull.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -29,10 +31,3 @@ resources:
   - deployment.yaml
   - service.yaml
   - networkpolicy.yaml
-
-images:
-  # Placeholder. No public image is published, so build and push your own and
-  # override this in your overlay.
-  - name: obsidian-mcp
-    newName: registry.example.com/obsidian-mcp
-    newTag: CHANGE-ME

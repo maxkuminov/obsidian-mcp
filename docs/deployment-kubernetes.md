@@ -204,7 +204,7 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 | `DATABASE_URL` | `postgresql+asyncpg://obsidian_mcp:changeme@postgres:5432/obsidian_mcp` | **Secret.** Must use `postgresql+asyncpg://`. URL-encode reserved characters in the password. TLS parameters (`ssl`, `sslmode`, …) are refused. |
 | `SECRET_KEY` | `changeme` (refused) | **Secret.** Signs session cookies and CSRF tokens. The app refuses to start on a placeholder. `openssl rand -hex 32`. |
 | `MCP_HOSTNAME` | unset | Public hostname. Derives `BASE_URL=https://<host>`, `ALLOWED_ORIGINS=["https://<host>"]` and `ALLOWED_HOSTS=[<host>, "localhost"]`. Required (or `BASE_URL`) for the transfer tools to mint links. |
-| `BASE_URL` | derived | Explicit public origin, e.g. when the OAuth issuer differs from the hostname. HTTPS except for loopback. |
+| `BASE_URL` | derived | Explicit public origin (scheme + host, no path). HTTPS except for loopback. When `MCP_HOSTNAME` is set it must be `https://` on that same host, or startup is refused. |
 | `ALLOWED_ORIGINS` | derived | CORS origins (JSON list). `*` is refused, since credentials are allowed. |
 | `ALLOWED_HOSTS` | derived | Accepted `Host` headers (JSON list). `localhost` is always added, which is what the probes rely on. |
 | `VAULT_PATH` | `/obsidian` | Vault mount inside the container. In multi-user mode, the bootstrap admin's vault. |
@@ -477,8 +477,11 @@ On Kubernetes:
   certificate. Use the exact Service DNS name the certificate carries
   (`<svc>`, `<svc>.<ns>.svc`, …).
 - A client key (`DATABASE_SSL_KEY_FILE`) must be readable by the pod's uid.
-  Mount it with `defaultMode: 0400`. The pod has no `fsGroup` to fix that for
-  you.
+  Secret volume files are owned by root, and the pod has no `fsGroup` to
+  change that, so a `0400`/`0600` mode makes the key unreadable to uid 1000.
+  Mount that Secret with `defaultMode: 0444` in a volume used only by this pod
+  (the app checks readability, not mode). The Secret's RBAC is what protects
+  the key. Mount the same volume into the `migrate` initContainer.
 - Never put `sslmode`/`ssl` into `DATABASE_URL` and never set `PGSSL*`. Both
   refuse startup.
 - An in-cluster Ollama over `http://ollama.<ns>:11434` refuses to start
@@ -645,7 +648,8 @@ The procedure:
    With the backup component:
    `kubectl -n obsidian-mcp create job --from=cronjob/obsidian-mcp-db-backup pre-upgrade-$(date +%s)`
    and wait for it to complete.
-3. Bump the image in your overlay (by digest) and apply.
+3. Bump the image in your overlay (`images:` entry `name: obsidian-mcp`, by
+   digest) and apply.
 4. Watch `kubectl logs deploy/obsidian-mcp -c migrate`, then the server's
    startup lines.
 5. Confirm the schema matches the models:
@@ -663,14 +667,20 @@ when it started, so after you change `EMBEDDING_DIMENSIONS` or `FTS_CONFIGS`
 in the ConfigMap an exec would reset the column at the old dimension or
 rebuild under the old configs (#142). And a pod whose dimension disagrees
 with the stored vectors exits at startup, so there may be nothing to exec
-into. Update the ConfigMap, then run a one-off Job from the same image and
-settings:
+into. `rebuild_tsvectors` also re-reads every note, so it needs **every
+vault volume mounted at the same paths as the app** (`/obsidian`, and each
+`/vaults/<name>` in multi-user mode), plus any TLS files the app mounts.
+
+1. Update the ConfigMap.
+2. `kubectl -n obsidian-mcp scale deploy/obsidian-mcp --replicas=0`. This
+   stops the indexer and frees a `ReadWriteOnce` vault volume for the Job.
+3. Run a one-off Job from the same image and settings:
 
 ```yaml
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: obsidian-mcp-reset-embeddings     # or -rebuild-tsvectors
+  name: obsidian-mcp-rebuild-tsvectors     # or -reset-embeddings
   namespace: obsidian-mcp
 spec:
   backoffLimit: 0
@@ -683,7 +693,7 @@ spec:
       restartPolicy: Never
       automountServiceAccountToken: false
       enableServiceLinks: false
-      securityContext:
+      securityContext:           # same uid/gid as the Deployment, no fsGroup
         runAsNonRoot: true
         runAsUser: 1000
         runAsGroup: 1000
@@ -691,7 +701,7 @@ spec:
       containers:
         - name: task
           image: registry.example.com/obsidian-mcp:<same tag as the Deployment>
-          command: ["python", "-m", "scripts.reset_embeddings"]   # or scripts.rebuild_tsvectors
+          command: ["python", "-m", "scripts.rebuild_tsvectors"]   # or scripts.reset_embeddings
           envFrom:
             - configMapRef: { name: obsidian-mcp-config }
             - secretRef: { name: obsidian-mcp-secrets }
@@ -699,16 +709,24 @@ spec:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: { drop: ["ALL"] }
-          volumeMounts: [{ name: tmp, mountPath: /tmp }]
-      volumes: [{ name: tmp, emptyDir: {} }]
+          volumeMounts:
+            - { name: vault, mountPath: /obsidian }
+            - { name: tmp, mountPath: /tmp }
+            # + every /vaults/<name> and TLS mount the Deployment has
+      volumes:
+        - name: vault
+          persistentVolumeClaim: { claimName: obsidian-mcp-vault }
+        - { name: tmp, emptyDir: {} }
 ```
 
-Then restart the Deployment (`kubectl rollout restart deploy/obsidian-mcp`)
-so the server picks up the new settings. Both tasks wait for the index
-generation lock, which a running index pass holds for its whole transaction.
-That wait is expected. Do not give them a short timeout. See
-[indexing and embeddings](architecture/indexing-and-embeddings.md). An
-on-demand reindex is the panel's "Reindex Now" button.
+4. When it has completed, `kubectl -n obsidian-mcp scale deploy/obsidian-mcp --replicas=1`.
+
+Both tasks take the index generation lock. With the app scaled down nothing
+else holds it. If you run one with the app up (possible only for
+`reset_embeddings` on a node that can share the volume), it waits for the
+running index pass to commit. That wait is expected. Do not give it a short
+timeout. See [indexing and embeddings](architecture/indexing-and-embeddings.md).
+An on-demand reindex is the panel's "Reindex Now" button.
 
 ## Backups
 
@@ -726,7 +744,10 @@ Two things hold state: the **vault** and the **database**.
 [`components/db-backup`](../deploy/kubernetes/components/db-backup/) is a
 nightly CronJob that follows `make db-backup`'s contract. It writes a
 `pg_dump` under `umask 077`, gzips and verifies it, prunes past 30 days while
-keeping the newest 7, and records the dump in `backups_log`. That table is
+keeping the newest 7, and records the dump in `backups_log`. A dump is
+accepted only if the archive verifies *and* the SQL ends with pg_dump's
+end-of-dump trailer, because an empty or truncated dump still gzips to a valid
+file. That table is
 where the panel's Health page reads the last backup's age, so a dump taken by
 any other means leaves the page warning. The backup volume is mounted only by
 the backup Job, never by the app container. The Job uses only
@@ -740,9 +761,40 @@ With CloudNativePG, prefer its own WAL-archive backups and keep this
 component for the `backups_log` record, or record your own backups in that
 table.
 
-Restore: scale the app to zero, restore into an empty database as the app
-role (`gunzip -c backup_….sql.gz | psql "$URL"`, where `URL` is `DATABASE_URL`
-without `+asyncpg`), scale back up.
+**Restore** (tested against the bundled Postgres, as the non-superuser app
+role):
+
+1. Stop writers: `kubectl -n obsidian-mcp scale deploy/obsidian-mcp --replicas=0`,
+   and `kubectl -n obsidian-mcp patch cronjob obsidian-mcp-db-backup -p '{"spec":{"suspend":true}}'`.
+2. As a superuser, recreate the database empty, owned by the app role, with
+   the extension installed. The app role cannot create `vector` itself.
+
+   ```sql
+   DROP DATABASE obsidian_mcp;
+   CREATE DATABASE obsidian_mcp OWNER obsidian_mcp;
+   \c obsidian_mcp
+   CREATE EXTENSION vector;
+   ```
+
+3. Load the dump as the app role, in one transaction, stopping at the first
+   error. The dump's `COMMENT ON EXTENSION vector` line is filtered out
+   because only the extension's owner (the superuser) may set it. It is only
+   the extension's description. Run it from a pod with the postgres client,
+   for example the backup image with the backup volume mounted:
+
+   ```bash
+   set -euo pipefail
+   F=/backups/backup_YYYYMMDD_HHMMSS.sql.gz
+   URL="postgresql://${DATABASE_URL#postgresql+asyncpg://}"
+   gzip -t "$F"
+   gzip -dc "$F" | grep -v '^COMMENT ON EXTENSION ' \
+     | psql -X -q -v ON_ERROR_STOP=1 --single-transaction "$URL"
+   ```
+
+   A failure rolls the whole restore back and leaves the database empty. Do
+   not start the app on it.
+4. Scale the app back to 1. Its migration initContainer brings an older dump
+   up to the image's schema. Resume the CronJob.
 
 ## Troubleshooting
 
