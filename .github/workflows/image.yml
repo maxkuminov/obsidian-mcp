@@ -281,11 +281,22 @@ jobs:
 
       # Flux image automation (maxkuminov/infra docs/homelab-image-automation.md,
       # D1): an immutable, sortable main-<shortsha>-<run_number> tag next to
-      # the tags above. github.run_number is unchanged by a re-run, so a re-run
-      # of an old commit can never outrank a newer one. Published only on the
-      # workflow_run path, only while the built commit is still the main tip (a
-      # slower run for an older push must not publish after a newer one), and
-      # only once: a re-run that finds the tag present does not re-push it.
+      # the tags above. <run_number> is the TRIGGERING CI run's number
+      # (github.event.workflow_run.run_number), not this workflow's: GitHub
+      # assigns it when the push starts CI, so a later push always gets a
+      # higher one, and a re-run of CI or of this workflow keeps it. This
+      # workflow's own github.run_number would NOT do: it is assigned when CI
+      # completes, and CI runs for two pushes can complete out of order.
+      # Ordering by the CI number means an older commit's tag - even one
+      # published late - can never outrank a newer commit's, so there is
+      # deliberately NO "still the main tip" check. A tip check only added a
+      # failure mode: when a newer push's CI failed, or its image run built
+      # nothing, this passing build exited 0 unpublished (and so did its
+      # re-run), and the cluster silently stayed on the previous build.
+      # Published only on the workflow_run path, and only once: a re-run that
+      # finds the tag present does not re-push it, and any other answer from
+      # the registry fails the job. The CI numbers are far above every tag
+      # published under the old scheme, so the switch cannot go backwards.
       # Every other tag above behaves exactly as before.
       - name: Push Flux tag (main-<shortsha>-<run_number>)
         if: github.event_name == 'workflow_run' && env.IMAGE_RELEVANT == 'true'
@@ -293,17 +304,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           ACTOR: ${{ github.actor }}
           BRANCH: main
-          RUN_NUMBER: ${{ github.run_number }}
+          RUN_NUMBER: ${{ github.event.workflow_run.run_number }}
         run: |
           set -euo pipefail
           [[ "$RUN_NUMBER" =~ ^[0-9]+$ ]] || { echo "::error::bad run number '$RUN_NUMBER'"; exit 1; }
           tag="${BRANCH}-${SHORT_SHA}-${RUN_NUMBER}"
-          tip=$(gh api "repos/${GITHUB_REPOSITORY}/commits/${BRANCH}" --jq .sha)
-          if [ "$tip" != "$BUILD_SHA" ]; then
-            echo "::notice::${BRANCH} is now ${tip}, not ${BUILD_SHA}: ${tag} not published"
-            echo "Flux tag \`${tag}\` **not published**: ${BRANCH} moved on to \`${tip}\`." >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
           echo "$GH_TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
           if out=$(docker manifest inspect "${IMAGE}:${tag}" 2>&1); then
             echo "::notice::${IMAGE}:${tag} already exists (re-run): not re-pushed"
