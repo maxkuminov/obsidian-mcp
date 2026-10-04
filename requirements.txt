@@ -31,7 +31,7 @@ idna==3.18
 # src/mcp_server/tools.py (find_related's cosine similarity). Previously only
 # present transitively via pgvector, which stops requiring numpy in 0.5.0.
 # Pinned to the version already running in the production image.
-numpy==2.5.1
+numpy==2.5.3
 
 # YAML parsing
 pyyaml==6.0.3
