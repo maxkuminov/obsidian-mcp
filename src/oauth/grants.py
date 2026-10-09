@@ -26,11 +26,14 @@ This module is dependency-light on purpose -- the control panel and the OAuth
 routes both use it, and #67 warned against the panel reaching into
 `src/oauth/routes.py`.
 """
+import datetime
 import hashlib
 import secrets
+from dataclasses import dataclass
 
 from sqlalchemy import select, text, update
 
+from src.config import settings
 from src.models.db import OAuthToken
 
 # 32 URL-safe characters. Opaque: nothing may parse it, and it is never shown
@@ -257,3 +260,117 @@ async def set_grant_family_scope(session, grant_id: str, scope: str) -> int:
         .values(scope=scope)
     )
     return result.rowcount or 0
+
+
+# ── Absolute grant lifetime (#326) ──────────────────────────────────────────
+#
+# A grant family's deadline is `grant_issued_at + OAUTH_GRANT_ABSOLUTE_
+# LIFETIME_DAYS`, **derived at use from the current setting** rather than
+# stored: storing it would freeze each family to the policy in force when it
+# was minted, so shortening the setting after an incident would touch nothing.
+# Every enforcement point — both mint sites, the MCP middleware, the panel's
+# status and the transfer subsystem's credential re-validation — reads the
+# deadline from `grant_deadline` and nowhere else.
+
+#: Per-token lifetimes. Unchanged by #326; both are clamped to the deadline.
+ACCESS_TOKEN_LIFETIME = datetime.timedelta(hours=1)
+REFRESH_TOKEN_LIFETIME = datetime.timedelta(days=30)
+
+#: A refresh with less than this left before the deadline is refused rather
+#: than answered with an `expires_in` of zero.
+MIN_GRANT_REMAINING = datetime.timedelta(seconds=1)
+
+_EPOCH = datetime.datetime.min.replace(tzinfo=datetime.timezone.utc)
+
+
+def _aware(value: datetime.datetime) -> datetime.datetime:
+    """UTC-aware copy; asyncpg returns aware `timestamptz`, a test row may not."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=datetime.timezone.utc)
+    return value
+
+
+def grant_lifetime() -> datetime.timedelta:
+    """The configured absolute lifetime, read at call time."""
+    return datetime.timedelta(days=settings.oauth_grant_absolute_lifetime_days)
+
+
+def grant_deadline(grant_issued_at: datetime.datetime | None) -> datetime.datetime:
+    """The instant a grant family dies: issuance plus the *current* setting.
+
+    A missing issuance time fails closed — it reads as a family that is
+    already past its deadline. The column is NOT NULL, so this is only a row
+    built in memory and never flushed; treating it as immortal would be the
+    defect this exists to close.
+    """
+    if grant_issued_at is None:
+        return _EPOCH
+    return _aware(grant_issued_at) + grant_lifetime()
+
+
+def grant_expired(
+    grant_issued_at: datetime.datetime | None, now: datetime.datetime
+) -> bool:
+    """Dead **at** the deadline (`now >= deadline`), not just after it."""
+    return _aware(now) >= grant_deadline(grant_issued_at)
+
+
+@dataclass(frozen=True)
+class ClampedExpiry:
+    """What one mint may promise: both expiries and the `expires_in` to report."""
+
+    access_expires_at: datetime.datetime
+    refresh_expires_at: datetime.datetime
+    expires_in: int
+
+
+def clamp_token_expiry(
+    now: datetime.datetime, deadline: datetime.datetime
+) -> ClampedExpiry | None:
+    """Clamp a new access/refresh pair to the family's deadline.
+
+    `None` when less than `MIN_GRANT_REMAINING` is left — the caller refuses
+    rather than minting a token that is dead on arrival. Otherwise
+    `access = min(now + 1h, deadline)`, `refresh = min(now + 30d, deadline)`
+    and `expires_in = floor(access - now)`, which is at least 1 by the refusal
+    rule. One `now`, captured once by the caller, for all three values.
+    """
+    now = _aware(now)
+    deadline = _aware(deadline)
+    if deadline - now < MIN_GRANT_REMAINING:
+        return None
+    access = min(now + ACCESS_TOKEN_LIFETIME, deadline)
+    refresh = min(now + REFRESH_TOKEN_LIFETIME, deadline)
+    return ClampedExpiry(
+        access_expires_at=access,
+        refresh_expires_at=refresh,
+        expires_in=int((access - now).total_seconds()),
+    )
+
+
+def _humanize(delta: datetime.timedelta) -> str:
+    """'1 hour', '30 days', '7 days' — whole units, rounded down."""
+    seconds = int(delta.total_seconds())
+    if seconds >= 86_400 and seconds % 86_400 == 0:
+        n, unit = seconds // 86_400, "day"
+    elif seconds >= 3_600:
+        n, unit = seconds // 3_600, "hour"
+    else:
+        n, unit = max(seconds // 60, 1), "minute"
+    return f"{n} {unit}" + ("" if n == 1 else "s")
+
+
+def consent_lifetimes() -> dict[str, str]:
+    """The three periods the consent page states, derived from policy alone.
+
+    Each is the lesser of the per-token lifetime and the absolute cap, so the
+    page can never promise more than the server enforces. The absolute period
+    runs from the family's `grant_issued_at` — the code exchange that follows
+    approval, not the approval click.
+    """
+    cap = grant_lifetime()
+    return {
+        "access": _humanize(min(ACCESS_TOKEN_LIFETIME, cap)),
+        "refresh": _humanize(min(REFRESH_TOKEN_LIFETIME, cap)),
+        "absolute": _humanize(cap),
+    }

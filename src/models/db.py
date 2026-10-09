@@ -322,6 +322,15 @@ _OAUTH_CLIENT_LAST_USED_COLUMN_MARKER = (
     "(025_oauth_client_last_used)"
 )
 
+# Same device, same rule: byte identical to `CODE_GRANT_MARKER` and
+# `ISSUED_AT_MARKER` in `alembic/versions/029_oauth_grant_lifetime.py`.
+_OAUTH_CODE_GRANT_ID_COLUMN_MARKER = (
+    "grant family the exchange of this code issued (029_oauth_grant_lifetime)"
+)
+_OAUTH_GRANT_ISSUED_AT_COLUMN_MARKER = (
+    "grant family issuance time, inherited by rotation (029_oauth_grant_lifetime)"
+)
+
 # Same device, same rule: byte identical to `MARKER` in
 # `alembic/versions/026_note_stat_columns.py`, stamped on each of the four
 # `notes_metadata.stat_*` columns (#282).
@@ -615,9 +624,9 @@ class OAuthClient(Base):
     * `user_id` is the first authorizing user, but it is NULL for **every**
       client in a single-user deployment — the configuration `DEPLOYMENT.md`
       walks a new operator through — so "no owner" cannot mean "never used".
-    * Child rows cannot mean it either. A **used** `OAuthCode` is deleted the
-      moment it is spent, with no age gate at all, and an `OAuthToken` is
-      deleted seven days after it expires. A client that was genuinely used,
+    * Child rows cannot mean it either. An `OAuthCode`, spent or not, and an
+      `OAuthToken` are each deleted seven days after they expire (until 029 a
+      **used** code was deleted the moment it was spent). A client that was genuinely used,
       whose grant was revoked and whose rows aged out, is indistinguishable
       from one that never was.
     * `usage_logs.actor_ref` survives credential deletion by design, but it
@@ -694,6 +703,16 @@ class OAuthCode(Base):
     code_challenge_method: Mapped[str] = mapped_column(String(10), nullable=False, default="S256")
     expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     used: Mapped[bool] = mapped_column(Boolean, default=False)
+    # The grant family this code's exchange issued (migration 029, #325).
+    # Written in the same transaction that sets `used = True` and inserts the
+    # tokens, so a replay of the spent code can revoke exactly that family
+    # (RFC 6749 §4.1.2). NULL means "unspent", or "spent before 029 / by a
+    # pre-029 process during a rollout" — a replay of such a code refuses and
+    # revokes nothing. No default, no index (codes are looked up by
+    # `code_hash`), no FK (there is no grants table).
+    grant_id: Mapped[str | None] = mapped_column(
+        String(64), nullable=True, comment=_OAUTH_CODE_GRANT_ID_COLUMN_MARKER
+    )
     created_at: Mapped[datetime.datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -842,6 +861,25 @@ class OAuthToken(Base):
     # in #64 was explicit that a nullable grant_id with a fallback "find the
     # family" path is how this bug comes back.
     grant_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    # When the grant family was first issued (migration 029, #326): the code
+    # exchange's time, copied verbatim from the locked refresh row by every
+    # rotation — the same inheritance rule `grant_id` follows — so it is
+    # uniform across a family and rotation never restarts the clock. The
+    # family's absolute deadline is this plus `OAUTH_GRANT_ABSOLUTE_LIFETIME_
+    # DAYS`, derived at use (`src/oauth/grants.py:grant_deadline`).
+    #
+    # The server default exists **only** so a process still running the
+    # previous image during a rolling deploy can insert a token without a NOT
+    # NULL violation. Application code must never rely on it: a mint site that
+    # forgot to copy the value would silently restart the family's clock,
+    # which is #326 again. `tests/test_oauth_grant_lifetime.py` requires every
+    # `OAuthToken(` construction under `src/` to pass it explicitly.
+    grant_issued_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        comment=_OAUTH_GRANT_ISSUED_AT_COLUMN_MARKER,
+    )
     expires_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime.datetime] = mapped_column(
