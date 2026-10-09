@@ -21,21 +21,26 @@ In `docker-compose.simple.yml` and `docker-compose.proxy.yml`, the postgres serv
 
 ### Requirement: The administrative database password MUST NOT reach the application container
 
-The superuser password SHALL be supplied only through `postgres.env`, which SHALL be listed in the postgres service's `env_file` and in no other service's. The application service's `environment` SHALL NOT contain `POSTGRES_PASSWORD`. `postgres.env` SHALL be gitignored and a `postgres.env.example` SHALL be tracked. At startup the server SHALL log one WARNING naming `postgres.env` when `POSTGRES_PASSWORD` is present in its own environment.
+The superuser password SHALL be supplied only through `postgres.env`, which SHALL be listed in the postgres service's `env_file` and in no other service's. The application service's `environment` SHALL set `POSTGRES_PASSWORD` to the empty string, so that a value in `.env` cannot reach the application container through `env_file`. `postgres.env` SHALL be gitignored and a `postgres.env.example` SHALL be tracked. At startup the server SHALL log one WARNING naming `postgres.env` when `POSTGRES_PASSWORD` is present in its own environment.
 
 #### Scenario: Only the postgres service loads the admin file
 
 - **WHEN** the configuration test parses both compose files
-- **THEN** the postgres service's `env_file` SHALL include `postgres.env`, no other service's `env_file` SHALL include it, and no other service's `environment` SHALL contain the key `POSTGRES_PASSWORD`
+- **THEN** the postgres service's `env_file` SHALL include `postgres.env`, no other service's `env_file` SHALL include it, and the application service's `environment` SHALL map `POSTGRES_PASSWORD` to the empty string
+
+#### Scenario: A stale admin password in .env does not reach the app
+
+- **WHEN** `docker compose config` renders either bundle from a project directory whose `.env` sets `POSTGRES_PASSWORD` to a sentinel value and whose `postgres.env` sets a different one
+- **THEN** the sentinel SHALL NOT appear anywhere in the application service's rendered environment, and the postgres service's rendered `POSTGRES_PASSWORD` SHALL be the `postgres.env` value
 
 #### Scenario: A leftover admin password in the app environment is flagged
 
-- **WHEN** the server starts with `POSTGRES_PASSWORD` set in its process environment
+- **WHEN** the server starts with a non-empty `POSTGRES_PASSWORD` in its process environment
 - **THEN** it SHALL log exactly one WARNING naming `postgres.env` and not containing the value, and SHALL continue starting
 
 ### Requirement: The Compose bundles MUST NOT start PostgreSQL with a missing, placeholder or weak password
 
-Neither bundle SHALL contain a default value (`:-`) for any password variable or the literal `changeme`. `OBSIDIAN_DB_PASSWORD` SHALL be interpolated with `${OBSIDIAN_DB_PASSWORD:?…}` wherever it is used. The postgres service's entrypoint SHALL be a wrapper that, before invoking the image's `docker-entrypoint.sh`, exits non-zero unless `POSTGRES_PASSWORD` and `OBSIDIAN_DB_PASSWORD` are each set, at least 24 characters long, and not a shipped placeholder (compared case-insensitively after trimming), `OBSIDIAN_DB_PASSWORD` contains only `A-Z a-z 0-9 . _ ~ -`, and the two differ. Its error output SHALL name each failing variable and SHALL NOT contain any password value.
+Neither bundle SHALL contain a default value (`:-`) for any password variable or the literal `changeme`. `OBSIDIAN_DB_PASSWORD` SHALL be interpolated with `${OBSIDIAN_DB_PASSWORD:?…}` wherever it is used. The postgres service's entrypoint SHALL be a wrapper that, before invoking the image's `docker-entrypoint.sh`, exits non-zero unless `POSTGRES_PASSWORD` and `OBSIDIAN_DB_PASSWORD` are each set, at least 24 characters long, and not a shipped placeholder (compared case-insensitively after trimming), `OBSIDIAN_DB_PASSWORD` contains only `A-Z a-z 0-9 . _ ~ -`, and the two differ. Its error output SHALL name each failing variable and SHALL NOT contain any password value. The initialisation script SHALL record `started` in `$PGDATA/obsidian-mcp-init.state` before its first statement and replace it atomically with `complete` after its last; the wrapper SHALL exit non-zero, with instructions to recreate the volume, when `$PGDATA/PG_VERSION` exists and the marker exists without reading `complete`. A data directory with no marker SHALL be allowed to start.
 
 #### Scenario: Unset runtime password fails at configuration time
 
@@ -56,6 +61,16 @@ Neither bundle SHALL contain a default value (`:-`) for any password variable or
 
 - **WHEN** the wrapper runs with two distinct 32-character hex passwords and arguments `postgres`
 - **THEN** it SHALL `exec` the stub with exactly the arguments `postgres`
+
+#### Scenario: A half-initialised volume is refused on the next start
+
+- **WHEN** the initialisation script fails after recording `started` and the postgres container is started again on the same volume
+- **THEN** the wrapper SHALL exit non-zero before invoking `docker-entrypoint.sh`, and its output SHALL name the volume as half-initialised and say how to recreate it
+
+#### Scenario: A pre-existing volume without a marker still starts
+
+- **WHEN** the wrapper runs over a data directory that has `PG_VERSION` and no marker
+- **THEN** it SHALL `exec` the image entrypoint
 
 #### Scenario: No usable fallback remains in the files
 
@@ -107,12 +122,22 @@ During startup, after the database transport assertion and not in `MCP_SANDBOX_M
 
 ### Requirement: Existing Compose clusters SHALL be converted only by an operator-run script that reaches the fresh-install shape atomically
 
-`docker/upgrade-split-db-roles.sql` SHALL, when run as documented against a cluster whose OID-10 superuser is `obsidian_mcp`, rename that role to `postgres` with the supplied admin password, create a non-superuser `obsidian_mcp` with the supplied runtime password, and transfer to it ownership of database `obsidian_mcp` and every non-extension object in its non-system schemas, in one transaction that ends in a self-check and rolls back entirely if the check fails. It SHALL refuse to start when either password variable is unset or the cluster is in neither the pre-split nor the split shape, SHALL exit 0 reporting "already split" on a split cluster, and SHALL leave no temporary role behind on success. No compose file, entrypoint or server code SHALL run it or alter an existing cluster's roles.
+`docker/upgrade-split-db-roles.sql` SHALL, when run as documented against a cluster whose OID-10 superuser is `obsidian_mcp`, rename that role to `postgres` with the supplied admin password, create a non-superuser `obsidian_mcp` with the supplied runtime password, and transfer to it ownership of database `obsidian_mcp` and of every user object (OID at or above 16384, outside the dependency closure of an installed extension) and every default-privilege entry the old role held in that database, in one transaction that ends in a self-check and rolls back entirely if the check fails. It SHALL refuse to start when either password variable is unset or the cluster is in neither the pre-split nor the split shape, SHALL exit 0 reporting "already split" on a split cluster after removing a temporary role left by an interrupted earlier run, and SHALL leave no temporary role behind on success. No compose file, entrypoint or server code SHALL run it or alter an existing cluster's roles.
 
 #### Scenario: Pre-split cluster is converted
 
 - **WHEN** a `pgvector/pgvector:pg16` volume initialised with `POSTGRES_USER=obsidian_mcp`, migrated to head and holding a row, is upgraded by the documented command
-- **THEN** OID 10 SHALL be named `postgres` and authenticate with the admin password, `obsidian_mcp` SHALL be a non-superuser owning the database and every table, the old password SHALL be rejected for `obsidian_mcp`, the new one SHALL authenticate, the row SHALL be readable, `alembic check` as `obsidian_mcp` SHALL be clean, and no role named `obsidian_mcp_split_tmp` SHALL exist
+- **THEN** OID 10 SHALL be named `postgres` and authenticate with the admin password, `obsidian_mcp` SHALL be a non-superuser, the new runtime password SHALL authenticate, the row SHALL be readable, `alembic check` as `obsidian_mcp` SHALL be clean, and no role named `obsidian_mcp_split_tmp` SHALL exist
+
+#### Scenario: Every promised object category changes owner
+
+- **WHEN** the pre-split database additionally holds, created by the old superuser, a free sequence, a column-owned sequence, a function, a procedure, an enum, a domain, a standalone composite type, a view, a materialized view, an extra schema with a table, and database-wide and in-schema default privileges, and is upgraded by the documented command
+- **THEN** the catalogs SHALL show `obsidian_mcp` owning the database, every user schema, every table including `alembic_version`, every sequence, and every seeded routine and type; no user object in any catalog SHALL remain owned by OID 10; the `vector` extension and every member of its dependency closure SHALL remain owned by `postgres`; and no `pg_default_acl` row SHALL name OID 10 while equivalent rows SHALL exist for `obsidian_mcp`
+
+#### Scenario: A left-behind temporary role is removed
+
+- **WHEN** the script runs against a split cluster on which `obsidian_mcp_split_tmp` exists
+- **THEN** it SHALL remove that role, print "already split" and exit 0
 
 #### Scenario: Re-run is a no-op
 
@@ -131,12 +156,17 @@ During startup, after the database transport assertion and not in `MCP_SANDBOX_M
 
 ### Requirement: An unconverted existing install MUST fail loudly rather than serve
 
-On a pre-split volume brought up with the new compose file, the application SHALL NOT serve. If authentication as `obsidian_mcp` fails, `alembic/env.py` SHALL print one line naming `docker/upgrade-split-db-roles.sql` and the DEPLOYMENT.md section before re-raising. If authentication succeeds because the role is still the superuser, the superuser refusal SHALL stop the server.
+On a pre-split volume brought up with the new compose file, the application SHALL NOT serve. If authentication as `obsidian_mcp` fails (SQLSTATE `28P01` or `28000` anywhere in the raised exception's `orig` / `__cause__` / `__context__` chain), `alembic/env.py` SHALL print one line naming `docker/upgrade-split-db-roles.sql` and the DEPLOYMENT.md section before re-raising. If authentication succeeds because the role is still the superuser, the superuser refusal SHALL stop the server.
 
 #### Scenario: New password on old volume
 
-- **WHEN** migrations connect and asyncpg raises `InvalidPasswordError`
-- **THEN** stderr SHALL contain one line naming `docker/upgrade-split-db-roles.sql`, and the process SHALL exit non-zero
+- **WHEN** `alembic upgrade head` connects to a real PostgreSQL server with a wrong password, so that SQLAlchemy raises its own connection exception wrapping asyncpg's
+- **THEN** stderr SHALL contain exactly one line naming `docker/upgrade-split-db-roles.sql`, and the process SHALL exit non-zero
+
+#### Scenario: Other connection failures get no hint
+
+- **WHEN** migrations fail to connect for a reason whose SQLSTATE chain contains neither `28P01` nor `28000`
+- **THEN** the hint SHALL NOT be printed and the original exception SHALL propagate
 
 #### Scenario: Old password reused on old volume
 
@@ -150,4 +180,4 @@ On a pre-split volume brought up with the new compose file, the application SHAL
 #### Scenario: Non-superuser owner migrates a fresh database
 
 - **WHEN** the integration test creates a `NOSUPERUSER` role, a database it owns with `vector` installed by `postgres`, and runs `alembic upgrade head` then `alembic check` as that role
-- **THEN** both SHALL succeed, the session SHALL report `rolsuper = false`, and every table in `public` SHALL be owned by that role
+- **THEN** both SHALL succeed, the session SHALL report `rolsuper = false`, every table in `public` SHALL be owned by that role, and the server's startup superuser check SHALL pass for that session
