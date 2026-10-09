@@ -42,6 +42,8 @@ nothing to slow it and nothing to tell it to stop.
 | 5c | Atomic tool slots (#261, #188) | `_tracked`, after argument screens and before quota | class / principal / tenant / global | classes embedding 1 / vector 1 / write 1 / scan 2 / light 4; principal 3 / tenant 4 / global 6; 5 s wait; mode default **shadow** | enforce: in-band sentinel after the wait; queue: admitted with an overrun, call runs; shadow: call runs | `slot_timeout`, coalesced, only for actual enforcement refusals; `concurrency_shadow` / `concurrency_queue` annotate otherwise |
 | 6 | Daily quota (#162) | `_tracked`, last pre-body gate | api key | 5,000 for **new** keys (`DEFAULT_DAILY_REQUEST_LIMIT`) | in-band | `over_quota` |
 | 7 | Provider input rejection | inside the body, on the provider's answer | argument | the provider's own limit | in-band, `argument_too_long` **code** | `provider_input_rejected` — **post-body** |
+| K | Key-creation budget (#323) — *upstream of every row above: it bounds how fast new principals appear* | `POST /api/keys` **and** `POST /admin/keys/create`, after validation, the unlimited rule and the cap | account (exact) **and** trusted address, both must admit | 10 / account and 20 / address per 3600 s (`KEY_CREATION_ACCOUNT_LIMIT`, `KEY_CREATION_ADDRESS_LIMIT`, `KEY_CREATION_WINDOW_SECONDS`; null ⇒ that counter off) | JSON **429** + `Retry-After`; form flash + 303 | `key_creation_throttled` event; no `usage_logs` row |
+| K2 | Active-key cap (#323) | the same two routes, under a `users` row lock | non-admin account | 25 active keys (`KEY_MAX_ACTIVE_PER_ACCOUNT`; null ⇒ off); admins and single-user exempt | JSON **409**; form flash + 303 | none — an ordinary, visible quota |
 
 The eight write-class tools (L3) are `create_note`, `edit_note`, `move_note`,
 `delete_note`, `set_frontmatter`, `write_file`, `delete_file` and
@@ -454,21 +456,99 @@ A `server_default` would be a schema change, would apply to every future insert
 path, and still could not express "grandfather the rows that exist".
 **Existing keys are untouched.**
 
-- **JSON API.** Omitted vs. explicit-`null` is distinguished by
-  `model_fields_set`, not by truthiness: an omitted field means the default, an
-  explicit `null` still means **unlimited**, and an explicit value wins. The
-  setting is read per request, never captured at import.
-- **Panel.** The default is materialised only as the create form's pre-filled
-  value. A blank submitted field is an explicit unlimited with **no POST-side
-  substitution**, so the operator's last view of the field is what the key
-  receives. `keys_page` passes the default to the template; the create handler
-  never reads the setting. The edit path substitutes nothing, on either
-  surface.
+Since #323 (owner decision) the rule is the same on both surfaces, and lives
+once, in `src/services/api_keys.py` (`resolve_create_limit`,
+`resolve_edit_limit`), which both create handlers and both edit handlers call:
+
+- **A blank or omitted limit gets the default.** On the JSON API "omitted" is
+  told from explicit `null` by `model_fields_set`, never by truthiness. On the
+  panel a blank submitted field gets the default too; the form is still
+  pre-filled with it. Before #323 a blank form field meant unlimited, so a
+  scripted blank form minted principals with no daily quota at all.
+- **Unlimited is an administrator's explicit request only**: an explicit JSON
+  `null`, or the panel's `unlimited` box (`value="1"`, rendered for admins
+  only, and winning over any number sent beside it). A non-admin's request is
+  a 403 / flash recorded as `panel_forbidden` (`unlimited_requires_admin`) —
+  refused, never silently downgraded to a limited key.
+- **With the default null, a create that names no limit is refused** as
+  missing a required one (400 / flash). It no longer becomes unlimited.
+- **The edit path never applies the default.** A blank edit is a validation
+  error for everyone; only an admin clears a limit, explicitly.
+- The setting is read per request, never captured at import.
 
 **Why 5,000.** ~1,600 tool calls per 30 days across all credentials, so
 5,000/day is two orders of magnitude of headroom and cannot interrupt a real
 session, while a runaway stops the same day. At 120/min it takes ≥ 42 minutes
 to spend. It binds only keys created after this shipped.
+
+## Key creation is one budget across two representations (#323)
+
+Every new API key is a new `/mcp` principal, and a new principal starts with a
+full general (30) and write (15) burst. Until #323 only `POST /api/keys` was
+throttled (5/min per address, slowapi); `POST /admin/keys/create` was not, so a
+session plus its CSRF token could script it and reset both per-principal
+buckets at will — and, with a blank limit field, skip the daily quota too.
+
+**Why not slowapi.** slowapi namespaces its storage key by the decorated
+endpoint, so the same decorator on both routes is two independent buckets and
+a caller alternating JSON and form requests gets both allowances.
+`shared_limit` would share the bucket but charges every request that reaches
+the decorator — invalid names, non-admin unlimited attempts — so a typo would
+spend allowance, and its state would live in a backend nothing else here uses.
+
+**What it is.** `rate_limits.try_charge_key_creation(account_key, address)`,
+a synchronous function both handlers call, beside the login budget it copies:
+
+- **Two counters, both must admit, charged together.** One keyed **exactly**
+  on the authenticated account — `("user", users.id)`, or `("single-user",)`
+  for the sentinel, whose id is None — and one on the trusted client address
+  (`request.client.host` after `ProxyHeadersMiddleware`; no address is one
+  shared `None` bucket, a bound rather than a bypass). Neither subsumes the
+  other: rotating addresses must not outrun the account counter, rotating
+  accounts must not outrun the address counter. Both are checked, then both
+  are incremented, with no `await` between — atomic on the single loop. If
+  either refuses, neither is charged.
+- **Fixed windows** opened by a counter's first charge,
+  `KEY_CREATION_WINDOW_SECONDS` (3600). A fixed window can admit up to 2× the
+  limit across a boundary (L3, accepted; the login budget's shape).
+- **Charged last.** The order on both routes is: auth and CSRF → pure
+  validation and the unlimited rule → the active-key cap → the budget →
+  insert. A refused check spends no allowance; a cap refusal spends no
+  velocity. A charged creation whose commit then fails is not refunded (L2: a
+  refund path is a second piece of state to get wrong, and over-charging is
+  the safe direction).
+- **Admins are subject to it.** A scripted admin session is where it matters
+  most. Not a lockout: the window heals itself and a restart clears it.
+- **Refusals.** JSON: 429 with `Retry-After` (seconds until the refusing window
+  ends, never more than the window) and a `detail` naming the wait, not the
+  counter. Form: a flash and a 303 to `/admin/keys`. Either way no row is
+  written and one `key_creation_throttled` event is emitted, its suppression
+  subject the same exact account identity (never the address — the sentinel
+  has no id, and an address subject would give a rotating caller fresh log
+  allowance). The JSON route's 5/min slowapi limit stays, in addition.
+
+**The active-key cap bounds the stock, not the flow.** At 10/hour a non-admin
+could add 240 keys a day and thousands a month, each with its own bursts, which
+defeats the per-principal buckets another way and pushes towards
+`MCP_LIMITER_MAX_TRACKED_PRINCIPALS`. `KEY_MAX_ACTIVE_PER_ACCOUNT` (25)
+counts `is_active` keys — revoked keys do not count, expired-but-unrevoked keys
+do — inside the creating transaction under `SELECT … FOR UPDATE` on the
+owning `users` row, so concurrent creates cannot overshoot it. Admins and the
+single-user operator are exempt (L7). An account already over it is
+grandfathered: nothing is revoked, and its next create is refused until it
+revokes below the cap. A refusal is 409 / flash naming the cap and the remedy,
+and is not a security event.
+
+**Rollback** is configuration: null `KEY_CREATION_ACCOUNT_LIMIT`,
+`KEY_CREATION_ADDRESS_LIMIT` and `KEY_MAX_ACTIVE_PER_ACCOUNT`.
+`KEY_CREATION_WINDOW_SECONDS` stays a valid integer (it is inert with both
+counters off). The blank/null limit semantics are code; only an image rollback
+restores "blank or null means unlimited for anyone".
+
+**Related, out of scope (L6).** OAuth grants are principals too and can be
+minted with no creation budget beyond the `/register` and `/token` address
+throttles, and they carry no daily quota. Same class of finding on a different
+surface; recorded as an owner question, not closed silently.
 
 ## The quota's retry interval comes from the admission's own clock read
 
@@ -689,10 +769,18 @@ with the number of usernames an attacker submits. No table, no salt, no cap:
 merging two keys here would refuse an unrelated account's correct password,
 which is why the salted address table is deliberately not reused for it.
 
+The **key-creation budget** (#323) has an account dict of the same shape —
+exact, keyed on `("user", users.id)` or the one fixed single-user key, swept on
+access — and beside it an **address** dict that is exact too, without being a
+salted table, because it is charged only on an *admitted* creation: it holds at
+most one entry per admitted creation in the window, which is at most accounts ×
+the account limit, so an attacker cannot grow it without a session and spent
+account allowance. Refused attempts create no entry in either dict.
+
 ## Limiter state is in-process, and `--workers 1` is part of the contract
 
-All bucket, coalescing, failed-authentication and panel-login-budget state
-lives in the worker process and is **not** persisted, replicated or shared. A
+All bucket, coalescing, failed-authentication, panel-login-budget and
+key-creation-budget state lives in the worker process and is **not** persisted, replicated or shared. A
 restart begins with every bucket full and every counter zero — which is also
 the login budget's recovery path if an operator does not want to wait out a
 flood's window.
@@ -782,7 +870,11 @@ the page to see. The full reading rules are in
 | `MCP_WRITE_RATE_LIMIT_BURST` | `15` | Capacity of the write bucket. |
 | `MCP_LIMITER_MAX_TRACKED_PRINCIPALS` | `10000` | Principals holding their own limiter entry before the shared overflow entry. |
 | `MCP_REFUSAL_LOG_INTERVAL_SECONDS` | `10` | How long one coalescing window stays open. |
-| `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** key receives when the caller does not say otherwise. Null creates unlimited keys. |
+| `DEFAULT_DAILY_REQUEST_LIMIT` | `5000` | Daily quota a **newly created** key receives when the caller names none (omitted JSON field, blank form field). Null makes the limit **required** on create; unlimited is only ever an administrator's explicit request (#323). |
+| `KEY_CREATION_ACCOUNT_LIMIT` | `10` | Keys one **account** may create per window, across both creation routes. Null disables the account counter. |
+| `KEY_CREATION_ADDRESS_LIMIT` | `20` | Keys created from one trusted client address per window, across both routes and all accounts. Null disables the address counter. |
+| `KEY_CREATION_WINDOW_SECONDS` | `3600` | The fixed window both key-creation counters are counted over. Not nullable: disable the counters instead. |
+| `KEY_MAX_ACTIVE_PER_ACCOUNT` | `25` | Active keys a **non-admin** account may hold; creation beyond it is refused (409 / flash). Admins and single-user exempt. Null disables. |
 | `MAX_SEARCH_QUERY_CHARS` | `8192` | Module constant, not a setting: the longest `query` `keyword_search` / `semantic_search` accept. |
 | `MAX_IMPORT_URL_CHARS` | `8192` | Module constant, not a setting: the longest `url` `import_from_url` accepts (#322). Not the memory bound. |
 | `MCP_BODY_MEMORY_BUDGET_BYTES` | unset | The body-memory budget in bytes (≥ 64 MiB). **Unset means derive, never off**; refused at startup above the safe allocation of a readable cgroup limit. |

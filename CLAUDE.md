@@ -171,10 +171,25 @@ update it in the same change.** What stays here is the short list:
   transfer redemption) are deliberately outside that contract. `rate_limited` and enforced `slot_timeout`
   rows are coalesced — a row stands for `1 + suppressed` refusals.
 - **New API keys get `DEFAULT_DAILY_REQUEST_LIMIT` (5,000); existing keys are
-  grandfathered** — applied in application code, never as a column default, and
-  an explicit `null` (or a blank panel field) still means unlimited. OAuth
+  grandfathered** — applied in application code, never as a column default.
+  A blank panel field or an omitted JSON field gets the default; **only an
+  administrator creates or restores an unlimited key**, by the panel's
+  admin-only Unlimited box or an explicit JSON `null` (a non-admin's is a 403 /
+  flash plus `panel_forbidden` `unlimited_requires_admin`); a blank edit is an
+  error; and with the default null a create must name its limit (#323). OAuth
   grants and pre-existing NULL-limit keys therefore have **velocity bounds
   only**, owner-accepted.
+- **Key creation is one budget across both routes, plus a stock cap** (#323).
+  `POST /api/keys` and `POST /admin/keys/create` charge one in-process
+  `try_charge_key_creation` with two counters that must both admit — exact
+  account (10/h) and trusted address (20/h) — charged last, after validation,
+  the unlimited rule and the cap, so a refused request spends nothing.
+  slowapi cannot share a bucket across two routes, which is why it is not
+  slowapi. A non-admin holds at most `KEY_MAX_ACTIVE_PER_ACCOUNT` (25) active
+  keys, counted under `FOR UPDATE` on the `users` row; admins exempt, nothing
+  revoked. Refusal event `key_creation_throttled`, subject = the exact
+  account identity, never the address. The rules live in
+  `src/services/api_keys.py` — see [rate limits](docs/architecture/rate-limits.md).
 - **Concurrency admission has four modes — `off | shadow | queue | enforce` —
   and defaults to `shadow`** (#261, #188): observe, never wait or refuse.
   `queue` waits like `enforce` but admits with an `overrun` mark where enforce
@@ -368,7 +383,7 @@ summaries.
 | [search.md](docs/architecture/search.md) | `semantic_search` / `keyword_search` / `find_related` and every `SET LOCAL` they issue |
 | [indexing-and-embeddings.md](docs/architecture/indexing-and-embeddings.md) | the indexer loop, the embed pass, tsvector writers, provider abstraction |
 | [security-event-logging.md](docs/architecture/security-event-logging.md) | `src/logging_setup.py`, `src/services/security_events.py`, and any call site that logs a refusal: the field allow-list, the event catalogue, the suppressor |
-| [rate-limits.md](docs/architecture/rate-limits.md) | `src/services/rate_limits.py`, `src/services/concurrency.py`, `src/services/pool_budget.py`, `src/services/concurrency_counters.py`, `src/services/concurrency_readiness.py`, `src/services/refusals.py`, the pool subclass in `src/database.py`, the failed-auth budget in `APIKeyMiddleware`, the gate order in `_tracked`, the worker count, and every `MCP_RATE_LIMIT_*` / `MCP_AUTH_FAILURE_*` / `MCP_CONCURRENCY_*` / `DEFAULT_DAILY_REQUEST_LIMIT` setting |
+| [rate-limits.md](docs/architecture/rate-limits.md) | `src/services/rate_limits.py`, `src/services/concurrency.py`, `src/services/pool_budget.py`, `src/services/concurrency_counters.py`, `src/services/concurrency_readiness.py`, `src/services/refusals.py`, the pool subclass in `src/database.py`, the failed-auth budget in `APIKeyMiddleware`, the gate order in `_tracked`, the worker count, the key-creation budget and active-key cap (`src/services/api_keys.py`), and every `MCP_RATE_LIMIT_*` / `MCP_AUTH_FAILURE_*` / `MCP_CONCURRENCY_*` / `KEY_CREATION_*` / `KEY_MAX_ACTIVE_PER_ACCOUNT` / `DEFAULT_DAILY_REQUEST_LIMIT` setting |
 | [usage-attribution.md](docs/architecture/usage-attribution.md) | `usage_logs`, `_log_usage`, actor columns |
 | [control-panel.md](docs/architecture/control-panel.md) | panel templates, flash messages, admin guards, the Danger zone |
 
