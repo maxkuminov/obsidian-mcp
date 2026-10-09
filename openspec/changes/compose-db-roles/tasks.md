@@ -6,7 +6,7 @@ Slices A, B and C touch disjoint files and can run in parallel worktrees; D depe
 - [x] 1.2 `docker/db-init-compose.sh` (replaces `docker/db-init-simple.sql`; delete the old file): role with D1 attributes via psql `:'pw'`, `CREATE DATABASE obsidian_mcp OWNER obsidian_mcp`, `CREATE EXTENSION IF NOT EXISTS vector` as superuser; `started` / `complete` marker in `$PGDATA/obsidian-mcp-init.state` (D4)
 - [x] 1.3 `docker-compose.simple.yml` and `docker-compose.proxy.yml`: postgres `POSTGRES_USER: postgres`, no `POSTGRES_DB`, `env_file: postgres.env`, `OBSIDIAN_DB_PASSWORD: ${OBSIDIAN_DB_PASSWORD:?…}`, `entrypoint` wrapper + `command: ["postgres"]`, init mount at `/docker-entrypoint-initdb.d/10-obsidian-mcp.sh`, healthcheck `pg_isready -h 127.0.0.1 -U obsidian_mcp -d obsidian_mcp`; app `environment: DATABASE_URL` built from `${OBSIDIAN_DB_PASSWORD:?…}` and `POSTGRES_PASSWORD: ""` (D2, overrides `.env`); header comments updated; identical postgres blocks
 - [x] 1.4 `postgres.env.example` (tracked), `postgres.env` in `.gitignore`
-- [x] 1.5 `tests/test_compose_db_roles.py`: D9 YAML assertions for both bundles plus wrapper shell matrix (stub entrypoint on `PATH`); optional `docker compose config` cases skipped without `docker`, including the sentinel-admin-password render (D2) and the half-initialised-volume refusal with an injected init failure (D4)
+- [x] 1.5 `tests/test_compose_db_roles.py`: D9 YAML assertions for both bundles plus wrapper shell matrix (stub entrypoint on `PATH`); optional `docker compose config` cases skipped without `docker`, including the sentinel-admin-password render (D2). The half-initialised-volume refusal with an injected init failure (D4) is a real-container case in `tests/integration/test_compose_postgres_init_pg.py`, not in this offline file
 
 ## 2. Slice B: Server-side guards (D5, D6 hint)
 
@@ -40,3 +40,9 @@ Slices A, B and C touch disjoint files and can run in parallel worktrees; D depe
 - [ ] 6.2 `openspec-verifier`; adversarial Codex (credential and privilege boundary; existing-install data path → mandatory). Triage per the workflow budget; record declined findings under Accepted limitations
 - [ ] 6.3 `openspec validate compose-db-roles --strict`; `/openspec-archive-change compose-db-roles -y` as the last commit of the feature branch; PR `Closes #324`
 - [ ] 6.4 Post-merge: no production deploy action (k3s unaffected); confirm the image build only
+
+## 7. Review fixes (adversarial Codex + openspec-verifier)
+
+- [x] 7.1 Codex MAJOR: after the commit the script terminates every other OID-10 client backend and fails unless none remains; DEPLOYMENT.md stops the app first and restarts postgres after the conversion (D7 steps 3–4). Integration: a held old-password TCP session is disconnected and cannot reconnect
+- [x] 7.2 Codex MINOR: the already-split path runs the full self-check and refuses a partly split cluster naming each problem (D7 step 1). Integration: five malformed-split shapes, plus the fresh compose volume passing
+- [x] 7.3 Verifier: k8s doc default `DATABASE_URL` and troubleshooting rows; `.env.example` `DATABASE_URL` commented out with `make init` uncommenting it (offline test runs the Makefile's seds); rollback limitation in DEPLOYMENT.md and D6; `make init`'s `postgres.env` noted; logging off around passwords (L12); missing-`admin_pw` test; this file's 1.5 wording

@@ -209,7 +209,8 @@ List-valued settings: `TRUSTED_PROXY_IPS`, `FTS_CONFIGS` and
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DATABASE_URL` | `postgresql+asyncpg://obsidian_mcp:changeme@postgres:5432/obsidian_mcp` | **Secret.** Must use `postgresql+asyncpg://`. URL-encode reserved characters in the password. TLS parameters (`ssl`, `sslmode`, …) are refused. |
+| `DATABASE_URL` | `postgresql+asyncpg://obsidian_mcp@postgres:5432/obsidian_mcp` (no password) | **Secret.** Must use `postgresql+asyncpg://`. URL-encode reserved characters in the password. TLS parameters (`ssl`, `sslmode`, …) are refused, and so is a `changeme` / `CHANGE_ME` password. The role must not be a PostgreSQL superuser (see `DATABASE_ALLOW_SUPERUSER`). |
+| `DATABASE_ALLOW_SUPERUSER` | `false` | `true` turns the startup refusal to run as a PostgreSQL superuser into a warning. A stop-gap while fixing the role, not a setting to keep. |
 | `SECRET_KEY` | `changeme` (refused) | **Secret.** Signs session cookies and CSRF tokens. The app refuses to start on a placeholder. `openssl rand -hex 32`. |
 | `MCP_HOSTNAME` | unset | Public hostname. Derives `BASE_URL=https://<host>`, `ALLOWED_ORIGINS=["https://<host>"]` and `ALLOWED_HOSTS=[<host>, "localhost"]`. Required (or `BASE_URL`) for the transfer tools to mint links. |
 | `BASE_URL` | derived | Explicit public origin (scheme + host, no path). HTTPS except for loopback. When `MCP_HOSTNAME` is set it must be `https://` on that same host, or startup is refused. |
@@ -838,6 +839,8 @@ unverified archive.
 | Every request through the ingress gets **400** | The ingress rewrites `Host`. It must reach the app as `MCP_HOSTNAME`. |
 | Container exits at start with a `critical` log line | Each startup check names itself: `openat2` unavailable (kernel or seccomp), pgvector < 0.8.0, `EMBEDDING_DIMENSIONS` or model disagreeing with the stored vectors, a placeholder `SECRET_KEY`, a plaintext embedding URL without `EMBEDDING_ALLOW_PLAINTEXT`, a TLS key in `DATABASE_URL`. |
 | `migrate` initContainer fails with `permission denied to create extension "vector"` | Create the extension once as a superuser in the app database. |
+| Container exits at start: `Database role … is a PostgreSQL superuser. Refusing to start` | The role in `DATABASE_URL` is a superuser. Point it at a non-superuser role that owns the app database (the bundled Postgres and CloudNativePG both create one). `DATABASE_ALLOW_SUPERUSER=true` turns the refusal into a warning, as a stop-gap only. |
+| Container exits at start: `DATABASE_URL carries a placeholder password (changeme / CHANGE_ME)` | The Secret still carries a shipped placeholder. Generate one (`openssl rand -hex 32`), set it on the database role, and put it in `DATABASE_URL`. |
 | Writes fail with "permission denied"; `Found 0 markdown files` | The vault volume is not owned by / writable for the pod's uid. See [ownership](#vault-storage-and-ownership). |
 | Index runs fail with "vault root is empty but the index holds N note(s)"; `/health` degraded | The vault volume mounted empty (wrong claim, unbound volume, empty `hostPath`). Nothing was deleted. Fix the mount; if the vault really was emptied, confirm it in the panel (Settings → Danger zone, or the user's page). |
 | Runs read `walk incomplete: N dir(s) not listed: …` | A folder in the vault is not listable by the pod's uid. Its notes keep their index rows until it is readable again. See [ownership](#vault-storage-and-ownership). |

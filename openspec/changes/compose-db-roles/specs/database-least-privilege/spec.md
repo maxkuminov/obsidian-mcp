@@ -122,7 +122,7 @@ During startup, after the database transport assertion and not in `MCP_SANDBOX_M
 
 ### Requirement: Existing Compose clusters SHALL be converted only by an operator-run script that reaches the fresh-install shape atomically
 
-`docker/upgrade-split-db-roles.sql` SHALL, when run as documented against a cluster whose OID-10 superuser is `obsidian_mcp`, rename that role to `postgres` with the supplied admin password, create a non-superuser `obsidian_mcp` with the supplied runtime password, and transfer to it ownership of database `obsidian_mcp` and of every user object (OID at or above 16384, outside the dependency closure of an installed extension) and every default-privilege entry the old role held in that database, in one transaction that ends in a self-check and rolls back entirely if the check fails. It SHALL refuse to start when either password variable is unset or the cluster is in neither the pre-split nor the split shape, SHALL exit 0 reporting "already split" on a split cluster after removing a temporary role left by an interrupted earlier run, and SHALL leave no temporary role behind on success. No compose file, entrypoint or server code SHALL run it or alter an existing cluster's roles.
+`docker/upgrade-split-db-roles.sql` SHALL, when run as documented against a cluster whose OID-10 superuser is `obsidian_mcp`, rename that role to `postgres` with the supplied admin password, create a non-superuser `obsidian_mcp` with the supplied runtime password, and transfer to it ownership of database `obsidian_mcp` and of every user object (OID at or above 16384, outside the dependency closure of an installed extension) and every default-privilege entry the old role held in that database, in one transaction that ends in a self-check and rolls back entirely if the check fails. It SHALL refuse to start when either password variable is unset or empty or the cluster is in neither the pre-split nor the split shape. After the commit it SHALL terminate every other client session whose role is OID 10, and SHALL exit non-zero, naming a restart of the postgres container, if any such session remains. On a cluster whose role names show the split shape it SHALL remove a temporary role left by an interrupted earlier run and then run the same self-check as the conversion, exiting 0 reporting "already split" only if that check passes and otherwise exiting non-zero with a message naming each failed condition, changing no role or owner. It SHALL turn off statement and error-statement logging in every session that sends a password, and SHALL leave no temporary role behind on success. No compose file, entrypoint or server code SHALL run it or alter an existing cluster's roles.
 
 #### Scenario: Pre-split cluster is converted
 
@@ -146,8 +146,23 @@ During startup, after the database transport assertion and not in `MCP_SANDBOX_M
 
 #### Scenario: Missing input aborts before any change
 
-- **WHEN** the script runs without `app_pw` set
-- **THEN** it SHALL exit non-zero and every role and owner SHALL be unchanged
+- **WHEN** the script runs without `app_pw` set, or without `admin_pw` set, or with either passed but empty
+- **THEN** it SHALL exit non-zero naming the missing variable, and every role and owner SHALL be unchanged
+
+#### Scenario: A session of the old superuser identity does not survive
+
+- **WHEN** a TCP session authenticated as the pre-split `obsidian_mcp` with the old password is open while the documented command converts the cluster
+- **THEN** the script SHALL exit 0, that session SHALL be disconnected, no other client session with role OID 10 SHALL remain, and neither `obsidian_mcp` nor `postgres` SHALL accept the old password
+
+#### Scenario: A partly split cluster is refused
+
+- **WHEN** the script runs against a cluster whose bootstrap superuser is `postgres` and whose `obsidian_mcp` is not a superuser, but where database `obsidian_mcp` is owned by `postgres`, or `obsidian_mcp` has `CREATEDB` or `CREATEROLE`, or a user object or a default-privilege entry is owned by OID 10
+- **THEN** it SHALL exit non-zero without printing "already split", its message SHALL name each such condition, and every role and owner SHALL be unchanged apart from the removal of a left-behind temporary role
+
+#### Scenario: A fresh install passes the re-run check
+
+- **WHEN** the script runs against a volume initialised by the bundle's postgres service
+- **THEN** it SHALL print "already split" and exit 0
 
 #### Scenario: Nothing runs it automatically
 

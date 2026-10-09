@@ -132,6 +132,14 @@ the variable and file (never the value). `docker compose config` already
 fails if `OBSIDIAN_DB_PASSWORD` is unset or `postgres.env` is missing.
 `make init` generates both files with random values.
 
+Do not set `DATABASE_URL` in `.env` for the bundles: `.env.example`
+leaves it commented out, and the compose file's own value would win
+anyway. It is for other deployments (an external or shared PostgreSQL,
+the `make init` / `make db-init` compose-host path, where `make init`
+uncomments it with the generated password). `make init` also creates
+`postgres.env` on every path; a deployment against an external
+PostgreSQL never reads it, and you can delete it there.
+
 Minimum values you need to set in `.env`:
 
 ```env
@@ -820,7 +828,18 @@ script.
 
 ### Steps
 
-1. **Back up.** Nothing below deletes data, and the conversion is one
+Run every step from the repository checkout that holds your bundle, with
+`docker-compose.simple.yml` replaced by `docker-compose.proxy.yml` if that
+is your bundle.
+
+1. **Stop the app first,** with the compose file you are running today, so
+   nothing is connected as the old superuser while you work:
+
+   ```bash
+   docker compose -f docker-compose.simple.yml stop obsidian-mcp
+   ```
+
+2. **Back up.** Nothing below deletes data, and the conversion is one
    transaction that rolls back entirely if its self-check fails, but take
    a dump first:
 
@@ -829,25 +848,24 @@ script.
      pg_dump -U obsidian_mcp obsidian_mcp | gzip > obsidian_mcp-pre-324.sql.gz
    ```
 
-2. **Pull** the new version of the repository.
-3. **Create `postgres.env`** from `postgres.env.example` (`chmod 600`)
+3. **Pull** the new version of the repository.
+4. **Create `postgres.env`** from `postgres.env.example` (`chmod 600`)
    with a new `POSTGRES_PASSWORD` (`openssl rand -hex 32`). This becomes
    the superuser's password.
-4. **Edit `.env`:** add `OBSIDIAN_DB_PASSWORD` with a **new** value
+5. **Edit `.env`:** add `OBSIDIAN_DB_PASSWORD` with a **new** value
    (`openssl rand -hex 32`, different from the superuser's). Do not reuse
    the old password: it was the superuser's, and nothing checks that you
    changed it. Remove `POSTGRES_PASSWORD` and `DATABASE_URL` from `.env`;
    the compose file now builds `DATABASE_URL` itself and blanks
    `POSTGRES_PASSWORD` in the app container, but neither belongs there.
-5. **Stop the app and (re)start the database only**, so it picks up the
-   new entrypoint and `postgres.env`:
+6. **Start the database only,** so it is recreated with the new
+   entrypoint and `postgres.env` (the app stays stopped):
 
    ```bash
-   docker compose -f docker-compose.simple.yml stop obsidian-mcp
    docker compose -f docker-compose.simple.yml up -d postgres
    ```
 
-6. **Run the conversion script.** It takes both passwords from the
+7. **Run the conversion script.** It takes both passwords from the
    postgres container's own environment, so they never appear on the host
    command line, and connects over the container's local socket:
 
@@ -863,37 +881,69 @@ script.
    (with the `.env` password), and gives it ownership of the database,
    every table, sequence, view, function, type and schema in it, and any
    default privileges the old role had set. The `vector` extension stays
-   with `postgres`, as on a fresh install. It prints
-   `upgrade-split-db-roles: done …` on success. Running it again prints
-   `already split` and changes nothing (it also removes a temporary role
-   an interrupted earlier run may have left behind).
+   with `postgres`, as on a fresh install. After the commit it terminates
+   every session still connected under the old superuser identity (a
+   session that logged in as the old `obsidian_mcp` would otherwise keep
+   superuser rights under the new name) and fails if any is left. It
+   prints `upgrade-split-db-roles: done …` on success.
 
-7. **Start everything:**
+   Running it again checks the cluster against the fresh-install shape:
+   if everything matches it prints `already split` and changes nothing
+   (it also removes a temporary role an interrupted earlier run may have
+   left behind); if the cluster is only partly split (the database still
+   owned by `postgres`, `obsidian_mcp` with extra attributes such as
+   `CREATEDB`, objects or default privileges still owned by the
+   superuser) it exits non-zero with `… is not in the fresh-install
+   shape: …` and lists each problem, for you to fix by hand as `postgres`.
+
+8. **Restart the database** before the app connects, so no session from
+   before the conversion survives in any form:
+
+   ```bash
+   docker compose -f docker-compose.simple.yml restart postgres
+   ```
+
+9. **Start everything:**
 
    ```bash
    docker compose -f docker-compose.simple.yml up -d
    ```
 
-Use `docker-compose.proxy.yml` in place of `docker-compose.simple.yml`
-throughout if that is your bundle. The script relies on the image's
-default `trust` for local-socket connections; if you hardened
-`pg_hba.conf`, run the same `psql` with explicit credentials for the
-existing superuser.
+The script relies on the image's default `trust` for local-socket
+connections; if you hardened `pg_hba.conf`, run the same `psql` with
+explicit credentials for the existing superuser. It turns statement and
+error-statement logging off for its own sessions, so a failing step does
+not write a password into the postgres container's log. A logging
+extension you added yourself (such as `pgaudit`) is outside that switch
+and may still record the `ALTER ROLE … PASSWORD` statements.
 
 **If the script fails,** it prints why and its transaction rolls back:
 the cluster is as it was, apart from a temporary role that the next run
 removes. A missing password reads `admin_pw is not set` / `app_pw is
 empty`; a cluster that is neither the old nor the new shape is refused
-with a description of what it found.
+with a description of what it found. The one failure that comes after
+the commit is `… session(s) of the old superuser identity are still
+connected`: the conversion is done, and step 8's restart clears them.
 
-**Rollback.** Restore the previous compose files and `.env`, and set
-`DATABASE_URL` in `.env` to
-`postgresql+asyncpg://obsidian_mcp:<OBSIDIAN_DB_PASSWORD>@postgres:5432/obsidian_mcp`.
-The converted cluster works with the old files, without the superuser
-privilege. To run unconverted for a night instead, keep the new files
-with `OBSIDIAN_DB_PASSWORD` set to the old password and
-`DATABASE_ALLOW_SUPERUSER=true` in `.env`; the server then logs a warning
-on every start.
+**Rollback.** The script changes roles, not data, and the previous
+release works with either shape of cluster:
+
+- **After converting:** check out the release you ran before (its
+  compose files build the image from the checkout), restore its `.env`
+  without `POSTGRES_PASSWORD`, and set `DATABASE_URL` in it to
+  `postgresql+asyncpg://obsidian_mcp:<OBSIDIAN_DB_PASSWORD>@postgres:5432/obsidian_mcp`
+  (the new runtime password). Then `docker compose -f <bundle> up -d
+  --build`. The app runs as the non-superuser; nothing else changes.
+- **Without converting** (to keep running on the old superuser for a
+  while): check out the release you ran before and its `.env`
+  unchanged, and `up -d --build`. Nothing on the volume has changed.
+  Keeping the **new** files on an unconverted volume instead
+  (`DATABASE_ALLOW_SUPERUSER=true` and `OBSIDIAN_DB_PASSWORD` set to the
+  old password) works only when the old password passes the postgres
+  container's checks: at least 24 characters, only `A-Z a-z 0-9 . _ ~
+  -`, not a placeholder, and different from `POSTGRES_PASSWORD`. An
+  install on the old `changeme` default or any short password cannot do
+  this; use the previous release.
 
 ## What's not covered
 

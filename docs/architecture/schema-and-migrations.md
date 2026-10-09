@@ -712,6 +712,20 @@ Load-bearing rules:
   (`tests/integration/test_upgrade_split_db_roles_pg.py`) seeds every
   category and asserts through the catalogs.
 
+  Two things the script does that look optional and are not (Codex review
+  of #324). **After the commit it terminates every other OID-10 client
+  backend and fails unless none is left:** a session that logged in as the
+  old `obsidian_mcp` is still OID 10 afterwards, i.e. still a superuser
+  under the new name, for as long as it stays connected. The procedure also
+  stops the app first and restarts postgres before the app comes back.
+  **"Already split" runs the full self-check:** role names plus `rolsuper`
+  also match a half-converted cluster (database owned by `postgres`, a
+  `CREATEDB` runtime role, objects left with OID 10), which must be refused
+  with what is wrong, not reported as done. Every session that sends a
+  password sets `log_statement = none` and `log_min_error_statement =
+  panic` first, because the default `error` level logs a failing
+  `ALTER ROLE … PASSWORD` with its password.
+
 **Accepted limitations** (full list in the change's design): password
 strength is length, charset and a placeholder list, not entropy; the
 superuser check is point-in-time at startup; the runtime role owns its
