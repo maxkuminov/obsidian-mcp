@@ -6504,8 +6504,16 @@ async def cleanup_expired_tokens():
     branch, so the correct implementation is the single predicate below rather
     than a redundant `or_`. Revoked tokens are still deleted; they are deleted
     seven days after they would have expired anyway, which is the same
-    retention their unrevoked siblings get. The auth-code half is unchanged: a
-    used code is spent immediately and has no history value.
+    retention their unrevoked siblings get.
+
+    **Auth codes follow the same rule (#325), spent or not.** This half used
+    to delete every *used* code on the next pass, on the theory that a spent
+    code has no history value. It has one: `oauth_codes.grant_id` names the
+    family its exchange issued, and a replay of the spent code — RFC 6749
+    §4.1.2's theft signal — revokes that family. A code can only be spent
+    before it expires (``spent_at <= expires_at``), so ``expires_at < now -
+    7d`` keeps every spent code, and its lineage, for at least seven days
+    after it was spent: the same argument and the same window as tokens.
 
     Edge case, stated rather than hidden: a family revocation also flips
     `revoked` on tokens that had *already* expired, so for those R can exceed
@@ -6595,14 +6603,12 @@ async def cleanup_expired_tokens():
     )
 
     async with async_session() as session:
-        # Clean up expired/used auth codes
+        # Auth codes, spent or not, seven days past their expiry (#325). The
+        # `OR used` disjunct is gone: a spent code carries the lineage a
+        # replay revokes, and a code can only be spent before it expires, so
+        # this keeps every spent code for at least seven days after spending.
         result = await session.execute(
-            delete(OAuthCode).where(
-                or_(
-                    OAuthCode.expires_at < cutoff,
-                    OAuthCode.used == True,
-                )
-            )
+            delete(OAuthCode).where(OAuthCode.expires_at < cutoff)
         )
         codes_deleted = result.rowcount
 

@@ -164,6 +164,7 @@ def test_oauth_write_predicate_reads_scope_as_a_set(scope, expected):
     quietly become an equality test.
     """
     token = OAuthToken(
+        grant_issued_at=datetime.datetime.now(datetime.timezone.utc),
         user_id=None,
         token_hash="x" * 64,
         token_type="access",

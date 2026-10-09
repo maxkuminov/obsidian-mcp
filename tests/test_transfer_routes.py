@@ -1726,6 +1726,7 @@ async def test_the_oauth_principal_costs_exactly_the_identity_check(monkeypatch)
     from src.models.db import OAuthToken, User
 
     cred = OAuthToken(
+        grant_issued_at=datetime.datetime.now(datetime.timezone.utc),
         id=41,
         grant_id="grant-abc",
         user_id=3,

@@ -133,19 +133,20 @@ def test_the_cutoff_is_seven_days_before_now(monkeypatch):
     assert params == {"expires_at_1": EXPECTED_CUTOFF}
 
 
-def test_auth_code_cleanup_is_deliberately_unchanged(monkeypatch):
-    """A used code is spent immediately and has no history value.
+def test_auth_code_cleanup_retains_spent_codes_until_seven_days_past_expiry(monkeypatch):
+    """A spent code carries the lineage a replay revokes (#325).
 
-    Pinned so the fix above is visibly scoped to tokens: an editor who
-    "simplified" both branches together would drop the `used` disjunct and
-    leave spent codes in the table until their expiry.
+    This used to pin `expires_at < cutoff OR used` — "a used code is spent
+    immediately and has no history value". It has one now: `oauth_codes.
+    grant_id` names the family its exchange issued, and a replay of the spent
+    code (RFC 6749 §4.1.2) revokes that family. So codes follow the token
+    rule exactly: one comparison on `expires_at`, spent or not, which keeps a
+    spent code for at least seven days after it was spent.
     """
     session = run_cleanup(monkeypatch)
     where = statement_for(session, OAuthCode).whereclause
 
-    assert where.compare(
-        or_(OAuthCode.expires_at < EXPECTED_CUTOFF, OAuthCode.used == True)  # noqa: E712
-    )
+    assert where.compare(OAuthCode.expires_at < EXPECTED_CUTOFF)
 
 
 # --- what that predicate does to actual rows ------------------------------

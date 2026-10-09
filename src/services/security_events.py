@@ -210,6 +210,18 @@ EVENT_FIELDS: dict[str, frozenset[str]] = {
     "oauth_refresh_reuse_revocation_failed": frozenset(
         {"client_id", "grant_id", "user_id", "client_ip", "error_type"}
     ),
+    # The #325 authorization-code replay alarm: a spent code presented again
+    # *after* full revalidation (client, redirect URI, PKCE), which revoked the
+    # family its first exchange issued. Same fields and same reasoning as the
+    # refresh-reuse pair above; never a code, verifier, challenge or hash.
+    "oauth_code_replay_detected": frozenset(
+        {"client_id", "grant_id", "user_id", "revoked_tokens", "client_ip"}
+    ),
+    # Class name only, no `exc_info`: the failing statement's bound parameters
+    # include the code hash.
+    "oauth_code_replay_revocation_failed": frozenset(
+        {"client_id", "grant_id", "user_id", "client_ip", "error_type"}
+    ),
     "oauth_consent_granted": frozenset({"client_id", "user_id", "scope", "client_ip"}),
     "oauth_consent_denied": frozenset(
         {"client_id", "client_id_submitted", "user_id", "client_ip"}

@@ -211,6 +211,20 @@
 
         .request-note.warn { color: var(--consent-warn); }
 
+        /* ── Credential lifetimes (#326, ASVS V10.7.2) ──
+           Every value comes from `consent_lifetimes()`, so the page can
+           never state a period longer than the server enforces. */
+        .lifetime-box {
+            border-left: 2px solid var(--consent-surface-border);
+            padding: 2px 0 2px 12px;
+            margin-bottom: 22px;
+            font-size: 12px;
+            color: var(--consent-text-2);
+            line-height: 1.5;
+        }
+
+        .lifetime-box strong { color: var(--consent-text); font-weight: 500; }
+
         .scope-label {
             font-size: 10px;
             font-weight: 600;
@@ -435,6 +449,19 @@
                 {% if client_can_write %}
                 <div class="request-note">Read only is preselected. Read + Write is granted only if you select it below.</div>
                 {% endif %}
+            </div>
+
+            {# The effective credential lifetimes (#326). The absolute period
+               runs from the code exchange that follows approval
+               (`grant_issued_at`), so the text says "first receives its
+               tokens", never "after you approve". #}
+            <div class="lifetime-box">
+                <strong>How long this access lasts.</strong>
+                The application receives an access token valid for {{ lifetimes.access }},
+                which it renews using a refresh token valid for {{ lifetimes.refresh }} from
+                its last renewal. Renewal stops {{ lifetimes.absolute }} after the application
+                first receives its tokens (moments after you approve); after that it must ask
+                you again. You can revoke this access at any time from the control panel.
             </div>
 
             {# `autocomplete="off"` on the form *and* on each radio is

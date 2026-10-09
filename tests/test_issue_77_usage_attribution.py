@@ -266,6 +266,7 @@ def test_middleware_binds_the_oauth_client_name_and_id():
     from datetime import datetime, timedelta, timezone
 
     token = OAuthToken(
+        grant_issued_at=datetime.now(timezone.utc),
         id=11,
         token_hash="y",
         token_type="access",
@@ -813,6 +814,7 @@ def _oauth_token_row(user_id=None):
     from datetime import datetime, timedelta, timezone
 
     return OAuthToken(
+        grant_issued_at=datetime.now(timezone.utc),
         id=11, token_hash="y", token_type="access", client_id="client-abc",
         scope="read", user_id=user_id, grant_id="g1",
         expires_at=datetime.now(timezone.utc) + timedelta(hours=1), revoked=False,

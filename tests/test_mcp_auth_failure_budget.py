@@ -143,6 +143,7 @@ def _token(**kwargs):
         expires_at=kwargs.pop(
             "expires_at", datetime.now(timezone.utc) + timedelta(hours=1)
         ),
+        grant_issued_at=kwargs.pop("grant_issued_at", datetime.now(timezone.utc)),
     )
 
 
@@ -257,6 +258,17 @@ BRANCHES = [
         "no_vault_scope",
         dict(token="tok", session=_Session(oauth=_token(scope="offline_access"))),
     ),
+    (
+        "grant_lifetime_exceeded",
+        dict(
+            token="tok",
+            session=_Session(
+                oauth=_token(
+                    grant_issued_at=datetime.now(timezone.utc) - timedelta(days=400)
+                )
+            ),
+        ),
+    ),
 ]
 
 
@@ -309,8 +321,9 @@ def test_the_charge_sites_are_structural_not_remembered():
                     "to the failed-authentication budget"
                 )
 
-    assert blocks_with_401 == 11, (
-        f"expected 11 branches that answer 401, found {blocks_with_401} — "
+    # 12 since #326 added the grant-lifetime refusal on the OAuth branch.
+    assert blocks_with_401 == 12, (
+        f"expected 12 branches that answer 401, found {blocks_with_401} — "
         "if a branch was added or removed, say so here"
     )
 

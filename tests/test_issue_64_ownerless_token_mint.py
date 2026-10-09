@@ -381,6 +381,7 @@ def _drive_middleware(token, *, multi_user, client_owner=None):
 
 def _live_token(user_id, *, client_id="client123", scope="readwrite"):
     return OAuthToken(
+        grant_issued_at=datetime.now(timezone.utc),
         id=91,
         token_hash=oauth._hash("live-token"),
         token_type="access",
