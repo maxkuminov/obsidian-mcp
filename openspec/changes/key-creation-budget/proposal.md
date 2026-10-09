@@ -33,6 +33,7 @@ The documented rule "an explicit null, or a blank panel field, means unlimited" 
 - `usage-quotas`: "New API keys receive a configurable default daily request limit". A blank panel field now gets the default, an explicit null is admin-only, and a null default makes the limit required.
 - `panel-usage-slicing`: "Quota administration". The create and edit forms get the admin-only Unlimited control, and a blank field no longer means unlimited.
 - `security-event-logging`: adds the `key_creation_throttled` event.
+- `api-auth-hardening`: "REST API application-level auth". The archived requirement still called `POST /api/keys` admin-only, which the code has not been since multi-user mode shipped; the delta states the actual owner-scoped creation (bounded by this change's budget, cap and unlimited rule) and the 401 a JSON client gets without a session.
 
 ## Impact
 

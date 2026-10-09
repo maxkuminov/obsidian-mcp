@@ -6,7 +6,7 @@ The keys UI SHALL allow setting and changing a key's `daily_request_limit` at cr
 
 A **blank submitted create field SHALL receive the configured default**, and SHALL NOT create an unlimited key. When no default is configured, a blank field SHALL be refused as a missing required limit.
 
-The create form and the edit-limit form SHALL each carry an "Unlimited" checkbox (`name="unlimited"`, `value="1"`), rendered **only for administrators**. It is the only panel control that produces or restores an unlimited key. While it is ticked, the numeric field SHALL be disabled by a delegated `data-unlimited-toggle` listener in `panel.js`, under the panel CSP rules: no inline handler, no inline style, no `!important`. The edit form SHALL open with the box ticked when the key is currently unlimited.
+The create form and the edit-limit form SHALL each carry an "Unlimited" checkbox (`name="unlimited"`, `value="1"`), rendered **only for administrators**. It is the only panel control that produces or restores an unlimited key. While it is ticked, the numeric field SHALL be disabled by a delegated `data-unlimited-toggle` listener in `panel.js`, under the panel CSP rules: no inline handler, no inline style, no `!important`. For an administrator, the edit form SHALL open with the box ticked when the key is currently unlimited. For a non-admin the box is absent, so the edit form SHALL open with an empty, enabled numeric field, and the `panel.js` editor code SHALL tolerate the absent toggle. A non-admin MAY assign a numeric limit to their own currently unlimited key.
 
 A blank edit field without the checkbox SHALL be a validation error that leaves the key unchanged. The edit path SHALL NOT apply the default to an existing key.
 
@@ -28,6 +28,11 @@ The help text SHALL state that a blank create field receives the default, and th
 - **WHEN** a non-admin account opens the keys page
 - **THEN** neither the create form nor the edit-limit form contains the `unlimited` field
 - **AND** when an administrator opens it, both forms contain it
+
+#### Scenario: A non-admin limits a grandfathered unlimited key
+- **WHEN** a non-admin opens the limit editor for their own existing unlimited key
+- **THEN** no Unlimited control is present, the numeric field is empty and enabled
+- **AND** saving a number sets that limit on the key
 
 #### Scenario: Ticking Unlimited disables the number field
 - **WHEN** an administrator ticks Unlimited in either form

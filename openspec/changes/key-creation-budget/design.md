@@ -94,7 +94,7 @@ There is one resolver per operation in `src/services/api_keys.py`, called by bot
 - The edit path still never applies the default to an existing key.
 - The NULL→value counter reset in `apply_daily_request_limit` is unchanged.
 
-**Grandfathered unlimited keys** owned by non-admins stay unlimited. Opening their edit modal shows an empty field. Saving requires a number, and cancelling keeps them unlimited. The remedy for those keys is an admin setting a limit. Nothing is backfilled (L4).
+**Grandfathered unlimited keys** owned by non-admins stay unlimited. Opening their edit modal shows an empty, *enabled* number field: the "open with Unlimited ticked" behaviour exists only where the checkbox is rendered, which is for admins. `editLimit` in `panel.js` must therefore tolerate an absent toggle and never leave the number input disabled when there is no box to untick it. Saving requires a number, and cancelling keeps them unlimited. A non-admin may assign a numeric limit to their own grandfathered unlimited key (that only tightens it). The remedy for those keys is otherwise an admin setting a limit. Nothing is backfilled (L4).
 
 ### D6. Refusal shapes
 
@@ -109,7 +109,9 @@ A form refusal is a flash, not a status page, the same as every other key-form e
 
 ### D7. `key_creation_throttled` security event
 
-`security_events.emit("key_creation_throttled", subject=subject_for(user_id=actor, request=request), …)` with fields `actor_user_id`, `actor_username`, `client_ip`, `route`, `method`, `reason` (`account_budget` | `address_budget`), `limit_count`, `window_seconds`. All of them except the event name are existing allow-listed field names, so no new field bound is introduced. The subject is the authenticated actor, not a caller-supplied value, so the existing per-subject suppressor bounds the volume. Cap refusals emit nothing (D4). Unlimited refusals reuse `panel_forbidden`.
+`security_events.emit("key_creation_throttled", subject=<account subject>, …)` with fields `actor_user_id`, `actor_username`, `client_ip`, `route`, `method`, `reason` (`account_budget` | `address_budget`), `limit_count`, `window_seconds`. All of them except the event name are existing allow-listed field names, so no new field bound is introduced. Exactly one emitter invocation per refusal; whether it reaches the sink stays subject to the global suppressor.
+
+**The suppression subject is the same exact account identity the budget keys on**, derived from the D2 account key: `user:<users.id>` for a real account and one fixed `account:single-user` for the sentinel. It is *not* `subject_for(user_id=actor, request=request)`: the sentinel has `id=None`, so that helper falls back to the client address, and a single-user caller rotating trusted addresses would get a fresh log allowance per address. `client_ip` stays only an event field. Cap refusals emit nothing (D4). Unlimited refusals reuse `panel_forbidden`.
 
 ### D8. What a non-admin may still choose
 
@@ -146,10 +148,12 @@ Offline (`tests/test_issue_323_key_creation_budget.py`) with the settings patche
 10. **Null default**: blank or omitted create refused with "required"; admin Unlimited still works.
 11. **Template**: the checkbox is rendered for an admin and absent for a non-admin; no inline handler or style (the existing CSP template inventory tests cover new markup); `data-unlimited-toggle` is handled in `panel.js`.
 12. **Settings**: zero refused, the null forms accepted, above-ceiling refused, through a real env file like the existing limiter-setting tests.
+13. **Single-user suppression subject.** In single-user mode, budget refusals from rotating trusted client addresses all charge one fixed suppression subject: with the suppressor live, they do not each get a fresh allowance.
+14. **Non-admin grandfathered key.** A non-admin can open the editor of their own grandfathered unlimited key (no Unlimited control rendered) and assign a numeric limit.
 
 Real Postgres (`tests/integration/`):
 
-13. **Cap is exact under concurrency.** With the cap at N-1 active keys, two concurrent creates for one non-admin account result in exactly one new row. An admin is not capped, and revoked keys do not count.
+15. **Cap is exact under concurrency.** With the cap at N-1 active keys, two concurrent creates for one non-admin account result in exactly one new row. An admin is not capped, and revoked keys do not count.
 
 ## Risks / Trade-offs
 
@@ -169,4 +173,4 @@ Real Postgres (`tests/integration/`):
 
 ## Migration plan
 
-No schema change. Deploy is the normal merge to `main` followed by Flux. Rollback: set the four settings to null, which restores pre-change creation velocity. The unlimited semantics are code and roll back with the image.
+No schema change. Deploy is the normal merge to `main` followed by Flux. Rollback, configuration only: set `KEY_CREATION_ACCOUNT_LIMIT`, `KEY_CREATION_ADDRESS_LIMIT` and `KEY_MAX_ACTIVE_PER_ACCOUNT` to null, which disables the account counter, the address counter and the active-key cap and restores pre-change creation velocity. `KEY_CREATION_WINDOW_SECONDS` is a non-nullable integer and stays at a valid value (it is inert once both counters are off). The blank/null limit semantics are code: only an image rollback restores the old "blank or explicit null means unlimited for anyone" behaviour.
