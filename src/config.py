@@ -187,6 +187,19 @@ MAX_LIST_PATTERN_CHARS = 1024
 # purpose.
 MAX_SEARCH_QUERY_CHARS = 8192
 
+# Upper bound on `import_from_url`'s `url` argument (#322), through the same
+# declarative `arg_char_caps` screen as the search query: the existing
+# `argument_too_long` refusal, before any DNS resolution, connection or quota
+# statement. Presigned S3/GCS URLs carrying session tokens reach 2–4 KB, so
+# 8 KiB clears every real one while staying ~7,000× below the request-body
+# limit. Its logging transform (`_url_host`) refuses to parse a longer value,
+# which removes the canonicalisation peak the ASVS reproduction measured.
+#
+# **This is not the memory bound.** Every other near-limit envelope still
+# buffers; the process-wide body budget (`src/services/body_budget.py`) is
+# what bounds them all.
+MAX_IMPORT_URL_CHARS = 8192
+
 # Aggregate bound on the preflight of `move_note(rewrite_links=True)`. That
 # preflight holds, for every backlink source, both the original bytes and the
 # rewritten content in memory before a single byte is mutated — the price of

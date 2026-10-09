@@ -35,6 +35,7 @@ from src.auth.session import (
 )
 from src.config import (
     MAX_CHUNKS_PER_NOTE,
+    MAX_IMPORT_URL_CHARS,
     MAX_LINKS_PER_NOTE,
     MAX_MOVE_REWRITE_BYTES,
     MAX_NOTE_BYTES,
@@ -6742,7 +6743,17 @@ def _url_host(url) -> str:
     A URL is caller-supplied and can carry a credential in its query string, so
     only the host goes to `usage_logs` — enough to audit where the server was
     made to connect, not enough to replay it.
+
+    A value longer than `MAX_IMPORT_URL_CHARS` is never converted or parsed
+    (#322): it is the fixed placeholder `<over-long>`. `named_params()` runs
+    this transform on every row, the length refusal's included, and parsing a
+    near-limit argument here was the highest memory peak in the reproduction.
     """
+    try:
+        if len(url) > MAX_IMPORT_URL_CHARS:
+            return "<over-long>"
+    except TypeError:
+        pass  # no length: not a string; `str()` below decides
     try:
         return urlsplit(str(url)).hostname or "<no host>"
     except ValueError:
@@ -6754,6 +6765,7 @@ def _url_host(url) -> str:
     ["url", "path", "overwrite"],
     transforms={"url": _url_host},
     write_class=True,
+    arg_char_caps={"url": MAX_IMPORT_URL_CHARS},
 )
 async def import_from_url_impl(url: str, path: str, overwrite: bool = False) -> str:
     """Fetch a public URL straight into the vault, under the outbound policy."""

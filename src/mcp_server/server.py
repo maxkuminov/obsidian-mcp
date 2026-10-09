@@ -1238,7 +1238,8 @@ async def import_from_url(url: str, path: str, overwrite: bool = False) -> str:
     around.
 
     Args:
-        url: Public https URL of the file.
+        url: Public https URL of the file, at most 8,192 characters; a longer
+            one is refused with `argument_too_long` before anything is fetched.
         path: Vault-relative destination (e.g. "Attachments/paper.pdf").
         overwrite: If True, allow replacing an existing file at `path`.
     """
