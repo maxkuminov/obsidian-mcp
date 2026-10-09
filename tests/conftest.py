@@ -101,6 +101,12 @@ SETTINGS_ENV_KEYS = (
     "MCP_CONCURRENCY_WRITER_WAITERS",
     "MCP_CONCURRENCY_WRITER_WAIT_SECONDS",
     "MCP_CONCURRENCY_REPLAY_BUDGET_BYTES",
+    # The /mcp body-memory budget (#322).
+    "MCP_BODY_MEMORY_BUDGET_BYTES",
+    "MCP_BODY_MEMORY_FRACTION",
+    "MCP_BODY_MEMORY_MULTIPLIER",
+    "MCP_BODY_BUDGET_WAIT_SECONDS",
+    "MCP_BODY_BUDGET_WAITERS",
     "MCP_SANDBOX_MODE",
     # Unknown-argument refusal on MCP tools (#295).
     "MCP_REJECT_UNKNOWN_ARGUMENTS",
@@ -399,6 +405,31 @@ def _reset_concurrency_controller():
     concurrency.reset_controller()
     yield
     concurrency.get_controller().shutdown(close_writers=True)
+
+
+@pytest.fixture(autouse=True)
+def _reset_body_budget():
+    """Give each test a fresh, host-independent /mcp body budget (#322).
+
+    Derived from the default settings with *no* readable cgroup limit (the
+    1 GiB fallback: 128 MiB capacity), so a developer's or a CI runner's own
+    memory limit never changes what the suite measures, and a reservation a
+    test left behind never leaks into the next one. The module's default
+    reader is pointed at "no limit" too, so a lifespan a test runs derives the
+    same plan instead of reading the host's cgroup; the reader's own tests
+    call it with a fake root explicitly.
+    """
+    from src.config import settings
+    from src.services import body_budget
+
+    real_reader = body_budget.read_cgroup_memory_limit
+    body_budget.read_cgroup_memory_limit = lambda *a, **k: None
+    body_budget.configure(settings, log_line=False)
+    try:
+        yield
+    finally:
+        body_budget.read_cgroup_memory_limit = real_reader
+        body_budget.reset_body_budget(None)
 
 
 @pytest.fixture(autouse=True)
