@@ -177,8 +177,8 @@ update it in the same change.** What stays here is the short list:
   admin-only Unlimited box or an explicit JSON `null` (a non-admin's is a 403 /
   flash plus `panel_forbidden` `unlimited_requires_admin`); a blank edit is an
   error; and with the default null a create must name its limit (#323). OAuth
-  grants and pre-existing NULL-limit keys therefore have **velocity bounds
-  only**, owner-accepted.
+  grants (#327), pre-existing NULL-limit keys and admin-made unlimited keys
+  therefore have **velocity bounds only**, owner-accepted.
 - **Key creation is one budget across both routes, plus a stock cap** (#323).
   `POST /api/keys` and `POST /admin/keys/create` charge one in-process
   `try_charge_key_creation` with two counters that must both admit — exact
