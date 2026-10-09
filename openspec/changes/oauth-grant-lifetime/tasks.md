@@ -26,6 +26,7 @@ Implementation order: slice 1 first (everything depends on the columns, the sett
 - [ ] 3.4 `src/control_panel/routes.py` `_token_status`: `now >= deadline` → `expired`.
 - [ ] 3.5 `authorize_get` passes `consent_lifetimes()`; `authorize.html` renders the D10 block — no `style=`, no `on*=`, any new CSS in the nonce'd style block, text escaped.
 - [ ] 3.6 AST test: every `OAuthToken(` construction under `src/` passes `grant_issued_at=` explicitly.
+- [ ] 3.7 `src/services/transfer.py`: `credential_expires_at` returns `min(expires_at, grant_deadline(grant_issued_at))` for an `OAuthToken`, and `_credential_ok`'s OAuth expiry comparison uses it — so `plan_mint_window`, redemption (`resolve_identity`) and the locked pre-publication re-check (`_identity_publish_ok`, the upload gate) all honour the deadline through the one predicate.
 
 ## 4. Tests
 
@@ -48,6 +49,9 @@ Unit tests (fake-session pattern of `tests/test_issue_182_refresh_reuse.py`) for
 - [ ] 4.15 Setting validation: `0`, empty, `null`, `none`, `366` refused at settings construction; `1` and `365` accepted.
 - [ ] 4.16 Consent page: renders the three lifetimes from the setting (default, and a value below 30 days where refresh shows the cap); no `style=` attribute and no `on*=` in the rendered HTML.
 - [ ] 4.17 Migration: pre-existing families read `grant_issued_at` = migration timestamp and can still refresh immediately after upgrade.
+- [ ] 4.18 Reuse vs deadline precedence: a rotated-away refresh token after the deadline gets the byte-identical generic replay response (no `error_description`) and revokes the family; a live one gets `grant_lifetime_exceeded` and revokes nothing.
+- [ ] 4.19 Consent anchor: time advanced between approval (`/authorize` POST) and the code exchange — `grant_issued_at` equals the exchange time, not the approval time.
+- [ ] 4.20 Transfer (real Postgres): a pending upload and a pending download capability minted by an OAuth access token are refused (uniform 404, nothing written) once the setting is shortened past the family's deadline while token and capability are unexpired; the mint window is clamped to the deadline; no capability is minted from a credential past its deadline; the locked pre-publication re-check refuses.
 
 ## 5. Docs
 
@@ -57,6 +61,7 @@ Unit tests (fake-session pattern of `tests/test_issue_182_refresh_reuse.py`) for
 - [ ] 5.4 `CLAUDE.md` key decisions: one bullet — absolute grant lifetime (`OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS`, 90, not disable-able, issuance inherited like `grant_id`) and code-replay family revocation after full revalidation, spent codes retained 7 days past expiry.
 - [ ] 5.5 `.env.example`: commented `OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS=90` with range and why there is no off value.
 - [ ] 5.6 `README.md` settings table: the new row.
+- [ ] 5.7 `docs/architecture/file-transfer.md`: the OAuth credential's effective expiry is `min(expires_at, grant deadline)` at mint, redemption and pre-publication.
 
 ## 6. Gates
 

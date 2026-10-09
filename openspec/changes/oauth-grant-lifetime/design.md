@@ -40,9 +40,13 @@ At both mint sites, with one `now` captured once:
 
 In `_handle_refresh` the deadline check sits **after** the reuse branch and the client checks and **before** the per-token expiry check, with reason `invalid_grant.grant_lifetime_exceeded` and `error_description: "grant lifetime exceeded; re-authorize"`. After the reuse branch, because a rotated-away token presented after the deadline is still reuse (the family-kill is harmless there, and a patient thief must gain nothing by waiting). Before per-token expiry, because once tokens are clamped the two coincide and the operator should see the cause that actually ended the grant. Nothing is revoked on this refusal — it is a grant reaching its end, the same reasoning #182 applies to an expired never-rotated token.
 
+**Precedence, stated once so the two rules cannot be read as contradicting each other (Codex spec review).** The reuse decision comes first and wins: a presented refresh token whose locked row is `revoked` takes #182's branch — family revoked, the byte-identical generic `{"error": "invalid_grant"}` 400, no `error_description` — whether or not the family is past its deadline. The deadline refusal (`grant_lifetime_exceeded`, re-authorize description, nothing revoked) applies **only to a live, unrevoked refresh token**. A rotated-away token therefore never learns from the response that the grant has also aged out.
+
 `APIKeyMiddleware` gets the same check on the OAuth path, immediately after its `expires_at` check: `now >= grant_deadline(...)` ⇒ 401 `invalid_token`, auth-failure reason `grant_lifetime_exceeded`. Clamping already guarantees this for every token minted after the change; the check exists for tokens minted *before a shortening* of the setting, so a shortened policy takes effect at the next request instead of up to an hour later. It reads a column of the row the middleware already loaded — no new query.
 
 The panel's `_token_status` treats `now >= deadline` as `expired` (the #76 rule: the panel must never show live what the middleware refuses).
+
+**The transfer subsystem is a fourth enforcement point (Codex spec review, MAJOR).** `src/services/transfer.py` re-validates the minting credential on its own, without going through the middleware: `plan_mint_window` clamps a capability to `credential_expires_at(cred)`, every redemption runs `_credential_ok`, and the publish gate re-runs `_credential_ok` against the credential row it holds `FOR UPDATE`. All three read `OAuthToken.expires_at` alone, so a pending upload capability minted before a shortening of the setting would still overwrite the vault after the grant was supposed to be dead. Both helpers therefore treat an `OAuthToken`'s effective expiry as `min(expires_at, grant_deadline(grant_issued_at))` — one change in `credential_expires_at`, which `_credential_ok` then uses for its OAuth expiry comparison, so the mint clamp, the redemption check and the pre-publication re-check stay literally the same predicate. API keys are untouched.
 
 Boundary: the grant is dead **at** its deadline (`now >= deadline`). The middleware's existing per-token check treats the `expires_at` instant itself as live; a clamped access token whose `expires_at == deadline` is therefore refused by the deadline check at that instant. Tests pin both sides of the instant with an injected clock.
 
@@ -104,7 +108,9 @@ Because both exchanges take the global bootstrap key first, they are serialized:
 
 `authorize_get` passes three strings from one helper in `src/oauth/grants.py` (`consent_lifetimes()`): access lifetime (`min(1 hour, cap)`), refresh lifetime (`min(30 days, cap)`) and the cap, humanized ("1 hour", "30 days", "90 days"). The template renders a block, after the request box and before the scope radios:
 
-> **How long this access lasts.** The application receives an access token valid for 1 hour, which it renews using a refresh token valid for 30 days from its last renewal. Renewal stops 90 days after you approve; after that the application must ask you again. You can revoke this access at any time from the control panel.
+> **How long this access lasts.** The application receives an access token valid for 1 hour, which it renews using a refresh token valid for 30 days from its last renewal. Renewal stops 90 days after the application first receives its tokens (moments after you approve); after that the application must ask you again. You can revoke this access at any time from the control panel.
+
+**Anchor (Codex spec review, MINOR).** The absolute period runs from `grant_issued_at`, which is the code exchange, not the approval click. The two are normally seconds apart and at most the code's ten-minute life; the disclosure says "after the application first receives its tokens" rather than "after you approve" so it never promises a deadline the server does not enforce. A test advances the clock between approval and exchange and asserts the deadline is anchored to the exchange.
 
 Values come only from the helper, so the page cannot promise more than policy. Markup uses existing classes or new rules in the template's nonce'd `<style>` block; no `style=` attribute, no `on*=` handler. Owner browser pass with devtools open; zero CSP violations.
 
@@ -120,6 +126,14 @@ One unit, 025's pattern (marker comment mirrored in `src/models/db.py`; reconcil
 The ORM declares the default (`server_default=func.now()`) and NOT NULL so `alembic check` is clean; the gate also verifies the default through the catalogue, since autogenerate does not compare server defaults.
 
 Order inside the migration: `oauth_codes` then `oauth_tokens`, matching the app's own direction (code row, then token inserts), so a concurrent exchange queues behind it rather than closing a wait cycle.
+
+## Owner decisions (recorded)
+
+- Default **90 days**, range **1–365**, **not disable-able** (D4).
+- Every pre-existing family's clock **starts at migration time** (D11, L2).
+- **Raising** the setting extends existing grants (L1, accepted).
+- A client that **retries a code exchange** loses that grant (RFC 6749 §4.1.2, L4, accepted).
+- Codex spec-review findings (transfer enforcement, reuse-vs-deadline precedence, consent anchor) were accepted and folded into D3, D10 and the `file-transfer` delta.
 
 ## Accepted limitations
 

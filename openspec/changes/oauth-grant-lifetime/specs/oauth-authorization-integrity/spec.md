@@ -88,7 +88,7 @@ Every `oauth_tokens` row SHALL carry a non-null grant issuance time. Both tokens
 - **THEN** each SHALL pass the issuance time explicitly
 
 ### Requirement: Grant families SHALL expire absolutely at their issuance time plus the configured lifetime
-A grant family's absolute deadline SHALL be its issuance time plus `OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS`, evaluated against the current setting. Every access and refresh token minted for a family MUST expire no later than that deadline, and the `expires_in` returned with an access token MUST state its clamped lifetime. A refresh presented at or after the deadline, or with less than one second remaining, SHALL be refused with `invalid_grant` and a description asking the client to re-authorize, SHALL mint nothing and SHALL revoke nothing. The MCP authentication middleware SHALL refuse an access token whose family is at or past its deadline. Single-use rotation, refresh-token reuse detection and family revocation SHALL be unchanged: the reuse decision is taken before the deadline check, so a rotated-away refresh token presented after the deadline still revokes its family.
+A grant family's absolute deadline SHALL be its issuance time plus `OAUTH_GRANT_ABSOLUTE_LIFETIME_DAYS`, evaluated against the current setting. Every access and refresh token minted for a family MUST expire no later than that deadline, and the `expires_in` returned with an access token MUST state its clamped lifetime. Refresh-token reuse detection SHALL be decided first and is unchanged by this requirement: a presented refresh token whose row is already revoked (rotated away or revoked outright) SHALL revoke every live token in its family and receive the generic constant `invalid_grant` replay response, with no re-authorization description, whether or not the family is past its deadline. Only a live, unrevoked refresh token presented at or after the deadline, or with less than one second remaining, SHALL be refused with `invalid_grant` and a description asking the client to re-authorize; that refusal SHALL mint nothing and SHALL revoke nothing. The MCP authentication middleware SHALL refuse an access token whose family is at or past its deadline. Single-use rotation and family revocation SHALL be unchanged.
 
 #### Scenario: Far from the deadline nothing is clamped
 - **WHEN** a refresh is performed when more than 30 days remain before the family's deadline
@@ -116,6 +116,7 @@ A grant family's absolute deadline SHALL be its issuance time plus `OAUTH_GRANT_
 #### Scenario: Reuse detection survives the deadline
 - **WHEN** a refresh token that was rotated away is presented after its family's deadline
 - **THEN** every live token in the family SHALL be revoked and the request SHALL be rejected with `invalid_grant`
+- **AND** the response SHALL be byte-identical to the unknown-token refusal, carrying no re-authorization description
 
 #### Scenario: Concurrent refreshes near the deadline
 - **WHEN** the same live refresh token is presented by two concurrent requests one day before the deadline
@@ -138,7 +139,7 @@ A grant family's absolute deadline SHALL be its issuance time plus `OAUTH_GRANT_
 - **THEN** settings construction SHALL succeed with that value
 
 ### Requirement: The consent screen SHALL disclose the effective credential lifetimes
-The `/authorize` consent page SHALL state, on every render, the access-token lifetime, that it is renewed by a refresh token valid for a stated period from its last renewal, the absolute period after approval at which renewal stops and the user must approve again, and that access can be revoked from the control panel. Each stated period SHALL be derived from the configured policy and SHALL NOT exceed it: the access lifetime is the lesser of one hour and the absolute lifetime, the refresh lifetime the lesser of 30 days and the absolute lifetime. The disclosure SHALL comply with the panel content security policy — no inline style attribute and no inline event handler.
+The `/authorize` consent page SHALL state, on every render, the access-token lifetime, that it is renewed by a refresh token valid for a stated period from its last renewal, the absolute period — counted from when the application first receives its tokens, i.e. the authorization-code exchange that follows approval, which is the family's `grant_issued_at` — at which renewal stops and the user must approve again, and that access can be revoked from the control panel. The page MUST NOT state that the period runs from approval. Each stated period SHALL be derived from the configured policy and SHALL NOT exceed it: the access lifetime is the lesser of one hour and the absolute lifetime, the refresh lifetime the lesser of 30 days and the absolute lifetime. The disclosure SHALL comply with the panel content security policy — no inline style attribute and no inline event handler.
 
 #### Scenario: Default policy is disclosed
 - **WHEN** the consent page renders under the default setting
@@ -147,6 +148,11 @@ The `/authorize` consent page SHALL state, on every render, the access-token lif
 #### Scenario: A short policy is not overstated
 - **WHEN** the absolute lifetime is configured to 7 days
 - **THEN** the page SHALL state a 7 day refresh lifetime and a 7 day absolute lifetime, and no period longer than 7 days
+
+#### Scenario: The disclosed period is anchored to the exchange, not the approval
+- **WHEN** a user approves consent and the client exchanges the resulting code several minutes later
+- **THEN** the family's `grant_issued_at` SHALL equal the exchange time, not the approval time
+- **AND** the family's deadline SHALL be the configured lifetime after the exchange
 
 #### Scenario: The disclosure is CSP-clean
 - **WHEN** the rendered consent page is inspected
