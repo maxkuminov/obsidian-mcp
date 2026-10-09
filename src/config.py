@@ -786,7 +786,10 @@ class Settings(BaseSettings):
     # Share of the cgroup limit given to request bodies. Capped at 0.5 so the
     # fixed non-body headroom stays.
     mcp_body_memory_fraction: float = Field(0.5, ge=0.1, le=0.5, allow_inf_nan=False)
-    # Peak memory per raw body byte (measured ~6.7×). 8 is the floor.
+    # Peak memory per raw body byte. 6.7× was the import_from_url figure
+    # before its URL cap; after it, measured 3.17× (write_file) and 4.09×
+    # (import_from_url) — see docs/architecture/rate-limits.md. 8 is the
+    # safety floor, with headroom over both.
     mcp_body_memory_multiplier: int = Field(8, ge=8, le=32)
     # How long a request that does not fit waits before its transport 429.
     mcp_body_budget_wait_seconds: float = Field(15, ge=0, le=60, allow_inf_nan=False)

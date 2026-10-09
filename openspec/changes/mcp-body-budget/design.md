@@ -166,7 +166,8 @@ lanes. The line is WARNING when no cgroup limit was readable (source
 - **`Content-Length` present and valid.** Reserve exactly that many bytes.
   A request whose declared length is above `mcp_max_request_body_bytes` gets
   an immediate **413**, the SDK's own response shape, with no reservation and
-  no wait. A length of 0 reserves nothing and skips the budget.
+  no wait. A length of 0 reserves nothing and takes no lease, but its
+  delivered bytes are still counted against zero (streamed counting below).
 - **Absent or unparseable (chunked).** Reserve `mcp_max_request_body_bytes`
   in the large lane. MCP clients send `Content-Length` on JSON POSTs, so this
   is rare and is costed at the worst case rather than guessed.

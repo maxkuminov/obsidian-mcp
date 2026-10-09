@@ -324,6 +324,30 @@ async def test_immediate_admission_starts_no_watcher(harness, monkeypatch):
     assert c.requests.active == c.authentication.active == 0
 
 
+
+@pytest.mark.asyncio
+async def test_immediate_admission_passes_a_get_the_raw_receive(harness, monkeypatch):
+    # The original #188 identity assertion, for the unwrapped path: a GET has
+    # no body budget (#322), so with immediate admission the app receives the
+    # server's own `receive`, not a wrapper.
+    c = harness.install('enforce')
+    started = []
+    monkeypatch.setattr(auth.ReceiveWatch, 'start', lambda self: started.append(True))
+    wire = Wire()
+    seen = []
+
+    async def authenticate(self, *a):
+        return None
+
+    async def app(scope_, receive, send):
+        seen.append(receive)
+
+    monkeypatch.setattr(auth.APIKeyMiddleware, '_authenticate', authenticate)
+    await auth.APIKeyMiddleware(app)(scope(method='GET'), wire.receive, record(harness))
+    assert started == [] and wire.delivered == 0
+    assert seen == [wire.receive]
+    assert c.requests.active == c.authentication.active == 0
+
 def test_uvicorn_flow_control_constant_bounding_l11():
     # L11's ~62 MiB bound is budget + 96 waiters x (HIGH_WATER_LIMIT + one
     # 256 KiB read). A uvicorn upgrade that changes this must re-derive it.

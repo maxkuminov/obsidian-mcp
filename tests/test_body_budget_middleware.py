@@ -276,6 +276,25 @@ async def test_after_the_cut_every_receive_is_a_disconnect(harness):
     assert_clean(b)
 
 
+
+async def test_a_declared_empty_body_is_counted_too(harness):
+    """`Content-Length: 0` takes no reservation, but over-delivery is still cut."""
+    b = harness.install_budget()
+    probe, sent = Probe(), []
+    await run(probe, scope(length=0), Wire(body(b"surprise", True), body(b"!")), sent)
+    assert [m["type"] for m in probe.received] == ["http.disconnect"]
+    assert received_body(probe) == b""
+    assert_clean(b)
+
+
+async def test_a_declared_empty_body_passes_an_empty_message(harness):
+    b = harness.install_budget()
+    probe, sent = Probe(), []
+    await run(probe, scope(length=0), Wire(body(b"")), sent)
+    assert [m["type"] for m in probe.received] == ["http.request"]
+    assert status(sent) == 200
+    assert_clean(b)
+
 @pytest.mark.parametrize("mode", ["off", "shadow", "queue", "enforce"])
 async def test_the_budget_enforces_in_every_concurrency_mode(harness, mode):
     harness.install_controller(mode)
@@ -525,6 +544,52 @@ async def test_watchers_leave_nothing_behind_before_the_handoff(harness, exit_):
     holder.lease.release()
     assert_clean(b)
 
+
+
+def _pending_reads():
+    """Pending reads through either layer: `Wire.receive` or a watcher's replay."""
+    return [t for t in asyncio.all_tasks()
+            if not t.done() and any(name in repr(t.get_coro())
+                                    for name in ("Wire.receive", "downstream.<locals>.replay"))]
+
+
+@pytest.mark.parametrize("exit_", ["disconnect", "cancel"])
+async def test_both_watchers_leave_nothing_behind_before_the_handoff(harness, exit_):
+    """The transport watcher (a held auth slot) and the body watcher both read
+    bytes; the request then ends before the handoff. Every replay byte comes
+    back and no `receive` is left pending."""
+    c = harness.install_controller("enforce", mcp_concurrency_transport_wait_seconds=5)
+    b = harness.install_budget(wait=5)
+    auth_holders = [await c.auth() for _ in range(c.limits["auth"])]
+    body_holder = await b.reserve(112 * MIB, small=False)
+    replay_before = concurrency.replay_budget().used
+    wire = Wire(body(b"a" * 1500, True))
+    task = run(Probe(), scope(length=20 * MIB), wire, [])
+    await until(lambda: c.pending and wire.delivered == 1
+                and concurrency.replay_budget().used >= replay_before + 1500)
+    auth_holders.pop().lease.release()
+    await until(lambda: b.waiting == 1)
+    wire.push(body(b"b" * 500, True))
+    await until(lambda: wire.delivered == 2
+                and concurrency.replay_budget().used >= replay_before + 2000)
+    # The body watcher's in-flight read is the transport watcher's replay,
+    # now past its list and calling `Wire.receive` directly.
+    assert _pending_reads(), "the body watcher should be blocked in receive"
+    if exit_ == "disconnect":
+        wire.push(DISCONNECT)
+        await asyncio.wait_for(task, 1)
+    else:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert concurrency.replay_budget().used == replay_before
+    assert _pending_reads() == [] and _pending_receives() == []
+    body_holder.lease.release()
+    for h in auth_holders:
+        h.lease.release()
+    assert_clean(b)
 
 async def test_waiting_behind_a_transport_watcher_replays_in_order(harness):
     """A request that waited at the auth stage *and* for body budget: both

@@ -743,7 +743,13 @@ class APIKeyMiddleware:
                 per_request = settings.mcp_max_request_body_bytes
                 if declared is not None and declared > per_request:
                     response = _body_too_large_response()
-                elif declared != 0:
+                elif declared == 0:
+                    # A declared-empty body reserves nothing, but it is still
+                    # counted: any byte delivered beyond the declaration is
+                    # over-reservation and is cut off like any other. No lease
+                    # is taken, so there is nothing to release.
+                    app_receive = _counting_receive(app_receive, 0)
+                else:
                     size = per_request if declared is None else declared
                     small = (declared is not None
                              and declared <= body_budget.SMALL_REQUEST_MAX_BYTES)
