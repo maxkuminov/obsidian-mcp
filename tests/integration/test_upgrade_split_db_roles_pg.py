@@ -380,7 +380,26 @@ MALFORMED_SPLITS = [
     ("ALTER DATABASE obsidian_mcp OWNER TO postgres; ALTER ROLE obsidian_mcp BYPASSRLS;",
      "ALTER DATABASE obsidian_mcp OWNER TO obsidian_mcp; ALTER ROLE obsidian_mcp NOBYPASSRLS;",
      ["database obsidian_mcp is owned by postgres", "role obsidian_mcp has BYPASSRLS"]),
+    # Codex round 2: a plain obsidian_mcp that can SET ROLE to the superuser.
+    ("GRANT postgres TO obsidian_mcp;",
+     "REVOKE postgres FROM obsidian_mcp;",
+     ["role obsidian_mcp is a member (directly or through other roles) of privileged role(s) postgres (SUPERUSER, "]),
+    # ... and through an intermediate role, to two privileged roles at once.
+    ("CREATE ROLE omcp_mid NOLOGIN; CREATE ROLE omcp_maker NOLOGIN CREATEROLE;"
+     " GRANT postgres TO omcp_mid; GRANT omcp_mid TO obsidian_mcp; GRANT omcp_maker TO omcp_mid;",
+     "DROP ROLE omcp_mid; DROP ROLE omcp_maker;",
+     ["of privileged role(s) omcp_maker (CREATEROLE), postgres (SUPERUSER, "]),
+    # Codex round 2: the extension owned by the runtime role.
+    ("DROP EXTENSION vector; ALTER ROLE obsidian_mcp SUPERUSER; SET ROLE obsidian_mcp;"
+     " CREATE EXTENSION vector; RESET ROLE; ALTER ROLE obsidian_mcp NOSUPERUSER;",
+     "DROP EXTENSION vector; CREATE EXTENSION vector;",
+     ["extension vector is owned by obsidian_mcp, not postgres"]),
 ]
+
+MEMBERSHIPS = """
+SELECT pg_get_userbyid(roleid) || '>' || pg_get_userbyid(member) || '|' || admin_option::text
+  FROM pg_auth_members ORDER BY 1
+"""
 
 
 def test_partly_split_cluster_is_refused():
@@ -403,7 +422,7 @@ def test_partly_split_cluster_is_refused():
             c.psql(defect, user="postgres")
             # A temporary role left by an interrupted run is still removed.
             c.psql("CREATE ROLE obsidian_mcp_split_tmp LOGIN SUPERUSER;", user="postgres")
-            before = (roles(c, "postgres"), owners(c, "postgres"))
+            before = (roles(c, "postgres"), owners(c, "postgres"), q(c, MEMBERSHIPS))
             result = run_script(c, env=env)
             output = result.stdout + result.stderr
             assert result.returncode != 0, (defect, output)
@@ -417,6 +436,7 @@ def test_partly_split_cluster_is_refused():
             assert not any("obsidian_mcp_split_tmp" in line for line in after_roles)
             assert after_roles == [r for r in before[0] if "obsidian_mcp_split_tmp" not in r]
             assert owners(c, "postgres") == before[1]
+            assert q(c, MEMBERSHIPS) == before[2]
             c.psql(undo, user="postgres")
 
         result = run_script(c, env=env)

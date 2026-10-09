@@ -721,7 +721,11 @@ Load-bearing rules:
   **"Already split" runs the full self-check:** role names plus `rolsuper`
   also match a half-converted cluster (database owned by `postgres`, a
   `CREATEDB` runtime role, objects left with OID 10), which must be refused
-  with what is wrong, not reported as done. Every session that sends a
+  with what is wrong, not reported as done. The check also refuses a
+  runtime role that is a member, directly or through another role, of any
+  role with `SUPERUSER`/`CREATEDB`/`CREATEROLE`/`REPLICATION`/`BYPASSRLS`
+  (`GRANT postgres TO obsidian_mcp` passes a `rolsuper` test but allows
+  `SET ROLE postgres`), and any extension not owned by OID 10. Every session that sends a
   password sets `log_statement = none` and `log_min_error_statement =
   panic` first, because the default `error` level logs a failing
   `ALTER ROLE … PASSWORD` with its password.
@@ -734,7 +738,9 @@ Kubernetes); `postgres` can still log in over `mcp_internal` with the admin
 password; the upgrade script relies on local-socket `trust`; nothing proves
 an upgraded install's new runtime password differs from the old superuser
 password; a failure in the image's own init before our script runs leaves
-no marker and is not detected by the wrapper.
+no marker and is not detected by the wrapper; the server's startup refusal
+checks the session role's own `rolsuper`, not membership in a privileged
+role (the upgrade script's self-check does catch that shape; L14).
 
 ## Backups are protected data, not just a rollback tool
 

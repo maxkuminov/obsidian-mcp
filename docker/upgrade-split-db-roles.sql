@@ -422,8 +422,9 @@ $convert$;
 -- Self-check: the fresh-install shape. On the conversion path any failure
 -- raises and the whole transaction rolls back; on the already-split path it
 -- refuses a cluster that is only partly in that shape (database owned by
--- postgres, a privileged obsidian_mcp, objects or default privileges left with
--- the superuser), naming every problem it found.
+-- postgres, a privileged obsidian_mcp or one that is a member of a privileged
+-- role, an extension not owned by postgres, objects or default privileges
+-- left with the superuser), naming every problem it found.
 DO $check$
 DECLARE
     problems text[] := '{}';
@@ -443,6 +444,37 @@ BEGIN
         problems := problems || 'role obsidian_mcp does not exist'::text;
     ELSIF attrs <> '' THEN
         problems := problems || format('role obsidian_mcp has %s (expected a plain LOGIN role)', attrs);
+    END IF;
+
+    -- A plain role that can SET ROLE to a privileged one is a privileged role
+    -- (Codex review round 2). pg_has_role(..., 'MEMBER') follows direct and
+    -- nested grants whatever their INHERIT/SET options.
+    IF attrs IS NOT NULL THEN
+        SELECT string_agg(format('%s (%s)', quote_ident(r.rolname), concat_ws(', ',
+                   CASE WHEN r.rolsuper THEN 'SUPERUSER' END,
+                   CASE WHEN r.rolcreatedb THEN 'CREATEDB' END,
+                   CASE WHEN r.rolcreaterole THEN 'CREATEROLE' END,
+                   CASE WHEN r.rolreplication THEN 'REPLICATION' END,
+                   CASE WHEN r.rolbypassrls THEN 'BYPASSRLS' END)), ', ' ORDER BY r.rolname)
+          INTO found
+          FROM pg_roles r
+         WHERE r.rolname <> 'obsidian_mcp'
+           AND (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls)
+           AND pg_has_role('obsidian_mcp', r.oid, 'MEMBER');
+        IF found IS NOT NULL THEN
+            problems := problems || format('role obsidian_mcp is a member (directly or through other roles) of privileged role(s) %s', found);
+        END IF;
+    END IF;
+
+    -- Extensions belong to the bootstrap superuser, as on a fresh install
+    -- (plpgsql from initdb, vector from the init script).
+    SELECT string_agg(format('extension %s is owned by %s, not postgres',
+                             quote_ident(e.extname), pg_get_userbyid(e.extowner)), '; ' ORDER BY e.extname)
+      INTO found
+      FROM pg_extension e
+     WHERE e.extowner <> 10;
+    IF found IS NOT NULL THEN
+        problems := problems || found;
     END IF;
 
     found := (SELECT rolname FROM pg_roles WHERE oid = 10);
