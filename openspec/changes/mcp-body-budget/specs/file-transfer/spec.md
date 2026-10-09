@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: `import_from_url` SHALL refuse a `url` longer than `MAX_IMPORT_URL_CHARS` before the tool body and without parsing it
-`import_from_url` SHALL refuse a `url` argument longer than `MAX_IMPORT_URL_CHARS` (8,192 characters) through the shared decorator's declarative argument-length screen. The refusal SHALL be the existing pre-body `argument_too_long` refusal: it carries the `MCP-REFUSAL` line, names the argument, its length and the limit, does not echo the value, writes a `usage_logs` row with the `argument_too_long` marker, and is issued before any DNS resolution, connection, vault access or quota statement.
+`import_from_url` SHALL refuse a `url` argument longer than `MAX_IMPORT_URL_CHARS` (8,192 characters) through the shared decorator's declarative argument-length screen. The refusal SHALL be the existing pre-body `argument_too_long` refusal: it carries the `MCP-REFUSAL` line, names the argument, its length and the limit, does not echo the value, writes a `usage_logs` row with the `argument_too_long` marker, and is issued before any DNS resolution, connection or quota statement, in the decorator's existing gate order (rate buckets, vault-root admission, encoding screen, argument-length screen, slot, quota).
 
 The `url` logging transform SHALL return the fixed placeholder `<over-long>` for a value longer than `MAX_IMPORT_URL_CHARS`, without converting or parsing that value, so that no code path, including the refusal's usage row, runs URL parsing on an over-long argument.
 

@@ -26,19 +26,28 @@ contains the proposal commit. For S2, also confirm that
 
 - [ ] 1.1 `Settings`: add `mcp_body_memory_budget_bytes: int | None`
   (≥ 64 MiB when set), `mcp_body_memory_fraction: float = 0.5`
-  ([0.1, 0.8]), `mcp_body_memory_multiplier: int = 8` ([4, 32]),
+  ([0.1, 0.5]), `mcp_body_memory_multiplier: int = 8` ([8, 32]; 8 is the
+  measured floor, Codex finding 1),
   `mcp_body_budget_wait_seconds: float = 15` ([0, 60], no inf or NaN),
   `mcp_body_budget_waiters: int = 8` ([1, 256]). The budget setting is
   **not** a `NullableLimit`: unset means "derive", never "disabled", and the
   field's comment must say so, because elsewhere null means off.
 - [ ] 1.2 Derivation (design D2): a pure function
   `derive_body_budget(settings, cgroup_reader) -> BodyBudgetPlan(source, memory_budget, multiplier, capacity, small_lane, large_lane, cgroup_limit)`.
-  The cgroup reader is injectable. It reads v2 `memory.max`, then v1
-  `memory.limit_in_bytes`, and treats `max`, unreadable or ≥ 2⁶⁰ as none.
-- [ ] 1.3 Boot check in a `Settings` model validator, or at controller
-  construction if the cgroup read must stay out of settings load (document
-  which). Fail when `large_lane < mcp_max_request_body_bytes` or
-  `small_lane < 1 MiB`, with an error naming the four settings.
+  The cgroup reader is injectable. For v2 it resolves the process's own path
+  from `/proc/self/cgroup` and the mount from `/proc/self/mountinfo`, and
+  takes the minimum finite `memory.max` over that directory and its ancestors
+  up to the mount. Only if v2 yields nothing it reads v1
+  `memory.limit_in_bytes` at the memory controller's mount root. `max`,
+  unreadable, unparseable or ≥ 2⁶⁰ count as none (Codex finding 5).
+- [ ] 1.3 Boot check in `body_budget.configure()`, called from the lifespan
+  (never in `Settings` construction or on `import src.config`: the alembic
+  initContainer imports the settings under a 1 GiB limit, Codex finding 4).
+  Fail when `large_lane < mcp_max_request_body_bytes`, `small_lane < 1 MiB`,
+  or a readable limit's safe allocation
+  `min(0.5 × L, L − (384 MiB + replay budget))` is below the memory budget
+  (an unsafe explicit budget, finding 1), with an error naming the four
+  settings.
 - [ ] 1.4 `BodyBudget`: two lanes and two FIFOs, one shared waiter bound.
   `async reserve(size, *, small, deadline, disconnected) -> BodyAdmission(admitted, lease, lane, queue_ms, refused_reason)`.
   Implement the borrow rule (small borrows from large only while the large
@@ -62,12 +71,19 @@ contains the proposal commit. For S2, also confirm that
   scenarios (2 GiB cgroup → 128/16/112 MiB; `max` → fallback 1 GiB; 512 MiB →
   boot error naming four settings; explicit 1.5 GiB → 192 MiB, source
   `setting`); range validation of each setting; v1 fallback path; the boot
-  check against a raised `MAX_FILE_WRITE_BYTES`.
+  check against a raised `MAX_FILE_WRITE_BYTES`; the unsafe-override
+  refusals (explicit budget above the safe allocation, multiplier 4,
+  fraction 0.8); the cgroup reader against fake proc/sys trees (private-root
+  v2, nested v2 taking the smallest ancestor, v1, `max` everywhere, nothing
+  readable); and the init-container regression (constructing `Settings` and
+  importing `src.config` in a fresh process never reads a cgroup file and
+  never raises under a 512 MiB limit).
 
 ## 2. S2 — middleware wiring
 
 - [ ] 2.1 In `APIKeyMiddleware.__call__`, after `_authenticate` returns
-  `None` (success) and the auth lease is released: parse `Content-Length`,
+  `None` (success) and the auth lease is released, **for `POST` only** (GET,
+  DELETE and every other method bypass, Codex finding 2): parse `Content-Length`,
   413 above `mcp_max_request_body_bytes` (the SDK's response shape), skip at
   0, and otherwise reserve (small if ≤ 1 MiB declared, large otherwise or when
   unknown). Do this through a second `ReceiveWatch` wrapping the first watch's
@@ -77,7 +93,10 @@ contains the proposal commit. For S2, also confirm that
   deliver `http.disconnect` in place of a message that would cross the
   reservation and for every call after it.
 - [ ] 2.3 Release the body lease in the existing `finally`, beside the request
-  lease. On disconnect during the wait, return with no response.
+  lease. On disconnect during the wait, return with no response. The same
+  `finally` aborts the body-budget watcher and then the transport watcher, so
+  replay-budget bytes and pending `receive` tasks never outlive the request
+  (Codex finding 3).
 - [ ] 2.4 `_body_budget_response(admission)`: the 429 with `Retry-After: 2` and
   `{"error", "code": "body_memory", "scope", "limit"}`. Emit
   `mcp_concurrency_pressure` with `reason="body:memory"`, outcome
@@ -101,7 +120,11 @@ contains the proposal commit. For S2, also confirm that
   - a disconnect while waiting;
   - release on SDK 400, on a raising app, and on cancellation in both
     phases;
-  - the 429 shape is identical in keys to `_concurrency_response`.
+  - the 429 shape is identical in keys to `_concurrency_response`;
+  - a long-lived GET (and a DELETE) reserves nothing while a maximum POST is
+    admitted beside it;
+  - disconnect and cancellation before the handoff restore the replay
+    budget's used bytes and leave no pending `receive` task.
 
 ## 3. S3 — `import_from_url` URL cap
 
@@ -124,8 +147,10 @@ contains the proposal commit. For S2, also confirm that
   envelope and one `import_from_url`-shaped envelope, and report peak RSS
   growth ÷ body length for each (sampled from `/proc/<pid>/status` `VmHWM`).
   Record the measured ratios in `docs/architecture/rate-limits.md` (S5).
-- [ ] 4.2 `tests/integration/test_body_budget_stack_pg.py` (guarded on
-  `PGVECTOR_TEST_ADMIN_URL`, like the rest of `tests/integration/`):
+- [ ] 4.2 `tests/integration/test_body_budget_stack_pg.py`, guarded on
+  `PGVECTOR_TEST_ADMIN_URL` **and** on `BODY_BUDGET_RSS_TESTS=1`, which the
+  `make test-integration` target sets and CI does not (owner decision, Codex
+  finding 6):
   - the multiplier guard (ratio ≤ `MCP_BODY_MEMORY_MULTIPLIER` for both
     shapes);
   - the six-writer burst at a 1 GiB budget: the process alive, peak RSS ≤

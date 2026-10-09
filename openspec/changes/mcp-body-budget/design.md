@@ -60,9 +60,15 @@ each step to `enforce` is earned with evidence. The body budget is a
 **memory-safety** bound: running it in shadow would leave the bug in place. It
 is therefore its own module (`src/services/body_budget.py`), it enforces in
 every `MCP_CONCURRENCY_MODE` including `off`, and it has **no off switch**.
-The rollback lever is size: set `MCP_BODY_MEMORY_BUDGET_BYTES` larger. A
-budget larger than the container is still allowed, but the startup line says
-so (D2).
+Every override moves only in the safe direction (D2): the multiplier cannot
+go below its measured floor, the fraction cannot eat the fixed headroom, and
+an explicit budget above the safe allocation of a readable cgroup limit is
+refused at startup. No setting re-opens the OOM. The operator's levers are a
+larger container or a smaller `MAX_FILE_WRITE_BYTES`.
+
+**Owner decisions (2026-10-09, after the Codex spec review).** The guard is
+always on (no shadow mode, no off switch), and startup refusal of a budget too
+small for one maximum write stays. Both were re-confirmed after the review.
 
 Why not fold it into the request envelope: the envelope counts requests, has
 a 2–5 s deadline sized for authentication, and is mode-gated. A body wait is
@@ -84,28 +90,65 @@ small_lane     = capacity // 8
 large_lane     = capacity − small_lane
 ```
 
-- `limit` is read once at startup from cgroup v2 `/sys/fs/cgroup/memory.max`,
-  falling back to v1 `/sys/fs/cgroup/memory/memory.limit_in_bytes`. A value of
-  `max`, an unreadable file, or a value ≥ 2⁶⁰ (v1's "unlimited") counts as no
-  limit.
-- `MCP_BODY_MEMORY_FRACTION` defaults to 0.5, range [0.1, 0.8]. The other half
-  covers the baseline (~57 MiB at idle, 378 MiB observed peak), the replay
-  budget (32 MiB), indexer and embedding work, and responses.
-- `MCP_BODY_MEMORY_MULTIPLIER` defaults to **8**, integer range [4, 32]. The
-  measured 6.7× plus margin. A guard test re-measures it (task 4.2), and a
-  failing measurement means raising the default, not loosening the test.
+- `limit` is read once, at web-application startup, as the **process's own**
+  effective cgroup limit (Codex spec review, finding 5):
+  - **cgroup v2.** The process's cgroup path comes from the `0::` line of
+    `/proc/self/cgroup`, and the v2 mount point and the mount's root from the
+    `cgroup2` entry of `/proc/self/mountinfo` (default `/sys/fs/cgroup` when
+    mountinfo is unreadable). The limit is the **minimum finite**
+    `memory.max` across that directory and each ancestor up to the mount
+    point. This covers a private cgroup namespace (path `/`, the container's
+    own root) and a host or nested namespace (a systemd service several levels
+    below the mount), where a smaller ancestor limit applies.
+  - **cgroup v1**, only when v2 yields no finite limit (pure v1 or hybrid):
+    `memory.limit_in_bytes` at the memory controller's mount point (from
+    mountinfo, default `/sys/fs/cgroup/memory`). The controller root only: in
+    a Docker or Kubernetes v1 container that root is the container's own
+    cgroup. A v1 process nested below its mount's root is not resolved (L10).
+  - `max`, an unreadable or unparseable file, or a value ≥ 2⁶⁰ (v1's
+    "unlimited") counts as no limit. Nothing readable means the 1 GiB
+    fallback, logged WARNING.
+- `MCP_BODY_MEMORY_FRACTION` defaults to 0.5, range **[0.1, 0.5]**. The other
+  half covers the baseline (~57 MiB at idle, 378 MiB observed peak), the replay
+  budget (32 MiB), indexer and embedding work, and responses. The ceiling is
+  0.5 because above it the fixed headroom is no longer guaranteed (finding 1).
+- `MCP_BODY_MEMORY_MULTIPLIER` defaults to **8**, integer range **[8, 32]**.
+  The measured 6.7× plus margin, and 8 is also the **floor**: a smaller
+  multiplier admits more raw bytes than the measured amplification allows
+  (finding 1: fraction 0.8 with multiplier 4 on 2 GiB admitted five 61 MiB
+  bodies, which is the reproduced OOM). A guard test re-measures it (task
+  4.2), and a failing measurement means raising the default and the floor,
+  not loosening the test.
+- **Safe allocation.** With a readable limit `L`,
+  `safe(L) = min(floor(0.5 × L), L − (384 MiB + MCP_CONCURRENCY_REPLAY_BUDGET_BYTES))`.
+  384 MiB is the fixed non-body headroom (the 378 MiB observed peak baseline,
+  rounded up). Startup refuses a memory budget above `safe(L)`, whether it
+  came from the fraction or from `MCP_BODY_MEMORY_BUDGET_BYTES`. An explicit
+  budget is taken as given only when no limit is readable, and the startup
+  line is then WARNING, as for the fallback.
 - On 2 GiB: memory budget 1 GiB, capacity 128 MiB, small lane 16 MiB, large
   lane 112 MiB. That admits one 61 MiB body plus 51 MiB of other large
   traffic, with 16 MiB always available to small requests.
 
-**Boot check (fail closed).** Startup raises a configuration error naming
-`MCP_BODY_MEMORY_BUDGET_BYTES`, `MCP_BODY_MEMORY_FRACTION`,
-`MCP_BODY_MEMORY_MULTIPLIER` and `MAX_FILE_WRITE_BYTES` when either of these
-holds:
+**Boot check (fail closed).** The web application's lifespan refuses to
+start, with an error naming `MCP_BODY_MEMORY_BUDGET_BYTES`,
+`MCP_BODY_MEMORY_FRACTION`, `MCP_BODY_MEMORY_MULTIPLIER` and
+`MAX_FILE_WRITE_BYTES`, when any of these holds:
 
 - `large_lane < mcp_max_request_body_bytes`: a supported maximum write could
   never be admitted;
-- `small_lane < 1 MiB`: one small envelope could not be admitted.
+- `small_lane < 1 MiB`: one small envelope could not be admitted;
+- the memory budget exceeds `safe(L)` for a readable limit `L`.
+
+**Where the check runs** (finding 4). Derivation and the boot check run in
+`body_budget.configure()`, called from the FastAPI lifespan after the sandbox
+short-circuit and before the first database check. They never run in
+`Settings` construction or on `import src.config`. The reason: the Kubernetes
+`alembic` initContainer imports `src.config.settings` under its own 1 GiB
+limit, which derives a 56 MiB large lane. A check in `Settings` would fail
+every migration before the 2 GiB app container is launched. The `Settings`
+fields carry only their static ranges. Sandbox mode bypasses the middleware,
+so it skips `configure()` as it skips the other startup guards.
 
 With the defaults this needs a cgroup limit of at least ≈ 1.1 GiB. A smaller
 container must either lower `MAX_FILE_WRITE_BYTES` (which shrinks the body
@@ -115,8 +158,8 @@ question in the report).
 
 The derived figures go into one INFO line at startup: source
 (`setting|cgroup|fallback`), memory budget, multiplier, capacity and both
-lanes. The line is WARNING when the source is `fallback`, or when the memory
-budget exceeds the cgroup limit.
+lanes. The line is WARNING when no cgroup limit was readable (source
+`fallback`, or source `setting` with no limit to check it against).
 
 ### D3 — Accounting: declared length up front, the maximum when unknown
 
@@ -139,8 +182,13 @@ budget exceeds the cgroup limit.
   budget. Two such requests can each hold half and wait for the other, which
   is deadlock or livelock. Reserving the full amount up front makes admission
   atomic and order-independent.
-- The method is not consulted. Any request carrying a body is charged. A GET
-  or DELETE without a body has length 0 and passes through.
+- **POST only** (Codex spec review, finding 2). Admission applies only to
+  the method whose body the SDK buffers. `RequestBodyLimitMiddleware` (SDK
+  1.29) buffers `POST` alone and passes every other method straight through,
+  so GET (the SSE stream), DELETE and anything else bypass the budget. Costing
+  a bodyless GET at the chunked worst case would reserve about 61 MiB for the
+  lifetime of an SSE stream, and one such stream would stop a maximum write
+  from ever fitting.
 
 ### D4 — Placement: after authentication, before the app
 
@@ -200,6 +248,13 @@ auth-failure budget → bearer check → request envelope → auth permit
   the shared replay budget, so L8 of #188 (deadline-bounded once the replay
   budget is exhausted) carries over unchanged. A disconnect ends the wait with
   no response and nothing reserved.
+- **Teardown of both watchers** (Codex spec review, finding 3). The outer
+  `finally` aborts the body-budget watcher and then the transport watcher, on
+  every exit including a disconnect or a cancellation before the handoff. The
+  body watcher goes first because its in-flight `receive` is the transport
+  watcher's `downstream()`. `abort()` releases the bytes each one charged to
+  the replay budget and cancels any still-pending `receive` task, so neither
+  replay usage nor a pending task outlives the request.
 - **Refusal.** HTTP **429**,
   `{"error": "MCP request body memory budget is unavailable", "code": "body_memory", "scope": "<small|large>", "limit": <lane capacity in bytes>}`,
   with `Retry-After: 2`. This is the same keys and status as the concurrency
@@ -250,7 +305,10 @@ frees it by refcount. Whether the allocator returns pages to the OS is L2.
 - Applied as `arg_char_caps={"url": MAX_IMPORT_URL_CHARS}` on
   `import_from_url_impl`, the existing L5b screen. The result is the existing
   `argument_too_long` refusal: pre-body, carrying the `MCP-REFUSAL` line, a
-  usage row, not coalesced.
+  usage row, not coalesced. The screen keeps its place in `_tracked`'s
+  existing gate order (rate buckets, vault-root admission, encoding screen,
+  argument-length screen, slot, quota). It is **not** claimed to run before
+  vault-root resolution, which precedes it (Codex spec review, finding 7).
 - `_url_host` returns the fixed string `"<over-long>"` for a value longer than
   `MAX_IMPORT_URL_CHARS`, **before** `str()` or `urlsplit`. Without this, the
   refusal path would still run the transform (`named_params()` runs on every
@@ -264,8 +322,12 @@ frees it by refcount. Whether the allocator returns pages to the OS is L2.
   deployment one maximum write plus 51 MiB alongside it. Before this change the
   same load could restart the process for every tenant.
 - **The multiplier is measured, not proven.** An SDK or Pydantic upgrade can
-  raise it. Mitigation: the guard measurement (task 4.2) runs in CI, and the
-  fraction leaves half the container as slack.
+  raise it. Mitigation: the guard measurement (task 4.2) runs under
+  `make test-integration`, and the fraction leaves half the container as
+  slack. By owner decision it does **not** run in CI (finding 6): it is gated
+  on its own opt-in variable, `BODY_BUDGET_RSS_TESTS=1`, which the Makefile
+  target sets and CI's `tests` job does not. A peak-RSS bound on a shared CI
+  runner measures the runner.
 - **Boot refusal on small containers.** That is the intent (D2), but it could
   surprise an operator on upgrade. The error names the knobs, and the
   `.env.example` comment gives the minimum.
@@ -299,6 +361,15 @@ frees it by refcount. Whether the allocator returns pages to the OS is L2.
   entirely.
 - **L9** The response side is not budgeted. Read responses are already capped
   (`MAX_READ_RESPONSE_CHARS`, `MAX_FILE_READ_BYTES`).
+- **L10** On cgroup v1 only the memory controller's mount root is read. In a
+  container that root is the container's own cgroup; a v1 process nested
+  below it (a v1 host running the app outside a container) is not resolved,
+  and a smaller ancestor limit there is missed. cgroup v2, which every current
+  distribution and k3s default to, resolves the process's own path and its
+  ancestors.
+- **L11** Methods other than POST bypass the budget, because the SDK buffers
+  no body for them. A future SDK that buffered another method's body would
+  need this re-checked.
 
 ## Alternatives rejected
 

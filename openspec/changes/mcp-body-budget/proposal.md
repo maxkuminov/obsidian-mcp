@@ -33,8 +33,9 @@ while a request waits, not the bytes the app reads afterwards.
 ## What Changes
 
 - **A process-wide, always-on MCP body-memory budget** (new
-  `src/services/body_budget.py`). Every authenticated `/mcp` request with a body
-  reserves its declared `Content-Length`, or the full per-request limit when
+  `src/services/body_budget.py`). Every authenticated `/mcp` `POST` (the only
+  method whose body the SDK buffers; GET streams and DELETE bypass) reserves
+  its declared `Content-Length`, or the full per-request limit when
   the length is unknown (chunked), **before the app reads a single body byte**.
   It holds the reservation until the downstream ASGI call returns. The budget is
   a memory-safety bound, not a tuning knob. It ignores
@@ -45,8 +46,13 @@ while a request waits, not the bytes the app reads afterwards.
   1 GiB fallback when no limit is readable. The raw-byte capacity is the memory
   budget ÷ `MCP_BODY_MEMORY_MULTIPLIER` (8, from the measured ~6.7×). On the
   2 GiB reference deployment that gives 128 MiB of raw body in flight: one
-  maximum-size write plus all ordinary traffic. Startup **refuses** a
-  configuration whose large lane cannot hold one maximum-size body. Large
+  maximum-size write plus all ordinary traffic. The cgroup limit is the
+  process's own (its `/proc/self/cgroup` path and ancestors). Overrides only
+  move in the safe direction: the multiplier's floor is 8, the fraction's
+  ceiling 0.5, and an explicit budget above the safe allocation of a readable
+  limit is refused. Web-application startup **refuses** a configuration whose
+  large lane cannot hold one maximum-size body; importing the settings (the
+  migration init container) never runs that check. Large
   supported writes therefore never become impossible, and the global body limit
   is unchanged.
 - **Two lanes, so small requests are never starved.** Requests of at most
@@ -95,8 +101,9 @@ None.
 
 ## Impact
 
-- Code: new `src/services/body_budget.py`; `src/config.py` (five settings, the
-  derivation and the boot check); `src/mcp_server/auth.py` (the
+- Code: new `src/services/body_budget.py` (the derivation, the cgroup
+  reader and the boot check); `src/config.py` (five settings with static
+  ranges); `src/mcp_server/auth.py` (the
   reservation step in `APIKeyMiddleware.__call__` after authentication, a
   receive-counting wrapper); `src/mcp_server/tools.py` (`arg_char_caps` on
   `import_from_url_impl`, `_url_host` guard); `src/mcp_server/server.py`
