@@ -451,11 +451,12 @@ exactly as an oversized file does.
 
 ## Three kinds of size cap — don't confuse them
 
-There are **byte** caps, a **character** cap, and a **transport** cap, and they protect different things:
+There are **byte** caps, a **character** cap, a **transport** cap and a process-wide **body budget**, and they protect different things:
 
 - `MAX_FILE_READ_BYTES` / `MAX_FILE_WRITE_BYTES` bound what the **server** reads into or writes out of memory. They refuse the operation.
 - `MAX_READ_RESPONSE_CHARS` (default 40,000 ≈ 10K tokens) bounds what `read_note` / `read_file` **return to the caller**, whose context the result consumes. It truncates rather than refusing.
 - The MCP streamable-HTTP **request body limit** bounds what the transport accepts at all, before any tool runs. It is derived, not configured: `max(2 × MAX_FILE_WRITE_BYTES, 6 × MAX_NOTE_BYTES) + 1 MiB` (61 MiB with the defaults), passed to `FastMCP(max_request_body_size=)` from `Settings.mcp_max_request_body_bytes`. The SDK's own default is 4 MiB, which would silently reject writes far below our documented 25 MB cap. The formula guarantees — for a *canonical* envelope, i.e. JSON-RPC framing plus non-content arguments under 1 MiB — that a base64 `write_file` at the cap (base64 is `4·⌈n/3⌉ ≤ 2n + 2`) and any note write up to `MAX_NOTE_BYTES` (JSON escaping expands a byte at most 6×) always reach the tool, which then decides. Unsupported shapes are bounded by the transport with a bare HTTP 413 and no tool error: text-mode `write_file` whose escaping exceeds the limit (send base64 — always safe), an envelope over 1 MiB, and arguments that are large but discarded.
+- The **body-memory budget** (#322) is the process-wide counterpart of that per-request limit: it bounds the *sum* of request bodies in flight across all `/mcp` requests, before the app reads a byte. Each authenticated POST reserves its declared `Content-Length` (the full per-request limit when unknown) against a budget derived from the container's memory (cgroup limit × 0.5 ÷ 8: 128 MiB of raw body on 2 GiB, one maximum write plus everything else), waits up to 15 s if it does not fit, and is otherwise answered with a transport 429 `code: body_memory`. It does not change the per-request limit, and startup refuses a container too small to admit one maximum body. See [rate limits](rate-limits.md).
 
 **An argument that is not UTF-8 never reaches a tool body.** `_tracked` screens
 every bound argument — strings, and an **iterative, depth-unlimited** walk into
