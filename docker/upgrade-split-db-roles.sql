@@ -447,7 +447,8 @@ BEGIN
     END IF;
 
     -- A plain role that can SET ROLE to a privileged one is a privileged role
-    -- (Codex review round 2). pg_has_role(..., 'MEMBER') follows direct and
+    -- (Codex review round 2), and so is one in a predefined role that reads,
+    -- writes or executes on the server's filesystem (superuser-equivalent). pg_has_role(..., 'MEMBER') follows direct and
     -- nested grants whatever their INHERIT/SET options.
     IF attrs IS NOT NULL THEN
         SELECT string_agg(format('%s (%s)', quote_ident(r.rolname), concat_ws(', ',
@@ -455,11 +456,16 @@ BEGIN
                    CASE WHEN r.rolcreatedb THEN 'CREATEDB' END,
                    CASE WHEN r.rolcreaterole THEN 'CREATEROLE' END,
                    CASE WHEN r.rolreplication THEN 'REPLICATION' END,
-                   CASE WHEN r.rolbypassrls THEN 'BYPASSRLS' END)), ', ' ORDER BY r.rolname)
+                   CASE WHEN r.rolbypassrls THEN 'BYPASSRLS' END,
+                   CASE WHEN r.rolname IN ('pg_execute_server_program', 'pg_read_server_files',
+                                           'pg_write_server_files')
+                        THEN 'server file/program access' END)), ', ' ORDER BY r.rolname)
           INTO found
           FROM pg_roles r
          WHERE r.rolname <> 'obsidian_mcp'
-           AND (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls)
+           AND (r.rolsuper OR r.rolcreatedb OR r.rolcreaterole OR r.rolreplication OR r.rolbypassrls
+                OR r.rolname IN ('pg_execute_server_program', 'pg_read_server_files',
+                                 'pg_write_server_files'))
            AND pg_has_role('obsidian_mcp', r.oid, 'MEMBER');
         IF found IS NOT NULL THEN
             problems := problems || format('role obsidian_mcp is a member (directly or through other roles) of privileged role(s) %s', found);

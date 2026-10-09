@@ -389,6 +389,10 @@ MALFORMED_SPLITS = [
      " GRANT postgres TO omcp_mid; GRANT omcp_mid TO obsidian_mcp; GRANT omcp_maker TO omcp_mid;",
      "DROP ROLE omcp_mid; DROP ROLE omcp_maker;",
      ["of privileged role(s) omcp_maker (CREATEROLE), postgres (SUPERUSER, "]),
+    # A predefined superuser-equivalent role (server filesystem access).
+    ("GRANT pg_read_server_files TO obsidian_mcp;",
+     "REVOKE pg_read_server_files FROM obsidian_mcp;",
+     ["of privileged role(s) pg_read_server_files (server file/program access)"]),
     # Codex round 2: the extension owned by the runtime role.
     ("DROP EXTENSION vector; ALTER ROLE obsidian_mcp SUPERUSER; SET ROLE obsidian_mcp;"
      " CREATE EXTENSION vector; RESET ROLE; ALTER ROLE obsidian_mcp NOSUPERUSER;",
