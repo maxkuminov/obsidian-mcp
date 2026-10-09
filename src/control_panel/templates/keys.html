@@ -6,6 +6,7 @@
     .keys-new-key-label { font-size: 11px; font-weight: 600; letter-spacing: 0.1em; text-transform: uppercase; margin-bottom: 10px; opacity: 0.75; }
     .keys-new-key { flex: 1; background: var(--code-bg); padding: 10px 14px; border-radius: 5px; font-size: 12px; word-break: break-all; color: var(--key-text); }
     .keys-field-help { font-size: 11px; color: var(--text-3); margin-top: 6px; line-height: 1.5; }
+    .keys-check-hint { color: var(--text-3); font-size: 12px; display: block; margin-top: 2px; }
     /* Cell classes are scoped to beat `.data-table td` and
        `.data-table tbody tr:hover td` (0,2,3), which the inline style used
        to beat: equal specificity, later in the cascade. */
@@ -171,23 +172,39 @@
             </div>
             <div class="field">
                 <label class="field-label">Daily request limit</label>
-                <input type="number" name="daily_request_limit" class="field-input"
-                       min="1" max="{{ quota_limit_max }}" step="1" placeholder="Leave empty for unlimited"
+                <input type="number" id="create-limit-input" name="daily_request_limit" class="field-input"
+                       min="1" max="{{ quota_limit_max }}" step="1"
+                       placeholder="{{ 'Leave empty for the default' if quota_limit_default|default(none) is not none else 'Required' }}"
                        value="{{ quota_limit_default|default(none) if quota_limit_default|default(none) is not none else '' }}">
                 <div class="keys-field-help">
-                    Tool calls this key may make per UTC day. Empty means unlimited.
+                    Tool calls this key may make per UTC day.
                     Calls over the limit are refused before they run and do not
                     count toward it; the counter resets at UTC midnight. To stop a
                     key entirely, revoke it — a limit of 0 is not accepted.
                     {% if quota_limit_default|default(none) is not none %}
                     This box is pre-filled with the server's default for new keys
-                    ({{ quota_limit_default }}); change it or clear it — whatever
-                    is in the box when you submit is what the key gets, and an
-                    empty box creates an unlimited key. Keys that already exist
-                    are unaffected.
+                    ({{ quota_limit_default }}); an empty box also gets that
+                    default.
+                    {% else %}
+                    A limit is required: the server has no default for new keys.
                     {% endif %}
+                    Only an administrator can make a key unlimited.
+                    Keys that already exist are unaffected.
                 </div>
             </div>
+            {% if is_admin %}
+            <div class="field u-display-flex u-align-items-center u-gap-10px">
+                <input type="checkbox" name="unlimited" value="1" id="create-unlimited"
+                       data-unlimited-toggle data-unlimited-target="create-limit-input"
+                       class="u-width-18px u-height-18px u-accent-color-primary">
+                <label for="create-unlimited" class="u-font-size-14px u-color-text u-cursor-pointer">
+                    Unlimited
+                    <span class="keys-check-hint">
+                        No daily ceiling for this key. Administrators only.
+                    </span>
+                </label>
+            </div>
+            {% endif %}
             <div class="modal-footer">
                 <button type="button" data-modal-close="create-modal" class="btn btn-ghost">Cancel</button>
                 <button type="submit" class="btn btn-primary">Create</button>
@@ -207,9 +224,13 @@
             <div class="field">
                 <label class="field-label">Calls per UTC day</label>
                 <input type="number" id="limit-input" name="daily_request_limit" class="field-input"
-                       min="1" max="{{ quota_limit_max }}" step="1" placeholder="Leave empty for unlimited">
+                       min="1" max="{{ quota_limit_max }}" step="1" placeholder="Required">
                 <div class="keys-field-help">
-                    Empty clears the limit and returns the key to unlimited.
+                    {% if is_admin %}
+                    Enter a limit, or tick Unlimited to remove it.
+                    {% else %}
+                    Enter a limit. Only an administrator can make a key unlimited.
+                    {% endif %}
                     <strong>Setting a limit on an unlimited key restarts its
                     count at zero</strong> — consumption is counted from the
                     moment the limit is set, not from midnight. Changing an
@@ -219,6 +240,19 @@
                     call already in flight finishes under the old value.
                 </div>
             </div>
+            {% if is_admin %}
+            <div class="field u-display-flex u-align-items-center u-gap-10px">
+                <input type="checkbox" name="unlimited" value="1" id="limit-unlimited"
+                       data-unlimited-toggle data-unlimited-target="limit-input"
+                       class="u-width-18px u-height-18px u-accent-color-primary">
+                <label for="limit-unlimited" class="u-font-size-14px u-color-text u-cursor-pointer">
+                    Unlimited
+                    <span class="keys-check-hint">
+                        No daily ceiling for this key. Administrators only.
+                    </span>
+                </label>
+            </div>
+            {% endif %}
             <div class="modal-footer">
                 <button type="button" data-modal-close="limit-modal" class="btn btn-ghost">Cancel</button>
                 <button type="submit" class="btn btn-primary">Save</button>

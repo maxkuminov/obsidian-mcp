@@ -46,8 +46,26 @@
         if (!/^[0-9]+$/.test(keyId)) { return; }
         var form = document.getElementById('limit-form');
         form.action = '/admin/keys/' + keyId + '/limit';
-        document.getElementById('limit-input').value = current;
+        var input = document.getElementById('limit-input');
+        input.value = current;
+        /* The Unlimited box is rendered for administrators only (#323). For
+           an admin, an unlimited key (current === '') opens with the box
+           ticked and the number disabled. Without the box — a non-admin's
+           page — the number is always left enabled, so a non-admin can put a
+           limit on their own grandfathered unlimited key. */
+        var toggle = form.querySelector('[data-unlimited-toggle]');
+        if (toggle) { toggle.checked = current === ''; }
+        syncUnlimited(toggle, input);
         document.getElementById('limit-modal').classList.add('open');
+    }
+
+    /* `data-unlimited-toggle` on a checkbox disables the number input named
+       by its `data-unlimited-target` while it is ticked. A disabled input is
+       not submitted, and the server ignores a number sent alongside
+       `unlimited=1` anyway. No toggle means enabled. */
+    function syncUnlimited(toggle, input) {
+        if (!input) { return; }
+        input.disabled = !!(toggle && toggle.checked);
     }
 
     /* Dashboard "Reindex Now": POST in the background with the CSRF token as
@@ -168,7 +186,13 @@
     });
 
     document.addEventListener('change', function (event) {
-        var el = closest(event, '[data-autosubmit]');
+        var el = closest(event, '[data-unlimited-toggle]');
+        if (el) {
+            syncUnlimited(el, document.getElementById(el.getAttribute('data-unlimited-target') || ''));
+            return;
+        }
+
+        el = closest(event, '[data-autosubmit]');
         if (el && el.form) {
             if (typeof el.form.requestSubmit === 'function') { el.form.requestSubmit(); }
             else { el.form.submit(); }

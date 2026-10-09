@@ -64,6 +64,8 @@ from src.services.index_state import (
     set_state,
 )
 from src.services.indexer import clear_sweep_state, invalidate_hnsw_index_cache
+from src.services import api_keys as key_issuance
+from src.services.rate_limits import KeyCreationRefusal
 from src.services.quotas import (
     apply_daily_request_limit,
     consumed_today,
@@ -351,6 +353,43 @@ def _log_panel_forbidden(
         route=_request_route(request),
         method=_request_method(request),
     )
+
+
+def _log_key_creation_throttled(
+    request: Request | None,
+    user,
+    refusal: KeyCreationRefusal,
+) -> None:
+    """One `key_creation_throttled` record for a budget refusal (#323).
+
+    Shared by both create routes so the two refusals are one record shape. The
+    subject is the budget's own exact account identity
+    (`key_issuance.account_subject`), never the address: in single-user mode
+    the sentinel has no id, and an address-derived subject would give a caller
+    rotating addresses a fresh log allowance per address. `client_ip` is a
+    field only. Exactly one emitter call per refusal; the suppressor decides
+    whether it reaches the sink.
+    """
+    actor_user_id, actor_username = _actor(user)
+    security_events.emit(
+        "key_creation_throttled",
+        subject=key_issuance.account_subject(user),
+        actor_user_id=actor_user_id,
+        actor_username=actor_username,
+        client_ip=security_events.client_ip(request),
+        route=_request_route(request),
+        method=_request_method(request),
+        reason=refusal.reason,
+        limit_count=refusal.limit,
+        window_seconds=refusal.window_seconds,
+    )
+
+
+def key_creation_throttled_message(refusal: KeyCreationRefusal) -> str:
+    """The user-facing budget refusal. Names the wait, not the counter."""
+    minutes = max(1, -(-refusal.retry_after_seconds // 60))
+    unit = "minute" if minutes == 1 else "minutes"
+    return f"Too many keys created recently — try again in {minutes} {unit}."
 
 
 def _panel_context(
@@ -1064,13 +1103,13 @@ async def keys_page(
         "active": "keys", "keys": keys, "new_key": new_key, "key_error": key_error,
         "quota_day": quota_day,
         "quota_limit_max": DAILY_REQUEST_LIMIT_MAX,
-        # The configured default for *new* keys (#194), and the **only** place
-        # the panel applies it: the create form is pre-filled with it, and
-        # `create_key_form` substitutes nothing. So the operator's last view of
-        # that field is what the key receives — clearing the box creates an
-        # unlimited key, exactly as it always did. None leaves the box empty,
-        # which is the same page this was before the setting existed. Existing
-        # keys are untouched by it in either direction.
+        # The configured default for *new* keys (#194). The create form is
+        # pre-filled with it, and since #323 `create_key_form` also applies it
+        # to a blank field — clearing the box no longer means unlimited; only
+        # an administrator's Unlimited box does (`is_admin` from
+        # `_panel_context` gates that control in the template). None leaves the
+        # box empty and makes the field required. Existing keys are untouched
+        # by it in either direction.
         "quota_limit_default": settings.default_daily_request_limit,
     }))
 
@@ -1124,40 +1163,68 @@ async def create_key_form(
     name: str = Form(...),
     permission: str = Form("read"),
     daily_request_limit: str = Form(""),
+    unlimited: str = Form(""),
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
+    # The order is the JSON twin's (`src/api/routes.py` `create_key`), and the
+    # point of it is that nothing before step 3 charges anything: validation,
+    # then the limit rule, then the active-key cap under a `users` row lock,
+    # then the shared key-creation budget, then the insert (#323 D3).
     name_error = _key_name_error(name)
     if name_error is not None:
         _flash_key_error(request, name_error)
         return RedirectResponse("/admin/keys", status_code=303)
 
-    # Server-side, above the DB CHECK (#162). Both layers: the constraint is
-    # what makes the invariant true of the data, and this is what makes it
-    # fixable — a violated CHECK is a 500 with no key and no explanation.
-    #
-    # **No default substitution here, deliberately** (#194, D9). A blank field
-    # is an explicit unlimited: `DEFAULT_DAILY_REQUEST_LIMIT` reaches the panel
-    # only as `keys_page`'s pre-filled value, so what the operator saw in the
-    # box is what the key gets. Substituting it on this side would mean an
-    # operator who deliberately cleared the field got a limited key anyway —
-    # the surprise that gets a quota feature turned off — and would give the
-    # default two places to be overridden instead of one. The JSON API
-    # distinguishes omitted from null and applies the default there
-    # (`_created_key_limit`); a form has no such distinction to make, because
-    # every submission carries the field.
-    limit, limit_error = parse_limit_form_value(daily_request_limit)
-    if limit_error is not None:
-        _flash_key_error(request, limit_error)
-        return RedirectResponse("/admin/keys", status_code=303)
-
-    raw_key = f"omcp_{secrets.token_hex(24)}"
     # The keys.html <select> only constrains the UI; a scripted/tampered POST
     # can submit any value. Mirror the JSON API's invariant (src/api/routes.py)
     # and fail safe to read-only so the column never holds nonsense like
     # "admin" or a trailing-space "readwrite " that silently behaves as read.
     if permission not in ("read", "readwrite"):
         permission = "read"
+
+    # **A blank field gets the default; only an admin's Unlimited box means
+    # NULL** (owner decision, #323). Before, a blank field was an explicit
+    # unlimited, which made a scripted blank form a way to mint principals with
+    # no daily quota at all. The box is the only unlimited request the form
+    # can make and only exactly `"1"` counts; when it is set the number is
+    # ignored (panel.js disables the input, and a scripted value alongside is
+    # discarded). A non-admin's form never renders the box, so a non-admin
+    # `unlimited=1` is tampered — refused and recorded, not downgraded.
+    wants_unlimited = unlimited == "1"
+    value: int | None = None
+    if not wants_unlimited:
+        # Server-side, above the DB CHECK (#162): a violated CHECK is a 500
+        # with no key and no explanation. A non-number is an error, never a
+        # silent blank.
+        value, limit_error = parse_limit_form_value(daily_request_limit)
+        if limit_error is not None:
+            _flash_key_error(request, limit_error)
+            return RedirectResponse("/admin/keys", status_code=303)
+    limit, refusal = key_issuance.resolve_create_limit(
+        user, provided=value is not None, value=value, unlimited=wants_unlimited
+    )
+    if refusal is not None:
+        if refusal.code == key_issuance.REFUSAL_FORBIDDEN_UNLIMITED:
+            _log_panel_forbidden(
+                request, key_issuance.FORBIDDEN_UNLIMITED_REASON, user, user.id
+            )
+        _flash_key_error(request, refusal.message)
+        return RedirectResponse("/admin/keys", status_code=303)
+
+    admission = await key_issuance.admit_key_creation(
+        session, user, security_events.client_ip(request)
+    )
+    if admission is not None:
+        await session.rollback()
+        if isinstance(admission, KeyCreationRefusal):
+            _log_key_creation_throttled(request, user, admission)
+            _flash_key_error(request, key_creation_throttled_message(admission))
+        else:
+            _flash_key_error(request, admission.message)
+        return RedirectResponse("/admin/keys", status_code=303)
+
+    raw_key = f"omcp_{secrets.token_hex(24)}"
     # Always stamp the creator's user_id (even admins get their own keys
     # attributed to themselves — admin's omniscient view doesn't extend to
     # "create keys on behalf of"; that's a separate per-user-edit action).
@@ -1240,10 +1307,17 @@ async def set_key_limit_form(
     request: Request,
     key_id: int,
     daily_request_limit: str = Form(""),
+    unlimited: str = Form(""),
     session: AsyncSession = Depends(get_session),
     user=Depends(require_user_panel),
 ):
-    """Set, change, or clear a key's daily request limit (#162).
+    """Set, change, or clear a key's daily request limit (#162, #323).
+
+    Since #323 a blank field is a validation error for everyone, not a clear:
+    clearing a limit to unlimited is an administrator's explicit request (the
+    `unlimited` box, which only admins are shown), and a non-admin's is refused
+    and recorded as `panel_forbidden`. The edit path never applies the default
+    to an existing key (`key_issuance.resolve_edit_limit`).
 
     The enable-reset rule and its single transaction live in
     `src.services.quotas.apply_daily_request_limit`, shared with the JSON API's
@@ -1256,9 +1330,22 @@ async def set_key_limit_form(
     api_key = result.scalar_one_or_none()
     _assert_key_owner(api_key, user, request=request)
 
-    limit, limit_error = parse_limit_form_value(daily_request_limit)
-    if limit_error is not None:
-        _flash_key_error(request, limit_error)
+    wants_unlimited = unlimited == "1"
+    value: int | None = None
+    if not wants_unlimited:
+        value, limit_error = parse_limit_form_value(daily_request_limit)
+        if limit_error is not None:
+            _flash_key_error(request, limit_error)
+            return RedirectResponse("/admin/keys", status_code=303)
+    limit, refusal = key_issuance.resolve_edit_limit(
+        user, value=value, unlimited=wants_unlimited
+    )
+    if refusal is not None:
+        if refusal.code == key_issuance.REFUSAL_FORBIDDEN_UNLIMITED:
+            _log_panel_forbidden(
+                request, key_issuance.FORBIDDEN_UNLIMITED_REASON, user, api_key.user_id
+            )
+        _flash_key_error(request, refusal.message)
         return RedirectResponse("/admin/keys", status_code=303)
 
     await apply_daily_request_limit(session, api_key, limit)

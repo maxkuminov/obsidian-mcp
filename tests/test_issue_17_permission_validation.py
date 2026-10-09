@@ -54,9 +54,23 @@ class _FakeSession:
     async def commit(self):
         self.committed = True
 
+    async def execute(self, stmt, params=None):
+        # The non-admin active-key cap (#323) locks the user row and counts
+        # active keys; this fake owns none, so the count is zero.
+        class _Result:
+            def scalar(self):
+                return 0
+
+        return _Result()
+
+    async def rollback(self):
+        pass
+
 
 class _FakeUser:
     id = 1
+    is_admin = False
+    username = "u1"
 
 
 class _FakeRequest:
