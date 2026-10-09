@@ -187,7 +187,7 @@ contains the proposal commit. For S2, also confirm that
 
 ## 6. Gates and archive
 
-- [ ] 6.1 `openspec validate mcp-body-budget --strict`, the offline test
+- [x] 6.1 `openspec validate mcp-body-budget --strict`, the offline test
   suite, `make test-integration` and `make audit`. No migration is carried,
   so `make test-schema` is not required.
 - [ ] 6.2 The `openspec-verifier` subagent against this change, iterating to
