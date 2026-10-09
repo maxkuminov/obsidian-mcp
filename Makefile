@@ -108,7 +108,7 @@ init:
 		cp .env.example $(ENV_FILE); \
 		DB_PASS=$$(openssl rand -hex 16); \
 		SECRET=$$(openssl rand -hex 32); \
-		sed -i "s/^\(DATABASE_URL=.*\)CHANGE_ME/\1$$DB_PASS/" $(ENV_FILE); \
+		sed -i "s/^# DATABASE_URL=\(.*\)CHANGE_ME/DATABASE_URL=\1$$DB_PASS/" $(ENV_FILE); \
 		sed -i "s/^OBSIDIAN_DB_PASSWORD=.*/OBSIDIAN_DB_PASSWORD=$$DB_PASS/" $(ENV_FILE); \
 		sed -i "s/^SECRET_KEY=.*/SECRET_KEY=$$SECRET/" $(ENV_FILE); \
 		chmod 600 $(ENV_FILE); \
@@ -118,6 +118,8 @@ init:
 	fi
 	# The database SUPERUSER password for the bundled compose stacks (#324):
 	# its own file, loaded by the postgres service only, never by the app.
+	# Created on every path; a deployment against an external PostgreSQL never
+	# reads it (DEPLOYMENT.md, Step 2).
 	@if [ ! -f "$(POSTGRES_ENV_FILE)" ]; then \
 		echo "$(GREEN)Creating $(POSTGRES_ENV_FILE) from template...$(NC)"; \
 		(umask 077 && cp postgres.env.example $(POSTGRES_ENV_FILE)); \

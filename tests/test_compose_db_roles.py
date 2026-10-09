@@ -158,6 +158,32 @@ def test_admin_file_is_gitignored_and_its_example_tracked():
     assert re.search(r"^POSTGRES_PASSWORD=$", example, re.M)
 
 
+def test_env_example_sets_no_database_url_and_make_init_fills_one(tmp_path):
+    """`.env.example` leaves DATABASE_URL commented out (the bundles set it);
+    `make init`'s anchored seds, run as written in the Makefile, produce an
+    uncommented URL and OBSIDIAN_DB_PASSWORD carrying the same generated value."""
+    example = (ROOT / ".env.example").read_text()
+    assert not re.search(r"^DATABASE_URL=", example, re.M)
+    assert len(re.findall(r"^# DATABASE_URL=.*CHANGE_ME", example, re.M)) == 1
+
+    makefile = (ROOT / "Makefile").read_text()
+    recipe = makefile.split("\ninit:\n", 1)[1].split("\n\n", 1)[0]
+    seds = re.findall(r'^\t+(sed -i "[^"]+" \$\(ENV_FILE\)); \\$', recipe, re.M)
+    assert len(seds) == 3, seds
+    env_file = tmp_path / ".env"
+    env_file.write_text(example)
+    script = "\n".join(s.replace("$(ENV_FILE)", '"$ENV_FILE"').replace("$$", "$") for s in seds)
+    subprocess.run(["bash", "-ec", script], check=True,
+                   env={**os.environ, "ENV_FILE": str(env_file),
+                        "DB_PASS": "f" * 32, "SECRET": "e" * 64})
+    rendered = env_file.read_text()
+    active = [line for line in rendered.splitlines() if line and not line.startswith("#")]
+    assert f"DATABASE_URL=postgresql+asyncpg://obsidian_mcp:{'f' * 32}@postgres:5432/obsidian_mcp" in active
+    assert f"OBSIDIAN_DB_PASSWORD={'f' * 32}" in active
+    assert f"SECRET_KEY={'e' * 64}" in active
+    assert not [line for line in active if "CHANGE_ME" in line]
+
+
 # ── The entrypoint wrapper (design D3) ─────────────────────────────────────
 
 GOOD_ADMIN = "a" * 16 + "0123456789abcdef"  # 32 chars
