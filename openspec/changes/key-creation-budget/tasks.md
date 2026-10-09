@@ -57,8 +57,8 @@ Slices A and B touch disjoint files and can run in parallel. Slice C depends on 
 
 ## 6. Gates and archive
 
-- [ ] 6.1 Offline suite green; `make test-integration` green (the cap test needs it).
-- [ ] 6.2 `openspec validate key-creation-budget --strict` clean.
+- [x] 6.1 Offline suite green; `make test-integration` green (the cap test needs it).
+- [x] 6.2 `openspec validate key-creation-budget --strict` clean.
 - [ ] 6.3 `openspec-verifier` subagent, run by a non-author.
 - [ ] 6.4 Adversarial Codex (auth/permissions and quota correctness: mandatory). Two rounds by default; declined findings go under Accepted limitations in `design.md`.
 - [ ] 6.5 End-to-end check against the live server after deploy: create keys through `/api/keys` and the form until refused, then confirm an MCP tool call with a new default-limited key is quota-accounted. The report names the routes and tools actually called.

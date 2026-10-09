@@ -424,12 +424,27 @@ async def test_enabling_a_limit_resets_the_day_and_changing_one_keeps_it(quota_d
         key = (await session.execute(select(APIKey).where(APIKey.id == key_id))).scalar_one()
         assert key.daily_request_limit == 200
 
-    # Clearing returns the key to unlimited and stops the accounting.
+    # Clearing returns the key to unlimited and stops the accounting. #323
+    # edit: a blank field used to clear; it is now an error, and clearing is an
+    # administrator's explicit Unlimited box.
     async with quota_db() as session:
         await panel.set_key_limit_form(
             request=request,
             key_id=key_id,
             daily_request_limit="",
+            unlimited="",
+            session=session,
+            user=admin,
+        )
+    async with quota_db() as session:
+        key = (await session.execute(select(APIKey).where(APIKey.id == key_id))).scalar_one()
+        assert key.daily_request_limit == 200, "a blank edit changed the limit"
+    async with quota_db() as session:
+        await panel.set_key_limit_form(
+            request=request,
+            key_id=key_id,
+            daily_request_limit="",
+            unlimited="1",
             session=session,
             user=admin,
         )
